@@ -3,6 +3,7 @@ package harness
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"strings"
@@ -50,17 +51,110 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	} else if runErr != nil {
 		return res, runErr
 	}
-	// TODO: parse the --json JSONL event stream — token_count /
-	// turn.completed.usage for the Budget, turn.failed/error for limits.
+	c.parse(&res)
 	return res, nil
 }
 
+// codexEvent is one line of the `codex exec --json` JSONL stream. The schema is
+// experimental/underdocumented, so this captures only the fields we need and
+// tolerates everything else. Field names follow the documented shape (the
+// capability spike); unknown/missing fields are simply skipped.
+type codexEvent struct {
+	Type            string      `json:"type"`
+	Usage           *codexUsage `json:"usage"` // on turn.completed
+	InputTokens     *int        `json:"input_tokens"`
+	CachedInput     *int        `json:"cached_input_tokens"`
+	OutputTokens    *int        `json:"output_tokens"`
+	ReasoningTokens *int        `json:"reasoning_output_tokens"`
+	Text            string      `json:"text"`
+	Item            *codexItem  `json:"item"`
+}
+
+type codexUsage struct {
+	InputTokens     int `json:"input_tokens"`
+	CachedInput     int `json:"cached_input_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	ReasoningTokens int `json:"reasoning_output_tokens"`
+}
+
+type codexItem struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
+}
+
+// text returns the assistant message text this event carries, if any — captured
+// best-effort, preferring items that look like agent messages over tool output.
+func (ev codexEvent) text() string {
+	if ev.Item != nil && ev.Item.Text != "" {
+		if ev.Item.Type == "" || strings.Contains(ev.Item.Type, "message") || strings.Contains(ev.Item.Type, "agent") {
+			return ev.Item.Text
+		}
+	}
+	if ev.Text != "" && strings.Contains(ev.Type, "message") {
+		return ev.Text
+	}
+	return ""
+}
+
+// parse walks the JSONL stream to fill FinalMessage and Tokens (for the Budget).
+func (codex) parse(res *Result) {
+	var (
+		lastText                string
+		in, cached, out, reason int
+		sawUsage                bool
+	)
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var ev codexEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue // partial/non-JSON line — skip
+		}
+		// Take the LAST usage-bearing event as the session total. This assumes
+		// turn.completed / token_count report cumulative usage.
+		// TODO: confirm cumulative-vs-delta against real `codex exec --json`.
+		switch {
+		case ev.Usage != nil:
+			in, cached, out, reason = ev.Usage.InputTokens, ev.Usage.CachedInput, ev.Usage.OutputTokens, ev.Usage.ReasoningTokens
+			sawUsage = true
+		case ev.InputTokens != nil || ev.OutputTokens != nil:
+			in, cached, out, reason = deref(ev.InputTokens), deref(ev.CachedInput), deref(ev.OutputTokens), deref(ev.ReasoningTokens)
+			sawUsage = true
+		}
+		if t := ev.text(); t != "" {
+			lastText = t
+		}
+	}
+	res.FinalMessage = lastText
+	if sawUsage {
+		// Exclude cached input (discounted reads); reasoning counts as output spend.
+		res.Tokens = in + out + reason
+		res.Raw = map[string]any{
+			"input_tokens": in, "cached_input_tokens": cached,
+			"output_tokens": out, "reasoning_output_tokens": reason,
+		}
+	}
+}
+
+func deref(p *int) int {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
 func (codex) DetectLimit(res Result) Limit {
-	// TODO: match the provider 429 / "usage limit" in the JSONL error events.
-	// Best-effort text scan until the parser lands.
-	blob := res.Stdout + res.Stderr
-	if strings.Contains(blob, "usage limit") || strings.Contains(blob, `"statusCode":429`) || strings.Contains(blob, "rate limit") {
-		return Limit{Limited: true, Reason: "usage_limit"}
+	// Codex has no stable limit exit code and (exec --json) emits rate_limits:null,
+	// so limit detection is a best-effort text scan of the JSONL error/turn.failed
+	// events and stderr. Reset time is not exposed structurally, so ResetAt stays
+	// zero and the loop leans on interval probing.
+	blob := strings.ToLower(res.Stdout + res.Stderr)
+	for _, needle := range []string{"usage limit", "rate limit", "too many requests", `"statuscode":429`, `"status":429`} {
+		if strings.Contains(blob, needle) {
+			return Limit{Limited: true, Reason: "usage_limit"}
+		}
 	}
 	return Limit{}
 }
