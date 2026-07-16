@@ -1,0 +1,10 @@
+# built binary
+/clankerbar
+/dist/
+
+# loop state (markers + per-iteration logs)
+.clankerbar-loop/
+
+# local config that may hold paths/secrets
+/clankerbar.json
+*.local.json
