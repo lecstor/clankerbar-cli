@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -110,10 +112,78 @@ func (claude) ReadUsage(context.Context, Invocation) (Usage, error) {
 }
 
 // parseClaudeReset extracts the reset time from a message like
-// "You've hit your session limit · resets 9:40pm (Europe/Madrid)". The format is
-// timezone- and locale-fragile, so this is deliberately best-effort: on any doubt
-// it returns the zero time and the loop falls back to interval polling.
 //
-// TODO: parse the "9:40pm" clock time against the "(Europe/Madrid)" zone and
-// roll to tomorrow when it's already past — mirroring loop.sh's date logic.
-func parseClaudeReset(string) time.Time { return time.Time{} }
+//	You've hit your session limit · resets 9:40pm (Europe/Madrid)
+//	You've hit your weekly limit · resets Sunday 12:00am
+//
+// The reset is only an upper bound for the supervised wait (the loop still polls
+// for an early reset), so this is deliberately best-effort: on any doubt it
+// returns the zero time and the loop falls back to interval polling.
+func parseClaudeReset(s string) time.Time { return parseClaudeResetAt(s, time.Now()) }
+
+// resetRe captures: [weekday] hour [:minute] [am/pm] [(timezone)].
+var resetRe = regexp.MustCompile(`(?i)resets\s+(?:(mon|tue|wed|thu|fri|sat|sun)[a-z]*\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*\(([^)]+)\))?`)
+
+// parseClaudeResetAt is parseClaudeReset with an injectable "now" for testing.
+func parseClaudeResetAt(s string, now time.Time) time.Time {
+	m := resetRe.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}
+	}
+	hour, err := strconv.Atoi(m[2])
+	if err != nil {
+		return time.Time{}
+	}
+	minute := 0
+	if m[3] != "" {
+		minute, _ = strconv.Atoi(m[3])
+	}
+	switch strings.ToLower(m[4]) {
+	case "pm":
+		if hour != 12 {
+			hour += 12
+		}
+	case "am":
+		if hour == 12 {
+			hour = 0
+		}
+	}
+	if hour > 23 || minute > 59 {
+		return time.Time{}
+	}
+
+	// Interpret the clock time in the stated zone when present, else locally.
+	loc := time.Local
+	if tz := strings.TrimSpace(m[5]); tz != "" {
+		if l, lerr := time.LoadLocation(tz); lerr == nil {
+			loc = l
+		}
+	}
+	now = now.In(loc)
+	target := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, loc)
+
+	if wd := strings.ToLower(m[1]); wd != "" {
+		// Weekly: advance to the next occurrence of the named weekday in the future.
+		want, ok := weekdayNum[wd]
+		if !ok {
+			return time.Time{}
+		}
+		for i := 0; i < 8; i++ {
+			if target.Weekday() == want && target.After(now) {
+				return target
+			}
+			target = target.AddDate(0, 0, 1)
+		}
+		return time.Time{}
+	}
+	// Session: a clock time already past today means tomorrow.
+	if !target.After(now) {
+		target = target.AddDate(0, 0, 1)
+	}
+	return target
+}
+
+var weekdayNum = map[string]time.Weekday{
+	"sun": time.Sunday, "mon": time.Monday, "tue": time.Tuesday, "wed": time.Wednesday,
+	"thu": time.Thursday, "fri": time.Friday, "sat": time.Saturday,
+}
