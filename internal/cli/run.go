@@ -5,8 +5,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
@@ -21,8 +23,9 @@ func Run(ctx context.Context, args []string) error {
 		harnessName  = fs.String("harness", "", "coding-agent harness to drive: claude | codex")
 		model        = fs.String("model", "", "model to pin (harness-specific alias, e.g. opus)")
 		workdir      = fs.String("workdir", "", "directory to run the harness in (default: current dir)")
-		maxIter      = fs.Int("max-iterations", 0, "stop after N iterations (0 = until the backlog is dry or stopped)")
+		maxIter      = fs.Int("max-iterations", 0, "stop after N drain iterations (0 = run as a daemon until stopped)")
 		pollInterval = fs.Duration("poll-interval", 0, "while paused on a usage limit, re-probe this often to catch an early reset")
+		idlePoll     = fs.Duration("idle-poll-interval", 0, "when the backlog has no claimable work, re-check this often (stay running)")
 	)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: clankerbar run [flags]\n\nFlags:")
@@ -40,11 +43,12 @@ func Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("load config: %w", err)
 	}
 	cfg.ApplyFlagOverrides(config.Overrides{
-		Harness:       *harnessName,
-		Model:         *model,
-		WorkDir:       *workdir,
-		MaxIterations: *maxIter,
-		PollInterval:  time.Duration(*pollInterval),
+		Harness:          *harnessName,
+		Model:            *model,
+		WorkDir:          *workdir,
+		MaxIterations:    *maxIter,
+		PollInterval:     time.Duration(*pollInterval),
+		IdlePollInterval: time.Duration(*idlePoll),
 	})
 	if err := cfg.Validate(); err != nil {
 		return err
@@ -55,5 +59,9 @@ func Run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	return loop.New(cfg, adapter).Run(ctx)
+	// The driver reads backlog counts directly (cheap, no tokens) to gate each
+	// iteration and to keep polling while idle. Key is project-scoped, from env.
+	poller := backlog.New(cfg.BacklogURL, os.Getenv("CLANKERBAR_API_KEY"))
+
+	return loop.New(cfg, adapter, poller).Run(ctx)
 }

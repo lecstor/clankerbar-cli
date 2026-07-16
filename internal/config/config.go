@@ -43,6 +43,16 @@ type Config struct {
 	// to catch an early reset. 0 = a built-in default (see loop.supervisedWait).
 	PollInterval Duration `json:"poll_interval"`
 
+	// IdlePollInterval is how often, when the backlog has no claimable work, the
+	// loop re-checks (and logs) instead of exiting — so it reacts to answered
+	// questions, promotions, and newly filed work. 0 = a built-in default.
+	IdlePollInterval Duration `json:"idle_poll_interval"`
+
+	// BacklogURL is the clankerbar base URL the driver reads backlog counts from
+	// (cheap, no tokens). The project-scoped API key comes from CLANKERBAR_API_KEY
+	// in the environment, never the config file.
+	BacklogURL string `json:"backlog_url"`
+
 	// Budget is the circuit breaker / headroom knob. See Budget.
 	Budget Budget `json:"budget"`
 
@@ -78,8 +88,9 @@ func (b Budget) Exceeded(tokens int, costUSD float64, elapsed time.Duration) boo
 
 func defaults() *Config {
 	return &Config{
-		Harness: "claude",
-		Prompt:  "Work the backlog.",
+		Harness:    "claude",
+		Prompt:     "Work the backlog.",
+		BacklogURL: "https://clankerbar.com",
 	}
 }
 
@@ -123,11 +134,12 @@ func discover() string {
 
 // Overrides carries explicit flag values; zero values are left untouched.
 type Overrides struct {
-	Harness       string
-	Model         string
-	WorkDir       string
-	MaxIterations int
-	PollInterval  time.Duration
+	Harness          string
+	Model            string
+	WorkDir          string
+	MaxIterations    int
+	PollInterval     time.Duration
+	IdlePollInterval time.Duration
 }
 
 // ApplyFlagOverrides layers non-zero flag values over the loaded config.
@@ -146,6 +158,9 @@ func (c *Config) ApplyFlagOverrides(o Overrides) {
 	}
 	if o.PollInterval != 0 {
 		c.PollInterval = Duration(o.PollInterval)
+	}
+	if o.IdlePollInterval != 0 {
+		c.IdlePollInterval = Duration(o.IdlePollInterval)
 	}
 }
 
