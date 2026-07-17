@@ -2,14 +2,15 @@
 // a cheap backlog read, spends a fresh harness session only when there is
 // claimable work, and — crucially — stays alive and keeps polling when the queue
 // is empty, so it reacts when questions are answered, items are promoted, or new
-// work is filed. On a usage limit it pauses and polls for an early reset. All
-// durable state lives in the backlog (over MCP), so a session killed mid-task is
-// reclaimed by the next iteration.
+// work is filed. On a usage limit it pauses and polls for an early reset; on a
+// transient blip it backs off and retries. All durable state lives in the backlog
+// (over MCP), so a session killed mid-task is reclaimed by the next iteration.
 package loop
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -23,10 +24,11 @@ import (
 
 // Driver runs the loop for one harness against one backlog.
 type Driver struct {
-	cfg     *config.Config
-	h       harness.Adapter
-	backlog backlog.Poller
-	blind   bool // no cheap backlog read available — drain then idle-poll
+	cfg      *config.Config
+	h        harness.Adapter
+	backlog  backlog.Poller
+	stateDir string
+	blind    bool // no cheap backlog read available — drain then idle-poll
 }
 
 // New builds a Driver.
@@ -36,18 +38,18 @@ func New(cfg *config.Config, h harness.Adapter, poller backlog.Poller) *Driver {
 
 // Run drives the daemon until STOP/HALT, a ceiling (max-iterations / budget), or
 // context cancellation. An empty queue is NOT a stop condition — it idles and
-// keeps polling. Returns nil on a graceful stop; an error only on an unexpected
-// failure worth surfacing.
+// keeps polling. Returns nil on a graceful stop; an error only on an unexpected,
+// non-retryable failure.
 func (d *Driver) Run(ctx context.Context) error {
-	stateDir := d.cfg.ResolveStateDir()
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	d.stateDir = d.cfg.ResolveStateDir()
+	if err := os.MkdirAll(d.stateDir, 0o755); err != nil {
 		return err
 	}
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
-	log.Printf("driving %s; state in %s; idle poll every %s", d.h.Name(), stateDir, idle)
+	log.Printf("driving %s; state in %s; idle poll every %s", d.h.Name(), d.stateDir, idle)
 
 	start := time.Now()
 	var totalTokens int
@@ -59,12 +61,12 @@ func (d *Driver) Run(ctx context.Context) error {
 			log.Print("cancelled — stopping")
 			return nil
 		}
-		if present, msg := readMarker(stateDir, "HALT"); present {
-			log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(stateDir, "HALT"))
+		if present, msg := d.readMarker("HALT"); present {
+			log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.stateDir, "HALT"))
 			return nil
 		}
-		if present, _ := readMarker(stateDir, "STOP"); present {
-			_ = os.Remove(filepath.Join(stateDir, "STOP"))
+		if present, _ := d.readMarker("STOP"); present {
+			_ = os.Remove(filepath.Join(d.stateDir, "STOP"))
 			log.Print("STOP requested — stopping")
 			return nil
 		}
@@ -91,7 +93,7 @@ func (d *Driver) Run(ctx context.Context) error {
 				d.blind = true
 			case err != nil:
 				log.Printf("backlog poll error: %v — retry in %s", err, idle)
-				if d.sleep(ctx, idle) {
+				if d.waitOrStop(ctx, idle) {
 					return nil
 				}
 				continue
@@ -99,7 +101,7 @@ func (d *Driver) Run(ctx context.Context) error {
 				log.Printf("queue: ready=%d claimable=%d in_progress=%d open_questions=%d (v%d)",
 					sum.Ready, sum.Claimable, sum.InProgress, sum.OpenQuestions, sum.Version)
 				if sum.Claimable == 0 {
-					if d.sleep(ctx, idle) {
+					if d.waitOrStop(ctx, idle) {
 						return nil
 					}
 					continue
@@ -107,70 +109,140 @@ func (d *Driver) Run(ctx context.Context) error {
 			}
 		}
 
-		// There is work (or we're blind) — spend a session.
+		// There is work (or we're blind) — spend a session, retrying transient
+		// blips with backoff (a fresh session reclaims any half-done task).
 		drains++
-		log.Printf("iteration %d — spawning %s", drains, d.h.Name())
-		res, err := d.h.Invoke(ctx, d.invocation(false))
+		tokens, cost, stop, err := d.drainWithRetries(ctx, drains)
 		if err != nil {
-			if ctx.Err() != nil {
-				return nil
-			}
-			log.Printf("iteration %d: invoke error: %v — stopping (unexpected)", drains, err)
 			return err
 		}
-		totalTokens += res.Tokens
-		totalCost += res.CostUSD
-
-		if lim := d.h.DetectLimit(res); lim.Limited {
-			log.Printf("iteration %d hit a usage limit", drains)
-			if err := d.supervisedWait(ctx, lim); err != nil {
-				return err
-			}
-			continue // retry — clankerbar reclaims any half-done task
+		if stop {
+			return nil
 		}
-		log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drains, res.Tokens, res.CostUSD)
+		totalTokens += tokens
+		totalCost += cost
 
 		// In blind mode a "work the backlog" session drains everything ready, so
 		// idle before re-attempting. In wired mode, loop straight back — the next
 		// cheap poll decides whether more work appeared.
 		if d.blind {
 			log.Printf("idle — re-checking in %s", idle)
-			if d.sleep(ctx, idle) {
+			if d.waitOrStop(ctx, idle) {
 				return nil
 			}
 		}
 	}
 }
 
+// drainWithRetries runs one drain to a clean finish, absorbing usage-limit pauses
+// (supervised wait) and transient blips (exponential backoff) by re-running the
+// SAME session — neither costs a drain count. Returns the tokens/cost consumed on
+// a clean finish; stop=true if a STOP/cancel landed during a wait; err only on a
+// genuine, non-retryable failure (or exhausted retries).
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int, cost float64, stop bool, err error) {
+	retries := 0
+	for {
+		if retries == 0 {
+			log.Printf("iteration %d — spawning %s", drainNum, d.h.Name())
+		}
+		res, ierr := d.h.Invoke(ctx, d.invocation(false))
+		if ierr != nil {
+			if ctx.Err() != nil {
+				return 0, 0, true, nil
+			}
+			// Couldn't launch the harness at all (bad PATH/flags/env) — not a blip.
+			return 0, 0, false, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
+		}
+
+		// Subscription usage cap → supervised wait, then re-run the same session.
+		if lim := d.h.DetectLimit(res); lim.Limited {
+			log.Printf("iteration %d hit a usage limit", drainNum)
+			if d.supervisedWait(ctx, lim) {
+				return 0, 0, true, nil
+			}
+			continue
+		}
+
+		if res.ExitCode == 0 {
+			log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drainNum, res.Tokens, res.CostUSD)
+			return res.Tokens, res.CostUSD, false, nil
+		}
+
+		// Non-zero exit, not the usage cap: a transient server/network blip backs
+		// off and retries; anything else is a genuine failure and stops.
+		if d.h.IsTransient(res) {
+			retries++
+			if d.cfg.MaxRetries > 0 && retries > d.cfg.MaxRetries {
+				return 0, 0, false, fmt.Errorf(
+					"iteration %d: transient failures persisted after %d retries (check https://status.claude.com; rerun to resume)",
+					drainNum, d.cfg.MaxRetries)
+			}
+			wait := d.backoff(retries)
+			log.Printf("iteration %d transient failure (exit %d) — %s in %s (a fresh session reclaims any half-done task)",
+				drainNum, res.ExitCode, retryLabel(retries, d.cfg.MaxRetries), wait)
+			if d.waitOrStop(ctx, wait) {
+				return 0, 0, true, nil
+			}
+			continue
+		}
+
+		return 0, 0, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping", drainNum, d.h.Name(), res.ExitCode)
+	}
+}
+
 // supervisedWait pauses on a usage limit, then polls for an early reset rather
-// than sleeping blindly to the stated reset — the window frees semi-randomly and
-// the stated time is only an upper bound.
-func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit) error {
+// than sleeping blindly to the stated reset. Returns true if the loop should stop
+// (STOP marker or context cancel during the wait).
+func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit) (stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
 	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 
 	for {
-		if d.sleep(ctx, interval) {
-			return nil
+		if d.waitOrStop(ctx, interval) {
+			return true
 		}
 		if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) {
 			log.Print("stated reset passed — resuming")
-			return nil
+			return false
 		}
 		got, err := d.h.Probe(ctx, d.invocation(true))
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return true
 			}
 			log.Printf("probe error: %v — will retry next interval", err)
 			continue
 		}
 		if !got.Limited {
 			log.Print("limit lifted — resuming")
-			return nil
+			return false
 		}
 		log.Print("still limited — continuing to wait")
 	}
+}
+
+// backoff is the exponential delay before transient retry n (1-based): 30s, 60s,
+// 120s, ..., capped at RetryCap. Computed by doubling to avoid shift overflow.
+func (d *Driver) backoff(n int) time.Duration {
+	ceil := d.cfg.RetryCap.OrDefault(300 * time.Second)
+	b := 30 * time.Second
+	for i := 1; i < n; i++ {
+		b *= 2
+		if b >= ceil {
+			return ceil
+		}
+	}
+	if b > ceil {
+		return ceil
+	}
+	return b
+}
+
+func retryLabel(n, max int) string {
+	if max > 0 {
+		return fmt.Sprintf("retry %d/%d", n, max)
+	}
+	return fmt.Sprintf("retry %d", n)
 }
 
 func (d *Driver) invocation(probe bool) harness.Invocation {
@@ -183,19 +255,36 @@ func (d *Driver) invocation(probe bool) harness.Invocation {
 	}
 }
 
-// sleep waits dur or until the context is cancelled; it reports cancellation.
-func (d *Driver) sleep(ctx context.Context, dur time.Duration) bool {
-	select {
-	case <-ctx.Done():
-		return true
-	case <-time.After(dur):
-		return false
+// waitOrStop waits up to dur, but stays responsive to a STOP marker (consuming it)
+// and to context cancellation. Reports whether the loop should stop.
+func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
+	const chunk = 3 * time.Second
+	end := time.Now().Add(dur)
+	for {
+		if present, _ := d.readMarker("STOP"); present {
+			_ = os.Remove(filepath.Join(d.stateDir, "STOP"))
+			log.Print("STOP requested during wait — stopping")
+			return true
+		}
+		remaining := time.Until(end)
+		if remaining <= 0 {
+			return false
+		}
+		w := chunk
+		if remaining < w {
+			w = remaining
+		}
+		select {
+		case <-ctx.Done():
+			return true
+		case <-time.After(w):
+		}
 	}
 }
 
 // readMarker reports whether a control marker file exists, and its first line.
-func readMarker(dir, name string) (bool, string) {
-	b, err := os.ReadFile(filepath.Join(dir, name))
+func (d *Driver) readMarker(name string) (bool, string) {
+	b, err := os.ReadFile(filepath.Join(d.stateDir, name))
 	if err != nil {
 		return false, ""
 	}

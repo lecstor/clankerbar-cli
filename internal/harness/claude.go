@@ -105,6 +105,18 @@ func (c claude) Probe(ctx context.Context, in Invocation) (Limit, error) {
 	return c.DetectLimit(res), nil
 }
 
+// claudeTransientRe anchors on the "API Error:" prefix (and bare connection
+// errors) so a task log that legitimately mentions an HTTP 500 can't be mistaken
+// for a dead session. A 400 bad-request is NOT here — retrying won't help it.
+// Ported from loop.sh's TRANSIENT_RE.
+var claudeTransientRe = regexp.MustCompile(`(?i)api error: (408|429|5\d\d)` +
+	`|api error:.*(overloaded|internal server|bad gateway|service unavailable|gateway time|too many requests)` +
+	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
+
+func (claude) IsTransient(res Result) bool {
+	return claudeTransientRe.MatchString(res.Stdout + res.Stderr)
+}
+
 func (claude) ReadUsage(context.Context, Invocation) (Usage, error) {
 	// /usage is TTY-only; --output-format json carries no remaining quota; no
 	// local file persists it (see the memo, and anthropics/claude-code#32796).

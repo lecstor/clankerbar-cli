@@ -53,6 +53,15 @@ type Config struct {
 	// in the environment, never the config file.
 	BacklogURL string `json:"backlog_url"`
 
+	// MaxRetries bounds consecutive transient-failure retries within one drain
+	// before the loop gives up. 0 = never give up (keep retrying at the backoff
+	// ceiling until the API recovers) — the right default for a persistent daemon.
+	MaxRetries int `json:"max_retries"`
+
+	// RetryCap ceilings the exponential backoff between transient retries
+	// (30s → 60s → 120s → ..., capped here). 0 = a built-in default (300s).
+	RetryCap Duration `json:"retry_cap"`
+
 	// Budget is the circuit breaker / headroom knob. See Budget.
 	Budget Budget `json:"budget"`
 

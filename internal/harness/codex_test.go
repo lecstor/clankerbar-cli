@@ -36,21 +36,44 @@ func TestCodexParse_empty(t *testing.T) {
 }
 
 func TestCodexDetectLimit(t *testing.T) {
+	// DetectLimit is the SUBSCRIPTION cap only; API 429s are transient (below).
 	cases := []struct {
 		name string
 		blob string
 		want bool
 	}{
-		{"429 statusCode", `{"type":"turn.failed","error":{"statusCode":429,"message":"rate limited"}}`, true},
 		{"usage limit prose", "You've hit your usage limit, try again in 4 hours", true},
-		{"too many requests", "Error: 429 Too Many Requests", true},
+		{"weekly limit", "you've hit your weekly limit", true},
+		{"429 is transient not the cap", `{"type":"turn.failed","error":{"statusCode":429}}`, false},
 		{"clean run", `{"type":"turn.completed","usage":{"input_tokens":10}}`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := codex{}.DetectLimit(Result{Stdout: tc.blob}).Limited
-			if got != tc.want {
+			if got := (codex{}).DetectLimit(Result{Stdout: tc.blob}).Limited; got != tc.want {
 				t.Errorf("DetectLimit = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCodexIsTransient(t *testing.T) {
+	cases := []struct {
+		name string
+		blob string
+		want bool
+	}{
+		{"429 statusCode", `{"type":"turn.failed","error":{"statusCode":429}}`, true},
+		{"5xx statusCode", `{"error":{"statusCode":503}}`, true},
+		{"too many requests", "Error: 429 Too Many Requests", true},
+		{"connection blip", "fetch failed", true},
+		{"overloaded", "provider overloaded", true},
+		{"subscription cap is not transient", "you've hit your usage limit", false},
+		{"clean run", `{"type":"turn.completed","usage":{"input_tokens":10}}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (codex{}).IsTransient(Result{Stdout: tc.blob}); got != tc.want {
+				t.Errorf("IsTransient = %v, want %v", got, tc.want)
 			}
 		})
 	}

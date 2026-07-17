@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 )
 
@@ -146,17 +147,27 @@ func deref(p *int) int {
 }
 
 func (codex) DetectLimit(res Result) Limit {
-	// Codex has no stable limit exit code and (exec --json) emits rate_limits:null,
-	// so limit detection is a best-effort text scan of the JSONL error/turn.failed
-	// events and stderr. Reset time is not exposed structurally, so ResetAt stays
-	// zero and the loop leans on interval probing.
+	// The subscription usage cap (the long-pause case) only. An API-level 429 /
+	// "rate limit" / "too many requests" is a transient blip handled by IsTransient,
+	// NOT this. Codex exposes no structured reset, so ResetAt stays zero and the
+	// loop leans on interval probing.
 	blob := strings.ToLower(res.Stdout + res.Stderr)
-	for _, needle := range []string{"usage limit", "rate limit", "too many requests", `"statuscode":429`, `"status":429`} {
+	for _, needle := range []string{"usage limit", "weekly limit", "session limit"} {
 		if strings.Contains(blob, needle) {
 			return Limit{Limited: true, Reason: "usage_limit"}
 		}
 	}
 	return Limit{}
+}
+
+// codexTransientRe: API-level rate limits (429/too many requests) and server/
+// network blips are retryable; the subscription cap (DetectLimit) is not.
+var codexTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d\d)` +
+	`|overloaded|too many requests|rate limit` +
+	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
+
+func (codex) IsTransient(res Result) bool {
+	return codexTransientRe.MatchString(res.Stdout + res.Stderr)
 }
 
 func (c codex) Probe(ctx context.Context, in Invocation) (Limit, error) {

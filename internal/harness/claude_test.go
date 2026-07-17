@@ -61,6 +61,35 @@ func TestParseClaudeResetAt(t *testing.T) {
 	}
 }
 
+func TestClaudeIsTransient(t *testing.T) {
+	cases := []struct {
+		name string
+		blob string
+		want bool
+	}{
+		{"API 500", "API Error: 500 Internal Server Error", true},
+		{"API 529 overloaded", `API Error: 529 {"type":"overloaded_error"}`, true},
+		{"API 429", "API Error: 429 Too Many Requests", true},
+		{"connection error", "Connection error.", true},
+		{"econnreset", "read ECONNRESET", true},
+		// Anchored: a task log mentioning an HTTP 500 without the API Error prefix
+		// is NOT a dead session.
+		{"task log mentions 500", "the endpoint returned HTTP 500 to the user", false},
+		// A 400 bad-request is a real failure — retrying won't help.
+		{"API 400 stops", "API Error: 400 invalid request", false},
+		// The subscription cap is handled by DetectLimit, not here.
+		{"usage cap not transient", "You've hit your session limit · resets 9:40pm", false},
+		{"clean", "done", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (claude{}).IsTransient(Result{Stdout: tc.blob}); got != tc.want {
+				t.Errorf("IsTransient(%q) = %v, want %v", tc.blob, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestParseClaudeResetAt_unparseable(t *testing.T) {
 	now := time.Now()
 	for _, msg := range []string{

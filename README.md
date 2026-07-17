@@ -61,7 +61,10 @@ the likely final format.)
   "model": "opus",
   "prompt": "Work the backlog.",
   "mcp_config_path": "./clankerbar-mcp.json",
+  "idle_poll_interval": "60s",
   "poll_interval": "30m",
+  "max_retries": 0,
+  "retry_cap": "5m",
   "budget": {
     "max_tokens": 0,
     "max_cost_usd": 0,
@@ -69,6 +72,20 @@ the likely final format.)
   }
 }
 ```
+
+### Resilience
+
+A fresh session can die on a server blip (API 5xx / overloaded) or a network
+hiccup — nothing to do with the task. These are **retried with exponential
+backoff** (30s → 60s → … capped at `retry_cap`), re-running the same iteration; a
+fresh session reclaims any half-done task, so a retry costs minutes, not work.
+Detection is anchored (Claude's `API Error:` prefix, connection-error strings), so
+a task log that merely *mentions* an HTTP 500 isn't mistaken for a dead session,
+and a `400` still stops. `max_retries: 0` (the default) means **never give up** —
+keep retrying at the ceiling until the API recovers, right for a daemon; set a
+positive number to bound it. A usage-limit pause and a transient retry both re-run
+the same iteration and neither advances the iteration count. `STOP` stays
+responsive during any wait.
 
 ### Not getting locked out
 

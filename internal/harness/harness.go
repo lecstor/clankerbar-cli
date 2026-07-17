@@ -25,10 +25,18 @@ type Adapter interface {
 	// cancellation (Ctrl-C / SIGTERM / a supervised-wait deadline).
 	Invoke(ctx context.Context, in Invocation) (Result, error)
 
-	// DetectLimit decides whether a finished Result died on a usage/rate limit,
-	// and if so when it is expected to reset (best-effort; the reset is an upper
-	// bound, not a wake signal — the loop polls for an early reset).
+	// DetectLimit decides whether a finished Result died on the subscription usage
+	// cap (5-hour / weekly), and if so when it is expected to reset (best-effort;
+	// the reset is an upper bound, not a wake signal — the loop polls for an early
+	// reset). This is the long-pause case, distinct from a transient blip.
 	DetectLimit(Result) Limit
+
+	// IsTransient reports whether a non-zero exit is a retryable server/network
+	// blip (API 5xx/408/429, overloaded, connection reset, ...) rather than a real
+	// failure — so the loop backs off and retries the same iteration instead of
+	// dying. Detection is anchored (e.g. on Claude's "API Error:" prefix) so a task
+	// log that merely mentions an HTTP 500 is not mistaken for a dead session.
+	IsTransient(Result) bool
 
 	// Probe runs the cheapest possible request to answer "am I still limited?"
 	// without doing real work — used while paused to catch an early reset.
