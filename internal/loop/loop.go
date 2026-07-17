@@ -269,6 +269,8 @@ func (d *Driver) invocation(probe bool) harness.Invocation {
 		WorkDir:       d.cfg.WorkDir,
 		MCPConfigPath: d.cfg.MCPConfigPath,
 		ConfigDir:     d.cfg.ConfigDir,
+		SettingsPath:  d.cfg.SettingsPath,
+		Env:           d.cfg.EnvSlice(),
 		Probe:         probe,
 	}
 }

@@ -41,6 +41,12 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if in.MCPConfigPath != "" {
 		args = append(args, "--mcp-config", in.MCPConfigPath, "--strict-mcp-config")
 	}
+	// The headless permission policy: with no human to prompt, an unattended run
+	// is gated entirely by this file's allow/deny rules (deny wins over the
+	// config-dir's ambient allowlist).
+	if in.SettingsPath != "" {
+		args = append(args, "--settings", in.SettingsPath)
+	}
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	if in.WorkDir != "" {

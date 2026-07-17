@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -76,7 +77,29 @@ type Config struct {
 	// logs. Empty = "<workdir>/.clankerbar-loop".
 	StateDir string `json:"state_dir"`
 
-	source string // path the config was loaded from, for diagnostics
+	// SettingsPath points the harness at an extra settings file (Claude Code's
+	// --settings) carrying the headless permission policy — the allow/deny rules
+	// that gate what an unattended run may call, since there is no human to prompt
+	// and no interactive auto-mode classifier. It MERGES with (does not replace)
+	// the config-dir's own settings, and deny rules win — so this file's job is to
+	// grant the few tools the run needs and to deny the exfil vectors the ambient
+	// allowlist leaves open. Claude-specific; other harnesses ignore it. ~ expands.
+	SettingsPath string `json:"settings_path"`
+
+	// Env is extra environment for the spawned harness process, as KEY=VALUE
+	// pairs. The child already inherits the loop's own environment, so this is for
+	// the unattended case (cron / launchd / systemd) where there is no interactive
+	// shell to export into — e.g. supplying CLAUDE_CODE_OAUTH_TOKEN when auth lives
+	// in a shell alias rather than the config dir.
+	//
+	// A value of the form "@path" is replaced by the contents of that file
+	// (trimmed; a leading ~ is expanded). Keep a secret in a 0600 file and point at
+	// it here rather than inlining it — mirroring CLANKERBAR_API_KEY, which is read
+	// from the environment, never this config file.
+	Env map[string]string `json:"env"`
+
+	source string   // path the config was loaded from, for diagnostics
+	env    []string // resolved KEY=VALUE pairs (built in Validate)
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
@@ -199,6 +222,7 @@ func (c *Config) Validate() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
 	c.WorkDir = expandHome(c.WorkDir)
 	c.MCPConfigPath = expandHome(c.MCPConfigPath)
+	c.SettingsPath = expandHome(c.SettingsPath)
 	c.StateDir = expandHome(c.StateDir)
 
 	switch c.Harness {
@@ -209,8 +233,45 @@ func (c *Config) Validate() error {
 	if c.Prompt == "" {
 		return errors.New("prompt is empty")
 	}
+	resolved, err := resolveEnv(c.Env)
+	if err != nil {
+		return err
+	}
+	c.env = resolved
 	return nil
 }
+
+// resolveEnv turns the env map into sorted KEY=VALUE pairs, reading "@path"
+// values from disk so a secret needn't be inlined in the config file. Sorting
+// keeps the child's environment deterministic across runs.
+func resolveEnv(m map[string]string) ([]string, error) {
+	if len(m) == 0 {
+		return nil, nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		v := m[k]
+		if strings.HasPrefix(v, "@") {
+			path := expandHome(strings.TrimPrefix(v, "@"))
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return nil, fmt.Errorf("env %s: %w", k, err)
+			}
+			v = strings.TrimSpace(string(data))
+		}
+		out = append(out, k+"="+v)
+	}
+	return out, nil
+}
+
+// EnvSlice returns the resolved extra environment (KEY=VALUE) for the harness,
+// populated by Validate. Nil when no env is configured.
+func (c *Config) EnvSlice() []string { return c.env }
 
 // ResolveStateDir returns where control markers and logs live.
 func (c *Config) ResolveStateDir() string {

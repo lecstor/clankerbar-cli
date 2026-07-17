@@ -61,6 +61,10 @@ type Invocation struct {
 	// headless session loads the same skills, plugins, and auth as the interactive
 	// one. Empty inherits the ambient environment.
 	ConfigDir string
+	// SettingsPath is an extra settings file (Claude Code --settings) carrying the
+	// headless permission policy. Merges with the config-dir's settings; deny wins.
+	// Empty = no extra file. Claude-specific; other adapters ignore it.
+	SettingsPath string
 	// Console is where the adapter streams live, human-readable progress (the
 	// terminal and/or a per-iteration logfile). Nil → os.Stderr.
 	Console io.Writer
