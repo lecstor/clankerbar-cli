@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -183,8 +184,23 @@ func (c *Config) ApplyFlagOverrides(o Overrides) {
 	}
 }
 
-// Validate checks the resolved config is runnable.
+// expandHome expands a leading ~ (Go does not do this for us).
+func expandHome(p string) string {
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, strings.TrimPrefix(p, "~"))
+		}
+	}
+	return p
+}
+
+// Validate normalizes path fields and checks the resolved config is runnable.
 func (c *Config) Validate() error {
+	c.ConfigDir = expandHome(c.ConfigDir)
+	c.WorkDir = expandHome(c.WorkDir)
+	c.MCPConfigPath = expandHome(c.MCPConfigPath)
+	c.StateDir = expandHome(c.StateDir)
+
 	switch c.Harness {
 	case "claude", "codex":
 	default:
