@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 	"time"
@@ -56,7 +57,14 @@ type Invocation struct {
 	Model         string
 	WorkDir       string
 	MCPConfigPath string
-	Env           []string // extra env, appended to the process environment
+	// ConfigDir sets the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
+	// headless session loads the same skills, plugins, and auth as the interactive
+	// one. Empty inherits the ambient environment.
+	ConfigDir string
+	// Console is where the adapter streams live, human-readable progress (the
+	// terminal and/or a per-iteration logfile). Nil → os.Stderr.
+	Console io.Writer
+	Env     []string // extra env, appended to the process environment
 	// Probe marks this as a cheap liveness check, not real work — adapters run
 	// the smallest possible request instead of the drain prompt.
 	Probe bool

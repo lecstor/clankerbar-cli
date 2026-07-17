@@ -1,9 +1,37 @@
 package harness
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestClaudeRenderAndParse(t *testing.T) {
+	var res Result
+	var console bytes.Buffer
+	lines := []string{
+		`{"type":"system","subtype":"init"}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"Draining."},{"type":"tool_use","name":"Bash"}]}}`,
+		`{"type":"result","subtype":"success","result":"Backlog drained.","total_cost_usd":0.12,"usage":{"input_tokens":100,"output_tokens":20}}`,
+		`not json — must be tolerated`,
+	}
+	for _, l := range lines {
+		(claude{}).renderAndParse([]byte(l), &console, &res)
+	}
+	if res.FinalMessage != "Backlog drained." {
+		t.Errorf("FinalMessage = %q", res.FinalMessage)
+	}
+	if res.Tokens != 120 {
+		t.Errorf("Tokens = %d, want 120", res.Tokens)
+	}
+	if res.CostUSD != 0.12 {
+		t.Errorf("CostUSD = %v, want 0.12", res.CostUSD)
+	}
+	if out := console.String(); !strings.Contains(out, "Draining.") || !strings.Contains(out, "Bash") {
+		t.Errorf("console missing rendered content:\n%s", out)
+	}
+}
 
 func TestParseClaudeResetAt(t *testing.T) {
 	madrid, err := time.LoadLocation("Europe/Madrid")

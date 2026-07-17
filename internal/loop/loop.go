@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -142,10 +143,26 @@ func (d *Driver) Run(ctx context.Context) error {
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int, cost float64, stop bool, err error) {
 	retries := 0
 	for {
-		if retries == 0 {
-			log.Printf("iteration %d — spawning %s", drainNum, d.h.Name())
+		// Each attempt streams live to the terminal and to its own logfile.
+		inv := d.invocation(false)
+		logPath := filepath.Join(d.stateDir, "iteration-"+time.Now().Format("20060102-150405")+".log")
+		f, ferr := os.Create(logPath)
+		if ferr == nil {
+			inv.Console = io.MultiWriter(os.Stderr, f)
+		} else {
+			inv.Console = os.Stderr
+			log.Printf("could not open iteration log %s: %v", logPath, ferr)
 		}
-		res, ierr := d.h.Invoke(ctx, d.invocation(false))
+		if retries == 0 {
+			log.Printf("iteration %d — spawning %s (log: %s)", drainNum, d.h.Name(), logPath)
+		} else {
+			log.Printf("iteration %d — retry %d, spawning %s (log: %s)", drainNum, retries, d.h.Name(), logPath)
+		}
+
+		res, ierr := d.h.Invoke(ctx, inv)
+		if f != nil {
+			_ = f.Close()
+		}
 		if ierr != nil {
 			if ctx.Err() != nil {
 				return 0, 0, true, nil
@@ -251,6 +268,7 @@ func (d *Driver) invocation(probe bool) harness.Invocation {
 		Model:         d.cfg.Model,
 		WorkDir:       d.cfg.WorkDir,
 		MCPConfigPath: d.cfg.MCPConfigPath,
+		ConfigDir:     d.cfg.ConfigDir,
 		Probe:         probe,
 	}
 }

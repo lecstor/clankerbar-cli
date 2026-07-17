@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -41,9 +42,19 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = append(os.Environ(), in.Env...)
+	if in.ConfigDir != "" {
+		cmd.Env = append(cmd.Env, "CODEX_HOME="+in.ConfigDir)
+	}
 
+	// Capture for parsing, and tee live to the console when one is set (the JSONL
+	// event stream — a readable renderer is a TODO; raw is honest live output).
 	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if in.Console != nil && !in.Probe {
+		cmd.Stdout = io.MultiWriter(&stdout, in.Console)
+		cmd.Stderr = io.MultiWriter(&stderr, in.Console)
+	} else {
+		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	}
 	runErr := cmd.Run()
 
 	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}

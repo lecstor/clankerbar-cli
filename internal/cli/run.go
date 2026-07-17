@@ -23,6 +23,7 @@ func Run(ctx context.Context, args []string) error {
 		harnessName  = fs.String("harness", "", "coding-agent harness to drive: claude | codex")
 		model        = fs.String("model", "", "model to pin (harness-specific alias, e.g. opus)")
 		workdir      = fs.String("workdir", "", "directory to run the harness in (default: current dir)")
+		configDir    = fs.String("config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) — for skill/plugin/auth parity")
 		maxIter      = fs.Int("max-iterations", 0, "stop after N drain iterations (0 = run as a daemon until stopped)")
 		pollInterval = fs.Duration("poll-interval", 0, "while paused on a usage limit, re-probe this often to catch an early reset")
 		idlePoll     = fs.Duration("idle-poll-interval", 0, "when the backlog has no claimable work, re-check this often (stay running)")
@@ -46,6 +47,7 @@ func Run(ctx context.Context, args []string) error {
 		Harness:          *harnessName,
 		Model:            *model,
 		WorkDir:          *workdir,
+		ConfigDir:        *configDir,
 		MaxIterations:    *maxIter,
 		PollInterval:     time.Duration(*pollInterval),
 		IdlePollInterval: time.Duration(*idlePoll),

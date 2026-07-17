@@ -46,8 +46,24 @@ clankerbar run --config ./clankerbar.json
 Control an in-flight run with markers in the state dir (`<workdir>/.clankerbar-loop`):
 
 ```sh
-touch .clankerbar-loop/STOP     # stop gracefully after the current iteration
+touch .clankerbar-loop/STOP     # stop gracefully (responsive even mid-wait)
 ```
+
+### Visibility
+
+The driver logs milestones to your terminal as it goes (timestamped): spawning,
+queue state each poll, done + tokens/cost, usage-limit pauses, transient retries.
+The Claude harness runs with `--output-format stream-json`, so the agent's own
+progress — assistant text and `→ Tool` markers — streams live too, and each
+attempt is captured to its own `<state-dir>/iteration-<ts>.log`.
+
+### Skills, plugins, and auth
+
+A headless session loads **project** skills from the working directory
+(`.claude/skills/`) and **user/plugin** skills + auth from the config dir. Set
+`config_dir` (→ `CLAUDE_CONFIG_DIR` / `CODEX_HOME`) so an unattended run loads the
+*same* skills, plugins, and login as your interactive session — a bare cron
+environment would otherwise have none of them.
 
 ## Config
 
@@ -60,7 +76,8 @@ the likely final format.)
   "harness": "claude",
   "model": "opus",
   "prompt": "Work the backlog.",
-  "mcp_config_path": "./clankerbar-mcp.json",
+  "mcp_config_path": "./.mcp.json",
+  "config_dir": "~/.claude",
   "idle_poll_interval": "60s",
   "poll_interval": "30m",
   "max_retries": 0,

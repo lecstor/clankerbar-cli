@@ -30,6 +30,12 @@ type Config struct {
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
 	WorkDir string `json:"workdir"`
 
+	// ConfigDir pins the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
+	// headless session loads the same skills, plugins, and auth as the interactive
+	// one. Empty inherits the ambient environment — declare it for an unattended
+	// daemon / cron, whose bare environment would otherwise have none of them.
+	ConfigDir string `json:"config_dir"`
+
 	// MCPConfigPath points the harness at the clankerbar MCP server. Claude Code
 	// takes it as --mcp-config (NOT auto-discovered in -p mode); Codex merges it
 	// into config.toml [mcp_servers]. See the adapters.
@@ -146,6 +152,7 @@ type Overrides struct {
 	Harness          string
 	Model            string
 	WorkDir          string
+	ConfigDir        string
 	MaxIterations    int
 	PollInterval     time.Duration
 	IdlePollInterval time.Duration
@@ -161,6 +168,9 @@ func (c *Config) ApplyFlagOverrides(o Overrides) {
 	}
 	if o.WorkDir != "" {
 		c.WorkDir = o.WorkDir
+	}
+	if o.ConfigDir != "" {
+		c.ConfigDir = o.ConfigDir
 	}
 	if o.MaxIterations != 0 {
 		c.MaxIterations = o.MaxIterations
