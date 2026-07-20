@@ -171,8 +171,16 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 			return 0, 0, false, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
 		}
 
-		// Subscription usage cap → supervised wait, then re-run the same session.
+		// A usage limit. A rolling-window subscription cap is waited out and the
+		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
+		// poll for, so the run stops cleanly and the operator resumes it once
+		// they've topped up.
 		if lim := d.h.DetectLimit(res); lim.Limited {
+			if lim.Stop {
+				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved)",
+					drainNum, limitReason(lim))
+				return 0, 0, true, nil
+			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
 			if d.supervisedWait(ctx, lim) {
 				return 0, 0, true, nil
@@ -320,4 +328,13 @@ func resetSuffix(t time.Time) string {
 		return ""
 	}
 	return " (stated reset " + t.Format("Mon 15:04") + ")"
+}
+
+// limitReason renders a limit's reason for a log line, defaulting when a harness
+// leaves it blank.
+func limitReason(lim harness.Limit) string {
+	if lim.Reason != "" {
+		return lim.Reason
+	}
+	return "usage limit"
 }

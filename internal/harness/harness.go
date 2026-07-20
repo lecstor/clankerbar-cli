@@ -88,6 +88,12 @@ type Result struct {
 // Limit describes a usage/rate-limit state.
 type Limit struct {
 	Limited bool
+	// Stop marks a HARD limit the loop cannot wait out: a budget/credit
+	// exhaustion (out of credits, spend-cap or monthly-limit reached) with no
+	// rolling-window reset to poll for. The loop stops the run cleanly instead of
+	// entering the supervised wait. Zero value (false) keeps the wait-and-poll
+	// behaviour for the rolling-window subscription caps that claude/codex hit.
+	Stop    bool
 	ResetAt time.Time // zero = unknown
 	Reason  string
 }
