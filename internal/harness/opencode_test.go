@@ -53,6 +53,21 @@ func TestOpencodeParse_multiStep(t *testing.T) {
 	}
 }
 
+// A step-finish that carries cost but no tokens block must still contribute its
+// cost to the budget total (the two fields are independent siblings).
+func TestOpencodeParse_costOnlyStep(t *testing.T) {
+	const stream = `{"type":"text","part":{"type":"text","text":"ok"}}
+{"type":"step_finish","part":{"type":"step-finish","cost":0.05}}`
+	res := Result{Stdout: stream}
+	opencode{}.parse(&res)
+	if res.CostUSD != 0.05 {
+		t.Errorf("CostUSD = %v, want 0.05 (cost counted without a tokens block)", res.CostUSD)
+	}
+	if res.Tokens != 0 {
+		t.Errorf("Tokens = %d, want 0", res.Tokens)
+	}
+}
+
 func TestOpencodeParse_empty(t *testing.T) {
 	res := Result{Stdout: ""}
 	opencode{}.parse(&res)
@@ -62,25 +77,27 @@ func TestOpencodeParse_empty(t *testing.T) {
 }
 
 func TestOpencodeDetectLimit(t *testing.T) {
-	// DetectLimit is the HARD budget/credit-exhaustion STOP only; an API 429 rate
-	// limit is transient (below), not this.
+	// DetectLimit is the HARD budget/credit-exhaustion STOP only, and only from the
+	// harness's own diagnostics (an error event, or stderr) — never the agent's
+	// narration. An API 429 rate limit is transient (below), not this.
 	cases := []struct {
 		name string
-		blob string
+		res  Result
 		want bool
 	}{
-		{"402 payment required (opencode error event)", `{"type":"error","error":{"data":{"message":"Payment Required","statusCode":402,"isRetryable":false}}}`, true},
-		{"out of credits prose", "Your account is out of credits", true},
-		{"insufficient credits", `{"error":{"message":"Insufficient credits to run this request"}}`, true},
-		{"openrouter credit balance too low", "Your credit balance is too low to access this model", true},
-		{"monthly limit reached", "You have reached your monthly limit", true},
-		{"spend cap", "spend cap exceeded for this workspace", true},
-		{"429 is transient not the cap", `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`, false},
-		{"clean run", opencodeStream, false},
+		{"402 payment required (opencode error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Payment Required","statusCode":402,"isRetryable":false}}}`}, true},
+		{"out of credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your account is out of credits"}}}`}, true},
+		{"insufficient credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Insufficient credits to run this request"}}}`}, true},
+		{"openrouter credit balance too low (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your credit balance is too low to access this model"}}}`}, true},
+		{"monthly limit reached (stderr diagnostic)", Result{Stderr: "opencode: you have reached your monthly limit"}, true},
+		{"spend cap (stderr diagnostic)", Result{Stderr: "spend cap exceeded for this workspace"}, true},
+		{"429 is transient not the cap", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`}, false},
+		{"agent narration about credits is NOT a stop", Result{Stdout: `{"type":"text","part":{"type":"text","text":"The billing note says the account is out of credits and hit its monthly limit."}}`}, false},
+		{"clean run", Result{Stdout: opencodeStream}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := (opencode{}).DetectLimit(Result{Stdout: tc.blob})
+			got := (opencode{}).DetectLimit(tc.res)
 			if got.Limited != tc.want {
 				t.Errorf("DetectLimit.Limited = %v, want %v", got.Limited, tc.want)
 			}

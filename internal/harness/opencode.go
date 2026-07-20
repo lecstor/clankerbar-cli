@@ -201,6 +201,8 @@ func (opencode) parse(res *Result) {
 				lastText = t
 			}
 		case "step_finish":
+			// tokens and cost are siblings on the part; count each independently so
+			// a step that reports one without the other still lands in the budget.
 			if tk := ev.Part.Tokens; tk != nil {
 				total += tk.Total
 				in += tk.Input
@@ -208,6 +210,9 @@ func (opencode) parse(res *Result) {
 				reason += tk.Reasoning
 				cWrite += tk.Cache.Write
 				cRead += tk.Cache.Read
+				sawUsage = true
+			}
+			if ev.Part.Cost != 0 {
 				cost += ev.Part.Cost
 				sawUsage = true
 			}
@@ -240,10 +245,37 @@ var opencodeBudgetRe = regexp.MustCompile(`(?i)"status(code)?": ?402` +
 	`|monthly (usage )?limit|billing (hard )?limit|usage limit reached`)
 
 func (opencode) DetectLimit(res Result) Limit {
-	if opencodeBudgetRe.MatchString(res.Stdout + res.Stderr) {
+	// Scan only the harness's own diagnostics, NOT the agent's narration: with
+	// --format json the assistant's text is a {"type":"text"} part on stdout, so a
+	// task that merely discusses billing ("we're out of credits") must not trip a
+	// terminal stop. Budget errors arrive as a {"type":"error"} event (or plain
+	// text on stderr), which is what opencodeErrorText gathers.
+	if opencodeBudgetRe.MatchString(opencodeErrorText(res)) {
 		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
 	}
 	return Limit{}
+}
+
+// opencodeErrorText collects the harness-level diagnostic text — all of stderr,
+// plus the stdout lines that decode to a {"type":"error"} event — so a limit scan
+// sees provider/transport errors but never the agent's own assistant text.
+func opencodeErrorText(res Result) string {
+	var b strings.Builder
+	b.WriteString(res.Stderr)
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "error" {
+			b.WriteByte('\n')
+			b.WriteString(line)
+		}
+	}
+	return b.String()
 }
 
 // opencodeTransientRe: retryable server/network blips and API-level rate limits.
