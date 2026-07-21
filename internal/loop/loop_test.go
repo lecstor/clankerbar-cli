@@ -102,8 +102,10 @@ func (f *fakeAdapter) ReadUsage(ctx context.Context, in harness.Invocation) (har
 }
 
 type fakePoller struct {
-	sum    backlog.Summary
-	err    error
+	sum    backlog.Summary   // constant fallback once the script (if any) is exhausted
+	err    error             // constant fallback error
+	sums   []backlog.Summary // optional per-call script, indexed by call number
+	errs   []error           // optional per-call errors, aligned with sums
 	calls  int
 	onCall func(i int) // hook fired at the start of each Poll (e.g. cancel ctx)
 }
@@ -113,6 +115,13 @@ func (p *fakePoller) Poll(ctx context.Context) (backlog.Summary, error) {
 	p.calls++
 	if p.onCall != nil {
 		p.onCall(i)
+	}
+	if i < len(p.sums) {
+		var e error
+		if i < len(p.errs) {
+			e = p.errs[i]
+		}
+		return p.sums[i], e
 	}
 	return p.sum, p.err
 }
@@ -180,6 +189,53 @@ func TestRun_GateDecision(t *testing.T) {
 		}
 		if h.invokeCalls != 1 {
 			t.Errorf("claimable>0 must spawn exactly one session; got %d", h.invokeCalls)
+		}
+	})
+
+	t.Run("idle loop wakes and spawns when work appears", func(t *testing.T) {
+		// The loop's whole reason to idle rather than exit: an empty queue that
+		// later gains claimable work must produce a spawn on the next poll.
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		cfg.MaxIterations = 1
+		h := &fakeAdapter{steps: []invokeStep{{res: okResult(0, 0)}}}
+		p := &fakePoller{sums: []backlog.Summary{
+			{Ready: 2, Claimable: 0}, // first poll: idle, no spawn
+			{Ready: 2, Claimable: 1}, // second poll: work appeared → spawn
+		}}
+		if err := runLoop(t, cfg, h, p); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 1 {
+			t.Errorf("loop should spawn once work appears; got %d Invoke calls", h.invokeCalls)
+		}
+		if p.calls != 2 {
+			t.Errorf("expected exactly two polls (idle then wake); got %d", p.calls)
+		}
+	})
+
+	t.Run("generic poll error is retried, not treated as blind mode", func(t *testing.T) {
+		// A non-ErrNotWired poll error must back off and retry the poll (never
+		// spawn, never flip to blind mode). The hook cancels after two polls.
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		h := &fakeAdapter{}
+		p := &fakePoller{err: errors.New("boom")}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		p.onCall = func(i int) {
+			if i >= 1 {
+				cancel()
+			}
+		}
+		if err := New(cfg, h, p).Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 0 {
+			t.Errorf("a poll error must not spawn a session; got %d Invoke calls", h.invokeCalls)
+		}
+		if p.calls < 2 {
+			t.Errorf("a poll error must be retried; got %d polls", p.calls)
 		}
 	})
 
@@ -325,6 +381,27 @@ func TestDrainWithRetries_StatedResetPassed(t *testing.T) {
 	}
 	if h.probeCalls != 0 {
 		t.Errorf("a passed stated reset should resume without probing; got %d probes", h.probeCalls)
+	}
+}
+
+// End-to-end confirmation that a transient retry stays a SINGLE drain: with
+// MaxIterations=1, a transient-then-success drain (two Invoke calls) must still
+// be counted as one iteration and stop. If the retry loop ever leaked into the
+// drain count, this would either stop early (one Invoke) or over-run.
+func TestRun_TransientRetryIsOneDrain(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+	h := &fakeAdapter{steps: []invokeStep{{res: transientResult()}, {res: okResult(1, 0)}}}
+	p := &fakePoller{sum: backlog.Summary{Claimable: 1}}
+	if err := runLoop(t, cfg, h, p); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("one drain with a transient retry should Invoke twice; got %d", h.invokeCalls)
+	}
+	if p.calls != 1 {
+		t.Errorf("the retry must not trigger a re-poll; expected 1 poll, got %d", p.calls)
 	}
 }
 
