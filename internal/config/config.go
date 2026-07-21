@@ -287,3 +287,52 @@ func (c *Config) ResolveStateDir() string {
 
 // Source is the file the config was loaded from ("" if none).
 func (c *Config) Source() string { return c.source }
+
+// BacklogEndpoint returns the full, project-scoped MCP URL the driver's own
+// backlog poll should hit — the same `/mcp/<project>` endpoint the harness uses.
+//
+// BacklogURL defaults to a bare base (`https://clankerbar.com`), which the plane
+// rejects without the project slug in the path. The exact URL already lives in the
+// harness .mcp.json (MCPConfigPath), so we reuse it — keeping the cheap poll and
+// the harness pointed at the same plane. An explicit backlog_url that already names
+// an `/mcp` path wins; otherwise we derive from .mcp.json, then fall back to the
+// configured base.
+func (c *Config) BacklogEndpoint() string {
+	if strings.Contains(c.BacklogURL, "/mcp") {
+		return c.BacklogURL
+	}
+	if u := mcpURLFromConfig(c.MCPConfigPath); u != "" {
+		return u
+	}
+	return c.BacklogURL
+}
+
+// mcpURLFromConfig reads a Claude-shaped .mcp.json and returns the clankerbar MCP
+// server URL (or the first http server's URL), or "" if the file is absent or has
+// no usable url. Best-effort: any read/parse failure yields "".
+func mcpURLFromConfig(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(expandHome(path))
+	if err != nil {
+		return ""
+	}
+	var f struct {
+		MCPServers map[string]struct {
+			URL string `json:"url"`
+		} `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(data, &f); err != nil {
+		return ""
+	}
+	if s, ok := f.MCPServers["clankerbar"]; ok && s.URL != "" {
+		return s.URL
+	}
+	for _, s := range f.MCPServers {
+		if s.URL != "" {
+			return s.URL
+		}
+	}
+	return ""
+}
