@@ -27,13 +27,22 @@ Anthropic's semi-random early resets), then continues.
 
 ## Install
 
-Requires Go 1.26+ (pre-release; build from source):
+**Download a prebuilt binary.** Each release ships cross-platform binaries
+(macOS and Linux, amd64 + arm64) on the [releases page][releases] — grab the
+archive for your OS/arch, extract, and put `clankerbar` on your `PATH`. No Go
+toolchain required. Releases are semver tags (`vX.Y.Z`); the tool is pre-1.0, so
+expect the `v0.x` line while the surface settles. Verify a download against the
+`checksums.txt` published alongside it.
+
+**Or build from source** (requires Go 1.26+):
 
 ```sh
 go install github.com/lecstor/clankerbar-cli/cmd/clankerbar@latest
 # or, from a checkout:
 go build -o clankerbar ./cmd/clankerbar
 ```
+
+[releases]: https://github.com/lecstor/clankerbar-cli/releases
 
 ## Usage
 

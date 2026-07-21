@@ -1,0 +1,46 @@
+name: ci
+
+# Gate every PR (and every push to main) on a clean build, vet, and race-enabled
+# test run. This is the "green check" the operator gates merges on — make it a
+# required status check on main via branch protection.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# A newer push to the same branch/PR supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: ci
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pin Go to the version declared in go.mod (currently 1.26) so CI and the
+      # module never drift. go-version-file reads the toolchain line directly.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        run: go build ./...
+
+      - name: vet
+        run: go vet ./...
+
+      - name: test
+        run: go test -race ./...
+
+# golangci-lint was evaluated and deliberately left out for now: golangci-lint v2
+# flags a handful of low-value nits (unchecked fmt.Fprint* returns, a nil test
+# context) that would only add a perpetually-red, non-blocking check. Add it back
+# once the findings are addressed or a tuned .golangci.yml silences them, so the
+# lint signal is trustworthy rather than noise.
