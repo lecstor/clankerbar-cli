@@ -1,11 +1,17 @@
 // Package backlog is the driver's own cheap, read-only view of the clankerbar
 // backlog — used to decide whether there is claimable work before spending tokens
-// on a harness session, and to keep polling (and logging) while idle so the loop
-// reacts when questions are answered, items are promoted, or new work is filed.
+// on a harness session, to keep polling (and logging) while idle so the loop reacts
+// when questions are answered, items are promoted, or new work is filed, and to
+// learn when the operator has paused the run from the web console.
 //
-// This is a control-plane read (no agent, no tokens): a single authenticated
-// call to clankerbar's `get_backlog_summary` MCP tool, mirroring the freshness
-// `backlog` block that clankerbar already exposes.
+// This is a control-plane read (no agent, no tokens): a single authenticated GET of
+// clankerbar's project-scoped `/api/backlog-summary` route (CLA-76), which returns
+// the same freshness snapshot the MCP `backlog` block carries — `{version, counts,
+// claimable, openQuestions}` — PLUS a `loopPaused` boolean. Folding the pause flag
+// into the same cheap read means the loop never needs a second call to learn it
+// should stop spawning sessions. This route (unlike the MCP `get_backlog_summary`
+// tool) needs a PROJECT-scoped API key: it carries no project slug in its path, so
+// the key alone selects the project.
 package backlog
 
 import (
@@ -24,9 +30,10 @@ import (
 type Summary struct {
 	Version       int // per-project monotonic counter; bumps on every write
 	Ready         int
-	Claimable     int // dep-unblocked ready — the count that means "work to do now"
+	Claimable     int  // dep-unblocked ready — the count that means "work to do now"
 	InProgress    int
 	OpenQuestions int
+	Paused        bool // console-driven loop pause (CLA-76): stop spawning, keep polling
 }
 
 // Poller reads the backlog summary cheaply.
@@ -34,56 +41,54 @@ type Poller interface {
 	Poll(ctx context.Context) (Summary, error)
 }
 
-// ErrNotWired means no backlog endpoint is configured, so the loop cannot gate on
-// live counts and falls back to blind draining. It is returned ONLY when creds are
-// absent — a wired poller reports transient failures as ordinary (retryable)
-// errors, never ErrNotWired, so the loop never mistakes a blip for "no endpoint".
+// ErrNotWired means the driver cannot do its cheap project-scoped read, so the loop
+// cannot gate on live counts (or honour the console pause) and falls back to blind
+// draining. It is returned when creds are absent, and also when the configured key
+// is an ACCOUNT key that the project-scoped `/api/backlog-summary` route rejects
+// (see Poll) — either way there is no usable live read, so blind drain (which still
+// makes progress) beats idle-polling a permanent failure. A wired poller reports
+// transient failures as ordinary (retryable) errors, never ErrNotWired, so the loop
+// never mistakes a blip for "no endpoint".
 var ErrNotWired = errors.New("backlog polling not wired")
 
 type notWired struct{}
 
 func (notWired) Poll(context.Context) (Summary, error) { return Summary{}, ErrNotWired }
 
-// httpPoller calls clankerbar's `get_backlog_summary` MCP tool over HTTP: a single
-// JSON-RPC `tools/call` with a Bearer API key. No agent, no tokens — just the live
-// counts the loop gates on.
+// httpPoller GETs clankerbar's project-scoped `/api/backlog-summary` route with a
+// Bearer API key. No agent, no tokens — just the live counts the loop gates on and
+// the console-pause flag it honours, in one read.
 type httpPoller struct {
-	endpoint string // full project-scoped MCP endpoint, e.g. https://clankerbar.com/mcp/<project>
+	endpoint string // full /api/backlog-summary URL, e.g. https://clankerbar.com/api/backlog-summary
 	apiKey   string
 	client   *http.Client
 }
 
 // New builds a Poller. With no endpoint / API key it returns a not-wired poller,
-// which is the ONLY thing that reports ErrNotWired (and so the only thing that puts
-// the loop into blind mode). Given both, it returns a real HTTP poller that fetches
-// live {version, counts, claimable, openQuestions} from the plane.
+// which reports ErrNotWired (and so puts the loop into blind mode). Given both, it
+// returns a real HTTP poller that fetches live {version, counts, claimable,
+// openQuestions, loopPaused} from the plane.
 //
-// baseURL is expected to be the full project-scoped MCP endpoint (the same
-// `/mcp/<project>` URL the harness uses, resolved from the operator's .mcp.json).
-func New(baseURL, apiKey string) Poller {
-	if baseURL == "" || apiKey == "" {
+// summaryURL is the full `/api/backlog-summary` URL (see config.BacklogSummaryURL):
+// the project-scoped read surface CLA-76 built for this driver.
+func New(summaryURL, apiKey string) Poller {
+	if summaryURL == "" || apiKey == "" {
 		return notWired{}
 	}
 	return &httpPoller{
-		endpoint: strings.TrimRight(baseURL, "/"),
+		endpoint: strings.TrimRight(summaryURL, "/"),
 		apiKey:   apiKey,
 		client:   &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
-// summaryRequest is the JSON-RPC call for the read-only summary tool. Stateless:
-// the plane answers a bare tools/call without an initialize handshake or session.
-const summaryRequest = `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_backlog_summary","arguments":{}}}`
-
 func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.endpoint, strings.NewReader(summaryRequest))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint, nil)
 	if err != nil {
 		return Summary{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	// The MCP HTTP transport may answer either as JSON or as an SSE frame; accept both.
-	req.Header.Set("Accept", "application/json, text/event-stream")
+	req.Header.Set("Accept", "application/json")
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -96,57 +101,40 @@ func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
 		return Summary{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
+		// An ACCOUNT key can't drive this project-scoped route: the route carries no
+		// project slug (an account key selects its project via the /mcp/<slug> path),
+		// so it answers 400 `project_required`. That is a persistent wiring mismatch,
+		// not a transient blip — treat it like "not wired" so the loop drains blind
+		// (still makes progress) instead of idle-polling a 400 forever. Console pause
+		// and live count-gating require a project-scoped key.
+		if resp.StatusCode == http.StatusBadRequest && errorCode(body) == "project_required" {
+			return Summary{}, ErrNotWired
+		}
 		return Summary{}, fmt.Errorf("backlog summary: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return parseSummary(body)
 }
 
-// parseSummary decodes a get_backlog_summary response body into a Summary. It
-// accepts both a plain JSON-RPC body and an SSE frame whose `data:` line carries
-// the envelope, then unwraps the tool's text content (itself a JSON document).
+// parseSummary decodes the `/api/backlog-summary` JSON body into a Summary. The
+// route returns a plain JSON object (no MCP JSON-RPC / SSE envelope): {version,
+// counts:{ready,in_progress,...}, claimable, openQuestions, loopPaused}.
 func parseSummary(body []byte) (Summary, error) {
-	env, err := extractJSONRPC(body)
-	if err != nil {
-		return Summary{}, err
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 {
+		return Summary{}, errors.New("backlog summary: empty response")
 	}
-
-	var rpc struct {
-		Result *struct {
-			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-			} `json:"content"`
-			IsError bool `json:"isError"`
-		} `json:"result"`
-		Error *struct {
-			Code    int    `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if err := json.Unmarshal(env, &rpc); err != nil {
-		return Summary{}, fmt.Errorf("decode backlog summary envelope: %w", err)
-	}
-	if rpc.Error != nil {
-		return Summary{}, fmt.Errorf("backlog summary rpc error %d: %s", rpc.Error.Code, rpc.Error.Message)
-	}
-	if rpc.Result == nil || len(rpc.Result.Content) == 0 || rpc.Result.Content[0].Text == "" {
-		return Summary{}, errors.New("backlog summary: empty tool result")
-	}
-	if rpc.Result.IsError {
-		return Summary{}, fmt.Errorf("backlog summary tool error: %s", rpc.Result.Content[0].Text)
-	}
-
 	var payload struct {
 		Version int `json:"version"`
 		Counts  struct {
 			Ready      int `json:"ready"`
 			InProgress int `json:"in_progress"`
 		} `json:"counts"`
-		Claimable     int `json:"claimable"`
-		OpenQuestions int `json:"openQuestions"`
+		Claimable     int  `json:"claimable"`
+		OpenQuestions int  `json:"openQuestions"`
+		LoopPaused    bool `json:"loopPaused"`
 	}
-	if err := json.Unmarshal([]byte(rpc.Result.Content[0].Text), &payload); err != nil {
-		return Summary{}, fmt.Errorf("decode backlog summary payload: %w", err)
+	if err := json.Unmarshal(trimmed, &payload); err != nil {
+		return Summary{}, fmt.Errorf("decode backlog summary: %w", err)
 	}
 	return Summary{
 		Version:       payload.Version,
@@ -154,32 +142,18 @@ func parseSummary(body []byte) (Summary, error) {
 		Claimable:     payload.Claimable,
 		InProgress:    payload.Counts.InProgress,
 		OpenQuestions: payload.OpenQuestions,
+		Paused:        payload.LoopPaused,
 	}, nil
 }
 
-// extractJSONRPC pulls the JSON-RPC envelope out of an MCP HTTP response, which is
-// either a plain JSON object or a text/event-stream frame carrying the envelope on
-// a `data:` line. The last `data:` line wins (an SSE stream may precede the payload
-// with other events).
-func extractJSONRPC(body []byte) ([]byte, error) {
-	trimmed := bytes.TrimSpace(body)
-	if len(trimmed) == 0 {
-		return nil, errors.New("backlog summary: empty response")
+// errorCode pulls the `error.code` string out of the plane's JSON error shape
+// (`{"error":{"code","message"}}`), or "" if the body is not that shape.
+func errorCode(body []byte) string {
+	var e struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
 	}
-	if trimmed[0] == '{' {
-		return trimmed, nil
-	}
-	var data []byte
-	for _, line := range bytes.Split(body, []byte("\n")) {
-		line = bytes.TrimSpace(line)
-		if bytes.HasPrefix(line, []byte("data:")) {
-			if d := bytes.TrimSpace(line[len("data:"):]); len(d) > 0 {
-				data = d
-			}
-		}
-	}
-	if len(data) == 0 {
-		return nil, errors.New("backlog summary: no JSON-RPC data in response")
-	}
-	return data, nil
+	_ = json.Unmarshal(body, &e)
+	return e.Error.Code
 }

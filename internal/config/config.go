@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -306,6 +307,42 @@ func (c *Config) BacklogEndpoint() string {
 		return c.BacklogURL
 	}
 	return mcpURLFromConfig(c.MCPConfigPath)
+}
+
+// BacklogSummaryURL returns the URL of the driver's cheap backlog read — the
+// plane's project-scoped `GET /api/backlog-summary` route (CLA-76), which returns
+// {version, counts, claimable, openQuestions, loopPaused} in one authenticated call
+// (counts to gate on, plus the console-driven pause the driver honours).
+//
+// Unlike the MCP `get_backlog_summary` tool, this route carries no project slug in
+// its path — a project-scoped API key selects the project — so only the plane ORIGIN
+// is needed. We take it from the resolved MCP endpoint when available (so a
+// self-hosted plane / .mcp.json url is honoured), else from BacklogURL's own origin
+// (which, for this route, needs no slug — so a bare `https://clankerbar.com` base
+// that BacklogEndpoint rejects for MCP still yields a working summary URL). Returns
+// "" when no origin can be resolved (New("") then yields a not-wired, blind poller).
+func (c *Config) BacklogSummaryURL() string {
+	origin := originOf(c.BacklogEndpoint())
+	if origin == "" {
+		origin = originOf(c.BacklogURL)
+	}
+	if origin == "" {
+		return ""
+	}
+	return origin + "/api/backlog-summary"
+}
+
+// originOf returns the scheme://host of a URL, or "" if it cannot be parsed or lacks
+// a scheme/host.
+func originOf(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
 
 // mcpURLFromConfig reads a Claude-shaped .mcp.json and returns the clankerbar MCP
