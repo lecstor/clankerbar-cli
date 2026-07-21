@@ -83,10 +83,12 @@ func TestBacklogEndpoint(t *testing.T) {
 		}
 	})
 
-	t.Run("falls back to backlog_url when no .mcp.json url is available", func(t *testing.T) {
+	t.Run("returns empty when only a bare base and no .mcp.json url are available", func(t *testing.T) {
+		// A slug-less base is not a usable endpoint; "" makes New() not-wired so the
+		// loop blind-drains instead of retrying an endpoint the plane always rejects.
 		c := &Config{BacklogURL: "https://clankerbar.com", MCPConfigPath: ""}
-		if got := c.BacklogEndpoint(); got != "https://clankerbar.com" {
-			t.Errorf("BacklogEndpoint() = %q, want the base backlog_url", got)
+		if got := c.BacklogEndpoint(); got != "" {
+			t.Errorf("BacklogEndpoint() = %q, want \"\"", got)
 		}
 	})
 }

@@ -132,7 +132,7 @@ func TestPoll_ErrorIsNonFatalNotNotWired(t *testing.T) {
 	}
 }
 
-func TestBacklogEndpointTrimsTrailingSlash(t *testing.T) {
+func TestNew_TrimsTrailingSlash(t *testing.T) {
 	p, ok := New("https://clankerbar.com/mcp/proj/", "k").(*httpPoller)
 	if !ok {
 		t.Fatal("want *httpPoller")

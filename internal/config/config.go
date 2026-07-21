@@ -295,16 +295,17 @@ func (c *Config) Source() string { return c.source }
 // rejects without the project slug in the path. The exact URL already lives in the
 // harness .mcp.json (MCPConfigPath), so we reuse it — keeping the cheap poll and
 // the harness pointed at the same plane. An explicit backlog_url that already names
-// an `/mcp` path wins; otherwise we derive from .mcp.json, then fall back to the
-// configured base.
+// a `/mcp/<project>` path wins; otherwise we derive from .mcp.json.
+//
+// Returns "" when no usable project-scoped endpoint can be resolved (a bare base
+// and no .mcp.json url). That is deliberate: New("") yields a not-wired poller, so
+// the loop falls into blind drain — which still makes progress — rather than
+// retrying forever against a slug-less base the plane can only reject.
 func (c *Config) BacklogEndpoint() string {
-	if strings.Contains(c.BacklogURL, "/mcp") {
+	if strings.Contains(c.BacklogURL, "/mcp/") {
 		return c.BacklogURL
 	}
-	if u := mcpURLFromConfig(c.MCPConfigPath); u != "" {
-		return u
-	}
-	return c.BacklogURL
+	return mcpURLFromConfig(c.MCPConfigPath)
 }
 
 // mcpURLFromConfig reads a Claude-shaped .mcp.json and returns the clankerbar MCP
