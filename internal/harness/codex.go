@@ -124,9 +124,14 @@ func (codex) parse(res *Result) {
 		if json.Unmarshal([]byte(line), &ev) != nil {
 			continue // partial/non-JSON line — skip
 		}
-		// Take the LAST usage-bearing event as the session total. This assumes
-		// turn.completed / token_count report cumulative usage.
-		// TODO: confirm cumulative-vs-delta against real `codex exec --json`.
+		// Take the LAST usage-bearing event as the session total — never sum.
+		// Confirmed against codex 0.144.6 (rust-v0.144.6): `codex exec --json`
+		// emits one `turn.completed` per turn whose top-level `usage` is the
+		// CUMULATIVE session running total (built from `total_token_usage`), not a
+		// per-turn delta — so summing would double-count. Unlike the opencode
+		// adapter, which sums per-step deltas, here we keep only the final total.
+		// (`token_count` is a separate rollout/app-server stream not on --json
+		// stdout; its top-level fallback below is harmless defensive parsing.)
 		switch {
 		case ev.Usage != nil:
 			in, cached, out, reason = ev.Usage.InputTokens, ev.Usage.CachedInput, ev.Usage.OutputTokens, ev.Usage.ReasoningTokens

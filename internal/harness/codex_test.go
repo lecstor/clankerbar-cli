@@ -27,6 +27,32 @@ func TestCodexParse(t *testing.T) {
 	}
 }
 
+// A multi-turn `codex exec --json` stream. Each `turn.completed.usage` is the
+// CUMULATIVE session total (codex 0.144.6 / rust-v0.144.6), so the per-run total
+// must be the LAST event's usage, NOT the sum of the two. This locks the parser
+// against a regression to delta-summing / double-counting.
+const codexCumulativeStream = `{"type":"thread.started","thread_id":"t1"}
+{"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":200,"output_tokens":100,"reasoning_output_tokens":50}}
+{"type":"item.completed","item":{"type":"agent_message","text":"working"}}
+{"type":"turn.completed","usage":{"input_tokens":3000,"cached_input_tokens":900,"output_tokens":400,"reasoning_output_tokens":120}}`
+
+func TestCodexParse_cumulativeNotSummed(t *testing.T) {
+	res := Result{Stdout: codexCumulativeStream}
+	codex{}.parse(&res)
+
+	// Correct: last turn.completed only — input(3000)+output(400)+reasoning(120),
+	// cached excluded.
+	last := 3000 + 400 + 120
+	if res.Tokens != last {
+		t.Errorf("Tokens = %d, want %d (last cumulative total, not the sum)", res.Tokens, last)
+	}
+	// Guard the specific regression: summing both turns would double-count.
+	summed := (1000 + 100 + 50) + (3000 + 400 + 120)
+	if res.Tokens == summed {
+		t.Errorf("Tokens = %d equals the summed total; codex usage is cumulative and must not be summed", res.Tokens)
+	}
+}
+
 func TestCodexParse_empty(t *testing.T) {
 	res := Result{Stdout: ""}
 	codex{}.parse(&res)
