@@ -61,10 +61,11 @@ func Run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// The driver reads backlog counts directly (cheap, no tokens) to gate each
-	// iteration and to keep polling while idle. It hits the same project-scoped MCP
-	// endpoint the harness uses (resolved from .mcp.json); key is from the env.
-	poller := backlog.New(cfg.BacklogEndpoint(), os.Getenv("CLANKERBAR_API_KEY"))
+	// The driver reads backlog state directly (cheap, no tokens) to gate each
+	// iteration, to keep polling while idle, and to honour the console pause flag. It
+	// GETs the plane's project-scoped /api/backlog-summary route (counts + loopPaused
+	// in one read); the project-scoped key is from the env.
+	poller := backlog.New(cfg.BacklogSummaryURL(), os.Getenv("CLANKERBAR_API_KEY"))
 
 	return loop.New(cfg, adapter, poller).Run(ctx)
 }

@@ -92,3 +92,45 @@ func TestBacklogEndpoint(t *testing.T) {
 		}
 	})
 }
+
+// BacklogSummaryURL points at the project-scoped /api/backlog-summary route (counts
+// + console pause). It needs only the plane ORIGIN — no project slug in the path —
+// so it resolves in more cases than BacklogEndpoint, including a bare base.
+func TestBacklogSummaryURL(t *testing.T) {
+	dir := t.TempDir()
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://self.example.com/mcp/proj"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("takes the origin of the resolved MCP endpoint (honours .mcp.json / self-host)", func(t *testing.T) {
+		c := &Config{BacklogURL: "https://clankerbar.com", MCPConfigPath: mcp}
+		if got := c.BacklogSummaryURL(); got != "https://self.example.com/api/backlog-summary" {
+			t.Errorf("BacklogSummaryURL() = %q, want the .mcp.json origin", got)
+		}
+	})
+
+	t.Run("falls back to BacklogURL's own origin when no MCP endpoint resolves", func(t *testing.T) {
+		// The key improvement over BacklogEndpoint: a bare base with no .mcp.json is
+		// still usable here (the route needs no project slug), so pause/count-gating
+		// work rather than dropping to blind mode.
+		c := &Config{BacklogURL: "https://clankerbar.com", MCPConfigPath: ""}
+		if got := c.BacklogSummaryURL(); got != "https://clankerbar.com/api/backlog-summary" {
+			t.Errorf("BacklogSummaryURL() = %q, want the bare-base origin", got)
+		}
+	})
+
+	t.Run("strips any /mcp path on an explicit backlog_url down to the origin", func(t *testing.T) {
+		c := &Config{BacklogURL: "https://example.com/mcp/other", MCPConfigPath: ""}
+		if got := c.BacklogSummaryURL(); got != "https://example.com/api/backlog-summary" {
+			t.Errorf("BacklogSummaryURL() = %q, want the origin only", got)
+		}
+	})
+
+	t.Run("empty when no origin can be resolved", func(t *testing.T) {
+		c := &Config{BacklogURL: "", MCPConfigPath: ""}
+		if got := c.BacklogSummaryURL(); got != "" {
+			t.Errorf("BacklogSummaryURL() = %q, want \"\"", got)
+		}
+	})
+}

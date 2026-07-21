@@ -6,55 +6,54 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 )
 
-// A real get_backlog_summary response, as the MCP HTTP transport returns it: an
-// SSE frame whose `data:` line carries the JSON-RPC envelope, whose tool content is
-// itself a JSON document.
-const sseFixture = "event: message\n" +
-	`data: {"result":{"content":[{"type":"text","text":"{\n  \"version\": 603,\n  \"counts\": {\n    \"backlog\": 15,\n    \"ready\": 6,\n    \"in_progress\": 1,\n    \"in_review\": 0,\n    \"blocked\": 0,\n    \"parked\": 7,\n    \"done\": 99\n  },\n  \"claimable\": 4,\n  \"openQuestions\": 2\n}"}]},"jsonrpc":"2.0","id":1}` + "\n"
+// A real /api/backlog-summary response: a plain JSON object carrying the freshness
+// snapshot plus the console-pause flag (CLA-76). Not paused.
+const summaryJSON = `{"version":603,"counts":{"backlog":15,"ready":6,"in_progress":1,"in_review":0,"blocked":0,"parked":7,"done":99},"claimable":4,"openQuestions":2,"loopPaused":false}`
 
-// The same envelope delivered as a plain JSON body (the transport may answer either way).
-const jsonFixture = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"version\":42,\"counts\":{\"ready\":3,\"in_progress\":2},\"claimable\":3,\"openQuestions\":0}"}]}}`
+// The same shape with the console pause engaged.
+const summaryPausedJSON = `{"version":604,"counts":{"ready":6,"in_progress":1},"claimable":4,"openQuestions":2,"loopPaused":true}`
 
-func wantSummary(t *testing.T, got Summary, ver, ready, claimable, inProgress, openQ int) {
+func wantSummary(t *testing.T, got Summary, ver, ready, claimable, inProgress, openQ int, paused bool) {
 	t.Helper()
 	if got.Version != ver || got.Ready != ready || got.Claimable != claimable ||
-		got.InProgress != inProgress || got.OpenQuestions != openQ {
-		t.Fatalf("summary mismatch: got %+v, want {Version:%d Ready:%d Claimable:%d InProgress:%d OpenQuestions:%d}",
-			got, ver, ready, claimable, inProgress, openQ)
+		got.InProgress != inProgress || got.OpenQuestions != openQ || got.Paused != paused {
+		t.Fatalf("summary mismatch: got %+v, want {Version:%d Ready:%d Claimable:%d InProgress:%d OpenQuestions:%d Paused:%t}",
+			got, ver, ready, claimable, inProgress, openQ, paused)
 	}
 }
 
-func TestParseSummary_SSE(t *testing.T) {
-	got, err := parseSummary([]byte(sseFixture))
+func TestParseSummary_Counts(t *testing.T) {
+	got, err := parseSummary([]byte(summaryJSON))
 	if err != nil {
-		t.Fatalf("parseSummary(SSE): %v", err)
+		t.Fatalf("parseSummary: %v", err)
 	}
-	wantSummary(t, got, 603, 6, 4, 1, 2)
+	wantSummary(t, got, 603, 6, 4, 1, 2, false)
 }
 
-func TestParseSummary_PlainJSON(t *testing.T) {
-	got, err := parseSummary([]byte(jsonFixture))
+// The load-bearing field for CLA-130: loopPaused must parse into Summary.Paused.
+func TestParseSummary_LoopPaused(t *testing.T) {
+	got, err := parseSummary([]byte(summaryPausedJSON))
 	if err != nil {
-		t.Fatalf("parseSummary(JSON): %v", err)
+		t.Fatalf("parseSummary: %v", err)
 	}
-	wantSummary(t, got, 42, 3, 3, 2, 0)
-}
-
-func TestParseSummary_ToolError(t *testing.T) {
-	body := `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"boom"}]}}`
-	if _, err := parseSummary([]byte(body)); err == nil {
-		t.Fatal("expected error for isError result, got nil")
+	wantSummary(t, got, 604, 6, 4, 1, 2, true)
+	if !got.Paused {
+		t.Fatal("loopPaused:true must set Summary.Paused")
 	}
 }
 
-func TestParseSummary_RPCError(t *testing.T) {
-	body := `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"unauthorized"}}`
-	if _, err := parseSummary([]byte(body)); err == nil {
-		t.Fatal("expected error for rpc error, got nil")
+// A payload with no loopPaused field (e.g. an older plane) parses as not paused —
+// the driver must never spuriously pause on a missing flag.
+func TestParseSummary_MissingPauseIsFalse(t *testing.T) {
+	got, err := parseSummary([]byte(`{"version":1,"counts":{"ready":0,"in_progress":0},"claimable":0,"openQuestions":0}`))
+	if err != nil {
+		t.Fatalf("parseSummary: %v", err)
+	}
+	if got.Paused {
+		t.Fatal("a missing loopPaused field must parse as not paused")
 	}
 }
 
@@ -64,35 +63,41 @@ func TestParseSummary_Empty(t *testing.T) {
 	}
 }
 
-// New with no creds must return the not-wired poller — the only thing that reports
-// ErrNotWired, so the only thing that flips the loop into blind mode.
+func TestParseSummary_Garbage(t *testing.T) {
+	if _, err := parseSummary([]byte("not json")); err == nil {
+		t.Fatal("expected error for non-JSON body, got nil")
+	}
+}
+
+// New with no creds must return the not-wired poller — the thing that reports
+// ErrNotWired, so the thing that flips the loop into blind mode.
 func TestNew_NotWiredWithoutCreds(t *testing.T) {
-	cases := []struct{ base, key string }{
+	cases := []struct{ url, key string }{
 		{"", ""},
-		{"https://clankerbar.com/mcp/x", ""},
+		{"https://clankerbar.com/api/backlog-summary", ""},
 		{"", "secret"},
 	}
 	for _, c := range cases {
-		p := New(c.base, c.key)
+		p := New(c.url, c.key)
 		if _, ok := p.(notWired); !ok {
-			t.Fatalf("New(%q,%q): want notWired, got %T", c.base, c.key, p)
+			t.Fatalf("New(%q,%q): want notWired, got %T", c.url, c.key, p)
 		}
 		if _, err := p.Poll(context.Background()); !errors.Is(err, ErrNotWired) {
-			t.Fatalf("New(%q,%q).Poll: want ErrNotWired, got %v", c.base, c.key, err)
+			t.Fatalf("New(%q,%q).Poll: want ErrNotWired, got %v", c.url, c.key, err)
 		}
 	}
 }
 
-// New with creds returns a real HTTP poller (never notWired) that fetches and
-// parses live counts from the endpoint.
+// New with creds returns a real HTTP poller (never notWired) that GETs and parses
+// live counts + pause from the endpoint with a Bearer key.
 func TestNew_WiredPollsLiveCounts(t *testing.T) {
-	var gotAuth, gotBody string
+	var gotAuth, gotMethod, gotAccept string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotAuth = r.Header.Get("Authorization")
-		b, _ := io.ReadAll(r.Body)
-		gotBody = string(b)
-		w.Header().Set("Content-Type", "text/event-stream")
-		_, _ = io.WriteString(w, sseFixture)
+		gotMethod = r.Method
+		gotAccept = r.Header.Get("Accept")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, summaryPausedJSON)
 	}))
 	defer srv.Close()
 
@@ -105,19 +110,22 @@ func TestNew_WiredPollsLiveCounts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Poll: %v", err)
 	}
-	wantSummary(t, sum, 603, 6, 4, 1, 2)
+	wantSummary(t, sum, 604, 6, 4, 1, 2, true)
+	if gotMethod != http.MethodGet {
+		t.Errorf("method = %q, want GET", gotMethod)
+	}
 	if gotAuth != "Bearer secret-key" {
 		t.Errorf("Authorization header = %q, want %q", gotAuth, "Bearer secret-key")
 	}
-	if !strings.Contains(gotBody, "get_backlog_summary") {
-		t.Errorf("request body missing tool name: %q", gotBody)
+	if gotAccept != "application/json" {
+		t.Errorf("Accept header = %q, want application/json", gotAccept)
 	}
 }
 
-// A live poll failure (server error) must map to an ordinary, non-fatal error —
-// NOT ErrNotWired — so the loop backs off and retries rather than dropping into
-// blind mode.
-func TestPoll_ErrorIsNonFatalNotNotWired(t *testing.T) {
+// A live poll failure (server error) must map to an ordinary, non-fatal error — NOT
+// ErrNotWired — so the loop backs off and retries rather than dropping into blind
+// mode.
+func TestPoll_ServerErrorIsNonFatalNotNotWired(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
@@ -132,12 +140,46 @@ func TestPoll_ErrorIsNonFatalNotNotWired(t *testing.T) {
 	}
 }
 
+// An account key hitting this project-scoped route gets 400 `project_required`. That
+// is a persistent wiring mismatch, not a blip: it must map to ErrNotWired so the
+// loop drains blind (making progress) instead of idle-polling a 400 forever.
+func TestPoll_ProjectRequiredMapsToNotWired(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"project_required","message":"needs a project-scoped API key"}}`)
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, "account-key").Poll(context.Background())
+	if !errors.Is(err, ErrNotWired) {
+		t.Fatalf("project_required must map to ErrNotWired, got %v", err)
+	}
+}
+
+// A different 400 (some other bad-request code) is NOT the account-key case, so it
+// stays an ordinary retryable error — never ErrNotWired.
+func TestPoll_OtherBadRequestStaysRetryable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"error":{"code":"something_else","message":"nope"}}`)
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, "k").Poll(context.Background())
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if errors.Is(err, ErrNotWired) {
+		t.Fatalf("a non-project_required 400 must stay retryable, not ErrNotWired: %v", err)
+	}
+}
+
 func TestNew_TrimsTrailingSlash(t *testing.T) {
-	p, ok := New("https://clankerbar.com/mcp/proj/", "k").(*httpPoller)
+	p, ok := New("https://clankerbar.com/api/backlog-summary/", "k").(*httpPoller)
 	if !ok {
 		t.Fatal("want *httpPoller")
 	}
-	if p.endpoint != "https://clankerbar.com/mcp/proj" {
+	if p.endpoint != "https://clankerbar.com/api/backlog-summary" {
 		t.Errorf("endpoint = %q, want trailing slash trimmed", p.endpoint)
 	}
 }

@@ -56,6 +56,7 @@ func (d *Driver) Run(ctx context.Context) error {
 	var totalTokens int
 	var totalCost float64
 	drains := 0
+	paused := false // tracks console-pause state so we log the transition once, not every idle tick
 
 	for {
 		if ctx.Err() != nil {
@@ -71,8 +72,6 @@ func (d *Driver) Run(ctx context.Context) error {
 			log.Print("STOP requested — stopping")
 			return nil
 		}
-		// TODO(track B): poll the clankerbar console-pause flag over MCP and treat
-		// it like STOP — so an overnight run can be halted from the console.
 		if d.cfg.MaxIterations > 0 && drains >= d.cfg.MaxIterations {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
@@ -99,8 +98,29 @@ func (d *Driver) Run(ctx context.Context) error {
 				}
 				continue
 			default:
-				log.Printf("queue: ready=%d claimable=%d in_progress=%d open_questions=%d (v%d)",
-					sum.Ready, sum.Claimable, sum.InProgress, sum.OpenQuestions, sum.Version)
+				log.Printf("queue: ready=%d claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
+					sum.Ready, sum.Claimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
+				// Console pause (CLA-76 plane / CLA-130 driver): the operator can pause
+				// an overnight run from the web console. Honour it BEFORE the claimable
+				// gate so a paused loop never spawns a new session even when there IS
+				// claimable work — it just idle-polls until the flag clears, then
+				// resumes. Distinct from STOP (which exits) and from an empty queue. A
+				// pause landing mid-drain is only seen here, between iterations, so it
+				// never kills an in-flight session (exactly like STOP).
+				if sum.Paused {
+					if !paused {
+						paused = true
+						log.Print("console pause active — not spawning new sessions; idle-polling until resumed")
+					}
+					if d.waitOrStop(ctx, idle) {
+						return nil
+					}
+					continue
+				}
+				if paused {
+					paused = false
+					log.Print("console pause cleared — resuming")
+				}
 				if sum.Claimable == 0 {
 					if d.waitOrStop(ctx, idle) {
 						return nil

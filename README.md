@@ -58,6 +58,15 @@ Control an in-flight run with markers in the state dir (`<workdir>/.clankerbar-l
 touch .clankerbar-loop/STOP     # stop gracefully (responsive even mid-wait)
 ```
 
+You can also **pause a run remotely from the clankerbar web console** (Settings →
+Pause). A paused loop stops spawning new sessions and idle-polls until you Resume —
+without exiting, and without killing an in-flight session (a pause is honoured
+between iterations, like `STOP`). Remote pause rides on the driver's cheap backlog
+read, so it needs a **wired poller**: a *project-scoped* `CLANKERBAR_API_KEY` (mint
+one at `clankerbar.com/projects/<slug>/api-keys`) and a resolvable plane URL. With
+only an account key or no endpoint the loop drains blind and can't see the flag —
+the local `STOP`/`HALT` markers remain the fallback there.
+
 ### Visibility
 
 The driver logs milestones to your terminal as it goes (timestamped): spawning,

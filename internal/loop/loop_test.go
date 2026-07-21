@@ -529,6 +529,59 @@ func TestRun_Markers(t *testing.T) {
 	})
 }
 
+// ---------------------------------------------------------------------------
+// Console pause (CLA-130): loopPaused on the cheap read stops the loop spawning
+// new sessions WITHOUT exiting — it idle-polls until the flag clears, then resumes.
+// Distinct from STOP (exits) and from an empty queue (pause holds even with work).
+
+func TestRun_ConsolePause(t *testing.T) {
+	t.Run("paused with claimable work spawns nothing and keeps polling", func(t *testing.T) {
+		// The load-bearing behaviour: pause is ordered BEFORE the claimable gate, so a
+		// paused loop never spawns even though there IS claimable work. The poller
+		// cancels the ctx on its second poll so the idling loop terminates.
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		h := &fakeAdapter{}
+		p := &fakePoller{sum: backlog.Summary{Ready: 5, Claimable: 5, Paused: true}}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		p.onCall = func(i int) {
+			if i >= 1 {
+				cancel()
+			}
+		}
+		if err := New(cfg, h, p).Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 0 {
+			t.Errorf("a paused loop must not spawn even with claimable work; got %d Invoke calls", h.invokeCalls)
+		}
+		if p.calls < 2 {
+			t.Errorf("a paused loop must keep idle-polling (not exit); got %d polls", p.calls)
+		}
+	})
+
+	t.Run("clearing the pause resumes and spawns", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		cfg.MaxIterations = 1 // stop after the first spawn so the test terminates
+		h := &fakeAdapter{steps: []invokeStep{{res: okResult(0, 0)}}}
+		p := &fakePoller{sums: []backlog.Summary{
+			{Ready: 1, Claimable: 1, Paused: true},  // paused: no spawn despite work
+			{Ready: 1, Claimable: 1, Paused: false}, // resumed: spawn
+		}}
+		if err := runLoop(t, cfg, h, p); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 1 {
+			t.Errorf("clearing the pause must resume and spawn exactly once; got %d Invoke calls", h.invokeCalls)
+		}
+		if p.calls != 2 {
+			t.Errorf("expected exactly two polls (paused then resumed); got %d", p.calls)
+		}
+	})
+}
+
 func writeMarker(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
