@@ -1,0 +1,35 @@
+name: release
+
+# Cut a GitHub Release with cross-platform binaries when a semver tag is pushed.
+#   git tag v0.1.0 && git push origin v0.1.0
+on:
+  push:
+    tags:
+      - "v*"
+
+# GoReleaser needs write access to create the Release and upload assets.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags so GoReleaser can build the changelog.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: goreleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: release --clean
+        env:
+          # Provided automatically by Actions; scoped by the permissions block above.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
