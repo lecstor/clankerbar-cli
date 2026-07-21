@@ -21,7 +21,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -45,12 +44,23 @@ type Poller interface {
 // ErrNotWired means the driver cannot do its cheap project-scoped read, so the loop
 // cannot gate on live counts (or honour the console pause) and falls back to blind
 // draining. It is returned when creds are absent, and also when the configured key
-// is an ACCOUNT key that the project-scoped `/api/backlog-summary` route rejects
-// (see Poll) — either way there is no usable live read, so blind drain (which still
-// makes progress) beats idle-polling a permanent failure. A wired poller reports
-// transient failures as ordinary (retryable) errors, never ErrNotWired, so the loop
-// never mistakes a blip for "no endpoint".
+// is an ACCOUNT key that the project-scoped `/api/backlog-summary` route rejects with
+// `400 project_required` (see Poll) — either way there is no usable live read, so
+// blind drain (which still makes progress) beats idle-polling a permanent failure. A
+// wired poller reports transient failures as ordinary (retryable) errors, never
+// ErrNotWired, so the loop never mistakes a blip for "no endpoint".
+//
+// A 401/403 auth rejection is deliberately NOT ErrNotWired: see ErrUnauthorized.
 var ErrNotWired = errors.New("backlog polling not wired")
+
+// ErrUnauthorized means the plane rejected the driver's API key with 401/403 — a
+// revoked, wrong, or malformed CLANKERBAR_API_KEY. Unlike ErrNotWired this is NOT a
+// cue to blind-drain: the harness sessions the loop would spawn use the SAME key, so
+// draining blind just burns sessions that also can't reach the plane. An auth failure
+// is a persistent operator misconfiguration, not a transient blip that self-heals, so
+// the loop treats it as a loud hard stop (see loop.Run) — exit non-zero and name the
+// key — rather than idle-polling or blind-draining a dead credential (CLA-132).
+var ErrUnauthorized = errors.New("backlog auth rejected (401/403)")
 
 type notWired struct{}
 
@@ -112,15 +122,13 @@ func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
 			return Summary{}, ErrNotWired
 		}
 		// A revoked/wrong API key answers 401/403. That is a PERMANENT auth failure,
-		// not a transient blip — retrying it just idle-polls a dead key forever. Map it
-		// to ErrNotWired (like the 400 case) so the loop drops into blind drain instead.
-		// The loop logs the blind-mode transition once and stops polling, so this line
-		// fires at most once per run; it names auth specifically to distinguish it from
-		// the project_required wiring mismatch. (Blind drain then spawns sessions whose
-		// own key is likely also bad — accepted for now over a tight infinite poll.)
+		// not a transient blip — and NOT a cue to blind-drain: the harness sessions the
+		// loop spawns carry the SAME key, so blind draining just burns sessions that
+		// also can't reach the plane. Map it to ErrUnauthorized (distinct from both the
+		// project_required wiring mismatch and a transient blip) so the loop hard-stops
+		// loudly and the operator fixes the key (CLA-132).
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			log.Printf("backlog summary: HTTP %d (auth rejected — revoked or wrong CLANKERBAR_API_KEY); treating as not-wired", resp.StatusCode)
-			return Summary{}, ErrNotWired
+			return Summary{}, ErrUnauthorized
 		}
 		return Summary{}, fmt.Errorf("backlog summary: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
