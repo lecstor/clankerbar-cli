@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
@@ -19,8 +20,10 @@ import (
 func Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	var (
-		cfgPath      = fs.String("config", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
-		harnessName  = fs.String("harness", "", "coding-agent harness to drive: claude | codex")
+		cfgPath = fs.String("config", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
+		// Flag help lists exactly the registered adapters (derived from the harness
+		// registry, the same source config validation checks) so it can't drift.
+		harnessName  = fs.String("harness", "", "coding-agent harness to drive: "+strings.Join(harness.Names(), " | "))
 		model        = fs.String("model", "", "model to pin (harness-specific alias, e.g. opus)")
 		workdir      = fs.String("workdir", "", "directory to run the harness in (default: current dir)")
 		configDir    = fs.String("config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) — for skill/plugin/auth parity")

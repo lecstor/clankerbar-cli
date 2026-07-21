@@ -284,6 +284,32 @@ func TestDrainWithRetries(t *testing.T) {
 			wantInvokes: 2,
 		},
 		{
+			// Regression for finding #3: a failed+retried attempt still burned tokens,
+			// and the budget breaker must see that spend. The transient attempt's
+			// 100 tokens / $1.00 are counted alongside the clean re-run's 5 / $0.50.
+			name: "budget breaker sees spend from a failed+retried attempt",
+			steps: []invokeStep{
+				{res: harness.Result{ExitCode: 1, Tokens: 100, CostUSD: 1.0, Raw: map[string]any{"kind": "transient"}}},
+				{res: okResult(5, 0.5)},
+			},
+			wantTokens:  105,
+			wantCost:    1.5,
+			wantInvokes: 2,
+		},
+		{
+			// A usage-limit attempt also spends before the supervised re-run, so its
+			// 20 tokens / $0.50 must be counted alongside the clean re-run's 7 / $0.25.
+			name: "budget breaker sees spend from a usage-limited attempt",
+			steps: []invokeStep{
+				{res: harness.Result{ExitCode: 1, Tokens: 20, CostUSD: 0.5, Raw: map[string]any{"kind": "limit"}}},
+				{res: okResult(7, 0.25)},
+			},
+			wantTokens:  27,
+			wantCost:    0.75,
+			wantInvokes: 2,
+			wantProbes:  1,
+		},
+		{
 			name:        "non-transient non-zero exit is a genuine failure",
 			steps:       []invokeStep{{res: nonRetryableResult()}},
 			wantErr:     "non-retryable",

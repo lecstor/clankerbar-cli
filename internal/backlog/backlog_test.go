@@ -174,6 +174,24 @@ func TestPoll_OtherBadRequestStaysRetryable(t *testing.T) {
 	}
 }
 
+// A revoked/wrong API key answers 401 or 403. That is a PERMANENT auth failure, not
+// a transient blip: it must map to ErrNotWired (like the 400 project_required case)
+// so the loop drops into blind drain instead of idle-polling a dead key forever.
+// Regression for finding #5.
+func TestPoll_AuthRejectedMapsToNotWired(t *testing.T) {
+	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(code)
+			_, _ = io.WriteString(w, `{"error":{"code":"unauthorized","message":"bad key"}}`)
+		}))
+		_, err := New(srv.URL, "revoked-key").Poll(context.Background())
+		srv.Close()
+		if !errors.Is(err, ErrNotWired) {
+			t.Fatalf("HTTP %d must map to ErrNotWired, got %v", code, err)
+		}
+	}
+}
+
 func TestNew_TrimsTrailingSlash(t *testing.T) {
 	p, ok := New("https://clankerbar.com/api/backlog-summary/", "k").(*httpPoller)
 	if !ok {

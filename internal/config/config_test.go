@@ -4,8 +4,49 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
+
+// Every harness the registry actually offers must pass config validation. The
+// accepted set is derived from harness.Known (not a hand-kept switch), so a newly
+// registered adapter can never be rejected here again — the bug this guards: the
+// opencode adapter was registered but the old validation switch still rejected it,
+// making `clankerbar run --harness opencode` fail before harness.Get was consulted.
+func TestValidateHarnessFromRegistry(t *testing.T) {
+	names := harness.Names()
+	if len(names) == 0 {
+		t.Fatal("registry is empty; expected at least the built-in adapters")
+	}
+	sawOpencode := false
+	for _, name := range names {
+		if name == "opencode" {
+			sawOpencode = true
+		}
+		c := defaults()
+		c.Harness = name
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate() rejected registered harness %q: %v", name, err)
+		}
+	}
+	if !sawOpencode {
+		t.Error("opencode must be registered and accepted (the CLA-117 adapter has to be reachable)")
+	}
+
+	// An unregistered harness is still rejected, and the message lists the
+	// registered names so the error is actionable.
+	c := defaults()
+	c.Harness = "nope-not-a-harness"
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate() accepted an unregistered harness")
+	}
+	if !strings.Contains(err.Error(), "opencode") {
+		t.Errorf("rejection message %q should list the registered harness names", err.Error())
+	}
+}
 
 func TestResolveEnv(t *testing.T) {
 	dir := t.TempDir()
@@ -124,6 +165,25 @@ func TestBacklogSummaryURL(t *testing.T) {
 		c := &Config{BacklogURL: "https://example.com/mcp/other", MCPConfigPath: ""}
 		if got := c.BacklogSummaryURL(); got != "https://example.com/api/backlog-summary" {
 			t.Errorf("BacklogSummaryURL() = %q, want the origin only", got)
+		}
+	})
+
+	t.Run("an explicit backlog_url wins over a different .mcp.json origin", func(t *testing.T) {
+		// Explicit config overrides (README): the operator pointed backlog_url at a
+		// self-hosted plane, so the summary poll must hit THAT origin even though
+		// .mcp.json names https://self.example.com. Regression for finding #4.
+		c := &Config{BacklogURL: "https://plane.internal/mcp/proj", MCPConfigPath: mcp}
+		if got := c.BacklogSummaryURL(); got != "https://plane.internal/api/backlog-summary" {
+			t.Errorf("BacklogSummaryURL() = %q, want the explicit backlog_url's origin to win", got)
+		}
+	})
+
+	t.Run("the default base does NOT override a resolved .mcp.json origin", func(t *testing.T) {
+		// The flip side: leaving backlog_url at the default must still defer to the
+		// .mcp.json origin, so a self-hosted plane wired only through .mcp.json works.
+		c := &Config{BacklogURL: defaultBacklogURL, MCPConfigPath: mcp}
+		if got := c.BacklogSummaryURL(); got != "https://self.example.com/api/backlog-summary" {
+			t.Errorf("BacklogSummaryURL() = %q, want the .mcp.json origin", got)
 		}
 	})
 

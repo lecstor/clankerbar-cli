@@ -110,25 +110,34 @@ func TestOpencodeDetectLimit(t *testing.T) {
 	}
 }
 
+// IsTransient must scan only the harness-level diagnostic text (opencodeErrorText:
+// stderr + {"type":"error"} events), NOT the agent's own {"type":"text"} narration.
+// So real provider/transport errors — whether they arrive as an error event or on
+// stderr — trip it, but a session that merely *discusses* a rate limit before
+// exiting non-zero does not. Cases mark where the signal lives (stdout error event
+// vs. stderr) to match how opencode actually emits it.
 func TestOpencodeIsTransient(t *testing.T) {
 	cases := []struct {
 		name string
-		blob string
+		res  Result
 		want bool
 	}{
-		{"429 statusCode", `{"type":"error","error":{"data":{"statusCode":429}}}`, true},
-		{"5xx statusCode", `{"error":{"data":{"statusCode":503}}}`, true},
-		{"isRetryable flag", `{"type":"error","error":{"data":{"statusCode":529,"isRetryable":true}}}`, true},
-		{"too many requests", "Error: 429 Too Many Requests", true},
-		{"connection blip", "fetch failed", true},
-		{"overloaded", "provider overloaded", true},
-		{"402 payment required is NOT transient", `{"error":{"data":{"statusCode":402,"isRetryable":false}}}`, false},
-		{"budget exhaustion is NOT transient", "Your account is out of credits", false},
-		{"clean run", opencodeStream, false},
+		{"429 error event", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429}}}`}, true},
+		{"503 error event", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":503}}}`}, true},
+		{"isRetryable flag", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":529,"isRetryable":true}}}`}, true},
+		{"too many requests on stderr", Result{Stderr: "Error: 429 Too Many Requests"}, true},
+		{"connection blip on stderr", Result{Stderr: "fetch failed"}, true},
+		{"overloaded on stderr", Result{Stderr: "provider overloaded"}, true},
+		{"402 payment required is NOT transient", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":402,"isRetryable":false}}}`}, false},
+		{"budget exhaustion is NOT transient", Result{Stderr: "Your account is out of credits"}, false},
+		// Regression for finding #2: an assistant text part mentioning a rate limit
+		// must NOT be read as a transient error — only opencodeErrorText is scanned.
+		{"assistant narration mentioning a rate limit does NOT trip", Result{Stdout: `{"type":"text","text":"Earlier I hit a rate limit and connection error, so I paused before retrying."}`}, false},
+		{"clean run", Result{Stdout: opencodeStream}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := (opencode{}).IsTransient(Result{Stdout: tc.blob}); got != tc.want {
+			if got := (opencode{}).IsTransient(tc.res); got != tc.want {
 				t.Errorf("IsTransient = %v, want %v", got, tc.want)
 			}
 		})
