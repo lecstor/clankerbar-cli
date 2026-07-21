@@ -163,9 +163,13 @@ func (d *Driver) Run(ctx context.Context) error {
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int, cost float64, stop bool, err error) {
 	retries := 0
 	for {
-		// Each attempt streams live to the terminal and to its own logfile.
+		// Each attempt streams live to the terminal and to its own logfile. The name
+		// carries the drain number and attempt counter as well as the timestamp: two
+		// attempts in the same second (a sub-second backoff) would otherwise share a
+		// name and os.Create would truncate the earlier attempt's log.
 		inv := d.invocation(false)
-		logPath := filepath.Join(d.stateDir, "iteration-"+time.Now().Format("20060102-150405")+".log")
+		logPath := filepath.Join(d.stateDir, fmt.Sprintf("iteration-%s-d%d-a%d.log",
+			time.Now().Format("20060102-150405"), drainNum, retries))
 		f, ferr := os.Create(logPath)
 		if ferr == nil {
 			inv.Console = io.MultiWriter(os.Stderr, f)
@@ -185,11 +189,20 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 		}
 		if ierr != nil {
 			if ctx.Err() != nil {
-				return 0, 0, true, nil
+				return tokens, cost, true, nil
 			}
 			// Couldn't launch the harness at all (bad PATH/flags/env) — not a blip.
-			return 0, 0, false, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
+			return tokens, cost, false, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
 		}
+
+		// Count THIS attempt's spend toward the budget breaker regardless of how it
+		// ends — usage-limit, transient, stop, or clean. A failed/retried attempt
+		// still burned tokens, and a "leave headroom" breaker must err toward seeing
+		// real spend, not under-counting it. Each attempt is a distinct session, so
+		// summing per attempt (and returning the accumulator, not the final res)
+		// counts every session exactly once.
+		tokens += res.Tokens
+		cost += res.CostUSD
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
@@ -199,18 +212,18 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 			if lim.Stop {
 				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved)",
 					drainNum, limitReason(lim))
-				return 0, 0, true, nil
+				return tokens, cost, true, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
 			if d.supervisedWait(ctx, lim) {
-				return 0, 0, true, nil
+				return tokens, cost, true, nil
 			}
 			continue
 		}
 
 		if res.ExitCode == 0 {
-			log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drainNum, res.Tokens, res.CostUSD)
-			return res.Tokens, res.CostUSD, false, nil
+			log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drainNum, tokens, cost)
+			return tokens, cost, false, nil
 		}
 
 		// Non-zero exit, not the usage cap: a transient server/network blip backs
@@ -218,7 +231,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 		if d.h.IsTransient(res) {
 			retries++
 			if d.cfg.MaxRetries > 0 && retries > d.cfg.MaxRetries {
-				return 0, 0, false, fmt.Errorf(
+				return tokens, cost, false, fmt.Errorf(
 					"iteration %d: transient failures persisted after %d retries (check https://status.claude.com; rerun to resume)",
 					drainNum, d.cfg.MaxRetries)
 			}
@@ -226,12 +239,12 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 			log.Printf("iteration %d transient failure (exit %d) — %s in %s (a fresh session reclaims any half-done task)",
 				drainNum, res.ExitCode, retryLabel(retries, d.cfg.MaxRetries), wait)
 			if d.waitOrStop(ctx, wait) {
-				return 0, 0, true, nil
+				return tokens, cost, true, nil
 			}
 			continue
 		}
 
-		return 0, 0, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping", drainNum, d.h.Name(), res.ExitCode)
+		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping", drainNum, d.h.Name(), res.ExitCode)
 	}
 }
 

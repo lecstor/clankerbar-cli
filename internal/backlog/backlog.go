@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -108,6 +109,17 @@ func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
 		// (still makes progress) instead of idle-polling a 400 forever. Console pause
 		// and live count-gating require a project-scoped key.
 		if resp.StatusCode == http.StatusBadRequest && errorCode(body) == "project_required" {
+			return Summary{}, ErrNotWired
+		}
+		// A revoked/wrong API key answers 401/403. That is a PERMANENT auth failure,
+		// not a transient blip — retrying it just idle-polls a dead key forever. Map it
+		// to ErrNotWired (like the 400 case) so the loop drops into blind drain instead.
+		// The loop logs the blind-mode transition once and stops polling, so this line
+		// fires at most once per run; it names auth specifically to distinguish it from
+		// the project_required wiring mismatch. (Blind drain then spawns sessions whose
+		// own key is likely also bad — accepted for now over a tight infinite poll.)
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			log.Printf("backlog summary: HTTP %d (auth rejected — revoked or wrong CLANKERBAR_API_KEY); treating as not-wired", resp.StatusCode)
 			return Summary{}, ErrNotWired
 		}
 		return Summary{}, fmt.Errorf("backlog summary: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))

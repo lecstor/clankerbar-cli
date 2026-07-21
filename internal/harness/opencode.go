@@ -288,7 +288,12 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 func (opencode) IsTransient(res Result) bool {
-	return opencodeTransientRe.MatchString(res.Stdout + res.Stderr)
+	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw
+	// Stdout+Stderr: the latter includes {"type":"text"} assistant narration, so a
+	// session that merely *discusses* a rate limit / connection error before exiting
+	// non-zero would be retried as transient instead of surfacing the real failure —
+	// the same reason DetectLimit scopes its scan this way.
+	return opencodeTransientRe.MatchString(opencodeErrorText(res))
 }
 
 func (o opencode) Probe(ctx context.Context, in Invocation) (Limit, error) {

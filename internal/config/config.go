@@ -13,12 +13,21 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
+
+// defaultBacklogURL is the base the driver reads backlog counts from when the
+// operator sets no backlog_url. Kept as a named constant so BacklogSummaryURL can
+// tell an explicit backlog_url apart from this default (explicit config overrides).
+const defaultBacklogURL = "https://clankerbar.com"
 
 // Config is the resolved loop configuration. The comments here are the source of
 // truth for each knob until the README/docs catch up.
 type Config struct {
-	// Harness selects the coding-agent CLI to drive: "claude" or "codex".
+	// Harness selects the coding-agent CLI to drive (e.g. "claude", "codex",
+	// "opencode"). Validated against the harness registry (harness.Known), so the
+	// accepted set is exactly what is registered — see Validate.
 	Harness string `json:"harness"`
 
 	// Model is a harness-specific model alias to pin (e.g. "opus"). Empty = the
@@ -130,7 +139,7 @@ func defaults() *Config {
 	return &Config{
 		Harness:    "claude",
 		Prompt:     "Work the backlog.",
-		BacklogURL: "https://clankerbar.com",
+		BacklogURL: defaultBacklogURL,
 	}
 }
 
@@ -226,10 +235,12 @@ func (c *Config) Validate() error {
 	c.SettingsPath = expandHome(c.SettingsPath)
 	c.StateDir = expandHome(c.StateDir)
 
-	switch c.Harness {
-	case "claude", "codex":
-	default:
-		return fmt.Errorf("unknown harness %q (want: claude, codex)", c.Harness)
+	// Validate against the harness registry (not a hand-kept switch) so the accepted
+	// set can never drift from what is actually registered — an unregistered value is
+	// rejected here before harness.Get is consulted, and a newly registered adapter is
+	// accepted automatically. harness does not import config, so there is no cycle.
+	if !harness.Known(c.Harness) {
+		return fmt.Errorf("unknown harness %q (want: %s)", c.Harness, strings.Join(harness.Names(), ", "))
 	}
 	if c.Prompt == "" {
 		return errors.New("prompt is empty")
@@ -316,13 +327,25 @@ func (c *Config) BacklogEndpoint() string {
 //
 // Unlike the MCP `get_backlog_summary` tool, this route carries no project slug in
 // its path — a project-scoped API key selects the project — so only the plane ORIGIN
-// is needed. We take it from the resolved MCP endpoint when available (so a
-// self-hosted plane / .mcp.json url is honoured), else from BacklogURL's own origin
-// (which, for this route, needs no slug — so a bare `https://clankerbar.com` base
+// is needed.
+//
+// Precedence (explicit config overrides, per the README): an explicitly set
+// backlog_url — one that differs from the default base — wins, so an operator who
+// points backlog_url at a self-hosted plane is honoured even when .mcp.json names a
+// different origin. Only when backlog_url is left at the default do we fall back to
+// the resolved MCP endpoint's origin (so a self-hosted plane wired solely through
+// .mcp.json is still honoured), and finally to the default base's own origin (which,
+// for this slug-less route, needs no project path — so a bare `https://clankerbar.com`
 // that BacklogEndpoint rejects for MCP still yields a working summary URL). Returns
 // "" when no origin can be resolved (New("") then yields a not-wired, blind poller).
 func (c *Config) BacklogSummaryURL() string {
-	origin := originOf(c.BacklogEndpoint())
+	var origin string
+	if c.BacklogURL != "" && c.BacklogURL != defaultBacklogURL {
+		origin = originOf(c.BacklogURL)
+	}
+	if origin == "" {
+		origin = originOf(c.BacklogEndpoint())
+	}
 	if origin == "" {
 		origin = originOf(c.BacklogURL)
 	}

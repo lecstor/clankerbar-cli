@@ -119,10 +119,24 @@ func Get(name string) (Adapter, error) {
 	if a, ok := registry[name]; ok {
 		return a, nil
 	}
+	return nil, fmt.Errorf("unknown harness %q (have: %s)", name, strings.Join(Names(), ", "))
+}
+
+// Known reports whether name is a registered harness. It is the single source of
+// truth for the accepted set, so config validation can never drift from what the
+// registry actually offers (see config.Validate).
+func Known(name string) bool {
+	_, ok := registry[name]
+	return ok
+}
+
+// Names returns the registered harness names, sorted — for validation errors and
+// flag help that should list exactly what is registered.
+func Names() []string {
 	names := make([]string, 0, len(registry))
 	for n := range registry {
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	return nil, fmt.Errorf("unknown harness %q (have: %s)", name, strings.Join(names, ", "))
+	return names
 }
