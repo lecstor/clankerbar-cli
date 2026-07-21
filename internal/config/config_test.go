@@ -61,3 +61,34 @@ func TestValidatePopulatesEnvSlice(t *testing.T) {
 		t.Fatalf("EnvSlice = %v", got)
 	}
 }
+
+func TestBacklogEndpoint(t *testing.T) {
+	dir := t.TempDir()
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("derives project-scoped URL from .mcp.json when backlog_url is a bare base", func(t *testing.T) {
+		c := &Config{BacklogURL: "https://clankerbar.com", MCPConfigPath: mcp}
+		if got := c.BacklogEndpoint(); got != "https://clankerbar.com/mcp/proj" {
+			t.Errorf("BacklogEndpoint() = %q, want the .mcp.json URL", got)
+		}
+	})
+
+	t.Run("explicit backlog_url with an /mcp path wins over .mcp.json", func(t *testing.T) {
+		c := &Config{BacklogURL: "https://example.com/mcp/other", MCPConfigPath: mcp}
+		if got := c.BacklogEndpoint(); got != "https://example.com/mcp/other" {
+			t.Errorf("BacklogEndpoint() = %q, want the explicit backlog_url", got)
+		}
+	})
+
+	t.Run("returns empty when only a bare base and no .mcp.json url are available", func(t *testing.T) {
+		// A slug-less base is not a usable endpoint; "" makes New() not-wired so the
+		// loop blind-drains instead of retrying an endpoint the plane always rejects.
+		c := &Config{BacklogURL: "https://clankerbar.com", MCPConfigPath: ""}
+		if got := c.BacklogEndpoint(); got != "" {
+			t.Errorf("BacklogEndpoint() = %q, want \"\"", got)
+		}
+	})
+}
