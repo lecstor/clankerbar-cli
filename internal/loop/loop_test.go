@@ -255,6 +255,32 @@ func TestRun_GateDecision(t *testing.T) {
 			t.Errorf("blind mode must stop polling after the not-wired signal; got %d polls", p.calls)
 		}
 	})
+
+	t.Run("ErrUnauthorized hard-stops: returns a non-nil error and spawns nothing", func(t *testing.T) {
+		// A 401/403 (ErrUnauthorized) is a bad API key the harness sessions share, so
+		// the loop must NOT blind-drain or idle-retry — it hard-stops with a non-nil
+		// error (non-zero exit) and spawns no session (CLA-132).
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		h := &fakeAdapter{}
+		p := &fakePoller{err: backlog.ErrUnauthorized}
+		err := runLoop(t, cfg, h, p)
+		if err == nil {
+			t.Fatal("ErrUnauthorized must make Run return a non-nil error (loud hard stop), got nil")
+		}
+		if !errors.Is(err, backlog.ErrUnauthorized) {
+			t.Errorf("returned error should wrap backlog.ErrUnauthorized; got %v", err)
+		}
+		if !strings.Contains(err.Error(), "CLANKERBAR_API_KEY") {
+			t.Errorf("hard-stop error should name CLANKERBAR_API_KEY as the cause; got %v", err)
+		}
+		if h.invokeCalls != 0 {
+			t.Errorf("auth failure must spawn NO harness session; got %d Invoke calls", h.invokeCalls)
+		}
+		if p.calls != 1 {
+			t.Errorf("auth failure must stop after the first poll, not idle-retry; got %d polls", p.calls)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------

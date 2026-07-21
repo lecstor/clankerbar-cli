@@ -91,6 +91,14 @@ func (d *Driver) Run(ctx context.Context) error {
 			case errors.Is(err, backlog.ErrNotWired):
 				log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
 				d.blind = true
+			case errors.Is(err, backlog.ErrUnauthorized):
+				// A 401/403 means CLANKERBAR_API_KEY is bad — and the harness sessions
+				// we'd spawn carry the SAME key, so blind-draining or idle-retrying just
+				// burns dead work against a credential that won't self-heal. Hard-stop
+				// LOUDLY with a non-nil error (non-zero exit — distinct from the graceful
+				// nil stop STOP/budget return) so the operator fixes the key (CLA-132).
+				log.Print("backlog auth failed (401/403) — check CLANKERBAR_API_KEY; stopping")
+				return fmt.Errorf("backlog auth failed (401/403) — check CLANKERBAR_API_KEY: %w", err)
 			case err != nil:
 				log.Printf("backlog poll error: %v — retry in %s", err, idle)
 				if d.waitOrStop(ctx, idle) {

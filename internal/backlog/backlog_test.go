@@ -175,10 +175,11 @@ func TestPoll_OtherBadRequestStaysRetryable(t *testing.T) {
 }
 
 // A revoked/wrong API key answers 401 or 403. That is a PERMANENT auth failure, not
-// a transient blip: it must map to ErrNotWired (like the 400 project_required case)
-// so the loop drops into blind drain instead of idle-polling a dead key forever.
-// Regression for finding #5.
-func TestPoll_AuthRejectedMapsToNotWired(t *testing.T) {
+// a transient blip — and NOT a blind-drain cue (the harness sessions carry the same
+// bad key): it must map to the distinct ErrUnauthorized sentinel so the loop hard-
+// stops loudly instead of blind-draining or idle-polling a dead key (CLA-132, which
+// reverses CLA-131 finding #5's ErrNotWired mapping).
+func TestPoll_AuthRejectedMapsToUnauthorized(t *testing.T) {
 	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(code)
@@ -186,8 +187,11 @@ func TestPoll_AuthRejectedMapsToNotWired(t *testing.T) {
 		}))
 		_, err := New(srv.URL, "revoked-key").Poll(context.Background())
 		srv.Close()
-		if !errors.Is(err, ErrNotWired) {
-			t.Fatalf("HTTP %d must map to ErrNotWired, got %v", code, err)
+		if !errors.Is(err, ErrUnauthorized) {
+			t.Fatalf("HTTP %d must map to ErrUnauthorized, got %v", code, err)
+		}
+		if errors.Is(err, ErrNotWired) {
+			t.Fatalf("HTTP %d must NOT map to ErrNotWired (would blind-drain a dead key), got %v", code, err)
 		}
 	}
 }
