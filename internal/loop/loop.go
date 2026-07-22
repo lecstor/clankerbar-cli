@@ -99,6 +99,15 @@ func (d *Driver) Run(ctx context.Context) error {
 				// nil stop STOP/budget return) so the operator fixes the key (CLA-132).
 				log.Print("backlog auth failed (401/403) — check CLANKERBAR_API_KEY; stopping")
 				return fmt.Errorf("backlog auth failed (401/403) — check CLANKERBAR_API_KEY: %w", err)
+			case errors.Is(err, backlog.ErrProjectRequired):
+				// A 400 project_required means CLANKERBAR_API_KEY is ACCOUNT-scoped but a
+				// PROJECT-scoped key is required — and the harness sessions we'd spawn carry
+				// the SAME account key, so they can't do project-scoped MCP work either.
+				// Blind-draining or idle-retrying just burns doomed sessions against a wiring
+				// mismatch that won't self-heal. Hard-stop LOUDLY with a non-nil error
+				// (non-zero exit) so the operator sets a project-scoped key (CLA-133).
+				log.Print("backlog poll: API key is account-scoped but a project-scoped key is required — set CLANKERBAR_API_KEY to a project key; stopping")
+				return fmt.Errorf("backlog poll: API key is account-scoped but a project-scoped key is required — set CLANKERBAR_API_KEY to a project key: %w", err)
 			case err != nil:
 				log.Printf("backlog poll error: %v — retry in %s", err, idle)
 				if d.waitOrStop(ctx, idle) {

@@ -64,8 +64,12 @@ without exiting, and without killing an in-flight session (a pause is honoured
 between iterations, like `STOP`). Remote pause rides on the driver's cheap backlog
 read, so it needs a **wired poller**: a *project-scoped* `CLANKERBAR_API_KEY` (mint
 one at `clankerbar.com/projects/<slug>/api-keys`) and a resolvable plane URL. With
-only an account key or no endpoint the loop drains blind and can't see the flag —
-the local `STOP`/`HALT` markers remain the fallback there.
+no creds or no resolvable endpoint the loop drains blind and can't see the flag —
+the local `STOP`/`HALT` markers remain the fallback there. An **account-scoped** key
+is a different case: the project-scoped read rejects it with `400 project_required`,
+and since the harness sessions share that same key they can't do project-scoped work
+either, so the loop **hard-stops** (non-zero exit) and asks you to set a project key
+rather than blind-draining doomed sessions — just as a revoked key (`401/403`) does.
 
 ### Visibility
 

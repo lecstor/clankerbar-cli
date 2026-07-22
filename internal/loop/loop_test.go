@@ -281,6 +281,33 @@ func TestRun_GateDecision(t *testing.T) {
 			t.Errorf("auth failure must stop after the first poll, not idle-retry; got %d polls", p.calls)
 		}
 	})
+
+	t.Run("ErrProjectRequired hard-stops: returns a non-nil error and spawns nothing", func(t *testing.T) {
+		// A 400 project_required (ErrProjectRequired) means the key is account-scoped but
+		// a project-scoped key is required; the harness sessions share that account key,
+		// so the loop must NOT blind-drain or idle-retry — it hard-stops with a non-nil
+		// error (non-zero exit) and spawns no session (CLA-133).
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		h := &fakeAdapter{}
+		p := &fakePoller{err: backlog.ErrProjectRequired}
+		err := runLoop(t, cfg, h, p)
+		if err == nil {
+			t.Fatal("ErrProjectRequired must make Run return a non-nil error (loud hard stop), got nil")
+		}
+		if !errors.Is(err, backlog.ErrProjectRequired) {
+			t.Errorf("returned error should wrap backlog.ErrProjectRequired; got %v", err)
+		}
+		if !strings.Contains(err.Error(), "project-scoped") {
+			t.Errorf("hard-stop error should tell the operator to use a project-scoped key; got %v", err)
+		}
+		if h.invokeCalls != 0 {
+			t.Errorf("project_required must spawn NO harness session; got %d Invoke calls", h.invokeCalls)
+		}
+		if p.calls != 1 {
+			t.Errorf("project_required must stop after the first poll, not idle-retry; got %d polls", p.calls)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
