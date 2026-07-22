@@ -141,9 +141,11 @@ func TestPoll_ServerErrorIsNonFatalNotNotWired(t *testing.T) {
 }
 
 // An account key hitting this project-scoped route gets 400 `project_required`. That
-// is a persistent wiring mismatch, not a blip: it must map to ErrNotWired so the
-// loop drains blind (making progress) instead of idle-polling a 400 forever.
-func TestPoll_ProjectRequiredMapsToNotWired(t *testing.T) {
+// is a persistent wiring mismatch the harness sessions share (same account key), not a
+// blip: it must map to the distinct ErrProjectRequired sentinel so the loop hard-stops
+// loudly instead of blind-draining doomed sessions — NOT ErrNotWired (CLA-133, which
+// reverses CLA-130's blind-drain mapping).
+func TestPoll_ProjectRequiredMapsToProjectRequired(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = io.WriteString(w, `{"error":{"code":"project_required","message":"needs a project-scoped API key"}}`)
@@ -151,8 +153,11 @@ func TestPoll_ProjectRequiredMapsToNotWired(t *testing.T) {
 	defer srv.Close()
 
 	_, err := New(srv.URL, "account-key").Poll(context.Background())
-	if !errors.Is(err, ErrNotWired) {
-		t.Fatalf("project_required must map to ErrNotWired, got %v", err)
+	if !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("project_required must map to ErrProjectRequired, got %v", err)
+	}
+	if errors.Is(err, ErrNotWired) {
+		t.Fatalf("project_required must NOT map to ErrNotWired (would blind-drain doomed sessions), got %v", err)
 	}
 }
 

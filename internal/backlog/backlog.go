@@ -43,14 +43,17 @@ type Poller interface {
 
 // ErrNotWired means the driver cannot do its cheap project-scoped read, so the loop
 // cannot gate on live counts (or honour the console pause) and falls back to blind
-// draining. It is returned when creds are absent, and also when the configured key
-// is an ACCOUNT key that the project-scoped `/api/backlog-summary` route rejects with
-// `400 project_required` (see Poll) — either way there is no usable live read, so
-// blind drain (which still makes progress) beats idle-polling a permanent failure. A
-// wired poller reports transient failures as ordinary (retryable) errors, never
-// ErrNotWired, so the loop never mistakes a blip for "no endpoint".
+// draining. It is returned only for the genuinely benign gap: creds are absent, or
+// no summary endpoint is configured, so there is nothing to poll — blind drain (which
+// still makes progress) beats idle-polling a permanent no-op. A wired poller reports
+// transient failures as ordinary (retryable) errors, never ErrNotWired, so the loop
+// never mistakes a blip for "no endpoint".
 //
-// A 401/403 auth rejection is deliberately NOT ErrNotWired: see ErrUnauthorized.
+// Two failures are deliberately NOT ErrNotWired, because both are operator
+// misconfigurations the harness sessions share and cannot self-heal — blind-draining
+// either would just burn doomed sessions. A 401/403 auth rejection maps to
+// ErrUnauthorized; a `400 project_required` (an account-scoped key on a project-scoped
+// route) maps to ErrProjectRequired. Both are loud hard stops (see loop.Run).
 var ErrNotWired = errors.New("backlog polling not wired")
 
 // ErrUnauthorized means the plane rejected the driver's API key with 401/403 — a
@@ -61,6 +64,17 @@ var ErrNotWired = errors.New("backlog polling not wired")
 // the loop treats it as a loud hard stop (see loop.Run) — exit non-zero and name the
 // key — rather than idle-polling or blind-draining a dead credential (CLA-132).
 var ErrUnauthorized = errors.New("backlog auth rejected (401/403)")
+
+// ErrProjectRequired means the plane rejected the read with `400 project_required`:
+// the configured CLANKERBAR_API_KEY is ACCOUNT-scoped, but the project-scoped
+// `/api/backlog-summary` route (no project slug in its path) needs a PROJECT-scoped
+// key. Like ErrUnauthorized, and unlike ErrNotWired, this is NOT a blind-drain cue:
+// the harness sessions the loop spawns carry the SAME account key, so they can't do
+// project-scoped MCP work (`next_task`/`claim_task`/…) either — blind-draining just
+// burns doomed sessions against a wiring mismatch that won't self-heal. The loop
+// hard-stops loudly (see loop.Run) and tells the operator to set a project-scoped key
+// (CLA-133, which reverses CLA-130's ErrNotWired mapping).
+var ErrProjectRequired = errors.New("backlog needs a project-scoped API key (400 project_required)")
 
 type notWired struct{}
 
@@ -115,11 +129,13 @@ func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
 		// An ACCOUNT key can't drive this project-scoped route: the route carries no
 		// project slug (an account key selects its project via the /mcp/<slug> path),
 		// so it answers 400 `project_required`. That is a persistent wiring mismatch,
-		// not a transient blip — treat it like "not wired" so the loop drains blind
-		// (still makes progress) instead of idle-polling a 400 forever. Console pause
-		// and live count-gating require a project-scoped key.
+		// not a transient blip — and NOT a cue to blind-drain: the harness sessions the
+		// loop spawns carry the SAME account key, so they can't do project-scoped MCP
+		// work either. Map it to ErrProjectRequired (distinct from both an auth failure
+		// and a transient blip) so the loop hard-stops loudly and the operator switches
+		// to a project-scoped key (CLA-133, reversing CLA-130's blind-drain mapping).
 		if resp.StatusCode == http.StatusBadRequest && errorCode(body) == "project_required" {
-			return Summary{}, ErrNotWired
+			return Summary{}, ErrProjectRequired
 		}
 		// A revoked/wrong API key answers 401/403. That is a PERMANENT auth failure,
 		// not a transient blip — and NOT a cue to blind-drain: the harness sessions the
