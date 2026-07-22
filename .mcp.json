@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "clankerbar": {
+      "type": "http",
+      "url": "https://clankerbar.com/mcp/clankerbar",
+      "headers": {
+        "Authorization": "Bearer ${CLANKERBAR_API_KEY}"
+      }
+    }
+  }
+}
