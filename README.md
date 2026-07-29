@@ -52,6 +52,55 @@ clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json
 ```
 
+### Preflight: `clankerbar doctor`
+
+Most of what goes wrong in an unattended run only shows up as *degraded
+behaviour*, hours in — a rejected key silently drops the loop into blind mode, a
+missing binary kills the first session, an unreachable plane looks exactly like an
+empty queue. `doctor` turns all of that into one cheap answer before you start:
+
+```sh
+clankerbar doctor
+clankerbar doctor --config ./clankerbar.json --harness codex
+clankerbar doctor && clankerbar run --harness=claude   # gate a cron wrapper
+```
+
+It prints one `PASS` / `WARN` / `FAIL` line per check, with a one-line remedy
+under anything that isn't a PASS, and **exits non-zero if any check FAILs** — so
+it composes with `&&` as above.
+
+```
+PASS  config       loaded ./clankerbar.json
+                   harness: claude
+                   workdir: /Users/you/dev
+                   backlog: https://clankerbar.com/api/projects/acme/backlog-summary
+PASS  harness      /usr/local/bin/claude (2.1.0)
+WARN  config_dir   not set — the session inherits the ambient environment
+                -> set config_dir (or --config-dir) so a cron/launchd run loads the same skills, plugins and auth as your terminal
+PASS  backlog      https://clankerbar.com/api/projects/acme/backlog-summary — 7 claimable, 0 open question(s)
+WARN  workdir      /Users/you/dev/.clankerbar-loop has a leftover STOP marker
+                -> delete it, or the loop stops immediately: rm /Users/you/dev/.clankerbar-loop/STOP
+PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
+PASS  budget       no ceiling configured — the loop runs until the backlog is dry or it is stopped
+```
+
+The checks: **config** (discovered, parses, validates — plus the resolved harness,
+workdir and derived backlog URLs), **harness** (binary on PATH and runnable, with
+its version), **config_dir** (resolves, exists, looks initialised for the chosen
+harness), **backlog** (creds present and the summary read succeeds — distinguishing
+no creds, a rejected key, a `project_required` key/route mismatch, and an
+unreachable endpoint), **workdir** (state dir writable, no leftover `HALT`/`STOP`,
+and an `.mcp.json` if the workdir is a multi-repo parent), **permissions**
+(harness-specific policy sanity), and **budget** (ceilings parse and are sane).
+
+A multi-project config gets **one backlog check per project** — one queue can be
+wired wrong while the others are fine.
+
+WARN vs FAIL is the "would this still make progress?" line: no creds and an
+unreachable plane WARN, because the loop drains blind and still gets work done; a
+rejected key and a key/route mismatch FAIL, because they never self-heal and every
+session the loop spawns carries the same broken credential.
+
 Control an in-flight run with markers in the state dir (`<workdir>/.clankerbar-loop`):
 
 ```sh
