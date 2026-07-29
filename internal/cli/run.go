@@ -65,10 +65,25 @@ func Run(ctx context.Context, args []string) error {
 	}
 
 	// The driver reads backlog state directly (cheap, no tokens) to gate each
-	// iteration, to keep polling while idle, and to honour the console pause flag. It
-	// GETs the plane's project-scoped /api/backlog-summary route (counts + loopPaused
-	// in one read); the project-scoped key is from the env.
-	poller := backlog.New(cfg.BacklogSummaryURL(), os.Getenv("CLANKERBAR_API_KEY"))
+	// iteration, to keep polling while idle, and to honour the console pause flag —
+	// one GET per project of the plane's backlog-summary surface (counts +
+	// loopPaused in one read). The API key comes from the env: the operator's
+	// ACCOUNT key covers every configured project (CLA-142); a project-scoped key
+	// still works for single-project / CI setups.
+	apiKey := os.Getenv("CLANKERBAR_API_KEY")
 
-	return loop.New(cfg, adapter, poller).Run(ctx)
+	if projects := cfg.Projects; len(projects) > 0 {
+		targets := make([]loop.Target, 0, len(projects))
+		for _, p := range projects {
+			targets = append(targets, loop.Target{
+				Name:          p.Slug,
+				Poller:        backlog.New(cfg.ProjectSummaryURL(p), apiKey),
+				WorkDir:       p.WorkDir,
+				MCPConfigPath: p.MCPConfigPath,
+			})
+		}
+		return loop.NewMulti(cfg, adapter, targets).Run(ctx)
+	}
+
+	return loop.New(cfg, adapter, backlog.New(cfg.BacklogSummaryURL(), apiKey)).Run(ctx)
 }

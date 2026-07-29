@@ -5,13 +5,19 @@
 // learn when the operator has paused the run from the web console.
 //
 // This is a control-plane read (no agent, no tokens): a single authenticated GET of
-// clankerbar's project-scoped `/api/backlog-summary` route (CLA-76), which returns
-// the same freshness snapshot the MCP `backlog` block carries — `{version, counts,
-// claimable, openQuestions}` — PLUS a `loopPaused` boolean. Folding the pause flag
-// into the same cheap read means the loop never needs a second call to learn it
-// should stop spawning sessions. This route (unlike the MCP `get_backlog_summary`
-// tool) needs a PROJECT-scoped API key: it carries no project slug in its path, so
-// the key alone selects the project.
+// clankerbar's backlog-summary surface, which returns the same freshness snapshot
+// the MCP `backlog` block carries — `{version, counts, claimable, openQuestions}` —
+// PLUS a `loopPaused` boolean. Folding the pause flag into the same cheap read means
+// the loop never needs a second call to learn it should stop spawning sessions.
+//
+// Two route forms exist (CLA-141); config.BacklogSummaryURL / ProjectSummaryURL
+// decide which this poller is given:
+//
+//   - `/api/projects/<slug>/backlog-summary` — the project named in the PATH, so the
+//     operator's ACCOUNT key works (membership-gated, like /mcp/<slug>). The form a
+//     multi-project instance polls per project (CLA-142).
+//   - `/api/backlog-summary` — legacy, slug-less: only a PROJECT-scoped key can
+//     select the project, and an account key gets `400 project_required`.
 package backlog
 
 import (
@@ -30,7 +36,7 @@ import (
 type Summary struct {
 	Version       int // per-project monotonic counter; bumps on every write
 	Ready         int
-	Claimable     int  // dep-unblocked ready — the count that means "work to do now"
+	Claimable     int // dep-unblocked ready — the count that means "work to do now"
 	InProgress    int
 	OpenQuestions int
 	Paused        bool // console-driven loop pause (CLA-76): stop spawning, keep polling
@@ -66,25 +72,29 @@ var ErrNotWired = errors.New("backlog polling not wired")
 var ErrUnauthorized = errors.New("backlog auth rejected (401/403)")
 
 // ErrProjectRequired means the plane rejected the read with `400 project_required`:
-// the configured CLANKERBAR_API_KEY is ACCOUNT-scoped, but the project-scoped
-// `/api/backlog-summary` route (no project slug in its path) needs a PROJECT-scoped
-// key. Like ErrUnauthorized, and unlike ErrNotWired, this is NOT a blind-drain cue:
-// the harness sessions the loop spawns carry the SAME account key, so they can't do
-// project-scoped MCP work (`next_task`/`claim_task`/…) either — blind-draining just
-// burns doomed sessions against a wiring mismatch that won't self-heal. The loop
-// hard-stops loudly (see loop.Run) and tells the operator to set a project-scoped key
-// (CLA-133, which reverses CLA-130's ErrNotWired mapping).
-var ErrProjectRequired = errors.New("backlog needs a project-scoped API key (400 project_required)")
+// the poll hit the LEGACY slug-less `/api/backlog-summary` route with an
+// ACCOUNT-scoped key, which that route cannot bind to a project. The remedy is a
+// project SELECTOR, not a different key (decision 2026-07-29): give the loop a slug
+// to name in the path — a `projects` list in the config, or an .mcp.json whose
+// clankerbar URL is `/mcp/<slug>` — so it polls the slug-ful route (CLA-141/142). A
+// project-scoped key also avoids it, but that is the CI-style setup, not the fix.
+//
+// Like ErrUnauthorized, and unlike ErrNotWired, this is NOT a blind-drain cue: the
+// mismatch won't self-heal, and the sessions the loop would spawn burn tokens for
+// nothing while the loop can't gate or see the console pause. The loop hard-stops
+// loudly (see loop.Run) with the remedy above (CLA-133 made it a hard stop; CLA-142
+// reworded the remedy).
+var ErrProjectRequired = errors.New("backlog summary needs a project selector (400 project_required)")
 
 type notWired struct{}
 
 func (notWired) Poll(context.Context) (Summary, error) { return Summary{}, ErrNotWired }
 
-// httpPoller GETs clankerbar's project-scoped `/api/backlog-summary` route with a
-// Bearer API key. No agent, no tokens — just the live counts the loop gates on and
-// the console-pause flag it honours, in one read.
+// httpPoller GETs clankerbar's backlog-summary route (either form) with a Bearer
+// API key. No agent, no tokens — just the live counts the loop gates on and the
+// console-pause flag it honours, in one read.
 type httpPoller struct {
-	endpoint string // full /api/backlog-summary URL, e.g. https://clankerbar.com/api/backlog-summary
+	endpoint string // full summary URL, e.g. https://clankerbar.com/api/projects/<slug>/backlog-summary
 	apiKey   string
 	client   *http.Client
 }
@@ -94,8 +104,8 @@ type httpPoller struct {
 // returns a real HTTP poller that fetches live {version, counts, claimable,
 // openQuestions, loopPaused} from the plane.
 //
-// summaryURL is the full `/api/backlog-summary` URL (see config.BacklogSummaryURL):
-// the project-scoped read surface CLA-76 built for this driver.
+// summaryURL is the full summary-route URL — config.BacklogSummaryURL for the
+// single default target, config.ProjectSummaryURL for each multi-project entry.
 func New(summaryURL, apiKey string) Poller {
 	if summaryURL == "" || apiKey == "" {
 		return notWired{}
@@ -126,14 +136,11 @@ func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
 		return Summary{}, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		// An ACCOUNT key can't drive this project-scoped route: the route carries no
-		// project slug (an account key selects its project via the /mcp/<slug> path),
-		// so it answers 400 `project_required`. That is a persistent wiring mismatch,
-		// not a transient blip — and NOT a cue to blind-drain: the harness sessions the
-		// loop spawns carry the SAME account key, so they can't do project-scoped MCP
-		// work either. Map it to ErrProjectRequired (distinct from both an auth failure
-		// and a transient blip) so the loop hard-stops loudly and the operator switches
-		// to a project-scoped key (CLA-133, reversing CLA-130's blind-drain mapping).
+		// An ACCOUNT key on the legacy slug-less route answers 400 `project_required`
+		// — the route has no path slug to bind the key's project. A persistent wiring
+		// mismatch, not a transient blip, and NOT a cue to blind-drain. Map it to
+		// ErrProjectRequired (distinct from both an auth failure and a transient blip)
+		// so the loop hard-stops loudly with the project-selector remedy (see the var).
 		if resp.StatusCode == http.StatusBadRequest && errorCode(body) == "project_required" {
 			return Summary{}, ErrProjectRequired
 		}
