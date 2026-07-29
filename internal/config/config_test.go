@@ -326,3 +326,18 @@ func TestProjectSummaryURL(t *testing.T) {
 		}
 	})
 }
+
+func TestProjectsSlugMCPMismatchRefused(t *testing.T) {
+	// The slug decides which queue is polled; the .mcp.json decides which project
+	// sessions work. A disagreement is a silent split-brain — Validate must refuse.
+	dir := t.TempDir()
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Harness: "claude", Prompt: "Work the backlog.", Projects: []Project{{Slug: "proj", WorkDir: dir}}}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "does not match its .mcp.json") {
+		t.Errorf("Validate() = %v, want a slug/.mcp.json mismatch refusal", err)
+	}
+}

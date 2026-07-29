@@ -815,3 +815,57 @@ func TestRun_MultiProject(t *testing.T) {
 		}
 	})
 }
+
+func TestRun_MultiProject_ThreeTargetRotation(t *testing.T) {
+	// The scan must skip a non-candidate BETWEEN the cursor and the next claimable
+	// target — with gamma idle, drains rotate alpha↔charlie without ever landing on
+	// gamma or getting stuck.
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 4
+	h := &fakeAdapter{}
+	targets := []Target{
+		{Name: "alpha", Poller: &fakePoller{sum: backlog.Summary{Claimable: 9}}, WorkDir: "/repos/alpha"},
+		{Name: "gamma", Poller: &fakePoller{sum: backlog.Summary{Claimable: 0}}, WorkDir: "/repos/gamma"},
+		{Name: "charlie", Poller: &fakePoller{sum: backlog.Summary{Claimable: 9}}, WorkDir: "/repos/charlie"},
+	}
+	if err := runLoopMulti(t, cfg, h, targets); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	var seq []string
+	for _, inv := range h.invocations {
+		seq = append(seq, inv.WorkDir)
+	}
+	want := []string{"/repos/charlie", "/repos/alpha", "/repos/charlie", "/repos/alpha"}
+	if len(seq) != len(want) {
+		t.Fatalf("drain sequence %v, want %v", seq, want)
+	}
+	for i := range want {
+		if seq[i] != want[i] {
+			t.Fatalf("drain sequence %v, want %v (idle gamma must be skipped, never starve the rest)", seq, want)
+		}
+	}
+}
+
+func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
+	// The multi-project win over the old single-poller flow: a transient poll error
+	// on one queue must not idle the whole instance — a sibling with claimable work
+	// is drained in the same cycle.
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+	h := &fakeAdapter{}
+	targets := []Target{
+		{Name: "alpha", Poller: &fakePoller{err: errors.New("boom: 502")}},
+		{Name: "beta", Poller: &fakePoller{sum: backlog.Summary{Claimable: 1}}, WorkDir: "/repos/beta"},
+	}
+	if err := runLoopMulti(t, cfg, h, targets); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("want the healthy queue drained despite the sibling's poll error; got %d sessions", h.invokeCalls)
+	}
+	if got := h.invocations[0].WorkDir; got != "/repos/beta" {
+		t.Errorf("session ran in %q, want /repos/beta", got)
+	}
+}

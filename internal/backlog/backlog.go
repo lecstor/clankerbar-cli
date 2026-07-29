@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -95,8 +96,14 @@ func (notWired) Poll(context.Context) (Summary, error) { return Summary{}, ErrNo
 // console-pause flag it honours, in one read.
 type httpPoller struct {
 	endpoint string // full summary URL, e.g. https://clankerbar.com/api/projects/<slug>/backlog-summary
-	apiKey   string
-	client   *http.Client
+	// legacy is the slug-less fallback for a plane that predates the slug-ful route
+	// (CLA-141): a 404 on the slug-ful endpoint permanently switches to it, so an
+	// upgraded CLI against an old plane degrades to the previous behaviour (works
+	// with a project key; an account key then gets the loud project_required stop)
+	// instead of idle-polling a 404 forever. "" when the endpoint is already legacy.
+	legacy string
+	apiKey string
+	client *http.Client
 }
 
 // New builds a Poller. With no endpoint / API key it returns a not-wired poller,
@@ -110,30 +117,45 @@ func New(summaryURL, apiKey string) Poller {
 	if summaryURL == "" || apiKey == "" {
 		return notWired{}
 	}
+	endpoint := strings.TrimRight(summaryURL, "/")
 	return &httpPoller{
-		endpoint: strings.TrimRight(summaryURL, "/"),
+		endpoint: endpoint,
+		legacy:   legacyFallbackURL(endpoint),
 		apiKey:   apiKey,
 		client:   &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
+// legacyFallbackURL returns the slug-less legacy summary URL for a slug-ful one
+// (`/api/projects/<slug>/backlog-summary` → `/api/backlog-summary`, same origin),
+// or "" when the URL is not the slug-ful form.
+func legacyFallbackURL(summaryURL string) string {
+	u, err := url.Parse(summaryURL)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) == 4 && parts[0] == "api" && parts[1] == "projects" && parts[3] == "backlog-summary" {
+		return u.Scheme + "://" + u.Host + "/api/backlog-summary"
+	}
+	return ""
+}
+
 func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.endpoint, nil)
+	resp, body, err := p.get(ctx, p.endpoint)
 	if err != nil {
 		return Summary{}, err
 	}
-	req.Header.Set("Authorization", "Bearer "+p.apiKey)
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return Summary{}, err
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return Summary{}, err
+	if resp.StatusCode == http.StatusNotFound && p.legacy != "" {
+		// The slug-ful route 404s — a plane that predates CLA-141. Fall back to the
+		// legacy slug-less route PERMANENTLY (this poller), restoring pre-upgrade
+		// behaviour: a project key keeps working; an account key gets the loud
+		// project_required hard stop and its remedy — never an idle-forever 404 loop.
+		p.endpoint, p.legacy = p.legacy, ""
+		resp, body, err = p.get(ctx, p.endpoint)
+		if err != nil {
+			return Summary{}, err
+		}
 	}
 	if resp.StatusCode != http.StatusOK {
 		// An ACCOUNT key on the legacy slug-less route answers 400 `project_required`
@@ -153,9 +175,34 @@ func (p *httpPoller) Poll(ctx context.Context) (Summary, error) {
 		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			return Summary{}, ErrUnauthorized
 		}
-		return Summary{}, fmt.Errorf("backlog summary: HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		// Name the endpoint: a repeated non-OK here (e.g. a 404 with no fallback
+		// left) idle-retries in the loop, and the URL is what makes that diagnosable.
+		return Summary{}, fmt.Errorf("backlog summary: GET %s: HTTP %d: %s", p.endpoint, resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 	return parseSummary(body)
+}
+
+// get performs one authenticated GET of a summary URL, returning the response
+// (body already read and closed) so Poll can decide on fallback by status.
+func (p *httpPoller) get(ctx context.Context, endpoint string) (*http.Response, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+p.apiKey)
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, nil, err
+	}
+	return resp, body, nil
 }
 
 // parseSummary decodes the `/api/backlog-summary` JSON body into a Summary. The

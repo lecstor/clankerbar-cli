@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -208,5 +209,83 @@ func TestNew_TrimsTrailingSlash(t *testing.T) {
 	}
 	if p.endpoint != "https://clankerbar.com/api/backlog-summary" {
 		t.Errorf("endpoint = %q, want trailing slash trimmed", p.endpoint)
+	}
+}
+
+// A plane that predates the slug-ful route (CLA-141) 404s it. The poller must fall
+// back to the legacy slug-less route — permanently — instead of feeding the loop an
+// idle-forever generic error against a URL the plane will never serve.
+func TestPoll_SlugfulRoute404FallsBackToLegacy(t *testing.T) {
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		if r.URL.Path != "/api/backlog-summary" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		_, _ = w.Write([]byte(`{"version":7,"counts":{"ready":1,"in_progress":0},"claimable":1,"openQuestions":0,"loopPaused":false}`))
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL+"/api/projects/proj/backlog-summary", "clk_test")
+	sum, err := p.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("Poll() error = %v, want fallback success", err)
+	}
+	if sum.Claimable != 1 || sum.Version != 7 {
+		t.Errorf("Poll() = %+v, want the legacy route's summary", sum)
+	}
+
+	// Permanent: the next poll goes straight to the legacy route, no 404 round-trip.
+	if _, err := p.Poll(context.Background()); err != nil {
+		t.Fatalf("second Poll() error = %v", err)
+	}
+	want := []string{"/api/projects/proj/backlog-summary", "/api/backlog-summary", "/api/backlog-summary"}
+	if len(paths) != len(want) {
+		t.Fatalf("paths = %v, want %v", paths, want)
+	}
+	for i := range want {
+		if paths[i] != want[i] {
+			t.Fatalf("paths = %v, want %v", paths, want)
+		}
+	}
+}
+
+// After the 404 fallback, an ACCOUNT key on the legacy route still surfaces the
+// loud project_required hard stop — the fallback restores pre-upgrade behaviour,
+// it does not swallow the misconfiguration.
+func TestPoll_FallbackThenProjectRequiredStillHardStops(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/backlog-summary" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"code":"project_required","message":"nope"}}`))
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL+"/api/projects/proj/backlog-summary", "clk_test")
+	_, err := p.Poll(context.Background())
+	if !errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("Poll() error = %v, want ErrProjectRequired", err)
+	}
+}
+
+// A 404 on the LEGACY route has no further fallback: it stays an ordinary
+// (retryable) error, and the message names the endpoint so the cause is diagnosable.
+func TestPoll_Legacy404IsOrdinaryErrorNamingTheEndpoint(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	p := New(srv.URL+"/api/backlog-summary", "clk_test")
+	_, err := p.Poll(context.Background())
+	if err == nil || errors.Is(err, ErrNotWired) || errors.Is(err, ErrProjectRequired) {
+		t.Fatalf("Poll() error = %v, want a plain retryable error", err)
+	}
+	if !strings.Contains(err.Error(), "/api/backlog-summary") {
+		t.Errorf("error should name the endpoint; got %q", err.Error())
 	}
 }

@@ -299,6 +299,12 @@ func (c *Config) Validate() error {
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(p.WorkDir)
 		}
+		// The slug decides which queue is POLLED; the .mcp.json decides which
+		// project the sessions WORK. If they disagree, the loop would gate on one
+		// project while draining another — a silent split-brain. Refuse it here.
+		if fromMCP := slugFromMCPURL(mcpURLFromConfig(p.MCPConfigPath)); fromMCP != "" && fromMCP != p.Slug {
+			return fmt.Errorf("projects[%d]: slug %q does not match its .mcp.json, which names /mcp/%s — the poll would gate on one project while sessions work another", i, p.Slug, fromMCP)
+		}
 	}
 
 	resolved, err := resolveEnv(c.Env)
