@@ -23,18 +23,46 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
-// Driver runs the loop for one harness against one backlog.
+// Target is one backlog a Driver drives: a project's cheap poller plus where that
+// project's drain sessions run (CLA-142). A single-project Driver has exactly one,
+// unnamed target; a multi-project Driver has one per configured project.
+type Target struct {
+	// Name is the project slug, used to prefix log lines when there is more than
+	// one target. Empty for the single default target.
+	Name string
+
+	// Poller is this project's cheap backlog read.
+	Poller backlog.Poller
+
+	// WorkDir is where this project's sessions run. Empty = the config's workdir.
+	WorkDir string
+
+	// MCPConfigPath points this project's sessions at its .mcp.json (the file
+	// whose /mcp/<slug> URL selects the project). Empty = the config's path.
+	MCPConfigPath string
+}
+
+// Driver runs the loop for one harness against one or more backlogs.
 type Driver struct {
 	cfg      *config.Config
 	h        harness.Adapter
-	backlog  backlog.Poller
+	targets  []Target
+	paused   []bool // per-target console-pause state, to log transitions once
+	cursor   int    // round-robin position over targets (last drained)
 	stateDir string
 	blind    bool // no cheap backlog read available — drain then idle-poll
 }
 
-// New builds a Driver.
+// New builds a single-project Driver — the original mode, driven entirely by the
+// top-level config fields.
 func New(cfg *config.Config, h harness.Adapter, poller backlog.Poller) *Driver {
-	return &Driver{cfg: cfg, h: h, backlog: poller}
+	return NewMulti(cfg, h, []Target{{Poller: poller}})
+}
+
+// NewMulti builds a Driver over several targets (CLA-142): one loop instance, one
+// account key, many project queues — round-robin over whichever have claimable work.
+func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
+	return &Driver{cfg: cfg, h: h, targets: targets, paused: make([]bool, len(targets))}
 }
 
 // Run drives the daemon until STOP/HALT, a ceiling (max-iterations / budget), or
@@ -56,7 +84,6 @@ func (d *Driver) Run(ctx context.Context) error {
 	var totalTokens int
 	var totalCost float64
 	drains := 0
-	paused := false // tracks console-pause state so we log the transition once, not every idle tick
 
 	for {
 		if ctx.Err() != nil {
@@ -82,75 +109,102 @@ func (d *Driver) Run(ctx context.Context) error {
 			return nil
 		}
 
-		// Gate on a cheap control-plane read: only spend a session when there is
-		// claimable work. When idle, keep polling (and logging) so the loop reacts
-		// to answered questions / promotions / newly filed work.
+		// Gate on cheap control-plane reads: only spend a session when some target
+		// has claimable work. When idle, keep polling (and logging) so the loop
+		// reacts to answered questions / promotions / newly filed work. With several
+		// targets (CLA-142) every queue is polled each cycle, and the drain goes to
+		// the next claimable one after the last drained (round-robin) — a busy queue
+		// can't starve a quiet one.
+		var target Target
 		if !d.blind {
-			sum, err := d.backlog.Poll(ctx)
-			switch {
-			case errors.Is(err, backlog.ErrNotWired):
-				log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
-				d.blind = true
-			case errors.Is(err, backlog.ErrUnauthorized):
-				// A 401/403 means CLANKERBAR_API_KEY is bad — and the harness sessions
-				// we'd spawn carry the SAME key, so blind-draining or idle-retrying just
-				// burns dead work against a credential that won't self-heal. Hard-stop
-				// LOUDLY with a non-nil error (non-zero exit — distinct from the graceful
-				// nil stop STOP/budget return) so the operator fixes the key (CLA-132).
-				log.Print("backlog auth failed (401/403) — check CLANKERBAR_API_KEY; stopping")
-				return fmt.Errorf("backlog auth failed (401/403) — check CLANKERBAR_API_KEY: %w", err)
-			case errors.Is(err, backlog.ErrProjectRequired):
-				// A 400 project_required means CLANKERBAR_API_KEY is ACCOUNT-scoped but a
-				// PROJECT-scoped key is required — and the harness sessions we'd spawn carry
-				// the SAME account key, so they can't do project-scoped MCP work either.
-				// Blind-draining or idle-retrying just burns doomed sessions against a wiring
-				// mismatch that won't self-heal. Hard-stop LOUDLY with a non-nil error
-				// (non-zero exit) so the operator sets a project-scoped key (CLA-133).
-				log.Print("backlog poll: API key is account-scoped but a project-scoped key is required — set CLANKERBAR_API_KEY to a project key; stopping")
-				return fmt.Errorf("backlog poll: API key is account-scoped but a project-scoped key is required — set CLANKERBAR_API_KEY to a project key: %w", err)
-			case err != nil:
-				log.Printf("backlog poll error: %v — retry in %s", err, idle)
-				if d.waitOrStop(ctx, idle) {
-					return nil
-				}
-				continue
-			default:
-				log.Printf("queue: ready=%d claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
-					sum.Ready, sum.Claimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
-				// Console pause (CLA-76 plane / CLA-130 driver): the operator can pause
-				// an overnight run from the web console. Honour it BEFORE the claimable
-				// gate so a paused loop never spawns a new session even when there IS
-				// claimable work — it just idle-polls until the flag clears, then
-				// resumes. Distinct from STOP (which exits) and from an empty queue. A
-				// pause landing mid-drain is only seen here, between iterations, so it
-				// never kills an in-flight session (exactly like STOP).
-				if sum.Paused {
-					if !paused {
-						paused = true
-						log.Print("console pause active — not spawning new sessions; idle-polling until resumed")
+			candidates := make([]bool, len(d.targets))
+			anyCandidate := false
+			for i := range d.targets {
+				t := d.targets[i]
+				sum, err := t.Poller.Poll(ctx)
+				switch {
+				case errors.Is(err, backlog.ErrNotWired):
+					log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
+					d.blind = true
+				case errors.Is(err, backlog.ErrUnauthorized):
+					// A 401/403 means CLANKERBAR_API_KEY is bad — and the harness sessions
+					// we'd spawn carry the SAME key, so blind-draining or idle-retrying just
+					// burns dead work against a credential that won't self-heal. Hard-stop
+					// LOUDLY with a non-nil error (non-zero exit — distinct from the graceful
+					// nil stop STOP/budget return) so the operator fixes the key (CLA-132).
+					log.Printf("%sbacklog auth failed (401/403) — check CLANKERBAR_API_KEY; stopping", d.prefix(i))
+					return fmt.Errorf("backlog auth failed (401/403) — check CLANKERBAR_API_KEY: %w", err)
+				case errors.Is(err, backlog.ErrProjectRequired):
+					// A 400 project_required means the poll hit the LEGACY slug-less summary
+					// route with an ACCOUNT-scoped key, which that route cannot bind to a
+					// project. The remedy is a project selector, NOT abandoning the account
+					// key (decision 2026-07-29): give the loop a slug to name in the path —
+					// a `projects` list in the config, or an .mcp.json whose clankerbar URL
+					// is /mcp/<slug> — or, for CI-style setups only, a project-scoped key.
+					// Still a hard stop: the mismatch won't self-heal, and idle-retrying or
+					// blind-draining would just burn doomed sessions (CLA-133/CLA-142).
+					log.Printf("%sbacklog poll: the summary route needs a project selector — add a `projects` list to the config, or point the loop at an .mcp.json naming /mcp/<slug>; stopping", d.prefix(i))
+					return fmt.Errorf("backlog poll needs a project selector (configure `projects` or an /mcp/<slug> .mcp.json; a project-scoped key also works for CI): %w", err)
+				case err != nil:
+					log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
+				default:
+					log.Printf("%squeue: ready=%d claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
+						d.prefix(i), sum.Ready, sum.Claimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
+					// Console pause (CLA-76 plane / CLA-130 driver): the operator can pause
+					// a run from the web console, PER PROJECT. Honour it BEFORE the
+					// claimable gate so a paused project never gets a new session even when
+					// it has claimable work — other projects keep draining. Distinct from
+					// STOP (which exits the instance) and from an empty queue. A pause
+					// landing mid-drain is only seen here, between iterations, so it never
+					// kills an in-flight session (exactly like STOP).
+					if sum.Paused {
+						if !d.paused[i] {
+							d.paused[i] = true
+							log.Printf("%sconsole pause active — not spawning new sessions; idle-polling until resumed", d.prefix(i))
+						}
+					} else {
+						if d.paused[i] {
+							d.paused[i] = false
+							log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
+						}
+						if sum.Claimable > 0 {
+							candidates[i] = true
+							anyCandidate = true
+						}
 					}
-					if d.waitOrStop(ctx, idle) {
-						return nil
-					}
-					continue
 				}
-				if paused {
-					paused = false
-					log.Print("console pause cleared — resuming")
-				}
-				if sum.Claimable == 0 {
-					if d.waitOrStop(ctx, idle) {
-						return nil
-					}
-					continue
+				if d.blind {
+					break
 				}
 			}
+			if !d.blind {
+				if !anyCandidate {
+					if d.waitOrStop(ctx, idle) {
+						return nil
+					}
+					continue
+				}
+				for i := 1; i <= len(d.targets); i++ {
+					idx := (d.cursor + i) % len(d.targets)
+					if candidates[idx] {
+						d.cursor = idx
+						break
+					}
+				}
+				target = d.targets[d.cursor]
+			}
+		}
+		if d.blind {
+			// Blind mode has no counts to route on — rotate across targets so every
+			// queue still gets sessions.
+			d.cursor = (d.cursor + 1) % len(d.targets)
+			target = d.targets[d.cursor]
 		}
 
 		// There is work (or we're blind) — spend a session, retrying transient
 		// blips with backoff (a fresh session reclaims any half-done task).
 		drains++
-		tokens, cost, stop, err := d.drainWithRetries(ctx, drains)
+		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target)
 		if err != nil {
 			return err
 		}
@@ -177,14 +231,14 @@ func (d *Driver) Run(ctx context.Context) error {
 // SAME session — neither costs a drain count. Returns the tokens/cost consumed on
 // a clean finish; stop=true if a STOP/cancel landed during a wait; err only on a
 // genuine, non-retryable failure (or exhausted retries).
-func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int, cost float64, stop bool, err error) {
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (tokens int, cost float64, stop bool, err error) {
 	retries := 0
 	for {
 		// Each attempt streams live to the terminal and to its own logfile. The name
 		// carries the drain number and attempt counter as well as the timestamp: two
 		// attempts in the same second (a sub-second backoff) would otherwise share a
 		// name and os.Create would truncate the earlier attempt's log.
-		inv := d.invocation(false)
+		inv := d.invocation(t, false)
 		logPath := filepath.Join(d.stateDir, fmt.Sprintf("iteration-%s-d%d-a%d.log",
 			time.Now().Format("20060102-150405"), drainNum, retries))
 		f, ferr := os.Create(logPath)
@@ -195,9 +249,9 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 			log.Printf("could not open iteration log %s: %v", logPath, ferr)
 		}
 		if retries == 0 {
-			log.Printf("iteration %d — spawning %s (log: %s)", drainNum, d.h.Name(), logPath)
+			log.Printf("iteration %d %s— spawning %s (log: %s)", drainNum, labelOf(t), d.h.Name(), logPath)
 		} else {
-			log.Printf("iteration %d — retry %d, spawning %s (log: %s)", drainNum, retries, d.h.Name(), logPath)
+			log.Printf("iteration %d %s— retry %d, spawning %s (log: %s)", drainNum, labelOf(t), retries, d.h.Name(), logPath)
 		}
 
 		res, ierr := d.h.Invoke(ctx, inv)
@@ -232,7 +286,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 				return tokens, cost, true, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
-			if d.supervisedWait(ctx, lim) {
+			if d.supervisedWait(ctx, lim, t) {
 				return tokens, cost, true, nil
 			}
 			continue
@@ -268,7 +322,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int) (tokens int
 // supervisedWait pauses on a usage limit, then polls for an early reset rather
 // than sleeping blindly to the stated reset. Returns true if the loop should stop
 // (STOP marker or context cancel during the wait).
-func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit) (stop bool) {
+func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target) (stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
 	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 
@@ -280,7 +334,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit) (stop bo
 			log.Print("stated reset passed — resuming")
 			return false
 		}
-		got, err := d.h.Probe(ctx, d.invocation(true))
+		got, err := d.h.Probe(ctx, d.invocation(t, true))
 		if err != nil {
 			if ctx.Err() != nil {
 				return true
@@ -320,17 +374,40 @@ func retryLabel(n, max int) string {
 	return fmt.Sprintf("retry %d", n)
 }
 
-func (d *Driver) invocation(probe bool) harness.Invocation {
+// invocation builds the harness invocation for one target: the target's workdir
+// and .mcp.json (which select the project) over the config's global fields.
+func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
+	workdir := t.WorkDir
+	if workdir == "" {
+		workdir = d.cfg.WorkDir
+	}
+	mcp := t.MCPConfigPath
+	if mcp == "" {
+		mcp = d.cfg.MCPConfigPath
+	}
 	return harness.Invocation{
 		Prompt:        d.cfg.Prompt,
 		Model:         d.cfg.Model,
-		WorkDir:       d.cfg.WorkDir,
-		MCPConfigPath: d.cfg.MCPConfigPath,
+		WorkDir:       workdir,
+		MCPConfigPath: mcp,
 		ConfigDir:     d.cfg.ConfigDir,
 		SettingsPath:  d.cfg.SettingsPath,
 		Env:           d.cfg.EnvSlice(),
 		Probe:         probe,
 	}
+}
+
+// prefix returns the per-target log prefix ("[slug] "), or "" when the instance
+// drives a single unnamed target — so single-project logs read exactly as before.
+func (d *Driver) prefix(i int) string {
+	return labelOf(d.targets[i])
+}
+
+func labelOf(t Target) string {
+	if t.Name == "" {
+		return ""
+	}
+	return "[" + t.Name + "] "
 }
 
 // waitOrStop waits up to dur, but stays responsive to a STOP marker (consuming it)

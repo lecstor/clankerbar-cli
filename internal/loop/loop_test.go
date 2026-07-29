@@ -54,6 +54,7 @@ func kindOf(r harness.Result) string {
 type fakeAdapter struct {
 	steps        []invokeStep
 	invokeCalls  int
+	invocations  []harness.Invocation // every Invoke's argument, for asserting routing (CLA-142)
 	probeResults []harness.Limit
 	probeErr     error
 	probeCalls   int
@@ -63,6 +64,7 @@ type fakeAdapter struct {
 func (f *fakeAdapter) Name() string { return "fake" }
 
 func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harness.Result, error) {
+	f.invocations = append(f.invocations, in)
 	i := f.invokeCalls
 	f.invokeCalls++
 	if i < len(f.steps) {
@@ -405,7 +407,7 @@ func TestDrainWithRetries(t *testing.T) {
 			d := New(cfg, h, &fakePoller{})
 			d.stateDir = t.TempDir() // drainWithRetries writes per-iteration logs here
 
-			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1)
+			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0])
 
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -448,7 +450,7 @@ func TestDrainWithRetries_StatedResetPassed(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	d.stateDir = t.TempDir()
 
-	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1)
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0])
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -665,5 +667,205 @@ func writeMarker(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 		t.Fatalf("writing %s marker: %v", name, err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Multi-project (CLA-142): one instance, one account key, many queues.
+
+// runLoopMulti runs a multi-target Run under a safety timeout.
+func runLoopMulti(t *testing.T, cfg *config.Config, h harness.Adapter, targets []Target) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return NewMulti(cfg, h, targets).Run(ctx)
+}
+
+func TestRun_MultiProject(t *testing.T) {
+	t.Run("drains the claimable project in ITS workdir, not the paused one", func(t *testing.T) {
+		// alpha has more claimable work but is console-paused; beta must be the one
+		// drained, and the session must spawn in beta's workdir with beta's .mcp.json
+		// — the pause is per project, never instance-wide.
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		cfg.MaxIterations = 1
+		h := &fakeAdapter{}
+		targets := []Target{
+			{Name: "alpha", Poller: &fakePoller{sum: backlog.Summary{Claimable: 5, Paused: true}}, WorkDir: "/repos/alpha", MCPConfigPath: "/repos/alpha/.mcp.json"},
+			{Name: "beta", Poller: &fakePoller{sum: backlog.Summary{Claimable: 1}}, WorkDir: "/repos/beta", MCPConfigPath: "/repos/beta/.mcp.json"},
+		}
+		if err := runLoopMulti(t, cfg, h, targets); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 1 {
+			t.Fatalf("want exactly one session; got %d", h.invokeCalls)
+		}
+		if got := h.invocations[0].WorkDir; got != "/repos/beta" {
+			t.Errorf("session ran in %q, want the claimable project's workdir /repos/beta", got)
+		}
+		if got := h.invocations[0].MCPConfigPath; got != "/repos/beta/.mcp.json" {
+			t.Errorf("session got mcp config %q, want beta's", got)
+		}
+	})
+
+	t.Run("round-robins across projects that both have claimable work", func(t *testing.T) {
+		// Neither queue may starve the other: successive drains must alternate.
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		cfg.MaxIterations = 4
+		h := &fakeAdapter{}
+		targets := []Target{
+			{Name: "alpha", Poller: &fakePoller{sum: backlog.Summary{Claimable: 9}}, WorkDir: "/repos/alpha"},
+			{Name: "beta", Poller: &fakePoller{sum: backlog.Summary{Claimable: 9}}, WorkDir: "/repos/beta"},
+		}
+		if err := runLoopMulti(t, cfg, h, targets); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 4 {
+			t.Fatalf("want 4 sessions; got %d", h.invokeCalls)
+		}
+		var seq []string
+		for _, inv := range h.invocations {
+			seq = append(seq, inv.WorkDir)
+		}
+		for i := 1; i < len(seq); i++ {
+			if seq[i] == seq[i-1] {
+				t.Fatalf("drains did not alternate between projects: %v", seq)
+			}
+		}
+	})
+
+	t.Run("all projects idle: no sessions, keeps polling every queue", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		h := &fakeAdapter{}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		alpha := &fakePoller{sum: backlog.Summary{Ready: 2, Claimable: 0}}
+		beta := &fakePoller{sum: backlog.Summary{Claimable: 0}}
+		// End the run once both queues have been polled at least twice.
+		beta.onCall = func(i int) {
+			if i >= 1 {
+				cancel()
+			}
+		}
+		targets := []Target{
+			{Name: "alpha", Poller: alpha},
+			{Name: "beta", Poller: beta},
+		}
+		if err := NewMulti(cfg, h, targets).Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 0 {
+			t.Errorf("idle queues must not spawn; got %d sessions", h.invokeCalls)
+		}
+		if alpha.calls < 2 || beta.calls < 2 {
+			t.Errorf("every queue must keep being polled while idle; got alpha=%d beta=%d", alpha.calls, beta.calls)
+		}
+	})
+
+	t.Run("a paused project resumes draining once the flag clears", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		cfg.MaxIterations = 1
+		h := &fakeAdapter{}
+		alpha := &fakePoller{
+			sums: []backlog.Summary{{Claimable: 2, Paused: true}},
+			sum:  backlog.Summary{Claimable: 2}, // pause cleared from the second poll on
+		}
+		targets := []Target{
+			{Name: "alpha", Poller: alpha, WorkDir: "/repos/alpha"},
+			{Name: "beta", Poller: &fakePoller{sum: backlog.Summary{Claimable: 0}}},
+		}
+		if err := runLoopMulti(t, cfg, h, targets); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 1 {
+			t.Fatalf("want one session after the pause cleared; got %d", h.invokeCalls)
+		}
+		if got := h.invocations[0].WorkDir; got != "/repos/alpha" {
+			t.Errorf("session ran in %q, want /repos/alpha", got)
+		}
+	})
+
+	t.Run("project_required from any queue is still a loud hard stop with the new remedy", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		h := &fakeAdapter{}
+		targets := []Target{
+			{Name: "alpha", Poller: &fakePoller{err: backlog.ErrProjectRequired}},
+		}
+		err := runLoopMulti(t, cfg, h, targets)
+		if err == nil {
+			t.Fatal("want a non-nil (non-zero-exit) error on project_required")
+		}
+		if !errors.Is(err, backlog.ErrProjectRequired) {
+			t.Errorf("error should wrap ErrProjectRequired; got %v", err)
+		}
+		// The remedy is a project selector, never "switch to a project key"
+		// (decision 2026-07-29).
+		if !strings.Contains(err.Error(), "projects") || !strings.Contains(err.Error(), "/mcp/<slug>") {
+			t.Errorf("error should point at the projects config / slug remedy; got %q", err.Error())
+		}
+		if strings.Contains(err.Error(), "set CLANKERBAR_API_KEY to a project key") {
+			t.Errorf("error must not tell the operator to abandon the account key; got %q", err.Error())
+		}
+		if h.invokeCalls != 0 {
+			t.Errorf("must not spawn doomed sessions; got %d", h.invokeCalls)
+		}
+	})
+}
+
+func TestRun_MultiProject_ThreeTargetRotation(t *testing.T) {
+	// The scan must skip a non-candidate BETWEEN the cursor and the next claimable
+	// target — with gamma idle, drains rotate alpha↔charlie without ever landing on
+	// gamma or getting stuck.
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 4
+	h := &fakeAdapter{}
+	targets := []Target{
+		{Name: "alpha", Poller: &fakePoller{sum: backlog.Summary{Claimable: 9}}, WorkDir: "/repos/alpha"},
+		{Name: "gamma", Poller: &fakePoller{sum: backlog.Summary{Claimable: 0}}, WorkDir: "/repos/gamma"},
+		{Name: "charlie", Poller: &fakePoller{sum: backlog.Summary{Claimable: 9}}, WorkDir: "/repos/charlie"},
+	}
+	if err := runLoopMulti(t, cfg, h, targets); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	var seq []string
+	for _, inv := range h.invocations {
+		seq = append(seq, inv.WorkDir)
+	}
+	want := []string{"/repos/charlie", "/repos/alpha", "/repos/charlie", "/repos/alpha"}
+	if len(seq) != len(want) {
+		t.Fatalf("drain sequence %v, want %v", seq, want)
+	}
+	for i := range want {
+		if seq[i] != want[i] {
+			t.Fatalf("drain sequence %v, want %v (idle gamma must be skipped, never starve the rest)", seq, want)
+		}
+	}
+}
+
+func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
+	// The multi-project win over the old single-poller flow: a transient poll error
+	// on one queue must not idle the whole instance — a sibling with claimable work
+	// is drained in the same cycle.
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+	h := &fakeAdapter{}
+	targets := []Target{
+		{Name: "alpha", Poller: &fakePoller{err: errors.New("boom: 502")}},
+		{Name: "beta", Poller: &fakePoller{sum: backlog.Summary{Claimable: 1}}, WorkDir: "/repos/beta"},
+	}
+	if err := runLoopMulti(t, cfg, h, targets); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("want the healthy queue drained despite the sibling's poll error; got %d sessions", h.invokeCalls)
+	}
+	if got := h.invocations[0].WorkDir; got != "/repos/beta" {
+		t.Errorf("session ran in %q, want /repos/beta", got)
 	}
 }

@@ -59,17 +59,21 @@ touch .clankerbar-loop/STOP     # stop gracefully (responsive even mid-wait)
 ```
 
 You can also **pause a run remotely from the clankerbar web console** (Settings →
-Pause). A paused loop stops spawning new sessions and idle-polls until you Resume —
-without exiting, and without killing an in-flight session (a pause is honoured
-between iterations, like `STOP`). Remote pause rides on the driver's cheap backlog
-read, so it needs a **wired poller**: a *project-scoped* `CLANKERBAR_API_KEY` (mint
-one at `clankerbar.com/projects/<slug>/api-keys`) and a resolvable plane URL. With
-no creds or no resolvable endpoint the loop drains blind and can't see the flag —
-the local `STOP`/`HALT` markers remain the fallback there. An **account-scoped** key
-is a different case: the project-scoped read rejects it with `400 project_required`,
-and since the harness sessions share that same key they can't do project-scoped work
-either, so the loop **hard-stops** (non-zero exit) and asks you to set a project key
-rather than blind-draining doomed sessions — just as a revoked key (`401/403`) does.
+Pause) — per project. A paused project stops getting new sessions (other projects
+keep draining) and the loop idle-polls until you Resume — without exiting, and
+without killing an in-flight session (a pause is honoured between iterations, like
+`STOP`). Remote pause rides on the driver's cheap backlog read, so it needs a
+**wired poller**: a `CLANKERBAR_API_KEY` and a resolvable plane URL. Your
+**account key** (mint at `clankerbar.com/account/api-keys`) is the normal choice —
+the driver polls the project-in-path summary route whenever it knows the slug, which
+it derives from your `.mcp.json`'s `/mcp/<slug>` URL or from the `projects` config
+(below). A *project-scoped* key works too (the CI-style setup). With no creds or no
+resolvable endpoint the loop drains blind and can't see the flag — the local
+`STOP`/`HALT` markers remain the fallback there. Two misconfigurations hard-stop
+(non-zero exit) instead of blind-draining doomed sessions: a revoked/wrong key
+(`401/403`), and an account key with **no derivable project slug** (`400
+project_required` from the legacy slug-less route) — give the loop a slug via
+`projects` or an `/mcp/<slug>` `.mcp.json`.
 
 ### Visibility
 
@@ -111,6 +115,34 @@ the likely final format.)
   }
 }
 ```
+
+`mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
+headless mode does not auto-discover it, so the default is what gives spawned
+sessions their clankerbar tools (and gives the driver a project slug to poll with).
+
+### Multi-project: one instance, many queues
+
+One loop instance can drive **several projects** with a single **account-scoped**
+key — you never need an instance per project, or per-project keys. Declare the
+projects; the driver polls each queue and round-robins sessions across whichever
+have claimable work, each session spawning in its own project's workdir (whose
+`.mcp.json` names `/mcp/<slug>`, selecting that project's tools):
+
+```json
+{
+  "harness": "claude",
+  "projects": [
+    { "slug": "clankerbar", "workdir": "~/dev" },
+    { "slug": "ezyapp", "workdir": "~/work/ezyapp" }
+  ]
+}
+```
+
+Per entry: `slug` (required, the `<slug>` in `/mcp/<slug>`), `workdir`, and
+optionally `mcp_config_path` (defaults to `<workdir>/.mcp.json`). Budgets,
+`max_iterations`, and the `STOP`/`HALT` markers stay **instance-global** — one
+operator, one spend pool; the console pause is per project. With no `projects`
+list, the top-level fields drive a single project exactly as before.
 
 ### Resilience
 
