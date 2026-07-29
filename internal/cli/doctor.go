@@ -165,7 +165,9 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 		checkConfigDir(cfg),
 	}
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
-	return append(checks, checkWorkdir(cfg), checkPermissions(cfg), checkBudget(cfg))
+	checks = append(checks, checkStateDir(cfg))
+	checks = append(checks, checkSessions(cfg)...)
+	return append(checks, checkPermissions(cfg), checkToolchains(cfg), checkBudget(cfg))
 }
 
 func doctorFailed(n int) error {
@@ -297,12 +299,19 @@ func checkConfigDir(cfg *config.Config) check {
 }
 
 func hasAnyMarker(dir string, markers []string) bool {
+	return firstMarker(dir, markers) != ""
+}
+
+// firstMarker returns the first of markers that exists in dir, or "". Callers
+// report the name they found, so an operator can see WHICH file satisfied a
+// check rather than trusting that one did.
+func firstMarker(dir string, markers []string) string {
 	for _, m := range markers {
 		if _, err := os.Stat(filepath.Join(dir, m)); err == nil {
-			return true
+			return m
 		}
 	}
-	return false
+	return ""
 }
 
 // --- 4. backlog wiring -------------------------------------------------------
@@ -349,6 +358,15 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 		if sum.Paused {
 			c.detail += " [loop paused from the console]"
 		}
+		// Nothing claimable is not itself a problem — the loop idle-polls for free
+		// rather than spawning. It IS worth saying out loud when the operator holds
+		// the only key, because "no work" and "work you have not unblocked" look
+		// identical in the counts and read as a healthy queue.
+		if sum.Claimable == 0 && sum.OpenQuestions > 0 && !sum.Paused {
+			c.status = warn
+			c.detail += " — nothing to claim; the loop will idle without spawning"
+			c.remedy = "answer the open question(s) at clankerbar.com, or expect an idle run"
+		}
 	case errors.Is(err, backlog.ErrUnauthorized):
 		c.status = fail
 		c.detail = "key rejected (401/403) by " + summaryURL
@@ -371,10 +389,13 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 	return c
 }
 
-// --- 5. workdir --------------------------------------------------------------
+// --- 5. state dir ------------------------------------------------------------
 
-func checkWorkdir(cfg *config.Config) check {
-	c := check{name: "workdir"}
+// checkStateDir covers the one directory the DRIVER itself writes: iteration
+// logs and the stop/pause markers. The directories the SESSIONS run in are a
+// separate, per-project concern — see checkSessions.
+func checkStateDir(cfg *config.Config) check {
+	c := check{name: "state_dir"}
 	stateDir := cfg.ResolveStateDir()
 
 	if err := os.MkdirAll(stateDir, 0o755); err != nil {
@@ -409,17 +430,93 @@ func checkWorkdir(cfg *config.Config) check {
 		return c
 	}
 
+	c.status = pass
+	c.detail = stateDir + " writable, no stop markers"
+	return c
+}
+
+// --- 6. session workdirs -----------------------------------------------------
+
+// agentInstructionFiles are the names a harness reads a project's standing
+// instructions from, in the session's cwd. AGENTS.md is the cross-tool
+// convention and CLAUDE.md the Claude Code one; either is enough to prove the
+// operator has oriented the sessions that start here.
+var agentInstructionFiles = []string{"AGENTS.md", "CLAUDE.md"}
+
+// checkSessions inspects the directory each project's sessions are spawned in.
+// ONE CHECK PER PROJECT, for the same reason the backlog check is per project: a
+// multi-project instance can have one queue pointed somewhere that teaches its
+// sessions nothing while the others are fine, and an aggregate line would hide
+// exactly that.
+//
+// The failure this exists for is silent and expensive rather than loud. A
+// harness reads its instruction file, its skills and its project settings from
+// the session's cwd AND UPWARD — never from repos below it. Spawn in a multi-repo
+// parent and every session starts with no protocol, no conventions and no
+// permissions beyond the ambient ones, then spends its opening minutes
+// rediscovering the layout. It still works, which is why nobody notices for
+// thirty iterations.
+func checkSessions(cfg *config.Config) []check {
+	if len(cfg.Projects) == 0 {
+		return []check{sessionCheck("workdir", cfg.WorkDir, cfg.MCPConfigPath)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, sessionCheck("workdir["+p.Slug+"]", p.WorkDir, p.MCPConfigPath))
+	}
+	return out
+}
+
+func sessionCheck(name, dir, mcpConfigPath string) check {
+	c := check{name: name}
+
+	resolved := dir
+	if resolved == "" {
+		resolved = "."
+	}
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		// The harness cannot start in a directory that is not there, so every
+		// iteration for this project would die on spawn.
+		c.status = fail
+		c.detail = workdirLabel(dir) + " does not resolve: " + err.Error()
+		c.remedy = "create it, or point this project's workdir at a real checkout"
+		return c
+	}
+	if !fi.IsDir() {
+		c.status = fail
+		c.detail = workdirLabel(dir) + " is not a directory"
+		c.remedy = "point the workdir at a directory, not a file"
+		return c
+	}
+
+	parent := isMultiRepoParent(resolved)
+
 	// Sessions spawned in a multi-repo parent with no .mcp.json get no clankerbar
 	// tools at all — they start, burn tokens, and cannot see the backlog.
-	if cfg.MCPConfigPath == "" && isMultiRepoParent(cfg.WorkDir) {
+	if mcpConfigPath == "" && parent {
 		c.status = warn
-		c.detail = workdirLabel(cfg.WorkDir) + " looks like a multi-repo parent but has no .mcp.json"
+		c.detail = workdirLabel(dir) + " looks like a multi-repo parent but has no .mcp.json"
 		c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools"
 		return c
 	}
 
+	if marker := firstMarker(resolved, agentInstructionFiles); marker == "" {
+		c.status = warn
+		c.detail = workdirLabel(dir) + " has no agent-instructions file (" + strings.Join(agentInstructionFiles, " / ") + ")"
+		if parent {
+			c.remedy = "add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it"
+		} else {
+			c.remedy = "add one so unattended sessions read the project's conventions instead of inferring them"
+		}
+		return c
+	}
+
 	c.status = pass
-	c.detail = stateDir + " writable, no stop markers"
+	c.detail = resolved + " (" + firstMarker(resolved, agentInstructionFiles) + ")"
+	if parent {
+		c.detail += ", multi-repo parent"
+	}
 	return c
 }
 
@@ -460,7 +557,7 @@ func workdirLabel(dir string) string {
 	return dir
 }
 
-// --- 6. permission policy ----------------------------------------------------
+// --- 7. permission policy ----------------------------------------------------
 
 func checkPermissions(cfg *config.Config) check {
 	c := check{name: "permissions"}
@@ -515,7 +612,238 @@ func checkPermissions(cfg *config.Config) check {
 	return c
 }
 
-// --- 7. budget ---------------------------------------------------------------
+// --- 8. toolchain grants -----------------------------------------------------
+
+// toolchainMarkers maps a marker file to the command a session must be allowed
+// to execute to verify that repo. Only markers that name their tool
+// UNAMBIGUOUSLY are listed: a bare package.json could be npm, pnpm or yarn, so
+// the lockfile is the marker and a lockless repo is left alone rather than
+// guessed at.
+var toolchainMarkers = []struct{ marker, tool string }{
+	{"go.mod", "go"},
+	{"Cargo.toml", "cargo"},
+	{"pnpm-lock.yaml", "pnpm"},
+	{"yarn.lock", "yarn"},
+	{"package-lock.json", "npm"},
+}
+
+// checkToolchains cross-references the build tools the backlog's repos need
+// against what the permission policy actually grants.
+//
+// A headless claude session FAILS CLOSED: anything the policy does not name is
+// refused outright, with no prompt reaching the operator. So a toolchain the
+// repos need but the allowlist never mentions does not stop a run — it produces
+// work that CANNOT BE VERIFIED, which is worse. One overnight run wrote a whole
+// Go subcommand, pushed it, and re-discovered the same wall on three separate
+// iterations because nothing checked this up front.
+//
+// Every finding here is a WARN, never a FAIL: doctor reads the settings files it
+// knows about, and a grant can also arrive by a rule form it does not parse or a
+// flag on the harness invocation. A false FAIL would block a run that works.
+func checkToolchains(cfg *config.Config) check {
+	c := check{name: "toolchains", status: pass}
+	if cfg.Harness != "claude" {
+		c.detail = "no allowlist to audit for " + cfg.Harness
+		return c
+	}
+
+	needed := detectToolchains(cfg)
+	if len(needed) == 0 {
+		c.detail = "no unambiguous build toolchains detected in the session workdirs"
+		return c
+	}
+	tools := make([]string, 0, len(needed))
+	for _, t := range needed {
+		tools = append(tools, t.tool)
+	}
+
+	if cfg.SettingsPath == "" {
+		// checkPermissions already warns about running on the ambient allowlist; here
+		// the useful thing is to name what would have to be in it.
+		c.detail = "needs " + strings.Join(tools, ", ") + " — grants come from the ambient allowlist, which doctor does not audit"
+		return c
+	}
+
+	allow, deny := grantedCommands(cfg)
+	var missing, blocked []string
+	for _, t := range needed {
+		switch {
+		case deny[t.tool]:
+			// Deny wins over every allow, so this one is decided and worth naming
+			// separately — an operator looking at an allow entry would call it granted.
+			blocked = append(blocked, t.tool+" ("+t.where+")")
+		case !allow[t.tool]:
+			missing = append(missing, t.tool+" ("+t.where+")")
+		}
+	}
+
+	switch {
+	case len(blocked) > 0:
+		c.status = warn
+		c.detail = "denied by policy: " + strings.Join(blocked, ", ")
+		c.remedy = "remove the deny rule in " + cfg.SettingsPath + ", or accept that tasks in those repos cannot be verified"
+	case len(missing) > 0:
+		c.status = warn
+		c.detail = "no grant for: " + strings.Join(missing, ", ")
+		c.remedy = "allow the verbs each one needs in " + cfg.SettingsPath +
+			" (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified"
+	default:
+		c.detail = "granted: " + strings.Join(tools, ", ")
+	}
+	return c
+}
+
+// neededToolchain is a tool the repos require, with one example of where the
+// requirement was found — an operator fixing a grant wants to know which repo
+// asked for it.
+type neededToolchain struct {
+	tool  string
+	where string
+}
+
+// detectToolchains looks in each session workdir and, when that workdir is a
+// multi-repo parent, in the checkouts under it that belong to the project.
+//
+// Scope is the whole difficulty here. A session rooted in a multi-repo parent
+// COULD be sent into any repo below it, but only the project's own repos are
+// plausibly in its backlog — and warning about every unrelated checkout on the
+// machine is how a WARN line becomes something an operator skims. The project's
+// repos are taken to be the ones named after its slug (`clankerbar` covers
+// `clankerbar/` and `clankerbar-cli/`), which under-reports for a project whose
+// repos are named differently. That direction is deliberate: a missed grant
+// surfaces as one refused command, while a wall of irrelevant warnings buries the
+// one that mattered.
+func detectToolchains(cfg *config.Config) []neededToolchain {
+	type target struct{ dir, slug string }
+	var targets []target
+	if len(cfg.Projects) == 0 {
+		targets = append(targets, target{dir: cfg.WorkDir})
+	} else {
+		for _, p := range cfg.Projects {
+			targets = append(targets, target{dir: p.WorkDir, slug: p.Slug})
+		}
+	}
+
+	found := map[string]string{}
+	for _, t := range targets {
+		dir := t.dir
+		if dir == "" {
+			dir = "."
+		}
+		for _, scan := range append([]string{dir}, projectRepos(dir, t.slug)...) {
+			for _, m := range toolchainMarkers {
+				if _, ok := found[m.tool]; ok {
+					continue
+				}
+				if _, err := os.Stat(filepath.Join(scan, m.marker)); err == nil {
+					found[m.tool] = scan
+				}
+			}
+		}
+	}
+
+	// Iterate the marker table, not the map, so the output order is stable.
+	out := make([]neededToolchain, 0, len(found))
+	for _, m := range toolchainMarkers {
+		if where, ok := found[m.tool]; ok {
+			out = append(out, neededToolchain{tool: m.tool, where: where})
+		}
+	}
+	return out
+}
+
+// projectRepos returns the immediate subdirectories of dir that are checkouts
+// belonging to slug. An empty slug matches nothing: without a project name there
+// is no way to tell the project's repos from everything else on the disk.
+func projectRepos(dir, slug string) []string {
+	if slug == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), slug) {
+			continue
+		}
+		child := filepath.Join(dir, entry.Name())
+		if _, err := os.Stat(filepath.Join(child, ".git")); err == nil {
+			out = append(out, child)
+		}
+	}
+	return out
+}
+
+// grantedCommands returns the Bash command heads the policy allows and denies.
+//
+// It reads the --settings file AND the config dir's settings, because Claude
+// MERGES them — auditing only the drain policy would report a tool as ungranted
+// when the operator's own settings already allow it.
+func grantedCommands(cfg *config.Config) (allow, deny map[string]bool) {
+	allow, deny = map[string]bool{}, map[string]bool{}
+	paths := []string{cfg.SettingsPath}
+	if cfg.ConfigDir != "" {
+		paths = append(paths,
+			filepath.Join(cfg.ConfigDir, "settings.json"),
+			filepath.Join(cfg.ConfigDir, "settings.local.json"),
+		)
+	}
+	for _, path := range paths {
+		if path == "" {
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue // absent or unreadable is not a grant; other checks report it
+		}
+		var doc struct {
+			Permissions struct {
+				Allow []string `json:"allow"`
+				Deny  []string `json:"deny"`
+			} `json:"permissions"`
+		}
+		if json.Unmarshal(data, &doc) != nil {
+			continue // checkPermissions reports unparseable JSON as a FAIL
+		}
+		for _, rule := range doc.Permissions.Allow {
+			if head := bashHead(rule); head != "" {
+				allow[head] = true
+			}
+		}
+		for _, rule := range doc.Permissions.Deny {
+			if head := bashHead(rule); head != "" {
+				deny[head] = true
+			}
+		}
+	}
+	return allow, deny
+}
+
+// bashHead extracts the command word from a Bash permission rule: `Bash(go
+// build:*)` and `Bash(go:*)` both yield "go". Non-Bash rules yield "".
+func bashHead(rule string) string {
+	inner, ok := strings.CutPrefix(strings.TrimSpace(rule), "Bash(")
+	if !ok {
+		return ""
+	}
+	inner = strings.TrimSuffix(inner, ")")
+	if before, _, found := strings.Cut(inner, ":"); found {
+		inner = before
+	}
+	return firstField(inner)
+}
+
+func firstField(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+// --- 9. budget ---------------------------------------------------------------
 
 func checkBudget(cfg *config.Config) check {
 	c := check{name: "budget"}

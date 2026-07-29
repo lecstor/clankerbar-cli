@@ -77,10 +77,15 @@ PASS  config       loaded ./clankerbar.json
 PASS  harness      /usr/local/bin/claude (2.1.0)
 WARN  config_dir   not set — the session inherits the ambient environment
                 -> set config_dir (or --config-dir) so a cron/launchd run loads the same skills, plugins and auth as your terminal
-PASS  backlog      https://clankerbar.com/api/projects/acme/backlog-summary — 7 claimable, 0 open question(s)
-WARN  workdir      /Users/you/dev/.clankerbar-loop has a leftover STOP marker
+WARN  backlog      https://clankerbar.com/api/projects/acme/backlog-summary — 0 claimable, 2 open question(s) — nothing to claim; the loop will idle without spawning
+                -> answer the open question(s) at clankerbar.com, or expect an idle run
+WARN  state_dir    /Users/you/dev/.clankerbar-loop has a leftover STOP marker
                 -> delete it, or the loop stops immediately: rm /Users/you/dev/.clankerbar-loop/STOP
+WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / CLAUDE.md)
+                -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it
 PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
+WARN  toolchains   no grant for: go (/Users/you/dev/acme-cli)
+                -> allow the verbs each one needs in /Users/you/.config/clankerbar/headless.json (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified
 PASS  budget       no ceiling configured — the loop runs until the backlog is dry or it is stopped
 ```
 
@@ -89,12 +94,30 @@ workdir and derived backlog URLs), **harness** (binary on PATH and runnable, wit
 its version), **config_dir** (resolves, exists, looks initialised for the chosen
 harness), **backlog** (creds present and the summary read succeeds — distinguishing
 no creds, a rejected key, a `project_required` key/route mismatch, and an
-unreachable endpoint), **workdir** (state dir writable, no leftover `HALT`/`STOP`,
-and an `.mcp.json` if the workdir is a multi-repo parent), **permissions**
-(harness-specific policy sanity), and **budget** (ceilings parse and are sane).
+unreachable endpoint — plus whether the queue is gated on *your* open questions),
+**state_dir** (the driver's own directory: writable, no leftover `HALT`/`STOP`),
+**workdir** (per project: it resolves, it has an `.mcp.json` if it is a multi-repo
+parent, and it carries an agent-instructions file), **permissions**
+(harness-specific policy sanity), **toolchains** (the build tools the project's
+repos need are actually granted), and **budget** (ceilings parse and are sane).
 
-A multi-project config gets **one backlog check per project** — one queue can be
-wired wrong while the others are fine.
+A multi-project config gets **one backlog check and one workdir check per
+project** — one queue can be wired wrong while the others are fine.
+
+Three of those exist because of failure modes that cost a real overnight run
+whole iterations:
+
+- **The queue said there was work and there wasn't.** A ready task gated on an
+  unanswered question still counts as claimable, so the loop spawns, the session
+  correctly declines to pre-empt your decision, and you pay for that report ten
+  times. Preflight now says so before the window opens.
+- **A session started in a multi-repo parent reads nothing.** A harness loads its
+  instruction file, skills and project settings from the session's cwd *and
+  upward* — never from the repos below it. Spawn in `~/dev` and every session
+  begins by rediscovering the layout, with none of your conventions.
+- **An ungranted toolchain does not stop a run, it un-verifies one.** A headless
+  session fails closed, so `go test` that was never allowed is refused with no
+  prompt reaching you — and the task ships written, pushed and never compiled.
 
 WARN vs FAIL is the "would this still make progress?" line: no creds and an
 unreachable plane WARN, because the loop drains blind and still gets work done; a

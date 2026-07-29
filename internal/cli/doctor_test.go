@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -207,6 +208,34 @@ func TestBacklogHealthyReportsCounts(t *testing.T) {
 	}
 }
 
+// Nothing claimable while questions wait on the operator is the state that reads
+// as a healthy queue and isn't: the loop idle-polls all night for free, and the
+// operator sees a run that "found no work" rather than one they never unblocked.
+func TestBacklogQuestionGatedQueueWarns(t *testing.T) {
+	c := backlogCheck(context.Background(), "backlog", "https://example.test/api/backlog-summary",
+		envWithPoll(backlog.Summary{Ready: 1, Claimable: 0, OpenQuestions: 2}, nil))
+
+	if c.status != warn {
+		t.Fatalf("question-gated queue: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "idle") {
+		t.Errorf("detail should say the loop will idle, got %q", c.detail)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN must carry a remedy line")
+	}
+}
+
+// An empty queue with no open questions is just an empty queue — warning there
+// would fire on every healthy drained backlog and train the operator to skim.
+func TestBacklogEmptyQueueWithoutQuestionsPasses(t *testing.T) {
+	c := backlogCheck(context.Background(), "backlog", "https://example.test/api/backlog-summary",
+		envWithPoll(backlog.Summary{}, nil))
+	if c.status != pass {
+		t.Errorf("drained queue: got %v, want PASS (%s)", c.status, c.detail)
+	}
+}
+
 // A multi-project instance gets one check per project: one queue can be wired
 // wrong while the others are fine, and an aggregate line would hide it.
 func TestBacklogChecksEachProject(t *testing.T) {
@@ -290,11 +319,11 @@ func TestConfigDirWithAuthStatePasses(t *testing.T) {
 	}
 }
 
-// --- workdir -----------------------------------------------------------------
+// --- state dir ---------------------------------------------------------------
 
 // A leftover marker is the failure that looks exactly like "the backlog was
 // empty": the loop stops on its first tick and exits clean.
-func TestWorkdirLeftoverMarkersWarn(t *testing.T) {
+func TestStateDirLeftoverMarkersWarn(t *testing.T) {
 	for _, marker := range []string{"HALT", "STOP"} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := validCfg(t)
@@ -306,7 +335,7 @@ func TestWorkdirLeftoverMarkersWarn(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			c := checkWorkdir(cfg)
+			c := checkStateDir(cfg)
 			if c.status != warn {
 				t.Errorf("leftover %s: got %v, want WARN", marker, c.status)
 			}
@@ -317,15 +346,15 @@ func TestWorkdirLeftoverMarkersWarn(t *testing.T) {
 	}
 }
 
-func TestWorkdirCleanPasses(t *testing.T) {
-	if c := checkWorkdir(validCfg(t)); c.status != pass {
-		t.Errorf("clean workdir: got %v, want PASS (%s)", c.status, c.detail)
+func TestStateDirCleanPasses(t *testing.T) {
+	if c := checkStateDir(validCfg(t)); c.status != pass {
+		t.Errorf("clean state dir: got %v, want PASS (%s)", c.status, c.detail)
 	}
 }
 
 // An unwritable state dir must FAIL rather than pass on "creatable": an existing
 // read-only dir is creatable (MkdirAll is a no-op) but the loop cannot log to it.
-func TestWorkdirUnwritableStateDirFails(t *testing.T) {
+func TestStateDirUnwritableFails(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("root ignores the permission bits this test relies on")
 	}
@@ -336,31 +365,106 @@ func TestWorkdirUnwritableStateDirFails(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o755) })
 
-	if c := checkWorkdir(cfg); c.status != fail {
+	if c := checkStateDir(cfg); c.status != fail {
 		t.Errorf("read-only state dir: got %v, want FAIL (%s)", c.status, c.detail)
 	}
 }
 
-// Sessions spawned in a multi-repo parent with no .mcp.json get no clankerbar
-// tools at all — they run, burn tokens, and cannot see the backlog.
-func TestWorkdirMultiRepoParentWithoutMCPWarns(t *testing.T) {
+// --- session workdirs --------------------------------------------------------
+
+// multiRepoParent builds the `~/dev` shape: a directory that is not itself a
+// checkout but holds several, optionally with an agent-instructions file.
+func multiRepoParent(t *testing.T, instructions string) string {
+	t.Helper()
 	parent := t.TempDir()
 	for _, repo := range []string{"repo-a", "repo-b"} {
 		if err := os.MkdirAll(filepath.Join(parent, repo, ".git"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	cfg := &config.Config{Harness: "claude", Prompt: "x", WorkDir: parent}
-	if err := cfg.Validate(); err != nil {
-		t.Fatal(err)
+	if instructions != "" {
+		if err := os.WriteFile(filepath.Join(parent, instructions), []byte("# orientation"), 0o600); err != nil {
+			t.Fatal(err)
+		}
 	}
+	return parent
+}
 
-	c := checkWorkdir(cfg)
+// Sessions spawned in a multi-repo parent with no .mcp.json get no clankerbar
+// tools at all — they run, burn tokens, and cannot see the backlog.
+func TestSessionMultiRepoParentWithoutMCPWarns(t *testing.T) {
+	c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "")
 	if c.status != warn {
 		t.Fatalf("multi-repo parent without .mcp.json: got %v, want WARN (%s)", c.status, c.detail)
 	}
 	if !strings.Contains(c.detail, ".mcp.json") {
 		t.Errorf("detail should name the missing .mcp.json, got %q", c.detail)
+	}
+}
+
+// The expensive silent failure: a session started where no instruction file
+// reaches it reads no protocol and no conventions, because a harness loads those
+// from the cwd upward and never from the repos below it.
+func TestSessionWithoutAgentInstructionsWarns(t *testing.T) {
+	c := sessionCheck("workdir", multiRepoParent(t, ""), "/tmp/.mcp.json")
+	if c.status != warn {
+		t.Fatalf("workdir with no instruction file: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "AGENTS.md") {
+		t.Errorf("detail should name the files it looked for, got %q", c.detail)
+	}
+	// The multi-repo remedy has to explain WHY, or an operator reasonably concludes
+	// the repos' own files already cover it.
+	if !strings.Contains(c.remedy, "multi-repo parent") {
+		t.Errorf("remedy should explain that repos below the workdir are not loaded, got %q", c.remedy)
+	}
+}
+
+// Either name satisfies it: AGENTS.md is the cross-tool convention, CLAUDE.md the
+// Claude Code one, and the check is "did the operator orient these sessions",
+// not "did they pick our favourite filename".
+func TestSessionAcceptsEitherInstructionFile(t *testing.T) {
+	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
+		t.Run(name, func(t *testing.T) {
+			c := sessionCheck("workdir", multiRepoParent(t, name), "/tmp/.mcp.json")
+			if c.status != pass {
+				t.Fatalf("%s present: got %v, want PASS (%s)", name, c.status, c.detail)
+			}
+			if !strings.Contains(c.detail, name) {
+				t.Errorf("PASS should name the file it found, got %q", c.detail)
+			}
+		})
+	}
+}
+
+// A workdir that is not there kills every spawn for that project, so it is the
+// one thing here that must FAIL rather than warn.
+func TestSessionMissingWorkdirFails(t *testing.T) {
+	c := sessionCheck("workdir[gone]", filepath.Join(t.TempDir(), "nope"), "")
+	if c.status != fail {
+		t.Errorf("absent workdir: got %v, want FAIL (%s)", c.status, c.detail)
+	}
+}
+
+// One check per project, for the same reason the backlog check is per project: a
+// multi-project instance can have one queue pointed somewhere useless while the
+// rest are fine.
+func TestSessionsCheckedPerProject(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Projects = []config.Project{
+		{Slug: "alpha", WorkDir: t.TempDir()},
+		{Slug: "beta", WorkDir: t.TempDir()},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	checks := checkSessions(cfg)
+	if len(checks) != 2 {
+		t.Fatalf("got %d session checks, want one per project: %v", len(checks), names(checks))
+	}
+	for _, want := range []string{"workdir[alpha]", "workdir[beta]"} {
+		find(t, checks, want)
 	}
 }
 
@@ -374,6 +478,155 @@ func TestSingleCheckoutIsNotAMultiRepoParent(t *testing.T) {
 	}
 	if isMultiRepoParent(dir) {
 		t.Error("a checkout must not be treated as a multi-repo parent")
+	}
+}
+
+// --- toolchain grants --------------------------------------------------------
+
+// seedRepo makes dir/name a checkout carrying marker.
+func seedRepo(t *testing.T, dir, name, marker string) string {
+	t.Helper()
+	repo := filepath.Join(dir, name)
+	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if marker != "" {
+		if err := os.WriteFile(filepath.Join(repo, marker), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return repo
+}
+
+// toolchainCfg builds a claude config for a project named "proj" whose workdir is
+// a multi-repo parent holding `proj-cli` with the given marker file, and whose
+// --settings file carries the given permission rules.
+func toolchainCfg(t *testing.T, marker string, allow, deny []string) *config.Config {
+	t.Helper()
+	parent := t.TempDir()
+	seedRepo(t, parent, "proj-cli", marker)
+
+	rules := map[string]any{"permissions": map[string]any{"allow": allow, "deny": deny}}
+	data, err := json.Marshal(rules)
+	if err != nil {
+		t.Fatal(err)
+	}
+	settings := filepath.Join(t.TempDir(), "headless.json")
+	if err := os.WriteFile(settings, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Harness:      "claude",
+		Prompt:       "x",
+		SettingsPath: settings,
+		Projects:     []config.Project{{Slug: "proj", WorkDir: parent}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+// The exact hole that cost one run three iterations: a Go repo in the queue, no
+// `go` in the allowlist, and a headless session that fails closed — so the task
+// gets written, pushed, and never compiled.
+func TestToolchainWithoutGrantWarns(t *testing.T) {
+	c := checkToolchains(toolchainCfg(t, "go.mod", []string{"Bash(gh:*)"}, nil))
+	if c.status != warn {
+		t.Fatalf("ungranted toolchain: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "go") {
+		t.Errorf("detail should name the ungranted tool, got %q", c.detail)
+	}
+	// The remedy has to say why silence is not consent, or an operator reads a green
+	// run as a verified one.
+	if !strings.Contains(c.remedy, "fails closed") {
+		t.Errorf("remedy should explain the fail-closed consequence, got %q", c.remedy)
+	}
+}
+
+// A grant on any verb of the tool counts: the check answers "can this session
+// run go at all", not "is every subcommand enumerated".
+func TestToolchainGrantedByVerbPasses(t *testing.T) {
+	c := checkToolchains(toolchainCfg(t, "go.mod", []string{"Bash(go build:*)", "Bash(go test:*)"}, nil))
+	if c.status != pass {
+		t.Fatalf("granted toolchain: got %v, want PASS (%s)", c.status, c.detail)
+	}
+}
+
+// Deny wins over allow, and it has to be reported as its own state — an operator
+// looking at the allow entry would otherwise call it granted and go hunting
+// somewhere else for the refusal.
+func TestToolchainDeniedIsDistinctFromMissing(t *testing.T) {
+	c := checkToolchains(toolchainCfg(t, "go.mod", []string{"Bash(go:*)"}, []string{"Bash(go:*)"}))
+	if c.status != warn {
+		t.Fatalf("denied toolchain: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "denied") {
+		t.Errorf("detail should say the tool is denied, not merely ungranted, got %q", c.detail)
+	}
+}
+
+// Claude MERGES the --settings file with the config dir's own settings, so
+// auditing only the drain policy would report a tool as ungranted when the
+// operator's own settings already allow it.
+func TestToolchainGrantFromConfigDirCounts(t *testing.T) {
+	cfg := toolchainCfg(t, "go.mod", nil, nil)
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "settings.json"),
+		[]byte(`{"permissions":{"allow":["Bash(go:*)"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.ConfigDir = dir
+
+	if c := checkToolchains(cfg); c.status != pass {
+		t.Errorf("grant in the config dir should count: got %v (%s)", c.status, c.detail)
+	}
+}
+
+// A bare package.json cannot name its package manager, and guessing would warn
+// about npm on every pnpm repo in existence. The lockfile is the marker.
+func TestToolchainAmbiguousMarkerIsNotGuessed(t *testing.T) {
+	c := checkToolchains(toolchainCfg(t, "package.json", nil, nil))
+	if c.status != pass {
+		t.Fatalf("ambiguous marker: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "no unambiguous") {
+		t.Errorf("detail should say nothing was detected, got %q", c.detail)
+	}
+}
+
+// Scope discipline: a session rooted in a multi-repo parent sits above every
+// checkout on the machine, and warning about each one's toolchain would bury the
+// grant that actually blocks the backlog. Only the project's own repos count.
+func TestToolchainIgnoresUnrelatedSiblingRepos(t *testing.T) {
+	cfg := toolchainCfg(t, "go.mod", []string{"Bash(go:*)"}, nil)
+	parent := cfg.Projects[0].WorkDir
+	seedRepo(t, parent, "someone-elses-app", "yarn.lock")
+
+	c := checkToolchains(cfg)
+	if c.status != pass {
+		t.Fatalf("unrelated sibling repo: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "yarn") {
+		t.Errorf("a repo outside the project must not be reported, got %q", c.detail)
+	}
+}
+
+func TestBashHeadParsesRuleForms(t *testing.T) {
+	for rule, want := range map[string]string{
+		"Bash(go build:*)":     "go",
+		"Bash(go:*)":           "go",
+		"Bash(go version)":     "go",
+		" Bash(pnpm test:*) ":  "pnpm",
+		"WebFetch(domain:x)":   "",
+		"Edit(//tmp/**)":       "",
+		"mcp__clankerbar__foo": "",
+	} {
+		if got := bashHead(rule); got != want {
+			t.Errorf("bashHead(%q) = %q, want %q", rule, got, want)
+		}
 	}
 }
 
@@ -531,7 +784,10 @@ func TestDoctorRunFailsOnUnparseableConfig(t *testing.T) {
 func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 	checks := doctorChecks(context.Background(), validCfg(t), okEnv())
 
-	for _, want := range []string{"config", "harness", "config_dir", "backlog", "workdir", "permissions", "budget"} {
+	for _, want := range []string{
+		"config", "harness", "config_dir", "backlog",
+		"state_dir", "workdir", "permissions", "toolchains", "budget",
+	} {
 		c := find(t, checks, want)
 		if c.detail == "" {
 			t.Errorf("check %q has no detail line", want)
