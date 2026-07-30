@@ -256,6 +256,23 @@ func TestBacklogChecksEachProject(t *testing.T) {
 
 // --- config_dir --------------------------------------------------------------
 
+// A paused queue is the most certain no-op there is — the driver polls all night
+// and spawns nothing. Reported as a PASS with a footnote, it reads as a healthy
+// queue, which is the exact confusion doctor exists to remove.
+func TestBacklogPausedWarns(t *testing.T) {
+	c := backlogCheck(context.Background(), "backlog", "https://example.test/api/backlog-summary",
+		envWithPoll(backlog.Summary{Claimable: 7, Paused: true}, nil))
+	if c.status != warn {
+		t.Fatalf("paused queue: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "paused") {
+		t.Errorf("detail should say the loop is paused, got %q", c.detail)
+	}
+	if c.remedy == "" {
+		t.Error("a paused queue needs a remedy line — it is fixed from the console")
+	}
+}
+
 func TestConfigDirUnsetWarns(t *testing.T) {
 	cfg := validCfg(t)
 	cfg.ConfigDir = ""
@@ -468,6 +485,112 @@ func TestSessionsCheckedPerProject(t *testing.T) {
 	}
 }
 
+// A plain workdir with no .mcp.json blinds its sessions just as completely as a
+// multi-repo parent does — the shape of the directory has nothing to do with
+// whether the harness gets clankerbar tools.
+func TestSessionWithoutMCPConfigWarnsEvenWhenNotAParent(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := sessionCheck("workdir", dir, "")
+	if c.status != warn {
+		t.Fatalf("single-repo workdir without .mcp.json: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, ".mcp.json") {
+		t.Errorf("detail should name the missing .mcp.json, got %q", c.detail)
+	}
+	if strings.Contains(c.detail, "multi-repo") {
+		t.Errorf("a single checkout must not be described as a multi-repo parent, got %q", c.detail)
+	}
+}
+
+// A project entry with no workdir of its own inherits the top-level one — that is
+// what loop.Driver.invocation does, and doctor answering a differently-resolved
+// question is exactly the failure it exists to prevent. Reading p.WorkDir raw
+// resolves "" to the CURRENT DIRECTORY, which always exists, so the check would
+// report green about a directory the loop will never use.
+func TestSessionFallsBackToTopLevelWorkDir(t *testing.T) {
+	parent := multiRepoParent(t, "AGENTS.md")
+	if err := os.WriteFile(filepath.Join(parent, ".mcp.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Harness:  "claude",
+		Prompt:   "x",
+		WorkDir:  parent,
+		Projects: []config.Project{{Slug: "acme"}}, // deliberately no workdir
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := find(t, checkSessions(cfg), "workdir[acme]")
+	if !strings.Contains(c.detail, parent) {
+		t.Errorf("project with no workdir must be checked against the top-level one (%s), got %q", parent, c.detail)
+	}
+	if c.status != pass {
+		t.Errorf("got %v, want PASS (%s)", c.status, c.detail)
+	}
+}
+
+// Same fallback for the .mcp.json: a top-level mcp_config_path covers projects
+// that do not restate it, so warning there sends the operator to add a file they
+// already have.
+func TestSessionFallsBackToTopLevelMCPConfig(t *testing.T) {
+	parent := multiRepoParent(t, "AGENTS.md")
+	mcp := filepath.Join(t.TempDir(), ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Harness:       "claude",
+		Prompt:        "x",
+		MCPConfigPath: mcp,
+		Projects:      []config.Project{{Slug: "acme", WorkDir: parent}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	if c := find(t, checkSessions(cfg), "workdir[acme]"); c.status != pass {
+		t.Errorf("top-level mcp_config_path should cover the project: got %v (%s)", c.status, c.detail)
+	}
+}
+
+// The toolchain scan resolves the project's workdir the same way, or it audits
+// the wrong tree entirely.
+func TestToolchainsFallBackToTopLevelWorkDir(t *testing.T) {
+	parent := t.TempDir()
+	seedRepo(t, parent, "acme-cli", "go.mod")
+	settings := filepath.Join(t.TempDir(), "headless.json")
+	if err := os.WriteFile(settings, []byte(`{"permissions":{"allow":["Bash(gh:*)"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{
+		Harness:      "claude",
+		Prompt:       "x",
+		WorkDir:      parent,
+		SettingsPath: settings,
+		Projects:     []config.Project{{Slug: "acme"}}, // deliberately no workdir
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkToolchains(cfg)
+	if c.status != warn || !strings.Contains(c.detail, "go") {
+		t.Errorf("go.mod under the inherited workdir should be detected: got %v (%s)", c.status, c.detail)
+	}
+}
+
 // A single checkout is not a multi-repo parent — one nested .git is more likely a
 // vendored dependency than a workspace, and warning there would be noise on the
 // most common setup of all.
@@ -615,18 +738,60 @@ func TestToolchainIgnoresUnrelatedSiblingRepos(t *testing.T) {
 }
 
 func TestBashHeadParsesRuleForms(t *testing.T) {
-	for rule, want := range map[string]string{
-		"Bash(go build:*)":     "go",
-		"Bash(go:*)":           "go",
-		"Bash(go version)":     "go",
-		" Bash(pnpm test:*) ":  "pnpm",
-		"WebFetch(domain:x)":   "",
-		"Edit(//tmp/**)":       "",
-		"mcp__clankerbar__foo": "",
+	type parsed struct{ head, verb string }
+	for rule, want := range map[string]parsed{
+		"Bash(go build:*)":     {"go", "build"},
+		"Bash(go:*)":           {"go", ""},
+		"Bash(go version)":     {"go", "version"},
+		"Bash(go)":             {"go", ""},
+		" Bash(pnpm test:*) ":  {"pnpm", "test"},
+		"WebFetch(domain:x)":   {"", ""},
+		"Edit(//tmp/**)":       {"", ""},
+		"mcp__clankerbar__foo": {"", ""},
 	} {
-		if got := bashHead(rule); got != want {
-			t.Errorf("bashHead(%q) = %q, want %q", rule, got, want)
+		head, verb := bashHead(rule)
+		if (parsed{head, verb}) != want {
+			t.Errorf("bashHead(%q) = (%q, %q), want (%q, %q)", rule, head, verb, want.head, want.verb)
 		}
+	}
+}
+
+// A narrow deny is a careful policy, not a blocked toolchain: `Bash(go run:*)`
+// denied alongside `Bash(go test:*)` allowed still verifies a Go repo perfectly
+// well. Reporting that as "go is denied, those tasks cannot be verified" would
+// send an operator to delete a rule they were right to write.
+func TestToolchainNarrowDenyDoesNotBlockTheTool(t *testing.T) {
+	c := checkToolchains(toolchainCfg(t, "go.mod",
+		[]string{"Bash(go build:*)", "Bash(go test:*)"}, []string{"Bash(go run:*)"}))
+	if c.status != pass {
+		t.Fatalf("verb-scoped deny should not block the tool: got %v (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "denied by policy") {
+		t.Errorf("a narrow deny must not read as a blanket denial, got %q", c.detail)
+	}
+	// It is still worth surfacing, so the hole is visible rather than discovered
+	// at 3am by a refused command.
+	if !strings.Contains(c.detail, "go run") {
+		t.Errorf("detail should name the narrowed verb, got %q", c.detail)
+	}
+}
+
+// The project layer (`<workdir>/.claude/settings.json`) is where an operator is
+// most likely to have granted the repo's own build tools, and Claude merges it —
+// so ignoring it reports a correctly-configured repo as ungranted.
+func TestToolchainGrantFromProjectSettingsCounts(t *testing.T) {
+	cfg := toolchainCfg(t, "go.mod", nil, nil)
+	workdir := cfg.Projects[0].WorkDir
+	if err := os.MkdirAll(filepath.Join(workdir, ".claude"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, ".claude", "settings.local.json"),
+		[]byte(`{"permissions":{"allow":["Bash(go test:*)"]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if c := checkToolchains(cfg); c.status != pass {
+		t.Errorf("grant in the project settings should count: got %v (%s)", c.status, c.detail)
 	}
 }
 

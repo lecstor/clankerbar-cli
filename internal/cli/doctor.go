@@ -24,6 +24,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -61,6 +63,11 @@ type check struct {
 	info   []string // extra indented lines (the config check's resolved values)
 }
 
+// binVersionTimeout bounds the harness version probe. Generous enough for a cold
+// Node/Bun start, short enough that a wedged shim still reports before a cron
+// window is wasted.
+const binVersionTimeout = 10 * time.Second
+
 // doctorEnv is the seam between the checks and the world. Defaults hit the real
 // PATH, the real binary and the real plane; tests substitute fakes.
 type doctorEnv struct {
@@ -74,6 +81,12 @@ func defaultDoctorEnv() doctorEnv {
 	return doctorEnv{
 		lookPath: exec.LookPath,
 		binVersion: func(ctx context.Context, bin string) (string, error) {
+			// Bounded, because the shim this is written to catch typically BLOCKS
+			// rather than erroring — a wrapper waiting on a TTY, say. doctor is
+			// documented as a cron gate (`doctor && run`), where there is nobody to
+			// Ctrl-C it, so an unbounded exec turns a FAIL into a hang.
+			ctx, cancel := context.WithTimeout(ctx, binVersionTimeout)
+			defer cancel()
 			out, err := exec.CommandContext(ctx, bin, "--version").CombinedOutput()
 			if err != nil {
 				return "", err
@@ -193,7 +206,9 @@ func checkConfig(cfg *config.Config) check {
 	c.info = append(c.info, "harness: "+cfg.Harness, "workdir: "+workdir)
 	if len(cfg.Projects) > 0 {
 		for _, p := range cfg.Projects {
-			c.info = append(c.info, "backlog ["+p.Slug+"]: "+orNone(cfg.ProjectSummaryURL(p)))
+			// Spelled exactly like the check name below, so an operator can grep one
+			// line for the other.
+			c.info = append(c.info, "backlog["+p.Slug+"]: "+orNone(cfg.ProjectSummaryURL(p)))
 		}
 	} else {
 		c.info = append(c.info, "backlog: "+orNone(cfg.BacklogSummaryURL()))
@@ -287,7 +302,10 @@ func checkConfigDir(cfg *config.Config) check {
 		c.remedy = "initialise it by running " + cfg.Harness + " once with this config dir, or point it elsewhere"
 		return c
 	}
-	if !hasAnyMarker(dir, authMarkers[cfg.Harness]) {
+	// A harness with no marker list is one doctor has no opinion about — a newly
+	// registered adapter, say. Asserting "no recognisable auth state" there would be
+	// a permanent, unfixable WARN about a table this file forgot to update.
+	if markers, known := authMarkers[cfg.Harness]; known && !hasAnyMarker(dir, markers) {
 		c.status = warn
 		c.detail = dir + " has no recognisable " + cfg.Harness + " auth state"
 		c.remedy = "confirm a headless run can authenticate (the credential may be in the OS keychain, which doctor cannot see)"
@@ -355,14 +373,21 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 	case err == nil:
 		c.status = pass
 		c.detail = fmt.Sprintf("%s — %d claimable, %d open question(s)", summaryURL, sum.Claimable, sum.OpenQuestions)
+		// A paused queue is the most certain no-op there is: the driver polls all
+		// night and spawns nothing. That is precisely the "the window produced
+		// nothing and I did not know" class doctor exists for, so it WARNs rather
+		// than decorating a PASS with a footnote the operator skims past.
 		if sum.Paused {
-			c.detail += " [loop paused from the console]"
+			c.status = warn
+			c.detail += " — paused from the console; the loop will not spawn sessions"
+			c.remedy = "resume the loop at clankerbar.com, or expect an idle run"
+			return c
 		}
 		// Nothing claimable is not itself a problem — the loop idle-polls for free
 		// rather than spawning. It IS worth saying out loud when the operator holds
 		// the only key, because "no work" and "work you have not unblocked" look
 		// identical in the counts and read as a healthy queue.
-		if sum.Claimable == 0 && sum.OpenQuestions > 0 && !sum.Paused {
+		if sum.Claimable == 0 && sum.OpenQuestions > 0 {
 			c.status = warn
 			c.detail += " — nothing to claim; the loop will idle without spawning"
 			c.remedy = "answer the open question(s) at clankerbar.com, or expect an idle run"
@@ -462,9 +487,34 @@ func checkSessions(cfg *config.Config) []check {
 	}
 	out := make([]check, 0, len(cfg.Projects))
 	for _, p := range cfg.Projects {
-		out = append(out, sessionCheck("workdir["+p.Slug+"]", p.WorkDir, p.MCPConfigPath))
+		out = append(out, sessionCheck("workdir["+p.Slug+"]", projectWorkDir(cfg, p), projectMCPConfig(cfg, p)))
 	}
 	return out
+}
+
+// projectWorkDir and projectMCPConfig resolve a project entry EXACTLY as
+// loop.Driver.invocation does — the project's own value, falling back to the
+// top-level one. Doctor answering a differently-resolved question is the whole
+// failure mode it exists to prevent: read p.WorkDir raw and an empty entry
+// resolves to the current directory, so a config like
+//
+//	{"workdir":"~/dev","projects":[{"slug":"acme"}]}
+//
+// would be diagnosed against wherever the operator happened to run doctor. That
+// never FAILs (a cwd always resolves), so it reports green for a directory the
+// loop will never use — the dangerous direction.
+func projectWorkDir(cfg *config.Config, p config.Project) string {
+	if p.WorkDir != "" {
+		return p.WorkDir
+	}
+	return cfg.WorkDir
+}
+
+func projectMCPConfig(cfg *config.Config, p config.Project) string {
+	if p.MCPConfigPath != "" {
+		return p.MCPConfigPath
+	}
+	return cfg.MCPConfigPath
 }
 
 func sessionCheck(name, dir, mcpConfigPath string) check {
@@ -492,11 +542,22 @@ func sessionCheck(name, dir, mcpConfigPath string) check {
 
 	parent := isMultiRepoParent(resolved)
 
-	// Sessions spawned in a multi-repo parent with no .mcp.json get no clankerbar
-	// tools at all — they start, burn tokens, and cannot see the backlog.
-	if mcpConfigPath == "" && parent {
+	// A session with no .mcp.json reaching it gets no clankerbar tools at all — it
+	// starts, burns tokens, and cannot see the backlog. config.Validate has already
+	// defaulted this to <workdir>/.mcp.json when that file exists, so an empty value
+	// here means none was found and none was configured.
+	//
+	// This is NOT gated on the multi-repo-parent shape: a plain single-repo workdir
+	// with no .mcp.json blinds its sessions just as completely. `parent` only
+	// selects the wording, because that is the case an operator is most likely to
+	// have reached by accident.
+	if mcpConfigPath == "" {
 		c.status = warn
-		c.detail = workdirLabel(dir) + " looks like a multi-repo parent but has no .mcp.json"
+		if parent {
+			c.detail = workdirLabel(dir) + " looks like a multi-repo parent and has no .mcp.json"
+		} else {
+			c.detail = workdirLabel(dir) + " has no .mcp.json"
+		}
 		c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools"
 		return c
 	}
@@ -664,16 +725,21 @@ func checkToolchains(cfg *config.Config) check {
 		return c
 	}
 
-	allow, deny := grantedCommands(cfg)
-	var missing, blocked []string
+	allow, denyAll, denyVerbs := grantedCommands(cfg)
+	var missing, blocked, narrowed []string
 	for _, t := range needed {
 		switch {
-		case deny[t.tool]:
-			// Deny wins over every allow, so this one is decided and worth naming
-			// separately — an operator looking at an allow entry would call it granted.
+		case denyAll[t.tool]:
+			// A bare-head deny wins over every allow, so this one is decided and worth
+			// naming separately — an operator looking at an allow entry would call it
+			// granted.
 			blocked = append(blocked, t.tool+" ("+t.where+")")
 		case !allow[t.tool]:
 			missing = append(missing, t.tool+" ("+t.where+")")
+		case len(denyVerbs[t.tool]) > 0:
+			// Granted, but with holes. Not a warning on its own — this is what a
+			// careful policy looks like — so it is reported alongside the PASS.
+			narrowed = append(narrowed, t.tool+" (except "+strings.Join(denyVerbs[t.tool], ", ")+")")
 		}
 	}
 
@@ -689,6 +755,9 @@ func checkToolchains(cfg *config.Config) check {
 			" (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified"
 	default:
 		c.detail = "granted: " + strings.Join(tools, ", ")
+		if len(narrowed) > 0 {
+			c.detail += "; narrowed by deny rules: " + strings.Join(narrowed, ", ")
+		}
 	}
 	return c
 }
@@ -720,7 +789,7 @@ func detectToolchains(cfg *config.Config) []neededToolchain {
 		targets = append(targets, target{dir: cfg.WorkDir})
 	} else {
 		for _, p := range cfg.Projects {
-			targets = append(targets, target{dir: p.WorkDir, slug: p.Slug})
+			targets = append(targets, target{dir: projectWorkDir(cfg, p), slug: p.Slug})
 		}
 	}
 
@@ -776,13 +845,14 @@ func projectRepos(dir, slug string) []string {
 	return out
 }
 
-// grantedCommands returns the Bash command heads the policy allows and denies.
+// policySettingsPaths lists every settings file Claude will MERGE for these
+// sessions, in no particular order — auditing only the drain policy would report
+// a tool as ungranted when another layer already allows it.
 //
-// It reads the --settings file AND the config dir's settings, because Claude
-// MERGES them — auditing only the drain policy would report a tool as ungranted
-// when the operator's own settings already allow it.
-func grantedCommands(cfg *config.Config) (allow, deny map[string]bool) {
-	allow, deny = map[string]bool{}, map[string]bool{}
+// The session's cwd matters as much as the config dir: `<workdir>/.claude/settings.json`
+// and its `.local` sibling are the project layer, and are where an operator is
+// most likely to have put `Bash(go test:*)` in the first place.
+func policySettingsPaths(cfg *config.Config) []string {
 	paths := []string{cfg.SettingsPath}
 	if cfg.ConfigDir != "" {
 		paths = append(paths,
@@ -790,7 +860,43 @@ func grantedCommands(cfg *config.Config) (allow, deny map[string]bool) {
 			filepath.Join(cfg.ConfigDir, "settings.local.json"),
 		)
 	}
-	for _, path := range paths {
+	for _, dir := range sessionWorkDirs(cfg) {
+		if dir == "" {
+			dir = "."
+		}
+		paths = append(paths,
+			filepath.Join(dir, ".claude", "settings.json"),
+			filepath.Join(dir, ".claude", "settings.local.json"),
+		)
+	}
+	return paths
+}
+
+// sessionWorkDirs is the set of directories sessions are actually spawned in,
+// resolved the way the loop resolves them.
+func sessionWorkDirs(cfg *config.Config) []string {
+	if len(cfg.Projects) == 0 {
+		return []string{cfg.WorkDir}
+	}
+	out := make([]string, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, projectWorkDir(cfg, p))
+	}
+	return out
+}
+
+// grantedCommands returns, per Bash command head, whether the policy grants it
+// and whether it denies it OUTRIGHT.
+//
+// "Outright" is the load-bearing word. Deny wins over allow in Claude's policy,
+// but only for what the deny rule actually covers: a narrow `Bash(go run:*)` deny
+// alongside a `Bash(go test:*)` allow is a normal, careful setup, and reporting
+// that as "go is denied, tasks in those repos cannot be verified" would be flatly
+// wrong. So only a BARE head deny (`Bash(go)` / `Bash(go:*)`) counts as decisive;
+// a verb-qualified deny is recorded separately and merely narrows.
+func grantedCommands(cfg *config.Config) (allow, denyAll map[string]bool, denyVerbs map[string][]string) {
+	allow, denyAll, denyVerbs = map[string]bool{}, map[string]bool{}, map[string][]string{}
+	for _, path := range policySettingsPaths(cfg) {
 		if path == "" {
 			continue
 		}
@@ -808,31 +914,45 @@ func grantedCommands(cfg *config.Config) (allow, deny map[string]bool) {
 			continue // checkPermissions reports unparseable JSON as a FAIL
 		}
 		for _, rule := range doc.Permissions.Allow {
-			if head := bashHead(rule); head != "" {
+			if head, _ := bashHead(rule); head != "" {
 				allow[head] = true
 			}
 		}
 		for _, rule := range doc.Permissions.Deny {
-			if head := bashHead(rule); head != "" {
-				deny[head] = true
+			head, verb := bashHead(rule)
+			switch {
+			case head == "":
+			case verb == "":
+				denyAll[head] = true
+			default:
+				denyVerbs[head] = append(denyVerbs[head], head+" "+verb)
 			}
 		}
 	}
-	return allow, deny
+	return allow, denyAll, denyVerbs
 }
 
-// bashHead extracts the command word from a Bash permission rule: `Bash(go
-// build:*)` and `Bash(go:*)` both yield "go". Non-Bash rules yield "".
-func bashHead(rule string) string {
+// bashHead splits a Bash permission rule into its command word and the verb that
+// qualifies it, if any: `Bash(go build:*)` yields ("go", "build"), while
+// `Bash(go:*)` and `Bash(go)` yield ("go", ""). Non-Bash rules yield ("", "").
+func bashHead(rule string) (head, verb string) {
 	inner, ok := strings.CutPrefix(strings.TrimSpace(rule), "Bash(")
 	if !ok {
-		return ""
+		return "", ""
 	}
 	inner = strings.TrimSuffix(inner, ")")
 	if before, _, found := strings.Cut(inner, ":"); found {
 		inner = before
 	}
-	return firstField(inner)
+	fields := strings.Fields(inner)
+	switch len(fields) {
+	case 0:
+		return "", ""
+	case 1:
+		return fields[0], ""
+	default:
+		return fields[0], fields[1]
+	}
 }
 
 func firstField(s string) string {
@@ -916,9 +1036,14 @@ func firstLine(s string) string {
 	return s
 }
 
+// truncate cuts to at most n bytes, backing off to a rune boundary so a
+// multi-byte character straddling the cut does not render as mojibake.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
 	return s[:n] + "..."
 }

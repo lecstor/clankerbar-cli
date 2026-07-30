@@ -94,15 +94,25 @@ workdir and derived backlog URLs), **harness** (binary on PATH and runnable, wit
 its version), **config_dir** (resolves, exists, looks initialised for the chosen
 harness), **backlog** (creds present and the summary read succeeds — distinguishing
 no creds, a rejected key, a `project_required` key/route mismatch, and an
-unreachable endpoint — plus whether the queue is gated on *your* open questions),
-**state_dir** (the driver's own directory: writable, no leftover `HALT`/`STOP`),
-**workdir** (per project: it resolves, it has an `.mcp.json` if it is a multi-repo
-parent, and it carries an agent-instructions file), **permissions**
+unreachable endpoint — plus whether the queue is gated on *your* open questions,
+or paused from the console), **state_dir** (the driver's own directory: writable,
+no leftover `HALT`/`STOP`), **workdir** (per project: it resolves, an `.mcp.json`
+reaches it, and it carries an agent-instructions file), **permissions**
 (harness-specific policy sanity), **toolchains** (the build tools the project's
 repos need are actually granted), and **budget** (ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
-project** — one queue can be wired wrong while the others are fine.
+project** — one queue can be wired wrong while the others are fine. A project
+entry that omits `workdir` or `mcp_config_path` inherits the top-level one, and
+doctor resolves it **exactly the way the loop does**, so it never reports on a
+directory your sessions will not use.
+
+The `toolchains` audit reads every settings file Claude merges — the `--settings`
+policy, the config dir's `settings.json`/`settings.local.json`, and each session
+workdir's `.claude/settings.json`/`.claude/settings.local.json`. A *narrow* deny
+(`Bash(go run:*)` alongside an allowed `Bash(go test:*)`) is reported as a hole in
+an otherwise-granted tool, not as a blocked one — only a bare `Bash(go:*)` deny
+means the toolchain is unusable.
 
 Three of those exist because of failure modes that cost a real overnight run
 whole iterations:
