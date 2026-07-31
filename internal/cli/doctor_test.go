@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -960,5 +961,35 @@ func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 		if c.status != pass && c.remedy == "" {
 			t.Errorf("check %q is %v but carries no remedy", want, c.status)
 		}
+	}
+}
+
+// Wall clock is the weakest proxy for spend of the three: it counts the hours a
+// run spends waiting out a usage limit, in which nothing is billed. One real run
+// spent 5h31m of a 10h23m elapsed asleep, then stopped for "budget".
+func TestBudgetWallClockOnlyWarns(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(8 * time.Hour)}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Fatalf("wall clock as the only ceiling: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "waiting") {
+		t.Errorf("detail should say the ceiling counts waiting time, got %q", c.detail)
+	}
+	if !strings.Contains(c.remedy, "max_cost_usd") {
+		t.Errorf("remedy should point at the dial that tracks spend, got %q", c.remedy)
+	}
+}
+
+// Paired with a spend ceiling it is a reasonable outer bound on how late a run may
+// finish, so it must not warn — otherwise the warning fires on a correct setup.
+func TestBudgetWallClockWithCostPasses(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(8 * time.Hour), MaxCostUSD: 50}
+
+	if c := checkBudget(cfg); c.status != pass {
+		t.Errorf("wall clock plus a cost ceiling: got %v, want PASS (%s)", c.status, c.detail)
 	}
 }

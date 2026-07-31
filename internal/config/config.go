@@ -151,15 +151,35 @@ type Budget struct {
 
 // Exceeded reports whether any enabled budget dimension has been reached.
 func (b Budget) Exceeded(tokens int, costUSD float64, elapsed time.Duration) bool {
+	return b.ExceededBy(tokens, costUSD, elapsed) != ""
+}
+
+// ExceededBy names the dimension that tripped, or "" if none has.
+//
+// Which dial stopped a run is the first thing an operator asks, and reporting
+// all three figures side by side answers it wrongly: a run under a wall-clock
+// ceiling alone still prints a token count and a dollar figure, which read as the
+// cause. Naming the dimension — and the ceiling it crossed — is the difference
+// between "why did it stop at $148" and "it ran for 10h23m against an 8h cap".
+func (b Budget) ExceededBy(tokens int, costUSD float64, elapsed time.Duration) string {
 	switch {
 	case b.MaxTokens > 0 && tokens >= b.MaxTokens:
-		return true
+		return fmt.Sprintf("tokens %d ≥ %d", tokens, b.MaxTokens)
 	case b.MaxCostUSD > 0 && costUSD >= b.MaxCostUSD:
-		return true
+		return fmt.Sprintf("cost $%.2f ≥ $%.2f", costUSD, b.MaxCostUSD)
 	case b.MaxWallClock > 0 && elapsed >= b.MaxWallClock.Duration():
-		return true
+		return fmt.Sprintf("wall clock %s ≥ %s", elapsed.Round(time.Second), b.MaxWallClock.Duration())
 	}
-	return false
+	return ""
+}
+
+// Deadline is when the wall-clock ceiling will be reached for a run that began at
+// start, or the zero time if no wall-clock ceiling is set.
+func (b Budget) Deadline(start time.Time) time.Time {
+	if b.MaxWallClock <= 0 {
+		return time.Time{}
+	}
+	return start.Add(b.MaxWallClock.Duration())
 }
 
 func defaults() *Config {

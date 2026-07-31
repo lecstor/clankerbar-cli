@@ -1005,6 +1005,18 @@ func checkBudget(cfg *config.Config) check {
 		c.detail = "no ceiling configured — the loop runs until the backlog is dry or it is stopped"
 		return c
 	}
+
+	// Wall clock is the weakest proxy for spend of the three, because it counts
+	// the hours a run spends WAITING OUT a usage limit — time in which nothing is
+	// billed. A run capped at 8h can spend five of them asleep and stop having done
+	// three iterations. Cost is the dial that tracks what an operator actually
+	// means by "leave headroom", and it comes straight from the harness.
+	if b.MaxWallClock > 0 && b.MaxCostUSD == 0 && b.MaxTokens == 0 {
+		c.status = warn
+		c.detail = strings.Join(set, ", ") + " — wall clock is the only ceiling, and it counts time spent waiting out usage limits"
+		c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
+		return c
+	}
 	c.detail = strings.Join(set, ", ")
 	return c
 }

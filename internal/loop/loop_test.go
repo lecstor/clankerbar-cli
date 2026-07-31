@@ -313,6 +313,85 @@ func TestRun_GateDecision(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// A reset that lands past the run's wall-clock ceiling must not be waited out.
+// The budget breaker only runs BETWEEN drains and the supervised wait sits inside
+// one, so waiting produces the worst possible shape: sleep through the window,
+// spend one session on the freshly reset quota, then stop on the very next check
+// — headroom saved all night and then declined. A real run did exactly that,
+// stopping eight minutes after an 8am reset having waited 5h31m for it.
+func TestDrainWithRetries_ResetPastDeadlineStopsInsteadOfWaiting(t *testing.T) {
+	cfg := fastCfg()
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
+		limitResetAt: time.Now().Add(3 * time.Hour),
+	}
+	d := New(cfg, h, &fakePoller{})
+	d.stateDir = t.TempDir()
+
+	deadline := time.Now().Add(30 * time.Minute) // reset lands well past it
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], deadline)
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stop {
+		t.Error("a reset past the ceiling must stop the run, not wait it out")
+	}
+	if h.probeCalls != 0 {
+		t.Errorf("stopping early must not enter the supervised wait; got %d probes", h.probeCalls)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("the session must not be re-run; got %d invokes", h.invokeCalls)
+	}
+}
+
+// The mirror case: a reset INSIDE the ceiling is still waited out, because the
+// wait is what lets an overnight run survive a rolling-window cap at all.
+func TestDrainWithRetries_ResetInsideDeadlineStillWaits(t *testing.T) {
+	cfg := fastCfg()
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
+		limitResetAt: time.Now().Add(time.Minute),
+	}
+	d := New(cfg, h, &fakePoller{})
+	d.stateDir = t.TempDir()
+
+	deadline := time.Now().Add(4 * time.Hour)
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], deadline)
+
+	if err != nil || stop {
+		t.Fatalf("a reset inside the ceiling must be waited out: stop=%v err=%v", stop, err)
+	}
+	if tokens != 7 {
+		t.Errorf("the session should have been re-run after the wait; got %d tokens", tokens)
+	}
+}
+
+// Both halves must be known before an early stop is justified: an unknown reset
+// is waited out because the supervised wait polls for an EARLY lift, and with no
+// wall-clock ceiling there is nothing to be past.
+func TestWaitPastDeadline(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name             string
+		resetAt          time.Time
+		deadline         time.Time
+		wantOverDeadline bool
+	}{
+		{"reset past deadline", now.Add(2 * time.Hour), now.Add(time.Hour), true},
+		{"reset inside deadline", now.Add(time.Hour), now.Add(2 * time.Hour), false},
+		{"unknown reset is waited out", time.Time{}, now.Add(time.Hour), false},
+		{"no ceiling means nothing to be past", now.Add(2 * time.Hour), time.Time{}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, got := waitPastDeadline(tc.resetAt, tc.deadline); got != tc.wantOverDeadline {
+				t.Errorf("waitPastDeadline = %v, want %v", got, tc.wantOverDeadline)
+			}
+		})
+	}
+}
+
 // drainWithRetries: transient retry / usage-limit wait / hard stop / genuine
 // failures. Exercised directly on the method — its retry loop is the unit that
 // must NOT advance the outer drain count, and testing it in isolation makes that
@@ -407,7 +486,7 @@ func TestDrainWithRetries(t *testing.T) {
 			d := New(cfg, h, &fakePoller{})
 			d.stateDir = t.TempDir() // drainWithRetries writes per-iteration logs here
 
-			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0])
+			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Time{})
 
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -450,7 +529,7 @@ func TestDrainWithRetries_StatedResetPassed(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	d.stateDir = t.TempDir()
 
-	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0])
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Time{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

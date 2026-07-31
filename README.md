@@ -253,6 +253,19 @@ alternatives, in order of preference:
    `max_wall_clock`; the loop self-accounts and stops early. Blunt but simple —
    tune it by watching a couple of runs.
 
+   **Prefer `max_cost_usd`.** It comes straight from the harness's own
+   `total_cost_usd`, so it measures the thing you actually care about.
+   `max_wall_clock` counts the hours a run spends *waiting out a usage limit*,
+   in which nothing is billed at all — one run elapsed 10h23m against an 8h
+   ceiling with 5h31m of that asleep. Keep it as an outer bound on how late a
+   run may finish, not as your spend ceiling. `doctor` warns if it is your only
+   dial.
+
+   When a limit's stated reset falls beyond `max_wall_clock`, the loop stops
+   right then and tells you when the quota returns, rather than sleeping
+   through the window to run one session against the fresh quota and stop on
+   the next check.
+
 ## Harnesses
 
 | Harness | Status |

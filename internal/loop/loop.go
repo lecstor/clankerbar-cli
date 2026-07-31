@@ -103,9 +103,9 @@ func (d *Driver) Run(ctx context.Context) error {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
 		}
-		if d.cfg.Budget.Exceeded(totalTokens, totalCost, time.Since(start)) {
-			log.Printf("budget reached (tokens=%d cost=$%.2f elapsed=%s) — stopping to leave headroom",
-				totalTokens, totalCost, time.Since(start).Round(time.Second))
+		if dim := d.cfg.Budget.ExceededBy(totalTokens, totalCost, time.Since(start)); dim != "" {
+			log.Printf("budget reached: %s — stopping to leave headroom (tokens=%d cost=$%.2f elapsed=%s)",
+				dim, totalTokens, totalCost, time.Since(start).Round(time.Second))
 			return nil
 		}
 
@@ -204,7 +204,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		// There is work (or we're blind) — spend a session, retrying transient
 		// blips with backoff (a fresh session reclaims any half-done task).
 		drains++
-		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target)
+		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target, d.cfg.Budget.Deadline(start))
 		if err != nil {
 			return err
 		}
@@ -231,7 +231,11 @@ func (d *Driver) Run(ctx context.Context) error {
 // SAME session — neither costs a drain count. Returns the tokens/cost consumed on
 // a clean finish; stop=true if a STOP/cancel landed during a wait; err only on a
 // genuine, non-retryable failure (or exhausted retries).
-func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (tokens int, cost float64, stop bool, err error) {
+//
+// deadline is when the run's wall-clock ceiling expires (zero = none). It is
+// passed down because the budget breaker only runs BETWEEN drains, and the
+// supervised wait happens inside one — see waitPastDeadline.
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, deadline time.Time) (tokens int, cost float64, stop bool, err error) {
 	retries := 0
 	for {
 		// Each attempt streams live to the terminal and to its own logfile. The name
@@ -286,6 +290,17 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (
 				return tokens, cost, true, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
+			// Waiting out a reset that lands past the wall-clock ceiling buys
+			// nothing: the budget check runs between drains, so the loop would
+			// sleep through the window, run one session on the freshly reset quota
+			// and stop on the very next check — having spent the night waiting for
+			// headroom it then declines to use. Stop now and say when the quota
+			// returns, so the operator can start a fresh run against it.
+			if until, over := waitPastDeadline(lim.ResetAt, deadline); over {
+				log.Printf("iteration %d: the limit resets at %s, past this run's ceiling (%s) — stopping now rather than waiting; start a fresh run after the reset",
+					drainNum, until.Format(time.Kitchen), deadline.Format(time.Kitchen))
+				return tokens, cost, true, nil
+			}
 			if d.supervisedWait(ctx, lim, t) {
 				return tokens, cost, true, nil
 			}
@@ -317,6 +332,18 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (
 
 		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping", drainNum, d.h.Name(), res.ExitCode)
 	}
+}
+
+// waitPastDeadline reports whether waiting for resetAt would carry the run past
+// deadline. Both being known is required: an unknown reset (zero) is waited out
+// as before, because the supervised wait polls for an EARLY lift and the limit
+// may clear long before any stated time — and with no wall-clock ceiling there is
+// nothing to be past.
+func waitPastDeadline(resetAt, deadline time.Time) (time.Time, bool) {
+	if resetAt.IsZero() || deadline.IsZero() {
+		return time.Time{}, false
+	}
+	return resetAt, resetAt.After(deadline)
 }
 
 // supervisedWait pauses on a usage limit, then polls for an early reset rather

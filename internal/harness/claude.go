@@ -109,10 +109,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		Result         string  `json:"result"`
 		TerminalReason string  `json:"terminal_reason"`
 		TotalCostUSD   float64 `json:"total_cost_usd"`
-		Usage          struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage          usage   `json:"usage"`
 	}
 	if json.Unmarshal(line, &ev) != nil {
 		return
@@ -132,9 +129,29 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 	case "result":
 		res.FinalMessage = ev.Result
 		res.CostUSD = ev.TotalCostUSD
-		res.Tokens = ev.Usage.InputTokens + ev.Usage.OutputTokens
+		res.Tokens = ev.Usage.total()
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
 	}
+}
+
+// usage is claude's reported token accounting for a session.
+//
+// The cache fields are the whole point of counting them. `input_tokens` is
+// UNCACHED input only, so summing it with output misses the cache reads and
+// writes that dominate a long agentic session — one real run reported 140,387
+// tokens against $147.98 of actual spend, about $1.05 per thousand, which is no
+// model's price. A budget dial that undercounts by an order of magnitude is worse
+// than no dial: max_tokens would silently allow roughly ten times what an
+// operator set it to.
+type usage struct {
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheCreationTokens int `json:"cache_creation_input_tokens"`
+	CacheReadTokens     int `json:"cache_read_input_tokens"`
+}
+
+func (u usage) total() int {
+	return u.InputTokens + u.OutputTokens + u.CacheCreationTokens + u.CacheReadTokens
 }
 
 // probe runs the cheapest possible request (tiny prompt, no tools, plain json) to
@@ -178,17 +195,14 @@ func (claude) parse(res *Result) {
 		Result         string  `json:"result"`
 		TerminalReason string  `json:"terminal_reason"`
 		TotalCostUSD   float64 `json:"total_cost_usd"`
-		Usage          struct {
-			InputTokens  int `json:"input_tokens"`
-			OutputTokens int `json:"output_tokens"`
-		} `json:"usage"`
+		Usage          usage   `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(res.Stdout)), &p); err != nil {
 		return
 	}
 	res.FinalMessage = p.Result
 	res.CostUSD = p.TotalCostUSD
-	res.Tokens = p.Usage.InputTokens + p.Usage.OutputTokens
+	res.Tokens = p.Usage.total()
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}
 }
 
