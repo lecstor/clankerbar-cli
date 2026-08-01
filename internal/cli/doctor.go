@@ -23,6 +23,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -75,6 +77,8 @@ type doctorEnv struct {
 	binVersion func(ctx context.Context, bin string) (string, error)
 	newPoller  func(summaryURL, apiKey string) backlog.Poller
 	apiKey     string
+	goos       string
+	pmset      func(ctx context.Context, args ...string) (string, error)
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -95,6 +99,13 @@ func defaultDoctorEnv() doctorEnv {
 		},
 		newPoller: backlog.New,
 		apiKey:    os.Getenv("CLANKERBAR_API_KEY"),
+		goos:      runtime.GOOS,
+		pmset: func(ctx context.Context, args ...string) (string, error) {
+			ctx, cancel := context.WithTimeout(ctx, binVersionTimeout)
+			defer cancel()
+			out, err := exec.CommandContext(ctx, "pmset", args...).Output()
+			return string(out), err
+		},
 	}
 }
 
@@ -180,7 +191,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
-	return append(checks, checkPermissions(cfg), checkToolchains(cfg), checkBudget(cfg))
+	return append(checks, checkPermissions(cfg), checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
 }
 
 func doctorFailed(n int) error {
@@ -963,7 +974,103 @@ func firstField(s string) string {
 	return fields[0]
 }
 
-// --- 9. budget ---------------------------------------------------------------
+// --- 9. power ----------------------------------------------------------------
+
+// checkPower answers the most basic precondition of an unattended run, and the
+// one nothing else checks: will this machine still be awake to do the work?
+//
+// Timers run on the monotonic clock, which does not advance while a machine is
+// suspended. So idle sleep does not pause a run, it FREEZES it — mid-wait,
+// silently, in a way that looks exactly like a hang. A real run lost 5h31m of a
+// 10h window to this, waking only for 45-second Power Nap bursts.
+//
+// Two facts decide it: whether anything holds a no-idle-sleep assertion, and what
+// the active power source's sleep timeout is. `clankerbar run` now takes an
+// assertion itself, so a green line here usually means that is working — but
+// doctor is also run standalone, before any loop exists, which is exactly when
+// the answer is worth having.
+func checkPower(ctx context.Context, e doctorEnv) check {
+	c := check{name: "power"}
+	if e.goos != "darwin" {
+		c.status = pass
+		c.detail = "no sleep-policy checks for " + e.goos
+		return c
+	}
+
+	if out, err := e.pmset(ctx, "-g", "assertions"); err == nil && holdsNoIdleSleep(out) {
+		c.status = pass
+		// Point-in-time, and said as such: assertions are commonly short-lived (the
+		// `caffeinate` default is 300 seconds), so one held while doctor runs is not
+		// proof one will be held all night. `clankerbar run` takes its own, tied to
+		// its pid, which is the only kind that covers a whole run.
+		c.detail = "a no-idle-sleep assertion is held right now — note assertions can be short-lived; `run` takes its own for the length of the run"
+		return c
+	}
+
+	out, err := e.pmset(ctx, "-g")
+	if err != nil {
+		// Not being able to ask is not evidence of a problem, and a FAIL here would
+		// block a cron gate over a missing binary.
+		c.status = warn
+		c.detail = "could not read the sleep settings: " + err.Error()
+		c.remedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait"
+		return c
+	}
+	mins, found := idleSleepMinutes(out)
+	switch {
+	case !found:
+		c.status = pass
+		c.detail = "no idle-sleep timeout reported for the active power source"
+	case mins == 0:
+		c.status = pass
+		c.detail = "idle sleep is disabled for the active power source (a closed lid still sleeps)"
+	default:
+		c.status = warn
+		c.detail = fmt.Sprintf("the machine idle-sleeps after %d min on the active power source, and nothing holds an assertion", mins)
+		c.remedy = "`clankerbar run` holds one itself; for any other invocation use `caffeinate -i …`. Start the run on AC — plugging in later does NOT wake a sleeping Mac, and a closed lid sleeps regardless of either"
+	}
+	return c
+}
+
+// holdsNoIdleSleep reports whether `pmset -g assertions` shows a live
+// PreventUserIdleSystemSleep. The count matters: the header line lists the
+// assertion name with a `0` when nothing holds it.
+func holdsNoIdleSleep(out string) bool {
+	for _, line := range strings.Split(out, "\n") {
+		if !strings.Contains(line, "PreventUserIdleSystemSleep") {
+			continue
+		}
+		fields := strings.Fields(line)
+		n, err := strconv.Atoi(fields[len(fields)-1])
+		if err != nil {
+			// A detail line rather than the summary row (those name the holding
+			// process); its presence means something holds it.
+			return true
+		}
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// idleSleepMinutes pulls the `sleep` timeout out of `pmset -g`, which reports the
+// settings currently in force for whichever power source is active — the right
+// question, since battery and AC usually differ sharply.
+func idleSleepMinutes(out string) (int, bool) {
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "sleep" {
+			continue
+		}
+		if n, err := strconv.Atoi(fields[1]); err == nil {
+			return n, true
+		}
+	}
+	return 0, false
+}
+
+// --- 10. budget --------------------------------------------------------------
 
 func checkBudget(cfg *config.Config) check {
 	c := check{name: "budget"}

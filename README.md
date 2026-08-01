@@ -99,7 +99,8 @@ or paused from the console), **state_dir** (the driver's own directory: writable
 no leftover `HALT`/`STOP`), **workdir** (per project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **permissions**
 (harness-specific policy sanity), **toolchains** (the build tools the project's
-repos need are actually granted), and **budget** (ceilings parse and are sane).
+repos need are actually granted), **power** (whether the machine will stay awake
+long enough to do the work), and **budget** (ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
@@ -128,6 +129,46 @@ whole iterations:
 - **An ungranted toolchain does not stop a run, it un-verifies one.** A headless
   session fails closed, so `go test` that was never allowed is refused with no
   prompt reaching you — and the task ships written, pushed and never compiled.
+- **A sleeping machine does not pause a run, it freezes one.** Timers use the
+  monotonic clock, which does not advance while the machine is suspended, so a
+  wait stops mid-flight and the loop goes silent exactly like a hang. One run lost
+  5h31m of a 10h window this way, waking only in 45-second Power Nap bursts.
+
+### Sleep, on laptops
+
+`clankerbar run` now holds a no-idle-sleep assertion for its own lifetime (macOS;
+it dies with the process, so nothing outlives the run). Two caveats it cannot fix,
+both of which have cost a real run its night:
+
+- **A closed lid sleeps regardless.** No assertion overrides clamshell sleep.
+- **Start the run on AC.** Plugging in later does *not* wake a sleeping Mac, so a
+  machine that idle-slept on battery stays down even once power arrives — its
+  never-idle-sleep-on-AC setting never gets a chance to apply.
+
+When a wait does get frozen, the loop now says so on the way out, rather than
+leaving an unexplained gap in the log:
+
+```
+wait of 30m0s took 2h28m11s of wall clock — the machine was suspended for ~1h58m11s;
+timers are frozen while it sleeps, so an unattended run stalls silently
+```
+
+### When the queue lies about having work
+
+`claimable > 0` means work is *available*, not that it can be *done*. A task gated
+on an unanswered question is claimable and unworkable: the loop spawns, the session
+correctly declines to pre-empt your decision, and you pay for that report every
+cycle. One run did it ten times.
+
+So after **three consecutive sessions that settle nothing** — nothing reaching
+`in_review` or `done`, which is the only progress signal a backlog can see —
+the loop backs that project off for 15 minutes, then 30, then an hour, capped at
+two. Other projects keep draining. Any progress from anywhere, including you
+merging a PR, clears it immediately.
+
+Three rather than one, because a genuinely large task can span several sessions
+before anything reaches a reviewer, and backing off then would throttle exactly
+the deep work the loop exists to do.
 
 WARN vs FAIL is the "would this still make progress?" line: no creds and an
 unreachable plane WARN, because the loop drains blind and still gets work done; a

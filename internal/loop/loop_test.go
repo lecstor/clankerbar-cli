@@ -948,3 +948,107 @@ func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
 		t.Errorf("session ran in %q, want /repos/beta", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// No-progress breaker: `claimable > 0` claims work is AVAILABLE, not that it can
+// be DONE. A task gated on an unanswered question is claimable and unworkable, so
+// the gate spawns, the session correctly declines, and the operator pays for the
+// same report every cycle — ten times, in the run this was written for.
+
+func TestRun_BacksOffAfterFruitlessDrains(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 10
+	h := &fakeAdapter{} // every session succeeds cleanly...
+	// ...but nothing ever reaches a reviewer or finishes, which is the shape of a
+	// queue whose only claimable task is waiting on the operator.
+	p := &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := New(cfg, h, p).Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	// Three sessions to reach the threshold, then a 15-minute back-off that no
+	// fast-config interval can skip — so the run cannot reach its 10 iterations.
+	if h.invokeCalls != quietThreshold {
+		t.Errorf("should stop spawning after %d fruitless drains; got %d sessions", quietThreshold, h.invokeCalls)
+	}
+}
+
+// The mirror: a queue that keeps settling work must never be backed off, or the
+// breaker would throttle exactly the runs that are working.
+func TestRun_ProgressResetsTheBreaker(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 6
+	h := &fakeAdapter{}
+	// Settled climbs on every poll — each drain delivered something.
+	p := &fakePoller{sums: []backlog.Summary{
+		{Claimable: 1, Done: 0}, {Claimable: 1, Done: 1}, {Claimable: 1, Done: 2},
+		{Claimable: 1, Done: 3}, {Claimable: 1, Done: 4}, {Claimable: 1, Done: 5},
+	}, sum: backlog.Summary{Claimable: 1, Done: 6}}
+
+	if err := runLoop(t, cfg, h, p); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 6 {
+		t.Errorf("a productive queue must never be backed off; got %d of 6 sessions", h.invokeCalls)
+	}
+}
+
+// Work settling while nothing is outstanding means someone else moved it — the
+// operator merging a PR, another machine's loop. Whatever was stuck may now be
+// unstuck, so the target comes straight back rather than serving out its wait.
+func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.quiet[0] = quietThreshold
+	d.skipUntil[0] = time.Now().Add(time.Hour)
+	d.baseline[0] = 4
+
+	d.judgeProgress(0, backlog.Summary{Done: 5})
+
+	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("outside progress must clear the back-off; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
+func TestQuietBackoffEscalatesToACap(t *testing.T) {
+	for _, tc := range []struct {
+		quiet int
+		want  time.Duration
+	}{
+		{3, 15 * time.Minute},
+		{4, 30 * time.Minute},
+		{5, time.Hour},
+		{6, 2 * time.Hour},
+		{99, 2 * time.Hour}, // never becomes "never" — the blocker is usually one answer away
+	} {
+		if got := quietBackoff(tc.quiet); got != tc.want {
+			t.Errorf("quietBackoff(%d) = %s, want %s", tc.quiet, got, tc.want)
+		}
+	}
+}
+
+// A wait that takes far longer in real time than in timer time means the machine
+// was suspended: Go's timers do not advance while it sleeps, so the loop freezes
+// mid-wait and goes silent in a way indistinguishable from a hang.
+func TestSleepStall(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		intended, wall time.Duration
+		wantStalled    bool
+	}{
+		{"the real case: a 30m wait that took 2h28m", 30 * time.Minute, 2*time.Hour + 28*time.Minute, true},
+		{"ordinary scheduling overshoot says nothing", 30 * time.Minute, 30*time.Minute + 2*time.Second, false},
+		{"a short idle poll can be stalled too", time.Minute, 20 * time.Minute, true},
+		{"just under the floor stays quiet", time.Minute, 5 * time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, got := sleepStall(tc.intended, tc.wall); got != tc.wantStalled {
+				t.Errorf("sleepStall(%s, %s) stalled = %v, want %v", tc.intended, tc.wall, got, tc.wantStalled)
+			}
+		})
+	}
+}

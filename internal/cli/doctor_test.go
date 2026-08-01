@@ -24,7 +24,29 @@ func okEnv() doctorEnv {
 		binVersion: func(context.Context, string) (string, error) { return "1.2.3", nil },
 		newPoller:  func(string, string) backlog.Poller { return fakePoller{} },
 		apiKey:     "key-123",
+		goos:       "darwin",
+		// Default: nothing holds an assertion, idle sleep disabled — a machine that
+		// will stay up, so power never becomes the reason an unrelated test fails.
+		pmset: func(_ context.Context, args ...string) (string, error) {
+			if len(args) > 1 && args[1] == "assertions" {
+				return "   PreventUserIdleSystemSleep       0\n", nil
+			}
+			return " sleep                0\n displaysleep        10\n", nil
+		},
 	}
+}
+
+// pmsetEnv builds a doctorEnv whose pmset returns the given assertions and
+// settings output — the two reads the power check makes.
+func pmsetEnv(assertions, settings string) doctorEnv {
+	e := okEnv()
+	e.pmset = func(_ context.Context, args ...string) (string, error) {
+		if len(args) > 1 && args[1] == "assertions" {
+			return assertions, nil
+		}
+		return settings, nil
+	}
+	return e
 }
 
 type fakePoller struct {
@@ -991,5 +1013,107 @@ func TestBudgetWallClockWithCostPasses(t *testing.T) {
 
 	if c := checkBudget(cfg); c.status != pass {
 		t.Errorf("wall clock plus a cost ceiling: got %v, want PASS (%s)", c.status, c.detail)
+	}
+}
+
+// --- power -------------------------------------------------------------------
+
+// The most basic precondition of an unattended run, and the one nothing else
+// checked: will the machine still be awake to do the work? Timers run on the
+// monotonic clock, which does not advance while a machine is suspended, so idle
+// sleep does not pause a run — it freezes it mid-wait, silently.
+func TestPowerIdleSleepEnabledWarns(t *testing.T) {
+	e := pmsetEnv("   PreventUserIdleSystemSleep       0\n", " sleep                10\n")
+
+	c := checkPower(context.Background(), e)
+	if c.status != warn {
+		t.Fatalf("idle sleep enabled with no assertion: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "10 min") {
+		t.Errorf("detail should name the timeout, got %q", c.detail)
+	}
+	// The two facts that cost a real run its night: plugging in later does not
+	// wake a sleeping Mac, and no assertion survives a closed lid.
+	if !strings.Contains(c.remedy, "AC") || !strings.Contains(c.remedy, "lid") {
+		t.Errorf("remedy should carry both caveats, got %q", c.remedy)
+	}
+}
+
+func TestPowerAssertionHeldPasses(t *testing.T) {
+	e := pmsetEnv("   PreventUserIdleSystemSleep       1\n", " sleep                10\n")
+	if c := checkPower(context.Background(), e); c.status != pass {
+		t.Errorf("assertion held: got %v, want PASS (%s)", c.status, c.detail)
+	}
+}
+
+func TestPowerSleepDisabledPasses(t *testing.T) {
+	e := pmsetEnv("   PreventUserIdleSystemSleep       0\n", " sleep                0\n")
+	c := checkPower(context.Background(), e)
+	if c.status != pass {
+		t.Fatalf("idle sleep disabled: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	// Even the PASS has to carry the lid caveat, or it reads as a guarantee the
+	// setting does not actually make.
+	if !strings.Contains(c.detail, "lid") {
+		t.Errorf("PASS should still note that a closed lid sleeps, got %q", c.detail)
+	}
+}
+
+// Being unable to ask is not evidence of a problem, and a FAIL would block a
+// documented cron gate (`doctor && run`) over a missing binary.
+func TestPowerUnreadableWarnsRatherThanFails(t *testing.T) {
+	e := okEnv()
+	e.pmset = func(context.Context, ...string) (string, error) { return "", errors.New("exec: pmset not found") }
+
+	c := checkPower(context.Background(), e)
+	if c.status != warn {
+		t.Errorf("unreadable pmset: got %v, want WARN (%s)", c.status, c.detail)
+	}
+}
+
+func TestPowerSkippedOffDarwin(t *testing.T) {
+	e := okEnv()
+	e.goos = "linux"
+	e.pmset = func(context.Context, ...string) (string, error) {
+		t.Fatal("must not shell out to a macOS-only tool on linux")
+		return "", nil
+	}
+	if c := checkPower(context.Background(), e); c.status != pass {
+		t.Errorf("non-darwin: got %v, want PASS (%s)", c.status, c.detail)
+	}
+}
+
+// The summary row lists the assertion name with a count even when nothing holds
+// it, so presence of the NAME proves nothing — only a non-zero count does.
+func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"zero count is not held", "   PreventUserIdleSystemSleep       0\n", false},
+		{"non-zero count is held", "   PreventUserIdleSystemSleep       1\n", true},
+		{"named holder is held", `   PreventUserIdleSystemSleep       1
+       pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"absent entirely", "   PreventUserIdleDisplaySleep      0\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := holdsNoIdleSleep(tc.out); got != tc.want {
+				t.Errorf("holdsNoIdleSleep = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestIdleSleepMinutesParsesActiveSettings(t *testing.T) {
+	out := " standby              1\n sleep                10\n displaysleep         2\n"
+	got, found := idleSleepMinutes(out)
+	if !found || got != 10 {
+		t.Errorf("idleSleepMinutes = %d, %v; want 10, true", got, found)
+	}
+	// `displaysleep` must not be mistaken for `sleep` — the display sleeping does
+	// not suspend the machine, and warning on it would be a false alarm.
+	if got, _ := idleSleepMinutes(" displaysleep         2\n"); got != 0 {
+		t.Errorf("displaysleep must not be read as the system sleep timeout, got %d", got)
 	}
 }

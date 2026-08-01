@@ -51,6 +51,19 @@ type Driver struct {
 	cursor   int    // round-robin position over targets (last drained)
 	stateDir string
 	blind    bool // no cheap backlog read available — drain then idle-poll
+
+	// Per-target no-progress state. `claimable > 0` is a claim that work is
+	// available, not that it can be DONE: a task can be claimable and still
+	// unworkable — gated on an unanswered question, needing a toolchain the
+	// harness may not run, blocked on something no session can resolve. The gate
+	// cannot tell, so it spawns, the session correctly declines, and the operator
+	// pays for the same report every cycle. One real run spent ten iterations
+	// re-writing the same two questions. These back a repeatedly fruitless target
+	// off instead.
+	quiet     []int       // consecutive drains of this target that settled nothing
+	baseline  []int       // settled count when this target's last drain began
+	pending   []bool      // a drain of this target is awaiting its progress verdict
+	skipUntil []time.Time // a backed-off target is ineligible until this time
 }
 
 // New builds a single-project Driver — the original mode, driven entirely by the
@@ -62,7 +75,15 @@ func New(cfg *config.Config, h harness.Adapter, poller backlog.Poller) *Driver {
 // NewMulti builds a Driver over several targets (CLA-142): one loop instance, one
 // account key, many project queues — round-robin over whichever have claimable work.
 func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
-	return &Driver{cfg: cfg, h: h, targets: targets, paused: make([]bool, len(targets))}
+	n := len(targets)
+	return &Driver{
+		cfg: cfg, h: h, targets: targets,
+		paused:    make([]bool, n),
+		quiet:     make([]int, n),
+		baseline:  make([]int, n),
+		pending:   make([]bool, n),
+		skipUntil: make([]time.Time, n),
+	}
 }
 
 // Run drives the daemon until STOP/HALT, a ceiling (max-iterations / budget), or
@@ -167,7 +188,8 @@ func (d *Driver) Run(ctx context.Context) error {
 							d.paused[i] = false
 							log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
 						}
-						if sum.Claimable > 0 {
+						d.judgeProgress(i, sum)
+						if sum.Claimable > 0 && !d.backedOff(i) {
 							candidates[i] = true
 							anyCandidate = true
 						}
@@ -204,6 +226,8 @@ func (d *Driver) Run(ctx context.Context) error {
 		// There is work (or we're blind) — spend a session, retrying transient
 		// blips with backoff (a fresh session reclaims any half-done task).
 		drains++
+		// The next poll of this target judges whether the drain settled anything.
+		d.pending[d.cursor] = true
 		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target, d.cfg.Budget.Deadline(start))
 		if err != nil {
 			return err
@@ -334,6 +358,103 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, d
 	}
 }
 
+// quietBackoff is how long a target sits out after `quiet` consecutive drains
+// that settled nothing: 15m, 30m, 1h, then 2h. It never reaches "never" — the
+// blocker is usually an operator answering a question, and a target that can
+// never come back would need a restart to notice.
+func quietBackoff(quiet int) time.Duration {
+	const (
+		base = 15 * time.Minute
+		cap_ = 2 * time.Hour
+	)
+	d := base
+	for i := quietThreshold; i < quiet; i++ {
+		if d *= 2; d >= cap_ {
+			return cap_
+		}
+	}
+	return d
+}
+
+// quietThreshold is how many fruitless drains it takes to back a target off.
+//
+// Three, not one or two. A single fruitless drain is ordinary, and so is a
+// second: a genuinely large task can span several sessions before anything
+// reaches a reviewer, and backing off then would punish exactly the deep work
+// this loop exists to do. Three consecutive sessions that settle nothing is a
+// different claim — and against the run this was written for, which repeated the
+// same no-op ten times, a threshold of three still saves seven of them.
+const quietThreshold = 3
+
+// judgeProgress reads this poll as the verdict on the target's last drain, and
+// backs the target off once it has spent enough sessions achieving nothing.
+//
+// Progress is `Settled()` rising — work reaching a reviewer or finishing. A drain
+// that only recorded why it could not proceed bumps `version` but settles
+// nothing, which is exactly the run this exists to stop repeating.
+func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
+	settled := sum.Settled()
+
+	if !d.pending[i] {
+		// No drain outstanding. Progress can still arrive from elsewhere — the
+		// operator merging a PR, another machine's loop — and it means whatever was
+		// stuck may now be unstuck, so let the target back in immediately.
+		if settled > d.baseline[i] && d.quiet[i] > 0 {
+			log.Printf("%sprogress from elsewhere — clearing the no-progress back-off", d.prefix(i))
+			d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+		}
+		d.baseline[i] = settled
+		return
+	}
+
+	d.pending[i] = false
+	if settled > d.baseline[i] {
+		d.quiet[i] = 0
+		d.baseline[i] = settled
+		return
+	}
+
+	d.quiet[i]++
+	d.baseline[i] = settled
+	if d.quiet[i] < quietThreshold {
+		return
+	}
+	wait := quietBackoff(d.quiet[i])
+	d.skipUntil[i] = time.Now().Add(wait)
+	log.Printf("%s%d consecutive sessions settled nothing — backing off for %s. The queue says there is claimable work, so something is stopping it being DONE: an unanswered question, a gate, a toolchain the session cannot run. Check the last iteration log.",
+		d.prefix(i), d.quiet[i], wait)
+}
+
+// backedOff reports whether a target is currently sitting out, logging the moment
+// it becomes eligible again so the silence has a visible end.
+func (d *Driver) backedOff(i int) bool {
+	if d.skipUntil[i].IsZero() {
+		return false
+	}
+	if time.Now().Before(d.skipUntil[i]) {
+		return true
+	}
+	d.skipUntil[i] = time.Time{}
+	log.Printf("%sback-off elapsed — trying again", d.prefix(i))
+	return false
+}
+
+// sleepStall reports how much real time a wait lost to system suspension, and
+// whether that is worth saying out loud.
+//
+// The threshold is absolute rather than proportional on purpose: five minutes of
+// unexplained wall clock is worth one log line whether it interrupted a one-minute
+// idle poll or a thirty-minute limit wait, and a proportional rule would either
+// spam the short waits or stay silent through the long ones. Small overshoots are
+// ordinary scheduling and say nothing.
+func sleepStall(intended, wall time.Duration) (lost time.Duration, stalled bool) {
+	const floor = 5 * time.Minute
+	if lost = wall - intended; lost < floor {
+		return 0, false
+	}
+	return lost, true
+}
+
 // waitPastDeadline reports whether waiting for resetAt would carry the run past
 // deadline. Both being known is required: an unknown reset (zero) is waited out
 // as before, because the supervised wait polls for an EARLY lift and the limit
@@ -441,6 +562,13 @@ func labelOf(t Target) string {
 // and to context cancellation. Reports whether the loop should stop.
 func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 	const chunk = 3 * time.Second
+	// Round(0) strips the monotonic reading, so wallStart measures REAL elapsed
+	// time. Everything else here runs on the monotonic clock, which does not
+	// advance while the machine is suspended — so comparing the two is the only
+	// way a slept-through wait becomes visible. Without it, a laptop that idle
+	// sleeps turns a 30-minute pause into a multi-hour silence that looks exactly
+	// like a hung process.
+	wallStart := time.Now().Round(0)
 	end := time.Now().Add(dur)
 	for {
 		if present, _ := d.readMarker("STOP"); present {
@@ -450,6 +578,10 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 		}
 		remaining := time.Until(end)
 		if remaining <= 0 {
+			if lost, stalled := sleepStall(dur, time.Now().Round(0).Sub(wallStart)); stalled {
+				log.Printf("wait of %s took %s of wall clock — the machine was suspended for ~%s; timers are frozen while it sleeps, so an unattended run stalls silently (macOS: `caffeinate -i clankerbar run …`, and start it on AC — plugging in later does not wake a sleeping Mac)",
+					dur, time.Now().Round(0).Sub(wallStart).Round(time.Second), lost.Round(time.Second))
+			}
 			return false
 		}
 		w := chunk
