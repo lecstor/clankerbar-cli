@@ -50,6 +50,7 @@ func newRunFlagSet(f *runFlags) *pflag.FlagSet {
 	fs.IntVar(&f.maxIter, "max-iterations", 0, "stop after N drain iterations (0 = run as a daemon until stopped)")
 	fs.DurationVar(&f.pollInterval, "poll-interval", 0, "while paused on a usage limit, re-probe this often to catch an early reset")
 	fs.DurationVar(&f.idlePoll, "idle-poll-interval", 0, "when the backlog has no claimable work, re-check this often (stay running)")
+	registerHelp(fs)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: clankerbar run [flags]\n\nFlags:")
 		fs.PrintDefaults()

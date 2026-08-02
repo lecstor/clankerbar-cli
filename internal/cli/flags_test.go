@@ -145,9 +145,10 @@ func TestLegacySingleDashFlagsAreRejected(t *testing.T) {
 			if errors.Is(err, pflag.ErrHelp) {
 				t.Fatalf("parsing %q returned ErrHelp, so the command would exit 0 instead of erroring", arg)
 			}
-			// It must name the flag and the spelling that works.
-			if !strings.Contains(err.Error(), arg) || !strings.Contains(err.Error(), "-"+arg) {
-				t.Errorf("error %q does not name both %s and --%s", err, arg, strings.TrimPrefix(arg, "-"))
+			// It must name the spelling that works, not merely complain.
+			want := "write --" + strings.TrimPrefix(arg, "-")
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error %q does not tell the user to %q", err, want)
 			}
 		})
 	}
@@ -180,21 +181,54 @@ func TestLegacySingleDashFlagsAreRejected(t *testing.T) {
 	}
 }
 
-// TestPflagAloneWouldMisreadLegacyFlags pins the upstream behaviour that
-// rejectSingleDashLongFlags exists to cover. It bypasses the guard and drives
-// pflag directly.
+// TestSingleDashTypoDoesNotSilentlySucceed is the regression test for the
+// nastiest failure this migration could have introduced.
 //
-// If this test fails after a pflag upgrade, upstream has started rejecting
-// these itself - which is good news: re-read rejectSingleDashLongFlags and
-// decide whether it is still earning its place.
+// pflag treats a lone dash as a bundle of SHORT flags, and if no `-h` is
+// registered it reads ANY bundle starting with 'h' as a request for help:
+// usage is printed, Parse returns ErrHelp, and the command exits 0 having done
+// nothing. For `doctor` that means zero preflight checks ran and `doctor &&
+// run` still fired. Go's stdlib `flag` errored on these, so this would have
+// been a regression, not an inherited quirk. registerHelp closes it.
+func TestSingleDashTypoDoesNotSilentlySucceed(t *testing.T) {
+	// Near-misses of a real flag. None is a valid short bundle, so none may be
+	// mistaken for --help. (`-hh` is genuinely `-h -h` and is left out: asking
+	// for help twice is still asking for help.)
+	typos := []string{"-harnes", "-hlp", "-harness2", "-help-me", "-hemp"}
+
+	for _, arg := range typos {
+		t.Run("run "+arg, func(t *testing.T) {
+			_, _, err := parseRun([]string{arg, "claude"})
+			if err == nil {
+				t.Fatalf("parsing %q succeeded; a typo must not be accepted", arg)
+			}
+			if errors.Is(err, pflag.ErrHelp) {
+				t.Fatalf("parsing %q was taken as --help, so the command would exit 0 without running", arg)
+			}
+		})
+
+		t.Run("doctor "+arg, func(t *testing.T) {
+			err := Doctor(t.Context(), []string{arg, "claude"})
+			if err == nil {
+				t.Fatalf("Doctor(%q) returned nil, so it exits 0 having run no checks", arg)
+			}
+		})
+	}
+}
+
+// TestPflagAloneWouldMisreadLegacyFlags pins the upstream behaviour the two
+// defences above exist for, by driving pflag directly.
+//
+// If these fail after a pflag upgrade, upstream has started rejecting them
+// itself - which is good news: re-read registerHelp and
+// rejectSingleDashLongFlags and decide whether they still earn their place.
 func TestPflagAloneWouldMisreadLegacyFlags(t *testing.T) {
-	t.Run("-harness is taken as a request for help, not an error", func(t *testing.T) {
-		var f runFlags
-		fs := newRunFlagSet(&f)
-		fs.SetOutput(&bytes.Buffer{})
-		err := fs.Parse([]string{"-harness", "claude"})
-		if !errors.Is(err, pflag.ErrHelp) {
-			t.Errorf("pflag returned %v for -harness, want ErrHelp (the 'h' is read as -h)", err)
+	t.Run("without -h registered, any -h bundle is taken as a help request", func(t *testing.T) {
+		bare := pflag.NewFlagSet("bare", pflag.ContinueOnError)
+		bare.SetOutput(&bytes.Buffer{})
+		bare.String("harness", "", "")
+		if err := bare.Parse([]string{"-harnes", "claude"}); !errors.Is(err, pflag.ErrHelp) {
+			t.Errorf("pflag returned %v for -harnes, want ErrHelp (the 'h' is read as -h)", err)
 		}
 	})
 
@@ -202,8 +236,10 @@ func TestPflagAloneWouldMisreadLegacyFlags(t *testing.T) {
 		var f runFlags
 		fs := newRunFlagSet(&f)
 		fs.SetOutput(&bytes.Buffer{})
-		err := fs.Parse([]string{"-config", "/tmp/cb.json"})
-		if err != nil {
+		if fs.ShorthandLookup("c") == nil {
+			t.Skip("no -c alias registered; this upstream misread needs one")
+		}
+		if err := fs.Parse([]string{"-config", "/tmp/cb.json"}); err != nil {
 			t.Errorf("pflag returned %v for -config, want it to parse (wrongly) as -c", err)
 		}
 		if f.cfgPath != "onfig" {
@@ -212,9 +248,9 @@ func TestPflagAloneWouldMisreadLegacyFlags(t *testing.T) {
 	})
 }
 
-// A bare `-c` is a real short flag and must keep working, and a genuinely
-// unknown short must still fail - the guard is targeted, not a blanket ban on
-// single-dash arguments.
+// A bare `-c` is a real short flag and must keep working, and a value that
+// merely looks like a flag must reach the flag it belongs to - the guard is
+// targeted, not a blanket ban on single-dash arguments.
 func TestGuardDoesNotSwallowRealShortFlags(t *testing.T) {
 	if _, _, err := parseRun([]string{"-c", "/tmp/cb.json"}); err != nil {
 		t.Errorf("-c should still parse: %v", err)
@@ -222,9 +258,65 @@ func TestGuardDoesNotSwallowRealShortFlags(t *testing.T) {
 	if _, _, err := parseRun([]string{"-z"}); err == nil {
 		t.Error("unknown short flag -z should fail")
 	}
-	// After `--`, arguments are positional and none of this applies.
-	if _, _, err := parseRun([]string{"--", "-harness"}); err != nil {
-		t.Errorf("arguments after -- should be left alone: %v", err)
+
+	// A directory genuinely named "-model" is the value of --workdir, not a
+	// legacy flag spelling.
+	f, _, err := parseRun([]string{"--workdir", "-model"})
+	if err != nil {
+		t.Errorf("--workdir -model should parse: %v", err)
+	}
+	if f.workdir != "-model" {
+		t.Errorf("workdir = %q, want %q", f.workdir, "-model")
+	}
+
+	// Same via the short alias, where the value comes from the next argument.
+	if f, _, err := parseRun([]string{"-c", "-harness"}); err != nil || f.cfgPath != "-harness" {
+		t.Errorf("-c -harness: cfgPath = %q, err = %v; want the value to reach --config", f.cfgPath, err)
+	}
+}
+
+// Neither subcommand takes positional arguments, so a leftover is a mistake and
+// must be reported rather than dropped. This is the second line of defence
+// behind `-config /path`, which pflag would otherwise split into `-c onfig`
+// plus a discarded /path.
+func TestPositionalArgumentsAreRejected(t *testing.T) {
+	for _, args := range [][]string{
+		{"stray"},
+		{"--harness", "claude", "stray"},
+		{"--", "-harness"},
+	} {
+		_, out, err := parseRun(args)
+		if err == nil {
+			t.Errorf("parseRun(%q) succeeded; leftover arguments must be reported", args)
+			continue
+		}
+		if !strings.Contains(err.Error(), "unexpected argument") {
+			t.Errorf("parseRun(%q) failed with %v, want an unexpected-argument error", args, err)
+		}
+		if !strings.Contains(out, "Usage: clankerbar run") {
+			t.Errorf("parseRun(%q) did not print usage on rejection:\n%s", args, out)
+		}
+	}
+}
+
+// pflag prints nothing at all on a parse error under ContinueOnError, where
+// stdlib `flag` printed the message and the whole flag list. Losing the flag
+// list exactly when a user mistyped a flag is a real downgrade, so parseFlags
+// prints usage itself - including for pflag's own errors, not just the guard's.
+func TestUsageIsPrintedOnEveryRejection(t *testing.T) {
+	for _, args := range [][]string{
+		{"--harnes", "claude"},      // pflag's own unknown-flag error
+		{"-harness", "claude"},      // the guard's error
+		{"--max-iterations", "abc"}, // a value that will not parse
+	} {
+		_, out, err := parseRun(args)
+		if err == nil {
+			t.Errorf("parseRun(%q) unexpectedly succeeded", args)
+			continue
+		}
+		if !strings.Contains(out, "--harness") {
+			t.Errorf("parseRun(%q) rejected without showing the flag list:\n%s", args, out)
+		}
 	}
 }
 

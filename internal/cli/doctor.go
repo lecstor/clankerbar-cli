@@ -118,6 +118,7 @@ func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
 	fs.StringVar(&f.harness, "harness", "", "harness to check: "+strings.Join(harness.Names(), " | "))
 	fs.StringVar(&f.workdir, "workdir", "", "directory the harness would run in (default: current dir)")
 	fs.StringVar(&f.configDir, "config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME)")
+	registerHelp(fs)
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: clankerbar doctor [flags]\n\nFlags:")
 		fs.PrintDefaults()
