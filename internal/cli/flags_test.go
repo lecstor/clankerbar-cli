@@ -242,7 +242,7 @@ func TestSingleDashTypoDoesNotSilentlySucceed(t *testing.T) {
 // short alias opened up.
 //
 // pflag lets a value-taking short flag swallow the rest of its token, so with
-// `-c` registered every `-c…` spelling parses clean: `-cofnig ./x.json` sets
+// `-c` registered every `-c...` spelling parses clean: `-cofnig ./x.json` sets
 // --config to "ofnig" and leaves ./x.json positional. Go's stdlib flag rejected
 // all of these, so accepting them would be a regression this migration
 // introduced, not one it inherited. The inline form is therefore refused

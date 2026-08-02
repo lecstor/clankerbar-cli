@@ -55,7 +55,7 @@ clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
 Flags are **GNU-style**: `--long` options, `-x` shorts. `--config` (`-c`) and
 `--help` (`-h`) are the only short aliases; everything else is long-form only.
 `clankerbar run --help` and `clankerbar doctor --help` list them. A short flag's
-value is separate (`-c ./x.json`) or `=`-joined (`-c=./x.json`) — the inline
+value is separate (`-c ./x.json`) or `=`-joined (`-c=./x.json`); the inline
 `-c./x.json` form is rejected, so a typo like `-cofnig` cannot quietly become
 `--config=ofnig`.
 

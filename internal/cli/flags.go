@@ -65,7 +65,7 @@ func helpRequested(fs *pflag.FlagSet) bool {
 func parseFlags(fs *pflag.FlagSet, args []string) error {
 	// No self-heal for a set that did not come from newFlagSet, deliberately.
 	// Registering --help here would panic on a set that has already bound -h to
-	// something else (`fs.StringP("host", "h", …)`), turning a hypothetical bug
+	// something else (`fs.StringP("host", "h", ...)`), turning a hypothetical bug
 	// into a certain crash on the happy path. It is not needed either:
 	// rejectShortBundle refuses any multi-letter single-dash token whose letters
 	// are not all registered shorts, which is what pflag's help fallback would
