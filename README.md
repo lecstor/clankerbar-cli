@@ -52,6 +52,88 @@ clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json
 ```
 
+### Preflight: `clankerbar doctor`
+
+Most of what goes wrong in an unattended run only shows up as *degraded
+behaviour*, hours in — a rejected key silently drops the loop into blind mode, a
+missing binary kills the first session, an unreachable plane looks exactly like an
+empty queue. `doctor` turns all of that into one cheap answer before you start:
+
+```sh
+clankerbar doctor
+clankerbar doctor --config ./clankerbar.json --harness codex
+clankerbar doctor && clankerbar run --harness=claude   # gate a cron wrapper
+```
+
+It prints one `PASS` / `WARN` / `FAIL` line per check, with a one-line remedy
+under anything that isn't a PASS, and **exits non-zero if any check FAILs** — so
+it composes with `&&` as above.
+
+```
+PASS  config       loaded ./clankerbar.json
+                   harness: claude
+                   workdir: /Users/you/dev
+                   backlog: https://clankerbar.com/api/projects/acme/backlog-summary
+PASS  harness      /usr/local/bin/claude (2.1.0)
+WARN  config_dir   not set — the session inherits the ambient environment
+                -> set config_dir (or --config-dir) so a cron/launchd run loads the same skills, plugins and auth as your terminal
+WARN  backlog      https://clankerbar.com/api/projects/acme/backlog-summary — 0 claimable, 2 open question(s) — nothing to claim; the loop will idle without spawning
+                -> answer the open question(s) at clankerbar.com, or expect an idle run
+WARN  state_dir    /Users/you/dev/.clankerbar-loop has a leftover STOP marker
+                -> delete it, or the loop stops immediately: rm /Users/you/dev/.clankerbar-loop/STOP
+WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / CLAUDE.md)
+                -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it
+PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
+WARN  toolchains   no grant for: go (/Users/you/dev/acme-cli)
+                -> allow the verbs each one needs in /Users/you/.config/clankerbar/headless.json (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified
+PASS  budget       no ceiling configured — the loop runs until the backlog is dry or it is stopped
+```
+
+The checks: **config** (discovered, parses, validates — plus the resolved harness,
+workdir and derived backlog URLs), **harness** (binary on PATH and runnable, with
+its version), **config_dir** (resolves, exists, looks initialised for the chosen
+harness), **backlog** (creds present and the summary read succeeds — distinguishing
+no creds, a rejected key, a `project_required` key/route mismatch, and an
+unreachable endpoint — plus whether the queue is gated on *your* open questions,
+or paused from the console), **state_dir** (the driver's own directory: writable,
+no leftover `HALT`/`STOP`), **workdir** (per project: it resolves, an `.mcp.json`
+reaches it, and it carries an agent-instructions file), **permissions**
+(harness-specific policy sanity), **toolchains** (the build tools the project's
+repos need are actually granted), and **budget** (ceilings parse and are sane).
+
+A multi-project config gets **one backlog check and one workdir check per
+project** — one queue can be wired wrong while the others are fine. A project
+entry that omits `workdir` or `mcp_config_path` inherits the top-level one, and
+doctor resolves it **exactly the way the loop does**, so it never reports on a
+directory your sessions will not use.
+
+The `toolchains` audit reads every settings file Claude merges — the `--settings`
+policy, the config dir's `settings.json`/`settings.local.json`, and each session
+workdir's `.claude/settings.json`/`.claude/settings.local.json`. A *narrow* deny
+(`Bash(go run:*)` alongside an allowed `Bash(go test:*)`) is reported as a hole in
+an otherwise-granted tool, not as a blocked one — only a bare `Bash(go:*)` deny
+means the toolchain is unusable.
+
+Three of those exist because of failure modes that cost a real overnight run
+whole iterations:
+
+- **The queue said there was work and there wasn't.** A ready task gated on an
+  unanswered question still counts as claimable, so the loop spawns, the session
+  correctly declines to pre-empt your decision, and you pay for that report ten
+  times. Preflight now says so before the window opens.
+- **A session started in a multi-repo parent reads nothing.** A harness loads its
+  instruction file, skills and project settings from the session's cwd *and
+  upward* — never from the repos below it. Spawn in `~/dev` and every session
+  begins by rediscovering the layout, with none of your conventions.
+- **An ungranted toolchain does not stop a run, it un-verifies one.** A headless
+  session fails closed, so `go test` that was never allowed is refused with no
+  prompt reaching you — and the task ships written, pushed and never compiled.
+
+WARN vs FAIL is the "would this still make progress?" line: no creds and an
+unreachable plane WARN, because the loop drains blind and still gets work done; a
+rejected key and a key/route mismatch FAIL, because they never self-heal and every
+session the loop spawns carries the same broken credential.
+
 Control an in-flight run with markers in the state dir (`<workdir>/.clankerbar-loop`):
 
 ```sh
