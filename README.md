@@ -49,8 +49,19 @@ go build -o clankerbar ./cmd/clankerbar
 ```sh
 clankerbar run --harness=claude
 clankerbar run --harness=claude --model=opus --max-iterations=10
-clankerbar run --config ./clankerbar.json
+clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
 ```
+
+Flags are **GNU-style**: `--long` options, `-x` shorts. `--config` (`-c`) is the
+only short alias; everything else is long-form only. `clankerbar run --help` and
+`clankerbar doctor --help` list them.
+
+> **Breaking (pre-release).** A single dash now introduces *short* flags, so the
+> Go-stdlib spelling `-harness claude` no longer works - use `--harness claude`.
+> Anything invoking `clankerbar` with single-dash long options (a cron wrapper,
+> a launchd plist, a shell alias) needs updating. The old spelling is rejected
+> with a message naming the double-dash form rather than being quietly
+> reinterpreted.
 
 ### Preflight: `clankerbar doctor`
 
@@ -61,7 +72,7 @@ empty queue. `doctor` turns all of that into one cheap answer before you start:
 
 ```sh
 clankerbar doctor
-clankerbar doctor --config ./clankerbar.json --harness codex
+clankerbar doctor --config ./clankerbar.json --harness codex   # or: -c ./clankerbar.json
 clankerbar doctor && clankerbar run --harness=claude   # gate a cron wrapper
 ```
 

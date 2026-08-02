@@ -17,7 +17,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"os"
@@ -26,6 +25,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/spf13/pflag"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -98,32 +99,49 @@ func defaultDoctorEnv() doctorEnv {
 	}
 }
 
-// Doctor parses the `doctor` flags and runs the preflight checks. It exits
-// non-zero (via a returned error) when any check FAILs, so it is usable as a
-// gate in a cron wrapper: `clankerbar doctor && clankerbar run`.
-func Doctor(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
-	var (
-		cfgPath     = fs.String("config", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
-		harnessName = fs.String("harness", "", "harness to check: "+strings.Join(harness.Names(), " | "))
-		workdir     = fs.String("workdir", "", "directory the harness would run in (default: current dir)")
-		configDir   = fs.String("config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME)")
-	)
+// doctorFlags holds the parsed `doctor` options, split out from Doctor for the
+// same reason runFlags is: so the parse step can be tested without running the
+// preflight checks behind it.
+type doctorFlags struct {
+	cfgPath   string
+	harness   string
+	workdir   string
+	configDir string
+}
+
+// newDoctorFlagSet registers the `doctor` flags onto a pflag set bound to f.
+// GNU-style long options, matching `run` - see newRunFlagSet for why, and for
+// the deliberate break this carries with it.
+func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
+	fs := pflag.NewFlagSet("doctor", pflag.ContinueOnError)
+	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
+	fs.StringVar(&f.harness, "harness", "", "harness to check: "+strings.Join(harness.Names(), " | "))
+	fs.StringVar(&f.workdir, "workdir", "", "directory the harness would run in (default: current dir)")
+	fs.StringVar(&f.configDir, "config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME)")
 	fs.Usage = func() {
 		fmt.Fprintln(fs.Output(), "Usage: clankerbar doctor [flags]\n\nFlags:")
 		fs.PrintDefaults()
 	}
-	if err := fs.Parse(args); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
+	return fs
+}
+
+// Doctor parses the `doctor` flags and runs the preflight checks. It exits
+// non-zero (via a returned error) when any check FAILs, so it is usable as a
+// gate in a cron wrapper: `clankerbar doctor && clankerbar run`.
+func Doctor(ctx context.Context, args []string) error {
+	var f doctorFlags
+	fs := newDoctorFlagSet(&f)
+	if err := parseFlags(fs, args); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
 			return nil // --help already printed usage
 		}
 		return err
 	}
 
-	return doctorRun(ctx, os.Stdout, *cfgPath, config.Overrides{
-		Harness:   *harnessName,
-		WorkDir:   *workdir,
-		ConfigDir: *configDir,
+	return doctorRun(ctx, os.Stdout, f.cfgPath, config.Overrides{
+		Harness:   f.harness,
+		WorkDir:   f.workdir,
+		ConfigDir: f.configDir,
 	}, defaultDoctorEnv())
 }
 
