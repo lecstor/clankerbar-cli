@@ -52,9 +52,12 @@ clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
 ```
 
-Flags are **GNU-style**: `--long` options, `-x` shorts. `--config` (`-c`) is the
-only short alias; everything else is long-form only. `clankerbar run --help` and
-`clankerbar doctor --help` list them.
+Flags are **GNU-style**: `--long` options, `-x` shorts. `--config` (`-c`) and
+`--help` (`-h`) are the only short aliases; everything else is long-form only.
+`clankerbar run --help` and `clankerbar doctor --help` list them. A short flag's
+value is separate (`-c ./x.json`) or `=`-joined (`-c=./x.json`) — the inline
+`-c./x.json` form is rejected, so a typo like `-cofnig` cannot quietly become
+`--config=ofnig`.
 
 > **Breaking (pre-release).** A single dash now introduces *short* flags, so the
 > Go-stdlib spelling `-harness claude` no longer works - use `--harness claude`.

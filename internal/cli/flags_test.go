@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"errors"
+	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -194,7 +196,15 @@ func TestSingleDashTypoDoesNotSilentlySucceed(t *testing.T) {
 	// Near-misses of a real flag. None is a valid short bundle, so none may be
 	// mistaken for --help. (`-hh` is genuinely `-h -h` and is left out: asking
 	// for help twice is still asking for help.)
-	typos := []string{"-harnes", "-hlp", "-harness2", "-help-me", "-hemp"}
+	//
+	// The `c`-leading cases matter for a different reason: `-c` IS registered, so
+	// pflag reads all of them as --config with an inline value and never errors.
+	// They are the sibling class to the `h` ones and are covered by
+	// rejectShortBundle rather than by registerHelp.
+	typos := []string{
+		"-harnes", "-hlp", "-harness2", "-help-me", "-hemp",
+		"-cofnig", "-configg", "-conf", "-cverbose", "-ch",
+	}
 
 	for _, arg := range typos {
 		t.Run("run "+arg, func(t *testing.T) {
@@ -207,12 +217,86 @@ func TestSingleDashTypoDoesNotSilentlySucceed(t *testing.T) {
 			}
 		})
 
+		// Driven through the parse seam, not through Doctor: Doctor's next act is
+		// doctorRun, which probes PATH, execs harness binaries and does HTTP to the
+		// control plane. Today parsing always fails first so none of that runs - but
+		// this test's whole point is the case where parsing STOPS failing, and it
+		// must not become a live network round-trip on CI when it goes red.
 		t.Run("doctor "+arg, func(t *testing.T) {
-			err := Doctor(t.Context(), []string{arg, "claude"})
+			_, _, err := parseDoctor([]string{arg, "claude"})
 			if err == nil {
-				t.Fatalf("Doctor(%q) returned nil, so it exits 0 having run no checks", arg)
+				t.Fatalf("parsing %q succeeded, so doctor would exit 0 having run no checks", arg)
+			}
+			if errors.Is(err, pflag.ErrHelp) {
+				t.Fatalf("parsing %q was taken as --help, so doctor would exit 0 having run no checks", arg)
 			}
 		})
+	}
+}
+
+// TestInlineShortValueIsRejected covers the silent-misparse class that adding a
+// short alias opened up.
+//
+// pflag lets a value-taking short flag swallow the rest of its token, so with
+// `-c` registered every `-c…` spelling parses clean: `-cofnig ./x.json` sets
+// --config to "ofnig" and leaves ./x.json positional. Go's stdlib flag rejected
+// all of these, so accepting them would be a regression this migration
+// introduced, not one it inherited. The inline form is therefore refused
+// outright; the separated and =-joined forms keep working.
+func TestInlineShortValueIsRejected(t *testing.T) {
+	for _, arg := range []string{"-c/tmp/cb.json", "-configg", "-ch"} {
+		f, out, err := parseRun([]string{arg})
+		if err == nil {
+			t.Errorf("parseRun(%q) succeeded with cfgPath=%q; an inline short value must be rejected", arg, f.cfgPath)
+			continue
+		}
+		if !strings.Contains(out, "--config") {
+			t.Errorf("parseRun(%q) rejected without showing the flag list:\n%s", arg, out)
+		}
+	}
+
+	// The two spellings that stay supported.
+	for _, args := range [][]string{{"-c", "/tmp/cb.json"}, {"-c=/tmp/cb.json"}} {
+		f, _, err := parseRun(args)
+		if err != nil {
+			t.Errorf("parseRun(%q): %v", args, err)
+			continue
+		}
+		if f.cfgPath != "/tmp/cb.json" {
+			t.Errorf("parseRun(%q): cfgPath = %q, want %q", args, f.cfgPath, "/tmp/cb.json")
+		}
+	}
+
+	// A bundle whose value-taking short comes last is a real GNU bundle and must
+	// still work: -h is a bool, so -c takes the following argument.
+	if _, _, err := parseRun([]string{"-hc", "/tmp/cb.json"}); !errors.Is(err, pflag.ErrHelp) {
+		t.Errorf("-hc /tmp/cb.json = %v, want ErrHelp (a genuine -h -c bundle)", err)
+	}
+}
+
+// The guarantees parseFlags relies on have to come from the constructor, not
+// from each subcommand remembering to repeat them. A set built the raw way must
+// still not exit 0 on a typo, and must still print the flag list on rejection.
+func TestFlagSetGuaranteesSurviveARawFlagSet(t *testing.T) {
+	newRaw := func() (*pflag.FlagSet, *bytes.Buffer) {
+		fs := pflag.NewFlagSet("raw", pflag.ContinueOnError)
+		fs.String("harness", "", "")
+		var out bytes.Buffer
+		fs.SetOutput(&out)
+		return fs, &out
+	}
+
+	fs, _ := newRaw()
+	if err := parseFlags(fs, []string{"-harnes", "claude"}); errors.Is(err, pflag.ErrHelp) {
+		t.Error("a raw flag set took -harnes as --help, so the subcommand would exit 0 having done nothing")
+	}
+
+	fs, out := newRaw()
+	if err := parseFlags(fs, []string{"--nope"}); err == nil {
+		t.Error("--nope should fail")
+	}
+	if !strings.Contains(out.String(), "--harness") {
+		t.Errorf("a raw flag set rejected without printing the flag list:\n%s", out.String())
 	}
 }
 
@@ -365,6 +449,34 @@ func TestHelpPrintsDoubleDashUsage(t *testing.T) {
 					}
 				}
 			})
+		}
+	}
+}
+
+// --help is a request that SUCCEEDED, so its output goes to stdout: piping
+// `clankerbar run --help | less` has to show something. pflag defaults a flag
+// set's output to stderr (as stdlib `flag` did), and rejections stay there.
+func TestHelpGoesToStdout(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := os.Stdout
+	os.Stdout = w
+	runErr := Run(t.Context(), []string{"--help"})
+	os.Stdout = orig
+	w.Close()
+
+	out, readErr := io.ReadAll(r)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if runErr != nil {
+		t.Fatalf("Run --help = %v, want nil", runErr)
+	}
+	for _, want := range []string{"Usage: clankerbar run [flags]", "--harness"} {
+		if !strings.Contains(string(out), want) {
+			t.Errorf("--help did not write %q to stdout; got:\n%s", want, out)
 		}
 	}
 }

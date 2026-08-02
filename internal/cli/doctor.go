@@ -113,16 +113,11 @@ type doctorFlags struct {
 // GNU-style long options, matching `run` - see newRunFlagSet for why, and for
 // the deliberate break this carries with it.
 func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
-	fs := pflag.NewFlagSet("doctor", pflag.ContinueOnError)
+	fs := newFlagSet("doctor")
 	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
 	fs.StringVar(&f.harness, "harness", "", "harness to check: "+strings.Join(harness.Names(), " | "))
 	fs.StringVar(&f.workdir, "workdir", "", "directory the harness would run in (default: current dir)")
 	fs.StringVar(&f.configDir, "config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME)")
-	registerHelp(fs)
-	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: clankerbar doctor [flags]\n\nFlags:")
-		fs.PrintDefaults()
-	}
 	return fs
 }
 

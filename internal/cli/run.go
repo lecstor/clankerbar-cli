@@ -39,7 +39,7 @@ type runFlags struct {
 // legacy `-harness claude` is no longer accepted, because pflag reads a single
 // dash as a bundle of SHORT flags (`-h -a -r ...`). See flags_test.go.
 func newRunFlagSet(f *runFlags) *pflag.FlagSet {
-	fs := pflag.NewFlagSet("run", pflag.ContinueOnError)
+	fs := newFlagSet("run")
 	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
 	// Flag help lists exactly the registered adapters (derived from the harness
 	// registry, the same source config validation checks) so it can't drift.
@@ -50,11 +50,6 @@ func newRunFlagSet(f *runFlags) *pflag.FlagSet {
 	fs.IntVar(&f.maxIter, "max-iterations", 0, "stop after N drain iterations (0 = run as a daemon until stopped)")
 	fs.DurationVar(&f.pollInterval, "poll-interval", 0, "while paused on a usage limit, re-probe this often to catch an early reset")
 	fs.DurationVar(&f.idlePoll, "idle-poll-interval", 0, "when the backlog has no claimable work, re-check this often (stay running)")
-	registerHelp(fs)
-	fs.Usage = func() {
-		fmt.Fprintln(fs.Output(), "Usage: clankerbar run [flags]\n\nFlags:")
-		fs.PrintDefaults()
-	}
 	return fs
 }
 
