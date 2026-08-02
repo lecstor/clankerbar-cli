@@ -206,9 +206,13 @@ func TestSingleDashTypoDoesNotSilentlySucceed(t *testing.T) {
 		"-cofnig", "-configg", "-conf", "-cverbose", "-ch",
 	}
 
+	// Each typo is passed ALONE, with no following value. With a value after it
+	// the leftover-positional check would reject the command anyway, and these
+	// assertions would pass whether or not the single-dash guards exist - the
+	// test would pin nothing.
 	for _, arg := range typos {
 		t.Run("run "+arg, func(t *testing.T) {
-			_, _, err := parseRun([]string{arg, "claude"})
+			_, _, err := parseRun([]string{arg})
 			if err == nil {
 				t.Fatalf("parsing %q succeeded; a typo must not be accepted", arg)
 			}
@@ -223,7 +227,7 @@ func TestSingleDashTypoDoesNotSilentlySucceed(t *testing.T) {
 		// this test's whole point is the case where parsing STOPS failing, and it
 		// must not become a live network round-trip on CI when it goes red.
 		t.Run("doctor "+arg, func(t *testing.T) {
-			_, _, err := parseDoctor([]string{arg, "claude"})
+			_, _, err := parseDoctor([]string{arg})
 			if err == nil {
 				t.Fatalf("parsing %q succeeded, so doctor would exit 0 having run no checks", arg)
 			}
@@ -272,11 +276,60 @@ func TestInlineShortValueIsRejected(t *testing.T) {
 	if _, _, err := parseRun([]string{"-hc", "/tmp/cb.json"}); !errors.Is(err, pflag.ErrHelp) {
 		t.Errorf("-hc /tmp/cb.json = %v, want ErrHelp (a genuine -h -c bundle)", err)
 	}
+
+	// `-c=` is the last member of the class: pflag's `=` branch needs a token
+	// longer than two characters, so it falls through and sets --config to "=".
+	if f, _, err := parseRun([]string{"-c="}); err == nil {
+		t.Errorf(`parseRun("-c=") succeeded with cfgPath=%q; an empty value must be rejected`, f.cfgPath)
+	}
 }
 
-// The guarantees parseFlags relies on have to come from the constructor, not
-// from each subcommand remembering to repeat them. A set built the raw way must
-// still not exit 0 on a typo, and must still print the flag list on rejection.
+// A single-dash token containing a non-ASCII byte must be REJECTED, not panic.
+//
+// pflag's ShorthandLookup panics on any name longer than one character, and
+// string(someByte) yields the two-byte UTF-8 encoding for anything >= 0x80. The
+// realistic way in is a copy-paste whose second hyphen was smart-substituted
+// into an en dash: `clankerbar run -<en dash>config ./x.json`. A stack trace is
+// not the rejection this guard exists to produce.
+func TestNonASCIISingleDashFlagDoesNotPanic(t *testing.T) {
+	for _, arg := range []string{"-–config", "-é", "-hü", "-h€"} {
+		t.Run(arg, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("parsing %q panicked: %v", arg, r)
+				}
+			}()
+			if _, _, err := parseRun([]string{arg}); err == nil {
+				t.Errorf("parsing %q succeeded; it is not a valid short bundle", arg)
+			}
+		})
+	}
+}
+
+// parseFlags must not assume it can register --help on a set it was handed.
+// A subcommand that binds -h to something of its own would make pflag panic
+// ("unable to redefine 'h' shorthand"), on the happy path, for every argument.
+func TestParseFlagsDoesNotRedefineAForeignShorthand(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("parseFlags panicked on a set that binds -h itself: %v", r)
+		}
+	}()
+	fs := pflag.NewFlagSet("probe", pflag.ContinueOnError)
+	fs.SetOutput(&bytes.Buffer{})
+	host := fs.StringP("host", "h", "", "")
+	if err := parseFlags(fs, []string{"--host", "example.com"}); err != nil {
+		t.Fatalf("parseFlags: %v", err)
+	}
+	if *host != "example.com" {
+		t.Errorf("host = %q, want %q", *host, "example.com")
+	}
+}
+
+// newFlagSet is where -h and Usage come from, but neither may be a PRECONDITION
+// of parseFlags: a set built the raw way must still not exit 0 on a typo
+// (rejectShortBundle catches it before pflag's help fallback can) and must still
+// print the flag list on rejection (printUsage falls back to PrintDefaults).
 func TestFlagSetGuaranteesSurviveARawFlagSet(t *testing.T) {
 	newRaw := func() (*pflag.FlagSet, *bytes.Buffer) {
 		fs := pflag.NewFlagSet("raw", pflag.ContinueOnError)
@@ -462,6 +515,9 @@ func TestHelpGoesToStdout(t *testing.T) {
 		t.Fatal(err)
 	}
 	orig := os.Stdout
+	// Deferred as well as restored inline: a panic in Run would otherwise leave
+	// the package's remaining tests writing to a closed pipe.
+	defer func() { os.Stdout = orig }()
 	os.Stdout = w
 	runErr := Run(t.Context(), []string{"--help"})
 	os.Stdout = orig

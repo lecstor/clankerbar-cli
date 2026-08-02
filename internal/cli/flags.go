@@ -63,12 +63,13 @@ func helpRequested(fs *pflag.FlagSet) bool {
 // message and the flag list), so without this an unknown flag would produce one
 // bare line and no hint about what the valid flags are.
 func parseFlags(fs *pflag.FlagSet, args []string) error {
-	// Self-heal a set that did not come from newFlagSet. Everything below assumes
-	// -h is registered: without it pflag reads any single-dash bundle beginning
-	// with 'h' as a help request and the command exits 0 (see registerHelp).
-	if fs.Lookup("help") == nil {
-		registerHelp(fs)
-	}
+	// No self-heal for a set that did not come from newFlagSet, deliberately.
+	// Registering --help here would panic on a set that has already bound -h to
+	// something else (`fs.StringP("host", "h", …)`), turning a hypothetical bug
+	// into a certain crash on the happy path. It is not needed either:
+	// rejectShortBundle refuses any multi-letter single-dash token whose letters
+	// are not all registered shorts, which is what pflag's help fallback would
+	// otherwise swallow (see registerHelp).
 	if err := rejectSingleDashLongFlags(fs, args); err != nil {
 		printUsage(fs)
 		return err
@@ -144,7 +145,7 @@ func rejectSingleDashLongFlags(fs *pflag.FlagSet, args []string) error {
 			}
 
 		case strings.HasPrefix(arg, "-") && len(arg) > 1:
-			name, _, hasEq := strings.Cut(arg[1:], "=")
+			name, value, hasEq := strings.Cut(arg[1:], "=")
 			if len(arg) > 2 {
 				// An exact long name gets the message that names the fix.
 				if fs.Lookup(name) != nil {
@@ -152,6 +153,13 @@ func rejectSingleDashLongFlags(fs *pflag.FlagSet, args []string) error {
 				}
 				if err := rejectShortBundle(fs, arg, name); err != nil {
 					return err
+				}
+				// pflag reads `-c=` as --config="=" rather than as an empty value:
+				// its `=` branch needs a token longer than two characters, so the
+				// `=` falls through and becomes the value itself. Refuse it rather
+				// than let a nonsense value through.
+				if hasEq && value == "" {
+					return fmt.Errorf("flag %q has no value: write -%s=<value>, or -%s <value>", arg, name, name)
 				}
 			}
 			if !hasEq && shortsConsumeNextArg(fs, arg[1:]) {
@@ -168,10 +176,16 @@ func rejectSingleDashLongFlags(fs *pflag.FlagSet, args []string) error {
 // pflag would swallow the tail as an inline value rather than erroring.
 func rejectShortBundle(fs *pflag.FlagSet, arg, bundle string) error {
 	for i := 0; i < len(bundle); i++ {
-		c := string(bundle[i])
+		// SLICE, never string(bundle[i]): converting a byte >= 0x80 yields its
+		// two-byte UTF-8 encoding, and pflag's ShorthandLookup PANICS on anything
+		// longer than one character. `-–config`, with the second hyphen smart-
+		// substituted into an en dash by whatever the user copied it from, is the
+		// realistic way in - and a stack trace is not the rejection this function
+		// exists to produce.
+		c := bundle[i : i+1]
 		f := fs.ShorthandLookup(c)
 		if f == nil {
-			return fmt.Errorf("unknown flag %q: a single dash introduces short flags (%s), so every letter after it must be one - %q is not; long options take two dashes", arg, shorthandList(fs), c)
+			return fmt.Errorf("unknown flag %q: a single dash introduces short flags%s, so every letter after it must be one - %q is not; long options take two dashes", arg, shorthandHint(fs), c)
 		}
 		if takesValue(f) && i < len(bundle)-1 {
 			return fmt.Errorf("ambiguous flag %q: the short flag -%s takes a value, so this would be read as --%s=%q; write -%s <value> or --%s=<value>", arg, c, f.Name, bundle[i+1:], c, f.Name)
@@ -180,16 +194,20 @@ func rejectShortBundle(fs *pflag.FlagSet, arg, bundle string) error {
 	return nil
 }
 
-// shorthandList renders the registered short flags, so a rejection can name
-// what a single dash CAN mean here rather than only what it cannot.
-func shorthandList(fs *pflag.FlagSet) string {
+// shorthandHint renders the registered short flags as a parenthetical, so a
+// rejection can name what a single dash CAN mean here rather than only what it
+// cannot. A set with no shorthands at all gets nothing rather than "()".
+func shorthandHint(fs *pflag.FlagSet) string {
 	var shorts []string
 	fs.VisitAll(func(f *pflag.Flag) {
 		if f.Shorthand != "" {
 			shorts = append(shorts, "-"+f.Shorthand)
 		}
 	})
-	return strings.Join(shorts, ", ")
+	if len(shorts) == 0 {
+		return ""
+	}
+	return " (" + strings.Join(shorts, ", ") + ")"
 }
 
 // takesValue reports whether f needs a separate argument for its value. A
@@ -204,7 +222,9 @@ func takesValue(f *pflag.Flag) bool {
 // than one letter, so a value-taking short here is always the last one.
 func shortsConsumeNextArg(fs *pflag.FlagSet, shorts string) bool {
 	for i := 0; i < len(shorts); i++ {
-		f := fs.ShorthandLookup(string(shorts[i]))
+		// Sliced, not converted - see rejectShortBundle: string(byte) panics
+		// ShorthandLookup for anything non-ASCII.
+		f := fs.ShorthandLookup(shorts[i : i+1])
 		if f == nil {
 			return false // unknown short; pflag will produce the error
 		}
