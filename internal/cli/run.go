@@ -14,6 +14,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
 // runFlags holds the parsed `run` options. It exists so the parse step is
@@ -95,12 +96,16 @@ func Run(ctx context.Context, args []string) error {
 	// still works for single-project / CI setups.
 	apiKey := os.Getenv("CLANKERBAR_API_KEY")
 
+	// The same key also authorises the driver's one WRITE: handing back a task a
+	// session was still holding when it ended, so an interrupted iteration does not
+	// leave a lease to expire and charge the task a reclaim (CLA-242).
 	if projects := cfg.Projects; len(projects) > 0 {
 		targets := make([]loop.Target, 0, len(projects))
 		for _, p := range projects {
 			targets = append(targets, loop.Target{
 				Name:          p.Slug,
 				Poller:        backlog.New(cfg.ProjectSummaryURL(p), apiKey),
+				Releaser:      plane.New(cfg.ProjectEndpoint(p), apiKey),
 				WorkDir:       p.WorkDir,
 				MCPConfigPath: p.MCPConfigPath,
 			})
@@ -108,5 +113,10 @@ func Run(ctx context.Context, args []string) error {
 		return loop.NewMulti(cfg, adapter, targets).Run(ctx)
 	}
 
-	return loop.New(cfg, adapter, backlog.New(cfg.BacklogSummaryURL(), apiKey)).Run(ctx)
+	// One unnamed target — NewMulti with a single entry is exactly what New builds,
+	// and it is the only form that can carry a Releaser.
+	return loop.NewMulti(cfg, adapter, []loop.Target{{
+		Poller:   backlog.New(cfg.BacklogSummaryURL(), apiKey),
+		Releaser: plane.New(cfg.BacklogEndpoint(), apiKey),
+	}}).Run(ctx)
 }

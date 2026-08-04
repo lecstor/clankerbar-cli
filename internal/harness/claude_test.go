@@ -86,7 +86,33 @@ func TestClaudeClaimTracking(t *testing.T) {
 			lines: []string{
 				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
 				toolResult("u1", claimOK),
+				toolUse("u2", updateTaskTool, `{"taskId":"t-1","outcome":"still going"}`),
+			},
+			want: Claim{TaskID: "t-1", RunID: "r-1"},
+		},
+		{
+			name: "recording a branch marks the claim as carrying pushed work",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", claimOK),
 				toolUse("u2", updateTaskTool, `{"taskId":"t-1","branch":"clanker/x"}`),
+			},
+			want: Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+		},
+		{
+			name: "a predecessor's WIP arrives with the claim",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1","takeover":true}`),
+				toolResult("u1", `{"task":{"id":"t-1"},"run":{"id":"r-1"},"hasWip":true}`),
+			},
+			want: Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+		},
+		{
+			name: "another task's branch is not my WIP",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", claimOK),
+				toolUse("u2", updateTaskTool, `{"taskId":"t-99","branch":"clanker/other"}`),
 			},
 			want: Claim{TaskID: "t-1", RunID: "r-1"},
 		},
@@ -152,11 +178,34 @@ func TestClaimHeld(t *testing.T) {
 		{"unsettled claim is held", Claim{TaskID: "t-1", RunID: "r-1"}, true},
 		{"settled claim is not", Claim{TaskID: "t-1", RunID: "r-1", Settled: true}, false},
 		{"no claim at all", Claim{}, false},
+		{"WIP does not stop it being HELD", Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}, true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := tt.claim.Held(); got != tt.want {
 				t.Errorf("Held() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClaimReleasable(t *testing.T) {
+	tests := []struct {
+		name  string
+		claim Claim
+		want  bool
+	}{
+		{"held with no WIP is the one releasable case", Claim{TaskID: "t-1", RunID: "r-1"}, true},
+		// Releasing this to `ready` would discard requiresTakeover and strand the
+		// pushed branch — worse than letting the lease expire.
+		{"held WITH WIP must be left to expire", Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}, false},
+		{"settled: the plane already released it", Claim{TaskID: "t-1", RunID: "r-1", Settled: true}, false},
+		{"nothing claimed", Claim{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.claim.Releasable(); got != tt.want {
+				t.Errorf("Releasable() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -192,19 +241,19 @@ func TestParseClaudeResetAt(t *testing.T) {
 		wantWD  time.Weekday // only checked when non-negative
 	}{
 		{
-			name:    "session later today, explicit zone",
-			msg:     "You've hit your session limit · resets 9:40pm (Europe/Madrid)",
-			wantH:   21, wantM: 40, wantDay: 16, wantWD: -1,
+			name:  "session later today, explicit zone",
+			msg:   "You've hit your session limit · resets 9:40pm (Europe/Madrid)",
+			wantH: 21, wantM: 40, wantDay: 16, wantWD: -1,
 		},
 		{
-			name:    "session already passed rolls to tomorrow",
-			msg:     "You've hit your session limit · resets 6:00am (Europe/Madrid)",
-			wantH:   6, wantM: 0, wantDay: 17, wantWD: -1,
+			name:  "session already passed rolls to tomorrow",
+			msg:   "You've hit your session limit · resets 6:00am (Europe/Madrid)",
+			wantH: 6, wantM: 0, wantDay: 17, wantWD: -1,
 		},
 		{
-			name:    "weekly names a weekday",
-			msg:     "You've hit your weekly limit · resets Sunday 12:00am (Europe/Madrid)",
-			wantH:   0, wantM: 0, wantDay: 19, wantWD: time.Sunday, // next Sunday after Thu 16th
+			name:  "weekly names a weekday",
+			msg:   "You've hit your weekly limit · resets Sunday 12:00am (Europe/Madrid)",
+			wantH: 0, wantM: 0, wantDay: 19, wantWD: time.Sunday, // next Sunday after Thu 16th
 		},
 	}
 

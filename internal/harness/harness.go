@@ -108,12 +108,33 @@ type Claim struct {
 	// own accord (done / in_review / parked / blocked). The plane has already
 	// released the task, so there is nothing for the driver to hand back.
 	Settled bool
+
+	// HasWIP reports that a work-in-progress branch is recorded against the task —
+	// either carried in on the claim (a predecessor's work) or recorded by this
+	// session after it pushed. It makes the claim UNSAFE to release: see
+	// Releasable.
+	HasWIP bool
 }
 
 // Held reports whether this session ended still holding a task — a claim that
 // was made, never settled, and therefore backed by a lease now ticking down with
 // nobody heartbeating it.
 func (c Claim) Held() bool { return c.TaskID != "" && !c.Settled }
+
+// Releasable reports whether the driver may hand this claim straight back to the
+// queue.
+//
+// A held claim with WIP is deliberately excluded, and the asymmetry is the point.
+// With no branch recorded, releasing to `ready` is exactly what the plane's own
+// expiry sweep would have done half an hour later, minus the reclaim it would
+// have charged — strictly better. With a branch recorded it is strictly WORSE:
+// `requiresTakeover` is computed only for an `in_progress` task whose lease has
+// died, so moving the task to `ready` throws away the flag that tells the next
+// clanker there is pushed work waiting. Letting that lease expire preserves the
+// handoff and costs one reclaim; releasing it saves the reclaim and strands the
+// work. Until the plane grows a release that keeps the handoff, the driver takes
+// the expiry.
+func (c Claim) Releasable() bool { return c.Held() && !c.HasWIP }
 
 // terminalStatuses are the update_task statuses that end a run and release the
 // task plane-side. Anything else (notably `in_progress`, and a bare revision with

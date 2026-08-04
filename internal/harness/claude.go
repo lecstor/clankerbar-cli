@@ -173,11 +173,13 @@ const (
 func noteClaimed(content json.RawMessage, res *Result) {
 	var payload struct {
 		Task struct {
-			ID string `json:"id"`
+			ID     string `json:"id"`
+			Branch string `json:"branch"`
 		} `json:"task"`
 		Run struct {
 			ID string `json:"id"`
 		} `json:"run"`
+		HasWip bool `json:"hasWip"`
 	}
 	if json.Unmarshal([]byte(toolResultText(content)), &payload) != nil {
 		return
@@ -185,7 +187,13 @@ func noteClaimed(content json.RawMessage, res *Result) {
 	if payload.Task.ID == "" || payload.Run.ID == "" {
 		return
 	}
-	res.Claim = Claim{TaskID: payload.Task.ID, RunID: payload.Run.ID}
+	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
+	// safer to release just because THIS session has not written anything yet.
+	res.Claim = Claim{
+		TaskID: payload.Task.ID,
+		RunID:  payload.Run.ID,
+		HasWIP: payload.HasWip || payload.Task.Branch != "",
+	}
 }
 
 // noteSettled marks the tracked claim settled when the session moves THAT task to
@@ -196,12 +204,21 @@ func noteSettled(input json.RawMessage, res *Result) {
 	var args struct {
 		TaskID string `json:"taskId"`
 		Status string `json:"status"`
+		Branch string `json:"branch"`
 	}
 	if json.Unmarshal(input, &args) != nil {
 		return
 	}
-	if args.TaskID != "" && args.TaskID == res.Claim.TaskID && terminalStatuses[args.Status] {
+	if args.TaskID == "" || args.TaskID != res.Claim.TaskID {
+		return
+	}
+	if terminalStatuses[args.Status] {
 		res.Claim.Settled = true
+	}
+	// Recording a branch is the session declaring it has pushed work worth handing
+	// over, which is precisely what makes the task unsafe to release to `ready`.
+	if args.Branch != "" {
+		res.Claim.HasWIP = true
 	}
 }
 

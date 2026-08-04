@@ -21,6 +21,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
 // Target is one backlog a Driver drives: a project's cheap poller plus where that
@@ -40,6 +41,11 @@ type Target struct {
 	// MCPConfigPath points this project's sessions at its .mcp.json (the file
 	// whose /mcp/<slug> URL selects the project). Empty = the config's path.
 	MCPConfigPath string
+
+	// Releaser hands back a claim a session left holding (CLA-242). Nil disables
+	// the handback for this target, which costs only the reclaim an expiring lease
+	// would have cost anyway — so a target without one degrades, it does not break.
+	Releaser plane.Releaser
 }
 
 // Driver runs the loop for one harness against one or more backlogs.
@@ -275,6 +281,11 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (
 		tokens += res.Tokens
 		cost += res.CostUSD
 
+		// Hand back anything the session was still holding, BEFORE deciding what to
+		// do next — every branch below either waits, retries or returns, and all
+		// three leave the lease unattended.
+		d.releaseHeldClaim(ctx, t, res)
+
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
 		// poll for, so the run stops cleanly and the operator resumes it once
@@ -317,6 +328,44 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (
 
 		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping", drainNum, d.h.Name(), res.ExitCode)
 	}
+}
+
+// releaseHeldClaim hands a task the session was still holding back to the queue,
+// instead of leaving its lease to run out with nobody heartbeating it.
+//
+// It runs on EVERY exit from a session, deliberately. A usage limit, a transient
+// blip, an outright failure and a clean finish with the work unfinished all leave
+// the same dead lease behind — and the usage-limit case is the worst of the four,
+// because the driver then goes to sleep for as long as the reset takes. One real
+// run slept ninety minutes on a live claim and cost the task a reclaim it had not
+// earned; the budget is two before the plane parks the task for the operator.
+//
+// A claim with pushed work is left alone; Claim.Releasable says why.
+func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result) {
+	if !res.Claim.Held() {
+		return
+	}
+	if !res.Claim.Releasable() {
+		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
+			labelOf(t), res.Claim.TaskID)
+		return
+	}
+	if t.Releaser == nil {
+		return
+	}
+	// Detach from ctx: a cancelled run (Ctrl-C, SIGTERM) is exactly when a claim
+	// would otherwise be abandoned, so the handback has to outlive the signal that
+	// prompted it. Bounded, so a wedged plane cannot hold up the shutdown.
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+
+	if err := t.Releaser.Release(rctx, res.Claim.TaskID, res.Claim.RunID); err != nil {
+		if !errors.Is(err, plane.ErrNotWired) {
+			log.Printf("%scould not hand %s back: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
+		}
+		return
+	}
+	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
 }
 
 // supervisedWait pauses on a usage limit, then polls for an early reset rather
