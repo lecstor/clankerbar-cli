@@ -378,6 +378,37 @@ func TestSettlesTask(t *testing.T) {
 	}
 }
 
+// `input_tokens` is UNCACHED input only. Summing it with output alone misses the
+// cache reads and writes that dominate a long agentic session, which is how a
+// real run reported 140,387 tokens against $147.98 of spend — about $1.05 per
+// thousand, no model's price. A max_tokens ceiling built on that number would
+// silently pass roughly ten times what the operator set.
+func TestClaudeCountsCacheTokens(t *testing.T) {
+	line := `{"type":"result","subtype":"success","total_cost_usd":33.92,"usage":` +
+		`{"input_tokens":100,"output_tokens":20,"cache_creation_input_tokens":5000,"cache_read_input_tokens":900000}}`
+
+	var res Result
+	var console bytes.Buffer
+	(claude{}).renderAndParse([]byte(line), &console, &res)
+
+	if want := 905120; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d (cache reads and writes are billed input)", res.Tokens, want)
+	}
+}
+
+// The non-streaming path parses the same envelope and must agree — it is the one
+// used for probes and any non-stream invocation.
+func TestClaudeParseCountsCacheTokens(t *testing.T) {
+	res := Result{Stdout: `{"result":"done","total_cost_usd":1.5,"usage":` +
+		`{"input_tokens":10,"output_tokens":5,"cache_creation_input_tokens":1000,"cache_read_input_tokens":20000}}`}
+
+	(claude{}).parse(&res)
+
+	if want := 21015; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d", res.Tokens, want)
+	}
+}
+
 func TestParseClaudeResetAt(t *testing.T) {
 	madrid, err := time.LoadLocation("Europe/Madrid")
 	if err != nil {

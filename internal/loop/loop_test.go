@@ -313,6 +313,115 @@ func TestRun_GateDecision(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// A reset that lands past the run's wall-clock ceiling must not be waited out.
+// The budget breaker only runs BETWEEN drains and the supervised wait sits inside
+// one, so waiting produces the worst possible shape: sleep through the window,
+// spend one session on the freshly reset quota, then stop on the very next check
+// — headroom saved all night and then declined. A real run did exactly that,
+// stopping eight minutes after an 8am reset having waited 5h31m for it.
+func TestDrainWithRetries_ResetPastBudgetStopsInsteadOfWaiting(t *testing.T) {
+	cfg := fastCfg()
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
+		limitResetAt: time.Now().Add(3 * time.Hour),
+	}
+	// A 30m ceiling with the run just started: 30m of budget left, reset in 3h.
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(30 * time.Minute)}
+	d := New(cfg, h, &fakePoller{})
+	d.stateDir = t.TempDir()
+
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Now())
+
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !stop {
+		t.Error("a reset past the ceiling must stop the run, not wait it out")
+	}
+	if h.probeCalls != 0 {
+		t.Errorf("stopping early must not enter the supervised wait; got %d probes", h.probeCalls)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("the session must not be re-run; got %d invokes", h.invokeCalls)
+	}
+}
+
+// The mirror case: a reset INSIDE the ceiling is still waited out, because the
+// wait is what lets an overnight run survive a rolling-window cap at all.
+func TestDrainWithRetries_ResetInsideBudgetStillWaits(t *testing.T) {
+	cfg := fastCfg()
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
+		limitResetAt: time.Now().Add(time.Minute),
+	}
+	// A 4h ceiling with the run just started: the 1m reset fits easily.
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(4 * time.Hour)}
+	d := New(cfg, h, &fakePoller{})
+	d.stateDir = t.TempDir()
+
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Now())
+
+	if err != nil || stop {
+		t.Fatalf("a reset inside the ceiling must be waited out: stop=%v err=%v", stop, err)
+	}
+	if tokens != 7 {
+		t.Errorf("the session should have been re-run after the wait; got %d tokens", tokens)
+	}
+}
+
+// Both halves must be known before an early stop is justified: an unknown reset
+// is waited out because the supervised wait polls for an EARLY lift, and with no
+// ceiling set there is nothing to be past.
+func TestWaitPastBudget(t *testing.T) {
+	now := time.Now()
+	cases := []struct {
+		name      string
+		resetAt   time.Time
+		remaining time.Duration
+		bounded   bool
+		wantOver  bool
+	}{
+		{"reset costs more than is left", now.Add(2 * time.Hour), time.Hour, true, true},
+		{"reset fits inside what is left", now.Add(time.Hour), 2 * time.Hour, true, false},
+		{"unknown reset is waited out", time.Time{}, time.Hour, true, false},
+		{"no ceiling means nothing to be past", now.Add(2 * time.Hour), 0, false, false},
+		{"an already-spent ceiling stops on any wait", now.Add(time.Minute), -time.Hour, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, got := waitPastBudget(tc.resetAt, tc.remaining, tc.bounded); got != tc.wantOver {
+				t.Errorf("waitPastBudget = %v, want %v", got, tc.wantOver)
+			}
+		})
+	}
+}
+
+// The decision must be taken on the SAME clock the budget breaker uses.
+//
+// Budget.Deadline keeps start's monotonic reading, and ExceededBy counts
+// monotonic elapsed; a suspended machine advances the wall clock and freezes the
+// monotonic one. Comparing a wall-clock reset against a wall-clock deadline
+// therefore stopped runs the breaker would have allowed to continue, and blamed
+// a ceiling that had not been reached. This pins the divergence directly.
+func TestWaitPastBudget_ignoresWallClockDrift(t *testing.T) {
+	const ceiling = 8 * time.Hour
+
+	// A run that began 8h ago by the WALL clock, but spent 5h30m suspended, so the
+	// breaker has only seen 2h30m of monotonic elapsed.
+	elapsedMonotonic := 2*time.Hour + 30*time.Minute
+	remaining, bounded := config.Budget{MaxWallClock: config.Duration(ceiling)}.Remaining(elapsedMonotonic)
+	if !bounded {
+		t.Fatal("a configured ceiling must report bounded")
+	}
+
+	// The quota returns in an hour - comfortably inside the 5h30m still budgeted.
+	resetAt := time.Now().Add(time.Hour)
+	if _, over := waitPastBudget(resetAt, remaining, bounded); over {
+		t.Errorf("stopped a run with %s of budget left for a %s wait; the wall clock is not the breaker's clock",
+			remaining.Round(time.Minute), time.Until(resetAt).Round(time.Minute))
+	}
+}
+
 // drainWithRetries: transient retry / usage-limit wait / hard stop / genuine
 // failures. Exercised directly on the method — its retry loop is the unit that
 // must NOT advance the outer drain count, and testing it in isolation makes that
@@ -407,7 +516,7 @@ func TestDrainWithRetries(t *testing.T) {
 			d := New(cfg, h, &fakePoller{})
 			d.stateDir = t.TempDir() // drainWithRetries writes per-iteration logs here
 
-			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0])
+			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Time{})
 
 			if tc.wantErr == "" && err != nil {
 				t.Fatalf("unexpected error: %v", err)
@@ -450,7 +559,7 @@ func TestDrainWithRetries_StatedResetPassed(t *testing.T) {
 	d := New(cfg, h, &fakePoller{})
 	d.stateDir = t.TempDir()
 
-	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0])
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Time{})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -992,6 +1101,109 @@ func TestRun_ReleaseHeldClaim(t *testing.T) {
 				if rel.calls[i] != tt.want[i] {
 					t.Errorf("release[%d] = %+v, want %+v", i, rel.calls[i], tt.want[i])
 				}
+			}
+		})
+	}
+}
+
+// No-progress breaker: `claimable > 0` claims work is AVAILABLE, not that it can
+// be DONE. A task gated on an unanswered question is claimable and unworkable, so
+// the gate spawns, the session correctly declines, and the operator pays for the
+// same report every cycle — ten times, in the run this was written for.
+
+func TestRun_BacksOffAfterFruitlessDrains(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 10
+	h := &fakeAdapter{} // every session succeeds cleanly...
+	// ...but nothing ever reaches a reviewer or finishes, which is the shape of a
+	// queue whose only claimable task is waiting on the operator.
+	p := &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := New(cfg, h, p).Run(ctx); err != nil && ctx.Err() == nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	// Three sessions to reach the threshold, then a 15-minute back-off that no
+	// fast-config interval can skip — so the run cannot reach its 10 iterations.
+	if h.invokeCalls != quietThreshold {
+		t.Errorf("should stop spawning after %d fruitless drains; got %d sessions", quietThreshold, h.invokeCalls)
+	}
+}
+
+// The mirror: a queue that keeps settling work must never be backed off, or the
+// breaker would throttle exactly the runs that are working.
+func TestRun_ProgressResetsTheBreaker(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 6
+	h := &fakeAdapter{}
+	// Settled climbs on every poll — each drain delivered something.
+	p := &fakePoller{sums: []backlog.Summary{
+		{Claimable: 1, Done: 0}, {Claimable: 1, Done: 1}, {Claimable: 1, Done: 2},
+		{Claimable: 1, Done: 3}, {Claimable: 1, Done: 4}, {Claimable: 1, Done: 5},
+	}, sum: backlog.Summary{Claimable: 1, Done: 6}}
+
+	if err := runLoop(t, cfg, h, p); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 6 {
+		t.Errorf("a productive queue must never be backed off; got %d of 6 sessions", h.invokeCalls)
+	}
+}
+
+// Work settling while nothing is outstanding means someone else moved it — the
+// operator merging a PR, another machine's loop. Whatever was stuck may now be
+// unstuck, so the target comes straight back rather than serving out its wait.
+func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.quiet[0] = quietThreshold
+	d.skipUntil[0] = time.Now().Add(time.Hour)
+	d.baseline[0] = 4
+
+	d.judgeProgress(0, backlog.Summary{Done: 5})
+
+	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("outside progress must clear the back-off; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
+func TestQuietBackoffEscalatesToACap(t *testing.T) {
+	for _, tc := range []struct {
+		quiet int
+		want  time.Duration
+	}{
+		{3, 15 * time.Minute},
+		{4, 30 * time.Minute},
+		{5, time.Hour},
+		{6, 2 * time.Hour},
+		{99, 2 * time.Hour}, // never becomes "never" — the blocker is usually one answer away
+	} {
+		if got := quietBackoff(tc.quiet); got != tc.want {
+			t.Errorf("quietBackoff(%d) = %s, want %s", tc.quiet, got, tc.want)
+		}
+	}
+}
+
+// A wait that takes far longer in real time than in timer time means the machine
+// was suspended: Go's timers do not advance while it sleeps, so the loop freezes
+// mid-wait and goes silent in a way indistinguishable from a hang.
+func TestSleepStall(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		intended, wall time.Duration
+		wantStalled    bool
+	}{
+		{"the real case: a 30m wait that took 2h28m", 30 * time.Minute, 2*time.Hour + 28*time.Minute, true},
+		{"ordinary scheduling overshoot says nothing", 30 * time.Minute, 30*time.Minute + 2*time.Second, false},
+		{"a short idle poll can be stalled too", time.Minute, 20 * time.Minute, true},
+		{"just under the floor stays quiet", time.Minute, 5 * time.Minute, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, got := sleepStall(tc.intended, tc.wall); got != tc.wantStalled {
+				t.Errorf("sleepStall(%s, %s) stalled = %v, want %v", tc.intended, tc.wall, got, tc.wantStalled)
 			}
 		})
 	}

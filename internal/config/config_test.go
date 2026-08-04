@@ -6,6 +6,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
@@ -339,5 +340,101 @@ func TestProjectsSlugMCPMismatchRefused(t *testing.T) {
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), "does not match its .mcp.json") {
 		t.Errorf("Validate() = %v, want a slug/.mcp.json mismatch refusal", err)
+	}
+}
+
+// Which dial stopped a run is the first thing an operator asks, and the log line
+// used to print all three figures side by side — so a run capped only on wall
+// clock still reported a token count and a dollar figure, which read as the cause.
+func TestBudgetExceededByNamesTheDimension(t *testing.T) {
+	cases := []struct {
+		name    string
+		budget  Budget
+		tokens  int
+		cost    float64
+		elapsed time.Duration
+		want    string // substring; "" means not exceeded
+	}{
+		{
+			name:    "wall clock alone names wall clock, not the incidental spend",
+			budget:  Budget{MaxWallClock: Duration(8 * time.Hour)},
+			tokens:  140387,
+			cost:    147.98,
+			elapsed: 10*time.Hour + 23*time.Minute,
+			want:    "wall clock",
+		},
+		{
+			budget: Budget{MaxCostUSD: 100},
+			name:   "cost ceiling names cost",
+			cost:   147.98,
+			want:   "cost $147.98",
+		},
+		{
+			budget: Budget{MaxTokens: 1000},
+			name:   "token ceiling names tokens",
+			tokens: 5000,
+			want:   "tokens 5000",
+		},
+		{
+			name:    "under every ceiling reports nothing",
+			budget:  Budget{MaxWallClock: Duration(8 * time.Hour), MaxCostUSD: 100},
+			cost:    12,
+			elapsed: time.Hour,
+			want:    "",
+		},
+		{
+			name:   "zero ceilings are disabled, not instantly exceeded",
+			budget: Budget{},
+			tokens: 1 << 30,
+			cost:   1e6,
+			want:   "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.budget.ExceededBy(tc.tokens, tc.cost, tc.elapsed)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("ExceededBy = %q, want no breach", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("ExceededBy = %q, want it to name %q", got, tc.want)
+			}
+			// Exceeded must stay consistent with the reason it now reports.
+			if !tc.budget.Exceeded(tc.tokens, tc.cost, tc.elapsed) {
+				t.Error("Exceeded disagrees with ExceededBy")
+			}
+		})
+	}
+}
+
+// The deadline is what lets the loop decide, mid-iteration, whether waiting out a
+// usage limit is worth anything — a zero ceiling means there is no deadline.
+func TestBudgetDeadline(t *testing.T) {
+	start := time.Now()
+	if got := (Budget{}).Deadline(start); !got.IsZero() {
+		t.Errorf("no wall-clock ceiling should give no deadline, got %v", got)
+	}
+	got := Budget{MaxWallClock: Duration(8 * time.Hour)}.Deadline(start)
+	if want := start.Add(8 * time.Hour); !got.Equal(want) {
+		t.Errorf("Deadline = %v, want %v", got, want)
+	}
+}
+
+func TestBudgetRemaining(t *testing.T) {
+	b := Budget{MaxWallClock: Duration(8 * time.Hour)}
+	if got, bounded := b.Remaining(2 * time.Hour); !bounded || got != 6*time.Hour {
+		t.Errorf("Remaining(2h) = %s, %v; want 6h, true", got, bounded)
+	}
+	// Overspent is reported as negative rather than clamped: the caller compares
+	// it against a wait, and clamping to zero would read as "no time left" for a
+	// run that is already over its ceiling — the same answer by luck, not by rule.
+	if got, _ := b.Remaining(9 * time.Hour); got != -time.Hour {
+		t.Errorf("Remaining(9h) = %s, want -1h", got)
+	}
+	if _, bounded := (Budget{}).Remaining(time.Hour); bounded {
+		t.Error("an unset ceiling must report bounded=false")
 	}
 }

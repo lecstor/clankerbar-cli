@@ -88,6 +88,10 @@ func Run(ctx context.Context, args []string) error {
 		return err
 	}
 
+	// A suspended machine freezes the loop's timers, so an unattended run has to
+	// hold the machine up itself — see awake.go.
+	defer keepAwake(ctx)()
+
 	// The driver reads backlog state directly (cheap, no tokens) to gate each
 	// iteration, to keep polling while idle, and to honour the console pause flag —
 	// one GET per project of the plane's backlog-summary surface (counts +
