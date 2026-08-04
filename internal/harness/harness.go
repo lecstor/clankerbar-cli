@@ -83,6 +83,46 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// Claim is the backlog task this session was still holding when it ended, so
+	// the driver can hand it back rather than leave the lease to die (CLA-242).
+	Claim Claim
+
+	// pendingClaimToolUse is the id of a claim_task tool_use whose result has not
+	// arrived yet. Parser state, not output.
+	pendingClaimToolUse string
+}
+
+// Claim is what a session did with the backlog: the task it most recently
+// claimed, and whether it let go of that task deliberately.
+//
+// Only the LATEST claim is tracked, which is the one that matters — a drain
+// claims tasks one after another, and every earlier one was necessarily settled
+// (or lost to a race) before the next claim was made. An unsettled latest claim
+// is exactly the lease that would otherwise expire in silence.
+type Claim struct {
+	TaskID string
+	RunID  string
+
+	// Settled reports that the session moved TaskID to a terminal status of its
+	// own accord (done / in_review / parked / blocked). The plane has already
+	// released the task, so there is nothing for the driver to hand back.
+	Settled bool
+}
+
+// Held reports whether this session ended still holding a task — a claim that
+// was made, never settled, and therefore backed by a lease now ticking down with
+// nobody heartbeating it.
+func (c Claim) Held() bool { return c.TaskID != "" && !c.Settled }
+
+// terminalStatuses are the update_task statuses that end a run and release the
+// task plane-side. Anything else (notably `in_progress`, and a bare revision with
+// no status at all) leaves the claim standing.
+var terminalStatuses = map[string]bool{
+	"done":      true,
+	"in_review": true,
+	"parked":    true,
+	"blocked":   true,
 }
 
 // Limit describes a usage/rate-limit state.

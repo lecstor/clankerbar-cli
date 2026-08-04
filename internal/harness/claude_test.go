@@ -2,6 +2,7 @@ package harness
 
 import (
 	"bytes"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +31,147 @@ func TestClaudeRenderAndParse(t *testing.T) {
 	}
 	if out := console.String(); !strings.Contains(out, "Draining.") || !strings.Contains(out, "Bash") {
 		t.Errorf("console missing rendered content:\n%s", out)
+	}
+}
+
+// claimStream renders the events a session emits around the clankerbar tools, so
+// each test states only the calls it cares about.
+func claimStream(lines ...string) Result {
+	var res Result
+	var console bytes.Buffer
+	for _, l := range lines {
+		(claude{}).renderAndParse([]byte(l), &console, &res)
+	}
+	return res
+}
+
+func toolUse(id, name, input string) string {
+	return `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"` + id +
+		`","name":"` + name + `","input":` + input + `}]}}`
+}
+
+func toolResult(id, text string) string {
+	b, _ := json.Marshal(text)
+	return `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"` + id +
+		`","content":[{"type":"text","text":` + string(b) + `}]}]}}`
+}
+
+const claimOK = `{"task":{"id":"t-1","ref":"CLA-1"},"run":{"id":"r-1"},"branch":"clanker/x"}`
+
+func TestClaudeClaimTracking(t *testing.T) {
+	tests := []struct {
+		name  string
+		lines []string
+		want  Claim
+	}{
+		{
+			name: "claimed and never settled — the lease the driver must hand back",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", claimOK),
+			},
+			want: Claim{TaskID: "t-1", RunID: "r-1"},
+		},
+		{
+			name: "settled at in_review — the plane already released it",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", claimOK),
+				toolUse("u2", updateTaskTool, `{"taskId":"t-1","runId":"r-1","status":"in_review"}`),
+			},
+			want: Claim{TaskID: "t-1", RunID: "r-1", Settled: true},
+		},
+		{
+			name: "a status-less revision of the held task leaves the claim standing",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", claimOK),
+				toolUse("u2", updateTaskTool, `{"taskId":"t-1","branch":"clanker/x"}`),
+			},
+			want: Claim{TaskID: "t-1", RunID: "r-1"},
+		},
+		{
+			name: "closing a DIFFERENT task must not look like letting go of mine",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", claimOK),
+				toolUse("u2", updateTaskTool, `{"taskId":"t-99","status":"done"}`),
+			},
+			want: Claim{TaskID: "t-1", RunID: "r-1"},
+		},
+		{
+			name: "a claim that lost the race records nothing to release",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", `{"error":{"code":"already_claimed"}}`),
+			},
+			want: Claim{},
+		},
+		{
+			name:  "a session that claimed nothing",
+			lines: []string{toolUse("u1", "Bash", `{"command":"ls"}`)},
+			want:  Claim{},
+		},
+		{
+			name: "the latest claim supersedes a settled earlier one",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u1", claimOK),
+				toolUse("u2", updateTaskTool, `{"taskId":"t-1","status":"in_review"}`),
+				toolUse("u3", claimTaskTool, `{"taskId":"t-2"}`),
+				toolResult("u3", `{"task":{"id":"t-2"},"run":{"id":"r-2"}}`),
+			},
+			want: Claim{TaskID: "t-2", RunID: "r-2"},
+		},
+		{
+			name: "an unrelated tool_result must not be read as a claim",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolResult("u2", claimOK),
+			},
+			want: Claim{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := claimStream(tt.lines...).Claim
+			if got != tt.want {
+				t.Errorf("Claim = %+v, want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClaimHeld(t *testing.T) {
+	tests := []struct {
+		name  string
+		claim Claim
+		want  bool
+	}{
+		{"unsettled claim is held", Claim{TaskID: "t-1", RunID: "r-1"}, true},
+		{"settled claim is not", Claim{TaskID: "t-1", RunID: "r-1", Settled: true}, false},
+		{"no claim at all", Claim{}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.claim.Held(); got != tt.want {
+				t.Errorf("Held() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A tool_result whose content is a bare string, rather than an array of blocks —
+// both shapes appear in the stream depending on the tool.
+func TestClaudeClaimTracking_stringContent(t *testing.T) {
+	b, _ := json.Marshal(claimOK)
+	res := claimStream(
+		toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"u1","content":`+string(b)+`}]}}`,
+	)
+	if want := (Claim{TaskID: "t-1", RunID: "r-1"}); res.Claim != want {
+		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
 	}
 }
 

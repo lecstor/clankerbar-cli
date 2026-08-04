@@ -101,9 +101,14 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		Type    string `json:"type"`
 		Message struct {
 			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-				Name string `json:"name"`
+				Type  string          `json:"type"`
+				Text  string          `json:"text"`
+				Name  string          `json:"name"`
+				ID    string          `json:"id"`
+				Input json.RawMessage `json:"input"`
+				// tool_result blocks, which arrive on a "user" event.
+				ToolUseID string          `json:"tool_use_id"`
+				Content   json.RawMessage `json:"content"`
 			} `json:"content"`
 		} `json:"message"`
 		Result         string  `json:"result"`
@@ -127,6 +132,23 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				}
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
+				switch b.Name {
+				case claimTaskTool:
+					// The ids we need are in the RESULT, not the arguments, so
+					// remember which result to read. A claim that loses the race
+					// returns no ids and so leaves the tracked claim untouched.
+					res.pendingClaimToolUse = b.ID
+				case updateTaskTool:
+					noteSettled(b.Input, res)
+				}
+			}
+		}
+	case "user":
+		// Tool results come back on a synthetic user turn.
+		for _, b := range ev.Message.Content {
+			if b.Type == "tool_result" && b.ToolUseID != "" && b.ToolUseID == res.pendingClaimToolUse {
+				res.pendingClaimToolUse = ""
+				noteClaimed(b.Content, res)
 			}
 		}
 	case "result":
@@ -135,6 +157,78 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		res.Tokens = ev.Usage.InputTokens + ev.Usage.OutputTokens
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
 	}
+}
+
+// The clankerbar MCP tools the driver watches for. Namespaced exactly as the
+// harness reports them, so an unrelated tool called "claim_task" cannot match.
+const (
+	claimTaskTool  = "mcp__clankerbar__claim_task"
+	updateTaskTool = "mcp__clankerbar__update_task"
+)
+
+// noteClaimed records the task/run a successful claim_task returned. A payload
+// missing either id (a lost race, a refusal, a shape we do not recognise) leaves
+// the tracked claim alone — the driver must never be handed a half-claim it would
+// then try to release.
+func noteClaimed(content json.RawMessage, res *Result) {
+	var payload struct {
+		Task struct {
+			ID string `json:"id"`
+		} `json:"task"`
+		Run struct {
+			ID string `json:"id"`
+		} `json:"run"`
+	}
+	if json.Unmarshal([]byte(toolResultText(content)), &payload) != nil {
+		return
+	}
+	if payload.Task.ID == "" || payload.Run.ID == "" {
+		return
+	}
+	res.Claim = Claim{TaskID: payload.Task.ID, RunID: payload.Run.ID}
+}
+
+// noteSettled marks the tracked claim settled when the session moves THAT task to
+// a terminal status. The task id is compared rather than assumed: a drain edits
+// other tasks routinely (filing follow-ups, correcting a premise), and treating
+// one of those as "I let go of my own task" would strand the real lease.
+func noteSettled(input json.RawMessage, res *Result) {
+	var args struct {
+		TaskID string `json:"taskId"`
+		Status string `json:"status"`
+	}
+	if json.Unmarshal(input, &args) != nil {
+		return
+	}
+	if args.TaskID != "" && args.TaskID == res.Claim.TaskID && terminalStatuses[args.Status] {
+		res.Claim.Settled = true
+	}
+}
+
+// toolResultText flattens a tool_result's `content`, which the stream renders
+// either as a bare string or as an array of typed blocks.
+func toolResultText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(content, &s) == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, blk := range blocks {
+		if blk.Type == "text" {
+			b.WriteString(blk.Text)
+		}
+	}
+	return b.String()
 }
 
 // probe runs the cheapest possible request (tiny prompt, no tools, plain json) to
