@@ -41,7 +41,18 @@ type Summary struct {
 	InProgress    int
 	OpenQuestions int
 	Paused        bool // console-driven loop pause (CLA-76): stop spawning, keep polling
+
+	// InReview and Done are the DELIVERED counts. Their sum is the loop's only
+	// honest progress signal: `version` bumps on any write at all, including a
+	// session that achieved nothing but recording why it achieved nothing, so a
+	// breaker built on version would never fire on the runs that most need it.
+	InReview int
+	Done     int
 }
+
+// Settled is the count of work that has reached a reviewer or is finished — the
+// number a drain has to move to have accomplished anything a backlog can see.
+func (s Summary) Settled() int { return s.InReview + s.Done }
 
 // Poller reads the backlog summary cheaply.
 type Poller interface {
@@ -218,6 +229,8 @@ func parseSummary(body []byte) (Summary, error) {
 		Counts  struct {
 			Ready      int `json:"ready"`
 			InProgress int `json:"in_progress"`
+			InReview   int `json:"in_review"`
+			Done       int `json:"done"`
 		} `json:"counts"`
 		Claimable     int  `json:"claimable"`
 		OpenQuestions int  `json:"openQuestions"`
@@ -233,6 +246,8 @@ func parseSummary(body []byte) (Summary, error) {
 		InProgress:    payload.Counts.InProgress,
 		OpenQuestions: payload.OpenQuestions,
 		Paused:        payload.LoopPaused,
+		InReview:      payload.Counts.InReview,
+		Done:          payload.Counts.Done,
 	}, nil
 }
 
