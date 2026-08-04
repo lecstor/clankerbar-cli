@@ -319,17 +319,18 @@ func TestRun_GateDecision(t *testing.T) {
 // spend one session on the freshly reset quota, then stop on the very next check
 // — headroom saved all night and then declined. A real run did exactly that,
 // stopping eight minutes after an 8am reset having waited 5h31m for it.
-func TestDrainWithRetries_ResetPastDeadlineStopsInsteadOfWaiting(t *testing.T) {
+func TestDrainWithRetries_ResetPastBudgetStopsInsteadOfWaiting(t *testing.T) {
 	cfg := fastCfg()
 	h := &fakeAdapter{
 		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
 		limitResetAt: time.Now().Add(3 * time.Hour),
 	}
+	// A 30m ceiling with the run just started: 30m of budget left, reset in 3h.
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(30 * time.Minute)}
 	d := New(cfg, h, &fakePoller{})
 	d.stateDir = t.TempDir()
 
-	deadline := time.Now().Add(30 * time.Minute) // reset lands well past it
-	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], deadline)
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Now())
 
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -347,17 +348,18 @@ func TestDrainWithRetries_ResetPastDeadlineStopsInsteadOfWaiting(t *testing.T) {
 
 // The mirror case: a reset INSIDE the ceiling is still waited out, because the
 // wait is what lets an overnight run survive a rolling-window cap at all.
-func TestDrainWithRetries_ResetInsideDeadlineStillWaits(t *testing.T) {
+func TestDrainWithRetries_ResetInsideBudgetStillWaits(t *testing.T) {
 	cfg := fastCfg()
 	h := &fakeAdapter{
 		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
 		limitResetAt: time.Now().Add(time.Minute),
 	}
+	// A 4h ceiling with the run just started: the 1m reset fits easily.
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(4 * time.Hour)}
 	d := New(cfg, h, &fakePoller{})
 	d.stateDir = t.TempDir()
 
-	deadline := time.Now().Add(4 * time.Hour)
-	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], deadline)
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Now())
 
 	if err != nil || stop {
 		t.Fatalf("a reset inside the ceiling must be waited out: stop=%v err=%v", stop, err)
@@ -369,26 +371,54 @@ func TestDrainWithRetries_ResetInsideDeadlineStillWaits(t *testing.T) {
 
 // Both halves must be known before an early stop is justified: an unknown reset
 // is waited out because the supervised wait polls for an EARLY lift, and with no
-// wall-clock ceiling there is nothing to be past.
-func TestWaitPastDeadline(t *testing.T) {
+// ceiling set there is nothing to be past.
+func TestWaitPastBudget(t *testing.T) {
 	now := time.Now()
 	cases := []struct {
-		name             string
-		resetAt          time.Time
-		deadline         time.Time
-		wantOverDeadline bool
+		name      string
+		resetAt   time.Time
+		remaining time.Duration
+		bounded   bool
+		wantOver  bool
 	}{
-		{"reset past deadline", now.Add(2 * time.Hour), now.Add(time.Hour), true},
-		{"reset inside deadline", now.Add(time.Hour), now.Add(2 * time.Hour), false},
-		{"unknown reset is waited out", time.Time{}, now.Add(time.Hour), false},
-		{"no ceiling means nothing to be past", now.Add(2 * time.Hour), time.Time{}, false},
+		{"reset costs more than is left", now.Add(2 * time.Hour), time.Hour, true, true},
+		{"reset fits inside what is left", now.Add(time.Hour), 2 * time.Hour, true, false},
+		{"unknown reset is waited out", time.Time{}, time.Hour, true, false},
+		{"no ceiling means nothing to be past", now.Add(2 * time.Hour), 0, false, false},
+		{"an already-spent ceiling stops on any wait", now.Add(time.Minute), -time.Hour, true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, got := waitPastDeadline(tc.resetAt, tc.deadline); got != tc.wantOverDeadline {
-				t.Errorf("waitPastDeadline = %v, want %v", got, tc.wantOverDeadline)
+			if _, got := waitPastBudget(tc.resetAt, tc.remaining, tc.bounded); got != tc.wantOver {
+				t.Errorf("waitPastBudget = %v, want %v", got, tc.wantOver)
 			}
 		})
+	}
+}
+
+// The decision must be taken on the SAME clock the budget breaker uses.
+//
+// Budget.Deadline keeps start's monotonic reading, and ExceededBy counts
+// monotonic elapsed; a suspended machine advances the wall clock and freezes the
+// monotonic one. Comparing a wall-clock reset against a wall-clock deadline
+// therefore stopped runs the breaker would have allowed to continue, and blamed
+// a ceiling that had not been reached. This pins the divergence directly.
+func TestWaitPastBudget_ignoresWallClockDrift(t *testing.T) {
+	const ceiling = 8 * time.Hour
+
+	// A run that began 8h ago by the WALL clock, but spent 5h30m suspended, so the
+	// breaker has only seen 2h30m of monotonic elapsed.
+	elapsedMonotonic := 2*time.Hour + 30*time.Minute
+	remaining, bounded := config.Budget{MaxWallClock: config.Duration(ceiling)}.Remaining(elapsedMonotonic)
+	if !bounded {
+		t.Fatal("a configured ceiling must report bounded")
+	}
+
+	// The quota returns in an hour - comfortably inside the 5h30m still budgeted.
+	resetAt := time.Now().Add(time.Hour)
+	if _, over := waitPastBudget(resetAt, remaining, bounded); over {
+		t.Errorf("stopped a run with %s of budget left for a %s wait; the wall clock is not the breaker's clock",
+			remaining.Round(time.Minute), time.Until(resetAt).Round(time.Minute))
 	}
 }
 

@@ -234,7 +234,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target, d.cfg.Budget.Deadline(start))
+		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target, start)
 		if err != nil {
 			return err
 		}
@@ -265,7 +265,7 @@ func (d *Driver) Run(ctx context.Context) error {
 // deadline is when the run's wall-clock ceiling expires (zero = none). It is
 // passed down because the budget breaker only runs BETWEEN drains, and the
 // supervised wait happens inside one — see waitPastDeadline.
-func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, deadline time.Time) (tokens int, cost float64, stop bool, err error) {
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, start time.Time) (tokens int, cost float64, stop bool, err error) {
 	retries := 0
 	for {
 		// Each attempt streams live to the terminal and to its own logfile. The name
@@ -334,9 +334,10 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, d
 			// and stop on the very next check — having spent the night waiting for
 			// headroom it then declines to use. Stop now and say when the quota
 			// returns, so the operator can start a fresh run against it.
-			if until, over := waitPastDeadline(lim.ResetAt, deadline); over {
-				log.Printf("iteration %d: the limit resets at %s, past this run's ceiling (%s) — stopping now rather than waiting; start a fresh run after the reset",
-					drainNum, until.Format(time.Kitchen), deadline.Format(time.Kitchen))
+			remaining, bounded := d.cfg.Budget.Remaining(time.Since(start))
+			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
+				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
+					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
 				return tokens, cost, true, nil
 			}
 			if d.supervisedWait(ctx, lim, t) {
@@ -507,16 +508,26 @@ func sleepStall(intended, wall time.Duration) (lost time.Duration, stalled bool)
 	return lost, true
 }
 
-// waitPastDeadline reports whether waiting for resetAt would carry the run past
-// deadline. Both being known is required: an unknown reset (zero) is waited out
-// as before, because the supervised wait polls for an EARLY lift and the limit
-// may clear long before any stated time — and with no wall-clock ceiling there is
-// nothing to be past.
-func waitPastDeadline(resetAt, deadline time.Time) (time.Time, bool) {
-	if resetAt.IsZero() || deadline.IsZero() {
+// waitPastBudget reports whether waiting for resetAt would cost more time than
+// the run has left. An unknown reset (zero) is waited out as before, because the
+// supervised wait polls for an EARLY lift and the limit may clear long before any
+// stated time; with no ceiling set there is nothing to be past.
+//
+// remaining comes from the breaker's own clock — MONOTONIC elapsed, which does
+// not advance while the machine is suspended. The wait is measured on the wall
+// clock, because a quota reset is a wall-clock event. Those are the right two
+// clocks for this question and the mixture is deliberate.
+//
+// The earlier form compared the reset against a wall-clock DEADLINE while the
+// breaker counted monotonic, so the two diverged by exactly the time the machine
+// spent asleep — the very thing this file's sleep detection exists to report. An
+// eight-hour run that lost five hours to a closed lid would stop with seven hours
+// of budget unspent, and tell the operator it had reached a ceiling it had not.
+func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (time.Time, bool) {
+	if resetAt.IsZero() || !bounded {
 		return time.Time{}, false
 	}
-	return resetAt, resetAt.After(deadline)
+	return resetAt, time.Until(resetAt) > remaining
 }
 
 // supervisedWait pauses on a usage limit, then polls for an early reset rather

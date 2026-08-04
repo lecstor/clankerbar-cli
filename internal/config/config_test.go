@@ -422,3 +422,19 @@ func TestBudgetDeadline(t *testing.T) {
 		t.Errorf("Deadline = %v, want %v", got, want)
 	}
 }
+
+func TestBudgetRemaining(t *testing.T) {
+	b := Budget{MaxWallClock: Duration(8 * time.Hour)}
+	if got, bounded := b.Remaining(2 * time.Hour); !bounded || got != 6*time.Hour {
+		t.Errorf("Remaining(2h) = %s, %v; want 6h, true", got, bounded)
+	}
+	// Overspent is reported as negative rather than clamped: the caller compares
+	// it against a wait, and clamping to zero would read as "no time left" for a
+	// run that is already over its ceiling — the same answer by luck, not by rule.
+	if got, _ := b.Remaining(9 * time.Hour); got != -time.Hour {
+		t.Errorf("Remaining(9h) = %s, want -1h", got)
+	}
+	if _, bounded := (Budget{}).Remaining(time.Hour); bounded {
+		t.Error("an unset ceiling must report bounded=false")
+	}
+}

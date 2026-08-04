@@ -182,6 +182,21 @@ func (b Budget) Deadline(start time.Time) time.Time {
 	return start.Add(b.MaxWallClock.Duration())
 }
 
+// Remaining is how much of the wall-clock ceiling is left after elapsed, and
+// whether a ceiling is set at all.
+//
+// Callers must pass the SAME elapsed the breaker is given (ExceededBy), so a
+// decision taken mid-drain cannot disagree with the breaker's own verdict
+// between drains. Deriving a wall-clock deadline is what let them disagree:
+// Deadline keeps start's monotonic reading while ExceededBy counts monotonic
+// elapsed, and a suspended machine advances the one and freezes the other.
+func (b Budget) Remaining(elapsed time.Duration) (time.Duration, bool) {
+	if b.MaxWallClock <= 0 {
+		return 0, false
+	}
+	return b.MaxWallClock.Duration() - elapsed, true
+}
+
 func defaults() *Config {
 	return &Config{
 		Harness:    "claude",

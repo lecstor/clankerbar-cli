@@ -335,6 +335,18 @@ alternatives, in order of preference:
    run may finish, not as your spend ceiling. `doctor` warns if it is your only
    dial.
 
+   **`max_tokens` counts about ten times more than it used to.** Token totals now
+   include cache reads and writes, which `input_tokens` excludes and which
+   dominate a long agentic session — one run reported 140,387 tokens against
+   $147.98 of real spend, about $1.05 per thousand, which is no model's price.
+   The old number was the wrong one, but a `max_tokens` you tuned against it will
+   now trip roughly ten times sooner. Re-tune it, or move to `max_cost_usd`.
+
+   `max_wall_clock` is measured on the **monotonic** clock, so time the machine
+   spends suspended does not count against it. That is also the clock the
+   limit-reset check uses, so the two cannot disagree about how much of a run is
+   left.
+
    When a limit's stated reset falls beyond `max_wall_clock`, the loop stops
    right then and tells you when the quota returns, rather than sleeping
    through the window to run one session against the fresh quota and stop on
