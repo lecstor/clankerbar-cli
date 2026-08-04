@@ -101,9 +101,15 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		Type    string `json:"type"`
 		Message struct {
 			Content []struct {
-				Type string `json:"type"`
-				Text string `json:"text"`
-				Name string `json:"name"`
+				Type  string          `json:"type"`
+				Text  string          `json:"text"`
+				Name  string          `json:"name"`
+				ID    string          `json:"id"`
+				Input json.RawMessage `json:"input"`
+				// tool_result blocks, which arrive on a "user" event.
+				ToolUseID string          `json:"tool_use_id"`
+				Content   json.RawMessage `json:"content"`
+				IsError   bool            `json:"is_error"`
 			} `json:"content"`
 		} `json:"message"`
 		Result         string  `json:"result"`
@@ -127,6 +133,33 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				}
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
+				noteToolUse(b.Name, b.ID, b.Input, res)
+			}
+		}
+	case "user":
+		// Tool results come back on a synthetic user turn.
+		for _, b := range ev.Message.Content {
+			if b.Type != "tool_result" || b.ToolUseID == "" {
+				continue
+			}
+			kind, waiting := res.pending[b.ToolUseID]
+			if !waiting {
+				continue
+			}
+			delete(res.pending, b.ToolUseID)
+			// A refused call changed nothing on the plane, so it must not change
+			// anything here either. This is the whole reason these are judged on
+			// the result: an `in_review` rejected for a missing Tests header
+			// leaves the task held, and that session is exactly the one whose
+			// claim needs handing back.
+			if b.IsError {
+				continue
+			}
+			switch kind {
+			case pendingClaim:
+				noteClaimed(b.Content, res, console)
+			case pendingSettle:
+				res.Claim.Settled = true
 			}
 		}
 	case "result":
@@ -135,6 +168,145 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		res.Tokens = ev.Usage.InputTokens + ev.Usage.OutputTokens
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
 	}
+}
+
+// The clankerbar MCP tools the driver watches for. Namespaced exactly as the
+// harness reports them, so an unrelated tool called "claim_task" cannot match.
+const (
+	claimTaskTool        = "mcp__clankerbar__claim_task"
+	updateTaskTool       = "mcp__clankerbar__update_task"
+	askQuestionTool      = "mcp__clankerbar__ask_question"
+	escalateQuestionTool = "mcp__clankerbar__escalate_question"
+)
+
+// noteToolUse records what a clankerbar call will mean once its result lands.
+//
+// `update_task` is not the only way a session lets go. A BLOCKING question ends
+// the run and sets the task `blocked` without any `update_task` at all — it is
+// the documented one-call handback, and the protocol explicitly calls
+// `update_task(status: "blocked")` a trap and steers clankers here instead.
+// Missing it is not a missed handback but a wrong one: the driver would post
+// `ready` over a task that is waiting on the operator, dropping it back into the
+// claimable queue with the question unanswered.
+func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
+	switch name {
+	case claimTaskTool:
+		// The ids are in the RESULT, not the arguments. A claim that loses the
+		// race carries none and so leaves the tracked claim untouched.
+		res.expect(toolUseID, pendingClaim)
+
+	case updateTaskTool:
+		var args struct {
+			TaskID string `json:"taskId"`
+			Status string `json:"status"`
+			Branch string `json:"branch"`
+		}
+		if json.Unmarshal(input, &args) != nil || !res.Claim.Names(args.TaskID) {
+			return
+		}
+		if settlesTask(args.Status) {
+			res.expect(toolUseID, pendingSettle)
+		}
+		// Recording a branch declares pushed work worth handing over, which is
+		// exactly what makes the task unsafe to release. Applied on the REQUEST,
+		// unlike settling: erring towards "there is WIP" only ever costs the
+		// reclaim an expiring lease already costs, while erring the other way
+		// strands the branch.
+		if args.Branch != "" {
+			res.Claim.HasWIP = true
+		}
+
+	case askQuestionTool:
+		var args struct {
+			TaskID   string `json:"taskId"`
+			Blocking bool   `json:"blocking"`
+		}
+		if json.Unmarshal(input, &args) != nil {
+			return
+		}
+		if args.Blocking && res.Claim.Names(args.TaskID) {
+			res.expect(toolUseID, pendingSettle)
+		}
+
+	case escalateQuestionTool:
+		// This one takes a questionId, so the held task cannot be confirmed from
+		// the arguments. Escalating blocks the question's task and ends that run,
+		// and a session escalating a question about some OTHER task while holding
+		// its own is not a thing the loop does. Treat it as settling: the cost of
+		// being wrong is one expiring lease, which is the behaviour this whole
+		// change replaces — versus un-blocking a task awaiting the operator.
+		res.expect(toolUseID, pendingSettle)
+	}
+}
+
+// noteClaimed records the task/run a successful claim_task returned. A payload
+// missing either id (a lost race, a refusal, a shape we do not recognise) leaves
+// the tracked claim alone — the driver must never be handed a half-claim it would
+// then try to release.
+func noteClaimed(content json.RawMessage, res *Result, console io.Writer) {
+	var payload struct {
+		Task struct {
+			ID     string `json:"id"`
+			Ref    string `json:"ref"`
+			Branch string `json:"branch"`
+		} `json:"task"`
+		Run struct {
+			ID string `json:"id"`
+		} `json:"run"`
+		HasWip bool `json:"hasWip"`
+	}
+	if json.Unmarshal([]byte(toolResultText(content)), &payload) != nil {
+		return
+	}
+	if payload.Task.ID == "" || payload.Run.ID == "" {
+		return
+	}
+	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
+	// safer to release just because THIS session has not written anything yet.
+	res.Claim = Claim{
+		TaskID: payload.Task.ID,
+		Ref:    payload.Task.Ref,
+		RunID:  payload.Run.ID,
+		HasWIP: payload.HasWip || payload.Task.Branch != "",
+	}
+	// Say it out loud. Everything downstream is silent by design — a claim that is
+	// never observed produces no handback and no complaint, so without this line
+	// the feature could quietly stop working (a stream-shape change under a
+	// harness upgrade) and look exactly like a run that never claimed anything.
+	fmt.Fprintf(console, "  · holding %s (release on exit if nothing is pushed)\n", claimLabel(res.Claim))
+}
+
+func claimLabel(c Claim) string {
+	if c.Ref != "" {
+		return c.Ref
+	}
+	return c.TaskID
+}
+
+// toolResultText flattens a tool_result's `content`, which the stream renders
+// either as a bare string or as an array of typed blocks.
+func toolResultText(content json.RawMessage) string {
+	if len(content) == 0 {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(content, &s) == nil {
+		return s
+	}
+	var blocks []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(content, &blocks) != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, blk := range blocks {
+		if blk.Type == "text" {
+			b.WriteString(blk.Text)
+		}
+	}
+	return b.String()
 }
 
 // probe runs the cheapest possible request (tiny prompt, no tools, plain json) to

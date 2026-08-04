@@ -869,3 +869,162 @@ func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
 		t.Errorf("session ran in %q, want /repos/beta", got)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Handing back a claim the session was still holding (CLA-242).
+
+type releaseCall struct{ taskID, runID string }
+
+type fakeReleaser struct {
+	calls  []releaseCall
+	err    error
+	onCall func() // fired inside Release, to observe what has NOT happened yet
+}
+
+func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error {
+	f.calls = append(f.calls, releaseCall{taskID, runID})
+	if f.onCall != nil {
+		f.onCall()
+	}
+	return f.err
+}
+
+// held is a scripted Result carrying the claim a session ended still holding.
+func held(base harness.Result, c harness.Claim) harness.Result {
+	base.Claim = c
+	return base
+}
+
+func openClaim() harness.Claim { return harness.Claim{TaskID: "t-1", RunID: "r-1"} }
+
+// runWithReleaser drives one unnamed target that has both a poller and a releaser.
+func runWithReleaser(t *testing.T, cfg *config.Config, h harness.Adapter, p backlog.Poller, r *fakeReleaser) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return NewMulti(cfg, h, []Target{{Poller: p, Releaser: r}}).Run(ctx)
+}
+
+func busyPoller() *fakePoller {
+	return &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1}}
+}
+
+// The case this whole change exists for: the driver knows it is about to sleep
+// for as long as the usage limit takes, so the claim must be handed back FIRST.
+// A real run slept ninety minutes on a live lease and spent a reclaim for it.
+func TestRun_ReleasesBeforeSleepingOutAUsageLimit(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+
+	h := &fakeAdapter{steps: []invokeStep{{res: held(limitResult(), openClaim())}}}
+	rel := &fakeReleaser{}
+	// Probing is the first thing supervisedWait does after its initial pause, so
+	// zero probes at release time proves the handback came before the sleep.
+	rel.onCall = func() {
+		if h.probeCalls != 0 {
+			t.Errorf("released AFTER the supervised wait began (%d probes already); the lease was unattended for the whole pause", h.probeCalls)
+		}
+	}
+
+	if err := runWithReleaser(t, cfg, h, busyPoller(), rel); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(rel.calls) != 1 {
+		t.Fatalf("expected exactly one release, got %d: %+v", len(rel.calls), rel.calls)
+	}
+	if rel.calls[0] != (releaseCall{"t-1", "r-1"}) {
+		t.Errorf("released %+v, want {t-1 r-1}", rel.calls[0])
+	}
+}
+
+func TestRun_ReleaseHeldClaim(t *testing.T) {
+	tests := []struct {
+		name string
+		res  harness.Result
+		want []releaseCall
+	}{
+		{
+			name: "a session that ended still holding the task hands it back",
+			res:  held(okResult(10, 0.1), openClaim()),
+			want: []releaseCall{{"t-1", "r-1"}},
+		},
+		{
+			name: "a session that handed its task to review releases nothing",
+			res:  held(okResult(10, 0.1), harness.Claim{TaskID: "t-1", RunID: "r-1", Settled: true}),
+			want: nil,
+		},
+		{
+			name: "a session that claimed nothing releases nothing",
+			res:  okResult(10, 0.1),
+			want: nil,
+		},
+		{
+			// Releasing to `ready` would discard requiresTakeover and strand the
+			// pushed branch, so the driver takes the expiry instead.
+			name: "a session holding PUSHED work is left to expire",
+			res:  held(okResult(10, 0.1), harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}),
+			want: nil,
+		},
+		{
+			name: "a session that died non-retryably still hands its task back",
+			res:  held(nonRetryableResult(), openClaim()),
+			want: []releaseCall{{"t-1", "r-1"}},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := fastCfg()
+			cfg.StateDir = t.TempDir()
+			cfg.MaxIterations = 1
+
+			h := &fakeAdapter{steps: []invokeStep{{res: tt.res}}}
+			rel := &fakeReleaser{}
+			// A non-retryable exit legitimately returns an error; the assertion
+			// under test is what was released, not whether the run survived.
+			_ = runWithReleaser(t, cfg, h, busyPoller(), rel)
+
+			if len(rel.calls) != len(tt.want) {
+				t.Fatalf("release calls = %+v, want %+v", rel.calls, tt.want)
+			}
+			for i := range tt.want {
+				if rel.calls[i] != tt.want[i] {
+					t.Errorf("release[%d] = %+v, want %+v", i, rel.calls[i], tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+// The handback is best-effort: the lease expiring is the old behaviour, so a
+// plane that refuses the release must not take the whole run down with it.
+func TestRun_ReleaseFailureDoesNotStopTheRun(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+
+	h := &fakeAdapter{steps: []invokeStep{{res: held(okResult(10, 0.1), openClaim())}}}
+	rel := &fakeReleaser{err: errors.New("plane unreachable")}
+
+	if err := runWithReleaser(t, cfg, h, busyPoller(), rel); err != nil {
+		t.Fatalf("a failed release must not fail the run, got: %v", err)
+	}
+	if len(rel.calls) != 1 {
+		t.Errorf("expected the release to have been attempted once, got %d", len(rel.calls))
+	}
+}
+
+// A target with no releaser configured must behave exactly as before.
+func TestRun_NoReleaserIsNotFatal(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+
+	h := &fakeAdapter{steps: []invokeStep{{res: held(okResult(10, 0.1), openClaim())}}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := NewMulti(cfg, h, []Target{{Poller: busyPoller()}}).Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+}

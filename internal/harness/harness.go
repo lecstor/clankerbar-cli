@@ -83,6 +83,107 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// Claim is the backlog task this session was still holding when it ended, so
+	// the driver can hand it back rather than leave the lease to die (CLA-242).
+	Claim Claim
+
+	// pending maps a tool_use id to what its result will mean. Parser state, not
+	// output: every clankerbar call that matters is judged on the plane's ANSWER,
+	// never on the request, because a refused call changes nothing.
+	pending map[string]pendingKind
+}
+
+// pendingKind is what a tool_result is expected to tell us.
+type pendingKind int
+
+const (
+	// pendingClaim: a claim_task whose result carries the task and run ids.
+	pendingClaim pendingKind = iota
+	// pendingSettle: a call that, if it SUCCEEDS, ends this run plane-side and
+	// releases the task — so there is nothing left for the driver to hand back.
+	pendingSettle
+)
+
+func (r *Result) expect(toolUseID string, k pendingKind) {
+	if toolUseID == "" {
+		return
+	}
+	if r.pending == nil {
+		r.pending = map[string]pendingKind{}
+	}
+	r.pending[toolUseID] = k
+}
+
+// Claim is what a session did with the backlog: the task it most recently
+// claimed, and whether it let go of that task deliberately.
+//
+// Only the LATEST claim is tracked, which is the one that matters — a drain
+// claims tasks one after another, and every earlier one was necessarily settled
+// (or lost to a race) before the next claim was made. An unsettled latest claim
+// is exactly the lease that would otherwise expire in silence.
+type Claim struct {
+	// TaskID is the task's UUID and Ref is its qualified form ("CLA-242"). BOTH
+	// are kept because the plane accepts either as `taskId`, so a session that
+	// settles its task by ref must not look like a session settling somebody
+	// else's — that mistake reverts an in_review task to `ready`.
+	TaskID string
+	Ref    string
+	RunID  string
+
+	// Settled reports that the session moved TaskID to a terminal status of its
+	// own accord (done / in_review / parked / blocked). The plane has already
+	// released the task, so there is nothing for the driver to hand back.
+	Settled bool
+
+	// HasWIP reports that a work-in-progress branch is recorded against the task —
+	// either carried in on the claim (a predecessor's work) or recorded by this
+	// session after it pushed. It makes the claim UNSAFE to release: see
+	// Releasable.
+	HasWIP bool
+}
+
+// Held reports whether this session ended still holding a task — a claim that
+// was made, never settled, and therefore backed by a lease now ticking down with
+// nobody heartbeating it.
+func (c Claim) Held() bool { return c.TaskID != "" && !c.Settled }
+
+// Releasable reports whether the driver may hand this claim straight back to the
+// queue.
+//
+// A held claim with WIP is deliberately excluded, and the asymmetry is the point.
+// With no branch recorded, releasing to `ready` is exactly what the plane's own
+// expiry sweep would have done half an hour later, minus the reclaim it would
+// have charged — strictly better. With a branch recorded it is strictly WORSE:
+// `requiresTakeover` is computed only for an `in_progress` task whose lease has
+// died, so moving the task to `ready` throws away the flag that tells the next
+// clanker there is pushed work waiting. Letting that lease expire preserves the
+// handoff and costs one reclaim; releasing it saves the reclaim and strands the
+// work. Until the plane grows a release that keeps the handoff, the driver takes
+// the expiry.
+func (c Claim) Releasable() bool { return c.Held() && !c.HasWIP }
+
+// Names reports whether id refers to this claim's task. The plane resolves a
+// `taskId` argument as either a UUID or a qualified ref, and its ref parsing
+// upper-cases the key, so both spellings must match and the ref must match
+// case-insensitively.
+func (c Claim) Names(id string) bool {
+	if id == "" || c.TaskID == "" {
+		return false
+	}
+	return id == c.TaskID || (c.Ref != "" && strings.EqualFold(id, c.Ref))
+}
+
+// settlesTask reports whether an update_task carrying this status would release
+// the task plane-side.
+//
+// Stated as "anything but in_progress" rather than as a list of terminal
+// statuses, because that is the plane's own rule: `updateStatus` clears the
+// holder for every status except `in_progress`. An allowlist here drifts the
+// moment a status is added — and a status this side has not heard of would be
+// read as "still held", which is the reading that produces a wrong write.
+func settlesTask(status string) bool {
+	return status != "" && status != "in_progress"
 }
 
 // Limit describes a usage/rate-limit state.

@@ -395,6 +395,22 @@ func (c *Config) BacklogEndpoint() string {
 	return mcpURLFromConfig(c.MCPConfigPath)
 }
 
+// ProjectEndpoint returns one configured project's MCP endpoint — the same
+// `/mcp/<slug>` URL that project's sessions are pointed at. Resolved from the
+// project's own .mcp.json, falling back to the config's, exactly as the harness
+// invocation resolves its own, so a write the driver makes lands on the same
+// project its sessions are working.
+func (c *Config) ProjectEndpoint(p Project) string {
+	path := p.MCPConfigPath
+	if path == "" {
+		path = c.MCPConfigPath
+	}
+	if u := mcpURLFromConfig(path); u != "" {
+		return u
+	}
+	return c.BacklogEndpoint()
+}
+
 // BacklogSummaryURL returns the URL of the driver's cheap backlog read: the
 // plane's `GET .../backlog-summary` surface, which returns {version, counts,
 // claimable, openQuestions, loopPaused} in one authenticated call (counts to gate
