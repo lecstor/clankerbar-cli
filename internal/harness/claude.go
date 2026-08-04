@@ -109,6 +109,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				// tool_result blocks, which arrive on a "user" event.
 				ToolUseID string          `json:"tool_use_id"`
 				Content   json.RawMessage `json:"content"`
+				IsError   bool            `json:"is_error"`
 			} `json:"content"`
 		} `json:"message"`
 		Result         string  `json:"result"`
@@ -132,23 +133,33 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				}
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
-				switch b.Name {
-				case claimTaskTool:
-					// The ids we need are in the RESULT, not the arguments, so
-					// remember which result to read. A claim that loses the race
-					// returns no ids and so leaves the tracked claim untouched.
-					res.pendingClaimToolUse = b.ID
-				case updateTaskTool:
-					noteSettled(b.Input, res)
-				}
+				noteToolUse(b.Name, b.ID, b.Input, res)
 			}
 		}
 	case "user":
 		// Tool results come back on a synthetic user turn.
 		for _, b := range ev.Message.Content {
-			if b.Type == "tool_result" && b.ToolUseID != "" && b.ToolUseID == res.pendingClaimToolUse {
-				res.pendingClaimToolUse = ""
-				noteClaimed(b.Content, res)
+			if b.Type != "tool_result" || b.ToolUseID == "" {
+				continue
+			}
+			kind, waiting := res.pending[b.ToolUseID]
+			if !waiting {
+				continue
+			}
+			delete(res.pending, b.ToolUseID)
+			// A refused call changed nothing on the plane, so it must not change
+			// anything here either. This is the whole reason these are judged on
+			// the result: an `in_review` rejected for a missing Tests header
+			// leaves the task held, and that session is exactly the one whose
+			// claim needs handing back.
+			if b.IsError {
+				continue
+			}
+			switch kind {
+			case pendingClaim:
+				noteClaimed(b.Content, res, console)
+			case pendingSettle:
+				res.Claim.Settled = true
 			}
 		}
 	case "result":
@@ -162,18 +173,81 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 // The clankerbar MCP tools the driver watches for. Namespaced exactly as the
 // harness reports them, so an unrelated tool called "claim_task" cannot match.
 const (
-	claimTaskTool  = "mcp__clankerbar__claim_task"
-	updateTaskTool = "mcp__clankerbar__update_task"
+	claimTaskTool        = "mcp__clankerbar__claim_task"
+	updateTaskTool       = "mcp__clankerbar__update_task"
+	askQuestionTool      = "mcp__clankerbar__ask_question"
+	escalateQuestionTool = "mcp__clankerbar__escalate_question"
 )
+
+// noteToolUse records what a clankerbar call will mean once its result lands.
+//
+// `update_task` is not the only way a session lets go. A BLOCKING question ends
+// the run and sets the task `blocked` without any `update_task` at all — it is
+// the documented one-call handback, and the protocol explicitly calls
+// `update_task(status: "blocked")` a trap and steers clankers here instead.
+// Missing it is not a missed handback but a wrong one: the driver would post
+// `ready` over a task that is waiting on the operator, dropping it back into the
+// claimable queue with the question unanswered.
+func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
+	switch name {
+	case claimTaskTool:
+		// The ids are in the RESULT, not the arguments. A claim that loses the
+		// race carries none and so leaves the tracked claim untouched.
+		res.expect(toolUseID, pendingClaim)
+
+	case updateTaskTool:
+		var args struct {
+			TaskID string `json:"taskId"`
+			Status string `json:"status"`
+			Branch string `json:"branch"`
+		}
+		if json.Unmarshal(input, &args) != nil || !res.Claim.Names(args.TaskID) {
+			return
+		}
+		if settlesTask(args.Status) {
+			res.expect(toolUseID, pendingSettle)
+		}
+		// Recording a branch declares pushed work worth handing over, which is
+		// exactly what makes the task unsafe to release. Applied on the REQUEST,
+		// unlike settling: erring towards "there is WIP" only ever costs the
+		// reclaim an expiring lease already costs, while erring the other way
+		// strands the branch.
+		if args.Branch != "" {
+			res.Claim.HasWIP = true
+		}
+
+	case askQuestionTool:
+		var args struct {
+			TaskID   string `json:"taskId"`
+			Blocking bool   `json:"blocking"`
+		}
+		if json.Unmarshal(input, &args) != nil {
+			return
+		}
+		if args.Blocking && res.Claim.Names(args.TaskID) {
+			res.expect(toolUseID, pendingSettle)
+		}
+
+	case escalateQuestionTool:
+		// This one takes a questionId, so the held task cannot be confirmed from
+		// the arguments. Escalating blocks the question's task and ends that run,
+		// and a session escalating a question about some OTHER task while holding
+		// its own is not a thing the loop does. Treat it as settling: the cost of
+		// being wrong is one expiring lease, which is the behaviour this whole
+		// change replaces — versus un-blocking a task awaiting the operator.
+		res.expect(toolUseID, pendingSettle)
+	}
+}
 
 // noteClaimed records the task/run a successful claim_task returned. A payload
 // missing either id (a lost race, a refusal, a shape we do not recognise) leaves
 // the tracked claim alone — the driver must never be handed a half-claim it would
 // then try to release.
-func noteClaimed(content json.RawMessage, res *Result) {
+func noteClaimed(content json.RawMessage, res *Result, console io.Writer) {
 	var payload struct {
 		Task struct {
 			ID     string `json:"id"`
+			Ref    string `json:"ref"`
 			Branch string `json:"branch"`
 		} `json:"task"`
 		Run struct {
@@ -191,35 +265,22 @@ func noteClaimed(content json.RawMessage, res *Result) {
 	// safer to release just because THIS session has not written anything yet.
 	res.Claim = Claim{
 		TaskID: payload.Task.ID,
+		Ref:    payload.Task.Ref,
 		RunID:  payload.Run.ID,
 		HasWIP: payload.HasWip || payload.Task.Branch != "",
 	}
+	// Say it out loud. Everything downstream is silent by design — a claim that is
+	// never observed produces no handback and no complaint, so without this line
+	// the feature could quietly stop working (a stream-shape change under a
+	// harness upgrade) and look exactly like a run that never claimed anything.
+	fmt.Fprintf(console, "  · holding %s (release on exit if nothing is pushed)\n", claimLabel(res.Claim))
 }
 
-// noteSettled marks the tracked claim settled when the session moves THAT task to
-// a terminal status. The task id is compared rather than assumed: a drain edits
-// other tasks routinely (filing follow-ups, correcting a premise), and treating
-// one of those as "I let go of my own task" would strand the real lease.
-func noteSettled(input json.RawMessage, res *Result) {
-	var args struct {
-		TaskID string `json:"taskId"`
-		Status string `json:"status"`
-		Branch string `json:"branch"`
+func claimLabel(c Claim) string {
+	if c.Ref != "" {
+		return c.Ref
 	}
-	if json.Unmarshal(input, &args) != nil {
-		return
-	}
-	if args.TaskID == "" || args.TaskID != res.Claim.TaskID {
-		return
-	}
-	if terminalStatuses[args.Status] {
-		res.Claim.Settled = true
-	}
-	// Recording a branch is the session declaring it has pushed work worth handing
-	// over, which is precisely what makes the task unsafe to release to `ready`.
-	if args.Branch != "" {
-		res.Claim.HasWIP = true
-	}
+	return c.TaskID
 }
 
 // toolResultText flattens a tool_result's `content`, which the stream renders

@@ -56,7 +56,36 @@ func toolResult(id, text string) string {
 		`","content":[{"type":"text","text":` + string(b) + `}]}]}}`
 }
 
-const claimOK = `{"task":{"id":"t-1","ref":"CLA-1"},"run":{"id":"r-1"},"branch":"clanker/x"}`
+// A refused MCP call. The plane changed nothing, so neither may we.
+func toolResultErr(id, text string) string {
+	b, _ := json.Marshal(text)
+	return `{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"` + id +
+		`","is_error":true,"content":[{"type":"text","text":` + string(b) + `}]}]}}`
+}
+
+// The plane returns BOTH a UUID and a qualified ref, and accepts either as a
+// later `taskId`. Real-shaped ids here on purpose: synthetic "t-1" everywhere is
+// what let a ref/UUID mismatch hide.
+const (
+	claimUUID = "99f0647b-cef2-45cd-b2bc-23e8a7f97b0d"
+	claimRef  = "CLA-242"
+	claimOK   = `{"task":{"id":"` + claimUUID + `","ref":"` + claimRef + `"},"run":{"id":"r-1"},"branch":"clanker/x"}`
+)
+
+// heldClaim is the claim the fixture stream establishes.
+func heldClaim() Claim { return Claim{TaskID: claimUUID, Ref: claimRef, RunID: "r-1"} }
+
+// withClaim prefixes the two events that claim the task, so each case states
+// only what it is actually about.
+func withClaim(more ...string) []string {
+	return append([]string{
+		toolUse("u1", claimTaskTool, `{"taskId":"`+claimUUID+`"}`),
+		toolResult("u1", claimOK),
+	}, more...)
+}
+
+func settled() Claim { c := heldClaim(); c.Settled = true; return c }
+func withWIP() Claim { c := heldClaim(); c.HasWIP = true; return c }
 
 func TestClaudeClaimTracking(t *testing.T) {
 	tests := []struct {
@@ -65,71 +94,158 @@ func TestClaudeClaimTracking(t *testing.T) {
 		want  Claim
 	}{
 		{
-			name: "claimed and never settled — the lease the driver must hand back",
-			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
-				toolResult("u1", claimOK),
-			},
-			want: Claim{TaskID: "t-1", RunID: "r-1"},
+			name:  "claimed and never settled - the lease the driver must hand back",
+			lines: withClaim(),
+			want:  heldClaim(),
 		},
 		{
-			name: "settled at in_review — the plane already released it",
-			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
-				toolResult("u1", claimOK),
-				toolUse("u2", updateTaskTool, `{"taskId":"t-1","runId":"r-1","status":"in_review"}`),
-			},
-			want: Claim{TaskID: "t-1", RunID: "r-1", Settled: true},
+			name: "settled at in_review by UUID",
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review"}`),
+				toolResult("u2", `{"task":{"id":"`+claimUUID+`"}}`),
+			),
+			want: settled(),
+		},
+		{
+			// The plane resolves a taskId as a UUID *or* a ref. Miss this and the
+			// driver posts `ready` over a task already handed to review.
+			name: "settled at in_review by REF",
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimRef+`","status":"in_review"}`),
+				toolResult("u2", `{"task":{"id":"`+claimUUID+`"}}`),
+			),
+			want: settled(),
+		},
+		{
+			name: "ref matching is case-insensitive, as the plane's own parse is",
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"cla-242","status":"done"}`),
+				toolResult("u2", `{}`),
+			),
+			want: settled(),
+		},
+		{
+			// updateStatus clears the holder for every status but in_progress, so
+			// an allowlist of "terminal" ones would read this as still held and
+			// promote an explicitly de-scoped task back to ready.
+			name: "demoting the task to backlog also lets go of it",
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"backlog"}`),
+				toolResult("u2", `{}`),
+			),
+			want: settled(),
+		},
+		{
+			// evidence_required / delivery_required land here. The task is still
+			// held, and this is exactly the session whose claim wants handing back.
+			name: "a REFUSED terminal update leaves the claim standing",
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review"}`),
+				toolResultErr("u2", "evidence_required"),
+			),
+			want: heldClaim(),
 		},
 		{
 			name: "a status-less revision of the held task leaves the claim standing",
-			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
-				toolResult("u1", claimOK),
-				toolUse("u2", updateTaskTool, `{"taskId":"t-1","outcome":"still going"}`),
-			},
-			want: Claim{TaskID: "t-1", RunID: "r-1"},
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","outcome":"still going"}`),
+				toolResult("u2", `{}`),
+			),
+			want: heldClaim(),
+		},
+		{
+			// A blocking question ends the run and sets the task `blocked` with no
+			// update_task at all. Releasing it would drop a task awaiting the
+			// operator back into the claimable queue, question unanswered.
+			name: "a BLOCKING question is a handback",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"`+claimUUID+`","question":"which?","blocking":true}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			want: settled(),
+		},
+		{
+			name: "a blocking question named by ref is also a handback",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"`+claimRef+`","question":"which?","blocking":true}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			want: settled(),
+		},
+		{
+			name: "a NON-blocking question holds the task",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"`+claimUUID+`","question":"fyi","blocking":false}`),
+				toolResult("u2", `{"taskBlocked":false}`),
+			),
+			want: heldClaim(),
+		},
+		{
+			name: "a blocking question about someone else's task is not my handback",
+			lines: withClaim(
+				toolUse("u2", askQuestionTool, `{"taskId":"other-uuid","question":"q","blocking":true}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			want: heldClaim(),
+		},
+		{
+			name: "escalating a question is a handback",
+			lines: withClaim(
+				toolUse("u2", escalateQuestionTool, `{"questionId":"q-1"}`),
+				toolResult("u2", `{"taskBlocked":true}`),
+			),
+			want: settled(),
 		},
 		{
 			name: "recording a branch marks the claim as carrying pushed work",
-			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
-				toolResult("u1", claimOK),
-				toolUse("u2", updateTaskTool, `{"taskId":"t-1","branch":"clanker/x"}`),
-			},
-			want: Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
+			),
+			want: withWIP(),
+		},
+		{
+			name: "a branch recorded by REF is still my pushed work",
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimRef+`","branch":"clanker/x"}`),
+			),
+			want: withWIP(),
 		},
 		{
 			name: "a predecessor's WIP arrives with the claim",
 			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1","takeover":true}`),
-				toolResult("u1", `{"task":{"id":"t-1"},"run":{"id":"r-1"},"hasWip":true}`),
+				toolUse("u1", claimTaskTool, `{"taskId":"`+claimUUID+`","takeover":true}`),
+				toolResult("u1", `{"task":{"id":"`+claimUUID+`","ref":"`+claimRef+`"},"run":{"id":"r-1"},"hasWip":true}`),
 			},
-			want: Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			want: withWIP(),
 		},
 		{
 			name: "another task's branch is not my WIP",
-			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
-				toolResult("u1", claimOK),
+			lines: withClaim(
 				toolUse("u2", updateTaskTool, `{"taskId":"t-99","branch":"clanker/other"}`),
-			},
-			want: Claim{TaskID: "t-1", RunID: "r-1"},
+			),
+			want: heldClaim(),
 		},
 		{
 			name: "closing a DIFFERENT task must not look like letting go of mine",
-			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
-				toolResult("u1", claimOK),
+			lines: withClaim(
 				toolUse("u2", updateTaskTool, `{"taskId":"t-99","status":"done"}`),
-			},
-			want: Claim{TaskID: "t-1", RunID: "r-1"},
+				toolResult("u2", `{}`),
+			),
+			want: heldClaim(),
 		},
 		{
 			name: "a claim that lost the race records nothing to release",
 			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolUse("u1", claimTaskTool, `{"taskId":"`+claimUUID+`"}`),
 				toolResult("u1", `{"error":{"code":"already_claimed"}}`),
+			},
+			want: Claim{},
+		},
+		{
+			name: "a REFUSED claim records nothing to release",
+			lines: []string{
+				toolUse("u1", claimTaskTool, `{"taskId":"`+claimUUID+`"}`),
+				toolResultErr("u1", "human_only"),
 			},
 			want: Claim{},
 		},
@@ -140,19 +256,18 @@ func TestClaudeClaimTracking(t *testing.T) {
 		},
 		{
 			name: "the latest claim supersedes a settled earlier one",
-			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
-				toolResult("u1", claimOK),
-				toolUse("u2", updateTaskTool, `{"taskId":"t-1","status":"in_review"}`),
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review"}`),
+				toolResult("u2", `{}`),
 				toolUse("u3", claimTaskTool, `{"taskId":"t-2"}`),
-				toolResult("u3", `{"task":{"id":"t-2"},"run":{"id":"r-2"}}`),
-			},
-			want: Claim{TaskID: "t-2", RunID: "r-2"},
+				toolResult("u3", `{"task":{"id":"t-2","ref":"CLA-2"},"run":{"id":"r-2"}}`),
+			),
+			want: Claim{TaskID: "t-2", Ref: "CLA-2", RunID: "r-2"},
 		},
 		{
 			name: "an unrelated tool_result must not be read as a claim",
 			lines: []string{
-				toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
+				toolUse("u1", claimTaskTool, `{"taskId":"`+claimUUID+`"}`),
 				toolResult("u2", claimOK),
 			},
 			want: Claim{},
@@ -219,8 +334,47 @@ func TestClaudeClaimTracking_stringContent(t *testing.T) {
 		toolUse("u1", claimTaskTool, `{"taskId":"t-1"}`),
 		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"u1","content":`+string(b)+`}]}}`,
 	)
-	if want := (Claim{TaskID: "t-1", RunID: "r-1"}); res.Claim != want {
+	if want := heldClaim(); res.Claim != want {
 		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
+	}
+}
+
+func TestClaimNames(t *testing.T) {
+	c := heldClaim()
+	for _, tt := range []struct {
+		id   string
+		want bool
+	}{
+		{claimUUID, true},
+		{claimRef, true},
+		{"cla-242", true},
+		{"CLA-243", false},
+		{"other-uuid", false},
+		{"", false},
+	} {
+		if got := c.Names(tt.id); got != tt.want {
+			t.Errorf("Names(%q) = %v, want %v", tt.id, got, tt.want)
+		}
+	}
+	// An empty claim names nothing — otherwise a session that never claimed would
+	// match every id it touched.
+	if (Claim{}).Names("anything") {
+		t.Error("an empty claim must name nothing")
+	}
+}
+
+func TestSettlesTask(t *testing.T) {
+	// The plane's rule is "every status but in_progress clears the holder", so
+	// this must not be an allowlist that a new status silently falls outside.
+	for _, s := range []string{"done", "in_review", "parked", "blocked", "ready", "backlog", "some_future_status"} {
+		if !settlesTask(s) {
+			t.Errorf("settlesTask(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"in_progress", ""} {
+		if settlesTask(s) {
+			t.Errorf("settlesTask(%q) = true, want false", s)
+		}
 	}
 }
 

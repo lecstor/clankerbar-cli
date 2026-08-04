@@ -264,6 +264,14 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (
 		if f != nil {
 			_ = f.Close()
 		}
+		// Hand back anything the session was still holding, BEFORE deciding what to
+		// do next — every branch below either waits, retries or returns, and all of
+		// them leave the lease unattended. Above the ierr check too: Invoke returns
+		// a fully parsed Result alongside a Wait failure, so a claim observed on
+		// that stream is real and must not be dropped just because the process died
+		// untidily. A launch failure yields a zero Result, which releases nothing.
+		d.releaseHeldClaim(ctx, t, res)
+
 		if ierr != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true, nil
@@ -280,11 +288,6 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target) (
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
-
-		// Hand back anything the session was still holding, BEFORE deciding what to
-		// do next — every branch below either waits, retries or returns, and all
-		// three leave the lease unattended.
-		d.releaseHeldClaim(ctx, t, res)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to

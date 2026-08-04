@@ -19,8 +19,9 @@ trust it with an overnight run.
 Each iteration is a *fresh* harness session told to work the backlog (which it does
 by dispatching tasks to subagents and landing PRs at `in_review`). When a session
 ends, the driver spawns a new one — so context never rots across a long run, and a
-session killed mid-task is fine: clankerbar reclaims and continues the task on the
-next iteration. The backlog is the durable state; the loop is thin.
+session killed mid-task is fine: the driver hands the task straight back to the
+queue (see [Resilience](#resilience)) and the next iteration picks it up. The
+backlog is the durable state; the loop is thin.
 
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
@@ -253,6 +254,24 @@ keep retrying at the ceiling until the API recovers, right for a daemon; set a
 positive number to bound it. A usage-limit pause and a transient retry both re-run
 the same iteration and neither advances the iteration count. `STOP` stays
 responsive during any wait.
+
+**Handing the task back.** A claim carries a 30-minute lease that the session
+heartbeats. When a session ends mid-task, that lease is left ticking with nobody
+renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
+there are only two before the task is parked for a human. So the driver watches
+the session's stream for what it claimed, and hands the task straight back
+(`update_task(status: ready)`) on **every** exit: usage limit, transient blip,
+outright failure, or a clean finish with the work unfinished. The usage-limit case
+is why this matters most — the pause that follows can be hours, and the release is
+ordered before it.
+
+One case is deliberately left to expire: a task whose session **pushed a branch**.
+clankerbar computes its takeover hint only for an in-progress task with a dead
+lease, so handing that one back would discard the very flag telling the next
+clanker there is work to pick up. There it takes the reclaim and keeps the
+hand-off. Releasing is best-effort throughout — if the plane refuses or is
+unreachable, the loop logs it and carries on, since an expiring lease is merely
+the behaviour it already had.
 
 ### Not getting locked out
 
