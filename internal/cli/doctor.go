@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -125,7 +126,7 @@ type doctorFlags struct {
 // the deliberate break this carries with it.
 func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
 	fs := newFlagSet("doctor")
-	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
+	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ~/.config/clankerbar/config.json; a ./clankerbar.json is never auto-loaded - name it here)")
 	fs.StringVar(&f.harness, "harness", "", "harness to check: "+strings.Join(harness.Names(), " | "))
 	fs.StringVar(&f.workdir, "workdir", "", "directory the harness would run in (default: current dir)")
 	fs.StringVar(&f.configDir, "config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME)")
@@ -165,7 +166,7 @@ func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overr
 			name:   "config",
 			status: fail,
 			detail: err.Error(),
-			remedy: "fix the config file, or point --config at a different one",
+			remedy: "fix the config file, or name the one you mean with --config (nothing outside ~/.config/clankerbar/config.json is loaded implicitly)",
 		})
 		return doctorFailed(1)
 	}
@@ -233,6 +234,13 @@ func checkConfig(cfg *config.Config) check {
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
 	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
+	// What this config hands the child process, by NAME only - never a value, and
+	// never the file an @path names. A config that reaches the loop decides the
+	// spawned session's environment (CLA-260), so "which variables am I injecting"
+	// should be answerable from the preflight rather than by re-reading the file.
+	if names := envKeyNames(cfg.Env); names != "" {
+		c.info = append(c.info, "env: "+names)
+	}
 	if len(cfg.Projects) > 0 {
 		for _, p := range cfg.Projects {
 			// Spelled exactly like the check name below, so an operator can grep one
@@ -243,6 +251,21 @@ func checkConfig(cfg *config.Config) check {
 		c.info = append(c.info, "backlog: "+orNone(cfg.BacklogSummaryURL()))
 	}
 	return c
+}
+
+// envKeyNames renders the config's extra environment as a sorted list of KEYS,
+// with no values: one of them is routinely a credential, and doctor's output is
+// the thing an operator pastes into an issue.
+func envKeyNames(env map[string]string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
 }
 
 // --- 2. harness --------------------------------------------------------------
