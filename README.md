@@ -11,8 +11,10 @@ coding agent. Because it holds your credentials and can edit your code and run
 shell commands, the source is open so you can audit exactly what it does before you
 trust it with an overnight run.
 
-> **Status: work in progress.** The skeleton runs; the harness adapters and the
-> limit/budget machinery are being hardened. Not yet released.
+> **Status: pre-1.0, and released.** The loop runs and is what drives clankerbar's
+> own backlog; the harness adapters and the limit/budget machinery are still being
+> hardened. It is a supported surface, not an internal tool - see
+> [Versioning](#versioning) for what the `v0.x` line does and does not promise.
 
 ## How it works
 
@@ -28,12 +30,23 @@ Anthropic's semi-random early resets), then continues.
 
 ## Install
 
-**Download a prebuilt binary.** Each release ships cross-platform binaries
-(macOS and Linux, amd64 + arm64) on the [releases page][releases] — grab the
-archive for your OS/arch, extract, and put `clankerbar` on your `PATH`. No Go
-toolchain required. Releases are semver tags (`vX.Y.Z`); the tool is pre-1.0, so
-expect the `v0.x` line while the surface settles. Verify a download against the
-`checksums.txt` published alongside it.
+**Download a prebuilt binary.** Each release ships cross-platform binaries on the
+[releases page][releases] - macOS and Linux, amd64 and arm64, as
+`clankerbar_<version>_<os>_<arch>.tar.gz`. Extract it and put `clankerbar` on your
+`PATH`. No Go toolchain required.
+
+```sh
+# macOS arm64; swap the os/arch for yours.
+VERSION=0.1.0 OSARCH=darwin_arm64
+curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/clankerbar_${VERSION}_${OSARCH}.tar.gz"
+curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/checksums.txt"
+shasum -a 256 --ignore-missing -c checksums.txt   # Linux: sha256sum -c
+tar -xzf "clankerbar_${VERSION}_${OSARCH}.tar.gz"
+./clankerbar version
+```
+
+Verifying the checksum is worth the two extra lines: this binary holds your
+credentials and runs shell commands on your machine.
 
 **Or build from source** (requires Go 1.26+):
 
@@ -43,7 +56,25 @@ go install github.com/lecstor/clankerbar-cli/cmd/clankerbar@latest
 go build -o clankerbar ./cmd/clankerbar
 ```
 
+A source build reports the version it was stamped with - `go install` leaves it at
+the `0.0.0-dev` default, so `clankerbar version` naming a real `vX.Y.Z` means you
+are on a release archive.
+
 [releases]: https://github.com/lecstor/clankerbar-cli/releases
+
+## Versioning
+
+Releases are semver tags (`vX.Y.Z`) and the tool is pre-1.0, so expect the `v0.x`
+line while the surface settles. Concretely, while pre-1.0:
+
+- **A breaking change can land on a minor bump** (`v0.1` -> `v0.2`). That is what
+  the `v0.x` line means; pin a version if you are automating against it.
+- **A breaking change is always called out in the release notes.** Permitted is not
+  the same as silent - if a flag changes under you, the notes say so.
+- **Releases are cut when there is something to ship**, not on a schedule. The
+  commitment is that a tag produces working, downloadable binaries.
+
+Those promises harden at v1.0.
 
 ## Usage
 
@@ -60,12 +91,13 @@ value is separate (`-c ./x.json`) or `=`-joined (`-c=./x.json`); the inline
 `-c./x.json` form is rejected, so a typo like `-cofnig` cannot quietly become
 `--config=ofnig`.
 
-> **Breaking (pre-release).** A single dash now introduces *short* flags, so the
-> Go-stdlib spelling `-harness claude` no longer works - use `--harness claude`.
-> Anything invoking `clankerbar` with single-dash long options (a cron wrapper,
-> a launchd plist, a shell alias) needs updating. The old spelling is rejected
-> with a message naming the double-dash form rather than being quietly
-> reinterpreted.
+> **If you built from a checkout before v0.1.0**, this changed under you. A single
+> dash now introduces *short* flags, so the Go-stdlib spelling `-harness claude` no
+> longer works - use `--harness claude`. Anything invoking `clankerbar` with
+> single-dash long options (a cron wrapper, a launchd plist, a shell alias) needs
+> updating. The old spelling is rejected with a message naming the double-dash form
+> rather than being quietly reinterpreted. v0.1.0 is the first release, so it ships
+> the GNU-style spelling from the start.
 
 ### Preflight: `clankerbar doctor`
 
