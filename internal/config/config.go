@@ -316,6 +316,26 @@ func (c *Config) Validate() error {
 		c.MCPConfigPath = discoverMCPConfig(c.WorkDir)
 	}
 
+	// Where the account-scoped API key is allowed to go, settled once, here
+	// (CLA-257). backlog_url is the operator's own statement of it and is held to
+	// the TLS floor; the workdir's .mcp.json is untrusted input and may not name a
+	// different host. Refusing at Validate means `doctor` reports it as a failed
+	// config check and `run` never starts — neither one makes a credentialed
+	// request to the host the file named.
+	// An empty backlog_url used to mean "take the origin from .mcp.json"; with that
+	// road closed it would mean "no origin at all", which is a silent blind drain
+	// for a config that merely omitted a field. Fill it, so a validated config
+	// always has exactly one trusted origin to check the rest against.
+	if c.BacklogURL == "" {
+		c.BacklogURL = defaultBacklogURL
+	}
+	if _, err := credentialOrigin(c.BacklogURL); err != nil {
+		return fmt.Errorf("backlog_url: %w", err)
+	}
+	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
+		return err
+	}
+
 	// Multi-project entries: slug required and unique; paths normalized; each
 	// project's mcp config defaults to its own workdir's .mcp.json (falling back to
 	// the top-level one at invocation time — see loop.Target).
@@ -333,6 +353,9 @@ func (c *Config) Validate() error {
 		p.MCPConfigPath = expandHome(p.MCPConfigPath)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(p.WorkDir)
+		}
+		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+			return err
 		}
 		// The slug decides which queue is POLLED; the .mcp.json decides which
 		// project the sessions WORK. If they disagree, the loop would gate on one
@@ -414,36 +437,48 @@ func (c *Config) Source() string { return c.source }
 // backlog poll should hit — the same `/mcp/<project>` endpoint the harness uses.
 //
 // BacklogURL defaults to a bare base (`https://clankerbar.com`), which the plane
-// rejects without the project slug in the path. The exact URL already lives in the
-// harness .mcp.json (MCPConfigPath), so we reuse it — keeping the cheap poll and
-// the harness pointed at the same plane. An explicit backlog_url that already names
-// a `/mcp/<project>` path wins; otherwise we derive from .mcp.json.
+// rejects without the project slug in the path. The slug lives in the harness
+// .mcp.json (MCPConfigPath), so we take it from there — but ONLY the slug. The
+// origin always comes from CredentialOrigin, because this URL carries the API key
+// (CLA-257): a file inside the workdir may say which project, never which host.
+// An explicit backlog_url that already names a `/mcp/<project>` path wins outright.
 //
 // Returns "" when no usable project-scoped endpoint can be resolved (a bare base
-// and no .mcp.json url). That is deliberate: New("") yields a not-wired poller, so
-// the loop falls into blind drain — which still makes progress — rather than
-// retrying forever against a slug-less base the plane can only reject.
+// and no slug). That is deliberate: New("") yields a not-wired poller, so the loop
+// falls into blind drain — which still makes progress — rather than retrying
+// forever against a slug-less base the plane can only reject.
 func (c *Config) BacklogEndpoint() string {
+	origin := c.CredentialOrigin()
+	if origin == "" {
+		return ""
+	}
 	if strings.Contains(c.BacklogURL, "/mcp/") {
 		return c.BacklogURL
 	}
-	return mcpURLFromConfig(c.MCPConfigPath)
+	slug := slugFromMCPURL(mcpURLFromConfig(c.MCPConfigPath))
+	if slug == "" {
+		return ""
+	}
+	return mcpPath(origin, slug)
 }
 
 // ProjectEndpoint returns one configured project's MCP endpoint — the same
-// `/mcp/<slug>` URL that project's sessions are pointed at. Resolved from the
-// project's own .mcp.json, falling back to the config's, exactly as the harness
-// invocation resolves its own, so a write the driver makes lands on the same
-// project its sessions are working.
+// `/mcp/<slug>` URL that project's sessions are pointed at — so a write the driver
+// makes lands on the same project its sessions are working.
+//
+// The slug is the project's own declared `slug`, which Validate has already
+// cross-checked against its .mcp.json; the origin is CredentialOrigin. Neither
+// half is read off the workdir's file (CLA-257).
 func (c *Config) ProjectEndpoint(p Project) string {
-	path := p.MCPConfigPath
-	if path == "" {
-		path = c.MCPConfigPath
+	origin := c.CredentialOrigin()
+	if origin == "" || p.Slug == "" {
+		return c.BacklogEndpoint()
 	}
-	if u := mcpURLFromConfig(path); u != "" {
-		return u
-	}
-	return c.BacklogEndpoint()
+	return mcpPath(origin, p.Slug)
+}
+
+func mcpPath(origin, slug string) string {
+	return origin + "/mcp/" + url.PathEscape(slug)
 }
 
 // BacklogSummaryURL returns the URL of the driver's cheap backlog read: the
@@ -461,50 +496,36 @@ func (c *Config) ProjectEndpoint(p Project) string {
 //     project-scoped key can select the project. The fallback when no slug is
 //     derivable, so pre-CLA-141 setups keep working unchanged.
 //
-// Origin precedence (explicit config overrides, per the README): an explicitly set
-// backlog_url — one that differs from the default base — wins, so an operator who
-// points backlog_url at a self-hosted plane is honoured even when .mcp.json names a
-// different origin. Only when backlog_url is left at the default do we fall back to
-// the resolved MCP endpoint's origin (so a self-hosted plane wired solely through
-// .mcp.json is still honoured), and finally to the default base's own origin.
+// The origin is CredentialOrigin — `backlog_url`, the operator's own config, or
+// the default base — and nothing else. Before CLA-257 it fell back to the origin
+// named by the workdir's .mcp.json whenever backlog_url was left at its default,
+// which is the normal setup, so a committed file in a cloned repo could redirect
+// this credentialed GET to any host over plain http. A self-hosted plane is still
+// reachable; it just has to be named in `backlog_url`. Only the SLUG still comes
+// from .mcp.json, and it only chooses a path on an origin we already trust.
+//
 // Returns "" when no origin can be resolved (New("") then yields a not-wired,
 // blind poller).
 func (c *Config) BacklogSummaryURL() string {
-	endpoint := c.BacklogEndpoint()
-	origin := c.summaryOrigin(endpoint)
+	origin := c.CredentialOrigin()
 	if origin == "" {
 		return ""
 	}
-	if slug := slugFromMCPURL(endpoint); slug != "" {
+	if slug := slugFromMCPURL(c.BacklogEndpoint()); slug != "" {
 		return projectSummaryPath(origin, slug)
 	}
 	return origin + "/api/backlog-summary"
 }
 
 // ProjectSummaryURL returns the slug-ful summary URL for one configured project
-// (CLA-142): `<origin>/api/projects/<slug>/backlog-summary`. The origin follows the
-// same precedence as BacklogSummaryURL, using this project's own .mcp.json for the
-// self-hosted-plane fallback; the default base guarantees a non-empty result.
+// (CLA-142): `<origin>/api/projects/<slug>/backlog-summary`, on the same trusted
+// CredentialOrigin as every other credentialed call.
 func (c *Config) ProjectSummaryURL(p Project) string {
-	origin := c.summaryOrigin(mcpURLFromConfig(p.MCPConfigPath))
+	origin := c.CredentialOrigin()
 	if origin == "" {
 		return ""
 	}
 	return projectSummaryPath(origin, p.Slug)
-}
-
-// summaryOrigin resolves the plane origin for a summary read: explicit backlog_url
-// wins, then the given MCP endpoint's origin, then the (default) backlog_url base.
-func (c *Config) summaryOrigin(mcpEndpoint string) string {
-	if c.BacklogURL != "" && c.BacklogURL != defaultBacklogURL {
-		if origin := originOf(c.BacklogURL); origin != "" {
-			return origin
-		}
-	}
-	if origin := originOf(mcpEndpoint); origin != "" {
-		return origin
-	}
-	return originOf(c.BacklogURL)
 }
 
 func projectSummaryPath(origin, slug string) string {
@@ -529,44 +550,26 @@ func slugFromMCPURL(raw string) string {
 	return ""
 }
 
-// originOf returns the scheme://host of a URL, or "" if it cannot be parsed or lacks
-// a scheme/host.
-func originOf(raw string) string {
-	if raw == "" {
-		return ""
-	}
-	u, err := url.Parse(raw)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return ""
-	}
-	return u.Scheme + "://" + u.Host
-}
-
 // mcpURLFromConfig reads a Claude-shaped .mcp.json and returns the clankerbar MCP
-// server URL (or the first http server's URL), or "" if the file is absent or has
-// no usable url. Best-effort: any read/parse failure yields "".
+// server URL, or "" if the file is absent or names no such server. Best-effort:
+// any read/parse failure yields "".
+//
+// Callers use this for the project SLUG only — never for an origin (see
+// origin.go). The old "else the first http server's URL" fallback is gone with
+// it: it made an unrelated MCP entry (a docs server, a browser driver) speak for
+// clankerbar, and picked which one by map iteration order. What is left is the
+// entry named `clankerbar`, else whichever entry is handed CLANKERBAR_API_KEY —
+// the two ways a file can actually mean "this is the clankerbar server".
 func mcpURLFromConfig(path string) string {
-	if path == "" {
-		return ""
+	servers := readMCPServers(path)
+	for _, s := range servers {
+		if s.name == "clankerbar" {
+			return s.url
+		}
 	}
-	data, err := os.ReadFile(expandHome(path))
-	if err != nil {
-		return ""
-	}
-	var f struct {
-		MCPServers map[string]struct {
-			URL string `json:"url"`
-		} `json:"mcpServers"`
-	}
-	if err := json.Unmarshal(data, &f); err != nil {
-		return ""
-	}
-	if s, ok := f.MCPServers["clankerbar"]; ok && s.URL != "" {
-		return s.URL
-	}
-	for _, s := range f.MCPServers {
-		if s.URL != "" {
-			return s.URL
+	for _, s := range servers {
+		if s.usesKey {
+			return s.url
 		}
 	}
 	return ""

@@ -111,10 +111,10 @@ func TestBacklogEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("derives project-scoped URL from .mcp.json when backlog_url is a bare base", func(t *testing.T) {
+	t.Run("derives the project-scoped path from .mcp.json when backlog_url is a bare base", func(t *testing.T) {
 		c := &Config{BacklogURL: "https://clankerbar.com", MCPConfigPath: mcp}
 		if got := c.BacklogEndpoint(); got != "https://clankerbar.com/mcp/proj" {
-			t.Errorf("BacklogEndpoint() = %q, want the .mcp.json URL", got)
+			t.Errorf("BacklogEndpoint() = %q, want the trusted origin + the .mcp.json slug", got)
 		}
 	})
 
@@ -139,9 +139,13 @@ func TestBacklogEndpoint(t *testing.T) {
 // pause). When a project slug is derivable from the resolved MCP endpoint it returns
 // the slug-ful `/api/projects/<slug>/backlog-summary` form (CLA-141), which the
 // operator's ACCOUNT key can poll; only when no slug resolves does it fall back to
-// the legacy slug-less route, which needs a project-scoped key. Origin precedence is
-// unchanged, and it still resolves in more cases than BacklogEndpoint (a bare base
-// with no .mcp.json is usable — via the legacy form).
+// the legacy slug-less route, which needs a project-scoped key. It still resolves in
+// more cases than BacklogEndpoint (a bare base with no .mcp.json is usable — via the
+// legacy form).
+//
+// The ORIGIN, though, is always backlog_url's (CLA-257). It is the one part of a
+// credentialed URL a file inside the workdir may not move; .mcp.json contributes the
+// slug and nothing else.
 func TestBacklogSummaryURL(t *testing.T) {
 	dir := t.TempDir()
 	mcp := filepath.Join(dir, ".mcp.json")
@@ -149,12 +153,13 @@ func TestBacklogSummaryURL(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Run("takes the origin of the resolved MCP endpoint (honours .mcp.json / self-host)", func(t *testing.T) {
-		// The .mcp.json names /mcp/proj, so the slug rides into the path too (CLA-141):
-		// the account key can poll this URL, no project-scoped key needed.
+	t.Run("takes the SLUG from .mcp.json but never its origin", func(t *testing.T) {
+		// Before CLA-257 this returned https://self.example.com/... — the origin came
+		// from a file inside the workdir, so a committed .mcp.json in a cloned repo
+		// chose where the account-scoped key went. Now only /mcp/proj's slug is read.
 		c := &Config{BacklogURL: "https://clankerbar.com", MCPConfigPath: mcp}
-		if got := c.BacklogSummaryURL(); got != "https://self.example.com/api/projects/proj/backlog-summary" {
-			t.Errorf("BacklogSummaryURL() = %q, want the .mcp.json origin + slug-ful path", got)
+		if got := c.BacklogSummaryURL(); got != "https://clankerbar.com/api/projects/proj/backlog-summary" {
+			t.Errorf("BacklogSummaryURL() = %q, want backlog_url's origin + the .mcp.json slug", got)
 		}
 	})
 
@@ -187,12 +192,15 @@ func TestBacklogSummaryURL(t *testing.T) {
 		}
 	})
 
-	t.Run("the default base does NOT override a resolved .mcp.json origin", func(t *testing.T) {
-		// The flip side: leaving backlog_url at the default must still defer to the
-		// .mcp.json origin, so a self-hosted plane wired only through .mcp.json works.
+	t.Run("the DEFAULT base still beats a resolved .mcp.json origin", func(t *testing.T) {
+		// This is the case the exploit rode in on, and the reason the old behaviour
+		// had to go rather than be narrowed: leaving backlog_url at its default is the
+		// documented normal setup, so "defer to .mcp.json when backlog_url is default"
+		// meant every ordinary run took its credential destination from the checkout.
+		// Self-hosting is still supported — by SAYING so in backlog_url, per CLA-257.
 		c := &Config{BacklogURL: defaultBacklogURL, MCPConfigPath: mcp}
-		if got := c.BacklogSummaryURL(); got != "https://self.example.com/api/projects/proj/backlog-summary" {
-			t.Errorf("BacklogSummaryURL() = %q, want the .mcp.json origin", got)
+		if got := c.BacklogSummaryURL(); got != "https://clankerbar.com/api/projects/proj/backlog-summary" {
+			t.Errorf("BacklogSummaryURL() = %q, want the default base's origin", got)
 		}
 	})
 
@@ -298,7 +306,11 @@ func TestProjectSummaryURL(t *testing.T) {
 		}
 	})
 
-	t.Run("uses the project's own .mcp.json origin (self-hosted plane per project)", func(t *testing.T) {
+	t.Run("ignores the project's own .mcp.json origin (CLA-257)", func(t *testing.T) {
+		// Per-project self-hosting moved to the same rule as everything else: state
+		// the origin in backlog_url. A project's .mcp.json no longer redirects the
+		// key, and a run whose backlog_url disagrees with it is refused by Validate
+		// outright — see TestHostileMCPConfigRefused.
 		dir := t.TempDir()
 		mcp := filepath.Join(dir, ".mcp.json")
 		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://plane.internal/mcp/proj"}}}`), 0o600); err != nil {
@@ -306,8 +318,8 @@ func TestProjectSummaryURL(t *testing.T) {
 		}
 		c := &Config{BacklogURL: defaultBacklogURL}
 		p := Project{Slug: "proj", MCPConfigPath: mcp}
-		if got := c.ProjectSummaryURL(p); got != "https://plane.internal/api/projects/proj/backlog-summary" {
-			t.Errorf("ProjectSummaryURL() = %q, want the project's .mcp.json origin", got)
+		if got := c.ProjectSummaryURL(p); got != "https://clankerbar.com/api/projects/proj/backlog-summary" {
+			t.Errorf("ProjectSummaryURL() = %q, want backlog_url's origin", got)
 		}
 	})
 
