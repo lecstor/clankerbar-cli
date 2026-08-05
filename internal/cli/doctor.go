@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -125,7 +126,7 @@ type doctorFlags struct {
 // the deliberate break this carries with it.
 func newDoctorFlagSet(f *doctorFlags) *pflag.FlagSet {
 	fs := newFlagSet("doctor")
-	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
+	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ~/.config/clankerbar/config.json; a ./clankerbar.json is never auto-loaded - name it here)")
 	fs.StringVar(&f.harness, "harness", "", "harness to check: "+strings.Join(harness.Names(), " | "))
 	fs.StringVar(&f.workdir, "workdir", "", "directory the harness would run in (default: current dir)")
 	fs.StringVar(&f.configDir, "config-dir", "", "harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME)")
@@ -165,7 +166,7 @@ func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overr
 			name:   "config",
 			status: fail,
 			detail: err.Error(),
-			remedy: "fix the config file, or point --config at a different one",
+			remedy: "fix the config file, or name the one you mean with --config (nothing outside ~/.config/clankerbar/config.json is loaded implicitly)",
 		})
 		return doctorFailed(1)
 	}
@@ -205,7 +206,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
-	return append(checks, checkPermissions(cfg), checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
+	return append(checks, checkMCPServers(cfg), checkPermissions(cfg), checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
 }
 
 func doctorFailed(n int) error {
@@ -233,6 +234,13 @@ func checkConfig(cfg *config.Config) check {
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
 	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
+	// What this config hands the child process, by NAME only - never a value, and
+	// never the file an @path names. A config that reaches the loop decides the
+	// spawned session's environment (CLA-260), so "which variables am I injecting"
+	// should be answerable from the preflight rather than by re-reading the file.
+	if names := envKeyNames(cfg.Env); names != "" {
+		c.info = append(c.info, "env: "+names)
+	}
 	if len(cfg.Projects) > 0 {
 		for _, p := range cfg.Projects {
 			// Spelled exactly like the check name below, so an operator can grep one
@@ -243,6 +251,21 @@ func checkConfig(cfg *config.Config) check {
 		c.info = append(c.info, "backlog: "+orNone(cfg.BacklogSummaryURL()))
 	}
 	return c
+}
+
+// envKeyNames renders the config's extra environment as a sorted list of KEYS,
+// with no values: one of them is routinely a credential, and doctor's output is
+// the thing an operator pastes into an issue.
+func envKeyNames(env map[string]string) string {
+	if len(env) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(env))
+	for k := range env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
 }
 
 // --- 2. harness --------------------------------------------------------------
@@ -647,7 +670,38 @@ func workdirLabel(dir string) string {
 	return dir
 }
 
-// --- 7. permission policy ----------------------------------------------------
+// --- 7. mcp servers ----------------------------------------------------------
+
+// checkMCPServers names the MCP entries that start a LOCAL PROCESS in every
+// spawned session.
+//
+// `mcp_config_path` defaults to `<workdir>/.mcp.json` - a file inside a checkout,
+// which the sessions themselves can write - and the harness starts every server
+// it declares at MCP init, before any allow/deny rule is consulted. CLA-257
+// constrains where that file may send the API key; nothing constrains what it may
+// RUN, and nothing said so out loud. This says so.
+//
+// A WARN, never a FAIL: a local MCP server in a repo's .mcp.json is a normal,
+// wanted thing, and failing the preflight over one would block runs that work.
+// What an operator needs is to have seen the list once.
+func checkMCPServers(cfg *config.Config) check {
+	c := check{name: "mcp_servers"}
+	local := cfg.LocalMCPServers()
+	if len(local) == 0 {
+		c.status = pass
+		c.detail = "no MCP server starts a local process"
+		return c
+	}
+	c.status = warn
+	c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	for _, s := range local {
+		c.info = append(c.info, s.Name+": "+truncate(s.Command, 80)+"  ("+s.ConfigPath+")")
+	}
+	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and a checkout's .mcp.json can declare them"
+	return c
+}
+
+// --- 8. permission policy ----------------------------------------------------
 
 func checkPermissions(cfg *config.Config) check {
 	c := check{name: "permissions"}
@@ -702,7 +756,7 @@ func checkPermissions(cfg *config.Config) check {
 	return c
 }
 
-// --- 8. toolchain grants -----------------------------------------------------
+// --- 9. toolchain grants -----------------------------------------------------
 
 // toolchainMarkers maps a marker file to the command a session must be allowed
 // to execute to verify that repo. Only markers that name their tool
@@ -992,7 +1046,7 @@ func firstField(s string) string {
 	return fields[0]
 }
 
-// --- 9. power ----------------------------------------------------------------
+// --- 10. power ----------------------------------------------------------------
 
 // checkPower answers the most basic precondition of an unattended run, and the
 // one nothing else checks: will this machine still be awake to do the work?
@@ -1088,7 +1142,7 @@ func idleSleepMinutes(out string) (int, bool) {
 	return 0, false
 }
 
-// --- 10. budget --------------------------------------------------------------
+// --- 11. budget --------------------------------------------------------------
 
 func checkBudget(cfg *config.Config) check {
 	c := check{name: "budget"}

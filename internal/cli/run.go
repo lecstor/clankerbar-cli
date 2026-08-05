@@ -42,7 +42,7 @@ type runFlags struct {
 // dash as a bundle of SHORT flags (`-h -a -r ...`). See flags_test.go.
 func newRunFlagSet(f *runFlags) *pflag.FlagSet {
 	fs := newFlagSet("run")
-	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ./clankerbar.json, then ~/.config/clankerbar/config.json)")
+	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ~/.config/clankerbar/config.json; a ./clankerbar.json is never auto-loaded - name it here)")
 	// Flag help lists exactly the registered adapters (derived from the harness
 	// registry, the same source config validation checks) so it can't drift.
 	fs.StringVar(&f.harness, "harness", "", "coding-agent harness to drive: "+strings.Join(harness.Names(), " | "))

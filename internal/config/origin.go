@@ -52,7 +52,8 @@ func (c *Config) CredentialOrigin() string {
 type mcpServer struct {
 	name    string
 	url     string
-	usesKey bool // some header or env value references CLANKERBAR_API_KEY
+	usesKey bool   // some header or env value references CLANKERBAR_API_KEY
+	command string // non-empty when the entry starts a LOCAL PROCESS, as written
 }
 
 // mcpFile is the union of the two schemas a harness MCP config can be in, because
@@ -75,6 +76,18 @@ type mcpEntry struct {
 	Headers     map[string]string `json:"headers"`
 	Env         map[string]string `json:"env"`         // Claude's spelling
 	Environment map[string]string `json:"environment"` // opencode's spelling
+
+	// Command is left RAW because the two dialects disagree on its type: Claude
+	// writes a string plus a separate `args` array, opencode writes the whole
+	// argv as one array. Nothing here needs to run it - only to report that the
+	// file starts a local process at all - so modelling either shape would be
+	// precision this cannot use and a way to miss the other one.
+	Command json.RawMessage `json:"command"`
+
+	// Args is Claude's other half of the same thing. Reported alongside Command
+	// because the interesting part of `bash -c "curl ... | sh"` is entirely in
+	// here - naming the entry as running "bash" would be true and useless.
+	Args json.RawMessage `json:"args"`
 }
 
 // readMCPServers parses a harness MCP config and returns its server entries,
@@ -106,11 +119,66 @@ func readMCPServers(path string) ([]mcpServer, error) {
 				name:    name,
 				url:     s.URL,
 				usesKey: referencesKey(s.Headers) || referencesKey(s.Env) || referencesKey(s.Environment),
+				command: strings.TrimSpace(strings.TrimSpace(string(s.Command)) + " " + strings.TrimSpace(string(s.Args))),
 			})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out, nil
+}
+
+// LocalMCPServer is one MCP entry that starts a LOCAL PROCESS in the session,
+// named so `doctor` can say what a config would execute.
+type LocalMCPServer struct {
+	ConfigPath string // the file that declares it
+	Name       string // the entry's key
+	Command    string // its `command` value, verbatim as JSON
+}
+
+// LocalMCPServers lists every entry in the resolved MCP config(s) that spawns a
+// local process rather than talking to an http server.
+//
+// Why this is worth surfacing (CLA-260): `mcp_config_path` defaults to
+// `<workdir>/.mcp.json`, the file is handed to the harness whole
+// (`--mcp-config`, or as opencode's entire `OPENCODE_CONFIG`), and an entry
+// carrying a `command` is started at MCP init - BEFORE any tool-permission rule
+// has an opinion, which is the same reasoning checkMCPConfigOrigins already
+// applies to a local server handed the API key. checkMCPConfigOrigins leaves
+// entries that neither are named `clankerbar` nor reference the key alone, and
+// that is still the right call for an ORIGIN check, but it means a checkout can
+// declare a process the next unattended session will run.
+//
+// Naming them is not the same as refusing them: local MCP servers are a normal,
+// wanted thing to put in a repo's .mcp.json, and refusing them is a product
+// decision rather than a bug fix (filed separately). What this closes is the
+// silence.
+func (c *Config) LocalMCPServers() []LocalMCPServer {
+	seen := make(map[string]bool)
+	var out []LocalMCPServer
+	paths := []string{c.MCPConfigPath}
+	for _, p := range c.Projects {
+		paths = append(paths, p.MCPConfigPath)
+	}
+	for _, path := range paths {
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		servers, err := readMCPServers(path)
+		if err != nil {
+			// Validate has already refused an unreadable config outright, so this is
+			// unreachable from a validated config; reporting nothing is right either
+			// way, since a file that cannot be parsed declares nothing we can name.
+			continue
+		}
+		for _, s := range servers {
+			if s.command == "" {
+				continue
+			}
+			out = append(out, LocalMCPServer{ConfigPath: path, Name: s.name, Command: s.command})
+		}
+	}
+	return out
 }
 
 func referencesKey(m map[string]string) bool {
