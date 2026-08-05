@@ -8,3 +8,9 @@
 # local config that may hold paths/secrets
 /clankerbar.json
 *.local.json
+
+# Local run artifacts. The repo is public now, and a transcript records whatever
+# the harness printed - prompts, paths, occasionally a token. Keep a careless
+# `git add -A` from publishing one.
+/*transcript*.txt
+/*.bak
