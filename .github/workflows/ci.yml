@@ -21,13 +21,24 @@ jobs:
     name: ci
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to full commit SHAs, like release.yml - the trailing comment is the
+      # version label, the SHA is what is fetched. This job only holds
+      # `contents: read`, so the blast radius is smaller than release.yml's, but a
+      # substituted action here still runs arbitrary code against every PR.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Pin Go to the version declared in go.mod (currently 1.26) so CI and the
       # module never drift. go-version-file reads the toolchain line directly.
-      - uses: actions/setup-go@v5
+      # check-latest matters because govulncheck below is a BLOCKING gate on a
+      # repo whose only realistic vulnerability class is the stdlib. Left at the
+      # default, setup-go searches the runner's tool cache first, so `go 1.26`
+      # resolves to the newest 1.26.x baked into the image - not the newest that
+      # exists. Between a Go security release and the image rebuilding, that
+      # leaves CI red on every PR with no repo-side fix available.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+          check-latest: true
           cache: true
 
       - name: build
@@ -38,6 +49,25 @@ jobs:
 
       - name: test
         run: go test -race ./...
+
+      # With one direct dependency, a stdlib CVE is the likeliest way this ships a
+      # known-vulnerable binary, and govulncheck is the only check here that looks
+      # at the toolchain rather than the code. It reports only vulnerabilities the
+      # code actually REACHES, so it stays quiet about the rest of the stdlib.
+      #
+      # Installed by module version rather than via govulncheck-action: a
+      # `pkg@version` install is immutable and checked against the Go checksum
+      # database, which is a stronger pin than a git SHA and one less action in the
+      # supply chain.
+      #
+      # This can go red on a disclosure before a patched Go exists. That is the
+      # check working - the fix is to wait for the patch, not to drop the step.
+      # Once it lands, `go-version-file` plus the `check-latest` above picks it up
+      # with no repo change.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
 
 # golangci-lint was evaluated and deliberately left out for now: golangci-lint v2
 # flags a handful of low-value nits (unchecked fmt.Fprint* returns, a nil test
