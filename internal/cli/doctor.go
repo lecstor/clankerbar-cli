@@ -229,6 +229,10 @@ func checkConfig(cfg *config.Config) check {
 		workdir = "(current directory)"
 	}
 	c.info = append(c.info, "harness: "+cfg.Harness, "workdir: "+workdir)
+	// The one destination the account-scoped key is allowed to reach (CLA-257).
+	// Named here so the preflight answers "where does my credential go" without the
+	// operator having to reason about which file won.
+	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
 	if len(cfg.Projects) > 0 {
 		for _, p := range cfg.Projects {
 			// Spelled exactly like the check name below, so an operator can grep one

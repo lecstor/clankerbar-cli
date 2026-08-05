@@ -289,3 +289,28 @@ func TestPoll_Legacy404IsOrdinaryErrorNamingTheEndpoint(t *testing.T) {
 		t.Errorf("error should name the endpoint; got %q", err.Error())
 	}
 }
+
+// A redirect must not be able to move a request that is already carrying the
+// bearer token to a cleartext destination (CLA-257). Go strips Authorization on a
+// cross-host hop but FORWARDS it on an https -> http hop to the same host, so the
+// scheme floor has to be re-checked per hop rather than only at config time.
+func TestPollRefusesARedirectOffTheCredentialFloor(t *testing.T) {
+	var hops int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hops++
+		http.Redirect(w, r, "http://attacker.example/api/backlog-summary", http.StatusFound)
+	}))
+	defer srv.Close()
+
+	// The first hop is loopback http, which the floor allows; the redirect is not.
+	_, err := New(srv.URL+"/api/backlog-summary", "key-123").Poll(context.Background())
+	if err == nil {
+		t.Fatal("Poll followed a redirect to a cleartext non-loopback host")
+	}
+	if !strings.Contains(err.Error(), "refusing redirect") {
+		t.Errorf("Poll error = %v, want the redirect refusal", err)
+	}
+	if hops != 1 {
+		t.Errorf("hops = %d, want the request to stop at the first response", hops)
+	}
+}

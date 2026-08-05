@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"time"
@@ -100,6 +101,13 @@ func Run(ctx context.Context, args []string) error {
 	// still works for single-project / CI setups.
 	apiKey := os.Getenv("CLANKERBAR_API_KEY")
 
+	// Say where the key is going, once, before the first request carries it
+	// (CLA-257). A redirected credential used to be invisible: the origin was
+	// derived from a file in the workdir and never printed, so the only trace of it
+	// was in the traffic. In the first ten lines of an overnight log it is a fact
+	// the operator can check at a glance.
+	log.Print(credentialNotice(cfg, apiKey))
+
 	// The same key also authorises the driver's one WRITE: handing back a task a
 	// session was still holding when it ended, so an interrupted iteration does not
 	// leave a lease to expire and charge the task a reclaim (CLA-242).
@@ -123,4 +131,18 @@ func Run(ctx context.Context, args []string) error {
 		Poller:   backlog.New(cfg.BacklogSummaryURL(), apiKey),
 		Releaser: plane.New(cfg.BacklogEndpoint(), apiKey),
 	}}).Run(ctx)
+}
+
+// credentialNotice is the startup line naming where CLANKERBAR_API_KEY will be
+// sent. Only the ORIGIN is named — never the key, and never the full path, which
+// would put a project slug into a log an operator may paste.
+func credentialNotice(cfg *config.Config, apiKey string) string {
+	if apiKey == "" {
+		return "CLANKERBAR_API_KEY is unset — no credential will be sent (the driver polls blind)"
+	}
+	origin := cfg.CredentialOrigin()
+	if origin == "" {
+		return "no plane origin is configured — no credential will be sent (the driver polls blind)"
+	}
+	return "sending the API key to " + origin
 }
