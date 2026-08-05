@@ -206,7 +206,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
-	return append(checks, checkPermissions(cfg), checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
+	return append(checks, checkMCPServers(cfg), checkPermissions(cfg), checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
 }
 
 func doctorFailed(n int) error {
@@ -670,7 +670,38 @@ func workdirLabel(dir string) string {
 	return dir
 }
 
-// --- 7. permission policy ----------------------------------------------------
+// --- 7. mcp servers ----------------------------------------------------------
+
+// checkMCPServers names the MCP entries that start a LOCAL PROCESS in every
+// spawned session.
+//
+// `mcp_config_path` defaults to `<workdir>/.mcp.json` - a file inside a checkout,
+// which the sessions themselves can write - and the harness starts every server
+// it declares at MCP init, before any allow/deny rule is consulted. CLA-257
+// constrains where that file may send the API key; nothing constrains what it may
+// RUN, and nothing said so out loud. This says so.
+//
+// A WARN, never a FAIL: a local MCP server in a repo's .mcp.json is a normal,
+// wanted thing, and failing the preflight over one would block runs that work.
+// What an operator needs is to have seen the list once.
+func checkMCPServers(cfg *config.Config) check {
+	c := check{name: "mcp_servers"}
+	local := cfg.LocalMCPServers()
+	if len(local) == 0 {
+		c.status = pass
+		c.detail = "no MCP server starts a local process"
+		return c
+	}
+	c.status = warn
+	c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	for _, s := range local {
+		c.info = append(c.info, s.Name+": "+truncate(s.Command, 80)+"  ("+s.ConfigPath+")")
+	}
+	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and a checkout's .mcp.json can declare them"
+	return c
+}
+
+// --- 8. permission policy ----------------------------------------------------
 
 func checkPermissions(cfg *config.Config) check {
 	c := check{name: "permissions"}
@@ -725,7 +756,7 @@ func checkPermissions(cfg *config.Config) check {
 	return c
 }
 
-// --- 8. toolchain grants -----------------------------------------------------
+// --- 9. toolchain grants -----------------------------------------------------
 
 // toolchainMarkers maps a marker file to the command a session must be allowed
 // to execute to verify that repo. Only markers that name their tool
@@ -1015,7 +1046,7 @@ func firstField(s string) string {
 	return fields[0]
 }
 
-// --- 9. power ----------------------------------------------------------------
+// --- 10. power ----------------------------------------------------------------
 
 // checkPower answers the most basic precondition of an unattended run, and the
 // one nothing else checks: will this machine still be awake to do the work?
@@ -1111,7 +1142,7 @@ func idleSleepMinutes(out string) (int, bool) {
 	return 0, false
 }
 
-// --- 10. budget --------------------------------------------------------------
+// --- 11. budget --------------------------------------------------------------
 
 func checkBudget(cfg *config.Config) check {
 	c := check{name: "budget"}

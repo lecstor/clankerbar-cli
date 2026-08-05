@@ -368,15 +368,15 @@ const (
 // their own "and here is why that matters" without re-deriving the mode.
 var errInsecureMode = errors.New("insecure file mode")
 
-// readOwnerOnly reads a file the loop is about to trust, refusing it when its
-// permission bits include any of forbid.
+// readOwnerOnly reads a file the loop is about to trust, refusing it when anyone
+// but the owner (or root) could have decided its contents.
 //
-// The mode is taken from the OPEN FILE HANDLE, not from a separate os.Stat of the
-// path, so there is no window between the mode that was checked and the bytes
-// that were read: a file swapped after the check is a different inode, and this
-// reads the one it vetted. Symlinks are followed (the target's mode is what
-// matters), which is deliberate - an operator pointing at ~/.secrets/token
-// through a symlink is normal.
+// The file's own mode is taken from the OPEN FILE HANDLE, not from a separate
+// os.Stat of the path, so there is no window between the mode that was checked
+// and the bytes that were read: a file swapped after the check is a different
+// inode, and this reads the one it vetted. Symlinks are followed (the target's
+// mode is what matters), which is deliberate - an operator pointing at
+// ~/.secrets/token through a symlink is normal.
 func readOwnerOnly(path string, forbid os.FileMode) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -387,14 +387,92 @@ func readOwnerOnly(path string, forbid os.FileMode) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := vetTrustedFile(path, fi, forbid); err != nil {
+		return nil, err
+	}
+	return io.ReadAll(f)
+}
+
+// vetTrustedFile is the three questions a mode check has to answer to mean what
+// it says. Only the first is about the file's own bits:
+//
+//  1. Can group or other CHANGE (or, for a secret, READ) it?
+//  2. Is it OWNED by someone else? A 0600 file is unreadable by a peer, so under a
+//     normal uid this is nearly self-enforcing - but a root daemon reading a
+//     user-owned config is exactly the case where mode alone says "fine" and the
+//     file is under someone else's control.
+//  3. Can group or other REPLACE it by writing its directory? A 0600 token in a
+//     0777 directory can be unlinked and recreated by any local account, which
+//     defeats (1) entirely. This checks the immediate parent only, not the whole
+//     ancestor chain - a world-writable /home is its own, larger problem, and
+//     OpenSSH's StrictModes draws the line in the same place. The sticky bit is
+//     the documented exception (/tmp), where only an entry's owner may remove it.
+func vetTrustedFile(path string, fi os.FileInfo, forbid os.FileMode) error {
+	if !permissionBitsAreMeaningful {
+		// Go synthesises a fixed mode for ordinary files on such platforms, so the
+		// bits carry no information and enforcing them would refuse every config
+		// the tool has - a denial, not a defence.
+		return nil
+	}
 	if perm := fi.Mode().Perm(); perm&forbid != 0 {
 		verb := "writable by group or other"
 		if forbid&groupOtherAccess == groupOtherAccess {
 			verb = "readable by group or other"
 		}
-		return nil, fmt.Errorf("%w: %s is %s (mode %04o)", errInsecureMode, path, verb, perm)
+		return fmt.Errorf("%w: %s is %s (mode %04o)", errInsecureMode, path, verb, perm)
 	}
-	return io.ReadAll(f)
+	if uid, ok := fileOwnerUID(fi); ok {
+		if me := os.Geteuid(); uid != me && uid != 0 {
+			return fmt.Errorf("%w: %s is owned by uid %d, not by you (uid %d) or root - its owner decides its contents whatever its mode says", errInsecureMode, path, uid, me)
+		}
+	}
+	dir := filepath.Dir(path)
+	if dfi, err := os.Stat(dir); err == nil {
+		if m := dfi.Mode(); m.Perm()&groupOtherWrite != 0 && m&os.ModeSticky == 0 {
+			return fmt.Errorf("%w: %s sits in %s, which is writable by group or other (mode %04o) - anyone who can write the directory can replace the file whatever the file's own mode is", errInsecureMode, path, dir, m.Perm())
+		}
+	}
+	return nil
+}
+
+// refuseInsecureMode vets a file the loop hands ONWARD rather than reads, so the
+// same rule covers a path whose contents are another program's business.
+//
+// Only an insecure-mode verdict is returned: absence and unreadability belong to
+// whichever check already reports them (for settings_path, `doctor`'s permissions
+// check, which says what a missing policy file means far better than a config
+// error could).
+func refuseInsecureMode(path string, forbid os.FileMode) error {
+	if path == "" {
+		return nil
+	}
+	if _, err := readOwnerOnly(path, forbid); errors.Is(err, errInsecureMode) {
+		return err
+	}
+	return nil
+}
+
+// underWorkDir resolves a RELATIVE path the way the spawned harness will: against
+// the session's working directory, not against the daemon's.
+//
+// The two are routinely different, and every one of these paths is handed to the
+// child verbatim while `cmd.Dir` is the workdir (harness/claude.go), so a
+// relative value used to be read by US against one directory and by the CHILD
+// against another. That is not a cosmetic mismatch: `mcp_config_path: ".mcp.json"`
+// with a workdir elsewhere made checkMCPConfigOrigins vet a file that did not
+// exist (absent is the one benign case, so the gate passed) while the session
+// loaded the checkout's file with its own origins and its own `Authorization`
+// headers - the CLA-257 property defeated by a relative path, with `doctor` green
+// throughout. Resolving here means the file that is VETTED is provably the file
+// that is USED.
+//
+// An empty workdir means the child inherits our cwd, so relative already means
+// the same thing to both and is left alone.
+func underWorkDir(p, workdir string) string {
+	if p == "" || workdir == "" || filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(workdir, p)
 }
 
 // Validate normalizes path fields and checks the resolved config is runnable.
@@ -404,6 +482,10 @@ func (c *Config) Validate() error {
 	c.MCPConfigPath = expandHome(c.MCPConfigPath)
 	c.SettingsPath = expandHome(c.SettingsPath)
 	c.StateDir = expandHome(c.StateDir)
+
+	c.MCPConfigPath = underWorkDir(c.MCPConfigPath, c.WorkDir)
+	c.SettingsPath = underWorkDir(c.SettingsPath, c.WorkDir)
+	c.ConfigDir = underWorkDir(c.ConfigDir, c.WorkDir)
 
 	// Validate against the harness registry (not a hand-kept switch) so the accepted
 	// set can never drift from what is actually registered — an unregistered value is
@@ -444,6 +526,15 @@ func (c *Config) Validate() error {
 		return err
 	}
 
+	// The settings file IS the permission policy - the allow/deny rules that are
+	// the only thing gating what an unattended session may call, since there is no
+	// human to prompt. Holding the config file to a mode check and not this one
+	// would leave the shorter route to the same capture open: rewrite the policy
+	// rather than the config that names it.
+	if err := refuseInsecureMode(c.SettingsPath, groupOtherWrite); err != nil {
+		return fmt.Errorf("settings_path: %w - it is the allow/deny policy the unattended session is gated by: chmod go-w %s", err, c.SettingsPath)
+	}
+
 	// Multi-project entries: slug required and unique; paths normalized; each
 	// project's mcp config defaults to its own workdir's .mcp.json (falling back to
 	// the top-level one at invocation time — see loop.Target).
@@ -459,8 +550,16 @@ func (c *Config) Validate() error {
 		seen[p.Slug] = true
 		p.WorkDir = expandHome(p.WorkDir)
 		p.MCPConfigPath = expandHome(p.MCPConfigPath)
+		// Against the workdir the SESSIONS for this project get - its own, falling
+		// back to the top-level one, exactly as loop.Driver.invocation resolves it.
+		// See underWorkDir for why a relative path may not be left to the daemon's cwd.
+		effectiveWorkDir := p.WorkDir
+		if effectiveWorkDir == "" {
+			effectiveWorkDir = c.WorkDir
+		}
+		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
-			p.MCPConfigPath = discoverMCPConfig(p.WorkDir)
+			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
 		}
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
 			return err
