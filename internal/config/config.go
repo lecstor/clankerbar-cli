@@ -15,11 +15,13 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // defaultBacklogURL is the base the driver reads backlog counts from when the
-// operator sets no backlog_url. Kept as a named constant so BacklogSummaryURL can
-// tell an explicit backlog_url apart from this default (explicit config overrides).
+// operator sets no backlog_url — and, since CLA-257, the default TRUSTED ORIGIN:
+// the only host the account-scoped API key is sent to unless the operator names
+// another one in their own config file.
 const defaultBacklogURL = "https://clankerbar.com"
 
 // Config is the resolved loop configuration. The comments here are the source of
@@ -329,7 +331,7 @@ func (c *Config) Validate() error {
 	if c.BacklogURL == "" {
 		c.BacklogURL = defaultBacklogURL
 	}
-	if _, err := credentialOrigin(c.BacklogURL); err != nil {
+	if _, err := secureurl.Origin(c.BacklogURL); err != nil {
 		return fmt.Errorf("backlog_url: %w", err)
 	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
@@ -455,11 +457,20 @@ func (c *Config) BacklogEndpoint() string {
 	if strings.Contains(c.BacklogURL, "/mcp/") {
 		return c.BacklogURL
 	}
-	slug := slugFromMCPURL(mcpURLFromConfig(c.MCPConfigPath))
-	if slug == "" {
-		return ""
+	raw := mcpURLFromConfig(c.MCPConfigPath)
+	if slug := slugFromMCPURL(raw); slug != "" {
+		return mcpPath(origin, slug)
 	}
-	return mcpPath(origin, slug)
+	// A pre-CLA-99 file names a bare `/mcp` with no slug to lift out. Take its
+	// path verbatim, but only once its origin is proven to BE the trusted one —
+	// which Validate has already refused the file for otherwise. Dropping to ""
+	// here instead would silently disable the driver's one write (the CLA-242
+	// release-on-interrupt) for those setups: a security fix quietly deleting an
+	// unrelated feature.
+	if secureurl.SameOrigin(origin, raw) {
+		return raw
+	}
+	return ""
 }
 
 // ProjectEndpoint returns one configured project's MCP endpoint — the same
@@ -550,18 +561,24 @@ func slugFromMCPURL(raw string) string {
 	return ""
 }
 
-// mcpURLFromConfig reads a Claude-shaped .mcp.json and returns the clankerbar MCP
-// server URL, or "" if the file is absent or names no such server. Best-effort:
-// any read/parse failure yields "".
+// mcpURLFromConfig reads a harness MCP config and returns the clankerbar MCP
+// server URL, or "" if the file is absent or names no such server.
 //
-// Callers use this for the project SLUG only — never for an origin (see
+// Callers use this for the PATH — a project slug — never for an origin (see
 // origin.go). The old "else the first http server's URL" fallback is gone with
 // it: it made an unrelated MCP entry (a docs server, a browser driver) speak for
 // clankerbar, and picked which one by map iteration order. What is left is the
 // entry named `clankerbar`, else whichever entry is handed CLANKERBAR_API_KEY —
 // the two ways a file can actually mean "this is the clankerbar server".
+//
+// A read/parse failure yields "", which is safe HERE and only here: Validate has
+// already refused such a file outright (checkMCPConfigOrigins fails closed), so
+// this is never reached with one.
 func mcpURLFromConfig(path string) string {
-	servers := readMCPServers(path)
+	servers, err := readMCPServers(path)
+	if err != nil {
+		return ""
+	}
 	for _, s := range servers {
 		if s.name == "clankerbar" {
 			return s.url

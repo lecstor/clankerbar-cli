@@ -31,6 +31,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/secureurl"
 )
 
 // Summary is a point-in-time view of the queue.
@@ -133,7 +135,7 @@ func New(summaryURL, apiKey string) Poller {
 		endpoint: endpoint,
 		legacy:   legacyFallbackURL(endpoint),
 		apiKey:   apiKey,
-		client:   &http.Client{Timeout: 15 * time.Second},
+		client:   &http.Client{Timeout: 15 * time.Second, CheckRedirect: noDowngradeRedirect},
 	}
 }
 
@@ -261,4 +263,16 @@ func errorCode(body []byte) string {
 	}
 	_ = json.Unmarshal(body, &e)
 	return e.Error.Code
+}
+
+// noDowngradeRedirect refuses a redirect that would put the bearer token on the
+// wire in cleartext. Go already strips Authorization when a redirect changes
+// host, but it FORWARDS it on an https -> http hop to the SAME host — which is
+// exactly the cleartext exposure the credential-origin rule exists to prevent
+// (CLA-257), arriving by a route config validation cannot see.
+func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
+	if _, err := secureurl.Origin(req.URL.String()); err != nil {
+		return fmt.Errorf("refusing redirect: %w", err)
+	}
+	return nil
 }
