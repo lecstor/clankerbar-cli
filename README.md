@@ -47,8 +47,24 @@ tar -xzf "clankerbar_${VERSION}_${OSARCH}.tar.gz"
 ./clankerbar version
 ```
 
-Verifying the checksum is worth the two extra lines: this binary holds your
-credentials and runs shell commands on your machine.
+**Then verify where it came from, not just that it arrived intact.** The checksum
+above catches a corrupt or truncated download, and that is all it catches: it is
+served from the same release page as the archive, so anyone able to replace one
+could replace both. Every release is also signed with [build provenance][slsa] -
+a Sigstore attestation held by GitHub, not by the release, recording that these
+exact bytes came out of this repo's `release.yml` at a specific commit:
+
+```sh
+gh attestation verify "clankerbar_${VERSION}_${OSARCH}.tar.gz" --repo lecstor/clankerbar-cli
+```
+
+That one is worth the extra line: this binary holds your credentials and runs
+shell commands on your machine, and provenance is the part that would notice if
+the archive were not ours. It needs the [GitHub CLI][gh-cli] and a `gh auth login`
+- `gh attestation verify --help` covers the offline and JSON-output variants.
+
+[slsa]: https://slsa.dev/spec/v1.0/provenance
+[gh-cli]: https://cli.github.com
 
 Downloading in a browser instead of with `curl` gets the archive quarantined by
 macOS, and the binaries are not notarized, so the first run is refused with

@@ -7,7 +7,15 @@ project_name: clankerbar
 
 before:
   hooks:
-    - go mod tidy
+    # NOT `go mod tidy`. Tidy REWRITES go.mod/go.sum from the network in the middle
+    # of a release, so the dependency set that gets compiled into the published
+    # binary need not be the one reviewed on the tagged commit. `download` fetches
+    # exactly the versions go.mod already pins, `verify` checks the module cache
+    # against go.sum, and the `git diff` below turns "the release did not mutate
+    # its own inputs" from an assertion into a check that fails the release.
+    - go mod download
+    - go mod verify
+    - git diff --exit-code -- go.mod go.sum
 
 builds:
   - id: clankerbar
@@ -15,6 +23,11 @@ builds:
     binary: clankerbar
     env:
       - CGO_ENABLED=0
+    # -mod=readonly is already the default, so this is a latch rather than a fix:
+    # it keeps the guarantee if a GOFLAGS or a future hook ever relaxes it. An
+    # import missing from go.mod fails the release instead of being added to it.
+    flags:
+      - -mod=readonly
     # main.version is stamped so `clankerbar version` reports the release tag.
     ldflags:
       - -s -w -X main.version={{ .Version }}

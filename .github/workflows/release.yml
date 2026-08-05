@@ -7,20 +7,31 @@ on:
     tags:
       - "v*"
 
-# GoReleaser needs write access to create the Release and upload assets.
+# Every action below is pinned to a full commit SHA, not a tag. This job holds a
+# write token and publishes the binaries users install, so a moved or hijacked
+# `v4`-style tag on any dependency would be able to substitute what ships. The
+# trailing comment is the human-readable version the SHA corresponded to; it is a
+# label, not the thing that is fetched. To bump one, resolve the new SHA from the
+# upstream repo and update both halves together.
 permissions:
+  # GoReleaser needs write access to create the Release and upload assets.
   contents: write
+  # The two below are for actions/attest-build-provenance, and are the minimum it
+  # takes: id-token mints the short-lived Sigstore OIDC token that signs the
+  # provenance, attestations writes the result to this repo's attestation store.
+  id-token: write
+  attestations: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           # Full history + tags so GoReleaser can build the changelog.
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
           cache: true
@@ -33,10 +44,29 @@ jobs:
         run: go test -race ./...
 
       - name: goreleaser
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
         with:
           version: "~> v2"
           args: release --clean
         env:
           # Provided automatically by Actions; scoped by the permissions block above.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # checksums.txt says the download was not corrupted. It says nothing about
+      # WHO built it: it travels with the binaries, from the same release, over the
+      # same channel, so anyone who could swap one could swap both. The attestation
+      # is the missing half - a Sigstore-signed statement, held by GitHub rather
+      # than by the release, that these exact bytes came out of this workflow at
+      # this commit. Verified with `gh attestation verify` (see README "Install").
+      #
+      # It runs AFTER goreleaser deliberately: it attests the archives that were
+      # actually published, read back off disk, rather than any earlier copy. The
+      # cost of that ordering is that a failure HERE leaves a published release
+      # with no attestation - the run goes red, and the fix is to re-run the job,
+      # not to assume the release is fine because the assets are there.
+      - name: attest release artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt
