@@ -40,13 +40,19 @@ Anthropic's semi-random early resets), then continues.
 VERSION=0.1.0 OSARCH=darwin_arm64
 curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/clankerbar_${VERSION}_${OSARCH}.tar.gz"
 curl -fsSLO "https://github.com/lecstor/clankerbar-cli/releases/download/v${VERSION}/checksums.txt"
-shasum -a 256 --ignore-missing -c checksums.txt   # Linux: sha256sum -c
+shasum -a 256 --ignore-missing -c checksums.txt   # Linux: sha256sum --ignore-missing -c checksums.txt
 tar -xzf "clankerbar_${VERSION}_${OSARCH}.tar.gz"
 ./clankerbar version
 ```
 
 Verifying the checksum is worth the two extra lines: this binary holds your
 credentials and runs shell commands on your machine.
+
+Downloading in a browser instead of with `curl` gets the archive quarantined by
+macOS, and the binaries are not notarized, so the first run is refused with
+"cannot be opened because the developer cannot be verified". Clear it with
+`xattr -d com.apple.quarantine clankerbar`, or use the `curl` route above, which
+never sets the attribute.
 
 **Or build from source** (requires Go 1.26+):
 
@@ -69,8 +75,10 @@ line while the surface settles. Concretely, while pre-1.0:
 
 - **A breaking change can land on a minor bump** (`v0.1` -> `v0.2`). That is what
   the `v0.x` line means; pin a version if you are automating against it.
-- **A breaking change is always called out in the release notes.** Permitted is not
-  the same as silent - if a flag changes under you, the notes say so.
+- **A breaking change is never silent.** Permitted is not the same as unannounced:
+  breaking commits carry a `!` (`feat(cli)!: ...`) and the release config hoists
+  them into a **Breaking changes** heading at the top of the notes, rather than
+  leaving them as one line among thirty.
 - **Releases are cut when there is something to ship**, not on a schedule. The
   commitment is that a tag produces working, downloadable binaries.
 
@@ -289,6 +297,11 @@ the likely final format.)
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so the default is what gives spawned
 sessions their clankerbar tools (and gives the driver a project slug to poll with).
+
+Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at the
+root here is the maintainers' own agent wiring and names the `clankerbar` project
+slug; running the loop from inside this checkout would have it poll a queue you
+cannot read, which it refuses rather than drains.
 
 ### Multi-project: one instance, many queues
 

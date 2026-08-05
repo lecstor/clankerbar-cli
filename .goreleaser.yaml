@@ -41,18 +41,50 @@ snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
 
 changelog:
+  # `use: github` needs a PREVIOUS tag to diff against. On the first tag there is
+  # none, and GoReleaser SILENTLY falls back to the plain `git` changeloger, which
+  # logs the entire history. That is survivable for v0.1.0 (the whole history is
+  # what v0.1.0 is) but only because the grouping and filters below make it
+  # readable - without them it was 51 lines of raw SHAs and merge commits carrying
+  # internal branch slugs, sorted alphabetically. Do not remove them.
   use: github
-  sort: asc
+  # No `sort:` on purpose. `sort: asc` orders ALPHABETICALLY by commit subject, not
+  # chronologically, which interleaves "#1, #10, #11, #2" and reads as damage.
+  # Empty keeps git order.
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
+      # Scoped conventional-commit types are the norm here (`test(loop):`), and an
+      # unscoped `^test:` does not match them - hence the optional scope group.
+      - "^docs(\\(.+\\))?:"
+      - "^test(\\(.+\\))?:"
+      - "^chore(\\(.+\\))?:"
+      # Review-cycle chatter and merge commits carrying internal branch slugs.
+      # Both are ours, not news to anyone installing this.
+      - "^review(\\(.+\\))?:"
+      - "^Merge pull request"
+      - "^Merge branch"
+      - "^Merge remote-tracking branch"
+  groups:
+    # The README promises a breaking change is never silent. This is what makes
+    # that true rather than aspirational: `!`-marked commits are hoisted to the
+    # top under their own heading instead of sitting mid-list.
+    - title: "Breaking changes"
+      regexp: '^.*?[a-zA-Z]+(\(.+\))?!:.+$'
+      order: 0
+    - title: "Features"
+      regexp: '^.*?feat(\(.+\))?:.+$'
+      order: 1
+    - title: "Fixes"
+      regexp: '^.*?fix(\(.+\))?:.+$'
+      order: 2
+    - title: "Other changes"
+      order: 999
 
 release:
-  # Auto-generate release notes from the commit history / PRs.
   github:
     owner: lecstor
     name: clankerbar-cli
   draft: false
+  # `auto` marks a release as a prerelease only when the tag carries a semver
+  # prerelease field (`v0.1.0-rc1`). Plain `v0.1.0` publishes as a full release.
   prerelease: auto

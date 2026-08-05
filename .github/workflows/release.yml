@@ -25,6 +25,13 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # The README commits to a tag producing WORKING binaries. `ci.yml` only runs
+      # on pull_request and pushes to main, so nothing tests the tag path itself -
+      # a green cross-compile of a red test suite would publish happily. Tag a
+      # commit whose tests fail and this fails the release instead of shipping it.
+      - name: test
+        run: go test -race ./...
+
       - name: goreleaser
         uses: goreleaser/goreleaser-action@v6
         with:
