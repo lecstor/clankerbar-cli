@@ -55,13 +55,18 @@ a Sigstore attestation held by GitHub, not by the release, recording that these
 exact bytes came out of this repo's `release.yml` at a specific commit:
 
 ```sh
-gh attestation verify "clankerbar_${VERSION}_${OSARCH}.tar.gz" --repo lecstor/clankerbar-cli
+gh attestation verify "clankerbar_${VERSION}_${OSARCH}.tar.gz" \
+  --repo lecstor/clankerbar-cli \
+  --signer-workflow lecstor/clankerbar-cli/.github/workflows/release.yml
 ```
 
-That one is worth the extra line: this binary holds your credentials and runs
-shell commands on your machine, and provenance is the part that would notice if
-the archive were not ours. It needs the [GitHub CLI][gh-cli] and a `gh auth login`
-- `gh attestation verify --help` covers the offline and JSON-output variants.
+`--signer-workflow` is the half that makes the sentence above true: `--repo`
+alone accepts an attestation signed by *any* workflow in this repo, while naming
+the workflow pins it to the one that publishes releases. That is worth the extra
+line - this binary holds your credentials and runs shell commands on your
+machine, and provenance is the part that would notice if the archive were not
+ours. Needs the [GitHub CLI][gh-cli] and a `gh auth login`; run
+`gh attestation verify --help` for the offline and JSON-output variants.
 
 [slsa]: https://slsa.dev/spec/v1.0/provenance
 [gh-cli]: https://cli.github.com

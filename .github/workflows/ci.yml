@@ -29,9 +29,16 @@ jobs:
 
       # Pin Go to the version declared in go.mod (currently 1.26) so CI and the
       # module never drift. go-version-file reads the toolchain line directly.
+      # check-latest matters because govulncheck below is a BLOCKING gate on a
+      # repo whose only realistic vulnerability class is the stdlib. Left at the
+      # default, setup-go searches the runner's tool cache first, so `go 1.26`
+      # resolves to the newest 1.26.x baked into the image - not the newest that
+      # exists. Between a Go security release and the image rebuilding, that
+      # leaves CI red on every PR with no repo-side fix available.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+          check-latest: true
           cache: true
 
       - name: build
@@ -54,9 +61,9 @@ jobs:
       # supply chain.
       #
       # This can go red on a disclosure before a patched Go exists. That is the
-      # check working - the fix is to bump Go once the patch lands, not to drop the
-      # step. go-version-file resolves `go 1.26` to the newest 1.26.x, so a patched
-      # toolchain is picked up without a repo change.
+      # check working - the fix is to wait for the patch, not to drop the step.
+      # Once it lands, `go-version-file` plus the `check-latest` above picks it up
+      # with no repo change.
       - name: govulncheck
         run: |
           go install golang.org/x/vuln/cmd/govulncheck@v1.6.0

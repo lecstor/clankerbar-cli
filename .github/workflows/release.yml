@@ -31,9 +31,14 @@ jobs:
           # Full history + tags so GoReleaser can build the changelog.
           fetch-depth: 0
 
+      # check-latest for the same reason as in ci.yml, and one more that only
+      # applies here: this is the toolchain that gets COMPILED INTO the published
+      # binaries, so a stale cached patch ships the vulnerability rather than
+      # merely failing to notice it.
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
+          check-latest: true
           cache: true
 
       # The README commits to a tag producing WORKING binaries. `ci.yml` only runs
@@ -42,6 +47,16 @@ jobs:
       # commit whose tests fail and this fails the release instead of shipping it.
       - name: test
         run: go test -race ./...
+
+      # Same argument as the test step above, applied to the vulnerability gate:
+      # a tag cut some time after the last push to `main` can publish binaries
+      # built against a stdlib with a known reachable CVE, and nothing in `ci.yml`
+      # would be running. The provenance below says who built the artifact; this
+      # is what keeps that a claim worth having.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
 
       - name: goreleaser
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6.4.0
