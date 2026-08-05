@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,7 +13,21 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
+
+// openTestStateDir gives a Driver a real, opened state dir in a temp directory —
+// what Run does for itself. Tests that call drainWithRetries directly need it,
+// because that path writes a per-iteration log.
+func openTestStateDir(t *testing.T, d *Driver) {
+	t.Helper()
+	st, err := statedir.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("statedir.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	d.state = st
+}
 
 // --- Fakes for the two seams the loop depends on: harness.Adapter and
 // backlog.Poller. Both are injected via loop.New. The fakes model the real
@@ -328,7 +343,7 @@ func TestDrainWithRetries_ResetPastBudgetStopsInsteadOfWaiting(t *testing.T) {
 	// A 30m ceiling with the run just started: 30m of budget left, reset in 3h.
 	cfg.Budget = config.Budget{MaxWallClock: config.Duration(30 * time.Minute)}
 	d := New(cfg, h, &fakePoller{})
-	d.stateDir = t.TempDir()
+	openTestStateDir(t, d)
 
 	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Now())
 
@@ -357,7 +372,7 @@ func TestDrainWithRetries_ResetInsideBudgetStillWaits(t *testing.T) {
 	// A 4h ceiling with the run just started: the 1m reset fits easily.
 	cfg.Budget = config.Budget{MaxWallClock: config.Duration(4 * time.Hour)}
 	d := New(cfg, h, &fakePoller{})
-	d.stateDir = t.TempDir()
+	openTestStateDir(t, d)
 
 	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Now())
 
@@ -514,7 +529,7 @@ func TestDrainWithRetries(t *testing.T) {
 			cfg.MaxRetries = tc.maxRetries
 			h := &fakeAdapter{steps: tc.steps, probeResults: tc.probeResults}
 			d := New(cfg, h, &fakePoller{})
-			d.stateDir = t.TempDir() // drainWithRetries writes per-iteration logs here
+			openTestStateDir(t, d) // drainWithRetries writes per-iteration logs here
 
 			tokens, cost, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Time{})
 
@@ -557,7 +572,7 @@ func TestDrainWithRetries_StatedResetPassed(t *testing.T) {
 		limitResetAt: time.Now().Add(-time.Hour), // already past
 	}
 	d := New(cfg, h, &fakePoller{})
-	d.stateDir = t.TempDir()
+	openTestStateDir(t, d)
 
 	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Time{})
 	if err != nil {
@@ -1239,4 +1254,166 @@ func TestRun_NoReleaserIsNotFatal(t *testing.T) {
 	if err := NewMulti(cfg, h, []Target{{Poller: busyPoller()}}).Run(ctx); err != nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// State-dir confinement (CLA-259). The daemon runs OUTSIDE the sandbox its own
+// sessions run inside, so anything it writes on a path a session can influence
+// is that sandbox defeated by proxy. These drive the behaviour rather than
+// asserting a mode: a real drain, then look at what is on disk.
+
+// A transcript records whatever the harness printed — prompts, tool arguments,
+// occasionally a token. No other user on the machine may read one.
+func TestDrainWritesOwnerOnlyTranscripts(t *testing.T) {
+	cfg := fastCfg()
+	dir := t.TempDir()
+	cfg.StateDir = dir
+	cfg.MaxIterations = 1
+	if err := runLoop(t, cfg, &fakeAdapter{}, &fakePoller{sum: backlog.Summary{Claimable: 1}}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	logs := iterationLogs(t, dir)
+	if len(logs) != 1 {
+		t.Fatalf("got %d iteration logs, want 1: %v", len(logs), logs)
+	}
+	fi, err := os.Lstat(filepath.Join(dir, logs[0]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o600 {
+		t.Errorf("iteration log mode: got %04o, want 0600", got)
+	}
+	if di, err := os.Lstat(dir); err != nil {
+		t.Fatal(err)
+	} else if got := di.Mode().Perm(); got != 0o700 {
+		t.Errorf("state dir mode: got %04o, want 0700", got)
+	}
+}
+
+// The self-ignoring .gitignore, so a state dir an operator points back inside a
+// repo can still never be staged by an unattended `git add -A`.
+func TestDrainLeavesTheStateDirUnstageable(t *testing.T) {
+	cfg := fastCfg()
+	dir := t.TempDir()
+	cfg.StateDir = dir
+	cfg.MaxIterations = 1
+	if err := runLoop(t, cfg, &fakeAdapter{}, &fakePoller{sum: backlog.Summary{Claimable: 1}}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, ".gitignore"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != "*\n" {
+		t.Errorf(".gitignore body: got %q, want %q", b, "*\n")
+	}
+}
+
+// The log name used to be derivable to within a second by the very session whose
+// transcript it holds, which is all a pre-planted decoy needs.
+func TestIterationLogNamesAreNotGuessable(t *testing.T) {
+	cfg := fastCfg()
+	dir := t.TempDir()
+	cfg.StateDir = dir
+	cfg.MaxIterations = 3
+	if err := runLoop(t, cfg, &fakeAdapter{}, &fakePoller{sum: backlog.Summary{Claimable: 1}}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	logs := iterationLogs(t, dir)
+	if len(logs) != 3 {
+		t.Fatalf("got %d iteration logs, want 3: %v", len(logs), logs)
+	}
+	seen := map[string]bool{}
+	for _, name := range logs {
+		tail := strings.TrimSuffix(name[strings.LastIndexByte(name, '-')+1:], ".log")
+		if len(tail) != 8 {
+			t.Fatalf("log %q has no 8-hex random tail", name)
+		}
+		if seen[tail] {
+			t.Errorf("log tail %q repeated — it is not random", tail)
+		}
+		seen[tail] = true
+	}
+}
+
+// The escape this task closes: a session pre-plants a symlink at a path the
+// daemon writes, and the daemon truncates a file the session cannot reach. The
+// log name is unguessable now, so this drives the guarantee directly — every
+// name is refused, and the victim survives.
+func TestIterationLogNeverWritesThroughAPlantedSymlink(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	openTestStateDir(t, d)
+
+	victim := filepath.Join(t.TempDir(), "authorized_keys")
+	const body = "ssh-ed25519 AAAA... operator@laptop\n"
+	if err := os.WriteFile(victim, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Plant the link at every name a drain could pick this second, plus the whole
+	// fan of attempt counters — the pre-CLA-259 attack, minus the guessing.
+	stamp := time.Now().Format("20060102-150405")
+	planted := 0
+	for a := 0; a < 4; a++ {
+		name := fmt.Sprintf("iteration-%s-d1-a%d-%s.log", stamp, a, randomTail())
+		if err := os.Symlink(victim, filepath.Join(d.state.Path(), name)); err != nil {
+			t.Fatal(err)
+		}
+		planted++
+		// Prove the guard directly on the exact name, not only on the drain's pick.
+		if f, err := d.state.Create(name); err == nil {
+			f.Close()
+			t.Fatalf("Create(%q) through a planted symlink succeeded", name)
+		}
+	}
+	if planted == 0 {
+		t.Fatal("planted nothing")
+	}
+
+	if _, _, _, err := d.drainWithRetries(context.Background(), 1, d.targets[0], time.Now()); err != nil {
+		t.Fatalf("drain returned error: %v", err)
+	}
+	got, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body {
+		t.Errorf("the symlink target was written through: got %q, want %q", got, body)
+	}
+}
+
+// A marker is the operator's switch. Following a symlink at STOP would let
+// whoever planted it choose a file for the daemon to open and a line of it to
+// echo into the log.
+func TestMarkersAreNotReadThroughASymlink(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	openTestStateDir(t, d)
+
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte("sk-live-hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(d.state.Path(), "STOP")); err != nil {
+		t.Fatal(err)
+	}
+
+	if present, msg := d.readMarker("STOP"); present {
+		t.Errorf("a symlinked STOP was honoured, carrying %q", msg)
+	}
+}
+
+// iterationLogs lists the per-iteration transcripts in a state dir.
+func iterationLogs(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "iteration-") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
 }

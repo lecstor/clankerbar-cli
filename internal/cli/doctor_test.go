@@ -68,6 +68,10 @@ func envWithPoll(sum backlog.Summary, err error) doctorEnv {
 // disposable so the workdir check writes into the test's temp dir.
 func validCfg(t *testing.T) *config.Config {
 	t.Helper()
+	// The state dir now defaults OUTSIDE the workdir, under XDG_STATE_HOME
+	// (CLA-259). Point that at a temp dir so no test touches the real
+	// ~/.local/state, and so each test gets its own.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	cfg := &config.Config{
 		Harness: "claude",
 		Prompt:  "Work the backlog.",
@@ -361,14 +365,23 @@ func TestConfigDirWithAuthStatePasses(t *testing.T) {
 
 // --- state dir ---------------------------------------------------------------
 
+func mustResolveStateDir(t *testing.T, cfg *config.Config) string {
+	t.Helper()
+	dir, err := cfg.ResolveStateDir()
+	if err != nil {
+		t.Fatalf("ResolveStateDir: %v", err)
+	}
+	return dir
+}
+
 // A leftover marker is the failure that looks exactly like "the backlog was
 // empty": the loop stops on its first tick and exits clean.
 func TestStateDirLeftoverMarkersWarn(t *testing.T) {
 	for _, marker := range []string{"HALT", "STOP"} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := validCfg(t)
-			stateDir := cfg.ResolveStateDir()
-			if err := os.MkdirAll(stateDir, 0o755); err != nil {
+			stateDir := mustResolveStateDir(t, cfg)
+			if err := os.MkdirAll(stateDir, 0o700); err != nil {
 				t.Fatal(err)
 			}
 			if err := os.WriteFile(filepath.Join(stateDir, marker), []byte("stale"), 0o600); err != nil {
@@ -399,14 +412,68 @@ func TestStateDirUnwritableFails(t *testing.T) {
 		t.Skip("root ignores the permission bits this test relies on")
 	}
 	cfg := validCfg(t)
-	stateDir := cfg.ResolveStateDir()
-	if err := os.MkdirAll(stateDir, 0o555); err != nil {
+	stateDir := mustResolveStateDir(t, cfg)
+	if err := os.MkdirAll(filepath.Dir(stateDir), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o755) })
+	if err := os.Mkdir(stateDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
 
 	if c := checkStateDir(cfg); c.status != fail {
 		t.Errorf("read-only state dir: got %v, want FAIL (%s)", c.status, c.detail)
+	}
+}
+
+// The mode tightening must only ever REMOVE permission. A state dir an operator
+// deliberately made read-only stays read-only (0555 -> 0500, not 0700): the tool
+// clears the group/other bits that leak transcripts, it does not hand itself
+// write access to a directory somebody locked.
+func TestStateDirTighteningNeverWidens(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the permission bits this test relies on")
+	}
+	cfg := validCfg(t)
+	stateDir := mustResolveStateDir(t, cfg)
+	if err := os.MkdirAll(filepath.Dir(stateDir), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(stateDir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stateDir, 0o700) })
+
+	_ = checkStateDir(cfg)
+
+	fi, err := os.Lstat(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := fi.Mode().Perm(); got != 0o500 {
+		t.Errorf("0555 state dir after doctor: got %04o, want 0500", got)
+	}
+}
+
+// The pre-CLA-259 state dir left in the workdir is a WARN, not silence: markers
+// touched there do nothing now, and its transcripts sit inside a repo an
+// unattended agent commits from.
+func TestStateDirLegacyInWorkdirWarns(t *testing.T) {
+	cfg := validCfg(t)
+	legacy := filepath.Join(cfg.WorkDir, ".clankerbar-loop")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("leftover in-workdir state dir: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, legacy) {
+		t.Errorf("detail should name %s, got %q", legacy, c.detail)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN must carry a remedy")
 	}
 }
 
@@ -1062,6 +1129,7 @@ func TestMCPServersCheckPassesWithoutLocalCommands(t *testing.T) {
 // an .mcp.json where the config will discover it.
 func validCfgIn(t *testing.T, workdir string) *config.Config {
 	t.Helper()
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	cfg := &config.Config{Harness: "claude", Prompt: "Work the backlog.", WorkDir: workdir}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture config does not validate: %v", err)

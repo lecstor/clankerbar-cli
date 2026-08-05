@@ -15,6 +15,8 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -34,6 +36,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
 // status is a check's verdict. The ordering matters only for reporting.
@@ -473,30 +476,45 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 // separate, per-project concern — see checkSessions.
 func checkStateDir(cfg *config.Config) check {
 	c := check{name: "state_dir"}
-	stateDir := cfg.ResolveStateDir()
-
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	stateDir, err := cfg.ResolveStateDir()
+	if err != nil {
 		c.status = fail
-		c.detail = stateDir + " is not creatable: " + err.Error()
-		c.remedy = "create it by hand, or point state_dir somewhere writable"
+		c.detail = "cannot resolve the state dir: " + err.Error()
+		c.remedy = "set state_dir explicitly, or XDG_STATE_HOME"
 		return c
 	}
+
+	// Open it exactly as the loop will, so the preflight exercises the real
+	// creation, the real mode tightening, the real symlink refusal and the real
+	// .gitignore — not an approximation that could pass where the loop fails.
+	dir, err := statedir.Open(stateDir)
+	if err != nil {
+		c.status = fail
+		c.detail = err.Error()
+		c.remedy = "fix its permissions or ownership, or point state_dir at a real directory you own"
+		return c
+	}
+	defer dir.Close()
+
 	// Creatable is not writable: an already-existing state dir can be read-only,
-	// and the loop writes a log per iteration. Prove it with a real write.
-	probe := filepath.Join(stateDir, ".doctor-write-probe")
-	if err := os.WriteFile(probe, []byte("ok"), 0o600); err != nil {
+	// and the loop writes a log per iteration. Prove it with a real write, under
+	// a name nobody could have got to first — a fixed probe name in a directory
+	// somebody else can write is a path they can point at a file of their
+	// choosing, and this used to truncate whatever it found there (CLA-259).
+	probe := ".doctor-write-probe-" + randomTail()
+	if err := dir.WriteFile(probe, []byte("ok")); err != nil {
 		c.status = fail
 		c.detail = stateDir + " is not writable: " + err.Error()
 		c.remedy = "fix its permissions, or point state_dir somewhere writable"
 		return c
 	}
-	_ = os.Remove(probe)
+	_ = dir.Remove(probe)
 
 	// A leftover marker stops the loop on its first tick — the failure that looks
 	// exactly like "the backlog was empty".
 	var found []string
 	for _, m := range []string{"HALT", "STOP"} {
-		if _, err := os.Stat(filepath.Join(stateDir, m)); err == nil {
+		if dir.Exists(m) {
 			found = append(found, m)
 		}
 	}
@@ -507,9 +525,28 @@ func checkStateDir(cfg *config.Config) check {
 		return c
 	}
 
+	// The state dir moved out of the workdir in CLA-259. A leftover one in the old
+	// place is worth a WARN on both counts an operator cares about: markers they
+	// touch there do nothing, and the transcripts already in it are sitting inside
+	// a repo an unattended agent commits from.
+	if legacy := cfg.LegacyStateDir(); legacy != "" {
+		c.status = warn
+		c.detail = stateDir + " writable; " + legacy + " is a leftover from before the state dir moved out of the workdir"
+		c.remedy = "markers there are ignored now — move anything you want out of it, then: rm -rf " + legacy
+		return c
+	}
+
 	c.status = pass
 	c.detail = stateDir + " writable, no stop markers"
 	return c
+}
+
+// randomTail is an unguessable filename suffix. See loop.randomTail — the same
+// reasoning, for the probe this check writes.
+func randomTail() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // --- 6. session workdirs -----------------------------------------------------
