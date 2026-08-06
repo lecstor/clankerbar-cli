@@ -9,6 +9,8 @@ package loop
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -22,6 +24,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
 // Target is one backlog a Driver drives: a project's cheap poller plus where that
@@ -55,7 +58,7 @@ type Driver struct {
 	targets  []Target
 	paused   []bool // per-target console-pause state, to log transitions once
 	cursor   int    // round-robin position over targets (last drained)
-	stateDir string
+	state    *statedir.Dir
 	blind    bool // no cheap backlog read available — drain then idle-poll
 
 	// Per-target no-progress state. `claimable > 0` is a claim that work is
@@ -97,15 +100,35 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 // keeps polling. Returns nil on a graceful stop; an error only on an unexpected,
 // non-retryable failure.
 func (d *Driver) Run(ctx context.Context) error {
-	d.stateDir = d.cfg.ResolveStateDir()
-	if err := os.MkdirAll(d.stateDir, 0o755); err != nil {
-		return err
+	// A caller may have opened the state dir already (tests, and any future entry
+	// point that wants to fail before spawning anything). Opening it here is the
+	// normal path.
+	if d.state == nil {
+		dir, err := d.cfg.ResolveStateDir()
+		if err != nil {
+			return err
+		}
+		st, err := statedir.Open(dir, d.cfg.SessionWorkDirs()...)
+		if err != nil {
+			return err
+		}
+		d.state = st
+		defer func() {
+			_ = st.Close()
+			d.state = nil
+		}()
 	}
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
-	log.Printf("driving %s; state in %s; idle poll every %s", d.h.Name(), d.stateDir, idle)
+	log.Printf("driving %s; state in %s; idle poll every %s", d.h.Name(), d.state.Path(), idle)
+	// Say it once, loudly, if the pre-CLA-259 directory is still sitting in the
+	// workdir: an operator who touches STOP there would otherwise watch the loop
+	// ignore it and conclude the stop switch is broken.
+	if legacy := d.cfg.LegacyStateDir(); legacy != "" {
+		log.Printf("note: %s is left over from before the state dir moved out of the workdir — markers there are IGNORED, and its old transcripts are still world-readable inside your repo; move or delete it", legacy)
+	}
 
 	start := time.Now()
 	var totalTokens int
@@ -118,11 +141,11 @@ func (d *Driver) Run(ctx context.Context) error {
 			return nil
 		}
 		if present, msg := d.readMarker("HALT"); present {
-			log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.stateDir, "HALT"))
+			log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
 			return nil
 		}
 		if present, _ := d.readMarker("STOP"); present {
-			_ = os.Remove(filepath.Join(d.stateDir, "STOP"))
+			_ = d.state.Remove("STOP")
 			log.Print("STOP requested — stopping")
 			return nil
 		}
@@ -271,11 +294,21 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, s
 		// Each attempt streams live to the terminal and to its own logfile. The name
 		// carries the drain number and attempt counter as well as the timestamp: two
 		// attempts in the same second (a sub-second backoff) would otherwise share a
-		// name and os.Create would truncate the earlier attempt's log.
+		// name, and a name already taken is REFUSED rather than truncated.
+		//
+		// The random tail is not decoration. This log carries the session's whole
+		// output — prompts, tool arguments, tool output, occasionally a token — and
+		// the rest of the name is derivable to within a second by the session that
+		// produced it. Unguessable names mean a session that CAN write to the state
+		// dir (an operator who pointed state_dir back inside the workdir) still
+		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
+		// refuses an existing path either way; this stops it turning into a denial
+		// of the log itself.
 		inv := d.invocation(t, false)
-		logPath := filepath.Join(d.stateDir, fmt.Sprintf("iteration-%s-d%d-a%d.log",
-			time.Now().Format("20060102-150405"), drainNum, retries))
-		f, ferr := os.Create(logPath)
+		logName := fmt.Sprintf("iteration-%s-d%d-a%d-%s.log",
+			time.Now().Format("20060102-150405"), drainNum, retries, randomTail())
+		f, ferr := d.state.Create(logName)
+		logPath := filepath.Join(d.state.Path(), logName)
 		if ferr == nil {
 			inv.Console = io.MultiWriter(os.Stderr, f)
 		} else {
@@ -635,7 +668,7 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 	end := time.Now().Add(dur)
 	for {
 		if present, _ := d.readMarker("STOP"); present {
-			_ = os.Remove(filepath.Join(d.stateDir, "STOP"))
+			_ = d.state.Remove("STOP")
 			log.Print("STOP requested during wait — stopping")
 			return true
 		}
@@ -660,8 +693,13 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 }
 
 // readMarker reports whether a control marker file exists, and its first line.
+//
+// A marker is the operator's switch, so it is read through the state dir handle:
+// a symlink at the name is refused rather than followed, and the read is capped.
+// Following one would let whoever planted it choose a file for us to open and a
+// line of it to echo into the daemon's log.
 func (d *Driver) readMarker(name string) (bool, string) {
-	b, err := os.ReadFile(filepath.Join(d.stateDir, name))
+	b, err := d.state.ReadFile(name)
 	if err != nil {
 		return false, ""
 	}
@@ -670,6 +708,18 @@ func (d *Driver) readMarker(name string) (bool, string) {
 		line = line[:i]
 	}
 	return true, line
+}
+
+// randomTail is the unguessable part of an iteration log's name. crypto/rand,
+// not math/rand: the whole point is that the session whose transcript this is
+// cannot predict it, and a seeded PRNG in a daemon it can watch start is not
+// unpredictable. rand.Read never fails on any supported platform (it panics
+// internally rather than returning an error), so there is no fallback branch to
+// get wrong.
+func randomTail() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 func resetSuffix(t time.Time) string {

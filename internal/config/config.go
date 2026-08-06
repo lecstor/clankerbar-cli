@@ -4,6 +4,8 @@
 package config
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -87,7 +89,9 @@ type Config struct {
 	Budget Budget `json:"budget"`
 
 	// StateDir holds the loop's control markers (STOP/HALT) and per-iteration
-	// logs. Empty = "<workdir>/.clankerbar-loop".
+	// logs. Empty = an XDG state path OUTSIDE the workdir, keyed to it — see
+	// ResolveStateDir. Setting it back inside the workdir is allowed and is the
+	// operator's call to make; the hardening in internal/statedir holds either way.
 	StateDir string `json:"state_dir"`
 
 	// SettingsPath points the harness at an extra settings file (Claude Code's
@@ -124,6 +128,13 @@ type Config struct {
 
 	source string   // path the config was loaded from, for diagnostics
 	env    []string // resolved KEY=VALUE pairs (built in Validate)
+
+	// workDirImplicit records that WorkDir arrived empty and Validate filled it in
+	// from the cwd. The value is then absolute like any other, so nothing
+	// downstream can tell the difference — but the state dir hangs off it, and an
+	// operator diagnosing "doctor says no STOP marker but the loop will not start"
+	// needs to be told the two processes were started in different places.
+	workDirImplicit bool
 }
 
 // Project is one backlog a multi-project instance drives (CLA-142).
@@ -483,6 +494,31 @@ func (c *Config) Validate() error {
 	c.SettingsPath = expandHome(c.SettingsPath)
 	c.StateDir = expandHome(c.StateDir)
 
+	// The workdir becomes absolute HERE, once, before anything is derived from it
+	// — the same treatment MCPConfigPath/SettingsPath/ConfigDir get on the next
+	// three lines. It used to stay as written and be resolved at each point of use
+	// against whatever cwd that process had, so one config file described
+	// different runs: `clankerbar run` from the repo and `clankerbar doctor` from
+	// ~ hashed to two DIFFERENT state dirs (ResolveStateDir -> stateSlug). Doctor
+	// then reported "no stop markers" about a directory the running loop had never
+	// opened, and a stray state dir accumulated at every cwd anyone invoked from.
+	// Before CLA-259 the same cwd-dependence was at least visible as
+	// `./.clankerbar-loop`; a hashed name under ~/.local/state hides it.
+	//
+	// An empty workdir still means "where the daemon was started" — that is the
+	// directory the child inherits either way. It is just pinned now, not re-read.
+	// Sticky: Validate is not guaranteed to be called only once, and a second call
+	// sees the absolute value the first one wrote — it would then answer
+	// "configured" about a workdir nobody configured.
+	if c.WorkDir == "" {
+		c.workDirImplicit = true
+	}
+	absWorkDir, err := filepath.Abs(c.WorkDir)
+	if err != nil {
+		return fmt.Errorf("workdir %s: %w", c.WorkDir, err)
+	}
+	c.WorkDir = absWorkDir
+
 	c.MCPConfigPath = underWorkDir(c.MCPConfigPath, c.WorkDir)
 	c.SettingsPath = underWorkDir(c.SettingsPath, c.WorkDir)
 	c.ConfigDir = underWorkDir(c.ConfigDir, c.WorkDir)
@@ -549,6 +585,17 @@ func (c *Config) Validate() error {
 		}
 		seen[p.Slug] = true
 		p.WorkDir = expandHome(p.WorkDir)
+		if p.WorkDir != "" {
+			// Absolute for the same reason the top-level workdir is, and so
+			// SessionWorkDirs can be compared against a state dir path lexically.
+			// Left empty when empty: that means "the top-level workdir", which is
+			// already absolute, and filling it in here would hide the fallback.
+			abs, err := filepath.Abs(p.WorkDir)
+			if err != nil {
+				return fmt.Errorf("projects[%d].workdir %s: %w", i, p.WorkDir, err)
+			}
+			p.WorkDir = abs
+		}
 		p.MCPConfigPath = expandHome(p.MCPConfigPath)
 		// Against the workdir the SESSIONS for this project get - its own, falling
 		// back to the top-level one, exactly as loop.Driver.invocation resolves it.
@@ -636,16 +683,171 @@ func resolveEnv(m map[string]string) ([]string, error) {
 // populated by Validate. Nil when no env is configured.
 func (c *Config) EnvSlice() []string { return c.env }
 
-// ResolveStateDir returns where control markers and logs live.
-func (c *Config) ResolveStateDir() string {
+// legacyStateDirName is where the state dir used to live, relative to the
+// workdir. Kept only so `doctor` and the loop can point an operator at a
+// leftover one — nothing reads markers from it (see LegacyStateDir).
+const legacyStateDirName = ".clankerbar-loop"
+
+// ResolveStateDir returns the absolute path where control markers and iteration
+// logs live.
+//
+// It defaults OUTSIDE the workdir (CLA-259), to
+// `$XDG_STATE_HOME/clankerbar/loop/<slug>` — `~/.local/state/...` when that
+// variable is unset. It used to be `<workdir>/.clankerbar-loop`, which put the
+// daemon's own writes inside the one tree its spawned sessions are permitted to
+// write, and that placement was the root of three separate defects rather than a
+// detail: transcripts a session could read or commit, and paths a session could
+// pre-plant a symlink at to make the daemon truncate a file outside the
+// confinement the adapters impose on the session. Moving it removes the class
+// instead of guarding three symptoms — the session cannot reach the directory at
+// all.
+//
+// The slug is `<workdir basename>-<hash of its absolute path>`. The hash keeps
+// two checkouts that share a basename apart; the basename keeps the directory
+// recognisable when an operator goes looking for a transcript. It is derived
+// from the cleaned absolute path and nothing else — deliberately NOT from
+// EvalSymlinks, because a symlinked workdir that resolves differently once its
+// target exists would silently move an operator's STOP marker out from under
+// them.
+//
+// An explicit state_dir always wins, including one pointed back inside the
+// workdir: that is a supported thing to want, and internal/statedir keeps its
+// guarantees there too.
+func (c *Config) ResolveStateDir() (string, error) {
 	if c.StateDir != "" {
-		return c.StateDir
+		abs, err := filepath.Abs(c.StateDir)
+		if err != nil {
+			return "", fmt.Errorf("state_dir %s: %w", c.StateDir, err)
+		}
+		return abs, nil
 	}
+	abs, err := c.absWorkDir()
+	if err != nil {
+		return "", err
+	}
+	home, err := stateHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "clankerbar", "loop", stateSlug(abs)), nil
+}
+
+// LegacyStateDir is the pre-CLA-259 `<workdir>/.clankerbar-loop`, returned only
+// when it still exists on disk AND is not where we are actually writing. It is
+// reported, never read: honouring a STOP marker there would hand a spawned
+// session the daemon's stop switch back, which is half of what moving the
+// directory bought. Empty means there is nothing to tell the operator about.
+func (c *Config) LegacyStateDir() string {
+	abs, err := c.absWorkDir()
+	if err != nil {
+		return ""
+	}
+	legacy := filepath.Join(abs, legacyStateDirName)
+	if current, err := c.ResolveStateDir(); err != nil || current == legacy {
+		return ""
+	}
+	if _, err := os.Lstat(legacy); err != nil {
+		return ""
+	}
+	return legacy
+}
+
+// absWorkDir is the workdir as an absolute, cleaned path.
+//
+// Validate already made WorkDir absolute (see the comment there — resolving it
+// per use against the caller's cwd is what gave one config file two state dirs).
+// The fallback is only for a Config that was never validated, which is tests and
+// nothing else.
+func (c *Config) absWorkDir() (string, error) {
 	base := c.WorkDir
 	if base == "" {
 		base = "."
 	}
-	return filepath.Join(base, ".clankerbar-loop")
+	abs, err := filepath.Abs(base)
+	if err != nil {
+		return "", fmt.Errorf("workdir %s: %w", base, err)
+	}
+	return abs, nil
+}
+
+// WorkDirIsImplicit reports whether the workdir was taken from the directory
+// this process started in rather than configured. Validate pins it either way,
+// so the only thing that still varies between two invocations of the SAME config
+// is this case — which is worth saying out loud, because the state dir's name is
+// a hash and the divergence is otherwise invisible.
+func (c *Config) WorkDirIsImplicit() bool { return c.workDirImplicit }
+
+// SessionWorkDirs is every directory a spawned session actually runs in,
+// absolute, resolved the way the loop resolves them.
+//
+// It is the CONFINEMENT boundary expressed as paths: a session may write
+// anywhere under one of these and nowhere else, so these are exactly the trees
+// in which a symlink is something that may have been planted rather than
+// something the operator laid out. statedir.Open takes them for that reason.
+func (c *Config) SessionWorkDirs() []string {
+	if len(c.Projects) == 0 {
+		abs, err := c.absWorkDir()
+		if err != nil {
+			return nil
+		}
+		return []string{abs}
+	}
+	out := make([]string, 0, len(c.Projects))
+	for _, p := range c.Projects {
+		dir := p.WorkDir
+		if dir == "" {
+			dir = c.WorkDir
+		}
+		if abs, err := filepath.Abs(dir); err == nil {
+			out = append(out, abs)
+		}
+	}
+	return out
+}
+
+// stateHome is $XDG_STATE_HOME, or ~/.local/state. A relative XDG_STATE_HOME is
+// ignored rather than honoured: the spec says the variable must hold an absolute
+// path, and a relative one would resolve against whatever cwd the daemon happens
+// to have been started in — the exact ambiguity underWorkDir exists to stamp out.
+func stateHome() (string, error) {
+	if v := os.Getenv("XDG_STATE_HOME"); filepath.IsAbs(v) {
+		return filepath.Clean(v), nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot locate a home directory for the loop's state dir (set state_dir, or XDG_STATE_HOME): %w", err)
+	}
+	return filepath.Join(home, ".local", "state"), nil
+}
+
+// stateSlug names one workdir's state directory: a readable basename plus a hash
+// of the full path, so it is both recognisable and unambiguous.
+func stateSlug(absWorkDir string) string {
+	sum := sha256.Sum256([]byte(absWorkDir))
+	return sanitizeSlug(filepath.Base(absWorkDir)) + "-" + hex.EncodeToString(sum[:8])
+}
+
+// sanitizeSlug reduces a directory basename to something plainly safe as one
+// path component: no separators, no dot-prefix, no surprises from a checkout
+// named by someone else.
+func sanitizeSlug(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), ".-")
+	if len(out) > 40 {
+		out = out[:40]
+	}
+	if out == "" {
+		return "workdir"
+	}
+	return out
 }
 
 // Source is the file the config was loaded from ("" if none).
