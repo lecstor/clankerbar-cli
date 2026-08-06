@@ -139,3 +139,100 @@ func TestStateSlugIsAlwaysOnePathComponent(t *testing.T) {
 		}
 	}
 }
+
+// The state dir is pinned when the config is VALIDATED, not recomputed at each
+// point of use. It used to be derived from `filepath.Abs(WorkDir)` on demand, so
+// one config described a different run depending on where the process stood:
+// `clankerbar run` and `clankerbar doctor` could hash to two different state
+// dirs, and doctor would report "no stop markers" about a directory the running
+// loop had never opened. Before CLA-259 that cwd-dependence was at least visible
+// as `./.clankerbar-loop`; a hashed name under ~/.local/state hides it.
+func TestStateDirIsPinnedAtValidateNotAtUse(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	work := t.TempDir()
+	t.Chdir(filepath.Dir(work))
+
+	c := defaults()
+	c.WorkDir = filepath.Base(work) // relative, as a hand-written config may well be
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if !filepath.IsAbs(c.WorkDir) {
+		t.Errorf("workdir after Validate = %q, want an absolute path", c.WorkDir)
+	}
+
+	before := resolve(t, c)
+	t.Chdir(t.TempDir())
+	after := resolve(t, c)
+
+	if before != after {
+		t.Errorf("state dir moved with the process cwd:\n  before chdir: %s\n  after chdir:  %s", before, after)
+	}
+}
+
+// An unset workdir still means "where this process was started" - it is the one
+// thing about a validated config that two invocations can legitimately disagree
+// on, so doctor is told to say so rather than print a hash and leave it there.
+func TestWorkDirIsImplicitOnlyWhenItWasNotConfigured(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	c := defaults()
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if !c.WorkDirIsImplicit() {
+		t.Error("an unset workdir should be reported as implicit")
+	}
+
+	c2 := defaults()
+	c2.WorkDir = t.TempDir()
+	if err := c2.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if c2.WorkDirIsImplicit() {
+		t.Error("a configured workdir should not be reported as implicit")
+	}
+}
+
+// The workdir a session is spawned in is the boundary statedir.Open is handed to
+// tell a planted symlink from the operator's own filesystem layout, so it has to
+// be absolute and it has to cover every project.
+func TestSessionWorkDirsAreAbsoluteAndCoverEveryProject(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	top := t.TempDir()
+	other := t.TempDir()
+
+	c := defaults()
+	c.WorkDir = top
+	c.Projects = []Project{
+		{Slug: "alpha"},
+		{Slug: "beta", WorkDir: other},
+	}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	got := c.SessionWorkDirs()
+	want := []string{top, other}
+	if len(got) != len(want) {
+		t.Fatalf("SessionWorkDirs() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("SessionWorkDirs()[%d] = %q, want %q", i, got[i], want[i])
+		}
+		if !filepath.IsAbs(got[i]) {
+			t.Errorf("SessionWorkDirs()[%d] = %q, want an absolute path", i, got[i])
+		}
+	}
+
+	// No projects: the top-level workdir is the only place sessions run.
+	c2 := defaults()
+	c2.WorkDir = top
+	if err := c2.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	if got := c2.SessionWorkDirs(); len(got) != 1 || got[0] != top {
+		t.Errorf("SessionWorkDirs() with no projects = %v, want [%s]", got, top)
+	}
+}

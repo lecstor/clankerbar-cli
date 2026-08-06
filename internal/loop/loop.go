@@ -108,7 +108,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		st, err := statedir.Open(dir)
+		st, err := statedir.Open(dir, d.cfg.SessionWorkDirs()...)
 		if err != nil {
 			return err
 		}

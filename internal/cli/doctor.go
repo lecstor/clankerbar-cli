@@ -487,11 +487,15 @@ func checkStateDir(cfg *config.Config) check {
 	// Open it exactly as the loop will, so the preflight exercises the real
 	// creation, the real mode tightening, the real symlink refusal and the real
 	// .gitignore — not an approximation that could pass where the loop fails.
-	dir, err := statedir.Open(stateDir)
+	dir, err := statedir.Open(stateDir, cfg.SessionWorkDirs()...)
 	if err != nil {
 		c.status = fail
 		c.detail = err.Error()
-		c.remedy = "fix its permissions or ownership, or point state_dir at a real directory you own"
+		// Deliberately generic: Open refuses for several distinct reasons — mode,
+		// ownership, a symlink on the path, a directory that is somebody else's —
+		// and each of those errors already names the path and the way out. A
+		// specific remedy here would contradict most of them.
+		c.remedy = "point state_dir at a directory you own that is empty or already a clankerbar state dir; the message above says which part is wrong"
 		return c
 	}
 	defer dir.Close()
@@ -538,6 +542,15 @@ func checkStateDir(cfg *config.Config) check {
 
 	c.status = pass
 	c.detail = stateDir + " writable, no stop markers"
+	// The state dir's name is a hash of the workdir, so when the workdir itself
+	// came from the cwd, this line is about a directory that MOVES with where the
+	// operator happened to be standing: doctor from ~ and `run` from the checkout
+	// then talk about two different directories, and doctor's "no stop markers" is
+	// true of one the loop never opens. Say which directory it resolved from.
+	if cfg.WorkDirIsImplicit() {
+		c.detail += " (workdir not configured - derived from " + cfg.WorkDir + ")"
+		c.remedy = "set workdir so the state dir does not move with the directory you run from"
+	}
 	return c
 }
 
@@ -980,29 +993,16 @@ func policySettingsPaths(cfg *config.Config) []string {
 			filepath.Join(cfg.ConfigDir, "settings.local.json"),
 		)
 	}
-	for _, dir := range sessionWorkDirs(cfg) {
-		if dir == "" {
-			dir = "."
-		}
+	// config owns this list: it is the confinement boundary, and statedir.Open is
+	// handed the same one. Two copies of "where do sessions run" is exactly the
+	// drift projectWorkDir exists to prevent.
+	for _, dir := range cfg.SessionWorkDirs() {
 		paths = append(paths,
 			filepath.Join(dir, ".claude", "settings.json"),
 			filepath.Join(dir, ".claude", "settings.local.json"),
 		)
 	}
 	return paths
-}
-
-// sessionWorkDirs is the set of directories sessions are actually spawned in,
-// resolved the way the loop resolves them.
-func sessionWorkDirs(cfg *config.Config) []string {
-	if len(cfg.Projects) == 0 {
-		return []string{cfg.WorkDir}
-	}
-	out := make([]string, 0, len(cfg.Projects))
-	for _, p := range cfg.Projects {
-		out = append(out, projectWorkDir(cfg, p))
-	}
-	return out
 }
 
 // grantedCommands returns, per Bash command head, whether the policy grants it

@@ -420,8 +420,10 @@ func TestRelativeSettingsAndConfigDirResolveAgainstTheWorkDir(t *testing.T) {
 	}
 }
 
-// An ABSOLUTE path, and a relative one with no workdir to resolve against, are
-// both left exactly as written.
+// An ABSOLUTE path is left exactly as written. A relative one with no workdir
+// resolves against the cwd the daemon started in — the very directory the child
+// would have inherited, so the file vetted is still the file used; it is just
+// pinned once by Validate instead of re-resolved at each point of use.
 func TestAbsolutePathsAndNoWorkDirAreLeftAlone(t *testing.T) {
 	abs := filepath.Join(t.TempDir(), "headless.json")
 	if err := os.WriteFile(abs, []byte(`{}`), 0o600); err != nil {
@@ -437,15 +439,23 @@ func TestAbsolutePathsAndNoWorkDirAreLeftAlone(t *testing.T) {
 		t.Errorf("absolute settings_path was rewritten to %q", c.SettingsPath)
 	}
 
-	// No workdir: the child inherits our cwd, so relative already means the same
-	// thing on both sides and must not be rewritten.
+	// No workdir: the child inherits our cwd, so relative means the same thing on
+	// both sides — and Validate now says which directory that is, rather than
+	// leaving every later use to ask its own process.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
 	c2 := defaults()
 	c2.SettingsPath = "headless.json"
 	if err := c2.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
-	if c2.SettingsPath != "headless.json" {
-		t.Errorf("relative settings_path was rewritten with no workdir: %q", c2.SettingsPath)
+	if want := filepath.Join(cwd, "headless.json"); c2.SettingsPath != want {
+		t.Errorf("relative settings_path with no workdir = %q, want %q", c2.SettingsPath, want)
+	}
+	if c2.WorkDir != cwd {
+		t.Errorf("empty workdir = %q, want the cwd %q", c2.WorkDir, cwd)
 	}
 }
 
