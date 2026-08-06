@@ -590,3 +590,111 @@ func TestOpenAdoptsAnEmptyDirectory(t *testing.T) {
 		t.Errorf("an empty directory was not adopted: %v", err)
 	}
 }
+
+// Nested workdirs are legal in a multi-project config, and anchoring at the
+// DEEPEST enclosing one would be an escape: a session running in the outer
+// workdir can replace the inner one with a symlink, and anchoring at the link
+// resolves it before anything is inspected. Anchoring at the shallowest root
+// makes that same component an intermediate one, which makeChain refuses.
+func TestOpenAnchorsAtTheShallowestSessionRoot(t *testing.T) {
+	base := t.TempDir()
+	outer := filepath.Join(base, "repo")
+	inner := filepath.Join(outer, "sub")
+	escape := filepath.Join(base, "escape")
+	for _, d := range []string{outer, escape} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// What a session in the OUTER workdir can do to the inner one.
+	if err := os.Symlink(escape, inner); err != nil {
+		t.Fatal(err)
+	}
+	state := filepath.Join(inner, "state")
+
+	if _, err := Open(state, outer, inner); err == nil {
+		t.Fatal("Open anchored at a swapped inner workdir: want an error, got nil")
+	}
+	if _, err := os.Lstat(filepath.Join(escape, "state")); !os.IsNotExist(err) {
+		t.Errorf("%s was created through the swapped workdir", filepath.Join(escape, "state"))
+	}
+}
+
+// `state_dir` back inside a workdir is supported, so the confined session can
+// write the state dir — and a DIRECTORY squatting on one of the two names we
+// insist on owning cannot simply be removed. Left unhandled that wedges every
+// later `run` and `doctor` alike on a bare `removeat: directory not empty`,
+// which is a denial of the daemon driven from inside the sandbox, and one
+// `doctor` cannot diagnose because it fails the same way.
+func TestOpenSaysWhatToDoAboutADirectorySquattingOnOurNames(t *testing.T) {
+	for _, name := range []string{".gitignore", sentinelName} {
+		t.Run(name, func(t *testing.T) {
+			path := tempStateDir(t)
+			if err := os.MkdirAll(filepath.Join(path, name, "child"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+
+			_, err := Open(path)
+			if err == nil {
+				t.Fatal("Open with a non-empty directory in the way: want an error, got nil")
+			}
+			if !strings.Contains(err.Error(), filepath.Join(path, name)) {
+				t.Errorf("error should name the path in the way, got %v", err)
+			}
+			if !strings.Contains(err.Error(), "rm -rf") {
+				t.Errorf("error should say how to clear it, got %v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(path, name, "child")); err != nil {
+				t.Errorf("the directory in the way was deleted: %v", err)
+			}
+		})
+	}
+}
+
+// The state dir is exactly the directory an operator opens to read a transcript,
+// and on darwin that leaves a .DS_Store behind — invisible in the tool that made
+// it. Refusing on one would stop the daemon over a file the operator cannot see.
+func TestOpenAdoptsDespiteAFileManagerDropping(t *testing.T) {
+	path := tempStateDir(t)
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		".gitignore":                        gitignoreBody,
+		".DS_Store":                         "\x00\x01",
+		"iteration-20260101-d1-a0-abcd.log": "transcript\n",
+	} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mustOpen(t, path)
+
+	if _, err := os.Lstat(filepath.Join(path, sentinelName)); err != nil {
+		t.Errorf("a state dir with a .DS_Store in it was not adopted: %v", err)
+	}
+}
+
+// A refusal has to list EVERY offending name. Half of them are dotfiles the
+// operator cannot see in a file manager, and reporting one at a time turns
+// clearing the directory into a guessing game one round trip deep.
+func TestOpenNamesEveryForeignEntryItRefusesOver(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "repo")
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hi\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Open(dir)
+	if err == nil {
+		t.Fatal("Open on somebody else's directory: want an error, got nil")
+	}
+	for _, name := range []string{"src", "README.md"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("error should name %s, got %v", name, err)
+		}
+	}
+}

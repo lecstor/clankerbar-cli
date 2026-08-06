@@ -1287,3 +1287,43 @@ func TestIdleSleepMinutesParsesActiveSettings(t *testing.T) {
 		t.Errorf("displaysleep must not be read as the system sleep timeout, got %d", got)
 	}
 }
+
+// The confinement boundary has to REACH statedir.Open. Fix #1 of the CLA-259
+// review is entirely carried by the session-workdir argument at the call site,
+// and the statedir package's own tests pass it themselves — so without a test
+// here, dropping the argument breaks the guarantee with a green suite.
+//
+// The scenario is the one the reviewer demonstrated: an in-workdir state_dir
+// (explicitly supported) with a symlink planted by a session at an intermediate
+// component. `doctor` reported PASS while the real directory sat outside the
+// workdir.
+func TestStateDirRefusesASymlinkASessionCouldHavePlanted(t *testing.T) {
+	base := t.TempDir()
+	workdir := filepath.Join(base, "repo")
+	outside := filepath.Join(base, "sensitive")
+	for _, d := range []string{workdir, outside} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(outside, filepath.Join(workdir, "sub")); err != nil {
+		t.Fatal(err)
+	}
+	cfg := validCfgIn(t, workdir)
+	cfg.StateDir = filepath.Join(workdir, "sub", "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+
+	c := checkStateDir(cfg)
+
+	if c.status != fail {
+		t.Errorf("state dir reached through a planted symlink: got %v, want FAIL (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "symlink") {
+		t.Errorf("detail should name the symlink, got %q", c.detail)
+	}
+	if _, err := os.Lstat(filepath.Join(outside, "state")); !os.IsNotExist(err) {
+		t.Errorf("doctor created %s through the symlink", filepath.Join(outside, "state"))
+	}
+}

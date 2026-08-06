@@ -59,6 +59,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -141,9 +142,18 @@ func Open(path string, sessionRoots ...string) (*Dir, error) {
 	if err := makeChain(anchorRoot, anchor, abs, rel); err != nil {
 		return nil, err
 	}
-	fi, err := verify(anchorRoot, rel, abs)
+	// The last look at the state dir BY PATH: a symlink here has to be caught
+	// before OpenRoot, which would follow it and then answer every later question
+	// about the target instead.
+	before, err := anchorRoot.Lstat(rel)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("state dir %s: %w", abs, err)
+	}
+	if before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("state dir %s is a symlink - refusing to write session transcripts through it; point state_dir at a real directory", abs)
+	}
+	if !before.IsDir() {
+		return nil, fmt.Errorf("state dir %s is not a directory", abs)
 	}
 
 	root, err := anchorRoot.OpenRoot(rel)
@@ -152,13 +162,21 @@ func Open(path string, sessionRoots ...string) (*Dir, error) {
 	}
 	d := &Dir{root: root, path: abs}
 
+	// From here nothing is resolved by path again — every check and every change
+	// goes through the handle, on ".". Re-resolving `rel` for the ownership check,
+	// then again for the chmod, would let a session inside the workdir swap the
+	// directory between them and take the chmod somewhere else.
+	if err := d.verify(before); err != nil {
+		root.Close()
+		return nil, err
+	}
 	// Adoption is decided BEFORE anything is written or chmodded, and reads only.
 	// A refusal here must leave the directory exactly as it was found.
 	if err := d.checkAdoptable(); err != nil {
 		root.Close()
 		return nil, err
 	}
-	if err := tighten(anchorRoot, rel, abs, fi); err != nil {
+	if err := d.tighten(); err != nil {
 		root.Close()
 		return nil, err
 	}
@@ -197,8 +215,24 @@ func anchorFor(abs string, sessionRoots []string) (anchor, rel string, err error
 	return anchor, rel, nil
 }
 
-// enclosingSessionRoot is the longest session root that strictly contains abs,
+// enclosingSessionRoot is the SHORTEST session root that strictly contains abs,
 // or "" if none does.
+//
+// Shortest, not longest, and that choice is the security property. The anchor is
+// the point below which every component gets checked, so the SHALLOWEST
+// enclosing root checks the most. Preferring the deepest is an escape wherever
+// workdirs nest, which a multi-project config may legally do:
+//
+//	{"projects":[{"slug":"a","workdir":"/w/repo"},
+//	             {"slug":"b","workdir":"/w/repo/sub"}],
+//	 "state_dir":"/w/repo/sub/state"}
+//
+// A session for project `a` can `rm -rf sub && ln -s /anywhere sub`. Anchored at
+// `/w/repo/sub` the planted link IS the anchor, resolved before anything is
+// inspected; anchored at `/w/repo` it is an intermediate component makeChain
+// refuses. Same reason Lstat and not Stat below: Stat follows the link and
+// reports a perfectly good directory, which is precisely the answer that hides
+// the swap.
 //
 // A root is matched both as given and as EvalSymlinks resolves it, because
 // `state_dir` and `workdir` may name the same tree by different routes (macOS
@@ -216,10 +250,13 @@ func enclosingSessionRoot(abs string, roots []string) string {
 		}
 		for _, cand := range candidates {
 			cand, err := filepath.Abs(cand)
-			if err != nil || !strings.HasPrefix(abs, cand+string(filepath.Separator)) || len(cand) <= len(best) {
+			if err != nil || !strings.HasPrefix(abs, cand+string(filepath.Separator)) {
 				continue
 			}
-			if fi, err := os.Stat(cand); err != nil || !fi.IsDir() {
+			if best != "" && len(cand) >= len(best) {
+				continue
+			}
+			if fi, err := os.Lstat(cand); err != nil || !fi.IsDir() {
 				continue
 			}
 			best = cand
@@ -255,8 +292,8 @@ func deepestExistingAncestor(abs string) string {
 // each component is Lstat'd through the root before the next one is touched, and
 // os.Root refuses on its own account any resolution that leaves the anchor.
 //
-// The final component is left to verify, which already has the message for a
-// symlink or a non-directory sitting where the state dir should be.
+// The final component is left to Open, which has the message for a symlink or a
+// non-directory sitting where the state dir itself should be.
 func makeChain(root *os.Root, anchor, abs, rel string) error {
 	parts := strings.Split(rel, string(filepath.Separator))
 	cum := ""
@@ -293,37 +330,45 @@ func makeChain(root *os.Root, anchor, abs, rel string) error {
 	return nil
 }
 
-// verify refuses a state dir that is not a plain directory we own. It reads only
-// — tightening a mode is tighten's job, and must not happen before the caller has
-// established the directory is ours to change.
+// verify refuses a state dir that is not ours to write, working through the open
+// handle so it is answering about the directory we will actually write.
 //
-// Lstat, not Stat: a symlink is exactly what we are refusing, and Stat would
-// report the target and pass.
-func verify(root *os.Root, rel, abs string) (os.FileInfo, error) {
-	fi, err := root.Lstat(rel)
+// before is what the path looked like a moment ago; if the handle does not point
+// at that same directory, something replaced it between the check and the open —
+// refuse rather than carry on against whatever we ended up holding.
+//
+// It reads only. Tightening a mode is tighten's job and must not happen before
+// the caller has established the directory is ours to change.
+func (d *Dir) verify(before os.FileInfo) error {
+	fi, err := d.root.Lstat(".")
 	if err != nil {
-		return nil, fmt.Errorf("state dir %s: %w", abs, err)
+		return fmt.Errorf("state dir %s: %w", d.path, err)
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("state dir %s is a symlink - refusing to write session transcripts through it; point state_dir at a real directory", abs)
+	if !os.SameFile(before, fi) {
+		return fmt.Errorf("state dir %s was replaced while it was being opened - refusing", d.path)
 	}
 	if !fi.IsDir() {
-		return nil, fmt.Errorf("state dir %s is not a directory", abs)
+		return fmt.Errorf("state dir %s is not a directory", d.path)
 	}
 	if permissionBitsAreMeaningful {
 		if uid, ok := fileOwnerUID(fi); ok && uid != os.Getuid() {
-			return nil, fmt.Errorf("state dir %s is owned by uid %d, not by you (uid %d) - refusing: its contents are session transcripts", abs, uid, os.Getuid())
+			return fmt.Errorf("state dir %s is owned by uid %d, not by you (uid %d) - refusing: its contents are session transcripts", d.path, uid, os.Getuid())
 		}
 	}
-	return fi, nil
+	return nil
 }
 
 // tighten clears any group/other bits an older, looser clankerbar left on the
 // directory.
-func tighten(root *os.Root, rel, abs string, fi os.FileInfo) error {
+func (d *Dir) tighten() error {
 	if !permissionBitsAreMeaningful {
 		return nil
 	}
+	fi, err := d.root.Lstat(".")
+	if err != nil {
+		return fmt.Errorf("state dir %s: %w", d.path, err)
+	}
+	abs := d.path
 	perm := fi.Mode().Perm()
 	if perm&0o077 == 0 {
 		return nil
@@ -337,10 +382,10 @@ func tighten(root *os.Root, rel, abs string, fi os.FileInfo) error {
 	// gets 0500 and a plain "not writable" further on, rather than having the
 	// tool quietly hand itself write access to a directory they locked.
 	tightened := perm &^ 0o077
-	if err := root.Chmod(rel, tightened); err != nil {
+	if err := d.root.Chmod(".", tightened); err != nil {
 		return fmt.Errorf("state dir %s is mode %04o and could not be tightened to %04o: %w", abs, perm, tightened, err)
 	}
-	after, err := root.Lstat(rel)
+	after, err := d.root.Lstat(".")
 	if err != nil {
 		return fmt.Errorf("state dir %s: %w", abs, err)
 	}
@@ -459,11 +504,19 @@ func (d *Dir) checkAdoptable() error {
 	if err != nil {
 		return fmt.Errorf("state dir %s: %w", d.path, err)
 	}
+	var foreign []string
 	for _, name := range names {
-		if d.isOurArtifact(name) {
-			continue
+		if !d.isOurArtifact(name) {
+			foreign = append(foreign, name)
 		}
-		return fmt.Errorf("state dir %s already exists and holds %s, which clankerbar did not write - refusing to adopt it: adopting means rewriting its .gitignore to `*` (hiding everything in it from git) and taking its mode to 0700. Point state_dir at a new or empty directory, or move that content aside", d.path, name)
+	}
+	if len(foreign) > 0 {
+		sort.Strings(foreign)
+		// EVERY offending name, not the first: half of these are dotfiles the
+		// operator cannot see in a file manager, and reporting them one at a time
+		// turns clearing the directory into a guessing game one round trip deep.
+		return fmt.Errorf("state dir %s already exists and holds %s, which clankerbar did not write - refusing to adopt it: adopting means rewriting its .gitignore to `*` (hiding everything in it from git) and taking its mode to 0700. Point state_dir at a new or empty directory, or clear that content: cd %s && rm -rf %s",
+			d.path, strings.Join(foreign, ", "), d.path, strings.Join(foreign, " "))
 	}
 	return nil
 }
@@ -475,6 +528,12 @@ func (d *Dir) checkAdoptable() error {
 func (d *Dir) isOurArtifact(name string) bool {
 	switch {
 	case name == sentinelName, name == "STOP", name == "HALT":
+		return true
+	case name == ".DS_Store", name == "Thumbs.db":
+		// Not ours, but not the operator's either: the file manager writes these
+		// into any directory somebody LOOKS at, and the state dir is exactly the
+		// directory an operator opens to read a transcript. Refusing on one would
+		// stop the daemon over a file that is invisible in the tool that made it.
 		return true
 	case strings.HasPrefix(name, "iteration-") && strings.HasSuffix(name, ".log"):
 		return true
@@ -502,12 +561,35 @@ func (d *Dir) ensureSentinel() error {
 		if fi.Mode().IsRegular() {
 			return nil
 		}
-		if err := d.root.Remove(sentinelName); err != nil {
-			return fmt.Errorf("state dir %s: %w", filepath.Join(d.path, sentinelName), err)
+		if err := d.clearForOurFile(sentinelName, fi); err != nil {
+			return err
 		}
 	}
 	if err := d.WriteFile(sentinelName, []byte(sentinelBody)); err != nil {
 		return fmt.Errorf("state dir %s: %w", filepath.Join(d.path, sentinelName), err)
+	}
+	return nil
+}
+
+// clearForOurFile removes whatever is squatting on one of the two names we
+// insist on owning, and says something an operator can act on when it cannot.
+//
+// A NON-EMPTY DIRECTORY at either name is the case worth spelling out. Removing
+// it fails, and the bare `removeat ...: directory not empty` that comes back is
+// no help at all — while `state_dir` pointed back inside a workdir is a supported
+// configuration, so the confined session CAN create one. `mkdir .gitignore &&
+// touch .gitignore/x` would otherwise wedge every later `run` AND `doctor` (which
+// fails identically, so it cannot diagnose it) on an opaque error: a denial of
+// the daemon, driven from inside the sandbox. It is not removed recursively —
+// deleting a directory tree the daemon did not create is not a thing to do
+// unasked — so it names the path and the command instead.
+func (d *Dir) clearForOurFile(name string, fi os.FileInfo) error {
+	full := filepath.Join(d.path, name)
+	if err := d.root.Remove(name); err != nil {
+		if fi.IsDir() {
+			return fmt.Errorf("state dir %s: %s is a directory, and clankerbar needs that name for its own file - refusing to delete a directory tree it did not create: rm -rf %s", d.path, full, full)
+		}
+		return fmt.Errorf("state dir %s: %s is in the way and could not be removed: %w", d.path, full, err)
 	}
 	return nil
 }
@@ -526,8 +608,8 @@ func (d *Dir) ensureGitignore() error {
 				return nil
 			}
 		}
-		if err := d.root.Remove(name); err != nil {
-			return fmt.Errorf("state dir %s: %w", filepath.Join(d.path, name), err)
+		if err := d.clearForOurFile(name, fi); err != nil {
+			return err
 		}
 	}
 	if err := d.WriteFile(name, []byte(gitignoreBody)); err != nil {

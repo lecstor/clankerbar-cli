@@ -507,7 +507,12 @@ func (c *Config) Validate() error {
 	//
 	// An empty workdir still means "where the daemon was started" — that is the
 	// directory the child inherits either way. It is just pinned now, not re-read.
-	c.workDirImplicit = c.WorkDir == ""
+	// Sticky: Validate is not guaranteed to be called only once, and a second call
+	// sees the absolute value the first one wrote — it would then answer
+	// "configured" about a workdir nobody configured.
+	if c.WorkDir == "" {
+		c.workDirImplicit = true
+	}
 	absWorkDir, err := filepath.Abs(c.WorkDir)
 	if err != nil {
 		return fmt.Errorf("workdir %s: %w", c.WorkDir, err)
