@@ -11,12 +11,10 @@ coding agent. Because it holds your credentials and can edit your code and run
 shell commands, the source is open so you can audit exactly what it does before you
 trust it with an overnight run.
 
-> **Status: pre-1.0, first release pending.** The loop runs and is what drives
-> clankerbar's own backlog; the harness adapters and the limit/budget machinery are
-> still being hardened. It is a supported surface rather than an internal tool - see
+> **Status: pre-1.0, released.** The loop runs and is what drives clankerbar's own
+> backlog; the harness adapters and the limit/budget machinery are still being
+> hardened. It is a supported surface rather than an internal tool - see
 > [Versioning](#versioning) for what the `v0.x` line does and does not promise.
-> **`v0.1.0` is not tagged yet**, so the download instructions below describe the
-> release you will get, not one you can fetch today; until then, build from source.
 
 ## How it works
 
