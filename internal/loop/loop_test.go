@@ -103,6 +103,11 @@ func (f *fakeAdapter) DetectLimit(r harness.Result) harness.Limit {
 
 func (f *fakeAdapter) IsTransient(r harness.Result) bool { return kindOf(r) == "transient" }
 
+// Diagnostic stands in for a real adapter's scoped text. Stderr is where every
+// adapter's scope starts, so returning it keeps the fake honest about what the
+// driver is allowed to quote.
+func (f *fakeAdapter) Diagnostic(r harness.Result) string { return r.Stderr }
+
 func (f *fakeAdapter) Probe(ctx context.Context, in harness.Invocation) (harness.Limit, error) {
 	i := f.probeCalls
 	f.probeCalls++
@@ -626,6 +631,84 @@ func TestRun_NonRetryableFailurePropagates(t *testing.T) {
 	if !strings.Contains(err.Error(), "non-retryable") {
 		t.Errorf("error %q does not mention non-retryable", err.Error())
 	}
+}
+
+// Stopping the whole run has to say WHAT it stopped on (CLA-268). An operator
+// reading the terminal at 8am needs to tell "the flag is wrong" from "the
+// classifier does not know this blip yet"; "exited 2 (non-retryable)" cannot.
+func TestRun_NonRetryableFailureNamesTheText(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	res := nonRetryableResult()
+	res.Stderr = "API Error: Something Nobody Classified Yet"
+	h := &fakeAdapter{steps: []invokeStep{{res: res}}}
+	p := &fakePoller{sum: backlog.Summary{Claimable: 1}}
+
+	err := runLoop(t, cfg, h, p)
+	if err == nil {
+		t.Fatal("expected Run to return the non-retryable failure")
+	}
+	if !strings.Contains(err.Error(), "API Error: Something Nobody Classified Yet") {
+		t.Errorf("error %q does not name the text that was judged non-retryable", err.Error())
+	}
+}
+
+func TestFailureDetail(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// Nothing to say leaves the caller's message untouched — no dangling colon.
+		{"empty", "", ""},
+		{"only whitespace", "   \n\t ", ""},
+		{"collapses to one line", "API Error: 503\n  Service Unavailable\n", ": API Error: 503 Service Unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := failureDetail(tc.in); got != tc.want {
+				t.Errorf("failureDetail(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+
+	t.Run("keeps the tail, bounded", func(t *testing.T) {
+		// The head of a real diagnostic is startup noise identical on every
+		// session; the thing that killed this one is said last.
+		got := failureDetail(strings.Repeat("x", 1000) + " THE ACTUAL FAILURE")
+		if !strings.Contains(got, "THE ACTUAL FAILURE") {
+			t.Errorf("truncation dropped the tail: %q", got)
+		}
+		// Exactly ": " (2) + "..." (3) of overhead — asserted tight, so an
+		// off-by-one in the slice is caught rather than absorbed by slack.
+		if n, want := len([]rune(got)), failureDetailMax+5; n != want {
+			t.Errorf("detail is %d runes, want exactly %d", n, want)
+		}
+	})
+
+	// The diagnostic is rendered to a TTY now, not just matched against. A harness
+	// writes stderr through verbatim, so an ESC sequence in it would be EXECUTED
+	// by the terminal rather than shown — repainting or clearing the one line the
+	// operator came back to read.
+	t.Run("strips control bytes but keeps the text", func(t *testing.T) {
+		got := failureDetail("API Error: \x1b[2J\x1b[1;1Hnothing to see \x07here")
+		if strings.ContainsAny(got, "\x1b\x07") {
+			t.Errorf("control bytes reached the log line: %q", got)
+		}
+		for _, want := range []string{"API Error:", "nothing to see", "here"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("stripping ate real text (%q missing): %q", want, got)
+			}
+		}
+	})
+
+	t.Run("does not split a rune", func(t *testing.T) {
+		// The harness's own text carries · in every usage-limit notice.
+		got := failureDetail(strings.Repeat("·", 1000))
+		if strings.ContainsRune(got, '�') {
+			t.Errorf("truncation cut a rune in half: %q", got)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
