@@ -180,9 +180,11 @@ harness), **backlog** (creds present and the summary read succeeds — distingui
 no creds, a rejected key, a `project_required` key/route mismatch, and an
 unreachable endpoint — plus whether the queue is gated on *your* open questions,
 or paused from the console), **state_dir** (the driver's own directory: writable,
-no leftover `HALT`/`STOP`, and not sitting inside a workdir - a state dir under one
-is writable by every session spawned there, which hands them the loop's own
-`STOP`/`HALT` switch), **workdir** (per project: it resolves, an `.mcp.json`
+no leftover `HALT`/`STOP`, and not sitting inside a configured workdir - a state
+dir under one a session is spawned in is writable by that session, which hands it
+the loop's own `STOP`/`HALT` switch; under a workdir nothing runs in *yet* it is
+the same trap for the next `projects[]` entry that inherits it), **workdir** (per
+project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **permissions**
 (harness-specific policy sanity), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
@@ -271,8 +273,9 @@ touch ~/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP   # stop graceful
 ```
 
 An explicit `state_dir` wins, but pointing it back inside a workdir gives every
-session spawned there the ability to write these markers - `doctor` WARNs when it
-is.
+session spawned there the ability to write these markers. `doctor` WARNs whenever
+the resolved state dir sits inside a configured workdir - including the default,
+if your workdir happens to contain `~/.local/state`.
 
 You can also **pause a run remotely from the clankerbar web console** (Settings →
 Pause) — per project. A paused project stops getting new sessions (other projects

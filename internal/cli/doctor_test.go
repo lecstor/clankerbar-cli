@@ -493,7 +493,9 @@ func stateDirIn(t *testing.T, workdir, stateDir string) *config.Config {
 // The assertion most likely to be got wrong, so it is written first: containment
 // is component-wise, not a string prefix. /a/workdir-2 is a sibling of /a/workdir,
 // not a directory inside it, and no session spawned in /a/workdir can reach it.
-// A HasPrefix implementation passes every other test here and fails this one.
+// A bare HasPrefix(state, workdir) passes every other test here and fails this
+// one; the HasPrefix(state, workdir+separator) variant is the sibling wrong
+// answer, and TestStateDirEqualToTheWorkDirWarns is what catches that.
 func TestStateDirSharingAPrefixWithTheWorkDirDoesNotWarn(t *testing.T) {
 	base := t.TempDir()
 	workdir := filepath.Join(base, "workdir")
@@ -603,6 +605,35 @@ func TestStateDirNamesTheDeepestSessionWorkDir(t *testing.T) {
 	}
 }
 
+// Two SESSION workdirs can nest as well - a project on a checkout inside another
+// project's tree. The deepest is the one to name; the outermost is what the
+// remedy has to clear, because moving just outside the inner one lands in the
+// outer one and warns again.
+func TestStateDirNestedSessionWorkDirsNameTheDeepestAndClearTheOutermost(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "inner")
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := validCfgIn(t, t.TempDir())
+	cfg.Projects = []config.Project{{Slug: "outer", WorkDir: outer}, {Slug: "inner", WorkDir: inner}}
+	cfg.StateDir = filepath.Join(inner, "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, inner) {
+		t.Errorf("detail should name the deepest workdir %s, got %q", inner, c.detail)
+	}
+	if !strings.Contains(c.remedy, outer) || strings.Contains(c.remedy, inner) {
+		t.Errorf("remedy should send them outside the outermost workdir %s, not merely outside %s: %q", outer, inner, c.remedy)
+	}
+}
+
 // A top-level workdir that only PARENTS the project workdirs has no sessions in
 // it, so claiming a spawned session can write there is a claim the operator can
 // disprove - and disproving one warning is how they learn to skim the rest. It is
@@ -657,6 +688,52 @@ func TestStateDirDefaultInsideTheWorkDirRemedyDoesNotSayRemove(t *testing.T) {
 	}
 	if !strings.Contains(c.remedy, "set state_dir") {
 		t.Errorf("remedy should tell them to set one outside the workdir, got %q", c.remedy)
+	}
+}
+
+// "Remove state_dir" is only good advice when the DEFAULT lands outside. With a
+// workdir that contains the state home - a workdir of ~, or one derived from a
+// cwd above ~/.local/state - taking the default just moves the same warning to a
+// different path, so the remedy has to say something else.
+func TestStateDirRemedyDoesNotOfferTheDefaultWhenItIsAlsoInsideTheWorkDir(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := validCfgIn(t, workdir)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(workdir, "xdg"))
+	cfg.StateDir = filepath.Join(workdir, "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.remedy, "remove state_dir") {
+		t.Errorf("the default lands inside this workdir too, so removing state_dir is not the way out: %q", c.remedy)
+	}
+	if !strings.Contains(c.remedy, workdir) {
+		t.Errorf("remedy should name the workdir to get outside of (%s), got %q", workdir, c.remedy)
+	}
+}
+
+// With no workdir configured, the state dir both moves with the directory doctor
+// was run from AND is reachable by the sessions. `workdir` is the knob that fixes
+// both, so the note the PASS line carries must not vanish on this path.
+func TestStateDirInsideAnImplicitWorkDirStillSaysToSetWorkdir(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := &config.Config{Harness: "claude", Prompt: "Work the backlog."} // no workdir
+	t.Chdir(workdir)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(workdir, "xdg"))
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "workdir is not configured") {
+		t.Errorf("the implicit-workdir note must survive on this path, got %v", c.info)
 	}
 }
 

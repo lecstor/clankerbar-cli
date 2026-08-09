@@ -551,11 +551,17 @@ func checkStateDir(cfg *config.Config) check {
 	// works.
 	if inside.dir != "" {
 		c.status = warn
-		c.detail, c.remedy = stateDirInWorkDir(stateDir, inside, cfg.StateDir != "")
+		c.detail, c.remedy = stateDirInWorkDir(stateDir, inside, cfg)
 		// The legacy report below is unreachable once we return, and it is a
 		// separate fact about a separate directory - carry it rather than lose it.
 		if legacy := cfg.LegacyStateDir(); legacy != "" {
 			c.info = append(c.info, legacy+" is also a leftover from before the state dir moved out of the workdir; markers there are ignored now")
+		}
+		// Same for the implicit-workdir note the PASS line carries below: with no
+		// workdir configured, `workdir` is the one knob that fixes both this and the
+		// state dir moving with whatever directory doctor was run from.
+		if cfg.WorkDirIsImplicit() {
+			c.info = append(c.info, "workdir is not configured - it was derived from "+cfg.WorkDir+", so set workdir too, or the state dir moves with the directory you run from")
 		}
 		return c
 	}
@@ -593,9 +599,13 @@ func checkStateDir(cfg *config.Config) check {
 // wrong one is not a wording detail: telling an operator a session can write
 // their state dir when no session runs there is a claim they can check and
 // disprove, which is how a warning gets skimmed past.
+// outer is the OUTERMOST containing workdir, which is what a remedy has to name:
+// every match is an ancestor of the same state dir, so they form a chain, and
+// "point it outside ~/dev/acme" is satisfied by ~/dev/state - which warns again.
 type workDirMatch struct {
 	dir     string
 	session bool
+	outer   string
 }
 
 // containingWorkDir finds the configured workdir the state dir sits at or under.
@@ -626,7 +636,7 @@ func containingWorkDir(stateDir string, cfg *config.Config) workDirMatch {
 		sessions[d] = true
 	}
 
-	var best, bestConfigured string
+	var best, bestConfigured, outer string
 	for _, wd := range configuredWorkDirs(cfg) {
 		if !pathWithin(stateDir, wd) && !pathWithin(resolvePath(stateDir), resolvePath(wd)) {
 			continue
@@ -640,31 +650,57 @@ func containingWorkDir(stateDir string, cfg *config.Config) workDirMatch {
 		} else if len(wd) > len(bestConfigured) {
 			bestConfigured = wd
 		}
+		if outer == "" || len(wd) < len(outer) {
+			outer = wd
+		}
 	}
 	if best != "" {
-		return workDirMatch{dir: best, session: true}
+		return workDirMatch{dir: best, session: true, outer: outer}
 	}
-	return workDirMatch{dir: bestConfigured}
+	return workDirMatch{dir: bestConfigured, outer: outer}
 }
 
 // stateDirInWorkDir words the in-workdir warning. Two populations, because they
 // are owed different sentences: a SESSION workdir is a live capability, while a
 // configured-but-unused one is a trap set for whoever next adds a `projects[]`
-// entry without a workdir of its own. explicit distinguishes an operator-set
-// state_dir (which they can remove) from the default landing inside the workdir
-// anyway (which happens when the workdir is an ancestor of the state home - a
-// workdir of ~, say - and where "remove state_dir" is advice about a key that is
-// not in their config).
-func stateDirInWorkDir(stateDir string, m workDirMatch, explicit bool) (detail, remedy string) {
+// entry without a workdir of its own.
+//
+// The remedy is the half that has to survive being FOLLOWED, so it is checked
+// against the config rather than assumed. "Remove state_dir" is only offered when
+// the default would actually land outside - a workdir of ~ contains
+// ~/.local/state, so for those operators removing it changes the path and not the
+// warning - and it names the OUTERMOST containing workdir, since moving just
+// outside the innermost one lands in the next one out.
+func stateDirInWorkDir(stateDir string, m workDirMatch, cfg *config.Config) (detail, remedy string) {
 	if m.session {
 		detail = stateDir + " is inside the session workdir " + m.dir + ": a session spawned there can write the loop's own STOP/HALT markers"
 	} else {
 		detail = stateDir + " is inside the configured workdir " + m.dir + ": no session runs there today, but a projects[] entry that omits workdir inherits it, and every session it spawns could then write the loop's STOP/HALT markers"
 	}
-	if explicit {
-		return detail, "remove state_dir to take the default outside the workdir, or point it somewhere outside " + m.dir
+
+	switch {
+	case cfg.StateDir != "" && defaultStateDirIsOutside(cfg):
+		remedy = "remove state_dir to take the default outside the workdir, or point it somewhere outside " + m.outer
+	case cfg.StateDir != "":
+		remedy = "point state_dir somewhere outside " + m.outer + " - removing it will not help, the default lands inside that workdir too"
+	default:
+		remedy = "set state_dir to a directory outside " + m.outer + " - the default lives under your home, which is inside the workdir here"
 	}
-	return detail, "set state_dir to a directory outside " + m.dir + " - the default lives under your home, which is inside the workdir here"
+	return detail, remedy
+}
+
+// defaultStateDirIsOutside reports whether dropping an explicit state_dir would
+// actually move the state dir out of every workdir. Answering it by resolving the
+// default is the only honest way: the default is under the state home, which an
+// outer-enough workdir (~, or the cwd a workdir was derived from) contains.
+func defaultStateDirIsOutside(cfg *config.Config) bool {
+	def := *cfg
+	def.StateDir = ""
+	dir, err := def.ResolveStateDir()
+	if err != nil {
+		return false // cannot say it is outside, so do not advise it
+	}
+	return containingWorkDir(dir, cfg).dir == ""
 }
 
 // configuredWorkDirs is every directory this config names as a workdir, absolute,
