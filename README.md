@@ -1,9 +1,9 @@
 # clankerbar
 
 Drive a coding agent through your [clankerbar](https://clankerbar.com) backlog,
-unattended. `clankerbar` respawns fresh harness sessions that drain the backlog
-and **survives usage limits** — pausing on the cap and resuming (including on an
-early reset) instead of dying until you come back.
+unattended. `clankerbar` respawns fresh harness sessions that work the backlog one
+task at a time, and **survives usage limits** — pausing on the cap and resuming
+(including on an early reset) instead of dying until you come back.
 
 It's a local, open-source client of the clankerbar control plane: the hosted plane
 holds the state (your backlog, over MCP), this runs on your machine and drives your
@@ -18,10 +18,18 @@ trust it with an overnight run.
 
 ## How it works
 
-Each iteration is a *fresh* harness session told to work the backlog (which it does
-by dispatching tasks to subagents and landing PRs at `in_review`). When a session
-ends, the driver spawns a new one — so context never rots across a long run, and a
-session killed mid-task is fine: the driver hands the task straight back to the
+Each iteration is a *fresh* harness session told to work **one** task, landing a PR
+at `in_review`. That is the `prompt` knob, and the wording is exact: the served
+protocol reads "work the next backlog item" as one task and "work the backlog" as
+*drain the whole ready queue in this session*. One task per iteration is the default
+because it is what keeps a session's context bounded no matter how long the queue
+is, and because the operator's controls — console pause, `HALT`, `max_iterations`,
+the budget breaker — are consulted between iterations, so a shorter iteration is a
+shorter wait for them to bite. Set `prompt` to the drain phrase if you want the old
+behaviour, and expect both properties to go with it.
+
+When a session ends, the driver spawns a new one — so context never rots across a
+long run, and a session killed mid-task is fine: the driver hands the task straight back to the
 queue (see [Resilience](#resilience)) and the next iteration picks it up. The
 backlog is the durable state; the loop is thin.
 
@@ -356,7 +364,7 @@ the likely final format.)
 {
   "harness": "claude",
   "model": "opus",
-  "prompt": "Work the backlog.",
+  "prompt": "Work the next backlog item.",
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
   "idle_poll_interval": "60s",

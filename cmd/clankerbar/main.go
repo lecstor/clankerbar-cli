@@ -1,6 +1,6 @@
 // Command clankerbar drives a coding-agent CLI (Claude Code, Codex, ...) through
-// a clankerbar backlog, unattended: it respawns fresh harness sessions that drain
-// the backlog and survives usage limits. State lives in the backlog (over MCP),
+// a clankerbar backlog, unattended: it respawns fresh harness sessions that work
+// the backlog one task at a time, and survives usage limits. State lives in the backlog (over MCP),
 // not in any session — so a killed session's task is reclaimed and continued.
 //
 // This is a local, open-source client of the clankerbar control plane. See the
