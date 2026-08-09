@@ -476,9 +476,22 @@ func TestClaudeIsTransient(t *testing.T) {
 		{"API 429", "API Error: 429 Too Many Requests", true},
 		{"connection error", "Connection error.", true},
 		{"econnreset", "read ECONNRESET", true},
+
+		// The three documented "the response above may be incomplete" variants
+		// (code.claude.com/docs/en/errors). Every one of them missed every arm
+		// before CLA-268: "Connection closed" is not "connection error", "Server
+		// error" is not "internal server", and a stalled stream names no status
+		// code. A miss here stops the daemon rather than costing an iteration.
+		{"connection closed mid-response", "API Error: Connection closed mid-response. The response above may be incomplete.", true},
+		{"server error mid-response", "API Error: Server error mid-response. The response above may be incomplete.", true},
+		{"response stalled mid-stream", "API Error: Response stalled mid-stream. The response above may be incomplete.", true},
+
 		// Anchored: a task log mentioning an HTTP 500 without the API Error prefix
 		// is NOT a dead session.
 		{"task log mentions 500", "the endpoint returned HTTP 500 to the user", false},
+		// The same anchoring has to hold for the new arm, or CLA-268's own body —
+		// which quotes the wording verbatim — becomes a retry trigger.
+		{"prose mentions mid-response without the prefix", "the stream was closed mid-response, per the bug report", false},
 		// A 400 bad-request is a real failure — retrying won't help.
 		{"API 400 stops", "API Error: 400 invalid request", false},
 		// The subscription cap is handled by DetectLimit, not here.
@@ -492,6 +505,93 @@ func TestClaudeIsTransient(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Where the mid-response notice ACTUALLY arrives in headless mode, and the gate
+// that decides whether it is read at all.
+//
+// The bare-string cases above prove the regex; this proves the path. Claude
+// Code's error reference says that with `--output-format json` or `stream-json`
+// the notice is reported in the `result` field — which claudeText reads only
+// when the CLI itself marked the session failed (claudeDiagnostic + ev.failed).
+//
+// Both halves matter and they are not the same claim:
+//   - a FAILED result event carrying the notice must be retryable, or the daemon
+//     stops on a network blip;
+//   - a SUCCESSFUL one must not be, because on a clean finish `result` is the
+//     agent's own closing summary, and reading it would hand a task body the
+//     power to fake a transient failure all over again (CLA-258, decision
+//     28b13387). A session that kept its partial output and exited zero is not
+//     classified at all — the loop never asks.
+func TestClaudeMidResponseNoticeInTheResultField(t *testing.T) {
+	const notice = "API Error: Connection closed mid-response. The response above may be incomplete."
+
+	failed := Result{ExitCode: 1, Stdout: `{"type":"result","subtype":"error_during_execution","is_error":true,` +
+		`"result":` + mustJSON(t, notice) + `}`}
+	if !(claude{}).IsTransient(failed) {
+		t.Error("the documented mid-response notice, in the field the CLI actually puts it in, was judged non-retryable — the daemon would stop on a connection drop")
+	}
+
+	clean := Result{ExitCode: 0, Stdout: `{"type":"result","subtype":"success","is_error":false,` +
+		`"result":` + mustJSON(t, "I finished. Note: "+notice) + `}`}
+	if (claude{}).IsTransient(clean) {
+		t.Error("a clean session's closing summary was read as a transient failure — the agent's narration is back inside the scan")
+	}
+}
+
+// Diagnostic must report exactly the text IsTransient judged — no wider and no
+// NARROWER. Both directions are regressions with teeth:
+//
+//   - wider (e.g. raw Stdout) prints a quoted task body to the operator's
+//     terminal, which is CLA-258 arriving by a new door;
+//   - narrower (e.g. claudeTyped) drops the `result` field of a failed session,
+//     which is exactly where the CLI puts the mid-response notice — so the stop
+//     message would come back EMPTY on the very failure this exists to explain.
+//
+// The narrowing case is the one to be careful about in a test: a fixture built
+// from a CLEAN result event is dropped at both widths, so it cannot tell the two
+// apart and would pass green against `claudeTyped`. Both cases below therefore
+// use a FAILED event, which is the only shape the two widths disagree on.
+func TestClaudeDiagnosticMatchesWhatIsTransientReads(t *testing.T) {
+	const notice = "API Error: Connection closed mid-response. The response above may be incomplete."
+
+	failed := Result{
+		Stderr: "some stderr",
+		Stdout: `{"type":"result","subtype":"error_during_execution","is_error":true,` +
+			`"result":` + mustJSON(t, notice) + `}`,
+	}
+	got := (claude{}).Diagnostic(failed)
+	if !strings.Contains(got, "some stderr") {
+		t.Errorf("Diagnostic dropped stderr, which IsTransient reads: %q", got)
+	}
+	// The load-bearing assertion: this is the text the operator is shown when the
+	// run stops, and it is only present at the diagnostic width.
+	if !strings.Contains(got, notice) {
+		t.Errorf("Diagnostic narrowed past the failed session's `result` — the stop message would name nothing: %q", got)
+	}
+	if got != claudeText(failed, claudeDiagnostic) {
+		t.Errorf("Diagnostic scope drifted from the one IsTransient reads:\n got %q\nwant %q", got, claudeText(failed, claudeDiagnostic))
+	}
+
+	// A session the CLI did NOT call failed keeps its narration out, at every
+	// width — the agent's closing summary is not the operator's diagnostic.
+	clean := Result{
+		Stderr: "some stderr",
+		Stdout: `{"type":"result","subtype":"success","is_error":false,` +
+			`"result":` + mustJSON(t, "the agent's closing summary") + `}`,
+	}
+	if g := (claude{}).Diagnostic(clean); strings.Contains(g, "closing summary") {
+		t.Errorf("Diagnostic exposed the agent's narration, which IsTransient does not read: %q", g)
+	}
+}
+
+func mustJSON(t *testing.T, s string) string {
+	t.Helper()
+	b, err := json.Marshal(s)
+	if err != nil {
+		t.Fatalf("marshal %q: %v", s, err)
+	}
+	return string(b)
 }
 
 func TestParseClaudeResetAt_unparseable(t *testing.T) {
