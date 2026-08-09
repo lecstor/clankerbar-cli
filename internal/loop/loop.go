@@ -428,11 +428,18 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
 				return tokens, cost, true, nil
 			}
-			if d.supervisedWait(ctx, lim, t, spend{
+			// The wait's own probe spend lands in the SAME accumulator as the
+			// sessions', so it reaches the breaker at the top of this loop, the one in
+			// Run between drains, and the iteration's cost line — rather than a
+			// separate figure nothing is measured against (CLA-287).
+			ptokens, pcost, pstop := d.supervisedWait(ctx, lim, t, spend{
 				start:  prior.start,
 				tokens: prior.tokens + tokens,
 				cost:   prior.cost + cost,
-			}) {
+			})
+			tokens += ptokens
+			cost += pcost
+			if pstop {
 				return tokens, cost, true, nil
 			}
 			continue
@@ -822,8 +829,9 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 }
 
 // supervisedWait pauses on a usage limit, then polls for an early reset rather
-// than sleeping blindly to the stated reset. Returns true if the loop should stop
-// (STOP marker, context cancel, or a budget ceiling reached during the wait).
+// than sleeping blindly to the stated reset. Returns the probe spend it incurred,
+// and stop=true if the loop should stop (STOP marker, context cancel, or a budget
+// ceiling reached during the wait).
 //
 // sofar is everything the run has spent, including this drain's attempts. The
 // breaker is consulted HERE and not only by the caller, because this loop does not
@@ -832,34 +840,45 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 // stuck in a supervised wait — was the one shape no ceiling could end, and it is
 // the shape codex always produces, since it states no reset for waitPastBudget to
 // measure (CLA-258).
-func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target, sofar spend) (stop bool) {
+//
+// The probes are themselves paid sessions, so their spend is added to `sofar` as it
+// accrues and returned to the caller for the run's accumulator. A breaker that can
+// only be tripped by spend it can SEE was blind to exactly the spend this loop
+// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
+// and this is the one loop with no other way out (CLA-287).
+func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
 	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 
 	for {
-		if dim := d.cfg.Budget.ExceededBy(sofar.tokens, sofar.cost, time.Since(sofar.start)); dim != "" {
+		if dim := d.cfg.Budget.ExceededBy(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
 			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
-				dim, sofar.tokens, sofar.cost, time.Since(sofar.start).Round(time.Second))
-			return true
+				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
+			return tokens, cost, true
 		}
 		if d.waitOrStop(ctx, interval) {
-			return true
+			return tokens, cost, true
 		}
 		if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) {
 			log.Print("stated reset passed — resuming")
-			return false
+			return tokens, cost, false
 		}
 		got, err := d.h.Probe(ctx, d.invocation(t, true))
+		// Count the probe BEFORE reading its verdict, and before the error branch: a
+		// probe that failed still spawned the harness and still spent. Every path out
+		// of here — resume, stop, or another lap — carries it.
+		tokens += got.Tokens
+		cost += got.CostUSD
 		if err != nil {
 			if ctx.Err() != nil {
-				return true
+				return tokens, cost, true
 			}
 			log.Printf("probe error: %v — will retry next interval", err)
 			continue
 		}
-		if !got.Limited {
+		if !got.Limit.Limited {
 			log.Print("limit lifted — resuming")
-			return false
+			return tokens, cost, false
 		}
 		log.Print("still limited — continuing to wait")
 	}
