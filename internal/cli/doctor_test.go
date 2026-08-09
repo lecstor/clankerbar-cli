@@ -477,6 +477,100 @@ func TestStateDirLegacyInWorkdirWarns(t *testing.T) {
 	}
 }
 
+// stateDirIn builds a config whose workdir is workdir and whose EXPLICIT state
+// dir is stateDir - the shape the in-workdir warning is about, since the default
+// has sat outside the workdir since CLA-259.
+func stateDirIn(t *testing.T, workdir, stateDir string) *config.Config {
+	t.Helper()
+	cfg := validCfgIn(t, workdir)
+	cfg.StateDir = stateDir
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
+	return cfg
+}
+
+// The assertion most likely to be got wrong, so it is written first: containment
+// is component-wise, not a string prefix. /a/workdir-2 is a sibling of /a/workdir,
+// not a directory inside it, and no session spawned in /a/workdir can reach it.
+// A HasPrefix implementation passes every other test here and fails this one.
+func TestStateDirSharingAPrefixWithTheWorkDirDoesNotWarn(t *testing.T) {
+	base := t.TempDir()
+	workdir := filepath.Join(base, "workdir")
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := stateDirIn(t, workdir, filepath.Join(base, "workdir-2"))
+
+	c := checkStateDir(cfg)
+	if c.status != pass {
+		t.Fatalf("sibling state dir: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "inside") {
+		t.Errorf("a sibling of the workdir is not inside it, got %q", c.detail)
+	}
+}
+
+// The whole point: the state dir holds STOP and HALT, and a session may write
+// anywhere under the workdir it is spawned in. Inside means every session the loop
+// spawns can stop the daemon that spawned it.
+func TestStateDirInsideTopLevelWorkDirWarns(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := stateDirIn(t, workdir, filepath.Join(workdir, "state"))
+
+	c := checkStateDir(cfg)
+	// WARN and not FAIL: an explicit state_dir is supported and the loop still
+	// runs, so this must not gate `doctor && run`.
+	if c.status != warn {
+		t.Fatalf("state dir inside the workdir: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, workdir) {
+		t.Errorf("detail should name the workdir %s, got %q", workdir, c.detail)
+	}
+	if !strings.Contains(c.detail, "STOP") || !strings.Contains(c.detail, "HALT") {
+		t.Errorf("detail should say what it costs (STOP/HALT), got %q", c.detail)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN must carry a remedy - naming the problem without the way out gets nothing done")
+	}
+}
+
+// One project's workdir is enough. A multi-project config resolves each project's
+// workdir the way the loop does (an entry with none inherits the top-level one),
+// and a state dir inside ANY of them is reachable by that project's sessions.
+func TestStateDirInsideOneProjectWorkDirWarns(t *testing.T) {
+	alpha, beta := t.TempDir(), t.TempDir()
+	cfg := validCfg(t)
+	cfg.Projects = []config.Project{{Slug: "alpha", WorkDir: alpha}, {Slug: "beta", WorkDir: beta}}
+	cfg.StateDir = filepath.Join(beta, "nested", "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("state dir inside a project workdir: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, beta) {
+		t.Errorf("detail should name the workdir it is inside (%s), got %q", beta, c.detail)
+	}
+	if strings.Contains(c.detail, alpha) {
+		t.Errorf("detail names a workdir it is not inside (%s): %q", alpha, c.detail)
+	}
+}
+
+// The default has been outside the workdir since CLA-259, so the operators who
+// never set state_dir must hear nothing about this at all.
+func TestStateDirDefaultSaysNothingAboutTheWorkDir(t *testing.T) {
+	c := checkStateDir(validCfg(t))
+	if c.status != pass {
+		t.Fatalf("default state dir: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "inside") || strings.Contains(strings.Join(c.info, "\n"), "inside") {
+		t.Errorf("the default sits outside the workdir and should say nothing about it, got %q %v", c.detail, c.info)
+	}
+}
+
 // --- session workdirs --------------------------------------------------------
 
 // multiRepoParent builds the `~/dev` shape: a directory that is not itself a

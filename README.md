@@ -163,8 +163,8 @@ WARN  config_dir   not set — the session inherits the ambient environment
                 -> set config_dir (or --config-dir) so a cron/launchd run loads the same skills, plugins and auth as your terminal
 WARN  backlog      https://clankerbar.com/api/projects/acme/backlog-summary — 0 claimable, 2 open question(s) — nothing to claim; the loop will idle without spawning
                 -> answer the open question(s) at clankerbar.com, or expect an idle run
-WARN  state_dir    /Users/you/dev/.clankerbar-loop has a leftover STOP marker
-                -> delete it, or the loop stops immediately: rm /Users/you/dev/.clankerbar-loop/STOP
+WARN  state_dir    /Users/you/.local/state/clankerbar/loop/dev-1f2e3d4c has a leftover STOP marker
+                -> delete it, or the loop stops immediately: rm /Users/you/.local/state/clankerbar/loop/dev-1f2e3d4c/STOP
 WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / CLAUDE.md)
                 -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it
 PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
@@ -180,7 +180,9 @@ harness), **backlog** (creds present and the summary read succeeds — distingui
 no creds, a rejected key, a `project_required` key/route mismatch, and an
 unreachable endpoint — plus whether the queue is gated on *your* open questions,
 or paused from the console), **state_dir** (the driver's own directory: writable,
-no leftover `HALT`/`STOP`), **workdir** (per project: it resolves, an `.mcp.json`
+no leftover `HALT`/`STOP`, and not sitting inside a workdir - a state dir under one
+is writable by every session spawned there, which hands them the loop's own
+`STOP`/`HALT` switch), **workdir** (per project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **permissions**
 (harness-specific policy sanity), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
@@ -259,11 +261,18 @@ unreachable plane WARN, because the loop drains blind and still gets work done; 
 rejected key and a key/route mismatch FAIL, because they never self-heal and every
 session the loop spawns carries the same broken credential.
 
-Control an in-flight run with markers in the state dir (`<workdir>/.clankerbar-loop`):
+Control an in-flight run with markers in the state dir, which lives OUTSIDE the
+workdir - `$XDG_STATE_HOME/clankerbar/loop/<workdir-slug>`, i.e.
+`~/.local/state/clankerbar/loop/<workdir-slug>` by default. `doctor` prints the
+resolved path:
 
 ```sh
-touch .clankerbar-loop/STOP     # stop gracefully (responsive even mid-wait)
+touch ~/.local/state/clankerbar/loop/dev-1f2e3d4c/STOP   # stop gracefully (responsive even mid-wait)
 ```
+
+An explicit `state_dir` wins, but pointing it back inside a workdir gives every
+session spawned there the ability to write these markers - `doctor` WARNs when it
+is.
 
 You can also **pause a run remotely from the clankerbar web console** (Settings →
 Pause) — per project. A paused project stops getting new sessions (other projects

@@ -500,6 +500,14 @@ func checkStateDir(cfg *config.Config) check {
 	}
 	defer dir.Close()
 
+	// WHERE the state dir sits is a capability question, not a tidiness one: STOP
+	// and HALT live there, and a session may write anywhere under the workdir it is
+	// spawned in. A state dir inside one hands every spawned session the daemon's
+	// own stop switch. CLA-259 moved the DEFAULT out; an explicit state_dir still
+	// wins, including one pointed back inside, so the operators this catches are
+	// exactly the ones the new default never reached.
+	inside := containingWorkDir(stateDir, cfg)
+
 	// Creatable is not writable: an already-existing state dir can be read-only,
 	// and the loop writes a log per iteration. Prove it with a real write, under
 	// a name nobody could have got to first — a fixed probe name in a directory
@@ -526,6 +534,29 @@ func checkStateDir(cfg *config.Config) check {
 		c.status = warn
 		c.detail = stateDir + " has a leftover " + strings.Join(found, " and ") + " marker"
 		c.remedy = "delete it, or the loop stops immediately: rm " + filepath.Join(stateDir, found[0])
+		if inside != "" {
+			// Otherwise the operator deletes the marker, runs again, and a session
+			// writes it back - the remedy above is a symptom's remedy when the state
+			// dir is somewhere the sessions can reach.
+			c.info = append(c.info, "it is inside the session workdir "+inside+", so a session could have written that marker itself")
+		}
+		return c
+	}
+
+	// Reported ahead of the legacy leftover below, which is the smaller problem: a
+	// leftover directory is only ever READ from, while this is a live write
+	// capability. WARN, not FAIL - an explicit state_dir is supported and the run
+	// still makes progress, and `doctor && run` must not be gated on a setup that
+	// works.
+	if inside != "" {
+		c.status = warn
+		c.detail = stateDir + " is inside the session workdir " + inside + ": a session spawned there can write the loop's own STOP/HALT markers"
+		c.remedy = "remove state_dir to take the default outside every workdir, or point it at a directory no session runs in"
+		// The legacy report below is unreachable once we return, and it is a
+		// separate fact about a separate directory - carry it rather than lose it.
+		if legacy := cfg.LegacyStateDir(); legacy != "" {
+			c.info = append(c.info, legacy+" is also a leftover from before the state dir moved out of the workdir; markers there are ignored now")
+		}
 		return c
 	}
 
@@ -552,6 +583,75 @@ func checkStateDir(cfg *config.Config) check {
 		c.remedy = "set workdir so the state dir does not move with the directory you run from"
 	}
 	return c
+}
+
+// containingWorkDir names the configured workdir the state dir sits at or under,
+// or "" when it is outside every one of them.
+//
+// EVERY configured workdir, not just the ones sessions provably run in: the
+// top-level `workdir` and each project's (resolved with the same fallback the
+// loop uses). A project entry added later inherits the top-level value, so a
+// state dir sitting in it is a capability waiting for the next config edit.
+//
+// Both a lexical and a symlink-resolved comparison are made, and either one
+// counts. The lexical pass is what an operator can check against their own config
+// by eye; the resolved pass catches the case where two different-looking paths are
+// the same directory - /var vs /private/var on macOS, or a workdir reached through
+// a symlinked parent. Resolution is best-effort: an unresolvable path falls back
+// to its lexical form rather than dropping the comparison.
+func containingWorkDir(stateDir string, cfg *config.Config) string {
+	for _, wd := range configuredWorkDirs(cfg) {
+		if pathWithin(stateDir, wd) || pathWithin(resolvePath(stateDir), resolvePath(wd)) {
+			return wd
+		}
+	}
+	return ""
+}
+
+// configuredWorkDirs is every directory this config names as a workdir, absolute,
+// cleaned and de-duplicated.
+func configuredWorkDirs(cfg *config.Config) []string {
+	dirs := []string{cfg.WorkDir}
+	for _, p := range cfg.Projects {
+		dirs = append(dirs, projectWorkDir(cfg, p))
+	}
+
+	out := make([]string, 0, len(dirs))
+	seen := make(map[string]bool, len(dirs))
+	for _, d := range dirs {
+		if d == "" {
+			continue
+		}
+		abs, err := filepath.Abs(d)
+		if err != nil || seen[abs] {
+			continue
+		}
+		seen[abs] = true
+		out = append(out, abs)
+	}
+	return out
+}
+
+// pathWithin reports whether path is dir itself or sits under it, COMPONENT-WISE.
+// A string prefix would say yes to /a/workdir-2 against /a/workdir, which is a
+// different directory a session never touches - the false positive that would
+// teach operators to skim past this warning.
+func pathWithin(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		return false // different volumes, or one is relative: not containment
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// resolvePath is EvalSymlinks that never fails: an unresolvable path (it does not
+// exist yet, or a component is not readable) comes back as it went in, so the
+// caller compares something rather than nothing.
+func resolvePath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return p
 }
 
 // randomTail is an unguessable filename suffix. See loop.randomTail — the same
