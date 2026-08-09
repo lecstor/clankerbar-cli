@@ -534,11 +534,12 @@ func checkStateDir(cfg *config.Config) check {
 		c.status = warn
 		c.detail = stateDir + " has a leftover " + strings.Join(found, " and ") + " marker"
 		c.remedy = "delete it, or the loop stops immediately: rm " + filepath.Join(stateDir, found[0])
-		if inside != "" {
+		if inside.session {
 			// Otherwise the operator deletes the marker, runs again, and a session
 			// writes it back - the remedy above is a symptom's remedy when the state
-			// dir is somewhere the sessions can reach.
-			c.info = append(c.info, "it is inside the session workdir "+inside+", so a session could have written that marker itself")
+			// dir is somewhere the sessions can reach. Only for a SESSION workdir: a
+			// configured-but-unused one is not somewhere a marker can have come from.
+			c.info = append(c.info, "it is inside the session workdir "+inside.dir+", so a session could have written that marker itself")
 		}
 		return c
 	}
@@ -548,10 +549,9 @@ func checkStateDir(cfg *config.Config) check {
 	// capability. WARN, not FAIL - an explicit state_dir is supported and the run
 	// still makes progress, and `doctor && run` must not be gated on a setup that
 	// works.
-	if inside != "" {
+	if inside.dir != "" {
 		c.status = warn
-		c.detail = stateDir + " is inside the session workdir " + inside + ": a session spawned there can write the loop's own STOP/HALT markers"
-		c.remedy = "remove state_dir to take the default outside every workdir, or point it at a directory no session runs in"
+		c.detail, c.remedy = stateDirInWorkDir(stateDir, inside, cfg.StateDir != "")
 		// The legacy report below is unreachable once we return, and it is a
 		// separate fact about a separate directory - carry it rather than lose it.
 		if legacy := cfg.LegacyStateDir(); legacy != "" {
@@ -585,31 +585,95 @@ func checkStateDir(cfg *config.Config) check {
 	return c
 }
 
-// containingWorkDir names the configured workdir the state dir sits at or under,
-// or "" when it is outside every one of them.
+// workDirMatch is the configured workdir a state dir was found at or under. dir
+// is "" when it is outside every one of them.
 //
-// EVERY configured workdir, not just the ones sessions provably run in: the
+// session says whether the loop actually SPAWNS sessions in that directory, and
+// the two cases cost different things - see stateDirInWorkDir. Reporting the
+// wrong one is not a wording detail: telling an operator a session can write
+// their state dir when no session runs there is a claim they can check and
+// disprove, which is how a warning gets skimmed past.
+type workDirMatch struct {
+	dir     string
+	session bool
+}
+
+// containingWorkDir finds the configured workdir the state dir sits at or under.
+//
+// EVERY configured workdir is considered, not just the ones sessions run in: the
 // top-level `workdir` and each project's (resolved with the same fallback the
-// loop uses). A project entry added later inherits the top-level value, so a
-// state dir sitting in it is a capability waiting for the next config edit.
+// loop uses). A `projects[]` entry that omits `workdir` inherits the top-level
+// one, so a state dir inside it is a capability waiting for the next config edit
+// even when nothing is spawned there today.
+//
+// A session workdir wins over a merely-configured one, and the DEEPEST match wins
+// within each group: for `workdir: ~/dev` with `projects[0].workdir: ~/dev/acme`,
+// the answer an operator can act on is ~/dev/acme, the directory their sessions
+// are really in.
 //
 // Both a lexical and a symlink-resolved comparison are made, and either one
 // counts. The lexical pass is what an operator can check against their own config
 // by eye; the resolved pass catches the case where two different-looking paths are
 // the same directory - /var vs /private/var on macOS, or a workdir reached through
 // a symlinked parent. Resolution is best-effort: an unresolvable path falls back
-// to its lexical form rather than dropping the comparison.
-func containingWorkDir(stateDir string, cfg *config.Config) string {
+// to its lexical form rather than dropping the comparison. Both passes are
+// CASE-SENSITIVE, so on a case-insensitive filesystem `~/Dev` against `~/dev` is a
+// known miss - the same lexical assumption config and statedir already make, and
+// a miss here costs a warning rather than a guarantee.
+func containingWorkDir(stateDir string, cfg *config.Config) workDirMatch {
+	sessions := make(map[string]bool)
+	for _, d := range cfg.SessionWorkDirs() {
+		sessions[d] = true
+	}
+
+	var best, bestConfigured string
 	for _, wd := range configuredWorkDirs(cfg) {
-		if pathWithin(stateDir, wd) || pathWithin(resolvePath(stateDir), resolvePath(wd)) {
-			return wd
+		if !pathWithin(stateDir, wd) && !pathWithin(resolvePath(stateDir), resolvePath(wd)) {
+			continue
+		}
+		// Longest path == deepest directory, since every candidate is absolute and
+		// cleaned and they are all ancestors of the same state dir.
+		if sessions[wd] {
+			if len(wd) > len(best) {
+				best = wd
+			}
+		} else if len(wd) > len(bestConfigured) {
+			bestConfigured = wd
 		}
 	}
-	return ""
+	if best != "" {
+		return workDirMatch{dir: best, session: true}
+	}
+	return workDirMatch{dir: bestConfigured}
+}
+
+// stateDirInWorkDir words the in-workdir warning. Two populations, because they
+// are owed different sentences: a SESSION workdir is a live capability, while a
+// configured-but-unused one is a trap set for whoever next adds a `projects[]`
+// entry without a workdir of its own. explicit distinguishes an operator-set
+// state_dir (which they can remove) from the default landing inside the workdir
+// anyway (which happens when the workdir is an ancestor of the state home - a
+// workdir of ~, say - and where "remove state_dir" is advice about a key that is
+// not in their config).
+func stateDirInWorkDir(stateDir string, m workDirMatch, explicit bool) (detail, remedy string) {
+	if m.session {
+		detail = stateDir + " is inside the session workdir " + m.dir + ": a session spawned there can write the loop's own STOP/HALT markers"
+	} else {
+		detail = stateDir + " is inside the configured workdir " + m.dir + ": no session runs there today, but a projects[] entry that omits workdir inherits it, and every session it spawns could then write the loop's STOP/HALT markers"
+	}
+	if explicit {
+		return detail, "remove state_dir to take the default outside the workdir, or point it somewhere outside " + m.dir
+	}
+	return detail, "set state_dir to a directory outside " + m.dir + " - the default lives under your home, which is inside the workdir here"
 }
 
 // configuredWorkDirs is every directory this config names as a workdir, absolute,
 // cleaned and de-duplicated.
+//
+// An empty value is resolved rather than skipped, matching config.absWorkDir and
+// config.SessionWorkDirs: an unset workdir means the cwd everywhere else in the
+// tool, and skipping it here would make the containment check silently answer
+// about fewer directories than the loop uses.
 func configuredWorkDirs(cfg *config.Config) []string {
 	dirs := []string{cfg.WorkDir}
 	for _, p := range cfg.Projects {
@@ -619,9 +683,6 @@ func configuredWorkDirs(cfg *config.Config) []string {
 	out := make([]string, 0, len(dirs))
 	seen := make(map[string]bool, len(dirs))
 	for _, d := range dirs {
-		if d == "" {
-			continue
-		}
 		abs, err := filepath.Abs(d)
 		if err != nil || seen[abs] {
 			continue

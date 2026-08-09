@@ -163,8 +163,8 @@ WARN  config_dir   not set — the session inherits the ambient environment
                 -> set config_dir (or --config-dir) so a cron/launchd run loads the same skills, plugins and auth as your terminal
 WARN  backlog      https://clankerbar.com/api/projects/acme/backlog-summary — 0 claimable, 2 open question(s) — nothing to claim; the loop will idle without spawning
                 -> answer the open question(s) at clankerbar.com, or expect an idle run
-WARN  state_dir    /Users/you/.local/state/clankerbar/loop/dev-1f2e3d4c has a leftover STOP marker
-                -> delete it, or the loop stops immediately: rm /Users/you/.local/state/clankerbar/loop/dev-1f2e3d4c/STOP
+WARN  state_dir    /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549 has a leftover STOP marker
+                -> delete it, or the loop stops immediately: rm /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP
 WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / CLAUDE.md)
                 -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it
 PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
@@ -267,7 +267,7 @@ workdir - `$XDG_STATE_HOME/clankerbar/loop/<workdir-slug>`, i.e.
 resolved path:
 
 ```sh
-touch ~/.local/state/clankerbar/loop/dev-1f2e3d4c/STOP   # stop gracefully (responsive even mid-wait)
+touch ~/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP   # stop gracefully (responsive even mid-wait)
 ```
 
 An explicit `state_dir` wins, but pointing it back inside a workdir gives every
