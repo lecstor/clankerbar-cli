@@ -1665,6 +1665,139 @@ func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
 	}
 }
 
+// The back-off's own message asks the operator to go and answer the question that
+// is stopping the queue. Answering it takes the task `blocked -> ready`, which
+// moves neither half of `Settled()`, so before CLA-248 the operator did exactly
+// what they were told, within seconds, and the target still served out the wait.
+//
+// Driven on the SECOND of two targets, so a baseline that crossed indices would
+// show up here rather than passing by luck on the only slice entry there is.
+func TestJudgeProgressClearsBackOffWhenAQuestionIsAnswered(t *testing.T) {
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: &fakePoller{}}, {Poller: &fakePoller{}}})
+	d.quiet[1] = quietThreshold
+	d.skipUntil[1] = time.Now().Add(time.Hour)
+	d.baseline[1], d.openQs[1] = 4, 2
+
+	// Nothing settled: Settled() is exactly what it was. The only thing that moved
+	// is the answer the message asked for. Claimable stays > 0 so this exercises the
+	// answered-question path rather than the idle reset above it — with nothing
+	// claimable the back-off clears for a different reason entirely.
+	d.judgeProgress(1, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 1})
+
+	if d.quiet[1] != 0 || !d.skipUntil[1].IsZero() {
+		t.Errorf("an answered question must clear the back-off; quiet=%d skipUntil=%v", d.quiet[1], d.skipUntil[1])
+	}
+	if d.backedOff(1) {
+		t.Error("the target must be eligible on that same poll, not once the remaining wait elapses")
+	}
+	if d.openQs[1] != 1 {
+		t.Errorf("the open-question baseline must track the poll; got %d, want 1", d.openQs[1])
+	}
+	if d.openQs[0] != 0 || d.quiet[0] != 0 {
+		t.Errorf("the sibling target must be untouched; openQs=%d quiet=%d", d.openQs[0], d.quiet[0])
+	}
+}
+
+// The mirror. Only a FALL is the operator acting; anything else must leave a
+// backed-off target sitting out, or the breaker clears itself on ordinary noise.
+func TestJudgeProgressKeepsBackOffWhenQuestionsDoNotFall(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		wasOpen int
+		sum     backlog.Summary
+	}{
+		// Claimable stays > 0 throughout. Not a tidy-up: once CLA-249's idle branch
+		// landed, a poll with nothing claimable clears the back-off on its own
+		// account, so at 0 all three cases assert the inverse of what now happens and
+		// go RED. The summary has to be spawnable for "back-off must survive" to be a
+		// claim about the question-fall path at all.
+		{"a NEW question is not an answered one", 2, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 3}},
+		{"an unchanged count says nothing happened", 2, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 2}},
+		{"none open, none answered", 0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+			until := time.Now().Add(time.Hour)
+			d.quiet[0], d.skipUntil[0] = quietThreshold, until
+			d.baseline[0], d.openQs[0] = 4, tc.wasOpen
+
+			d.judgeProgress(0, tc.sum)
+
+			if d.quiet[0] != quietThreshold || !d.skipUntil[0].Equal(until) {
+				t.Errorf("back-off must survive; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+			}
+		})
+	}
+}
+
+// A drain that settled nothing is fruitless even if questions fell while it ran:
+// the verdict on a drain is what it SETTLED, and a session that answers its own
+// question has not thereby delivered anything. The baseline still tracks, so the
+// next poll judges the change since this one rather than re-reading it.
+func TestJudgeProgressDrainThatSettlesNothingIsStillFruitless(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.pending[0] = true
+	d.quiet[0], d.baseline[0], d.openQs[0] = 1, 4, 3
+
+	d.judgeProgress(0, backlog.Summary{Done: 4, OpenQuestions: 1})
+
+	if d.quiet[0] != 2 {
+		t.Errorf("a drain that settled nothing must still count against the target; quiet=%d, want 2", d.quiet[0])
+	}
+	if d.openQs[0] != 1 {
+		t.Errorf("the open-question baseline must track through a drain verdict too; got %d, want 1", d.openQs[0])
+	}
+}
+
+// The window the fall is otherwise LOST in: the back-off elapses, a drain goes
+// out, and the operator answers while it is running. That poll is the only one
+// that will ever see the fall, because the baseline advances on it - so if it
+// merely counts the strike, the target sits out the next rung of the ladder on a
+// queue that is already unblocked, which is the CLA-248 bug again in a narrower
+// window. It takes the strike and skips the sit-out: one immediate retry.
+func TestJudgeProgressAnswerDuringADrainSkipsTheSitOut(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.pending[0] = true
+	d.quiet[0], d.baseline[0], d.openQs[0] = quietThreshold, 4, 1
+
+	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0})
+
+	if d.quiet[0] != quietThreshold+1 {
+		t.Errorf("the drain settled nothing, so the strike is still earned; quiet=%d, want %d", d.quiet[0], quietThreshold+1)
+	}
+	if d.backedOff(0) {
+		t.Error("an answer that landed mid-drain must buy one immediate retry, not the next rung of the ladder")
+	}
+	// And the retry is ONE: a second fruitless drain, with nothing having moved,
+	// backs the target off at the rung its strike count has reached.
+	d.pending[0] = true
+	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0})
+	if !d.backedOff(0) {
+		t.Error("the retry is one, not an exemption; a second fruitless drain must back the target off")
+	}
+}
+
+// The reported sequence end to end: a session blocks on a question, three fruitless
+// drains back the target off, the operator reads the message and answers, and the
+// target is eligible again on the very next poll instead of after 15 minutes.
+func TestJudgeProgressAnswerEndsTheBackOffOnTheNextPoll(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	blocked := backlog.Summary{Claimable: 1, OpenQuestions: 1}
+	for n := 0; n < quietThreshold; n++ {
+		d.pending[0] = true         // a drain went out...
+		d.judgeProgress(0, blocked) // ...and settled nothing
+	}
+	if !d.backedOff(0) {
+		t.Fatalf("%d fruitless drains must back the target off", quietThreshold)
+	}
+
+	d.judgeProgress(0, backlog.Summary{Claimable: 1, OpenQuestions: 0})
+
+	if d.backedOff(0) {
+		t.Error("the answer must end the back-off on the next poll, not after the full wait")
+	}
+}
+
 // A target with nothing claimable is IDLE, not fruitless — there is nothing for
 // the gate to spawn, so there is nothing it can have failed at. `quiet` used to
 // survive that, and survive the blocker being parked (`parked` is not counted in
@@ -1730,6 +1863,50 @@ func TestJudgeProgressStillJudgesADrainOutstandingWhenTheQueueGoesQuiet(t *testi
 	d.judgeProgress(0, backlog.Summary{Claimable: 0, InProgress: 1})
 	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
 		t.Errorf("a settled, idle target must forget; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
+// The idle branch must advance the open-question baseline as every other path
+// does. This is the one place the two rules meet: CLA-249's idle reset returns
+// early, and CLA-248 added a second baseline that every other path advances
+// beside the first, so the merge of the two left `openQs` behind.
+//
+// It is an INVARIANT violation, not a live bug, and the distinction is the point
+// of this comment. The stale value is unreachable today: the idle branch zeroes
+// `quiet` in the same statement, the `!pending` fall detector is gated on
+// `quiet > 0`, and the drain-verdict path drops its `answered` flag below
+// quietThreshold — so the first poll after an idle stretch always consumes the
+// stale baseline somewhere it cannot change the outcome, and refreshes it. The
+// fix is here because the invariant is what the doc comment above judgeProgress
+// promises, and because three separate conditions currently have to hold for it
+// not to matter: drop quietThreshold to 1, stop zeroing `quiet` in the idle
+// branch, or add a consumer of the fall that is not gated on `quiet > 0`, and it
+// becomes reachable.
+//
+// So the assertion that pins this is the baseline itself, below. The drains after
+// it are a plain regression guard and pass with or without the fix; they are not
+// a demonstration of the failure, because no reachable sequence is.
+func TestJudgeProgressIdlePollAdvancesTheOpenQuestionBaseline(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.baseline[0], d.openQs[0] = 4, 3
+
+	// An idle stretch during which the operator clears the queue's questions.
+	d.judgeProgress(0, backlog.Summary{Claimable: 0, Done: 4, OpenQuestions: 1})
+
+	if d.openQs[0] != 1 {
+		t.Fatalf("an idle poll must track the open-question baseline like every other path; got %d, want 1", d.openQs[0])
+	}
+
+	// Guard, not a demonstration (see above): work is filed and its drains settle
+	// nothing, and the third backs the target off. Green either way today — it is
+	// here so that if the fall ever becomes readable while `quiet > 0`, an idle
+	// stretch cannot hand a later drain a retry it did not earn.
+	for range quietThreshold {
+		d.pending[0] = true
+		d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 1})
+	}
+	if !d.backedOff(0) {
+		t.Error("a fall consumed during an idle stretch must not buy a later drain a free retry")
 	}
 }
 
