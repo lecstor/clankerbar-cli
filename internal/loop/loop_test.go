@@ -1475,10 +1475,109 @@ func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
 	d.skipUntil[0] = time.Now().Add(time.Hour)
 	d.baseline[0] = 4
 
-	d.judgeProgress(0, backlog.Summary{Done: 5})
+	// Claimable stays > 0 so this exercises the outside-progress path and not the
+	// idle reset below it — with nothing claimable the back-off would clear for a
+	// different reason and this test would pass without testing anything.
+	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 5})
 
 	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
 		t.Errorf("outside progress must clear the back-off; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
+// A target with nothing claimable is IDLE, not fruitless — there is nothing for
+// the gate to spawn, so there is nothing it can have failed at. `quiet` used to
+// survive that, and survive the blocker being parked (`parked` is not counted in
+// Settled(), so nothing else cleared it), so a task filed a week later inherited
+// the escalated wait on its first strike.
+func TestJudgeProgressForgetsFruitlessDrainsOnceNothingIsClaimable(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+
+	// Six fruitless drains against a claimable-but-unworkable queue: the target is
+	// at the 2h cap.
+	for range 6 {
+		d.pending[0] = true
+		d.judgeProgress(0, backlog.Summary{Claimable: 1})
+	}
+	if d.quiet[0] != 6 {
+		t.Fatalf("setup: quiet = %d, want 6", d.quiet[0])
+	}
+	if got := time.Until(d.skipUntil[0]).Round(time.Minute); got != 2*time.Hour {
+		t.Fatalf("setup: backed off for %s, want the escalated 2h", got)
+	}
+
+	// The operator parks the blocker: the queue is now empty.
+	d.judgeProgress(0, backlog.Summary{Claimable: 0})
+	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Fatalf("an idle poll must forget the fruitless count and its wait; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+
+	// A week later, unrelated work is filed and its first drains settle nothing —
+	// a large task spanning sessions looks exactly like this. It must serve the
+	// BASE wait, not inherit the one the parked blocker earned.
+	for range quietThreshold {
+		d.pending[0] = true
+		d.judgeProgress(0, backlog.Summary{Claimable: 1})
+	}
+	if got := time.Until(d.skipUntil[0]).Round(time.Minute); got != 15*time.Minute {
+		t.Errorf("new work backed off for %s, want the base 15m", got)
+	}
+}
+
+// The other half of the rule: an idle poll must not CANCEL a verdict that is
+// still outstanding. `claimable == 0` also means "everything ready is claimed
+// right now", and the poll straight after a drain is exactly when that happens —
+// a session that ends holding a task it pushed work on is deliberately not handed
+// back. Forgetting there would let a target that always ends that way alternate
+// spawn / forget forever and never back off at all.
+func TestJudgeProgressStillJudgesADrainOutstandingWhenTheQueueGoesQuiet(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+
+	// Each drain settles nothing and leaves the task claimed, so every verdict poll
+	// sees an empty queue. The count must still climb.
+	for n := 1; n <= quietThreshold; n++ {
+		d.pending[0] = true
+		d.judgeProgress(0, backlog.Summary{Claimable: 0, InProgress: 1})
+		if d.quiet[0] != n {
+			t.Fatalf("after %d fruitless drains quiet = %d, want %d — an outstanding verdict was cancelled", n, d.quiet[0], n)
+		}
+	}
+	if d.skipUntil[0].IsZero() {
+		t.Error("three fruitless drains must back the target off, whatever the queue looked like at verdict time")
+	}
+
+	// One more idle poll with nothing outstanding IS the idle signal, and forgets.
+	d.judgeProgress(0, backlog.Summary{Claimable: 0, InProgress: 1})
+	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("a settled, idle target must forget; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
+// The same thing through Run: a backed-off target whose queue then empties starts
+// spawning again the moment work reappears, rather than serving out a wait no
+// fast-config interval can skip.
+func TestRun_IdleQueueLiftsTheNoProgressBackOff(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 4
+	h := &fakeAdapter{}
+	// Polls 1-3 each spawn a session that settles nothing; poll 4 is the verdict on
+	// the third and earns a 15-minute wait no fast-config interval can skip. Poll 5
+	// shows an empty queue, which lifts it, and the work that arrives after must
+	// get a session rather than serve out somebody else's back-off.
+	p := &fakePoller{sums: []backlog.Summary{
+		{Ready: 1, Claimable: 1},
+		{Ready: 1, Claimable: 1},
+		{Ready: 1, Claimable: 1},
+		{Ready: 1, Claimable: 1},
+		{Ready: 0, Claimable: 0},
+	}, sum: backlog.Summary{Ready: 1, Claimable: 1}}
+
+	if err := runLoop(t, cfg, h, p); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 4 {
+		t.Errorf("work arriving after an idle stretch must not inherit the back-off; got %d of 4 sessions", h.invokeCalls)
 	}
 }
 

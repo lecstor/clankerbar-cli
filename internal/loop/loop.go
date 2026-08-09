@@ -231,7 +231,7 @@ func (d *Driver) Run(ctx context.Context) error {
 							log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
 						}
 						d.judgeProgress(i, sum)
-						if sum.Claimable > 0 && !d.backedOff(i) {
+						if sum.Spawnable() && !d.backedOff(i) {
 							candidates[i] = true
 							anyCandidate = true
 						}
@@ -643,6 +643,60 @@ const quietThreshold = 3
 // nothing, which is exactly the run this exists to stop repeating.
 func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	settled := sum.Settled()
+
+	// IDLE IS NOT FRUITLESS. `quiet` counts consecutive DRAINS that settled
+	// nothing, and a poll with nothing claimable is not a drain — the gate below
+	// will not spend a session, so this target has not failed at anything. Without
+	// this the count is immortal: it survives the blocker being parked (`parked`
+	// is not in Settled(), so nothing else clears it), an arbitrarily long idle
+	// stretch, and a complete turnover of the queue. A task filed a week later
+	// then inherits a back-off it did nothing to earn and serves the escalated
+	// 2h wait on its FIRST fruitless drain — defeating quietThreshold, which
+	// exists precisely so a large task spanning sessions is not punished.
+	//
+	// ONLY WITH NO VERDICT OUTSTANDING, and that condition is load-bearing rather
+	// than defensive. `claimable == 0` does not only mean "the queue is empty" — it
+	// also means "everything ready is claimed right now", and the poll immediately
+	// after a drain is exactly when that is most likely, because a session that
+	// ends still holding a task it pushed work on is deliberately NOT handed back
+	// (see releaseHeldClaim). Forgetting the count there would not merely decline
+	// to charge the drain, it would CANCEL the verdict on one that already ran — so
+	// a target whose every session ends holding its task would alternate spawn /
+	// forget forever and never back off at all. Requiring the verdict to be settled
+	// first costs one extra poll of an idle stretch and nothing else: the drain is
+	// judged, and the NEXT poll — still idle — does the forgetting.
+	//
+	// Clearing skipUntil too, and not only the count: an in-flight wait is moot
+	// while there is nothing to spawn for, and leaving it set would make the next
+	// task filed sit out the tail of a wait somebody else's blocker earned.
+	//
+	// RESIDUAL, stated rather than implied. A target whose only claimable task is
+	// held ELSEWHERE for more than one poll — another driver on the same project,
+	// an agent working it by hand — reads as idle for that stretch, so it forgets
+	// and lifts. Such a target backs off at the base 15m every quietThreshold
+	// fruitless drains instead of escalating toward 2h: the breaker still bounds
+	// the spend, it just stops tightening. That is accepted rather than narrowed
+	// away, because the two obvious narrowings are both worse. Requiring
+	// `in_progress == 0` reinstates the immortal count for any project holding
+	// abandoned WIP (CLA-274), which is precisely the population most likely to
+	// have some. Requiring N consecutive idle polls does not discriminate at all:
+	// a task held elsewhere is held for a lease, which is many poll intervals.
+	// Nothing in a summary count separates "quiet because there is no work" from
+	// "quiet because somebody else has it" — only whether WE are still spending
+	// sessions does, and the guard above is the part of that signal worth having.
+	//
+	// This cannot spin. A drain needs a poll where the target IS spawnable, so the
+	// reset never applies to the poll that authorises a session; the count climbs
+	// from zero the ordinary way, and reaching the threshold again takes
+	// quietThreshold fresh fruitless drains.
+	if !sum.Spawnable() && !d.pending[i] {
+		if d.quiet[i] > 0 {
+			log.Printf("%snothing claimable — idle, not fruitless; forgetting %d drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quiet[i])
+		}
+		d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+		d.baseline[i] = settled
+		return
+	}
 
 	if !d.pending[i] {
 		// No drain outstanding. Progress can still arrive from elsewhere — the

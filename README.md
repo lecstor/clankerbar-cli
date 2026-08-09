@@ -254,6 +254,13 @@ the loop backs that project off for 15 minutes, then 30, then an hour, capped at
 two. Other projects keep draining. Any progress from anywhere, including you
 merging a PR, clears it immediately.
 
+So does the queue simply going quiet. A poll that shows nothing claimable at all
+means the project is *idle*, not fruitless — there is nothing for the loop to
+spawn, so it has not failed at anything — and the count is forgotten along with
+any wait still running. Without that, parking the blocker would leave the count
+standing (`parked` is not progress a backlog can see), and the next task you file
+would serve out a two-hour wait it did nothing to earn.
+
 Three rather than one, because a genuinely large task can span several sessions
 before anything reaches a reviewer, and backing off then would throttle exactly
 the deep work the loop exists to do.
