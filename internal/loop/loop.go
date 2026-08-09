@@ -230,7 +230,7 @@ func (d *Driver) Run(ctx context.Context) error {
 							log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
 						}
 						d.judgeProgress(i, sum)
-						if sum.Claimable > 0 && !d.backedOff(i) {
+						if spawnable(sum) && !d.backedOff(i) {
 							candidates[i] = true
 							anyCandidate = true
 						}
@@ -627,6 +627,11 @@ func quietBackoff(quiet int) time.Duration {
 // same no-op ten times, a threshold of three still saves seven of them.
 const quietThreshold = 3
 
+// spawnable reports whether this poll shows work a session could pick up — the
+// spawn gate's whole question. judgeProgress asks it too, so "this target is
+// idle" and "the gate declined to spawn" cannot drift apart.
+func spawnable(sum backlog.Summary) bool { return sum.Claimable > 0 }
+
 // judgeProgress reads this poll as the verdict on the target's last drain, and
 // backs the target off once it has spent enough sessions achieving nothing.
 //
@@ -635,6 +640,34 @@ const quietThreshold = 3
 // nothing, which is exactly the run this exists to stop repeating.
 func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	settled := sum.Settled()
+
+	// IDLE IS NOT FRUITLESS. `quiet` counts consecutive DRAINS that settled
+	// nothing, and a poll with nothing claimable is not a drain — the gate below
+	// will not spend a session, so this target has not failed at anything. Without
+	// this the count is immortal: it survives the blocker being parked (`parked`
+	// is not in Settled(), so nothing else clears it), an arbitrarily long idle
+	// stretch, and a complete turnover of the queue. A task filed a week later
+	// then inherits a back-off it did nothing to earn and serves the escalated
+	// 2h wait on its FIRST fruitless drain — defeating quietThreshold, which
+	// exists precisely so a large task spanning sessions is not punished.
+	//
+	// Clearing skipUntil too, and not only the count: an in-flight wait is moot
+	// while there is nothing to spawn for, and leaving it set would make the next
+	// task filed sit out the tail of a wait somebody else's blocker earned.
+	//
+	// This cannot spin. A drain needs a poll where the target IS spawnable, so the
+	// reset only ever applies to a LATER poll; the count then climbs from zero the
+	// ordinary way, and reaching the threshold again takes quietThreshold fresh
+	// fruitless drains.
+	if !spawnable(sum) {
+		if d.quiet[i] > 0 {
+			log.Printf("%snothing claimable — idle, not fruitless; forgetting %d drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quiet[i])
+		}
+		d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+		d.pending[i] = false
+		d.baseline[i] = settled
+		return
+	}
 
 	if !d.pending[i] {
 		// No drain outstanding. Progress can still arrive from elsewhere — the
