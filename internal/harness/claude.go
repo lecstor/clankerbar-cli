@@ -402,12 +402,74 @@ func (claude) parse(res *Result) {
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}
 }
 
+// claudeErrorText collects the harness's OWN diagnostic text — all of stderr, the
+// stdout lines that are not stream events at all, and the terminal `result` event
+// when it reports a failure — so a limit or transient scan never reads the agent's
+// narration.
+//
+// Both scans used to run over the whole of Stdout+Stderr, and Stdout is the entire
+// raw NDJSON stream: every assistant message, and every `tool_result` block, which
+// carries the verbatim MCP response to `claim_task`. So a backlog task whose body
+// merely said "hit your" reported a usage limit that never happened — and the loop
+// then slept, re-spawned the same paid session, re-claimed the same task and did it
+// again, with every budget ceiling sitting inert inside the drain (CLA-258). Same
+// defect, same fix, as opencodeErrorText.
+//
+// Non-JSON stdout lines are kept deliberately: under `--output-format stream-json`
+// every word the agent says arrives inside a JSON event, so a bare line is the CLI
+// talking — which is how a usage-limit notice arrives when the stream never starts.
+// A line that starts like an event but does not parse is dropped rather than read
+// raw; a half-written event is not something to classify a run on.
+func claudeErrorText(res Result) string {
+	var b strings.Builder
+	b.WriteString(res.Stderr)
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "{") {
+			b.WriteByte('\n')
+			b.WriteString(line)
+			continue
+		}
+		var ev struct {
+			Type           string `json:"type"`
+			Subtype        string `json:"subtype"`
+			IsError        bool   `json:"is_error"`
+			Result         string `json:"result"`
+			TerminalReason string `json:"terminal_reason"`
+		}
+		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type != "result" {
+			continue
+		}
+		// terminal_reason is a typed field the CLI sets; it is never the agent's words.
+		if ev.TerminalReason != "" {
+			b.WriteByte('\n')
+			b.WriteString(ev.TerminalReason)
+		}
+		// `result` is free text. On a clean finish it is the agent's own closing
+		// summary — narration by another name — so it is read only once the CLI has
+		// said the session ended badly.
+		if ev.IsError || ev.TerminalReason != "" || (ev.Subtype != "" && ev.Subtype != "success") {
+			b.WriteByte('\n')
+			b.WriteString(ev.Result)
+		}
+	}
+	return b.String()
+}
+
 func (claude) DetectLimit(res Result) Limit {
 	reason, _ := res.Raw["terminal_reason"].(string)
-	if reason == "usage_limit" || strings.Contains(res.Stdout+res.Stderr, "hit your") {
+	text := claudeErrorText(res)
+	if reason == "usage_limit" || strings.Contains(text, "hit your") {
 		return Limit{
 			Limited: true,
-			ResetAt: parseClaudeReset(res.Stdout + res.Stderr),
+			// From the same scoped text, and for the same reason: reading the reset
+			// out of the narration would let backlog text choose how long the loop
+			// sleeps. Missing it costs nothing but the upper bound — the supervised
+			// wait polls for an early lift either way.
+			ResetAt: parseClaudeReset(text),
 			Reason:  "usage_limit",
 		}
 	}
@@ -418,12 +480,15 @@ func (claude) DetectLimit(res Result) Limit {
 // errors) so a task log that legitimately mentions an HTTP 500 can't be mistaken
 // for a dead session. A 400 bad-request is NOT here — retrying won't help it.
 // Ported from loop.sh's TRANSIENT_RE.
+//
+// The anchoring is the second line of defence, not the first: it is applied to
+// claudeErrorText, so the agent's narration is not scanned at all.
 var claudeTransientRe = regexp.MustCompile(`(?i)api error: (408|429|5\d\d)` +
 	`|api error:.*(overloaded|internal server|bad gateway|service unavailable|gateway time|too many requests)` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 func (claude) IsTransient(res Result) bool {
-	return claudeTransientRe.MatchString(res.Stdout + res.Stderr)
+	return claudeTransientRe.MatchString(claudeErrorText(res))
 }
 
 func (c claude) Probe(ctx context.Context, in Invocation) (Limit, error) {

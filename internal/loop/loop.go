@@ -269,15 +269,19 @@ func (d *Driver) Run(ctx context.Context) error {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target, start)
+		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target,
+			spend{start: start, tokens: totalTokens, cost: totalCost})
+		// Count the spend BEFORE deciding what to do with the outcome: a drain that
+		// stopped or failed still burned what it burned, and the figures this run
+		// reports have to include its last session.
+		totalTokens += tokens
+		totalCost += cost
 		if err != nil {
 			return err
 		}
 		if stop {
 			return nil
 		}
-		totalTokens += tokens
-		totalCost += cost
 
 		// Blind mode has no counts to gate on, so it idles between sessions rather
 		// than spinning. Note this is a PER-TASK pause now: the default prompt asks
@@ -295,18 +299,45 @@ func (d *Driver) Run(ctx context.Context) error {
 	}
 }
 
+// spend is what the run had already consumed when this drain began, plus when it
+// began — the budget breaker's whole view, handed down from Run.
+//
+// It is handed down because the ceilings are CUMULATIVE across the run while a
+// drain only sees its own attempts, and because a drain can wait for hours
+// (supervised wait, transient backoff) without ever returning to the breaker
+// between drains. Measuring a mid-drain decision against this drain's spend alone
+// would let a run walk past a ceiling it had already reached.
+type spend struct {
+	start  time.Time
+	tokens int
+	cost   float64
+}
+
 // drainWithRetries runs one drain to a clean finish, absorbing usage-limit pauses
 // (supervised wait) and transient blips (exponential backoff) by re-running the
 // SAME session — neither costs a drain count. Returns the tokens/cost consumed on
 // a clean finish; stop=true if a STOP/cancel landed during a wait; err only on a
 // genuine, non-retryable failure (or exhausted retries).
 //
-// deadline is when the run's wall-clock ceiling expires (zero = none). It is
-// passed down because the budget breaker only runs BETWEEN drains, and the
-// supervised wait happens inside one — see waitPastDeadline.
-func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, start time.Time) (tokens int, cost float64, stop bool, err error) {
+// prior carries the run's ceilings down into the drain, because the budget breaker
+// in Run only runs BETWEEN drains and every wait in here happens inside one — see
+// the check at the top of the loop, and waitPastBudget.
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	retries := 0
 	for {
+		// The breaker, from inside the drain. Every path that loops back here has
+		// just waited — a supervised wait on a usage limit, an exponential backoff
+		// on a transient blip — and each of those waits used to be unbounded by
+		// anything but the wall clock, which is only one of three dials and the one
+		// an operator is least likely to have set. A drain that re-spawns a paid
+		// session on a loop is the expensive failure this stops, whatever put it
+		// there (CLA-258).
+		if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+			log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
+				drainNum, dim, prior.tokens+tokens, prior.cost+cost, time.Since(prior.start).Round(time.Second))
+			return tokens, cost, true, nil
+		}
+
 		// Each attempt streams live to the terminal and to its own logfile. The name
 		// carries the drain number and attempt counter as well as the timestamp: two
 		// attempts in the same second (a sub-second backoff) would otherwise share a
@@ -388,7 +419,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, s
 			// and stop on the very next check — having spent the night waiting for
 			// headroom it then declines to use. Stop now and say when the quota
 			// returns, so the operator can start a fresh run against it.
-			remaining, bounded := d.cfg.Budget.Remaining(time.Since(start))
+			remaining, bounded := d.cfg.Budget.Remaining(time.Since(prior.start))
 			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
 					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
