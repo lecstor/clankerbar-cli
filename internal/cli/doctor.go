@@ -442,7 +442,7 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 		// rather than spawning. It IS worth saying out loud when the operator holds
 		// the only key, because "no work" and "work you have not unblocked" look
 		// identical in the counts and read as a healthy queue.
-		if sum.Claimable == 0 && sum.OpenQuestions > 0 {
+		if !sum.Spawnable() && sum.OpenQuestions > 0 {
 			c.status = warn
 			c.detail += " — nothing to claim; the loop will idle without spawning"
 			c.remedy = "answer the open question(s) at clankerbar.com, or expect an idle run"
@@ -1282,6 +1282,15 @@ func firstField(s string) string {
 
 // --- 10. power ----------------------------------------------------------------
 
+// unknownSleepRemedy is shared by both ways doctor can fail to learn the sleep
+// policy — `pmset -g` not running at all, and running but reporting no
+// idle-sleep field. The two states are the same state, so they say the same
+// thing; keeping one string means a future edit cannot improve the advice for
+// one of them and leave the other behind. It has to be actionable for a reader
+// who has just been told the command doctor would send them to did not answer,
+// so it names the mitigation as well as the manual check.
+const unknownSleepRemedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait. Either way, `clankerbar run` holds a no-idle-sleep assertion for the length of the run; for any other invocation use `caffeinate -i …`"
+
 // checkPower answers the most basic precondition of an unattended run, and the
 // one nothing else checks: will this machine still be awake to do the work?
 //
@@ -1319,14 +1328,27 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 		// block a cron gate over a missing binary.
 		c.status = warn
 		c.detail = "could not read the sleep settings: " + err.Error()
-		c.remedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait"
+		c.remedy = unknownSleepRemedy
 		return c
 	}
 	mins, found := idleSleepMinutes(out)
 	switch {
 	case !found:
-		c.status = pass
-		c.detail = "no idle-sleep timeout reported for the active power source"
+		// Informationally identical to the read failing outright: the command
+		// exited zero, but no idle-sleep field came back, so doctor does not know
+		// the answer. A renamed, re-cased or locale-shifted field, or a VM whose
+		// `pmset` omits it, used to render a green line on the exact question this
+		// check exists to answer. Failing open on the unknown case is worse than
+		// not checking, because the operator gets a green line telling them not to
+		// look. Note what the WARN does and does not buy: only `fail` stops
+		// `doctor && run`, so the documented cron gate opens either way — what
+		// changes is that a human reading the output has a line worth reading. Do
+		// not "restore consistency" by making this a FAIL; that would block the
+		// gate over a machine that may well be fine, which is why the read-failure
+		// branch above is a WARN too.
+		c.status = warn
+		c.detail = "no idle-sleep timeout reported for the active power source, so the sleep policy is unknown"
+		c.remedy = unknownSleepRemedy
 	case mins == 0:
 		c.status = pass
 		c.detail = "idle sleep is disabled for the active power source (a closed lid still sleeps)"

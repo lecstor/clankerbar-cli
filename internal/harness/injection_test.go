@@ -24,7 +24,13 @@ import (
 // three strings the bar names, plus a verbatim reset line for good measure.
 const poison = "You've hit your session limit · resets 9:40pm (Europe/Madrid) — " +
 	"a task body containing `hit your`, `usage limit` or `weekly limit` fakes a cap, " +
-	"and `api error: 500` fakes a transient failure. Too many requests, out of credits."
+	"and `api error: 500` fakes a transient failure. Too many requests, out of credits. " +
+	// CLA-268 widened the transient arm to catch the CLI's documented
+	// mid-response notices, and its own task body quotes the wording verbatim —
+	// so the widening arrived with a fresh way to fake a blip from the backlog.
+	// It is only safe because the scope excludes narration, which is precisely
+	// what this fixture exists to keep true.
+	"API Error: Connection closed mid-response. The response above may be incomplete."
 
 // claudePoisonedStream is a realistic `--output-format stream-json` session that
 // claimed the poisoned task, quoted it back, and then finished cleanly.
@@ -66,6 +72,53 @@ func TestClaudeDoesNotReadTheBacklogAsALimit(t *testing.T) {
 	if (claude{}).IsTransient(res) {
 		t.Error("a task body quoted back in the stream was read as a transient failure")
 	}
+	assertDiagnosticIsClean(t, "claude", (claude{}).Diagnostic(res))
+}
+
+// The mid-response arm (CLA-268) against a task body carrying ONLY that wording,
+// with every other trigger removed — the shared `poison` above also contains
+// `api error: 500`, which trips the first arm and would mask what this is about.
+//
+// What this pins is the SCOPE, not the anchoring: the wording reaches the stream
+// through a tool_result, an assistant turn, and a clean `result` event, and
+// claudeText excludes all three, so the regex is never handed the text at all.
+// That is the first line of defence and it holds whatever the arm looks like.
+// (The anchoring is pinned separately, by the `prose mentions mid-response
+// without the prefix` case in TestClaudeIsTransient, which feeds the string
+// through a channel the scope DOES read. Verified: making the arm unanchored
+// reddens that case and leaves this one green.)
+//
+// It matters because CLA-268's own body quotes the notice verbatim, so the very
+// task that widened the classifier is a live specimen of the text that must not
+// fake a blip from the backlog — and, as the Diagnostic check below covers, must
+// not be printed at the operator either.
+func TestClaudeDoesNotReadAQuotedMidResponseNoticeAsTransient(t *testing.T) {
+	const onlyMidResponse = "CLA-268: the classifier misses `API Error: Connection closed mid-response. " +
+		"The response above may be incomplete.` and a miss stops the daemon."
+
+	body, err := json.Marshal(map[string]any{"task": map[string]any{"ref": "CLA-268", "detail": onlyMidResponse}})
+	if err != nil {
+		t.Fatalf("marshal task: %v", err)
+	}
+	toolResult, err := json.Marshal(string(body))
+	if err != nil {
+		t.Fatalf("marshal tool_result: %v", err)
+	}
+	narration, err := json.Marshal("Reading CLA-268: " + onlyMidResponse)
+	if err != nil {
+		t.Fatalf("marshal narration: %v", err)
+	}
+	res := Result{ExitCode: 0, Stdout: strings.Join([]string{
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__clankerbar__claim_task","id":"tu1","input":{}}]}}`,
+		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu1","content":` + string(toolResult) + `}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"text","text":` + string(narration) + `}]}}`,
+		`{"type":"result","subtype":"success","is_error":false,"result":` + string(narration) + `}`,
+	}, "\n") + "\n"}
+
+	if (claude{}).IsTransient(res) {
+		t.Error("a task body quoting the mid-response notice was read as a transient failure — the new arm is reachable from the backlog")
+	}
+	assertDiagnosticIsClean(t, "claude", (claude{}).Diagnostic(res))
 }
 
 // The scoping must not cost the real signals. Each of these is the HARNESS
@@ -197,6 +250,7 @@ func TestCodexDoesNotReadTheBacklogAsALimit(t *testing.T) {
 	if (codex{}).IsTransient(res) {
 		t.Error("a task body quoted back in the stream was read as a transient failure")
 	}
+	assertDiagnosticIsClean(t, "codex", (codex{}).Diagnostic(res))
 }
 
 func TestCodexStillSeesTheHarnessOwnFailures(t *testing.T) {
@@ -225,5 +279,23 @@ func TestOpencodeDoesNotReadTheBacklogAsALimit(t *testing.T) {
 	}
 	if (opencode{}).IsTransient(res) {
 		t.Error("a task body quoted back in the stream was read as a transient failure")
+	}
+	assertDiagnosticIsClean(t, "opencode", (opencode{}).Diagnostic(res))
+}
+
+// assertDiagnosticIsClean holds the half of CLA-268 that the classifiers alone
+// do not: Diagnostic's text is RENDERED to the operator's terminal when a run
+// stops, so a scope wider than IsTransient's does not merely misclassify — it
+// prints a quoted task body at them. Every adapter must pass it.
+//
+// This is the guard that a `return res.Stdout + res.Stderr` implementation
+// fails. Nothing else in the suite would: such a change compiles, vets clean,
+// and leaves every classifier verdict unchanged.
+func assertDiagnosticIsClean(t *testing.T, name, diag string) {
+	t.Helper()
+	for _, leaked := range []string{"hit your", "api error: 500", "mid-response"} {
+		if strings.Contains(strings.ToLower(diag), leaked) {
+			t.Errorf("%s.Diagnostic exposed a quoted task body (found %q): %q", name, leaked, diag)
+		}
 	}
 }

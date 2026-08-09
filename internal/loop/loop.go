@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -230,7 +231,7 @@ func (d *Driver) Run(ctx context.Context) error {
 							log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
 						}
 						d.judgeProgress(i, sum)
-						if sum.Claimable > 0 && !d.backedOff(i) {
+						if sum.Spawnable() && !d.backedOff(i) {
 							candidates[i] = true
 							anyCandidate = true
 						}
@@ -465,7 +466,14 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			continue
 		}
 
-		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping", drainNum, d.h.Name(), res.ExitCode)
+		// Stopping here ends the whole run, so say WHAT was judged non-retryable.
+		// Without it the operator gets "exited 1 (non-retryable)" and no way to
+		// tell a genuine failure from a blip the classifier merely does not know
+		// yet — which is the one thing they need in order to report the gap. The
+		// text is the harness's own diagnostic scope, never the raw stream, so
+		// the agent's narration is not quoted back at them (CLA-258).
+		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s",
+			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)))
 	}
 }
 
@@ -643,6 +651,60 @@ const quietThreshold = 3
 func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	settled := sum.Settled()
 
+	// IDLE IS NOT FRUITLESS. `quiet` counts consecutive DRAINS that settled
+	// nothing, and a poll with nothing claimable is not a drain — the gate below
+	// will not spend a session, so this target has not failed at anything. Without
+	// this the count is immortal: it survives the blocker being parked (`parked`
+	// is not in Settled(), so nothing else clears it), an arbitrarily long idle
+	// stretch, and a complete turnover of the queue. A task filed a week later
+	// then inherits a back-off it did nothing to earn and serves the escalated
+	// 2h wait on its FIRST fruitless drain — defeating quietThreshold, which
+	// exists precisely so a large task spanning sessions is not punished.
+	//
+	// ONLY WITH NO VERDICT OUTSTANDING, and that condition is load-bearing rather
+	// than defensive. `claimable == 0` does not only mean "the queue is empty" — it
+	// also means "everything ready is claimed right now", and the poll immediately
+	// after a drain is exactly when that is most likely, because a session that
+	// ends still holding a task it pushed work on is deliberately NOT handed back
+	// (see releaseHeldClaim). Forgetting the count there would not merely decline
+	// to charge the drain, it would CANCEL the verdict on one that already ran — so
+	// a target whose every session ends holding its task would alternate spawn /
+	// forget forever and never back off at all. Requiring the verdict to be settled
+	// first costs one extra poll of an idle stretch and nothing else: the drain is
+	// judged, and the NEXT poll — still idle — does the forgetting.
+	//
+	// Clearing skipUntil too, and not only the count: an in-flight wait is moot
+	// while there is nothing to spawn for, and leaving it set would make the next
+	// task filed sit out the tail of a wait somebody else's blocker earned.
+	//
+	// RESIDUAL, stated rather than implied. A target whose only claimable task is
+	// held ELSEWHERE for more than one poll — another driver on the same project,
+	// an agent working it by hand — reads as idle for that stretch, so it forgets
+	// and lifts. Such a target backs off at the base 15m every quietThreshold
+	// fruitless drains instead of escalating toward 2h: the breaker still bounds
+	// the spend, it just stops tightening. That is accepted rather than narrowed
+	// away, because the two obvious narrowings are both worse. Requiring
+	// `in_progress == 0` reinstates the immortal count for any project holding
+	// abandoned WIP (CLA-274), which is precisely the population most likely to
+	// have some. Requiring N consecutive idle polls does not discriminate at all:
+	// a task held elsewhere is held for a lease, which is many poll intervals.
+	// Nothing in a summary count separates "quiet because there is no work" from
+	// "quiet because somebody else has it" — only whether WE are still spending
+	// sessions does, and the guard above is the part of that signal worth having.
+	//
+	// This cannot spin. A drain needs a poll where the target IS spawnable, so the
+	// reset never applies to the poll that authorises a session; the count climbs
+	// from zero the ordinary way, and reaching the threshold again takes
+	// quietThreshold fresh fruitless drains.
+	if !sum.Spawnable() && !d.pending[i] {
+		if d.quiet[i] > 0 {
+			log.Printf("%snothing claimable — idle, not fruitless; forgetting %d drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quiet[i])
+		}
+		d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+		d.baseline[i] = settled
+		return
+	}
+
 	if !d.pending[i] {
 		// No drain outstanding. Progress can still arrive from elsewhere — the
 		// operator merging a PR, another machine's loop — and it means whatever was
@@ -803,6 +865,56 @@ func retryLabel(n, max int) string {
 		return fmt.Sprintf("retry %d/%d", n, max)
 	}
 	return fmt.Sprintf("retry %d", n)
+}
+
+// failureDetailMax bounds how much of the harness's diagnostic text reaches the
+// stop message. A session's stderr can run to megabytes; the operator needs
+// enough to recognise the failure and quote it in a bug report, not the log.
+const failureDetailMax = 400
+
+// failureDetail renders a harness diagnostic for a one-line stop message: the
+// TAIL of the text, non-printables stripped, whitespace collapsed, bounded.
+//
+// The tail rather than the head, deliberately. The scope starts with stderr,
+// which on a real run leads with startup noise that is identical on every
+// session; the thing that killed this one is the last thing said. Truncating
+// from the front would reliably show the operator the one part that is never
+// the answer.
+//
+// Non-printables are stripped because this changes what the text is FOR. Up to
+// now a diagnostic was only ever fed to regexp.MatchString, where a control byte
+// is inert; here it is rendered to a terminal, where ESC is executed. The
+// scoping rules inherited from CLA-258 answer "what may a classifier READ", which
+// is a different question from "what may be PRINTED", and stderr reaches this
+// verbatim from the harness. Stripping is cheap and the answer does not depend
+// on trusting the upstream CLI's output.
+//
+// Empty in, empty out — and the caller appends it, so a harness with nothing to
+// say leaves the existing message exactly as it was rather than trailing a
+// colon and a blank.
+func failureDetail(diag string) string {
+	printable := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) || unicode.IsSpace(r) {
+			return r
+		}
+		return -1
+	}, diag)
+
+	s := strings.Join(strings.Fields(printable), " ")
+	if s == "" {
+		return ""
+	}
+	// Counted and sliced in RUNES, not bytes: the harness's own text carries "·"
+	// in every usage-limit notice and "→" in rendered tool markers, so a byte
+	// slice would routinely cut a rune in half and emit U+FFFD at the seam.
+	//
+	// "..." rather than U+2026: this string exists to be pasted into a bug
+	// report, and a single-character ellipsis is exactly what arrives as
+	// mojibake when terminal output is copied out.
+	if r := []rune(s); len(r) > failureDetailMax {
+		s = "..." + string(r[len(r)-failureDetailMax:])
+	}
+	return ": " + s
 }
 
 // invocation builds the harness invocation for one target: the target's workdir

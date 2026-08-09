@@ -296,6 +296,10 @@ func (opencode) IsTransient(res Result) bool {
 	return opencodeTransientRe.MatchString(opencodeErrorText(res))
 }
 
+// Diagnostic returns the same scoped text IsTransient judged. See the claude
+// adapter's Diagnostic for why the scope must match exactly.
+func (opencode) Diagnostic(res Result) string { return opencodeErrorText(res) }
+
 func (o opencode) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	in.Probe = true
 	res, err := o.Invoke(ctx, in)
