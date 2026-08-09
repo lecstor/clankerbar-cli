@@ -299,11 +299,15 @@ after each session — no new credentials, no plane change:
 - **A declared delivery really landed**: `commit` is an ancestor of the remote tip
   of `integrationBranch` — the same ancestor check the plane asks the clanker to
   attest to, run rather than trusted. The integration branch is read from the
-  remote, never from a local `main` that is routinely tens of commits stale.
+  remote, never from a local `main` that is routinely tens of commits stale. Only
+  a *closure* is checked this way: a hand-off to `in_review` carries the delivery
+  it is proposing, and at that moment nothing has merged yet. And only a commit
+  **id** counts — a revision expression like `main` or `HEAD` is trivially its own
+  ancestor, so it is reported as unverifiable rather than checked.
 
 ```
-DELIVERY UNVERIFIED — CLA-134: branch "clanker/x" is 12 commits ahead of
-origin/clanker/x — local tip 4a91c0de, remote 0b3f21aa; that work is UNPUSHED and
+DELIVERY UNVERIFIED — CLA-134: branch "clanker/x" is ahead of origin/clanker/x by
+12 commits — local tip 4a91c0de, remote 0b3f21aa; that work is UNPUSHED and
 exists only in /Users/you/dev/acme
 ```
 
@@ -326,7 +330,10 @@ their repository's refs, so the specific directory does not matter: the driver
 looks for the *repository* whose refs carry the branch, searching the workdir and
 its first two directory levels (enough to reach both `~/dev/<repo>` and
 `~/dev/<repo>-wt/<task>`). Repositories are never descended into and bare ones are
-skipped, so the search costs a bounded handful of `git rev-parse` calls.
+skipped, so the search costs a bounded handful of `git rev-parse` calls. If *two*
+repositories under the workdir carry the same branch — a review clone sitting
+beside the session's own tree — that is reported as unverifiable too: checking the
+wrong tree is worse than not checking.
 
 This covers **unattended runs only**, by design: an interactive session bypasses
 the driver entirely.

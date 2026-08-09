@@ -45,6 +45,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Status is the outcome of one check. The three-way split is the whole point: see
@@ -174,21 +175,101 @@ func (v *Verifier) Verify(ctx context.Context, c Claim) Report {
 		return rep
 	}
 
-	repo, err := v.resolveRepo(ctx, c.Branch)
-	if err != nil {
-		rep.Checks = v.allUnknown(c, err.Error())
+	// One search, but the two claims are resolved INDEPENDENTLY. They are located
+	// by different evidence — a branch name, a commit object — and letting one
+	// unresolvable claim mark the other unknown loses real checks: a clanker that
+	// tidies up (`git branch -d`) after a merge would suppress the merge check,
+	// which is the one the bar cares about most, over a missing ref that is missing
+	// precisely because the work landed.
+	repos := v.candidateRepos(ctx)
+	if len(repos) == 0 {
+		rep.Checks = v.allUnknown(c, fmt.Sprintf(
+			"%s is not a git repository and none was found below it, so the claim cannot be checked locally", v.workdir))
 		return rep
 	}
-	rep.Repo = repo
-	remote := v.resolveRemote(ctx, repo)
 
 	if c.Branch != "" {
-		rep.Checks = append(rep.Checks, v.checkBranch(ctx, repo, remote, c.Branch))
+		rep.Checks = append(rep.Checks, v.branchCheck(ctx, repos, c.Branch, &rep))
 	}
 	if c.Commit != "" && c.IntegrationBranch != "" {
-		rep.Checks = append(rep.Checks, v.checkMerged(ctx, repo, remote, c.Commit, c.IntegrationBranch))
+		rep.Checks = append(rep.Checks, v.mergeCheck(ctx, repos, c.Commit, c.IntegrationBranch, &rep))
 	}
 	return rep
+}
+
+// branchCheck locates the repository carrying the branch, then checks it.
+//
+// A branch NAME is not an identity: two separate clones of the same project under
+// one workdir (the session's tree, and a `gh pr checkout` review clone beside it)
+// both carry `clanker/x`, and picking whichever the directory listing happened to
+// return first would answer about the wrong tree — turning the exact
+// unpushed-work failure this exists to catch into a Pass. Ambiguity is reported,
+// not guessed at.
+func (v *Verifier) branchCheck(ctx context.Context, repos []string, branch string, rep *Report) Check {
+	var found []string
+	for _, r := range repos {
+		if sha, err := v.run(ctx, r, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil && sha != "" {
+			found = append(found, r)
+		}
+	}
+	switch len(found) {
+	case 0:
+		return Check{Kind: BranchPushed, Status: Unknown, Detail: fmt.Sprintf(
+			"no repository at or below %s has a branch %q (looked in %s)",
+			v.workdir, branch, strings.Join(repos, ", "))}
+	case 1:
+	default:
+		return Check{Kind: BranchPushed, Status: Unknown, Detail: fmt.Sprintf(
+			"%d repositories below %s carry a branch %q (%s) — which one the session worked in cannot be told apart, and checking the wrong one is worse than not checking",
+			len(found), v.workdir, branch, strings.Join(found, ", "))}
+	}
+	rep.Repo = found[0]
+	return v.checkBranch(ctx, found[0], v.resolveRemote(ctx, found[0]), branch)
+}
+
+// mergeCheck locates the repository containing the declared commit, then checks it.
+//
+// Unlike a branch name, a commit id IS an identity, so several candidates holding
+// it are necessarily clones of the same history and answer alike; the first will
+// do. What is NOT safe is taking the declared commit as a revision expression:
+// `rev-parse` would happily resolve "main", "HEAD" or the integration branch
+// itself, each of which is trivially its own ancestor, letting the party under
+// check manufacture a green attestation. It must be a commit id, and the object it
+// names must be the one it spells.
+func (v *Verifier) mergeCheck(ctx context.Context, repos []string, commit, integration string, rep *Report) Check {
+	if !isCommitID(commit) {
+		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
+			"declared delivery commit %q is not a commit id — a revision expression (a branch, HEAD) is not a delivery and is not checked as one", commit)}
+	}
+	for _, r := range repos {
+		sha, err := v.run(ctx, r, "rev-parse", "--verify", "--quiet", commit+"^{commit}")
+		if err != nil || sha == "" || !strings.HasPrefix(sha, strings.ToLower(commit)) {
+			continue
+		}
+		if rep.Repo == "" {
+			rep.Repo = r
+		}
+		return v.checkMerged(ctx, r, v.resolveRemote(ctx, r), sha, integration)
+	}
+	return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
+		"commit %s is in no repository at or below %s, so it cannot be traced to %s (looked in %s)",
+		short(commit), v.workdir, integration, strings.Join(repos, ", "))}
+}
+
+// isCommitID reports whether s spells an abbreviated or full object id. Seven is
+// git's own minimum useful abbreviation; anything shorter is ambiguous by design.
+func isCommitID(s string) bool {
+	if len(s) < 7 || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9', r >= 'a' && r <= 'f', r >= 'A' && r <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // allUnknown marks every check the claim asked for as unrunnable for one shared
@@ -237,7 +318,7 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 		// AHEAD (or rewritten), never the local-ahead failure this check exists for:
 		// were we ahead, the remote tip would be one of our own ancestors and
 		// therefore present. Try one targeted fetch, then say we do not know.
-		_, _ = v.run(ctx, repo, "fetch", "--quiet", remote, branch)
+		_, _ = v.run(ctx, repo, "fetch", "--quiet", "--", remote, branch)
 	}
 	if !v.haveObject(ctx, repo, remoteSHA) {
 		return Check{Kind: BranchPushed, Status: Unknown, Detail: fmt.Sprintf(
@@ -249,10 +330,9 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 		return Check{Kind: BranchPushed, Status: Pass, Detail: fmt.Sprintf(
 			"local tip %s is an ancestor of %s/%s (%s)", short(local), remote, branch, short(remoteSHA))}
 	}
-	ahead := v.count(ctx, repo, remoteSHA+".."+local)
 	return Check{Kind: BranchPushed, Status: Fail, Detail: fmt.Sprintf(
-		"branch %q is %s ahead of %s/%s — local tip %s, remote %s; that work is UNPUSHED and exists only in %s",
-		branch, plural(ahead, "commit"), remote, branch, short(local), short(remoteSHA), repo)}
+		"branch %q is ahead of %s/%s%s — local tip %s, remote %s; that work is UNPUSHED and exists only in %s",
+		branch, remote, branch, v.aheadBy(ctx, repo, remoteSHA, local), short(local), short(remoteSHA), repo)}
 }
 
 // checkMerged answers: did the declared delivery really land on the integration
@@ -262,13 +342,8 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 // It is judged against the REMOTE tip of the integration branch, not a local one:
 // a local `main` is routinely tens of commits stale, and a check against a stale
 // ref answers a question nobody asked.
-func (v *Verifier) checkMerged(ctx context.Context, repo, remote, commit, integration string) Check {
-	sha, err := v.run(ctx, repo, "rev-parse", "--verify", "--quiet", commit+"^{commit}")
-	if err != nil || sha == "" {
-		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
-			"commit %s is not in %s, so it cannot be traced to %s", short(commit), repo, integration)}
-	}
-
+// sha is already resolved and confirmed present in repo by mergeCheck.
+func (v *Verifier) checkMerged(ctx context.Context, repo, remote, sha, integration string) Check {
 	tip, err := v.lsRemote(ctx, repo, remote, integration)
 	if err != nil {
 		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
@@ -279,7 +354,7 @@ func (v *Verifier) checkMerged(ctx context.Context, repo, remote, commit, integr
 			"%s has no branch %q to check the delivery against", remote, integration)}
 	}
 	if !v.haveObject(ctx, repo, tip) {
-		_, _ = v.run(ctx, repo, "fetch", "--quiet", remote, integration)
+		_, _ = v.run(ctx, repo, "fetch", "--quiet", "--", remote, integration)
 	}
 	if !v.haveObject(ctx, repo, tip) {
 		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
@@ -299,30 +374,14 @@ func (v *Verifier) checkMerged(ctx context.Context, repo, remote, commit, integr
 // resolveRepo finds the repository whose refs carry branch. See the package doc:
 // linked worktrees share a ref database, so any working tree of the right
 // repository will do, and the search only has to identify the repository.
-func (v *Verifier) resolveRepo(ctx context.Context, branch string) (string, error) {
-	if v.workdir == "" {
-		return "", fmt.Errorf("no workdir configured, so no repository to check against")
-	}
-	repos := v.candidateRepos(ctx)
-	if len(repos) == 0 {
-		return "", fmt.Errorf("%s is not a git repository and none was found below it, so the claim cannot be checked locally", v.workdir)
-	}
-	if branch == "" {
-		return repos[0], nil
-	}
-	for _, r := range repos {
-		if sha, err := v.run(ctx, r, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil && sha != "" {
-			return r, nil
-		}
-	}
-	return "", fmt.Errorf("no repository at or below %s has a branch %q (looked in %s)",
-		v.workdir, branch, strings.Join(repos, ", "))
-}
-
+//
 // candidateRepos collects one working tree per distinct repository at or below the
 // workdir, deduplicated by the shared git common directory so a repo and its
 // linked worktrees count once. Bounded by maxDepth and maxEntries.
 func (v *Verifier) candidateRepos(ctx context.Context) []string {
+	if v.workdir == "" {
+		return nil
+	}
 	seen := map[string]bool{}
 	var out []string
 
@@ -331,11 +390,21 @@ func (v *Verifier) candidateRepos(ctx context.Context) []string {
 		if ctx.Err() != nil {
 			return
 		}
-		if common, ok := v.commonGitDir(ctx, dir); ok {
+		common, root, inRepo := v.repoAt(ctx, dir)
+		// `git rev-parse` answers for the nearest ENCLOSING repository, which may be
+		// far above dir. Below the workdir that must not count: a `git init`-ed home
+		// directory would otherwise match ~/dev itself, and the walk would stop there
+		// having found no project at all. At the workdir itself an enclosing repo IS
+		// the answer (the single-project case, where the workdir is the checkout or a
+		// directory inside it) — but if it merely encloses, keep descending too.
+		atRoot := inRepo && sameDir(root, dir)
+		if inRepo && (atRoot || depth == 0) {
 			if !seen[common] {
 				seen[common] = true
 				out = append(out, dir)
 			}
+		}
+		if atRoot {
 			// Do not descend: everything inside shares these refs, and a nested
 			// repository is not part of the worktree convention this serves.
 			return
@@ -362,30 +431,42 @@ func (v *Verifier) candidateRepos(ctx context.Context) []string {
 	return out
 }
 
-// commonGitDir returns the repository's shared git directory for dir, and whether
-// dir is a WORKING TREE of a repository. The common dir (not the per-worktree one)
-// is what makes a worktree and its parent repository compare equal.
+// repoAt reports the shared git directory and the working-tree root for dir, and
+// whether dir is inside a non-bare repository at all. The common dir (not the
+// per-worktree one) is what makes a worktree and its parent repository compare
+// equal; the root is what tells "this IS a checkout" from "something above it is".
 //
-// A bare repository is rejected: sessions never work in one, it has no branch a
-// clanker could have committed to, and — as a mirror or a local remote sitting
+// A bare repository is rejected: sessions never work in one, it has no working tree
+// a clanker could have committed in, and — as a mirror or a local remote sitting
 // beside the checkouts — it would answer "yes, that branch exists" while having no
-// remote of its own to check anything against.
-func (v *Verifier) commonGitDir(ctx context.Context, dir string) (string, bool) {
+// remote of its own to check anything against. It reports not-a-repo rather than
+// stopping the walk, so a bare repo's internals are still skipped by the depth
+// bound rather than probed directory by directory.
+func (v *Verifier) repoAt(ctx context.Context, dir string) (common, root string, ok bool) {
 	out, err := v.run(ctx, dir, "rev-parse", "--git-common-dir")
 	if err != nil || out == "" {
-		return "", false
+		return "", "", false
 	}
-	if bare, err := v.run(ctx, dir, "rev-parse", "--is-bare-repository"); err != nil || bare == "true" {
-		return "", false
+	top, err := v.run(ctx, dir, "rev-parse", "--show-toplevel")
+	if err != nil || top == "" {
+		return "", "", false // bare, or otherwise not a working tree
 	}
 	if !filepath.IsAbs(out) {
 		out = filepath.Join(dir, out)
 	}
-	if resolved, err := filepath.EvalSymlinks(out); err == nil {
-		out = resolved
-	}
-	return filepath.Clean(out), true
+	return realPath(out), realPath(top), true
 }
+
+// realPath normalises a path for comparison: symlinks resolved where possible
+// (macOS temp dirs are /var -> /private/var), lexically cleaned otherwise.
+func realPath(p string) string {
+	if resolved, err := filepath.EvalSymlinks(p); err == nil {
+		return resolved
+	}
+	return filepath.Clean(p)
+}
+
+func sameDir(a, b string) bool { return realPath(a) == realPath(b) }
 
 // resolveRemote picks the remote to judge against: the configured one when the
 // repository has it, otherwise its only remote. A repo with several remotes and no
@@ -435,23 +516,35 @@ func (v *Verifier) isAncestor(ctx context.Context, repo, a, b string) bool {
 	return err == nil
 }
 
-func (v *Verifier) count(ctx context.Context, repo, rng string) int {
-	out, err := v.run(ctx, repo, "rev-list", "--count", rng)
+// aheadBy renders " by N commits" when the count can be read, and nothing at all
+// when it cannot. A count that silently defaults to zero would print the loudest
+// line in the feature as "is 0 commits ahead", which reads like a bug in the
+// checker rather than the finding it is.
+func (v *Verifier) aheadBy(ctx context.Context, repo, from, to string) string {
+	out, err := v.run(ctx, repo, "rev-list", "--count", from+".."+to)
 	if err != nil {
-		return 0
+		return ""
 	}
 	n := 0
-	if _, err := fmt.Sscanf(out, "%d", &n); err != nil {
-		return 0
+	if _, err := fmt.Sscanf(out, "%d", &n); err != nil || n <= 0 {
+		return ""
 	}
-	return n
+	return " by " + plural(n, "commit")
 }
 
 // run executes one git command in dir and returns its trimmed stdout.
 //
 // The environment is deliberately hostile to interaction: an unattended run has
 // no terminal, and a git that decides to ask for a password would hang the driver
-// until its context expires rather than answering the question.
+// rather than answering the question.
+//
+// The context alone does NOT bound this. `git ls-remote` and `git fetch` spawn
+// helpers (ssh, git-remote-https, a credential helper) that inherit the pipes
+// behind these buffers, and os/exec's Wait blocks until every inheritor closes its
+// write end — so a killed git can still leave the call sitting there. Measured at
+// 8s against a 500ms deadline, returning a nil error, which would have read as a
+// successful check. WaitDelay is what actually cuts it off, and the truncated read
+// is reported as the failure it is.
 func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, v.gitBin, args...)
 	cmd.Dir = dir
@@ -459,9 +552,10 @@ func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string,
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_ASKPASS=echo",
 		"SSH_ASKPASS=echo",
-		"GIT_SSH_COMMAND=ssh -oBatchMode=yes",
+		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
 		"GCM_INTERACTIVE=never",
 	)
+	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

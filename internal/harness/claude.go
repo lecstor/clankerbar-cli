@@ -206,6 +206,7 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			Delivery struct {
 				Commit            string `json:"commit"`
 				IntegrationBranch string `json:"integrationBranch"`
+				PR                string `json:"pr"`
 			} `json:"delivery"`
 		}
 		if json.Unmarshal(input, &args) != nil || !res.Claim.Names(args.TaskID) {
@@ -225,6 +226,7 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			Branch:            args.Branch,
 			Commit:            args.Delivery.Commit,
 			IntegrationBranch: args.Delivery.IntegrationBranch,
+			PR:                args.Delivery.PR,
 		})
 		// Recording a branch declares pushed work worth handing over, which is
 		// exactly what makes the task unsafe to release. Applied on the REQUEST,

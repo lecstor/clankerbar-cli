@@ -39,8 +39,8 @@ func (f *fakeVerifier) Verify(_ context.Context, c delivery.Claim) delivery.Repo
 }
 
 type attestCall struct {
-	taskID, runID, commit, integration string
-	verified                           bool
+	taskID, runID, commit, integration, pr string
+	verified                               bool
 }
 
 // attestingReleaser is a Releaser that can also attest — the shape the real
@@ -51,8 +51,8 @@ type attestingReleaser struct {
 	err     error
 }
 
-func (a *attestingReleaser) AttestMergeVerified(_ context.Context, taskID, runID, commit, integration string, verified bool) error {
-	a.attests = append(a.attests, attestCall{taskID, runID, commit, integration, verified})
+func (a *attestingReleaser) AttestMergeVerified(_ context.Context, taskID, runID string, d plane.Delivery, verified bool) error {
+	a.attests = append(a.attests, attestCall{taskID, runID, d.Commit, d.IntegrationBranch, d.PR, verified})
 	return a.err
 }
 
@@ -98,7 +98,7 @@ func branchReport() harness.Report {
 func mergeReport() harness.Report {
 	return harness.Report{
 		TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Status: "done",
-		Commit: "abc123", IntegrationBranch: "main",
+		Commit: "abc1234", IntegrationBranch: "main", PR: "#42",
 	}
 }
 
@@ -138,7 +138,7 @@ func TestVerifyDeliveries_ChecksEveryClaimInTheSessionsWorkdir(t *testing.T) {
 	if v.claims[0].Branch != "clanker/x" || v.claims[0].Label != "CLA-253" {
 		t.Errorf("branch claim = %+v", v.claims[0])
 	}
-	if v.claims[1].Commit != "abc123" || v.claims[1].IntegrationBranch != "main" {
+	if v.claims[1].Commit != "abc1234" || v.claims[1].IntegrationBranch != "main" {
 		t.Errorf("delivery claim = %+v", v.claims[1])
 	}
 }
@@ -277,8 +277,12 @@ func TestAttestMerge_WritesTheDriversVerdictBothWays(t *testing.T) {
 			}
 			// The attestation has to name what it is about, or a later reader cannot
 			// tell what was checked.
-			if got.taskID != "t-1" || got.runID != "r-1" || got.commit != "abc123" || got.integration != "main" {
-				t.Errorf("attestation = %+v, want it to name the declared delivery", got)
+			// The PR ref rides along even though the check did not use it: the plane
+			// takes `delivery` as an object, and sending a partial one could drop
+			// whatever the session put in the fields the driver did not name.
+			if got.taskID != "t-1" || got.runID != "r-1" || got.commit != "abc1234" ||
+				got.integration != "main" || got.pr != "#42" {
+				t.Errorf("attestation = %+v, want it to name the declared delivery in full", got)
 			}
 		})
 	}
@@ -327,6 +331,35 @@ func TestAttestMerge_NonAttestingReleaserIsNotFatal(t *testing.T) {
 	runWithVerifier(t, h, &fakeReleaser{}, v) // Release only, no AttestMergeVerified
 }
 
+// An `in_review` hand-off routinely carries the delivery it is proposing, and at
+// that moment nothing has merged — nobody has reviewed it yet. Checking it anyway
+// would fire the loudest line in the feature on the happy path and stamp
+// mergeVerified=false on a task that is fine.
+func TestVerifyDeliveries_InReviewIsNotAMergeClaim(t *testing.T) {
+	captureLogs(t)
+	v := &fakeVerifier{}
+	rel := &attestingReleaser{}
+	rep := mergeReport()
+	rep.Status = "in_review"
+	rep.Branch = "clanker/x"
+	h := &fakeAdapter{steps: []invokeStep{{res: reported(okResult(0, 0), rep)}}}
+
+	runWithVerifier(t, h, rel, v)
+
+	if len(v.claims) != 1 {
+		t.Fatalf("checked %d claims, want 1: %+v", len(v.claims), v.claims)
+	}
+	if v.claims[0].Branch != "clanker/x" {
+		t.Errorf("the branch is still worth checking at in_review: %+v", v.claims[0])
+	}
+	if v.claims[0].Commit != "" || v.claims[0].IntegrationBranch != "" {
+		t.Errorf("an in_review hand-off must not be checked as a merge: %+v", v.claims[0])
+	}
+	if len(rel.attests) != 0 {
+		t.Errorf("nothing merged, nothing to attest: %+v", rel.attests)
+	}
+}
+
 // --- end to end, against a real repository ---------------------------------
 
 // The whole chain with nothing stubbed but the harness: a session reports a
@@ -348,6 +381,7 @@ func TestRun_RealGitRepo_ReportsUnpushedWork(t *testing.T) {
 	gitRun(t, root, "init", "-b", "main", work)
 	gitRun(t, work, "config", "user.email", "driver@example.test")
 	gitRun(t, work, "config", "user.name", "Driver Test")
+	gitRun(t, work, "config", "commit.gpgsign", "false")
 	gitRun(t, work, "remote", "add", "origin", remote)
 	writeTestFile(t, filepath.Join(work, "a.txt"), "a")
 	gitRun(t, work, "add", ".")
@@ -377,7 +411,7 @@ func TestRun_RealGitRepo_ReportsUnpushedWork(t *testing.T) {
 	}
 
 	out := logs.String()
-	if !strings.Contains(out, "DELIVERY UNVERIFIED") || !strings.Contains(out, "1 commit ahead") {
+	if !strings.Contains(out, "DELIVERY UNVERIFIED") || !strings.Contains(out, "ahead of origin/clanker/x by 1 commit") {
 		t.Errorf("the driver should have caught the unpushed commit, got:\n%s", out)
 	}
 }
@@ -386,8 +420,12 @@ func gitRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
+	// Insulated from the developer's own git config: a system-wide
+	// `commit.gpgsign = true` would otherwise fail this test on their machine and
+	// nowhere else.
 	cmd.Env = append(os.Environ(),
 		"GIT_TERMINAL_PROMPT=0",
+		"GIT_CONFIG_NOSYSTEM=1",
 		"HOME="+t.TempDir(),
 		"GIT_AUTHOR_NAME=Driver Test", "GIT_AUTHOR_EMAIL=driver@example.test",
 		"GIT_COMMITTER_NAME=Driver Test", "GIT_COMMITTER_EMAIL=driver@example.test",

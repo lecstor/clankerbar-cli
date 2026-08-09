@@ -67,7 +67,7 @@ func TestCommittedButUnpushed_Fails(t *testing.T) {
 		t.Fatalf("unpushed local commits should fail, got %s", render(rep))
 	}
 	c := mustStatus(t, rep, BranchPushed, Fail)
-	if !strings.Contains(c.Detail, "2 commits ahead") {
+	if !strings.Contains(c.Detail, "ahead of origin/clanker/feature by 2 commits") {
 		t.Errorf("detail should name how much is unpushed, got %q", c.Detail)
 	}
 	if !strings.Contains(c.Detail, "UNPUSHED") {
@@ -264,6 +264,152 @@ func TestUnknownCommit_DegradesToCannotCheck(t *testing.T) {
 	mustStatus(t, rep, CommitMerged, Unknown)
 	if _, ran := rep.MergeVerified(); ran {
 		t.Error("nothing was checked, so nothing may be attested")
+	}
+}
+
+// The declared commit is agent-supplied text, and `rev-parse` resolves ANY
+// revision. Left unguarded, a session that did no work at all could declare
+// `delivery.commit: "main"` — trivially its own ancestor — and be handed a green
+// attestation by the one process meant to be checking it.
+func TestRevisionExpressionIsNotADelivery(t *testing.T) {
+	env := newEnv(t)
+	env.commit("main", "base.txt", "base")
+	env.push("main")
+
+	for _, spelling := range []string{"main", "HEAD", "origin/main", "HEAD~1", "v1.0.0", "abc123"} {
+		rep := verify(t, env.work, Claim{Label: "CLA-253", Commit: spelling, IntegrationBranch: "main"})
+		if rep.Failed() {
+			t.Errorf("%q: should be unverifiable, not a failure: %s", spelling, render(rep))
+		}
+		mustStatus(t, rep, CommitMerged, Unknown)
+		if _, ran := rep.MergeVerified(); ran {
+			t.Errorf("%q: attested off a revision expression — %s", spelling, render(rep))
+		}
+	}
+}
+
+// An abbreviated id must still name the object it spells: a prefix match stops a
+// truncated or mistyped id resolving to something unrelated.
+func TestAbbreviatedCommitIDIsAccepted(t *testing.T) {
+	env := newEnv(t)
+	env.commit("main", "base.txt", "base")
+	env.push("main")
+	full := env.head()
+
+	rep := verify(t, env.work, Claim{Label: "CLA-253", Commit: full[:10], IntegrationBranch: "main"})
+	mustStatus(t, rep, CommitMerged, Pass)
+}
+
+// A branch NAME is not an identity. Two clones of the same project under one
+// workdir — the session's tree, and a review clone beside it — both carry the
+// branch, and picking whichever the directory listing returned first answers about
+// the wrong tree. That turns the exact unpushed-work failure into a Pass.
+func TestAmbiguousBranchAcrossClones_DegradesToCannotCheck(t *testing.T) {
+	env := newEnv(t)
+	env.commit("main", "base.txt", "base")
+	env.push("main")
+	env.checkout("clanker/feature")
+	env.commit("clanker/feature", "work.txt", "work")
+	env.push("clanker/feature")
+	// The work that never left the laptop, in the tree the session actually used.
+	env.commit("clanker/feature", "more.txt", "more")
+
+	// A second clone, sorting FIRST, whose copy of the branch is at the pushed tip.
+	review := filepath.Join(env.root, "aaa-review")
+	run(t, env.root, "git", "clone", env.remote, review)
+	configure(t, review)
+	run(t, review, "git", "checkout", "-b", "clanker/feature", "origin/clanker/feature")
+
+	rep := verify(t, env.root, Claim{Label: "CLA-253", Branch: "clanker/feature"})
+
+	c := mustStatus(t, rep, BranchPushed, Unknown)
+	if !strings.Contains(c.Detail, "2 repositories") {
+		t.Errorf("the detail should name the ambiguity, got %q", c.Detail)
+	}
+}
+
+// `git rev-parse` answers for the nearest ENCLOSING repository. A `git init`-ed
+// home directory would otherwise match the multi-repo parent itself, the walk
+// would stop there, and the feature would report "cannot check" forever.
+func TestRepositoryAboveTheWorkdirDoesNotCaptureTheSearch(t *testing.T) {
+	env := newEnv(t)
+	env.commit("main", "base.txt", "base")
+	env.push("main")
+
+	// A dotfiles-style repository wrapping everything, with the driver's workdir a
+	// plain directory inside it and the real project below that.
+	run(t, env.root, "git", "init", "-b", "main", env.root)
+	configure(t, env.root)
+
+	workdir := filepath.Join(env.root, "dev")
+	proj := filepath.Join(workdir, "proj")
+	if err := os.MkdirAll(workdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run(t, env.root, "git", "clone", env.remote, proj)
+	configure(t, proj)
+	run(t, proj, "git", "checkout", "-b", "clanker/feature")
+	writeFile(t, filepath.Join(proj, "work.txt"), "work")
+	run(t, proj, "git", "add", ".")
+	run(t, proj, "git", "commit", "-m", "work nobody pushed")
+
+	rep := verify(t, workdir, Claim{Label: "CLA-253", Branch: "clanker/feature"})
+
+	if rep.Repo == "" {
+		t.Fatalf("the enclosing repo swallowed the search: %s", render(rep))
+	}
+	mustStatus(t, rep, BranchPushed, Fail)
+}
+
+// Tidying up after a merge (`git branch -d`) removes the ref the branch check
+// needs — and must not take the merge check with it. That check is the one the bar
+// cares about most, and the ref is missing precisely because the work landed.
+func TestBranchDeletedAfterMerge_MergeCheckStillRuns(t *testing.T) {
+	env := newEnv(t)
+	env.commit("main", "base.txt", "base")
+	env.push("main")
+
+	env.checkout("clanker/feature")
+	env.commit("clanker/feature", "work.txt", "work")
+	env.push("clanker/feature")
+	sha := env.head()
+
+	env.checkout("main")
+	env.git("merge", "--no-ff", "-m", "merge feature", "clanker/feature")
+	env.push("main")
+	env.git("branch", "-D", "clanker/feature")
+
+	rep := verify(t, env.work, Claim{
+		Label: "CLA-253", Branch: "clanker/feature",
+		Commit: sha, IntegrationBranch: "main",
+	})
+
+	mustStatus(t, rep, BranchPushed, Unknown) // no local ref left to compare
+	mustStatus(t, rep, CommitMerged, Pass)    // but the delivery is still traceable
+	if verified, ran := rep.MergeVerified(); !ran || !verified {
+		t.Errorf("MergeVerified() = (%v, %v), want (true, true)", verified, ran)
+	}
+}
+
+// A bare repository sitting beside the checkouts (a local remote, a mirror) would
+// answer "yes, that branch exists" while having no remote of its own to check
+// anything against. It must not be a candidate — and its internals must not be
+// walked directory by directory either.
+func TestBareRepositoryIsNotACandidate(t *testing.T) {
+	env := newEnv(t)
+	env.commit("main", "base.txt", "base")
+	env.push("main")
+	env.checkout("clanker/feature")
+	env.commit("clanker/feature", "work.txt", "work")
+	env.push("clanker/feature")
+
+	// env.remote is a bare repo sitting at <root>/remote.git, and it sorts before
+	// <root>/work. It carries refs/heads/clanker/feature.
+	rep := verify(t, env.root, Claim{Label: "CLA-253", Branch: "clanker/feature"})
+
+	mustStatus(t, rep, BranchPushed, Pass)
+	if rep.Repo != env.work {
+		t.Errorf("checked %q, want the working tree %q", rep.Repo, env.work)
 	}
 }
 

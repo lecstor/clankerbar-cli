@@ -489,19 +489,28 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 	if len(res.Reports) == 0 || d.newVerifier == nil {
 		return
 	}
-	// Detached and bounded, for the same reason as the handback: the session has
-	// already ended, and a wedged remote must not hold up the loop.
-	vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
-	defer cancel()
+	// Unlike the handback, this is NOT worth outliving a Ctrl-C. The handback races
+	// a lease that is already ticking; a delivery claim will still be wrong in the
+	// morning, and the checks reach the network, so insisting on them would add a
+	// visible stall to every interactive shutdown.
+	if ctx.Err() != nil {
+		return
+	}
 
 	v := d.newVerifier(d.invocation(t, false).WorkDir)
 	for _, rep := range res.Reports {
-		out := v.Verify(vctx, delivery.Claim{
-			Label:             rep.Label(),
-			Branch:            rep.Branch,
-			Commit:            rep.Commit,
-			IntegrationBranch: rep.IntegrationBranch,
-		})
+		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch}
+		if rep.ClaimsMerge() {
+			claim.Commit, claim.IntegrationBranch = rep.Commit, rep.IntegrationBranch
+		}
+		// Detached and bounded PER REPORT: a shared deadline would silently degrade
+		// every claim after the first slow one to "cannot check". Detached because a
+		// cancel arriving mid-check should not turn a real answer into a half one —
+		// the guard above is what makes cancellation prompt.
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
+		out := v.Verify(vctx, claim)
+		cancel()
+
 		for _, c := range out.Checks {
 			switch c.Status {
 			case delivery.Fail:
@@ -538,7 +547,11 @@ func (d *Driver) attestMerge(ctx context.Context, t Target, rep harness.Report, 
 	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 	defer cancel()
 
-	if err := a.AttestMergeVerified(actx, rep.TaskID, rep.RunID, rep.Commit, rep.IntegrationBranch, verified); err != nil {
+	if err := a.AttestMergeVerified(actx, rep.TaskID, rep.RunID, plane.Delivery{
+		Commit:            rep.Commit,
+		IntegrationBranch: rep.IntegrationBranch,
+		PR:                rep.PR,
+	}, verified); err != nil {
 		if !errors.Is(err, plane.ErrNotWired) {
 			log.Printf("%scould not record the merge check for %s: %v", labelOf(t), rep.Label(), err)
 		}

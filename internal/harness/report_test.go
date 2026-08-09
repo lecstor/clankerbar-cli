@@ -84,6 +84,23 @@ func TestClaudeDeliveryReports(t *testing.T) {
 			want: nil,
 		},
 		{
+			// The protocol encourages recording the branch as you go, so the same
+			// claim arrives many times. Each restatement would otherwise cost a
+			// network round trip, a duplicate log line and a duplicate plane write.
+			name: "the same claim restated is one report",
+			lines: withClaim(
+				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_progress","branch":"clanker/x"}`),
+				toolResult("u2", `{}`),
+				toolUse("u3", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_progress","branch":"clanker/x"}`),
+				toolResult("u3", `{}`),
+				toolUse("u4", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review","branch":"clanker/x"}`),
+				toolResult("u4", `{}`),
+			),
+			// The LAST status wins: it is the most recent one that says whether the
+			// work is being handed to review or declared landed.
+			want: []Report{{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Status: "in_review", Branch: "clanker/x"}},
+		},
+		{
 			name: "several deliveries are kept in order",
 			lines: withClaim(
 				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
@@ -110,6 +127,30 @@ func TestClaudeDeliveryReports(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestReportClaimsMerge(t *testing.T) {
+	delivered := Report{Commit: "abc1234", IntegrationBranch: "main"}
+	for _, tc := range []struct {
+		status string
+		want   bool
+		why    string
+	}{
+		{"done", true, "the closure that declares it landed"},
+		{"", true, "a status-less revision carrying a delivery declares the same thing"},
+		{"in_review", false, "at in_review nobody has reviewed it yet, so nothing has merged"},
+		{"in_progress", false, "work in flight is not a merge claim"},
+		{"parked", false, "a parked task delivered nothing"},
+	} {
+		r := delivered
+		r.Status = tc.status
+		if got := r.ClaimsMerge(); got != tc.want {
+			t.Errorf("status %q: ClaimsMerge() = %v, want %v — %s", tc.status, got, tc.want, tc.why)
+		}
+	}
+	if (Report{Status: "done", Branch: "clanker/x"}).ClaimsMerge() {
+		t.Error("a closure with no delivery declared is not a merge claim")
 	}
 }
 
