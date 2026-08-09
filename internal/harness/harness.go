@@ -39,6 +39,16 @@ type Adapter interface {
 	// log that merely mentions an HTTP 500 is not mistaken for a dead session.
 	IsTransient(Result) bool
 
+	// Diagnostic returns the harness-authored text IsTransient and DetectLimit
+	// were judged on — stderr, the CLI's own non-event output, typed error
+	// events — with the agent's narration excluded exactly as those scans
+	// exclude it. It exists so a caller that STOPS on a classification can name
+	// the message it stopped on: an unrecognised non-zero exit ends the whole
+	// run, and "exited 1 (non-retryable)" tells an operator nothing about which
+	// failure that was. Implementations must return the same scope IsTransient
+	// reads, never a wider one.
+	Diagnostic(Result) string
+
 	// Probe runs the cheapest possible request to answer "am I still limited?"
 	// without doing real work — used while paused to catch an early reset.
 	Probe(ctx context.Context, in Invocation) (Limit, error)

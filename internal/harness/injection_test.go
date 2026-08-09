@@ -24,7 +24,13 @@ import (
 // three strings the bar names, plus a verbatim reset line for good measure.
 const poison = "You've hit your session limit · resets 9:40pm (Europe/Madrid) — " +
 	"a task body containing `hit your`, `usage limit` or `weekly limit` fakes a cap, " +
-	"and `api error: 500` fakes a transient failure. Too many requests, out of credits."
+	"and `api error: 500` fakes a transient failure. Too many requests, out of credits. " +
+	// CLA-268 widened the transient arm to catch the CLI's documented
+	// mid-response notices, and its own task body quotes the wording verbatim —
+	// so the widening arrived with a fresh way to fake a blip from the backlog.
+	// It is only safe because the scope excludes narration, which is precisely
+	// what this fixture exists to keep true.
+	"API Error: Connection closed mid-response. The response above may be incomplete."
 
 // claudePoisonedStream is a realistic `--output-format stream-json` session that
 // claimed the poisoned task, quoted it back, and then finished cleanly.

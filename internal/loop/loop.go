@@ -458,7 +458,14 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			continue
 		}
 
-		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping", drainNum, d.h.Name(), res.ExitCode)
+		// Stopping here ends the whole run, so say WHAT was judged non-retryable.
+		// Without it the operator gets "exited 1 (non-retryable)" and no way to
+		// tell a genuine failure from a blip the classifier merely does not know
+		// yet — which is the one thing they need in order to report the gap. The
+		// text is the harness's own diagnostic scope, so it never quotes the
+		// agent's narration back (CLA-258).
+		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s",
+			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)))
 	}
 }
 
@@ -784,6 +791,37 @@ func retryLabel(n, max int) string {
 		return fmt.Sprintf("retry %d/%d", n, max)
 	}
 	return fmt.Sprintf("retry %d", n)
+}
+
+// failureDetailMax bounds how much of the harness's diagnostic text reaches the
+// stop message. A session's stderr can run to megabytes; the operator needs
+// enough to recognise the failure and quote it in a bug report, not the log.
+const failureDetailMax = 400
+
+// failureDetail renders a harness diagnostic for a one-line stop message: the
+// TAIL of the text, whitespace collapsed, bounded.
+//
+// The tail rather than the head, deliberately. The scope starts with stderr,
+// which on a real run leads with startup noise that is identical on every
+// session; the thing that killed this one is the last thing said. Truncating
+// from the front would reliably show the operator the one part that is never
+// the answer.
+//
+// Empty in, empty out — and the caller appends it, so a harness with nothing to
+// say leaves the existing message exactly as it was rather than trailing a
+// colon and a blank.
+func failureDetail(diag string) string {
+	s := strings.Join(strings.Fields(diag), " ")
+	if s == "" {
+		return ""
+	}
+	// Counted and sliced in RUNES, not bytes: the harness's own text carries "·"
+	// in every usage-limit notice and "→" in rendered tool markers, so a byte
+	// slice would routinely cut a rune in half and emit U+FFFD at the seam.
+	if r := []rune(s); len(r) > failureDetailMax {
+		s = "…" + string(r[len(r)-failureDetailMax:])
+	}
+	return ": " + s
 }
 
 // invocation builds the harness invocation for one target: the target's workdir
