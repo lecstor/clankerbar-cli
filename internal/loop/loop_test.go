@@ -72,8 +72,17 @@ type fakeAdapter struct {
 	invokeCalls  int
 	invocations  []harness.Invocation // every Invoke's argument, for asserting routing (CLA-142)
 	probeResults []harness.Limit
-	probeErr     error
-	probeCalls   int
+	// probeErrs is scripted by call index and falls back to NO error once exhausted,
+	// like fakePoller's errs. A constant error would make a probe loop unbounded, so
+	// a regression in the wait's exit conditions would hang the package instead of
+	// failing it.
+	probeErrs  []error
+	probeCalls int
+	// probeTokens/probeCost are what EACH probe reports spending. A probe is a real
+	// paid session (CLA-287), so the fake has to be able to charge for one; zero
+	// keeps every pre-existing test's arithmetic exactly as it was.
+	probeTokens  int
+	probeCost    float64
 	limitResetAt time.Time
 }
 
@@ -103,16 +112,22 @@ func (f *fakeAdapter) DetectLimit(r harness.Result) harness.Limit {
 
 func (f *fakeAdapter) IsTransient(r harness.Result) bool { return kindOf(r) == "transient" }
 
-func (f *fakeAdapter) Probe(ctx context.Context, in harness.Invocation) (harness.Limit, error) {
+func (f *fakeAdapter) Probe(ctx context.Context, in harness.Invocation) (harness.ProbeResult, error) {
 	i := f.probeCalls
 	f.probeCalls++
-	if f.probeErr != nil {
-		return harness.Limit{}, f.probeErr
+	// Charged on every path, including the error one. That is the loop's contract
+	// with an adapter — whatever a ProbeResult carries is counted — not a claim
+	// about what the real adapters manage to parse from a failed run (CLA-299).
+	out := harness.ProbeResult{Tokens: f.probeTokens, CostUSD: f.probeCost}
+	if i < len(f.probeErrs) && f.probeErrs[i] != nil {
+		return out, f.probeErrs[i]
 	}
 	if i < len(f.probeResults) {
-		return f.probeResults[i], nil
+		out.Limit = f.probeResults[i]
+		return out, nil
 	}
-	return harness.Limit{Limited: false}, nil // default: the limit has lifted
+	out.Limit = harness.Limit{Limited: false} // default: the limit has lifted
+	return out, nil
 }
 
 func (f *fakeAdapter) ReadUsage(ctx context.Context, in harness.Invocation) (harness.Usage, error) {
@@ -165,6 +180,18 @@ func runLoop(t *testing.T, cfg *config.Config, h harness.Adapter, p backlog.Poll
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return New(cfg, h, p).Run(ctx)
+}
+
+// drainOnce is runLoop's counterpart for the tests that drive drainWithRetries
+// directly: the same safety timeout, so a regression in one of the drain's exit
+// conditions fails the test instead of hanging the package. The waits inside a
+// drain are unbounded by design — a supervised wait polls for as long as the cap
+// lasts — so nothing but the context bounds them if a script stops terminating.
+func drainOnce(t *testing.T, d *Driver) (int, float64, bool, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return d.drainWithRetries(ctx, 1, d.targets[0], spend{start: time.Now()})
 }
 
 // ---------------------------------------------------------------------------
@@ -753,6 +780,159 @@ func TestDrainWithRetries_UnreachedCeilingStillWaitsOutTheLimit(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// A probe is a paid session, and its spend has to reach the accumulator the
+// breaker reads (CLA-287).
+//
+// CLA-258 put the breaker inside the supervised wait, but the wait can only be
+// ended by spend the breaker can SEE. Every adapter implements Probe as
+// Invoke-then-DetectLimit — a real session against the harness binary — and threw
+// away the tokens and cost it reported. So a cap that lasts a week, polled every
+// 30 minutes, was ~336 sessions no ceiling could count, in the one loop with no
+// other way out.
+//
+// Both cases below set NO wall clock, so waitPastBudget cannot fire, and the limit
+// NEVER lifts. The limited attempt itself spends nothing: every dollar and every
+// token in these tests arrives from probes alone.
+
+func TestSupervisedWait_ProbeSpendCrossesACeilingAndEndsTheWait(t *testing.T) {
+	t.Run("cost-only ceiling", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.Budget = config.Budget{MaxCostUSD: 0.5}
+		h := &fakeAdapter{
+			// The limited attempt is FREE, so nothing but probe spend can trip the
+			// ceiling. The clean re-run behind it must never be reached.
+			steps:     []invokeStep{{res: limitResult()}, {res: okResult(0, 0)}},
+			probeCost: 0.25,
+			// The limit never lifts. Finite so a regression fails rather than hangs,
+			// and longer than the run needs so exhaustion cannot rescue the test by
+			// falling through to the fake's "lifted" default.
+			probeResults: []harness.Limit{
+				{Limited: true}, {Limited: true}, {Limited: true},
+				{Limited: true}, {Limited: true},
+			},
+		}
+		d := New(cfg, h, &fakePoller{})
+		openTestStateDir(t, d)
+
+		_, cost, stop, err := drainOnce(t, d)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !stop {
+			t.Error("probe spend past the cost ceiling must end the wait, not poll on")
+		}
+		if h.probeCalls != 2 {
+			t.Errorf("two $0.25 probes reach a $0.50 ceiling; got %d probes", h.probeCalls)
+		}
+		if cost != 0.5 {
+			t.Errorf("cost = %v, want the probes' 0.5 reported back to Run's accumulator", cost)
+		}
+		if h.invokeCalls != 1 {
+			t.Errorf("the session must not be re-run past the ceiling; got %d invokes", h.invokeCalls)
+		}
+	})
+
+	t.Run("token-only ceiling", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.Budget = config.Budget{MaxTokens: 10}
+		h := &fakeAdapter{
+			steps:       []invokeStep{{res: limitResult()}, {res: okResult(0, 0)}},
+			probeTokens: 5,
+			probeResults: []harness.Limit{
+				{Limited: true}, {Limited: true}, {Limited: true},
+				{Limited: true}, {Limited: true},
+			},
+		}
+		d := New(cfg, h, &fakePoller{})
+		openTestStateDir(t, d)
+
+		tokens, _, stop, err := drainOnce(t, d)
+
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !stop {
+			t.Error("probe spend past the token ceiling must end the wait, not poll on")
+		}
+		if h.probeCalls != 2 {
+			t.Errorf("two 5-token probes reach a 10-token ceiling; got %d probes", h.probeCalls)
+		}
+		if tokens != 10 {
+			t.Errorf("tokens = %d, want the probes' 10 reported back to Run's accumulator", tokens)
+		}
+		if h.invokeCalls != 1 {
+			t.Errorf("the session must not be re-run past the ceiling; got %d invokes", h.invokeCalls)
+		}
+	})
+}
+
+// The other half of "the SAME accumulator": a wait that ends normally still has to
+// hand its probe spend back, or the ceiling between drains is under-counted by
+// every probe the run ever made — including the runs that never trip one.
+func TestSupervisedWait_ProbeSpendIsReportedEvenWhenTheLimitLifts(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Budget = config.Budget{MaxCostUSD: 10.0} // nowhere near reached
+	h := &fakeAdapter{
+		steps:     []invokeStep{{res: limitResult()}, {res: okResult(0, 0.5)}},
+		probeCost: 0.25,
+		// Default (no script): the first probe sees the limit lifted.
+	}
+	d := New(cfg, h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	_, cost, stop, err := drainOnce(t, d)
+
+	if err != nil || stop {
+		t.Fatalf("an unreached ceiling must resume: stop=%v err=%v", stop, err)
+	}
+	if h.probeCalls != 1 {
+		t.Errorf("expected one probe to see the limit lift; got %d", h.probeCalls)
+	}
+	if cost != 0.75 {
+		t.Errorf("cost = %v, want the probe's 0.25 plus the re-run's 0.50", cost)
+	}
+}
+
+// The wait counts whatever a ProbeResult carries, error or not — so a harness
+// failing every poll cannot be the cheapest-looking loop in the driver and the
+// most expensive one to run.
+//
+// This pins the LOOP's side of the contract, deliberately, and not the adapters':
+// today all three parse nothing before returning a run error, so what they report
+// there is zero (CLA-299). This is what stops the loop from being the thing that
+// drops it once they do.
+func TestSupervisedWait_ReportedSpendCountsOnAFailedProbe(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Budget = config.Budget{MaxCostUSD: 0.5}
+	h := &fakeAdapter{
+		steps:     []invokeStep{{res: limitResult()}, {res: okResult(0, 0)}},
+		probeCost: 0.25,
+		// Two failures reach the ceiling. The script then runs out, so a regression
+		// falls through to the fake's "limit lifted" default and fails this test
+		// rather than polling forever.
+		probeErrs: []error{errors.New("harness exploded"), errors.New("harness exploded")},
+	}
+	d := New(cfg, h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	_, cost, stop, err := drainOnce(t, d)
+
+	if err != nil {
+		t.Fatalf("a probe error is retried next interval, not returned: %v", err)
+	}
+	if !stop {
+		t.Error("spend from FAILED probes must reach the ceiling too, not loop forever")
+	}
+	if h.probeCalls != 2 {
+		t.Errorf("two $0.25 failed probes reach a $0.50 ceiling; got %d probes", h.probeCalls)
+	}
+	if cost != 0.5 {
+		t.Errorf("cost = %v, want the failed probes' 0.5 counted", cost)
+	}
+}
+
 func TestDrainWithRetries_TokenCeilingEndsATransientRetry(t *testing.T) {
 	cfg := fastCfg()
 	cfg.Budget = config.Budget{MaxTokens: 10} // no wall clock, no MaxRetries — unbounded before this
@@ -848,9 +1028,9 @@ func (a *realClassifierAdapter) Invoke(context.Context, harness.Invocation) (har
 	return okResult(0, 0), nil
 }
 
-func (a *realClassifierAdapter) Probe(context.Context, harness.Invocation) (harness.Limit, error) {
+func (a *realClassifierAdapter) Probe(context.Context, harness.Invocation) (harness.ProbeResult, error) {
 	a.probeCalls++
-	return harness.Limit{}, nil // the limit that never was has "lifted"
+	return harness.ProbeResult{}, nil // the limit that never was has "lifted"
 }
 
 func TestDrainWithRetries_BacklogTextCannotFakeALimit(t *testing.T) {

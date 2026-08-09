@@ -296,13 +296,16 @@ func (opencode) IsTransient(res Result) bool {
 	return opencodeTransientRe.MatchString(opencodeErrorText(res))
 }
 
-func (o opencode) Probe(ctx context.Context, in Invocation) (Limit, error) {
+func (o opencode) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	in.Probe = true
 	res, err := o.Invoke(ctx, in)
+	// Spend is taken off the Result on every path — see claude.Probe for why.
+	out := ProbeResult{Tokens: res.Tokens, CostUSD: res.CostUSD}
 	if err != nil {
-		return Limit{}, err
+		return out, err
 	}
-	return o.DetectLimit(res), nil
+	out.Limit = o.DetectLimit(res)
+	return out, nil
 }
 
 func (opencode) ReadUsage(context.Context, Invocation) (Usage, error) {

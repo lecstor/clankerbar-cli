@@ -479,7 +479,7 @@ alternatives, in order of preference:
    **Prefer `max_cost_usd`.** It comes straight from the harness's own
    `total_cost_usd`, so it measures the thing you actually care about.
    `max_wall_clock` counts the hours a run spends *waiting out a usage limit*,
-   in which nothing is billed at all — one run elapsed 10h23m against an 8h
+   in which almost nothing is billed — one run elapsed 10h23m against an 8h
    ceiling with 5h31m of that asleep. Keep it as an outer bound on how late a
    run may finish, not as your spend ceiling. `doctor` warns if it is your only
    dial.
@@ -505,6 +505,14 @@ alternatives, in order of preference:
    session that paused on a usage limit or backed off on a transient blip. Those
    waits can repeat for hours, and a run that reached its ceiling during one stops
    there instead of spending another session first.
+
+   **The polls during a pause count too.** Waiting out a usage limit means probing
+   for an early reset every `poll_interval`, and a probe is a real harness session
+   — cheap (a one-character prompt, with the harness locked down to no tools or
+   read-only), but not free, and a week-long cap polled every 30 minutes is a few
+   hundred of them. Their tokens and cost go into the same running total the
+   breaker reads, so a pause whose probes alone cross a ceiling ends on that
+   ceiling rather than polling on.
 
 ## Harnesses
 

@@ -239,13 +239,16 @@ func (codex) IsTransient(res Result) bool {
 	return codexTransientRe.MatchString(codexErrorText(res))
 }
 
-func (c codex) Probe(ctx context.Context, in Invocation) (Limit, error) {
+func (c codex) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	in.Probe = true
 	res, err := c.Invoke(ctx, in)
+	// Spend is taken off the Result on every path — see claude.Probe for why.
+	out := ProbeResult{Tokens: res.Tokens, CostUSD: res.CostUSD}
 	if err != nil {
-		return Limit{}, err
+		return out, err
 	}
-	return c.DetectLimit(res), nil
+	out.Limit = c.DetectLimit(res)
+	return out, nil
 }
 
 func (codex) ReadUsage(context.Context, Invocation) (Usage, error) {
