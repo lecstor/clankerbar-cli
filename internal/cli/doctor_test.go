@@ -477,6 +477,326 @@ func TestStateDirLegacyInWorkdirWarns(t *testing.T) {
 	}
 }
 
+// stateDirIn builds a config whose workdir is workdir and whose EXPLICIT state
+// dir is stateDir - the shape the in-workdir warning is about, since the default
+// has sat outside the workdir since CLA-259.
+func stateDirIn(t *testing.T, workdir, stateDir string) *config.Config {
+	t.Helper()
+	cfg := validCfgIn(t, workdir)
+	cfg.StateDir = stateDir
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
+	return cfg
+}
+
+// The assertion most likely to be got wrong, so it is written first: containment
+// is component-wise, not a string prefix. /a/workdir-2 is a sibling of /a/workdir,
+// not a directory inside it, and no session spawned in /a/workdir can reach it.
+// A bare HasPrefix(state, workdir) passes every other test here and fails this
+// one; the HasPrefix(state, workdir+separator) variant is the sibling wrong
+// answer, and TestStateDirEqualToTheWorkDirWarns is what catches that.
+func TestStateDirSharingAPrefixWithTheWorkDirDoesNotWarn(t *testing.T) {
+	base := t.TempDir()
+	workdir := filepath.Join(base, "workdir")
+	if err := os.MkdirAll(workdir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := stateDirIn(t, workdir, filepath.Join(base, "workdir-2"))
+
+	c := checkStateDir(cfg)
+	if c.status != pass {
+		t.Fatalf("sibling state dir: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "inside") {
+		t.Errorf("a sibling of the workdir is not inside it, got %q", c.detail)
+	}
+}
+
+// The whole point: the state dir holds STOP and HALT, and a session may write
+// anywhere under the workdir it is spawned in. Inside means every session the loop
+// spawns can stop the daemon that spawned it.
+func TestStateDirInsideTopLevelWorkDirWarns(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := stateDirIn(t, workdir, filepath.Join(workdir, "state"))
+
+	c := checkStateDir(cfg)
+	// WARN and not FAIL: an explicit state_dir is supported and the loop still
+	// runs, so this must not gate `doctor && run`.
+	if c.status != warn {
+		t.Fatalf("state dir inside the workdir: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, workdir) {
+		t.Errorf("detail should name the workdir %s, got %q", workdir, c.detail)
+	}
+	if !strings.Contains(c.detail, "STOP") || !strings.Contains(c.detail, "HALT") {
+		t.Errorf("detail should say what it costs (STOP/HALT), got %q", c.detail)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN must carry a remedy - naming the problem without the way out gets nothing done")
+	}
+}
+
+// One project's workdir is enough. A multi-project config resolves each project's
+// workdir the way the loop does (an entry with none inherits the top-level one),
+// and a state dir inside ANY of them is reachable by that project's sessions.
+func TestStateDirInsideOneProjectWorkDirWarns(t *testing.T) {
+	alpha, beta := t.TempDir(), t.TempDir()
+	cfg := validCfg(t)
+	cfg.Projects = []config.Project{{Slug: "alpha", WorkDir: alpha}, {Slug: "beta", WorkDir: beta}}
+	cfg.StateDir = filepath.Join(beta, "nested", "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("state dir inside a project workdir: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, beta) {
+		t.Errorf("detail should name the workdir it is inside (%s), got %q", beta, c.detail)
+	}
+	if strings.Contains(c.detail, alpha) {
+		t.Errorf("detail names a workdir it is not inside (%s): %q", alpha, c.detail)
+	}
+}
+
+// The state dir being the workdir ITSELF is containment too. This is the case
+// that separates a real containment check from `HasPrefix(state, workdir+"/")`,
+// which passes every other test here.
+func TestStateDirEqualToTheWorkDirWarns(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := stateDirIn(t, workdir, workdir)
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("state dir IS the workdir: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, workdir) {
+		t.Errorf("detail should name the workdir %s, got %q", workdir, c.detail)
+	}
+}
+
+// Naming the outermost containing workdir sends the operator to a directory their
+// sessions are not in. The deepest match - and a session workdir over a merely
+// configured one - is the answer they can act on.
+func TestStateDirNamesTheDeepestSessionWorkDir(t *testing.T) {
+	parent := t.TempDir()
+	project := filepath.Join(parent, "acme")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := validCfgIn(t, parent)
+	cfg.Projects = []config.Project{{Slug: "acme", WorkDir: project}}
+	cfg.StateDir = filepath.Join(project, "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, project) {
+		t.Errorf("detail should name the project workdir %s, got %q", project, c.detail)
+	}
+	if !strings.Contains(c.detail, "session workdir") {
+		t.Errorf("a workdir sessions really run in should be described as one, got %q", c.detail)
+	}
+}
+
+// Two SESSION workdirs can nest as well - a project on a checkout inside another
+// project's tree. The deepest is the one to name; the outermost is what the
+// remedy has to clear, because moving just outside the inner one lands in the
+// outer one and warns again.
+func TestStateDirNestedSessionWorkDirsNameTheDeepestAndClearTheOutermost(t *testing.T) {
+	outer := t.TempDir()
+	inner := filepath.Join(outer, "inner")
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := validCfgIn(t, t.TempDir())
+	cfg.Projects = []config.Project{{Slug: "outer", WorkDir: outer}, {Slug: "inner", WorkDir: inner}}
+	cfg.StateDir = filepath.Join(inner, "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, inner) {
+		t.Errorf("detail should name the deepest workdir %s, got %q", inner, c.detail)
+	}
+	if !strings.Contains(c.remedy, outer) || strings.Contains(c.remedy, inner) {
+		t.Errorf("remedy should send them outside the outermost workdir %s, not merely outside %s: %q", outer, inner, c.remedy)
+	}
+}
+
+// A top-level workdir that only PARENTS the project workdirs has no sessions in
+// it, so claiming a spawned session can write there is a claim the operator can
+// disprove - and disproving one warning is how they learn to skim the rest. It is
+// still worth a WARN: the next projects[] entry that omits workdir inherits this
+// directory and makes it real.
+func TestStateDirInAParentWorkDirIsNotCalledASessionWorkDir(t *testing.T) {
+	parent := t.TempDir()
+	alpha, beta := filepath.Join(parent, "alpha"), filepath.Join(parent, "beta")
+	for _, d := range []string{alpha, beta} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg := validCfgIn(t, parent)
+	cfg.Projects = []config.Project{{Slug: "alpha", WorkDir: alpha}, {Slug: "beta", WorkDir: beta}}
+	cfg.StateDir = filepath.Join(parent, "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "session workdir") {
+		t.Errorf("no session runs in %s, so it must not be described as a session workdir: %q", parent, c.detail)
+	}
+	if !strings.Contains(c.detail, "projects[]") {
+		t.Errorf("detail should say what makes it real (a projects[] entry inheriting it), got %q", c.detail)
+	}
+	if strings.Contains(c.remedy, "no session runs in") {
+		t.Errorf("remedy must not tell them to pick a directory no session runs in - this already is one: %q", c.remedy)
+	}
+}
+
+// The default can land inside the workdir too - a workdir of ~ contains
+// ~/.local/state. "Remove state_dir" is then advice about a key that is not in
+// their config, so the remedy has to be the other way round.
+func TestStateDirDefaultInsideTheWorkDirRemedyDoesNotSayRemove(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := validCfgIn(t, workdir)
+	// No cfg.StateDir: the default resolves under XDG_STATE_HOME, pointed here
+	// inside the workdir, exactly as ~/.local/state sits inside a workdir of ~.
+	t.Setenv("XDG_STATE_HOME", filepath.Join(workdir, "state"))
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("default state dir inside the workdir: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.remedy, "remove state_dir") {
+		t.Errorf("there is no state_dir to remove here: %q", c.remedy)
+	}
+	if !strings.Contains(c.remedy, "set state_dir") {
+		t.Errorf("remedy should tell them to set one outside the workdir, got %q", c.remedy)
+	}
+}
+
+// "Remove state_dir" is only good advice when the DEFAULT lands outside. With a
+// workdir that contains the state home - a workdir of ~, or one derived from a
+// cwd above ~/.local/state - taking the default just moves the same warning to a
+// different path, so the remedy has to say something else.
+func TestStateDirRemedyDoesNotOfferTheDefaultWhenItIsAlsoInsideTheWorkDir(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := validCfgIn(t, workdir)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(workdir, "xdg"))
+	cfg.StateDir = filepath.Join(workdir, "state")
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.remedy, "remove state_dir") {
+		t.Errorf("the default lands inside this workdir too, so removing state_dir is not the way out: %q", c.remedy)
+	}
+	if !strings.Contains(c.remedy, workdir) {
+		t.Errorf("remedy should name the workdir to get outside of (%s), got %q", workdir, c.remedy)
+	}
+}
+
+// With no workdir configured, the state dir both moves with the directory doctor
+// was run from AND is reachable by the sessions. `workdir` is the knob that fixes
+// both, so the note the PASS line carries must not vanish on this path.
+func TestStateDirInsideAnImplicitWorkDirStillSaysToSetWorkdir(t *testing.T) {
+	workdir := t.TempDir()
+	cfg := &config.Config{Harness: "claude", Prompt: "Work the backlog."} // no workdir
+	t.Chdir(workdir)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(workdir, "xdg"))
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "workdir is not configured") {
+		t.Errorf("the implicit-workdir note must survive on this path, got %v", c.info)
+	}
+}
+
+// The legacy leftover is a separate fact about a separate directory. The
+// in-workdir warning takes the primary line, so the legacy report has to be
+// carried rather than swallowed - without this, deleting that carry is silent.
+func TestStateDirInsideWorkDirStillReportsTheLegacyLeftover(t *testing.T) {
+	workdir := t.TempDir()
+	legacy := filepath.Join(workdir, ".clankerbar-loop")
+	if err := os.MkdirAll(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := stateDirIn(t, workdir, filepath.Join(workdir, "state"))
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "STOP") {
+		t.Errorf("the capability takes the primary line, got %q", c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), legacy) {
+		t.Errorf("the legacy leftover %s must survive as an extra line, got %v", legacy, c.info)
+	}
+}
+
+// "rm the marker" is a symptom's remedy when the state dir sits where sessions can
+// write: delete it, run again, and a session puts it back. Say so.
+func TestStateDirLeftoverMarkerInsideWorkDirNamesTheWorkDir(t *testing.T) {
+	workdir := t.TempDir()
+	stateDir := filepath.Join(workdir, "state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, "STOP"), []byte("stale"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := stateDirIn(t, workdir, stateDir)
+
+	c := checkStateDir(cfg)
+	if c.status != warn {
+		t.Fatalf("got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "STOP") {
+		t.Errorf("the marker keeps the primary line, got %q", c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), workdir) {
+		t.Errorf("the operator should be told a session could have written it (%s), got %v", workdir, c.info)
+	}
+}
+
+// The default has been outside the workdir since CLA-259, so the operators who
+// never set state_dir must hear nothing about this at all.
+func TestStateDirDefaultSaysNothingAboutTheWorkDir(t *testing.T) {
+	c := checkStateDir(validCfg(t))
+	if c.status != pass {
+		t.Fatalf("default state dir: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "inside") || strings.Contains(strings.Join(c.info, "\n"), "inside") {
+		t.Errorf("the default sits outside the workdir and should say nothing about it, got %q %v", c.detail, c.info)
+	}
+}
+
 // --- session workdirs --------------------------------------------------------
 
 // multiRepoParent builds the `~/dev` shape: a directory that is not itself a
