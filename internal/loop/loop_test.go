@@ -1417,3 +1417,35 @@ func iterationLogs(t *testing.T, dir string) []string {
 	}
 	return out
 }
+
+// The configured prompt is the ONLY thing bounding how much a session takes on -
+// there is no per-session task cap, turn cap or deadline anywhere in the driver -
+// so the wording is the interface, and it has to arrive at the harness unchanged.
+//
+// Nothing asserted this before. `internal/config` pins what the default IS, but a
+// change to Driver.invocation that dropped, defaulted or rewrote Prompt would have
+// left every test in the repo green while every session silently got a different
+// instruction. That is the same shape as the bug this all came from (CLA-281): a
+// string nobody was watching decided how much work a session did.
+func TestInvocationCarriesTheConfiguredPromptVerbatim(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+	// Deliberately not the default, and deliberately containing punctuation and
+	// case: this asserts pass-through, not a match against the default constant.
+	cfg.Prompt = "Work the next backlog item."
+	h := &fakeAdapter{}
+	targets := []Target{
+		{Name: "solo", Poller: &fakePoller{sum: backlog.Summary{Claimable: 1}}, WorkDir: "/repos/solo", MCPConfigPath: "/repos/solo/.mcp.json"},
+	}
+
+	if err := runLoopMulti(t, cfg, h, targets); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("want exactly one session; got %d", h.invokeCalls)
+	}
+	if got := h.invocations[0].Prompt; got != cfg.Prompt {
+		t.Errorf("harness got prompt %q, want the configured %q verbatim", got, cfg.Prompt)
+	}
+}

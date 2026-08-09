@@ -279,9 +279,13 @@ func (d *Driver) Run(ctx context.Context) error {
 		totalTokens += tokens
 		totalCost += cost
 
-		// In blind mode a "work the backlog" session drains everything ready, so
-		// idle before re-attempting. In wired mode, loop straight back — the next
-		// cheap poll decides whether more work appeared.
+		// Blind mode has no counts to gate on, so it idles between sessions rather
+		// than spinning. Note this is a PER-TASK pause now: the default prompt asks
+		// for one task, so a blind run alternates task / idle / task, where the old
+		// drain default spent one idle on the whole queue. An operator tuning
+		// `idle_poll_interval` on a blind run is setting the gap between tasks.
+		// In wired mode, loop straight back — the next cheap poll decides whether
+		// more work appeared.
 		if d.blind {
 			log.Printf("idle — re-checking in %s", idle)
 			if d.waitOrStop(ctx, idle) {

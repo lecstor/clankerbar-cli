@@ -450,3 +450,89 @@ func TestBudgetRemaining(t *testing.T) {
 		t.Error("an unset ceiling must report bounded=false")
 	}
 }
+
+// The default prompt decides how much ONE session takes on, and it silently
+// decided the wrong thing for as long as this package has existed: the default
+// was "Work the backlog.", which the served protocol defines as *drain the whole
+// ready queue*. So a loop whose entire purpose is one-task-per-session — a fresh,
+// bounded context each iteration — asked every session to do the opposite, and no
+// test disagreed. One observed session ran 2h06m on a single accumulating context
+// and had to be killed, because `loopPaused`/STOP/HALT are read between
+// ITERATIONS and an iteration had become "the whole queue".
+//
+// This pins the phrase rather than merely asserting non-emptiness, because the
+// wording is the interface: the agent reading it has read the protocol, where
+// "work the backlog" and "work the next backlog item" are two different
+// instructions. A paraphrase that loses "next" is the regression to catch.
+func TestDefaultPromptAsksForOneTask(t *testing.T) {
+	got := defaults().Prompt
+
+	if got != defaultPrompt {
+		t.Fatalf("defaults().Prompt = %q, want the defaultPrompt constant %q", got, defaultPrompt)
+	}
+	// The protocol's single-task phrase, matched case-insensitively so a capital
+	// letter is not a failure while a changed INSTRUCTION is.
+	if !strings.Contains(strings.ToLower(got), "next backlog item") {
+		t.Errorf("default prompt %q does not ask for the NEXT backlog item; the served protocol\n"+
+			"reads that phrase as 'exactly one task', and anything else risks a full drain", got)
+	}
+	// Ban the drain VOCABULARY, not one exact string. "Work the next backlog item,
+	// then keep going until next_task is dry" passes the check above while doing
+	// exactly what this test exists to stop, so a single-phrase ban is too narrow.
+	for _, banned := range []string{
+		"work the backlog",
+		"drain",
+		"until next_task is dry",
+		"keep going",
+		"whole queue",
+		"every ready task",
+	} {
+		if strings.Contains(strings.ToLower(got), banned) {
+			t.Errorf("default prompt %q contains %q, which reads as an instruction to work past\n"+
+				"one task; that costs the bounded per-session context and pushes the operator's\n"+
+				"pause/HALT boundary to the end of the queue", got, banned)
+		}
+	}
+}
+
+// The symmetric regression to the one above: an operator who DOES set a prompt
+// must keep it. Layering can fail in both directions, and a default that
+// clobbered an explicit setting would be the more offensive failure - it would
+// silently override a deliberate choice rather than supply a missing one.
+func TestLoadKeepsAnExplicitPrompt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "clankerbar.json")
+	const custom = "Work the backlog."
+	if err := os.WriteFile(path, []byte(`{"harness":"claude","prompt":"`+custom+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// Deliberately the DRAIN phrase: opting back into the old behaviour is a
+	// supported choice, and this pins that the new default does not take it away.
+	if c.Prompt != custom {
+		t.Errorf("Load() Prompt = %q, want the explicitly configured %q", c.Prompt, custom)
+	}
+}
+
+// A config file that says nothing about the prompt must inherit the one-task
+// default. This is the path every end user is on: `go install` plus a config that
+// sets a harness and little else. Asserting it through Load (rather than through
+// defaults() alone) is the point — the layering is what could drop it.
+func TestLoadWithoutPromptInheritsOneTaskDefault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "clankerbar.json")
+	if err := os.WriteFile(path, []byte(`{"harness":"claude"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.Prompt != defaultPrompt {
+		t.Errorf("Load() Prompt = %q, want %q", c.Prompt, defaultPrompt)
+	}
+}

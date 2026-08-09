@@ -12,7 +12,9 @@ func Usage(w io.Writer) {
 
 Usage:
   clankerbar run [flags]     Start the loop: respawn fresh harness sessions that
-                             drain the backlog, surviving usage limits.
+                             work the backlog one task at a time, surviving usage
+                             limits. The "prompt" config knob changes how much a
+                             single session takes on.
   clankerbar doctor [flags]  Preflight the setup — config, harness, backlog
                              wiring, workdir, permissions. Exits non-zero on any
                              FAIL, so it gates a run: doctor && run.

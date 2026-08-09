@@ -27,6 +27,17 @@ import (
 // another one in their own config file.
 const defaultBacklogURL = "https://clankerbar.com"
 
+// defaultPrompt asks each session for exactly ONE task.
+//
+// The wording is not casual: the served protocol
+// (clankerbar.com/skills/clankerbar.md) defines "work the next backlog item" as
+// "means exactly one - run the loop once, finish that task, and stop", against
+// "work the backlog", which it defines as drain the whole ready queue. This
+// string is read by an agent that has read that document, so a paraphrase is a
+// behaviour change. It is pinned by TestDefaultPromptAsksForOneTask, which is
+// there because the previous default was the DRAIN phrase and nothing failed.
+const defaultPrompt = "Work the next backlog item."
+
 // Config is the resolved loop configuration. The comments here are the source of
 // truth for each knob until the README/docs catch up.
 type Config struct {
@@ -39,9 +50,32 @@ type Config struct {
 	// harness default.
 	Model string `json:"model"`
 
-	// Prompt is what each fresh session is asked to do. Default: drain the
-	// clankerbar backlog. This is the drain instruction, not a per-task prompt —
-	// the backlog is the source of tasks.
+	// Prompt is what each fresh session is asked to do. Default: work ONE task.
+	// It is not a per-task prompt - the backlog is the source of tasks - but it
+	// does decide how much a session takes on, and the served protocol reads the
+	// wording precisely: "work the next backlog item" means exactly one task,
+	// while "work the backlog" means drain the whole ready queue in that session.
+	//
+	// One task is the default for two reasons, and only the second is unconditional.
+	//
+	// Context: each session starts fresh, so per-session cost stays bounded however
+	// long the queue is, where a draining session CAN accumulate every task it
+	// touches into one context. "Can", not "does" - a repo whose agent guide tells
+	// the session to dispatch each task to a subagent keeps the orchestrator thin,
+	// so this argument is contingent on the target repo's own guidance.
+	//
+	// Control latency: this one always holds. The console pause, HALT,
+	// max_iterations and the budget breaker are all evaluated at the top of
+	// loop.Run's iteration, and none of them can interrupt a session that is
+	// already running (STOP is additionally honoured inside waitOrStop, but only
+	// while the driver is between or backing off from sessions, never mid-session).
+	// So the iteration IS the operator's control granularity: one task per
+	// iteration means a pause takes effect after the current task instead of after
+	// the whole queue.
+	//
+	// The trade being bought: a session's fixed startup cost - re-reading the
+	// served protocol and the repo's agent guide - is now paid per task rather
+	// than amortised across a drain.
 	Prompt string `json:"prompt"`
 
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
@@ -215,7 +249,7 @@ func (b Budget) Remaining(elapsed time.Duration) (time.Duration, bool) {
 func defaults() *Config {
 	return &Config{
 		Harness:    "claude",
-		Prompt:     "Work the backlog.",
+		Prompt:     defaultPrompt,
 		BacklogURL: defaultBacklogURL,
 	}
 }
