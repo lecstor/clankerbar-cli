@@ -1465,6 +1465,10 @@ func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 	for _, want := range []string{
 		"config", "harness", "config_dir", "backlog",
 		"state_dir", "workdir", "mcp_servers", "permissions", "toolchains", "budget",
+		// power has three WARN branches, two of which are the "doctor does not
+		// know the sleep policy" states — exactly the kind of line that is useless
+		// without a remedy.
+		"power",
 	} {
 		c := find(t, checks, want)
 		if c.detail == "" {
@@ -1567,9 +1571,10 @@ func TestPowerUnreadableWarnsRatherThanFails(t *testing.T) {
 // `pmset -g` exiting zero is not an answer. If no line's first field is exactly
 // `sleep` — a renamed or re-cased field, a locale-shifted output, a VM whose
 // pmset omits it — doctor knows exactly as much as it does when the command
-// cannot be run at all. Reporting PASS there put a green line on the one
-// question the check exists to answer and opened the `doctor && run` gate on a
-// machine that idle-sleeps, which is the failure the check was added to prevent.
+// cannot be run at all, so the distinction that decides this is "I asked and the
+// answer is fine" versus "I could not get an answer", never "the command exited
+// zero". Reporting PASS there put a green line on the one question the check
+// exists to answer, and an operator with a green line does not look.
 func TestPowerFieldMissingWarnsRatherThanPasses(t *testing.T) {
 	// Real-shaped output: displaysleep is present, the system `sleep` field is
 	// not, so idleSleepMinutes finds nothing to parse.
@@ -1581,34 +1586,6 @@ func TestPowerFieldMissingWarnsRatherThanPasses(t *testing.T) {
 	}
 	if c.remedy != unknownSleepRemedy {
 		t.Errorf("a missing field should carry the same remedy as an unreadable pmset, got %q", c.remedy)
-	}
-}
-
-// The distinction worth keeping is "I asked and the answer is fine" versus "I
-// could not get an answer" — not "the command exited zero". Only a parsed
-// timeout of 0 earns the PASS.
-func TestPowerOnlyAParsedAnswerPasses(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		settings string
-		want     status
-	}{
-		{"parsed, idle sleep disabled", " sleep                0\n", pass},
-		{"parsed, idle sleep enabled", " sleep                10\n", warn},
-		{"readable, no idle-sleep field", " displaysleep        10\n", warn},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			e := pmsetEnv("   PreventUserIdleSystemSleep       0\n", tc.settings)
-			if c := checkPower(context.Background(), e); c.status != tc.want {
-				t.Errorf("got %v, want %v (%s)", c.status, tc.want, c.detail)
-			}
-		})
-	}
-
-	e := okEnv()
-	e.pmset = func(context.Context, ...string) (string, error) { return "", errors.New("exec: pmset not found") }
-	if c := checkPower(context.Background(), e); c.status != warn {
-		t.Errorf("unreadable: got %v, want WARN (%s)", c.status, c.detail)
 	}
 }
 

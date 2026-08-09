@@ -1282,6 +1282,15 @@ func firstField(s string) string {
 
 // --- 10. power ----------------------------------------------------------------
 
+// unknownSleepRemedy is shared by both ways doctor can fail to learn the sleep
+// policy — `pmset -g` not running at all, and running but reporting no
+// idle-sleep field. The two states are the same state, so they say the same
+// thing; keeping one string means a future edit cannot improve the advice for
+// one of them and leave the other behind. It has to be actionable for a reader
+// who has just been told the command doctor would send them to did not answer,
+// so it names the mitigation as well as the manual check.
+const unknownSleepRemedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait. Either way, `clankerbar run` holds a no-idle-sleep assertion for the length of the run; for any other invocation use `caffeinate -i …`"
+
 // checkPower answers the most basic precondition of an unattended run, and the
 // one nothing else checks: will this machine still be awake to do the work?
 //
@@ -1295,13 +1304,6 @@ func firstField(s string) string {
 // assertion itself, so a green line here usually means that is working — but
 // doctor is also run standalone, before any loop exists, which is exactly when
 // the answer is worth having.
-// unknownSleepRemedy is shared by both ways doctor can fail to learn the sleep
-// policy — `pmset -g` not running at all, and running but reporting no
-// idle-sleep field. The two states are the same state, so they say the same
-// thing; keeping one string means a future edit cannot improve the advice for
-// one of them and leave the other behind.
-const unknownSleepRemedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait"
-
 func checkPower(ctx context.Context, e doctorEnv) check {
 	c := check{name: "power"}
 	if e.goos != "darwin" {
@@ -1334,12 +1336,16 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 	case !found:
 		// Informationally identical to the read failing outright: the command
 		// exited zero, but no idle-sleep field came back, so doctor does not know
-		// the answer. A PASS here would render a green line on the exact question
-		// the check exists to answer, and `doctor && run` is a documented cron
-		// gate — so a renamed, re-cased or locale-shifted field, or a VM whose
-		// `pmset` omits it, would open the gate on a machine that idle-sleeps.
-		// Failing open on the unknown case is worse than not checking, because the
-		// operator now has a green line telling them not to look.
+		// the answer. A renamed, re-cased or locale-shifted field, or a VM whose
+		// `pmset` omits it, used to render a green line on the exact question this
+		// check exists to answer. Failing open on the unknown case is worse than
+		// not checking, because the operator gets a green line telling them not to
+		// look. Note what the WARN does and does not buy: only `fail` stops
+		// `doctor && run`, so the documented cron gate opens either way — what
+		// changes is that a human reading the output has a line worth reading. Do
+		// not "restore consistency" by making this a FAIL; that would block the
+		// gate over a machine that may well be fine, which is why the read-failure
+		// branch above is a WARN too.
 		c.status = warn
 		c.detail = "no idle-sleep timeout reported for the active power source, so the sleep policy is unknown"
 		c.remedy = unknownSleepRemedy
