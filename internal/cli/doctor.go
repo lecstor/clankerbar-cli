@@ -1295,6 +1295,13 @@ func firstField(s string) string {
 // assertion itself, so a green line here usually means that is working — but
 // doctor is also run standalone, before any loop exists, which is exactly when
 // the answer is worth having.
+// unknownSleepRemedy is shared by both ways doctor can fail to learn the sleep
+// policy — `pmset -g` not running at all, and running but reporting no
+// idle-sleep field. The two states are the same state, so they say the same
+// thing; keeping one string means a future edit cannot improve the advice for
+// one of them and leave the other behind.
+const unknownSleepRemedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait"
+
 func checkPower(ctx context.Context, e doctorEnv) check {
 	c := check{name: "power"}
 	if e.goos != "darwin" {
@@ -1319,14 +1326,23 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 		// block a cron gate over a missing binary.
 		c.status = warn
 		c.detail = "could not read the sleep settings: " + err.Error()
-		c.remedy = "check manually with `pmset -g` — if idle sleep is enabled, an unattended run will freeze mid-wait"
+		c.remedy = unknownSleepRemedy
 		return c
 	}
 	mins, found := idleSleepMinutes(out)
 	switch {
 	case !found:
-		c.status = pass
-		c.detail = "no idle-sleep timeout reported for the active power source"
+		// Informationally identical to the read failing outright: the command
+		// exited zero, but no idle-sleep field came back, so doctor does not know
+		// the answer. A PASS here would render a green line on the exact question
+		// the check exists to answer, and `doctor && run` is a documented cron
+		// gate — so a renamed, re-cased or locale-shifted field, or a VM whose
+		// `pmset` omits it, would open the gate on a machine that idle-sleeps.
+		// Failing open on the unknown case is worse than not checking, because the
+		// operator now has a green line telling them not to look.
+		c.status = warn
+		c.detail = "no idle-sleep timeout reported for the active power source, so the sleep policy is unknown"
+		c.remedy = unknownSleepRemedy
 	case mins == 0:
 		c.status = pass
 		c.detail = "idle sleep is disabled for the active power source (a closed lid still sleeps)"
