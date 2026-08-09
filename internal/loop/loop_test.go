@@ -1706,8 +1706,11 @@ func TestJudgeProgressKeepsBackOffWhenQuestionsDoNotFall(t *testing.T) {
 		wasOpen int
 		sum     backlog.Summary
 	}{
-		// Claimable stays > 0 throughout: an idle poll clears the back-off on its own
-		// account, which would make every case here pass without testing anything.
+		// Claimable stays > 0 throughout. Not a tidy-up: once CLA-249's idle branch
+		// landed, a poll with nothing claimable clears the back-off on its own
+		// account, so at 0 all three cases assert the inverse of what now happens and
+		// go RED. The summary has to be spawnable for "back-off must survive" to be a
+		// claim about the question-fall path at all.
 		{"a NEW question is not an answered one", 2, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 3}},
 		{"an unchanged count says nothing happened", 2, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 2}},
 		{"none open, none answered", 0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0}},
@@ -1864,11 +1867,25 @@ func TestJudgeProgressStillJudgesADrainOutstandingWhenTheQueueGoesQuiet(t *testi
 }
 
 // The idle branch must advance the open-question baseline as every other path
-// does, and this is the one place the two rules meet: CLA-249's idle reset returns
-// early, and CLA-248's fall detector reads the baseline it would have skipped.
-// Left stale, questions answered during an idle stretch are re-read later as an
-// answer that landed mid-drain — so the next fruitless drain pockets the
-// one-immediate-retry exemption it never earned. Neither change has this alone.
+// does. This is the one place the two rules meet: CLA-249's idle reset returns
+// early, and CLA-248 added a second baseline that every other path advances
+// beside the first, so the merge of the two left `openQs` behind.
+//
+// It is an INVARIANT violation, not a live bug, and the distinction is the point
+// of this comment. The stale value is unreachable today: the idle branch zeroes
+// `quiet` in the same statement, the `!pending` fall detector is gated on
+// `quiet > 0`, and the drain-verdict path drops its `answered` flag below
+// quietThreshold — so the first poll after an idle stretch always consumes the
+// stale baseline somewhere it cannot change the outcome, and refreshes it. The
+// fix is here because the invariant is what the doc comment above judgeProgress
+// promises, and because three separate conditions currently have to hold for it
+// not to matter: drop quietThreshold to 1, stop zeroing `quiet` in the idle
+// branch, or add a consumer of the fall that is not gated on `quiet > 0`, and it
+// becomes reachable.
+//
+// So the assertion that pins this is the baseline itself, below. The drains after
+// it are a plain regression guard and pass with or without the fix; they are not
+// a demonstration of the failure, because no reachable sequence is.
 func TestJudgeProgressIdlePollAdvancesTheOpenQuestionBaseline(t *testing.T) {
 	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
 	d.baseline[0], d.openQs[0] = 4, 3
@@ -1880,8 +1897,10 @@ func TestJudgeProgressIdlePollAdvancesTheOpenQuestionBaseline(t *testing.T) {
 		t.Fatalf("an idle poll must track the open-question baseline like every other path; got %d, want 1", d.openQs[0])
 	}
 
-	// Work is filed and its drains settle nothing. The fall already happened and was
-	// already accounted for, so these are ordinary strikes and the third backs off.
+	// Guard, not a demonstration (see above): work is filed and its drains settle
+	// nothing, and the third backs the target off. Green either way today — it is
+	// here so that if the fall ever becomes readable while `quiet > 0`, an idle
+	// stretch cannot hand a later drain a retry it did not earn.
 	for range quietThreshold {
 		d.pending[0] = true
 		d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 1})
