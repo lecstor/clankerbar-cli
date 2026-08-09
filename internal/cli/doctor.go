@@ -442,7 +442,7 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 		// rather than spawning. It IS worth saying out loud when the operator holds
 		// the only key, because "no work" and "work you have not unblocked" look
 		// identical in the counts and read as a healthy queue.
-		if sum.Claimable == 0 && sum.OpenQuestions > 0 {
+		if !sum.Spawnable() && sum.OpenQuestions > 0 {
 			c.status = warn
 			c.detail += " — nothing to claim; the loop will idle without spawning"
 			c.remedy = "answer the open question(s) at clankerbar.com, or expect an idle run"

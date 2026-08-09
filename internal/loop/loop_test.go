@@ -1441,6 +1441,35 @@ func TestJudgeProgressForgetsFruitlessDrainsOnceNothingIsClaimable(t *testing.T)
 	}
 }
 
+// The other half of the rule: an idle poll must not CANCEL a verdict that is
+// still outstanding. `claimable == 0` also means "everything ready is claimed
+// right now", and the poll straight after a drain is exactly when that happens —
+// a session that ends holding a task it pushed work on is deliberately not handed
+// back. Forgetting there would let a target that always ends that way alternate
+// spawn / forget forever and never back off at all.
+func TestJudgeProgressStillJudgesADrainOutstandingWhenTheQueueGoesQuiet(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+
+	// Each drain settles nothing and leaves the task claimed, so every verdict poll
+	// sees an empty queue. The count must still climb.
+	for n := 1; n <= quietThreshold; n++ {
+		d.pending[0] = true
+		d.judgeProgress(0, backlog.Summary{Claimable: 0, InProgress: 1})
+		if d.quiet[0] != n {
+			t.Fatalf("after %d fruitless drains quiet = %d, want %d — an outstanding verdict was cancelled", n, d.quiet[0], n)
+		}
+	}
+	if d.skipUntil[0].IsZero() {
+		t.Error("three fruitless drains must back the target off, whatever the queue looked like at verdict time")
+	}
+
+	// One more idle poll with nothing outstanding IS the idle signal, and forgets.
+	d.judgeProgress(0, backlog.Summary{Claimable: 0, InProgress: 1})
+	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("a settled, idle target must forget; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
 // The same thing through Run: a backed-off target whose queue then empties starts
 // spawning again the moment work reappears, rather than serving out a wait no
 // fast-config interval can skip.

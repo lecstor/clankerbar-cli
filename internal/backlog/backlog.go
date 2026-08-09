@@ -56,6 +56,15 @@ type Summary struct {
 // number a drain has to move to have accomplished anything a backlog can see.
 func (s Summary) Settled() int { return s.InReview + s.Done }
 
+// Spawnable reports whether this poll shows work a session could pick up. It is
+// the loop's spawn gate, and it lives on the value rather than in the loop
+// because three places ask it: the gate itself, the loop's no-progress breaker
+// (which must read "not spawnable" as an IDLE target rather than a fruitless
+// one), and doctor, which tells the operator the loop will idle. Widening what
+// counts as spawnable has to move all three at once or one of them starts
+// lying — so they ask here, not each in their own words.
+func (s Summary) Spawnable() bool { return s.Claimable > 0 }
+
 // Poller reads the backlog summary cheaply.
 type Poller interface {
 	Poll(ctx context.Context) (Summary, error)
