@@ -1399,6 +1399,98 @@ func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
 	}
 }
 
+// The back-off's own message asks the operator to go and answer the question that
+// is stopping the queue. Answering it takes the task `blocked -> ready`, which
+// moves neither half of `Settled()` — so before CLA-248 the operator did exactly
+// what they were told, within seconds, and the target still served out the wait.
+func TestJudgeProgressClearsBackOffWhenAQuestionIsAnswered(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.quiet[0] = quietThreshold
+	d.skipUntil[0] = time.Now().Add(time.Hour)
+	d.baseline[0], d.openQs[0] = 4, 2
+
+	// Nothing settled: Settled() is exactly what it was. The only thing that moved
+	// is the answer the message asked for.
+	d.judgeProgress(0, backlog.Summary{Done: 4, OpenQuestions: 1})
+
+	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("an answered question must clear the back-off; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+	if d.backedOff(0) {
+		t.Error("the target must be eligible on that same poll, not once the remaining wait elapses")
+	}
+	if d.openQs[0] != 1 {
+		t.Errorf("the open-question baseline must track the poll; got %d, want 1", d.openQs[0])
+	}
+}
+
+// The mirror. Only a FALL is the operator acting; anything else must leave a
+// backed-off target sitting out, or the breaker clears itself on ordinary noise.
+func TestJudgeProgressKeepsBackOffWhenQuestionsDoNotFall(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		wasOpen int
+		sum     backlog.Summary
+	}{
+		{"a NEW question is not an answered one", 2, backlog.Summary{Done: 4, OpenQuestions: 3}},
+		{"an unchanged count says nothing happened", 2, backlog.Summary{Done: 4, OpenQuestions: 2}},
+		{"none open, none answered", 0, backlog.Summary{Done: 4, OpenQuestions: 0}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+			until := time.Now().Add(time.Hour)
+			d.quiet[0], d.skipUntil[0] = quietThreshold, until
+			d.baseline[0], d.openQs[0] = 4, tc.wasOpen
+
+			d.judgeProgress(0, tc.sum)
+
+			if d.quiet[0] != quietThreshold || !d.skipUntil[0].Equal(until) {
+				t.Errorf("back-off must survive; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+			}
+		})
+	}
+}
+
+// A drain that settled nothing is fruitless even if questions fell while it ran —
+// the verdict on a drain is what it SETTLED, and a session that answers its own
+// question has not thereby delivered anything. The baseline still tracks, so the
+// next poll judges the change since this one rather than re-reading it.
+func TestJudgeProgressDrainThatSettlesNothingIsStillFruitless(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.pending[0] = true
+	d.quiet[0], d.baseline[0], d.openQs[0] = 1, 4, 3
+
+	d.judgeProgress(0, backlog.Summary{Done: 4, OpenQuestions: 1})
+
+	if d.quiet[0] != 2 {
+		t.Errorf("a drain that settled nothing must still count against the target; quiet=%d, want 2", d.quiet[0])
+	}
+	if d.openQs[0] != 1 {
+		t.Errorf("the open-question baseline must track through a drain verdict too; got %d, want 1", d.openQs[0])
+	}
+}
+
+// The reported sequence end to end: a session blocks on a question, three fruitless
+// drains back the target off, the operator reads the message and answers, and the
+// target is eligible again on the very next poll instead of after 15 minutes.
+func TestJudgeProgressAnswerEndsTheBackOffOnTheNextPoll(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	blocked := backlog.Summary{Claimable: 1, OpenQuestions: 1}
+	for n := 0; n < quietThreshold; n++ {
+		d.pending[0] = true         // a drain went out...
+		d.judgeProgress(0, blocked) // ...and settled nothing
+	}
+	if !d.backedOff(0) {
+		t.Fatalf("%d fruitless drains must back the target off", quietThreshold)
+	}
+
+	d.judgeProgress(0, backlog.Summary{Claimable: 1, OpenQuestions: 0})
+
+	if d.backedOff(0) {
+		t.Error("the answer must end the back-off on the next poll, not after the full wait")
+	}
+}
+
 func TestQuietBackoffEscalatesToACap(t *testing.T) {
 	for _, tc := range []struct {
 		quiet int

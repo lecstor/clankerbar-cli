@@ -249,10 +249,15 @@ correctly declines to pre-empt your decision, and you pay for that report every
 cycle. One run did it ten times.
 
 So after **three consecutive sessions that settle nothing** — nothing reaching
-`in_review` or `done`, which is the only progress signal a backlog can see —
-the loop backs that project off for 15 minutes, then 30, then an hour, capped at
-two. Other projects keep draining. Any progress from anywhere, including you
-merging a PR, clears it immediately.
+`in_review` or `done` — the loop backs that project off for 15 minutes, then 30,
+then an hour, capped at two. Other projects keep draining. Any progress from
+anywhere, including you merging a PR, clears it immediately.
+
+**Answering the question also clears it, on the next poll.** That is what the
+back-off message asks you to do, so it had better not leave you waiting: an answer
+takes the task `blocked -> ready`, which moves neither `in_review` nor `done`, and
+a falling open-question count is the only trace of it the loop can see. It watches
+both.
 
 Three rather than one, because a genuinely large task can span several sessions
 before anything reaches a reviewer, and backing off then would throttle exactly

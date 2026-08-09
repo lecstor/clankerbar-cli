@@ -72,6 +72,7 @@ type Driver struct {
 	// off instead.
 	quiet     []int       // consecutive drains of this target that settled nothing
 	baseline  []int       // settled count when this target's last drain began
+	openQs    []int       // open-question count at this target's last poll
 	pending   []bool      // a drain of this target is awaiting its progress verdict
 	skipUntil []time.Time // a backed-off target is ineligible until this time
 
@@ -101,6 +102,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		paused:      make([]bool, n),
 		quiet:       make([]int, n),
 		baseline:    make([]int, n),
+		openQs:      make([]int, n),
 		pending:     make([]bool, n),
 		skipUntil:   make([]time.Time, n),
 		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
@@ -633,30 +635,51 @@ const quietThreshold = 3
 // Progress is `Settled()` rising — work reaching a reviewer or finishing. A drain
 // that only recorded why it could not proceed bumps `version` but settles
 // nothing, which is exactly the run this exists to stop repeating.
+//
+// An ANSWERED QUESTION is the one kind of progress `Settled()` cannot see, and it
+// is the very thing the back-off's own message asks the operator to go and do
+// (CLA-248). The plane takes the task `blocked -> ready`, which moves neither
+// `InReview` nor `Done`, so a falling `OpenQuestions` is the only trace of it a
+// poll can read. Both signals are watched, and both baselines move on every poll:
+// the verdict is always about the change since the last look.
 func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	settled := sum.Settled()
+	openQs := sum.OpenQuestions
 
 	if !d.pending[i] {
 		// No drain outstanding. Progress can still arrive from elsewhere — the
 		// operator merging a PR, another machine's loop — and it means whatever was
 		// stuck may now be unstuck, so let the target back in immediately.
-		if settled > d.baseline[i] && d.quiet[i] > 0 {
-			log.Printf("%sprogress from elsewhere — clearing the no-progress back-off", d.prefix(i))
-			d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+		//
+		// Note what the merge case actually rides on, because it is not obvious and
+		// a future edit could break it silently: `resolveReview` first takes the task
+		// back to `ready`, which DROPS `Settled()` by one and lowers the baseline
+		// with it here, so the later `done` reads as a rise. It is the two-step, not
+		// the merge, that this branch sees.
+		if d.quiet[i] > 0 {
+			switch {
+			case settled > d.baseline[i]:
+				log.Printf("%sprogress from elsewhere — clearing the no-progress back-off", d.prefix(i))
+				d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+			case openQs < d.openQs[i]:
+				log.Printf("%sopen questions fell %d -> %d: the operator answered, so clearing the no-progress back-off",
+					d.prefix(i), d.openQs[i], openQs)
+				d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+			}
 		}
-		d.baseline[i] = settled
+		d.baseline[i], d.openQs[i] = settled, openQs
 		return
 	}
 
 	d.pending[i] = false
 	if settled > d.baseline[i] {
 		d.quiet[i] = 0
-		d.baseline[i] = settled
+		d.baseline[i], d.openQs[i] = settled, openQs
 		return
 	}
 
 	d.quiet[i]++
-	d.baseline[i] = settled
+	d.baseline[i], d.openQs[i] = settled, openQs
 	if d.quiet[i] < quietThreshold {
 		return
 	}
