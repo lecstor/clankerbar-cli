@@ -272,8 +272,8 @@ func (d *Driver) Run(ctx context.Context) error {
 		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target,
 			spend{start: start, tokens: totalTokens, cost: totalCost})
 		// Count the spend BEFORE deciding what to do with the outcome: a drain that
-		// stopped or failed still burned what it burned, and the figures this run
-		// reports have to include its last session.
+		// stopped or failed still burned what it burned, and the accumulator is what
+		// the next iteration's breaker and log line are measured against.
 		totalTokens += tokens
 		totalCost += cost
 		if err != nil {
@@ -425,7 +425,11 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
 				return tokens, cost, true, nil
 			}
-			if d.supervisedWait(ctx, lim, t) {
+			if d.supervisedWait(ctx, lim, t, spend{
+				start:  prior.start,
+				tokens: prior.tokens + tokens,
+				cost:   prior.cost + cost,
+			}) {
 				return tokens, cost, true, nil
 			}
 			continue
@@ -716,12 +720,25 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 
 // supervisedWait pauses on a usage limit, then polls for an early reset rather
 // than sleeping blindly to the stated reset. Returns true if the loop should stop
-// (STOP marker or context cancel during the wait).
-func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target) (stop bool) {
+// (STOP marker, context cancel, or a budget ceiling reached during the wait).
+//
+// sofar is everything the run has spent, including this drain's attempts. The
+// breaker is consulted HERE and not only by the caller, because this loop does not
+// return to the caller while the limit persists: it waits, probes, and waits again
+// for as long as it takes. Without this, the one shape the task names — a drain
+// stuck in a supervised wait — was the one shape no ceiling could end, and it is
+// the shape codex always produces, since it states no reset for waitPastBudget to
+// measure (CLA-258).
+func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target, sofar spend) (stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
 	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 
 	for {
+		if dim := d.cfg.Budget.ExceededBy(sofar.tokens, sofar.cost, time.Since(sofar.start)); dim != "" {
+			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
+				dim, sofar.tokens, sofar.cost, time.Since(sofar.start).Round(time.Second))
+			return true
+		}
 		if d.waitOrStop(ctx, interval) {
 			return true
 		}

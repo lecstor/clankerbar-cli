@@ -402,10 +402,7 @@ func (claude) parse(res *Result) {
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}
 }
 
-// claudeErrorText collects the harness's OWN diagnostic text — all of stderr, the
-// stdout lines that are not stream events at all, and the terminal `result` event
-// when it reports a failure — so a limit or transient scan never reads the agent's
-// narration.
+// claudeScope is how much of claude's output a scan is allowed to read.
 //
 // Both scans used to run over the whole of Stdout+Stderr, and Stdout is the entire
 // raw NDJSON stream: every assistant message, and every `tool_result` block, which
@@ -414,15 +411,44 @@ func (claude) parse(res *Result) {
 // then slept, re-spawned the same paid session, re-claimed the same task and did it
 // again, with every budget ceiling sitting inert inside the drain (CLA-258). Same
 // defect, same fix, as opencodeErrorText.
+type claudeScope int
+
+const (
+	// claudeTyped is the narrow width: only what the CLI itself authored outside
+	// the event stream, or set in a machine-written field — stderr, stdout lines
+	// that are not events at all, and `terminal_reason`. Nothing here can carry a
+	// word the agent chose.
+	claudeTyped claudeScope = iota
+	// claudeDiagnostic adds the free text of a session the CLI says ended BADLY:
+	// the `result` field of a failed result event, and typed error events whole.
+	claudeDiagnostic
+)
+
+// claudeText collects claude's own output at the given width, so a scan never
+// reads the agent's narration.
 //
-// Non-JSON stdout lines are kept deliberately: under `--output-format stream-json`
+// Non-event stdout lines are kept deliberately: under `--output-format stream-json`
 // every word the agent says arrives inside a JSON event, so a bare line is the CLI
 // talking — which is how a usage-limit notice arrives when the stream never starts.
 // A line that starts like an event but does not parse is dropped rather than read
 // raw; a half-written event is not something to classify a run on.
-func claudeErrorText(res Result) string {
+func claudeText(res Result, scope claudeScope) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
+
+	// The probe path uses `--output-format json` — ONE object, with no
+	// one-event-per-line contract to lean on. Take it whole. Walking a
+	// pretty-printed object line by line would fail to parse the opening `{` and
+	// then read every remaining line as CLI text, which is precisely how the
+	// agent's own `result` would get back into the scan.
+	if whole := strings.TrimSpace(res.Stdout); strings.HasPrefix(whole, "{") {
+		var ev claudeEvent
+		if json.Unmarshal([]byte(whole), &ev) == nil {
+			writeClaudeEvent(&b, ev, whole, scope)
+			return b.String()
+		}
+	}
+
 	for _, line := range strings.Split(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -433,47 +459,71 @@ func claudeErrorText(res Result) string {
 			b.WriteString(line)
 			continue
 		}
-		var ev struct {
-			Type           string `json:"type"`
-			Subtype        string `json:"subtype"`
-			IsError        bool   `json:"is_error"`
-			Result         string `json:"result"`
-			TerminalReason string `json:"terminal_reason"`
-		}
-		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type != "result" {
+		var ev claudeEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
 			continue
 		}
-		// terminal_reason is a typed field the CLI sets; it is never the agent's words.
+		writeClaudeEvent(&b, ev, line, scope)
+	}
+	return b.String()
+}
+
+// claudeEvent is the sliver of a stream event that says whether the CLI is
+// reporting a failure, and what it called it.
+type claudeEvent struct {
+	Type           string `json:"type"`
+	Subtype        string `json:"subtype"`
+	IsError        bool   `json:"is_error"`
+	Result         string `json:"result"`
+	TerminalReason string `json:"terminal_reason"`
+}
+
+// failed reports whether the CLI itself said this session ended badly — the
+// condition under which its `result` text is the CLI's own words rather than the
+// agent's closing summary.
+func (ev claudeEvent) failed() bool {
+	return ev.IsError || ev.TerminalReason != "" || (ev.Subtype != "" && ev.Subtype != "success")
+}
+
+func writeClaudeEvent(b *strings.Builder, ev claudeEvent, line string, scope claudeScope) {
+	switch {
+	case ev.Type == "result":
+		// terminal_reason is a typed field the CLI sets; never the agent's words,
+		// so it is read at both widths.
 		if ev.TerminalReason != "" {
 			b.WriteByte('\n')
 			b.WriteString(ev.TerminalReason)
 		}
 		// `result` is free text. On a clean finish it is the agent's own closing
-		// summary — narration by another name — so it is read only once the CLI has
-		// said the session ended badly.
-		if ev.IsError || ev.TerminalReason != "" || (ev.Subtype != "" && ev.Subtype != "success") {
+		// summary — narration by another name.
+		if scope == claudeDiagnostic && ev.failed() {
 			b.WriteByte('\n')
 			b.WriteString(ev.Result)
 		}
+	case scope == claudeDiagnostic && strings.Contains(ev.Type, "error"):
+		// A typed error event, read whole — the parity codex and opencode already
+		// have. Dropping these would turn a retryable blip the CLI announced this
+		// way into a "non-retryable, stopping".
+		b.WriteByte('\n')
+		b.WriteString(line)
 	}
-	return b.String()
 }
 
 func (claude) DetectLimit(res Result) Limit {
 	reason, _ := res.Raw["terminal_reason"].(string)
-	text := claudeErrorText(res)
-	if reason == "usage_limit" || strings.Contains(text, "hit your") {
-		return Limit{
-			Limited: true,
-			// From the same scoped text, and for the same reason: reading the reset
-			// out of the narration would let backlog text choose how long the loop
-			// sleeps. Missing it costs nothing but the upper bound — the supervised
-			// wait polls for an early lift either way.
-			ResetAt: parseClaudeReset(text),
-			Reason:  "usage_limit",
-		}
+	if reason != "usage_limit" && !strings.Contains(claudeText(res, claudeDiagnostic), "hit your") {
+		return Limit{}
 	}
-	return Limit{}
+	return Limit{
+		Limited: true,
+		// The reset comes from the NARROW width, unlike the detection above. It is
+		// not just how long to nap: waitPastBudget abandons the run outright when a
+		// reset lands past the wall-clock ceiling, so a reset read out of free text
+		// would let backlog text end the run. Losing it costs only the upper bound
+		// — the supervised wait polls for an early lift regardless.
+		ResetAt: parseClaudeReset(claudeText(res, claudeTyped)),
+		Reason:  "usage_limit",
+	}
 }
 
 // claudeTransientRe anchors on the "API Error:" prefix (and bare connection
@@ -482,13 +532,13 @@ func (claude) DetectLimit(res Result) Limit {
 // Ported from loop.sh's TRANSIENT_RE.
 //
 // The anchoring is the second line of defence, not the first: it is applied to
-// claudeErrorText, so the agent's narration is not scanned at all.
+// claudeText, so the agent's narration is not scanned at all.
 var claudeTransientRe = regexp.MustCompile(`(?i)api error: (408|429|5\d\d)` +
 	`|api error:.*(overloaded|internal server|bad gateway|service unavailable|gateway time|too many requests)` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 func (claude) IsTransient(res Result) bool {
-	return claudeTransientRe.MatchString(claudeErrorText(res))
+	return claudeTransientRe.MatchString(claudeText(res, claudeDiagnostic))
 }
 
 func (c claude) Probe(ctx context.Context, in Invocation) (Limit, error) {

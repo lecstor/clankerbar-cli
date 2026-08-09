@@ -201,8 +201,16 @@ func codexErrorText(res Result) string {
 		if !hasError && !strings.Contains(ev.Type, "error") && !strings.Contains(ev.Type, "failed") {
 			continue
 		}
+		// The TYPE and the ERROR member, never the whole line: an event may carry a
+		// failure alongside a sibling field holding the failed command's output, and
+		// that output is the agent's business. codexTransientRe matches a bare "rate
+		// limit", so there is no anchoring here to fall back on.
 		b.WriteByte('\n')
-		b.WriteString(line)
+		b.WriteString(ev.Type)
+		if hasError {
+			b.WriteByte('\n')
+			b.Write(ev.Error)
+		}
 	}
 	return b.String()
 }

@@ -696,10 +696,17 @@ func TestDrainWithRetries_CostCeilingEndsASupervisedWait(t *testing.T) {
 	// to be past), so this is the hole it never covered. The limited attempt spends
 	// $2 against a $1 ceiling.
 	cfg.Budget = config.Budget{MaxCostUSD: 1.0}
-	h := &fakeAdapter{steps: []invokeStep{
-		{res: harness.Result{ExitCode: 1, CostUSD: 2.0, Raw: map[string]any{"kind": "limit"}}},
-		{res: okResult(0, 0)}, // must never be reached
-	}}
+	h := &fakeAdapter{
+		steps: []invokeStep{
+			{res: harness.Result{ExitCode: 1, CostUSD: 2.0, Raw: map[string]any{"kind": "limit"}}},
+			{res: okResult(0, 0)}, // must never be reached
+		},
+		// The limit does NOT lift. This is the stuck wait the bar names: without a
+		// stated reset there is nothing for waitPastBudget to measure, so before
+		// this the loop probed here for as long as the cap lasted, with the ceiling
+		// one stack frame up. (Finite so a regression fails rather than hangs.)
+		probeResults: []harness.Limit{{Limited: true}, {Limited: true}, {Limited: true}},
+	}
 	d := New(cfg, h, &fakePoller{})
 	openTestStateDir(t, d)
 
@@ -709,13 +716,40 @@ func TestDrainWithRetries_CostCeilingEndsASupervisedWait(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if !stop {
-		t.Error("a blown cost ceiling must end the drain, not re-spawn the session")
+		t.Error("a blown cost ceiling must end the drain, not wait out the limit")
 	}
 	if cost != 2.0 {
 		t.Errorf("cost = %v, want the limited attempt's 2.0 reported back to Run", cost)
 	}
 	if h.invokeCalls != 1 {
 		t.Errorf("the session must not be re-run past the ceiling; got %d invokes", h.invokeCalls)
+	}
+	if h.probeCalls != 0 {
+		t.Errorf("a ceiling already reached must end the wait before it polls; got %d probes", h.probeCalls)
+	}
+}
+
+// The mirror: a ceiling still in credit must not cut a legitimate pause short.
+func TestDrainWithRetries_UnreachedCeilingStillWaitsOutTheLimit(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Budget = config.Budget{MaxCostUSD: 10.0}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: harness.Result{ExitCode: 1, CostUSD: 1.0, Raw: map[string]any{"kind": "limit"}}},
+		{res: okResult(4, 0)},
+	}}
+	d := New(cfg, h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	tokens, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+
+	if err != nil || stop {
+		t.Fatalf("$1 of a $10 ceiling must still be waited out: stop=%v err=%v", stop, err)
+	}
+	if tokens != 4 {
+		t.Errorf("the session should have been re-run after the wait; got %d tokens", tokens)
+	}
+	if h.probeCalls != 1 {
+		t.Errorf("the supervised wait should have probed once; got %d", h.probeCalls)
 	}
 }
 
@@ -769,10 +803,9 @@ func TestDrainWithRetries_CeilingCountsSpendFromEarlierDrains(t *testing.T) {
 	}
 }
 
-// A drain that stops on the budget still spent its tokens, and Run must carry
-// them into the figures it reports — otherwise the run's own accounting quietly
-// loses the last session.
-func TestRun_CountsSpendFromABudgetStoppedDrain(t *testing.T) {
+// End to end through Run: the wiring that hands a drain the run's ceilings, and
+// takes its mid-drain stop as a graceful end of the run.
+func TestRun_MidDrainBudgetStopEndsTheRun(t *testing.T) {
 	cfg := fastCfg()
 	cfg.StateDir = t.TempDir()
 	cfg.Budget = config.Budget{MaxCostUSD: 1.0}

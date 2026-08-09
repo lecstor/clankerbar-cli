@@ -107,19 +107,69 @@ func TestClaudeStillSeesTheHarnessOwnFailures(t *testing.T) {
 	}
 }
 
-// A reset time is only trusted from the same scoped text. Reading it out of the
-// narration would let backlog text choose how long the loop sleeps.
-func TestClaudeResetTimeIsNotTakenFromNarration(t *testing.T) {
-	res := Result{
-		Stdout: claudePoisonedStream(t),
-		Raw:    map[string]any{"terminal_reason": "usage_limit"},
+// A reset time is read only from what the CLI itself wrote — never from free
+// text, even the free text of a session it says FAILED.
+//
+// This is not just about how long the loop naps. waitPastBudget abandons the run
+// outright when a reset lands past the wall-clock ceiling, so a reset lifted out of
+// a `result` string would let a task body containing "resets Sunday 12:00am" end
+// somebody's overnight run.
+func TestClaudeResetTimeIsNotTakenFromFreeText(t *testing.T) {
+	quoted, err := json.Marshal("The task body says: " + poison)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
 	}
+	// A self-consistent stream: the CLI says the session hit the cap, and the
+	// result text is where the quoted task body ended up.
+	stream := `{"type":"result","subtype":"error_during_execution","is_error":true,` +
+		`"terminal_reason":"usage_limit","result":` + string(quoted) + "}\n"
+	res := Result{Stdout: stream, Raw: map[string]any{"terminal_reason": "usage_limit"}}
+
 	lim := (claude{}).DetectLimit(res)
 	if !lim.Limited {
-		t.Fatal("terminal_reason: usage_limit is the harness's own word and must still be believed")
+		t.Fatal("terminal_reason: usage_limit is the CLI's own word and must still be believed")
 	}
 	if !lim.ResetAt.IsZero() {
-		t.Errorf("the reset time came from the agent's narration: %v", lim.ResetAt)
+		t.Errorf("the reset time was lifted out of free text: %v", lim.ResetAt)
+	}
+
+	// The same limit, stated where the CLI actually states it, keeps its reset.
+	onStderr := Result{Stderr: "You've hit your session limit · resets 9:40pm (Europe/Madrid)"}
+	if (claude{}).DetectLimit(onStderr).ResetAt.IsZero() {
+		t.Error("a reset the CLI stated on stderr must still be parsed")
+	}
+}
+
+// The probe path is `--output-format json` — one object, with no per-line
+// contract. A pretty-printed object must not be walked line by line, or every
+// line after the opening brace reads as CLI text and the agent's own `result`
+// lands back in the scan. A probe that misreads its answer keeps the supervised
+// wait from ever ending.
+func TestClaudeProbeShapeIsParsedWhole(t *testing.T) {
+	body, err := json.MarshalIndent(map[string]any{
+		"type": "result", "subtype": "success", "is_error": false,
+		"result": "The task body says: " + poison,
+	}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	res := Result{Stdout: string(body) + "\n"}
+
+	if lim := (claude{}).DetectLimit(res); lim.Limited {
+		t.Error("a pretty-printed probe result was read as a usage limit")
+	}
+	if (claude{}).IsTransient(res) {
+		t.Error("a pretty-printed probe result was read as a transient failure")
+	}
+}
+
+// A typed error event that is not the terminal `result` must still be read — the
+// parity codex and opencode already have. Dropping it would turn a retryable blip
+// the CLI announced this way into "non-retryable, stopping".
+func TestClaudeReadsTypedErrorEvents(t *testing.T) {
+	res := Result{Stdout: `{"type":"error","error":{"message":"API Error: 503 Service Unavailable"}}` + "\n"}
+	if !(claude{}).IsTransient(res) {
+		t.Error("a typed error event went unread")
 	}
 }
 
