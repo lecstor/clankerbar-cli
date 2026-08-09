@@ -162,12 +162,65 @@ func deref(p *int) int {
 	return *p
 }
 
+// codexErrorText collects the harness's OWN diagnostic text — all of stderr, the
+// stdout lines that are not events at all, and the events that carry an `error` or
+// announce a failure — so a limit or transient scan never reads the agent's
+// narration.
+//
+// Both scans used to run over the whole of Stdout+Stderr, and under `--json`
+// stdout is the event stream: the agent's messages, and its tool output, which
+// includes the verbatim MCP response to `claim_task`. A backlog task whose body
+// merely said "usage limit" therefore reported a subscription cap that never
+// happened, and the loop paused and re-spawned the same paid session on a cycle no
+// budget ceiling stopped (CLA-258). Same defect, same fix, as opencodeErrorText.
+//
+// Non-JSON stdout lines are kept deliberately: every word the agent says arrives
+// inside an event, so a bare line is the CLI talking — which is how codex reports a
+// cap it has no typed event for.
+func codexErrorText(res Result) string {
+	var b strings.Builder
+	b.WriteString(res.Stderr)
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "{") {
+			b.WriteByte('\n')
+			b.WriteString(line)
+			continue
+		}
+		var ev struct {
+			Type  string          `json:"type"`
+			Error json.RawMessage `json:"error"`
+		}
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			continue
+		}
+		hasError := len(ev.Error) > 0 && string(ev.Error) != "null"
+		if !hasError && !strings.Contains(ev.Type, "error") && !strings.Contains(ev.Type, "failed") {
+			continue
+		}
+		// The TYPE and the ERROR member, never the whole line: an event may carry a
+		// failure alongside a sibling field holding the failed command's output, and
+		// that output is the agent's business. codexTransientRe matches a bare "rate
+		// limit", so there is no anchoring here to fall back on.
+		b.WriteByte('\n')
+		b.WriteString(ev.Type)
+		if hasError {
+			b.WriteByte('\n')
+			b.Write(ev.Error)
+		}
+	}
+	return b.String()
+}
+
 func (codex) DetectLimit(res Result) Limit {
 	// The subscription usage cap (the long-pause case) only. An API-level 429 /
 	// "rate limit" / "too many requests" is a transient blip handled by IsTransient,
 	// NOT this. Codex exposes no structured reset, so ResetAt stays zero and the
 	// loop leans on interval probing.
-	blob := strings.ToLower(res.Stdout + res.Stderr)
+	blob := strings.ToLower(codexErrorText(res))
 	for _, needle := range []string{"usage limit", "weekly limit", "session limit"} {
 		if strings.Contains(blob, needle) {
 			return Limit{Limited: true, Reason: "usage_limit"}
@@ -183,7 +236,7 @@ var codexTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d\d)
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 func (codex) IsTransient(res Result) bool {
-	return codexTransientRe.MatchString(res.Stdout + res.Stderr)
+	return codexTransientRe.MatchString(codexErrorText(res))
 }
 
 func (c codex) Probe(ctx context.Context, in Invocation) (Limit, error) {

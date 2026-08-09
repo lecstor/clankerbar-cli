@@ -438,6 +438,13 @@ positive number to bound it. A usage-limit pause and a transient retry both re-r
 the same iteration and neither advances the iteration count. `STOP` stays
 responsive during any wait.
 
+**What gets read as a failure.** A session's output is the whole event stream, and
+the events quote the backlog verbatim — the task the session claimed is sitting in
+the same bytes. So both classifications read only what the *harness* said: its
+stderr, its own non-event output, its typed error events, and Claude's
+`terminal_reason`. A task whose body happens to say "hit your", "usage limit" or
+"api error: 500" is narration, and narration is never a cap and never a blip.
+
 **Handing the task back.** A claim carries a 30-minute lease that the session
 heartbeats. When a session ends mid-task, that lease is left ticking with nobody
 renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
@@ -493,6 +500,11 @@ alternatives, in order of preference:
    right then and tells you when the quota returns, rather than sleeping
    through the window to run one session against the fresh quota and stop on
    the next check.
+
+   Every ceiling is also checked **inside** an iteration, before each re-run of a
+   session that paused on a usage limit or backed off on a transient blip. Those
+   waits can repeat for hours, and a run that reached its ceiling during one stops
+   there instead of spending another session first.
 
 ## Harnesses
 
