@@ -88,10 +88,20 @@ type Result struct {
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
 
+	// Reports are the delivery claims this session got the plane to ACCEPT — a
+	// branch recorded as the hand-off, a commit declared landed — for the driver
+	// to check against local git (CLA-253). Order is the order they were made.
+	Reports []Report
+
 	// pending maps a tool_use id to what its result will mean. Parser state, not
 	// output: every clankerbar call that matters is judged on the plane's ANSWER,
 	// never on the request, because a refused call changes nothing.
 	pending map[string]pendingKind
+
+	// pendingReports is the same discipline for delivery claims: an `update_task`
+	// REFUSED by the plane (a missing Tests header, a superseded run) recorded
+	// nothing, so there is nothing to check and nothing to complain about.
+	pendingReports map[string]Report
 }
 
 // pendingKind is what a tool_result is expected to tell us.
@@ -113,6 +123,115 @@ func (r *Result) expect(toolUseID string, k pendingKind) {
 		r.pending = map[string]pendingKind{}
 	}
 	r.pending[toolUseID] = k
+}
+
+// expectReport arms a delivery claim, to be kept only if the plane accepts it.
+func (r *Result) expectReport(toolUseID string, rep Report) {
+	if toolUseID == "" || rep.Empty() {
+		return
+	}
+	if r.pendingReports == nil {
+		r.pendingReports = map[string]Report{}
+	}
+	r.pendingReports[toolUseID] = rep
+}
+
+// settleReport resolves an armed delivery claim on its tool_result. accepted=false
+// (the plane refused the call) drops it: nothing was recorded, so there is nothing
+// to verify.
+//
+// Identical claims collapse. A clanker that carries `branch` on every progress
+// update — which the protocol encourages, since the branch is the hand-off record
+// — restates the same claim many times in one session, and each restatement would
+// otherwise cost a network round trip, a duplicate log line, and a duplicate write
+// to the plane.
+func (r *Result) settleReport(toolUseID string, accepted bool) {
+	rep, armed := r.pendingReports[toolUseID]
+	if !armed {
+		return
+	}
+	delete(r.pendingReports, toolUseID)
+	if !accepted {
+		return
+	}
+	// Deduplicated on the CLAIM, not on the whole call, and the later one wins: two
+	// updates can restate the same branch under different statuses, and it is the
+	// most recent status that says whether the work is being handed to review or
+	// declared landed.
+	for i, prior := range r.Reports {
+		if prior.sameClaim(rep) {
+			r.Reports[i] = rep
+			return
+		}
+	}
+	r.Reports = append(r.Reports, rep)
+}
+
+// Report is a delivery claim the plane accepted: the branch a session recorded as
+// its hand-off, and/or the commit it declared landed on an integration branch.
+//
+// Both are claims the plane cannot check — it holds the backlog and takes a
+// clanker at its word — and both have been wrong in ways that cost real work: a
+// branch recorded but never pushed past its first commits reads as a hand-off to
+// the next clanker and is a dead end. The driver is local and in the git tree, so
+// it can simply look (CLA-253).
+type Report struct {
+	// TaskID and Ref identify the task, and RunID signs any write the driver makes
+	// off the back of the check.
+	TaskID string
+	Ref    string
+	RunID  string
+
+	// Status is the status the same call carried, if any ("in_review", "done").
+	Status string
+
+	// Branch is a recorded work-in-progress branch.
+	Branch string
+
+	// Commit and IntegrationBranch are a declared delivery, and PR is the pull
+	// request that carried it. PR is captured only so the driver can echo the whole
+	// declaration back when it attests to the merge, rather than posting a partial
+	// `delivery` object that could drop it.
+	Commit            string
+	IntegrationBranch string
+	PR                string
+}
+
+// Empty reports that this claim asserts nothing checkable.
+func (r Report) Empty() bool {
+	return r.Branch == "" && (r.Commit == "" || r.IntegrationBranch == "")
+}
+
+// sameClaim reports whether two reports assert the same thing about the same task,
+// ignoring the status the call happened to carry.
+func (r Report) sameClaim(o Report) bool {
+	return r.TaskID == o.TaskID && r.Branch == o.Branch &&
+		r.Commit == o.Commit && r.IntegrationBranch == o.IntegrationBranch
+}
+
+// ClaimsMerge reports whether this is a claim that the delivery has LANDED, which
+// is the only thing the ancestor check can sensibly be run against.
+//
+// A hand-off to `in_review` routinely carries the delivery it is proposing, and at
+// that moment the commit has by definition not merged — nobody has reviewed it
+// yet. Checking it anyway would fire the loudest log line in the feature on the
+// happy path and stamp `mergeVerified: false` on a task that is perfectly fine,
+// which is how a warning system trains its operator to ignore it.
+func (r Report) ClaimsMerge() bool {
+	if r.Commit == "" || r.IntegrationBranch == "" {
+		return false
+	}
+	// `done` is the closure that declares it landed; a status-less revision that
+	// carries a delivery is making the same declaration on its own.
+	return r.Status == "" || r.Status == "done"
+}
+
+// Label is the task's most human-readable identifier.
+func (r Report) Label() string {
+	if r.Ref != "" {
+		return r.Ref
+	}
+	return r.TaskID
 }
 
 // Claim is what a session did with the backlog: the task it most recently

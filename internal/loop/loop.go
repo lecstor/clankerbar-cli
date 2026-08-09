@@ -22,6 +22,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
@@ -53,13 +54,13 @@ type Target struct {
 
 // Driver runs the loop for one harness against one or more backlogs.
 type Driver struct {
-	cfg      *config.Config
-	h        harness.Adapter
-	targets  []Target
-	paused   []bool // per-target console-pause state, to log transitions once
-	cursor   int    // round-robin position over targets (last drained)
-	state    *statedir.Dir
-	blind    bool // no cheap backlog read available — drain then idle-poll
+	cfg     *config.Config
+	h       harness.Adapter
+	targets []Target
+	paused  []bool // per-target console-pause state, to log transitions once
+	cursor  int    // round-robin position over targets (last drained)
+	state   *statedir.Dir
+	blind   bool // no cheap backlog read available — drain then idle-poll
 
 	// Per-target no-progress state. `claimable > 0` is a claim that work is
 	// available, not that it can be DONE: a task can be claimable and still
@@ -73,6 +74,16 @@ type Driver struct {
 	baseline  []int       // settled count when this target's last drain began
 	pending   []bool      // a drain of this target is awaiting its progress verdict
 	skipUntil []time.Time // a backed-off target is ineligible until this time
+
+	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
+	// tests can substitute one; production always gets internal/delivery.
+	newVerifier func(workdir string) deliveryVerifier
+}
+
+// deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
+// call it makes.
+type deliveryVerifier interface {
+	Verify(ctx context.Context, c delivery.Claim) delivery.Report
 }
 
 // New builds a single-project Driver — the original mode, driven entirely by the
@@ -87,11 +98,12 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
 	return &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:    make([]bool, n),
-		quiet:     make([]int, n),
-		baseline:  make([]int, n),
-		pending:   make([]bool, n),
-		skipUntil: make([]time.Time, n),
+		paused:      make([]bool, n),
+		quiet:       make([]int, n),
+		baseline:    make([]int, n),
+		pending:     make([]bool, n),
+		skipUntil:   make([]time.Time, n),
+		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
 	}
 }
 
@@ -332,6 +344,11 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, s
 		// that stream is real and must not be dropped just because the process died
 		// untidily. A launch failure yields a zero Result, which releases nothing.
 		d.releaseHeldClaim(ctx, t, res)
+		// Then check what it said it delivered. After the handback, because a dead
+		// lease is time-sensitive and a git check is not; on every exit, because a
+		// session that pushed nothing and died is exactly as likely to have recorded
+		// a branch as one that finished cleanly.
+		d.verifyDeliveries(ctx, t, res)
 
 		if ierr != nil {
 			if ctx.Err() != nil {
@@ -442,6 +459,105 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		return
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
+}
+
+// verifyDeliveries checks, against local git, what the session told the plane it
+// delivered — and says so out loud (CLA-253).
+//
+// The plane is a pipe: it stores a recorded branch and a declared merge and takes
+// the clanker at its word, because it has no access to a git host and, by the
+// standing decision behind this, is not being given any. The driver is already
+// local and already in the tree, so it is the one place the claim can simply be
+// looked at.
+//
+// # Warn, do not refuse
+//
+// A failed check is logged loudly and names what is unpushed or unmerged. It does
+// NOT override the session's report, and this is a deliberate first cut rather
+// than an oversight: refusing would mean the driver reverting a status a session
+// chose, on the strength of a check that can be wrong about which tree it is
+// looking at. Loud logging is the floor, it is cheap, and it is reversible.
+// Recorded as a decision on CLA-253.
+//
+// # Fail open
+//
+// A check that could not run reports "could not verify" and the run carries on.
+// Blocking a legitimate closure because the tree could not be found would be worse
+// than the gap this replaces — and an Unknown is never allowed to read as a pass:
+// the attestation below is written only for a check that actually ran.
+func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Result) {
+	if len(res.Reports) == 0 || d.newVerifier == nil {
+		return
+	}
+	// Unlike the handback, this is NOT worth outliving a Ctrl-C. The handback races
+	// a lease that is already ticking; a delivery claim will still be wrong in the
+	// morning, and the checks reach the network, so insisting on them would add a
+	// visible stall to every interactive shutdown.
+	if ctx.Err() != nil {
+		return
+	}
+
+	v := d.newVerifier(d.invocation(t, false).WorkDir)
+	for _, rep := range res.Reports {
+		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch}
+		if rep.ClaimsMerge() {
+			claim.Commit, claim.IntegrationBranch = rep.Commit, rep.IntegrationBranch
+		}
+		// Detached and bounded PER REPORT: a shared deadline would silently degrade
+		// every claim after the first slow one to "cannot check". Detached because a
+		// cancel arriving mid-check should not turn a real answer into a half one —
+		// the guard above is what makes cancellation prompt.
+		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
+		out := v.Verify(vctx, claim)
+		cancel()
+
+		for _, c := range out.Checks {
+			switch c.Status {
+			case delivery.Fail:
+				log.Printf("%sDELIVERY UNVERIFIED — %s: %s", labelOf(t), rep.Label(), c.Detail)
+			case delivery.Unknown:
+				log.Printf("%scould not verify %s: %s — carrying on", labelOf(t), rep.Label(), c.Detail)
+			default:
+				log.Printf("%sverified %s: %s", labelOf(t), rep.Label(), c.Detail)
+			}
+		}
+		d.attestMerge(ctx, t, rep, out)
+	}
+}
+
+// deliveryCheckTimeout bounds one session's worth of git checks, including the
+// `ls-remote` that goes over the network.
+const deliveryCheckTimeout = 60 * time.Second
+
+// attestMerge writes the driver's verdict onto the task's delivery record, so the
+// answer survives the log. Only for a check that RAN: `mergeVerified` means "I ran
+// the ancestor check and this is what it said", and writing it off the back of a
+// check that could not run would be the same false attestation this exists to
+// catch. Best-effort throughout — an unreachable or unwired plane costs the record,
+// not the run, and the loud log above already carries the finding.
+func (d *Driver) attestMerge(ctx context.Context, t Target, rep harness.Report, out delivery.Report) {
+	verified, ran := out.MergeVerified()
+	if !ran || rep.TaskID == "" || rep.RunID == "" {
+		return
+	}
+	a, ok := t.Releaser.(plane.Attester)
+	if !ok {
+		return
+	}
+	actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+
+	if err := a.AttestMergeVerified(actx, rep.TaskID, rep.RunID, plane.Delivery{
+		Commit:            rep.Commit,
+		IntegrationBranch: rep.IntegrationBranch,
+		PR:                rep.PR,
+	}, verified); err != nil {
+		if !errors.Is(err, plane.ErrNotWired) {
+			log.Printf("%scould not record the merge check for %s: %v", labelOf(t), rep.Label(), err)
+		}
+		return
+	}
+	log.Printf("%srecorded delivery.mergeVerified=%t for %s", labelOf(t), verified, rep.Label())
 }
 
 // quietBackoff is how long a target sits out after `quiet` consecutive drains

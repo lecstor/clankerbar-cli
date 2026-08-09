@@ -52,6 +52,32 @@ type Releaser interface {
 	Release(ctx context.Context, taskID, runID string) error
 }
 
+// Attester records the driver's own verdict on a delivery a session declared.
+//
+// `delivery.mergeVerified` is an attestation the plane STORES and does not
+// confirm — it is the clanker saying "I ran `git merge-base --is-ancestor`". The
+// driver is the one process in the loop that actually can, so when it has run that
+// check it writes down what it found (CLA-253), true or false. It writes nothing
+// when the check could not run: an absent attestation is honest, a fabricated one
+// is the exact failure this exists to catch.
+//
+// It is a SEPARATE interface from Releaser on purpose. The driver type-asserts for
+// it, so a Releaser that cannot attest (a not-wired plane, a test double) degrades
+// to warn-only rather than failing to compile or failing to run.
+type Attester interface {
+	AttestMergeVerified(ctx context.Context, taskID, runID string, d Delivery, verified bool) error
+}
+
+// Delivery is the declaration being attested to, echoed back exactly as the
+// session made it. The whole thing is resent, not just the two fields the check
+// used: `update_task` takes `delivery` as an object, and a partial one risks
+// dropping whatever the session put in the fields this driver did not name.
+type Delivery struct {
+	Commit            string
+	IntegrationBranch string
+	PR                string
+}
+
 type notWired struct{}
 
 func (notWired) Release(context.Context, string, string) error { return ErrNotWired }
@@ -94,6 +120,41 @@ func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
 		"taskId": taskID,
 		"runId":  runID,
 		"status": "ready",
+	})
+}
+
+// AttestMergeVerified writes the driver's verdict onto the task's delivery record.
+//
+// The declaration is echoed back exactly as the session made it, so the stored
+// delivery stays internally consistent: an attestation has to name the thing it is
+// about, or a later reader cannot tell what was checked. No `status` and no
+// `outcome` are sent — this revises a record, it does not move the task or
+// overwrite the session's own words.
+//
+// It runs AFTER the session ended, which is later than any other write here. The
+// plane credits a `runId` while it is the task's most recent run — which it still
+// is once the task is handed to review and the lock released — so this is a
+// supported write rather than a stolen one. If the plane refuses it anyway, the
+// caller logs and carries on: the loud log already carries the finding.
+func (r *mcpReleaser) AttestMergeVerified(ctx context.Context, taskID, runID string, d Delivery, verified bool) error {
+	if taskID == "" || runID == "" {
+		return errors.New("attest: taskId and runId are both required")
+	}
+	if d.Commit == "" || d.IntegrationBranch == "" {
+		return errors.New("attest: the delivery being attested must name a commit and an integration branch")
+	}
+	delivery := map[string]any{
+		"commit":            d.Commit,
+		"integrationBranch": d.IntegrationBranch,
+		"mergeVerified":     verified,
+	}
+	if d.PR != "" {
+		delivery["pr"] = d.PR
+	}
+	return r.call(ctx, "update_task", map[string]any{
+		"taskId":   taskID,
+		"runId":    runID,
+		"delivery": delivery,
 	})
 }
 

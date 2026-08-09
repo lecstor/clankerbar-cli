@@ -282,6 +282,62 @@ The Claude harness runs with `--output-format stream-json`, so the agent's own
 progress — assistant text and `→ Tool` markers — streams live too, and each
 attempt is captured to its own `<state-dir>/iteration-<ts>.log`.
 
+### Checking what a session says it delivered
+
+The control plane holds the backlog and takes a clanker at its word. When a session
+records a branch (`update_task(branch: …)`) or declares a delivery merged
+(`delivery.commit` + `integrationBranch`), nothing on the plane can look at a
+repository to see whether either is true. One task read `done` for four days while
+about 900 lines of its work sat unpushed on one laptop, and its own PR merged a
+stale snapshot.
+
+The driver is already local and already in the git tree, so it checks both claims
+after each session — no new credentials, no plane change:
+
+- **A recorded branch is really on the remote**, and the local tip is an ancestor
+  of the remote tip. A local branch *ahead* of its remote is the failure above.
+- **A declared delivery really landed**: `commit` is an ancestor of the remote tip
+  of `integrationBranch` — the same ancestor check the plane asks the clanker to
+  attest to, run rather than trusted. The integration branch is read from the
+  remote, never from a local `main` that is routinely tens of commits stale. Only
+  a *closure* is checked this way: a hand-off to `in_review` carries the delivery
+  it is proposing, and at that moment nothing has merged yet. And only a commit
+  **id** counts — a revision expression like `main` or `HEAD` is trivially its own
+  ancestor, so it is reported as unverifiable rather than checked.
+
+```
+DELIVERY UNVERIFIED — CLA-134: branch "clanker/x" is ahead of origin/clanker/x by
+12 commits — local tip 4a91c0de, remote 0b3f21aa; that work is UNPUSHED and
+exists only in /Users/you/dev/acme
+```
+
+**It warns; it does not refuse.** A failed check is logged loudly and names what is
+unpushed or unmerged, but the session's own report stands — the driver does not
+revert a status a session chose on the strength of a check that could be looking at
+the wrong tree. When the merge check *ran*, its verdict is written back to the task
+as `delivery.mergeVerified`, true or false, so the answer outlives the log.
+
+**It fails open.** No git, no remote, a workdir that is not a repository, a remote
+tip that cannot be fetched — all report *could not verify* and the run carries on.
+Blocking a legitimate closure because the tree could not be found would be worse
+than the gap this closes. A check that could not run never writes an attestation:
+not knowing is not the same as knowing it is fine.
+
+**Finding the tree.** The driver spawns sessions in a workdir, but the work happens
+in a per-task worktree it did not create — and the workdir is routinely a
+multi-repo parent (`~/dev`) that is not a repository at all. Linked worktrees share
+their repository's refs, so the specific directory does not matter: the driver
+looks for the *repository* whose refs carry the branch, searching the workdir and
+its first two directory levels (enough to reach both `~/dev/<repo>` and
+`~/dev/<repo>-wt/<task>`). Repositories are never descended into and bare ones are
+skipped, so the search costs a bounded handful of `git rev-parse` calls. If *two*
+repositories under the workdir carry the same branch — a review clone sitting
+beside the session's own tree — that is reported as unverifiable too: checking the
+wrong tree is worse than not checking.
+
+This covers **unattended runs only**, by design: an interactive session bypasses
+the driver entirely.
+
 ### Skills, plugins, and auth
 
 A headless session loads **project** skills from the working directory

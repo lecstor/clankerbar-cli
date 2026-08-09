@@ -139,6 +139,12 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			if b.Type != "tool_result" || b.ToolUseID == "" {
 				continue
 			}
+			// A delivery claim is kept only if the plane ACCEPTED the call that made
+			// it — same rule as everything else here, and for the same reason: a
+			// refused `update_task` recorded no branch and declared no delivery, so
+			// there is nothing to check and nothing to complain about.
+			res.settleReport(b.ToolUseID, !b.IsError)
+
 			kind, waiting := res.pending[b.ToolUseID]
 			if !waiting {
 				continue
@@ -194,9 +200,14 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 
 	case updateTaskTool:
 		var args struct {
-			TaskID string `json:"taskId"`
-			Status string `json:"status"`
-			Branch string `json:"branch"`
+			TaskID   string `json:"taskId"`
+			Status   string `json:"status"`
+			Branch   string `json:"branch"`
+			Delivery struct {
+				Commit            string `json:"commit"`
+				IntegrationBranch string `json:"integrationBranch"`
+				PR                string `json:"pr"`
+			} `json:"delivery"`
 		}
 		if json.Unmarshal(input, &args) != nil || !res.Claim.Names(args.TaskID) {
 			return
@@ -204,6 +215,19 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		if settlesTask(args.Status) {
 			res.expect(toolUseID, pendingSettle)
 		}
+		// The two claims the plane cannot check for itself. Armed here, kept only if
+		// the call is accepted, and verified against local git once the session ends
+		// (CLA-253).
+		res.expectReport(toolUseID, Report{
+			TaskID:            res.Claim.TaskID,
+			Ref:               res.Claim.Ref,
+			RunID:             res.Claim.RunID,
+			Status:            args.Status,
+			Branch:            args.Branch,
+			Commit:            args.Delivery.Commit,
+			IntegrationBranch: args.Delivery.IntegrationBranch,
+			PR:                args.Delivery.PR,
+		})
 		// Recording a branch declares pushed work worth handing over, which is
 		// exactly what makes the task unsafe to release. Applied on the REQUEST,
 		// unlike settling: erring towards "there is WIP" only ever costs the
