@@ -88,10 +88,20 @@ type Result struct {
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
 
+	// Reports are the delivery claims this session got the plane to ACCEPT — a
+	// branch recorded as the hand-off, a commit declared landed — for the driver
+	// to check against local git (CLA-253). Order is the order they were made.
+	Reports []Report
+
 	// pending maps a tool_use id to what its result will mean. Parser state, not
 	// output: every clankerbar call that matters is judged on the plane's ANSWER,
 	// never on the request, because a refused call changes nothing.
 	pending map[string]pendingKind
+
+	// pendingReports is the same discipline for delivery claims: an `update_task`
+	// REFUSED by the plane (a missing Tests header, a superseded run) recorded
+	// nothing, so there is nothing to check and nothing to complain about.
+	pendingReports map[string]Report
 }
 
 // pendingKind is what a tool_result is expected to tell us.
@@ -113,6 +123,70 @@ func (r *Result) expect(toolUseID string, k pendingKind) {
 		r.pending = map[string]pendingKind{}
 	}
 	r.pending[toolUseID] = k
+}
+
+// expectReport arms a delivery claim, to be kept only if the plane accepts it.
+func (r *Result) expectReport(toolUseID string, rep Report) {
+	if toolUseID == "" || rep.Empty() {
+		return
+	}
+	if r.pendingReports == nil {
+		r.pendingReports = map[string]Report{}
+	}
+	r.pendingReports[toolUseID] = rep
+}
+
+// settleReport resolves an armed delivery claim on its tool_result. accepted=false
+// (the plane refused the call) drops it: nothing was recorded, so there is nothing
+// to verify.
+func (r *Result) settleReport(toolUseID string, accepted bool) {
+	rep, armed := r.pendingReports[toolUseID]
+	if !armed {
+		return
+	}
+	delete(r.pendingReports, toolUseID)
+	if accepted {
+		r.Reports = append(r.Reports, rep)
+	}
+}
+
+// Report is a delivery claim the plane accepted: the branch a session recorded as
+// its hand-off, and/or the commit it declared landed on an integration branch.
+//
+// Both are claims the plane cannot check — it holds the backlog and takes a
+// clanker at its word — and both have been wrong in ways that cost real work: a
+// branch recorded but never pushed past its first commits reads as a hand-off to
+// the next clanker and is a dead end. The driver is local and in the git tree, so
+// it can simply look (CLA-253).
+type Report struct {
+	// TaskID and Ref identify the task, and RunID signs any write the driver makes
+	// off the back of the check.
+	TaskID string
+	Ref    string
+	RunID  string
+
+	// Status is the status the same call carried, if any ("in_review", "done").
+	Status string
+
+	// Branch is a recorded work-in-progress branch.
+	Branch string
+
+	// Commit and IntegrationBranch are a declared delivery.
+	Commit            string
+	IntegrationBranch string
+}
+
+// Empty reports that this claim asserts nothing checkable.
+func (r Report) Empty() bool {
+	return r.Branch == "" && (r.Commit == "" || r.IntegrationBranch == "")
+}
+
+// Label is the task's most human-readable identifier.
+func (r Report) Label() string {
+	if r.Ref != "" {
+		return r.Ref
+	}
+	return r.TaskID
 }
 
 // Claim is what a session did with the backlog: the task it most recently
