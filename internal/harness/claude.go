@@ -533,12 +533,50 @@ func (claude) DetectLimit(res Result) Limit {
 //
 // The anchoring is the second line of defence, not the first: it is applied to
 // claudeText, so the agent's narration is not scanned at all.
+//
+// The mid-response arm is not a guess. Claude Code's error reference documents
+// exactly three "the response above may be incomplete" variants, emitted when a
+// stream fails after Claude has completed a block of text or a tool call:
+//
+//	API Error: Server error mid-response. The response above may be incomplete.
+//	API Error: Connection closed mid-response. The response above may be incomplete.
+//	API Error: Response stalled mid-stream. The response above may be incomplete.
+//
+// All three missed every arm above. "Connection closed" is not "connection
+// error"; "Server error" is not "internal server"; a stalled stream names no
+// status code — so the 5\d\d arm has nothing to catch either. Every one of them
+// is a network/server fault that a fresh session is exactly the right answer to,
+// and the cost of missing one is not a lost iteration but a stopped daemon
+// (loop.go treats an unrecognised non-zero exit as fatal).
+//
+// Matching on "mid-response|mid-stream" rather than on "connection|closed" keeps
+// the arm as narrow as the documented wording: those two tokens are the CLI's
+// own, they cover all three variants including ones with no connection word in
+// them, and they do not fire on the ordinary English an error string quotes.
+//
+// The same doc says that in headless mode ("--output-format json" or
+// "stream-json") this message is reported in the `result` field. claudeText only
+// reads `result` when the CLI marked the session failed, which is the correct
+// gate rather than a gap: a session that keeps its partial output and exits zero
+// is never classified at all, and one that reports the turn as an error is
+// exactly the one whose exit code brings the loop here.
+//
+// See https://code.claude.com/docs/en/errors#the-response-above-may-be-incomplete
 var claudeTransientRe = regexp.MustCompile(`(?i)api error: (408|429|5\d\d)` +
 	`|api error:.*(overloaded|internal server|bad gateway|service unavailable|gateway time|too many requests)` +
+	`|api error:.*(mid-response|mid-stream)` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 func (claude) IsTransient(res Result) bool {
 	return claudeTransientRe.MatchString(claudeText(res, claudeDiagnostic))
+}
+
+// Diagnostic returns the same CLI-authored text IsTransient judged, so a caller
+// that stops on a non-retryable exit can say WHICH message it stopped on. It is
+// deliberately the identical scope: showing an operator text the classifier
+// never read would send them chasing a string that could not have mattered.
+func (claude) Diagnostic(res Result) string {
+	return claudeText(res, claudeDiagnostic)
 }
 
 func (c claude) Probe(ctx context.Context, in Invocation) (Limit, error) {

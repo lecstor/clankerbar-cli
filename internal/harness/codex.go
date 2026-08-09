@@ -239,6 +239,10 @@ func (codex) IsTransient(res Result) bool {
 	return codexTransientRe.MatchString(codexErrorText(res))
 }
 
+// Diagnostic returns the same scoped text IsTransient judged. See the claude
+// adapter's Diagnostic for why the scope must match exactly.
+func (codex) Diagnostic(res Result) string { return codexErrorText(res) }
+
 func (c codex) Probe(ctx context.Context, in Invocation) (Limit, error) {
 	in.Probe = true
 	res, err := c.Invoke(ctx, in)
