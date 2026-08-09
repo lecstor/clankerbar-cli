@@ -679,8 +679,26 @@ func TestFailureDetail(t *testing.T) {
 		if !strings.Contains(got, "THE ACTUAL FAILURE") {
 			t.Errorf("truncation dropped the tail: %q", got)
 		}
-		if n := len([]rune(got)); n > failureDetailMax+4 {
-			t.Errorf("detail is %d runes, want <= %d", n, failureDetailMax+4)
+		// Exactly ": " (2) + "..." (3) of overhead — asserted tight, so an
+		// off-by-one in the slice is caught rather than absorbed by slack.
+		if n, want := len([]rune(got)), failureDetailMax+5; n != want {
+			t.Errorf("detail is %d runes, want exactly %d", n, want)
+		}
+	})
+
+	// The diagnostic is rendered to a TTY now, not just matched against. A harness
+	// writes stderr through verbatim, so an ESC sequence in it would be EXECUTED
+	// by the terminal rather than shown — repainting or clearing the one line the
+	// operator came back to read.
+	t.Run("strips control bytes but keeps the text", func(t *testing.T) {
+		got := failureDetail("API Error: \x1b[2J\x1b[1;1Hnothing to see \x07here")
+		if strings.ContainsAny(got, "\x1b\x07") {
+			t.Errorf("control bytes reached the log line: %q", got)
+		}
+		for _, want := range []string{"API Error:", "nothing to see", "here"} {
+			if !strings.Contains(got, want) {
+				t.Errorf("stripping ate real text (%q missing): %q", want, got)
+			}
 		}
 	})
 

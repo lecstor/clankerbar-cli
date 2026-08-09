@@ -539,20 +539,49 @@ func TestClaudeMidResponseNoticeInTheResultField(t *testing.T) {
 	}
 }
 
-// Diagnostic must report exactly the text IsTransient judged — no wider, or an
-// operator is shown a string that could not have caused the stop.
+// Diagnostic must report exactly the text IsTransient judged — no wider and no
+// NARROWER. Both directions are regressions with teeth:
+//
+//   - wider (e.g. raw Stdout) prints a quoted task body to the operator's
+//     terminal, which is CLA-258 arriving by a new door;
+//   - narrower (e.g. claudeTyped) drops the `result` field of a failed session,
+//     which is exactly where the CLI puts the mid-response notice — so the stop
+//     message would come back EMPTY on the very failure this exists to explain.
+//
+// The narrowing case is the one to be careful about in a test: a fixture built
+// from a CLEAN result event is dropped at both widths, so it cannot tell the two
+// apart and would pass green against `claudeTyped`. Both cases below therefore
+// use a FAILED event, which is the only shape the two widths disagree on.
 func TestClaudeDiagnosticMatchesWhatIsTransientReads(t *testing.T) {
-	res := Result{
+	const notice = "API Error: Connection closed mid-response. The response above may be incomplete."
+
+	failed := Result{
+		Stderr: "some stderr",
+		Stdout: `{"type":"result","subtype":"error_during_execution","is_error":true,` +
+			`"result":` + mustJSON(t, notice) + `}`,
+	}
+	got := (claude{}).Diagnostic(failed)
+	if !strings.Contains(got, "some stderr") {
+		t.Errorf("Diagnostic dropped stderr, which IsTransient reads: %q", got)
+	}
+	// The load-bearing assertion: this is the text the operator is shown when the
+	// run stops, and it is only present at the diagnostic width.
+	if !strings.Contains(got, notice) {
+		t.Errorf("Diagnostic narrowed past the failed session's `result` — the stop message would name nothing: %q", got)
+	}
+	if got != claudeText(failed, claudeDiagnostic) {
+		t.Errorf("Diagnostic scope drifted from the one IsTransient reads:\n got %q\nwant %q", got, claudeText(failed, claudeDiagnostic))
+	}
+
+	// A session the CLI did NOT call failed keeps its narration out, at every
+	// width — the agent's closing summary is not the operator's diagnostic.
+	clean := Result{
 		Stderr: "some stderr",
 		Stdout: `{"type":"result","subtype":"success","is_error":false,` +
 			`"result":` + mustJSON(t, "the agent's closing summary") + `}`,
 	}
-	got := (claude{}).Diagnostic(res)
-	if !strings.Contains(got, "some stderr") {
-		t.Errorf("Diagnostic dropped stderr, which IsTransient reads: %q", got)
-	}
-	if strings.Contains(got, "closing summary") {
-		t.Errorf("Diagnostic exposed the agent's narration, which IsTransient does not read: %q", got)
+	if g := (claude{}).Diagnostic(clean); strings.Contains(g, "closing summary") {
+		t.Errorf("Diagnostic exposed the agent's narration, which IsTransient does not read: %q", g)
 	}
 }
 
