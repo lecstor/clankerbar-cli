@@ -50,8 +50,11 @@ type Adapter interface {
 	Diagnostic(Result) string
 
 	// Probe runs the cheapest possible request to answer "am I still limited?"
-	// without doing real work — used while paused to catch an early reset.
-	Probe(ctx context.Context, in Invocation) (Limit, error)
+	// without doing real work — used while paused to catch an early reset. It
+	// reports what the probe COST as well as what it found: a probe is a real
+	// session against the harness binary, so a wait that polls for a week is real
+	// spend and the loop's ceilings have to be able to see it (CLA-287).
+	Probe(ctx context.Context, in Invocation) (ProbeResult, error)
 
 	// ReadUsage returns current window usage if the harness exposes it headless.
 	// NO harness does today (see the memo), so implementations return
@@ -326,6 +329,34 @@ type Limit struct {
 	Stop    bool
 	ResetAt time.Time // zero = unknown
 	Reason  string
+}
+
+// ProbeResult is what a liveness probe learned, and what it cost.
+//
+// The cost half is the reason this type exists at all. Every adapter implements
+// Probe as Invoke-then-DetectLimit, so each poll is a genuine paid session — cheap
+// (the prompt is "." with tools denied) but not free, and a cap that lasts a week
+// polled every 30 minutes is ~336 of them. Returning only the Limit threw the spend
+// away, so the one loop that cannot reach the caller — the supervised wait, which
+// polls for as long as the cap lasts — was spending money no ceiling could count
+// (CLA-287).
+type ProbeResult struct {
+	// Limit is what the probe found: still limited, or lifted.
+	Limit Limit
+
+	// Tokens and CostUSD are this probe session's spend, for the same Budget
+	// accumulator an ordinary session's Result feeds.
+	//
+	// Carried on the error return too, so the loop counts whatever the adapter
+	// managed to parse rather than discarding a session that ended untidily. Note
+	// what that is worth TODAY: all three adapters return early on a run error that
+	// is not an *exec.ExitError, before parsing, so these are zero on that path —
+	// which is the right answer for its common cause (the binary never started, and
+	// spent nothing) and the wrong one if a session emitted its result and then died
+	// in Wait. Filed as CLA-299; the accumulator here is ready for the fix either
+	// way. A non-zero EXIT is not that path: it parses normally and is counted.
+	Tokens  int
+	CostUSD float64
 }
 
 // Usage is current window consumption, when a harness can report it headless.

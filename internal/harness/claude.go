@@ -579,13 +579,19 @@ func (claude) Diagnostic(res Result) string {
 	return claudeText(res, claudeDiagnostic)
 }
 
-func (c claude) Probe(ctx context.Context, in Invocation) (Limit, error) {
+func (c claude) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	in.Probe = true
 	res, err := c.Invoke(ctx, in)
+	// Spend first, and off the Result on every path: a probe that exited non-zero
+	// still cost what it cost, and under-counting is the one direction a budget
+	// breaker must not err in. On the error return this is whatever got parsed,
+	// which today is nothing — see ProbeResult and CLA-299.
+	out := ProbeResult{Tokens: res.Tokens, CostUSD: res.CostUSD}
 	if err != nil {
-		return Limit{}, err
+		return out, err
 	}
-	return c.DetectLimit(res), nil
+	out.Limit = c.DetectLimit(res)
+	return out, nil
 }
 
 func (claude) ReadUsage(context.Context, Invocation) (Usage, error) {
