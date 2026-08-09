@@ -1264,6 +1264,127 @@ func TestRun_ConsolePause(t *testing.T) {
 	})
 }
 
+// The deadlock CLA-274 closes, end to end through Run. A project whose ready queue
+// has emptied while it holds an abandoned branch used to be wedged shut: the gate
+// read `claimable == 0` and spawned nothing, nothing called next_task, and the
+// sweep that would have released or offered that branch runs ONLY inside next_task.
+// The gate prevented the one call that could clear it, so the branch was stranded
+// for good.
+func TestRun_SpawnsToRecoverAbandonedWIPWithAnEmptyReadyQueue(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(0, 0)}}}
+	// Nothing ready at all; one abandoned branch the plane would offer for takeover.
+	p := &fakePoller{sum: backlog.Summary{Ready: 0, Claimable: 0, InProgress: 1, StaleClaimable: 1}}
+
+	if err := runLoop(t, cfg, h, p); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("offerable abandoned WIP must earn a recovery session; got %d Invoke calls", h.invokeCalls)
+	}
+}
+
+// The other side of it, and the reason the count is a separate field rather than
+// added into `claimable`: a target with nothing ready AND nothing offerable is
+// genuinely idle and must still cost nothing. `in_progress` on its own is not the
+// signal — that counts work in flight as well as work abandoned, which is exactly
+// why the sweep's own verdict is what the plane sends.
+func TestRun_StillIdlesWhenThereIsNeitherReadyNorAbandonedWork(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	h := &fakeAdapter{}
+	p := &fakePoller{sum: backlog.Summary{Ready: 0, Claimable: 0, InProgress: 2, StaleClaimable: 0}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p.onCall = func(i int) {
+		if i >= 1 {
+			cancel()
+		}
+	}
+
+	if err := New(cfg, h, p).Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 0 {
+		t.Errorf("an idle target must still spawn nothing; got %d Invoke calls", h.invokeCalls)
+	}
+	if p.calls < 2 {
+		t.Errorf("and it must keep idle-polling rather than exiting; got %d polls", p.calls)
+	}
+}
+
+// The console pause outranks the widened gate exactly as it outranks the original
+// one. Pause is ordered BEFORE the gate, so this holds by construction — pinned
+// because "recovery work is different" is precisely the argument someone would
+// later make for letting it through, and the operator's pause must mean no
+// sessions, not no ORDINARY sessions.
+func TestRun_ConsolePauseOutranksAbandonedWIP(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	h := &fakeAdapter{}
+	p := &fakePoller{sum: backlog.Summary{Ready: 0, Claimable: 0, StaleClaimable: 3, Paused: true}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p.onCall = func(i int) {
+		if i >= 1 {
+			cancel()
+		}
+	}
+
+	if err := New(cfg, h, p).Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if h.invokeCalls != 0 {
+		t.Errorf("a paused loop must not spawn a recovery session either; got %d Invoke calls", h.invokeCalls)
+	}
+}
+
+// The judgeProgress interaction the task flagged, pinned rather than assumed. A
+// target spawning purely to recover abandoned WIP is no longer IDLE — Spawnable()
+// is what the breaker reads to mean idle, and it is now true — so the breaker
+// charges those drains and backs the target off after quietThreshold fruitless
+// ones, instead of forgetting the count every poll.
+//
+// That is the wanted composition, not a regression: the target IS spending
+// sessions, so the breaker that exists to bound repeated fruitless spend must see
+// them. The failure it prevents is the real one here — a branch nobody can finish
+// would otherwise spawn a recovery session every poll, for ever.
+func TestJudgeProgressChargesRecoveryDrainsRatherThanReadingThemAsIdle(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	recovering := backlog.Summary{Claimable: 0, InProgress: 1, StaleClaimable: 1}
+
+	// Two fruitless recovery drains, then a settled poll with the branch still
+	// abandoned. THIS is the discriminating step: before the widening the summary
+	// read as not-spawnable, so the breaker forgot the count on every such poll and
+	// an unfinishable branch could spawn for ever. Now the target is spawnable, so
+	// the strikes stand.
+	for range 2 {
+		d.pending[0] = true
+		d.judgeProgress(0, recovering)
+	}
+	d.judgeProgress(0, recovering)
+	if d.quiet[0] != 2 {
+		t.Fatalf("a target still holding recoverable WIP is not idle, so its strikes must stand; quiet=%d, want 2", d.quiet[0])
+	}
+
+	// So the third fruitless drain reaches the threshold and backs it off, rather
+	// than the count being reset to zero underneath it every poll.
+	d.pending[0] = true
+	d.judgeProgress(0, recovering)
+	if !d.backedOff(0) {
+		t.Error("an unfinishable abandoned branch must back the target off rather than spawning for ever")
+	}
+
+	// And once the branch is gone, the target is idle on the old terms again and
+	// forgets, so the recovery episode does not follow it into later work.
+	d.judgeProgress(0, backlog.Summary{})
+	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("with the branch cleared the target is idle again; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
 func writeMarker(t *testing.T, dir, name, body string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {

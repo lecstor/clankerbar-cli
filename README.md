@@ -252,12 +252,21 @@ So after **three consecutive sessions that settle nothing** — nothing reaching
 `in_review` or `done` — the loop backs that project off for 15 minutes, then 30,
 then an hour, capped at two. Other projects keep draining.
 
-So does the queue simply going quiet. A poll that shows nothing claimable at all
+So does the queue simply going quiet. A poll that shows nothing to spawn for at all
 means the project is *idle*, not fruitless — there is nothing for the loop to
 spawn, so it has not failed at anything — and the count is forgotten along with
 any wait still running. Without that, parking the blocker would leave the count
 standing (`parked` is not progress a backlog can see), and the next task you file
 would serve out a two-hour wait it did nothing to earn.
+
+Note "nothing to spawn for" rather than "nothing claimable": abandoned work counts
+as something to spawn for. A project can hold a branch whose session died, and the
+sweep that hands it back runs only when an agent asks the plane for its next task
+— so if the loop declined to spawn while the ready queue was empty, nothing would
+ever ask, and the branch would sit there for good. The gate is `claimable +
+stale_claimable`, both of which the queue line reports, and a target recovering
+abandoned work is *spending sessions*, so those drains are charged against the
+back-off like any other.
 
 Three rather than one, because a genuinely large task can span several sessions
 before anything reaches a reviewer, and backing off then would throttle exactly

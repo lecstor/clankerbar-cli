@@ -6,9 +6,10 @@
 //
 // This is a control-plane read (no agent, no tokens): a single authenticated GET of
 // clankerbar's backlog-summary surface, which returns the same freshness snapshot
-// the MCP `backlog` block carries — `{version, counts, claimable, openQuestions}` —
-// PLUS a `loopPaused` boolean. Folding the pause flag into the same cheap read means
-// the loop never needs a second call to learn it should stop spawning sessions.
+// the MCP `backlog` block carries — `{version, counts, claimable, staleClaimable,
+// openQuestions}` — PLUS a `loopPaused` boolean. Folding the pause flag into the same
+// cheap read means the loop never needs a second call to learn it should stop
+// spawning sessions.
 //
 // Two route forms exist (CLA-141); config.BacklogSummaryURL / ProjectSummaryURL
 // decide which this poller is given:
@@ -44,6 +45,18 @@ type Summary struct {
 	OpenQuestions int
 	Paused        bool // console-driven loop pause (CLA-76): stop spawning, keep polling
 
+	// StaleClaimable counts in-progress tasks whose lease has expired and which the
+	// plane WOULD offer for takeover — abandoned work, not merely work in flight, so
+	// it is a strict subset of InProgress and excludes anything next_task withholds.
+	//
+	// It is a separate field rather than folded into Claimable because three readers
+	// already agree on what Claimable means and the plane documents it as equal to
+	// next_task's readyCount; widening it in place would move that number under all
+	// of them (CLA-273). Absent from an older plane's payload, it decodes to 0 and
+	// the loop behaves exactly as it did before — the correct fallback, and why this
+	// needs no version negotiation.
+	StaleClaimable int
+
 	// InReview and Done are the DELIVERED counts. Their sum is the loop's only
 	// honest progress signal: `version` bumps on any write at all, including a
 	// session that achieved nothing but recording why it achieved nothing, so a
@@ -63,7 +76,14 @@ func (s Summary) Settled() int { return s.InReview + s.Done }
 // one), and doctor, which tells the operator the loop will idle. Widening what
 // counts as spawnable has to move all three at once or one of them starts
 // lying — so they ask here, not each in their own words.
-func (s Summary) Spawnable() bool { return s.Claimable > 0 }
+//
+// Offerable stale WIP counts (CLA-274). Gating on ready work alone deadlocks a
+// project that empties its queue while holding an abandoned branch: the sweep
+// that would recover it runs only inside next_task, next_task is only ever called
+// by a session, and no session is spawned because nothing reads as claimable. The
+// gate prevented the one call that could clear it. A session spawned on the
+// strength of stale WIP alone is not a wasted one — it is the recovery.
+func (s Summary) Spawnable() bool { return s.Claimable+s.StaleClaimable > 0 }
 
 // Poller reads the backlog summary cheaply.
 type Poller interface {
@@ -243,22 +263,24 @@ func parseSummary(body []byte) (Summary, error) {
 			InReview   int `json:"in_review"`
 			Done       int `json:"done"`
 		} `json:"counts"`
-		Claimable     int  `json:"claimable"`
-		OpenQuestions int  `json:"openQuestions"`
-		LoopPaused    bool `json:"loopPaused"`
+		Claimable      int  `json:"claimable"`
+		StaleClaimable int  `json:"staleClaimable"`
+		OpenQuestions  int  `json:"openQuestions"`
+		LoopPaused     bool `json:"loopPaused"`
 	}
 	if err := json.Unmarshal(trimmed, &payload); err != nil {
 		return Summary{}, fmt.Errorf("decode backlog summary: %w", err)
 	}
 	return Summary{
-		Version:       payload.Version,
-		Ready:         payload.Counts.Ready,
-		Claimable:     payload.Claimable,
-		InProgress:    payload.Counts.InProgress,
-		OpenQuestions: payload.OpenQuestions,
-		Paused:        payload.LoopPaused,
-		InReview:      payload.Counts.InReview,
-		Done:          payload.Counts.Done,
+		Version:        payload.Version,
+		Ready:          payload.Counts.Ready,
+		Claimable:      payload.Claimable,
+		StaleClaimable: payload.StaleClaimable,
+		InProgress:     payload.Counts.InProgress,
+		OpenQuestions:  payload.OpenQuestions,
+		Paused:         payload.LoopPaused,
+		InReview:       payload.Counts.InReview,
+		Done:           payload.Counts.Done,
 	}, nil
 }
 

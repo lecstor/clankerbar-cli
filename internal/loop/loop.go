@@ -213,8 +213,14 @@ func (d *Driver) Run(ctx context.Context) error {
 				case err != nil:
 					log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
 				default:
-					log.Printf("%squeue: ready=%d claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
-						d.prefix(i), sum.Ready, sum.Claimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
+					// stale_claimable is reported beside claimable, not folded into it: an
+					// operator watching the console has to be able to tell "spawning
+					// because there is fresh work" from "spawning to recover an abandoned
+					// branch", and before CLA-274 those were indistinguishable — the
+					// second did not happen at all, and now that it does it must not look
+					// like the first.
+					log.Printf("%squeue: ready=%d claimable=%d stale_claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
+						d.prefix(i), sum.Ready, sum.Claimable, sum.StaleClaimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
 					// Console pause (CLA-76 plane / CLA-130 driver): the operator can pause
 					// a run from the web console, PER PROJECT. Honour it BEFORE the
 					// claimable gate so a paused project never gets a new session even when

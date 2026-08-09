@@ -428,6 +428,14 @@ func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) che
 	case err == nil:
 		c.status = pass
 		c.detail = fmt.Sprintf("%s — %d claimable, %d open question(s)", summaryURL, sum.Claimable, sum.OpenQuestions)
+		// Named only when there is some, and named separately from `claimable`. The
+		// warning below already reads through Spawnable() and so goes quiet on its
+		// own, but a PASS reading "0 claimable" in front of an operator whose loop is
+		// about to start spawning is the same drift one line earlier: they would read
+		// it as an idle night (CLA-274).
+		if sum.StaleClaimable > 0 {
+			c.detail += fmt.Sprintf(", %d abandoned to recover", sum.StaleClaimable)
+		}
 		// A paused queue is the most certain no-op there is: the driver polls all
 		// night and spawns nothing. That is precisely the "the window produced
 		// nothing and I did not know" class doctor exists for, so it WARNs rather
