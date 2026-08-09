@@ -1465,6 +1465,10 @@ func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 	for _, want := range []string{
 		"config", "harness", "config_dir", "backlog",
 		"state_dir", "workdir", "mcp_servers", "permissions", "toolchains", "budget",
+		// power has three WARN branches, two of which are the "doctor does not
+		// know the sleep policy" states — exactly the kind of line that is useless
+		// without a remedy.
+		"power",
 	} {
 		c := find(t, checks, want)
 		if c.detail == "" {
@@ -1558,6 +1562,30 @@ func TestPowerUnreadableWarnsRatherThanFails(t *testing.T) {
 	c := checkPower(context.Background(), e)
 	if c.status != warn {
 		t.Errorf("unreadable pmset: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if c.remedy != unknownSleepRemedy {
+		t.Errorf("unreadable pmset should carry the unknown-policy remedy, got %q", c.remedy)
+	}
+}
+
+// `pmset -g` exiting zero is not an answer. If no line's first field is exactly
+// `sleep` — a renamed or re-cased field, a locale-shifted output, a VM whose
+// pmset omits it — doctor knows exactly as much as it does when the command
+// cannot be run at all, so the distinction that decides this is "I asked and the
+// answer is fine" versus "I could not get an answer", never "the command exited
+// zero". Reporting PASS there put a green line on the one question the check
+// exists to answer, and an operator with a green line does not look.
+func TestPowerFieldMissingWarnsRatherThanPasses(t *testing.T) {
+	// Real-shaped output: displaysleep is present, the system `sleep` field is
+	// not, so idleSleepMinutes finds nothing to parse.
+	e := pmsetEnv("   PreventUserIdleSystemSleep       0\n", " displaysleep        10\n hibernatemode       3\n")
+
+	c := checkPower(context.Background(), e)
+	if c.status != warn {
+		t.Fatalf("no idle-sleep field reported: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if c.remedy != unknownSleepRemedy {
+		t.Errorf("a missing field should carry the same remedy as an unreadable pmset, got %q", c.remedy)
 	}
 }
 
