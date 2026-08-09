@@ -1401,26 +1401,32 @@ func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
 
 // The back-off's own message asks the operator to go and answer the question that
 // is stopping the queue. Answering it takes the task `blocked -> ready`, which
-// moves neither half of `Settled()` — so before CLA-248 the operator did exactly
+// moves neither half of `Settled()`, so before CLA-248 the operator did exactly
 // what they were told, within seconds, and the target still served out the wait.
+//
+// Driven on the SECOND of two targets, so a baseline that crossed indices would
+// show up here rather than passing by luck on the only slice entry there is.
 func TestJudgeProgressClearsBackOffWhenAQuestionIsAnswered(t *testing.T) {
-	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
-	d.quiet[0] = quietThreshold
-	d.skipUntil[0] = time.Now().Add(time.Hour)
-	d.baseline[0], d.openQs[0] = 4, 2
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: &fakePoller{}}, {Poller: &fakePoller{}}})
+	d.quiet[1] = quietThreshold
+	d.skipUntil[1] = time.Now().Add(time.Hour)
+	d.baseline[1], d.openQs[1] = 4, 2
 
 	// Nothing settled: Settled() is exactly what it was. The only thing that moved
 	// is the answer the message asked for.
-	d.judgeProgress(0, backlog.Summary{Done: 4, OpenQuestions: 1})
+	d.judgeProgress(1, backlog.Summary{Done: 4, OpenQuestions: 1})
 
-	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
-		t.Errorf("an answered question must clear the back-off; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	if d.quiet[1] != 0 || !d.skipUntil[1].IsZero() {
+		t.Errorf("an answered question must clear the back-off; quiet=%d skipUntil=%v", d.quiet[1], d.skipUntil[1])
 	}
-	if d.backedOff(0) {
+	if d.backedOff(1) {
 		t.Error("the target must be eligible on that same poll, not once the remaining wait elapses")
 	}
-	if d.openQs[0] != 1 {
-		t.Errorf("the open-question baseline must track the poll; got %d, want 1", d.openQs[0])
+	if d.openQs[1] != 1 {
+		t.Errorf("the open-question baseline must track the poll; got %d, want 1", d.openQs[1])
+	}
+	if d.openQs[0] != 0 || d.quiet[0] != 0 {
+		t.Errorf("the sibling target must be untouched; openQs=%d quiet=%d", d.openQs[0], d.quiet[0])
 	}
 }
 
@@ -1451,7 +1457,7 @@ func TestJudgeProgressKeepsBackOffWhenQuestionsDoNotFall(t *testing.T) {
 	}
 }
 
-// A drain that settled nothing is fruitless even if questions fell while it ran —
+// A drain that settled nothing is fruitless even if questions fell while it ran:
 // the verdict on a drain is what it SETTLED, and a session that answers its own
 // question has not thereby delivered anything. The baseline still tracks, so the
 // next poll judges the change since this one rather than re-reading it.
@@ -1467,6 +1473,34 @@ func TestJudgeProgressDrainThatSettlesNothingIsStillFruitless(t *testing.T) {
 	}
 	if d.openQs[0] != 1 {
 		t.Errorf("the open-question baseline must track through a drain verdict too; got %d, want 1", d.openQs[0])
+	}
+}
+
+// The window the fall is otherwise LOST in: the back-off elapses, a drain goes
+// out, and the operator answers while it is running. That poll is the only one
+// that will ever see the fall, because the baseline advances on it - so if it
+// merely counts the strike, the target sits out the next rung of the ladder on a
+// queue that is already unblocked, which is the CLA-248 bug again in a narrower
+// window. It takes the strike and skips the sit-out: one immediate retry.
+func TestJudgeProgressAnswerDuringADrainSkipsTheSitOut(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.pending[0] = true
+	d.quiet[0], d.baseline[0], d.openQs[0] = quietThreshold, 4, 1
+
+	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0})
+
+	if d.quiet[0] != quietThreshold+1 {
+		t.Errorf("the drain settled nothing, so the strike is still earned; quiet=%d, want %d", d.quiet[0], quietThreshold+1)
+	}
+	if d.backedOff(0) {
+		t.Error("an answer that landed mid-drain must buy one immediate retry, not the next rung of the ladder")
+	}
+	// And the retry is ONE: a second fruitless drain, with nothing having moved,
+	// backs the target off at the rung its strike count has reached.
+	d.pending[0] = true
+	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0})
+	if !d.backedOff(0) {
+		t.Error("the retry is one, not an exemption; a second fruitless drain must back the target off")
 	}
 }
 

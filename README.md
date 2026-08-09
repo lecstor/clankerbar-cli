@@ -250,18 +250,21 @@ cycle. One run did it ten times.
 
 So after **three consecutive sessions that settle nothing** — nothing reaching
 `in_review` or `done` — the loop backs that project off for 15 minutes, then 30,
-then an hour, capped at two. Other projects keep draining. Any progress from
-anywhere, including you merging a PR, clears it immediately.
-
-**Answering the question also clears it, on the next poll.** That is what the
-back-off message asks you to do, so it had better not leave you waiting: an answer
-takes the task `blocked -> ready`, which moves neither `in_review` nor `done`, and
-a falling open-question count is the only trace of it the loop can see. It watches
-both.
+then an hour, capped at two. Other projects keep draining.
 
 Three rather than one, because a genuinely large task can span several sessions
 before anything reaches a reviewer, and backing off then would throttle exactly
 the deep work the loop exists to do.
+
+**Answering the question ends the wait, and so does any other progress**: you
+merging a PR, another machine's loop settling something. Both are seen on the next
+poll, so "immediately" means within one `idle_poll_interval` (60s by default), not
+sooner. The answer is the one worth spelling out, because it is what the back-off
+message asks you to go and do: an answer moves neither `in_review` nor `done`, so
+a falling open-question count is the only trace of it the loop can see, and it
+watches both signals for that reason. Answer while a session happens to be running
+and the loop gives that project one immediate retry rather than the next rung of
+the ladder. That session still settled nothing, and its strike stands.
 
 WARN vs FAIL is the "would this still make progress?" line: no creds and an
 unreachable plane WARN, because the loop drains blind and still gets work done; a

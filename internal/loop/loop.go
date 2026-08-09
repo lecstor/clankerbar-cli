@@ -638,13 +638,14 @@ const quietThreshold = 3
 //
 // An ANSWERED QUESTION is the one kind of progress `Settled()` cannot see, and it
 // is the very thing the back-off's own message asks the operator to go and do
-// (CLA-248). The plane takes the task `blocked -> ready`, which moves neither
-// `InReview` nor `Done`, so a falling `OpenQuestions` is the only trace of it a
-// poll can read. Both signals are watched, and both baselines move on every poll:
-// the verdict is always about the change since the last look.
+// (CLA-248). Answering a BLOCKING question takes its task `blocked -> ready` on
+// the plane, and a non-blocking one never moved its task at all; either way
+// neither `InReview` nor `Done` shifts, so a falling `OpenQuestions` is the only
+// trace of it a poll can read. Both signals are watched, and both baselines move
+// on every poll: the verdict is always about the change since the last look.
 func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	settled := sum.Settled()
-	openQs := sum.OpenQuestions
+	openQs, wasOpen := sum.OpenQuestions, d.openQs[i]
 
 	if !d.pending[i] {
 		// No drain outstanding. Progress can still arrive from elsewhere — the
@@ -652,18 +653,21 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 		// stuck may now be unstuck, so let the target back in immediately.
 		//
 		// Note what the merge case actually rides on, because it is not obvious and
-		// a future edit could break it silently: `resolveReview` first takes the task
-		// back to `ready`, which DROPS `Settled()` by one and lowers the baseline
-		// with it here, so the later `done` reads as a rise. It is the two-step, not
-		// the merge, that this branch sees.
+		// nothing here can pin it: the plane approves a task back to `ready` BEFORE
+		// its PR is merged and it is marked `done`. The first write DROPS `Settled()`
+		// by one and lowers the baseline with it here, so the later `done` reads as a
+		// rise. It is that two-step, not the merge, that this branch sees, and only
+		// because a poll lands between the two writes - which an idle poll of a minute
+		// against a human-paced approve-then-merge ordinarily does. `in_review -> done`
+		// with no poll in between is invisible, exactly like `blocked -> ready`.
 		if d.quiet[i] > 0 {
 			switch {
 			case settled > d.baseline[i]:
 				log.Printf("%sprogress from elsewhere — clearing the no-progress back-off", d.prefix(i))
 				d.quiet[i], d.skipUntil[i] = 0, time.Time{}
-			case openQs < d.openQs[i]:
-				log.Printf("%sopen questions fell %d -> %d: the operator answered, so clearing the no-progress back-off",
-					d.prefix(i), d.openQs[i], openQs)
+			case openQs < wasOpen:
+				log.Printf("%sopen questions fell %d -> %d, so something was resolved: clearing the no-progress back-off",
+					d.prefix(i), wasOpen, openQs)
 				d.quiet[i], d.skipUntil[i] = 0, time.Time{}
 			}
 		}
@@ -678,9 +682,23 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 		return
 	}
 
+	// The strike is earned whatever else moved: a session that answered its own
+	// question has not thereby delivered anything, and the drain is being judged on
+	// what it SETTLED. But an answer that landed while the drain was running is the
+	// operator doing the very thing the back-off message asked for, and this poll is
+	// the only one that can ever see it: the baseline advances just below, so a fall
+	// consumed here is gone rather than deferred. Take the strike, skip the sit-out.
+	// The target gets one immediate retry against the answer, and if that settles
+	// nothing too, the ladder is already a rung higher for it.
+	answered := openQs < wasOpen
 	d.quiet[i]++
 	d.baseline[i], d.openQs[i] = settled, openQs
 	if d.quiet[i] < quietThreshold {
+		return
+	}
+	if answered {
+		log.Printf("%s%d consecutive sessions settled nothing, but open questions fell %d -> %d while the last one ran - retrying once before backing off",
+			d.prefix(i), d.quiet[i], wasOpen, openQs)
 		return
 	}
 	wait := quietBackoff(d.quiet[i])
