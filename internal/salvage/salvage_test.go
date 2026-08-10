@@ -298,6 +298,46 @@ func TestParseWorktrees(t *testing.T) {
 	}
 }
 
+// The most destructive thing this package could possibly do: overwrite work
+// another machine has already pushed to the same branch. It must not, and the
+// reason it cannot is that the push carries no --force and no --force-with-lease,
+// so a diverged remote rejects it. That is a property of one flag, which is
+// exactly the kind of thing a later edit removes without noticing - so it is
+// asserted against a real remote that really has diverged, not read off the
+// source.
+func TestSalvage_NeverOverwritesABranchAnotherRunPushed(t *testing.T) {
+	e := newEnv(t)
+	// Another run got there first: the remote's copy of this branch carries a
+	// commit this machine has never seen.
+	write(t, filepath.Join(e.repo, "theirs.txt"), "another machine's work")
+	git(t, e.repo, "add", ".")
+	git(t, e.repo, "commit", "-m", "work pushed by another run")
+	git(t, e.repo, "push", "origin", "main:refs/heads/"+e.branch)
+	theirs := lsRemote(t, e.repo, e.branch)
+	if theirs == "" {
+		t.Fatal("the fixture no longer puts a commit on the remote branch")
+	}
+	// And this machine has uncommitted work on a branch that diverged from it.
+	write(t, filepath.Join(e.wt, "ours.txt"), "hours of it")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-314")
+
+	if out.Status != Failed {
+		t.Fatalf("status = %q (%s), want failed - a rejected push is a fact to report, never one to overrule", out.Status, out.Detail)
+	}
+	if out.Branch != "" {
+		t.Errorf("recorded branch %q for a push the remote rejected", out.Branch)
+	}
+	// The whole point: the other machine's commit is still what the remote has.
+	if after := lsRemote(t, e.repo, e.branch); after != theirs {
+		t.Fatalf("the remote branch moved from %q to %q - another run's pushed work was overwritten", theirs, after)
+	}
+	// The local commit still happened, so the work is not lost either.
+	if out.Commit == "" {
+		t.Error("nothing was committed locally, so the work is still only in the working tree")
+	}
+}
+
 // A conflict with NO operation in flight. `git stash pop` (and `git apply
 // --3way`, and `git checkout -m`) leaves unmerged entries and conflict markers in
 // the tree while git considers itself idle: no MERGE_HEAD, no rebase directory,

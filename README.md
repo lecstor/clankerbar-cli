@@ -429,9 +429,14 @@ that reads `WIP salvage: … (unreviewed, may not build)` and a body saying in a
 many words that nothing here was reviewed, built or tested. It skips hooks and
 commit signing on purpose: a lint hook would reject exactly the half-finished
 tree this exists to save, and a signing passphrase has nobody to ask at 3am.
-**One exception**: a worktree in the middle of a merge, rebase, cherry-pick or
-revert is left exactly as it is, because committing it would record a state
-nobody chose. That is logged as `STRANDED WORK LEFT AS IS` with the path.
+**One exception**: a worktree holding an unresolved conflict is left exactly as
+it is, because committing it would record a state nobody chose — it would
+fabricate a resolution out of the conflict markers and push a file that reads as
+source with `<<<<<<<` in it. That covers both a git operation still in flight (a
+merge, rebase, cherry-pick or revert) and a conflict nothing is holding open: a
+`git stash pop`, `git apply --3way` or `git checkout -m` leaves unmerged entries
+with no state file at all, so the unmerged index is checked as well as the
+operation. Either way it is logged as `STRANDED WORK LEFT AS IS` with the path.
 
 **It cannot touch a tree that is not this task's.** The worktree is identified by
 its checked-out branch carrying `clanker/<first 8 characters of the task id>` —
