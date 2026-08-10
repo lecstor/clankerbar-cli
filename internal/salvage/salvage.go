@@ -181,7 +181,44 @@ func (s *Salvager) Salvage(ctx context.Context, taskID, label string) Outcome {
 			"%s is clean, so there is nothing to salvage and no branch to record", wt.path)}
 	}
 
+	// The same refusal as the in-progress operation above, reached from the other
+	// direction. inProgressOp asks git what it is BUSY doing, and a conflict that
+	// nothing is busy doing has no state file to find: `git stash pop`, `git apply
+	// --3way` and `git checkout -m` all leave unmerged entries and conflict markers
+	// in the tree with no MERGE_HEAD, no rebase directory and no sequencer.
+	// Committing those is the exact thing the carve-out exists to prevent - it does
+	// not preserve a state, it invents one, and the markers land in a file that
+	// reads as source. The unmerged index is the operation-independent signal, and
+	// it costs nothing: the porcelain that answers it has already been read.
+	if conflicted := unmergedPaths(dirty); len(conflicted) > 0 {
+		return Outcome{Status: Refused, Worktree: wt.path, Detail: fmt.Sprintf(
+			"%s has %d unresolved conflict(s) (%s) - committing them would record conflict markers as though they were the work, so the tree is left exactly as it is for a human to look at",
+			wt.path, len(conflicted), strings.Join(conflicted, ", "))}
+	}
+
 	return s.commitAndPush(ctx, wt, taskID, label)
+}
+
+// unmergedPaths reads `git status --porcelain` (v1) and returns the paths whose
+// two-letter code marks them unmerged: DD, AU, UD, UA, DU, AA, UU. Every one of
+// them means the file on disk may hold conflict markers.
+//
+// The rule is the porcelain's own: a `U` on either side is unmerged, and AA/DD
+// are the two both-sides cases that spell no `U`. Anything else - modified,
+// added, deleted, renamed, untracked - is ordinary work and is salvaged.
+func unmergedPaths(porcelain string) []string {
+	var out []string
+	for _, line := range strings.Split(porcelain, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if len(line) < 4 {
+			continue
+		}
+		x, y := line[0], line[1]
+		if x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D') {
+			out = append(out, strings.TrimSpace(line[2:]))
+		}
+	}
+	return out
 }
 
 // commitAndPush is the only mutating path in this package. Everything above it is

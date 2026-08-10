@@ -298,6 +298,74 @@ func TestParseWorktrees(t *testing.T) {
 	}
 }
 
+// A conflict with NO operation in flight. `git stash pop` (and `git apply
+// --3way`, and `git checkout -m`) leaves unmerged entries and conflict markers in
+// the tree while git considers itself idle: no MERGE_HEAD, no rebase directory,
+// no sequencer. The state-file probe cannot see this one, so the tree would be
+// committed with its markers in it - the exact state nobody chose that the
+// mid-merge carve-out exists to refuse.
+func TestSalvage_RefusesConflictMarkersWithNoOperationInFlight(t *testing.T) {
+	e := newEnv(t)
+	// Stash an edit, commit a different one over it, then pop: conflict.
+	write(t, filepath.Join(e.wt, "tracked.txt"), "the stashed version")
+	git(t, e.wt, "stash")
+	write(t, filepath.Join(e.wt, "tracked.txt"), "the committed version")
+	git(t, e.wt, "commit", "-am", "diverge")
+	if _, err := gitErr(t, e.wt, "stash", "pop"); err == nil {
+		t.Fatal("the stash pop was expected to conflict; the fixture no longer sets this case up")
+	}
+	// The guard under test is NOT the state-file probe: assert that probe is blind
+	// here, so this test cannot pass by accident if the conflict check is removed.
+	if op := New(e.root, "").inProgressOp(context.Background(), e.wt); op != "" {
+		t.Fatalf("git reports an operation in flight (%q); this fixture no longer isolates the stateless case", op)
+	}
+	before := git(t, e.wt, "rev-parse", "HEAD")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-314")
+
+	if out.Status != Refused {
+		t.Fatalf("status = %q (%s), want refused", out.Status, out.Detail)
+	}
+	if !strings.Contains(out.Detail, "conflict") || !strings.Contains(out.Detail, e.wt) {
+		t.Errorf("the refusal must name the problem and the tree to look at, got: %s", out.Detail)
+	}
+	if out.Branch != "" {
+		t.Errorf("a refused salvage recorded branch %q", out.Branch)
+	}
+	if after := git(t, e.wt, "rev-parse", "HEAD"); after != before {
+		t.Errorf("conflict markers were committed: %s -> %s", before, after)
+	}
+	// And the markers are still on disk for a human, not staged away.
+	if body := read(t, filepath.Join(e.wt, "tracked.txt")); !strings.Contains(body, "<<<<<<<") {
+		t.Errorf("the conflicted file was altered; salvage must leave it exactly as it is:\n%s", body)
+	}
+}
+
+func TestUnmergedPaths(t *testing.T) {
+	// The porcelain's own table: a U on either side, plus the two both-sides cases
+	// that spell no U. Everything else is ordinary work and must be salvaged.
+	unmerged := []string{"UU a.txt", "AA b.txt", "DD c.txt", "AU d.txt", "UA e.txt", "DU f.txt", "UD g.txt"}
+	ordinary := []string{" M h.txt", "M  i.txt", "A  j.txt", "?? k.txt", "D  l.txt", "R  m.txt -> n.txt", "MM o.txt"}
+
+	for _, line := range unmerged {
+		if got := unmergedPaths(line); len(got) != 1 {
+			t.Errorf("unmergedPaths(%q) = %v, want one conflicted path", line, got)
+		}
+	}
+	for _, line := range ordinary {
+		if got := unmergedPaths(line); len(got) != 0 {
+			t.Errorf("unmergedPaths(%q) = %v, want none - this is ordinary work and must be salvaged", line, got)
+		}
+	}
+	got := unmergedPaths(strings.Join(append(append([]string{}, ordinary...), unmerged...), "\n"))
+	if len(got) != len(unmerged) {
+		t.Errorf("mixed porcelain: found %d conflicted paths (%v), want %d", len(got), got, len(unmerged))
+	}
+	if len(got) > 0 && got[0] != "a.txt" {
+		t.Errorf("path = %q, want the path with its status code stripped", got[0])
+	}
+}
+
 // --- fixtures ---------------------------------------------------------------
 
 type env struct {
@@ -388,6 +456,15 @@ func lsRemote(t *testing.T, repo, branch string) string {
 		return ""
 	}
 	return fields[0]
+}
+
+func read(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
 }
 
 func write(t *testing.T, path string, body string) {
