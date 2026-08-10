@@ -1,0 +1,260 @@
+package config
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/harness"
+)
+
+// A config with no phases must behave exactly as it always has. This is the
+// back-compat guarantee that lets phases be opt-in rather than a migration.
+func TestEffectivePhases_UnphasedIsOnePhaseCarryingThePrompt(t *testing.T) {
+	c := defaults()
+	c.Prompt = "Work the next backlog item."
+
+	got := c.EffectivePhases()
+	if len(got) != 1 {
+		t.Fatalf("an unphased config resolved to %d phases, want exactly 1: %+v", len(got), got)
+	}
+	if got[0].Prompt != c.Prompt {
+		t.Errorf("the single phase carries %q, want the configured prompt %q", got[0].Prompt, c.Prompt)
+	}
+	if got[0].MaxTurns != 0 {
+		t.Errorf("an unphased run picked up a turn cap of %d; nothing should bound it but its prompt", got[0].MaxTurns)
+	}
+}
+
+func TestEffectivePhases_ResolvesBuiltinsByNameAndLetsAPromptOverride(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{
+		{Name: "implement"},
+		{Name: "review", Prompt: "my own brief"},
+	}
+
+	got := c.EffectivePhases()
+	if len(got) != 2 {
+		t.Fatalf("got %d phases, want 2", len(got))
+	}
+	if got[0].Prompt != builtinPhasePrompts["implement"] {
+		t.Errorf("a named phase with no prompt did not take its built-in brief; got %q", got[0].Prompt)
+	}
+	if got[1].Prompt != "my own brief" {
+		t.Errorf("an explicit prompt was overwritten by the built-in; got %q", got[1].Prompt)
+	}
+	// Resolution must not mutate the config it read.
+	if c.Phases[0].Prompt != "" {
+		t.Error("EffectivePhases wrote a resolved prompt back into the config")
+	}
+}
+
+// The phase-1 brief is an interface, exactly as the default prompt is: it is read
+// by an agent that has read the served protocol, and the whole mechanism is that
+// the session STOPS at the checkpoint. A paraphrase that drops the stop turns the
+// split back into one long session while every other test stays green.
+func TestBuiltinImplementPhaseTellsTheSessionToStopAtTheCheckpoint(t *testing.T) {
+	brief := builtinPhasePrompts["implement"]
+	if brief == "" {
+		t.Fatal("no built-in brief for the implement phase")
+	}
+	lower := strings.ToLower(brief)
+	for _, want := range []string{"push", "stop"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the implement brief never says %q; it must push its work and then stop:\n%s", want, brief)
+		}
+	}
+	// The two things it must forbid, because doing either makes the second phase
+	// pointless: reviewing its own work, and closing the task itself.
+	if !strings.Contains(lower, "in_review") {
+		t.Errorf("the implement brief does not tell the session to leave in_review alone:\n%s", brief)
+	}
+}
+
+// The resume brief is useless without the ids, and they are substituted by the
+// driver — so the placeholders have to actually be in the shipped text.
+func TestBuiltinReviewPhaseCarriesTheResumePlaceholders(t *testing.T) {
+	brief := builtinPhasePrompts["review"]
+	for _, ph := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder} {
+		if !strings.Contains(brief, ph) {
+			t.Errorf("the review brief is missing the %s placeholder, so a resuming session is never told which run it is on:\n%s", ph, brief)
+		}
+	}
+	if !strings.Contains(strings.ToLower(brief), "heartbeat") {
+		t.Errorf("the review brief does not tell the session to resume the run with heartbeat:\n%s", brief)
+	}
+}
+
+func TestValidate_PhasesAndPromptAreMutuallyExclusive(t *testing.T) {
+	c := defaults()
+	c.Prompt = "something the operator wrote"
+	c.Phases = []Phase{{Name: "implement"}, {Name: "review"}}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted both `prompt` and `phases`; one of the two would then be silently ignored")
+	}
+	if !strings.Contains(err.Error(), "prompt") || !strings.Contains(err.Error(), "phases") {
+		t.Errorf("the rejection names neither field, so it is not actionable: %v", err)
+	}
+}
+
+// The residue of detecting "set" by comparing against the default: a prompt left
+// untouched is not a conflict, because defaults() filled it before the operator's
+// file was ever layered on top.
+func TestValidate_AnUntouchedDefaultPromptDoesNotConflictWithPhases(t *testing.T) {
+	c := defaults()
+	c.Phases = []Phase{{Name: "implement"}, {Name: "review"}}
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate rejected phases alongside the untouched default prompt: %v", err)
+	}
+}
+
+func TestValidate_RejectsAPhaseWithNoPromptAndNoBuiltin(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: "implement"}, {Name: "not-a-real-phase"}}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted a phase that resolves to an empty prompt; its session would be spawned with nothing to do")
+	}
+	if !strings.Contains(err.Error(), "not-a-real-phase") {
+		t.Errorf("the rejection does not name the offending phase: %v", err)
+	}
+	for _, n := range BuiltinPhaseNames() {
+		if !strings.Contains(err.Error(), n) {
+			t.Errorf("the rejection does not list the built-in name %q, so an operator cannot see what they meant to type: %v", n, err)
+		}
+	}
+}
+
+// Phases rest entirely on the adapter observing the session's claim. An adapter
+// that does not would not FAIL — it would implement and push and then stop after
+// phase 1 on every task, reported by a log line that reads like an ordinary early
+// finish. Refusing at validation is the difference between a config error and a
+// silent half-run every night.
+func TestValidate_RefusesPhasesOnAHarnessThatCannotObserveAClaim(t *testing.T) {
+	for _, name := range harness.Names() {
+		caps, ok := harness.CapabilitiesOf(name)
+		if !ok {
+			t.Fatalf("registered harness %q has no capabilities", name)
+		}
+		c := defaults()
+		c.Harness = name
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: "implement"}, {Name: "review"}}
+
+		err := c.Validate()
+		if caps.TracksClaims {
+			if err != nil {
+				t.Errorf("Validate rejected phases on %q, which tracks claims: %v", name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("Validate accepted phases on %q, which does not observe a claim — every task would stop after phase 1", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("the rejection for %q does not name the harness: %v", name, err)
+		}
+	}
+}
+
+// A single phase needs no hand-off, so it does not need claim tracking either —
+// but it does need a brief that can finish a task. The phase carries its own
+// prompt here for exactly that reason; see the test below.
+func TestValidate_AllowsASinglePhaseOnAnyHarness(t *testing.T) {
+	for _, name := range harness.Names() {
+		c := defaults()
+		c.Harness = name
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: "solo", Prompt: "Work the next backlog item."}}
+
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate rejected a single self-contained phase on %q: %v — one phase hands off to nobody", name, err)
+		}
+	}
+}
+
+// `phases: [{"name":"implement"}]` validates as a shape and is a trap: the brief
+// tells its session to stop at the checkpoint and leave in_review alone, and
+// there is no successor to do the rest. Every task would stop half-implemented,
+// every night, with nothing in the logs reading as an error.
+func TestValidate_RefusesASequenceThatEndsOnTheImplementBrief(t *testing.T) {
+	for _, phases := range [][]Phase{
+		{{Name: implementPhaseName}},
+		{{Name: reviewPhaseName, Prompt: "something"}, {Name: implementPhaseName}},
+	} {
+		c := defaults()
+		c.Prompt = ""
+		c.Phases = phases
+
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("Validate accepted a sequence ending on the %q brief (%d phases); nothing would ever hand a task to review", implementPhaseName, len(phases))
+			continue
+		}
+		if !strings.Contains(err.Error(), reviewPhaseName) {
+			t.Errorf("the rejection does not point at the fix: %v", err)
+		}
+	}
+}
+
+// The reverse: a resume brief cannot go FIRST, because there is no previous claim
+// to fill its placeholders from — it would spend a session telling a model to
+// heartbeat a literal "{{runId}}".
+func TestValidate_RefusesAResumeBriefInFirstPosition(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: reviewPhaseName}, {Name: "closer", Prompt: "finish up"}}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted a resume brief as phase 0, which has no previous claim to resume")
+	}
+	if !strings.Contains(err.Error(), PhaseRunPlaceholder) && !strings.Contains(err.Error(), PhaseTaskPlaceholder) {
+		t.Errorf("the rejection does not name the placeholder that cannot be filled: %v", err)
+	}
+}
+
+// The name becomes part of an iteration log's filename, and statedir refuses one
+// it does not like — costing the phase the single artifact an operator has to
+// debug the sequence with.
+func TestValidate_RejectsAPhaseNameThatCannotBeAFilename(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: "impl/one", Prompt: "do the thing"}}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted a phase name containing a path separator; its sessions would run with no iteration log at all")
+	}
+	if !strings.Contains(err.Error(), "impl/one") {
+		t.Errorf("the rejection does not name the offending phase: %v", err)
+	}
+}
+
+func TestValidate_RejectsANegativeTurnCap(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: "implement", MaxTurns: -1}}
+
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted a negative max_turns")
+	}
+}
+
+// An unphased config with an empty prompt is still the old error, unchanged: the
+// new phases check must not have swallowed it.
+func TestValidate_StillRejectsAnEmptyPromptWhenUnphased(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "prompt is empty") {
+		t.Fatalf("Validate() = %v, want the empty-prompt rejection", err)
+	}
+}

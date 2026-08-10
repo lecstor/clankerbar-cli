@@ -298,6 +298,16 @@ func (codex) IsTransient(res Result) bool {
 	return codexTransientRe.MatchString(codexErrorText(res))
 }
 
+// No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
+// attributed to one.
+func (codex) TurnCapped(Result) bool { return false }
+
+// This adapter does not populate Result.Claim — it does not watch the session's
+// clankerbar tool calls at all — so the driver's handback, salvage and delivery
+// check are all inert under it, and `phases` is refused for it in config.Validate
+// rather than half-working. Flip TracksClaims the day claim observation lands here.
+func (codex) Capabilities() Capabilities { return Capabilities{} }
+
 // Diagnostic returns the same scoped text IsTransient judged. See the claude
 // adapter's Diagnostic for why the scope must match exactly.
 func (codex) Diagnostic(res Result) string { return codexErrorText(res) }

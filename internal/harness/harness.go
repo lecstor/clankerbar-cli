@@ -39,6 +39,21 @@ type Adapter interface {
 	// log that merely mentions an HTTP 500 is not mistaken for a dead session.
 	IsTransient(Result) bool
 
+	// TurnCapped reports whether the session ended because it hit
+	// Invocation.MaxTurns, rather than finishing or failing.
+	//
+	// It has to be its own classification because a capped end looks exactly like
+	// a fatal one from the outside: Claude exits 1 with `terminal_reason:
+	// "max_turns"`, which matches neither the usage-limit scan nor the transient
+	// one, so without this the loop would call it non-retryable and end the whole
+	// RUN — turning the phase backstop into the thing that kills the daemon.
+	// An adapter with no turn cap returns false for everything.
+	TurnCapped(Result) bool
+
+	// Capabilities reports what this adapter can do that the DRIVER's behaviour
+	// depends on — as distinct from how it classifies a given Result.
+	Capabilities() Capabilities
+
 	// Diagnostic returns the harness-authored text IsTransient and DetectLimit
 	// were judged on — stderr, the CLI's own non-event output, typed error
 	// events — with the agent's narration excluded exactly as those scans
@@ -118,6 +133,40 @@ const (
 	MCPConfigNative
 )
 
+// Capabilities are the adapter facts the driver has to branch on, so a feature
+// that silently half-works on an adapter that cannot support it is refused up
+// front instead.
+type Capabilities struct {
+	// TracksClaims reports whether this adapter watches the session's clankerbar
+	// tool calls and populates Result.Claim.
+	//
+	// Everything the driver does about a task hangs off Result.Claim.Held():
+	// the handback, the CLA-314 salvage, and the CLA-253 delivery check. An
+	// adapter that never populates it leaves all three inert — which is
+	// survivable for an unphased run (nothing is being handed across a seam) and
+	// is NOT for a phased one, where the sequence would implement and push and
+	// then stop after phase 1 on every task, announced by a log line that reads
+	// like an ordinary early finish. config.Validate refuses `phases` without
+	// this rather than let that happen quietly.
+	TracksClaims bool
+
+	// HonoursMaxTurns reports whether Invocation.MaxTurns reaches the CLI. False
+	// means a phase's turn cap is silently inert, so the boundary rests on the
+	// prompt alone.
+	HonoursMaxTurns bool
+}
+
+// CapabilitiesOf resolves a registered harness's capabilities by name, for
+// config validation that runs before any adapter is instantiated. Reports false
+// for an unregistered name, which Validate has already rejected by then.
+func CapabilitiesOf(name string) (Capabilities, bool) {
+	a, ok := registry[name]
+	if !ok {
+		return Capabilities{}, false
+	}
+	return a.Capabilities(), true
+}
+
 // Invocation is everything a harness needs to run one session. The loop builds it
 // from config; adapters translate it into their own CLI dialect.
 type Invocation struct {
@@ -140,6 +189,29 @@ type Invocation struct {
 	// Probe marks this as a cheap liveness check, not real work — adapters run
 	// the smallest possible request instead of the drain prompt.
 	Probe bool
+	// MaxTurns caps the session's turns so a phase boundary lands even if the
+	// model works past its brief. 0 = uncapped, which is every unphased run.
+	//
+	// It is a BACKSTOP, not the mechanism: the boundary is meant to land because
+	// the phase's prompt scoped the session, and a session cut off here has by
+	// definition been stopped mid-thought. What makes that survivable is the
+	// salvage that already runs on every session end — it commits and pushes
+	// whatever the tree holds — so a hit cap costs a scruffy commit, not work.
+	// An adapter whose CLI has no equivalent ignores it, and the phase then
+	// relies on the prompt alone.
+	MaxTurns int
+
+	// ResumeClaim is the claim a PREVIOUS phase left held, seeded into this
+	// session's Result before its stream is parsed.
+	//
+	// It exists because a resumed phase is told not to claim anything — it is
+	// continuing a run, not starting one — so it never calls claim_task, so the
+	// adapter would otherwise observe no claim at all. That is not cosmetic:
+	// Result.Claim.Held() is the gate on the handback, the salvage and the
+	// delivery check, so an unseeded resumed phase runs with all three inert,
+	// and it is the phase that does the pushing. Seeding restores them, and
+	// leaves Settled/HasWIP to be observed from the stream as usual.
+	ResumeClaim Claim
 }
 
 // Result is the outcome of one session, both raw and parsed.

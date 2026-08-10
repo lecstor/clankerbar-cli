@@ -33,6 +33,73 @@ long run, and a session killed mid-task is fine: the driver hands the task strai
 queue (see [Resilience](#resilience)) and the next iteration picks it up. The
 backlog is the durable state; the loop is thin.
 
+### Phases: splitting one task across two sessions
+
+A session's context grows monotonically and is re-read on every turn, so a long
+task gets expensive at the *end*: one measured task spent 66.2M tokens over 370
+turns, and its last four deciles were 53% of that purely because each of those
+turns re-read a quarter of a million tokens. The served protocol already tells a
+session to shed its context at a safe checkpoint, and says in the same breath
+that the rule is a no-op if the harness cannot discard context. Inside a `claude
+-p` run there is no tool and no slash command **the model** can use to discard
+its own context, so for the agent that rule is dead letter.
+
+The driver does have options, and they were evaluated rather than assumed away
+(claude 2.1.226): `--autocompact <auto|tokens>` compacts at a *threshold*, and
+`--continue` / `--resume` / `--fork-session` restore a session rather than
+shedding one. A phase boundary was chosen over compaction because it lands where
+everything load-bearing is already durable somewhere else — code pushed, bar and
+standing decisions on the plane — so the next phase re-reads them from source,
+where a summary that garbled the bar would not announce itself. It is also
+harness-agnostic, where `--autocompact` is Claude-only. The two compose, and
+trying autocompact inside a long phase costs nothing.
+
+`phases` splits one task across several sessions, so the context resets at that
+checkpoint:
+
+```json
+"phases": [{ "name": "implement" }, { "name": "review" }]
+```
+
+Phase 1 claims the task, implements it, self-verifies, commits, pushes and
+records the branch — then stops. Phase 2 starts on a **fresh context**, resumes
+the *same* run (the driver substitutes the task and run ids into its brief, so it
+calls `heartbeat` instead of claiming), re-reads the bar and the standing
+decisions from the plane, runs the adversarial review, fixes what it finds and
+hands the task to `in_review`. The claim is held across the seam, so the task is
+never posted back to the queue mid-sequence.
+
+The split works because each phase's prompt is a **scope** instruction — "your
+job this session is implementation only, then stop" — rather than a request that
+the model manage its own context. Naming a phase takes its built-in brief; set
+`prompt` on it to write your own, and `max_turns` to cap it as a backstop for a
+session that works past its brief (whatever it leaves uncommitted is then caught
+by the salvage). `prompt` and `phases` are mutually exclusive.
+
+**It is opt-in, and worth understanding before switching it on.** A task that
+reaches its checkpoint and stops is only half finished until the next session
+runs, so this trades a driver that cannot lose a task for one that can leave it
+half-done if the sequence is interrupted. The budget breaker fires at the phase
+boundary too. Two other consequences worth knowing:
+
+- **`max_iterations` counts task sequences, not sessions.** A two-phase config
+  spawns roughly twice the sessions for the same limit.
+- **A multi-phase config requires a harness that observes the session's task
+  claim**, which today means `claude`. The handback across a seam, the salvage and
+  the delivery check all depend on it, so a config naming `codex` or `opencode`
+  alongside two or more phases is refused at validation rather than quietly
+  stopping after phase 1 on every task. A single phase hands off to nobody, so it
+  is allowed anywhere.
+- **A sequence that ends on the `implement` brief is refused**, on any harness:
+  that brief tells its session to stop at the checkpoint and leave `in_review`
+  alone, so with no phase after it every task would stop half-finished, forever,
+  with nothing in the logs reading as an error.
+
+The saving is **projected** at 20-28% for a two-way cut — modelled off one real
+task's decile curve, not measured from a phased run, and stated that way
+deliberately until a phased run has been measured. Splitting thinner earns less
+each time while every extra boundary still pays a session's full startup cost.
+
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
 
