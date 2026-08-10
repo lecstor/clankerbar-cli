@@ -84,15 +84,21 @@ boundary too. Two other consequences worth knowing:
 
 - **`max_iterations` counts task sequences, not sessions.** A two-phase config
   spawns roughly twice the sessions for the same limit.
-- **`phases` requires a harness that observes the session's task claim**, which
-  today means `claude`. The handback across a seam, the salvage and the delivery
-  check all depend on it, so a config naming `codex` or `opencode` alongside
-  `phases` is refused at validation rather than quietly stopping after phase 1 on
-  every task.
+- **A multi-phase config requires a harness that observes the session's task
+  claim**, which today means `claude`. The handback across a seam, the salvage and
+  the delivery check all depend on it, so a config naming `codex` or `opencode`
+  alongside two or more phases is refused at validation rather than quietly
+  stopping after phase 1 on every task. A single phase hands off to nobody, so it
+  is allowed anywhere.
+- **A sequence that ends on the `implement` brief is refused**, on any harness:
+  that brief tells its session to stop at the checkpoint and leave `in_review`
+  alone, so with no phase after it every task would stop half-finished, forever,
+  with nothing in the logs reading as an error.
 
-The saving on the measured curve is 20-28% for a two-way cut; splitting thinner
-earns less each time while every extra boundary still pays a session's full
-startup cost.
+The saving is **projected** at 20-28% for a two-way cut — modelled off one real
+task's decile curve, not measured from a phased run, and stated that way
+deliberately until a phased run has been measured. Splitting thinner earns less
+each time while every extra boundary still pays a session's full startup cost.
 
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.

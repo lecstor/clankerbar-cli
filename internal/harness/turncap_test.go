@@ -1,6 +1,9 @@
 package harness
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // A turn-capped session exits NON-ZERO and matches neither the usage-limit scan
 // nor the transient one, so without its own classification the driver reads it as
@@ -63,6 +66,23 @@ func TestClaudeTurnCapped(t *testing.T) {
 				t.Errorf("claude.TurnCapped() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// The cap has to actually reach the CLI. Nothing else observes argv, so a flag
+// that stopped being emitted would leave the backstop inert with every test still
+// green — and this one is undocumented in `claude --help`, so a version bump is
+// precisely how it would go.
+func TestClaudeArgsCarryTheTurnCap(t *testing.T) {
+	got := strings.Join(claudeArgs(Invocation{Prompt: "work", MaxTurns: 40}), " ")
+	if !strings.Contains(got, "--max-turns 40") {
+		t.Errorf("argv does not carry the turn cap: %s", got)
+	}
+
+	// 0 means uncapped, which is every unphased run: the flag must be ABSENT, not
+	// passed as zero, which claude would read as a cap of nothing.
+	if got := strings.Join(claudeArgs(Invocation{Prompt: "work"}), " "); strings.Contains(got, "--max-turns") {
+		t.Errorf("an uncapped invocation still emitted --max-turns: %s", got)
 	}
 }
 

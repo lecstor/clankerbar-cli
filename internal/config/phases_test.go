@@ -163,17 +163,60 @@ func TestValidate_RefusesPhasesOnAHarnessThatCannotObserveAClaim(t *testing.T) {
 	}
 }
 
-// A single phase needs no hand-off, so it does not need claim tracking either.
+// A single phase needs no hand-off, so it does not need claim tracking either —
+// but it does need a brief that can finish a task. The phase carries its own
+// prompt here for exactly that reason; see the test below.
 func TestValidate_AllowsASinglePhaseOnAnyHarness(t *testing.T) {
 	for _, name := range harness.Names() {
 		c := defaults()
 		c.Harness = name
 		c.Prompt = ""
-		c.Phases = []Phase{{Name: "implement"}}
+		c.Phases = []Phase{{Name: "solo", Prompt: "Work the next backlog item."}}
 
 		if err := c.Validate(); err != nil {
-			t.Errorf("Validate rejected a single phase on %q: %v — one phase hands off to nobody", name, err)
+			t.Errorf("Validate rejected a single self-contained phase on %q: %v — one phase hands off to nobody", name, err)
 		}
+	}
+}
+
+// `phases: [{"name":"implement"}]` validates as a shape and is a trap: the brief
+// tells its session to stop at the checkpoint and leave in_review alone, and
+// there is no successor to do the rest. Every task would stop half-implemented,
+// every night, with nothing in the logs reading as an error.
+func TestValidate_RefusesASequenceThatEndsOnTheImplementBrief(t *testing.T) {
+	for _, phases := range [][]Phase{
+		{{Name: implementPhaseName}},
+		{{Name: reviewPhaseName, Prompt: "something"}, {Name: implementPhaseName}},
+	} {
+		c := defaults()
+		c.Prompt = ""
+		c.Phases = phases
+
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("Validate accepted a sequence ending on the %q brief (%d phases); nothing would ever hand a task to review", implementPhaseName, len(phases))
+			continue
+		}
+		if !strings.Contains(err.Error(), reviewPhaseName) {
+			t.Errorf("the rejection does not point at the fix: %v", err)
+		}
+	}
+}
+
+// The reverse: a resume brief cannot go FIRST, because there is no previous claim
+// to fill its placeholders from — it would spend a session telling a model to
+// heartbeat a literal "{{runId}}".
+func TestValidate_RefusesAResumeBriefInFirstPosition(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: reviewPhaseName}, {Name: "closer", Prompt: "finish up"}}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted a resume brief as phase 0, which has no previous claim to resume")
+	}
+	if !strings.Contains(err.Error(), PhaseRunPlaceholder) && !strings.Contains(err.Error(), PhaseTaskPlaceholder) {
+		t.Errorf("the rejection does not name the placeholder that cannot be filled: %v", err)
 	}
 }
 

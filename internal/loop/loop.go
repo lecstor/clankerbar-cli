@@ -397,7 +397,17 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 		//   - the phase observed nothing (it never launched) → KEEP the predecessor's,
 		//     or a phase 2 that failed to start would silently drop the handback for
 		//     the task phase 1 is still holding.
+		//
+		// A phase that went off-brief and claimed a DIFFERENT task is its own case.
+		// noteClaimed replaces the observed claim wholesale, so the seam releases
+		// that task and reports `released` — which would drop the predecessor's
+		// still-live claim and hand back a task the sequence was never meant to
+		// touch. Keep what we had: the task phase 1 is holding is the one owed a
+		// handback, whatever its successor went and did.
 		switch {
+		case carried != nil && end.claim != nil && end.claim.Claim.TaskID != carried.Claim.TaskID:
+			log.Printf("iteration %d: the %s phase claimed %s, which is NOT the task it was resuming (%s) — it was told not to claim at all; keeping the original for the handback",
+				drainNum, ph.Label(i), end.claim.Claim.TaskID, carried.Claim.TaskID)
 		case end.released:
 			carried = nil
 		case end.claim != nil:
@@ -555,16 +565,26 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, tag string, ph co
 		// stream must not be read for claim state at all, because the settle we
 		// never saw may be in the bytes that never arrived (CLA-262).
 		//
-		// A turn-capped end counts as orderly. It exits non-zero, but the salvage
-		// immediately above has just committed and pushed whatever the cut-off
-		// session left, so the checkpoint the next phase needs exists — which is
-		// the entire reason the cap is safe to set.
+		// A turn-capped end CAN be orderly — but only if something durable came out
+		// of it. The salvage above is not a guarantee: it commits nothing on a
+		// clean worktree, and refuses outright on a diverged remote or a tree in
+		// the middle of a merge. A phase 1 that burned its turns reading and
+		// planning without writing therefore leaves no branch at all, and calling
+		// that a checkpoint spawns a session told "an earlier session has already
+		// implemented, committed and pushed" and pointed at a branch that is not
+		// there — a paid session that can only fail, or worse, move the task to
+		// review over no work.
+		//
+		// HasWIP is exactly that signal: it is set by the only two things that make
+		// a checkpoint real — the phase recording its own branch, or the salvage
+		// recording one for it and the PLANE accepting the record.
 		capped := d.h.TurnCapped(res)
+		checkpointable := res.ExitCode == 0 || (capped && res.Claim.HasWIP)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
 		}
-		if !last && res.Untrusted == "" && (res.ExitCode == 0 || capped) && res.Claim.Held() {
+		if !last && res.Untrusted == "" && checkpointable && res.Claim.Held() {
 			end.checkpoint = true
 			log.Printf("%siteration %d: phase reached its checkpoint holding %s — keeping the lease for the next phase",
 				labelOf(t), drainNum, res.Claim.TaskID)
@@ -684,6 +704,21 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, tag string, ph co
 		// Non-zero exit, not the usage cap: a transient server/network blip backs
 		// off and retries; anything else is a genuine failure and stops.
 		if d.h.IsTransient(res) {
+			// A RESUMED phase does not retry, for the same reason it does not wait
+			// out a usage limit — and this path is the more dangerous of the two,
+			// because MaxRetries defaults to 0, meaning never give up. Seeding the
+			// resumed claim made the seam's handback live for phase 2, so a blip
+			// here hands the task back mid-sequence while the retry is handed the
+			// very same heartbeat(runId) brief; and where the handback is declined
+			// (HasWIP), the backoff ladder walks past the 30-minute lease in about
+			// six steps and then re-spawns, indefinitely, against a run the plane
+			// has swept. End the sequence: the branch is pushed, the lease lapses,
+			// and the task comes back as a takeover.
+			if prev != nil {
+				log.Printf("iteration %d: a resumed phase hit a transient failure (exit %d) — ending the sequence rather than retrying on a 30-minute lease nothing renews; the task returns as a takeover with its branch recorded",
+					drainNum, res.ExitCode)
+				return tokens, cost, true, end, nil
+			}
 			// As in the limit branch: the retry is a fresh session that re-claims,
 			// so nothing may stay held open across it.
 			end = d.releaseCarriedEnd(ctx, t, end)

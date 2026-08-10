@@ -40,6 +40,13 @@ const defaultBacklogURL = "https://clankerbar.com"
 // there because the previous default was the DRAIN phrase and nothing failed.
 const defaultPrompt = "Work the next backlog item."
 
+// The built-in phase names, as constants because Validate reasons about them: a
+// sequence that ENDS on the implement brief can never reach review.
+const (
+	implementPhaseName = "implement"
+	reviewPhaseName    = "review"
+)
+
 // Phase is one session in a task's sequence. A task runs as an ordered list of
 // them, each a separate harness process, so context resets between them.
 //
@@ -101,13 +108,13 @@ type Phase struct {
 // workflow puts implementation and fix in ONE actor and the review in a separate
 // read-only one. Splitting where that workflow already splits is the whole idea.
 var builtinPhasePrompts = map[string]string{
-	"implement": "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
+	implementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
 		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned.",
 
-	"review": "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
+	reviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
 		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
 		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
 		"then get_task with includeDecisions: true to re-read the bar and the standing decisions, and read the diff " +
@@ -766,6 +773,37 @@ func (c *Config) Validate() error {
 		}
 		if ph.MaxTurns < 0 {
 			return fmt.Errorf("phases[%d]: max_turns is negative", i)
+		}
+		// The resume placeholders are filled from the claim the PREVIOUS phase left
+		// held, so the first phase has nothing to fill them from. The driver leaves
+		// an unfilled one standing rather than blanking it — a literal {{runId}} in
+		// a log is a misconfiguration announcing itself — but there is no reason to
+		// spend a session discovering that when the config says it up front.
+		//
+		// Checked against the RESOLVED prompt, not the configured one: the usual way
+		// to get this wrong is `phases: [{"name": "review"}, …]`, whose configured
+		// prompt is empty and whose built-in brief is full of placeholders.
+		if i == 0 {
+			effective := ph.Prompt
+			if effective == "" {
+				effective = builtinPhasePrompts[ph.Name]
+			}
+			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder} {
+				if strings.Contains(effective, pl) {
+					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim to fill it from — it claims a task of its own, so a resume brief cannot go first",
+						ph.Label(0), pl)
+				}
+			}
+		}
+	}
+	// A sequence whose last phase is the implement brief has no path to in_review:
+	// every task would stop half-finished, forever. Cheap to catch here, expensive
+	// to discover a night later.
+	if n := len(c.Phases); n > 0 {
+		lastPh := c.Phases[n-1]
+		if lastPh.Prompt == "" && lastPh.Name == implementPhaseName {
+			return fmt.Errorf("phases[%d]: the sequence ends on the %q brief, which tells its session to stop at the checkpoint — nothing would ever hand a task to review (add a %q phase, or give this one its own prompt)",
+				n-1, implementPhaseName, reviewPhaseName)
 		}
 	}
 

@@ -34,11 +34,30 @@ func (claude) Name() string { return "claude" }
 // session its clankerbar tools. No note - there is nothing surprising to say.
 func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfigClaudeJSON} }
 
-func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
-	if in.Probe {
-		return c.probe(ctx, in)
-	}
+// newSessionResult is the Result a session starts from, before a byte of its
+// stream is parsed.
+//
+// It exists so the SEED is testable. A resumed phase never calls claim_task — it
+// was told to continue a run, not start one — so without this its claim would be
+// the zero value, and Result.Claim.Held() is what gates the driver's handback,
+// the CLA-314 salvage and the CLA-253 delivery check. Seeding leaves the stream
+// to supply Settled/HasWIP on top: noteToolUse matches `update_task` against this
+// TaskID, which is precisely the arm that would otherwise never fire for the
+// phase that pushes the branch and opens the PR.
+//
+// Extracted rather than assigned inline because a test that builds its own
+// Result does not exercise an assignment inside Invoke — which is exactly how the
+// first cut of this shipped with the seed untested and a mutation of it surviving
+// the whole suite.
+func newSessionResult(in Invocation) Result {
+	return Result{Claim: in.ResumeClaim}
+}
 
+// claudeArgs builds the session's argv. Extracted from Invoke so it can be
+// asserted directly: a flag that silently stops being emitted is invisible to
+// every other test, and one of these is a dependency on an UNDOCUMENTED flag
+// (see claudeMaxTurnsReason), where a version bump is exactly how it would go.
+func claudeArgs(in Invocation) []string {
 	args := []string{"-p", in.Prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits"}
 	if in.Model != "" {
 		args = append(args, "--model", in.Model)
@@ -57,8 +76,15 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if in.MaxTurns > 0 {
 		args = append(args, "--max-turns", strconv.Itoa(in.MaxTurns))
 	}
+	return args
+}
 
-	cmd := exec.CommandContext(ctx, "claude", args...)
+func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
+	if in.Probe {
+		return c.probe(ctx, in)
+	}
+
+	cmd := exec.CommandContext(ctx, "claude", claudeArgs(in)...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
@@ -83,14 +109,7 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// Stream stdout line-by-line: parse each event as it arrives, render readable
 	// progress to the console, and retain a bounded tail for the text scans.
 	stdoutTail := newTail()
-	var res Result
-	// A resumed phase never calls claim_task — it was told to continue a run, not
-	// start one — so seed the claim its predecessor left held BEFORE the stream is
-	// parsed. Held() then gates the handback, the salvage and the delivery check
-	// the same way it does for a session that claimed for itself, and the stream
-	// still supplies Settled/HasWIP on top: noteToolUse matches update_task
-	// against this TaskID, which is exactly the arm that would otherwise never fire.
-	res.Claim = in.ResumeClaim
+	res := newSessionResult(in)
 	c.consume(stdoutPipe, console, stdoutTail, &res)
 	waitErr := cmd.Wait()
 

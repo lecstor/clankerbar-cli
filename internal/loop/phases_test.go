@@ -233,24 +233,119 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 // one, so without its own classification it lands in the non-retryable branch
 // and ends the whole run — with the task released half-implemented.
 func TestDrainPhases_ATurnCappedPhaseIsACheckpointNotAFatalExit(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		claim       harness.Claim
+		wantInvokes int
+	}{
+		{
+			// The salvage recorded a branch (or the phase did), so a checkpoint
+			// genuinely exists for phase 2 to resume from.
+			name:        "capped with work pushed: phase 2 resumes it",
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			wantInvokes: 2,
+		},
+		{
+			// Nothing durable came out of it: a phase that burned its turns
+			// reading and planning leaves a CLEAN tree, and the salvage commits
+			// nothing on a clean tree (and refuses outright mid-merge). Spawning
+			// phase 2 here would hand a review brief a branch that is not there
+			// and tell it to move the task to in_review.
+			name:        "capped with nothing pushed: no checkpoint to hand on",
+			claim:       openClaim(),
+			wantInvokes: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: held(turnCappedResult(), tc.claim)},
+				{res: okResult(1, 0)},
+			}}
+			d, _ := phaseDriver(t, h, []config.Phase{
+				{Name: "implement", MaxTurns: 5},
+				{Name: "review"},
+			})
+
+			_, _, stop, err := drainPhasesOnce(t, d)
+			if err != nil {
+				t.Fatalf("a turn-capped phase ended the RUN: %v — a hit cap is the phase ending, never the daemon failing", err)
+			}
+			if stop {
+				t.Error("a turn-capped phase stopped the run")
+			}
+			if h.invokeCalls != tc.wantInvokes {
+				t.Errorf("spawned %d sessions, want %d", h.invokeCalls, tc.wantInvokes)
+			}
+		})
+	}
+}
+
+// Seeding made the seam's handback live for a resumed phase, which turned a
+// transient blip into a task handed back mid-sequence while the retry is given
+// the same heartbeat(runId) brief — and MaxRetries defaults to 0, "never give
+// up", so the ladder walks past the 30-minute lease and re-spawns indefinitely
+// against a run the plane has swept.
+func TestDrainPhases_AResumedPhaseDoesNotRetryATransientFailure(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
-		{res: held(turnCappedResult(), openClaim())},
-		{res: okResult(1, 0)},
+		{res: checkpointed(1, 0)},
+		{res: held(transientResult(), openClaim())},
 	}}
-	d, _ := phaseDriver(t, h, []config.Phase{
-		{Name: "implement", MaxTurns: 5},
-		{Name: "review"},
-	})
+	d, _ := phaseDriver(t, h, twoPhases())
 
 	_, _, stop, err := drainPhasesOnce(t, d)
 	if err != nil {
-		t.Fatalf("a turn-capped phase ended the RUN: %v — the salvage has already committed what it left, so this is the phase ending, not a failure", err)
+		t.Fatalf("drainPhases: %v", err)
 	}
-	if stop {
-		t.Error("a turn-capped phase stopped the run")
+	if !stop {
+		t.Error("a resumed phase hit a transient failure and the run did not stop")
 	}
 	if h.invokeCalls != 2 {
-		t.Errorf("spawned %d sessions; phase 2 should still run after phase 1 hit its cap", h.invokeCalls)
+		t.Errorf("spawned %d sessions; a resumed phase must not be retried on a lease nothing renews", h.invokeCalls)
+	}
+}
+
+// CLA-262 applied to the seam. A phase whose stream could not be read whole may
+// have settled its task in the bytes that never arrived, so its claim state is
+// not evidence of anything — handing it across would spawn a session to resume a
+// run that may already be in review.
+func TestDrainPhases_AnUntrustedStreamNeverHandsOnACheckpoint(t *testing.T) {
+	res := held(okResult(1, 0), openClaim())
+	res.Untrusted = "a line overran the reader"
+	h := &fakeAdapter{steps: []invokeStep{{res: res}, {res: okResult(1, 0)}}}
+	d, rel := phaseDriver(t, h, twoPhases())
+
+	if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions; a stream we could not read whole is not a checkpoint to build on", h.invokeCalls)
+	}
+	if len(rel.calls) != 0 {
+		t.Errorf("released a task from an unreadable stream: %+v — CLA-262 says let the lease expire", rel.calls)
+	}
+}
+
+// An off-brief phase 2 that claims a DIFFERENT task must not strand the one it
+// was resuming, nor hand back a task the sequence was never meant to touch.
+func TestDrainPhases_AnOffBriefClaimDoesNotStrandThePredecessorsTask(t *testing.T) {
+	other := harness.Claim{TaskID: "t-999", RunID: "r-999"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: held(okResult(1, 0), other)},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+
+	if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	var sawOriginal bool
+	for _, c := range rel.calls {
+		if c.taskID == "t-1" {
+			sawOriginal = true
+		}
+	}
+	if !sawOriginal {
+		t.Errorf("phase 1's task t-1 was never handed back: %+v — an off-brief claim replaced the observed claim wholesale, so the task the sequence was actually working got stranded on a lease nobody renews", rel.calls)
 	}
 }
 
