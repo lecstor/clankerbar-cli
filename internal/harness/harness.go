@@ -449,6 +449,26 @@ type Usage struct {
 // quota introspection — which, today, is all of them.
 var ErrUsageUnsupported = errors.New("usage introspection not supported by this harness")
 
+// probeVerdict turns a finished probe session into what the caller may act on.
+//
+// A probe exists to answer one question — am I still limited? — and the supervised
+// wait resumes spending real sessions on a "no". So an UNTRUSTED probe must not
+// answer it: a Limit{} read out of output the adapter could not read whole is
+// indistinguishable from a lifted cap, and acting on it resumes the run on a
+// reading the drain path would have refused (CLA-262).
+//
+// It comes back as an error rather than as a third state because the loop already
+// does the right thing with one: it logs the probe error and waits another
+// interval, which is exactly "I still do not know". The spend is on `out`
+// regardless, since a probe that could not be read still cost what it cost.
+func probeVerdict(out ProbeResult, res Result, limit func(Result) Limit) (ProbeResult, error) {
+	if res.Untrusted != "" {
+		return out, fmt.Errorf("probe output could not be trusted: %s", res.Untrusted)
+	}
+	out.Limit = limit(res)
+	return out, nil
+}
+
 var registry = map[string]Adapter{}
 
 // Register adds an adapter to the registry (called from adapter init()s).

@@ -3,7 +3,6 @@ package harness
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -56,24 +55,16 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// afterwards would silently drop the early steps and under-count the budget by
 	// however much of the stream had scrolled away (CLA-262).
 	var p opencodeParse
-	stdout, stderr := newTail(), newTail()
-	sink := newLineSink(p.line)
-	outWriters := []io.Writer{stdout, sink}
-	errWriters := []io.Writer{stderr}
-	if in.Console != nil && !in.Probe {
-		outWriters = append(outWriters, in.Console)
-		errWriters = append(errWriters, in.Console)
+	captured := newCapture(p.line)
+	console := in.Console
+	if in.Probe {
+		console = nil
 	}
-	cmd.Stdout, cmd.Stderr = io.MultiWriter(outWriters...), io.MultiWriter(errWriters...)
+	captured.attach(cmd, console)
 	runErr := cmd.Run()
-	sink.Flush() // a final line that arrived without a newline
 
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), scans: newScanCache()}
+	res := captured.result("opencode")
 	p.finish(&res)
-	if sink.Overran() {
-		res.markUntrusted("an opencode event exceeded the line cap and was discarded: " +
-			"this session's token and cost figures are incomplete")
-	}
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
@@ -332,8 +323,7 @@ func (o opencode) Probe(ctx context.Context, in Invocation) (ProbeResult, error)
 	if err != nil {
 		return out, err
 	}
-	out.Limit = o.DetectLimit(res)
-	return out, nil
+	return probeVerdict(out, res, o.DetectLimit)
 }
 
 func (opencode) ReadUsage(context.Context, Invocation) (Usage, error) {

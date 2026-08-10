@@ -3,7 +3,6 @@ package harness
 import (
 	"context"
 	"encoding/json"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -53,24 +52,16 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// cap safe: the usage figures are read out of events as they pass, so trimming
 	// the retained text cannot cost the budget a single token (CLA-262).
 	var p codexParse
-	stdout, stderr := newTail(), newTail()
-	sink := newLineSink(p.line)
-	outWriters := []io.Writer{stdout, sink}
-	errWriters := []io.Writer{stderr}
-	if in.Console != nil && !in.Probe {
-		outWriters = append(outWriters, in.Console)
-		errWriters = append(errWriters, in.Console)
+	captured := newCapture(p.line)
+	console := in.Console
+	if in.Probe {
+		console = nil
 	}
-	cmd.Stdout, cmd.Stderr = io.MultiWriter(outWriters...), io.MultiWriter(errWriters...)
+	captured.attach(cmd, console)
 	runErr := cmd.Run()
-	sink.Flush() // a final line that arrived without a newline
 
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), scans: newScanCache()}
+	res := captured.result("codex")
 	p.finish(&res)
-	if sink.Overran() {
-		res.markUntrusted("a codex event exceeded the line cap and was discarded: " +
-			"this session's token figures are incomplete")
-	}
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
@@ -275,8 +266,7 @@ func (c codex) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	if err != nil {
 		return out, err
 	}
-	out.Limit = c.DetectLimit(res)
-	return out, nil
+	return probeVerdict(out, res, c.DetectLimit)
 }
 
 func (codex) ReadUsage(context.Context, Invocation) (Usage, error) {

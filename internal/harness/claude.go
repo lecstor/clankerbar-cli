@@ -412,6 +412,14 @@ func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	runErr := cmd.Run()
 
 	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), scans: newScanCache()}
+	// `--output-format json` is ONE object, so a trimmed tail does not merely lose
+	// context here — it loses the answer, and parse would fail into a Result that
+	// reads exactly like "no limit found". A few hundred bytes never reaches the
+	// window, so this is the improbable path; it is checked because the whole point
+	// of this change is that a silent zero is worse than a loud stop.
+	if stdout.Dropped() > 0 {
+		res.markUntrusted(fmt.Sprintf("the probe's output overran the retained window (%d bytes dropped), so its verdict cannot be read", stdout.Dropped()))
+	}
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
@@ -641,8 +649,7 @@ func (c claude) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	if err != nil {
 		return out, err
 	}
-	out.Limit = c.DetectLimit(res)
-	return out, nil
+	return probeVerdict(out, res, c.DetectLimit)
 }
 
 func (claude) ReadUsage(context.Context, Invocation) (Usage, error) {

@@ -23,6 +23,11 @@ func TestTailHoldsNoMoreThanTheCap(t *testing.T) {
 		}
 	}
 
+	// CAPACITY, not length: the allocation is what the supervisor's memory bill is
+	// made of, and append's growth factor would overshoot a length-only bound.
+	if got := cap(keep.buf); got > retainedTail {
+		t.Errorf("retained buffer capacity %d, want <= the %d-byte cap", got, retainedTail)
+	}
 	if got := len(keep.buf); got > retainedTail {
 		t.Errorf("retained %d bytes, want <= the %d-byte cap", got, retainedTail)
 	}
@@ -37,18 +42,18 @@ func TestTailHoldsNoMoreThanTheCap(t *testing.T) {
 
 // A tail keeps the END of the stream, which is where every answer it is read for
 // lives: the usage-limit notice, the terminal_reason, the last error the CLI
-// printed.
+// printed. And a trim that happens to land ON a newline leaves a whole line at
+// the front, which must be KEPT — dropping it would be a silent loss for nothing.
 func TestTailKeepsTheEnd(t *testing.T) {
-	keep := &tail{max: 32}
-	for i := 0; i < 20; i++ {
+	keep := &tail{max: 32} // exactly four "line NN\n" lines
+	for i := 10; i < 30; i++ {
 		fmt.Fprintf(keep, "line %d\n", i)
 	}
-	got := keep.String()
-	if !strings.Contains(got, "line 19") {
-		t.Errorf("tail lost the last line:\n%q", got)
+	if want := "line 26\nline 27\nline 28\nline 29\n"; keep.String() != want {
+		t.Errorf("String() = %q, want %q", keep.String(), want)
 	}
-	if strings.Contains(got, "line 0\n") {
-		t.Errorf("tail kept the start of the stream:\n%q", got)
+	if keep.partial {
+		t.Error("partial = true after a trim that landed exactly on a newline")
 	}
 }
 
@@ -59,20 +64,32 @@ func TestTailKeepsTheEnd(t *testing.T) {
 // the backlog text it quotes, dressed up as a harness diagnostic — the injection
 // CLA-258 closed.
 func TestTailDropsThePartialFirstLine(t *testing.T) {
-	keep := &tail{max: 40}
-	if _, err := io.WriteString(keep, `{"type":"user","content":"You've hit your session limit"}`+"\n"); err != nil {
+	const event = `{"type":"user","content":"You've hit your session limit"}`
+	const after = "codex: whole line\n"
+
+	// Sized so the byte trim leaves the poisoned phrase INSIDE the retained
+	// bytes — otherwise the arithmetic does the work and the alignment is never
+	// exercised. The guard below fails if a later edit breaks that.
+	keep := &tail{max: len("hit your session limit\"}\n") + len(after)}
+	if _, err := io.WriteString(keep, event+"\n"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	if _, err := io.WriteString(keep, "codex: whole line\n"); err != nil {
+	if _, err := io.WriteString(keep, after); err != nil {
 		t.Fatalf("write: %v", err)
+	}
+	if !strings.Contains(string(keep.buf), "hit your") {
+		t.Fatalf("fixture no longer exercises the line alignment: the byte trim already removed the phrase from %q", string(keep.buf))
+	}
+	if !keep.partial {
+		t.Fatal("partial = false, but the retained bytes start mid-line")
 	}
 
 	got := keep.String()
+	if got != after {
+		t.Errorf("String() = %q, want exactly %q — the partial line must go whole", got, after)
+	}
 	if strings.Contains(got, "hit your") {
 		t.Errorf("a trimmed event's tail survived as if it were CLI text:\n%q", got)
-	}
-	if !strings.Contains(got, "codex: whole line") {
-		t.Errorf("the whole line that followed was lost:\n%q", got)
 	}
 }
 
@@ -148,7 +165,8 @@ func TestLineSinkDiscardsAnOversizedLine(t *testing.T) {
 }
 
 // The line cap is a bound on MEMORY too: a single line that never ends must not
-// accumulate. Nothing may be held beyond the cap while it is being discarded.
+// accumulate, and the array behind an abandoned one must not be held for the rest
+// of the session either.
 func TestLineSinkHoldsNoMoreThanTheCap(t *testing.T) {
 	s := &lineSink{onLine: func([]byte) {}, max: 1024}
 	for i := 0; i < 5000; i++ {
@@ -156,10 +174,30 @@ func TestLineSinkHoldsNoMoreThanTheCap(t *testing.T) {
 			t.Fatalf("write: %v", err)
 		}
 	}
-	if got := len(s.cur); got > s.max {
-		t.Errorf("holding %d bytes of an unterminated line, want <= %d", got, s.max)
+	if got := cap(s.cur); got > s.max {
+		t.Errorf("holding a %d-byte array for an abandoned line, want <= %d", got, s.max)
 	}
 	if !s.Overran() {
 		t.Error("Overran() = false after 5 MiB with no newline in it")
+	}
+
+	// The interesting case the loop above does not reach: a long but LEGAL line,
+	// held right up against the cap and then delivered whole.
+	var got []string
+	s = &lineSink{onLine: func(b []byte) { got = append(got, string(b)) }, max: 1024}
+	legal := strings.Repeat("k", 1024)
+	for _, chunk := range []string{legal[:1000], legal[1000:], "\n"} {
+		if _, err := io.WriteString(s, chunk); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if len(got) != 1 || got[0] != legal {
+		t.Errorf("a line of exactly the cap was not delivered whole: got %d line(s), first %d bytes", len(got), len(got[0]))
+	}
+	if s.Overran() {
+		t.Error("Overran() = true for a line of exactly the cap")
+	}
+	if cap(s.cur) > s.max {
+		t.Errorf("holding %d bytes after emitting, want <= %d", cap(s.cur), s.max)
 	}
 }

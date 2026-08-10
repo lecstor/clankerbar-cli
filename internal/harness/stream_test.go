@@ -3,6 +3,7 @@ package harness
 import (
 	"bytes"
 	"io"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -243,6 +244,112 @@ func TestCodexAndOpencodeRetentionIsBoundedWithoutLosingSpend(t *testing.T) {
 	})
 }
 
+// codex and opencode assemble lines on the WRITER side, so their oversized-line
+// case is the lineSink's rather than the scanner's — and it has the worse
+// consequence, because for opencode the discarded event is the one carrying that
+// step's tokens and cost. This drives the exact wiring Invoke uses (capture ->
+// cmd.Stdout -> tail + lineSink -> parser) without executing a binary.
+func TestCaptureMarksAnOversizedEventUntrusted(t *testing.T) {
+	for _, tc := range []struct {
+		harness string
+		wire    func(*capture) func(*Result)
+		before  string
+		after   string
+		want    int // tokens from the events that DID land
+	}{
+		{
+			harness: "opencode",
+			wire: func(c *capture) func(*Result) {
+				var p opencodeParse
+				c.sink.onLine = p.line
+				return p.finish
+			},
+			before: `{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":700,"input":1,"output":1,"reasoning":0,"cache":{"write":698,"read":0}}}}`,
+			after:  `{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":300,"input":1,"output":1,"reasoning":0,"cache":{"write":298,"read":0}}}}`,
+			want:   1000,
+		},
+		{
+			harness: "codex",
+			wire: func(c *capture) func(*Result) {
+				var p codexParse
+				c.sink.onLine = p.line
+				return p.finish
+			},
+			before: `{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}`,
+			after:  `{"type":"turn.completed","usage":{"input_tokens":900,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}`,
+			want:   900,
+		},
+	} {
+		t.Run(tc.harness, func(t *testing.T) {
+			captured := newCapture(nil)
+			finish := tc.wire(captured)
+			captured.sink.max = 4096 // so the oversized line is a fast fixture
+
+			cmd := &exec.Cmd{}
+			captured.attach(cmd, nil)
+
+			// A tool_result carrying a large file read, between two usage events.
+			oversized := `{"type":"text","part":{"type":"text","text":"` + strings.Repeat("y", 8192) + `"}}`
+			if _, err := io.WriteString(cmd.Stdout, tc.before+"\n"+oversized+"\n"+tc.after+"\n"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+
+			res := captured.result(tc.harness)
+			finish(&res)
+
+			if res.Untrusted == "" {
+				t.Fatal("Untrusted is empty: an event was silently discarded and the figures below have a hole in them")
+			}
+			if !strings.Contains(res.Untrusted, tc.harness) {
+				t.Errorf("Untrusted = %q, want it to name the harness", res.Untrusted)
+			}
+			// The events either side still landed — the overrun costs one line, not
+			// the stream.
+			if res.Tokens != tc.want {
+				t.Errorf("Tokens = %d, want %d (the events either side of the oversized one)", res.Tokens, tc.want)
+			}
+		})
+	}
+}
+
+// A clean stream through the same wiring is trusted, retained whole, and tees to
+// the console — the behaviour the old io.MultiWriter(&buf, console) had.
+func TestCaptureCleanStreamTeesAndTrusts(t *testing.T) {
+	var p codexParse
+	captured := newCapture(p.line)
+
+	var console bytes.Buffer
+	cmd := &exec.Cmd{}
+	captured.attach(cmd, &console)
+
+	const stream = `{"type":"turn.completed","usage":{"input_tokens":42,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}` + "\n"
+	if _, err := io.WriteString(cmd.Stdout, stream); err != nil {
+		t.Fatalf("write stdout: %v", err)
+	}
+	if _, err := io.WriteString(cmd.Stderr, "codex: warming up\n"); err != nil {
+		t.Fatalf("write stderr: %v", err)
+	}
+
+	res := captured.result("codex")
+	p.finish(&res)
+
+	if res.Untrusted != "" {
+		t.Errorf("Untrusted = %q on a clean stream", res.Untrusted)
+	}
+	if res.Tokens != 42 {
+		t.Errorf("Tokens = %d, want 42", res.Tokens)
+	}
+	if res.Stdout != stream {
+		t.Errorf("Stdout = %q, want the stream verbatim", res.Stdout)
+	}
+	if res.Stderr != "codex: warming up\n" {
+		t.Errorf("Stderr = %q", res.Stderr)
+	}
+	if out := console.String(); !strings.Contains(out, "turn.completed") || !strings.Contains(out, "warming up") {
+		t.Errorf("console lost the live tee of one or both streams:\n%q", out)
+	}
+}
+
 // The classifiers are handed the Result by value and each used to rebuild the same
 // scoped copy of it. With a memo they build it once.
 func TestScanIsBuiltOncePerWidth(t *testing.T) {
@@ -270,6 +377,36 @@ func TestScanIsBuiltOncePerWidth(t *testing.T) {
 	plain.scan(int(claudeTyped), build)
 	if builds != 2 {
 		t.Errorf("uncached Result: builds = %d, want 2 (no memo, but a working answer)", builds)
+	}
+}
+
+// A probe answers one question, and the supervised wait resumes spending real
+// sessions on a "no". So an untrusted probe must not answer it: an empty Limit
+// read out of output the adapter could not read whole is indistinguishable from a
+// lifted cap. It comes back as an error, which the loop already treats as "still
+// do not know" and waits another interval on.
+func TestProbeVerdictRefusesToReadAnUntrustedProbe(t *testing.T) {
+	limited := func(Result) Limit { return Limit{Limited: true, Reason: "usage_limit"} }
+	lifted := func(Result) Limit { return Limit{} }
+
+	// The trustworthy case still answers, both ways round.
+	if out, err := probeVerdict(ProbeResult{}, Result{}, lifted); err != nil || out.Limit.Limited {
+		t.Errorf("a clean probe must report the lift: out=%+v err=%v", out, err)
+	}
+	if out, err := probeVerdict(ProbeResult{}, Result{}, limited); err != nil || !out.Limit.Limited {
+		t.Errorf("a clean probe must report the cap: out=%+v err=%v", out, err)
+	}
+
+	// The untrusted case answers nothing — and still reports what it cost.
+	out, err := probeVerdict(ProbeResult{Tokens: 12, CostUSD: 0.02}, Result{Untrusted: "stream cut short"}, lifted)
+	if err == nil {
+		t.Fatal("err = nil: an unreadable probe reported 'not limited', which resumes the run")
+	}
+	if out.Limit.Limited {
+		t.Error("an untrusted probe must not report a limit either — it reports nothing")
+	}
+	if out.Tokens != 12 || out.CostUSD != 0.02 {
+		t.Errorf("spend = %d / $%v, want it carried out through the error: a probe that could not be read still cost what it cost", out.Tokens, out.CostUSD)
 	}
 }
 
