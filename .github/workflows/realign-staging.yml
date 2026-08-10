@@ -1,0 +1,69 @@
+name: realign-staging
+
+# After the `staging -> main` promotion PR merges, `staging` sits one merge
+# commit behind `main` — identical trees, diverged history. This fast-forwards
+# `staging` back up to `main` on every push to `main`, so the next batch starts
+# from a released, prod-equal base and the standing promotion PR's diff shows the
+# NEXT batch rather than re-showing the one just published.
+#
+# Ported from the web repo's workflow of the same name, deliberately: the
+# operator's decision was to mirror the web app's shape here rather than invent a
+# second one, so the two repos stay one mental model.
+#
+# Why a plain (non-force) fast-forward is both correct and safe:
+#   - The promotion is a MERGE COMMIT, so `main` CONTAINS `staging`'s whole
+#     history — `staging` is an ancestor of `main`, and advancing it is a
+#     fast-forward, never a rewrite. This is why squash and rebase merging are
+#     DISABLED on this repo: a squashed promotion would sever staging's history
+#     from main and turn this step into a destructive force-push.
+#   - `staging`'s protection disables force-pushes but allows ordinary pushes, and
+#     a fast-forward is an ordinary push. No protection is bypassed.
+#   - There is no `--force` anywhere below, so if `staging` has advanced past what
+#     was promoted (a task PR merged in after the promotion PR's head was fixed)
+#     GitHub rejects the non-fast-forward push. That case is detected and SKIPPED
+#     rather than failed — staging being ahead is fine, and the next promotion
+#     carries those commits.
+#
+# Separate workflow from release-on-merge.yml on purpose: the realign must happen
+# for EVERY promotion, including a docs-only one that publishes no release.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: realign-staging
+  cancel-in-progress: false
+
+jobs:
+  realign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # To push the fast-forward to `staging`.
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history so `git merge-base --is-ancestor` can decide correctly.
+          fetch-depth: 0
+
+      - name: Fast-forward staging up to main
+        run: |
+          set -euo pipefail
+          git fetch origin --quiet
+
+          if ! staging_sha=$(git rev-parse -q --verify origin/staging 2>/dev/null); then
+            echo "::warning::No origin/staging branch — nothing to realign."
+            exit 0
+          fi
+          main_sha=$(git rev-parse origin/main)
+
+          if [ "$main_sha" = "$staging_sha" ]; then
+            echo "staging is already level with main ($main_sha) — nothing to fast-forward."
+          elif git merge-base --is-ancestor "$staging_sha" "$main_sha"; then
+            echo "Fast-forwarding staging ($staging_sha) up to main ($main_sha)."
+            git push origin "$main_sha:refs/heads/staging"
+          else
+            echo "staging ($staging_sha) is ahead of / diverged from main ($main_sha) — skipping ff to avoid a non-fast-forward push."
+          fi

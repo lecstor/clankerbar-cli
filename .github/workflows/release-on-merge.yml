@@ -1,0 +1,201 @@
+name: release-on-merge
+
+# Publish a release when the operator merges the standing `staging -> main`
+# promotion PR. That merge IS the publish gate: `staging` is where task PRs land
+# (clankers may merge those), and only a human may merge `staging -> main`.
+#
+# This is the machine half of that model. It does three things in order, and each
+# one is allowed to stop the release:
+#
+#   1. GATE   — wait for the required `ci` check on THIS EXACT COMMIT and refuse
+#               unless it passed. An absent check is a refusal, not a pass.
+#   2. DERIVE — work out the version from the conventional commits since the last
+#               tag. A promotion carrying nothing releasable (docs, chores) skips
+#               quietly: no tag, no release, green run.
+#   3. TAG + PUBLISH — push the tag, then INVOKE release.yml directly.
+#
+# Step 3's "invoke directly" is the non-obvious part. A tag pushed with
+# GITHUB_TOKEN does NOT trigger another workflow — GitHub suppresses that to
+# prevent recursion — so pushing a tag and expecting `release.yml`'s `push: tags`
+# trigger to fire produces a tag with no release. `release.yml` is therefore
+# `workflow_call`-able and is called here. Full reasoning in its header and in
+# `docs/releases.md`.
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  # Never run two releases at once: a second promotion merged while the first is
+  # still deriving would race on the tag. Queue behind, never cancel — cancelling
+  # mid-publish could leave a tag pushed with no release built for it.
+  group: release-on-merge
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # ── 1 + 2: is this commit green, and what should it be called? ───────────────
+  gate:
+    name: gate and derive
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      # REQUIRED, and its absence fails in a way that looks like something else.
+      # The workflow-level `permissions: contents: read` above sets every other
+      # scope to `none`, and the gate reads
+      # GET /repos/{owner}/{repo}/commits/{sha}/check-runs, which needs this. Drop
+      # it and the read 403s on a private repo, which the gate cannot distinguish
+      # from "no checks yet" - so it waits out its full timeout and then refuses
+      # the release. Every promotion would silently stop publishing. Fail-closed,
+      # so this is an availability bug rather than a hole, but a quiet one.
+      checks: read
+    outputs:
+      release: ${{ steps.derive.outputs.release }}
+      version: ${{ steps.derive.outputs.version }}
+      bump: ${{ steps.derive.outputs.bump }}
+      previous: ${{ steps.derive.outputs.previous }}
+    steps:
+      # Pinned to full commit SHAs for the same reason release.yml is: this
+      # workflow decides whether binaries users install get published, and a moved
+      # tag on any action here could substitute that decision. The trailing
+      # comment is the version label; the SHA is what is fetched.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history AND tags: the derivation walks `<last tag>..HEAD`.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      # ── THE GATE ───────────────────────────────────────────────────────────
+      # Gated on `ci` for `github.sha` — the merge commit that actually landed on
+      # main — and NOT on the promotion PR's own check. main's protection is
+      # `strict: false`, so a PR may merge without being up to date with its base;
+      # CI ran against `refs/pull/<n>/merge` as it stood at the time, and if the
+      # base advanced afterwards the commit that ships is a combination nothing
+      # ever compiled. Publishing that is releasing an untested artifact.
+      #
+      # This step WAITS, because `ci` is triggered by the same push and is
+      # routinely not created yet when this first looks. The wait resolves to a
+      # FAILURE, never to a pass: an absent or never-finishing check refuses the
+      # release exactly as a red one does. That rule is pinned by tests in
+      # internal/release/checks_test.go, not asserted by this comment.
+      - name: Require a green ci on the merge commit
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          go run ./cmd/release-tool await-check \
+            --repo "${{ github.repository }}" \
+            --sha "${{ github.sha }}" \
+            --required ci \
+            --timeout 30m \
+            --interval 15s
+
+      # ── THE DERIVATION ─────────────────────────────────────────────────────
+      - name: Derive the version from conventional commits
+        id: derive
+        run: |
+          set -euo pipefail
+
+          # The newest release tag reachable from here. --match keeps stray
+          # non-version tags out; if there is genuinely no tag, fail red rather
+          # than inventing v0.0.0 — the FIRST release is a maintainer's decision,
+          # not something a pipeline should make on its own.
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' 2>/dev/null || true)
+          if [ -z "$previous" ]; then
+            echo "::error::No existing v* tag to derive from. Cut the first release by hand (git tag vX.Y.Z && git push origin vX.Y.Z)."
+            exit 1
+          fi
+          echo "Deriving from $previous..${{ github.sha }}"
+
+          # --no-merges is REQUIRED, not a tidy-up. Every task PR lands here as a
+          # merge commit, so the first-parent subjects are all
+          # "Merge pull request #NN from ..." — unrecognised, therefore patch, so
+          # a `feat` would never produce a minor. The conventional-commit prefixes
+          # live on the inner commits and only --no-merges sees them. Pinned by
+          # TestNextFromCommits_MergeSubjectsAloneWouldMisderive.
+          #
+          # %B is the FULL message (a BREAKING CHANGE: footer lives in the body),
+          # NUL-separated because a body contains newlines.
+          git log --no-merges --format=%B%x00 "$previous..${{ github.sha }}" \
+            | go run ./cmd/release-tool next-version --current "$previous"
+
+      - name: Say what will happen
+        run: |
+          if [ "${{ steps.derive.outputs.release }}" = "true" ]; then
+            echo "::notice::Publishing ${{ steps.derive.outputs.version }} (${{ steps.derive.outputs.bump }} bump from ${{ steps.derive.outputs.previous }})."
+          else
+            # The decided behaviour for a docs-only promotion: skip QUIETLY. An
+            # empty version bump would publish a release indistinguishable from
+            # the last, and failing would make a docs promotion look broken.
+            echo "::notice::Nothing releasable since ${{ steps.derive.outputs.previous }} (docs/chores only) — no tag, no release."
+          fi
+
+  # ── 3a: the tag ─────────────────────────────────────────────────────────────
+  tag:
+    name: tag
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # To push the tag. Deliberately NOT granted to the gate job above.
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+
+      - name: Create and push the tag
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          # Idempotent under a re-run, and LOUD on a real collision. A tag that
+          # already points at this commit means someone re-ran the job — carry on
+          # to the publish step. A tag that exists and points SOMEWHERE ELSE means
+          # the version derivation collided with history; moving it would change
+          # what a published release refers to, so stop instead.
+          if existing=$(git rev-parse -q --verify "refs/tags/$VERSION^{commit}" 2>/dev/null); then
+            if [ "$existing" = "${{ github.sha }}" ]; then
+              echo "::notice::Tag $VERSION already exists at this commit — reusing it."
+              exit 0
+            fi
+            echo "::error::Tag $VERSION already exists at $existing, not ${{ github.sha }}. Refusing to move a published tag."
+            exit 1
+          fi
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$VERSION" -m "$VERSION" "${{ github.sha }}"
+          git push origin "refs/tags/$VERSION"
+          echo "::notice::Pushed $VERSION at ${{ github.sha }}."
+
+  # ── 3b: the publish ─────────────────────────────────────────────────────────
+  # Calls release.yml rather than relying on the tag push above to trigger it —
+  # a GITHUB_TOKEN-pushed tag does not trigger workflows. `release.yml` keeps
+  # every action pinned to a SHA and still produces checksums AND a Sigstore
+  # build-provenance attestation; routing through it is what keeps the automated
+  # release no weaker than a hand-cut one.
+  publish:
+    name: publish
+    needs: [gate, tag]
+    if: needs.gate.outputs.release == 'true'
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.gate.outputs.version }}
+    permissions:
+      # A called workflow cannot hold more than the caller grants it, so these
+      # must be declared here too. They are exactly release.yml's own set:
+      # contents to create the Release, id-token + attestations for the
+      # provenance. Nothing wider.
+      contents: write
+      id-token: write
+      attestations: write

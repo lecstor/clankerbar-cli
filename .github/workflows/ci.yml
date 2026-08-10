@@ -1,12 +1,19 @@
 name: ci
 
-# Gate every PR (and every push to main) on a clean build, vet, and race-enabled
-# test run. This is the "green check" the operator gates merges on — make it a
-# required status check on main via branch protection.
+# Gate every PR (and every push to an integration branch) on a clean build, vet,
+# and race-enabled test run. This is the "green check" merges are gated on — it
+# is a required status check on both `main` and `staging` via branch protection.
+#
+# The push list is not cosmetic. `release-on-merge.yml` gates publishing on the
+# `ci` check of the MERGE COMMIT ON MAIN, not on the PR's check — because main's
+# protection is `strict: false`, so a PR can merge without being up to date and
+# the commit that actually lands may be a combination nothing ever compiled. That
+# gate has something to read only because `main` is in this list; drop it and the
+# gate would wait, find nothing, and (correctly) refuse every release.
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, staging]
 
 # A newer push to the same branch/PR supersedes an in-flight run.
 concurrency:
@@ -18,6 +25,11 @@ permissions:
 
 jobs:
   ci:
+    # This name is LOAD-BEARING. GitHub names a check run after its job, and
+    # `release-on-merge.yml` gates publishing on a check called exactly `ci`
+    # (internal/release.DefaultRequiredCheck). Rename it, or add a matrix, and the
+    # gate waits for a check that never arrives and refuses every release.
+    # TestRequiredCheckMatchesTheCIWorkflow fails if this drifts.
     name: ci
     runs-on: ubuntu-latest
     steps:
