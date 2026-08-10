@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -37,6 +38,76 @@ const defaultBacklogURL = "https://clankerbar.com"
 // behaviour change. It is pinned by TestDefaultPromptAsksForOneTask, which is
 // there because the previous default was the DRAIN phrase and nothing failed.
 const defaultPrompt = "Work the next backlog item."
+
+// Phase is one session in a task's sequence. A task runs as an ordered list of
+// them, each a separate harness process, so context resets between them.
+//
+// The point is a context reset the model cannot perform for itself. A session's
+// context grows monotonically and is re-read on every turn: one measured task
+// (CLA-309, 2026-08-11) spent 66.2M tokens over 370 turns, and its last four
+// deciles were 53% of that purely because each of those turns re-read ~250k. The
+// served protocol already tells a session to shed at a safe checkpoint, and says
+// in the same breath that the rule is a no-op if the harness cannot discard
+// context — which `claude -p` cannot: no --continue, no --resume, and no
+// compaction the model can reach. A process boundary is the only lever there is.
+//
+// Why phases and not a better-worded rule: "your job this session is
+// implementation only, then stop" is a SCOPE instruction, and scope is the kind
+// an agent follows reliably. The driver decides the boundary; the model only has
+// to respect its brief. MaxTurns is the backstop for when it does not, and the
+// existing salvage (CLA-314) commits and pushes whatever a cut-off phase left.
+//
+// The cost being paid: a session's fixed startup — re-reading the served
+// protocol and the repo's agent guide — is paid per PHASE rather than per task.
+// That is real, and it is why phases are opt-in and why splitting thin is a bad
+// trade: the saving falls off per extra cut while the ramp does not.
+type Phase struct {
+	// Name selects a built-in prompt when Prompt is empty, and labels the phase
+	// in the iteration log. See builtinPhasePrompts.
+	Name string `json:"name"`
+
+	// Prompt is what this phase's session is asked to do. Empty means "use the
+	// built-in prompt for Name". Two placeholders are substituted by the driver
+	// from the claim the previous phase left held: {{taskId}} and {{runId}}.
+	// They are the whole reason a later phase can RESUME a run instead of
+	// claiming a new task, and they are only available once a phase has held a
+	// claim — so they are meaningless in the first phase.
+	Prompt string `json:"prompt"`
+
+	// MaxTurns caps the session's turns (harness permitting) so the boundary
+	// lands even if the model works past its brief. 0 = uncapped.
+	MaxTurns int `json:"max_turns"`
+}
+
+// builtinPhasePrompts are the shipped briefs, selected by phase name.
+//
+// The split is implement, then review-and-fix, and that grouping is deliberate:
+// the reviewing session dispatches the review itself, so it holds the findings
+// while it fixes them. A third "fix" phase would hold neither the implementation
+// nor the review context and would re-acquire both — which is why the repo's own
+// workflow puts implementation and fix in ONE actor and the review in a separate
+// read-only one. Splitting where that workflow already splits is the whole idea.
+var builtinPhasePrompts = map[string]string{
+	"implement": "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
+		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
+		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
+		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
+		"Ending there is this task going to plan, not the task being abandoned.",
+
+	"review": "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
+		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
+		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
+		"then get_task with includeDecisions: true to re-read the bar and the standing decisions, and read the diff " +
+		"on the branch recorded on the task. Then run the adversarial review gate, fix what it finds, re-verify, " +
+		"push, and hand the task to in_review.",
+}
+
+// The placeholders a phase prompt may carry, substituted by the driver from the
+// claim the previous phase left held.
+const (
+	PhaseTaskPlaceholder = "{{taskId}}"
+	PhaseRunPlaceholder  = "{{runId}}"
+)
 
 // Config is the resolved loop configuration. The comments here are the source of
 // truth for each knob until the README/docs catch up.
@@ -77,6 +148,26 @@ type Config struct {
 	// served protocol and the repo's agent guide - is now paid per task rather
 	// than amortised across a drain.
 	Prompt string `json:"prompt"`
+
+	// Phases splits ONE task across several sessions, so its context resets at a
+	// checkpoint the model cannot reach itself. See Phase for why this exists.
+	//
+	// OPT-IN, and deliberately so. Left empty, a task runs exactly as it always
+	// has: one session, asked Prompt. Two phases mean a task that reaches its
+	// checkpoint and stops there is only HALF finished until the next session
+	// runs, so switching it on before the sequence has been watched end to end
+	// would turn a driver bug into tasks that silently never reach review. An
+	// operator opts in per config, and the shipped briefs are one line each:
+	//
+	//	"phases": [{"name": "implement"}, {"name": "review"}]
+	//
+	// Naming a phase and leaving its prompt empty takes the built-in brief for
+	// that name; set `prompt` to override it, and `max_turns` to cap it.
+	//
+	// Phases and Prompt are mutually exclusive — Validate refuses both, rather
+	// than silently preferring one and leaving an operator to wonder which of
+	// two prompts their sessions are actually being handed.
+	Phases []Phase `json:"phases"`
 
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
 	WorkDir string `json:"workdir"`
@@ -254,6 +345,47 @@ func (b Budget) Remaining(elapsed time.Duration) (time.Duration, bool) {
 		return 0, false
 	}
 	return b.MaxWallClock.Duration() - elapsed, true
+}
+
+// EffectivePhases is the sequence a task runs as: the configured phases with
+// their built-in prompts resolved, or — when none are configured — a single
+// phase carrying Prompt.
+//
+// The unphased case is expressed as one phase on purpose, so the driver has
+// exactly ONE shape to run and the old behaviour is not a second code path that
+// can rot untested. "No phases" and "one phase" are the same thing downstream.
+func (c *Config) EffectivePhases() []Phase {
+	if len(c.Phases) == 0 {
+		return []Phase{{Prompt: c.Prompt}}
+	}
+	out := make([]Phase, len(c.Phases))
+	for i, ph := range c.Phases {
+		if ph.Prompt == "" {
+			ph.Prompt = builtinPhasePrompts[ph.Name]
+		}
+		out[i] = ph
+	}
+	return out
+}
+
+// BuiltinPhaseNames lists the shipped phase briefs, sorted so the error naming
+// them is stable.
+func BuiltinPhaseNames() []string {
+	names := make([]string, 0, len(builtinPhasePrompts))
+	for n := range builtinPhasePrompts {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// Label names a phase for logs and log filenames: its name, or its 1-based
+// position when it has none.
+func (p Phase) Label(i int) string {
+	if p.Name != "" {
+		return p.Name
+	}
+	return strconv.Itoa(i + 1)
 }
 
 func defaults() *Config {
@@ -574,8 +706,31 @@ func (c *Config) Validate() error {
 	if !harness.Known(c.Harness) {
 		return fmt.Errorf("unknown harness %q (want: %s)", c.Harness, strings.Join(harness.Names(), ", "))
 	}
-	if c.Prompt == "" {
+	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")
+	}
+	// Two answers to the same question. A phased task is asked its PHASE's
+	// prompt and never this one, so a config carrying both is refused rather
+	// than resolved — an operator who set one and forgot the other gets told,
+	// instead of wondering which of two prompts their sessions were handed.
+	//
+	// "Set" means "differs from the built-in default": defaults() fills Prompt
+	// before the file is layered over it, so an untouched Prompt is
+	// indistinguishable from an absent one by the time we get here. The residue
+	// is that writing the default string out by hand alongside phases is
+	// accepted silently, which costs nothing — it is the same prompt, unused.
+	if len(c.Phases) > 0 && c.Prompt != "" && c.Prompt != defaultPrompt {
+		return errors.New("config sets both `prompt` and `phases`; a phased task is asked its phase's prompt " +
+			"and never `prompt`, so remove one of them")
+	}
+	for i, ph := range c.Phases {
+		if ph.Prompt == "" && builtinPhasePrompts[ph.Name] == "" {
+			return fmt.Errorf("phases[%d]: no `prompt`, and %q is not a built-in phase name (built-ins: %s)",
+				i, ph.Name, strings.Join(BuiltinPhaseNames(), ", "))
+		}
+		if ph.MaxTurns < 0 {
+			return fmt.Errorf("phases[%d]: max_turns is negative", i)
+		}
 	}
 
 	// Default mcp_config_path to <workdir>/.mcp.json when that file exists. Claude's

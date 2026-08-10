@@ -287,12 +287,13 @@ func (d *Driver) Run(ctx context.Context) error {
 			target = d.targets[d.cursor]
 		}
 
-		// There is work (or we're blind) — spend a session, retrying transient
-		// blips with backoff (a fresh session reclaims any half-done task).
+		// There is work (or we're blind) — spend a session (or a phase sequence of
+		// them, one task either way), retrying transient blips with backoff (a
+		// fresh session reclaims any half-done task).
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, stop, err := d.drainWithRetries(ctx, drains, target,
+		tokens, cost, stop, err := d.drainPhases(ctx, drains, target,
 			spend{start: start, tokens: totalTokens, cost: totalCost})
 		// Count the spend BEFORE deciding what to do with the outcome: a drain that
 		// stopped or failed still burned what it burned, and the accumulator is what
@@ -336,16 +337,112 @@ type spend struct {
 	cost   float64
 }
 
-// drainWithRetries runs one drain to a clean finish, absorbing usage-limit pauses
+// drainPhases runs ONE drain as its configured sequence of phase sessions —
+// each a separate harness process, so the context resets between them. With no
+// phases configured that sequence is one session and this is exactly the old
+// behaviour; see config.Phase for why the split exists and config.EffectivePhases
+// for why "unphased" is expressed as a single phase rather than a second path.
+//
+// Two things have to be true across a seam, and they are the whole design:
+//
+//  1. The claim is NOT handed back. The next phase resumes the same run with
+//     heartbeat(runId) rather than claiming, so the lease has to survive the gap.
+//     A handback here would put the task in the queue while we are still on it.
+//  2. If the next phase will never run, the handback skipped at the seam happens
+//     here instead — otherwise a budget stop leaves the task leased to nobody.
+func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
+	phases := d.cfg.EffectivePhases()
+	// The claim a phase deliberately left held for its successor, and the source
+	// of the task/run ids that successor's prompt needs.
+	var carried *harness.Result
+
+	for i, ph := range phases {
+		last := i == len(phases)-1
+		// Unphased runs keep their log names byte-identical: no phase tag.
+		tag := ""
+		if len(phases) > 1 {
+			tag = "-p" + ph.Label(i)
+		}
+
+		if i > 0 {
+			// The breaker at a phase boundary — the third place a session ends and
+			// the loop decides whether to spawn another, alongside between-drains
+			// and between-attempts, and the finest granularity the ceiling has had.
+			// It is not decoration: one measured task spent 92% of a whole run's
+			// 75M ceiling inside a single session, which a between-drains check
+			// cannot see coming and cannot interrupt.
+			if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+				log.Printf("iteration %d: budget reached at the %s phase boundary: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
+					drainNum, ph.Label(i), dim, prior.tokens+tokens, prior.cost+cost,
+					time.Since(prior.start).Round(time.Second))
+				stop = true
+				break
+			}
+		}
+
+		ptokens, pcost, pstop, held, perr := d.drainPhase(ctx, drainNum, tag, ph, last, carried, t, spend{
+			start:  prior.start,
+			tokens: prior.tokens + tokens,
+			cost:   prior.cost + cost,
+		})
+		tokens += ptokens
+		cost += pcost
+		carried = held
+
+		if perr != nil {
+			err = perr
+			break
+		}
+		if pstop {
+			stop = true
+			break
+		}
+		// A non-final phase that ended without holding the task leaves the next one
+		// nothing to resume: the session settled the task itself (worked past its
+		// brief and finished it), or its stream could not be trusted to say either
+		// way. The sequence is over, and neither case is a failure — a task that
+		// reached in_review in one session is a task that got done.
+		if !last && carried == nil {
+			log.Printf("iteration %d: the %s phase ended without holding the task — nothing for the next phase to resume, so this drain ends here",
+				drainNum, ph.Label(i))
+			break
+		}
+	}
+
+	// The deferred handback (2, above). Skipped at every seam that led to another
+	// phase; owed at the one that did not.
+	if carried != nil {
+		d.releaseHeldClaim(ctx, t, *carried)
+	}
+	return tokens, cost, stop, err
+}
+
+// drainWithRetries runs a single unphased drain — the whole task in one session.
+// It is what a config with no `phases` gets, and it is kept as its own entry
+// point because that is the shape every existing test drives.
+func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, "", config.Phase{Prompt: d.cfg.Prompt}, true, nil, t, prior)
+	return tokens, cost, stop, err
+}
+
+// drainPhase runs ONE phase to a clean finish, absorbing usage-limit pauses
 // (supervised wait) and transient blips (exponential backoff) by re-running the
 // SAME session — neither costs a drain count. Returns the tokens/cost consumed on
 // a clean finish; stop=true if a STOP/cancel landed during a wait; err only on a
 // genuine, non-retryable failure (or exhausted retries).
 //
+// held is non-nil only when this phase ended cleanly, is not the last, and left
+// the task's claim open for its successor — see drainPhases, which either carries
+// it to the next phase or hands it back.
+//
+// prev is the claim the PREVIOUS phase left held, and is what fills the task/run
+// placeholders in this phase's prompt. nil for the first phase, which has no run
+// to resume and claims one of its own.
+//
 // prior carries the run's ceilings down into the drain, because the budget breaker
 // in Run only runs BETWEEN drains and every wait in here happens inside one — see
 // the check at the top of the loop, and waitPastBudget.
-func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, held *harness.Result, err error) {
 	retries := 0
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
@@ -358,7 +455,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
 			log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
 				drainNum, dim, prior.tokens+tokens, prior.cost+cost, time.Since(prior.start).Round(time.Second))
-			return tokens, cost, true, nil
+			return tokens, cost, true, held, nil
 		}
 
 		// Each attempt streams live to the terminal and to its own logfile. The name
@@ -374,9 +471,9 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv := d.invocation(t, false)
-		logName := fmt.Sprintf("iteration-%s-d%d-a%d-%s.log",
-			time.Now().Format("20060102-150405"), drainNum, retries, randomTail())
+		inv := d.invocationFor(t, ph, prev)
+		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
+			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
 		f, ferr := d.state.Create(logName)
 		logPath := filepath.Join(d.state.Path(), logName)
 		if ferr == nil {
@@ -405,7 +502,28 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		// a fully parsed Result alongside a Wait failure, so a claim observed on
 		// that stream is real and must not be dropped just because the process died
 		// untidily. A launch failure yields a zero Result, which releases nothing.
-		d.releaseHeldClaim(ctx, t, res)
+		//
+		// UNLESS this phase reached its checkpoint with another phase still to run.
+		// Then the sequence is not over: the next phase resumes THIS run with
+		// heartbeat(runId) instead of claiming, so handing the lease back here
+		// would post the task to the queue while we are still working it, and the
+		// next phase would find someone else's task or none at all. drainPhases
+		// owns the handback in that case and performs it the moment the sequence
+		// ends for any other reason.
+		//
+		// Only a clean end holds it open, and each conjunct is load-bearing: a
+		// retry deliberately re-claims a half-done task with a fresh session
+		// (which is why a non-zero exit still releases), and an untrusted stream
+		// must not be read for claim state at all, because the settle we never saw
+		// may be in the bytes that never arrived (CLA-262).
+		if !last && res.Untrusted == "" && res.ExitCode == 0 && res.Claim.Held() {
+			held = &res
+			log.Printf("%siteration %d: phase reached its checkpoint holding %s — keeping the lease for the next phase",
+				labelOf(t), drainNum, res.Claim.TaskID)
+		} else {
+			held = nil
+			d.releaseHeldClaim(ctx, t, res)
+		}
 		// Then check what it said it delivered. After the handback, because a dead
 		// lease is time-sensitive and a git check is not; on every exit, because a
 		// session that pushed nothing and died is exactly as likely to have recorded
@@ -414,10 +532,10 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 
 		if ierr != nil {
 			if ctx.Err() != nil {
-				return tokens, cost, true, nil
+				return tokens, cost, true, held, nil
 			}
 			// Couldn't launch the harness at all (bad PATH/flags/env) — not a blip.
-			return tokens, cost, false, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
+			return tokens, cost, false, held, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
 		}
 
 		// A session whose stream could not be read whole (CLA-262). Everything below
@@ -425,7 +543,10 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		// classifying the exit or retrying on the strength of it are three ways to
 		// make a confident decision on data with a hole in it.
 		if res.Untrusted != "" {
-			return d.endUntrustedDrain(drainNum, res, tokens, cost)
+			// held is nil here by construction — an untrusted stream never holds a
+			// phase open — so the sequence ends and nothing is carried forward.
+			utokens, ucost, ustop, uerr := d.endUntrustedDrain(drainNum, res, tokens, cost)
+			return utokens, ucost, ustop, held, uerr
 		}
 
 		// Count THIS attempt's spend toward the budget breaker regardless of how it
@@ -445,7 +566,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			if lim.Stop {
 				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved)",
 					drainNum, limitReason(lim))
-				return tokens, cost, true, nil
+				return tokens, cost, true, held, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
 			// Waiting out a reset that lands past the wall-clock ceiling buys
@@ -458,7 +579,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
 					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
-				return tokens, cost, true, nil
+				return tokens, cost, true, held, nil
 			}
 			// The wait's own probe spend lands in the SAME accumulator as the
 			// sessions', so it reaches the breaker at the top of this loop, the one in
@@ -472,14 +593,14 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			tokens += ptokens
 			cost += pcost
 			if pstop {
-				return tokens, cost, true, nil
+				return tokens, cost, true, held, nil
 			}
 			continue
 		}
 
 		if res.ExitCode == 0 {
 			log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drainNum, tokens, cost)
-			return tokens, cost, false, nil
+			return tokens, cost, false, held, nil
 		}
 
 		// Non-zero exit, not the usage cap: a transient server/network blip backs
@@ -487,7 +608,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		if d.h.IsTransient(res) {
 			retries++
 			if d.cfg.MaxRetries > 0 && retries > d.cfg.MaxRetries {
-				return tokens, cost, false, fmt.Errorf(
+				return tokens, cost, false, held, fmt.Errorf(
 					"iteration %d: transient failures persisted after %d retries (check https://status.claude.com; rerun to resume)",
 					drainNum, d.cfg.MaxRetries)
 			}
@@ -495,7 +616,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			log.Printf("iteration %d transient failure (exit %d) — %s in %s (a fresh session reclaims any half-done task)",
 				drainNum, res.ExitCode, retryLabel(retries, d.cfg.MaxRetries), wait)
 			if d.waitOrStop(ctx, wait) {
-				return tokens, cost, true, nil
+				return tokens, cost, true, held, nil
 			}
 			continue
 		}
@@ -506,7 +627,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		// yet — which is the one thing they need in order to report the gap. The
 		// text is the harness's own diagnostic scope, never the raw stream, so
 		// the agent's narration is not quoted back at them (CLA-258).
-		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s%s",
+		return tokens, cost, false, held, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s%s",
 			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)), droppedNote(res.OutputDropped))
 	}
 }
@@ -1174,6 +1295,32 @@ func droppedNote(dropped int64) string {
 	}
 	return fmt.Sprintf(" (note: %.1f MiB of this session's output was past the retained window, so the classification read only the tail)",
 		float64(dropped)/(1<<20))
+}
+
+// invocationFor builds the invocation for one PHASE: the target's invocation,
+// carrying this phase's prompt and turn cap, with the previous phase's claim
+// substituted into the prompt's placeholders.
+//
+// The substitution is what lets a later phase RESUME a run rather than claim a
+// task. A session cannot know its own run id — it never called claim_task — so
+// the driver, which watched the earlier phase's stream go by, is the only thing
+// that can tell it. That is also why the ids come from the observed claim and
+// not from config: they are per-task facts, discovered at runtime.
+//
+// A placeholder with no claim to fill it is LEFT STANDING rather than blanked.
+// A literal {{runId}} in the log is a misconfigured sequence announcing itself;
+// an empty string is a session quietly deciding to claim fresh work instead.
+func (d *Driver) invocationFor(t Target, ph config.Phase, prev *harness.Result) harness.Invocation {
+	inv := d.invocation(t, false)
+	inv.MaxTurns = ph.MaxTurns
+	inv.Prompt = ph.Prompt
+	if prev != nil && prev.Claim.Held() {
+		inv.Prompt = strings.NewReplacer(
+			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
+			config.PhaseRunPlaceholder, prev.Claim.RunID,
+		).Replace(inv.Prompt)
+	}
+	return inv
 }
 
 // invocation builds the harness invocation for one target: the target's workdir

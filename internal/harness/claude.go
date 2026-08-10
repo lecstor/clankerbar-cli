@@ -52,6 +52,11 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if in.SettingsPath != "" {
 		args = append(args, "--settings", in.SettingsPath)
 	}
+	// The phase backstop. Claude ends the session at the cap; whatever the tree
+	// holds is then the salvage's problem, which is exactly what it is for.
+	if in.MaxTurns > 0 {
+		args = append(args, "--max-turns", strconv.Itoa(in.MaxTurns))
+	}
 
 	cmd := exec.CommandContext(ctx, "claude", args...)
 	if in.WorkDir != "" {

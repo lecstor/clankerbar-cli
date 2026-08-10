@@ -2365,9 +2365,12 @@ func iterationLogs(t *testing.T, dir string) []string {
 	return out
 }
 
-// The configured prompt is the ONLY thing bounding how much a session takes on -
-// there is no per-session task cap, turn cap or deadline anywhere in the driver -
-// so the wording is the interface, and it has to arrive at the harness unchanged.
+// For an UNPHASED run — what this test drives, and what a config with no `phases`
+// gets — the configured prompt is the ONLY thing bounding how much a session takes
+// on, so the wording is the interface and it has to arrive at the harness
+// unchanged. (A phased run also has config.Phase.MaxTurns, but that is a backstop
+// under a boundary the prompt is meant to land on its own, not a second dial on
+// scope — see TestDrainPhases_CarriesTheTurnCapToTheHarness.)
 //
 // Nothing asserted this before. `internal/config` pins what the default IS, but a
 // change to Driver.invocation that dropped, defaulted or rewrote Prompt would have

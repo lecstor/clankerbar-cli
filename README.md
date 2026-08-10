@@ -33,6 +33,46 @@ long run, and a session killed mid-task is fine: the driver hands the task strai
 queue (see [Resilience](#resilience)) and the next iteration picks it up. The
 backlog is the durable state; the loop is thin.
 
+### Phases: splitting one task across two sessions
+
+A session's context grows monotonically and is re-read on every turn, so a long
+task gets expensive at the *end*: one measured task spent 66.2M tokens over 370
+turns, and its last four deciles were 53% of that purely because each of those
+turns re-read a quarter of a million tokens. The served protocol already tells a
+session to shed its context at a safe checkpoint, and says in the same breath
+that the rule is a no-op if the harness cannot discard context — which `claude
+-p` cannot. **A process boundary is the only lever there is.**
+
+`phases` splits one task across several sessions, so the context resets at that
+checkpoint:
+
+```json
+"phases": [{ "name": "implement" }, { "name": "review" }]
+```
+
+Phase 1 claims the task, implements it, self-verifies, commits, pushes and
+records the branch — then stops. Phase 2 starts on a **fresh context**, resumes
+the *same* run (the driver substitutes the task and run ids into its brief, so it
+calls `heartbeat` instead of claiming), re-reads the bar and the standing
+decisions from the plane, runs the adversarial review, fixes what it finds and
+hands the task to `in_review`. The claim is held across the seam, so the task is
+never posted back to the queue mid-sequence.
+
+The split works because each phase's prompt is a **scope** instruction — "your
+job this session is implementation only, then stop" — rather than a request that
+the model manage its own context. Naming a phase takes its built-in brief; set
+`prompt` on it to write your own, and `max_turns` to cap it as a backstop for a
+session that works past its brief (whatever it leaves uncommitted is then caught
+by the salvage). `prompt` and `phases` are mutually exclusive.
+
+**It is opt-in, and worth understanding before switching it on.** A task that
+reaches its checkpoint and stops is only half finished until the next session
+runs, so this trades a driver that cannot lose a task for one that can leave it
+half-done if the sequence is interrupted. The budget breaker fires at the phase
+boundary too, and hands the task back when it does. The saving on the measured
+curve is 20-28% for a two-way cut; splitting thinner earns less each time while
+every extra boundary still pays a session's full startup cost.
+
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
 

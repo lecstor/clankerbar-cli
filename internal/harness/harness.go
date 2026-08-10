@@ -140,6 +140,17 @@ type Invocation struct {
 	// Probe marks this as a cheap liveness check, not real work — adapters run
 	// the smallest possible request instead of the drain prompt.
 	Probe bool
+	// MaxTurns caps the session's turns so a phase boundary lands even if the
+	// model works past its brief. 0 = uncapped, which is every unphased run.
+	//
+	// It is a BACKSTOP, not the mechanism: the boundary is meant to land because
+	// the phase's prompt scoped the session, and a session cut off here has by
+	// definition been stopped mid-thought. What makes that survivable is the
+	// salvage that already runs on every session end — it commits and pushes
+	// whatever the tree holds — so a hit cap costs a scruffy commit, not work.
+	// An adapter whose CLI has no equivalent ignores it, and the phase then
+	// relies on the prompt alone.
+	MaxTurns int
 }
 
 // Result is the outcome of one session, both raw and parsed.
