@@ -20,22 +20,66 @@ func init() { Register(codex{}) }
 //     unless --json (then a JSONL event stream on stdout).
 //   - No stable limit exit code and rate_limits is null in exec --json, so limit
 //     detection is fuzzy text-matching and there is nothing to introspect.
+//   - Invocation.MCPConfigPath is DELIBERATELY UNUSED. codex has no per-run MCP
+//     flag and no reader for Claude's `.mcp.json` schema; it takes its servers
+//     from `[mcp_servers]` in config.toml under CODEX_HOME, which ConfigDir
+//     already pins. Saying so here because the field is on every Invocation and
+//     silently dropping it read as wiring that was never there: `doctor`'s
+//     workdir check passed a codex workdir green on the strength of an .mcp.json
+//     no codex session would ever see (CLA-263). doctor now states the exclusion
+//     rather than implying the wiring - see MCPConfigUse below.
 type codex struct{}
 
 func (codex) Name() string { return "codex" }
 
-func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
-	var args []string
-	if in.Probe {
-		args = []string{"exec", ".", "--json", "--sandbox", "read-only", "--ask-for-approval", "never"}
-	} else {
-		args = []string{"exec", in.Prompt, "--json", "--sandbox", "workspace-write", "--ask-for-approval", "never"}
-		if in.Model != "" {
-			args = append(args, "-m", in.Model)
-		}
+func (codex) MCPConfigUse() MCPConfigUse {
+	return MCPConfigUse{
+		Schema: MCPConfigUnused,
+		Note: "the codex adapter does not pass mcp_config_path to its sessions - " +
+			"their MCP servers come from [mcp_servers] in config.toml under the config dir (CODEX_HOME)",
 	}
+}
 
-	cmd := exec.CommandContext(ctx, "codex", args...)
+// codexArgs maps an Invocation to `codex exec`'s CLI dialect. Split out so the
+// argument shape is unit-testable without executing anything - the parity with
+// opencodeArgs.
+//
+// The prompt goes LAST, behind a `--` terminator. It is a bare positional, so a
+// prompt that is itself a flag token would be parsed as a flag and the session
+// would run with no message at all (or read one from stdin). Nothing from the
+// BACKLOG can reach argv - Invocation.Prompt is set once from the config's
+// `prompt` (loop.go), there is no --prompt flag, and the backlog client decodes
+// counts rather than strings - so this hardens the config-file path (the CLA-260
+// class), not a live injection hole.
+//
+// The second thing the terminator buys is subcommand disambiguation, and it is
+// codex-specific: `codex exec` takes SUBCOMMANDS - resume, fork, review - in the
+// same position the prompt used to occupy. Under the old shape a prompt of
+// exactly `resume` was consumed as one, and the session ran somebody else's
+// conversation instead of the drain. Behind `--` it is a prompt.
+//
+// CORRECTION to this commit's first message, which justified the reorder as
+// dropping a reliance on "last-wins" for the pinned --sandbox/--ask-for-approval
+// posture: that reliance never existed. Both are clap 4 Option args
+// (ArgAction::Set), which ERROR on a repeated occurrence rather than taking the
+// last one - so a prompt of `--sandbox danger-full-access` made codex exit
+// non-zero, not run write-capable. The old shape was fail-loud. This change
+// PRESERVES that safety property rather than creating it; only the recorded
+// reasoning was wrong, and it is corrected here so the next reader does not build
+// on it.
+func codexArgs(in Invocation) []string {
+	if in.Probe {
+		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}
+	}
+	args := []string{"exec", "--json", "--sandbox", "workspace-write", "--ask-for-approval", "never"}
+	if in.Model != "" {
+		args = append(args, "-m", in.Model)
+	}
+	return append(args, "--", in.Prompt)
+}
+
+func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
+	cmd := exec.CommandContext(ctx, "codex", codexArgs(in)...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}

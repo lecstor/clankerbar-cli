@@ -161,8 +161,9 @@ func TestOpencodeIsTransient(t *testing.T) {
 func TestOpencodeProbeIsReadOnly(t *testing.T) {
 	args := opencodeArgs(Invocation{Probe: true, Prompt: "Work the backlog.", Model: "opencode/claude-haiku-4-5"})
 	joined := strings.Join(args, " ")
-	if !strings.HasPrefix(joined, "run . --format json") {
-		t.Errorf("probe args = %q, want a trivial `run . --format json` request", joined)
+	// The prompt sits last, behind a `--` terminator (see args_test.go).
+	if !strings.HasPrefix(joined, "run --format json") || !strings.HasSuffix(joined, " -- .") {
+		t.Errorf("probe args = %q, want a trivial `run --format json ... -- .` request", joined)
 	}
 	for _, a := range args {
 		if a == "Work the backlog." {
@@ -187,8 +188,8 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 func TestOpencodeDrainInvocation(t *testing.T) {
 	args := opencodeArgs(Invocation{Prompt: "Work the backlog.", Model: "opencode/claude-sonnet-4-5"})
 	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "run Work the backlog. --format json") {
-		t.Errorf("drain args = %q, want the prompt carried into `opencode run`", joined)
+	if !strings.HasPrefix(joined, "run --format json") || !strings.HasSuffix(joined, " -- Work the backlog.") {
+		t.Errorf("drain args = %q, want the prompt carried into `opencode run` behind a `--` terminator", joined)
 	}
 	if !strings.Contains(joined, "--model opencode/claude-sonnet-4-5") {
 		t.Errorf("drain args = %q, want the model passed through", joined)

@@ -89,6 +89,12 @@ type fakeAdapter struct {
 
 func (f *fakeAdapter) Name() string { return "fake" }
 
+// The fake carries the MCPConfigPath through to f.invocations for the delivery
+// tests to assert on, so the Claude reading is the honest one to declare.
+func (f *fakeAdapter) MCPConfigUse() harness.MCPConfigUse {
+	return harness.MCPConfigUse{Schema: harness.MCPConfigClaudeJSON}
+}
+
 func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harness.Result, error) {
 	f.invocations = append(f.invocations, in)
 	i := f.invokeCalls

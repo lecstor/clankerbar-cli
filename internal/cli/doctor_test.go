@@ -12,9 +12,22 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
 // --- helpers -----------------------------------------------------------------
+
+// harnessNote is the adapter's own account of what it does with mcp_config_path,
+// rendered as doctor renders it. Taken from the registry rather than retyped, so
+// a test cannot go on pinning wording the adapter has stopped saying.
+func harnessNote(t *testing.T, name string) string {
+	t.Helper()
+	a, err := harness.Get(name)
+	if err != nil {
+		t.Fatalf("harness.Get(%q): %v", name, err)
+	}
+	return mcpConfigNotCheckedNote(a.MCPConfigUse())
+}
 
 // okEnv is a doctorEnv where everything the world provides works, so each test
 // can break exactly one thing and attribute the result to it.
@@ -850,7 +863,7 @@ func multiRepoParent(t *testing.T, instructions string) string {
 // Sessions spawned in a multi-repo parent with no .mcp.json get no clankerbar
 // tools at all — they run, burn tokens, and cannot see the backlog.
 func TestSessionMultiRepoParentWithoutMCPWarns(t *testing.T) {
-	c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "")
+	c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "", "claude")
 	if c.status != warn {
 		t.Fatalf("multi-repo parent without .mcp.json: got %v, want WARN (%s)", c.status, c.detail)
 	}
@@ -863,7 +876,7 @@ func TestSessionMultiRepoParentWithoutMCPWarns(t *testing.T) {
 // reaches it reads no protocol and no conventions, because a harness loads those
 // from the cwd upward and never from the repos below it.
 func TestSessionWithoutAgentInstructionsWarns(t *testing.T) {
-	c := sessionCheck("workdir", multiRepoParent(t, ""), "/tmp/.mcp.json")
+	c := sessionCheck("workdir", multiRepoParent(t, ""), "/tmp/.mcp.json", "claude")
 	if c.status != warn {
 		t.Fatalf("workdir with no instruction file: got %v, want WARN (%s)", c.status, c.detail)
 	}
@@ -883,7 +896,7 @@ func TestSessionWithoutAgentInstructionsWarns(t *testing.T) {
 func TestSessionAcceptsEitherInstructionFile(t *testing.T) {
 	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
 		t.Run(name, func(t *testing.T) {
-			c := sessionCheck("workdir", multiRepoParent(t, name), "/tmp/.mcp.json")
+			c := sessionCheck("workdir", multiRepoParent(t, name), "/tmp/.mcp.json", "claude")
 			if c.status != pass {
 				t.Fatalf("%s present: got %v, want PASS (%s)", name, c.status, c.detail)
 			}
@@ -897,7 +910,7 @@ func TestSessionAcceptsEitherInstructionFile(t *testing.T) {
 // A workdir that is not there kills every spawn for that project, so it is the
 // one thing here that must FAIL rather than warn.
 func TestSessionMissingWorkdirFails(t *testing.T) {
-	c := sessionCheck("workdir[gone]", filepath.Join(t.TempDir(), "nope"), "")
+	c := sessionCheck("workdir[gone]", filepath.Join(t.TempDir(), "nope"), "", "claude")
 	if c.status != fail {
 		t.Errorf("absent workdir: got %v, want FAIL (%s)", c.status, c.detail)
 	}
@@ -937,7 +950,7 @@ func TestSessionWithoutMCPConfigWarnsEvenWhenNotAParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := sessionCheck("workdir", dir, "")
+	c := sessionCheck("workdir", dir, "", "claude")
 	if c.status != warn {
 		t.Fatalf("single-repo workdir without .mcp.json: got %v, want WARN (%s)", c.status, c.detail)
 	}
@@ -946,6 +959,188 @@ func TestSessionWithoutMCPConfigWarnsEvenWhenNotAParent(t *testing.T) {
 	}
 	if strings.Contains(c.detail, "multi-repo") {
 		t.Errorf("a single checkout must not be described as a multi-repo parent, got %q", c.detail)
+	}
+}
+
+// The codex adapter never hands mcp_config_path to the session it spawns, so the
+// .mcp.json arm of this check cannot say anything true about a codex workdir.
+// Both directions were wrong before CLA-263, and this pins both:
+//
+//   - a workdir WITH an .mcp.json passed green on wiring no codex session gets,
+//     which is the dangerous half - a preflight that passes when the thing it
+//     checks is not true is one an operator learns to trust;
+//   - a workdir WITHOUT one warned, and sent the operator to add a file that
+//     would not have helped.
+//
+// The check now states the exclusion instead, on whichever verdict it reaches.
+func TestSessionCheckDoesNotClaimMCPWiringForCodex(t *testing.T) {
+	withMCP := multiRepoParent(t, "AGENTS.md")
+	if err := os.WriteFile(filepath.Join(withMCP, ".mcp.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name          string
+		dir           string
+		mcpConfigPath string
+	}{
+		{"an .mcp.json is configured", withMCP, filepath.Join(withMCP, ".mcp.json")},
+		{"none is configured", multiRepoParent(t, "AGENTS.md"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := sessionCheck("workdir", tc.dir, tc.mcpConfigPath, "codex")
+
+			if c.status != pass {
+				t.Fatalf("codex workdir: got %v, want PASS - the .mcp.json arm does not apply (%s)", c.status, c.detail)
+			}
+			if strings.Contains(c.detail, ".mcp.json") {
+				t.Errorf("the verdict line must not rest on the .mcp.json for codex, got %q", c.detail)
+			}
+			if !strings.Contains(strings.Join(c.info, "\n"), "not checked") {
+				t.Errorf("a codex workdir check must SAY the .mcp.json was not checked, got info %q", c.info)
+			}
+			if !strings.Contains(strings.Join(c.info, "\n"), "CODEX_HOME") {
+				t.Errorf("the note must point at where codex sessions DO get their MCP servers, got info %q", c.info)
+			}
+		})
+	}
+}
+
+// The same workdir under claude keeps the check it has always had - the exclusion
+// is one harness's, not a hole opened in the check for everyone. claude is the
+// ONLY harness this applies to: it is the only one that reads the file as
+// Claude's `.mcp.json`, which is the premise the missing-file WARN rests on.
+func TestSessionCheckKeepsTheMCPArmForClaude(t *testing.T) {
+	c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "", "claude")
+	if c.status != warn {
+		t.Fatalf("claude workdir without .mcp.json: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, ".mcp.json") {
+		t.Errorf("detail should name the missing .mcp.json, got %q", c.detail)
+	}
+}
+
+// opencode was certified by the first version of this arm, which asked "does the
+// adapter HAND the path to the session". opencode does - as OPENCODE_CONFIG - and
+// then refuses to start, because what arrives is Claude's schema and opencode's
+// servers live under `mcp`. Reproduced against opencode 1.18.2:
+//
+//	Error: Configuration is invalid at <dir>/.mcp.json
+//	  Unrecognized key: mcpServers
+//
+// config.Validate auto-fills mcp_config_path from `<workdir>/.mcp.json` for every
+// harness, so this is not an exotic config: it is what an operator who switches
+// `harness` to opencode in a Claude-shaped checkout gets by default. doctor printed
+// PASS and every session died at spawn - a worse version of the codex bug this
+// check was written to fix (CLA-263).
+//
+// FAIL, not WARN, is the recorded decision: a WARN is advice about a run that will
+// happen, and there is no run here to advise about.
+func TestSessionCheckFailsOpencodePointedAtAClaudeShapedConfig(t *testing.T) {
+	dir := multiRepoParent(t, "AGENTS.md")
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := sessionCheck("workdir", dir, mcp, "opencode")
+	if c.status != fail {
+		t.Fatalf("opencode pointed at a Claude-shaped .mcp.json: got %v, want FAIL (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "mcpServers") {
+		t.Errorf("the detail must name the key opencode rejects, got %q", c.detail)
+	}
+	if !strings.Contains(c.remedy, "OPENCODE_CONFIG") {
+		t.Errorf("the remedy must say where the file goes and under what name, got %q", c.remedy)
+	}
+
+	// The same config under claude is the SUPPORTED one, so the FAIL must be
+	// opencode's and not a new refusal of every .mcp.json.
+	if c := sessionCheck("workdir", dir, mcp, "claude"); c.status != pass {
+		t.Errorf("claude with a Claude-shaped .mcp.json: got %v, want PASS (%s)", c.status, c.detail)
+	}
+}
+
+// The other two opencode shapes must NOT fail. An absent path is normal - opencode
+// carries its own config - and a present non-Claude file is one doctor has no
+// schema to judge. Both get the caveat instead of a verdict, so a PASS is never
+// read as "the clankerbar wiring is there".
+func TestSessionCheckDoesNotClaimMCPWiringForOpencode(t *testing.T) {
+	native := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(native, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name          string
+		mcpConfigPath string
+	}{
+		{"none is configured", ""},
+		{"an opencode-shaped config is configured", native},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), tc.mcpConfigPath, "opencode")
+			if c.status != pass {
+				t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
+			}
+			if strings.Contains(c.detail, ".mcp.json") {
+				t.Errorf("the verdict line must not rest on the .mcp.json for opencode, got %q", c.detail)
+			}
+			if !strings.Contains(strings.Join(c.info, "\n"), "OPENCODE_CONFIG") {
+				t.Errorf("an opencode workdir must SAY where its MCP servers come from, got info %q", c.info)
+			}
+		})
+	}
+}
+
+// The backstop for the hole the first fix left: it gated the arm on a `switch`
+// with `default: return true`, so registering a codex-shaped adapter would have
+// earned a silent green with no test failing. The declaration now lives on
+// harness.Adapter, so the COMPILER asks a new adapter the question - and this
+// walks the registry to check doctor was taught what to do with every answer
+// given, which the compiler cannot do for a switch on an int.
+//
+// A new harness makes this fail until sessionCheck handles it. That is the point.
+func TestEveryRegisteredHarnessIsClassifiedByTheWorkdirCheck(t *testing.T) {
+	dir := multiRepoParent(t, "AGENTS.md")
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, name := range harness.Names() {
+		t.Run(name, func(t *testing.T) {
+			a, err := harness.Get(name)
+			if err != nil {
+				t.Fatalf("harness.Get(%q): %v", name, err)
+			}
+			use := a.MCPConfigUse()
+			switch use.Schema {
+			case harness.MCPConfigClaudeJSON, harness.MCPConfigUnused, harness.MCPConfigNative:
+			default:
+				t.Fatalf("%s declares MCPConfigUse schema %d, which sessionCheck does not handle", name, use.Schema)
+			}
+			// Anything other than the Claude reading is a surprise to the operator,
+			// so it owes them a sentence saying where their servers really come from.
+			if use.Schema != harness.MCPConfigClaudeJSON && strings.TrimSpace(use.Note) == "" {
+				t.Errorf("%s does not read mcp_config_path as Claude's .mcp.json and must say what it does instead", name)
+			}
+
+			// And the check must reach a verdict it can defend, with the file present
+			// and absent alike: never a PASS that leans on an .mcp.json this harness
+			// does not read as Claude's.
+			for _, path := range []string{mcp, ""} {
+				c := sessionCheck("workdir", dir, path, name)
+				if c.status != pass || use.Schema == harness.MCPConfigClaudeJSON {
+					continue
+				}
+				if !strings.Contains(strings.Join(c.info, "\n"), "not checked") {
+					t.Errorf("%s passed (mcp_config_path=%q) without saying the .mcp.json was not checked: info %q, detail %q", name, path, c.info, c.detail)
+				}
+			}
+		})
 	}
 }
 
@@ -1364,6 +1559,48 @@ func TestDoctorRunSucceedsWhenOnlyWarnings(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "WARN") {
 		t.Errorf("expected warnings in output:\n%s", out.String())
+	}
+}
+
+// The codex exclusion has to survive the trip through the renderer, because the
+// rendered line is the whole artifact: a PASS whose caveat never reached stdout
+// is exactly the reassurance CLA-263 was about. `remedy` would not do - it is
+// suppressed under PASS by design - so the note rides on `info`, which prints
+// under every status.
+func TestDoctorRunPrintsTheCodexMCPCaveat(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# orientation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "clankerbar.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"harness":"codex","workdir":"`+dir+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	if err := doctorRun(context.Background(), &out, cfgPath, config.Overrides{}, okEnv()); err != nil {
+		t.Fatalf("doctorRun: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), harnessNote(t, "codex")) {
+		t.Errorf("the codex .mcp.json caveat never reached the operator:\n%s", out.String())
+	}
+
+	// The same config under claude must NOT carry it - the exclusion is one
+	// harness's, and a caveat printed everywhere is one nobody reads.
+	claudeCfg := filepath.Join(t.TempDir(), "clankerbar.json")
+	if err := os.WriteFile(claudeCfg, []byte(`{"harness":"claude","workdir":"`+dir+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var claudeOut strings.Builder
+	if err := doctorRun(context.Background(), &claudeOut, claudeCfg, config.Overrides{}, okEnv()); err != nil {
+		t.Fatalf("doctorRun (claude): %v\n%s", err, claudeOut.String())
+	}
+	if strings.Contains(claudeOut.String(), "not checked") {
+		t.Errorf("claude picked up codex's caveat:\n%s", claudeOut.String())
 	}
 }
 
