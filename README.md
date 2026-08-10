@@ -392,6 +392,69 @@ wrong tree is worse than not checking.
 This covers **unattended runs only**, by design: an interactive session bypasses
 the driver entirely.
 
+### Rescuing work a killed session left behind
+
+A usage limit kills a session mid-turn. There is no graceful shutdown, so the
+protocol's *commit, push, record the branch before you let go* never runs — there
+is no *before*. The uncommitted work survives in the worktree and nowhere else:
+invisible to the plane, invisible to another machine, invisible to the next
+session. The lease then expires with no branch recorded, the task correctly
+returns to `ready`, and the next clanker starts from nothing — redoing hours of
+work sitting intact on the same disk. One such task cost 112.7M tokens, a third
+of a day's spend, for work that was done twice.
+
+So when a session ends still holding a task, the driver looks for the worktree it
+was working in and, if anything is uncommitted, **commits it, pushes it, and
+records the branch on the task** — turning a redo into a takeover:
+
+```
+salvaged CLA-314: committed the uncommitted work in /Users/you/dev/acme-wt/cc561415
+as 4a91c0de and pushed it to origin/clanker/cc561415-a-session-killed-mid-task
+recorded clanker/cc561415-a-session-killed-mid-task as the hand-off branch for
+CLA-314 — the next clanker takes it over instead of starting again
+```
+
+**On every abrupt ending, not only a usage limit.** A crash, a killed process and
+a limit are different to the supervisor and identical to the worktree, and the
+limit is only detected by parsing a stream that may not have arrived whole.
+Running it when it was not needed costs nothing: a clean worktree commits
+nothing, pushes nothing, and records nothing — an empty hand-off would send the
+next clanker to fetch a branch with nothing on it, which is worse than recording
+none at all.
+
+**It commits work it cannot vouch for, and says so.** The driver cannot tell a
+half-applied refactor from good work, and the failure it exists to prevent is
+caused by dropping work, never by keeping it. So the commit lands with a subject
+that reads `WIP salvage: … (unreviewed, may not build)` and a body saying in as
+many words that nothing here was reviewed, built or tested. It skips hooks and
+commit signing on purpose: a lint hook would reject exactly the half-finished
+tree this exists to save, and a signing passphrase has nobody to ask at 3am.
+**One exception**: a worktree holding an unresolved conflict is left exactly as
+it is, because committing it would record a state nobody chose — it would
+fabricate a resolution out of the conflict markers and push a file that reads as
+source with `<<<<<<<` in it. That covers both a git operation still in flight (a
+merge, rebase, cherry-pick or revert) and a conflict nothing is holding open: a
+`git stash pop`, `git apply --3way` or `git checkout -m` leaves unmerged entries
+with no state file at all, so the unmerged index is checked as well as the
+operation. Either way it is logged as `STRANDED WORK LEFT AS IS` with the path.
+
+**It cannot touch a tree that is not this task's.** The worktree is identified by
+its checked-out branch carrying `clanker/<first 8 characters of the task id>` —
+the *task-id* half, not the title-derived slug, so a task retitled mid-flight is
+still matched. A detached HEAD is never matched, `main` and `staging` can never
+match, and two trees answering to the same task is reported rather than guessed
+at. Nothing is ever forced: no `push --force`, no checkout, no branch creation,
+no worktree removal. A push the remote rejects leaves the commit safely on this
+machine and records **no** branch — a recorded branch is a promise that another
+machine can fetch it.
+
+**Recording a branch is not settling a claim.** The record carries no status, so
+it cannot move a task, clear a holder, or post `ready` over work already in
+review — which is why it is still safe on a session whose output could not be
+read whole, where handing the claim back is forbidden. Once a branch *is*
+recorded, the claim is deliberately not handed back either: the lease expires and
+the task stays a takeover, so the next clanker is told there is work to fetch.
+
 ### Skills, plugins, and auth
 
 A headless session loads **project** skills from the working directory
