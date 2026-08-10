@@ -83,6 +83,18 @@ func (s Summary) Settled() int { return s.InReview + s.Done }
 // by a session, and no session is spawned because nothing reads as claimable. The
 // gate prevented the one call that could clear it. A session spawned on the
 // strength of stale WIP alone is not a wasted one — it is the recovery.
+//
+// WHAT BOUNDS A RECOVERY THAT NEVER FINISHES is the plane, and it has to be,
+// because the loop's own breaker cannot: a takeover RENEWS the branch's lease, so
+// the task drops out of this count until the lease lapses again, and the settled
+// poll in between reads as idle and forgets the strike. The count does not climb
+// across successive takeovers of one branch. The plane closes that instead — it
+// counts hand-offs per task and parks a branch that has exhausted its allowance,
+// raising a question rather than offering it a further time, which removes it from
+// `staleClaimable` permanently. Do NOT reach for a local bound here: suppressing
+// the idle reset while work is in progress is the narrowing decision 2026-08-09
+// (CLA-249) explicitly rejected, because it reinstates an immortal `quiet` count
+// for exactly the projects that hold abandoned WIP.
 func (s Summary) Spawnable() bool { return s.Claimable+s.StaleClaimable > 0 }
 
 // Poller reads the backlog summary cheaply.

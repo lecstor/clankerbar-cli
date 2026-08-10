@@ -264,9 +264,19 @@ as something to spawn for. A project can hold a branch whose session died, and t
 sweep that hands it back runs only when an agent asks the plane for its next task
 — so if the loop declined to spawn while the ready queue was empty, nothing would
 ever ask, and the branch would sit there for good. The gate is `claimable +
-stale_claimable`, both of which the queue line reports, and a target recovering
-abandoned work is *spending sessions*, so those drains are charged against the
-back-off like any other.
+stale_claimable`, both of which the queue line reports.
+
+**What bounds a recovery that never finishes is the plane, not this back-off.**
+Taking a branch over renews its lease, so the task stops being offerable until the
+lease lapses again — and the poll in between reads as idle and forgets the strike.
+The count therefore does *not* climb across successive takeovers of one branch, and
+the local back-off will usually never reach its threshold. That is deliberate: the
+plane counts hand-offs per task, and once a branch has defeated its allowance it is
+**parked and raised to you as a question** instead of being offered again, which
+drops it out of `stale_claimable` for good. So the spend is bounded per branch by
+the plane, at a session or so per lease period, rather than by three strikes here.
+The local back-off still bites the case it was built for — a target that keeps
+being offered the *same* unfinishable work without the lease resetting.
 
 Three rather than one, because a genuinely large task can span several sessions
 before anything reaches a reviewer, and backing off then would throttle exactly

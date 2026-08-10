@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1264,6 +1265,31 @@ func TestRun_ConsolePause(t *testing.T) {
 	})
 }
 
+// The queue line is a bar clause in its own right: an operator watching the console
+// has to be able to tell "spawning because there is fresh work" from "spawning to
+// recover an abandoned branch". Before CLA-274 the second did not happen, so the
+// line did not have to distinguish them; now it does, and a count that only reaches
+// the gate would leave the two indistinguishable on screen.
+func TestRun_QueueLineReportsTheStaleCount(t *testing.T) {
+	var logged strings.Builder
+	prev := log.Writer()
+	log.SetOutput(&logged)
+	t.Cleanup(func() { log.SetOutput(prev) })
+
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(0, 0)}}}
+	p := &fakePoller{sum: backlog.Summary{Ready: 0, Claimable: 0, InProgress: 2, StaleClaimable: 2}}
+
+	if err := runLoop(t, cfg, h, p); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if got := logged.String(); !strings.Contains(got, "claimable=0 stale_claimable=2") {
+		t.Errorf("the queue line must report the stale count beside claimable; got:\n%s", got)
+	}
+}
+
 // The deadlock CLA-274 closes, end to end through Run. A project whose ready queue
 // has emptied while it holds an abandoned branch used to be wedged shut: the gate
 // read `claimable == 0` and spawned nothing, nothing called next_task, and the
@@ -1347,10 +1373,13 @@ func TestRun_ConsolePauseOutranksAbandonedWIP(t *testing.T) {
 // charges those drains and backs the target off after quietThreshold fruitless
 // ones, instead of forgetting the count every poll.
 //
-// That is the wanted composition, not a regression: the target IS spending
-// sessions, so the breaker that exists to bound repeated fruitless spend must see
-// them. The failure it prevents is the real one here — a branch nobody can finish
-// would otherwise spawn a recovery session every poll, for ever.
+// This is the case where the branch STAYS offerable across the drains — a session
+// that declined the takeover, or a second abandoned branch behind the first. There
+// the strikes accumulate and the breaker bites, which is what this pins.
+//
+// It is deliberately not the whole story, and the sibling test below is the other
+// half: once a session actually TAKES a branch over, the lease renews and the count
+// does not climb. What bounds that is the plane, not this breaker.
 func TestJudgeProgressChargesRecoveryDrainsRatherThanReadingThemAsIdle(t *testing.T) {
 	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
 	recovering := backlog.Summary{Claimable: 0, InProgress: 1, StaleClaimable: 1}
@@ -1382,6 +1411,44 @@ func TestJudgeProgressChargesRecoveryDrainsRatherThanReadingThemAsIdle(t *testin
 	d.judgeProgress(0, backlog.Summary{})
 	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
 		t.Errorf("with the branch cleared the target is idle again; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	}
+}
+
+// The half the local breaker does NOT bound, asserted rather than left to be
+// discovered on a live run. A takeover RENEWS the branch's lease, so the task stops
+// being offerable and `stale_claimable` drops to 0 — and the settled poll before
+// the lease lapses again reads as idle and forgets the strike. So `quiet`
+// oscillates and never reaches quietThreshold, however many times the loop retries
+// one unfinishable branch.
+//
+// That is not an oversight to fix here. The bound is the PLANE's: it counts
+// hand-offs per task and parks a branch that has exhausted its allowance, raising a
+// question instead of offering it again, at which point it leaves `stale_claimable`
+// for good. A local bound would mean suppressing the idle reset while work is in
+// progress, which is precisely the narrowing CLA-249 weighed and rejected — it
+// reinstates an immortal `quiet` count for every project holding abandoned WIP.
+//
+// This test exists so that if someone later "fixes" the oscillation locally, they
+// have to delete a test whose comment tells them why not.
+func TestJudgeProgressDoesNotAccumulateStrikesAcrossTakeoversOfOneBranch(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	offered := backlog.Summary{Claimable: 0, InProgress: 1, StaleClaimable: 1}
+	// The lease is fresh again because a session took the branch over: still one
+	// task in progress, but nothing offerable, so nothing to spawn for.
+	takenOver := backlog.Summary{Claimable: 0, InProgress: 1, StaleClaimable: 0}
+
+	for range quietThreshold + 2 {
+		d.pending[0] = true
+		d.judgeProgress(0, takenOver) // the verdict on a drain that settled nothing
+		d.judgeProgress(0, takenOver) // settled poll, lease still live -> reads idle
+		d.judgeProgress(0, offered)   // lease lapsed, offered again
+	}
+
+	if d.quiet[0] != 0 {
+		t.Errorf("the strike is forgotten while the lease is live, so the count cannot climb; quiet=%d, want 0", d.quiet[0])
+	}
+	if d.backedOff(0) {
+		t.Error("and the local breaker therefore never bites here — the plane's reclaim bound is what stops this")
 	}
 }
 
