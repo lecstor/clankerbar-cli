@@ -8,9 +8,16 @@ import (
 // The prompt is a bare POSITIONAL for codex (`codex exec <prompt>`) and opencode
 // (`opencode run <message..>`), and a positional that begins with `-` is read as
 // a flag. The failure mode is not a corrupted message - it is a session that runs
-// with NO message at all, or blocks reading one from stdin, and on codex it used
-// to leave the pinned `--sandbox`/`--ask-for-approval` posture surviving only on
-// last-wins.
+// with NO message at all, or blocks reading one from stdin. On codex there is a
+// second one: `codex exec` has SUBCOMMANDS (resume, fork, review) in the prompt's
+// old position, so a prompt of exactly `resume` was taken as one and the session
+// ran a stored conversation instead of the drain.
+//
+// It is NOT that the pinned `--sandbox`/`--ask-for-approval` posture used to
+// survive on last-wins - the commit that added this said so and was wrong. Those
+// are clap 4 Option args (ArgAction::Set): a repeated occurrence is an ERROR, not
+// a silent override, so the old shape failed loud. The terminator preserves that
+// property; it did not introduce it.
 //
 // Nothing from the BACKLOG can get here: Invocation.Prompt is set once from the
 // config's `prompt`, there is no --prompt flag, and the backlog client decodes
@@ -26,9 +33,9 @@ var terminatorAdapters = []struct {
 	args func(Invocation) []string
 	// wantFlags is every argument the adapter emits for a drain, which must all
 	// sit AHEAD of the terminator. A flag that fell behind it is not merely
-	// misplaced: the child would read it as more message, so the posture it sets
-	// is silently not applied - which is how codex's pinned --sandbox used to
-	// depend on last-wins.
+	// misplaced: the child reads it as more message, so the posture it sets is
+	// silently not applied at all - the sandbox pin would be absent rather than
+	// overridden, and codex's own default would decide the session's write access.
 	wantFlags []string
 }{
 	{"codex", codexArgs, []string{
@@ -37,21 +44,34 @@ var terminatorAdapters = []struct {
 	{"opencode", opencodeArgs, []string{"--format", "json", "--model", "some/model"}},
 }
 
-// promptsThatLookLikeFlags are the shapes that actually bite: a bare terminator,
-// a long flag the target CLI really has (so it would be ACCEPTED, not rejected),
-// and a short one.
-var promptsThatLookLikeFlags = []string{
+// promptsTheParserWouldSteal are the shapes that actually bite: a bare
+// terminator, a long flag the target CLI really has (so it would be ACCEPTED, not
+// rejected), a short one, a lone `-`, and a subcommand name.
+var promptsTheParserWouldSteal = []string{
 	"--",
 	"--json",
 	"--sandbox",
 	"--format",
 	"-m",
 	"--help Work the backlog.",
+
+	// A lone `-` is the one case in the original threat model the first fix did
+	// not close, because it is not a flag: both CLIs read it as "take the
+	// instructions from stdin", and cmd.Stdin is nil for every Invocation the loop
+	// builds (codex.go, opencode.go), so the session gets an immediate EOF and no
+	// instructions at all. Degenerate as a config value, free to cover.
+	"-",
+
+	// Not flag-shaped, and stolen anyway: `codex exec` has subcommands - resume,
+	// fork, review - in the position the prompt used to sit in, so this ran a
+	// stored conversation rather than the drain. Kept in the shared table because
+	// costing opencode one extra case is cheaper than a second table.
+	"resume",
 }
 
-func TestPromptBeginningWithADashArrivesAsTheMessage(t *testing.T) {
+func TestAPromptTheParserWouldStealArrivesAsTheMessage(t *testing.T) {
 	for _, a := range terminatorAdapters {
-		for _, prompt := range promptsThatLookLikeFlags {
+		for _, prompt := range promptsTheParserWouldSteal {
 			t.Run(a.name+"/"+prompt, func(t *testing.T) {
 				args := a.args(Invocation{Prompt: prompt, Model: "some/model"})
 

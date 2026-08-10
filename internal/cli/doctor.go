@@ -824,40 +824,41 @@ func projectMCPConfig(cfg *config.Config, p config.Project) string {
 	return cfg.MCPConfigPath
 }
 
-// mcpConfigReachesSession reports whether the configured harness actually hands
-// `mcp_config_path` to the sessions it spawns.
+// mcpConfigIsClaudeShaped reports whether the file at path declares Claude's
+// `mcpServers` block - the shape config.Validate auto-discovers from a workdir's
+// `.mcp.json`.
 //
-// Two of the three do: claude takes it as `--mcp-config` (with
-// `--strict-mcp-config`), opencode gets it as `OPENCODE_CONFIG`. The codex
-// adapter does NOT, and cannot - codex has no per-run MCP flag and reads its
-// servers from `[mcp_servers]` in config.toml under CODEX_HOME. The field is
-// inert there (harness/codex.go says so at the type).
-//
-// This gates the `.mcp.json` half of the workdir check, because a check whose
-// premise is false is worse than no check at all. It reported a codex workdir
-// PASS on the strength of an `.mcp.json` no codex session would ever be handed,
-// and when the file was missing it sent the operator to add one that would not
-// have helped - a preflight that passes when the thing it checks is not true is
-// how an operator learns to trust it (CLA-263).
-//
-// Stated as "which harnesses DO" rather than "codex does not", so a harness added
-// without an MCP path stays honest by default: an unknown name is assumed to
-// carry it, which is the reading that makes the check speak up rather than go
-// quiet. Today's registry has no such case.
-func mcpConfigReachesSession(harnessName string) bool {
-	switch harnessName {
-	case "codex":
+// It answers only on POSITIVE evidence. An empty path, an unreadable file or one
+// that will not parse all return false, because each of those is already someone
+// else's check (config.Validate fails closed on an unparseable MCP config) and a
+// preflight that guesses at a file it could not read is how this arm went wrong in
+// the first place.
+func mcpConfigIsClaudeShaped(path string) bool {
+	if path == "" {
 		return false
-	default:
-		return true
 	}
+	// Validate has already expanded a leading ~, so this is the same path the
+	// harness will be handed.
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(data, &top); err != nil {
+		return false
+	}
+	_, ok := top["mcpServers"]
+	return ok
 }
 
-// codexMCPNote is what the workdir check says INSTEAD of a verdict on the
-// `.mcp.json`, on every status it can still reach - so a PASS never reads as
-// "the clankerbar wiring is there".
-const codexMCPNote = ".mcp.json not checked: the codex adapter does not pass mcp_config_path to its sessions - " +
-	"their MCP servers come from [mcp_servers] in config.toml under the config dir (CODEX_HOME)"
+// mcpConfigNotCheckedNote is the workdir check's stand-in for a verdict on the
+// `.mcp.json`, printed on every status it can still reach - so a PASS never reads
+// as "the clankerbar wiring is there". The harness supplies the second half,
+// because where a session really gets its MCP servers is a fact about the adapter
+// and belongs next to the code that proves it.
+func mcpConfigNotCheckedNote(use harness.MCPConfigUse) string {
+	return ".mcp.json not checked: " + use.Note
+}
 
 func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 	c := check{name: name}
@@ -884,27 +885,82 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 
 	parent := isMultiRepoParent(resolved)
 
-	// A session with no .mcp.json reaching it gets no clankerbar tools at all — it
-	// starts, burns tokens, and cannot see the backlog. config.Validate has already
-	// defaulted this to <workdir>/.mcp.json when that file exists, so an empty value
-	// here means none was found and none was configured.
+	// The `.mcp.json` arm, and what the configured harness makes of that file.
 	//
-	// This is NOT gated on the multi-repo-parent shape: a plain single-repo workdir
-	// with no .mcp.json blinds its sessions just as completely. `parent` only
-	// selects the wording, because that is the case an operator is most likely to
-	// have reached by accident.
-	switch {
-	case !mcpConfigReachesSession(harnessName):
-		// Say the exclusion out loud and carry it onto whatever verdict follows.
-		c.info = append(c.info, codexMCPNote)
-	case mcpConfigPath == "":
+	// The question this used to ask was "does the adapter HAND the path to the
+	// session", and that question certifies opencode, which does hand it over and
+	// then dies on it. The question it asks now is the one the check actually rests
+	// on: does the file MEAN anything to this harness. Only the adapter knows, so
+	// only the adapter is asked (harness.Adapter.MCPConfigUse) - see CLA-263.
+	adapter, err := harness.Get(harnessName)
+	if err != nil {
+		// config.Validate rejects an unregistered harness long before doctor runs,
+		// so this is all but unreachable in practice. It refuses to guess anyway:
+		// assuming a default for an unknown harness is the precise shape of the bug
+		// this arm is being fixed for.
 		c.status = warn
-		if parent {
-			c.detail = workdirLabel(dir) + " looks like a multi-repo parent and has no .mcp.json"
-		} else {
-			c.detail = workdirLabel(dir) + " has no .mcp.json"
+		c.detail = workdirLabel(dir) + ": " + err.Error()
+		c.remedy = "set harness to one of: " + strings.Join(harness.Names(), ", ")
+		return c
+	}
+	use := adapter.MCPConfigUse()
+
+	switch use.Schema {
+	case harness.MCPConfigUnused:
+		// The file is inert for this harness. Say the exclusion out loud and carry
+		// it onto whatever verdict follows, rather than reporting on it either way.
+		c.info = append(c.info, mcpConfigNotCheckedNote(use))
+
+	case harness.MCPConfigNative:
+		// The path IS handed over, but read in the harness's own schema. A
+		// Claude-shaped file here is not "no clankerbar tools", it is a config the
+		// harness refuses to start on - every iteration dies at spawn, forever. That
+		// is strictly worse than the missing-file case below, so it FAILs rather
+		// than WARNs: a WARN is advice, and there is no run to advise about.
+		if mcpConfigIsClaudeShaped(mcpConfigPath) {
+			c.status = fail
+			c.detail = mcpConfigPath + " is a Claude-shaped .mcp.json (`mcpServers`), which " + harnessName + " cannot read"
+			// Deliberately not "or unset it": an empty mcp_config_path re-runs the
+			// <workdir>/.mcp.json discovery (config.discoverMCPConfig), which is
+			// harness-blind, so removing the setting hands the same file over again.
+			// Naming a config the harness can read is the only remedy that works.
+			c.remedy = "point mcp_config_path at a " + harnessName + " config - " + use.Note
+			return c
 		}
-		c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools"
+		// Otherwise there is nothing here we can honestly verdict on: an absent
+		// path is normal for this harness, and a present non-Claude one we have no
+		// schema to judge.
+		c.info = append(c.info, mcpConfigNotCheckedNote(use))
+
+	case harness.MCPConfigClaudeJSON:
+		// A session with no .mcp.json reaching it gets no clankerbar tools at all — it
+		// starts, burns tokens, and cannot see the backlog. config.Validate has already
+		// defaulted this to <workdir>/.mcp.json when that file exists, so an empty value
+		// here means none was found and none was configured.
+		//
+		// This is NOT gated on the multi-repo-parent shape: a plain single-repo workdir
+		// with no .mcp.json blinds its sessions just as completely. `parent` only
+		// selects the wording, because that is the case an operator is most likely to
+		// have reached by accident.
+		if mcpConfigPath == "" {
+			c.status = warn
+			if parent {
+				c.detail = workdirLabel(dir) + " looks like a multi-repo parent and has no .mcp.json"
+			} else {
+				c.detail = workdirLabel(dir) + " has no .mcp.json"
+			}
+			c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools"
+			return c
+		}
+
+	default:
+		// A schema added to harness but not taught to doctor. Go will not make this
+		// a compile error, so it is made LOUD instead of silent - the whole point of
+		// CLA-263 is that this arm must never pass a workdir on a premise it has not
+		// checked.
+		c.status = warn
+		c.detail = workdirLabel(dir) + ": doctor cannot judge mcp_config_path for harness " + harnessName
+		c.remedy = "teach sessionCheck this harness's MCPConfigUse schema before trusting a green workdir here"
 		return c
 	}
 

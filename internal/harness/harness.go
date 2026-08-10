@@ -61,7 +61,62 @@ type Adapter interface {
 	// ErrUsageUnsupported and the loop falls back to the self-accounted Budget.
 	// Kept in the contract because it is the right seam the day one adds it.
 	ReadUsage(ctx context.Context, in Invocation) (Usage, error)
+
+	// MCPConfigUse declares what this adapter does with Invocation.MCPConfigPath,
+	// so a preflight can say something TRUE about the operator's `.mcp.json`
+	// instead of inferring one from the field's existence.
+	//
+	// It is on the interface, not a lookup table in cli, because a table is not
+	// coupled to the registry: the first version of this lived in doctor as a
+	// switch with `default: return true`, and registering an adapter that did not
+	// carry the config would have silently earned a green workdir with no test
+	// failing (CLA-263). Here the compiler asks the question at the moment an
+	// adapter is written, which is the only moment the answer is known.
+	MCPConfigUse() MCPConfigUse
 }
+
+// MCPConfigUse is one adapter's answer about Invocation.MCPConfigPath: whether
+// the path reaches the session at all, in which schema it is read if it does,
+// and where that harness's sessions really get their MCP servers.
+type MCPConfigUse struct {
+	Schema MCPConfigSchema
+
+	// Note is operator-facing prose naming where this harness's sessions ACTUALLY
+	// get their MCP servers. `doctor` prints it verbatim, so it must read as a
+	// sentence and must not assume the reader knows the adapter. Required for
+	// every schema except MCPConfigClaudeJSON, where there is nothing surprising
+	// to explain.
+	Note string
+}
+
+// MCPConfigSchema is what a harness makes of the file at Invocation.MCPConfigPath.
+//
+// The distinction that matters is NOT "does the adapter hand the path over" -
+// that is the question doctor used to ask, and opencode answers it yes while
+// still dying on the file. It is "does that file MEAN anything to that harness".
+type MCPConfigSchema int
+
+const (
+	// MCPConfigUnused: the path never reaches the session. The adapter drops the
+	// field, so the file on disk is inert - neither its presence nor its absence
+	// tells an operator anything about the tools their sessions will have. codex
+	// is this: no per-run MCP flag, servers come from config.toml under CODEX_HOME.
+	MCPConfigUnused MCPConfigSchema = iota
+
+	// MCPConfigClaudeJSON: the path is handed over and read as Claude Code's
+	// `.mcp.json` - servers under `mcpServers`. This is the only case where a
+	// present-and-Claude-shaped file really does give the session its clankerbar
+	// tools, and so the only case where checking for one is a true check.
+	MCPConfigClaudeJSON
+
+	// MCPConfigNative: the path is handed over, but read in the HARNESS'S OWN
+	// schema. A Claude-shaped `.mcp.json` here is not merely useless, it is a
+	// config error the harness refuses to start on - so pointing this harness at
+	// one is worse than pointing it at nothing. opencode is this: the path becomes
+	// OPENCODE_CONFIG, whose servers live under `mcp`, and opencode rejects an
+	// unrecognised top-level key outright.
+	MCPConfigNative
+)
 
 // Invocation is everything a harness needs to run one session. The loop builds it
 // from config; adapters translate it into their own CLI dialect.

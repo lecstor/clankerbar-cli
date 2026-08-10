@@ -29,6 +29,12 @@ type claude struct{}
 
 func (claude) Name() string { return "claude" }
 
+// claude is the one harness for which `mcp_config_path` means what its name
+// suggests: the file is passed as --mcp-config (with --strict-mcp-config) and
+// read as Claude's own `.mcp.json`, so a present one really does hand the
+// session its clankerbar tools. No note - there is nothing surprising to say.
+func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfigClaudeJSON} }
+
 func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if in.Probe {
 		return c.probe(ctx, in)

@@ -426,8 +426,24 @@ the likely final format.)
 ```
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
-headless mode does not auto-discover it, so the default is what gives spawned
-sessions their clankerbar tools (and gives the driver a project slug to poll with).
+headless mode does not auto-discover it, so **under `harness: "claude"`** the default
+is what gives spawned sessions their clankerbar tools. It always gives the driver a
+project slug to poll with, whichever harness is configured.
+
+**The other two harnesses do not read that file, and one of them chokes on it.**
+The default is applied regardless of harness, so this matters the moment you switch:
+
+| harness | what it does with `mcp_config_path` |
+| --- | --- |
+| `claude` | passed as `--mcp-config` (with `--strict-mcp-config`) and read as Claude's `.mcp.json`. |
+| `codex` | **ignored.** codex has no per-run MCP flag; its servers come from `[mcp_servers]` in `config.toml` under `CODEX_HOME` (which `config_dir` pins). |
+| `opencode` | passed as `OPENCODE_CONFIG`, and **must be an opencode config** - servers under `mcp`, not Claude's `mcpServers`. Pointed at a Claude-shaped `.mcp.json`, opencode refuses to start and every session dies at spawn. |
+
+Under `opencode`, set `mcp_config_path` **explicitly** to an opencode config. Leaving
+it out does not opt out: an empty value re-runs the `<workdir>/.mcp.json` discovery,
+so a workdir that carries a Claude `.mcp.json` hands it over no matter what. Run
+`clankerbar doctor` - it prints the caveat instead of a verdict where the file is not
+read, and FAILs the workdir check when `opencode` is pointed at a Claude-shaped one.
 
 Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at the
 root here is the maintainers' own agent wiring and names the `clankerbar` project

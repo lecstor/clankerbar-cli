@@ -29,10 +29,18 @@ func init() { Register(codex{}) }
 //     silently dropping it read as wiring that was never there: `doctor`'s
 //     workdir check passed a codex workdir green on the strength of an .mcp.json
 //     no codex session would ever see (CLA-263). doctor now states the exclusion
-//     rather than implying the wiring - see cli.mcpConfigReachesSession.
+//     rather than implying the wiring - see MCPConfigUse below.
 type codex struct{}
 
 func (codex) Name() string { return "codex" }
+
+func (codex) MCPConfigUse() MCPConfigUse {
+	return MCPConfigUse{
+		Schema: MCPConfigUnused,
+		Note: "the codex adapter does not pass mcp_config_path to its sessions - " +
+			"their MCP servers come from [mcp_servers] in config.toml under the config dir (CODEX_HOME)",
+	}
+}
 
 // codexArgs maps an Invocation to `codex exec`'s CLI dialect. Split out so the
 // argument shape is unit-testable without executing anything - the parity with
@@ -46,9 +54,21 @@ func (codex) Name() string { return "codex" }
 // counts rather than strings - so this hardens the config-file path (the CLA-260
 // class), not a live injection hole.
 //
-// Putting every flag AHEAD of the terminator is the other half. The pinned
-// posture used to sit after the positional and survive only by last-wins; now
-// nothing follows the prompt, so there is no ordering left to reason about.
+// The second thing the terminator buys is subcommand disambiguation, and it is
+// codex-specific: `codex exec` takes SUBCOMMANDS - resume, fork, review - in the
+// same position the prompt used to occupy. Under the old shape a prompt of
+// exactly `resume` was consumed as one, and the session ran somebody else's
+// conversation instead of the drain. Behind `--` it is a prompt.
+//
+// CORRECTION to this commit's first message, which justified the reorder as
+// dropping a reliance on "last-wins" for the pinned --sandbox/--ask-for-approval
+// posture: that reliance never existed. Both are clap 4 Option args
+// (ArgAction::Set), which ERROR on a repeated occurrence rather than taking the
+// last one - so a prompt of `--sandbox danger-full-access` made codex exit
+// non-zero, not run write-capable. The old shape was fail-loud. This change
+// PRESERVES that safety property rather than creating it; only the recorded
+// reasoning was wrong, and it is corrected here so the next reader does not build
+// on it.
 func codexArgs(in Invocation) []string {
 	if in.Probe {
 		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}

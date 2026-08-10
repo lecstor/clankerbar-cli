@@ -39,6 +39,27 @@ type opencode struct{}
 
 func (opencode) Name() string { return "opencode" }
 
+// opencode DOES receive mcp_config_path - as OPENCODE_CONFIG (see env below) -
+// and that is exactly why "does the adapter hand it over" was the wrong question
+// to gate a preflight on. What arrives has to be an opencode config, whose
+// servers live under `mcp`; the Claude-shaped `.mcp.json` that config.Validate
+// auto-discovers from the workdir is a different schema, and opencode does not
+// ignore the difference. Verified against opencode 1.18.2:
+//
+//	$ OPENCODE_CONFIG=<dir>/.mcp.json opencode run --format json ... -- hi
+//	Error: Configuration is invalid at <dir>/.mcp.json
+//	  Unrecognized key: mcpServers
+//
+// So every session dies at startup, which is why doctor treats that combination
+// as a FAIL rather than a missing-tools WARN (CLA-263).
+func (opencode) MCPConfigUse() MCPConfigUse {
+	return MCPConfigUse{
+		Schema: MCPConfigNative,
+		Note: "the opencode adapter passes mcp_config_path as OPENCODE_CONFIG, which must be an opencode " +
+			"config (servers under `mcp`, not Claude's `mcpServers`) - opencode refuses to start on a file it cannot parse",
+	}
+}
+
 func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	args := opencodeArgs(in)
 
