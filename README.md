@@ -252,12 +252,31 @@ So after **three consecutive sessions that settle nothing** — nothing reaching
 `in_review` or `done` — the loop backs that project off for 15 minutes, then 30,
 then an hour, capped at two. Other projects keep draining.
 
-So does the queue simply going quiet. A poll that shows nothing claimable at all
+So does the queue simply going quiet. A poll that shows nothing to spawn for at all
 means the project is *idle*, not fruitless — there is nothing for the loop to
 spawn, so it has not failed at anything — and the count is forgotten along with
 any wait still running. Without that, parking the blocker would leave the count
 standing (`parked` is not progress a backlog can see), and the next task you file
 would serve out a two-hour wait it did nothing to earn.
+
+Note "nothing to spawn for" rather than "nothing claimable": abandoned work counts
+as something to spawn for. A project can hold a branch whose session died, and the
+sweep that hands it back runs only when an agent asks the plane for its next task
+— so if the loop declined to spawn while the ready queue was empty, nothing would
+ever ask, and the branch would sit there for good. The gate is `claimable +
+stale_claimable`, both of which the queue line reports.
+
+**What bounds a recovery that never finishes is the plane, not this back-off.**
+Taking a branch over renews its lease, so the task stops being offerable until the
+lease lapses again — and the poll in between reads as idle and forgets the strike.
+The count therefore does *not* climb across successive takeovers of one branch, and
+the local back-off will usually never reach its threshold. That is deliberate: the
+plane counts hand-offs per task, and once a branch has defeated its allowance it is
+**parked and raised to you as a question** instead of being offered again, which
+drops it out of `stale_claimable` for good. So the spend is bounded per branch by
+the plane, at a session or so per lease period, rather than by three strikes here.
+The local back-off still bites the case it was built for — a target that keeps
+being offered the *same* unfinishable work without the lease resetting.
 
 Three rather than one, because a genuinely large task can span several sessions
 before anything reaches a reviewer, and backing off then would throttle exactly

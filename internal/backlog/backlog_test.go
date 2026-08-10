@@ -58,6 +58,61 @@ func TestParseSummary_MissingPauseIsFalse(t *testing.T) {
 	}
 }
 
+// staleClaimable is what the plane reports as offerable abandoned WIP (CLA-273),
+// and it must land in its own field rather than being folded into Claimable —
+// three readers agree on what that number means.
+func TestParseSummary_StaleClaimable(t *testing.T) {
+	got, err := parseSummary([]byte(`{"version":7,"counts":{"ready":0,"in_progress":2},"claimable":0,"staleClaimable":2,"openQuestions":0}`))
+	if err != nil {
+		t.Fatalf("parseSummary: %v", err)
+	}
+	if got.StaleClaimable != 2 {
+		t.Errorf("staleClaimable must parse into StaleClaimable; got %d, want 2", got.StaleClaimable)
+	}
+	if got.Claimable != 0 {
+		t.Errorf("Claimable must keep meaning ready-and-unblocked only; got %d, want 0", got.Claimable)
+	}
+}
+
+// An older plane does not send the field at all. It must decode to 0 and leave the
+// loop behaving exactly as it did before — the whole reason this needs no version
+// negotiation.
+func TestParseSummary_MissingStaleClaimableIsZero(t *testing.T) {
+	got, err := parseSummary([]byte(summaryJSON))
+	if err != nil {
+		t.Fatalf("parseSummary: %v", err)
+	}
+	if got.StaleClaimable != 0 {
+		t.Errorf("a payload without staleClaimable must decode to 0; got %d", got.StaleClaimable)
+	}
+	if !got.Spawnable() {
+		t.Error("and the old behaviour must be unchanged: 4 claimable is still spawnable")
+	}
+}
+
+// The gate itself. Abandoned WIP alone must open it, because the sweep that frees
+// that WIP runs only inside next_task and only a session ever calls it — so gating
+// on ready work alone is what makes the deadlock permanent (CLA-274).
+func TestSpawnableCountsOfferableStaleWIP(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		sum       Summary
+		spawnable bool
+	}{
+		{"ready work alone", Summary{Claimable: 1}, true},
+		{"abandoned work alone — the deadlock this closes", Summary{StaleClaimable: 1}, true},
+		{"both", Summary{Claimable: 2, StaleClaimable: 1}, true},
+		{"neither is genuinely idle", Summary{}, false},
+		{"in-progress work that is NOT offerable does not count", Summary{InProgress: 3}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.sum.Spawnable(); got != tc.spawnable {
+				t.Errorf("Spawnable() = %t, want %t for %+v", got, tc.spawnable, tc.sum)
+			}
+		})
+	}
+}
+
 func TestParseSummary_Empty(t *testing.T) {
 	if _, err := parseSummary(nil); err == nil {
 		t.Fatal("expected error for empty body, got nil")

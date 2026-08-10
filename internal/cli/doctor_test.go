@@ -263,6 +263,36 @@ func TestBacklogEmptyQueueWithoutQuestionsPasses(t *testing.T) {
 	}
 }
 
+// Abandoned work is something to spawn for, so doctor must not tell the operator
+// the loop will idle. Both halves matter and they are separate lines of code: the
+// WARN goes quiet (it reads through Spawnable()), and the PASS detail names the
+// recoverable work rather than reporting a bare "0 claimable" in front of an
+// operator whose loop is about to start spawning (CLA-274).
+func TestBacklogAbandonedWIPIsNotAnIdleQueue(t *testing.T) {
+	c := backlogCheck(context.Background(), "backlog", "https://example.test/api/backlog-summary",
+		envWithPoll(backlog.Summary{Claimable: 0, InProgress: 2, StaleClaimable: 2, OpenQuestions: 2}, nil))
+
+	if c.status != pass {
+		t.Fatalf("recoverable work is not an idle queue: got %v, want PASS (%s)", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "idle") {
+		t.Errorf("doctor must not say the loop will idle when it is about to spawn, got %q", c.detail)
+	}
+	if !strings.Contains(c.detail, "2 abandoned to recover") {
+		t.Errorf("PASS should name the recoverable work beside the claimable count, got %q", c.detail)
+	}
+}
+
+// And it stays silent when there is none, so the ordinary line does not grow a
+// "0 abandoned" clause every operator learns to skip.
+func TestBacklogSaysNothingAboutAbandonedWorkWhenThereIsNone(t *testing.T) {
+	c := backlogCheck(context.Background(), "backlog", "https://example.test/api/backlog-summary",
+		envWithPoll(backlog.Summary{Claimable: 7, OpenQuestions: 2}, nil))
+	if strings.Contains(c.detail, "abandoned") {
+		t.Errorf("no abandoned work should mean no clause about it, got %q", c.detail)
+	}
+}
+
 // A multi-project instance gets one check per project: one queue can be wired
 // wrong while the others are fine, and an aggregate line would hide it.
 func TestBacklogChecksEachProject(t *testing.T) {

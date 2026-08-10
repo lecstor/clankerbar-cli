@@ -175,11 +175,12 @@ func (d *Driver) Run(ctx context.Context) error {
 		}
 
 		// Gate on cheap control-plane reads: only spend a session when some target
-		// has claimable work. When idle, keep polling (and logging) so the loop
-		// reacts to answered questions / promotions / newly filed work. With several
-		// targets (CLA-142) every queue is polled each cycle, and the drain goes to
-		// the next claimable one after the last drained (round-robin) — a busy queue
-		// can't starve a quiet one.
+		// has work to spawn for — ready work, or abandoned work the plane would
+		// offer for takeover (Summary.Spawnable, CLA-274). When idle, keep polling
+		// (and logging) so the loop reacts to answered questions / promotions /
+		// newly filed work. With several targets (CLA-142) every queue is polled
+		// each cycle, and the drain goes to the next spawnable one after the last
+		// drained (round-robin) — a busy queue can't starve a quiet one.
 		var target Target
 		if !d.blind {
 			candidates := make([]bool, len(d.targets))
@@ -213,12 +214,20 @@ func (d *Driver) Run(ctx context.Context) error {
 				case err != nil:
 					log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
 				default:
-					log.Printf("%squeue: ready=%d claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
-						d.prefix(i), sum.Ready, sum.Claimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
+					// stale_claimable is reported beside claimable, not folded into it: an
+					// operator watching the console has to be able to tell "spawning
+					// because there is fresh work" from "spawning to recover an abandoned
+					// branch", and before CLA-274 those were indistinguishable — the
+					// second did not happen at all, and now that it does it must not look
+					// like the first.
+					log.Printf("%squeue: ready=%d claimable=%d stale_claimable=%d in_progress=%d open_questions=%d paused=%t (v%d)",
+						d.prefix(i), sum.Ready, sum.Claimable, sum.StaleClaimable, sum.InProgress, sum.OpenQuestions, sum.Paused, sum.Version)
 					// Console pause (CLA-76 plane / CLA-130 driver): the operator can pause
-					// a run from the web console, PER PROJECT. Honour it BEFORE the
-					// claimable gate so a paused project never gets a new session even when
-					// it has claimable work — other projects keep draining. Distinct from
+					// a run from the web console, PER PROJECT. Honour it BEFORE the spawn
+					// gate so a paused project never gets a new session even when it has
+					// work to spawn for — including a recovery session for abandoned work,
+					// which a pause outranks like any other. Other projects keep draining.
+					// Distinct from
 					// STOP (which exits the instance) and from an empty queue. A pause
 					// landing mid-drain is only seen here, between iterations, so it never
 					// kills an in-flight session (exactly like STOP).
@@ -709,7 +718,7 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// quietThreshold fresh fruitless drains.
 	if !sum.Spawnable() && !d.pending[i] {
 		if d.quiet[i] > 0 {
-			log.Printf("%snothing claimable — idle, not fruitless; forgetting %d drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quiet[i])
+			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quiet[i])
 		}
 		d.quiet[i], d.skipUntil[i] = 0, time.Time{}
 		d.baseline[i], d.openQs[i] = settled, openQs
@@ -772,6 +781,16 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	}
 	wait := quietBackoff(d.quiet[i])
 	d.skipUntil[i] = time.Now().Add(wait)
+	// Name the RIGHT cause. The original sentence asserts there is claimable work
+	// and lists the reasons a ready task resists being finished — all of which are
+	// wrong, and misdirecting, when the only thing that opened the gate was an
+	// abandoned branch (CLA-274). Sending an operator to look for an unanswered
+	// question when the real subject is stranded WIP costs them the diagnosis.
+	if sum.Claimable == 0 && sum.StaleClaimable > 0 {
+		log.Printf("%s%d consecutive sessions settled nothing — backing off for %s. Nothing is READY; the sessions were spawned to recover %d abandoned branch(es), and are not finishing them. Check the last iteration log, and the branch itself.",
+			d.prefix(i), d.quiet[i], wait, sum.StaleClaimable)
+		return
+	}
 	log.Printf("%s%d consecutive sessions settled nothing — backing off for %s. The queue says there is claimable work, so something is stopping it being DONE: an unanswered question, a gate, a toolchain the session cannot run. Check the last iteration log.",
 		d.prefix(i), d.quiet[i], wait)
 }
