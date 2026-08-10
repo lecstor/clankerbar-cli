@@ -134,6 +134,26 @@ func (r Report) MergeVerified() (verified, ran bool) {
 	return false, false
 }
 
+// Repos lists one working tree per distinct git repository at or below workdir -
+// the search described in this package's doc, exposed for the driver's salvage
+// path (CLA-314).
+//
+// It is shared rather than reimplemented because salvage has to find the SAME
+// repository these checks do. Two implementations of "which tree did the session
+// work in" would agree until the day they did not, and on that day one of them
+// would be committing.
+func Repos(ctx context.Context, workdir string) []string {
+	return New(workdir, "").candidateRepos(ctx)
+}
+
+// Remote picks the remote to act on in repo: the preferred one when the
+// repository has it, otherwise its only remote. Shared with salvage for the same
+// reason as Repos - a rescue has to push to the remote these checks will then
+// judge it against. The workdir plays no part in this one, hence the empty one.
+func Remote(ctx context.Context, repo, preferred string) string {
+	return New("", preferred).resolveRemote(ctx, repo)
+}
+
 // maxDepth is how far below the workdir a repository is looked for. Two levels
 // reaches `~/dev/<repo>` and `~/dev/<repo>-wt/<task-id>`, which is the layout the
 // per-task worktree convention produces. Deeper is a fishing expedition.

@@ -78,6 +78,30 @@ type Delivery struct {
 	PR                string
 }
 
+// Recorder records a work-in-progress branch on a task - the hand-off record
+// that turns a redo into a resume (CLA-314).
+//
+// It is deliberately NOT part of Releaser, and the difference is the whole point:
+// a release moves the task to `ready` and ends the run holding it, while this
+// carries no status at all. Plane-side, `updateStatus` is what clears a holder,
+// and a call with no status never reaches it - so recording a branch cannot
+// settle a claim, cannot hand a task back, and cannot revert one that has already
+// reached review. That is what makes it safe on the CLA-262 untrusted path, where
+// handing the claim back is forbidden precisely because a settle we never saw may
+// be in the bytes that never arrived.
+//
+// A separate interface, like Attester, so a not-wired plane or a test double
+// degrades to "the work is pushed and the log says where" rather than failing to
+// compile.
+type Recorder interface {
+	// RecordBranch writes branch onto taskID as its work-in-progress hand-off.
+	// It must only be called for a branch that is really ON THE REMOTE: the whole
+	// meaning of the field is that fetchable work exists, and a branch living on
+	// one laptop sends the next clanker - routinely on another machine - to fetch
+	// nothing.
+	RecordBranch(ctx context.Context, taskID, runID, branch string) error
+}
+
 type notWired struct{}
 
 func (notWired) Release(context.Context, string, string) error { return ErrNotWired }
@@ -120,6 +144,33 @@ func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
 		"taskId": taskID,
 		"runId":  runID,
 		"status": "ready",
+	})
+}
+
+// RecordBranch writes a work-in-progress branch onto a task, so a session that
+// died before it could hand over still leaves a hand-off behind (CLA-314).
+//
+// No `status`, no `outcome`, no `delivery`. That is not minimalism, it is the
+// safety property: this call has to be legal on a session whose stream could not
+// be read whole, where the driver may be wrong about whether the task is still
+// held. A `branch` on its own revises a record; it cannot move a task, cannot
+// clear a holder, and cannot post `ready` over something already in review.
+//
+// `runId` signs it. The plane credits the run while it is the task's most recent
+// one - which it still is after the session has ended - and refuses a superseded
+// one outright, which is the correct answer: a later run already owns the task
+// and its own branch record is the current one.
+func (r *mcpReleaser) RecordBranch(ctx context.Context, taskID, runID, branch string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("record branch: taskId and runId are both required")
+	}
+	if branch == "" {
+		return errors.New("record branch: refusing to record an empty branch")
+	}
+	return r.call(ctx, "update_task", map[string]any{
+		"taskId": taskID,
+		"runId":  runID,
+		"branch": branch,
 	})
 }
 

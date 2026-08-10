@@ -26,6 +26,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
+	"github.com/lecstor/clankerbar-cli/internal/salvage"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -80,12 +81,21 @@ type Driver struct {
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery.
 	newVerifier func(workdir string) deliveryVerifier
+
+	// newSalvager builds the stranded-work rescuer for a workdir (CLA-314). Same
+	// shape and the same reason as newVerifier.
+	newSalvager func(workdir string) workSalvager
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
 // call it makes.
 type deliveryVerifier interface {
 	Verify(ctx context.Context, c delivery.Claim) delivery.Report
+}
+
+// workSalvager is the driver's view of internal/salvage, narrowed the same way.
+type workSalvager interface {
+	Salvage(ctx context.Context, taskID, label string) salvage.Outcome
 }
 
 // New builds a single-project Driver — the original mode, driven entirely by the
@@ -107,6 +117,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		pending:     make([]bool, n),
 		skipUntil:   make([]time.Time, n),
 		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
+		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 	}
 }
 
@@ -384,6 +395,10 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		if f != nil {
 			_ = f.Close()
 		}
+		// Rescue whatever the session left uncommitted, FIRST — before the handback,
+		// because a successful salvage changes what the handback should do: a task
+		// with a branch recorded on it is no longer safe to release (CLA-314).
+		d.salvageStrandedWork(ctx, t, &res)
 		// Hand back anything the session was still holding, BEFORE deciding what to
 		// do next — every branch below either waits, retries or returns, and all of
 		// them leave the lease unattended. Above the ierr check too: Invoke returns
@@ -530,6 +545,106 @@ func (d *Driver) endUntrustedDrain(drainNum int, res harness.Result, tokens int,
 	}
 	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
 	return tokens, cost, true, nil
+}
+
+// salvageStrandedWork commits and pushes the work a dead session left in its
+// worktree, and records the branch on the task so another machine can pick it up
+// (CLA-314).
+//
+// # Why it runs on EVERY ending, not only on a usage limit
+//
+// The worktree is what is being rescued, and it looks identical whether the
+// session was killed by a limit, died in a crash, or simply stopped with the work
+// unfinished — while the cost of losing it is the same in all three. The limit,
+// besides, is detected by parsing the stream AFTER the fact, so gating on it
+// would skip exactly the sessions whose stream could not be read: the ones we
+// know least about, and the likeliest to have stranded something. Running it when
+// it was not needed costs nothing — a clean worktree commits nothing, pushes
+// nothing and records nothing.
+//
+// # Why it is safe on the untrusted path
+//
+// CLA-262 forbids acting on a truncated stream's CLAIM-STATE: a settle we never
+// saw may be in the bytes that never arrived, so handing the task back could post
+// `ready` over work already in review. This does something different in kind.
+// Recording a branch carries no status, so it cannot move a task, clear a holder
+// or revert a review — it is additive, and its worst case on a task that really
+// did reach review is that the branch field names the branch the work is on
+// anyway. What it acts on is the local worktree, which no truncation can
+// misreport. A claim we SAW settle is skipped entirely: Held() is false, and this
+// is a rescue, not a tidy-up.
+//
+// # What a success does to the handback
+//
+// Claim.HasWIP is set only when the plane ACCEPTED the branch, and that is what
+// makes the claim non-releasable below: the lease is left to expire so the task
+// stays a takeover and the hand-off survives. If the record failed, the task has
+// no branch on it, releasing to `ready` is still the better move, and the old
+// path runs unchanged.
+func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result) {
+	if d.newSalvager == nil || !res.Claim.Held() {
+		return
+	}
+	// Detached from ctx, like the handback and unlike the delivery checks: a
+	// cancelled run (Ctrl-C, SIGTERM) is precisely a session killed mid-task, so
+	// this is when work goes missing, not when it can be skipped. Bounded, so a
+	// wedged git or an unreachable remote cannot hold up the shutdown.
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), salvageTimeout)
+	defer cancel()
+
+	out := d.newSalvager(d.invocation(t, false).WorkDir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref)
+	label := claimLabel(res.Claim)
+	switch out.Status {
+	case salvage.Nothing:
+		// Silent on the ordinary case. A session that committed its own work leaves
+		// a clean tree, and a log line every iteration saying so would bury the ones
+		// that matter.
+		if out.Worktree != "" {
+			log.Printf("%snothing to salvage for %s: %s", labelOf(t), label, out.Detail)
+		}
+		return
+	case salvage.Refused:
+		log.Printf("%sSTRANDED WORK LEFT AS IS — %s: %s", labelOf(t), label, out.Detail)
+		return
+	case salvage.Failed:
+		log.Printf("%sSALVAGE FAILED — %s: %s", labelOf(t), label, out.Detail)
+		return
+	}
+
+	log.Printf("%ssalvaged %s: %s", labelOf(t), label, out.Detail)
+	rec, ok := t.Releaser.(plane.Recorder)
+	if !ok {
+		log.Printf("%sthe branch %s is pushed but cannot be recorded on %s (no plane writes configured) — a clanker on this machine can still find it by name",
+			labelOf(t), out.Branch, label)
+		return
+	}
+	rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer rcancel()
+
+	if err := rec.RecordBranch(rctx, res.Claim.TaskID, res.Claim.RunID, out.Branch); err != nil {
+		if !errors.Is(err, plane.ErrNotWired) {
+			log.Printf("%scould not record branch %s on %s: %v — the work IS pushed, so fetch that branch by name rather than starting again",
+				labelOf(t), out.Branch, label, err)
+		}
+		return
+	}
+	// Only now. HasWIP is a statement about the TASK, not about the disk: it means
+	// the next clanker will be told there is work to fetch.
+	res.Claim.HasWIP = true
+	log.Printf("%srecorded %s as the hand-off branch for %s — the next clanker takes it over instead of starting again",
+		labelOf(t), out.Branch, label)
+}
+
+// salvageTimeout bounds one rescue: a status read, a commit, and a push over the
+// network. Longer than the delivery checks' minute because this one uploads.
+const salvageTimeout = 3 * time.Minute
+
+// claimLabel is the task's most human-readable identifier.
+func claimLabel(c harness.Claim) string {
+	if c.Ref != "" {
+		return c.Ref
+	}
+	return c.TaskID
 }
 
 // releaseHeldClaim hands a task the session was still holding back to the queue,

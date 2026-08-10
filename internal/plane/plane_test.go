@@ -182,3 +182,64 @@ func TestRelease_RequiresBothIDs(t *testing.T) {
 		})
 	}
 }
+
+// Recording a work-in-progress branch (CLA-314). The shape is the safety
+// property, not a detail: this call has to be legal on a session whose stream
+// could not be read whole, and it is legal only because it cannot move the task.
+func TestRecordBranch_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	r, ok := New(srv.URL+"/mcp/demo", "k-1").(Recorder)
+	if !ok {
+		t.Fatal("the wired plane client does not implement Recorder, so no branch can ever be recorded")
+	}
+	if err := r.RecordBranch(context.Background(), "t-1", "r-1", "clanker/x"); err != nil {
+		t.Fatalf("RecordBranch: %v", err)
+	}
+
+	params, _ := got.body["params"].(map[string]any)
+	if params["name"] != "update_task" {
+		t.Errorf("tool = %v, want update_task", params["name"])
+	}
+	args, _ := params["arguments"].(map[string]any)
+	if args["taskId"] != "t-1" || args["runId"] != "r-1" || args["branch"] != "clanker/x" {
+		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1 branch=clanker/x", args)
+	}
+	// The whole distinction from Release. A status is what clears a holder
+	// plane-side, so carrying one here would turn a hand-off record into a settle
+	// - the one thing CLA-262 forbids on an unreadable stream.
+	for _, forbidden := range []string{"status", "outcome", "delivery"} {
+		if _, present := args[forbidden]; present {
+			t.Errorf("a branch record carried %q (%+v) - it must revise the record and nothing else", forbidden, args)
+		}
+	}
+}
+
+// An empty branch is refused before it reaches the wire: recording one would tell
+// the next clanker to fetch a branch that does not exist.
+func TestRecordBranch_RefusesAnEmptyBranch(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+	r := New(srv.URL+"/mcp/demo", "k-1").(Recorder)
+
+	for _, tc := range []struct{ taskID, runID, branch string }{
+		{"t-1", "r-1", ""},
+		{"", "r-1", "clanker/x"},
+		{"t-1", "", "clanker/x"},
+	} {
+		if err := r.RecordBranch(context.Background(), tc.taskID, tc.runID, tc.branch); err == nil {
+			t.Errorf("RecordBranch(%q, %q, %q) was accepted", tc.taskID, tc.runID, tc.branch)
+		}
+	}
+	if got.method != "" {
+		t.Errorf("a refused record still reached the plane (%s %s)", got.method, got.path)
+	}
+}
+
+// A not-wired plane must not be a Recorder that silently does nothing: the driver
+// type-asserts, and a no-op recorder would log "recorded" for a branch nothing
+// knows about.
+func TestRecordBranch_NotWiredIsNotARecorder(t *testing.T) {
+	if _, ok := New("", "").(Recorder); ok {
+		t.Error("the not-wired client claims to record branches")
+	}
+}
