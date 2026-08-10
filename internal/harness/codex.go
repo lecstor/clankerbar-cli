@@ -22,22 +22,46 @@ func init() { Register(codex{}) }
 //     unless --json (then a JSONL event stream on stdout).
 //   - No stable limit exit code and rate_limits is null in exec --json, so limit
 //     detection is fuzzy text-matching and there is nothing to introspect.
+//   - Invocation.MCPConfigPath is DELIBERATELY UNUSED. codex has no per-run MCP
+//     flag and no reader for Claude's `.mcp.json` schema; it takes its servers
+//     from `[mcp_servers]` in config.toml under CODEX_HOME, which ConfigDir
+//     already pins. Saying so here because the field is on every Invocation and
+//     silently dropping it read as wiring that was never there: `doctor`'s
+//     workdir check passed a codex workdir green on the strength of an .mcp.json
+//     no codex session would ever see (CLA-263). doctor now states the exclusion
+//     rather than implying the wiring - see cli.mcpConfigReachesSession.
 type codex struct{}
 
 func (codex) Name() string { return "codex" }
 
-func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
-	var args []string
+// codexArgs maps an Invocation to `codex exec`'s CLI dialect. Split out so the
+// argument shape is unit-testable without executing anything - the parity with
+// opencodeArgs.
+//
+// The prompt goes LAST, behind a `--` terminator. It is a bare positional, so a
+// prompt that is itself a flag token would be parsed as a flag and the session
+// would run with no message at all (or read one from stdin). Nothing from the
+// BACKLOG can reach argv - Invocation.Prompt is set once from the config's
+// `prompt` (loop.go), there is no --prompt flag, and the backlog client decodes
+// counts rather than strings - so this hardens the config-file path (the CLA-260
+// class), not a live injection hole.
+//
+// Putting every flag AHEAD of the terminator is the other half. The pinned
+// posture used to sit after the positional and survive only by last-wins; now
+// nothing follows the prompt, so there is no ordering left to reason about.
+func codexArgs(in Invocation) []string {
 	if in.Probe {
-		args = []string{"exec", ".", "--json", "--sandbox", "read-only", "--ask-for-approval", "never"}
-	} else {
-		args = []string{"exec", in.Prompt, "--json", "--sandbox", "workspace-write", "--ask-for-approval", "never"}
-		if in.Model != "" {
-			args = append(args, "-m", in.Model)
-		}
+		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}
 	}
+	args := []string{"exec", "--json", "--sandbox", "workspace-write", "--ask-for-approval", "never"}
+	if in.Model != "" {
+		args = append(args, "-m", in.Model)
+	}
+	return append(args, "--", in.Prompt)
+}
 
-	cmd := exec.CommandContext(ctx, "codex", args...)
+func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
+	cmd := exec.CommandContext(ctx, "codex", codexArgs(in)...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}

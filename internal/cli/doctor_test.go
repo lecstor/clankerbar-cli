@@ -850,7 +850,7 @@ func multiRepoParent(t *testing.T, instructions string) string {
 // Sessions spawned in a multi-repo parent with no .mcp.json get no clankerbar
 // tools at all — they run, burn tokens, and cannot see the backlog.
 func TestSessionMultiRepoParentWithoutMCPWarns(t *testing.T) {
-	c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "")
+	c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "", "claude")
 	if c.status != warn {
 		t.Fatalf("multi-repo parent without .mcp.json: got %v, want WARN (%s)", c.status, c.detail)
 	}
@@ -863,7 +863,7 @@ func TestSessionMultiRepoParentWithoutMCPWarns(t *testing.T) {
 // reaches it reads no protocol and no conventions, because a harness loads those
 // from the cwd upward and never from the repos below it.
 func TestSessionWithoutAgentInstructionsWarns(t *testing.T) {
-	c := sessionCheck("workdir", multiRepoParent(t, ""), "/tmp/.mcp.json")
+	c := sessionCheck("workdir", multiRepoParent(t, ""), "/tmp/.mcp.json", "claude")
 	if c.status != warn {
 		t.Fatalf("workdir with no instruction file: got %v, want WARN (%s)", c.status, c.detail)
 	}
@@ -883,7 +883,7 @@ func TestSessionWithoutAgentInstructionsWarns(t *testing.T) {
 func TestSessionAcceptsEitherInstructionFile(t *testing.T) {
 	for _, name := range []string{"AGENTS.md", "CLAUDE.md"} {
 		t.Run(name, func(t *testing.T) {
-			c := sessionCheck("workdir", multiRepoParent(t, name), "/tmp/.mcp.json")
+			c := sessionCheck("workdir", multiRepoParent(t, name), "/tmp/.mcp.json", "claude")
 			if c.status != pass {
 				t.Fatalf("%s present: got %v, want PASS (%s)", name, c.status, c.detail)
 			}
@@ -897,7 +897,7 @@ func TestSessionAcceptsEitherInstructionFile(t *testing.T) {
 // A workdir that is not there kills every spawn for that project, so it is the
 // one thing here that must FAIL rather than warn.
 func TestSessionMissingWorkdirFails(t *testing.T) {
-	c := sessionCheck("workdir[gone]", filepath.Join(t.TempDir(), "nope"), "")
+	c := sessionCheck("workdir[gone]", filepath.Join(t.TempDir(), "nope"), "", "claude")
 	if c.status != fail {
 		t.Errorf("absent workdir: got %v, want FAIL (%s)", c.status, c.detail)
 	}
@@ -937,7 +937,7 @@ func TestSessionWithoutMCPConfigWarnsEvenWhenNotAParent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	c := sessionCheck("workdir", dir, "")
+	c := sessionCheck("workdir", dir, "", "claude")
 	if c.status != warn {
 		t.Fatalf("single-repo workdir without .mcp.json: got %v, want WARN (%s)", c.status, c.detail)
 	}
@@ -946,6 +946,67 @@ func TestSessionWithoutMCPConfigWarnsEvenWhenNotAParent(t *testing.T) {
 	}
 	if strings.Contains(c.detail, "multi-repo") {
 		t.Errorf("a single checkout must not be described as a multi-repo parent, got %q", c.detail)
+	}
+}
+
+// The codex adapter never hands mcp_config_path to the session it spawns, so the
+// .mcp.json arm of this check cannot say anything true about a codex workdir.
+// Both directions were wrong before CLA-263, and this pins both:
+//
+//   - a workdir WITH an .mcp.json passed green on wiring no codex session gets,
+//     which is the dangerous half - a preflight that passes when the thing it
+//     checks is not true is one an operator learns to trust;
+//   - a workdir WITHOUT one warned, and sent the operator to add a file that
+//     would not have helped.
+//
+// The check now states the exclusion instead, on whichever verdict it reaches.
+func TestSessionCheckDoesNotClaimMCPWiringForCodex(t *testing.T) {
+	withMCP := multiRepoParent(t, "AGENTS.md")
+	if err := os.WriteFile(filepath.Join(withMCP, ".mcp.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name          string
+		dir           string
+		mcpConfigPath string
+	}{
+		{"an .mcp.json is configured", withMCP, filepath.Join(withMCP, ".mcp.json")},
+		{"none is configured", multiRepoParent(t, "AGENTS.md"), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := sessionCheck("workdir", tc.dir, tc.mcpConfigPath, "codex")
+
+			if c.status != pass {
+				t.Fatalf("codex workdir: got %v, want PASS - the .mcp.json arm does not apply (%s)", c.status, c.detail)
+			}
+			if strings.Contains(c.detail, ".mcp.json") {
+				t.Errorf("the verdict line must not rest on the .mcp.json for codex, got %q", c.detail)
+			}
+			if !strings.Contains(strings.Join(c.info, "\n"), "not checked") {
+				t.Errorf("a codex workdir check must SAY the .mcp.json was not checked, got info %q", c.info)
+			}
+			if !strings.Contains(strings.Join(c.info, "\n"), "CODEX_HOME") {
+				t.Errorf("the note must point at where codex sessions DO get their MCP servers, got info %q", c.info)
+			}
+		})
+	}
+}
+
+// The same workdir under claude keeps the check it has always had - the exclusion
+// is one harness's, not a hole opened in the check for everyone.
+func TestSessionCheckKeepsTheMCPArmForHarnessesThatPassItThrough(t *testing.T) {
+	for _, h := range []string{"claude", "opencode"} {
+		t.Run(h, func(t *testing.T) {
+			c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "", h)
+			if c.status != warn {
+				t.Fatalf("%s workdir without .mcp.json: got %v, want WARN (%s)", h, c.status, c.detail)
+			}
+			if !strings.Contains(c.detail, ".mcp.json") {
+				t.Errorf("detail should name the missing .mcp.json, got %q", c.detail)
+			}
+		})
 	}
 }
 
@@ -1364,6 +1425,48 @@ func TestDoctorRunSucceedsWhenOnlyWarnings(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "WARN") {
 		t.Errorf("expected warnings in output:\n%s", out.String())
+	}
+}
+
+// The codex exclusion has to survive the trip through the renderer, because the
+// rendered line is the whole artifact: a PASS whose caveat never reached stdout
+// is exactly the reassurance CLA-263 was about. `remedy` would not do - it is
+// suppressed under PASS by design - so the note rides on `info`, which prints
+// under every status.
+func TestDoctorRunPrintsTheCodexMCPCaveat(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "AGENTS.md"), []byte("# orientation"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(t.TempDir(), "clankerbar.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"harness":"codex","workdir":"`+dir+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var out strings.Builder
+	if err := doctorRun(context.Background(), &out, cfgPath, config.Overrides{}, okEnv()); err != nil {
+		t.Fatalf("doctorRun: %v\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), codexMCPNote) {
+		t.Errorf("the codex .mcp.json caveat never reached the operator:\n%s", out.String())
+	}
+
+	// The same config under claude must NOT carry it - the exclusion is one
+	// harness's, and a caveat printed everywhere is one nobody reads.
+	claudeCfg := filepath.Join(t.TempDir(), "clankerbar.json")
+	if err := os.WriteFile(claudeCfg, []byte(`{"harness":"claude","workdir":"`+dir+`"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var claudeOut strings.Builder
+	if err := doctorRun(context.Background(), &claudeOut, claudeCfg, config.Overrides{}, okEnv()); err != nil {
+		t.Fatalf("doctorRun (claude): %v\n%s", err, claudeOut.String())
+	}
+	if strings.Contains(claudeOut.String(), "not checked") {
+		t.Errorf("claude picked up codex's caveat:\n%s", claudeOut.String())
 	}
 }
 

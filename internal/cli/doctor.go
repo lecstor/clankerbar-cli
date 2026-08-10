@@ -790,11 +790,11 @@ var agentInstructionFiles = []string{"AGENTS.md", "CLAUDE.md"}
 // thirty iterations.
 func checkSessions(cfg *config.Config) []check {
 	if len(cfg.Projects) == 0 {
-		return []check{sessionCheck("workdir", cfg.WorkDir, cfg.MCPConfigPath)}
+		return []check{sessionCheck("workdir", cfg.WorkDir, cfg.MCPConfigPath, cfg.Harness)}
 	}
 	out := make([]check, 0, len(cfg.Projects))
 	for _, p := range cfg.Projects {
-		out = append(out, sessionCheck("workdir["+p.Slug+"]", projectWorkDir(cfg, p), projectMCPConfig(cfg, p)))
+		out = append(out, sessionCheck("workdir["+p.Slug+"]", projectWorkDir(cfg, p), projectMCPConfig(cfg, p), cfg.Harness))
 	}
 	return out
 }
@@ -824,7 +824,42 @@ func projectMCPConfig(cfg *config.Config, p config.Project) string {
 	return cfg.MCPConfigPath
 }
 
-func sessionCheck(name, dir, mcpConfigPath string) check {
+// mcpConfigReachesSession reports whether the configured harness actually hands
+// `mcp_config_path` to the sessions it spawns.
+//
+// Two of the three do: claude takes it as `--mcp-config` (with
+// `--strict-mcp-config`), opencode gets it as `OPENCODE_CONFIG`. The codex
+// adapter does NOT, and cannot - codex has no per-run MCP flag and reads its
+// servers from `[mcp_servers]` in config.toml under CODEX_HOME. The field is
+// inert there (harness/codex.go says so at the type).
+//
+// This gates the `.mcp.json` half of the workdir check, because a check whose
+// premise is false is worse than no check at all. It reported a codex workdir
+// PASS on the strength of an `.mcp.json` no codex session would ever be handed,
+// and when the file was missing it sent the operator to add one that would not
+// have helped - a preflight that passes when the thing it checks is not true is
+// how an operator learns to trust it (CLA-263).
+//
+// Stated as "which harnesses DO" rather than "codex does not", so a harness added
+// without an MCP path stays honest by default: an unknown name is assumed to
+// carry it, which is the reading that makes the check speak up rather than go
+// quiet. Today's registry has no such case.
+func mcpConfigReachesSession(harnessName string) bool {
+	switch harnessName {
+	case "codex":
+		return false
+	default:
+		return true
+	}
+}
+
+// codexMCPNote is what the workdir check says INSTEAD of a verdict on the
+// `.mcp.json`, on every status it can still reach - so a PASS never reads as
+// "the clankerbar wiring is there".
+const codexMCPNote = ".mcp.json not checked: the codex adapter does not pass mcp_config_path to its sessions - " +
+	"their MCP servers come from [mcp_servers] in config.toml under the config dir (CODEX_HOME)"
+
+func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 	c := check{name: name}
 
 	resolved := dir
@@ -858,7 +893,11 @@ func sessionCheck(name, dir, mcpConfigPath string) check {
 	// with no .mcp.json blinds its sessions just as completely. `parent` only
 	// selects the wording, because that is the case an operator is most likely to
 	// have reached by accident.
-	if mcpConfigPath == "" {
+	switch {
+	case !mcpConfigReachesSession(harnessName):
+		// Say the exclusion out loud and carry it onto whatever verdict follows.
+		c.info = append(c.info, codexMCPNote)
+	case mcpConfigPath == "":
 		c.status = warn
 		if parent {
 			c.detail = workdirLabel(dir) + " looks like a multi-repo parent and has no .mcp.json"

@@ -71,6 +71,10 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 
 // opencodeArgs maps an Invocation to `opencode run`'s CLI dialect. Split out so the
 // probe's read-only shape is unit-testable without executing anything.
+//
+// The prompt goes LAST, behind a `--` terminator, for the reason spelled out in
+// codexArgs: it is a bare positional, and a prompt that is itself a flag token
+// would otherwise be parsed as a flag rather than as the message.
 func opencodeArgs(in Invocation) []string {
 	prompt := in.Prompt
 	if in.Probe {
@@ -79,11 +83,11 @@ func opencodeArgs(in Invocation) []string {
 		// provider still answers or is budget-exhausted.
 		prompt = "."
 	}
-	args := []string{"run", prompt, "--format", "json"}
+	args := []string{"run", "--format", "json"}
 	if in.Model != "" {
 		args = append(args, "--model", in.Model)
 	}
-	return args
+	return append(args, "--", prompt)
 }
 
 // opencodePermission is the fail-closed OPENCODE_PERMISSION policy. A real drain
