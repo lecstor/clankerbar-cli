@@ -158,6 +158,48 @@ gh attestation verify clankerbar_0.4.0_darwin_arm64.tar.gz -R lecstor/clankerbar
   *create* one - which happens every cycle, since merging the promotion closes it.
   Without the secret, `promote.yml` goes red rather than silently skipping.
 
+## Two exposures this model creates, named rather than left implicit
+
+**1. Who may merge to `main` is now load-bearing, and it is not fully enforced.**
+
+The whole point of the promotion gate is that a clanker cannot publish. That
+holds only as far as `main`'s merge rules hold. Today `main` requires the `ci`
+check and **zero approving reviews**, and GitHub push restrictions are not
+available on a user-owned repo - so nothing at the git layer stops an agent with
+write access from opening a PR straight at `main`, watching `ci` go green, and
+merging it.
+
+Two things stand in the way, and it is worth knowing which is which:
+
+- `release-on-merge.yml` **refuses to publish any commit that did not arrive
+  through `staging`** (it checks in git that the merge's second parent is
+  reachable from `origin/staging`). That is a real control, and it is the one
+  actually stopping the scenario above from producing a release.
+- Everything else is convention: the served protocol and `AGENTS.md` tell
+  clankers to target `staging`.
+
+If you want the merge itself refused rather than just the publish, that is a
+branch-protection change on `main` and it is **yours to make deliberately**,
+because the obvious version of it backfires: requiring one approving review would
+also block *you* from merging the promotion, since GitHub forbids approving your
+own PR and the promotion PR is authored by the same account. Making it work means
+the promotion PR being authored by a *different* identity than the approver.
+
+**2. `PROMOTION_PR_TOKEN` is readable by code that merges without human review.**
+
+`promote.yml` runs `scripts/update-promotion-pr.sh` - and, through it,
+`go run ./cmd/release-tool` - from the merged `staging` tree, with the PAT in the
+environment. Clankers merge task PRs into `staging`, and the human gate sits
+downstream at `staging -> main`. So a task PR that edits that script, the release
+tool, or `promote.yml` itself can read the token on merge.
+
+This is inherent to holding a secret usable from a branch agents can merge to,
+not a bug in the script. What bounds it is the token's scope, which is why the
+scope above is a minimum and not a suggestion: `Contents: read` +
+`Pull requests: write` on this repo only. Note that `Pull requests: write` does
+include submitting approving reviews, so this token must not be the thing that
+satisfies any review requirement added under exposure 1.
+
 ## Break glass
 
 Cut a release by hand:
@@ -168,3 +210,23 @@ git tag v0.4.0 && git push origin v0.4.0
 
 That still triggers `release.yml` via `push: tags`. Use it when the derivation is
 wrong or a release must be re-cut; prefer fixing the commits otherwise.
+
+### A tag that exists with no release behind it
+
+`release-on-merge.yml` validates (`go test -race`, `govulncheck`) **before** it
+pushes a tag, precisely so this should not happen. If it happens anyway - a
+GoReleaser failure, a cancelled run between the tag and the publish - **delete the
+tag rather than leaving it**:
+
+```bash
+git push --delete origin v0.4.0 && git tag -d v0.4.0
+```
+
+A dangling tag is not cosmetic. The next derivation takes `previous` from
+`git describe --tags --abbrev=0`, and `.goreleaser.yaml` uses
+`changelog: use: github`, which diffs against the previous **tag** - so every
+commit the dangling tag covers would silently never appear in any published
+release's notes. Deleting it puts those commits back in the next release.
+
+Re-running the workflow does *not* clear this: the `tag` job sees the tag already
+at that commit, reuses it, and the publish fails the same way.

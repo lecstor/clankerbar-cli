@@ -73,6 +73,58 @@ jobs:
           check-latest: true
           cache: true
 
+      # ── ONLY A PROMOTION MAY PUBLISH ───────────────────────────────────────
+      # Without this step, "only a human publishes" is a CONVENTION, not a
+      # control, and this workflow would have turned it into a new capability
+      # rather than preserving it.
+      #
+      # The hole: `main` requires the `ci` check but ZERO approving reviews, and
+      # push restrictions are not available on a user-owned repo. So a clanker
+      # holding write access could open a PR from its task branch with
+      # `--base main`, wait for `ci` to go green, merge it, and this workflow
+      # would tag and publish an attested public release. Nothing would refuse it.
+      # Before release-on-merge existed, that same merge published nothing - so
+      # automating the release is exactly what created the exposure.
+      #
+      # The control: refuse to publish anything that did not arrive through
+      # `staging`. A promotion merge's second parent IS the promoted `staging`
+      # head, so it is reachable from `origin/staging`; a task branch merged
+      # straight into `main` is not. This is checked in git, on the commit that
+      # actually landed, so it cannot be talked around by a PR title.
+      #
+      # It is defence in depth, NOT a replacement for the branch protection
+      # documented in docs/releases.md - it constrains what may be PUBLISHED, and
+      # says nothing about what may be merged.
+      - name: Refuse to publish anything that did not come through staging
+        run: |
+          set -euo pipefail
+          git fetch origin staging --quiet || true
+
+          if ! git rev-parse -q --verify origin/staging >/dev/null; then
+            echo "::error::No origin/staging branch. This repo publishes only promotions from staging; refusing."
+            exit 1
+          fi
+
+          # A promotion is a MERGE. A fast-forward or a direct push has one parent
+          # and is not a promotion, whatever else it may be.
+          if ! second_parent=$(git rev-parse -q --verify "${{ github.sha }}^2" 2>/dev/null); then
+            echo "::error::${{ github.sha }} is not a merge commit, so it did not arrive via the staging -> main promotion. Refusing to publish."
+            echo "::error::Cut this release by hand if that is really what you want: git tag vX.Y.Z && git push origin vX.Y.Z"
+            exit 1
+          fi
+
+          # Reachable from staging, rather than equal to staging's head: this must
+          # keep holding after realign-staging.yml fast-forwards `staging` up to
+          # `main`, and after further task PRs land on `staging`. In both of those
+          # the promoted commit remains an ancestor, so the check is stable in
+          # time rather than only true for the instant after the merge.
+          if ! git merge-base --is-ancestor "$second_parent" origin/staging; then
+            echo "::error::The merged branch ($second_parent) is not reachable from origin/staging, so ${{ github.sha }} is not a staging promotion. Refusing to publish."
+            exit 1
+          fi
+
+          echo "::notice::${{ github.sha }} is a promotion of $second_parent from staging."
+
       # ── THE GATE ───────────────────────────────────────────────────────────
       # Gated on `ci` for `github.sha` — the merge commit that actually landed on
       # main — and NOT on the promotion PR's own check. main's protection is
@@ -137,10 +189,56 @@ jobs:
             echo "::notice::Nothing releasable since ${{ steps.derive.outputs.previous }} (docs/chores only) — no tag, no release."
           fi
 
+  # ── 2b: everything release.yml would refuse on, BEFORE any tag exists ───────
+  # release.yml re-runs `go test -race` and `govulncheck` on the tagged commit,
+  # deliberately (a hand-pushed tag needs its own gates). But it runs them AFTER
+  # this workflow has already pushed the tag, and a failure there is not
+  # recoverable by re-running:
+  #
+  #   - the tag exists and no release does;
+  #   - the re-run's `tag` job takes the "already exists at this commit" branch
+  #     and `publish` fails identically;
+  #   - worst of all, the dangling tag becomes `previous` for the NEXT
+  #     derivation, and .goreleaser.yaml's `changelog: use: github` diffs against
+  #     the previous TAG - so every commit it covers silently never appears in any
+  #     published release's notes.
+  #
+  # These checks are not redundant with `ci`, which is why a green `ci` does not
+  # make this job pointless: `govulncheck` is TIME-dependent (a disclosure lands
+  # between the two runs) and `check-latest: true` can pull a newer toolchain, so
+  # the same commit can be green at `ci` time and red minutes later. Running them
+  # here means that failure costs a red workflow instead of a poisoned tag.
+  validate:
+    name: validate before tagging
+    needs: gate
+    if: needs.gate.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: test
+        run: go test -race ./...
+
+      # Same install-by-module-version as ci.yml and release.yml: a `pkg@version`
+      # install is immutable and checked against the Go checksum database.
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+          govulncheck ./...
+
   # ── 3a: the tag ─────────────────────────────────────────────────────────────
   tag:
     name: tag
-    needs: gate
+    needs: [gate, validate]
     if: needs.gate.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -186,7 +284,7 @@ jobs:
   # release no weaker than a hand-cut one.
   publish:
     name: publish
-    needs: [gate, tag]
+    needs: [gate, validate, tag]
     if: needs.gate.outputs.release == 'true'
     uses: ./.github/workflows/release.yml
     with:

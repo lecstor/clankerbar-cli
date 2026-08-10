@@ -32,6 +32,14 @@ name: realign-staging
 on:
   push:
     branches: [main]
+  # The escape hatch, and it is needed for a real case rather than for tidiness.
+  # ci.yml cancels in-progress runs for the same ref, so two pushes to `main` in
+  # quick succession (a promotion plus a break-glass fix) leave the FIRST commit's
+  # `ci` in state `cancelled` - which the gate below correctly scores as a
+  # failure. The release refusing is right. But the realign is only ever
+  # triggered by a push to `main`, so without this `staging` would simply stay
+  # behind with nothing left to re-trigger it.
+  workflow_dispatch:
 
 concurrency:
   group: realign-staging
@@ -92,13 +100,22 @@ jobs:
             echo "::warning::No origin/staging branch — nothing to realign."
             exit 0
           fi
-          main_sha=$(git rev-parse origin/main)
 
-          if [ "$main_sha" = "$staging_sha" ]; then
-            echo "staging is already level with main ($main_sha) — nothing to fast-forward."
-          elif git merge-base --is-ancestor "$staging_sha" "$main_sha"; then
-            echo "Fast-forwarding staging ($staging_sha) up to main ($main_sha)."
-            git push origin "$main_sha:refs/heads/staging"
+          # ${{ github.sha }}, NOT $(git rev-parse origin/main). The gate above
+          # waited for `ci` on github.sha, and `main` can advance during that wait
+          # of up to 30 minutes - so reading origin/main here would fast-forward
+          # `staging` onto a commit this job never gated, while the log claimed it
+          # had been verified. staging's required-check protection would still
+          # reject such a push, so it failed closed, but as an opaque rejection
+          # rather than the deliberate skip below. Gate and push must name the
+          # same commit.
+          target_sha="${{ github.sha }}"
+
+          if [ "$target_sha" = "$staging_sha" ]; then
+            echo "staging is already level with the gated commit ($target_sha) — nothing to fast-forward."
+          elif git merge-base --is-ancestor "$staging_sha" "$target_sha"; then
+            echo "Fast-forwarding staging ($staging_sha) up to the gated commit ($target_sha)."
+            git push origin "$target_sha:refs/heads/staging"
           else
-            echo "staging ($staging_sha) is ahead of / diverged from main ($main_sha) — skipping ff to avoid a non-fast-forward push."
+            echo "staging ($staging_sha) is ahead of / diverged from the gated commit ($target_sha) — skipping ff to avoid a non-fast-forward push."
           fi

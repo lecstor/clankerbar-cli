@@ -73,8 +73,14 @@ done
 version_line="_(version preview unavailable — see the release-on-merge run after merging)_"
 previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' origin/"$BASE" 2>/dev/null || true)
 if [ -n "$previous" ] && command -v go >/dev/null 2>&1; then
+  # GITHUB_OUTPUT is cleared for this call on purpose. next-version appends its
+  # key=value lines to that file whenever it is set, so running this script inside
+  # a workflow would otherwise write `release=`/`version=`/`bump=`/`previous=`
+  # onto the CALLING job's outputs - a job that has nothing to do with releasing
+  # and never asked for them. Harmless today, confusing the moment someone reads
+  # that job's outputs.
   if derived=$(git log --no-merges --format=%B%x00 "$previous..origin/$HEAD" \
-      | go run ./cmd/release-tool next-version --current "$previous" 2>/dev/null); then
+      | GITHUB_OUTPUT= go run ./cmd/release-tool next-version --current "$previous" 2>/dev/null); then
     # `|| true` on each, and it is load-bearing rather than defensive. These are
     # plain assignments in an `if` BODY, so unlike the `if` condition above they
     # are NOT exempt from `set -e`, and `pipefail` propagates grep's exit 1 when a

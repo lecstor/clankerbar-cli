@@ -15,10 +15,20 @@ on:
   push:
     branches: [main, staging]
 
-# A newer push to the same branch/PR supersedes an in-flight run.
+# A newer push to the same PR supersedes an in-flight run - but NEVER on `main`
+# or `staging`.
+#
+# On a PR, cancelling is free: the only consumer is the PR's own check, and it is
+# about to be replaced. On an integration branch it is not free, because `ci` is
+# now the input to two other workflows. A cancelled run concludes `cancelled`,
+# which the release gate correctly scores as a FAILURE - so two pushes to `main`
+# in quick succession (a promotion plus a break-glass fix) would cancel the first
+# commit's `ci` and, with it, that commit's release and the `staging` realign.
+# The realign has a workflow_dispatch escape hatch for when this happens anyway;
+# not cancelling is what stops it happening.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
