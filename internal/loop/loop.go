@@ -405,6 +405,14 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			return tokens, cost, false, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
 		}
 
+		// A session whose stream could not be read whole (CLA-262). Everything below
+		// this line reads a figure parsed out of that stream, so counting the spend,
+		// classifying the exit or retrying on the strength of it are three ways to
+		// make a confident decision on data with a hole in it.
+		if res.Untrusted != "" {
+			return d.endUntrustedDrain(drainNum, res, tokens, cost)
+		}
+
 		// Count THIS attempt's spend toward the budget breaker regardless of how it
 		// ends — usage-limit, transient, stop, or clean. A failed/retried attempt
 		// still burned tokens, and a "leave headroom" breaker must err toward seeing
@@ -488,6 +496,42 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 	}
 }
 
+// endUntrustedDrain closes out a drain whose session output could not be read
+// whole, without acting on anything that stream said (CLA-262).
+//
+// # Why the spend is not counted
+//
+// It is not that the figure is inconvenient — it is that it is not a measurement.
+// The `result` event carrying a claude session's whole tokens-and-cost total is
+// the LAST thing on the stream, so a stream cut short reports zero for a session
+// that may have cost hundreds of dollars, and a partial sum from an adapter that
+// accumulates per step is a lower bound of unknown looseness. Adding either to the
+// accumulator would put a made-up number in front of the breaker and in the
+// iteration's cost line.
+//
+// # Why a spend ceiling then STOPS the run
+//
+// Because the ceiling is a promise, and this is the driver saying it can no longer
+// keep it. An operator who set `max_tokens` or `max_cost_usd` has asked to be
+// protected from exactly the shape this is: sessions whose cost nothing can see.
+// One unaccounted session is survivable; a night of them against an inert ceiling
+// is the failure CLA-287 and CLA-258 were both about. Stopping is clean, loud, and
+// resumable — the operator restarts the run once they know why.
+//
+// With no spend ceiling set there is nothing to break: the wall clock does not
+// depend on anything the child said, so the run carries on and the no-progress
+// back-off is what bounds a target that keeps producing these.
+func (d *Driver) endUntrustedDrain(drainNum int, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
+	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
+	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%d), and not handing back any claim it appeared to hold",
+		drainNum, res.Tokens, res.CostUSD, res.ExitCode)
+	if !d.cfg.Budget.CountsSpend() {
+		return tokens, cost, false, nil
+	}
+	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
+	return tokens, cost, true, nil
+}
+
 // releaseHeldClaim hands a task the session was still holding back to the queue,
 // instead of leaving its lease to run out with nobody heartbeating it.
 //
@@ -500,6 +544,19 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 //
 // A claim with pushed work is left alone; Claim.Releasable says why.
 func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result) {
+	// A stream read only in part tells us which calls we SAW, never which the
+	// session made: the settle that released the task may simply be in the bytes
+	// that never arrived. Handing the task back on that reading posts `ready` over
+	// work already in review, which is the one outcome worse than a lease expiring
+	// (CLA-262). Let it expire instead — the plane's own sweep does the right thing
+	// with it, and keeps the takeover hand-off if there is one.
+	if res.Untrusted != "" {
+		if res.Claim.Held() {
+			log.Printf("%ssession appeared to end holding %s, but its output could not be read whole — leaving the lease to expire rather than releasing a task that may already be settled",
+				labelOf(t), res.Claim.TaskID)
+		}
+		return
+	}
 	if !res.Claim.Held() {
 		return
 	}

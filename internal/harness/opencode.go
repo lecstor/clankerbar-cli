@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -48,24 +47,38 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	}
 	cmd.Env = o.env(in)
 
-	// Capture for parsing, and tee live to the console when one is set (the JSON
-	// event stream — a readable renderer is a TODO; raw is honest live output).
-	var stdout, stderr bytes.Buffer
+	// Parse as the stream arrives, retain only a bounded tail of it for the text
+	// scans, and tee live to the console when one is set (the JSON event stream —
+	// a readable renderer is a TODO; raw is honest live output).
+	//
+	// Live parsing is load-bearing here rather than merely tidy: this adapter SUMS
+	// per-step usage across the whole session, so a capped copy of stdout walked
+	// afterwards would silently drop the early steps and under-count the budget by
+	// however much of the stream had scrolled away (CLA-262).
+	var p opencodeParse
+	stdout, stderr := newTail(), newTail()
+	sink := newLineSink(p.line)
+	outWriters := []io.Writer{stdout, sink}
+	errWriters := []io.Writer{stderr}
 	if in.Console != nil && !in.Probe {
-		cmd.Stdout = io.MultiWriter(&stdout, in.Console)
-		cmd.Stderr = io.MultiWriter(&stderr, in.Console)
-	} else {
-		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+		outWriters = append(outWriters, in.Console)
+		errWriters = append(errWriters, in.Console)
 	}
+	cmd.Stdout, cmd.Stderr = io.MultiWriter(outWriters...), io.MultiWriter(errWriters...)
 	runErr := cmd.Run()
+	sink.Flush() // a final line that arrived without a newline
 
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), scans: newScanCache()}
+	p.finish(&res)
+	if sink.Overran() {
+		res.markUntrusted("an opencode event exceeded the line cap and was discarded: " +
+			"this session's token and cost figures are incomplete")
+	}
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
 		return res, runErr // couldn't launch opencode at all
 	}
-	o.parse(&res)
 	return res, nil
 }
 
@@ -169,64 +182,71 @@ type opencodeTokens struct {
 	} `json:"cache"`
 }
 
-// parse walks the event stream to fill FinalMessage, Tokens and CostUSD.
+// opencodeParse accumulates FinalMessage, Tokens and CostUSD from the event
+// stream, ONE LINE AT A TIME as it arrives.
 //
 // Tokens/cost are SUMMED across every step-finish part: opencode reports usage
 // per step (one step = one LLM turn), not cumulatively, so a multi-turn drain
 // emits several step-finish parts that each cover their own turn. FinalMessage is
 // the last non-empty text part — the final assistant answer, after any
 // intermediate per-step messages.
-func (opencode) parse(res *Result) {
-	var (
-		lastText                              string
-		total, in, out, reason, cWrite, cRead int
-		cost                                  float64
-		sawUsage                              bool
-	)
-	for _, line := range strings.Split(res.Stdout, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "{") {
-			continue
+//
+// Because it sums, it has to see EVERY step — which is exactly why it runs on the
+// live stream instead of over the retained tail (see Invoke).
+type opencodeParse struct {
+	lastText                              string
+	total, in, out, reason, cWrite, cRead int
+	cost                                  float64
+	sawUsage                              bool
+}
+
+func (p *opencodeParse) line(line []byte) {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "{") {
+		return
+	}
+	var ev opencodeEvent
+	if json.Unmarshal([]byte(trimmed), &ev) != nil {
+		return // partial/non-JSON line — skip
+	}
+	if ev.Part == nil {
+		return
+	}
+	switch ev.Type {
+	case "text":
+		if t := strings.TrimSpace(ev.Part.Text); t != "" {
+			p.lastText = t
 		}
-		var ev opencodeEvent
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue // partial/non-JSON line — skip
+	case "step_finish":
+		// tokens and cost are siblings on the part; count each independently so
+		// a step that reports one without the other still lands in the budget.
+		if tk := ev.Part.Tokens; tk != nil {
+			p.total += tk.Total
+			p.in += tk.Input
+			p.out += tk.Output
+			p.reason += tk.Reasoning
+			p.cWrite += tk.Cache.Write
+			p.cRead += tk.Cache.Read
+			p.sawUsage = true
 		}
-		if ev.Part == nil {
-			continue
-		}
-		switch ev.Type {
-		case "text":
-			if t := strings.TrimSpace(ev.Part.Text); t != "" {
-				lastText = t
-			}
-		case "step_finish":
-			// tokens and cost are siblings on the part; count each independently so
-			// a step that reports one without the other still lands in the budget.
-			if tk := ev.Part.Tokens; tk != nil {
-				total += tk.Total
-				in += tk.Input
-				out += tk.Output
-				reason += tk.Reasoning
-				cWrite += tk.Cache.Write
-				cRead += tk.Cache.Read
-				sawUsage = true
-			}
-			if ev.Part.Cost != 0 {
-				cost += ev.Part.Cost
-				sawUsage = true
-			}
+		if ev.Part.Cost != 0 {
+			p.cost += ev.Part.Cost
+			p.sawUsage = true
 		}
 	}
-	res.FinalMessage = lastText
-	if sawUsage {
+}
+
+// finish writes what the stream added up to onto res.
+func (p *opencodeParse) finish(res *Result) {
+	res.FinalMessage = p.lastText
+	if p.sawUsage {
 		// opencode's `total` already folds in input+output+reasoning+cache, so it
 		// is the honest spend figure for the budget.
-		res.Tokens = total
-		res.CostUSD = cost
+		res.Tokens = p.total
+		res.CostUSD = p.cost
 		res.Raw = map[string]any{
-			"input_tokens": in, "output_tokens": out, "reasoning_tokens": reason,
-			"cache_write_tokens": cWrite, "cache_read_tokens": cRead,
+			"input_tokens": p.in, "output_tokens": p.out, "reasoning_tokens": p.reason,
+			"cache_write_tokens": p.cWrite, "cache_read_tokens": p.cRead,
 		}
 	}
 }
@@ -260,6 +280,10 @@ func (opencode) DetectLimit(res Result) Limit {
 // plus the stdout lines that decode to a {"type":"error"} event — so a limit scan
 // sees provider/transport errors but never the agent's own assistant text.
 func opencodeErrorText(res Result) string {
+	return res.scan(scanErrorText, func() string { return buildOpencodeErrorText(res) })
+}
+
+func buildOpencodeErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
 	for _, line := range strings.Split(res.Stdout, "\n") {

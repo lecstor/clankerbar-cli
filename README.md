@@ -548,6 +548,18 @@ alternatives, in order of preference:
    breaker reads, so a pause whose probes alone cross a ceiling ends on that
    ceiling rather than polling on.
 
+   **A session whose spend cannot be measured stops the run, if you set a spend
+   ceiling.** Every figure the breaker reads is parsed out of the harness's event
+   stream, and one enormous line — a `tool_result` carrying a large file read —
+   can end that stream early. The session's own total arrives in its *last* event,
+   so a stream cut short reports near-zero for a session that may have cost
+   hundreds of dollars. The loop refuses to count that figure, says so loudly, and
+   then stops if `max_tokens` or `max_cost_usd` is set, because the ceiling you
+   asked for can no longer be honoured. Under `max_wall_clock` alone, or with no
+   ceiling at all, it carries on: the clock does not depend on anything the child
+   said. The same session's task is left to its lease rather than handed back —
+   the settle that released it may be in the bytes that never arrived.
+
 ## Harnesses
 
 | Harness | Status |

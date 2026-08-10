@@ -2,7 +2,6 @@ package harness
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -63,35 +62,80 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	var stderrBuf bytes.Buffer
-	cmd.Stderr = io.MultiWriter(&stderrBuf, console) // surface errors live too
+	stderrTail := newTail()
+	cmd.Stderr = io.MultiWriter(stderrTail, console) // surface errors live too
 
 	if err := cmd.Start(); err != nil {
 		return Result{}, err
 	}
 
-	// Stream stdout line-by-line: keep the raw NDJSON (for text scans and the
-	// logfile) and render readable progress to the console as it arrives.
-	var stdoutRaw bytes.Buffer
-	res := Result{}
-	sc := bufio.NewScanner(stdoutPipe)
-	sc.Buffer(make([]byte, 0, 64*1024), 16*1024*1024) // a result event can be large
-	for sc.Scan() {
-		line := sc.Bytes()
-		stdoutRaw.Write(line)
-		stdoutRaw.WriteByte('\n')
-		c.renderAndParse(line, console, &res)
-	}
+	// Stream stdout line-by-line: parse each event as it arrives, render readable
+	// progress to the console, and retain a bounded tail for the text scans.
+	stdoutTail := newTail()
+	res := Result{scans: newScanCache()}
+	c.consume(stdoutPipe, console, stdoutTail, &res)
 	waitErr := cmd.Wait()
 
-	res.Stdout = stdoutRaw.String()
-	res.Stderr = stderrBuf.String()
+	res.Stdout = stdoutTail.String()
+	res.Stderr = stderrTail.String()
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if waitErr != nil {
 		return res, waitErr // couldn't run claude at all
 	}
 	return res, nil
+}
+
+// consume reads the session's stream-json stdout to the end: parsing and
+// rendering every line as it arrives, and retaining a bounded tail in keep.
+//
+// # A line too long is a wrong answer, not a missing one
+//
+// bufio.Scanner ends its loop on a line above maxStreamLine with
+// bufio.ErrTooLong, and for years nothing here looked. Every consequence is a
+// silent wrong decision by the supervisor, which is the one class this loop is
+// built to avoid (CLA-262):
+//
+//   - The `result` event never arrives, so Tokens and CostUSD stay ZERO and a
+//     session that may have spent hundreds of dollars reports nothing to the
+//     budget breaker.
+//   - A claim's settle is never observed, so the driver reads a task the session
+//     handed to review as one it abandoned, and posts `ready` over it.
+//   - Abandoning the pipe with the child still writing means cmd.Wait closes our
+//     end, claude dies on EPIPE, and the exit code reads as a genuine
+//     non-retryable failure — which stops the whole run.
+//
+// So the error is said out loud on the console (and so into the iteration log),
+// the Result is marked untrusted for the driver, and the pipe is DRAINED to
+// io.Discard so the child finishes its own write and exits on its own terms.
+// Draining is not free — the bytes still arrive — but it is a fixed cost with
+// nothing retained, and it buys an honest exit code.
+func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result) {
+	sc := bufio.NewScanner(r)
+	sc.Buffer(make([]byte, 0, 64*1024), maxStreamLine) // a result event can be large
+	for sc.Scan() {
+		line := sc.Bytes()
+		keep.Write(line)
+		keep.Write(newline)
+		c.renderAndParse(line, console, res)
+	}
+	err := sc.Err()
+	if err == nil {
+		return
+	}
+	res.markUntrusted(fmt.Sprintf("claude's stdout could not be read to the end (%v)"+
+		": an unknown number of events never reached the parser, so this session's spend, "+
+		"its final message and any claim it settled are all incomplete", err))
+	fmt.Fprintf(console, "\n!! stream read failed: %v — draining the rest so the session is not killed mid-write; "+
+		"this run's parsed figures are NOT trustworthy\n", err)
+	// Read the remainder so the child is not killed by EPIPE. It has nowhere to
+	// go: nothing can be parsed out of a stream whose framing we have already
+	// lost.
+	if n, cerr := io.Copy(io.Discard, r); cerr != nil {
+		fmt.Fprintf(console, "!! discarded %d further bytes, then: %v\n", n, cerr)
+	} else {
+		fmt.Fprintf(console, "!! discarded %d further bytes of stdout\n", n)
+	}
 }
 
 // renderAndParse renders one stream-json event to the console (assistant text and
@@ -360,11 +404,14 @@ func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	}
 	cmd.Env = c.env(in)
 
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	// Bounded like the drain path, though a probe's answer is a few hundred bytes:
+	// the cap is what makes "how much can one session hold" answerable without
+	// reasoning about which path produced it.
+	stdout, stderr := newTail(), newTail()
+	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
 
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), scans: newScanCache()}
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
@@ -433,6 +480,10 @@ const (
 // A line that starts like an event but does not parse is dropped rather than read
 // raw; a half-written event is not something to classify a run on.
 func claudeText(res Result, scope claudeScope) string {
+	return res.scan(int(scope), func() string { return buildClaudeText(res, scope) })
+}
+
+func buildClaudeText(res Result, scope claudeScope) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
 
