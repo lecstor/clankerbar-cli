@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -42,14 +43,26 @@ const defaultPrompt = "Work the next backlog item."
 // Phase is one session in a task's sequence. A task runs as an ordered list of
 // them, each a separate harness process, so context resets between them.
 //
-// The point is a context reset the model cannot perform for itself. A session's
+// The point is a context reset the MODEL cannot perform for itself. A session's
 // context grows monotonically and is re-read on every turn: one measured task
 // (CLA-309, 2026-08-11) spent 66.2M tokens over 370 turns, and its last four
 // deciles were 53% of that purely because each of those turns re-read ~250k. The
 // served protocol already tells a session to shed at a safe checkpoint, and says
 // in the same breath that the rule is a no-op if the harness cannot discard
-// context — which `claude -p` cannot: no --continue, no --resume, and no
-// compaction the model can reach. A process boundary is the only lever there is.
+// context. Inside a `claude -p` run there is no tool and no slash command a model
+// can use to discard its own context, so for the agent that rule is dead letter.
+//
+// What was evaluated and NOT chosen, since the driver does have options here
+// (claude 2.1.226): `--autocompact <auto|tokens>` compacts at a THRESHOLD, and
+// `--continue` / `--resume` / `--fork-session` restore a session rather than
+// shedding one. Compaction lands wherever the threshold falls, which is the
+// specific thing the protocol warns about — a summarised context can garble the
+// bar the work is judged against, and the session will not know. A phase boundary
+// lands at a point where everything load-bearing is already durable elsewhere
+// (code pushed, bar and decisions on the plane), so the next phase re-reads them
+// from source instead of trusting a summary. Autocompact is also Claude-only,
+// where a process boundary is a thing every harness has. Worth revisiting: the
+// two compose, and autocompact inside a long phase costs nothing to try.
 //
 // Why phases and not a better-worded rule: "your job this session is
 // implementation only, then stop" is a SCOPE instruction, and scope is the kind
@@ -101,6 +114,10 @@ var builtinPhasePrompts = map[string]string{
 		"on the branch recorded on the task. Then run the adversarial review gate, fix what it finds, re-verify, " +
 		"push, and hand the task to in_review.",
 }
+
+// phaseNameRe is what a phase name may contain, because it becomes part of an
+// iteration log's filename.
+var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // The placeholders a phase prompt may carry, substituted by the driver from the
 // claim the previous phase left held.
@@ -723,10 +740,29 @@ func (c *Config) Validate() error {
 		return errors.New("config sets both `prompt` and `phases`; a phased task is asked its phase's prompt " +
 			"and never `prompt`, so remove one of them")
 	}
+	// Phases rest entirely on the adapter observing the session's claim: the
+	// handback across a seam, the salvage, and the delivery check all gate on
+	// Result.Claim.Held(). An adapter that never populates it would not fail —
+	// it would implement and push and then stop after phase 1 on EVERY task,
+	// reported by a log line that reads like an ordinary early finish. Refuse
+	// here instead, where an operator can see it, rather than at 3am.
+	if len(c.Phases) > 1 {
+		if caps, ok := harness.CapabilitiesOf(c.Harness); ok && !caps.TracksClaims {
+			return fmt.Errorf("harness %q cannot run `phases`: it does not observe the session's task claim, "+
+				"so a phase could not hand its task to the next one (only the claim-tracking harnesses can: use one, or drop `phases`)",
+				c.Harness)
+		}
+	}
 	for i, ph := range c.Phases {
 		if ph.Prompt == "" && builtinPhasePrompts[ph.Name] == "" {
 			return fmt.Errorf("phases[%d]: no `prompt`, and %q is not a built-in phase name (built-ins: %s)",
 				i, ph.Name, strings.Join(BuiltinPhaseNames(), ", "))
+		}
+		// The name reaches a log FILENAME, and statedir refuses one it does not
+		// like — which would cost the phase its iteration log entirely, the one
+		// artifact an operator has to debug the sequence with.
+		if ph.Name != "" && !phaseNameRe.MatchString(ph.Name) {
+			return fmt.Errorf("phases[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, ph.Name)
 		}
 		if ph.MaxTurns < 0 {
 			return fmt.Errorf("phases[%d]: max_turns is negative", i)

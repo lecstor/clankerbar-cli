@@ -84,6 +84,13 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// progress to the console, and retain a bounded tail for the text scans.
 	stdoutTail := newTail()
 	var res Result
+	// A resumed phase never calls claim_task — it was told to continue a run, not
+	// start one — so seed the claim its predecessor left held BEFORE the stream is
+	// parsed. Held() then gates the handback, the salvage and the delivery check
+	// the same way it does for a session that claimed for itself, and the stream
+	// still supplies Settled/HasWIP on top: noteToolUse matches update_task
+	// against this TaskID, which is exactly the arm that would otherwise never fire.
+	res.Claim = in.ResumeClaim
 	c.consume(stdoutPipe, console, stdoutTail, &res)
 	waitErr := cmd.Wait()
 
@@ -648,6 +655,36 @@ var claudeTransientRe = regexp.MustCompile(`(?i)api error: (408|429|5\d\d)` +
 
 func (claude) IsTransient(res Result) bool {
 	return claudeTransientRe.MatchString(claudeText(res, claudeDiagnostic))
+}
+
+// claudeMaxTurnsReason is what `claude -p --max-turns N` reports when the cap
+// fires, verified against claude 2.1.226:
+//
+//	exit 1, {"type":"result","subtype":"error_max_turns","is_error":true,
+//	         "result":null,"terminal_reason":"max_turns", ...}
+//
+// `result` is null and the text matches neither the usage-limit scan nor the
+// transient one, so WITHOUT this classification the loop reaches its
+// non-retryable branch and ends the whole run. That is the phase backstop
+// killing the daemon it was added to protect.
+//
+// --max-turns is not in `claude --help` for that version; it is accepted (an
+// unknown flag exits 1 with "error: unknown option"), so this is a dependency on
+// an undocumented flag, pinned here against a named version deliberately.
+const claudeMaxTurnsReason = "max_turns"
+
+func (claude) TurnCapped(res Result) bool {
+	if res.Raw == nil {
+		return false
+	}
+	r, _ := res.Raw["terminal_reason"].(string)
+	return r == claudeMaxTurnsReason
+}
+
+// Claude is the one adapter that watches the session's clankerbar tool calls, so
+// it is the only one phases can run on today. See Capabilities.TracksClaims.
+func (claude) Capabilities() Capabilities {
+	return Capabilities{TracksClaims: true, HonoursMaxTurns: true}
 }
 
 // Diagnostic returns the same CLI-authored text IsTransient judged, so a caller

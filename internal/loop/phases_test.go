@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 
 	"strings"
 	"testing"
@@ -160,12 +161,12 @@ func TestDrainPhases_ASettledFirstPhaseEndsTheSequence(t *testing.T) {
 // The finest granularity the spend ceiling has ever had. One measured task spent
 // 92% of a whole run's ceiling inside a single session, which a between-drains
 // check can neither see coming nor interrupt.
-func TestDrainPhases_BudgetAtTheSeamStopsBeforePhaseTwoAndHandsTheTaskBack(t *testing.T) {
+func TestDrainPhases_BudgetAtTheSeamStopsBeforePhaseTwo(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(500, 0)},
 		{res: okResult(1, 0)},
 	}}
-	d, rel := phaseDriver(t, h, twoPhases())
+	d, _ := phaseDriver(t, h, twoPhases())
 	d.cfg.Budget = config.Budget{MaxTokens: 100}
 
 	_, _, stop, err := drainPhasesOnce(t, d)
@@ -178,10 +179,183 @@ func TestDrainPhases_BudgetAtTheSeamStopsBeforePhaseTwoAndHandsTheTaskBack(t *te
 	if h.invokeCalls != 1 {
 		t.Errorf("spawned phase 2 past the ceiling: %d sessions", h.invokeCalls)
 	}
-	// The handback skipped at the seam is owed here, or the task sits leased to a
-	// sequence that will never continue.
+}
+
+// What the deferred handback does at a seam the sequence never crosses, in BOTH
+// dispositions — because the two differ and only one of them is what production
+// actually hits.
+//
+// The shipped phase-1 brief mandates update_task(taskId, runId, branch), which
+// sets HasWIP, which makes the claim non-releasable under CLA-314 so the takeover
+// hand-off survives. So the realistic case is "left to expire", not "handed
+// back". An earlier version of this test asserted the handback using a fixture
+// with HasWIP unset — a claim phase 1 cannot produce — and was green for a
+// behaviour the code would never perform.
+func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		claim        harness.Claim
+		wantReleases int
+	}{
+		{
+			name:         "nothing pushed: handed straight back",
+			claim:        openClaim(),
+			wantReleases: 1,
+		},
+		{
+			name: "work pushed (what phase 1 actually leaves): lease left to expire",
+			// update_task(branch:) sets HasWIP; CLA-314 keeps such a claim
+			// non-releasable so the task returns as a takeover with its branch.
+			claim:        harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			wantReleases: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: held(okResult(500, 0), tc.claim)},
+				{res: okResult(1, 0)},
+			}}
+			d, rel := phaseDriver(t, h, twoPhases())
+			d.cfg.Budget = config.Budget{MaxTokens: 100}
+
+			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || !stop {
+				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+			}
+			if len(rel.calls) != tc.wantReleases {
+				t.Errorf("handed the task back %d times, want %d: %+v", len(rel.calls), tc.wantReleases, rel.calls)
+			}
+		})
+	}
+}
+
+// The backstop must not become the thing that kills the daemon. A turn-capped
+// session exits NON-ZERO and matches neither the limit scan nor the transient
+// one, so without its own classification it lands in the non-retryable branch
+// and ends the whole run — with the task released half-implemented.
+func TestDrainPhases_ATurnCappedPhaseIsACheckpointNotAFatalExit(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(turnCappedResult(), openClaim())},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: "implement", MaxTurns: 5},
+		{Name: "review"},
+	})
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("a turn-capped phase ended the RUN: %v — the salvage has already committed what it left, so this is the phase ending, not a failure", err)
+	}
+	if stop {
+		t.Error("a turn-capped phase stopped the run")
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions; phase 2 should still run after phase 1 hit its cap", h.invokeCalls)
+	}
+}
+
+func TestDrainPhases_ATurnCappedFinalPhaseEndsTheDrainWithoutFailingTheRun(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: held(turnCappedResult(), openClaim())}}}
+	d, _ := phaseDriver(t, h, nil)
+	d.cfg.Prompt = "Work the next backlog item."
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("a turn-capped final phase ended the run: %v", err)
+	}
+	if stop {
+		t.Error("a turn-capped final phase stopped the run")
+	}
+}
+
+// Everything the driver does about a task hangs off Result.Claim.Held(): the
+// handback, the CLA-314 salvage, the CLA-253 delivery check. A resumed session is
+// told not to claim, so without seeding, the phase that pushes the branch and
+// opens the PR is the one running with all three switched off.
+func TestDrainPhases_SeedsTheResumedSessionsClaim(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+
+	if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if got := h.invocations[1].ResumeClaim; got.TaskID != "t-1" || got.RunID != "r-1" {
+		t.Errorf("phase 2 was invoked with ResumeClaim %+v, want the claim phase 1 held; without it the salvage, the handback and the delivery check are all inert for the phase that does the pushing", got)
+	}
+	if got := h.invocations[0].ResumeClaim; got.TaskID != "" {
+		t.Errorf("phase 1 was seeded with a claim %+v; it claims for itself", got)
+	}
+}
+
+// The clobbering case: a phase that reports no claim of its own must not erase
+// the one its predecessor is still holding, or the handback silently goes missing
+// for exactly the failure it exists to cover.
+func TestDrainPhases_APhaseThatNeverLaunchedKeepsThePredecessorsClaim(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		// A launch failure: a zero Result alongside an error, carrying no claim.
+		{res: harness.Result{}, err: errors.New("exec: claude not found")},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+
+	if _, _, _, err := drainPhasesOnce(t, d); err == nil {
+		t.Fatal("a launch failure should still be an error")
+	}
 	if len(rel.calls) != 1 {
-		t.Errorf("stopped at the seam without handing the task back, got %d releases: %+v", len(rel.calls), rel.calls)
+		t.Fatalf("phase 1's task was handed back %d times, want 1: %+v — phase 2 never launched, so it observed no claim, and its silence must not erase one that is still live", len(rel.calls), rel.calls)
+	}
+	if rel.calls[0].taskID != "t-1" {
+		t.Errorf("handed back %q, want the task phase 1 was holding", rel.calls[0].taskID)
+	}
+}
+
+// Pre-phases, the handback ran on EVERY attempt, so no wait could leave a lease
+// unattended. A seam hold must not survive into a retry that re-claims.
+func TestDrainPhases_AHoldDoesNotSurviveAUsageLimitRetry(t *testing.T) {
+	// Exit 0 AND a usage limit: the loop checks the limit before the exit code,
+	// and no adapter's DetectLimit consults the exit code at all.
+	capped := held(okResult(1, 0), openClaim())
+	capped.Raw = map[string]any{"kind": "limit"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: capped},
+		{res: checkpointed(1, 0)},
+		{res: okResult(1, 0)},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+
+	if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if len(rel.calls) == 0 {
+		t.Error("the claim held open by the limited attempt was never handed back; the retry re-claims, so the hold had to be undone first")
+	}
+}
+
+// A resumed phase is working a live 30-minute lease that nothing driver-side
+// heartbeats, so waiting hours would re-spawn it against a run the plane has
+// swept or handed to a takeover.
+func TestDrainPhases_AResumedPhaseDoesNotWaitOutAUsageLimit(t *testing.T) {
+	h := &fakeAdapter{
+		steps: []invokeStep{
+			{res: checkpointed(1, 0)},
+			{res: held(limitResult(), openClaim())},
+		},
+		limitResetAt: time.Now().Add(2 * time.Hour),
+	}
+	d, _ := phaseDriver(t, h, twoPhases())
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if !stop {
+		t.Error("a resumed phase hit a usage limit and the run did not stop")
+	}
+	if h.probeCalls != 0 {
+		t.Errorf("supervisedWait probed %d times on a resumed phase; it must not wait out a reset on a lease it cannot renew", h.probeCalls)
 	}
 }
 

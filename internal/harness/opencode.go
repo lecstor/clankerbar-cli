@@ -327,6 +327,15 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d
 	`|overloaded|too many requests|rate ?limit` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
+// No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
+// attributed to one.
+func (opencode) TurnCapped(Result) bool { return false }
+
+// Like codex, this adapter does not populate Result.Claim, so `phases` is refused
+// for it in config.Validate rather than silently stopping after phase 1 on every
+// task. See Capabilities.TracksClaims.
+func (opencode) Capabilities() Capabilities { return Capabilities{} }
+
 func (opencode) IsTransient(res Result) bool {
 	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw
 	// Stdout+Stderr: the latter includes {"type":"text"} assistant narration, so a

@@ -3,6 +3,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
 // A config with no phases must behave exactly as it always has. This is the
@@ -125,6 +127,70 @@ func TestValidate_RejectsAPhaseWithNoPromptAndNoBuiltin(t *testing.T) {
 		if !strings.Contains(err.Error(), n) {
 			t.Errorf("the rejection does not list the built-in name %q, so an operator cannot see what they meant to type: %v", n, err)
 		}
+	}
+}
+
+// Phases rest entirely on the adapter observing the session's claim. An adapter
+// that does not would not FAIL — it would implement and push and then stop after
+// phase 1 on every task, reported by a log line that reads like an ordinary early
+// finish. Refusing at validation is the difference between a config error and a
+// silent half-run every night.
+func TestValidate_RefusesPhasesOnAHarnessThatCannotObserveAClaim(t *testing.T) {
+	for _, name := range harness.Names() {
+		caps, ok := harness.CapabilitiesOf(name)
+		if !ok {
+			t.Fatalf("registered harness %q has no capabilities", name)
+		}
+		c := defaults()
+		c.Harness = name
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: "implement"}, {Name: "review"}}
+
+		err := c.Validate()
+		if caps.TracksClaims {
+			if err != nil {
+				t.Errorf("Validate rejected phases on %q, which tracks claims: %v", name, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("Validate accepted phases on %q, which does not observe a claim — every task would stop after phase 1", name)
+			continue
+		}
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("the rejection for %q does not name the harness: %v", name, err)
+		}
+	}
+}
+
+// A single phase needs no hand-off, so it does not need claim tracking either.
+func TestValidate_AllowsASinglePhaseOnAnyHarness(t *testing.T) {
+	for _, name := range harness.Names() {
+		c := defaults()
+		c.Harness = name
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: "implement"}}
+
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate rejected a single phase on %q: %v — one phase hands off to nobody", name, err)
+		}
+	}
+}
+
+// The name becomes part of an iteration log's filename, and statedir refuses one
+// it does not like — costing the phase the single artifact an operator has to
+// debug the sequence with.
+func TestValidate_RejectsAPhaseNameThatCannotBeAFilename(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: "impl/one", Prompt: "do the thing"}}
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate accepted a phase name containing a path separator; its sessions would run with no iteration log at all")
+	}
+	if !strings.Contains(err.Error(), "impl/one") {
+		t.Errorf("the rejection does not name the offending phase: %v", err)
 	}
 }
 

@@ -1,0 +1,111 @@
+package harness
+
+import "testing"
+
+// A turn-capped session exits NON-ZERO and matches neither the usage-limit scan
+// nor the transient one, so without its own classification the driver reads it as
+// a genuine failure and ends the whole run — the phase backstop killing the
+// daemon it was added to protect.
+//
+// The shape is from the real CLI (claude 2.1.226), running
+//
+//	claude -p "…" --max-turns 1 --output-format stream-json --verbose
+//
+// which exits 1 and emits:
+//
+//	{"type":"result","subtype":"error_max_turns","is_error":true,
+//	 "result":null,"terminal_reason":"max_turns",
+//	 "errors":["Reached maximum number of turns (1)"]}
+func TestClaudeTurnCapped(t *testing.T) {
+	tests := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{
+			name: "the real max-turns result",
+			res:  Result{ExitCode: 1, Raw: map[string]any{"terminal_reason": "max_turns", "is_error": true}},
+			want: true,
+		},
+		{
+			name: "a usage limit is not a turn cap",
+			res:  Result{ExitCode: 1, Raw: map[string]any{"terminal_reason": "usage_limit"}},
+			want: false,
+		},
+		{
+			name: "an ordinary clean finish",
+			res:  Result{ExitCode: 0, Raw: map[string]any{"terminal_reason": "end_turn"}},
+			want: false,
+		},
+		{
+			name: "no Raw at all (a launch failure)",
+			res:  Result{ExitCode: 1},
+			want: false,
+		},
+		{
+			name: "a non-string terminal_reason does not panic or match",
+			res:  Result{ExitCode: 1, Raw: map[string]any{"terminal_reason": 7}},
+			want: false,
+		},
+		{
+			// The scan reads the PARSED field, never the free text, so a task body
+			// or an agent's narration mentioning the phrase cannot forge one — the
+			// same defect class as CLA-258's "hit your".
+			name: "the phrase in narration is not a turn cap",
+			res:  Result{ExitCode: 1, Stdout: `{"type":"text","text":"I stopped at max_turns"}`},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := (claude{}).TurnCapped(tt.res); got != tt.want {
+				t.Errorf("claude.TurnCapped() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// Neither adapter is passed MaxTurns, so no exit of theirs can be attributed to
+// one. Pinned so a future adapter that DOES grow a cap has to say so here.
+func TestAdaptersWithoutATurnCapNeverReportOne(t *testing.T) {
+	res := Result{ExitCode: 1, Raw: map[string]any{"terminal_reason": "max_turns"}}
+	if (codex{}).TurnCapped(res) {
+		t.Error("codex reported a turn cap; it is never given MaxTurns")
+	}
+	if (opencode{}).TurnCapped(res) {
+		t.Error("opencode reported a turn cap; it is never given MaxTurns")
+	}
+}
+
+// Phases gate on this, in config.Validate, so it is not merely descriptive: the
+// day an adapter starts observing claims, flipping the flag is what turns phases
+// on for it.
+func TestCapabilitiesMatchWhatTheAdaptersActuallyDo(t *testing.T) {
+	if !(claude{}).Capabilities().TracksClaims {
+		t.Error("claude does populate Result.Claim; TracksClaims must say so or phases are refused for the one harness that supports them")
+	}
+	if !(claude{}).Capabilities().HonoursMaxTurns {
+		t.Error("claude passes --max-turns; HonoursMaxTurns must say so")
+	}
+	for name, caps := range map[string]Capabilities{
+		"codex":    (codex{}).Capabilities(),
+		"opencode": (opencode{}).Capabilities(),
+	} {
+		if caps.TracksClaims {
+			t.Errorf("%s claims to track claims, but it never assigns Result.Claim — phases would stop after phase 1 on every task", name)
+		}
+	}
+}
+
+// CapabilitiesOf is what config.Validate calls, before any adapter is built.
+func TestCapabilitiesOfResolvesEveryRegisteredHarness(t *testing.T) {
+	for _, name := range Names() {
+		if _, ok := CapabilitiesOf(name); !ok {
+			t.Errorf("CapabilitiesOf(%q) reported unknown for a registered harness", name)
+		}
+	}
+	if _, ok := CapabilitiesOf("nope-not-a-harness"); ok {
+		t.Error("CapabilitiesOf accepted an unregistered harness")
+	}
+}

@@ -40,8 +40,19 @@ task gets expensive at the *end*: one measured task spent 66.2M tokens over 370
 turns, and its last four deciles were 53% of that purely because each of those
 turns re-read a quarter of a million tokens. The served protocol already tells a
 session to shed its context at a safe checkpoint, and says in the same breath
-that the rule is a no-op if the harness cannot discard context — which `claude
--p` cannot. **A process boundary is the only lever there is.**
+that the rule is a no-op if the harness cannot discard context. Inside a `claude
+-p` run there is no tool and no slash command **the model** can use to discard
+its own context, so for the agent that rule is dead letter.
+
+The driver does have options, and they were evaluated rather than assumed away
+(claude 2.1.226): `--autocompact <auto|tokens>` compacts at a *threshold*, and
+`--continue` / `--resume` / `--fork-session` restore a session rather than
+shedding one. A phase boundary was chosen over compaction because it lands where
+everything load-bearing is already durable somewhere else — code pushed, bar and
+standing decisions on the plane — so the next phase re-reads them from source,
+where a summary that garbled the bar would not announce itself. It is also
+harness-agnostic, where `--autocompact` is Claude-only. The two compose, and
+trying autocompact inside a long phase costs nothing.
 
 `phases` splits one task across several sessions, so the context resets at that
 checkpoint:
@@ -69,9 +80,19 @@ by the salvage). `prompt` and `phases` are mutually exclusive.
 reaches its checkpoint and stops is only half finished until the next session
 runs, so this trades a driver that cannot lose a task for one that can leave it
 half-done if the sequence is interrupted. The budget breaker fires at the phase
-boundary too, and hands the task back when it does. The saving on the measured
-curve is 20-28% for a two-way cut; splitting thinner earns less each time while
-every extra boundary still pays a session's full startup cost.
+boundary too. Two other consequences worth knowing:
+
+- **`max_iterations` counts task sequences, not sessions.** A two-phase config
+  spawns roughly twice the sessions for the same limit.
+- **`phases` requires a harness that observes the session's task claim**, which
+  today means `claude`. The handback across a seam, the salvage and the delivery
+  check all depend on it, so a config naming `codex` or `opencode` alongside
+  `phases` is refused at validation rather than quietly stopping after phase 1 on
+  every task.
+
+The saving on the measured curve is 20-28% for a two-way cut; splitting thinner
+earns less each time while every extra boundary still pays a session's full
+startup cost.
 
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.

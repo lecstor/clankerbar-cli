@@ -56,6 +56,13 @@ func nonRetryableResult() harness.Result {
 func limitResult() harness.Result {
 	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "limit"}}
 }
+
+// turnCappedResult is a session cut off by Invocation.MaxTurns: a NON-ZERO exit
+// that is nonetheless an orderly end, which is the whole reason it needs its own
+// classification rather than falling through to "non-retryable".
+func turnCappedResult() harness.Result {
+	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "turnCapped"}}
+}
 func limitStopResult() harness.Result {
 	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "limitStop"}}
 }
@@ -85,6 +92,9 @@ type fakeAdapter struct {
 	probeTokens  int
 	probeCost    float64
 	limitResetAt time.Time
+	// caps overrides the fake's default capabilities, for the tests that drive an
+	// adapter which cannot observe a claim.
+	caps *harness.Capabilities
 }
 
 func (f *fakeAdapter) Name() string { return "fake" }
@@ -118,6 +128,19 @@ func (f *fakeAdapter) DetectLimit(r harness.Result) harness.Limit {
 }
 
 func (f *fakeAdapter) IsTransient(r harness.Result) bool { return kindOf(r) == "transient" }
+
+// The fake tracks claims — the loop tests script Result.Claim directly — so it
+// stands in for a claim-observing adapter and `phases` is allowed on it.
+func (f *fakeAdapter) Capabilities() harness.Capabilities {
+	if f.caps != nil {
+		return *f.caps
+	}
+	return harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true}
+}
+
+// Encoded in Raw like every other classification, so a scripted Result and how
+// the driver reads it cannot drift apart.
+func (f *fakeAdapter) TurnCapped(r harness.Result) bool { return kindOf(r) == "turnCapped" }
 
 // Diagnostic stands in for a real adapter's scoped text. Stderr is where every
 // adapter's scope starts, so returning it keeps the fake honest about what the
