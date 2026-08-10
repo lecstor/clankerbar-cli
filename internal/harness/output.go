@@ -89,15 +89,15 @@ func newTail() *tail { return &tail{max: retainedTail} }
 
 func (t *tail) Write(p []byte) (int, error) {
 	n := len(p)
+	if t.max < 0 {
+		// Retain nothing. Not constructed anywhere here; kept total rather than
+		// letting a negative window reach make() and panic.
+		t.dropped += int64(n)
+		return n, nil
+	}
 	if t.max == 0 {
 		// A zero-value tail must not silently swallow the stream.
 		t.max = retainedTail
-	}
-	// Allocated once, at exactly the window size, so the CAP is the bound too and
-	// not just the length: append's growth factor would otherwise overshoot it by
-	// a quarter for the life of the session.
-	if t.buf == nil {
-		t.buf = make([]byte, 0, t.max)
 	}
 
 	if n >= t.max {
@@ -110,7 +110,9 @@ func (t *tail) Write(p []byte) (int, error) {
 			t.partial = t.buf[len(t.buf)-1] != '\n'
 		}
 		t.dropped += int64(len(t.buf)) + int64(cut)
-		t.buf = append(t.buf[:0], p[cut:]...)
+		t.buf = t.buf[:0]
+		t.reserve(t.max)
+		t.buf = append(t.buf, p[cut:]...)
 		return n, nil
 	}
 	if over := len(t.buf) + n - t.max; over > 0 {
@@ -119,8 +121,44 @@ func (t *tail) Write(p []byte) (int, error) {
 		t.buf = t.buf[:len(t.buf)-over]
 		t.dropped += int64(over)
 	}
+	t.reserve(n)
 	t.buf = append(t.buf, p...)
 	return n, nil
+}
+
+// reserve makes room for need more bytes, growing by doubling and CLAMPING at max
+// so the buffer's capacity is bounded and not merely its length.
+//
+// Both halves matter. Unclamped, append's growth factor overshoots the window by
+// about a quarter for the life of the session; allocated eagerly at max, every
+// stream pays for the whole window up front — including a probe, which produces a
+// few hundred bytes and of which a week-long wait runs hundreds. Doubling with a
+// clamp costs a handful of copies on the way up and nothing after.
+//
+// Callers must have trimmed first: this never allocates past max, so it relies on
+// len(buf)+need <= max, which is what the trims in Write establish.
+func (t *tail) reserve(need int) {
+	want := len(t.buf) + need
+	if want > t.max {
+		want = t.max
+	}
+	if cap(t.buf) >= want {
+		return
+	}
+	grow := cap(t.buf)
+	const floor = 8 << 10 // one comfortable event, so a short stream stops growing at once
+	if grow < floor {
+		grow = floor
+	}
+	for grow < want {
+		grow *= 2
+	}
+	if grow > t.max {
+		grow = t.max
+	}
+	grown := make([]byte, len(t.buf), grow)
+	copy(grown, t.buf)
+	t.buf = grown
 }
 
 // String returns the retained tail, with a leading PARTIAL line dropped — see the
@@ -159,7 +197,8 @@ func (t *tail) Dropped() int64 { return t.dropped }
 // rather than reporting figures with a hole in them.
 //
 // onLine is handed a slice that is REUSED by the next line: copy anything you
-// keep, as both parsers do.
+// keep, as both parsers do. It must not be nil — a sink with nowhere to deliver a
+// line is a programming error, not a mode.
 type lineSink struct {
 	onLine func([]byte)
 	max    int
@@ -208,13 +247,33 @@ func (s *lineSink) take(p []byte) {
 
 func (s *lineSink) emit() {
 	if s.skipping {
+		// cur was already released by take; this only clears the skip.
 		s.cur, s.skipping = nil, false
 		return
 	}
 	if len(s.cur) > 0 {
 		s.onLine(s.cur)
 	}
-	s.cur = s.cur[:0]
+	s.cur = s.recycle()
+}
+
+// keepLineBuffer is how large an assembly buffer may be and still be REUSED for
+// the next line. Above it the array is released instead.
+//
+// Reuse is what keeps the ordinary case allocation-free: a stream is thousands of
+// events of a few KiB each, and re-growing for every one of them would be silly.
+// But a single legal 15 MiB event would otherwise leave 15 MiB pinned behind a
+// `cur[:0]` for the rest of a session that may run for hours — the same
+// hold-forever shape this file exists to remove, just moved from the tail to the
+// line buffer. So the buffer survives while it is cheap and is dropped once it is
+// not.
+const keepLineBuffer = 64 << 10
+
+func (s *lineSink) recycle() []byte {
+	if cap(s.cur) > keepLineBuffer {
+		return nil
+	}
+	return s.cur[:0]
 }
 
 // Flush emits a trailing line that arrived without a newline. Call it once the
@@ -266,7 +325,12 @@ func (c *capture) attach(cmd *exec.Cmd, console io.Writer) {
 // so what makes everything written here safe to read.
 func (c *capture) result(harness string) Result {
 	c.sink.Flush() // a final line that arrived without a newline
-	res := Result{Stdout: c.stdout.String(), Stderr: c.stderr.String(), scans: newScanCache()}
+	res := Result{
+		Stdout:        c.stdout.String(),
+		Stderr:        c.stderr.String(),
+		OutputDropped: c.stdout.Dropped() + c.stderr.Dropped(),
+		scans:         newScanCache(),
+	}
 	if c.sink.Overran() {
 		res.markUntrusted("a " + harness + " event was longer than the line cap and was discarded, " +
 			"so an unknown number of events never reached the parser: this session's token and cost " +

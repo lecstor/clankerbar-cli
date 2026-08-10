@@ -2,6 +2,7 @@ package harness
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"os/exec"
 	"strconv"
@@ -252,43 +253,49 @@ func TestCodexAndOpencodeRetentionIsBoundedWithoutLosingSpend(t *testing.T) {
 func TestCaptureMarksAnOversizedEventUntrusted(t *testing.T) {
 	for _, tc := range []struct {
 		harness string
-		wire    func(*capture) func(*Result)
-		before  string
-		after   string
-		want    int // tokens from the events that DID land
+		// wire builds the parser and hands back its two halves, so the capture is
+		// constructed exactly as production constructs it: with the callback.
+		wire   func() (func([]byte), func(*Result))
+		before string
+		after  string
+		want   int    // tokens from the events that DID land
+		msg    string // FinalMessage, when the fixture pins the BEFORE event that way
 	}{
 		{
 			harness: "opencode",
-			wire: func(c *capture) func(*Result) {
-				var p opencodeParse
-				c.sink.onLine = p.line
-				return p.finish
+			wire: func() (func([]byte), func(*Result)) {
+				p := new(opencodeParse)
+				return p.line, p.finish
 			},
+			// opencode SUMS, so the total alone proves both sides landed.
 			before: `{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":700,"input":1,"output":1,"reasoning":0,"cache":{"write":698,"read":0}}}}`,
 			after:  `{"type":"step_finish","part":{"type":"step-finish","tokens":{"total":300,"input":1,"output":1,"reasoning":0,"cache":{"write":298,"read":0}}}}`,
 			want:   1000,
 		},
 		{
 			harness: "codex",
-			wire: func(c *capture) func(*Result) {
-				var p codexParse
-				c.sink.onLine = p.line
-				return p.finish
+			wire: func() (func([]byte), func(*Result)) {
+				p := new(codexParse)
+				return p.line, p.finish
 			},
-			before: `{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}`,
+			// codex keeps the LAST cumulative usage event, so a token total proves
+			// nothing about the earlier one. The BEFORE event therefore leaves an
+			// independent trace instead, and the AFTER event carries usage only.
+			before: `{"type":"item.completed","item":{"type":"agent_message","text":"before the big one"}}`,
 			after:  `{"type":"turn.completed","usage":{"input_tokens":900,"cached_input_tokens":0,"output_tokens":0,"reasoning_output_tokens":0}}`,
 			want:   900,
+			msg:    "before the big one",
 		},
 	} {
 		t.Run(tc.harness, func(t *testing.T) {
-			captured := newCapture(nil)
-			finish := tc.wire(captured)
+			onLine, finish := tc.wire()
+			captured := newCapture(onLine)
 			captured.sink.max = 4096 // so the oversized line is a fast fixture
 
 			cmd := &exec.Cmd{}
 			captured.attach(cmd, nil)
 
-			// A tool_result carrying a large file read, between two usage events.
+			// A tool_result carrying a large file read, between two events.
 			oversized := `{"type":"text","part":{"type":"text","text":"` + strings.Repeat("y", 8192) + `"}}`
 			if _, err := io.WriteString(cmd.Stdout, tc.before+"\n"+oversized+"\n"+tc.after+"\n"); err != nil {
 				t.Fatalf("write: %v", err)
@@ -306,7 +313,10 @@ func TestCaptureMarksAnOversizedEventUntrusted(t *testing.T) {
 			// The events either side still landed — the overrun costs one line, not
 			// the stream.
 			if res.Tokens != tc.want {
-				t.Errorf("Tokens = %d, want %d (the events either side of the oversized one)", res.Tokens, tc.want)
+				t.Errorf("Tokens = %d, want %d (the event after the oversized one)", res.Tokens, tc.want)
+			}
+			if tc.msg != "" && res.FinalMessage != tc.msg {
+				t.Errorf("FinalMessage = %q, want %q — the event BEFORE the oversized one must still have been parsed", res.FinalMessage, tc.msg)
 			}
 		})
 	}
@@ -315,7 +325,7 @@ func TestCaptureMarksAnOversizedEventUntrusted(t *testing.T) {
 // A clean stream through the same wiring is trusted, retained whole, and tees to
 // the console — the behaviour the old io.MultiWriter(&buf, console) had.
 func TestCaptureCleanStreamTeesAndTrusts(t *testing.T) {
-	var p codexParse
+	p := new(codexParse)
 	captured := newCapture(p.line)
 
 	var console bytes.Buffer
@@ -344,6 +354,9 @@ func TestCaptureCleanStreamTeesAndTrusts(t *testing.T) {
 	}
 	if res.Stderr != "codex: warming up\n" {
 		t.Errorf("Stderr = %q", res.Stderr)
+	}
+	if res.OutputDropped != 0 {
+		t.Errorf("OutputDropped = %d on a stream that fitted the window", res.OutputDropped)
 	}
 	if out := console.String(); !strings.Contains(out, "turn.completed") || !strings.Contains(out, "warming up") {
 		t.Errorf("console lost the live tee of one or both streams:\n%q", out)
@@ -401,6 +414,11 @@ func TestProbeVerdictRefusesToReadAnUntrustedProbe(t *testing.T) {
 	out, err := probeVerdict(ProbeResult{Tokens: 12, CostUSD: 0.02}, Result{Untrusted: "stream cut short"}, lifted)
 	if err == nil {
 		t.Fatal("err = nil: an unreadable probe reported 'not limited', which resumes the run")
+	}
+	// Wrapped, so the wait can tell "cannot read this harness" (which will not clear
+	// itself) from a network blip (which will).
+	if !errors.Is(err, ErrUntrusted) {
+		t.Errorf("err = %v, want it to wrap ErrUntrusted", err)
 	}
 	if out.Limit.Limited {
 		t.Error("an untrusted probe must not report a limit either — it reports nothing")

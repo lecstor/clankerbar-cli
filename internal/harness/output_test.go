@@ -164,40 +164,132 @@ func TestLineSinkDiscardsAnOversizedLine(t *testing.T) {
 	}
 }
 
-// The line cap is a bound on MEMORY too: a single line that never ends must not
-// accumulate, and the array behind an abandoned one must not be held for the rest
-// of the session either.
-func TestLineSinkHoldsNoMoreThanTheCap(t *testing.T) {
-	s := &lineSink{onLine: func([]byte) {}, max: 1024}
+// A line that never ends must not accumulate, and the array behind an ABANDONED
+// one must be released rather than held for the rest of the session behind a
+// `cur[:0]`.
+//
+// The contract asserted is `cur == nil`, not a size: a capacity bound would be
+// satisfied by an implementation that keeps the array, since a size-class-aligned
+// cap equals the cap it is compared against.
+func TestLineSinkReleasesAnAbandonedLine(t *testing.T) {
+	// Chunked so the buffer GROWS large before the overrun — the whole point is
+	// what happens to an array that was actually allocated.
+	s := &lineSink{onLine: func([]byte) {}, max: 100_000}
 	for i := 0; i < 5000; i++ {
-		if _, err := io.WriteString(s, strings.Repeat("q", 1024)); err != nil {
+		if _, err := io.WriteString(s, strings.Repeat("q", 40_000)); err != nil {
 			t.Fatalf("write: %v", err)
 		}
+		if i == 0 && len(s.cur) != 40_000 {
+			t.Fatalf("fixture is wrong: after one chunk cur holds %d bytes, so the overrun below would find nothing to release", len(s.cur))
+		}
 	}
-	if got := cap(s.cur); got > s.max {
-		t.Errorf("holding a %d-byte array for an abandoned line, want <= %d", got, s.max)
+	if s.cur != nil {
+		t.Errorf("still holding a %d-byte array for an abandoned line; it must be released, not reset", cap(s.cur))
 	}
 	if !s.Overran() {
-		t.Error("Overran() = false after 5 MiB with no newline in it")
+		t.Error("Overran() = false after 200 MB with no newline in it")
 	}
 
-	// The interesting case the loop above does not reach: a long but LEGAL line,
-	// held right up against the cap and then delivered whole.
+	// And once the abandoned line finally ends, the sink is usable again.
+	if _, err := io.WriteString(s, "\n{\"type\":\"after\"}\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if s.skipping {
+		t.Error("still skipping after the oversized line's newline arrived")
+	}
+}
+
+// A LEGAL line can also be enormous — codex has no per-event size limit of its own
+// — and one of those must not leave its array pinned for the rest of the session
+// either. Above keepLineBuffer the buffer is released after delivery instead of
+// being reused.
+func TestLineSinkReleasesAnOversizedLegalLine(t *testing.T) {
+	var got int
+	s := newLineSink(func(b []byte) { got = len(b) })
+
+	huge := strings.Repeat("h", keepLineBuffer*2)
+	if _, err := io.WriteString(s, huge+"\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got != len(huge) {
+		t.Fatalf("delivered %d bytes, want %d — the line is legal and must arrive whole", got, len(huge))
+	}
+	if s.cur != nil {
+		t.Errorf("kept a %d-byte array for reuse; above keepLineBuffer (%d) it must be released", cap(s.cur), keepLineBuffer)
+	}
+}
+
+// A long but LEGAL line — held right up against the cap and then delivered whole —
+// is the case the abandoning loop above never reaches. `max` is deliberately NOT a
+// Go size class, so the capacity assertion is enforced by the code rather than by
+// the allocator rounding up to exactly it.
+func TestLineSinkDeliversALineAtTheCap(t *testing.T) {
 	var got []string
-	s = &lineSink{onLine: func(b []byte) { got = append(got, string(b)) }, max: 1024}
-	legal := strings.Repeat("k", 1024)
-	for _, chunk := range []string{legal[:1000], legal[1000:], "\n"} {
+	s := &lineSink{onLine: func(b []byte) { got = append(got, string(b)) }, max: 1000}
+	legal := strings.Repeat("k", 1000)
+	for _, chunk := range []string{legal[:997], legal[997:], "\n"} {
 		if _, err := io.WriteString(s, chunk); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 	}
 	if len(got) != 1 || got[0] != legal {
-		t.Errorf("a line of exactly the cap was not delivered whole: got %d line(s), first %d bytes", len(got), len(got[0]))
+		t.Fatalf("a line of exactly the cap was not delivered whole: got %d line(s), first %d bytes", len(got), len(got[0]))
 	}
 	if s.Overran() {
 		t.Error("Overran() = true for a line of exactly the cap")
 	}
-	if cap(s.cur) > s.max {
-		t.Errorf("holding %d bytes after emitting, want <= %d", cap(s.cur), s.max)
+	// Small enough to reuse, so the ordinary stream stays allocation-free.
+	if s.cur == nil {
+		t.Error("released a buffer well under keepLineBuffer; the common case should reuse it")
+	}
+}
+
+// A tail's CAPACITY is bounded, not just its length — and it is not allocated at
+// the full window up front either, because a probe writes a few hundred bytes and
+// a week-long wait runs hundreds of them.
+func TestTailCapacityGrowsAndIsClamped(t *testing.T) {
+	small := &tail{max: 1 << 20}
+	if _, err := io.WriteString(small, "codex: warming up\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if cap(small.buf) >= small.max {
+		t.Errorf("a %d-byte write allocated %d bytes, the whole window", len(small.buf), cap(small.buf))
+	}
+
+	// max is NOT a power of two, so a clamp that leaned on the allocator rounding
+	// down would fail here.
+	full := &tail{max: 100_000}
+	chunk := strings.Repeat("z", 4096) + "\n"
+	for i := 0; i < 200; i++ {
+		if _, err := io.WriteString(full, chunk); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	if cap(full.buf) > full.max {
+		t.Errorf("capacity %d exceeds the %d-byte window", cap(full.buf), full.max)
+	}
+	if len(full.buf) != full.max {
+		t.Errorf("len = %d, want the window full at %d", len(full.buf), full.max)
+	}
+	// A single write larger than the whole window takes the other branch.
+	if _, err := io.WriteString(full, strings.Repeat("y", 250_000)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if cap(full.buf) > full.max {
+		t.Errorf("capacity %d exceeds the window after an oversized single write", cap(full.buf))
+	}
+}
+
+// A negative window retains nothing rather than panicking in make().
+func TestTailNegativeWindowRetainsNothing(t *testing.T) {
+	keep := &tail{max: -1}
+	if _, err := io.WriteString(keep, "anything\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if got := keep.String(); got != "" {
+		t.Errorf("String() = %q, want empty", got)
+	}
+	if keep.Dropped() != int64(len("anything\n")) {
+		t.Errorf("Dropped() = %d, want %d", keep.Dropped(), len("anything\n"))
 	}
 }

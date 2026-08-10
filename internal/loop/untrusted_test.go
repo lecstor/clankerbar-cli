@@ -1,6 +1,9 @@
 package loop
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -198,6 +201,119 @@ func TestDrain_UntrustedStillVerifiesAcceptedDeliveries(t *testing.T) {
 	}
 	if len(v.claims) != 1 {
 		t.Errorf("verified %d claims, want 1 — an ACCEPTED delivery claim is not in doubt just because the stream broke afterwards", len(v.claims))
+	}
+}
+
+// The same reasoning reaches the supervised wait, which is the one loop that does
+// not return to the caller while a limit persists. A probe whose own output could
+// not be read reports no verdict AND no spend, so polling on it re-spawns a paid
+// session every interval against a ceiling that can never see the cost.
+func TestSupervisedWait_StopsOnAnUnreadableProbeUnderASpendCeiling(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		budget   config.Budget
+		wantStop bool
+		wantLog  string
+	}{
+		{
+			name:     "a spend ceiling cannot survive an unreadable probe",
+			budget:   config.Budget{MaxCostUSD: 20},
+			wantStop: true,
+			wantLog:  "cannot be counted",
+		},
+		{
+			// Nothing to protect, so it waits on exactly as it did before: the probe
+			// may become readable, and the limit may lift.
+			name:     "no spend ceiling: keep waiting",
+			budget:   config.Budget{},
+			wantStop: false,
+			wantLog:  "will retry next interval",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			cfg := fastCfg()
+			cfg.Budget = tc.budget
+
+			h := &fakeAdapter{probeErrs: []error{
+				fmt.Errorf("%w: claude's stdout could not be read to the end", harness.ErrUntrusted),
+			}}
+			d := New(cfg, h, busyPoller())
+			openTestStateDir(t, d)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, d.targets[0], spend{start: time.Now()})
+
+			if stop != tc.wantStop {
+				t.Errorf("stop = %t, want %t", stop, tc.wantStop)
+			}
+			if !strings.Contains(logs.String(), tc.wantLog) {
+				t.Errorf("logs do not contain %q:\n%s", tc.wantLog, logs.String())
+			}
+		})
+	}
+}
+
+// An ORDINARY probe failure is not this: a network blip clears itself, and the
+// wait exists to outlast exactly that. It must keep polling however the budget is
+// configured.
+func TestSupervisedWait_KeepsWaitingThroughAnOrdinaryProbeError(t *testing.T) {
+	logs := captureLogs(t)
+	cfg := fastCfg()
+	cfg.Budget = config.Budget{MaxCostUSD: 20}
+
+	h := &fakeAdapter{probeErrs: []error{errors.New("dial tcp: connection refused")}}
+	d := New(cfg, h, busyPoller())
+	openTestStateDir(t, d)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, d.targets[0], spend{start: time.Now()})
+
+	if stop {
+		t.Error("stop = true on a plain probe error under a spend ceiling; only an UNREADABLE probe ends the wait")
+	}
+	if !strings.Contains(logs.String(), "will retry next interval") {
+		t.Errorf("logs:\n%s", logs.String())
+	}
+}
+
+// A non-retryable stop names the message it stopped on, and that message reads as
+// "this was the failure". When the retained window did not hold the whole session,
+// the operator has to be told — otherwise they cannot tell a genuine failure from
+// one whose real cause scrolled past the window.
+func TestDrain_NonRetryableStopSaysWhenOutputWasDropped(t *testing.T) {
+	captureLogs(t)
+	cfg := fastCfg()
+
+	res := nonRetryableResult()
+	res.Stderr = "codex: exploded"
+	res.OutputDropped = 300 << 20 // 300 MiB past the window
+	d := New(cfg, &fakeAdapter{steps: []invokeStep{{res: res}}}, busyPoller())
+	openTestStateDir(t, d)
+
+	_, _, _, err := drainOnce(t, d)
+	if err == nil {
+		t.Fatal("err = nil on a non-retryable exit")
+	}
+	if !strings.Contains(err.Error(), "past the retained window") {
+		t.Errorf("the stop message does not say output was dropped:\n%v", err)
+	}
+	if !strings.Contains(err.Error(), "300.0 MiB") {
+		t.Errorf("the stop message does not say HOW MUCH was dropped:\n%v", err)
+	}
+
+	// And it says nothing at all when the whole session was retained.
+	res.OutputDropped = 0
+	d = New(cfg, &fakeAdapter{steps: []invokeStep{{res: res}}}, busyPoller())
+	openTestStateDir(t, d)
+	_, _, _, err = drainOnce(t, d)
+	if err == nil {
+		t.Fatal("err = nil on a non-retryable exit")
+	}
+	if strings.Contains(err.Error(), "retained window") {
+		t.Errorf("a fully retained session should not mention the window:\n%v", err)
 	}
 }
 

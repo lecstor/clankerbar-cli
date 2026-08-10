@@ -120,6 +120,16 @@ type Result struct {
 	// not release the claim, do not classify the exit. See CLA-262.
 	Untrusted string
 
+	// OutputDropped is how many bytes of this session's output were NOT retained,
+	// across both streams — the ordinary cost of the rolling window, not a fault.
+	//
+	// Worth carrying because it is the difference between "the classifier read this
+	// session" and "the classifier read the last couple of MiB of it". A run that
+	// stops on a non-retryable exit says which message it stopped on; without this
+	// the operator cannot tell whether the message they are being shown was the only
+	// candidate or merely the last one to survive the window.
+	OutputDropped int64
+
 	// Claim is the backlog task this session was still holding when it ended, so
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
@@ -449,6 +459,13 @@ type Usage struct {
 // quota introspection — which, today, is all of them.
 var ErrUsageUnsupported = errors.New("usage introspection not supported by this harness")
 
+// ErrUntrusted marks a probe whose own output could not be read, so it answered
+// nothing. Distinct from an ordinary probe failure — which the loop waits out,
+// because a network blip clears itself — because this one will not clear: it says
+// the harness's output is unreadable, and a wait that keeps polling on it is
+// spending money no ceiling can see. loop.supervisedWait tells them apart.
+var ErrUntrusted = errors.New("untrusted harness output")
+
 // probeVerdict turns a finished probe session into what the caller may act on.
 //
 // A probe exists to answer one question — am I still limited? — and the supervised
@@ -458,12 +475,14 @@ var ErrUsageUnsupported = errors.New("usage introspection not supported by this 
 // reading the drain path would have refused (CLA-262).
 //
 // It comes back as an error rather than as a third state because the loop already
-// does the right thing with one: it logs the probe error and waits another
-// interval, which is exactly "I still do not know". The spend is on `out`
-// regardless, since a probe that could not be read still cost what it cost.
+// waits another interval on one, which is exactly "I still do not know" — but it
+// wraps ErrUntrusted, because "I cannot read this harness" does not clear itself
+// the way a network blip does, and a wait that polls on it forever is unaccounted
+// spend. The spend is on `out` regardless, since a probe that could not be read
+// still cost what it cost.
 func probeVerdict(out ProbeResult, res Result, limit func(Result) Limit) (ProbeResult, error) {
 	if res.Untrusted != "" {
-		return out, fmt.Errorf("probe output could not be trusted: %s", res.Untrusted)
+		return out, fmt.Errorf("%w: %s", ErrUntrusted, res.Untrusted)
 	}
 	out.Limit = limit(res)
 	return out, nil

@@ -491,8 +491,8 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		// yet — which is the one thing they need in order to report the gap. The
 		// text is the harness's own diagnostic scope, never the raw stream, so
 		// the agent's narration is not quoted back at them (CLA-258).
-		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s",
-			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)))
+		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s%s",
+			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)), droppedNote(res.OutputDropped))
 	}
 }
 
@@ -949,6 +949,16 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target
 			if ctx.Err() != nil {
 				return tokens, cost, true
 			}
+			// A probe whose own output could not be read is not a blip that clears
+			// itself: it reports no verdict AND no spend, so a wait that keeps polling
+			// on it re-spawns a paid session every interval against a ceiling that can
+			// never see the cost — the one shape this loop's breaker exists to end
+			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
+			// ceiling there is nothing to protect, so it waits on as before.
+			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpend() {
+				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
+				return tokens, cost, true
+			}
 			log.Printf("probe error: %v — will retry next interval", err)
 			continue
 		}
@@ -1032,6 +1042,23 @@ func failureDetail(diag string) string {
 		s = "..." + string(r[len(r)-failureDetailMax:])
 	}
 	return ": " + s
+}
+
+// droppedNote says how much of a session's output the retained window did not
+// keep, when it kept less than all of it.
+//
+// It rides on the message that ENDS a run, because that is the message whose
+// weight depends on it: "exited 1 (non-retryable): <text>" reads as "this was the
+// failure", when what the classifier actually saw was the last couple of MiB. An
+// operator deciding whether the classifier merely does not know this failure yet
+// needs to know which of those they are looking at. Empty when nothing was
+// dropped, which is the ordinary case.
+func droppedNote(dropped int64) string {
+	if dropped <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (note: %.1f MiB of this session's output was past the retained window, so the classification read only the tail)",
+		float64(dropped)/(1<<20))
 }
 
 // invocation builds the harness invocation for one target: the target's workdir

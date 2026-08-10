@@ -72,12 +72,17 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// Stream stdout line-by-line: parse each event as it arrives, render readable
 	// progress to the console, and retain a bounded tail for the text scans.
 	stdoutTail := newTail()
-	res := Result{scans: newScanCache()}
+	var res Result
 	c.consume(stdoutPipe, console, stdoutTail, &res)
 	waitErr := cmd.Wait()
 
 	res.Stdout = stdoutTail.String()
 	res.Stderr = stderrTail.String()
+	res.OutputDropped = stdoutTail.Dropped() + stderrTail.Dropped()
+	// The memo is created only now that the text it memoizes is final: keyed on
+	// scope alone, a scan taken any earlier would freeze an answer built from an
+	// empty Stdout for the whole session.
+	res.scans = newScanCache()
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if waitErr != nil {
@@ -411,14 +416,18 @@ func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
 
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), scans: newScanCache()}
+	dropped := stdout.Dropped() + stderr.Dropped()
+	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), OutputDropped: dropped, scans: newScanCache()}
 	// `--output-format json` is ONE object, so a trimmed tail does not merely lose
 	// context here — it loses the answer, and parse would fail into a Result that
 	// reads exactly like "no limit found". A few hundred bytes never reaches the
 	// window, so this is the improbable path; it is checked because the whole point
 	// of this change is that a silent zero is worse than a loud stop.
-	if stdout.Dropped() > 0 {
-		res.markUntrusted(fmt.Sprintf("the probe's output overran the retained window (%d bytes dropped), so its verdict cannot be read", stdout.Dropped()))
+	//
+	// Either stream, not just stdout: a limit notice reaches a probe as CLI text on
+	// stderr when the JSON never starts, which is half of why this path exists.
+	if dropped > 0 {
+		res.markUntrusted(fmt.Sprintf("the probe's output overran the retained window (%d bytes dropped), so its verdict cannot be read", dropped))
 	}
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
