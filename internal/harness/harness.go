@@ -88,6 +88,12 @@ type Invocation struct {
 }
 
 // Result is the outcome of one session, both raw and parsed.
+//
+// Stdout and Stderr are the retained TAIL of each stream, not the whole of it: a
+// session's output is unbounded and the supervisor has to survive it (see
+// output.go). Everything parsed here is taken from the stream as it arrives, so
+// the trimming costs the classifiers context they do not use — unless a single
+// line overran maxStreamLine, which is what Untrusted is for.
 type Result struct {
 	ExitCode     int
 	Stdout       string
@@ -96,6 +102,33 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// Untrusted, when non-empty, says why this Result's PARSED fields cannot be
+	// believed: the child's stream could not be read whole, so an unknown number
+	// of events never reached the parser.
+	//
+	// It is a claim about the FIGURES, not about the child. Everything here is
+	// derived from events, and the ones that matter most arrive last: the `result`
+	// event carries the whole session's tokens and cost, so a stream cut short
+	// reports ZERO SPEND for a session that may have cost hundreds of dollars, and
+	// the settle of a claim never observed leaves Claim.Held() true on a task the
+	// session actually handed to review. Both are wrong decisions rather than
+	// missing ones, which is why this is a field and not a log line: a caller acting
+	// on the numbers has to be able to see that they are not answers.
+	//
+	// The driver's contract, in loop.drainWithRetries: do not count the spend, do
+	// not release the claim, do not classify the exit. See CLA-262.
+	Untrusted string
+
+	// OutputDropped is how many bytes of this session's output were NOT retained,
+	// across both streams — the ordinary cost of the rolling window, not a fault.
+	//
+	// Worth carrying because it is the difference between "the classifier read this
+	// session" and "the classifier read the last couple of MiB of it". A run that
+	// stops on a non-retryable exit says which message it stopped on; without this
+	// the operator cannot tell whether the message they are being shown was the only
+	// candidate or merely the last one to survive the window.
+	OutputDropped int64
 
 	// Claim is the backlog task this session was still holding when it ended, so
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
@@ -115,6 +148,62 @@ type Result struct {
 	// REFUSED by the plane (a missing Tests header, a superseded run) recorded
 	// nothing, so there is nothing to check and nothing to complain about.
 	pendingReports map[string]Report
+
+	// scans memoizes the harness-authored text a classifier reads. See scan.
+	scans *scanCache
+}
+
+// markUntrusted records why this Result's figures cannot be believed. The FIRST
+// reason wins: the earliest thing that went wrong is the one that explains
+// everything after it.
+func (r *Result) markUntrusted(reason string) {
+	if r.Untrusted == "" {
+		r.Untrusted = reason
+	}
+}
+
+// scanErrorText is the scan key for the adapters with a single classification
+// width (codex, opencode). claude has two and keys on its own claudeScope — whose
+// narrow width happens to share this number, which is harmless for the reason
+// Result.scan gives: one Result comes from one adapter.
+const scanErrorText = 0
+
+// scanCache holds the scoped text a classifier scans, built once per session
+// instead of once per call.
+//
+// DetectLimit, IsTransient and Diagnostic are each handed the whole Result and
+// each used to rebuild the same scoped copy of it, three times per session for
+// text that never changes. Bounding the retained output (output.go) already turned
+// that from hundreds of megabytes into a couple, and this makes it once.
+//
+// Not safe for concurrent use, and it does not need to be: one Result belongs to
+// one finished session, and the driver classifies it in sequence on the goroutine
+// that ran it.
+type scanCache struct {
+	m map[int]string
+}
+
+func newScanCache() *scanCache { return &scanCache{m: map[int]string{}} }
+
+// scan returns the text for key, building it on first use.
+//
+// A POINTER on Result, deliberately: every Adapter classification method takes
+// Result BY VALUE, so a cache stored inline would be filled in on a copy and
+// thrown away. Nil is a fully working, simply uncached Result — which is what a
+// hand-built literal in a test is, and why nothing may depend on the memo being
+// there. `key` is the adapter's own notion of scope (claude has two widths; codex
+// and opencode have one), and a Result only ever comes from ONE adapter, so the
+// key spaces cannot collide.
+func (r Result) scan(key int, build func() string) string {
+	if r.scans == nil {
+		return build()
+	}
+	if s, ok := r.scans.m[key]; ok {
+		return s
+	}
+	s := build()
+	r.scans.m[key] = s
+	return s
 }
 
 // pendingKind is what a tool_result is expected to tell us.
@@ -349,12 +438,12 @@ type ProbeResult struct {
 	//
 	// Carried on the error return too, so the loop counts whatever the adapter
 	// managed to parse rather than discarding a session that ended untidily. Note
-	// what that is worth TODAY: all three adapters return early on a run error that
-	// is not an *exec.ExitError, before parsing, so these are zero on that path —
-	// which is the right answer for its common cause (the binary never started, and
-	// spent nothing) and the wrong one if a session emitted its result and then died
-	// in Wait. Filed as CLA-299; the accumulator here is ready for the fix either
-	// way. A non-zero EXIT is not that path: it parses normally and is counted.
+	// what that is worth TODAY, which changed with CLA-262: codex and opencode now
+	// parse as the stream arrives, so a session that emitted its usage and then died
+	// in Wait carries that spend out through the error return. claude's DRAIN path
+	// always did (it streams). claude's PROBE path still returns before parsing, so
+	// it is zero there — the remaining half of CLA-299, and the accumulator here is
+	// ready for it. A non-zero EXIT is not that path: it parses normally either way.
 	Tokens  int
 	CostUSD float64
 }
@@ -369,6 +458,35 @@ type Usage struct {
 // ErrUsageUnsupported is returned by ReadUsage on harnesses without headless
 // quota introspection — which, today, is all of them.
 var ErrUsageUnsupported = errors.New("usage introspection not supported by this harness")
+
+// ErrUntrusted marks a probe whose own output could not be read, so it answered
+// nothing. Distinct from an ordinary probe failure — which the loop waits out,
+// because a network blip clears itself — because this one will not clear: it says
+// the harness's output is unreadable, and a wait that keeps polling on it is
+// spending money no ceiling can see. loop.supervisedWait tells them apart.
+var ErrUntrusted = errors.New("untrusted harness output")
+
+// probeVerdict turns a finished probe session into what the caller may act on.
+//
+// A probe exists to answer one question — am I still limited? — and the supervised
+// wait resumes spending real sessions on a "no". So an UNTRUSTED probe must not
+// answer it: a Limit{} read out of output the adapter could not read whole is
+// indistinguishable from a lifted cap, and acting on it resumes the run on a
+// reading the drain path would have refused (CLA-262).
+//
+// It comes back as an error rather than as a third state because the loop already
+// waits another interval on one, which is exactly "I still do not know" — but it
+// wraps ErrUntrusted, because "I cannot read this harness" does not clear itself
+// the way a network blip does, and a wait that polls on it forever is unaccounted
+// spend. The spend is on `out` regardless, since a probe that could not be read
+// still cost what it cost.
+func probeVerdict(out ProbeResult, res Result, limit func(Result) Limit) (ProbeResult, error) {
+	if res.Untrusted != "" {
+		return out, fmt.Errorf("%w: %s", ErrUntrusted, res.Untrusted)
+	}
+	out.Limit = limit(res)
+	return out, nil
+}
 
 var registry = map[string]Adapter{}
 

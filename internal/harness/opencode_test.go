@@ -2,9 +2,25 @@ package harness
 
 import (
 	"encoding/json"
+	"io"
 	"strings"
 	"testing"
 )
+
+// opencodeParsed runs a stdout stream through exactly the machinery Invoke uses —
+// the lineSink that splits it into whole lines, and the incremental parser that
+// sums usage as the steps arrive. Production parses live rather than walking a
+// saved copy of stdout, because the retained copy is now capped (CLA-262).
+func opencodeParsed(stdout string) Result {
+	var p opencodeParse
+	sink := newLineSink(p.line)
+	_, _ = io.WriteString(sink, stdout)
+	sink.Flush()
+
+	var res Result
+	p.finish(&res)
+	return res
+}
 
 // A representative single-turn `opencode run --format json` stream, captured from
 // opencode 1.18.2. One step: a step-start, the final text part, and a step-finish
@@ -16,8 +32,7 @@ not json, should be skipped
 {"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","reason":"stop","tokens":{"total":18909,"input":3,"output":4,"reasoning":0,"cache":{"write":18902,"read":0}},"cost":0.0236505}}`
 
 func TestOpencodeParse(t *testing.T) {
-	res := Result{Stdout: opencodeStream}
-	opencode{}.parse(&res)
+	res := opencodeParsed(opencodeStream)
 
 	if res.FinalMessage != "Backlog drained." {
 		t.Errorf("FinalMessage = %q, want %q", res.FinalMessage, "Backlog drained.")
@@ -39,8 +54,7 @@ func TestOpencodeParse_multiStep(t *testing.T) {
 {"type":"step_finish","part":{"type":"step-finish","tokens":{"total":100,"input":40,"output":10,"reasoning":0,"cache":{"write":50,"read":0}},"cost":0.01}}
 {"type":"text","part":{"type":"text","text":"Done: opened PR #7."}}
 {"type":"step_finish","part":{"type":"step-finish","tokens":{"total":200,"input":80,"output":20,"reasoning":0,"cache":{"write":100,"read":0}},"cost":0.02}}`
-	res := Result{Stdout: stream}
-	opencode{}.parse(&res)
+	res := opencodeParsed(stream)
 
 	if res.FinalMessage != "Done: opened PR #7." {
 		t.Errorf("FinalMessage = %q, want the last text part", res.FinalMessage)
@@ -58,8 +72,7 @@ func TestOpencodeParse_multiStep(t *testing.T) {
 func TestOpencodeParse_costOnlyStep(t *testing.T) {
 	const stream = `{"type":"text","part":{"type":"text","text":"ok"}}
 {"type":"step_finish","part":{"type":"step-finish","cost":0.05}}`
-	res := Result{Stdout: stream}
-	opencode{}.parse(&res)
+	res := opencodeParsed(stream)
 	if res.CostUSD != 0.05 {
 		t.Errorf("CostUSD = %v, want 0.05 (cost counted without a tokens block)", res.CostUSD)
 	}
@@ -69,8 +82,7 @@ func TestOpencodeParse_costOnlyStep(t *testing.T) {
 }
 
 func TestOpencodeParse_empty(t *testing.T) {
-	res := Result{Stdout: ""}
-	opencode{}.parse(&res)
+	res := opencodeParsed("")
 	if res.FinalMessage != "" || res.Tokens != 0 {
 		t.Errorf("empty stream: got msg=%q tokens=%d, want empty/0", res.FinalMessage, res.Tokens)
 	}

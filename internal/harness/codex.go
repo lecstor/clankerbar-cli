@@ -1,10 +1,8 @@
 package harness
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -46,24 +44,29 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		cmd.Env = append(cmd.Env, "CODEX_HOME="+in.ConfigDir)
 	}
 
-	// Capture for parsing, and tee live to the console when one is set (the JSONL
-	// event stream — a readable renderer is a TODO; raw is honest live output).
-	var stdout, stderr bytes.Buffer
-	if in.Console != nil && !in.Probe {
-		cmd.Stdout = io.MultiWriter(&stdout, in.Console)
-		cmd.Stderr = io.MultiWriter(&stderr, in.Console)
-	} else {
-		cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	// Parse as the stream arrives, retain only a bounded tail of it for the text
+	// scans, and tee live to the console when one is set (the JSONL event stream —
+	// a readable renderer is a TODO; raw is honest live output).
+	//
+	// Parsing live rather than walking a saved copy afterwards is what makes the
+	// cap safe: the usage figures are read out of events as they pass, so trimming
+	// the retained text cannot cost the budget a single token (CLA-262).
+	var p codexParse
+	captured := newCapture(p.line)
+	console := in.Console
+	if in.Probe {
+		console = nil
 	}
+	captured.attach(cmd, console)
 	runErr := cmd.Run()
 
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String()}
+	res := captured.result("codex")
+	p.finish(&res)
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
 		return res, runErr
 	}
-	c.parse(&res)
 	return res, nil
 }
 
@@ -108,49 +111,57 @@ func (ev codexEvent) text() string {
 	return ""
 }
 
-// parse walks the JSONL stream to fill FinalMessage and Tokens (for the Budget).
-func (codex) parse(res *Result) {
-	var (
-		lastText                string
-		in, cached, out, reason int
-		sawUsage                bool
-	)
-	for _, line := range strings.Split(res.Stdout, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "{") {
-			continue
-		}
-		var ev codexEvent
-		if json.Unmarshal([]byte(line), &ev) != nil {
-			continue // partial/non-JSON line — skip
-		}
-		// Take the LAST usage-bearing event as the session total — never sum.
-		// Confirmed against codex 0.144.6 (rust-v0.144.6): `codex exec --json`
-		// emits one `turn.completed` per turn whose top-level `usage` is the
-		// CUMULATIVE session running total (built from `total_token_usage`), not a
-		// per-turn delta — so summing would double-count. Unlike the opencode
-		// adapter, which sums per-step deltas, here we keep only the final total.
-		// (`token_count` is a separate rollout/app-server stream not on --json
-		// stdout; its top-level fallback below is harmless defensive parsing.)
-		switch {
-		case ev.Usage != nil:
-			in, cached, out, reason = ev.Usage.InputTokens, ev.Usage.CachedInput, ev.Usage.OutputTokens, ev.Usage.ReasoningTokens
-			sawUsage = true
-		case ev.InputTokens != nil || ev.OutputTokens != nil:
-			in, cached, out, reason = deref(ev.InputTokens), deref(ev.CachedInput), deref(ev.OutputTokens), deref(ev.ReasoningTokens)
-			sawUsage = true
-		}
-		if t := ev.text(); t != "" {
-			lastText = t
-		}
+// codexParse accumulates FinalMessage and Tokens (for the Budget) from the JSONL
+// stream, ONE LINE AT A TIME as it arrives.
+//
+// Incremental rather than a walk over saved output, so the retained text can be
+// capped without the token count depending on how much of the stream survived —
+// see output.go.
+type codexParse struct {
+	lastText                string
+	in, cached, out, reason int
+	sawUsage                bool
+}
+
+func (p *codexParse) line(line []byte) {
+	trimmed := strings.TrimSpace(string(line))
+	if !strings.HasPrefix(trimmed, "{") {
+		return
 	}
-	res.FinalMessage = lastText
-	if sawUsage {
+	var ev codexEvent
+	if json.Unmarshal([]byte(trimmed), &ev) != nil {
+		return // partial/non-JSON line — skip
+	}
+	// Take the LAST usage-bearing event as the session total — never sum.
+	// Confirmed against codex 0.144.6 (rust-v0.144.6): `codex exec --json`
+	// emits one `turn.completed` per turn whose top-level `usage` is the
+	// CUMULATIVE session running total (built from `total_token_usage`), not a
+	// per-turn delta — so summing would double-count. Unlike the opencode
+	// adapter, which sums per-step deltas, here we keep only the final total.
+	// (`token_count` is a separate rollout/app-server stream not on --json
+	// stdout; its top-level fallback below is harmless defensive parsing.)
+	switch {
+	case ev.Usage != nil:
+		p.in, p.cached, p.out, p.reason = ev.Usage.InputTokens, ev.Usage.CachedInput, ev.Usage.OutputTokens, ev.Usage.ReasoningTokens
+		p.sawUsage = true
+	case ev.InputTokens != nil || ev.OutputTokens != nil:
+		p.in, p.cached, p.out, p.reason = deref(ev.InputTokens), deref(ev.CachedInput), deref(ev.OutputTokens), deref(ev.ReasoningTokens)
+		p.sawUsage = true
+	}
+	if t := ev.text(); t != "" {
+		p.lastText = t
+	}
+}
+
+// finish writes what the stream added up to onto res.
+func (p *codexParse) finish(res *Result) {
+	res.FinalMessage = p.lastText
+	if p.sawUsage {
 		// Exclude cached input (discounted reads); reasoning counts as output spend.
-		res.Tokens = in + out + reason
+		res.Tokens = p.in + p.out + p.reason
 		res.Raw = map[string]any{
-			"input_tokens": in, "cached_input_tokens": cached,
-			"output_tokens": out, "reasoning_output_tokens": reason,
+			"input_tokens": p.in, "cached_input_tokens": p.cached,
+			"output_tokens": p.out, "reasoning_output_tokens": p.reason,
 		}
 	}
 }
@@ -178,6 +189,10 @@ func deref(p *int) int {
 // inside an event, so a bare line is the CLI talking — which is how codex reports a
 // cap it has no typed event for.
 func codexErrorText(res Result) string {
+	return res.scan(scanErrorText, func() string { return buildCodexErrorText(res) })
+}
+
+func buildCodexErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
 	for _, line := range strings.Split(res.Stdout, "\n") {
@@ -251,8 +266,7 @@ func (c codex) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	if err != nil {
 		return out, err
 	}
-	out.Limit = c.DetectLimit(res)
-	return out, nil
+	return probeVerdict(out, res, c.DetectLimit)
 }
 
 func (codex) ReadUsage(context.Context, Invocation) (Usage, error) {

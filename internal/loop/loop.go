@@ -405,6 +405,14 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 			return tokens, cost, false, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
 		}
 
+		// A session whose stream could not be read whole (CLA-262). Everything below
+		// this line reads a figure parsed out of that stream, so counting the spend,
+		// classifying the exit or retrying on the strength of it are three ways to
+		// make a confident decision on data with a hole in it.
+		if res.Untrusted != "" {
+			return d.endUntrustedDrain(drainNum, res, tokens, cost)
+		}
+
 		// Count THIS attempt's spend toward the budget breaker regardless of how it
 		// ends — usage-limit, transient, stop, or clean. A failed/retried attempt
 		// still burned tokens, and a "leave headroom" breaker must err toward seeing
@@ -483,9 +491,45 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 		// yet — which is the one thing they need in order to report the gap. The
 		// text is the harness's own diagnostic scope, never the raw stream, so
 		// the agent's narration is not quoted back at them (CLA-258).
-		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s",
-			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)))
+		return tokens, cost, false, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s%s",
+			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)), droppedNote(res.OutputDropped))
 	}
+}
+
+// endUntrustedDrain closes out a drain whose session output could not be read
+// whole, without acting on anything that stream said (CLA-262).
+//
+// # Why the spend is not counted
+//
+// It is not that the figure is inconvenient — it is that it is not a measurement.
+// The `result` event carrying a claude session's whole tokens-and-cost total is
+// the LAST thing on the stream, so a stream cut short reports zero for a session
+// that may have cost hundreds of dollars, and a partial sum from an adapter that
+// accumulates per step is a lower bound of unknown looseness. Adding either to the
+// accumulator would put a made-up number in front of the breaker and in the
+// iteration's cost line.
+//
+// # Why a spend ceiling then STOPS the run
+//
+// Because the ceiling is a promise, and this is the driver saying it can no longer
+// keep it. An operator who set `max_tokens` or `max_cost_usd` has asked to be
+// protected from exactly the shape this is: sessions whose cost nothing can see.
+// One unaccounted session is survivable; a night of them against an inert ceiling
+// is the failure CLA-287 and CLA-258 were both about. Stopping is clean, loud, and
+// resumable — the operator restarts the run once they know why.
+//
+// With no spend ceiling set there is nothing to break: the wall clock does not
+// depend on anything the child said, so the run carries on and the no-progress
+// back-off is what bounds a target that keeps producing these.
+func (d *Driver) endUntrustedDrain(drainNum int, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
+	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
+	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%d), and not handing back any claim it appeared to hold",
+		drainNum, res.Tokens, res.CostUSD, res.ExitCode)
+	if !d.cfg.Budget.CountsSpend() {
+		return tokens, cost, false, nil
+	}
+	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
+	return tokens, cost, true, nil
 }
 
 // releaseHeldClaim hands a task the session was still holding back to the queue,
@@ -500,6 +544,19 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 //
 // A claim with pushed work is left alone; Claim.Releasable says why.
 func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result) {
+	// A stream read only in part tells us which calls we SAW, never which the
+	// session made: the settle that released the task may simply be in the bytes
+	// that never arrived. Handing the task back on that reading posts `ready` over
+	// work already in review, which is the one outcome worse than a lease expiring
+	// (CLA-262). Let it expire instead — the plane's own sweep does the right thing
+	// with it, and keeps the takeover hand-off if there is one.
+	if res.Untrusted != "" {
+		if res.Claim.Held() {
+			log.Printf("%ssession appeared to end holding %s, but its output could not be read whole — leaving the lease to expire rather than releasing a task that may already be settled",
+				labelOf(t), res.Claim.TaskID)
+		}
+		return
+	}
 	if !res.Claim.Held() {
 		return
 	}
@@ -892,6 +949,16 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target
 			if ctx.Err() != nil {
 				return tokens, cost, true
 			}
+			// A probe whose own output could not be read is not a blip that clears
+			// itself: it reports no verdict AND no spend, so a wait that keeps polling
+			// on it re-spawns a paid session every interval against a ceiling that can
+			// never see the cost — the one shape this loop's breaker exists to end
+			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
+			// ceiling there is nothing to protect, so it waits on as before.
+			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpend() {
+				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
+				return tokens, cost, true
+			}
 			log.Printf("probe error: %v — will retry next interval", err)
 			continue
 		}
@@ -975,6 +1042,23 @@ func failureDetail(diag string) string {
 		s = "..." + string(r[len(r)-failureDetailMax:])
 	}
 	return ": " + s
+}
+
+// droppedNote says how much of a session's output the retained window did not
+// keep, when it kept less than all of it.
+//
+// It rides on the message that ENDS a run, because that is the message whose
+// weight depends on it: "exited 1 (non-retryable): <text>" reads as "this was the
+// failure", when what the classifier actually saw was the last couple of MiB. An
+// operator deciding whether the classifier merely does not know this failure yet
+// needs to know which of those they are looking at. Empty when nothing was
+// dropped, which is the ordinary case.
+func droppedNote(dropped int64) string {
+	if dropped <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(" (note: %.1f MiB of this session's output was past the retained window, so the classification read only the tail)",
+		float64(dropped)/(1<<20))
 }
 
 // invocation builds the harness invocation for one target: the target's workdir

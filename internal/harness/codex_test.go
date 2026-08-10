@@ -1,6 +1,25 @@
 package harness
 
-import "testing"
+import (
+	"io"
+	"testing"
+)
+
+// codexParsed runs a stdout stream through exactly the machinery Invoke uses —
+// the lineSink that splits it into whole lines, and the incremental parser that
+// reads them as they arrive — and returns the Result that falls out. Nothing here
+// walks a saved copy of stdout, because production no longer does either
+// (CLA-262).
+func codexParsed(stdout string) Result {
+	var p codexParse
+	sink := newLineSink(p.line)
+	_, _ = io.WriteString(sink, stdout)
+	sink.Flush()
+
+	var res Result
+	p.finish(&res)
+	return res
+}
 
 // A representative `codex exec --json` stream (documented shape; the parser is
 // defensive so exact fidelity to the live schema is not required). Interleaves an
@@ -14,8 +33,7 @@ not json, should be skipped
 {"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":800,"output_tokens":300,"reasoning_output_tokens":50}}`
 
 func TestCodexParse(t *testing.T) {
-	res := Result{Stdout: codexStream}
-	codex{}.parse(&res)
+	res := codexParsed(codexStream)
 
 	if res.FinalMessage != "Backlog drained." {
 		t.Errorf("FinalMessage = %q, want %q", res.FinalMessage, "Backlog drained.")
@@ -37,8 +55,7 @@ const codexCumulativeStream = `{"type":"thread.started","thread_id":"t1"}
 {"type":"turn.completed","usage":{"input_tokens":3000,"cached_input_tokens":900,"output_tokens":400,"reasoning_output_tokens":120}}`
 
 func TestCodexParse_cumulativeNotSummed(t *testing.T) {
-	res := Result{Stdout: codexCumulativeStream}
-	codex{}.parse(&res)
+	res := codexParsed(codexCumulativeStream)
 
 	// Correct: last turn.completed only — input(3000)+output(400)+reasoning(120),
 	// cached excluded.
@@ -54,10 +71,34 @@ func TestCodexParse_cumulativeNotSummed(t *testing.T) {
 }
 
 func TestCodexParse_empty(t *testing.T) {
-	res := Result{Stdout: ""}
-	codex{}.parse(&res)
+	res := codexParsed("")
 	if res.FinalMessage != "" || res.Tokens != 0 {
 		t.Errorf("empty stream: got msg=%q tokens=%d, want empty/0", res.FinalMessage, res.Tokens)
+	}
+}
+
+// The stream arrives in whatever chunks the pipe hands over, and an event is
+// routinely split across two writes. The parser must see whole lines regardless,
+// or a usage event cut in half is a usage event lost — which is a silent
+// under-count of the budget.
+func TestCodexParse_streamSplitMidEvent(t *testing.T) {
+	var p codexParse
+	s := newLineSink(p.line)
+	for i := 0; i < len(codexStream); i += 7 {
+		end := min(i+7, len(codexStream))
+		if _, err := io.WriteString(s, codexStream[i:end]); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	s.Flush()
+
+	var res Result
+	p.finish(&res)
+	if want := 1200 + 300 + 50; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d — a 7-byte-chunked stream must parse as the whole one does", res.Tokens, want)
+	}
+	if res.FinalMessage != "Backlog drained." {
+		t.Errorf("FinalMessage = %q", res.FinalMessage)
 	}
 }
 

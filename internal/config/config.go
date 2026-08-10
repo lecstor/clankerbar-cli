@@ -198,6 +198,16 @@ type Budget struct {
 	MaxWallClock Duration `json:"max_wall_clock"` // stop after this much elapsed
 }
 
+// CountsSpend reports whether this budget bounds SPEND — tokens or dollars — as
+// opposed to only the wall clock.
+//
+// The distinction matters when a session's spend cannot be measured at all (a
+// stream the supervisor could not read whole, CLA-262): a run under a spend
+// ceiling has been promised something the driver can no longer deliver, while a
+// run under a wall-clock ceiling alone still has its ceiling intact, because the
+// clock does not depend on anything the child said.
+func (b Budget) CountsSpend() bool { return b.MaxTokens > 0 || b.MaxCostUSD > 0 }
+
 // Exceeded reports whether any enabled budget dimension has been reached.
 func (b Budget) Exceeded(tokens int, costUSD float64, elapsed time.Duration) bool {
 	return b.ExceededBy(tokens, costUSD, elapsed) != ""
