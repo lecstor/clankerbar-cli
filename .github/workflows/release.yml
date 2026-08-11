@@ -1,11 +1,37 @@
 name: release
 
-# Cut a GitHub Release with cross-platform binaries when a semver tag is pushed.
-#   git tag v0.1.0 && git push origin v0.1.0
+# Cut a GitHub Release with cross-platform binaries for a semver tag.
+#
+# TWO ways in, and the second one is why this workflow is shaped like this:
+#
+#  1. `push: tags` — a tag pushed by a HUMAN.
+#         git tag v0.1.0 && git push origin v0.1.0
+#     This is the break-glass path, kept working deliberately.
+#
+#  2. `workflow_call` — invoked by `release-on-merge.yml` after the operator
+#     merges the `staging -> main` promotion. This exists because of a GitHub
+#     rule that silently breaks the obvious design: **a tag pushed using
+#     GITHUB_TOKEN does not trigger another workflow.** GitHub suppresses that to
+#     prevent recursion. So the natural implementation — a job on push-to-main
+#     that computes a version and pushes a tag — creates the tag and then NOTHING
+#     BUILDS. What you get is a tag with no release, which reads as a broken
+#     release rather than as a missing trigger.
+#
+#     The alternative fix was an app token or a PAT with permission to push tags
+#     that DO re-trigger workflows. Calling this workflow directly was chosen
+#     instead: it needs no new secret, no credential to rotate, and no token in
+#     the repo that can push tags outside a workflow's control. See
+#     `docs/releases.md`.
 on:
   push:
     tags:
       - "v*"
+  workflow_call:
+    inputs:
+      tag:
+        description: "The semver tag to build and publish, e.g. v0.4.0. It must ALREADY EXIST on the remote — the caller pushes it first."
+        required: true
+        type: string
 
 # Every action below is pinned to a full commit SHA, not a tag. This job holds a
 # write token and publishes the binaries users install, so a moved or hijacked
@@ -30,6 +56,14 @@ jobs:
         with:
           # Full history + tags so GoReleaser can build the changelog.
           fetch-depth: 0
+          # On the `push: tags` path `inputs.tag` is empty and this falls through
+          # to the default (the pushed tag). On the `workflow_call` path the
+          # caller's context is the push to `main`, so WITHOUT this we would check
+          # out main's head — GoReleaser would find no tag at HEAD and either fail
+          # or, worse, build something that is not the tag we are publishing.
+          # Checking out the tag ref puts HEAD exactly on the tagged commit, which
+          # is what `{{ .Version }}` in .goreleaser.yaml reads.
+          ref: ${{ inputs.tag || github.ref }}
 
       # check-latest for the same reason as in ci.yml, and one more that only
       # applies here: this is the toolchain that gets COMPILED INTO the published
