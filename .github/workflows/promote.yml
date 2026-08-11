@@ -28,10 +28,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # The script walks `origin/main..origin/staging` and derives a version
-    # preview; checkout uses the default GITHUB_TOKEN, so contents:read is all it
-    # needs. `gh` authenticates from a scoped PAT instead — see the step below.
+    # preview, which checkout covers with contents:read. `gh` creates and edits
+    # the promotion PR with the same GITHUB_TOKEN, which is what pull-requests:
+    # write is for — see the step below.
     permissions:
       contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         # Full history and tags: the script walks the first-parent commits of
@@ -49,29 +51,31 @@ jobs:
           cache: true
 
       - name: Ensure standing staging → main promotion PR
-        # gh authenticates from GH_TOKEN, and this is a SCOPED PAT
-        # (PROMOTION_PR_TOKEN), not the default GITHUB_TOKEN. The repo setting
-        # "Allow GitHub Actions to create and approve pull requests" is OFF here
-        # (verified 2026-08-10): the default token can EDIT an already-open PR but
-        # is refused when it must CREATE one — and creation is not an edge case,
-        # it happens on every cycle, because merging the promotion closes the PR.
-        # The PAT needs only Contents:read + Pull requests:write on this repo.
+        # gh authenticates from the default GITHUB_TOKEN. Creating a PR with it
+        # works only because the repo setting "Allow GitHub Actions to create and
+        # approve pull requests" is ON — operator decision, 2026-08-10, taken over
+        # provisioning a scoped PAT. Creation is not an edge case: it happens every
+        # cycle, because merging the promotion closes the PR. With that setting OFF
+        # the default token can EDIT an open PR but is REFUSED when it must create
+        # one, so flipping it back silently breaks the standing PR on the cycle
+        # after the next publish, not immediately.
         #
-        # Trade-off vs GITHUB_TOKEN: a PR created by a PAT CAN trigger further
-        # workflows (a GITHUB_TOKEN-created one cannot). Here that is safe and in
-        # fact wanted — `ci.yml` runs on pull_request, so a real `ci` check lands
-        # on the release PR. `release-on-merge.yml` triggers only on a push to
-        # `main`, so creating or updating this PR publishes NOTHING. Only MERGING
-        # it does, which is exactly the gate.
+        # The trade-off this choice accepts, and why it is safe HERE. A PR created
+        # by GITHUB_TOKEN triggers NO further workflows (GitHub suppresses that to
+        # prevent recursion), so `ci.yml` does NOT run on `pull_request` for this
+        # PR — and `main` requires the `ci` check. That would leave the promotion
+        # PR permanently unmergeable, except that `ci.yml` also runs on
+        # `push: [staging]`, and a required status check resolves against the PR's
+        # HEAD SHA. Every staging commit therefore already carries the `ci` run the
+        # promotion PR needs, whoever opened it.
         #
-        # If the secret is unset, gh errors and this job goes RED. That is the
-        # intended signal to provision the PAT, not a failure to work around: a
-        # silently-missing promotion PR is how a release quietly stops happening.
+        # So the load-bearing dependency is `staging` staying in ci.yml's push
+        # list. Drop it and this PR stops being mergeable — a different failure
+        # from the one that file's own comment warns about (dropping `main`, which
+        # starves the release gate). Both are silent until someone tries to ship.
+        #
+        # Creating or updating this PR publishes NOTHING: `release-on-merge.yml`
+        # triggers only on a push to `main`. Only MERGING it does, which is the gate.
         env:
-          GH_TOKEN: ${{ secrets.PROMOTION_PR_TOKEN }}
-        run: |
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "::error::PROMOTION_PR_TOKEN is not set. The standing staging → main promotion PR cannot be created without it (the default GITHUB_TOKEN is refused when creating PRs). Provision it — see docs/releases.md."
-            exit 1
-          fi
-          bash scripts/update-promotion-pr.sh
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/update-promotion-pr.sh

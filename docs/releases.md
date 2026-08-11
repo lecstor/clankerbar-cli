@@ -151,12 +151,21 @@ gh attestation verify clankerbar_0.4.0_darwin_arm64.tar.gz -R lecstor/clankerbar
 - **Merge method.** Squash and rebase merging are **disabled** repo-wide. The
   promotion must be a merge commit, or `staging` stops being an ancestor of `main`
   and `realign-staging.yml`'s fast-forward would become a destructive force-push.
-- **`PROMOTION_PR_TOKEN`.** A scoped PAT with `Contents: read` + `Pull requests:
-  write` on this repo, used only by `promote.yml`. It is needed because the repo
-  setting "Allow GitHub Actions to create and approve pull requests" is off, so
-  the default `GITHUB_TOKEN` can edit an open PR but is refused when it must
-  *create* one - which happens every cycle, since merging the promotion closes it.
-  Without the secret, `promote.yml` goes red rather than silently skipping.
+- **"Allow GitHub Actions to create and approve pull requests" is ON.** Operator
+  decision, 2026-08-10, taken over provisioning a scoped PAT. `promote.yml` opens
+  the standing PR with the default `GITHUB_TOKEN`, and with this setting off that
+  token can edit an open PR but is refused when it must *create* one - which
+  happens every cycle, since merging the promotion closes it. This repo holds **no
+  secrets**, which is the point: the alternative was its first long-lived
+  credential. Turning the setting back off breaks the standing PR on the cycle
+  *after* the next publish, not immediately - so the failure lands well away from
+  the change that caused it.
+- **`ci.yml` running on push to `staging`.** Not a convenience: it is what makes
+  the promotion PR mergeable at all. A PR created by `GITHUB_TOKEN` triggers no
+  `pull_request` run, so the `ci` check `main` requires can only come from the push
+  run on the head commit, which a required check resolves against. See the comment
+  in `ci.yml`, where each branch in the push list is load-bearing for a different
+  reason.
 
 ## Two exposures this model creates, named rather than left implicit
 
@@ -185,20 +194,27 @@ also block *you* from merging the promotion, since GitHub forbids approving your
 own PR and the promotion PR is authored by the same account. Making it work means
 the promotion PR being authored by a *different* identity than the approver.
 
-**2. `PROMOTION_PR_TOKEN` is readable by code that merges without human review.**
+**2. Actions can now approve pull requests, and that setting is repo-wide.**
 
-`promote.yml` runs `scripts/update-promotion-pr.sh` - and, through it,
-`go run ./cmd/release-tool` - from the merged `staging` tree, with the PAT in the
-environment. Clankers merge task PRs into `staging`, and the human gate sits
-downstream at `staging -> main`. So a task PR that edits that script, the release
-tool, or `promote.yml` itself can read the token on merge.
+The setting `promote.yml` depends on is "create **and approve**" - GitHub does not
+separate the two. So enabling PR creation for the promotion also grants every
+workflow in this repo the ability to submit approving reviews, and workflows run
+from the merged `staging` tree, which clankers merge into without human review.
 
-This is inherent to holding a secret usable from a branch agents can merge to,
-not a bug in the script. What bounds it is the token's scope, which is why the
-scope above is a minimum and not a suggestion: `Contents: read` +
-`Pull requests: write` on this repo only. Note that `Pull requests: write` does
-include submitting approving reviews, so this token must not be the thing that
-satisfies any review requirement added under exposure 1.
+Nothing exploits this today, because exposure 1 records that `main` requires
+**zero** approving reviews - there is no review requirement for a workflow-submitted
+approval to satisfy. The exposure is therefore **latent and conditional**: it
+becomes real the moment someone adds a review requirement to `main` under exposure
+1, which is exactly the fix that section invites. Doing so without also revisiting
+this setting would install a gate that a workflow can satisfy by itself, which is
+worse than no gate, because it looks like one.
+
+The trade this replaced, stated so the choice stays legible: a scoped PAT would
+have confined the capability to one credential with `Contents: read` +
+`Pull requests: write`, but it would have been this repo's first long-lived secret,
+readable by that same agent-mergeable tree - a narrower capability guarded by a
+thing that can leak, versus a broader one that cannot. The operator took the
+second. Revisit it if a review requirement ever lands on `main`.
 
 ## Break glass
 
