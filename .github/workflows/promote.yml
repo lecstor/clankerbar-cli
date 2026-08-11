@@ -1,0 +1,81 @@
+name: promote
+
+# Keep the standing `staging -> main` promotion PR present and current.
+#
+# Every push to `staging` (a task PR merged in by a clanker servicing the
+# close-out queue) ensures the permanent `staging -> main` release PR EXISTS and
+# that its queued-work body is up to date. That PR is the human-gated publish
+# surface: merging it is what publishes a release, and only the operator may
+# merge it. No agent has to remember to run anything — CI owns it.
+#
+# Idempotent: it updates the open PR, CREATES one if a prior promotion closed it
+# (which happens on every publish, since merging closes the PR), and no-ops when
+# `staging` is level with `main` — the state realign-staging.yml leaves behind
+# immediately after a promotion.
+
+on:
+  push:
+    branches: [staging]
+  # Hand-runnable, for recovering the PR without waiting for the next merge.
+  workflow_dispatch:
+
+concurrency:
+  group: promote
+  cancel-in-progress: false
+
+jobs:
+  promotion-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # The script walks `origin/main..origin/staging` and derives a version
+    # preview, which checkout covers with contents:read. `gh` creates and edits
+    # the promotion PR with the same GITHUB_TOKEN, which is what pull-requests:
+    # write is for - see the step below.
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        # Full history and tags: the script walks the first-parent commits of
+        # `origin/main..origin/staging` for the queued-work table, and reads the
+        # last tag for the version preview. A shallow clone can see neither.
+        with:
+          fetch-depth: 0
+
+      # For the version preview inside the script. Best-effort there: if this or
+      # the derivation fails, the PR body still updates, just without the preview.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      - name: Ensure standing staging → main promotion PR
+        # gh authenticates from the default GITHUB_TOKEN. Creating a PR with it
+        # works only because the repo setting "Allow GitHub Actions to create and
+        # approve pull requests" is ON - operator decision, 2026-08-10, taken over
+        # provisioning a scoped PAT. Creation is not an edge case: it happens every
+        # cycle, because merging the promotion closes the PR. With that setting OFF
+        # the default token can EDIT an open PR but is REFUSED when it must create
+        # one, so flipping it back silently breaks the standing PR on the cycle
+        # after the next publish, not immediately.
+        #
+        # The trade-off this choice accepts, and why it is safe HERE. A PR created
+        # by GITHUB_TOKEN triggers NO further workflows (GitHub suppresses that to
+        # prevent recursion), so `ci.yml` does NOT run on `pull_request` for this
+        # PR - and `main` requires the `ci` check. What satisfies it instead is
+        # that `ci.yml` also runs on `push: [staging]`, and a required status check
+        # resolves against the PR's HEAD SHA. Every staging commit therefore
+        # already carries the `ci` run this PR needs, whoever opened it.
+        #
+        # So the load-bearing dependency is `staging` staying in ci.yml's push
+        # list, which `TestCIWorkflowRunsOnBothIntegrationBranches` now guards.
+        # That is a different failure from dropping `main` (which starves the
+        # release gate and the staging realign), and both are silent until someone
+        # tries to ship.
+        #
+        # Creating or updating this PR publishes NOTHING: `release-on-merge.yml`
+        # triggers only on a push to `main`. Only MERGING it does, which is the gate.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/update-promotion-pr.sh

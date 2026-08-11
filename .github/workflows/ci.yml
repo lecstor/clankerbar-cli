@@ -1,23 +1,59 @@
 name: ci
 
-# Gate every PR (and every push to main) on a clean build, vet, and race-enabled
-# test run. This is the "green check" the operator gates merges on — make it a
-# required status check on main via branch protection.
+# Gate every PR (and every push to an integration branch) on a clean build, vet,
+# and race-enabled test run. This is the "green check" merges are gated on — it
+# is a required status check on both `main` and `staging` via branch protection.
+#
+# The push list is not cosmetic, and each branch in it is load-bearing for a
+# DIFFERENT reason. Both failures are silent until someone tries to ship.
+#
+# `main`: TWO workflows wait for the `ci` check of the MERGE COMMIT ON MAIN, not
+# the PR's check - `release-on-merge.yml` before it publishes, and
+# `realign-staging.yml` before it fast-forwards `staging`. They read the merge
+# commit because main's protection is `strict: false`, so a PR can merge without
+# being up to date and the commit that actually lands may be a combination
+# nothing ever compiled. Both have something to read only because `main` is in
+# this list; drop it and each waits, finds nothing, and (correctly) refuses.
+#
+# `staging`: it is what keeps the standing promotion PR MERGEABLE. `promote.yml`
+# opens that PR with GITHUB_TOKEN, and a PR created by GITHUB_TOKEN triggers no
+# `pull_request` run - so the `ci` check that `main` requires can only come from
+# the push run on the head commit. Drop `staging` and the promotion PR is stuck
+# behind a required check that never arrives, until the NEXT commit lands on
+# `staging`: that push carries a clanker's own credentials, so the resulting
+# `pull_request: synchronize` is not suppressed and does produce a run. So a
+# single-merge batch - the common case - blocks, and a two-merge batch heals
+# itself. Unreliable rather than permanent, which is worse to diagnose.
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, staging]
 
-# A newer push to the same branch/PR supersedes an in-flight run.
+# A newer push to the same PR supersedes an in-flight run - but NEVER on `main`
+# or `staging`.
+#
+# On a PR, cancelling is free: the only consumer is the PR's own check, and it is
+# about to be replaced. On an integration branch it is not free, because `ci` is
+# now the input to two other workflows. A cancelled run concludes `cancelled`,
+# which the release gate correctly scores as a FAILURE - so two pushes to `main`
+# in quick succession (a promotion plus a break-glass fix) would cancel the first
+# commit's `ci` and, with it, that commit's release and the `staging` realign.
+# The realign has a workflow_dispatch escape hatch for when this happens anyway;
+# not cancelling is what stops it happening.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   ci:
+    # This name is LOAD-BEARING. GitHub names a check run after its job, and
+    # `release-on-merge.yml` gates publishing on a check called exactly `ci`
+    # (internal/release.DefaultRequiredCheck). Rename it, or add a matrix, and the
+    # gate waits for a check that never arrives and refuses every release.
+    # TestRequiredCheckMatchesTheCIWorkflow fails if this drifts.
     name: ci
     runs-on: ubuntu-latest
     steps:

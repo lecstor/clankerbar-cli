@@ -1,0 +1,121 @@
+name: realign-staging
+
+# After the `staging -> main` promotion PR merges, `staging` sits one merge
+# commit behind `main` — identical trees, diverged history. This fast-forwards
+# `staging` back up to `main` on every push to `main`, so the next batch starts
+# from a released, prod-equal base and the standing promotion PR's diff shows the
+# NEXT batch rather than re-showing the one just published.
+#
+# Ported from the web repo's workflow of the same name, deliberately: the
+# operator's decision was to mirror the web app's shape here rather than invent a
+# second one, so the two repos stay one mental model.
+#
+# Why a plain (non-force) fast-forward is both correct and safe:
+#   - The promotion is a MERGE COMMIT, so `main` CONTAINS `staging`'s whole
+#     history — `staging` is an ancestor of `main`, and advancing it is a
+#     fast-forward, never a rewrite. This is why squash and rebase merging are
+#     DISABLED on this repo: a squashed promotion would sever staging's history
+#     from main and turn this step into a destructive force-push.
+#   - `staging`'s protection disables force-pushes but allows ordinary pushes, and
+#     a fast-forward is an ordinary push. No protection is bypassed. It DOES
+#     require the `ci` check, and required checks gate direct pushes too - which
+#     is why the job waits for `ci` on the commit before pushing it.
+#   - There is no `--force` anywhere below, so if `staging` has advanced past what
+#     was promoted (a task PR merged in after the promotion PR's head was fixed)
+#     GitHub rejects the non-fast-forward push. That case is detected and SKIPPED
+#     rather than failed — staging being ahead is fine, and the next promotion
+#     carries those commits.
+#
+# Separate workflow from release-on-merge.yml on purpose: the realign must happen
+# for EVERY promotion, including a docs-only one that publishes no release.
+
+on:
+  push:
+    branches: [main]
+  # The escape hatch, and it is needed for a real case rather than for tidiness.
+  # ci.yml cancels in-progress runs for the same ref, so two pushes to `main` in
+  # quick succession (a promotion plus a break-glass fix) leave the FIRST commit's
+  # `ci` in state `cancelled` - which the gate below correctly scores as a
+  # failure. The release refusing is right. But the realign is only ever
+  # triggered by a push to `main`, so without this `staging` would simply stay
+  # behind with nothing left to re-trigger it.
+  workflow_dispatch:
+
+concurrency:
+  group: realign-staging
+  cancel-in-progress: false
+
+jobs:
+  realign:
+    runs-on: ubuntu-latest
+    # Long enough to wait out `ci` on the merge commit (see the gate step below),
+    # which is triggered by the same push and has not started when this begins.
+    timeout-minutes: 45
+    permissions:
+      # To push the fast-forward to `staging`.
+      contents: write
+      # To read the `ci` check the step below waits on. Without it the read 403s,
+      # which is indistinguishable from "no checks yet" - so the wait would burn
+      # its whole timeout and the realign would never happen.
+      checks: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # Full history so `git merge-base --is-ancestor` can decide correctly.
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+          cache: true
+
+      # `staging`'s protection REQUIRES the `ci` check, and required checks gate
+      # direct pushes, not just PR merges. This job pushes main's head straight
+      # onto `staging`, so it must not do that until that commit has a green `ci`
+      # - otherwise the push is rejected and `staging` silently stops tracking
+      # `main`, which is the drift this workflow exists to prevent.
+      #
+      # Waiting is the right behaviour independently of the protection rule: it
+      # means `staging` only ever advances onto a commit that actually passed.
+      # The wait resolves an absent or unfinished check to a FAILURE, so a red
+      # `main` leaves `staging` where it is and says so, loudly, in Actions.
+      - name: Wait for a green ci on the commit being fast-forwarded onto
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          go run ./cmd/release-tool await-check \
+            --repo "${{ github.repository }}" \
+            --sha "${{ github.sha }}" \
+            --required ci \
+            --timeout 30m \
+            --interval 15s
+
+      - name: Fast-forward staging up to main
+        run: |
+          set -euo pipefail
+          git fetch origin --quiet
+
+          if ! staging_sha=$(git rev-parse -q --verify origin/staging 2>/dev/null); then
+            echo "::warning::No origin/staging branch — nothing to realign."
+            exit 0
+          fi
+
+          # ${{ github.sha }}, NOT $(git rev-parse origin/main). The gate above
+          # waited for `ci` on github.sha, and `main` can advance during that wait
+          # of up to 30 minutes - so reading origin/main here would fast-forward
+          # `staging` onto a commit this job never gated, while the log claimed it
+          # had been verified. staging's required-check protection would still
+          # reject such a push, so it failed closed, but as an opaque rejection
+          # rather than the deliberate skip below. Gate and push must name the
+          # same commit.
+          target_sha="${{ github.sha }}"
+
+          if [ "$target_sha" = "$staging_sha" ]; then
+            echo "staging is already level with the gated commit ($target_sha) — nothing to fast-forward."
+          elif git merge-base --is-ancestor "$staging_sha" "$target_sha"; then
+            echo "Fast-forwarding staging ($staging_sha) up to the gated commit ($target_sha)."
+            git push origin "$target_sha:refs/heads/staging"
+          else
+            echo "staging ($staging_sha) is ahead of / diverged from the gated commit ($target_sha) — skipping ff to avoid a non-fast-forward push."
+          fi
