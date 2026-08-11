@@ -8,10 +8,12 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func init() { Register(claude{}) }
@@ -59,8 +61,8 @@ func newSessionResult(in Invocation) Result {
 // (see claudeMaxTurnsReason), where a version bump is exactly how it would go.
 func claudeArgs(in Invocation) []string {
 	args := []string{"-p", in.Prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits"}
-	if in.Model != "" {
-		args = append(args, "--model", in.Model)
+	if m := in.ModelArg(); m != "" {
+		args = append(args, "--model", m)
 	}
 	if in.MCPConfigPath != "" {
 		args = append(args, "--mcp-config", in.MCPConfigPath, "--strict-mcp-config")
@@ -246,7 +248,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			}
 			switch kind {
 			case pendingClaim:
-				noteClaimed(b.Content, res, console)
+				noteClaimed(b.Content, b.ToolUseID, res, console)
 			case pendingSettle:
 				res.Claim.Settled = true
 			}
@@ -283,6 +285,15 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		// The ids are in the RESULT, not the arguments. A claim that loses the
 		// race carries none and so leaves the tracked claim untouched.
 		res.expect(toolUseID, pendingClaim)
+		// The REQUESTED task, kept only so a failure can name what it was about.
+		// Deliberately never promoted into a Claim: the run id exists only in the
+		// result, and a half-claim is the one thing the driver must not be handed.
+		var args struct {
+			TaskID string `json:"taskId"`
+		}
+		if json.Unmarshal(input, &args) == nil && args.TaskID != "" {
+			res.noteClaimRequest(toolUseID, args.TaskID)
+		}
 
 	case updateTaskTool:
 		var args struct {
@@ -350,7 +361,36 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 // missing either id (a lost race, a refusal, a shape we do not recognise) leaves
 // the tracked claim alone — the driver must never be handed a half-claim it would
 // then try to release.
-func noteClaimed(content json.RawMessage, res *Result, console io.Writer) {
+//
+// Both ways of giving up SAY SO. They used to return in silence, and the silence
+// cost a whole live phased run to localise (CLA-330): everything downstream reads
+// `Claim.Held()`, which is false on a zero Claim, so a claim that was never
+// recorded is indistinguishable from a session that never claimed — no handback,
+// no checkpoint, no complaint. A diagnostic here is the only place the difference
+// is still visible.
+func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console io.Writer) {
+	// Which task the session ASKED for, read off the tool_use arguments. Not
+	// enough to record a claim - the run id exists only in the result, and a claim
+	// that lost the race would otherwise be tracked as won - but exactly what a
+	// diagnostic needs. Without it the operator gets "something went wrong"
+	// followed by "ended without holding the task"; with it they get the id of the
+	// lease now ticking down unattended.
+	wanted := res.claimRequests[toolUseID]
+	delete(res.claimRequests, toolUseID)
+	about := ""
+	if wanted != "" {
+		about = fmt.Sprintf(" for %s", wanted)
+	}
+
+	text := toolResultText(content)
+	if path, ok := persistedOutputPath(text, toolUseID); ok {
+		b, err := readSpilled(path)
+		if err != nil {
+			fmt.Fprintf(console, "  · claim NOT tracked%s: the harness spilled this result to %s, which could not be read (%v)\n", about, path, err)
+			return
+		}
+		text = toolResultText(json.RawMessage(b))
+	}
 	var payload struct {
 		Task struct {
 			ID     string `json:"id"`
@@ -362,10 +402,17 @@ func noteClaimed(content json.RawMessage, res *Result, console io.Writer) {
 		} `json:"run"`
 		HasWip bool `json:"hasWip"`
 	}
-	if json.Unmarshal([]byte(toolResultText(content)), &payload) != nil {
+	if err := json.Unmarshal([]byte(text), &payload); err != nil {
+		fmt.Fprintf(console, "  · claim NOT tracked%s: its result is not JSON (%v) - %s\n", about, err, snippet(text))
 		return
 	}
 	if payload.Task.ID == "" || payload.Run.ID == "" {
+		// Benign when the claim simply lost the race or was refused, which is why
+		// this is a note and not a warning. It is worth saying anyway: the same
+		// line is what a SHAPE change looks like, and those two are otherwise
+		// impossible to tell apart from the outside.
+		fmt.Fprintf(console, "  · claim NOT tracked%s: its result carried task id %q and run id %q, and both are needed - %s\n",
+			about, payload.Task.ID, payload.Run.ID, snippet(text))
 		return
 	}
 	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
@@ -388,6 +435,135 @@ func claimLabel(c Claim) string {
 		return c.Ref
 	}
 	return c.TaskID
+}
+
+// The envelope Claude Code substitutes for a tool_result too large to inline: a
+// pointer to the file holding the real thing, plus a truncated preview of it. It
+// carries no `is_error` and nothing upstream flags it — the result simply stops
+// being the JSON a parser expects.
+//
+// This is what broke the phase seam (CLA-330), and it is neither of the two
+// causes that bug was first attributed to. A `claim_task` result reached 66KB and
+// was spilled; `noteClaimed` could not parse the pointer it got instead, so
+// `res.Claim` stayed at its zero value. The driver then read `Claim.Held()` as
+// false and ended the drain - "the implement phase ended without holding the
+// task" - while the plane had that task claimed the whole time, and phase 2 never
+// ran.
+//
+// Where the 66KB came from is worth stating exactly, because the obvious guess is
+// wrong: the decision list is ALREADY capped at 20, of 98. Those 20 were 48KB
+// between them, on top of a 13KB task detail. So the payload grows with the
+// LENGTH of decisions and details, not with how many exist - a count cap is not a
+// size cap, which is the same lesson clankerbar's own docs/token-budget.md draws
+// from the other side. Any agent-facing payload bounded only by a count will
+// eventually cross this threshold.
+const persistedOutputMarker = "<persisted-output>"
+
+// Deliberately NOT anchored to the start of a line: the pointer shares its line
+// with the size that caused the spill ("Output too large (66.4KB). Full output
+// saved to: /..."), and anchoring it was worth one red test to find out.
+var persistedOutputRe = regexp.MustCompile(`Full output saved to:[ \t]*(\S[^\n]*?)[ \t]*(?:\n|$)`)
+
+// persistedOutputPath returns the file a spilled tool_result was written to, if
+// this result is one.
+//
+// The path is honoured only when its base name is THIS tool call's id, and that
+// guard is the point rather than a nicety. Everything inside a tool_result is
+// potentially backlog text quoted back at the driver — the whole subject of
+// injection_test.go — so an unguarded "read the path you find in here" would let a
+// task body point the driver at a file of its choosing and have the contents
+// parsed as a claim, which is a claim on a task nobody asked for and a handback
+// aimed at it. A tool_use id is minted by the harness for THIS call in THIS
+// stream; text written before the call cannot name it.
+func persistedOutputPath(text, toolUseID string) (string, bool) {
+	if toolUseID == "" || !strings.HasPrefix(strings.TrimSpace(text), persistedOutputMarker) {
+		return "", false
+	}
+	m := persistedOutputRe.FindStringSubmatch(text)
+	if m == nil {
+		return "", false
+	}
+	path := m[1]
+	if !filepath.IsAbs(path) || filepath.Base(path) != toolUseID+".json" {
+		return "", false
+	}
+	return path, true
+}
+
+// readSpilled reads a spilled tool_result under the same bound every other read
+// in this package obeys.
+//
+// output.go states the invariant plainly - "a stream of any size costs a fixed
+// amount of memory", and no dial, because a dial is a way to reintroduce the OOM.
+// A whole-file read is bounded by nothing but what the plane chose to return,
+// which is precisely the thing that grows without warning: clankerbar's own
+// list_tasks reached ~253,000 tokens before anyone capped it. Today's spill is
+// 66KB, so this is a latent cost rather than a live one, and the cheap time to
+// bound it is while the bound is obviously generous.
+//
+// A file AT the limit is treated as unreadable rather than truncated, following
+// maxStreamLine's own rule that a payload above the bound is a lost event and not
+// a shortened one: half a JSON document parses as nothing anyway, and saying so is
+// worth more than a parse error that names the wrong cause.
+func readSpilled(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxStreamLine+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxStreamLine {
+		return nil, fmt.Errorf("spilled result exceeds %d bytes", maxStreamLine)
+	}
+	return b, nil
+}
+
+// snippetMax is how much of an unreadable payload a diagnostic quotes. Enough to
+// recognise the shape - an envelope, an MCP error, a lost race - and no more: the
+// thing being quoted is routinely the reason the payload was unreadable in the
+// first place, and a driver log nobody can scroll is its own kind of silent.
+const snippetMax = 160
+
+// snippet bounds and sanitises a diagnostic that quotes a tool_result.
+//
+// Both of those follow failureDetail in the loop package, for the same two
+// reasons, because this is the same kind of string: text from outside rendered to
+// a terminal an operator then copies out of.
+//
+// Non-printables are STRIPPED because this changes what the text is for. Result
+// content has until now only ever been fed to a JSON parser, where a control byte
+// is inert; here it is printed, where ESC is executed - and this is backlog text,
+// quoted verbatim into the stream, which is the threat model injection_test.go
+// exists for.
+//
+// The cut is in RUNES, not bytes. The payloads quoted here carry "·" and "→" from
+// the harness's own rendering, so a byte slice would cut a rune in half and emit
+// U+FFFD at the seam - mojibake in the one string whose whole purpose is to be
+// pasted into a bug report. "..." rather than U+2026 for the same reason.
+func snippet(s string) string {
+	printable := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) || unicode.IsSpace(r) {
+			return r
+		}
+		return -1
+	}, s)
+	// Cut first, THEN collapse whitespace: strings.Fields over a 66KB payload
+	// allocates a slice header per token to keep 160 bytes of it. The generous
+	// pre-cut leaves room for whitespace that is about to collapse.
+	if r := []rune(printable); len(r) > snippetMax*4 {
+		printable = string(r[:snippetMax*4])
+	}
+	out := strings.Join(strings.Fields(printable), " ")
+	if out == "" {
+		return "(empty)"
+	}
+	if r := []rune(out); len(r) > snippetMax {
+		return string(r[:snippetMax]) + "..."
+	}
+	return out
 }
 
 // toolResultText flattens a tool_result's `content`, which the stream renders

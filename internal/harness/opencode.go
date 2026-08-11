@@ -109,8 +109,8 @@ func opencodeArgs(in Invocation) []string {
 		prompt = "."
 	}
 	args := []string{"run", "--format", "json"}
-	if in.Model != "" {
-		args = append(args, "--model", in.Model)
+	if m := in.ModelArg(); m != "" {
+		args = append(args, "--model", m)
 	}
 	return append(args, "--", prompt)
 }

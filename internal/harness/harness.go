@@ -214,6 +214,20 @@ type Invocation struct {
 	ResumeClaim Claim
 }
 
+// ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
+// flag at all and let the harness pick".
+//
+// Every adapter goes through this rather than reading Model itself, so the
+// blank-but-not-empty case is handled in ONE place. A `"model": " "` in a config
+// file, or a tier mapped to a whitespace string, passes an `!= ""` check and then
+// reaches the child as a model alias no provider has — an unattended run that
+// dies on every session, for a space nobody can see in the config. Trimming here
+// makes it indistinguishable from the unset case it was obviously meant to be.
+//
+// A ratchet in the tests sweeps this package for adapters reading `.Model`
+// directly, because the failure mode is a NEW adapter, not this one.
+func (in Invocation) ModelArg() string { return strings.TrimSpace(in.Model) }
+
 // Result is the outcome of one session, both raw and parsed.
 //
 // Stdout and Stderr are the retained TAIL of each stream, not the whole of it: a
@@ -276,8 +290,25 @@ type Result struct {
 	// nothing, so there is nothing to check and nothing to complain about.
 	pendingReports map[string]Report
 
+	// claimRequests maps a claim_task tool_use id to the task it ASKED for. Kept
+	// for diagnostics only, and pointedly not a source of claim state: a request
+	// is not an answer, and a claim that LOST the race made this same request.
+	claimRequests map[string]string
+
 	// scans memoizes the harness-authored text a classifier reads. See scan.
 	scans *scanCache
+}
+
+// noteClaimRequest remembers which task a claim_task call asked for, so a failure
+// to record its result can name the lease it may have left ticking.
+func (r *Result) noteClaimRequest(toolUseID, taskID string) {
+	if toolUseID == "" || taskID == "" {
+		return
+	}
+	if r.claimRequests == nil {
+		r.claimRequests = map[string]string{}
+	}
+	r.claimRequests[toolUseID] = taskID
 }
 
 // markUntrusted records why this Result's figures cannot be believed. The FIRST
