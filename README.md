@@ -100,6 +100,31 @@ task's decile curve, not measured from a phased run, and stated that way
 deliberately until a phased run has been measured. Splitting thinner earns less
 each time while every extra boundary still pays a session's full startup cost.
 
+### Session-initiated handoff: a boundary the session chooses
+
+Phases cut at two fixed, driver-chosen points. A session can also choose its own
+cut: ending its **final message** with a marker line followed by a prompt makes
+the driver respawn a fresh session on that prompt, prefixed by driver-authored
+framing that carries the same "resume this run, do not claim" contract a phase
+resume gets from its brief — same task, same run-continuity rules as a phase
+resume — instead of moving on. The built-in
+briefs teach the mechanism and its trigger: hand off at a genuine *pivot*
+(exploration finished and implementation about to start; one sub-goal landed and
+the next beginning), writing the successor's prompt the way an operator's
+continuation prompt reads — decisions made, state verified, exact next steps,
+nothing about the journey. Most tasks need zero handoffs.
+
+A session-authored respawn prompt is self-directed prompt injection, so it is
+honoured only inside three guards: **each respawn consumes an iteration** of
+`max_iterations` (the one exception to "counts task sequences") and the budget
+breaker runs before the respawn ever spawns; an **over-size prompt** (over 4KB)
+is refused with a logged fallback to the normal path, never truncated; and a
+**chain of consecutive handoffs is capped** at 3 per phase, after which the
+sequence falls back to the standard brief; `max_iterations` and the budget
+still bound the total across every phase. Every respawn is named in the daemon
+log and tagged in its iteration log's filename (`-h1`, `-h2`, ...), so the
+chain reads the way phases do.
+
 ### The independence the split also buys
 
 Context economy is why phases were built, but it is not the only thing they are
