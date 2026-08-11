@@ -30,7 +30,7 @@ jobs:
     # The script walks `origin/main..origin/staging` and derives a version
     # preview, which checkout covers with contents:read. `gh` creates and edits
     # the promotion PR with the same GITHUB_TOKEN, which is what pull-requests:
-    # write is for — see the step below.
+    # write is for - see the step below.
     permissions:
       contents: read
       pull-requests: write
@@ -53,7 +53,7 @@ jobs:
       - name: Ensure standing staging → main promotion PR
         # gh authenticates from the default GITHUB_TOKEN. Creating a PR with it
         # works only because the repo setting "Allow GitHub Actions to create and
-        # approve pull requests" is ON — operator decision, 2026-08-10, taken over
+        # approve pull requests" is ON - operator decision, 2026-08-10, taken over
         # provisioning a scoped PAT. Creation is not an edge case: it happens every
         # cycle, because merging the promotion closes the PR. With that setting OFF
         # the default token can EDIT an open PR but is REFUSED when it must create
@@ -63,16 +63,16 @@ jobs:
         # The trade-off this choice accepts, and why it is safe HERE. A PR created
         # by GITHUB_TOKEN triggers NO further workflows (GitHub suppresses that to
         # prevent recursion), so `ci.yml` does NOT run on `pull_request` for this
-        # PR — and `main` requires the `ci` check. That would leave the promotion
-        # PR permanently unmergeable, except that `ci.yml` also runs on
-        # `push: [staging]`, and a required status check resolves against the PR's
-        # HEAD SHA. Every staging commit therefore already carries the `ci` run the
-        # promotion PR needs, whoever opened it.
+        # PR - and `main` requires the `ci` check. What satisfies it instead is
+        # that `ci.yml` also runs on `push: [staging]`, and a required status check
+        # resolves against the PR's HEAD SHA. Every staging commit therefore
+        # already carries the `ci` run this PR needs, whoever opened it.
         #
         # So the load-bearing dependency is `staging` staying in ci.yml's push
-        # list. Drop it and this PR stops being mergeable — a different failure
-        # from the one that file's own comment warns about (dropping `main`, which
-        # starves the release gate). Both are silent until someone tries to ship.
+        # list, which `TestCIWorkflowRunsOnBothIntegrationBranches` now guards.
+        # That is a different failure from dropping `main` (which starves the
+        # release gate and the staging realign), and both are silent until someone
+        # tries to ship.
         #
         # Creating or updating this PR publishes NOTHING: `release-on-merge.yml`
         # triggers only on a push to `main`. Only MERGING it does, which is the gate.

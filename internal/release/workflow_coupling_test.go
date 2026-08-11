@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -78,6 +79,54 @@ func TestCIWorkflowHasNoMatrix(t *testing.T) {
 				"never find - it would time out and refuse every release. Teach "+
 				"internal/release to match a prefix before adding one.",
 				path, strings.TrimSpace(line), DefaultRequiredCheck+" (…)", DefaultRequiredCheck)
+		}
+	}
+}
+
+// Both integration branches must stay in ci.yml's `push:` list, and each is
+// load-bearing for a DIFFERENT thing - so losing either is silent until someone
+// tries to publish, which is exactly when a guard is worth having.
+//
+//   - `main`  - release-on-merge.yml and realign-staging.yml both wait for the
+//     `ci` check on the merge commit ON MAIN. Drop it and both wait for a check
+//     nothing produces.
+//   - `staging` - it is what keeps the standing promotion PR MERGEABLE. promote.yml
+//     opens that PR with GITHUB_TOKEN, which triggers no `pull_request` run, so
+//     the `ci` check `main` requires can only come from the push run on the head
+//     SHA.
+//
+// The `staging` half has no other protection: nothing fails until a human opens
+// the promotion PR and finds a required check that never arrives.
+func TestCIWorkflowRunsOnBothIntegrationBranches(t *testing.T) {
+	path := filepath.Join("..", "..", ".github", "workflows", "ci.yml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("cannot read %s: %v", path, err)
+	}
+
+	// The `branches:` list under `push:`, as an inline flow sequence. Comments in
+	// this file discuss both names in prose, so match the KEY's value, not the
+	// words wherever they appear.
+	pushBranches := regexp.MustCompile(`(?m)^  push:\n    branches: \[(.+)\]$`)
+	m := pushBranches.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatalf("could not find a `push:`/`branches: [...]` block in %s - the "+
+			"coupling this test guards cannot be checked, which is itself the "+
+			"problem. If the trigger was reshaped, reshape this test with it.", path)
+	}
+
+	var listed []string
+	for _, b := range strings.Split(m[1], ",") {
+		listed = append(listed, strings.TrimSpace(b))
+	}
+
+	for _, want := range []string{"main", "staging"} {
+		if !slices.Contains(listed, want) {
+			t.Errorf("%s does not run on push to %q (push branches: %q). See this "+
+				"test's doc comment for what breaks - `main` starves the release "+
+				"gate and the staging realign; `staging` strands the standing "+
+				"promotion PR behind a required check that is never produced.",
+				path, want, listed)
 		}
 	}
 }

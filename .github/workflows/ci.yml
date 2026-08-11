@@ -7,18 +7,23 @@ name: ci
 # The push list is not cosmetic, and each branch in it is load-bearing for a
 # DIFFERENT reason. Both failures are silent until someone tries to ship.
 #
-# `main`: `release-on-merge.yml` gates publishing on the `ci` check of the MERGE
-# COMMIT ON MAIN, not on the PR's check — because main's protection is
-# `strict: false`, so a PR can merge without being up to date and the commit that
-# actually lands may be a combination nothing ever compiled. That gate has
-# something to read only because `main` is in this list; drop it and the gate
-# would wait, find nothing, and (correctly) refuse every release.
+# `main`: TWO workflows wait for the `ci` check of the MERGE COMMIT ON MAIN, not
+# the PR's check - `release-on-merge.yml` before it publishes, and
+# `realign-staging.yml` before it fast-forwards `staging`. They read the merge
+# commit because main's protection is `strict: false`, so a PR can merge without
+# being up to date and the commit that actually lands may be a combination
+# nothing ever compiled. Both have something to read only because `main` is in
+# this list; drop it and each waits, finds nothing, and (correctly) refuses.
 #
 # `staging`: it is what keeps the standing promotion PR MERGEABLE. `promote.yml`
 # opens that PR with GITHUB_TOKEN, and a PR created by GITHUB_TOKEN triggers no
-# `pull_request` run — so the `ci` check that `main` requires can only come from
-# the push run on the head commit. Drop `staging` and the promotion PR sits
-# forever with a missing required check.
+# `pull_request` run - so the `ci` check that `main` requires can only come from
+# the push run on the head commit. Drop `staging` and the promotion PR is stuck
+# behind a required check that never arrives, until the NEXT commit lands on
+# `staging`: that push carries a clanker's own credentials, so the resulting
+# `pull_request: synchronize` is not suppressed and does produce a run. So a
+# single-merge batch - the common case - blocks, and a two-merge batch heals
+# itself. Unreliable rather than permanent, which is worse to diagnose.
 on:
   pull_request:
   push:
