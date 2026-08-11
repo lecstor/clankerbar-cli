@@ -85,6 +85,42 @@ func TestBuiltinReviewPhaseCarriesTheResumePlaceholders(t *testing.T) {
 	}
 }
 
+// CLA-336: the post-fix pass is the expensive part paid twice. Phase 2's brief
+// once ended at "re-verify", and the session read that as dispatching a second
+// full review of the updated diff - eight minutes and most of a $12.64 phase,
+// spent to check a handful of fixes the first pass had already localised. The
+// brief must scope that pass to the fix commits and what they touch, name the
+// findings being verified, and keep the full re-review as a stated exception.
+func TestBuiltinReviewPhaseScopesThePostFixPassToTheFixes(t *testing.T) {
+	brief := builtinPhasePrompts["review"]
+	lower := strings.ToLower(brief)
+
+	// The scope: named findings, the fix commits, and their regression surface.
+	// Without the findings named, the re-reviewer reconstructs the list by
+	// reading everything - the behaviour being removed.
+	for _, want := range []string{"finding", "fix commit", "regression surface"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the review brief never says %q; a post-fix pass it dispatches has no scope to hold to:\n%s", want, brief)
+		}
+	}
+
+	// The escape hatch stays, and stays explicit: a full second pass is a
+	// judgement the session states, not the default it falls into silently.
+	for _, want := range []string{"exception", "default"} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the review brief never says %q; the full-pass escape hatch must be an explicit exception, not an unstated default:\n%s", want, brief)
+		}
+	}
+
+	// And the wording being removed must not come back: a follow-up pointed at
+	// the whole (updated) diff re-buys the full pass.
+	for _, banned := range []string{"review the updated diff", "over the updated diff", "review the whole diff"} {
+		if strings.Contains(lower, banned) {
+			t.Errorf("the review brief asks for %q - a whole-diff re-review, which is exactly the double-pay CLA-336 removed:\n%s", banned, brief)
+		}
+	}
+}
+
 func TestValidate_PhasesAndPromptAreMutuallyExclusive(t *testing.T) {
 	c := defaults()
 	c.Prompt = "something the operator wrote"
