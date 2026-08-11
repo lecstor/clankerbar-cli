@@ -135,12 +135,12 @@ var builtinPhasePrompts = map[string]string{
 		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
 		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
 		"then get_task with includeDecisions: true to re-read the bar and the standing decisions, and read the diff " +
-		"on the branch recorded on the task. Then run the adversarial review gate, fix what it finds, re-verify, " +
-		"push, and hand the task to in_review. If you want a second opinion after applying fixes, SCOPE it: brief " +
-		"the follow-up reviewer with the findings you fixed, by name, and point it at the fix commits and the " +
-		"regression surface they touch - not at the whole diff, whose full pass already happened. A full second " +
-		"pass is the exception you state a reason for (a fix that had to reach outside its own area), never the " +
-		"default.",
+		"on the branch recorded on the task. Then run the adversarial review gate, fix what it finds, and " +
+		"re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you fixed, by name, and " +
+		"point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
+		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception " +
+		"you state a reason for (a fix that had to reach outside its own area), never the default. Then push, " +
+		"and hand the task to in_review.",
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an

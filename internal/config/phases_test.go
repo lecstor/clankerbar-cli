@@ -113,8 +113,11 @@ func TestBuiltinReviewPhaseScopesThePostFixPassToTheFixes(t *testing.T) {
 	}
 
 	// And the wording being removed must not come back: a follow-up pointed at
-	// the whole (updated) diff re-buys the full pass.
-	for _, banned := range []string{"review the updated diff", "over the updated diff", "review the whole diff"} {
+	// the whole (updated) diff re-buys the full pass, however it is phrased.
+	for _, banned := range []string{
+		"review the updated diff", "over the updated diff", "review the whole diff",
+		"re-review the diff", "re-review the whole", "read the diff again", "a fresh review",
+	} {
 		if strings.Contains(lower, banned) {
 			t.Errorf("the review brief asks for %q - a whole-diff re-review, which is exactly the double-pay CLA-336 removed:\n%s", banned, brief)
 		}
