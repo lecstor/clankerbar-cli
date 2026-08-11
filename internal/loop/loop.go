@@ -293,13 +293,18 @@ func (d *Driver) Run(ctx context.Context) error {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, stop, err := d.drainPhases(ctx, drains, target,
+		tokens, cost, handoffs, stop, err := d.drainPhases(ctx, drains, target,
 			spend{start: start, tokens: totalTokens, cost: totalCost})
 		// Count the spend BEFORE deciding what to do with the outcome: a drain that
 		// stopped or failed still burned what it burned, and the accumulator is what
-		// the next iteration's breaker and log line are measured against.
+		// the next iteration's breaker and log line are measured against. Handoff
+		// respawns are charged here too (CLA-352): unlike phase sessions, which the
+		// operator priced in when they configured `phases`, each respawn is a
+		// session the SESSION chose to add, so it consumes an iteration of the
+		// operator's ceiling rather than extending the run for free.
 		totalTokens += tokens
 		totalCost += cost
+		drains += handoffs
 		if err != nil {
 			return err
 		}
@@ -350,35 +355,67 @@ type spend struct {
 //     A handback here would put the task in the queue while we are still on it.
 //  2. If the next phase will never run, the handback skipped at the seam happens
 //     here instead — otherwise a budget stop leaves the task leased to nobody.
-func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
+func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, handoffs int, stop bool, err error) {
 	phases := d.cfg.EffectivePhases()
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
 
-	for i, ph := range phases {
+	// A session-authored successor prompt, pending from the last session's
+	// handoff block (CLA-352). Non-empty means the next session is a handoff
+	// respawn continuing the SAME phase, not the next configured one.
+	nextPrompt := ""
+	chain := 0   // consecutive handoff respawns, against handoffChainCap
+	spawned := 0 // sessions this drain has launched, phase or respawn
+
+	for i := 0; i < len(phases); {
+		ph := phases[i]
 		last := i == len(phases)-1
-		// Unphased runs keep their log names byte-identical: no phase tag.
-		tag := ""
-		if len(phases) > 1 {
-			tag = "-p" + ph.Label(i)
+		isHandoff := nextPrompt != ""
+		if isHandoff {
+			// The respawn continues this phase's job under its knobs — turn cap
+			// and tier still apply — with only the prompt the session's own.
+			ph.Prompt = nextPrompt
+			nextPrompt = ""
 		}
 
-		if i > 0 {
+		if spawned > 0 {
 			// The breaker at a phase boundary — the third place a session ends and
 			// the loop decides whether to spawn another, alongside between-drains
 			// and between-attempts, and the finest granularity the ceiling has had.
 			// It is not decoration: one measured task spent 92% of a whole run's
 			// 75M ceiling inside a single session, which a between-drains check
-			// cannot see coming and cannot interrupt.
+			// cannot see coming and cannot interrupt. A handoff respawn gets the
+			// same check, BEFORE the respawn: a session cannot spend its way past
+			// the ceiling by handing off to itself.
 			if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
-				log.Printf("iteration %d: budget reached at the %s phase boundary: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-					drainNum, ph.Label(i), dim, prior.tokens+tokens, prior.cost+cost,
+				boundary := "the " + ph.Label(i) + " phase boundary"
+				if isHandoff {
+					boundary = "the handoff respawn"
+				}
+				log.Printf("iteration %d: budget reached at %s: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
+					drainNum, boundary, dim, prior.tokens+tokens, prior.cost+cost,
 					time.Since(prior.start).Round(time.Second))
 				stop = true
 				break
 			}
 		}
+
+		// Unphased runs keep their log names byte-identical: no phase tag. A
+		// handoff respawn is tagged too, so the state dir shows the chain the way
+		// the daemon log does.
+		tag := ""
+		if len(phases) > 1 {
+			tag = "-p" + ph.Label(i)
+		}
+		if isHandoff {
+			handoffs++
+			chain++
+			tag += fmt.Sprintf("-h%d", chain)
+			log.Printf("%siteration %d: handoff respawn %d — spawning a fresh session on the predecessor's own %d-byte prompt (counts as an iteration)",
+				labelOf(t), drainNum, chain, len(ph.Prompt))
+		}
+		spawned++
 
 		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, i, tag, ph, last, carried, t, spend{
 			start:  prior.start,
@@ -422,6 +459,31 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			stop = true
 			break
 		}
+
+		// A handoff the session emitted and drainPhase judged safe (clean exit,
+		// trusted stream, task still held, prompt within the size cap). Two guards
+		// remain, and both refuse toward the STANDARD path — the next configured
+		// brief, or the drain ending — never toward truncating or rewriting the
+		// session's prompt (CLA-352).
+		if end.handoff != "" {
+			switch {
+			case chain >= handoffChainCap:
+				log.Printf("%siteration %d: handoff refused — this task has already chained %d consecutive handoff respawns, the cap; falling back to the standard brief so a session cannot chain itself indefinitely",
+					labelOf(t), drainNum, chain)
+			case d.cfg.MaxIterations > 0 && drainNum+handoffs >= d.cfg.MaxIterations:
+				log.Printf("%siteration %d: handoff refused — a respawn counts as an iteration and max-iterations (%d) is already spent; falling back to the normal path",
+					labelOf(t), drainNum, d.cfg.MaxIterations)
+			default:
+				// Same phase index: the successor continues this phase's job. The
+				// budget breaker at the top of the loop runs before the spawn.
+				nextPrompt = end.handoff
+				continue
+			}
+		}
+		// This session ended without a respawn being accepted, so any chain is
+		// broken: a later handoff starts counting from a standard-brief session.
+		chain = 0
+
 		// A non-final phase that did not reach its checkpoint leaves the next one
 		// nothing to resume: the session settled the task itself (worked past its
 		// brief and finished it), its stream could not be trusted to say either way,
@@ -433,12 +495,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 				drainNum, ph.Label(i))
 			break
 		}
+		i++
 	}
 
 	// The deferred handback (2, above). Skipped at every seam that led to another
-	// phase; owed at the one that did not.
+	// phase; owed at the one that did not — including a final-phase handoff the
+	// guards above refused, whose claim was held for a successor that never ran.
 	carried = d.releaseCarried(ctx, t, carried)
-	return tokens, cost, stop, err
+	return tokens, cost, handoffs, stop, err
 }
 
 // phaseEnd is how a phase reports what it left behind, so drainPhases can decide
@@ -463,6 +527,15 @@ type phaseEnd struct {
 	// checkpoint reports an orderly end still holding the task, with the sequence
 	// meant to continue into the next phase.
 	checkpoint bool
+
+	// handoff is the successor prompt the session emitted in its final message's
+	// handoff block, already past the parse-time guards (marker present, prompt
+	// non-empty and under the size cap, clean exit, trusted stream, task still
+	// held — see detectHandoff). Non-empty implies checkpoint: the lease is
+	// being held for the successor. drainPhases owns the remaining guards — the
+	// chain cap, max-iterations, the budget breaker — and either respawns on it
+	// or falls back to the standard path (CLA-352).
+	handoff string
 }
 
 // drainWithRetries runs a single unphased drain — the whole task in one session.
@@ -587,10 +660,22 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if res.Claim.TaskID != "" {
 			end.claim = &res
 		}
-		if !last && res.Untrusted == "" && checkpointable && res.Claim.Held() {
+		// A handoff block ending the session's final message (CLA-352) holds the
+		// task open exactly like a phase seam — even on the LAST phase, where
+		// there is otherwise no successor to hold it for. The remaining guards
+		// live in drainPhases; if they refuse, the deferred handback there
+		// releases what this held.
+		handoff := detectHandoff(drainNum, t, res)
+		if (!last || handoff != "") && res.Untrusted == "" && checkpointable && res.Claim.Held() {
 			end.checkpoint = true
-			log.Printf("%siteration %d: phase reached its checkpoint holding %s — keeping the lease for the next phase",
-				labelOf(t), drainNum, res.Claim.TaskID)
+			end.handoff = handoff
+			if handoff != "" {
+				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
+					labelOf(t), drainNum, res.Claim.TaskID)
+			} else {
+				log.Printf("%siteration %d: phase reached its checkpoint holding %s — keeping the lease for the next phase",
+					labelOf(t), drainNum, res.Claim.TaskID)
+			}
 		} else {
 			// `released` records only a handback that could actually have happened:
 			// a zero Result from a failed launch releases nothing, and reporting it
