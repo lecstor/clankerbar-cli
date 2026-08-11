@@ -380,7 +380,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			}
 		}
 
-		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, tag, ph, last, carried, t, spend{
+		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, i, tag, ph, last, carried, t, spend{
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
@@ -469,7 +469,7 @@ type phaseEnd struct {
 // It is what a config with no `phases` gets, and it is kept as its own entry
 // point because that is the shape every existing test drives.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, "", config.Phase{Prompt: d.cfg.Prompt}, true, nil, t, prior)
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, "", config.Phase{Prompt: d.cfg.Prompt}, true, nil, t, prior)
 	return tokens, cost, stop, err
 }
 
@@ -490,7 +490,10 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // prior carries the run's ceilings down into the drain, because the budget breaker
 // in Run only runs BETWEEN drains and every wait in here happens inside one — see
 // the check at the top of the loop, and waitPastBudget.
-func (d *Driver) drainPhase(ctx context.Context, drainNum int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+// phaseIdx is this phase's 0-based position in the sequence, carried only so a
+// phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
+// back to "phase 2". An unphased drain passes 0 and never reaches those lines.
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	retries := 0
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
@@ -519,7 +522,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, tag string, ph co
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv := d.invocationFor(t, ph, prev)
+		inv := d.invocationFor(t, phaseIdx, ph, prev)
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
 		f, ferr := d.state.Create(logName)
@@ -1464,7 +1467,7 @@ func droppedNote(dropped int64) string {
 // A placeholder with no claim to fill it is LEFT STANDING rather than blanked.
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
-func (d *Driver) invocationFor(t Target, ph config.Phase, prev *harness.Result) harness.Invocation {
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result) harness.Invocation {
 	inv := d.invocation(t, false)
 	inv.MaxTurns = ph.MaxTurns
 	inv.Prompt = ph.Prompt
@@ -1473,10 +1476,17 @@ func (d *Driver) invocationFor(t Target, ph config.Phase, prev *harness.Result) 
 	// operator's map and the session otherwise runs on the default with nothing
 	// said — the quiet failure, since a tier is set precisely when the default is
 	// not what was wanted.
+	//
+	// "resolves to no model" rather than "the map does not define it": ModelForTier
+	// also says not-ok for a bucket that IS in the map and is mapped to blank or
+	// whitespace, and telling that operator their map lacks a bucket they can see
+	// sitting in it would send them looking in the wrong place — the more so
+	// because the whitespace is the thing they cannot see. Label(), not Name, so a
+	// phase carrying a custom prompt and no name is still identified.
 	model, ok := d.cfg.ModelForTier(ph.Tier)
 	if !ok {
-		log.Printf("%sphase %q names tier %q, which the `models` map does not define — running on the default model instead",
-			labelOf(t), ph.Name, ph.Tier)
+		log.Printf("%sphase %q names tier %q, which resolves to no model — running on the default model instead",
+			labelOf(t), ph.Label(phaseIdx), ph.Tier)
 	}
 	inv.Model = model
 	if prev != nil && prev.Claim.Held() {

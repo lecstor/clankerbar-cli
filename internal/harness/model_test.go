@@ -16,6 +16,12 @@ import (
 // unattended run dies on it. The flag has to be ABSENT for a blank, not present
 // with a blank argument, which is why each case below asserts the flag is gone
 // rather than that its value is empty.
+//
+// The three-entry list is hand-kept because an argv builder is an unexported
+// per-adapter func, not part of the Adapter interface, so there is nothing to
+// derive it from. A FOURTH adapter is therefore not exercised here - it is caught
+// by TestNoAdapterReadsTheRawModelField below, which is derived from the
+// directory. The two are a pair; neither covers the new-adapter case alone.
 func TestArgs_ABlankModelEmitsNoModelFlag(t *testing.T) {
 	adapters := []struct {
 		name string
@@ -74,8 +80,11 @@ func TestArgs_ARealModelReachesTheFlagTrimmed(t *testing.T) {
 // flag with nothing failing. Derived from the directory rather than a hand-kept
 // list, for the same reason.
 func TestNoAdapterReadsTheRawModelField(t *testing.T) {
-	// `in.Model` but not `in.ModelArg` — the word boundary is what separates them.
-	raw := regexp.MustCompile(`\bin\.Model\b`)
+	// Any receiver's `.Model`, but not `.ModelArg` — the trailing word boundary is
+	// what separates them. Matching on the RECEIVER NAME instead would pin nothing:
+	// a fourth adapter written as `func geminiArgs(inv Invocation)` reads the raw
+	// field and sweeps clean, which is the exact mutant this ratchet exists for.
+	raw := regexp.MustCompile(`\b[A-Za-z_][A-Za-z0-9_]*\.Model\b`)
 
 	entries, err := os.ReadDir(".")
 	if err != nil {

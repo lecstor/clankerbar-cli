@@ -154,6 +154,27 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 		t.Errorf("the reviewing brief changed with the implementing session's output.\n loud: %q\nquiet: %q",
 			h.invocations[1].Prompt, quiet.invocations[1].Prompt)
 	}
+
+	// And the assertion that closes the set. The two above SAMPLE the channel:
+	// four of Result's fields carry a sentinel, and the loud/quiet differential
+	// cannot reach the others, because quiet leaves them at the same zero value
+	// loud does. So a future `inv.Prompt += <something off prev>` reading any
+	// OTHER field - Reports, say, which is text phase 1 got the plane to accept -
+	// passes both of them, and is exactly the regression the comment above
+	// promises to catch.
+	//
+	// Stating the WHOLE of the brief's provenance closes it: the operator's
+	// config, with the two claim ids substituted, and nothing else. Any field that
+	// ever reaches the prompt makes it differ.
+	claim := openClaim()
+	want := strings.NewReplacer(
+		config.PhaseTaskPlaceholder, claim.TaskID,
+		config.PhaseRunPlaceholder, claim.RunID,
+	).Replace(d.cfg.EffectivePhases()[1].Prompt)
+	if h.invocations[1].Prompt != want {
+		t.Fatalf("phase 2's brief carried something other than config + the two claim ids:\n got: %q\nwant: %q",
+			h.invocations[1].Prompt, want)
+	}
 }
 
 // The other half of the same property: the reviewing brief IS derived from

@@ -104,9 +104,15 @@ type Phase struct {
 	//
 	// It is a bucket NAME, never a model alias: putting "opus" here does not pin
 	// opus, it looks for a bucket called "opus". Keeping the two apart is what
-	// lets the tier POLICY be shipped (implement is durable work, so it takes the
-	// strong bucket) while the models themselves stay the operator's, since
-	// clankerbar cannot know which ones they have or what they cost.
+	// lets a tier policy be RECOMMENDED — see the README, where a phase producing
+	// a durable artifact is worth the strong bucket — while the models themselves
+	// stay the operator's, since clankerbar cannot know which ones they have or
+	// what they cost.
+	//
+	// Nothing is tiered by DEFAULT. defaults() sets no phases at all and the
+	// built-in briefs carry prompts only, so an untouched config runs every phase
+	// on the run's model. The policy is advice in prose, never a shipped
+	// assignment.
 	Tier string `json:"tier"`
 }
 
