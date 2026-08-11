@@ -61,8 +61,8 @@ func newSessionResult(in Invocation) Result {
 // (see claudeMaxTurnsReason), where a version bump is exactly how it would go.
 func claudeArgs(in Invocation) []string {
 	args := []string{"-p", in.Prompt, "--output-format", "stream-json", "--verbose", "--permission-mode", "acceptEdits"}
-	if in.Model != "" {
-		args = append(args, "--model", in.Model)
+	if m := in.ModelArg(); m != "" {
+		args = append(args, "--model", m)
 	}
 	if in.MCPConfigPath != "" {
 		args = append(args, "--mcp-config", in.MCPConfigPath, "--strict-mcp-config")
