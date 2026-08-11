@@ -72,8 +72,8 @@ func codexArgs(in Invocation) []string {
 		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}
 	}
 	args := []string{"exec", "--json", "--sandbox", "workspace-write", "--ask-for-approval", "never"}
-	if in.Model != "" {
-		args = append(args, "-m", in.Model)
+	if m := in.ModelArg(); m != "" {
+		args = append(args, "-m", m)
 	}
 	return append(args, "--", in.Prompt)
 }

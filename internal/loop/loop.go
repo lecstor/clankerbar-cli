@@ -1468,6 +1468,17 @@ func (d *Driver) invocationFor(t Target, ph config.Phase, prev *harness.Result) 
 	inv := d.invocation(t, false)
 	inv.MaxTurns = ph.MaxTurns
 	inv.Prompt = ph.Prompt
+	// The phase's tier, or the run-wide model when it names none. Reported when a
+	// tier was named and resolved to nothing, because that is a typo in the
+	// operator's map and the session otherwise runs on the default with nothing
+	// said — the quiet failure, since a tier is set precisely when the default is
+	// not what was wanted.
+	model, ok := d.cfg.ModelForTier(ph.Tier)
+	if !ok {
+		log.Printf("%sphase %q names tier %q, which the `models` map does not define — running on the default model instead",
+			labelOf(t), ph.Name, ph.Tier)
+	}
+	inv.Model = model
 	if prev != nil && prev.Claim.Held() {
 		inv.Prompt = strings.NewReplacer(
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,

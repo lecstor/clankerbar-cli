@@ -100,6 +100,64 @@ task's decile curve, not measured from a phased run, and stated that way
 deliberately until a phased run has been measured. Splitting thinner earns less
 each time while every extra boundary still pays a session's full startup cost.
 
+### The independence the split also buys
+
+Context economy is why phases were built, but it is not the only thing they are
+worth. Before phases, one session implemented a task, dispatched its own reviewer
+and applied the fixes: **the thing being reviewed wrote the reviewer's brief.** An
+author naming what to attack frames away from its own weak spots without meaning
+to — measured on one task, a hand-written brief named three things to attack, all
+three came back fine, and the real defect the review found was something the brief
+never pointed at.
+
+A phase boundary fixes that structurally rather than by asking anyone to be
+fair-minded: **the driver is the caller, so the implementing session cannot write
+the reviewing session's prompt.** Phase N+1's brief is built from your config plus
+exactly two values off the held claim — the task id and the run id — and phase N's
+session output is not an input to it at all. A test pins that absence rather than
+the wording of the shipped brief, because the wording is the part that is allowed
+to change.
+
+The second phase also puts the review behind the checkpoint, which is where a
+session's context peaks and so where a usage limit or a crash is most likely to
+land. Before the split, a death there destroyed the findings and the half-applied
+fixes together; now it costs the review, never the implementation.
+
+### Per-phase models: a tier map you own
+
+`model` pins one model alias for the whole run. `models` and a phase's `tier` let
+different phases run on different models:
+
+```json
+"models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
+"phases": [
+  { "name": "implement", "tier": "strong" },
+  { "name": "review",    "tier": "strong" }
+]
+```
+
+**The buckets are yours, and the indirection is the point.** clankerbar drives
+three harnesses and cannot know which models you have, nor which of them is
+cheaper — that needs a price table, which goes stale silently and in the direction
+that costs money. So it never learns what models exist; it learns only that you
+bucketed them, and a phase names a **bucket**, never an alias. (`"tier": "opus"`
+does not pin opus. It looks for a bucket called `opus`.)
+
+**Everything falls back, and nothing here can stop a run.** A phase with no
+`tier` runs on `model`; a `tier` naming a bucket you never defined runs on `model`
+and says so in the iteration log; `model` itself empty means the harness picks, as
+it always has. A config written before any of this existed behaves exactly as it
+did. A mistyped bucket costs a log line at 3am, not a stopped drain.
+
+**Which way to tier is a question of blast radius, not difficulty.** A phase that
+produces a durable artifact — code, a recorded decision, a bar someone will be
+measured against — is worth the strong bucket, because a mis-recorded decision is
+read for months by people who cannot see it was wrong. A phase that only
+compresses a large output into a small answer can take a cheap one, because the
+error is visible immediately to whoever asked the closed question. Nothing is
+tiered by default: an untouched config runs every phase on the run's model, and
+these two shipped phases both produce durable artifacts.
+
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
 
@@ -540,6 +598,7 @@ the likely final format.)
 {
   "harness": "claude",
   "model": "opus",
+  "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
   "prompt": "Work the next backlog item.",
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",

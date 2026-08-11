@@ -97,6 +97,17 @@ type Phase struct {
 	// MaxTurns caps the session's turns (harness permitting) so the boundary
 	// lands even if the model works past its brief. 0 = uncapped.
 	MaxTurns int `json:"max_turns"`
+
+	// Tier names a bucket in Config.Models — which of the operator's models this
+	// phase's session runs on. Empty = the run-wide Model, and that empty = the
+	// harness default, so an untouched config is untouched behaviour.
+	//
+	// It is a bucket NAME, never a model alias: putting "opus" here does not pin
+	// opus, it looks for a bucket called "opus". Keeping the two apart is what
+	// lets the tier POLICY be shipped (implement is durable work, so it takes the
+	// strong bucket) while the models themselves stay the operator's, since
+	// clankerbar cannot know which ones they have or what they cost.
+	Tier string `json:"tier"`
 }
 
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
@@ -142,8 +153,25 @@ type Config struct {
 	Harness string `json:"harness"`
 
 	// Model is a harness-specific model alias to pin (e.g. "opus"). Empty = the
-	// harness default.
+	// harness default. It is the run-wide default, and the fallback every tier
+	// resolves to when it names nothing — see Models and ModelForTier.
 	Model string `json:"model"`
+
+	// Models is the operator's own tier map: bucket name -> harness-specific model
+	// alias, e.g. {"strong": "opus", "standard": "sonnet", "cheap": "haiku"}. A
+	// phase names a BUCKET (Phase.Tier), never an alias.
+	//
+	// The indirection is the whole point. clankerbar drives three harnesses and
+	// cannot know which models an operator has, nor which is cheaper — that would
+	// need a price table, which goes stale silently and in the direction that
+	// costs money. So it never learns what models exist; it only learns that the
+	// operator bucketed them, and ships a policy over the buckets.
+	//
+	// Everything here is OPTIONAL and every path falls back rather than refusing:
+	// no map, an unnamed bucket, or a bucket mapped to a blank string all resolve
+	// to Model, and Model empty resolves to the harness default. A mistyped tier
+	// therefore costs a line in the iteration log, not a stopped run.
+	Models map[string]string `json:"models"`
 
 	// Prompt is what each fresh session is asked to do. Default: work ONE task.
 	// It is not a per-task prompt - the backlog is the source of tasks - but it
@@ -401,6 +429,36 @@ func BuiltinPhaseNames() []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// ModelForTier resolves one phase's tier to the model alias its session runs on.
+//
+// It is TOTAL — there is no input for which it fails — because the fallback chain
+// is the design and not an error path: an unset tier, a tier the operator's map
+// does not name, and a tier mapped to a blank string all resolve to the run-wide
+// Model, and a blank Model resolves to "" (the harness's own default). That is
+// what keeps a config written before tiers existed behaving exactly as it did.
+//
+// Everything is trimmed on the way through, which is the load-bearing half: a
+// tier or a `"model": " "` that is blank-but-not-empty must resolve to the same
+// nothing an absent one does, or a whitespace alias reaches the child's model
+// flag and the session dies on an alias no provider has.
+//
+// `ok` is false only when a tier was NAMED and resolved to nothing — the typo
+// case. The caller says so in the iteration log rather than refusing: a mistyped
+// bucket should cost a log line and a run on the default model, not a stopped
+// unattended run at 3am. It is deliberately NOT reported for an unset tier,
+// which is the ordinary case and not a mistake.
+func (c *Config) ModelForTier(tier string) (model string, ok bool) {
+	runDefault := strings.TrimSpace(c.Model)
+	t := strings.TrimSpace(tier)
+	if t == "" {
+		return runDefault, true
+	}
+	if alias := strings.TrimSpace(c.Models[t]); alias != "" {
+		return alias, true
+	}
+	return runDefault, false
 }
 
 // Label names a phase for logs and log filenames: its name, or its 1-based
