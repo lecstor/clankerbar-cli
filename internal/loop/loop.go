@@ -372,10 +372,18 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 		ph := phases[i]
 		last := i == len(phases)-1
 		isHandoff := nextPrompt != ""
+		promptBytes := 0
 		if isHandoff {
 			// The respawn continues this phase's job under its knobs — turn cap
-			// and tier still apply — with only the prompt the session's own.
-			ph.Prompt = nextPrompt
+			// and tier still apply. The session's own prompt is framed by
+			// config.HandoffPreamble, not handed over bare: the successor needs
+			// the same "resume, don't claim" contract a phase resume gets from
+			// its brief, and a session-authored prompt cannot be trusted to
+			// carry that forward on its own. promptBytes is the session's own
+			// prompt alone — what the size cap was measured against — not the
+			// preamble-inflated total, so the log line stays comparable to it.
+			promptBytes = len(nextPrompt)
+			ph.Prompt = config.HandoffPreamble + nextPrompt
 			nextPrompt = ""
 		}
 
@@ -412,8 +420,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			handoffs++
 			chain++
 			tag += fmt.Sprintf("-h%d", chain)
-			log.Printf("%siteration %d: handoff respawn %d — spawning a fresh session on the predecessor's own %d-byte prompt (counts as an iteration)",
-				labelOf(t), drainNum, chain, len(ph.Prompt))
+			log.Printf("%siteration %d: handoff respawn %d — spawning a fresh session on the predecessor's own %d-byte prompt, framed by the driver's resume preamble (counts as an iteration)",
+				labelOf(t), drainNum, chain, promptBytes)
 		}
 		spawned++
 

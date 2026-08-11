@@ -138,6 +138,22 @@ const HandoffMarker = "=====CLANKERBAR HANDOFF====="
 // verified, exact next steps — fits in far less.
 const HandoffPromptMax = 4096
 
+// HandoffPreamble is driver-authored framing prepended to a handoff respawn's
+// prompt (CLA-352) — the successor never gets the emitting session's own
+// prompt bare. A phase resume (reviewPhaseName, above) works only because its
+// brief spells out "do not claim, call heartbeat first": a session-authored
+// prompt cannot be trusted to carry that instruction forward on its own, and
+// without it a successor calls next_task/claim_task on a fresh task, or its
+// run's lease lapses because nothing tells it to hold it. Placed FIRST, not
+// appended, so the driver's own constraints bound the prompt that follows
+// rather than being one more thing a self-authored prompt could bury or
+// contradict — the same reasoning behind refusing to truncate an over-cap
+// prompt rather than editing it.
+const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on task " + PhaseTaskPlaceholder +
+	", handed to you by the previous session on this task via a self-chosen handoff. Do NOT call next_task, and " +
+	"do NOT claim anything: call heartbeat(\"" + PhaseRunPlaceholder + "\") first to resume the run, then stay " +
+	"within this phase's scope. What follows is the previous session's own continuation prompt:\n\n"
+
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
 // may hand the rest of its job to a fresh successor, and how. The trigger is
 // deliberately EVENT-shaped — a session cannot measure its own context (there

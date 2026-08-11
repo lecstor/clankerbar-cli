@@ -37,10 +37,29 @@ func TestParseHandoff_Detection(t *testing.T) {
 			wantFound:  true,
 		},
 		{
-			name:       "surrounding whitespace on the marker line is ignored",
-			final:      "  " + config.HandoffMarker + "  \nDo the next thing.",
+			name:       "trailing whitespace on the marker line is ignored",
+			final:      config.HandoffMarker + "  \nDo the next thing.",
 			wantPrompt: "Do the next thing.",
 			wantFound:  true,
+		},
+		{
+			// An indented marker is a quotation, not an emission: a session that
+			// explains the mechanism (or explains why it decided against a
+			// handoff) inside a list item indents it, and that must not be
+			// mistaken for a real handoff block.
+			name:       "an indented marker line does not match",
+			final:      "  " + config.HandoffMarker + "\nDo the next thing.",
+			wantPrompt: "",
+			wantFound:  false,
+		},
+		{
+			// A fenced code block is the OTHER natural way a session quotes the
+			// marker while explaining the mechanism — unindented, so the
+			// indentation check alone would not catch it.
+			name:       "a marker line inside a fenced code block does not match",
+			final:      "Here's how it works:\n```\n" + config.HandoffMarker + "\n<the prompt>\n```\nI decided not to.",
+			wantPrompt: "",
+			wantFound:  false,
 		},
 		{
 			// The block is defined as ENDING the message, so a session that quotes
@@ -101,8 +120,16 @@ func TestDrainPhases_AHandoffRespawnsAFreshSessionOnTheEmittedPrompt(t *testing.
 	if h.invokeCalls != 2 {
 		t.Fatalf("spawned %d sessions, want 2 — the whole feature is that the marker respawns a successor", h.invokeCalls)
 	}
-	if got := h.invocations[1].Prompt; got != "Resume CLA-352: the parser is written; wire it into drainPhases and add the guards." {
-		t.Errorf("the successor was asked %q, not the session-authored prompt", got)
+	// The successor is not handed the predecessor's prompt bare: it is framed
+	// by config.HandoffPreamble, with the "resume, don't claim" contract a
+	// phase resume gets from its brief, placeholders substituted from the
+	// predecessor's claim.
+	wantPrompt := strings.NewReplacer(
+		config.PhaseTaskPlaceholder, "t-1",
+		config.PhaseRunPlaceholder, "r-1",
+	).Replace(config.HandoffPreamble) + "Resume CLA-352: the parser is written; wire it into drainPhases and add the guards."
+	if got := h.invocations[1].Prompt; got != wantPrompt {
+		t.Errorf("the successor was asked %q, want %q", got, wantPrompt)
 	}
 	// Same run continuity rules as a phase resume: the successor is seeded with
 	// the predecessor's claim, so the salvage, handback and delivery checks stay

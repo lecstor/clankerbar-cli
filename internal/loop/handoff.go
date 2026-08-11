@@ -26,11 +26,18 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
-// handoffChainCap bounds CONSECUTIVE handoff respawns on one task, so a session
-// cannot chain itself indefinitely: at the cap the emitted prompt is refused
-// and the sequence falls back to the standard brief — the next configured
-// phase, or the drain ending and the task returning to the queue, whose next
-// pickup runs on the configured prompt either way.
+// handoffChainCap bounds CONSECUTIVE handoff respawns within one phase, so a
+// session cannot chain itself indefinitely: at the cap the emitted prompt is
+// refused and the sequence falls back to the standard brief — the next
+// configured phase, or the drain ending and the task returning to the queue,
+// whose next pickup runs on the configured prompt either way.
+//
+// The chain resets at a phase boundary (drainPhases resets `chain` to 0
+// whenever a phase ends without an accepted handoff), so a multi-phase
+// sequence can chain up to this cap PER PHASE, not once for the whole task.
+// max_iterations and the token budget still bound the total across every
+// phase, so this is never the only ceiling — just the one that stops a single
+// phase's session from respawning itself forever.
 const handoffChainCap = 3
 
 // parseHandoff scans a session's final message for the handoff block: a line
@@ -48,11 +55,24 @@ const handoffChainCap = 3
 // a real block must get the real one, and everything above the last marker is
 // by definition not the successor's prompt. A marker mentioned inline in prose
 // does not match — it is not a line of its own.
+//
+// A marker line must be UNINDENTED, and must not sit inside a fenced code
+// block: a genuine emission is neither. Indentation catches a quotation
+// inside a list item; the fence tracking catches the other natural way a
+// session quotes the mechanism (or explains why it decided against a
+// handoff) — a ``` block, which is itself unindented and would otherwise
+// match. Both are real shapes a session explaining itself produces, and
+// neither may be mistaken for a real handoff block.
 func parseHandoff(final string) (prompt string, found bool, refusal string) {
 	at := -1
+	inFence := false
 	lines := strings.Split(final, "\n")
 	for i, line := range lines {
-		if strings.TrimSpace(line) == config.HandoffMarker {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			inFence = !inFence
+			continue
+		}
+		if !inFence && strings.TrimRight(line, " \t\r") == config.HandoffMarker {
 			at = i
 		}
 	}
