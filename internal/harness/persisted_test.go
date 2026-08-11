@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 // A tool_result too large for Claude Code to inline is replaced by a POINTER to a
@@ -15,8 +16,8 @@ import (
 // Why the existing suite could not fail on it: every case above builds its own
 // tool_result out of `claimOK`, a payload of a couple of hundred bytes, so the
 // spill threshold is never anywhere near. The live payload is not a couple of
-// hundred bytes - `claim_task` carries the project's standing decisions in full,
-// and at 103 of them it was 66KB. A green suite therefore proved nothing about the
+// hundred bytes - `claim_task` returns 20 standing decisions and the full task
+// detail, which came to 66KB. A green suite therefore proved nothing about the
 // path the driver actually runs, which is the whole argument for having run it
 // live at all.
 //
@@ -195,16 +196,113 @@ func TestClaudeClaimTracking_persistedFileMissing(t *testing.T) {
 }
 
 // snippet is what keeps a diagnostic from dumping the very payload that was too
-// big to inline into a log nobody can scroll.
+// big to inline into a log nobody can scroll - and, because the payload is
+// backlog text going to a terminal, from carrying anything else there either.
 func TestSnippetIsBounded(t *testing.T) {
 	got := snippet(strings.Repeat("detail ", 5000))
-	if len(got) > 200 {
-		t.Errorf("snippet len = %d, want it bounded", len(got))
+	if len([]rune(got)) > snippetMax+3 {
+		t.Errorf("snippet len = %d runes, want it bounded", len([]rune(got)))
 	}
 	if snippet("") != "(empty)" {
 		t.Errorf("snippet(\"\") = %q, want an explicit marker", snippet(""))
 	}
 	if got := snippet("a\n\tb"); got != "a b" {
 		t.Errorf("snippet = %q, want newlines collapsed to keep it one log line", got)
+	}
+}
+
+// The harness's own rendering carries "·" and "→", so a byte-sliced snippet cuts
+// a rune in half at the seam. This string exists to be pasted into a bug report;
+// half a rune arrives there as mojibake.
+func TestSnippetCutsRunesNotBytes(t *testing.T) {
+	// Both widths, because either one alone is a coin flip. "·" is 2 bytes, so a
+	// byte cut at an EVEN snippetMax lands on a boundary by luck and the bug
+	// survives; "→" is 3 bytes, which 160 does not divide. A later change to
+	// snippetMax flips which of these is the load-bearing one, so keep both.
+	for _, r := range []string{"·", "→", "·→"} {
+		got := snippet(strings.Repeat(r, 4000))
+		if !utf8.ValidString(got) {
+			t.Errorf("snippet(%q...) is not valid UTF-8: % x", r, got)
+		}
+		if strings.ContainsRune(got, utf8.RuneError) {
+			t.Errorf("snippet(%q...) = %q, want no U+FFFD from a half-cut rune", r, got)
+		}
+	}
+}
+
+// Result content has until now only ever been fed to a JSON parser, where a
+// control byte is inert. Printing it puts backlog text on a terminal, where ESC
+// is executed - the distinction internal/loop's failureDetail already draws.
+func TestSnippetStripsNonPrintables(t *testing.T) {
+	got := snippet("before \x1b[31m\x07 after")
+	if strings.ContainsAny(got, "\x1b\x07") {
+		t.Errorf("snippet = %q, want control bytes stripped", got)
+	}
+	if !strings.Contains(got, "before") || !strings.Contains(got, "after") {
+		t.Errorf("snippet = %q, want the readable text kept", got)
+	}
+}
+
+// A spilled result is bounded like every other read in this package. output.go:
+// "a stream of any size costs a fixed amount of memory", and no dial, because a
+// dial is a way to reintroduce the OOM. A file AT the bound is a lost event, not
+// a shortened one.
+func TestReadSpilledIsBounded(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "big.json")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), maxStreamLine+1), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := readSpilled(path); err == nil {
+		t.Error("readSpilled accepted a file over maxStreamLine, want it refused")
+	}
+
+	small := filepath.Join(t.TempDir(), "small.json")
+	if err := os.WriteFile(small, []byte(`"ok"`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if b, err := readSpilled(small); err != nil || string(b) != `"ok"` {
+		t.Errorf("readSpilled(small) = %q, %v", b, err)
+	}
+}
+
+// A diagnostic that cannot name the task leaves the operator with "something went
+// wrong" followed by the driver's "ended without holding the task" - which is the
+// pair of lines CLA-330 spent a live run decoding. The requested id is on the
+// tool_use arguments, so it is available even when the result is unreadable.
+func TestClaudeClaimTracking_aDroppedClaimNamesTheTaskItAskedFor(t *testing.T) {
+	const id = "toolu_018GK3yeNBtbkE3gyiprL1Dj"
+	missing := filepath.Join(t.TempDir(), id+".json")
+
+	for _, tt := range []struct{ name, result string }{
+		{"an unreadable spill", persistedResult(id, persistedEnvelope(missing))},
+		{"content that is not JSON", toolResult(id, "MCP error -32001: request timed out")},
+		{"a result carrying no ids", toolResult(id, `{"error":{"code":"already_claimed"}}`)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var console bytes.Buffer
+			var res Result
+			for _, l := range []string{
+				toolUse(id, claimTaskTool, `{"taskId":"`+claimUUID+`"}`),
+				tt.result,
+			} {
+				(claude{}).renderAndParse([]byte(l), &console, &res)
+			}
+			if got := console.String(); !strings.Contains(got, claimUUID) {
+				t.Errorf("console = %q, want it to name %s", got, claimUUID)
+			}
+		})
+	}
+}
+
+// The requested id is for the diagnostic ONLY. Promoting it to a Claim would
+// record a claim that lost the race as one that won, and hand the driver a
+// half-claim with no run id to release.
+func TestClaudeClaimTracking_theRequestedIdNeverBecomesAClaim(t *testing.T) {
+	res := claimStream(
+		toolUse("u1", claimTaskTool, `{"taskId":"`+claimUUID+`"}`),
+		toolResult("u1", `{"error":{"code":"already_claimed"}}`),
+	)
+	if res.Claim != (Claim{}) {
+		t.Errorf("Claim = %+v, want zero: a request is not an answer", res.Claim)
 	}
 }

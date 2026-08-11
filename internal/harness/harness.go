@@ -276,8 +276,25 @@ type Result struct {
 	// nothing, so there is nothing to check and nothing to complain about.
 	pendingReports map[string]Report
 
+	// claimRequests maps a claim_task tool_use id to the task it ASKED for. Kept
+	// for diagnostics only, and pointedly not a source of claim state: a request
+	// is not an answer, and a claim that LOST the race made this same request.
+	claimRequests map[string]string
+
 	// scans memoizes the harness-authored text a classifier reads. See scan.
 	scans *scanCache
+}
+
+// noteClaimRequest remembers which task a claim_task call asked for, so a failure
+// to record its result can name the lease it may have left ticking.
+func (r *Result) noteClaimRequest(toolUseID, taskID string) {
+	if toolUseID == "" || taskID == "" {
+		return
+	}
+	if r.claimRequests == nil {
+		r.claimRequests = map[string]string{}
+	}
+	r.claimRequests[toolUseID] = taskID
 }
 
 // markUntrusted records why this Result's figures cannot be believed. The FIRST

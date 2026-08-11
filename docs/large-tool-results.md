@@ -30,9 +30,8 @@ stream would have carried - so reading it and flattening it recovers everything 
 
 ## What it cost (CLA-330)
 
-`claim_task` returns the project's standing decisions **in full**, so its payload grows with
-the project's age. At 103 decisions it reached 66KB, over the threshold. The 2026-08-11
-live phased run then went like this:
+A `claim_task` result reached 66KB, over the threshold. The 2026-08-11 live phased run then
+went like this:
 
 1. The session claimed CLA-321. The plane recorded the claim and held it.
 2. `noteClaimed` got the envelope instead of the payload, could not parse it, and returned
@@ -68,11 +67,28 @@ nobody asked for and a handback aimed at it.
 A `tool_use` id is minted by the harness for that call in that stream. Text written before
 the call cannot name it.
 
-## This is not a one-off shape to paper over
+## Where the 66KB came from: a count cap is not a size cap
 
-Any agent-facing payload that grows without bound eventually crosses the threshold. That is
-the same failure clankerbar's own `docs/token-budget.md` exists to prevent from the other
-side, reached from this one: the plane grew a payload, and the *driver* broke.
+The obvious guess is wrong, and it is worth writing down before someone acts on it. The
+decision list is **already capped at 20**. Measured on the failing run's own spill file:
+
+| part of the payload | bytes |
+| --- | --- |
+| `decisions` (20 of 98) | 48,423 |
+| `task` (of which `task.detail` is 13,427) | 15,253 |
+| `policy` | 1,698 |
+| everything else | under 1,000 |
+
+So the payload did not grow with the *number* of decisions. It grew because 20 decisions
+averaged ~2.4KB of body each, on top of a 13KB task detail. Anyone going to the plane to cap
+an unbounded decisions list will find a limit of 20 already there and conclude this page is
+stale; the actual levers are per-decision body length and `task.detail`.
+
+The general lesson is sharpened rather than weakened by that: **a cap on how many items a
+payload carries says nothing about how large it is**. Any agent-facing payload bounded only
+by a count will eventually cross this threshold. That is the same failure clankerbar's own
+`docs/token-budget.md` exists to prevent from the other side, reached from this one - the
+plane grew a payload, and the *driver* broke.
 
 Two consequences worth keeping in view:
 
@@ -86,8 +102,12 @@ Two consequences worth keeping in view:
 ## Still owed
 
 An **end-to-end demonstration** driving a real two-phase sequence through a spawned harness
-binary. The parse seam (`claude.consume`) is unexported, so `internal/loop` cannot reach it;
-the loop's phase tests script `harness.Result` values directly and the harness tests stop at
-`renderAndParse`. The bug fell precisely into the gap between those two, and it is now
-covered from the harness side - but the gap itself is still there. Decision `50979b2e`
-already records this as owed.
+binary. The loop's phase tests script `harness.Result` values directly and the harness tests
+stop at `renderAndParse`; the bug fell precisely into the gap between those two. It is now
+covered from the harness side, but the gap itself is still there.
+
+Nothing blocks this in the API. `claude.Invoke` runs `exec.CommandContext(ctx, "claude",
+...)` - a bare PATH lookup - so a loop-level test can put a fake `claude` on PATH with
+`t.Setenv` and drive the whole seam through a spawned binary without exporting anything. The
+cost is writing that fixture, and nothing else. Decision `50979b2e` already records this as
+owed; saying it is blocked on an API change it does not need is how owed work stays owed.

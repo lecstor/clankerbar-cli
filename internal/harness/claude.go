@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 func init() { Register(claude{}) }
@@ -284,6 +285,15 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		// The ids are in the RESULT, not the arguments. A claim that loses the
 		// race carries none and so leaves the tracked claim untouched.
 		res.expect(toolUseID, pendingClaim)
+		// The REQUESTED task, kept only so a failure can name what it was about.
+		// Deliberately never promoted into a Claim: the run id exists only in the
+		// result, and a half-claim is the one thing the driver must not be handed.
+		var args struct {
+			TaskID string `json:"taskId"`
+		}
+		if json.Unmarshal(input, &args) == nil && args.TaskID != "" {
+			res.noteClaimRequest(toolUseID, args.TaskID)
+		}
 
 	case updateTaskTool:
 		var args struct {
@@ -359,11 +369,24 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 // no checkpoint, no complaint. A diagnostic here is the only place the difference
 // is still visible.
 func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console io.Writer) {
+	// Which task the session ASKED for, read off the tool_use arguments. Not
+	// enough to record a claim - the run id exists only in the result, and a claim
+	// that lost the race would otherwise be tracked as won - but exactly what a
+	// diagnostic needs. Without it the operator gets "something went wrong"
+	// followed by "ended without holding the task"; with it they get the id of the
+	// lease now ticking down unattended.
+	wanted := res.claimRequests[toolUseID]
+	delete(res.claimRequests, toolUseID)
+	about := ""
+	if wanted != "" {
+		about = fmt.Sprintf(" for %s", wanted)
+	}
+
 	text := toolResultText(content)
 	if path, ok := persistedOutputPath(text, toolUseID); ok {
-		b, err := os.ReadFile(path)
+		b, err := readSpilled(path)
 		if err != nil {
-			fmt.Fprintf(console, "  · claim NOT tracked: the harness spilled this result to %s, which could not be read (%v)\n", path, err)
+			fmt.Fprintf(console, "  · claim NOT tracked%s: the harness spilled this result to %s, which could not be read (%v)\n", about, path, err)
 			return
 		}
 		text = toolResultText(json.RawMessage(b))
@@ -380,7 +403,7 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		HasWip bool `json:"hasWip"`
 	}
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
-		fmt.Fprintf(console, "  · claim NOT tracked: its result is not JSON (%v) — %s\n", err, snippet(text))
+		fmt.Fprintf(console, "  · claim NOT tracked%s: its result is not JSON (%v) - %s\n", about, err, snippet(text))
 		return
 	}
 	if payload.Task.ID == "" || payload.Run.ID == "" {
@@ -388,8 +411,8 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		// this is a note and not a warning. It is worth saying anyway: the same
 		// line is what a SHAPE change looks like, and those two are otherwise
 		// impossible to tell apart from the outside.
-		fmt.Fprintf(console, "  · claim NOT tracked: its result carried task id %q and run id %q, and both are needed — %s\n",
-			payload.Task.ID, payload.Run.ID, snippet(text))
+		fmt.Fprintf(console, "  · claim NOT tracked%s: its result carried task id %q and run id %q, and both are needed - %s\n",
+			about, payload.Task.ID, payload.Run.ID, snippet(text))
 		return
 	}
 	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
@@ -420,17 +443,20 @@ func claimLabel(c Claim) string {
 // being the JSON a parser expects.
 //
 // This is what broke the phase seam (CLA-330), and it is neither of the two
-// causes that bug was first attributed to. `claim_task` returns the project's
-// standing decisions IN FULL, so its payload grows with the project's age: at 103
-// decisions it reached 66KB, the harness spilled it, `noteClaimed` could not parse
-// the pointer it got instead, and `res.Claim` stayed at its zero value. The driver
-// then read `Claim.Held()` as false and ended the drain — "the implement phase
-// ended without holding the task" — while the plane had that task claimed the
-// whole time and phase 2 never ran.
+// causes that bug was first attributed to. A `claim_task` result reached 66KB and
+// was spilled; `noteClaimed` could not parse the pointer it got instead, so
+// `res.Claim` stayed at its zero value. The driver then read `Claim.Held()` as
+// false and ended the drain - "the implement phase ended without holding the
+// task" - while the plane had that task claimed the whole time, and phase 2 never
+// ran.
 //
-// So this is not a one-off shape to paper over. Any agent-facing payload that
-// grows without bound eventually crosses the threshold, which is the same failure
-// clankerbar's own docs/token-budget.md exists to prevent from the other side.
+// Where the 66KB came from is worth stating exactly, because the obvious guess is
+// wrong: the decision list is ALREADY capped at 20, of 98. Those 20 were 48KB
+// between them, on top of a 13KB task detail. So the payload grows with the
+// LENGTH of decisions and details, not with how many exist - a count cap is not a
+// size cap, which is the same lesson clankerbar's own docs/token-budget.md draws
+// from the other side. Any agent-facing payload bounded only by a count will
+// eventually cross this threshold.
 const persistedOutputMarker = "<persisted-output>"
 
 // Deliberately NOT anchored to the start of a line: the pointer shares its line
@@ -464,19 +490,80 @@ func persistedOutputPath(text, toolUseID string) (string, bool) {
 	return path, true
 }
 
-// snippet bounds a diagnostic that quotes a payload. The thing being quoted is
-// routinely the reason the payload was unreadable in the first place — 66KB of
-// task detail — and a driver log nobody can scroll is its own kind of silent.
-func snippet(s string) string {
-	const max = 160
-	s = strings.Join(strings.Fields(s), " ")
-	if len(s) > max {
-		return s[:max] + "..."
+// readSpilled reads a spilled tool_result under the same bound every other read
+// in this package obeys.
+//
+// output.go states the invariant plainly - "a stream of any size costs a fixed
+// amount of memory", and no dial, because a dial is a way to reintroduce the OOM.
+// A whole-file read is bounded by nothing but what the plane chose to return,
+// which is precisely the thing that grows without warning: clankerbar's own
+// list_tasks reached ~253,000 tokens before anyone capped it. Today's spill is
+// 66KB, so this is a latent cost rather than a live one, and the cheap time to
+// bound it is while the bound is obviously generous.
+//
+// A file AT the limit is treated as unreadable rather than truncated, following
+// maxStreamLine's own rule that a payload above the bound is a lost event and not
+// a shortened one: half a JSON document parses as nothing anyway, and saying so is
+// worth more than a parse error that names the wrong cause.
+func readSpilled(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
 	}
-	if s == "" {
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxStreamLine+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxStreamLine {
+		return nil, fmt.Errorf("spilled result exceeds %d bytes", maxStreamLine)
+	}
+	return b, nil
+}
+
+// snippetMax is how much of an unreadable payload a diagnostic quotes. Enough to
+// recognise the shape - an envelope, an MCP error, a lost race - and no more: the
+// thing being quoted is routinely the reason the payload was unreadable in the
+// first place, and a driver log nobody can scroll is its own kind of silent.
+const snippetMax = 160
+
+// snippet bounds and sanitises a diagnostic that quotes a tool_result.
+//
+// Both of those follow failureDetail in the loop package, for the same two
+// reasons, because this is the same kind of string: text from outside rendered to
+// a terminal an operator then copies out of.
+//
+// Non-printables are STRIPPED because this changes what the text is for. Result
+// content has until now only ever been fed to a JSON parser, where a control byte
+// is inert; here it is printed, where ESC is executed - and this is backlog text,
+// quoted verbatim into the stream, which is the threat model injection_test.go
+// exists for.
+//
+// The cut is in RUNES, not bytes. The payloads quoted here carry "·" and "→" from
+// the harness's own rendering, so a byte slice would cut a rune in half and emit
+// U+FFFD at the seam - mojibake in the one string whose whole purpose is to be
+// pasted into a bug report. "..." rather than U+2026 for the same reason.
+func snippet(s string) string {
+	printable := strings.Map(func(r rune) rune {
+		if unicode.IsPrint(r) || unicode.IsSpace(r) {
+			return r
+		}
+		return -1
+	}, s)
+	// Cut first, THEN collapse whitespace: strings.Fields over a 66KB payload
+	// allocates a slice header per token to keep 160 bytes of it. The generous
+	// pre-cut leaves room for whitespace that is about to collapse.
+	if r := []rune(printable); len(r) > snippetMax*4 {
+		printable = string(r[:snippetMax*4])
+	}
+	out := strings.Join(strings.Fields(printable), " ")
+	if out == "" {
 		return "(empty)"
 	}
-	return s
+	if r := []rune(out); len(r) > snippetMax {
+		return string(r[:snippetMax]) + "..."
+	}
+	return out
 }
 
 // toolResultText flattens a tool_result's `content`, which the stream renders
