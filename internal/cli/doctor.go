@@ -1519,9 +1519,6 @@ func checkBudget(cfg *config.Config) check {
 	if b.MaxWallClock < 0 {
 		bad = append(bad, "max_wall_clock")
 	}
-	if b.MaxSessionTokens < 0 {
-		bad = append(bad, "max_session_tokens")
-	}
 	if len(bad) > 0 {
 		c.status = fail
 		c.detail = "negative budget " + plural(len(bad), "value", "values") + ": " + strings.Join(bad, ", ")
@@ -1539,16 +1536,11 @@ func checkBudget(cfg *config.Config) check {
 	if b.MaxWallClock > 0 {
 		set = append(set, "max_wall_clock="+b.MaxWallClock.Duration().String())
 	}
-	if b.MaxSessionTokens > 0 {
-		set = append(set, fmt.Sprintf("max_session_tokens=%d", b.MaxSessionTokens))
-	}
 
 	c.status = pass
 	if len(set) == 0 {
 		// Informational, not a failure: an unbounded daemon is a legitimate setup.
-		// The per-session runaway ceiling still applies regardless (CLA-343) — it
-		// is a detector, not a run budget.
-		c.detail = fmt.Sprintf("no ceiling configured — the loop runs until the backlog is dry or it is stopped (per-session runaway ceiling still active: %d tokens)", b.SessionTokenCeiling())
+		c.detail = "no ceiling configured — the loop runs until the backlog is dry or it is stopped"
 		return c
 	}
 
