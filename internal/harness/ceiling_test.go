@@ -24,7 +24,7 @@ func TestClaudeInvokeKillsTheProcessWhenTheCeilingCrosses(t *testing.T) {
 	script := `#!/bin/sh
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"one"}],"usage":{"input_tokens":60000000,"output_tokens":0}}}'
 echo '{"type":"assistant","message":{"content":[{"type":"text","text":"two"}],"usage":{"input_tokens":60000000,"output_tokens":0}}}'
-exec sleep 300
+exec sleep 30
 `
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 		t.Fatalf("writing stub: %v", err)
