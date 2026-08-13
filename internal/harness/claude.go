@@ -193,6 +193,11 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result,
 			// bytes are still buffered in the pipe are not events we may read — the
 			// `result` event among them would overwrite the kill marker and turn an
 			// orderly ceiling stop into an unclassified failure.
+			//
+			// The cost of a killed session is therefore UNMEASURED, not zero: the
+			// result event is the only carrier of total_cost_usd, and we deliberately
+			// never see it. The driver says so on the ceiling branch rather than
+			// printing $0.0000 as if it were real (CLA-343 review).
 			break
 		}
 	}

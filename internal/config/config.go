@@ -44,12 +44,14 @@ const defaultPrompt = "Work the next backlog item."
 //
 // Calibrated against the two measured anchors from the CLA-343 audit: the
 // largest legitimate session on record ran 370 turns (CLA-309, 66.2M tokens),
-// and the runaway this exists to stop ran 1093 turns (285.9M tokens). 300 sits
-// between them — comfortably above the largest legitimate session, well below
-// the runaway. It is a RUNAWAY DETECTOR, not a budget: the salvage (CLA-314)
+// and the runaway this exists to stop ran 1093 turns (285.9M tokens). 400 sits
+// between them — above the largest legitimate session with room to spare (8%
+// headroom is deliberate, not generous, because the cost of a false positive is
+// a scruffy salvage commit and a re-queued task), and at less than half the
+// runaway. It is a RUNAWAY DETECTOR, not a budget: the salvage (CLA-314)
 // commits and pushes whatever a cut-off session left, so a hit costs a scruffy
 // commit, not work.
-const DefaultMaxTurns = 300
+const DefaultMaxTurns = 400
 
 // The built-in phase names, as constants because Validate reasons about them: a
 // sequence that ENDS on the implement brief can never reach review.
@@ -884,6 +886,9 @@ func (c *Config) Validate() error {
 	}
 	if c.MaxTurns < 0 {
 		return errors.New("max_turns is negative")
+	}
+	if c.Budget.MaxSessionTokens < 0 {
+		return errors.New("max_session_tokens is negative")
 	}
 	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")

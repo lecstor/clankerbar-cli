@@ -730,9 +730,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// problem to handle, never a failure and never a retry. Retrying would
 		// re-spend against the same runaway ceiling; failing would stop the run
 		// over a kill that did its job (CLA-343).
+		//
+		// The cost is reported as unmeasured, never as a number: the result event
+		// — the only carrier of total_cost_usd — is deliberately not parsed on a
+		// killed stream, so res.CostUSD is 0 and printing it would under-report
+		// the drain's spend as exactly nothing. The tokens are the honest figure.
 		if ceiling {
-			log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
-				drainNum, tokens, cost)
+			log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d; cost not captured — killed mid-stream) — ending this phase; anything uncommitted was salvaged above",
+				drainNum, tokens)
 			return tokens, cost, false, end, nil
 		}
 
@@ -1144,11 +1149,13 @@ const quietThreshold = 3
 
 // quietTokenThreshold is the token-denominated replacement for the old
 // session-count trigger (CLA-343). Calibration: the old threshold of 3
-// fruitless SESSIONS first fired at ~78M tokens (~26M per measured iteration —
-// the audit's own figure); 80M preserves that while making ONE huge fruitless
-// drain trip it on its own — the 285.9M runaway would have earned its first
-// 15-minute sit-out at under a third of its spend instead of running three
-// sessions past it.
+// fruitless SESSIONS fired at ~78M tokens (~26M per measured iteration — the
+// audit's own figure); 80M lands within one drain of that (the third drain at
+// 26M each totals 78M, just under, and the fourth crosses). The drift is
+// deliberate and lenient, and it buys the property the session count could
+// never give: ONE huge fruitless drain trips the first 15-minute sit-out on its
+// own — the 285.9M runaway would have earned it at under a third of its spend
+// instead of running three sessions past it.
 const quietTokenThreshold = 80_000_000
 
 // judgeProgress reads this poll as the verdict on the target's last drain, and
@@ -1269,8 +1276,10 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// operator doing the very thing the back-off message asked for, and this poll is
 	// the only one that can ever see it: the baseline advances just below, so a fall
 	// consumed here is gone rather than deferred. Take the strike, skip the sit-out.
-	// The target gets one immediate retry against the answer, and if that settles
-	// nothing too, the ladder is already a rung higher for it.
+	// The target gets one immediate retry against the answer; if that settles
+	// nothing too, the retry's spend is charged like any other, so the rung it
+	// reaches depends on how big it was (a whole-threshold retry escalates at once,
+	// a smaller one repeats the band) — the retry is never an exemption.
 	answered := openQs < wasOpen
 	d.quietTokens[i] += spent
 	d.baseline[i], d.openQs[i] = settled, openQs

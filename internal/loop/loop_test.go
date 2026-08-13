@@ -519,6 +519,44 @@ func TestWaitPastBudget_ignoresWallClockDrift(t *testing.T) {
 // must NOT advance the outer drain count, and testing it in isolation makes that
 // structural fact assertable through Invoke-call counts.
 
+// CLA-343: the unphased path must carry the resolved turn cap to the harness —
+// this is the exact line the task changed (drainWithRetries used to build the
+// phase inline with a zero MaxTurns), and no other test reads MaxTurns off an
+// invocation this path produced. A revert of the EffectivePhases wiring would
+// fail this test and nothing else.
+func TestDrainWithRetries_CarriesTheResolvedTurnCap(t *testing.T) {
+	t.Run("a bare config gets the built-in default", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		h := &fakeAdapter{}
+		d := New(cfg, h, &fakePoller{})
+		openTestStateDir(t, d)
+
+		if _, _, _, err := drainOnce(t, d); err != nil {
+			t.Fatalf("drainWithRetries: %v", err)
+		}
+		if got := h.invocations[0].MaxTurns; got != config.DefaultMaxTurns {
+			t.Errorf("unphased invocation carries MaxTurns %d, want the default %d — an unphased run must never reach the harness uncapped", got, config.DefaultMaxTurns)
+		}
+	})
+
+	t.Run("the top-level cap wins over the default", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		cfg.MaxTurns = 25
+		h := &fakeAdapter{}
+		d := New(cfg, h, &fakePoller{})
+		openTestStateDir(t, d)
+
+		if _, _, _, err := drainOnce(t, d); err != nil {
+			t.Fatalf("drainWithRetries: %v", err)
+		}
+		if got := h.invocations[0].MaxTurns; got != 25 {
+			t.Errorf("unphased invocation carries MaxTurns %d, want the top-level 25", got)
+		}
+	})
+}
+
 func TestDrainWithRetries(t *testing.T) {
 	tests := []struct {
 		name         string

@@ -371,6 +371,16 @@ func TestValidate_RejectsANegativeTopLevelTurnCap(t *testing.T) {
 	}
 }
 
+func TestValidate_RejectsANegativeSessionTokenCeiling(t *testing.T) {
+	c := defaults()
+	c.Prompt = "work"
+	c.Budget = Budget{MaxSessionTokens: -1}
+
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted a negative max_session_tokens")
+	}
+}
+
 // CLA-343: the per-session token ceiling is the runaway detector, and it must
 // exist even for a config that sets no budget dials at all — the whole defect
 // was that nothing could stop the 285.9M session, so a ceiling that falls away
