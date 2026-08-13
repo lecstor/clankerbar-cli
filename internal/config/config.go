@@ -245,8 +245,12 @@ type Config struct {
 	// into config.toml [mcp_servers]. See the adapters.
 	MCPConfigPath string `json:"mcp_config_path"`
 
-	// MaxIterations stops the loop after N respawns. 0 = run until the backlog is
-	// dry (a HALT marker / "no work" result) or the loop is stopped.
+	// MaxIterations stops the loop after N respawns. 0 = no iteration ceiling:
+	// the loop runs until a STOP/HALT marker or a signal stops it (or a budget
+	// ceiling is reached); an empty queue idle-polls rather than exiting — the
+	// same falsehood-corrected shape CLA-290 applied to doctor's no-ceiling
+	// detail, kept in lockstep because this comment is where the old lie
+	// survived longest.
 	MaxIterations int `json:"max_iterations"`
 
 	// PollInterval is how often, while paused on a usage limit, the loop re-probes

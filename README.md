@@ -295,7 +295,7 @@ WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / C
 PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
 WARN  toolchains   no grant for: go (/Users/you/dev/acme-cli)
                 -> allow the verbs each one needs in /Users/you/.config/clankerbar/headless.json (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified
-PASS  budget       no ceiling configured — the loop runs until the backlog is dry or it is stopped
+PASS  budget       no ceiling configured — the loop stops on a STOP/HALT marker or signal; a dry backlog idle-polls rather than exiting
 ```
 
 The checks: **config** (discovered, parses, validates — plus the resolved harness,

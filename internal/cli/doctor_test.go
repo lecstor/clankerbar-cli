@@ -1521,12 +1521,15 @@ func TestBudgetNoCeilingDetailNamesWhatActuallyStopsTheLoop(t *testing.T) {
 	c := checkBudget(validCfg(t))
 	detail := c.detail
 
-	for _, banned := range []string{"backlog is dry", "runs until"} {
+	for _, banned := range []string{
+		"backlog is dry", "runs until",   // the exact old claim
+		"queue empties", "no work remains", "ends when", // rephrasings of the same lie
+	} {
 		if strings.Contains(detail, banned) {
 			t.Errorf("no-ceiling detail claims the loop stops when the backlog is dry (%q) — it idle-polls instead: %q", banned, detail)
 		}
 	}
-	for _, want := range []string{"STOP", "idle-polls"} {
+	for _, want := range []string{"STOP", "idle-polls", "rather than exiting"} {
 		if !strings.Contains(detail, want) {
 			t.Errorf("no-ceiling detail does not name %q; it must say what actually stops the loop: %q", want, detail)
 		}
