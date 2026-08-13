@@ -302,6 +302,11 @@ func (codex) IsTransient(res Result) bool {
 // attributed to one.
 func (codex) TurnCapped(Result) bool { return false }
 
+// No mid-stream token ceiling: codex's turn.completed usage is cumulative but
+// the adapter never kills the process, so no exit of its can be attributed to
+// one. Pinned by TestAdaptersWithoutATurnCapNeverReportOne's sibling.
+func (codex) TokenCeilingHit(Result) bool { return false }
+
 // This adapter does not populate Result.Claim — it does not watch the session's
 // clankerbar tool calls at all — so the driver's handback, salvage and delivery
 // check are all inert under it, and `phases` is refused for it in config.Validate

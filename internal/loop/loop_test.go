@@ -63,6 +63,13 @@ func limitResult() harness.Result {
 func turnCappedResult() harness.Result {
 	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "turnCapped"}}
 }
+
+// tokenCeilingResult is a session the ADAPTER killed mid-stream for crossing its
+// per-session token ceiling (CLA-343): the same orderly-end shape as a turn cap
+// — non-zero exit, its own classification, nothing retried and nothing failed.
+func tokenCeilingResult() harness.Result {
+	return harness.Result{ExitCode: -1, Tokens: 90_000_000, Raw: map[string]any{"kind": "tokenCeiling"}}
+}
 func limitStopResult() harness.Result {
 	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "limitStop"}}
 }
@@ -95,6 +102,11 @@ type fakeAdapter struct {
 	// caps overrides the fake's default capabilities, for the tests that drive an
 	// adapter which cannot observe a claim.
 	caps *harness.Capabilities
+	// tokens is charged per session when the steps are exhausted (the okResult
+	// path). Zero keeps every pre-existing test's arithmetic exactly as it was;
+	// the no-progress breaker tests set it so a fruitless session costs a real
+	// ~30M and the token threshold is actually reachable (CLA-343).
+	tokens int
 }
 
 func (f *fakeAdapter) Name() string { return "fake" }
@@ -114,7 +126,7 @@ func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harnes
 	}
 	// Steps exhausted → a clean success, so a loop that keeps draining does not
 	// panic and terminates via some other ceiling (max-iterations / budget).
-	return okResult(0, 0), nil
+	return okResult(f.tokens, 0), nil
 }
 
 func (f *fakeAdapter) DetectLimit(r harness.Result) harness.Limit {
@@ -141,6 +153,8 @@ func (f *fakeAdapter) Capabilities() harness.Capabilities {
 // Encoded in Raw like every other classification, so a scripted Result and how
 // the driver reads it cannot drift apart.
 func (f *fakeAdapter) TurnCapped(r harness.Result) bool { return kindOf(r) == "turnCapped" }
+
+func (f *fakeAdapter) TokenCeilingHit(r harness.Result) bool { return kindOf(r) == "tokenCeiling" }
 
 // Diagnostic stands in for a real adapter's scoped text. Stderr is where every
 // adapter's scope starts, so returning it keeps the fake honest about what the
@@ -1399,8 +1413,8 @@ func TestRun_ConsolePauseOutranksAbandonedWIP(t *testing.T) {
 // The judgeProgress interaction the task flagged, pinned rather than assumed. A
 // target spawning purely to recover abandoned WIP is no longer IDLE — Spawnable()
 // is what the breaker reads to mean idle, and it is now true — so the breaker
-// charges those drains and backs the target off after quietThreshold fruitless
-// ones, instead of forgetting the count every poll.
+// charges those drains and backs the target off after enough fruitless spend
+// (quietTokenThreshold, CLA-343), instead of forgetting the count every poll.
 //
 // This is the case where the branch STAYS offerable across the drains — a session
 // that declined the takeover, or a second abandoned branch behind the first. There
@@ -1417,19 +1431,22 @@ func TestJudgeProgressChargesRecoveryDrainsRatherThanReadingThemAsIdle(t *testin
 	// abandoned. THIS is the discriminating step: before the widening the summary
 	// read as not-spawnable, so the breaker forgot the count on every such poll and
 	// an unfinishable branch could spawn for ever. Now the target is spawnable, so
-	// the strikes stand.
+	// the strikes stand. Each drain spends 10M, so two of them sit well under the
+	// 80M threshold.
 	for range 2 {
 		d.pending[0] = true
+		d.spent[0] = 10_000_000
 		d.judgeProgress(0, recovering)
 	}
 	d.judgeProgress(0, recovering)
-	if d.quiet[0] != 2 {
-		t.Fatalf("a target still holding recoverable WIP is not idle, so its strikes must stand; quiet=%d, want 2", d.quiet[0])
+	if d.quietTokens[0] != 20_000_000 {
+		t.Fatalf("a target still holding recoverable WIP is not idle, so its strikes must stand; quietTokens=%d, want 20000000", d.quietTokens[0])
 	}
 
-	// So the third fruitless drain reaches the threshold and backs it off, rather
-	// than the count being reset to zero underneath it every poll.
+	// So a third fruitless drain big enough to cross the threshold backs it off,
+	// rather than the count being reset to zero underneath it every poll.
 	d.pending[0] = true
+	d.spent[0] = 60_000_000
 	d.judgeProgress(0, recovering)
 	if !d.backedOff(0) {
 		t.Error("an unfinishable abandoned branch must back the target off rather than spawning for ever")
@@ -1438,24 +1455,25 @@ func TestJudgeProgressChargesRecoveryDrainsRatherThanReadingThemAsIdle(t *testin
 	// And once the branch is gone, the target is idle on the old terms again and
 	// forgets, so the recovery episode does not follow it into later work.
 	d.judgeProgress(0, backlog.Summary{})
-	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
-		t.Errorf("with the branch cleared the target is idle again; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	if d.quietTokens[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("with the branch cleared the target is idle again; quietTokens=%d skipUntil=%v", d.quietTokens[0], d.skipUntil[0])
 	}
 }
 
 // The half the local breaker does NOT bound, asserted rather than left to be
 // discovered on a live run. A takeover RENEWS the branch's lease, so the task stops
 // being offerable and `stale_claimable` drops to 0 — and the settled poll before
-// the lease lapses again reads as idle and forgets the strike. So `quiet`
-// oscillates and never reaches quietThreshold, however many times the loop retries
-// one unfinishable branch.
+// the lease lapses again reads as idle and forgets the strike. So `quietTokens`
+// oscillates and never reaches quietTokenThreshold, however many times the loop
+// retries one unfinishable branch.
 //
 // That is not an oversight to fix here. The bound is the PLANE's: it counts
 // hand-offs per task and parks a branch that has exhausted its allowance, raising a
 // question instead of offering it again, at which point it leaves `stale_claimable`
 // for good. A local bound would mean suppressing the idle reset while work is in
 // progress, which is precisely the narrowing CLA-249 weighed and rejected — it
-// reinstates an immortal `quiet` count for every project holding abandoned WIP.
+// reinstates an immortal `quietTokens` accumulator for every project holding
+// abandoned WIP.
 //
 // This test exists so that if someone later "fixes" the oscillation locally, they
 // have to delete a test whose comment tells them why not.
@@ -1468,13 +1486,14 @@ func TestJudgeProgressDoesNotAccumulateStrikesAcrossTakeoversOfOneBranch(t *test
 
 	for range quietThreshold + 2 {
 		d.pending[0] = true
+		d.spent[0] = 30_000_000       // each fruitless drain is a real 30M session
 		d.judgeProgress(0, takenOver) // the verdict on a drain that settled nothing
 		d.judgeProgress(0, takenOver) // settled poll, lease still live -> reads idle
 		d.judgeProgress(0, offered)   // lease lapsed, offered again
 	}
 
-	if d.quiet[0] != 0 {
-		t.Errorf("the strike is forgotten while the lease is live, so the count cannot climb; quiet=%d, want 0", d.quiet[0])
+	if d.quietTokens[0] != 0 {
+		t.Errorf("the strike is forgotten while the lease is live, so the accumulator cannot climb; quietTokens=%d, want 0", d.quietTokens[0])
 	}
 	if d.backedOff(0) {
 		t.Error("and the local breaker therefore never bites here — the plane's reclaim bound is what stops this")
@@ -1824,8 +1843,9 @@ func TestRun_BacksOffAfterFruitlessDrains(t *testing.T) {
 	cfg := fastCfg()
 	cfg.StateDir = t.TempDir()
 	cfg.MaxIterations = 10
-	h := &fakeAdapter{} // every session succeeds cleanly...
-	// ...but nothing ever reaches a reviewer or finishes, which is the shape of a
+	// Every session succeeds cleanly, but each costs a real ~30M tokens...
+	h := &fakeAdapter{tokens: 30_000_000}
+	// ...and nothing ever reaches a reviewer or finishes, which is the shape of a
 	// queue whose only claimable task is waiting on the operator.
 	p := &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1}}
 
@@ -1835,8 +1855,10 @@ func TestRun_BacksOffAfterFruitlessDrains(t *testing.T) {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
-	// Three sessions to reach the threshold, then a 15-minute back-off that no
-	// fast-config interval can skip — so the run cannot reach its 10 iterations.
+	// Three sessions spend 90M, crossing the 80M token threshold; the 15-minute
+	// back-off that follows cannot be skipped by any fast-config interval — so the
+	// run cannot reach its 10 iterations. Same calibration as the old
+	// three-fruitless-sessions rule at ~26M each (CLA-343).
 	if h.invokeCalls != quietThreshold {
 		t.Errorf("should stop spawning after %d fruitless drains; got %d sessions", quietThreshold, h.invokeCalls)
 	}
@@ -1868,7 +1890,7 @@ func TestRun_ProgressResetsTheBreaker(t *testing.T) {
 // unstuck, so the target comes straight back rather than serving out its wait.
 func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
 	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
-	d.quiet[0] = quietThreshold
+	d.quietTokens[0] = quietTokenThreshold
 	d.skipUntil[0] = time.Now().Add(time.Hour)
 	d.baseline[0] = 4
 
@@ -1877,8 +1899,8 @@ func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
 	// different reason and this test would pass without testing anything.
 	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 5})
 
-	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
-		t.Errorf("outside progress must clear the back-off; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	if d.quietTokens[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("outside progress must clear the back-off; quietTokens=%d skipUntil=%v", d.quietTokens[0], d.skipUntil[0])
 	}
 }
 
@@ -1891,7 +1913,7 @@ func TestJudgeProgressClearsBackOffOnOutsideProgress(t *testing.T) {
 // show up here rather than passing by luck on the only slice entry there is.
 func TestJudgeProgressClearsBackOffWhenAQuestionIsAnswered(t *testing.T) {
 	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: &fakePoller{}}, {Poller: &fakePoller{}}})
-	d.quiet[1] = quietThreshold
+	d.quietTokens[1] = quietTokenThreshold
 	d.skipUntil[1] = time.Now().Add(time.Hour)
 	d.baseline[1], d.openQs[1] = 4, 2
 
@@ -1901,8 +1923,8 @@ func TestJudgeProgressClearsBackOffWhenAQuestionIsAnswered(t *testing.T) {
 	// claimable the back-off clears for a different reason entirely.
 	d.judgeProgress(1, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 1})
 
-	if d.quiet[1] != 0 || !d.skipUntil[1].IsZero() {
-		t.Errorf("an answered question must clear the back-off; quiet=%d skipUntil=%v", d.quiet[1], d.skipUntil[1])
+	if d.quietTokens[1] != 0 || !d.skipUntil[1].IsZero() {
+		t.Errorf("an answered question must clear the back-off; quietTokens=%d skipUntil=%v", d.quietTokens[1], d.skipUntil[1])
 	}
 	if d.backedOff(1) {
 		t.Error("the target must be eligible on that same poll, not once the remaining wait elapses")
@@ -1910,8 +1932,8 @@ func TestJudgeProgressClearsBackOffWhenAQuestionIsAnswered(t *testing.T) {
 	if d.openQs[1] != 1 {
 		t.Errorf("the open-question baseline must track the poll; got %d, want 1", d.openQs[1])
 	}
-	if d.openQs[0] != 0 || d.quiet[0] != 0 {
-		t.Errorf("the sibling target must be untouched; openQs=%d quiet=%d", d.openQs[0], d.quiet[0])
+	if d.openQs[0] != 0 || d.quietTokens[0] != 0 {
+		t.Errorf("the sibling target must be untouched; openQs=%d quietTokens=%d", d.openQs[0], d.quietTokens[0])
 	}
 }
 
@@ -1935,15 +1957,47 @@ func TestJudgeProgressKeepsBackOffWhenQuestionsDoNotFall(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
 			until := time.Now().Add(time.Hour)
-			d.quiet[0], d.skipUntil[0] = quietThreshold, until
+			d.quietTokens[0], d.skipUntil[0] = quietTokenThreshold, until
 			d.baseline[0], d.openQs[0] = 4, tc.wasOpen
 
 			d.judgeProgress(0, tc.sum)
 
-			if d.quiet[0] != quietThreshold || !d.skipUntil[0].Equal(until) {
-				t.Errorf("back-off must survive; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+			if d.quietTokens[0] != quietTokenThreshold || !d.skipUntil[0].Equal(until) {
+				t.Errorf("back-off must survive; quietTokens=%d skipUntil=%v", d.quietTokens[0], d.skipUntil[0])
 			}
 		})
+	}
+}
+
+// CLA-343: the back-off is denominated in TOKENS, so ONE huge fruitless drain
+// trips it — the property the session count could never give. The old rule
+// counted 3 fruitless SESSIONS (~78M at the measured ~26M each), so a single
+// runaway drain could repeat that spend without ever climbing the count: the
+// 285.9M session would have needed nine more like it before the first sit-out.
+// A single fruitless drain at or above quietTokenThreshold must earn the base
+// 15m on its first verdict. (Fails against the session-count behaviour, which
+// would need three such drains.)
+func TestJudgeProgressOneHugeFruitlessDrainTripsTheBackoff(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	d.pending[0] = true
+	d.spent[0] = quietTokenThreshold
+
+	d.judgeProgress(0, backlog.Summary{Claimable: 1})
+
+	if !d.backedOff(0) {
+		t.Fatal("one fruitless drain at the token threshold must back the target off — the old session count needed three of them")
+	}
+	if got := time.Until(d.skipUntil[0]).Round(time.Minute); got != 15*time.Minute {
+		t.Errorf("backed off for %s, want the base 15m", got)
+	}
+
+	// And a second drain at the threshold escalates to the next rung, exactly as
+	// the session-count ladder used to after a fourth fruitless drain.
+	d.pending[0] = true
+	d.spent[0] = quietTokenThreshold
+	d.judgeProgress(0, backlog.Summary{Claimable: 1})
+	if got := time.Until(d.skipUntil[0]).Round(time.Minute); got != 30*time.Minute {
+		t.Errorf("second crossing backed off for %s, want the 30m rung", got)
 	}
 }
 
@@ -1954,12 +2008,12 @@ func TestJudgeProgressKeepsBackOffWhenQuestionsDoNotFall(t *testing.T) {
 func TestJudgeProgressDrainThatSettlesNothingIsStillFruitless(t *testing.T) {
 	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
 	d.pending[0] = true
-	d.quiet[0], d.baseline[0], d.openQs[0] = 1, 4, 3
+	d.quietTokens[0], d.spent[0], d.baseline[0], d.openQs[0] = 10_000_000, 10_000_000, 4, 3
 
 	d.judgeProgress(0, backlog.Summary{Done: 4, OpenQuestions: 1})
 
-	if d.quiet[0] != 2 {
-		t.Errorf("a drain that settled nothing must still count against the target; quiet=%d, want 2", d.quiet[0])
+	if d.quietTokens[0] != 20_000_000 {
+		t.Errorf("a drain that settled nothing must still count against the target; quietTokens=%d, want 20000000", d.quietTokens[0])
 	}
 	if d.openQs[0] != 1 {
 		t.Errorf("the open-question baseline must track through a drain verdict too; got %d, want 1", d.openQs[0])
@@ -1975,19 +2029,20 @@ func TestJudgeProgressDrainThatSettlesNothingIsStillFruitless(t *testing.T) {
 func TestJudgeProgressAnswerDuringADrainSkipsTheSitOut(t *testing.T) {
 	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
 	d.pending[0] = true
-	d.quiet[0], d.baseline[0], d.openQs[0] = quietThreshold, 4, 1
+	d.quietTokens[0], d.spent[0], d.baseline[0], d.openQs[0] = quietTokenThreshold, 10_000_000, 4, 1
 
 	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0})
 
-	if d.quiet[0] != quietThreshold+1 {
-		t.Errorf("the drain settled nothing, so the strike is still earned; quiet=%d, want %d", d.quiet[0], quietThreshold+1)
+	if d.quietTokens[0] != quietTokenThreshold+10_000_000 {
+		t.Errorf("the drain settled nothing, so its spend is still charged; quietTokens=%d, want %d", d.quietTokens[0], quietTokenThreshold+10_000_000)
 	}
 	if d.backedOff(0) {
 		t.Error("an answer that landed mid-drain must buy one immediate retry, not the next rung of the ladder")
 	}
 	// And the retry is ONE: a second fruitless drain, with nothing having moved,
-	// backs the target off at the rung its strike count has reached.
+	// backs the target off at the rung its spend has reached.
 	d.pending[0] = true
+	d.spent[0] = 10_000_000
 	d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 0})
 	if !d.backedOff(0) {
 		t.Error("the retry is one, not an exemption; a second fruitless drain must back the target off")
@@ -2002,6 +2057,7 @@ func TestJudgeProgressAnswerEndsTheBackOffOnTheNextPoll(t *testing.T) {
 	blocked := backlog.Summary{Claimable: 1, OpenQuestions: 1}
 	for n := 0; n < quietThreshold; n++ {
 		d.pending[0] = true         // a drain went out...
+		d.spent[0] = 30_000_000     // ...costing a real ~30M (3x crosses the 80M threshold)
 		d.judgeProgress(0, blocked) // ...and settled nothing
 	}
 	if !d.backedOff(0) {
@@ -2023,14 +2079,15 @@ func TestJudgeProgressAnswerEndsTheBackOffOnTheNextPoll(t *testing.T) {
 func TestJudgeProgressForgetsFruitlessDrainsOnceNothingIsClaimable(t *testing.T) {
 	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
 
-	// Six fruitless drains against a claimable-but-unworkable queue: the target is
-	// at the 2h cap.
+	// Six fruitless drains of 60M each against a claimable-but-unworkable queue:
+	// 360M crosses three thresholds, putting the target at the 2h cap.
 	for range 6 {
 		d.pending[0] = true
+		d.spent[0] = 60_000_000
 		d.judgeProgress(0, backlog.Summary{Claimable: 1})
 	}
-	if d.quiet[0] != 6 {
-		t.Fatalf("setup: quiet = %d, want 6", d.quiet[0])
+	if d.quietTokens[0] != 360_000_000 {
+		t.Fatalf("setup: quietTokens = %d, want 360000000", d.quietTokens[0])
 	}
 	if got := time.Until(d.skipUntil[0]).Round(time.Minute); got != 2*time.Hour {
 		t.Fatalf("setup: backed off for %s, want the escalated 2h", got)
@@ -2038,8 +2095,8 @@ func TestJudgeProgressForgetsFruitlessDrainsOnceNothingIsClaimable(t *testing.T)
 
 	// The operator parks the blocker: the queue is now empty.
 	d.judgeProgress(0, backlog.Summary{Claimable: 0})
-	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
-		t.Fatalf("an idle poll must forget the fruitless count and its wait; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	if d.quietTokens[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Fatalf("an idle poll must forget the fruitless spend and its wait; quietTokens=%d skipUntil=%v", d.quietTokens[0], d.skipUntil[0])
 	}
 
 	// A week later, unrelated work is filed and its first drains settle nothing —
@@ -2047,6 +2104,7 @@ func TestJudgeProgressForgetsFruitlessDrainsOnceNothingIsClaimable(t *testing.T)
 	// BASE wait, not inherit the one the parked blocker earned.
 	for range quietThreshold {
 		d.pending[0] = true
+		d.spent[0] = 30_000_000
 		d.judgeProgress(0, backlog.Summary{Claimable: 1})
 	}
 	if got := time.Until(d.skipUntil[0]).Round(time.Minute); got != 15*time.Minute {
@@ -2064,12 +2122,13 @@ func TestJudgeProgressStillJudgesADrainOutstandingWhenTheQueueGoesQuiet(t *testi
 	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
 
 	// Each drain settles nothing and leaves the task claimed, so every verdict poll
-	// sees an empty queue. The count must still climb.
+	// sees an empty queue. The spend must still climb.
 	for n := 1; n <= quietThreshold; n++ {
 		d.pending[0] = true
+		d.spent[0] = 30_000_000
 		d.judgeProgress(0, backlog.Summary{Claimable: 0, InProgress: 1})
-		if d.quiet[0] != n {
-			t.Fatalf("after %d fruitless drains quiet = %d, want %d — an outstanding verdict was cancelled", n, d.quiet[0], n)
+		if d.quietTokens[0] != n*30_000_000 {
+			t.Fatalf("after %d fruitless drains quietTokens = %d, want %d — an outstanding verdict was cancelled", n, d.quietTokens[0], n*30_000_000)
 		}
 	}
 	if d.skipUntil[0].IsZero() {
@@ -2078,8 +2137,8 @@ func TestJudgeProgressStillJudgesADrainOutstandingWhenTheQueueGoesQuiet(t *testi
 
 	// One more idle poll with nothing outstanding IS the idle signal, and forgets.
 	d.judgeProgress(0, backlog.Summary{Claimable: 0, InProgress: 1})
-	if d.quiet[0] != 0 || !d.skipUntil[0].IsZero() {
-		t.Errorf("a settled, idle target must forget; quiet=%d skipUntil=%v", d.quiet[0], d.skipUntil[0])
+	if d.quietTokens[0] != 0 || !d.skipUntil[0].IsZero() {
+		t.Errorf("a settled, idle target must forget; quietTokens=%d skipUntil=%v", d.quietTokens[0], d.skipUntil[0])
 	}
 }
 
@@ -2116,10 +2175,11 @@ func TestJudgeProgressIdlePollAdvancesTheOpenQuestionBaseline(t *testing.T) {
 
 	// Guard, not a demonstration (see above): work is filed and its drains settle
 	// nothing, and the third backs the target off. Green either way today — it is
-	// here so that if the fall ever becomes readable while `quiet > 0`, an idle
+	// here so that if the fall ever becomes readable while `quietTokens > 0`, an idle
 	// stretch cannot hand a later drain a retry it did not earn.
 	for range quietThreshold {
 		d.pending[0] = true
+		d.spent[0] = 30_000_000
 		d.judgeProgress(0, backlog.Summary{Claimable: 1, Done: 4, OpenQuestions: 1})
 	}
 	if !d.backedOff(0) {
@@ -2134,7 +2194,9 @@ func TestRun_IdleQueueLiftsTheNoProgressBackOff(t *testing.T) {
 	cfg := fastCfg()
 	cfg.StateDir = t.TempDir()
 	cfg.MaxIterations = 4
-	h := &fakeAdapter{}
+	// Each fruitless session costs a real ~30M so three of them cross the 80M
+	// token threshold (CLA-343).
+	h := &fakeAdapter{tokens: 30_000_000}
 	// Polls 1-3 each spawn a session that settles nothing; poll 4 is the verdict on
 	// the third and earns a 15-minute wait no fast-config interval can skip. Poll 5
 	// shows an empty queue, which lifts it, and the work that arrives after must

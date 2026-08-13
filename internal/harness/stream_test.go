@@ -83,7 +83,7 @@ func TestClaudeOversizedLineIsReportedNotSwallowed(t *testing.T) {
 	var console bytes.Buffer
 	keep := newTail()
 	res := Result{scans: newScanCache()}
-	(claude{}).consume(stream, &console, keep, &res)
+	(claude{}).consume(stream, &console, keep, &res, 0, func() {})
 
 	if res.Untrusted == "" {
 		t.Fatal("Untrusted is empty after a line above the cap — the truncation is silent, which is the whole defect")
@@ -121,6 +121,80 @@ func TestClaudeOversizedLineIsReportedNotSwallowed(t *testing.T) {
 	}
 }
 
+// CLA-343: a session whose accumulated usage crosses the per-session ceiling is
+// killed MID-STREAM, and the Result carries the adapter's own marker so the
+// driver reads it as an orderly end. The spend parsed so far survives on
+// res.Tokens — the budget must see what the runaway cost even though the result
+// event (the usual carrier of the session total) never arrives.
+func TestClaudeConsumeKillsMidStreamWhenUsageCrossesTheCeiling(t *testing.T) {
+	// Two turns at 60M each: the second crosses a 100M ceiling.
+	stream := `{"type":"assistant","message":{"content":[{"type":"text","text":"one"}],"usage":{"input_tokens":30000000,"output_tokens":30000000}}}` + "\n" +
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"two"}],"usage":{"input_tokens":30000000,"output_tokens":30000000}}}` + "\n" +
+		`{"type":"result","subtype":"success","usage":{"input_tokens":120000000,"output_tokens":0}}` + "\n"
+
+	var console bytes.Buffer
+	killed := false
+	res := Result{scans: newScanCache()}
+	(claude{}).consume(strings.NewReader(stream), &console, newTail(), &res, 100_000_000, func() { killed = true })
+
+	if !killed {
+		t.Fatal("the kill was not called: a session that crossed the ceiling must be stopped in flight")
+	}
+	if !(claude{}).TokenCeilingHit(res) {
+		t.Error("the Result does not carry the adapter's own ceiling marker")
+	}
+	// The second assistant event's running total (120M) is the last figure parsed
+	// before the kill — the result event never arrived.
+	if res.Tokens != 120_000_000 {
+		t.Errorf("Tokens = %d, want the 120M accumulated before the kill", res.Tokens)
+	}
+	if !strings.Contains(console.String(), "per-session token ceiling") {
+		t.Error("the console does not say the session was killed for its ceiling")
+	}
+}
+
+// CLA-343: assistant events carry the API's per-turn usage on message.usage and
+// the result event carries the cumulative session total. The sum feeds the
+// mid-stream kill; the result's cumulative total overwrites it so the budget
+// sees the authoritative figure.
+func TestClaudeConsumeAccumulatesPerTurnUsageAndTrustsTheResultTotal(t *testing.T) {
+	stream := `{"type":"assistant","message":{"content":[{"type":"text","text":"one"}],"usage":{"input_tokens":10,"output_tokens":2,"cache_read_input_tokens":5}}}` + "\n" +
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"two"}],"usage":{"input_tokens":20,"output_tokens":4}}}` + "\n" +
+		`{"type":"result","subtype":"success","total_cost_usd":1.0,"usage":{"input_tokens":41,"output_tokens":6,"cache_read_input_tokens":5}}` + "\n"
+
+	res := Result{scans: newScanCache()}
+	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res, 0, func() {})
+
+	if res.Tokens != 52 {
+		t.Errorf("Tokens = %d, want the result event's cumulative 52 (41+6+5), not the 41 the turns summed to", res.Tokens)
+	}
+	if res.Untrusted != "" {
+		t.Errorf("Untrusted = %q on a clean stream", res.Untrusted)
+	}
+}
+
+// The kill fires only while the session is still live. A result event that
+// merely REPORTS a total above the ceiling is a session that already ended — it
+// must not be marked as killed, or the driver would lie about what happened.
+func TestClaudeConsumeDoesNotMarkASessionThatReportedItsOwnEnd(t *testing.T) {
+	stream := `{"type":"result","subtype":"success","usage":{"input_tokens":200000000,"output_tokens":0}}` + "\n"
+
+	var console bytes.Buffer
+	killed := false
+	res := Result{scans: newScanCache()}
+	(claude{}).consume(strings.NewReader(stream), &console, newTail(), &res, 100_000_000, func() { killed = true })
+
+	if killed {
+		t.Error("the kill fired on the result event: the session was already over, nothing was left to stop")
+	}
+	if (claude{}).TokenCeilingHit(res) {
+		t.Error("a finished session that merely reported a high total must not be classified as killed")
+	}
+	if res.Tokens != 200_000_000 {
+		t.Errorf("Tokens = %d, want the reported 200M — the figure must still reach the budget", res.Tokens)
+	}
+}
+
 // The ordinary path must be untouched: a whole stream parses as it always did, is
 // retained in full, and is trusted.
 func TestClaudeConsumeCleanStream(t *testing.T) {
@@ -131,7 +205,7 @@ func TestClaudeConsumeCleanStream(t *testing.T) {
 	var console bytes.Buffer
 	keep := newTail()
 	res := Result{scans: newScanCache()}
-	(claude{}).consume(strings.NewReader(stream), &console, keep, &res)
+	(claude{}).consume(strings.NewReader(stream), &console, keep, &res, 0, func() {})
 
 	if res.Untrusted != "" {
 		t.Errorf("Untrusted = %q on a clean stream", res.Untrusted)
@@ -164,7 +238,7 @@ func TestClaudeRetainedOutputIsBounded(t *testing.T) {
 
 	keep := newTail()
 	res := Result{scans: newScanCache()}
-	(claude{}).consume(strings.NewReader(stream.String()), io.Discard, keep, &res)
+	(claude{}).consume(strings.NewReader(stream.String()), io.Discard, keep, &res, 0, func() {})
 
 	if res.Untrusted != "" {
 		t.Errorf("Untrusted = %q: every line here is well under the line cap, so trimming the RETAINED text must not mark the run untrusted", res.Untrusted)

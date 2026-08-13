@@ -280,6 +280,91 @@ func TestDrainPhases_ATurnCappedPhaseIsACheckpointNotAFatalExit(t *testing.T) {
 	}
 }
 
+// The per-session token ceiling (CLA-343) is the same shape as the turn cap: the
+// adapter killed the session mid-stream for crossing Invocation.MaxSessionTokens,
+// and the driver must read that as the phase ending — never a failure that stops
+// the daemon, never a retry that re-spends against the same runaway ceiling.
+// With work pushed, a ceiling-hit phase is even a legitimate checkpoint.
+func TestDrainPhases_ATokenCeilingHitIsACheckpointNotAFatalExit(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		claim       harness.Claim
+		wantInvokes int
+	}{
+		{
+			name:        "killed with work pushed: phase 2 resumes it",
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			wantInvokes: 2,
+		},
+		{
+			name:        "killed with nothing pushed: no checkpoint to hand on",
+			claim:       openClaim(),
+			wantInvokes: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: held(tokenCeilingResult(), tc.claim)},
+				{res: okResult(1, 0)},
+			}}
+			d, _ := phaseDriver(t, h, []config.Phase{
+				{Name: "implement", MaxTurns: 5},
+				{Name: "review"},
+			})
+
+			_, _, stop, err := drainPhasesOnce(t, d)
+			if err != nil {
+				t.Fatalf("a ceiling-killed phase ended the RUN: %v — the kill was the point, not a fault", err)
+			}
+			if stop {
+				t.Error("a ceiling-killed phase stopped the run")
+			}
+			if h.invokeCalls != tc.wantInvokes {
+				t.Errorf("spawned %d sessions, want %d", h.invokeCalls, tc.wantInvokes)
+			}
+		})
+	}
+}
+
+// The ceiling must not be retried, in either direction the driver could go
+// wrong: not as a transient blip (a fresh session would re-spend against the
+// same ceiling) and not as a launch failure.
+func TestDrainPhases_ATokenCeilingFinalPhaseEndsTheDrainWithoutFailingTheRun(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: held(tokenCeilingResult(), openClaim())}}}
+	d, _ := phaseDriver(t, h, nil)
+	d.cfg.Prompt = "Work the next backlog item."
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("a ceiling-killed final phase ended the run: %v", err)
+	}
+	if stop {
+		t.Error("a ceiling-killed final phase stopped the run")
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions; a ceiling kill must never be retried", h.invokeCalls)
+	}
+}
+
+// The resolved ceiling reaches every session's invocation: invocationFor reads
+// Budget.SessionTokenCeiling, so the operator's dial and the 2x/default fallbacks
+// all arrive at the adapter. Pinned because a wire that silently drops the field
+// makes the whole mid-stream kill inert while every test stays green.
+func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
+	d, _ := phaseDriver(t, &fakeAdapter{}, twoPhases())
+	d.cfg.Budget = config.Budget{MaxTokens: 75_000_000}
+
+	ph := d.cfg.EffectivePhases()[0]
+	inv := d.invocationFor(d.targets[0], 0, ph, nil)
+
+	if want := d.cfg.Budget.SessionTokenCeiling(); inv.MaxSessionTokens != want {
+		t.Errorf("invocation carries MaxSessionTokens %d, want the resolved %d", inv.MaxSessionTokens, want)
+	}
+	if inv.MaxSessionTokens != 150_000_000 {
+		t.Errorf("MaxSessionTokens = %d, want 2x the 75M run ceiling (150M)", inv.MaxSessionTokens)
+	}
+}
+
 // Seeding made the seam's handback live for a resumed phase, which turned a
 // transient blip into a task handed back mid-sequence while the retry is given
 // the same heartbeat(runId) brief — and MaxRetries defaults to 0, "never give
@@ -499,6 +584,10 @@ func TestDrainPhases_NoPhasesConfiguredRunsExactlyOneSession(t *testing.T) {
 	}
 }
 
+// The cap has to actually reach the harness. Without it the boundary is
+// voluntary — and with CLA-343's resolution chain, "a phase with no cap" no
+// longer means "uncapped": it means "defer upward", and phase 2 of this config
+// defers to the built-in default. The phase's own cap still wins.
 func TestDrainPhases_CarriesTheTurnCapToTheHarness(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(1, 0)},
@@ -515,7 +604,10 @@ func TestDrainPhases_CarriesTheTurnCapToTheHarness(t *testing.T) {
 	if got := h.invocations[0].MaxTurns; got != 40 {
 		t.Errorf("phase 1 MaxTurns = %d, want 40 — without the cap the boundary is voluntary", got)
 	}
-	if got := h.invocations[1].MaxTurns; got != 0 {
-		t.Errorf("phase 2 MaxTurns = %d, want 0 (uncapped)", got)
+	// CLA-343, deliberately: this used to assert 0 ("uncapped"), the reading that
+	// left an unphased run with no cap anywhere in the chain. Phase 2 now defers
+	// upward to the built-in default instead.
+	if got := h.invocations[1].MaxTurns; got != config.DefaultMaxTurns {
+		t.Errorf("phase 2 MaxTurns = %d, want the built-in default %d — a phase with no cap defers upward, never to uncapped", got, config.DefaultMaxTurns)
 	}
 }

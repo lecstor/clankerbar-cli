@@ -72,11 +72,19 @@ type Driver struct {
 	// pays for the same report every cycle. One real run spent ten iterations
 	// re-writing the same two questions. These back a repeatedly fruitless target
 	// off instead.
-	quiet     []int       // consecutive drains of this target that settled nothing
-	baseline  []int       // settled count when this target's last drain began
-	openQs    []int       // open-question count at this target's last poll
-	pending   []bool      // a drain of this target is awaiting its progress verdict
-	skipUntil []time.Time // a backed-off target is ineligible until this time
+	//
+	// The accumulator is denominated in TOKENS, not sessions (CLA-343): the old
+	// count of 3 fruitless sessions cost ~78M tokens before it first fired (~26M
+	// per measured iteration), and one huge fruitless drain could repeat that
+	// spend without ever climbing the count. Tokens since last progress make the
+	// first sit-out land at the same ~80M while letting a single runaway drain
+	// trip it on its own.
+	quietTokens []int       // tokens spent on this target's drains that settled nothing
+	spent       []int       // the last drain's tokens, awaiting its progress verdict
+	baseline    []int       // settled count when this target's last drain began
+	openQs      []int       // open-question count at this target's last poll
+	pending     []bool      // a drain of this target is awaiting its progress verdict
+	skipUntil   []time.Time // a backed-off target is ineligible until this time
 
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery.
@@ -111,7 +119,8 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	return &Driver{
 		cfg: cfg, h: h, targets: targets,
 		paused:      make([]bool, n),
-		quiet:       make([]int, n),
+		quietTokens: make([]int, n),
+		spent:       make([]int, n),
 		baseline:    make([]int, n),
 		openQs:      make([]int, n),
 		pending:     make([]bool, n),
@@ -300,6 +309,11 @@ func (d *Driver) Run(ctx context.Context) error {
 		// the next iteration's breaker and log line are measured against.
 		totalTokens += tokens
 		totalCost += cost
+		// Hand the drain's tokens to the verdict that will judge it: a fruitless
+		// drain is charged to the token-denominated quiet accumulator (CLA-343), and
+		// the figure must be this drain's, not whatever total happened to be in
+		// scope when judgeProgress runs.
+		d.spent[d.cursor] = tokens
 		if err != nil {
 			return err
 		}
@@ -468,8 +482,14 @@ type phaseEnd struct {
 // drainWithRetries runs a single unphased drain — the whole task in one session.
 // It is what a config with no `phases` gets, and it is kept as its own entry
 // point because that is the shape every existing test drives.
+//
+// The phase comes from EffectivePhases, not an inline literal, so the unphased
+// path carries the same resolution every other path does — the top-level or
+// default turn cap (CLA-343), which is precisely what the inline zero-value
+// version failed to do.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, "", config.Phase{Prompt: d.cfg.Prompt}, true, nil, t, prior)
+	ph := d.cfg.EffectivePhases()[0]
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, "", ph, true, nil, t, prior)
 	return tokens, cost, stop, err
 }
 
@@ -582,7 +602,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// a checkpoint real — the phase recording its own branch, or the salvage
 		// recording one for it and the PLANE accepting the record.
 		capped := d.h.TurnCapped(res)
-		checkpointable := res.ExitCode == 0 || (capped && res.Claim.HasWIP)
+		ceiling := d.h.TokenCeilingHit(res)
+		checkpointable := res.ExitCode == 0 || ((capped || ceiling) && res.Claim.HasWIP)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
@@ -700,6 +721,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// Not retried either: the cap would fire again at the same place.
 		if capped {
 			log.Printf("iteration %d: the session hit its turn cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
+				drainNum, tokens, cost)
+			return tokens, cost, false, end, nil
+		}
+
+		// A session the ADAPTER killed for crossing its per-session token ceiling
+		// is the same shape as a turn cap: an orderly end with the salvage's
+		// problem to handle, never a failure and never a retry. Retrying would
+		// re-spend against the same runaway ceiling; failing would stop the run
+		// over a kill that did its job (CLA-343).
+		if ceiling {
+			log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
 				drainNum, tokens, cost)
 			return tokens, cost, false, end, nil
 		}
@@ -1075,17 +1107,21 @@ func (d *Driver) attestMerge(ctx context.Context, t Target, rep harness.Report, 
 	log.Printf("%srecorded delivery.mergeVerified=%t for %s", labelOf(t), verified, rep.Label())
 }
 
-// quietBackoff is how long a target sits out after `quiet` consecutive drains
-// that settled nothing: 15m, 30m, 1h, then 2h. It never reaches "never" — the
+// quietBackoff is how long a target sits out once its fruitless spend crosses
+// the quiet-token ladder: 15m, 30m, 1h, then 2h. It never reaches "never" — the
 // blocker is usually an operator answering a question, and a target that can
 // never come back would need a restart to notice.
-func quietBackoff(quiet int) time.Duration {
+//
+// rung counts how many quietTokenThresholds the accumulator has crossed, offset
+// by quietThreshold so the FIRST crossing lands on the same 15m the old
+// session-count ladder started at.
+func quietBackoff(rung int) time.Duration {
 	const (
 		base = 15 * time.Minute
 		cap_ = 2 * time.Hour
 	)
 	d := base
-	for i := quietThreshold; i < quiet; i++ {
+	for i := quietThreshold; i < rung; i++ {
 		if d *= 2; d >= cap_ {
 			return cap_
 		}
@@ -1093,22 +1129,37 @@ func quietBackoff(quiet int) time.Duration {
 	return d
 }
 
-// quietThreshold is how many fruitless drains it takes to back a target off.
+// quietThreshold is how many quietTokenThresholds of fruitless spend it takes
+// to back a target off — kept as the ladder's base rung so quietBackoff's shape
+// is unchanged from the session-count version.
 //
-// Three, not one or two. A single fruitless drain is ordinary, and so is a
-// second: a genuinely large task can span several sessions before anything
-// reaches a reviewer, and backing off then would punish exactly the deep work
-// this loop exists to do. Three consecutive sessions that settle nothing is a
-// different claim — and against the run this was written for, which repeated the
-// same no-op ten times, a threshold of three still saves seven of them.
+// The old "three, not one or two" rationale survives in token terms: a single
+// fruitless drain is ordinary, and so is a second — a genuinely large task can
+// span several sessions before anything reaches a reviewer, and backing off
+// then would punish exactly the deep work this loop exists to do. ~80M of
+// fruitless spend is a different claim, and against the run this was written
+// for — which repeated the same no-op ten times at ~26M each — the threshold
+// still saves most of them.
 const quietThreshold = 3
 
+// quietTokenThreshold is the token-denominated replacement for the old
+// session-count trigger (CLA-343). Calibration: the old threshold of 3
+// fruitless SESSIONS first fired at ~78M tokens (~26M per measured iteration —
+// the audit's own figure); 80M preserves that while making ONE huge fruitless
+// drain trip it on its own — the 285.9M runaway would have earned its first
+// 15-minute sit-out at under a third of its spend instead of running three
+// sessions past it.
+const quietTokenThreshold = 80_000_000
+
 // judgeProgress reads this poll as the verdict on the target's last drain, and
-// backs the target off once it has spent enough sessions achieving nothing.
+// backs the target off once its fruitless drains have spent enough tokens
+// achieving nothing.
 //
 // Progress is `Settled()` rising — work reaching a reviewer or finishing. A drain
 // that only recorded why it could not proceed bumps `version` but settles
-// nothing, which is exactly the run this exists to stop repeating.
+// nothing, which is exactly the run this exists to stop repeating. A fruitless
+// drain charges its tokens (Driver.spent) to the accumulator; progress clears
+// the accumulator.
 //
 // An ANSWERED QUESTION is the one kind of progress `Settled()` cannot see, and it
 // is the very thing the back-off's own message asks the operator to go and do
@@ -1167,10 +1218,10 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// from zero the ordinary way, and reaching the threshold again takes
 	// quietThreshold fresh fruitless drains.
 	if !sum.Spawnable() && !d.pending[i] {
-		if d.quiet[i] > 0 {
-			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quiet[i])
+		if d.quietTokens[i] > 0 {
+			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d tokens of drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quietTokens[i])
 		}
-		d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+		d.quietTokens[i], d.skipUntil[i] = 0, time.Time{}
 		d.baseline[i], d.openQs[i] = settled, openQs
 		return
 	}
@@ -1188,15 +1239,15 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 		// because a poll lands between the two writes - which an idle poll of a minute
 		// against a human-paced approve-then-merge ordinarily does. `in_review -> done`
 		// with no poll in between is invisible, exactly like `blocked -> ready`.
-		if d.quiet[i] > 0 {
+		if d.quietTokens[i] > 0 {
 			switch {
 			case settled > d.baseline[i]:
 				log.Printf("%sprogress from elsewhere — clearing the no-progress back-off", d.prefix(i))
-				d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+				d.quietTokens[i], d.skipUntil[i] = 0, time.Time{}
 			case openQs < wasOpen:
 				log.Printf("%sopen questions fell %d -> %d, so something was resolved: clearing the no-progress back-off",
 					d.prefix(i), wasOpen, openQs)
-				d.quiet[i], d.skipUntil[i] = 0, time.Time{}
+				d.quietTokens[i], d.skipUntil[i] = 0, time.Time{}
 			}
 		}
 		d.baseline[i], d.openQs[i] = settled, openQs
@@ -1204,8 +1255,10 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	}
 
 	d.pending[i] = false
+	spent := d.spent[i]
+	d.spent[i] = 0
 	if settled > d.baseline[i] {
-		d.quiet[i] = 0
+		d.quietTokens[i] = 0
 		d.baseline[i], d.openQs[i] = settled, openQs
 		return
 	}
@@ -1219,17 +1272,23 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// The target gets one immediate retry against the answer, and if that settles
 	// nothing too, the ladder is already a rung higher for it.
 	answered := openQs < wasOpen
-	d.quiet[i]++
+	d.quietTokens[i] += spent
 	d.baseline[i], d.openQs[i] = settled, openQs
-	if d.quiet[i] < quietThreshold {
+	// Bands, matching the old session-count ladder at the ~26M-per-drain
+	// calibration: 3 fruitless drains (~78M) earned 15m, 4 (~104M) earned 30m,
+	// 5 (~130M) earned 1h, 6+ (~156M) earned the 2h cap. In whole thresholds:
+	// acc in [80M,160M) → rung 3 → 15m; [160M,240M) → 30m; [240M,320M) → 1h;
+	// 320M+ → 2h. One huge fruitless drain (≥80M) trips the FIRST band on its
+	// own — the property the session count could never give (CLA-343).
+	if d.quietTokens[i] < quietTokenThreshold {
 		return
 	}
 	if answered {
-		log.Printf("%s%d consecutive sessions settled nothing, but open questions fell %d -> %d while the last one ran - retrying once before backing off",
-			d.prefix(i), d.quiet[i], wasOpen, openQs)
+		log.Printf("%s%d tokens spent on sessions that settled nothing, but open questions fell %d -> %d while the last one ran - retrying once before backing off",
+			d.prefix(i), d.quietTokens[i], wasOpen, openQs)
 		return
 	}
-	wait := quietBackoff(d.quiet[i])
+	wait := quietBackoff(2 + d.quietTokens[i]/quietTokenThreshold)
 	d.skipUntil[i] = time.Now().Add(wait)
 	// Name the RIGHT cause. The original sentence asserts there is claimable work
 	// and lists the reasons a ready task resists being finished — all of which are
@@ -1237,12 +1296,12 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// abandoned branch (CLA-274). Sending an operator to look for an unanswered
 	// question when the real subject is stranded WIP costs them the diagnosis.
 	if sum.Claimable == 0 && sum.StaleClaimable > 0 {
-		log.Printf("%s%d consecutive sessions settled nothing — backing off for %s. Nothing is READY; the sessions were spawned to recover %d abandoned branch(es), and are not finishing them. Check the last iteration log, and the branch itself.",
-			d.prefix(i), d.quiet[i], wait, sum.StaleClaimable)
+		log.Printf("%s%d tokens spent on sessions that settled nothing — backing off for %s. Nothing is READY; the sessions were spawned to recover %d abandoned branch(es), and are not finishing them. Check the last iteration log, and the branch itself.",
+			d.prefix(i), d.quietTokens[i], wait, sum.StaleClaimable)
 		return
 	}
-	log.Printf("%s%d consecutive sessions settled nothing — backing off for %s. The queue says there is claimable work, so something is stopping it being DONE: an unanswered question, a gate, a toolchain the session cannot run. Check the last iteration log.",
-		d.prefix(i), d.quiet[i], wait)
+	log.Printf("%s%d tokens spent on sessions that settled nothing — backing off for %s. The queue says there is claimable work, so something is stopping it being DONE: an unanswered question, a gate, a toolchain the session cannot run. Check the last iteration log.",
+		d.prefix(i), d.quietTokens[i], wait)
 }
 
 // backedOff reports whether a target is currently sitting out, logging the moment
@@ -1470,6 +1529,12 @@ func droppedNote(dropped int64) string {
 func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result) harness.Invocation {
 	inv := d.invocation(t, false)
 	inv.MaxTurns = ph.MaxTurns
+	// The per-session runaway ceiling, resolved once per drain from the budget:
+	// the operator's own dial, else 2x max_tokens, else the documented floor.
+	// 0 never reaches here — SessionTokenCeiling has no disabled state, because
+	// the whole point of CLA-343 is that nothing was able to stop the 285.9M
+	// session.
+	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeiling()
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the

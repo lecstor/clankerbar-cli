@@ -86,7 +86,13 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		return c.probe(ctx, in)
 	}
 
-	cmd := exec.CommandContext(ctx, "claude", claudeArgs(in)...)
+	// A derived context, not the caller's: the per-session token ceiling kills
+	// THIS process without cancelling the driver (CLA-343). exec.CommandContext
+	// kills the child when the context is cancelled, which is exactly the kill
+	// switch the ceiling needs — see consume.
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(sctx, "claude", claudeArgs(in)...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
@@ -109,10 +115,12 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	}
 
 	// Stream stdout line-by-line: parse each event as it arrives, render readable
-	// progress to the console, and retain a bounded tail for the text scans.
+	// progress to the console, and retain a bounded tail for the text scans. The
+	// ceiling is passed in so a session that crosses it is killed right here,
+	// mid-stream, instead of running to the end and being judged after.
 	stdoutTail := newTail()
 	res := newSessionResult(in)
-	c.consume(stdoutPipe, console, stdoutTail, &res)
+	c.consume(stdoutPipe, console, stdoutTail, &res, in.MaxSessionTokens, cancel)
 	waitErr := cmd.Wait()
 
 	res.Stdout = stdoutTail.String()
@@ -124,14 +132,26 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	res.scans = newScanCache()
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
-	} else if waitErr != nil {
+	} else if waitErr != nil && !c.TokenCeilingHit(res) {
 		return res, waitErr // couldn't run claude at all
+	} else if waitErr != nil {
+		// Our own ceiling kill: the child died on the cancel, and its exit code
+		// is the kill's, not a verdict. The marker below is the verdict.
+		res.ExitCode = -1
 	}
 	return res, nil
 }
 
 // consume reads the session's stream-json stdout to the end: parsing and
 // rendering every line as it arrives, and retaining a bounded tail in keep.
+//
+// ceiling is the per-session token ceiling (Invocation.MaxSessionTokens, 0 =
+// none) and kill cancels the session's context. When the session's accumulated
+// usage crosses the ceiling, the session is marked and killed ON THE SPOT —
+// mid-stream, while the runaway is still spending — rather than read to the end
+// and judged after. The kill closes our end of the pipe, so the scanner ends on
+// a clean EOF: no partial events, no untrusted stream, and the spend parsed so
+// far is the figure the budget sees (CLA-343).
 //
 // # A line too long is a wrong answer, not a missing one
 //
@@ -154,7 +174,7 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 // io.Discard so the child finishes its own write and exits on its own terms.
 // Draining is not free — the bytes still arrive — but it is a fixed cost with
 // nothing retained, and it buys an honest exit code.
-func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result) {
+func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result, ceiling int, kill context.CancelFunc) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), maxStreamLine) // a result event can be large
 	for sc.Scan() {
@@ -162,6 +182,19 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result)
 		keep.Write(line)
 		keep.Write(newline)
 		c.renderAndParse(line, console, res)
+		// The kill fires only before the session's own end: a result event that
+		// merely REPORTS a total above the ceiling is a finished session, and
+		// there is nothing left to stop (see Result.gotResult).
+		if ceiling > 0 && !res.gotResult && res.Tokens > ceiling && !c.TokenCeilingHit(*res) {
+			fmt.Fprintf(console, "\n!! session crossed its per-session token ceiling (%d tokens ≥ %d) — killing it here, mid-stream, instead of letting the runaway keep spending\n", res.Tokens, ceiling)
+			res.markCeilingHit()
+			kill()
+			// The kill is the end of this stream: the child is dying, and whatever
+			// bytes are still buffered in the pipe are not events we may read — the
+			// `result` event among them would overwrite the kill marker and turn an
+			// orderly ceiling stop into an unclassified failure.
+			break
+		}
 	}
 	err := sc.Err()
 	if err == nil {
@@ -184,6 +217,13 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result)
 
 // renderAndParse renders one stream-json event to the console (assistant text and
 // tool-use markers) and captures the final result/usage/limit into res.
+//
+// Token accounting spans both event shapes, verified against claude 2.1.229
+// (CLA-343): each `assistant` event carries the API's per-turn usage object
+// under `message.usage` — summed here as the session's running total — and the
+// final `result` event carries the CUMULATIVE session total, which overwrites
+// the sum on arrival. The running total is what the mid-stream ceiling kill
+// reads; the result total is what the budget sees.
 func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 	var ev struct {
 		Type    string `json:"type"`
@@ -199,6 +239,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				Content   json.RawMessage `json:"content"`
 				IsError   bool            `json:"is_error"`
 			} `json:"content"`
+			Usage usage `json:"usage"`
 		} `json:"message"`
 		Result         string  `json:"result"`
 		TerminalReason string  `json:"terminal_reason"`
@@ -220,6 +261,12 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				fmt.Fprintf(console, "  → %s\n", b.Name)
 				noteToolUse(b.Name, b.ID, b.Input, res)
 			}
+		}
+		// The API's per-turn usage rides on the assistant event's message. A
+		// zero object (a turn that spent nothing, or a shape change) adds
+		// nothing — the result event remains authoritative for the total.
+		if tot := ev.Message.Usage.total(); tot > 0 {
+			res.Tokens += tot
 		}
 	case "user":
 		// Tool results come back on a synthetic user turn.
@@ -256,8 +303,13 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 	case "result":
 		res.FinalMessage = ev.Result
 		res.CostUSD = ev.TotalCostUSD
+		// The result event's usage is the session's CUMULATIVE total, so it
+		// overwrites the running sum rather than adding to it. On a stream that
+		// reached its end this is the number the budget sees; on a stream we
+		// killed for the ceiling it never arrives, and the sum stands.
 		res.Tokens = ev.Usage.total()
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
+		res.gotResult = true
 	}
 }
 
@@ -874,6 +926,28 @@ func (claude) TurnCapped(res Result) bool {
 	}
 	r, _ := res.Raw["terminal_reason"].(string)
 	return r == claudeMaxTurnsReason
+}
+
+// tokenCeilingReason is the terminal_reason the ADAPTER writes into a Result
+// when it killed the session for crossing Invocation.MaxSessionTokens
+// (CLA-343). It is deliberately not a reason the CLI ever emits: the marker
+// exists so the driver can tell an orderly ceiling kill from a genuine failure,
+// and a marker the CLI itself could produce would be indistinguishable from
+// one — same reasoning as claudeMaxTurnsReason, except that one is the CLI's
+// own word and this one is ours.
+const tokenCeilingReason = "token_ceiling_hit"
+
+func (claude) TokenCeilingHit(res Result) bool {
+	if res.Raw == nil {
+		return false
+	}
+	r, _ := res.Raw["terminal_reason"].(string)
+	return r == tokenCeilingReason
+}
+
+// markCeilingHit writes the adapter's own kill marker onto a Result.
+func (r *Result) markCeilingHit() {
+	r.Raw = map[string]any{"terminal_reason": tokenCeilingReason}
 }
 
 // Claude is the one adapter that watches the session's clankerbar tool calls, so

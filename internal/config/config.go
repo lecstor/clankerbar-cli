@@ -40,6 +40,17 @@ const defaultBacklogURL = "https://clankerbar.com"
 // there because the previous default was the DRAIN phrase and nothing failed.
 const defaultPrompt = "Work the next backlog item."
 
+// DefaultMaxTurns bounds a session that sets no phase cap and no top-level cap.
+//
+// Calibrated against the two measured anchors from the CLA-343 audit: the
+// largest legitimate session on record ran 370 turns (CLA-309, 66.2M tokens),
+// and the runaway this exists to stop ran 1093 turns (285.9M tokens). 300 sits
+// between them — comfortably above the largest legitimate session, well below
+// the runaway. It is a RUNAWAY DETECTOR, not a budget: the salvage (CLA-314)
+// commits and pushes whatever a cut-off session left, so a hit costs a scruffy
+// commit, not work.
+const DefaultMaxTurns = 300
+
 // The built-in phase names, as constants because Validate reasons about them: a
 // sequence that ENDS on the implement brief can never reach review.
 const (
@@ -95,7 +106,11 @@ type Phase struct {
 	Prompt string `json:"prompt"`
 
 	// MaxTurns caps the session's turns (harness permitting) so the boundary
-	// lands even if the model works past its brief. 0 = uncapped.
+	// lands even if the model works past its brief. 0 = defer upward: the
+	// top-level Config.MaxTurns, then the built-in default (see
+	// Config.EffectivePhases). It is never "uncapped" — CLA-343 measured the
+	// unphased run that reading produced (1093 turns / 285.9M tokens, nothing
+	// able to stop it), so the cap chain always resolves to a number.
 	MaxTurns int `json:"max_turns"`
 
 	// Tier names a bucket in Config.Models — which of the operator's models this
@@ -249,6 +264,15 @@ type Config struct {
 	// dry (a HALT marker / "no work" result) or the loop is stopped.
 	MaxIterations int `json:"max_iterations"`
 
+	// MaxTurns is the run-wide turn cap any phase inherits when it sets none of
+	// its own (see Phase.MaxTurns for the resolution chain). It exists because
+	// the cap used to be reachable ONLY through per-phase config, so an unphased
+	// run — the default — had no cap at all: one measured session ran 1093 turns
+	// / 285.9M tokens with nothing able to interrupt it (CLA-343). 0 = defer
+	// upward to the built-in default; "uncapped" is not a value this config
+	// accepts.
+	MaxTurns int `json:"max_turns"`
+
 	// PollInterval is how often, while paused on a usage limit, the loop re-probes
 	// to catch an early reset. 0 = a built-in default (see loop.supervisedWait).
 	PollInterval Duration `json:"poll_interval"`
@@ -349,6 +373,46 @@ type Budget struct {
 	MaxTokens    int      `json:"max_tokens"`     // cumulative tokens across iterations
 	MaxCostUSD   float64  `json:"max_cost_usd"`   // cumulative $ across iterations
 	MaxWallClock Duration `json:"max_wall_clock"` // stop after this much elapsed
+
+	// MaxSessionTokens kills a single SESSION in flight when its own cumulative
+	// usage crosses this ceiling — the runaway detector, distinct from the
+	// run-wide breaker above, which only checks BETWEEN sessions and so cannot
+	// see a single huge session coming (CLA-343: the 285.9M runaway was 3.8x
+	// its run's whole 75M ceiling). 0 = defer to SessionTokenCeiling's default.
+	MaxSessionTokens int `json:"max_session_tokens"`
+}
+
+// The per-session ceiling's defaults, in the order the resolution chain falls
+// through (SessionTokenCeiling).
+const (
+	// sessionTokenCeilingMultiplier derives the ceiling from budget.max_tokens
+	// when the operator set one. 2x is defensible because the runaway this
+	// exists to stop ran 3.8x its run's ceiling: a detector at 2x catches that
+	// class of runaway while sitting far above what a large task can plausibly
+	// cost (~66M measured, CLA-309). It is a DETECTOR, deliberately not a
+	// tighter budget.
+	sessionTokenCeilingMultiplier = 2
+
+	// sessionTokenFloor is the ceiling when the operator set no budget ceiling
+	// at all. Anchors (CLA-343): the largest measured legitimate session was
+	// 66.2M tokens (370 turns, CLA-309); the runaway was 285.9M. 150M is ~2.3x
+	// the largest legitimate session and would have stopped the runaway at just
+	// over half its spend.
+	sessionTokenFloor = 150_000_000
+)
+
+// SessionTokenCeiling resolves the per-session runaway ceiling: the operator's
+// own dial, else 2x the run's max_tokens, else the floor. There is deliberately
+// no "disabled": the whole point of CLA-343 is that nothing was able to stop the
+// 285.9M session, so a ceiling that can be left unset by accident is the bug.
+func (b Budget) SessionTokenCeiling() int {
+	if b.MaxSessionTokens > 0 {
+		return b.MaxSessionTokens
+	}
+	if b.MaxTokens > 0 {
+		return sessionTokenCeilingMultiplier * b.MaxTokens
+	}
+	return sessionTokenFloor
 }
 
 // CountsSpend reports whether this budget bounds SPEND — tokens or dollars — as
@@ -416,18 +480,38 @@ func (b Budget) Remaining(elapsed time.Duration) (time.Duration, bool) {
 // The unphased case is expressed as one phase on purpose, so the driver has
 // exactly ONE shape to run and the old behaviour is not a second code path that
 // can rot untested. "No phases" and "one phase" are the same thing downstream.
+//
+// Each phase's MaxTurns is resolved here too: the phase's own cap, else the
+// top-level cap, else the built-in default. That resolution is what makes an
+// unphased run bounded — before CLA-343 it fell through to the zero value, and
+// one session ran 1093 turns / 285.9M tokens with no cap anywhere in the chain.
 func (c *Config) EffectivePhases() []Phase {
-	if len(c.Phases) == 0 {
-		return []Phase{{Prompt: c.Prompt}}
+	phases := c.Phases
+	if len(phases) == 0 {
+		phases = []Phase{{Prompt: c.Prompt}}
 	}
-	out := make([]Phase, len(c.Phases))
-	for i, ph := range c.Phases {
+	out := make([]Phase, len(phases))
+	for i, ph := range phases {
 		if ph.Prompt == "" {
 			ph.Prompt = builtinPhasePrompts[ph.Name]
 		}
+		ph.MaxTurns = c.resolveMaxTurns(ph.MaxTurns)
 		out[i] = ph
 	}
 	return out
+}
+
+// resolveMaxTurns is the turn-cap chain: the phase's own cap wins, then the
+// top-level cap, then the built-in default. Nothing resolves to zero — see
+// Phase.MaxTurns and DefaultMaxTurns for why "0 = uncapped" is gone.
+func (c *Config) resolveMaxTurns(phase int) int {
+	if phase > 0 {
+		return phase
+	}
+	if c.MaxTurns > 0 {
+		return c.MaxTurns
+	}
+	return DefaultMaxTurns
 }
 
 // BuiltinPhaseNames lists the shipped phase briefs, sorted so the error naming
@@ -797,6 +881,9 @@ func (c *Config) Validate() error {
 	// accepted automatically. harness does not import config, so there is no cycle.
 	if !harness.Known(c.Harness) {
 		return fmt.Errorf("unknown harness %q (want: %s)", c.Harness, strings.Join(harness.Names(), ", "))
+	}
+	if c.MaxTurns < 0 {
+		return errors.New("max_turns is negative")
 	}
 	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")
