@@ -1522,7 +1522,7 @@ func TestBudgetNoCeilingDetailNamesWhatActuallyStopsTheLoop(t *testing.T) {
 	detail := c.detail
 
 	for _, banned := range []string{
-		"backlog is dry", "runs until",   // the exact old claim
+		"backlog is dry", "runs until", // the exact old claim
 		"queue empties", "no work remains", "ends when", // rephrasings of the same lie
 	} {
 		if strings.Contains(detail, banned) {
