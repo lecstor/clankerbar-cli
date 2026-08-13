@@ -1540,7 +1540,12 @@ func checkBudget(cfg *config.Config) check {
 	c.status = pass
 	if len(set) == 0 {
 		// Informational, not a failure: an unbounded daemon is a legitimate setup.
-		c.detail = "no ceiling configured — the loop runs until the backlog is dry or it is stopped"
+		// The wording names what actually STOPS the loop, because the obvious
+		// sentence — "runs until the backlog is dry" — is false: a dry backlog
+		// idle-polls by design, so the daemon can react to answered questions,
+		// promotions and newly filed work (CLA-290). `--max-iterations` is a run
+		// flag doctor cannot see, so the config's contribution is described alone.
+		c.detail = "no ceiling configured — the loop stops on a STOP marker or signal; a dry backlog idle-polls rather than exiting"
 		return c
 	}
 
