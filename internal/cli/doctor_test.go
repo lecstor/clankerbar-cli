@@ -1511,6 +1511,31 @@ func TestBudgetUnsetIsInformational(t *testing.T) {
 	}
 }
 
+// CLA-290: the no-ceiling detail used to claim the loop "runs until the backlog
+// is dry" — false, a dry backlog idle-polls by design so the daemon can react to
+// answered questions and newly filed work. Pin the wording against the
+// behaviour: it must name what actually stops the loop (STOP marker or signal)
+// and say an empty queue idle-polls, and must not assert or imply dryness ends
+// the run. This assertion fails against the old string, which is the point.
+func TestBudgetNoCeilingDetailNamesWhatActuallyStopsTheLoop(t *testing.T) {
+	c := checkBudget(validCfg(t))
+	detail := c.detail
+
+	for _, banned := range []string{
+		"backlog is dry", "runs until", // the exact old claim
+		"queue empties", "no work remains", "ends when", // rephrasings of the same lie
+	} {
+		if strings.Contains(detail, banned) {
+			t.Errorf("no-ceiling detail claims the loop stops when the backlog is dry (%q) — it idle-polls instead: %q", banned, detail)
+		}
+	}
+	for _, want := range []string{"STOP", "idle-polls", "rather than exiting"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("no-ceiling detail does not name %q; it must say what actually stops the loop: %q", want, detail)
+		}
+	}
+}
+
 func TestBudgetSetIsReported(t *testing.T) {
 	cfg := validCfg(t)
 	cfg.Budget = config.Budget{MaxTokens: 500000}
