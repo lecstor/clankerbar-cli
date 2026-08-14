@@ -625,6 +625,7 @@ the likely final format.)
   "model": "opus",
   "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
   "prompt": "Work the next backlog item.",
+  "max_turns": 400,
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
   "idle_poll_interval": "60s",
@@ -634,10 +635,29 @@ the likely final format.)
   "budget": {
     "max_tokens": 0,
     "max_cost_usd": 0,
-    "max_wall_clock": "6h"
+    "max_wall_clock": "6h",
+    "max_session_tokens": 0
   }
 }
 ```
+
+`max_turns` bounds every session's turns when its phase sets none of its own:
+the phase's `max_turns` wins, then this, then a built-in default of 400
+(CLA-343 — an unphased run used to have no cap anywhere in the chain, and one
+session ran 1093 turns / 285.9M tokens with nothing able to stop it). "0" no
+longer means uncapped; it means "defer upward". Claude only: the other
+harnesses take no turn flag, so for them the cap is inert.
+
+`budget.max_session_tokens` is the per-session runaway detector: when a
+session's own cumulative usage crosses it, the harness kills the session
+mid-stream and the salvage commits whatever it left (CLA-343). Unlike the
+run-wide breaker, which only checks BETWEEN sessions, this one can stop a
+single huge session in flight — the 285.9M runaway was 3.8x its run's whole
+`max_tokens` ceiling. 0 defers: to 2x `budget.max_tokens` when that is set,
+else to a 150M floor (~2.3x the largest legitimate session measured, CLA-309).
+It is deliberately always on — it is a detector, not a budget. Claude only
+today: the other harnesses' streams are parsed but never killed mid-session,
+so for them the dial is inert until an adapter grows the kill.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default

@@ -33,7 +33,7 @@ func TestSeededResumeClaimArmsTheUpdateTaskArm(t *testing.T) {
 	// turns this red rather than leaving the suite green.
 	res := newSessionResult(Invocation{ResumeClaim: Claim{TaskID: seededTask, RunID: "run-xyz"}})
 	res.scans = newScanCache()
-	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res)
+	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res, 0, func() {})
 
 	if !res.Claim.HasWIP {
 		t.Error("update_task(branch:) did not set HasWIP on the seeded claim — the claim would look releasable, so the driver would post a task with pushed work back to the queue instead of leaving the takeover hand-off")
@@ -72,7 +72,7 @@ func TestSeededResumeClaimIgnoresAnUnrelatedTask(t *testing.T) {
 
 	res := newSessionResult(Invocation{ResumeClaim: Claim{TaskID: "task-abc", RunID: "run-xyz"}})
 	res.scans = newScanCache()
-	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res)
+	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res, 0, func() {})
 
 	if res.Claim.HasWIP {
 		t.Error("a branch recorded against a DIFFERENT task set HasWIP on ours")
@@ -91,7 +91,7 @@ func TestAnUnseededSessionIgnoresUpdateTaskUntilItClaims(t *testing.T) {
 
 	res := newSessionResult(Invocation{})
 	res.scans = newScanCache()
-	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res)
+	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res, 0, func() {})
 
 	if res.Claim.HasWIP || res.Claim.TaskID != "" {
 		t.Errorf("an unseeded session picked up claim state from an update_task it never claimed for: %+v", res.Claim)

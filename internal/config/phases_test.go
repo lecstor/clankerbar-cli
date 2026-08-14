@@ -20,8 +20,12 @@ func TestEffectivePhases_UnphasedIsOnePhaseCarryingThePrompt(t *testing.T) {
 	if got[0].Prompt != c.Prompt {
 		t.Errorf("the single phase carries %q, want the configured prompt %q", got[0].Prompt, c.Prompt)
 	}
-	if got[0].MaxTurns != 0 {
-		t.Errorf("an unphased run picked up a turn cap of %d; nothing should bound it but its prompt", got[0].MaxTurns)
+	// CLA-343, deliberately: the unphased phase used to carry MaxTurns 0 — the
+	// zero value the turn-cap chain resolved to when nothing set one — and one
+	// session ran 1093 turns / 285.9M tokens with no cap anywhere in the chain.
+	// "0 = uncapped" is gone; the chain falls through to the built-in default.
+	if got[0].MaxTurns != DefaultMaxTurns {
+		t.Errorf("an unphased run resolved to a turn cap of %d, want the built-in default %d — a bare config must still bound its sessions", got[0].MaxTurns, DefaultMaxTurns)
 	}
 }
 
@@ -295,6 +299,109 @@ func TestValidate_StillRejectsAnEmptyPromptWhenUnphased(t *testing.T) {
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), "prompt is empty") {
 		t.Fatalf("Validate() = %v, want the empty-prompt rejection", err)
+	}
+}
+
+// CLA-343: the turn-cap chain is phase → top-level → built-in default, and an
+// unphased run — the default config — must never resolve to uncapped. This pins
+// the two load-bearing readings: a bare config gets the default, and the
+// operator's top-level cap overrides it.
+func TestEffectivePhases_ResolvesTheTurnCapChain(t *testing.T) {
+	t.Run("a bare unphased config resolves to the built-in default", func(t *testing.T) {
+		c := defaults()
+		c.Prompt = "work"
+		got := c.EffectivePhases()[0]
+		if got.MaxTurns != DefaultMaxTurns {
+			t.Errorf("bare config resolved to MaxTurns %d, want the default %d", got.MaxTurns, DefaultMaxTurns)
+		}
+	})
+
+	t.Run("the top-level cap overrides the default", func(t *testing.T) {
+		c := defaults()
+		c.Prompt = "work"
+		c.MaxTurns = 50
+		got := c.EffectivePhases()[0]
+		if got.MaxTurns != 50 {
+			t.Errorf("top-level MaxTurns 50 resolved to %d", got.MaxTurns)
+		}
+	})
+
+	t.Run("a phase cap beats the top-level cap", func(t *testing.T) {
+		c := defaults()
+		c.Prompt = ""
+		c.MaxTurns = 50
+		c.Phases = []Phase{{Name: "implement", MaxTurns: 10}}
+		got := c.EffectivePhases()[0]
+		if got.MaxTurns != 10 {
+			t.Errorf("phase MaxTurns 10 resolved to %d, want the phase's own cap to win", got.MaxTurns)
+		}
+	})
+
+	t.Run("a phase without a cap inherits the top-level cap", func(t *testing.T) {
+		c := defaults()
+		c.Prompt = ""
+		c.MaxTurns = 50
+		c.Phases = []Phase{{Name: "implement"}, {Name: "review"}}
+		got := c.EffectivePhases()
+		for i, ph := range got {
+			if ph.MaxTurns != 50 {
+				t.Errorf("phase %d resolved to MaxTurns %d, want the top-level 50", i, ph.MaxTurns)
+			}
+		}
+	})
+
+	t.Run("resolution does not mutate the config it read", func(t *testing.T) {
+		c := defaults()
+		c.Prompt = "work"
+		c.MaxTurns = 50
+		c.EffectivePhases()
+		if c.MaxTurns != 50 {
+			t.Error("EffectivePhases wrote the resolved cap back into the config")
+		}
+	})
+}
+
+func TestValidate_RejectsANegativeTopLevelTurnCap(t *testing.T) {
+	c := defaults()
+	c.Prompt = "work"
+	c.MaxTurns = -1
+
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted a negative top-level max_turns")
+	}
+}
+
+func TestValidate_RejectsANegativeSessionTokenCeiling(t *testing.T) {
+	c := defaults()
+	c.Prompt = "work"
+	c.Budget = Budget{MaxSessionTokens: -1}
+
+	if err := c.Validate(); err == nil {
+		t.Fatal("Validate accepted a negative max_session_tokens")
+	}
+}
+
+// CLA-343: the per-session token ceiling is the runaway detector, and it must
+// exist even for a config that sets no budget dials at all — the whole defect
+// was that nothing could stop the 285.9M session, so a ceiling that falls away
+// by accident is the bug.
+func TestBudgetSessionTokenCeiling(t *testing.T) {
+	tests := []struct {
+		name   string
+		b      Budget
+		want   int
+		reason string
+	}{
+		{"the operator's own dial wins", Budget{MaxSessionTokens: 40_000_000}, 40_000_000, ""},
+		{"2x max_tokens when no dial is set", Budget{MaxTokens: 75_000_000}, 150_000_000, ""},
+		{"the documented floor with no budget at all", Budget{}, sessionTokenFloor, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.b.SessionTokenCeiling(); got != tc.want {
+				t.Errorf("SessionTokenCeiling() = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

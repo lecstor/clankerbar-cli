@@ -331,6 +331,10 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d
 // attributed to one.
 func (opencode) TurnCapped(Result) bool { return false }
 
+// No mid-stream token ceiling: opencode sums per-step usage but the adapter
+// never kills the process, so no exit of its can be attributed to one.
+func (opencode) TokenCeilingHit(Result) bool { return false }
+
 // Like codex, this adapter does not populate Result.Claim, so `phases` is refused
 // for it in config.Validate rather than silently stopping after phase 1 on every
 // task. See Capabilities.TracksClaims.
