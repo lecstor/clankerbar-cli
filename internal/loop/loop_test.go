@@ -1891,13 +1891,14 @@ func TestRun_BacksOffAfterFruitlessDrains(t *testing.T) {
 	p := &fakePoller{
 		sum: backlog.Summary{Ready: 1, Claimable: 1},
 		onCall: func(i int) {
-			// End the run once the back-off has stopped it from spawning: the
-			// assertion is about the session count, and the 15-minute quiet
-			// wait that follows is not what this test is for. Two consecutive
-			// polls with no new session means the loop is backed off; in a
+			// End the run on the first poll with no new session since the
+			// previous one: in this scripted run (claimable never falls) that
+			// can only happen once the back-off has engaged, and the 15-minute
+			// quiet wait that follows is not what this test is for. In a
 			// regression that keeps spawning, invokeCalls keeps advancing and
-			// the run falls through to the 5s deadline, failing the assertion
-			// below exactly as it would have today.
+			// the run stops on max-iterations (or the 5s deadline for slow
+			// drains), failing the assertion below exactly as it would have
+			// today.
 			if i > 0 && h.invokeCalls == lastInvokes {
 				cancel()
 			}
