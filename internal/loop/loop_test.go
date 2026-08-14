@@ -1885,17 +1885,35 @@ func TestRun_BacksOffAfterFruitlessDrains(t *testing.T) {
 	h := &fakeAdapter{tokens: 30_000_000}
 	// ...and nothing ever reaches a reviewer or finishes, which is the shape of a
 	// queue whose only claimable task is waiting on the operator.
-	p := &fakePoller{sum: backlog.Summary{Ready: 1, Claimable: 1}}
-
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	lastInvokes := 0
+	p := &fakePoller{
+		sum: backlog.Summary{Ready: 1, Claimable: 1},
+		onCall: func(i int) {
+			// End the run on the first poll with no new session since the
+			// previous one: in this scripted run (claimable never falls) that
+			// can only happen once the back-off has engaged, and the 15-minute
+			// quiet wait that follows is not what this test is for. In a
+			// regression that keeps spawning, invokeCalls keeps advancing and
+			// the run stops on max-iterations (or the 5s deadline for slow
+			// drains), failing the assertion below exactly as it would have
+			// today.
+			if i > 0 && h.invokeCalls == lastInvokes {
+				cancel()
+			}
+			lastInvokes = h.invokeCalls
+		},
+	}
+
 	if err := New(cfg, h, p).Run(ctx); err != nil && ctx.Err() == nil {
 		t.Fatalf("Run returned error: %v", err)
 	}
 
 	// Three sessions spend 90M, crossing the 80M token threshold; the 15-minute
 	// back-off that follows cannot be skipped by any fast-config interval — so the
-	// run cannot reach its 10 iterations. Same calibration as the old
+	// run cannot reach its 10 iterations (the poller's cancel above ends the run
+	// while it is sitting the wait out). Same calibration as the old
 	// three-fruitless-sessions rule at ~26M each (CLA-343).
 	if h.invokeCalls != quietThreshold {
 		t.Errorf("should stop spawning after %d fruitless drains; got %d sessions", quietThreshold, h.invokeCalls)
