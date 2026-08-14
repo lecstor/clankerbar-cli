@@ -79,8 +79,12 @@ func TestClaudeArgsCarryTheTurnCap(t *testing.T) {
 		t.Errorf("argv does not carry the turn cap: %s", got)
 	}
 
-	// 0 means uncapped, which is every unphased run: the flag must be ABSENT, not
-	// passed as zero, which claude would read as a cap of nothing.
+	// 0 must still be ABSENT, not passed as zero, which claude would read as a cap
+	// of nothing. The premise CHANGED with CLA-343: the driver used to hand 0 down
+	// for every unphased run (the "0 = uncapped" reading, which left one session
+	// unbounded at 1093 turns); it now resolves a cap in EffectivePhases before
+	// building the invocation, so a bare 0 here is a test-built invocation, not a
+	// real unphased run — and the flag must still be absent for it.
 	if got := strings.Join(claudeArgs(Invocation{Prompt: "work"}), " "); strings.Contains(got, "--max-turns") {
 		t.Errorf("an uncapped invocation still emitted --max-turns: %s", got)
 	}
@@ -95,6 +99,67 @@ func TestAdaptersWithoutATurnCapNeverReportOne(t *testing.T) {
 	}
 	if (opencode{}).TurnCapped(res) {
 		t.Error("opencode reported a turn cap; it is never given MaxTurns")
+	}
+}
+
+// The mid-stream token ceiling (CLA-343) is the same shape as the turn cap: a
+// kill the driver must read as an orderly end, never as a failure. The marker
+// is the ADAPTER's own, so the classifier must not fire on anything the CLI or
+// an agent could emit.
+func TestClaudeTokenCeilingHit(t *testing.T) {
+	tests := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{
+			name: "the adapter's own kill marker",
+			res:  Result{ExitCode: -1, Raw: map[string]any{"terminal_reason": tokenCeilingReason}},
+			want: true,
+		},
+		{
+			name: "a real max-turns result is not a ceiling hit",
+			res:  Result{ExitCode: 1, Raw: map[string]any{"terminal_reason": "max_turns", "is_error": true}},
+			want: false,
+		},
+		{
+			name: "a usage limit is not a ceiling hit",
+			res:  Result{ExitCode: 1, Raw: map[string]any{"terminal_reason": "usage_limit"}},
+			want: false,
+		},
+		{
+			name: "no Raw at all (a launch failure)",
+			res:  Result{ExitCode: 1},
+			want: false,
+		},
+		{
+			// The marker is a typed field the adapter writes, never free text — the
+			// same defect class as CLA-258's "hit your" and the phrase in narration
+			// test above.
+			name: "the phrase in narration is not a ceiling hit",
+			res:  Result{ExitCode: 1, Stdout: `{"type":"text","text":"token_ceiling_hit"}`},
+			want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := (claude{}).TokenCeilingHit(tt.res); got != tt.want {
+				t.Errorf("claude.TokenCeilingHit() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The other adapters never kill a session mid-stream, so no exit of theirs can
+// be attributed to the ceiling. Pinned so a future adapter that DOES grow one
+// has to say so here.
+func TestAdaptersWithoutATokenCeilingNeverReportOne(t *testing.T) {
+	res := Result{ExitCode: -1, Raw: map[string]any{"terminal_reason": tokenCeilingReason}}
+	if (codex{}).TokenCeilingHit(res) {
+		t.Error("codex reported a token ceiling hit; it never kills a session mid-stream")
+	}
+	if (opencode{}).TokenCeilingHit(res) {
+		t.Error("opencode reported a token ceiling hit; it never kills a session mid-stream")
 	}
 }
 

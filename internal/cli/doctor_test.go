@@ -1500,14 +1500,47 @@ func TestBudgetNegativeValuesFail(t *testing.T) {
 	}
 }
 
-// No ceiling is a legitimate daemon setup — informational, never a failure.
+// No ceiling is a legitimate daemon setup — the budget itself is never a
+// failure. The VERDICT changed under CLA-344, deliberately: a bare config now
+// WARNS, because the guards that were silently absent from the config that ran
+// a 285.9M single session are absent here too (default turn cap, retries
+// forever, unlimited sessions). "Informational" is now what the no-ceiling
+// detail says; the WARN is what the guard warnings say.
 func TestBudgetUnsetIsInformational(t *testing.T) {
 	c := checkBudget(validCfg(t))
-	if c.status != pass {
-		t.Errorf("no budget: got %v, want PASS", c.status)
+	if c.status != warn {
+		t.Errorf("no budget: got %v, want WARN (the missing guards are the point of CLA-344)", c.status)
 	}
 	if !strings.Contains(c.detail, "no ceiling") {
 		t.Errorf("detail should note the absent ceiling, got %q", c.detail)
+	}
+	if len(c.info) == 0 {
+		t.Error("a bare config warns with no guard findings to read")
+	}
+}
+
+// CLA-290: the no-ceiling detail used to claim the loop "runs until the backlog
+// is dry" — false, a dry backlog idle-polls by design so the daemon can react to
+// answered questions and newly filed work. Pin the wording against the
+// behaviour: it must name what actually stops the loop (STOP marker or signal)
+// and say an empty queue idle-polls, and must not assert or imply dryness ends
+// the run. This assertion fails against the old string, which is the point.
+func TestBudgetNoCeilingDetailNamesWhatActuallyStopsTheLoop(t *testing.T) {
+	c := checkBudget(validCfg(t))
+	detail := c.detail
+
+	for _, banned := range []string{
+		"backlog is dry", "runs until", // the exact old claim
+		"queue empties", "no work remains", "ends when", // rephrasings of the same lie
+	} {
+		if strings.Contains(detail, banned) {
+			t.Errorf("no-ceiling detail claims the loop stops when the backlog is dry (%q) — it idle-polls instead: %q", banned, detail)
+		}
+	}
+	for _, want := range []string{"STOP", "idle-polls", "rather than exiting"} {
+		if !strings.Contains(detail, want) {
+			t.Errorf("no-ceiling detail does not name %q; it must say what actually stops the loop: %q", want, detail)
+		}
 	}
 }
 
@@ -1516,8 +1549,169 @@ func TestBudgetSetIsReported(t *testing.T) {
 	cfg.Budget = config.Budget{MaxTokens: 500000}
 
 	c := checkBudget(cfg)
-	if c.status != pass || !strings.Contains(c.detail, "max_tokens=500000") {
-		t.Errorf("set budget: got %v %q", c.status, c.detail)
+	// WARN since CLA-344, not PASS: this config sets a run ceiling but none of
+	// the session guards (default turn cap, retries forever, unlimited
+	// iterations) — the verdict is the point, the detail still reports the set.
+	if !strings.Contains(c.detail, "max_tokens=500000") {
+		t.Errorf("set budget: got %q", c.detail)
+	}
+	if c.status != warn {
+		t.Errorf("a run ceiling without session guards: got %v, want WARN (CLA-344)", c.status)
+	}
+}
+
+// --- CLA-344: the guards that were silently absent --------------------------
+//
+// The config that ran a 285.9M-token single session passed doctor with a clean
+// PASS because checkBudget said nothing about missing guards. Each of these
+// pins a warning that FAILS against that silence: a bare config must not read
+// as a clean bill of health.
+
+// The turn-cap warning post-CLA-343: the effective config ALWAYS resolves a cap
+// (the operator's, else the built-in default), so the honest warning is that
+// the DEFAULT is in force — a runaway detector, not a budget the operator chose.
+// Claude only: the codex adapter has no turn cap at all, so under codex there
+// is nothing to warn about (pinned by the codex-skip test below).
+func TestBudgetGuards_WarnWhenTheTurnCapIsTheDefault(t *testing.T) {
+	cfg := validCfg(t) // bare: no top-level max_turns, no phase caps
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("a bare config with no explicit turn cap: got %v, want WARN — the default cap is load-bearing and doctor must say so", c.status)
+	}
+	found := false
+	for _, line := range c.info {
+		if strings.Contains(line, "max_turns: at the built-in default") && strings.Contains(line, "default") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no info line says the turn cap is the default: %q", c.info)
+	}
+}
+
+func TestBudgetGuards_ExplicitTurnCapDoesNotWarn(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.MaxTurns = 500
+
+	c := checkBudget(cfg)
+	for _, line := range c.info {
+		if strings.Contains(line, "max_turns: at the built-in default") {
+			t.Errorf("an explicitly configured turn cap still warns: %q", line)
+		}
+	}
+}
+
+func TestBudgetGuards_WarnWhenMaxRetriesIsZero(t *testing.T) {
+	t.Run("zero warns", func(t *testing.T) {
+		cfg := validCfg(t) // MaxRetries defaults to 0 = never give up
+
+		c := checkBudget(cfg)
+		if c.status != warn {
+			t.Errorf("max_retries: 0: got %v, want WARN", c.status)
+		}
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_retries: 0") && strings.Contains(line, "retried forever") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no info line says transient failures retry forever: %q", c.info)
+		}
+	})
+
+	t.Run("a positive bound does not warn", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.MaxRetries = 3
+
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_retries") {
+				t.Errorf("a bounded max_retries still warns: %q", line)
+			}
+		}
+	})
+}
+
+func TestBudgetGuards_WarnWhenMaxIterationsIsZero(t *testing.T) {
+	t.Run("zero warns", func(t *testing.T) {
+		cfg := validCfg(t) // MaxIterations defaults to 0 = unlimited sessions
+
+		c := checkBudget(cfg)
+		if c.status != warn {
+			t.Errorf("max_iterations: 0: got %v, want WARN", c.status)
+		}
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_iterations: 0") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no info line says the session count is unbounded: %q", c.info)
+		}
+	})
+
+	t.Run("a bound does not warn", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.MaxIterations = 10
+
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_iterations") {
+				t.Errorf("a bounded max_iterations still warns: %q", line)
+			}
+		}
+	})
+}
+
+// The max_tokens PASS line must say what the ceiling does and does not bound:
+// it is enforced BETWEEN sessions, so a single session can overrun it — the
+// exact shape of the 285.9M run under a 75M ceiling. The fixture configures
+// ALL the guards so the check is genuinely PASS: the note is part of the PASS
+// path the doneWhen names, and a pin that only ever ran under WARN would pass
+// if a later edit moved the note into the guard block.
+func TestBudgetGuards_MaxTokensLineNotesTheBetweenSessionsEnforcement(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{MaxTokens: 75_000_000}
+	cfg.MaxRetries = 3
+	cfg.MaxIterations = 10
+	cfg.MaxTurns = 500
+
+	c := checkBudget(cfg)
+	if c.status != pass {
+		t.Errorf("a fully guarded config with max_tokens: got %v, want PASS — this test pins the between-sessions note on the PASS path", c.status)
+	}
+	if !strings.Contains(c.detail, "BETWEEN sessions") {
+		t.Errorf("max_tokens PASS line does not note the between-sessions enforcement: %q", c.detail)
+	}
+	// And it names the mid-session bound that actually could have stopped the
+	// runaway (CLA-343: the resolved ceiling is 2x max_tokens when unset).
+	if !strings.Contains(c.detail, "max_session_tokens=150000000") {
+		t.Errorf("max_tokens PASS line does not name the resolved mid-session bound: %q", c.detail)
+	}
+}
+
+// The claude-only claims must not leak into a codex run: the codex adapter has
+// no turn cap (Invocation.MaxTurns never reaches the CLI) and no mid-session
+// ceiling (TokenCeilingHit never fires), so doctor claiming either is "in
+// force" would be the reassuring falsehood CLA-344 exists to remove.
+func TestBudgetGuards_ClaudeOnlyClaimsAreSkippedUnderCodex(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+
+	c := checkBudget(cfg)
+	for _, line := range c.info {
+		if strings.Contains(line, "max_turns:") {
+			t.Errorf("a codex run gets the claude-only turn-cap warning: %q", line)
+		}
+		if strings.Contains(line, "per-session runaway ceiling still active") {
+			t.Errorf("a codex run is told the claude-only per-session ceiling is active: %q", line)
+		}
+	}
+	if strings.Contains(c.remedy, "max_turns") {
+		t.Errorf("a codex run is told to set a dial the adapter ignores: %q", c.remedy)
 	}
 }
 
@@ -1771,9 +1965,14 @@ func TestBudgetWallClockOnlyWarns(t *testing.T) {
 func TestBudgetWallClockWithCostPasses(t *testing.T) {
 	cfg := validCfg(t)
 	cfg.Budget = config.Budget{MaxWallClock: config.Duration(8 * time.Hour), MaxCostUSD: 50}
+	cfg.MaxRetries = 3
+	cfg.MaxIterations = 10
+	cfg.MaxTurns = 500
 
+	// A fully guarded config — cost ceiling, bounded retries, bounded sessions,
+	// explicit turn cap — is the one shape that still PASSes (CLA-344).
 	if c := checkBudget(cfg); c.status != pass {
-		t.Errorf("wall clock plus a cost ceiling: got %v, want PASS (%s)", c.status, c.detail)
+		t.Errorf("wall clock plus a cost ceiling plus the session guards: got %v, want PASS (%s)", c.status, c.detail)
 	}
 }
 

@@ -50,6 +50,16 @@ type Adapter interface {
 	// An adapter with no turn cap returns false for everything.
 	TurnCapped(Result) bool
 
+	// TokenCeilingHit reports whether the adapter itself killed this session
+	// because its cumulative usage crossed Invocation.MaxSessionTokens
+	// mid-stream. The driver treats it exactly like a turn cap: the phase ends,
+	// the salvage handles whatever the tree holds, and nothing is retried or
+	// failed — the kill was the point, not a fault. The marker is the
+	// adapter's own (never text the CLI or an agent could emit), so it cannot
+	// be forged by a task body. An adapter with no mid-stream ceiling returns
+	// false for everything.
+	TokenCeilingHit(Result) bool
+
 	// Capabilities reports what this adapter can do that the DRIVER's behaviour
 	// depends on — as distinct from how it classifies a given Result.
 	Capabilities() Capabilities
@@ -201,6 +211,14 @@ type Invocation struct {
 	// relies on the prompt alone.
 	MaxTurns int
 
+	// MaxSessionTokens is the per-session runaway ceiling: when the session's
+	// own cumulative usage crosses it, the ADAPTER kills the process mid-stream
+	// and marks the Result so the driver treats the end like a turn cap (end
+	// the phase, salvage what it left, do not retry or fail). The driver
+	// resolves it from Budget.SessionTokenCeiling, so an unset value never
+	// reaches here. 0 = no ceiling for this invocation (probes).
+	MaxSessionTokens int
+
 	// ResumeClaim is the claim a PREVIOUS phase left held, seeded into this
 	// session's Result before its stream is parsed.
 	//
@@ -294,6 +312,13 @@ type Result struct {
 	// for diagnostics only, and pointedly not a source of claim state: a request
 	// is not an answer, and a claim that LOST the race made this same request.
 	claimRequests map[string]string
+
+	// gotResult records that the stream's `result` event has arrived — the
+	// session's own end. The mid-stream token-ceiling kill (CLA-343) deliberately
+	// fires only BEFORE it: once the result event has arrived there is nothing
+	// left to stop, and classifying a session that merely REPORTED a high total
+	// as killed would lie about what happened.
+	gotResult bool
 
 	// scans memoizes the harness-authored text a classifier reads. See scan.
 	scans *scanCache
