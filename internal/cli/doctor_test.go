@@ -1570,6 +1570,8 @@ func TestBudgetSetIsReported(t *testing.T) {
 // The turn-cap warning post-CLA-343: the effective config ALWAYS resolves a cap
 // (the operator's, else the built-in default), so the honest warning is that
 // the DEFAULT is in force — a runaway detector, not a budget the operator chose.
+// Claude only: the codex adapter has no turn cap at all, so under codex there
+// is nothing to warn about (pinned by the codex-skip test below).
 func TestBudgetGuards_WarnWhenTheTurnCapIsTheDefault(t *testing.T) {
 	cfg := validCfg(t) // bare: no top-level max_turns, no phase caps
 
@@ -1579,7 +1581,7 @@ func TestBudgetGuards_WarnWhenTheTurnCapIsTheDefault(t *testing.T) {
 	}
 	found := false
 	for _, line := range c.info {
-		if strings.Contains(line, "max_turns: not configured") && strings.Contains(line, "default") {
+		if strings.Contains(line, "max_turns: at the built-in default") && strings.Contains(line, "default") {
 			found = true
 		}
 	}
@@ -1594,7 +1596,7 @@ func TestBudgetGuards_ExplicitTurnCapDoesNotWarn(t *testing.T) {
 
 	c := checkBudget(cfg)
 	for _, line := range c.info {
-		if strings.Contains(line, "max_turns: not configured") {
+		if strings.Contains(line, "max_turns: at the built-in default") {
 			t.Errorf("an explicitly configured turn cap still warns: %q", line)
 		}
 	}
@@ -1666,12 +1668,21 @@ func TestBudgetGuards_WarnWhenMaxIterationsIsZero(t *testing.T) {
 
 // The max_tokens PASS line must say what the ceiling does and does not bound:
 // it is enforced BETWEEN sessions, so a single session can overrun it — the
-// exact shape of the 285.9M run under a 75M ceiling.
+// exact shape of the 285.9M run under a 75M ceiling. The fixture configures
+// ALL the guards so the check is genuinely PASS: the note is part of the PASS
+// path the doneWhen names, and a pin that only ever ran under WARN would pass
+// if a later edit moved the note into the guard block.
 func TestBudgetGuards_MaxTokensLineNotesTheBetweenSessionsEnforcement(t *testing.T) {
 	cfg := validCfg(t)
 	cfg.Budget = config.Budget{MaxTokens: 75_000_000}
+	cfg.MaxRetries = 3
+	cfg.MaxIterations = 10
+	cfg.MaxTurns = 500
 
 	c := checkBudget(cfg)
+	if c.status != pass {
+		t.Errorf("a fully guarded config with max_tokens: got %v, want PASS — this test pins the between-sessions note on the PASS path", c.status)
+	}
 	if !strings.Contains(c.detail, "BETWEEN sessions") {
 		t.Errorf("max_tokens PASS line does not note the between-sessions enforcement: %q", c.detail)
 	}
@@ -1679,6 +1690,28 @@ func TestBudgetGuards_MaxTokensLineNotesTheBetweenSessionsEnforcement(t *testing
 	// runaway (CLA-343: the resolved ceiling is 2x max_tokens when unset).
 	if !strings.Contains(c.detail, "max_session_tokens=150000000") {
 		t.Errorf("max_tokens PASS line does not name the resolved mid-session bound: %q", c.detail)
+	}
+}
+
+// The claude-only claims must not leak into a codex run: the codex adapter has
+// no turn cap (Invocation.MaxTurns never reaches the CLI) and no mid-session
+// ceiling (TokenCeilingHit never fires), so doctor claiming either is "in
+// force" would be the reassuring falsehood CLA-344 exists to remove.
+func TestBudgetGuards_ClaudeOnlyClaimsAreSkippedUnderCodex(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+
+	c := checkBudget(cfg)
+	for _, line := range c.info {
+		if strings.Contains(line, "max_turns:") {
+			t.Errorf("a codex run gets the claude-only turn-cap warning: %q", line)
+		}
+		if strings.Contains(line, "per-session runaway ceiling still active") {
+			t.Errorf("a codex run is told the claude-only per-session ceiling is active: %q", line)
+		}
+	}
+	if strings.Contains(c.remedy, "max_turns") {
+		t.Errorf("a codex run is told to set a dial the adapter ignores: %q", c.remedy)
 	}
 }
 
