@@ -32,12 +32,23 @@ func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Drive
 }
 
 // drainPhasesOnce drives one phase sequence under the same safety timeout the
-// other drain helpers use, so a control-flow regression fails fast.
+// other drain helpers use, so a control-flow regression fails fast. The handoff
+// count is dropped here — the tests that care about it use drainPhasesHandoffs.
 func drainPhasesOnce(t *testing.T, d *Driver) (int, float64, bool, error) {
+	t.Helper()
+	tokens, cost, _, stop, err := drainPhasesHandoffs(t, d, 1)
+	return tokens, cost, stop, err
+}
+
+// drainPhasesHandoffs is drainPhasesOnce with the handoff-respawn count kept
+// and the drain number scriptable, for the CLA-352 tests: the count is what Run
+// charges against max_iterations, and the guard inside drainPhases reads the
+// drain number it was handed.
+func drainPhasesHandoffs(t *testing.T, d *Driver, drainNum int) (int, float64, int, bool, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return d.drainPhases(ctx, 1, d.targets[0], spend{start: time.Now()})
+	return d.drainPhases(ctx, drainNum, d.targets[0], spend{start: time.Now()})
 }
 
 // twoPhases is the shipped sequence, by name, so the tests exercise the built-in

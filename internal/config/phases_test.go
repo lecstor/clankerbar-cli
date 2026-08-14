@@ -404,3 +404,21 @@ func TestBudgetSessionTokenCeiling(t *testing.T) {
 		})
 	}
 }
+
+// CLA-352: the built-in briefs are where the pivot-trigger guidance lives — a
+// session cannot measure its own context, so the trigger has to be event-shaped
+// and it has to be TAUGHT, or the marker the driver watches for is never
+// emitted. Pinned per brief so a rewrite cannot drop it from one silently.
+func TestBuiltinPhaseBriefsCarryTheHandoffGuidance(t *testing.T) {
+	for name, brief := range builtinPhasePrompts {
+		if !strings.Contains(brief, HandoffMarker) {
+			t.Errorf("the %q brief never names the handoff marker, so a session cannot use the mechanism", name)
+		}
+		if !strings.Contains(brief, "pivot") {
+			t.Errorf("the %q brief lost the pivot trigger — without it the only rule left is a vibe about context size, which a session cannot measure", name)
+		}
+		if !strings.Contains(brief, "most tasks need zero") {
+			t.Errorf("the %q brief must say most tasks need zero handoffs, or the exception becomes the habit", name)
+		}
+	}
+}

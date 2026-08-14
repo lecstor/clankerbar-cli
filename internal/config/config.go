@@ -133,6 +133,59 @@ type Phase struct {
 	Tier string `json:"tier"`
 }
 
+// HandoffMarker is the exact line a session puts in its FINAL message to hand
+// the rest of its job to a fresh successor session (CLA-352). Everything after
+// the marker line is the successor's prompt; the driver respawns on it with the
+// same run-continuity rules as a phase resume.
+//
+// The syntax had to be improbable in ordinary prose and easy to pin in a test,
+// and it must not resemble tool-call framing markup: the web repo's
+// docs/text-integrity.md records agents destroying their own output merely by
+// EMITTING such tags, so an angle-bracket or tag-shaped marker would put the
+// defect this feature rides on into the feature itself. A plain punctuated
+// uppercase line does neither.
+const HandoffMarker = "=====CLANKERBAR HANDOFF====="
+
+// HandoffPromptMax bounds the successor prompt a handoff block may carry, in
+// bytes. A session-authored respawn prompt is self-directed prompt injection,
+// and the size cap is one of the non-negotiable guards on it: an over-cap
+// prompt is refused (logged, normal path) rather than truncated, because a
+// truncated brief is a successor confidently working half an instruction. "A
+// few KB" is the spec; a genuine continuation prompt — decisions made, state
+// verified, exact next steps — fits in far less.
+const HandoffPromptMax = 4096
+
+// HandoffPreamble is driver-authored framing prepended to a handoff respawn's
+// prompt (CLA-352) — the successor never gets the emitting session's own
+// prompt bare. A phase resume (reviewPhaseName, above) works only because its
+// brief spells out "do not claim, call heartbeat first": a session-authored
+// prompt cannot be trusted to carry that instruction forward on its own, and
+// without it a successor calls next_task/claim_task on a fresh task, or its
+// run's lease lapses because nothing tells it to hold it. Placed FIRST, not
+// appended, so the driver's own constraints bound the prompt that follows
+// rather than being one more thing a self-authored prompt could bury or
+// contradict — the same reasoning behind refusing to truncate an over-cap
+// prompt rather than editing it.
+const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on task " + PhaseTaskPlaceholder +
+	", handed to you by the previous session on this task via a self-chosen handoff. Do NOT call next_task, and " +
+	"do NOT claim anything: call heartbeat(\"" + PhaseRunPlaceholder + "\") first to resume the run, then stay " +
+	"within this phase's scope. What follows is the previous session's own continuation prompt:\n\n"
+
+// handoffGuidance rides on every built-in phase brief (CLA-352): when a session
+// may hand the rest of its job to a fresh successor, and how. The trigger is
+// deliberately EVENT-shaped — a session cannot measure its own context (there
+// is no token counter in its view), so "hand off when you feel big" is not
+// implementable; a pivot is an event the session can recognise.
+const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine pivot mid-session - " +
+	"exploration finished and implementation about to start, or one distinct sub-goal landed and the next " +
+	"beginning - you may hand the REST of this session's job to a fresh successor session that starts without " +
+	"your accumulated context. First put durable state where it belongs: discovered constraints in repo docs, " +
+	"commit/branch state on the task record. Then end your FINAL message with a line that is exactly " +
+	HandoffMarker + " followed by the successor's starting prompt, written the way an operator's continuation " +
+	"prompt reads: decisions made, state verified, exact next steps - nothing about the journey, nothing that " +
+	"already lives in the repo or on the task, and under 4KB. The successor resumes this same run under this " +
+	"same brief's scope, so do NOT settle, release or hand back the task first."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
 // The split is implement, then review-and-fix, and that grouping is deliberate:
@@ -146,7 +199,7 @@ var builtinPhasePrompts = map[string]string{
 		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
-		"Ending there is this task going to plan, not the task being abandoned.",
+		"Ending there is this task going to plan, not the task being abandoned." + handoffGuidance,
 
 	reviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
 		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
@@ -157,7 +210,7 @@ var builtinPhasePrompts = map[string]string{
 		"point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
 		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception " +
 		"you state a reason for (a fix that had to reach outside its own area), never the default. Then push, " +
-		"and hand the task to in_review.",
+		"and hand the task to in_review." + handoffGuidance,
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
