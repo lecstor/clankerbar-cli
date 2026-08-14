@@ -1537,31 +1537,105 @@ func checkBudget(cfg *config.Config) check {
 		set = append(set, "max_wall_clock="+b.MaxWallClock.Duration().String())
 	}
 
+	// The guards that were silently absent from the config that ran a 285.9M
+	// single session (CLA-344): doctor's job is preflight, so the dials most
+	// likely to be missing are the ones it should name. Every line describes
+	// REAL behaviour — a reassuring falsehood is the exact defect CLA-290
+	// removed from the no-ceiling detail, and the same bar applies here.
+	var guardNotes []string
+	var guardDials []string
+	// Turn cap: since CLA-343 the effective CLAUDE config ALWAYS resolves one —
+	// the operator's, else the built-in default — so "no turn cap" cannot
+	// happen; what can happen is that the cap is the DEFAULT, a runaway
+	// detector tuned to the largest measured session, not a budget the
+	// operator chose. The codex adapter has NO turn cap at all (its
+	// Invocation.MaxTurns never reaches the CLI), so for it the warning is
+	// skipped rather than claiming a guard that does not exist there.
+	if cfg.Harness == "claude" && anyPhaseRunsTheDefaultTurnCap(cfg) {
+		guardNotes = append(guardNotes, fmt.Sprintf(
+			"max_turns: at the built-in default (%d turns): a runaway detector, not a budget, so a deep task that reaches it is cut off at the phase boundary (the salvage commits what it left); set max_turns (or a phase's) to tune",
+			config.DefaultMaxTurns))
+		guardDials = append(guardDials, "max_turns")
+	}
+	if cfg.MaxRetries == 0 {
+		guardNotes = append(guardNotes,
+			"max_retries: 0 — transient failures are retried forever (backoff capped at retry_cap), each retry a fresh paid session redoing the task; set a positive max_retries to bound a run window")
+		guardDials = append(guardDials, "max_retries")
+	}
+	if cfg.MaxIterations == 0 {
+		guardNotes = append(guardNotes,
+			"max_iterations: 0 — no session cap: the loop stops only on a STOP/HALT marker, a signal or a budget ceiling (a dry backlog idle-polls rather than exiting); set max_iterations to bound a run window")
+		guardDials = append(guardDials, "max_iterations")
+	}
+
 	c.status = pass
 	if len(set) == 0 {
-		// Informational, not a failure: an unbounded daemon is a legitimate setup.
 		// The wording names what actually STOPS the loop, because the obvious
 		// sentence — "runs until the backlog is dry" — is false: a dry backlog
 		// idle-polls by design, so the daemon can react to answered questions,
 		// promotions and newly filed work (CLA-290). `--max-iterations` is a run
 		// flag doctor cannot see, so the config's contribution is described alone.
 		c.detail = "no ceiling configured — the loop stops on a STOP/HALT marker or signal; a dry backlog idle-polls rather than exiting"
-		return c
-	}
-
-	// Wall clock is the weakest proxy for spend of the three, because it counts
-	// the hours a run spends WAITING OUT a usage limit — time in which nothing is
-	// billed. A run capped at 8h can spend five of them asleep and stop having done
-	// three iterations. Cost is the dial that tracks what an operator actually
-	// means by "leave headroom", and it comes straight from the harness.
-	if b.MaxWallClock > 0 && b.MaxCostUSD == 0 && b.MaxTokens == 0 {
+		// The per-session runaway ceiling still applies whatever the run-level
+		// dials say, and the operator should know the number (CLA-343). Claude
+		// only: the codex adapter has no mid-session ceiling (TokenCeilingHit
+		// never fires there), so claiming it is "still active" would be false.
+		if cfg.Harness == "claude" {
+			c.info = append(c.info, fmt.Sprintf("per-session runaway ceiling still active: max_session_tokens resolves to %d (the operator's own, else 2x max_tokens when set, else the floor)", b.SessionTokenCeiling()))
+		}
+	} else if b.MaxWallClock > 0 && b.MaxCostUSD == 0 && b.MaxTokens == 0 {
+		// Wall clock is the weakest proxy for spend of the three, because it counts
+		// the hours a run spends WAITING OUT a usage limit — time in which nothing is
+		// billed. A run capped at 8h can spend five of them asleep and stop having done
+		// three iterations. Cost is the dial that tracks what an operator actually
+		// means by "leave headroom", and it comes straight from the harness.
 		c.status = warn
 		c.detail = strings.Join(set, ", ") + " — wall clock is the only ceiling, and it counts time spent waiting out usage limits"
 		c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
-		return c
+	} else {
+		c.detail = strings.Join(set, ", ")
+		// The run-wide breaker is checked BETWEEN sessions: it cannot see a single
+		// huge session coming, which is exactly what happened to the 285.9M run
+		// under max_tokens=75M. Say so on the line that reports it (CLA-344).
+		if b.MaxTokens > 0 {
+			c.detail += fmt.Sprintf(" — max_tokens is enforced BETWEEN sessions, so one session can overrun it (max_session_tokens=%d is the mid-session bound)", b.SessionTokenCeiling())
+		}
 	}
-	c.detail = strings.Join(set, ", ")
+
+	// A missing guard turns the verdict WARN (a FAIL above stays a FAIL — a
+	// broken budget is worse than a bare one). The findings ride as info lines
+	// so the detail line stays the budget's own story; the remedy names the
+	// dials, whose specifics are one info line each — unless the branch above
+	// already had a more specific one (the wall-clock-only case's "add
+	// max_cost_usd" is the better advice there).
+	if len(guardNotes) > 0 {
+		if c.status == pass {
+			c.status = warn
+		}
+		if c.remedy == "" {
+			// Named from the dials actually warned on, so a codex run (no
+			// max_turns note) is not told to set a dial that does nothing there.
+			c.remedy = "set " + strings.Join(guardDials, ", ") + " (see the guard lines), or accept the defaults"
+		}
+		c.info = append(c.info, guardNotes...)
+	}
 	return c
+}
+
+// anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any
+// session by the built-in default rather than an operator-chosen cap — i.e.
+// whether CLA-343's default is load-bearing for this run. The effective phases
+// resolve phase → top-level → default, so a phase carrying DefaultMaxTurns is
+// exactly a phase the operator never capped (an operator who set the same
+// number explicitly is indistinguishable, and the statement "the default
+// applies" is still true for them).
+func anyPhaseRunsTheDefaultTurnCap(cfg *config.Config) bool {
+	for _, ph := range cfg.EffectivePhases() {
+		if ph.MaxTurns == config.DefaultMaxTurns {
+			return true
+		}
+	}
+	return false
 }
 
 // --- rendering ---------------------------------------------------------------
