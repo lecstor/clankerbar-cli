@@ -184,7 +184,10 @@ type opencodePart struct {
 	Text   string          `json:"text"`
 	Reason string          `json:"reason"`
 	Tokens *opencodeTokens `json:"tokens"`
-	Cost   float64         `json:"cost"`
+	// A POINTER for the same reason Tokens is one: a step reporting cost 0 has
+	// REPORTED, and the driver's zero-spend bound counts silence, not zeroes
+	// (CLA-288).
+	Cost *float64 `json:"cost"`
 }
 
 type opencodeTokens struct {
@@ -245,8 +248,8 @@ func (p *opencodeParse) line(line []byte) {
 			p.cRead += tk.Cache.Read
 			p.sawUsage = true
 		}
-		if ev.Part.Cost != 0 {
-			p.cost += ev.Part.Cost
+		if c := ev.Part.Cost; c != nil {
+			p.cost += *c
 			p.sawUsage = true
 		}
 	}

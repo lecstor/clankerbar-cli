@@ -63,7 +63,7 @@ const DefaultMaxTurns = 400
 //
 // What actually reaches this bound is narrower than it sounds, and worth naming
 // so nobody tunes it against the wrong failure: an attempt has to be classified
-// TRANSIENT (anything else ends the drain on the first one) and die before its
+// TRANSIENT (anything else ends the phase on the first one) and die before its
 // harness accounts for anything - a stream that never gets past the handshake, a
 // connection reset early in the session, an overloaded API turning it away. A
 // real blip that reaches the model is followed by a session that reports, which

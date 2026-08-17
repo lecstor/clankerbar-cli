@@ -1609,8 +1609,12 @@ func checkBudget(cfg *config.Config) check {
 		c.status = warn
 		c.detail = strings.Join(set, ", ") + " - wall clock is the only ceiling that can fire, and it counts time spent waiting out usage limits"
 		// The usual advice is "add max_cost_usd" - which under a harness that
-		// cannot report cost is advice to set the dial that got them here.
-		if inertCost {
+		// cannot report cost is advice to set a dial that does nothing, and it
+		// would be FOLLOWED, landing the operator in the cost-only case the
+		// sibling branch below warns about. Gated on the HARNESS, not on
+		// inertCost: the commonest codex config is a bare wall clock with cost
+		// unset, and that is the one that needs the corrected advice most.
+		if !harnessReportsCost(cfg.Harness) {
 			c.remedy = "add max_tokens as the real ceiling; under " + cfg.Harness + " max_cost_usd cannot fire, and max_wall_clock is only the outer bound on how late a run may finish"
 		} else {
 			c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
