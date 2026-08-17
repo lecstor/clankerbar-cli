@@ -2141,3 +2141,55 @@ func TestStateDirRefusesASymlinkASessionCouldHavePlanted(t *testing.T) {
 		t.Errorf("doctor created %s through the symlink", filepath.Join(outside, "state"))
 	}
 }
+
+// --- CLA-288: a cost ceiling on a harness that cannot report cost ------------
+//
+// The README used to recommend `max_cost_usd` unconditionally. Under codex that
+// configures a ceiling no code path can reach: the adapter never populates
+// Result.CostUSD, because `codex exec --json` reports tokens and not money. So a
+// codex run with cost as its only dial has, in fact, no ceiling at all, and the
+// old doctor reported it as a set budget. These pin the warning that says so.
+
+func TestBudget_WarnsWhenCostIsTheOnlyCeilingAndTheHarnessCannotReportCost(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{MaxCostUSD: 25}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("cost-only ceiling under codex: got %v, want WARN — the dial is inert, so this run has no ceiling", c.status)
+	}
+	for _, want := range []string{"max_cost_usd", "INERT", "codex"} {
+		if !strings.Contains(c.detail, want) {
+			t.Errorf("detail does not name %q; an operator must be able to see WHICH dial does nothing and why: %q", want, c.detail)
+		}
+	}
+	// The remedy has to name a dial that actually fires under this harness.
+	if !strings.Contains(c.remedy, "max_tokens") {
+		t.Errorf("remedy should point at max_tokens (or wall clock), got %q", c.remedy)
+	}
+}
+
+func TestBudget_CostOnlyCeilingIsFineWhenTheHarnessReportsCost(t *testing.T) {
+	cfg := validCfg(t) // claude: total_cost_usd is parsed off the result event
+	cfg.Budget = config.Budget{MaxCostUSD: 25}
+
+	c := checkBudget(cfg)
+	if strings.Contains(c.detail, "INERT") {
+		t.Errorf("claude reports cost, so max_cost_usd is a live ceiling: %q", c.detail)
+	}
+}
+
+// A second dial beside it is the documented fix, so it must clear the warning
+// rather than merely soften it — this is the configuration the corrected README
+// tells a codex operator to write.
+func TestBudget_CostPlusTokensUnderCodexDoesNotWarnAboutInertCost(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{MaxCostUSD: 25, MaxTokens: 5_000_000}
+
+	c := checkBudget(cfg)
+	if strings.Contains(c.detail, "INERT") {
+		t.Errorf("max_tokens beside it is the fix; the inert-cost warning must clear: %q", c.detail)
+	}
+}

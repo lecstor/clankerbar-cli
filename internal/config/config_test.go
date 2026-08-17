@@ -536,3 +536,31 @@ func TestLoadWithoutPromptInheritsOneTaskDefault(t *testing.T) {
 		t.Errorf("Load() Prompt = %q, want %q", c.Prompt, defaultPrompt)
 	}
 }
+
+// --- CLA-288: the zero-spend attempt bound -----------------------------------
+
+func TestZeroSpendAttemptBound(t *testing.T) {
+	t.Run("an unset dial resolves to the built-in default", func(t *testing.T) {
+		c := &Config{}
+		if got := c.ZeroSpendAttemptBound(); got != DefaultMaxZeroSpendAttempts {
+			t.Errorf("bound = %d, want the default %d — the breaker is always on, so nothing resolves to zero", got, DefaultMaxZeroSpendAttempts)
+		}
+	})
+
+	t.Run("the operator's own value wins", func(t *testing.T) {
+		c := &Config{MaxZeroSpendAttempts: 7}
+		if got := c.ZeroSpendAttemptBound(); got != 7 {
+			t.Errorf("bound = %d, want the configured 7", got)
+		}
+	})
+
+	t.Run("a negative value is refused, not clamped", func(t *testing.T) {
+		// Clamping would leave the config file reading as "set" while the default
+		// quietly applied — the silent-inert shape this whole task is about.
+		c := &Config{Harness: "claude", Prompt: "work", MaxZeroSpendAttempts: -1}
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "max_zero_spend_attempts") {
+			t.Errorf("Validate() = %v, want an error naming max_zero_spend_attempts", err)
+		}
+	})
+}

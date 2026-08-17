@@ -1559,7 +1559,7 @@ func checkBudget(cfg *config.Config) check {
 	}
 	if cfg.MaxRetries == 0 {
 		guardNotes = append(guardNotes,
-			"max_retries: 0 — transient failures are retried forever (backoff capped at retry_cap), each retry a fresh paid session redoing the task; set a positive max_retries to bound a run window")
+			fmt.Sprintf("max_retries: 0 — transient failures are retried forever (backoff capped at retry_cap), each retry a fresh paid session redoing the task; set a positive max_retries to bound a run window. Only a run of attempts reporting NO usage is bounded regardless, at max_zero_spend_attempts=%d", cfg.ZeroSpendAttemptBound()))
 		guardDials = append(guardDials, "max_retries")
 	}
 	if cfg.MaxIterations == 0 {
@@ -1592,6 +1592,16 @@ func checkBudget(cfg *config.Config) check {
 		c.status = warn
 		c.detail = strings.Join(set, ", ") + " — wall clock is the only ceiling, and it counts time spent waiting out usage limits"
 		c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
+	} else if b.MaxCostUSD > 0 && b.MaxTokens == 0 && b.MaxWallClock == 0 && !harnessReportsCost(cfg.Harness) {
+		// The sibling of the wall-clock-only warning, and the sharper case of the
+		// two: wall clock at least measures something, whereas a cost ceiling on a
+		// harness that never reports cost is not a weak ceiling but an absent one —
+		// no code path can reach it, because nothing populates the figure it
+		// compares against. The run has, in fact, no ceiling at all, which is why
+		// this cannot be left to the operator to notice from a green line (CLA-288).
+		c.status = warn
+		c.detail = strings.Join(set, ", ") + fmt.Sprintf(" — the %s harness never reports cost, so max_cost_usd is INERT and this run has no effective ceiling", cfg.Harness)
+		c.remedy = "set max_tokens (or max_wall_clock) beside it — under " + cfg.Harness + " those are the dials that can fire"
 	} else {
 		c.detail = strings.Join(set, ", ")
 		// The run-wide breaker is checked BETWEEN sessions: it cannot see a single
@@ -1620,6 +1630,20 @@ func checkBudget(cfg *config.Config) check {
 		c.info = append(c.info, guardNotes...)
 	}
 	return c
+}
+
+// harnessReportsCost asks the registry whether this harness ever populates
+// Result.CostUSD. An UNKNOWN harness is treated as reporting cost — i.e. the
+// warning is withheld — because config.Validate has already refused that name, so
+// the only way to get here is a doctor run over a config too broken to run at
+// all, and warning about an inert dial on a harness that does not exist would bury
+// the real finding under a speculative one.
+func harnessReportsCost(name string) bool {
+	caps, ok := harness.CapabilitiesOf(name)
+	if !ok {
+		return true
+	}
+	return caps.ReportsCost
 }
 
 // anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any

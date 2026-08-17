@@ -30,6 +30,18 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
+// errZeroSpendLoop marks the one give-up the budget breaker could not have
+// reached: a run of attempts that each ended before the harness reported any
+// usage, so nothing fed the token or cost ceiling and the retry ladder would have
+// gone on indefinitely (CLA-288).
+//
+// It is a distinct, wrapped sentinel rather than a plain string because the three
+// ways a run can end early are three different things for an operator to do next:
+// a budget stop means retune the ceiling, a wall-clock stop means the window was
+// too short, and this one means the harness is not running — none of which is
+// legible from "the run stopped".
+var errZeroSpendLoop = errors.New("zero-spend attempt loop")
+
 // Target is one backlog a Driver drives: a project's cheap poller plus where that
 // project's drain sessions run (CLA-142). A single-project Driver has exactly one,
 // unnamed target; a multi-project Driver has one per configured project.
@@ -598,6 +610,11 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
 func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	retries := 0
+	// Consecutive attempts that ended without the harness reporting any usage —
+	// the spend the budget breaker above can never see (CLA-288). Scoped to this
+	// phase's retry ladder, which is where the unbounded loop lives: every path
+	// that re-spawns a session comes back through the top of this loop.
+	noUsage := 0
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
 		// just waited — a supervised wait on a usage limit, an exponential backoff
@@ -610,6 +627,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
 				drainNum, dim, prior.tokens+tokens, prior.cost+cost, time.Since(prior.start).Round(time.Second))
 			return tokens, cost, true, end, nil
+		}
+
+		// The breaker's blind spot, bounded. The check above can only stop spend it
+		// was told about; an attempt that died before its harness reported usage
+		// added nothing to either accumulator, so a ladder of those attempts leaves
+		// the token and cost ceilings permanently unreachable and only
+		// max_wall_clock — the dial an operator is least likely to have set as a
+		// spend bound — can end the run. This is reached only on a re-spawn (the
+		// first pass has counted nothing), so a single silent attempt that ends the
+		// phase some other way never trips it.
+		if bound := d.cfg.ZeroSpendAttemptBound(); noUsage >= bound {
+			return tokens, cost, false, end, fmt.Errorf(
+				"iteration %d: %w: %d consecutive attempts ended without %s reporting any usage, so no token or cost ceiling could see them (raise max_zero_spend_attempts to allow more, or check the harness is starting: clankerbar doctor)",
+				drainNum, errZeroSpendLoop, noUsage, d.h.Name())
 		}
 
 		// Each attempt streams live to the terminal and to its own logfile. The name
@@ -747,6 +778,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
+
+		// ...and record whether it told us ANYTHING, which is a different question
+		// from what it told us. A report of zero is a report: a session that ran and
+		// legitimately spent nothing resets the count, so only silence accumulates
+		// (CLA-288). Counted here, enforced at the top of the loop, so the bound
+		// fires on the decision to spawn again rather than on this attempt's exit.
+		if res.UsageReported {
+			noUsage = 0
+		} else {
+			noUsage++
+		}
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to

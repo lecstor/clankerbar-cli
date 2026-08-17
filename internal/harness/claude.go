@@ -272,6 +272,10 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		// nothing — the result event remains authoritative for the total.
 		if tot := ev.Message.Usage.total(); tot > 0 {
 			res.Tokens += tot
+			// A per-turn usage object is a usage-bearing event in its own right:
+			// a session killed mid-stream never reaches the result event, and it
+			// still told us what it had spent by the time it died (CLA-288).
+			res.UsageReported = true
 		}
 	case "user":
 		// Tool results come back on a synthetic user turn.
@@ -315,6 +319,9 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		res.Tokens = ev.Usage.total()
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
 		res.gotResult = true
+		// The session's own accounting arrived, whatever it adds up to — a
+		// zero-token result event is a report, not a silence (CLA-288).
+		res.UsageReported = true
 	}
 }
 
@@ -733,6 +740,7 @@ func (claude) parse(res *Result) {
 	res.FinalMessage = p.Result
 	res.CostUSD = p.TotalCostUSD
 	res.Tokens = p.Usage.total()
+	res.UsageReported = true
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}
 }
 
@@ -958,7 +966,7 @@ func (r *Result) markCeilingHit() {
 // Claude is the one adapter that watches the session's clankerbar tool calls, so
 // it is the only one phases can run on today. See Capabilities.TracksClaims.
 func (claude) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, HonoursMaxTurns: true}
+	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true}
 }
 
 // Diagnostic returns the same CLI-authored text IsTransient judged, so a caller

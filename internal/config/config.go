@@ -53,6 +53,20 @@ const defaultPrompt = "Work the next backlog item."
 // commit, not work.
 const DefaultMaxTurns = 400
 
+// DefaultMaxZeroSpendAttempts bounds consecutive attempts within one drain that
+// ended without the harness reporting ANY usage (see Config.MaxZeroSpendAttempts).
+//
+// 3 is deliberately small, and small is the point: a spend ceiling cannot see an
+// attempt that reported nothing, so every one of these is a paid session the
+// breaker is blind to, and the loop's other backstop — `max_retries: 0`, never
+// give up — is exactly the setting that turns three of them into three thousand.
+// The failure it catches is systemic (a harness dying at spawn, a broken auth
+// token, a stream that never starts), not a blip: a real server blip is followed
+// by a session that reports, which resets the count, so the ladder an operator
+// tuned `retry_cap` for is untouched. Raise it if a harness legitimately dies
+// silently more often than that.
+const DefaultMaxZeroSpendAttempts = 3
+
 // The built-in phase names, as constants because Validate reasons about them: a
 // sequence that ENDS on the implement brief can never reach review.
 const (
@@ -355,6 +369,20 @@ type Config struct {
 	// (30s → 60s → 120s → ..., capped here). 0 = a built-in default (300s).
 	RetryCap Duration `json:"retry_cap"`
 
+	// MaxZeroSpendAttempts bounds consecutive attempts within one drain that
+	// ended without the harness reporting any usage at all. 0 = the built-in
+	// default (DefaultMaxZeroSpendAttempts).
+	//
+	// It is the ceiling's blind spot made bounded. A spend ceiling can only stop
+	// spend it is told about, and an attempt that dies before its harness reports
+	// usage tells it nothing — so under `max_retries: 0` and a token- or
+	// cost-only budget, the retry ladder is: attempt, zero spend, back off at
+	// retry_cap, attempt, forever, with only max_wall_clock able to end it
+	// (CLA-288). An attempt that DOES report resets the count, including one that
+	// honestly reports zero, so this never counts a session that merely did
+	// nothing.
+	MaxZeroSpendAttempts int `json:"max_zero_spend_attempts"`
+
 	// Budget is the circuit breaker / headroom knob. See Budget.
 	Budget Budget `json:"budget"`
 
@@ -571,6 +599,16 @@ func (c *Config) resolveMaxTurns(phase int) int {
 		return c.MaxTurns
 	}
 	return DefaultMaxTurns
+}
+
+// ZeroSpendAttemptBound is the effective bound on consecutive no-usage attempts:
+// the operator's own, else the built-in default. Like the turn cap, nothing
+// resolves to zero — the bound is a backstop, and "off" is not a value it takes.
+func (c *Config) ZeroSpendAttemptBound() int {
+	if c.MaxZeroSpendAttempts > 0 {
+		return c.MaxZeroSpendAttempts
+	}
+	return DefaultMaxZeroSpendAttempts
 }
 
 // BuiltinPhaseNames lists the shipped phase briefs, sorted so the error naming
@@ -946,6 +984,12 @@ func (c *Config) Validate() error {
 	}
 	if c.Budget.MaxSessionTokens < 0 {
 		return errors.New("max_session_tokens is negative")
+	}
+	// Refused rather than clamped: a negative here would read as "set" in the
+	// config and resolve to the default anyway, which is the silent-inert shape
+	// doctor's negative-budget check exists to stop.
+	if c.MaxZeroSpendAttempts < 0 {
+		return errors.New("max_zero_spend_attempts is negative")
 	}
 	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")
