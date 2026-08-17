@@ -2141,3 +2141,121 @@ func TestStateDirRefusesASymlinkASessionCouldHavePlanted(t *testing.T) {
 		t.Errorf("doctor created %s through the symlink", filepath.Join(outside, "state"))
 	}
 }
+
+// --- CLA-288: a cost ceiling on a harness that cannot report cost ------------
+//
+// The README used to recommend `max_cost_usd` unconditionally. Under codex that
+// configures a ceiling no code path can reach: the adapter never populates
+// Result.CostUSD, because `codex exec --json` reports tokens and not money. So a
+// codex run with cost as its only dial has, in fact, no ceiling at all, and the
+// old doctor reported it as a set budget. These pin the warning that says so.
+
+func TestBudget_WarnsWhenCostIsTheOnlyCeilingAndTheHarnessCannotReportCost(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{MaxCostUSD: 25}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("cost-only ceiling under codex: got %v, want WARN - the dial is inert, so this run has no ceiling", c.status)
+	}
+	for _, want := range []string{"max_cost_usd", "INERT", "codex"} {
+		if !strings.Contains(c.detail, want) {
+			t.Errorf("detail does not name %q; an operator must be able to see WHICH dial does nothing and why: %q", want, c.detail)
+		}
+	}
+	// The remedy has to name a dial that actually fires under this harness.
+	if !strings.Contains(c.remedy, "max_tokens") {
+		t.Errorf("remedy should point at max_tokens (or wall clock), got %q", c.remedy)
+	}
+}
+
+func TestBudget_CostOnlyCeilingIsFineWhenTheHarnessReportsCost(t *testing.T) {
+	cfg := validCfg(t) // claude: total_cost_usd is parsed off the result event
+	cfg.Budget = config.Budget{MaxCostUSD: 25}
+
+	c := checkBudget(cfg)
+	if strings.Contains(c.detail, "INERT") {
+		t.Errorf("claude reports cost, so max_cost_usd is a live ceiling: %q", c.detail)
+	}
+}
+
+// A second dial beside it is the documented fix, so it must clear the warning
+// rather than merely soften it - this is the configuration the corrected README
+// tells a codex operator to write.
+func TestBudget_CostPlusTokensUnderCodexKeepsTheLiveCeiling(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{MaxCostUSD: 25, MaxTokens: 5_000_000}
+
+	c := checkBudget(cfg)
+	// max_tokens is a live ceiling here, so the verdict must not claim the run has
+	// none - but the inert dial is still worth naming where it is reported.
+	if strings.Contains(c.detail, "NO effective ceiling") {
+		t.Errorf("max_tokens is live under codex; the no-ceiling verdict must not fire: %q", c.detail)
+	}
+	if !strings.Contains(c.detail, "INERT") {
+		t.Errorf("max_cost_usd still does nothing under codex and doctor should say so: %q", c.detail)
+	}
+}
+
+// The gap the review caught: cost plus wall clock under codex. Only the wall
+// clock can fire, which is byte-for-byte the situation the wall-clock-only
+// warning describes - and it used to be suppressed, because max_cost_usd was
+// non-zero. Reasoning about the LIVE ceilings rather than the written ones is
+// what closes it.
+func TestBudget_CostPlusWallClockUnderCodexWarnsAsWallClockOnly(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{MaxCostUSD: 25, MaxWallClock: config.Duration(8 * time.Hour)}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("codex with cost + wall clock: got %v, want WARN - the wall clock is the only dial that can fire", c.status)
+	}
+	if !strings.Contains(c.detail, "wall clock is the only ceiling that can fire") {
+		t.Errorf("detail should name the wall clock as the only live ceiling: %q", c.detail)
+	}
+	// The stock remedy is "add max_cost_usd", which here is advice to set the
+	// dial that does nothing.
+	if strings.Contains(c.remedy, "add max_cost_usd") {
+		t.Errorf("remedy tells a codex operator to add the inert dial: %q", c.remedy)
+	}
+	if !strings.Contains(c.remedy, "max_tokens") {
+		t.Errorf("remedy should point at max_tokens under codex: %q", c.remedy)
+	}
+}
+
+// The commonest codex config: a bare wall clock, cost unset. The stock remedy
+// here is "add max_cost_usd", which under codex is advice to set a dial that
+// cannot fire - and advice gets followed, landing the operator in the cost-only
+// state the sibling warning exists to catch. The remedy is gated on the harness
+// rather than on a cost dial already being set, which is what makes this case
+// covered at all.
+func TestBudget_WallClockOnlyUnderCodexDoesNotRecommendTheInertDial(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(8 * time.Hour)}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("codex with wall clock only: got %v, want WARN", c.status)
+	}
+	if strings.Contains(c.remedy, "add max_cost_usd") {
+		t.Errorf("remedy tells a codex operator to set the dial that cannot fire: %q", c.remedy)
+	}
+	if !strings.Contains(c.remedy, "max_tokens") {
+		t.Errorf("remedy should point at max_tokens under codex: %q", c.remedy)
+	}
+}
+
+// ...and the same case under claude keeps the original advice, which is correct
+// there: cost is the dial that tracks what an operator means by headroom.
+func TestBudget_WallClockOnlyUnderClaudeStillRecommendsCost(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(8 * time.Hour)}
+
+	if c := checkBudget(cfg); !strings.Contains(c.remedy, "add max_cost_usd") {
+		t.Errorf("claude reports cost, so the original remedy stands: %q", c.remedy)
+	}
+}

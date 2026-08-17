@@ -164,6 +164,19 @@ type Capabilities struct {
 	// means a phase's turn cap is silently inert, so the boundary rests on the
 	// prompt alone.
 	HonoursMaxTurns bool
+
+	// ReportsCost reports whether this adapter ever populates Result.CostUSD.
+	// False means `budget.max_cost_usd` is INERT for this harness - not
+	// approximate, not late: no code path can ever reach it, because nothing
+	// feeds the number it compares against. codex exec reports tokens, not
+	// money, so that is codex today.
+	//
+	// It is on Capabilities rather than inferred from a zero CostUSD because the
+	// two are indistinguishable at runtime: a claude session that genuinely cost
+	// nothing also reports 0. Only the adapter knows which case it is in, and
+	// `doctor` has to tell an operator BEFORE the run whether the ceiling they
+	// configured exists (CLA-288).
+	ReportsCost bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for
@@ -261,6 +274,19 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// UsageReported says the adapter actually SAW a usage-bearing event on this
+	// session's stream, as distinct from Tokens/CostUSD merely being zero.
+	//
+	// Those are not the same question, and the driver needs this one. A session
+	// killed before the harness reports anything leaves Tokens and CostUSD at
+	// zero, so it contributes nothing to the Budget - and a retry ladder made of
+	// such attempts can never reach a token or cost ceiling, whatever the
+	// operator set (CLA-288). A session that ran and legitimately spent nothing
+	// is a different thing entirely: it reported, and the report happened to be
+	// zero. loop.drainPhase bounds the first and not the second, so what it
+	// counts has to be the presence of the REPORT, never the size of it.
+	UsageReported bool
 
 	// Untrusted, when non-empty, says why this Result's PARSED fields cannot be
 	// believed: the child's stream could not be read whole, so an unknown number

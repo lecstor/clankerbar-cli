@@ -184,7 +184,10 @@ type opencodePart struct {
 	Text   string          `json:"text"`
 	Reason string          `json:"reason"`
 	Tokens *opencodeTokens `json:"tokens"`
-	Cost   float64         `json:"cost"`
+	// A POINTER for the same reason Tokens is one: a step reporting cost 0 has
+	// REPORTED, and the driver's zero-spend bound counts silence, not zeroes
+	// (CLA-288).
+	Cost *float64 `json:"cost"`
 }
 
 type opencodeTokens struct {
@@ -245,8 +248,8 @@ func (p *opencodeParse) line(line []byte) {
 			p.cRead += tk.Cache.Read
 			p.sawUsage = true
 		}
-		if ev.Part.Cost != 0 {
-			p.cost += ev.Part.Cost
+		if c := ev.Part.Cost; c != nil {
+			p.cost += *c
 			p.sawUsage = true
 		}
 	}
@@ -255,6 +258,9 @@ func (p *opencodeParse) line(line []byte) {
 // finish writes what the stream added up to onto res.
 func (p *opencodeParse) finish(res *Result) {
 	res.FinalMessage = p.lastText
+	// Recorded whatever the figures come to: the driver bounds attempts that
+	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
+	res.UsageReported = p.sawUsage
 	if p.sawUsage {
 		// opencode's `total` already folds in input+output+reasoning+cache, so it
 		// is the honest spend figure for the budget.
@@ -338,7 +344,11 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // Like codex, this adapter does not populate Result.Claim, so `phases` is refused
 // for it in config.Validate rather than silently stopping after phase 1 on every
 // task. See Capabilities.TracksClaims.
-func (opencode) Capabilities() Capabilities { return Capabilities{} }
+//
+// ReportsCost is true: opencode's step_finish parts carry a `cost` sibling to the
+// token counts, and opencodeParse sums it into Result.CostUSD, so
+// `budget.max_cost_usd` is a live ceiling here (CLA-288).
+func (opencode) Capabilities() Capabilities { return Capabilities{ReportsCost: true} }
 
 func (opencode) IsTransient(res Result) bool {
 	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw

@@ -632,6 +632,7 @@ the likely final format.)
   "poll_interval": "30m",
   "max_retries": 0,
   "retry_cap": "5m",
+  "max_zero_spend_attempts": 3,
   "budget": {
     "max_tokens": 0,
     "max_cost_usd": 0,
@@ -722,6 +723,24 @@ positive number to bound it. A usage-limit pause and a transient retry both re-r
 the same iteration and neither advances the iteration count. `STOP` stays
 responsive during any wait.
 
+**One thing is bounded even under `max_retries: 0`: attempts that report no spend
+at all.** A budget ceiling can only stop spend it is told about, and the figures it
+reads arrive in the harness's own usage events. A session killed before any of
+them arrives - the very thing a transient retry exists for - contributes *zero*,
+so with a token- or cost-only budget the ladder is: attempt, zero spend, back off
+at `retry_cap`, attempt, forever, with only `max_wall_clock` able to end it. So
+`max_zero_spend_attempts` (default **3**) caps **consecutive** attempts within one
+retry ladder that ended without the harness reporting any usage, and the run stops
+with a distinct error naming the zero-spend loop - not a budget stop, not a
+wall-clock stop, because what it means is that sessions are dying early rather
+than working. An attempt that *does* report resets the count, **including one that
+honestly reports zero**, so an ordinary retry ladder is untouched and a session
+that legitimately did nothing is never counted against you. A **usage-limit pause
+is counted neither way**: a session the cap turned away often reports nothing at
+all, and waiting out a quota overnight must not read as sessions failing to start.
+The ladder is per phase, so a phased config allows the bound in each. Raise it if a
+harness of yours dies silently more often than that.
+
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in
 the same bytes. So both classifications read only what the *harness* said: its
@@ -760,13 +779,21 @@ alternatives, in order of preference:
    `max_wall_clock`; the loop self-accounts and stops early. Blunt but simple —
    tune it by watching a couple of runs.
 
-   **Prefer `max_cost_usd`.** It comes straight from the harness's own
-   `total_cost_usd`, so it measures the thing you actually care about.
-   `max_wall_clock` counts the hours a run spends *waiting out a usage limit*,
-   in which almost nothing is billed — one run elapsed 10h23m against an 8h
-   ceiling with 5h31m of that asleep. Keep it as an outer bound on how late a
+   **Prefer `max_cost_usd` - under `claude` or `opencode`.** It comes straight
+   from the harness's own reported cost, so it measures the thing you actually
+   care about. `max_wall_clock` counts the hours a run spends *waiting out a usage
+   limit*, in which almost nothing is billed - one run elapsed 10h23m against an
+   8h ceiling with 5h31m of that asleep. Keep it as an outer bound on how late a
    run may finish, not as your spend ceiling. `doctor` warns if it is your only
    dial.
+
+   **Under `codex`, `max_cost_usd` is inert - set `max_tokens` beside it.**
+   `codex exec --json` reports tokens, not money, so the adapter never populates
+   a cost figure and no code path can reach that ceiling: it is not approximate,
+   it is absent. A codex run with cost as its *only* dial therefore has no
+   effective ceiling at all, whatever the config says. Give it `max_tokens` (or
+   `max_wall_clock`) alongside; `doctor` WARNs on the cost-only case rather than
+   reporting a budget that cannot fire.
 
    **`max_tokens` counts about ten times more than it used to.** Token totals now
    include cache reads and writes, which `input_tokens` excludes and which
