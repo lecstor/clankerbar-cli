@@ -1526,12 +1526,29 @@ func checkBudget(cfg *config.Config) check {
 		return c
 	}
 
+	// A cost ceiling on a harness that never reports cost is not a weak ceiling
+	// but an ABSENT one: no code path can reach it, because nothing populates the
+	// figure it compares against (codex exec reports tokens, not money). So every
+	// verdict below reasons about the ceilings that can actually FIRE, not the ones
+	// written down - otherwise a codex run whose only dial is cost reports a set
+	// budget while having none, and a codex run with cost plus wall clock escapes
+	// the wall-clock-only warning that in reality describes it exactly (CLA-288).
+	inertCost := b.MaxCostUSD > 0 && !harnessReportsCost(cfg.Harness)
+	costLive := b.MaxCostUSD > 0 && !inertCost
+
 	var set []string
 	if b.MaxTokens > 0 {
 		set = append(set, fmt.Sprintf("max_tokens=%d", b.MaxTokens))
 	}
 	if b.MaxCostUSD > 0 {
-		set = append(set, fmt.Sprintf("max_cost_usd=%g", b.MaxCostUSD))
+		entry := fmt.Sprintf("max_cost_usd=%g", b.MaxCostUSD)
+		if inertCost {
+			// Annotated wherever it appears, not only when it is the last ceiling
+			// standing: a dial that does nothing is worth saying out loud even
+			// when something else is holding the line.
+			entry += fmt.Sprintf(" (INERT: the %s harness never reports cost)", cfg.Harness)
+		}
+		set = append(set, entry)
 	}
 	if b.MaxWallClock > 0 {
 		set = append(set, "max_wall_clock="+b.MaxWallClock.Duration().String())
@@ -1559,7 +1576,7 @@ func checkBudget(cfg *config.Config) check {
 	}
 	if cfg.MaxRetries == 0 {
 		guardNotes = append(guardNotes,
-			fmt.Sprintf("max_retries: 0 — transient failures are retried forever (backoff capped at retry_cap), each retry a fresh paid session redoing the task; set a positive max_retries to bound a run window. Only a run of attempts reporting NO usage is bounded regardless, at max_zero_spend_attempts=%d", cfg.ZeroSpendAttemptBound()))
+			fmt.Sprintf("max_retries: 0 - transient failures are retried forever (backoff capped at retry_cap), each retry a fresh paid session redoing the task; set a positive max_retries to bound a run window. Only a run of attempts reporting NO usage is bounded regardless, at max_zero_spend_attempts=%d", cfg.ZeroSpendAttemptBound()))
 		guardDials = append(guardDials, "max_retries")
 	}
 	if cfg.MaxIterations == 0 {
@@ -1583,25 +1600,30 @@ func checkBudget(cfg *config.Config) check {
 		if cfg.Harness == "claude" {
 			c.info = append(c.info, fmt.Sprintf("per-session runaway ceiling still active: max_session_tokens resolves to %d (the operator's own, else 2x max_tokens when set, else the floor)", b.SessionTokenCeiling()))
 		}
-	} else if b.MaxWallClock > 0 && b.MaxCostUSD == 0 && b.MaxTokens == 0 {
+	} else if b.MaxWallClock > 0 && !costLive && b.MaxTokens == 0 {
 		// Wall clock is the weakest proxy for spend of the three, because it counts
 		// the hours a run spends WAITING OUT a usage limit — time in which nothing is
 		// billed. A run capped at 8h can spend five of them asleep and stop having done
 		// three iterations. Cost is the dial that tracks what an operator actually
 		// means by "leave headroom", and it comes straight from the harness.
 		c.status = warn
-		c.detail = strings.Join(set, ", ") + " — wall clock is the only ceiling, and it counts time spent waiting out usage limits"
-		c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
-	} else if b.MaxCostUSD > 0 && b.MaxTokens == 0 && b.MaxWallClock == 0 && !harnessReportsCost(cfg.Harness) {
+		c.detail = strings.Join(set, ", ") + " - wall clock is the only ceiling that can fire, and it counts time spent waiting out usage limits"
+		// The usual advice is "add max_cost_usd" - which under a harness that
+		// cannot report cost is advice to set the dial that got them here.
+		if inertCost {
+			c.remedy = "add max_tokens as the real ceiling; under " + cfg.Harness + " max_cost_usd cannot fire, and max_wall_clock is only the outer bound on how late a run may finish"
+		} else {
+			c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
+		}
+	} else if inertCost && b.MaxTokens == 0 && b.MaxWallClock == 0 {
 		// The sibling of the wall-clock-only warning, and the sharper case of the
-		// two: wall clock at least measures something, whereas a cost ceiling on a
-		// harness that never reports cost is not a weak ceiling but an absent one —
-		// no code path can reach it, because nothing populates the figure it
-		// compares against. The run has, in fact, no ceiling at all, which is why
-		// this cannot be left to the operator to notice from a green line (CLA-288).
+		// two: wall clock at least measures something, whereas this run's every
+		// configured ceiling is unreachable, so it has none at all. That cannot be
+		// left to the operator to notice from a line reporting a set budget
+		// (CLA-288).
 		c.status = warn
-		c.detail = strings.Join(set, ", ") + fmt.Sprintf(" — the %s harness never reports cost, so max_cost_usd is INERT and this run has no effective ceiling", cfg.Harness)
-		c.remedy = "set max_tokens (or max_wall_clock) beside it — under " + cfg.Harness + " those are the dials that can fire"
+		c.detail = strings.Join(set, ", ") + " - so this run has NO effective ceiling"
+		c.remedy = "set max_tokens (or max_wall_clock) beside it - under " + cfg.Harness + " those are the dials that can fire"
 	} else {
 		c.detail = strings.Join(set, ", ")
 		// The run-wide breaker is checked BETWEEN sessions: it cannot see a single
@@ -1633,8 +1655,8 @@ func checkBudget(cfg *config.Config) check {
 }
 
 // harnessReportsCost asks the registry whether this harness ever populates
-// Result.CostUSD. An UNKNOWN harness is treated as reporting cost — i.e. the
-// warning is withheld — because config.Validate has already refused that name, so
+// Result.CostUSD. An UNKNOWN harness is treated as reporting cost - i.e. the
+// warning is withheld - because config.Validate has already refused that name, so
 // the only way to get here is a doctor run over a config too broken to run at
 // all, and warning about an inert dial on a harness that does not exist would bury
 // the real finding under a speculative one.

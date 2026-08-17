@@ -10,7 +10,7 @@ import (
 // CLA-288: the driver bounds consecutive attempts that reported NO usage, because
 // those are the ones no spend ceiling can see. That makes "did this session report
 // anything?" a question every adapter has to answer honestly, and it is NOT the
-// same question as "did it spend anything?" — a session that reported zero has
+// same question as "did it spend anything?" - a session that reported zero has
 // reported. Result.UsageReported is that answer; these pin it per adapter.
 
 func TestClaudeMarksUsageReported(t *testing.T) {
@@ -52,7 +52,39 @@ func TestClaudeMarksUsageReported(t *testing.T) {
 		(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res, 0, func() {})
 
 		if res.UsageReported {
-			t.Error("no usage-bearing event arrived, so UsageReported must be false — this is exactly the attempt a spend ceiling cannot see")
+			t.Error("no usage-bearing event arrived, so UsageReported must be false - this is exactly the attempt a spend ceiling cannot see")
+		}
+	})
+
+	t.Run("a per-turn usage object of all zeros still reports", func(t *testing.T) {
+		// A report of zero is a report. The token SUM ignores it (the result event
+		// is authoritative for the total), which is why the flag has to be set on
+		// the object's presence rather than inherited from that gate.
+		line := `{"type":"assistant","message":{"content":[{"type":"text","text":"working"}],` +
+			`"usage":{"input_tokens":0,"output_tokens":0}}}`
+
+		var res Result
+		var console bytes.Buffer
+		(claude{}).renderAndParse([]byte(line), &console, &res)
+
+		if !res.UsageReported {
+			t.Error("a usage object carrying zeros is present, so it reported")
+		}
+		if res.Tokens != 0 {
+			t.Errorf("Tokens = %d, want 0: a zero object must not change the sum", res.Tokens)
+		}
+	})
+
+	t.Run("an envelope carrying no usage at all reports nothing", func(t *testing.T) {
+		// The same envelope is how an ERROR comes back, and one with no accounting
+		// in it must not claim a report of zero: this field is load-bearing now,
+		// and a false report is a bound that can never fire.
+		var res Result
+		res.Stdout = `{"is_error":true,"result":"claude: command failed"}`
+		(claude{}).parse(&res)
+
+		if res.UsageReported {
+			t.Error("no usage and no cost member is present; UsageReported must be false")
 		}
 	})
 

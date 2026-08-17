@@ -244,7 +244,11 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				Content   json.RawMessage `json:"content"`
 				IsError   bool            `json:"is_error"`
 			} `json:"content"`
-			Usage usage `json:"usage"`
+			// A POINTER, so a per-turn usage object that is present but all
+			// zeros is distinguishable from one that never came: the first is a
+			// report, the second is the silence the driver's bound counts
+			// (CLA-288).
+			Usage *usage `json:"usage"`
 		} `json:"message"`
 		Result         string  `json:"result"`
 		TerminalReason string  `json:"terminal_reason"`
@@ -267,15 +271,18 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				noteToolUse(b.Name, b.ID, b.Input, res)
 			}
 		}
-		// The API's per-turn usage rides on the assistant event's message. A
-		// zero object (a turn that spent nothing, or a shape change) adds
-		// nothing — the result event remains authoritative for the total.
-		if tot := ev.Message.Usage.total(); tot > 0 {
-			res.Tokens += tot
-			// A per-turn usage object is a usage-bearing event in its own right:
-			// a session killed mid-stream never reaches the result event, and it
-			// still told us what it had spent by the time it died (CLA-288).
+		// The API's per-turn usage rides on the assistant event's message, and it
+		// is a usage-bearing event in its own right: a session killed mid-stream
+		// never reaches the result event, and it still told us what it had spent
+		// by the time it died (CLA-288). A zero object (a turn that spent
+		// nothing, or a shape change) adds nothing to the SUM - the result event
+		// remains authoritative for the total - but the report is recorded either
+		// way, because a report of zero is not silence.
+		if u := ev.Message.Usage; u != nil {
 			res.UsageReported = true
+			if tot := u.total(); tot > 0 {
+				res.Tokens += tot
+			}
 		}
 	case "user":
 		// Tool results come back on a synthetic user turn.
@@ -319,7 +326,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		res.Tokens = ev.Usage.total()
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
 		res.gotResult = true
-		// The session's own accounting arrived, whatever it adds up to — a
+		// The session's own accounting arrived, whatever it adds up to - a
 		// zero-token result event is a report, not a silence (CLA-288).
 		res.UsageReported = true
 	}
@@ -727,20 +734,27 @@ func (claude) env(in Invocation) []string {
 
 // parse reads `claude --output-format json` — a single JSON object (probe path).
 func (claude) parse(res *Result) {
+	// The accounting members are POINTERS so their absence is distinguishable from
+	// a zero: this envelope is also how an error is reported, and one carrying no
+	// usage at all must not claim a report of zero (CLA-288).
 	var p struct {
-		IsError        bool    `json:"is_error"`
-		Result         string  `json:"result"`
-		TerminalReason string  `json:"terminal_reason"`
-		TotalCostUSD   float64 `json:"total_cost_usd"`
-		Usage          usage   `json:"usage"`
+		IsError        bool     `json:"is_error"`
+		Result         string   `json:"result"`
+		TerminalReason string   `json:"terminal_reason"`
+		TotalCostUSD   *float64 `json:"total_cost_usd"`
+		Usage          *usage   `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(strings.TrimSpace(res.Stdout)), &p); err != nil {
 		return
 	}
 	res.FinalMessage = p.Result
-	res.CostUSD = p.TotalCostUSD
-	res.Tokens = p.Usage.total()
-	res.UsageReported = true
+	if p.TotalCostUSD != nil {
+		res.CostUSD = *p.TotalCostUSD
+	}
+	if p.Usage != nil {
+		res.Tokens = p.Usage.total()
+	}
+	res.UsageReported = p.TotalCostUSD != nil || p.Usage != nil
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}
 }
 

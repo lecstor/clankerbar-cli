@@ -38,7 +38,7 @@ import (
 // It is a distinct, wrapped sentinel rather than a plain string because the three
 // ways a run can end early are three different things for an operator to do next:
 // a budget stop means retune the ceiling, a wall-clock stop means the window was
-// too short, and this one means the harness is not running — none of which is
+// too short, and this one means the harness is not running - none of which is
 // legible from "the run stopped".
 var errZeroSpendLoop = errors.New("zero-spend attempt loop")
 
@@ -610,10 +610,16 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
 func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	retries := 0
-	// Consecutive attempts that ended without the harness reporting any usage —
-	// the spend the budget breaker above can never see (CLA-288). Scoped to this
-	// phase's retry ladder, which is where the unbounded loop lives: every path
-	// that re-spawns a session comes back through the top of this loop.
+	// Consecutive attempts that ended without the harness reporting any usage -
+	// the spend the budget breaker above can never see (CLA-288).
+	//
+	// Deliberately scoped to THIS phase's attempt ladder, which is where the
+	// unbounded loop lives: every re-spawn of an attempt comes back through the
+	// top of this loop, and it is the ladder - not the phase sequence - that has
+	// no other bound under `max_retries: 0`. A phased run therefore allows the
+	// bound per phase, and a handoff respawn (which needs a clean exit and a held
+	// claim, so a silently dying attempt cannot produce one) starts a fresh count
+	// under drainPhases' own chain cap.
 	noUsage := 0
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
@@ -632,14 +638,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// The breaker's blind spot, bounded. The check above can only stop spend it
 		// was told about; an attempt that died before its harness reported usage
 		// added nothing to either accumulator, so a ladder of those attempts leaves
-		// the token and cost ceilings permanently unreachable and only
-		// max_wall_clock — the dial an operator is least likely to have set as a
-		// spend bound — can end the run. This is reached only on a re-spawn (the
-		// first pass has counted nothing), so a single silent attempt that ends the
-		// phase some other way never trips it.
+		// a token or cost ceiling permanently unreachable and only max_wall_clock -
+		// the dial an operator is least likely to have set as a spend bound - can
+		// end the run. Reached only on an attempt re-spawn (the first pass has
+		// counted nothing), so a single silent attempt that ends the phase some
+		// other way never trips it.
 		if bound := d.cfg.ZeroSpendAttemptBound(); noUsage >= bound {
 			return tokens, cost, false, end, fmt.Errorf(
-				"iteration %d: %w: %d consecutive attempts ended without %s reporting any usage, so no token or cost ceiling could see them (raise max_zero_spend_attempts to allow more, or check the harness is starting: clankerbar doctor)",
+				"iteration %d: %w: %d consecutive attempts died before %s reported any usage, so nothing the budget breaker reads was ever fed - the sessions are failing early rather than working (see the attempt logs in the state dir; raise max_zero_spend_attempts to allow more)",
 				drainNum, errZeroSpendLoop, noUsage, d.h.Name())
 		}
 
@@ -779,17 +785,6 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		tokens += res.Tokens
 		cost += res.CostUSD
 
-		// ...and record whether it told us ANYTHING, which is a different question
-		// from what it told us. A report of zero is a report: a session that ran and
-		// legitimately spent nothing resets the count, so only silence accumulates
-		// (CLA-288). Counted here, enforced at the top of the loop, so the bound
-		// fires on the decision to spawn again rather than on this attempt's exit.
-		if res.UsageReported {
-			noUsage = 0
-		} else {
-			noUsage++
-		}
-
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
 		// poll for, so the run stops cleanly and the operator resumes it once
@@ -844,6 +839,28 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 				return tokens, cost, true, end, nil
 			}
 			continue
+		}
+
+		// Below the limit branch, so a usage-limit attempt is counted NEITHER way.
+		// A session the subscription cap turned away often reports nothing at all
+		// - under claude the notice can arrive on stderr with no stream, and under
+		// codex as free text - so counting it as silence would end the run on the
+		// ordinary overnight quota wait, and blame a harness that is starting
+		// perfectly well. It is not a reset either: the cap is a known cause with
+		// its own breakers (the budget check inside supervisedWait, waitPastBudget,
+		// and the probes' own spend), and clearing the count on it would let a
+		// limit between silences hide the loop this bounds.
+		//
+		// Everything from here down is an attempt that RAN and ended on its own
+		// terms, which is where "did it tell us anything?" is the right question -
+		// a different question from what it told us, since a report of zero is
+		// still a report (CLA-288). Counted here, enforced at the top of the loop,
+		// so the bound fires on the decision to spawn again rather than on this
+		// attempt's exit.
+		if res.UsageReported {
+			noUsage = 0
+		} else {
+			noUsage++
 		}
 
 		if res.ExitCode == 0 {

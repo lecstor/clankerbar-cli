@@ -543,7 +543,7 @@ func TestZeroSpendAttemptBound(t *testing.T) {
 	t.Run("an unset dial resolves to the built-in default", func(t *testing.T) {
 		c := &Config{}
 		if got := c.ZeroSpendAttemptBound(); got != DefaultMaxZeroSpendAttempts {
-			t.Errorf("bound = %d, want the default %d — the breaker is always on, so nothing resolves to zero", got, DefaultMaxZeroSpendAttempts)
+			t.Errorf("bound = %d, want the default %d - the breaker is always on, so nothing resolves to zero", got, DefaultMaxZeroSpendAttempts)
 		}
 	})
 
@@ -556,7 +556,7 @@ func TestZeroSpendAttemptBound(t *testing.T) {
 
 	t.Run("a negative value is refused, not clamped", func(t *testing.T) {
 		// Clamping would leave the config file reading as "set" while the default
-		// quietly applied — the silent-inert shape this whole task is about.
+		// quietly applied - the silent-inert shape this whole task is about.
 		c := &Config{Harness: "claude", Prompt: "work", MaxZeroSpendAttempts: -1}
 		err := c.Validate()
 		if err == nil || !strings.Contains(err.Error(), "max_zero_spend_attempts") {

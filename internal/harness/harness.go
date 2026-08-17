@@ -166,7 +166,7 @@ type Capabilities struct {
 	HonoursMaxTurns bool
 
 	// ReportsCost reports whether this adapter ever populates Result.CostUSD.
-	// False means `budget.max_cost_usd` is INERT for this harness — not
+	// False means `budget.max_cost_usd` is INERT for this harness - not
 	// approximate, not late: no code path can ever reach it, because nothing
 	// feeds the number it compares against. codex exec reports tokens, not
 	// money, so that is codex today.
@@ -280,7 +280,7 @@ type Result struct {
 	//
 	// Those are not the same question, and the driver needs this one. A session
 	// killed before the harness reports anything leaves Tokens and CostUSD at
-	// zero, so it contributes nothing to the Budget — and a retry ladder made of
+	// zero, so it contributes nothing to the Budget - and a retry ladder made of
 	// such attempts can never reach a token or cost ceiling, whatever the
 	// operator set (CLA-288). A session that ran and legitimately spent nothing
 	// is a different thing entirely: it reported, and the report happened to be
