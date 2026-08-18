@@ -444,8 +444,16 @@ type harnessSpend struct {
 // An UNTRUSTED session is charged to neither, for the reason endUntrustedDrain
 // gives: a figure parsed out of a stream with a hole in it is not a measurement.
 //
+// The key is the phase's harness NAME AS THE CONFIG SPELLS IT (HarnessFor), never
+// the adapter's own Name(). The two agree in production - an adapter is fetched
+// from the registry by that same key - but only one of them is the currency the
+// breaker spends: budgetTrip looks these keys up in Budget.PerHarness, which the
+// operator keyed by config name. An adapter whose Name() diverged would silently
+// disable its own per-harness ceiling rather than failing, so the ledger asks the
+// config what a session IS and asks the adapter only behavioural questions.
+//
 // A run's phases can each name their own harness (CLA-366), so the caller charges
-// the PHASE's adapter, not the run's: on a mixed sequence the two call sites split
+// the PHASE's harness, not the run's: on a mixed sequence the two call sites split
 // the run's spend across one entry per harness, and on a single-harness run they
 // both land on the same key and it tracks the run total exactly as before. That is
 // the whole reason the ledger is keyed by name — passing d.h.Name() from a phase
@@ -906,7 +914,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if res.Untrusted != "" {
 			// held is nil here by construction — an untrusted stream never holds a
 			// phase open — so the sequence ends and nothing is carried forward.
-			utokens, ucost, ustop, uerr := d.endUntrustedDrain(drainNum, a.Name(), res, tokens, cost)
+			utokens, ucost, ustop, uerr := d.endUntrustedDrain(drainNum, d.cfg.HarnessFor(ph), res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
 
@@ -918,7 +926,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
-		d.charge(a.Name(), res.Tokens, res.CostUSD)
+		d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
@@ -1733,7 +1741,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// of here — resume, stop, or another lap — carries it.
 		tokens += got.Tokens
 		cost += got.CostUSD
-		d.charge(a.Name(), got.Tokens, got.CostUSD)
+		d.charge(d.cfg.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true
@@ -1744,7 +1752,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			// never see the cost — the one shape this loop's breaker exists to end
 			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
 			// ceiling there is nothing to protect, so it waits on as before.
-			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpendFor(a.Name()) {
+			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpendFor(d.cfg.HarnessFor(ph)) {
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
 				return tokens, cost, true
 			}

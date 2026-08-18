@@ -199,3 +199,119 @@ func TestBudget_DefaultTurnCapNoteFiresWhenClaudeRunsAnyPhase(t *testing.T) {
 			checkBudget(cfg).info)
 	}
 }
+
+// The between-sessions clause used to append sessionTokenBounds unguarded. That
+// function is empty for every harness with no mid-session ceiling - which is every
+// harness except claude - so an unphased opencode or codex run with max_tokens set
+// printed a bare "()": a broken sentence in the surface whose entire job is not
+// making sloppy or false statements, and a straight regression against staging.
+func TestBudget_NoEmptyParentheticalWhenTheHarnessHasNoMidSessionCeiling(t *testing.T) {
+	for _, harnessName := range []string{"claude", "opencode", "codex"} {
+		t.Run(harnessName, func(t *testing.T) {
+			cfg := validCfg(t)
+			cfg.Harness = harnessName
+			cfg.Budget = config.Budget{MaxTokens: 1_000_000}
+
+			d := checkBudget(cfg).detail
+			if strings.Contains(d, "()") {
+				t.Errorf("empty parenthetical in the budget detail: %s", d)
+			}
+			if !strings.Contains(d, "enforced BETWEEN sessions") {
+				t.Fatalf("the between-sessions warning is missing entirely: %s", d)
+			}
+			// And the sentence has to be TRUE either way: claude names its bound,
+			// the others say plainly that there is none rather than implying one.
+			if harnessName == "claude" {
+				if !strings.Contains(d, "max_session_tokens=") {
+					t.Errorf("claude has a mid-session bound and must name the number: %s", d)
+				}
+			} else {
+				if strings.Contains(d, "max_session_tokens=") {
+					t.Errorf("%s has no mid-session ceiling, so quoting a number claims a guard that cannot fire: %s", harnessName, d)
+				}
+				if !strings.Contains(d, "no mid-session token ceiling") {
+					t.Errorf("%s: the absence of a bound is the sharper finding and must be stated: %s", harnessName, d)
+				}
+			}
+		})
+	}
+}
+
+// A config whose phases ALL override the harness declares a run-wide `harness`
+// that never starts a session. Validate does not refuse that shape, and both
+// spawn sites in the driver are phase-driven, so a budget check reasoning from
+// the DECLARED harness makes three separate false statements about it.
+//
+// This is why doctor's budget check asks SpawnedHarnesses and not PhaseHarnesses:
+// the latter seeds the declared harness unconditionally, which is right for
+// "is every configured harness usable" and wrong for "what will this run do".
+func TestBudget_ADeclaredHarnessNoPhaseRunsIsNotTreatedAsSpawned(t *testing.T) {
+	// Every phase on claude; the run-wide harness is one that never spawns.
+	unspawned := func(t *testing.T, runHarness string) *config.Config {
+		t.Helper()
+		t.Setenv("XDG_STATE_HOME", t.TempDir())
+		cfg := &config.Config{
+			Harness: runHarness,
+			WorkDir: t.TempDir(),
+			Phases: []config.Phase{
+				{Name: "implement", Harness: "claude"},
+				{Name: "review", Harness: "claude"},
+			},
+			Harnesses: map[string]config.HarnessConfig{"claude": {ConfigDir: t.TempDir()}},
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("fixture does not validate: %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("a live cost ceiling is not called INERT by a cost-blind harness that never runs", func(t *testing.T) {
+		cfg := unspawned(t, "codex")
+		cfg.Budget = config.Budget{MaxCostUSD: 5}
+
+		c := checkBudget(cfg)
+		if strings.Contains(c.detail, "INERT") || strings.Contains(c.detail, "NO effective ceiling") {
+			t.Errorf("every session runs on claude, which reports cost, so max_cost_usd fires:\n%s -> %s", c.detail, c.remedy)
+		}
+		if strings.Contains(c.remedy, "codex") {
+			t.Errorf("the remedy points at a harness no session runs on: %s", c.remedy)
+		}
+	})
+
+	t.Run("an unreachable per_harness block for it is still INERT", func(t *testing.T) {
+		cfg := unspawned(t, "codex")
+		cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+			"codex": {MaxTokens: 100_000},
+		}}
+
+		c := checkBudget(cfg)
+		if !strings.Contains(c.detail, "INERT") {
+			t.Errorf("no phase runs codex, so its block can never fire and must be named inert:\n%s", c.detail)
+		}
+		// And it must not count as the run's live ceiling, which is the inverse
+		// error: the run would then look bounded while having no ceiling at all.
+		if !strings.Contains(c.detail, "effective ceiling") {
+			t.Errorf("the only ceiling is unreachable, so the run has none — doctor did not say so:\n%s -> %s", c.detail, c.remedy)
+		}
+	})
+
+	t.Run("an inert wall-clock dial is not excused by a harness that never runs", func(t *testing.T) {
+		// opencode honours a session wall clock and claude does not. Declaring
+		// opencode and running every phase on claude leaves the dial dead on every
+		// session the run actually spawns.
+		cfg := unspawned(t, "opencode")
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+		cfg.Budget = config.Budget{MaxTokens: 50_000_000}
+
+		found := false
+		for _, line := range checkBudget(cfg).info {
+			if strings.Contains(line, "max_session_wall_clock") && strings.Contains(line, "INERT") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no phase runs opencode, so nothing enforces the dial and it must be reported inert: %q",
+				checkBudget(cfg).info)
+		}
+	})
+}

@@ -1054,6 +1054,46 @@ func (c *Config) PhaseHarnesses() []string {
 	return out
 }
 
+// SpawnedHarnesses lists every harness this config will actually START A SESSION
+// on: the run-wide one for an unphased run, and otherwise exactly the harnesses
+// its phases resolve to. Deduplicated, in sequence order.
+//
+// It differs from PhaseHarnesses in one shape, and the difference is the whole
+// reason it exists: when EVERY phase names its own harness, the run-wide
+// `harness` field is DECLARED but never spawned - `Validate` does not refuse
+// that, and the only two spawn sites in the driver (the phase's Invoke and its
+// supervised-wait Probe) are both phase-driven. PhaseHarnesses seeds c.Harness
+// unconditionally, which is right for the questions IT answers - is every
+// declared harness registered and configured, is its binary on the PATH - since
+// a declared harness must be usable whether or not today's phases reach it.
+//
+// It is wrong for any question of the form "what is true of the sessions this run
+// will actually run", which is every inert-dial judgement in `doctor`'s budget
+// check. Asked of PhaseHarnesses, those get three separate false statements out
+// of a config whose phases all override: a live cost ceiling called INERT because
+// a never-spawned codex is cost-blind; an unreachable per_harness block for that
+// codex counted as a live ceiling; and an inert `max_session_wall_clock` passed
+// over in silence because a never-spawned opencode would have honoured it.
+//
+// So: ask PhaseHarnesses what is CONFIGURED, and SpawnedHarnesses what will RUN.
+func (c *Config) SpawnedHarnesses() []string {
+	// No phases means the synthesized single phase of EffectivePhases, which runs
+	// on the run-wide harness - so there the two are the same answer.
+	if len(c.Phases) == 0 {
+		return []string{c.Harness}
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, ph := range c.Phases {
+		h := c.HarnessFor(ph)
+		if !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 // Label names a phase for logs and log filenames: its name, or its 1-based
 // position when it has none.
 func (p Phase) Label(i int) string {

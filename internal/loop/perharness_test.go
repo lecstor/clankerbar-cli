@@ -297,8 +297,9 @@ func TestSupervisedWait_UnreadableProbeFollowsThePerHarnessBreaker(t *testing.T)
 			// The adapter and phase are the ones the WAITING phase runs on - which
 			// is what supervisedWait now charges and asks its ceiling of, rather
 			// than the run's d.h (CLA-366). Here they are the same, so the case
-			// this table describes is unchanged; PerPhaseHarness_SupervisedWait
-			// below is where they differ.
+			// this table describes is unchanged; the two
+			// TestPerPhaseHarness_SupervisedWait* tests in crossharness_test.go are
+			// where they differ.
 			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, h, cfg.EffectivePhases()[0], d.targets[0], spend{start: time.Now()})
 
 			if stop != tc.wantStop {

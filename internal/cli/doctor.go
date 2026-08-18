@@ -1259,10 +1259,12 @@ var toolchainMarkers = []struct{ marker, tool string }{
 // Every finding here is a WARN, never a FAIL: doctor reads the settings files it
 // knows about, and a grant can also arrive by a rule form it does not parse or a
 // flag on the harness invocation. A false FAIL would block a run that works.
-// runsHarness reports whether the named harness runs any phase of this config -
-// the run's own or one a phase selected.
+// runsHarness reports whether the named harness will actually START A SESSION in
+// this config. SpawnedHarnesses, not PhaseHarnesses: a run-wide `harness` that
+// every phase overrides is declared and never spawned, and a check reasoning
+// about what the run DOES must not count it.
 func runsHarness(cfg *config.Config, name string) bool {
-	for _, h := range cfg.PhaseHarnesses() {
+	for _, h := range cfg.SpawnedHarnesses() {
 		if h == name {
 			return true
 		}
@@ -1271,11 +1273,15 @@ func runsHarness(cfg *config.Config, name string) bool {
 }
 
 // costBlindHarnesses names every harness this run spawns that cannot report what
-// a session cost, in the order PhaseHarnesses lists them. Empty means a cost
+// a session cost, in the order SpawnedHarnesses lists them. Empty means a cost
 // ceiling can see the whole run.
+//
+// SPAWNED, not declared: a never-spawned cost-blind harness would make the run's
+// live `max_cost_usd` report as INERT and send the operator to fix a harness no
+// session ever runs on.
 func costBlindHarnesses(cfg *config.Config) []string {
 	var out []string
-	for _, h := range cfg.PhaseHarnesses() {
+	for _, h := range cfg.SpawnedHarnesses() {
 		if !harnessReportsCost(h) {
 			out = append(out, h)
 		}
@@ -1743,7 +1749,7 @@ func checkBudget(cfg *config.Config) check {
 	// harness since CLA-366, so a block for the harness the implement phase runs on
 	// is perfectly reachable while not being cfg.Harness, and calling it inert would
 	// be a false statement about a ceiling that will fire.
-	spawned := cfg.PhaseHarnesses()
+	spawned := cfg.SpawnedHarnesses()
 	// The spawned harness whose block sets a cost dial and NOTHING else - under a
 	// harness that never reports cost that block is a ceiling in name only, and the
 	// remedy has to name the unit rather than the placement. "" when no spawned
@@ -1949,7 +1955,19 @@ func checkBudget(cfg *config.Config) check {
 		// sessions in exactly the same way, so it needs the same warning and the
 		// same number (CLA-367).
 		if b.MaxTokens > 0 || spawnedBlockTokens {
-			c.detail += " — the token ceiling is enforced BETWEEN sessions, so one session can overrun it (" + sessionTokenBounds(cfg) + ")"
+			c.detail += " — the token ceiling is enforced BETWEEN sessions, so one session can overrun it"
+			// sessionTokenBounds is EMPTY when no spawned harness has a mid-session
+			// ceiling, which is every opencode-only and codex-only run. Appending it
+			// unguarded printed a bare "()" there - a broken sentence in the one
+			// surface whose whole job is not making sloppy or false statements. The
+			// two cases need different sentences, not one sentence with a hole:
+			// with a bound, name it; without, say plainly that nothing bounds the
+			// overrun, which is the sharper finding and was previously unsaid.
+			if bounds := sessionTokenBounds(cfg); bounds != "" {
+				c.detail += " (" + bounds + ")"
+			} else {
+				c.detail += " by any amount — " + strings.Join(spawned, "/") + " enforces no mid-session token ceiling"
+			}
 		}
 	}
 
@@ -2005,6 +2023,17 @@ func harnessReportsCost(name string) bool {
 // directions - a false INERT on a mixed run whose opencode phase honours the
 // dial, and silence on a claude phase where it truly does nothing.
 //
+// PARTIAL inertness of the run-wide dial is deliberately NOT reported, and this
+// is the one place the check chooses silence over a true statement. On the
+// implement-on-opencode / review-on-claude sequence the dial fires on the opencode
+// phase and is dead on the claude one - true, and not worth saying, because the
+// claude phase is bounded by its turn cap, so it is not the CLA-344 "bounded by
+// nothing" case that the sibling noSessionBackstop note exists for. Saying it
+// anyway would put a WARN on the shipped mixed-harness config that has no defect
+// and no action behind it, and a warning an operator learns to ignore costs more
+// than the sentence buys. If a harness ever appears with no turn cap AND no
+// session cap, noSessionBackstop is what catches it - per phase, by name.
+//
 // An UNKNOWN harness says nothing, for the reason harnessReportsCost gives:
 // config.Validate has already refused the name, and a speculative inert-dial
 // warning would bury the real finding.
@@ -2032,7 +2061,7 @@ func inertSessionWallClock(cfg *config.Config) (dial, on string) {
 	// first such harness is named, since with none enforcing it they are all
 	// equally the answer and naming one keeps the note short.
 	named := ""
-	for _, h := range cfg.PhaseHarnesses() {
+	for _, h := range cfg.SpawnedHarnesses() {
 		caps, ok := harness.CapabilitiesOf(h)
 		if !ok {
 			return "", ""
@@ -2098,7 +2127,7 @@ func noSessionBackstop(cfg *config.Config) string {
 // than shown as zero, which is the same choice the check makes everywhere else.
 func sessionTokenBounds(cfg *config.Config) string {
 	var parts, only []string
-	for _, h := range cfg.PhaseHarnesses() {
+	for _, h := range cfg.SpawnedHarnesses() {
 		caps, ok := harness.CapabilitiesOf(h)
 		if !ok || !caps.HasSessionTokenCeiling {
 			continue
@@ -2115,7 +2144,7 @@ func sessionTokenBounds(cfg *config.Config) string {
 	// fact the opencode phase beside it has no mid-session ceiling at all. So the
 	// common unphased config's line is unchanged byte for byte, and a mixed run
 	// always names whose ceiling it is quoting.
-	if len(cfg.PhaseHarnesses()) == 1 {
+	if len(cfg.SpawnedHarnesses()) == 1 {
 		return fmt.Sprintf("max_session_tokens=%d is the mid-session bound", cfg.Budget.SessionTokenCeilingFor(only[0]))
 	}
 	return "max_session_tokens is the mid-session bound, per harness: " + strings.Join(parts, ", ")

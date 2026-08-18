@@ -1,8 +1,11 @@
 package loop
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
@@ -171,6 +174,90 @@ func TestPerPhaseHarness_UntrustedBreakerAsksThePhasesOwnHarness(t *testing.T) {
 			}
 			if !strings.Contains(logs.String(), "UNTRUSTED") {
 				t.Fatalf("the drain did not take the untrusted path at all:\n%s", logs.String())
+			}
+		})
+	}
+}
+
+// The supervised-wait loop is the fifth and sixth reconciled call site, and the
+// two the first mutation check missed: reverting them alone left the package
+// green, because the four tests above are reddened by the OTHER mutations and
+// none of them ever enters this loop. A call site whose only evidence is that
+// some other test fails has no evidence at all.
+//
+// Both are about a phase that hit a usage limit and is being waited out. The
+// probes it spawns are real paid sessions on THAT phase's harness, so their spend
+// is that harness's, and whether a ceiling exists to be honoured is that
+// harness's question too.
+func TestPerPhaseHarness_SupervisedWaitChargesTheWaitingPhasesHarness(t *testing.T) {
+	impl := &fakeAdapter{
+		// One probe that reports the limit still live, then the wait is cut short
+		// by the context. What matters is that the probe was charged at all.
+		probeResults: []harness.Limit{{Limited: true}},
+		probeTokens:  7_000,
+		probeCost:    0.07,
+	}
+	review := &fakeAdapter{}
+	d := mixedBudgetDriver(t, impl, review, config.Budget{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	implPhase := d.cfg.EffectivePhases()[0]
+	d.supervisedWait(ctx, harness.Limit{Limited: true}, namedFake{impl, "opencode"}, implPhase, d.targets[0], spend{start: time.Now()})
+
+	if got := d.spentBy["opencode"].tokens; got == 0 {
+		t.Fatalf("the opencode phase's probes spent nothing on opencode's ledger (%v) — a probe is a paid session on the harness that RAN it, and charging d.h bills it to claude",
+			d.spentBy)
+	}
+	if _, billed := d.spentBy["claude"]; billed {
+		t.Errorf("claude was billed for a wait on the opencode phase: %v", d.spentBy)
+	}
+}
+
+// The sibling: an unreadable PROBE stops the run only when a ceiling it can no
+// longer honour is actually set — and that is a per-harness question about the
+// harness being probed, not the run's.
+func TestPerPhaseHarness_SupervisedWaitUntrustedProbeAsksThePhasesOwnHarness(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		perHarn  map[string]config.HarnessBudget
+		wantStop bool
+		wantLog  string
+	}{
+		{
+			name:     "the probed harness has a ceiling",
+			perHarn:  map[string]config.HarnessBudget{"opencode": {MaxTokens: 5_000_000}},
+			wantStop: true,
+			wantLog:  "stopping rather than polling on",
+		},
+		{
+			// The ceiling belongs to claude, which is not what is being probed.
+			// Nothing promised about these probes has been broken, so the wait
+			// continues — and a driver asking d.h would abandon the run instead.
+			name:     "only the OTHER harness has a ceiling",
+			perHarn:  map[string]config.HarnessBudget{"claude": {MaxTokens: 5_000_000}},
+			wantStop: false,
+			wantLog:  "will retry next interval",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			impl := &fakeAdapter{probeErrs: []error{
+				fmt.Errorf("%w: the harness's stdout could not be read to the end", harness.ErrUntrusted),
+			}}
+			d := mixedBudgetDriver(t, impl, &fakeAdapter{}, config.Budget{PerHarness: tc.perHarn})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			implPhase := d.cfg.EffectivePhases()[0]
+			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, namedFake{impl, "opencode"}, implPhase, d.targets[0], spend{start: time.Now()})
+
+			if stop != tc.wantStop {
+				t.Errorf("stop = %t, want %t — the breaker asked the wrong harness whether a ceiling is set\n%s",
+					stop, tc.wantStop, logs.String())
+			}
+			if !strings.Contains(logs.String(), tc.wantLog) {
+				t.Errorf("logs do not contain %q:\n%s", tc.wantLog, logs.String())
 			}
 		})
 	}
