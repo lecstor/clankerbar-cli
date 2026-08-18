@@ -205,6 +205,17 @@ type Capabilities struct {
 	// `doctor` has to tell an operator BEFORE the run whether the ceiling they
 	// configured exists (CLA-288).
 	ReportsCost bool
+
+	// HasSessionTokenCeiling reports whether this adapter enforces
+	// Invocation.MaxSessionTokens mid-session - i.e. whether TokenCeilingHit can
+	// ever fire. False means CLA-343's per-session runaway ceiling does not exist
+	// on this harness, so `doctor` must not print a number for it: reporting one
+	// would announce a guard that cannot fire, which is the same reassuring
+	// falsehood ReportsCost is on this struct to prevent. Claude alone has one
+	// today, which doctor used to encode as a literal `== "claude"` - a comparison
+	// that silently became wrong the moment a phase could name its own harness
+	// (CLA-366), because the question is about the harness running the PHASE.
+	HasSessionTokenCeiling bool
 }
 
 // CapabilitiesOf resolves a registered harness's capabilities by name, for

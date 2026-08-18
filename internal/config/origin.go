@@ -156,8 +156,19 @@ func (c *Config) LocalMCPServers() []LocalMCPServer {
 	seen := make(map[string]bool)
 	var out []LocalMCPServer
 	paths := []string{c.MCPConfigPath}
+	// Every file a session could actually be pointed at, including the
+	// per-harness ones (CLA-366). A mixed-harness run's other sessions read a
+	// DIFFERENT file, and this check's subject — a server that starts a local
+	// process at MCP init, before any tool-permission rule applies — is as true
+	// there. Sorted so the disclosure lists them in the same order every run.
+	for _, name := range sortedKeys(c.Harnesses) {
+		paths = append(paths, c.Harnesses[name].MCPConfigPath)
+	}
 	for _, p := range c.Projects {
 		paths = append(paths, p.MCPConfigPath)
+		for _, name := range sortedKeys(p.MCPConfigPaths) {
+			paths = append(paths, p.MCPConfigPaths[name])
+		}
 	}
 	for _, path := range paths {
 		if path == "" || seen[path] {
