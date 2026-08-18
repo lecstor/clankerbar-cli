@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"log"
 
 	"strings"
 	"testing"
@@ -712,5 +713,53 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	}
 	if got := d.invocationFor(d.targets[0], 1, phases[1], nil).MaxSessionWallClock; got != time.Hour {
 		t.Errorf("phase 2 invocation carries %s, want the run-wide 1h it inherits", got)
+	}
+}
+
+// The operator-facing line has to be TRUE, and today it is true only in the
+// direction nobody can reach: the salvage runs on an observed claim, and the
+// only adapter that enforces the cap does not observe claims. Reporting a
+// salvage that never ran would be the reassuring falsehood CLA-290 removed from
+// doctor, in the one place a run leaves work behind.
+func TestDrainPhases_AWallClockCapDoesNotClaimASalvageThatCouldNotRun(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		claim    harness.Claim
+		want     string
+		unwanted string
+	}{
+		{
+			name:     "no claim observed: say the work is still in the worktree",
+			claim:    harness.Claim{},
+			want:     "NOTHING was salvaged",
+			unwanted: "was salvaged above",
+		},
+		{
+			name:     "claim held: the salvage really did run",
+			claim:    harness.Claim{TaskID: "t-1", RunID: "r-1"},
+			want:     "was salvaged above",
+			unwanted: "NOTHING was salvaged",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged strings.Builder
+			prev := log.Writer()
+			log.SetOutput(&logged)
+			t.Cleanup(func() { log.SetOutput(prev) })
+
+			h := &fakeAdapter{steps: []invokeStep{{res: held(wallClockResult(), tc.claim)}}}
+			d, _ := phaseDriver(t, h, nil)
+			d.cfg.Prompt = "Work the next backlog item."
+
+			if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+				t.Fatalf("drainPhases: %v", err)
+			}
+			if !strings.Contains(logged.String(), tc.want) {
+				t.Errorf("the cap line does not say %q: %s", tc.want, logged.String())
+			}
+			if strings.Contains(logged.String(), tc.unwanted) {
+				t.Errorf("the cap line says %q, which is not true here: %s", tc.unwanted, logged.String())
+			}
+		})
 	}
 }

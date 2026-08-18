@@ -663,16 +663,24 @@ so for them the dial is inert until an adapter grows the kill.
 
 `max_session_wall_clock` is the same backstop measured in TIME, for a harness
 whose CLI takes no turn flag: when a session outlives it the adapter ends the
-process and the driver treats that exactly like a hit turn cap — the phase ends,
-the salvage commits and pushes whatever the session left, and the run carries on
-(CLA-368). A phase's own `max_wall_clock` wins over it, and **0 is off, which is
-the default**: unlike the turn cap it ships no built-in number, because a
-duration that catches a runaway on one model/provider is a routine session on
-another. **opencode only** today — it is the harness with no turn flag, so this
-is its phase backstop; under claude or codex the dial is inert and `doctor` says
-so. It is measured per SESSION, so it is not `budget.max_wall_clock`, which is
-the run-wide ceiling and counts the hours a run spends *waiting out* a usage
-limit.
+process and the driver treats that exactly like a hit turn cap — the session
+ends, nothing is retried, nothing fails, and the run carries on (CLA-368). A
+phase's own `max_wall_clock` wins over it, and **0 is off, which is the
+default**: unlike the turn cap it ships no built-in number, because a duration
+that catches a runaway on one model/provider is a routine session on another. It
+is measured per SESSION, so it is not `budget.max_wall_clock`, which is the
+run-wide ceiling and counts the hours a run spends *waiting out* a usage limit.
+
+**opencode only** today — it is the harness with no turn flag, so this is its
+backstop; under claude or codex the dial is inert and `doctor` says so. Two
+consequences of that pairing are worth knowing before you set it. The salvage
+that commits and pushes what a cut-off session left runs only for an adapter
+that observes the session's task claim, which opencode does not — so a capped
+session's uncommitted work stays **in the worktree**, and the driver's log says
+exactly that rather than claiming a salvage that never ran. And because
+`phases` is refused for opencode for that same reason, the per-phase
+`max_wall_clock` is reachable only in a single-phase config today; the run-wide
+dial is the one an unphased opencode run uses.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default

@@ -1578,14 +1578,32 @@ func checkBudget(cfg *config.Config) check {
 	// defect max_cost_usd-under-codex is (CLA-288): a dial the operator set as
 	// their backstop, doing nothing, discoverable only from a session that ran
 	// all night. Named here, before the run, rather than left to be inferred.
-	var guardRemedy string
 	if dial := inertSessionWallClock(cfg); dial != "" {
+		// The advice rides in the NOTE, not in c.remedy: the remedy line is one
+		// per check and the guard block's generic "set <dials>" usually claims it,
+		// so advice parked there is advice an operator routinely never sees. The
+		// tail clause is gated on the harness actually HAVING a turn cap: under
+		// codex MaxTurns never reaches the CLI either, so telling a codex operator
+		// the turn cap is their live backstop is advice that WOULD BE FOLLOWED
+		// straight back into the inert-dial hole this note exists to warn about
+		// (the reasoning harnessReportsCost uses below).
+		backstop := "under " + cfg.Harness + " the turn cap is the backstop that does fire"
+		if !harnessHonoursMaxTurns(cfg.Harness) {
+			backstop = "under " + cfg.Harness + " there is NO per-session backstop at all - bound the run with max_iterations / max_tokens instead"
+		}
 		guardNotes = append(guardNotes, fmt.Sprintf(
-			"%s: set, but harness %q does not enforce a per-session wall-clock cap, so it is INERT here",
-			dial, cfg.Harness))
-		// Not added to guardDials: those become "set <dial>", and this dial is
-		// already set — the advice is to stop relying on it, not to set it.
-		guardRemedy = "drop " + dial + " or run the harness that enforces it (opencode); under " + cfg.Harness + " the turn cap is the backstop that does fire"
+			"%s: set, but harness %q does not enforce a per-session wall-clock cap, so it is INERT here - drop it or run the harness that enforces it (opencode); %s",
+			dial, cfg.Harness, backstop))
+	}
+	// The complement, and the sharper case: the harness CAN enforce a session cap,
+	// takes no turn flag, has no mid-stream token ceiling — and the dial is unset.
+	// That run's sessions are bounded by nothing at all, which is the silently
+	// absent guard CLA-344 added this whole block for.
+	if noSessionBackstop(cfg) {
+		guardNotes = append(guardNotes, fmt.Sprintf(
+			"max_session_wall_clock: unset, and harness %q has no turn cap and no mid-session token ceiling - so nothing bounds a single session there; a run that works past its brief is stopped only by a run-level ceiling",
+			cfg.Harness))
+		guardDials = append(guardDials, "max_session_wall_clock")
 	}
 	if cfg.MaxRetries == 0 {
 		guardNotes = append(guardNotes,
@@ -1666,11 +1684,6 @@ func checkBudget(cfg *config.Config) check {
 			// max_turns note) is not told to set a dial that does nothing there.
 			c.remedy = "set " + strings.Join(guardDials, ", ") + " (see the guard lines), or accept the defaults"
 		}
-		// The inert-dial advice is "unset it", never "set it", so it cannot ride on
-		// the line above; it takes the remedy only when nothing better claimed it.
-		if c.remedy == "" {
-			c.remedy = guardRemedy
-		}
 		c.info = append(c.info, guardNotes...)
 	}
 	return c
@@ -1712,6 +1725,34 @@ func inertSessionWallClock(cfg *config.Config) string {
 		return "max_session_wall_clock"
 	}
 	return ""
+}
+
+// harnessHonoursMaxTurns asks the registry whether this harness takes a turn
+// flag at all. An UNKNOWN harness is treated as honouring one — the withheld
+// advice, for the reason harnessReportsCost gives.
+func harnessHonoursMaxTurns(name string) bool {
+	caps, ok := harness.CapabilitiesOf(name)
+	if !ok {
+		return true
+	}
+	return caps.HonoursMaxTurns
+}
+
+// noSessionBackstop reports a run whose sessions are bounded by NOTHING: a
+// harness that takes no turn flag and kills on no token ceiling, with the one
+// dial that could bound it left unset. Gated on the harness being able to
+// enforce the dial, so the advice ("set it") is advice that would work.
+func noSessionBackstop(cfg *config.Config) bool {
+	caps, ok := harness.CapabilitiesOf(cfg.Harness)
+	if !ok || caps.HonoursMaxTurns || !caps.HonoursSessionWallClock {
+		return false
+	}
+	for _, ph := range cfg.EffectivePhases() {
+		if ph.MaxWallClock > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any

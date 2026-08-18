@@ -39,7 +39,7 @@ exec sleep 30
 	start := time.Now()
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:              "work",
-		MaxSessionWallClock: 2 * time.Second,
+		MaxSessionWallClock: time.Second,
 		Console:             io.Discard,
 	})
 	if err != nil {
@@ -208,5 +208,41 @@ func TestOnlyOpencodeHonoursTheSessionWallClock(t *testing.T) {
 				t.Errorf("HonoursMaxTurns = %v, want %v", caps.HonoursMaxTurns, tc.wantTurns)
 			}
 		})
+	}
+}
+
+// The kill has to end the WAIT, not merely the child. cmd.Stdout is an
+// io.MultiWriter, so os/exec allocates its own pipe and cmd.Run blocks until
+// every writer of it closes — and CommandContext signals the direct child only.
+// A runaway session is exactly the one with a bash-tool grandchild (a build, a
+// test run) holding the inherited fd, so without cmd.WaitDelay the cap would
+// hang precisely where it is needed. The stub reproduces that shape: a
+// backgrounded child that outlives its parent and keeps stdout open.
+//
+// It does NOT assert the orphan dies — it does not, today; killing the process
+// GROUP is platform-specific and filed separately. What is pinned here is that
+// the adapter returns rather than waiting on it.
+func TestOpencodeWallClockKillDoesNotHangOnAGrandchildHoldingTheStream(t *testing.T) {
+	opencodeStub(t, `#!/bin/sh
+echo '{"type":"text","part":{"type":"text","text":"working"}}'
+sleep 30 &
+exec sleep 30
+`)
+
+	start := time.Now()
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt:              "work",
+		MaxSessionWallClock: 500 * time.Millisecond,
+		Console:             io.Discard,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if elapsed > 20*time.Second {
+		t.Fatalf("Invoke blocked for %s: it waited on the grandchild's copy of the stream, so a capped runaway is not actually capped", elapsed)
+	}
+	if !(opencode{}).WallClockCapped(res) {
+		t.Error("the session was not reported as wall-clock capped")
 	}
 }

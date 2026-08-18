@@ -901,17 +901,30 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		}
 
 		// A session the ADAPTER ended for outliving its wall-clock cap is the same
-		// shape again: the phase ends, the salvage above has already dealt with
-		// whatever the tree holds, and neither a retry nor a failure is right — a
-		// retry would spend the same hours over again and reach the same deadline,
+		// shape again: the phase ends, and neither a retry nor a failure is right —
+		// a retry would spend the same hours over again and reach the same deadline,
 		// and failing would stop the run over a cap doing its job (CLA-368).
 		//
 		// Spend IS reported here, unlike the token-ceiling branch: opencode's usage
 		// arrives per step_finish and is summed all the way to the kill, so the
 		// figures are the honest cost of the session up to the moment it ended.
+		//
+		// What the line must NOT say is that the salvage handled the tree. The
+		// salvage returns immediately without a claim (see salvageStrandedWork),
+		// and the only adapter that enforces this cap today is the one that does
+		// not observe claims — so on every kill that can currently happen, nothing
+		// was committed and the work is still sitting in the worktree. Saying
+		// otherwise would be the reassuring falsehood doctor's own checks exist to
+		// remove (CLA-290). The claim-held wording is the one a claim-observing
+		// adapter will earn later; it is not what opencode gets today.
 		if wallclock {
-			log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
-				drainNum, tokens, cost)
+			if res.Claim.Held() {
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
+					drainNum, tokens, cost)
+			} else {
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase. NOTHING was salvaged: this harness does not observe the session's task claim, so whatever the session left uncommitted is still in the worktree",
+					drainNum, tokens, cost)
+			}
 			return tokens, cost, false, end, nil
 		}
 

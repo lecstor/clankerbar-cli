@@ -65,8 +65,16 @@ type Adapter interface {
 	//
 	// It is the turn cap's stand-in for a harness whose CLI takes no turn flag,
 	// so the driver treats it exactly as it treats the other two: the phase
-	// ends, the salvage handles whatever the tree holds, and nothing is retried
-	// or failed — the kill was the point. Like the token ceiling, the marker is
+	// ends, and nothing is retried or failed — the kill was the point.
+	//
+	// What it does NOT buy today is the salvage. That runs only on a session
+	// whose claim the adapter observed (Capabilities.TracksClaims), and the one
+	// adapter enforcing this cap does not observe claims — so a capped opencode
+	// session leaves its uncommitted work in the worktree, and the driver's log
+	// line says exactly that rather than claiming a salvage that never ran. The
+	// two capabilities are independent on purpose: the day an adapter has both,
+	// this same path hands it the checkpoint too. Like the token ceiling, the
+	// marker is
 	// the adapter's own, never text the CLI or an agent could emit, so a task
 	// body cannot forge one. An adapter with no wall-clock cap returns false for
 	// everything.

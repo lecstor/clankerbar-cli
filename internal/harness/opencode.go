@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 func init() { Register(opencode{}) }
@@ -88,6 +89,21 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = o.env(in)
+	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
+	// io.MultiWriter values, so os/exec makes its own pipes and cmd.Run waits for
+	// every WRITER of them to close — and CommandContext kills the direct child
+	// only. A runaway session is exactly the case with a bash-tool grandchild (a
+	// build, a test run) or an MCP server holding the inherited fd, which survives
+	// the SIGKILL and keeps the pipe open: without a delay, Invoke blocks past its
+	// own deadline in the one scenario the cap exists for. WaitDelay force-closes
+	// the pipes and lets Wait return.
+	//
+	// It does NOT kill the orphan itself — that needs a process group, which is
+	// platform-specific and is filed rather than smuggled in here. Set only with
+	// a cap in play, so an ordinary session's I/O is never cut short by it.
+	if sctx != ctx {
+		cmd.WaitDelay = 5 * time.Second
+	}
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text
 	// scans, and tee live to the console when one is set (the JSON event stream —
@@ -113,11 +129,18 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// cut off from a run-wide Ctrl-C / SIGTERM / supervised-wait cancellation,
 	// which cancels the parent too and is NOT this phase reaching its backstop.
 	// Marked after p.finish, which rewrites Raw wholesale when it saw usage.
-	timedOut := sctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+	//
+	// runErr is the third conjunct because the deadline is read AFTER Run
+	// returned: a session that exited cleanly a hair before it, with the deadline
+	// passing in the window while the output was parsed, would otherwise be
+	// marked as capped. Nothing would misbehave today — the driver takes its
+	// exit-0 branch first — but the Result would be lying about how the session
+	// ended, and the next reader of this marker inherits the lie.
+	timedOut := runErr != nil && sctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 	if timedOut {
 		res.markWallClockCapped()
 		if console != nil {
-			fmt.Fprintf(console, "\n!! session outlived its wall-clock cap (%s) — ending it here; whatever it has written is the salvage's to commit\n", in.MaxSessionWallClock)
+			fmt.Fprintf(console, "\n!! session outlived its wall-clock cap (%s) — ending it here; whatever it wrote is still in the worktree, uncommitted\n", in.MaxSessionWallClock)
 		}
 	}
 

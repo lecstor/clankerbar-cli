@@ -2297,7 +2297,7 @@ func TestBudgetGuards_WarnWhenTheSessionWallClockCapIsInertForTheHarness(t *test
 			}
 		}
 		if !found {
-			t.Errorf("the note names the run-wide dial when the phase is the one set: %q", c.info)
+			t.Errorf("the phase's own dial is set, but the note does not name it: %q", c.info)
 		}
 	})
 
@@ -2322,4 +2322,109 @@ func TestBudgetGuards_WarnWhenTheSessionWallClockCapIsInertForTheHarness(t *test
 			}
 		}
 	})
+
+	// The remedy is advice that WILL be followed, so it must not send a codex
+	// operator to a turn cap codex does not have - that is the CLA-288 shape this
+	// note exists to warn about, handed back as the fix for itself.
+	t.Run("codex: the remedy does not promise a turn cap either", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "codex"
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		note := inertNote(t, c)
+		if strings.Contains(note, "the turn cap is the backstop that does fire") {
+			t.Errorf("the advice points a codex operator at a turn cap that never reaches its CLI: %q", note)
+		}
+		if !strings.Contains(note, "NO per-session backstop") {
+			t.Errorf("the advice does not say codex has no per-session backstop: %q", note)
+		}
+	})
+
+	t.Run("claude: the advice may name the turn cap", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		if note := inertNote(t, checkBudget(cfg)); !strings.Contains(note, "turn cap") {
+			t.Errorf("under claude the turn cap IS the live backstop; the advice does not say so: %q", note)
+		}
+	})
+}
+
+// The complement of the inert-dial note, and the sharper case: opencode takes no
+// turn flag and kills on no token ceiling, so with the wall-clock dial unset its
+// sessions are bounded by nothing at all - the silently absent guard the
+// surrounding block exists to name (CLA-344/CLA-368).
+func TestBudgetGuards_WarnWhenAnOpencodeRunHasNoSessionBackstopAtAll(t *testing.T) {
+	t.Run("unset: warns and names the dial to set", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "opencode"
+
+		c := checkBudget(cfg)
+		if c.status != warn {
+			t.Errorf("a run with no per-session backstop: got %v, want WARN", c.status)
+		}
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") && strings.Contains(line, "nothing bounds a single session") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no info line says the run has no per-session bound: %q", c.info)
+		}
+		if !strings.Contains(c.remedy, "max_session_wall_clock") {
+			t.Errorf("the remedy does not name the dial to set: %q", c.remedy)
+		}
+	})
+
+	t.Run("codex: no dial to recommend, so no missing-backstop line", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "codex"
+
+		// codex cannot enforce the cap either, so "set max_session_wall_clock"
+		// would be advice that does nothing - the very thing this note warns about.
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") {
+				t.Errorf("codex was told to set a dial it cannot enforce: %q", line)
+			}
+		}
+	})
+
+	t.Run("set: nothing to warn about", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "opencode"
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") {
+				t.Errorf("a configured cap was reported missing: %q", line)
+			}
+		}
+	})
+
+	t.Run("claude: its turn cap is the backstop, so nothing is said", func(t *testing.T) {
+		c := checkBudget(validCfg(t))
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") {
+				t.Errorf("claude was told it has no per-session backstop: %q", line)
+			}
+		}
+	})
+}
+
+// inertNote returns the check's inert-wall-clock info line, failing if there is
+// none: the advice lives in the note rather than the remedy, because the guard
+// block's generic "set <dials>" line routinely claims the remedy first.
+func inertNote(t *testing.T, c check) string {
+	t.Helper()
+	for _, line := range c.info {
+		if strings.Contains(line, "INERT") {
+			return line
+		}
+	}
+	t.Fatalf("no inert-dial info line in %q", c.info)
+	return ""
 }
