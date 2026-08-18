@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -22,10 +23,12 @@ func init() { Register(opencode{}) }
 //     the model, providers and auth all come from opencode's config dir, so
 //     ConfigDir → OPENCODE_CONFIG_DIR is the parity of claude's CLAUDE_CONFIG_DIR.
 //   - Permissions are set via the OPENCODE_PERMISSION env var (a JSON allow/ask/deny
-//     policy), not a run flag. We fail closed: a drain allows edit+bash within the
-//     working set but denies the exfil tools (webfetch/websearch/external_directory);
-//     a probe / read-only run denies edits and shell too. (We never pass --auto,
-//     which blanket-approves everything not explicitly denied.)
+//     policy), not a run flag. We fail closed: a drain allows read/edit/bash within
+//     the run's workdir subtree (path-scoped PermissionConfig — the session's
+//     worktrees live under it) but denies the exfil tools (webfetch/websearch) and
+//     everything outside the subtree; a probe / read-only run denies edits and
+//     shell too. (We never pass --auto, which blanket-approves everything not
+//     explicitly denied.)
 //   - Billing depends on the configured backend, not opencode: metered pay-per-token
 //     (OpenRouter / Zen) or a monthly-limit subscription (opencode Go). NONE impose a
 //     short rolling-window cap, so there is no supervised-wait/early-reset case here.
@@ -115,26 +118,113 @@ func opencodeArgs(in Invocation) []string {
 	return append(args, "--", prompt)
 }
 
-// opencodePermission is the fail-closed OPENCODE_PERMISSION policy. A real drain
-// allows edits and shell inside the working set (opencode confines writes to the
-// run directory) but denies the network/exfil tools; a read-only run (probe, or
-// the connectivity smoke) additionally denies edits and shell — zero writes, just
-// enough to reach the clankerbar MCP.
-func opencodePermission(readOnly bool) string {
-	perm := map[string]string{
-		"webfetch":           "deny",
-		"websearch":          "deny",
-		"external_directory": "deny",
+// opencodePermission is the fail-closed OPENCODE_PERMISSION policy: a path-scoped
+// PermissionConfig, not a flat tool map. The run's workdir subtree is the working
+// set — `read`/`edit` are allowed there and `external_directory` (opencode's gate
+// for any path-taking tool whose target is outside the project directory) allows
+// the same subtree, so the session's own worktrees, which live under the workdir
+// and are separate git roots, work normally. Everything else fails closed via the
+// `*` catch-all, and the network/exfil tools (webfetch/websearch) are denied in
+// both shapes. A read-only run (probe, or the connectivity smoke) additionally
+// denies edits and shell — zero writes, just enough to reach the clankerbar MCP.
+//
+// `bash` stays TOOL-LEVEL: its permission patterns match parsed COMMANDS ("git
+// status --porcelain"), not paths, so a path rule can never express it. Commands
+// whose file arguments fall outside the project boundary are gated separately via
+// external_directory, which IS scoped above — that is the carve-out that fixes
+// the old heuristic denials ("cp is denied but sed -i works").
+//
+// Three opencode quirks the emitted shape is fitted to (verified against opencode
+// 1.18.16 source: permission/index.ts, session/tools.ts, tool/read.ts,
+// tool/edit.ts, tool/external-directory.ts):
+//
+//   - Rules are evaluated LAST-MATCH-WINS on a flattened ruleset, so the specific
+//     rules must sort AFTER the `*` catch-all or the catch-all overrides them.
+//     Go marshals map keys sorted, and "*" sorts before every letter, so the
+//     order holds by construction; opencode_test.go pins it.
+//   - `*` also matches every MCP tool ask — the MCP adapter asks with the full
+//     tool name — so the catch-all would deny the session the plane itself. MCP
+//     tool names are `<sanitized-server>_<sanitized-tool>` (opencode 1.18.x,
+//     McpCatalog.toolName: "clankerbar_get_backlog_summary", "context7_query-docs",
+//     "chrome-devtools_click"), so the policy allows `*_*`. That rule also matches
+//     underscore-named built-ins (external_directory, list_mcp_resources,
+//     apply_patch, doom_loop, plan_enter/exit). The one that matters is
+//     external_directory: its own entry carries an inner `*` deny, which sorts
+//     after the `*_*` allow in the flattened ruleset, so an out-of-workdir ask
+//     still resolves to deny (the old flat `external_directory: deny`, restored);
+//     only an in-workdir ask reaches the allow. The other collisions are benign:
+//     list_mcp_resources/read_mcp_resource are read-only listings, apply_patch
+//     asks under "edit" (so the probe's edit:deny covers it), and doom_loop /
+//     plan_enter / plan_exit are loop/UI guards with no file side effects.
+//   - read/edit asks carry the path RELATIVE TO THE GIT WORKTREE
+//     (path.relative(worktree, file)); a session whose cwd is not inside a git
+//     repo — the multi-repo-parent case, workdir=~/dev — gets worktree "/", so
+//     its patterns are the absolute path minus the leading slash
+//     ("Users/jason/dev/..."). The read/edit patterns are therefore emitted in
+//     that same root-relative form. external_directory patterns are absolute
+//     globs (path.join(dir, "*")), so that rule uses the absolute form.
+func opencodePermission(readOnly bool, workdir string) string {
+	rootRel, abs := opencodeWorkdirPatterns(workdir)
+	// The exact (non-wildcard) workdir pattern, so reading the workdir root
+	// itself — a directory listing of ~/dev, pattern "Users/jason/dev" — is
+	// allowed along with everything under it.
+	exact := strings.TrimSuffix(rootRel, "/**")
+	perm := map[string]any{
+		// The working set: read/edit scoped to the workdir subtree (root
+		// included), plus the external_directory carve-out for the same
+		// subtree. The carve-out carries an inner `*` deny so an ask for a
+		// path OUTSIDE the subtree still resolves to deny — the old flat
+		// `external_directory: deny`, restored — while an in-subtree ask wins
+		// on the later absolute allow.
+		"read":               map[string]string{rootRel: "allow", exact: "allow"},
+		"edit":               map[string]string{rootRel: "allow", exact: "allow"},
+		"external_directory": map[string]string{"*": "deny", abs: "allow"},
+		// MCP tools must survive the `*` catch-all — see the function doc.
+		"*_*": "allow",
+		// The exfil guards, explicit in both shapes.
+		"webfetch":  "deny",
+		"websearch": "deny",
 	}
 	if readOnly {
 		perm["edit"] = "deny"
 		perm["bash"] = "deny"
 	} else {
-		perm["edit"] = "allow"
 		perm["bash"] = "allow"
 	}
+	// The catch-all: anything not named above — glob/grep/lsp/task/skill, reads
+	// or edits outside the workdir — is denied rather than asked. Sorts first
+	// (see the doc), so every specific rule wins the last-match-wins evaluation.
+	perm["*"] = "deny"
 	b, _ := json.Marshal(perm)
 	return string(b)
+}
+
+// opencodeWorkdirPatterns derives the two pattern forms the policy needs from
+// the run's workdir. rootRel is the pattern for read/edit asks — opencode's
+// path.relative(worktree, file) form, i.e. the absolute path minus its leading
+// separator (and drive letter on Windows) — so "Users/jason/dev/**" matches the
+// patterns a session with worktree "/" asks for files under /Users/jason/dev.
+// abs is the pattern for external_directory asks, which are absolute globs. An
+// empty workdir (the config default: run in the driver's cwd) falls back to the
+// resolved cwd so the policy still scopes the session to where it actually runs.
+func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
+	if workdir == "" {
+		var err error
+		if workdir, err = os.Getwd(); err != nil {
+			// Unresolvable cwd: match NOTHING rather than everything — the
+			// policy's stated posture is fail-closed. Never seen live.
+			return "/**", "\x00/**"
+		}
+	}
+	abs, err := filepath.Abs(workdir)
+	if err != nil {
+		return "/**", "\x00/**"
+	}
+	abs = filepath.Clean(abs)
+	vol := filepath.VolumeName(abs)
+	rel := strings.TrimPrefix(abs, vol)
+	rel = strings.TrimLeft(rel, `/\`)
+	return filepath.ToSlash(rel) + "/**", filepath.ToSlash(abs) + "/**"
 }
 
 func (opencode) env(in Invocation) []string {
@@ -142,7 +232,7 @@ func (opencode) env(in Invocation) []string {
 	// Fail-closed permission policy. Set before in.Env so an explicit caller
 	// OPENCODE_PERMISSION in in.Env still wins (exec takes the last of a dup key),
 	// but the ambient environment never silently loosens an unattended run.
-	env = append(env, "OPENCODE_PERMISSION="+opencodePermission(in.Probe))
+	env = append(env, "OPENCODE_PERMISSION="+opencodePermission(in.Probe, in.WorkDir))
 	// Pin the config dir so a headless session loads the SAME MCP servers,
 	// providers, model and auth as the interactive one (the claude/CODEX parity).
 	if in.ConfigDir != "" {
@@ -184,7 +274,10 @@ type opencodePart struct {
 	Text   string          `json:"text"`
 	Reason string          `json:"reason"`
 	Tokens *opencodeTokens `json:"tokens"`
-	Cost   float64         `json:"cost"`
+	// A POINTER for the same reason Tokens is one: a step reporting cost 0 has
+	// REPORTED, and the driver's zero-spend bound counts silence, not zeroes
+	// (CLA-288).
+	Cost *float64 `json:"cost"`
 }
 
 type opencodeTokens struct {
@@ -245,8 +338,8 @@ func (p *opencodeParse) line(line []byte) {
 			p.cRead += tk.Cache.Read
 			p.sawUsage = true
 		}
-		if ev.Part.Cost != 0 {
-			p.cost += ev.Part.Cost
+		if c := ev.Part.Cost; c != nil {
+			p.cost += *c
 			p.sawUsage = true
 		}
 	}
@@ -255,6 +348,9 @@ func (p *opencodeParse) line(line []byte) {
 // finish writes what the stream added up to onto res.
 func (p *opencodeParse) finish(res *Result) {
 	res.FinalMessage = p.lastText
+	// Recorded whatever the figures come to: the driver bounds attempts that
+	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
+	res.UsageReported = p.sawUsage
 	if p.sawUsage {
 		// opencode's `total` already folds in input+output+reasoning+cache, so it
 		// is the honest spend figure for the budget.
@@ -338,7 +434,11 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // Like codex, this adapter does not populate Result.Claim, so `phases` is refused
 // for it in config.Validate rather than silently stopping after phase 1 on every
 // task. See Capabilities.TracksClaims.
-func (opencode) Capabilities() Capabilities { return Capabilities{} }
+//
+// ReportsCost is true: opencode's step_finish parts carry a `cost` sibling to the
+// token counts, and opencodeParse sums it into Result.CostUSD, so
+// `budget.max_cost_usd` is a live ceiling here (CLA-288).
+func (opencode) Capabilities() Capabilities { return Capabilities{ReportsCost: true} }
 
 func (opencode) IsTransient(res Result) bool {
 	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw

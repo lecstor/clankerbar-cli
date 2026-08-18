@@ -200,6 +200,10 @@ func (p *codexParse) line(line []byte) {
 // finish writes what the stream added up to onto res.
 func (p *codexParse) finish(res *Result) {
 	res.FinalMessage = p.lastText
+	// Recorded whatever the figures come to: the driver bounds attempts that
+	// reported NOTHING, and a turn.completed carrying zeros still reported
+	// (CLA-288).
+	res.UsageReported = p.sawUsage
 	if p.sawUsage {
 		// Exclude cached input (discounted reads); reasoning counts as output spend.
 		res.Tokens = p.in + p.out + p.reason
@@ -311,6 +315,11 @@ func (codex) TokenCeilingHit(Result) bool { return false }
 // clankerbar tool calls at all — so the driver's handback, salvage and delivery
 // check are all inert under it, and `phases` is refused for it in config.Validate
 // rather than half-working. Flip TracksClaims the day claim observation lands here.
+//
+// ReportsCost is false for a harder reason than "not implemented yet":
+// `codex exec --json` reports tokens, never money, so there is nothing for the
+// adapter to read. `budget.max_cost_usd` is therefore inert under codex, and
+// `doctor` says so when it is the only ceiling set (CLA-288).
 func (codex) Capabilities() Capabilities { return Capabilities{} }
 
 // Diagnostic returns the same scoped text IsTransient judged. See the claude
