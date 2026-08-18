@@ -1027,6 +1027,11 @@ structured Read/Edit tools out with no error — the exact failure this change
 removes. A per-task worktree always lives *under* a parent workdir, so the
 parent is the correct setting.
 
+## Docs
+
+- [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
+- [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
+
 ## License
 
 MIT (see [LICENSE](./LICENSE)).
