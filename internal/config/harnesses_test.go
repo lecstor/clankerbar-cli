@@ -146,7 +146,7 @@ func TestModelForTier_UnphasedBehaviourIsUnchanged(t *testing.T) {
 	}
 }
 
-func TestPhaseHarnesses_ListsEveryHarnessTheRunWillSpawn(t *testing.T) {
+func TestPhaseHarnesses_ListsEveryHarnessTheConfigDeclares(t *testing.T) {
 	got := mixedCfg().PhaseHarnesses()
 	// Run-wide first, then sequence order, deduplicated: doctor prints these and
 	// the first one keeps the unqualified label.

@@ -294,10 +294,11 @@ func checkHarness(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	return checkHarnessNamed(ctx, "harness", cfg.Harness, e)
 }
 
-// checkHarnesses reports on EVERY harness this config will spawn — the run's and
-// every phase's (CLA-366). Checking only `harness` is how a mixed-harness config
-// earns a green preflight and then dies at its second phase on a binary that was
-// never on PATH.
+// checkHarnesses reports on EVERY harness this config DECLARES — the run's and
+// every phase's (CLA-366) - every harness the config DECLARES, since a declared
+// harness must be usable whether or not today's phases reach it. Checking only
+// `harness` is how a mixed-harness config earns a green preflight and then dies at
+// its second phase on a binary that was never on PATH.
 func checkHarnesses(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	names := cfg.PhaseHarnesses()
 	out := make([]check, 0, len(names))
@@ -1160,7 +1161,7 @@ func checkPermissions(cfg *config.Config) check {
 }
 
 // checkPermissionsAll reports on the policy of every harness this config will
-// spawn (CLA-366). The policy is per harness in both senses — a different
+// declares (CLA-366). The policy is per harness in both senses — a different
 // mechanism each (a settings file, a sandbox flag, an env var) and a different
 // file — so a mixed run that checked only `harness` would certify the policy of
 // one session and say nothing about the other.
@@ -1297,7 +1298,12 @@ func checkToolchains(cfg *config.Config) check {
 	// (CLA-366). So ask whether claude runs any phase at all, and audit the
 	// settings file THAT session gets.
 	if !runsHarness(cfg, "claude") {
-		c.detail = "no allowlist to audit for " + strings.Join(cfg.PhaseHarnesses(), ", ")
+		// SpawnedHarnesses, to agree with the gate directly above it. Listing
+		// PhaseHarnesses here named the DECLARED harness too, so a config whose
+		// phases all override it printed "no allowlist to audit for claude,
+		// opencode" - a sentence naming claude among the harnesses it has just
+		// said have no claude allowlist.
+		c.detail = "no allowlist to audit for " + strings.Join(cfg.SpawnedHarnesses(), ", ")
 		return c
 	}
 	settingsPath := cfg.SessionFor("claude").SettingsPath
@@ -1966,6 +1972,11 @@ func checkBudget(cfg *config.Config) check {
 			if bounds := sessionTokenBounds(cfg); bounds != "" {
 				c.detail += " (" + bounds + ")"
 			} else {
+				// The singular verb is safe because this branch implies exactly ONE
+				// spawned harness today: claude is the only harness with a
+				// mid-session ceiling, so reaching here means claude is not among
+				// the spawned. If a second such harness is ever added, make this
+				// agree in number rather than letting the sentence go ungrammatical.
 				c.detail += " by any amount — " + strings.Join(spawned, "/") + " enforces no mid-session token ceiling"
 			}
 		}

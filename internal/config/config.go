@@ -1032,15 +1032,22 @@ func (c *Config) ResolveMCPConfig(harnessName, projectMCP string, projectPerHarn
 	return c.SessionFor(harnessName).MCPConfigPath
 }
 
-// PhaseHarnesses lists every harness this config will actually spawn — the
-// run-wide one and every phase's — deduplicated, with the run-wide one first and
-// the rest in sequence order.
+// PhaseHarnesses lists every harness this config DECLARES — the run-wide one and
+// every phase's — deduplicated, with the run-wide one first and the rest in
+// sequence order.
 //
 // Callers are the ones that must reason about ALL of them rather than the
-// top-level name alone: `doctor` checking binaries, and Validate checking that
-// each is registered and configured. Reporting on `harness` alone is how a
-// mixed-harness config earns a green preflight and then dies on its second
-// phase.
+// top-level name alone: `doctor` checking binaries, config dirs and permission
+// policy, and Validate checking that each is registered and configured. Reporting
+// on `harness` alone is how a mixed-harness config earns a green preflight and
+// then dies on its second phase.
+//
+// **Declared, not spawned** — and the difference matters, so pick deliberately.
+// A declared harness must be USABLE whether or not today's phases reach it, which
+// is why every caller above wants the run-wide one included. For the other
+// question — what will this run actually do — use SpawnedHarnesses below, which
+// omits a run-wide harness that every phase overrides. Asking this one there
+// produces confidently false statements about a harness no session runs on.
 func (c *Config) PhaseHarnesses() []string {
 	out := []string{c.Harness}
 	seen := map[string]bool{c.Harness: true}

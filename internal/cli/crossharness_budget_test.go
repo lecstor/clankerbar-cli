@@ -315,3 +315,32 @@ func TestBudget_ADeclaredHarnessNoPhaseRunsIsNotTreatedAsSpawned(t *testing.T) {
 		}
 	})
 }
+
+// checkToolchains gates on whether a claude session will actually RUN, so its
+// fallback detail has to list the same set it gated on. Listing the DECLARED
+// harnesses there named claude among the harnesses it had just said have no
+// claude allowlist - the same class of confidently-false sentence as the budget
+// check's, introduced by the fix to the budget check's.
+func TestToolchains_FallbackNamesOnlyTheHarnessesThatWillRun(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness: "claude", // declared, and overridden by every phase
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement", Harness: "opencode"},
+			{Name: "review", Harness: "opencode"},
+		},
+		Harnesses: map[string]config.HarnessConfig{"opencode": {ConfigDir: t.TempDir()}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+
+	d := checkToolchains(cfg).detail
+	if strings.Contains(d, "claude") {
+		t.Errorf("no session runs on claude, so naming it in the no-claude-allowlist line contradicts the line itself: %q", d)
+	}
+	if !strings.Contains(d, "opencode") {
+		t.Errorf("the harnesses that DO run must be named: %q", d)
+	}
+}
