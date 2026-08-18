@@ -626,6 +626,7 @@ the likely final format.)
   "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
   "prompt": "Work the next backlog item.",
   "max_turns": 400,
+  "max_session_wall_clock": 0,
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
   "idle_poll_interval": "60s",
@@ -659,6 +660,19 @@ else to a 150M floor (~2.3x the largest legitimate session measured, CLA-309).
 It is deliberately always on — it is a detector, not a budget. Claude only
 today: the other harnesses' streams are parsed but never killed mid-session,
 so for them the dial is inert until an adapter grows the kill.
+
+`max_session_wall_clock` is the same backstop measured in TIME, for a harness
+whose CLI takes no turn flag: when a session outlives it the adapter ends the
+process and the driver treats that exactly like a hit turn cap — the phase ends,
+the salvage commits and pushes whatever the session left, and the run carries on
+(CLA-368). A phase's own `max_wall_clock` wins over it, and **0 is off, which is
+the default**: unlike the turn cap it ships no built-in number, because a
+duration that catches a runaway on one model/provider is a routine session on
+another. **opencode only** today — it is the harness with no turn flag, so this
+is its phase backstop; under claude or codex the dial is inert and `doctor` says
+so. It is measured per SESSION, so it is not `budget.max_wall_clock`, which is
+the run-wide ceiling and counts the hours a run spends *waiting out* a usage
+limit.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default

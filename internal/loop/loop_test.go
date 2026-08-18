@@ -70,6 +70,15 @@ func turnCappedResult() harness.Result {
 func tokenCeilingResult() harness.Result {
 	return harness.Result{ExitCode: -1, Tokens: 90_000_000, Raw: map[string]any{"kind": "tokenCeiling"}}
 }
+
+// wallClockResult is a session the ADAPTER ended for outliving its per-session
+// wall-clock cap (CLA-368) — the third member of the orderly-end family, and
+// the one that carries its spend: opencode's usage is summed per step all the
+// way to the kill, unlike the token-ceiling case where the total is never seen.
+func wallClockResult() harness.Result {
+	return harness.Result{ExitCode: -1, Tokens: 120_000, CostUSD: 1.25, Raw: map[string]any{"kind": "wallClock"}}
+}
+
 func limitStopResult() harness.Result {
 	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "limitStop"}}
 }
@@ -155,6 +164,8 @@ func (f *fakeAdapter) Capabilities() harness.Capabilities {
 func (f *fakeAdapter) TurnCapped(r harness.Result) bool { return kindOf(r) == "turnCapped" }
 
 func (f *fakeAdapter) TokenCeilingHit(r harness.Result) bool { return kindOf(r) == "tokenCeiling" }
+
+func (f *fakeAdapter) WallClockCapped(r harness.Result) bool { return kindOf(r) == "wallClock" }
 
 // Diagnostic stands in for a real adapter's scoped text. Stderr is where every
 // adapter's scope starts, so returning it keeps the fake honest about what the

@@ -723,7 +723,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// recording one for it and the PLANE accepting the record.
 		capped := d.h.TurnCapped(res)
 		ceiling := d.h.TokenCeilingHit(res)
-		checkpointable := res.ExitCode == 0 || ((capped || ceiling) && res.Claim.HasWIP)
+		// A session the adapter ended on its wall-clock cap is the third member of
+		// the same family: an orderly cut-off mid-thought, whose survivability rests
+		// on the salvage exactly as a turn cap's does — so it earns a checkpoint on
+		// the same terms, HasWIP and all (CLA-368).
+		wallclock := d.h.WallClockCapped(res)
+		checkpointable := res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
@@ -892,6 +897,21 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if ceiling {
 			log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d; cost not captured — killed mid-stream) — ending this phase; anything uncommitted was salvaged above",
 				drainNum, tokens)
+			return tokens, cost, false, end, nil
+		}
+
+		// A session the ADAPTER ended for outliving its wall-clock cap is the same
+		// shape again: the phase ends, the salvage above has already dealt with
+		// whatever the tree holds, and neither a retry nor a failure is right — a
+		// retry would spend the same hours over again and reach the same deadline,
+		// and failing would stop the run over a cap doing its job (CLA-368).
+		//
+		// Spend IS reported here, unlike the token-ceiling branch: opencode's usage
+		// arrives per step_finish and is summed all the way to the kill, so the
+		// figures are the honest cost of the session up to the moment it ended.
+		if wallclock {
+			log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
+				drainNum, tokens, cost)
 			return tokens, cost, false, end, nil
 		}
 
@@ -1698,6 +1718,11 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// the whole point of CLA-343 is that nothing was able to stop the 285.9M
 	// session.
 	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeiling()
+	// The per-session wall-clock cap, resolved by EffectivePhases: this phase's
+	// own, else the run-wide one, else zero — and zero is OFF, which is the
+	// shipped default (CLA-368). Unlike the token ceiling this one HAS a disabled
+	// state, because no default number is honest across models and providers.
+	inv.MaxSessionWallClock = ph.MaxWallClock.Duration()
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the

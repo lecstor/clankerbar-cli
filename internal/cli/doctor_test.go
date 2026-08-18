@@ -2259,3 +2259,67 @@ func TestBudget_WallClockOnlyUnderClaudeStillRecommendsCost(t *testing.T) {
 		t.Errorf("claude reports cost, so the original remedy stands: %q", c.remedy)
 	}
 }
+
+// A wall-clock session cap under a harness that never enforces one is the same
+// defect as max_cost_usd under codex (CLA-288): a dial the operator set as
+// their backstop, doing nothing. doctor names it before the run rather than
+// leaving it to be inferred from a session that ran all night (CLA-368).
+func TestBudgetGuards_WarnWhenTheSessionWallClockCapIsInertForTheHarness(t *testing.T) {
+	t.Run("claude: the dial cannot fire", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		if c.status != warn {
+			t.Errorf("an inert wall-clock cap: got %v, want WARN", c.status)
+		}
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock") && strings.Contains(line, "INERT") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no info line says the cap is inert under this harness: %q", c.info)
+		}
+	})
+
+	t.Run("the phase's own dial is the one named", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Prompt = ""
+		cfg.Phases = []config.Phase{{Name: "implement", MaxWallClock: config.Duration(time.Minute)}}
+
+		c := checkBudget(cfg)
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_wall_clock (phases)") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the note names the run-wide dial when the phase is the one set: %q", c.info)
+		}
+	})
+
+	t.Run("opencode: the dial fires, so nothing is said", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "opencode"
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock") {
+				t.Errorf("a cap the harness DOES enforce was reported inert: %q", line)
+			}
+		}
+	})
+
+	t.Run("unset: nothing to warn about", func(t *testing.T) {
+		c := checkBudget(validCfg(t))
+		for _, line := range c.info {
+			if strings.Contains(line, "wall_clock") && strings.Contains(line, "INERT") {
+				t.Errorf("an unset dial was reported inert: %q", line)
+			}
+		}
+	})
+}

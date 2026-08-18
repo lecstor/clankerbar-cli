@@ -1574,6 +1574,19 @@ func checkBudget(cfg *config.Config) check {
 			config.DefaultMaxTurns))
 		guardDials = append(guardDials, "max_turns")
 	}
+	// A session wall-clock cap the configured harness never enforces is the same
+	// defect max_cost_usd-under-codex is (CLA-288): a dial the operator set as
+	// their backstop, doing nothing, discoverable only from a session that ran
+	// all night. Named here, before the run, rather than left to be inferred.
+	var guardRemedy string
+	if dial := inertSessionWallClock(cfg); dial != "" {
+		guardNotes = append(guardNotes, fmt.Sprintf(
+			"%s: set, but harness %q does not enforce a per-session wall-clock cap, so it is INERT here",
+			dial, cfg.Harness))
+		// Not added to guardDials: those become "set <dial>", and this dial is
+		// already set — the advice is to stop relying on it, not to set it.
+		guardRemedy = "drop " + dial + " or run the harness that enforces it (opencode); under " + cfg.Harness + " the turn cap is the backstop that does fire"
+	}
 	if cfg.MaxRetries == 0 {
 		guardNotes = append(guardNotes,
 			fmt.Sprintf("max_retries: 0 - transient failures are retried forever (backoff capped at retry_cap), each retry a fresh paid session redoing the task; set a positive max_retries to bound a run window. Only a run of attempts reporting NO usage is bounded regardless, at max_zero_spend_attempts=%d", cfg.ZeroSpendAttemptBound()))
@@ -1648,10 +1661,15 @@ func checkBudget(cfg *config.Config) check {
 		if c.status == pass {
 			c.status = warn
 		}
-		if c.remedy == "" {
+		if c.remedy == "" && len(guardDials) > 0 {
 			// Named from the dials actually warned on, so a codex run (no
 			// max_turns note) is not told to set a dial that does nothing there.
 			c.remedy = "set " + strings.Join(guardDials, ", ") + " (see the guard lines), or accept the defaults"
+		}
+		// The inert-dial advice is "unset it", never "set it", so it cannot ride on
+		// the line above; it takes the remedy only when nothing better claimed it.
+		if c.remedy == "" {
+			c.remedy = guardRemedy
 		}
 		c.info = append(c.info, guardNotes...)
 	}
@@ -1670,6 +1688,30 @@ func harnessReportsCost(name string) bool {
 		return true
 	}
 	return caps.ReportsCost
+}
+
+// inertSessionWallClock names the wall-clock dial this config sets that the
+// configured harness will not enforce, or "" when there is nothing to say. The
+// phase's own `max_wall_clock` is named in preference to the run-wide
+// `max_session_wall_clock`, so an operator is pointed at the line they wrote.
+//
+// An UNKNOWN harness says nothing, for the reason harnessReportsCost gives:
+// config.Validate has already refused the name, and a speculative inert-dial
+// warning would bury the real finding.
+func inertSessionWallClock(cfg *config.Config) string {
+	caps, ok := harness.CapabilitiesOf(cfg.Harness)
+	if !ok || caps.HonoursSessionWallClock {
+		return ""
+	}
+	for _, ph := range cfg.Phases {
+		if ph.MaxWallClock > 0 {
+			return "max_wall_clock (phases)"
+		}
+	}
+	if cfg.MaxSessionWallClock > 0 {
+		return "max_session_wall_clock"
+	}
+	return ""
 }
 
 // anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any

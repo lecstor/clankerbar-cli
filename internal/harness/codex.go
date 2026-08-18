@@ -311,6 +311,12 @@ func (codex) TurnCapped(Result) bool { return false }
 // one. Pinned by TestAdaptersWithoutATurnCapNeverReportOne's sibling.
 func (codex) TokenCeilingHit(Result) bool { return false }
 
+// No wall-clock cap: this adapter runs its child on the caller's context alone,
+// so nothing here ends a session on elapsed time. Capabilities says as much up
+// front (HonoursSessionWallClock false), rather than leaving
+// `max_session_wall_clock` to be discovered inert at 3am.
+func (codex) WallClockCapped(Result) bool { return false }
+
 // This adapter does not populate Result.Claim — it does not watch the session's
 // clankerbar tool calls at all — so the driver's handback, salvage and delivery
 // check are all inert under it, and `phases` is refused for it in config.Validate
