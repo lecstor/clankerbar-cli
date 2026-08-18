@@ -15,7 +15,16 @@ import (
 // sums usage as the steps arrive. Production parses live rather than walking a
 // saved copy of stdout, because the retained copy is now capped (CLA-262).
 func opencodeParsed(stdout string) Result {
-	var p opencodeParse
+	return opencodeParsedFrom(Invocation{}, io.Discard, stdout)
+}
+
+// opencodeParsedFrom is the same, for the cases that need the Invocation the
+// session started from (a resumed phase's seeded claim) or the console a claim
+// diagnostic is written to. It builds the parser through the SAME constructor
+// Invoke uses, so deleting the seed there turns these red rather than leaving the
+// suite green.
+func opencodeParsedFrom(in Invocation, console io.Writer, stdout string) Result {
+	p := newOpencodeParse(in, console)
 	sink := newLineSink(p.line)
 	_, _ = io.WriteString(sink, stdout)
 	sink.Flush()
@@ -452,5 +461,239 @@ func TestOpencodeRegistered(t *testing.T) {
 	}
 	if a.Name() != "opencode" {
 		t.Errorf("Get(opencode).Name() = %q", a.Name())
+	}
+}
+
+// --- Claim observation (CLA-365) -------------------------------------------
+//
+// The fixture is a RECORDING, not a hand-built stream: two real `opencode run
+// --format json` sessions against opencode 1.18.16 and the live clankerbar MCP,
+// concatenated (nothing here is session-scoped, and the pair reads as one
+// session's traffic). Recording it was step 1 of the task — the question "does
+// this stream even carry tool-call arguments and results?" is answered by the
+// file, and if a future opencode stops carrying them these tests are where it
+// shows. The sessions claimed a throwaway task (CLA-371), tried to claim it a
+// second time to capture a REFUSAL verbatim, then parked it with a branch.
+//
+// Redactions, so a public repo does not carry a backlog dump: the claim result's
+// `task.detail`, its `decisions` array and its `decisionsNote` are replaced. The
+// envelope — event type, part, state, status, input, output, error — is byte-for-
+// byte what opencode emitted, and it is the envelope every assertion here is
+// about.
+const (
+	opencodeFixtureTask   = "e1d01dae-ba13-42ef-9ccc-580a9c6cdc70"
+	opencodeFixtureRef    = "CLA-371"
+	opencodeFixtureRun    = "6190e2fa-9d24-49e5-a6aa-e402e46a1289"
+	opencodeFixtureBranch = "clanker/e1d01dae-temp-fixture-recording"
+)
+
+// opencodeRecording returns the recorded session, or the first n of its lines.
+// n <= 0 means all of it.
+func opencodeRecording(t *testing.T, n int) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "opencode-claim-session.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the recorded opencode session: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if n > 0 && n < len(lines) {
+		lines = lines[:n]
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// The whole point of the change: a real recorded session's claim reaches
+// Result.Claim. Without it Claim.Held() is false for every opencode session, so a
+// phase seam hands nothing to the next phase and the driver reads a task it holds
+// as one it abandoned.
+func TestOpencodeObservesAClaimInARecordedSession(t *testing.T) {
+	var console strings.Builder
+	res := opencodeParsedFrom(Invocation{}, &console, opencodeRecording(t, 3))
+
+	want := Claim{TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun}
+	if res.Claim != want {
+		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
+	}
+	if !res.Claim.Held() {
+		t.Error("Claim.Held() is false after a recorded claim_task — every gate downstream (handback, salvage, delivery check) reads this")
+	}
+	// A claim that silently stops being tracked is indistinguishable from a session
+	// that never claimed, so the observation says so out loud.
+	if !strings.Contains(console.String(), opencodeFixtureRef) {
+		t.Errorf("the console never named the held task; got %q", console.String())
+	}
+}
+
+// A refused claim carries no ids and must leave the tracked claim exactly as it
+// was — which the recording covers, since opencode puts a refusal's payload in
+// `state.error` and leaves `state.output` empty.
+//
+// That alone does NOT pin the status reading, and saying so is the point: with
+// the output empty, even a status-blind read hands noteClaimed nothing to parse
+// and gives up anyway. TestOpencodeRefusedSettleChangesNothing below is the one
+// that fails when the status stops being read as the error flag.
+func TestOpencodeRefusedClaimChangesNothing(t *testing.T) {
+	afterFirst := opencodeParsedFrom(Invocation{}, io.Discard, opencodeRecording(t, 3)).Claim
+	afterRefusal := opencodeParsedFrom(Invocation{}, io.Discard, opencodeRecording(t, 6)).Claim
+
+	if afterRefusal != afterFirst {
+		t.Errorf("the refused second claim_task changed the tracked claim: %+v, want it left at %+v", afterRefusal, afterFirst)
+	}
+}
+
+// opencode has no `is_error` flag: the terminal STATUS is the only thing saying
+// whether the plane accepted the call. A refused `update_task` is where reading it
+// wrong actually costs something — an `in_review` rejected for a missing Tests
+// header leaves the task HELD, and that session is exactly the one whose claim
+// needs handing back. Read blind, the driver would instead record the task as let
+// go (no handback, no salvage) and keep a delivery Report for a branch the plane
+// never recorded.
+func TestOpencodeRefusedSettleChangesNothing(t *testing.T) {
+	stream := opencodeRecording(t, 3) +
+		opencodeToolLine("call-refused", "clankerbar_update_task",
+			`{"taskId":"`+opencodeFixtureTask+`","status":"in_review","branch":"`+opencodeFixtureBranch+`"}`,
+			"error", `{"error":{"code":"evidence_required","message":"outcome needs a **Tests** section"}}`) + "\n"
+
+	res := opencodeParsedFrom(Invocation{}, io.Discard, stream)
+
+	if res.Claim.Settled {
+		t.Error("a REFUSED update_task settled the claim — the driver would read a task the session still holds as one it let go of, and hand nothing back")
+	}
+	if !res.Claim.Held() {
+		t.Errorf("Claim.Held() = false after a refused settle; Claim = %+v", res.Claim)
+	}
+	if len(res.Reports) != 0 {
+		t.Errorf("Reports = %+v, want none: the plane refused the call, so it recorded no branch and there is nothing to check", res.Reports)
+	}
+}
+
+// A terminal event re-delivered for a callID already acted on must not rebuild a
+// claim a later call has since settled — noteClaimed assigns Result.Claim
+// wholesale, so a replay would clear Settled and the driver would post `ready`
+// over a task in review. Insurance against a stream shape, not an observed bug.
+func TestOpencodeIgnoresAReplayedTerminalEvent(t *testing.T) {
+	recording := opencodeRecording(t, 0)
+	claimEvent := strings.Split(strings.TrimRight(recording, "\n"), "\n")[1]
+
+	res := opencodeParsedFrom(Invocation{}, io.Discard, recording+claimEvent+"\n")
+
+	if !res.Claim.Settled {
+		t.Error("a replayed claim_task event resurrected a settled claim; the driver would post `ready` over a task already in review")
+	}
+}
+
+// The rest of the observation, over the same recording: recording a branch marks
+// the claim as carrying work worth handing over, a settling status releases it,
+// and the accepted call leaves a delivery Report for the driver to check against
+// local git.
+func TestOpencodeObservesTheSettleAndTheDeliveryReport(t *testing.T) {
+	res := opencodeParsedFrom(Invocation{}, io.Discard, opencodeRecording(t, 0))
+
+	want := Claim{
+		TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun,
+		HasWIP: true, Settled: true,
+	}
+	if res.Claim != want {
+		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
+	}
+	if res.Claim.Held() {
+		t.Error("Claim.Held() is still true after update_task settled the task — the driver would post `ready` over a task the session had already let go of")
+	}
+	wantReports := []Report{{
+		TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun,
+		Status: "parked", Branch: opencodeFixtureBranch,
+	}}
+	if len(res.Reports) != 1 || res.Reports[0] != wantReports[0] {
+		t.Errorf("Reports = %+v, want %+v", res.Reports, wantReports)
+	}
+	// The recording is also an ordinary session: the usage sum and final message
+	// must survive the tool events being parsed alongside them.
+	if res.FinalMessage != "DONE" {
+		t.Errorf("FinalMessage = %q, want the last text part of the recording", res.FinalMessage)
+	}
+	if !res.UsageReported || res.Tokens == 0 {
+		t.Errorf("the recording's step_finish usage did not reach the Result (UsageReported=%v, Tokens=%d)", res.UsageReported, res.Tokens)
+	}
+}
+
+// A resumed phase never calls claim_task, so its claim can only come from the
+// Invocation. The behavioural payload of the seed is that noteToolUse's
+// update_task arm matches — see the claude twin in resume_test.go.
+func TestOpencodeSeedsAResumedPhasesClaim(t *testing.T) {
+	stream := opencodeToolLine("call-1", "clankerbar_update_task", `{"taskId":"task-abc","branch":"clanker/task-abc-work"}`, "completed", `{}`) + "\n" +
+		opencodeToolLine("call-2", "clankerbar_update_task", `{"taskId":"task-abc","status":"in_review","branch":"clanker/task-abc-work","delivery":{"pr":"#42"}}`, "completed", `{}`) + "\n"
+
+	res := opencodeParsedFrom(Invocation{ResumeClaim: Claim{TaskID: "task-abc", RunID: "run-xyz"}}, io.Discard, stream)
+
+	if !res.Claim.HasWIP {
+		t.Error("update_task(branch:) did not set HasWIP on the seeded claim — the driver would read the task as safe to release and post it back to the queue over pushed work")
+	}
+	if !res.Claim.Settled {
+		t.Error("update_task(status: in_review) did not settle the seeded claim")
+	}
+	// Two updates restating the same branch collapse to one report, and the later
+	// status wins — the same dedup claude's stream gets.
+	want := Report{TaskID: "task-abc", RunID: "run-xyz", Status: "in_review", Branch: "clanker/task-abc-work", PR: "#42"}
+	if len(res.Reports) != 1 || res.Reports[0] != want {
+		t.Errorf("Reports = %+v, want exactly %+v", res.Reports, want)
+	}
+}
+
+// opencodeToolLine builds one `tool_use` event in opencode's shape. Hand-built
+// only for the cases the recording does not contain — the claim path itself is
+// asserted against the recording, never against this.
+func opencodeToolLine(callID, tool, input, status, output string) string {
+	state := map[string]any{"status": status, "input": json.RawMessage(input)}
+	if status == "error" {
+		state["error"] = output
+	} else {
+		state["output"] = output
+	}
+	b, err := json.Marshal(map[string]any{
+		"type": "tool_use",
+		"part": map[string]any{"type": "tool", "tool": tool, "callID": callID, "state": state},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
+}
+
+// A call that has not finished carries no result, and its status is the only
+// error flag there is — so acting on a non-terminal state would record a claim
+// from a call that might yet be refused.
+func TestOpencodeIgnoresNonTerminalAndForeignToolEvents(t *testing.T) {
+	claimOutput := `{"task":{"id":"t-1","ref":"CLA-1"},"run":{"id":"r-1"}}`
+	for _, tt := range []struct{ name, line string }{
+		{"still running", opencodeToolLine("c1", "clankerbar_claim_task", `{"taskId":"t-1"}`, "running", claimOutput)},
+		{"pending", opencodeToolLine("c1", "clankerbar_claim_task", `{"taskId":"t-1"}`, "pending", claimOutput)},
+		{"a status we do not know", opencodeToolLine("c1", "clankerbar_claim_task", `{"taskId":"t-1"}`, "cancelled", claimOutput)},
+		{"another server's tool", opencodeToolLine("c1", "context7_claim_task", `{"taskId":"t-1"}`, "completed", claimOutput)},
+		{"a built-in of the same name", opencodeToolLine("c1", "claim_task", `{"taskId":"t-1"}`, "completed", claimOutput)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if res := opencodeParsed(tt.line + "\n"); res.Claim != (Claim{}) {
+				t.Errorf("Claim = %+v, want none recorded", res.Claim)
+			}
+		})
+	}
+}
+
+// One list of watched tools, two namespacings. Adding a tool to the constants in
+// claude.go must reach opencode too, which it only does while this mapping holds.
+func TestOpencodeClankerbarToolMapsOntoTheWatchedNames(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"clankerbar_claim_task", claimTaskTool},
+		{"clankerbar_update_task", updateTaskTool},
+		{"clankerbar_ask_question", askQuestionTool},
+		{"clankerbar_escalate_question", escalateQuestionTool},
+		{"clankerbar_", "mcp__clankerbar__"},
+		{"context7_query-docs", ""},
+		{"bash", ""},
+		{"", ""},
+	} {
+		if got := opencodeClankerbarTool(tt.in); got != tt.want {
+			t.Errorf("opencodeClankerbarTool(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

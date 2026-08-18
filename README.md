@@ -85,11 +85,16 @@ boundary too. Two other consequences worth knowing:
 - **`max_iterations` counts task sequences, not sessions.** A two-phase config
   spawns roughly twice the sessions for the same limit.
 - **A multi-phase config requires a harness that observes the session's task
-  claim**, which today means `claude`. The handback across a seam, the salvage and
-  the delivery check all depend on it, so a config naming `codex` or `opencode`
+  claim**, which today means `claude` or `opencode`. The handback across a seam,
+  the salvage and the delivery check all depend on it, so a config naming `codex`
   alongside two or more phases is refused at validation rather than quietly
   stopping after phase 1 on every task. A single phase hands off to nobody, so it
   is allowed anywhere.
+- **`max_turns` is a `claude`-only backstop.** `opencode` can now run phases, but
+  `Invocation.MaxTurns` never reaches its CLI and it has no mid-stream token
+  ceiling either, so a phased `opencode` config has no per-session cap at all —
+  only the budget breaker at the phase boundary and `max_wall_clock`. Set those
+  deliberately rather than assuming the `max_turns` you wrote is doing anything.
 - **A sequence that ends on the `implement` brief is refused**, on any harness:
   that brief tells its session to stop at the checkpoint and leave `in_review`
   alone, so with no phase after it every task would stop half-finished, forever,
