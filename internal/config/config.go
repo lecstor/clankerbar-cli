@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -501,6 +503,100 @@ type Budget struct {
 	// see a single huge session coming (CLA-343: the 285.9M runaway was 3.8x
 	// its run's whole 75M ceiling). 0 = defer to SessionTokenCeiling's default.
 	MaxSessionTokens int `json:"max_session_tokens"`
+
+	// PerHarness are optional per-harness spend ceilings, keyed by harness name,
+	// each counted over ONLY that harness's own sessions (CLA-367).
+	//
+	// The dials above are one ceiling over every session a run spends, which is
+	// the right shape while a run drives one harness and the wrong one the moment
+	// it drives two. `max_tokens` is calibrated against a subscription plan — 75M
+	// is a sane week of Claude and roughly $2 on a DeepSeek-class backend, which
+	// would end a drain after a task or two. `max_cost_usd` is the meaningful dial
+	// for a metered backend and a meaningless one for a session billed to a
+	// subscription, which reports a price nobody is charged (CLA-289). Neither
+	// dial can hold a number that means the same thing on both sides, so a
+	// mixed-harness run gets one block per harness, each measured in the unit that
+	// harness understands.
+	//
+	// Any block that trips stops the WHOLE run. These are circuit breakers, not
+	// per-harness quotas to be juggled: a run that carried on with one harness
+	// switched off would be a shape nobody configured, and the phase that needed
+	// it would fail every iteration.
+	//
+	// The dials above keep working exactly as they always have, over the run's
+	// whole spend, and a config setting none of these behaves byte for byte as
+	// before. Set both and both apply — the global ceiling over everything, the
+	// per-harness one over its own sessions, whichever is reached first.
+	//
+	// Wall clock is deliberately absent: it measures the run, not a harness, and a
+	// run has one clock however many harnesses it spends it on. So is
+	// max_session_tokens, which is a runaway detector on a single session rather
+	// than an accumulating ceiling.
+	PerHarness map[string]HarnessBudget `json:"per_harness"`
+}
+
+// HarnessBudget is one harness's own spend ceiling inside a run's Budget — see
+// Budget.PerHarness for why a mixed-harness run needs one per side. Zero-valued
+// fields are disabled, as in Budget.
+type HarnessBudget struct {
+	MaxTokens  int     `json:"max_tokens"`   // cumulative tokens across THIS harness's sessions
+	MaxCostUSD float64 `json:"max_cost_usd"` // cumulative $ across THIS harness's sessions
+}
+
+// CountsSpend reports whether this block bounds spend at all — the question
+// Budget.CountsSpend answers, asked of one harness's block.
+func (h HarnessBudget) CountsSpend() bool { return h.MaxTokens > 0 || h.MaxCostUSD > 0 }
+
+// ExceededBy names the dimension of this block that tripped, or "" if none has.
+//
+// The harness name leads the string for the reason Budget.ExceededBy names the
+// dimension at all: in a run carrying two ceilings, "cost $2.05 ≥ $2.00" does not
+// say which side stopped it.
+func (h HarnessBudget) ExceededBy(harness string, tokens int, costUSD float64) string {
+	switch {
+	case h.MaxTokens > 0 && tokens >= h.MaxTokens:
+		return fmt.Sprintf("%s tokens %d ≥ %d", harness, tokens, h.MaxTokens)
+	case h.MaxCostUSD > 0 && costUSD >= h.MaxCostUSD:
+		return fmt.Sprintf("%s cost $%.2f ≥ $%.2f", harness, costUSD, h.MaxCostUSD)
+	}
+	return ""
+}
+
+// ForHarness is the block configured for a harness, and whether there is one. A
+// missing block is the zero HarnessBudget, disabled in every dimension, so a
+// caller that does not care which it got may use the value and drop the flag.
+func (b Budget) ForHarness(name string) (HarnessBudget, bool) {
+	hb, ok := b.PerHarness[name]
+	return hb, ok
+}
+
+// ExceededByHarness names the per-harness dimension that tripped for one
+// harness's own accumulated spend, or "" if none has. It consults ONLY that
+// harness's block — the dials above are Budget.ExceededBy's business, and a
+// caller enforcing both asks both.
+func (b Budget) ExceededByHarness(name string, tokens int, costUSD float64) string {
+	hb, ok := b.PerHarness[name]
+	if !ok {
+		return ""
+	}
+	return hb.ExceededBy(name, tokens, costUSD)
+}
+
+// CountsSpendFor reports whether a session run on this harness is under a spend
+// ceiling — its own block's, or the run-wide one.
+//
+// This is the question CLA-262's side effects turn on (see CountsSpend): a
+// session whose spend cannot be measured breaks a promise only where a promise
+// was made. In a mixed-harness run the promise follows the harness whose breaker
+// is set, so an unreadable opencode session stops a run carrying an opencode
+// block while an unreadable claude session does not — unless a global dial covers
+// them both, which is what every pre-CLA-367 config has.
+func (b Budget) CountsSpendFor(name string) bool {
+	if b.CountsSpend() {
+		return true
+	}
+	hb, _ := b.ForHarness(name)
+	return hb.CountsSpend()
 }
 
 // The per-session ceiling's defaults, in the order the resolution chain falls
@@ -522,10 +618,41 @@ const (
 	sessionTokenFloor = 150_000_000
 )
 
+// SessionTokenCeilingFor resolves the per-session runaway ceiling for a session
+// on this harness: the operator's own dial, else 2x the run's max_tokens, else
+// 2x that harness's own per_harness max_tokens, else the floor.
+//
+// The per-harness rung exists because CLA-367 tells an operator to move claude's
+// token ceiling out of the global dial and into its own block — and without it,
+// doing exactly that would silently LOOSEN the runaway detector the global dial
+// was deriving: per_harness.claude.max_tokens=20M would give a 150M floor rather
+// than the 40M the old shape gave, 7.5x the run's own ceiling. A detector that
+// gets weaker when you follow the documented migration is the CLA-343 bug
+// reappearing by another door.
+//
+// The global dial still wins over the per-harness one where both are set: it
+// bounds the whole run, so it is the tighter promise about any one session.
+func (b Budget) SessionTokenCeilingFor(harness string) int {
+	if b.MaxSessionTokens > 0 {
+		return b.MaxSessionTokens
+	}
+	if b.MaxTokens > 0 {
+		return sessionTokenCeilingMultiplier * b.MaxTokens
+	}
+	if hb, ok := b.ForHarness(harness); ok && hb.MaxTokens > 0 {
+		return sessionTokenCeilingMultiplier * hb.MaxTokens
+	}
+	return sessionTokenFloor
+}
+
 // SessionTokenCeiling resolves the per-session runaway ceiling: the operator's
 // own dial, else 2x the run's max_tokens, else the floor. There is deliberately
 // no "disabled": the whole point of CLA-343 is that nothing was able to stop the
 // 285.9M session, so a ceiling that can be left unset by accident is the bug.
+//
+// This is the harness-blind form, kept for callers with no harness in hand; a
+// caller that knows which harness the session runs on asks
+// SessionTokenCeilingFor, which can also see a per-harness token ceiling.
 func (b Budget) SessionTokenCeiling() int {
 	if b.MaxSessionTokens > 0 {
 		return b.MaxSessionTokens
@@ -1024,6 +1151,18 @@ func (c *Config) Validate() error {
 	// accepted automatically. harness does not import config, so there is no cycle.
 	if !harness.Known(c.Harness) {
 		return fmt.Errorf("unknown harness %q (want: %s)", c.Harness, strings.Join(harness.Names(), ", "))
+	}
+	// A per-harness block keyed by a name no adapter answers to is a ceiling that
+	// can never trip: nothing is ever charged to it, so the run is unbounded on
+	// exactly the side the operator meant to bound. Refuse it here, against the
+	// same registry as `harness` above, rather than at 3am with an inert breaker.
+	// Names are checked in sorted order so the message does not depend on map
+	// iteration. A negative ceiling INSIDE a block is doctor's finding, not this
+	// one, exactly as for the dials beside it — see checkBudget.
+	for _, name := range slices.Sorted(maps.Keys(c.Budget.PerHarness)) {
+		if !harness.Known(name) {
+			return fmt.Errorf("budget.per_harness[%q]: unknown harness (want: %s)", name, strings.Join(harness.Names(), ", "))
+		}
 	}
 	if c.MaxTurns < 0 {
 		return errors.New("max_turns is negative")

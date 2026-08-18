@@ -290,31 +290,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			if b.Type != "tool_result" || b.ToolUseID == "" {
 				continue
 			}
-			// A delivery claim is kept only if the plane ACCEPTED the call that made
-			// it — same rule as everything else here, and for the same reason: a
-			// refused `update_task` recorded no branch and declared no delivery, so
-			// there is nothing to check and nothing to complain about.
-			res.settleReport(b.ToolUseID, !b.IsError)
-
-			kind, waiting := res.pending[b.ToolUseID]
-			if !waiting {
-				continue
-			}
-			delete(res.pending, b.ToolUseID)
-			// A refused call changed nothing on the plane, so it must not change
-			// anything here either. This is the whole reason these are judged on
-			// the result: an `in_review` rejected for a missing Tests header
-			// leaves the task held, and that session is exactly the one whose
-			// claim needs handing back.
-			if b.IsError {
-				continue
-			}
-			switch kind {
-			case pendingClaim:
-				noteClaimed(b.Content, b.ToolUseID, res, console)
-			case pendingSettle:
-				res.Claim.Settled = true
-			}
+			noteToolResult(res, b.ToolUseID, b.IsError, b.Content, console)
 		}
 	case "result":
 		res.FinalMessage = ev.Result
@@ -332,8 +308,50 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 	}
 }
 
+// noteToolResult applies one clankerbar call's RESULT to res: it resolves the
+// delivery claim noteToolUse armed on the request, and then whatever else that
+// request was waiting to learn.
+//
+// A refused call changed nothing on the plane, so it must change nothing here
+// either — which is the whole reason these are judged on the result rather than
+// on the request. An `in_review` rejected for a missing Tests header leaves the
+// task held, and that session is exactly the one whose claim needs handing back.
+//
+// It lives beside noteToolUse and is called by BOTH adapters that observe a
+// session's clankerbar traffic: claude off its `user`/tool_result events, and
+// opencode off the single terminal `tool_use` event that carries a call's input
+// and output together (CLA-365). The two stream shapes differ; the rule about
+// what a result MEANS is the plane's, not either harness's, so it is stated once.
+func noteToolResult(res *Result, toolUseID string, isError bool, content json.RawMessage, console io.Writer) {
+	if toolUseID == "" {
+		return
+	}
+	// A delivery claim is kept only if the plane ACCEPTED the call that made it —
+	// same rule, same reason: a refused `update_task` recorded no branch and
+	// declared no delivery, so there is nothing to check and nothing to complain
+	// about.
+	res.settleReport(toolUseID, !isError)
+
+	kind, waiting := res.pending[toolUseID]
+	if !waiting {
+		return
+	}
+	delete(res.pending, toolUseID)
+	if isError {
+		return
+	}
+	switch kind {
+	case pendingClaim:
+		noteClaimed(content, toolUseID, res, console)
+	case pendingSettle:
+		res.Claim.Settled = true
+	}
+}
+
 // The clankerbar MCP tools the driver watches for. Namespaced exactly as the
 // harness reports them, so an unrelated tool called "claim_task" cannot match.
+// opencode namespaces the same tools differently and maps its names onto these
+// before calling noteToolUse — see opencodeClankerbarTool.
 const (
 	claimTaskTool        = "mcp__clankerbar__claim_task"
 	updateTaskTool       = "mcp__clankerbar__update_task"
@@ -982,8 +1000,9 @@ func (r *Result) markCeilingHit() {
 	r.Raw = map[string]any{"terminal_reason": tokenCeilingReason}
 }
 
-// Claude is the one adapter that watches the session's clankerbar tool calls, so
-// it is the only one phases can run on today. See Capabilities.TracksClaims.
+// Claude watches the session's clankerbar tool calls, so phases can run on it.
+// opencode does too as of CLA-365; codex still does not. See
+// Capabilities.TracksClaims.
 func (claude) Capabilities() Capabilities {
 	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true}
 }

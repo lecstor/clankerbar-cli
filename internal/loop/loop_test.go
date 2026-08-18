@@ -92,6 +92,9 @@ func kindOf(r harness.Result) string {
 }
 
 type fakeAdapter struct {
+	// name overrides the adapter's harness name, for the per-harness budget
+	// breakers, which key a run's spend by it (CLA-367).
+	name         string
 	steps        []invokeStep
 	invokeCalls  int
 	invocations  []harness.Invocation // every Invoke's argument, for asserting routing (CLA-142)
@@ -118,7 +121,15 @@ type fakeAdapter struct {
 	tokens int
 }
 
-func (f *fakeAdapter) Name() string { return "fake" }
+// Name is what the driver charges this adapter's spend to, so the per-harness
+// breakers (CLA-367) need it to be settable. Empty keeps every pre-existing
+// test's harness name exactly as it was.
+func (f *fakeAdapter) Name() string {
+	if f.name != "" {
+		return f.name
+	}
+	return "fake"
+}
 
 // The fake carries the MCPConfigPath through to f.invocations for the delivery
 // tests to assert on, so the Claude reading is the honest one to declare.
