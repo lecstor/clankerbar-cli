@@ -3,12 +3,14 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 func init() { Register(opencode{}) }
@@ -65,11 +67,44 @@ func (opencode) MCPConfigUse() MCPConfigUse {
 func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	args := opencodeArgs(in)
 
-	cmd := exec.CommandContext(ctx, "opencode", args...)
+	// The per-session wall-clock cap, enforced on the exec context so the kill
+	// needs nothing from the stream: opencode reports no turn count and takes no
+	// turn flag, so elapsed time is the only backstop this adapter can offer a
+	// phase (CLA-368). The derived context is ALWAYS created, cap or no cap, so
+	// there is one cancellation path rather than two shapes of ctx below.
+	//
+	// Never on a PROBE: a probe is a one-word liveness check, not a session doing
+	// work, and a capped probe would report a phase-shaped cap for something no
+	// phase ran. The driver never sets the field on a probe either — this is the
+	// belt to that braces, so a future caller reusing an Invocation cannot turn a
+	// probe into a capped session by accident.
+	sctx := ctx
+	cancel := context.CancelFunc(func() {})
+	if in.MaxSessionWallClock > 0 && !in.Probe {
+		sctx, cancel = context.WithTimeout(ctx, in.MaxSessionWallClock)
+	}
+	defer cancel()
+
+	cmd := exec.CommandContext(sctx, "opencode", args...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = o.env(in)
+	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
+	// io.MultiWriter values, so os/exec makes its own pipes and cmd.Run waits for
+	// every WRITER of them to close — and CommandContext kills the direct child
+	// only. A runaway session is exactly the case with a bash-tool grandchild (a
+	// build, a test run) or an MCP server holding the inherited fd, which survives
+	// the SIGKILL and keeps the pipe open: without a delay, Invoke blocks past its
+	// own deadline in the one scenario the cap exists for. WaitDelay force-closes
+	// the pipes and lets Wait return.
+	//
+	// It does NOT kill the orphan itself — that needs a process group, which is
+	// platform-specific and is filed rather than smuggled in here. Set only with
+	// a cap in play, so an ordinary session's I/O is never cut short by it.
+	if sctx != ctx {
+		cmd.WaitDelay = 5 * time.Second
+	}
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text
 	// scans, and tee live to the console when one is set (the JSON event stream —
@@ -93,10 +128,34 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 
 	res := captured.result("opencode")
 	p.finish(&res)
+
+	// Our own deadline, not the caller's: ctx.Err() distinguishes a session we
+	// cut off from a run-wide Ctrl-C / SIGTERM / supervised-wait cancellation,
+	// which cancels the parent too and is NOT this phase reaching its backstop.
+	// Marked after p.finish, which rewrites Raw wholesale when it saw usage.
+	//
+	// runErr is the third conjunct because the deadline is read AFTER Run
+	// returned: a session that exited cleanly a hair before it, with the deadline
+	// passing in the window while the output was parsed, would otherwise be
+	// marked as capped. Nothing would misbehave today — the driver takes its
+	// exit-0 branch first — but the Result would be lying about how the session
+	// ended, and the next reader of this marker inherits the lie.
+	timedOut := runErr != nil && sctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+	if timedOut {
+		res.markWallClockCapped()
+		if console != nil {
+			fmt.Fprintf(console, "\n!! session outlived its wall-clock cap (%s) — ending it here; whatever it wrote is still in the worktree, uncommitted\n", in.MaxSessionWallClock)
+		}
+	}
+
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
-	} else if runErr != nil {
+	} else if runErr != nil && !timedOut {
 		return res, runErr // couldn't launch opencode at all
+	} else if runErr != nil {
+		// Our own kill: the child died on the cancel, so its error is the kill's
+		// and not a verdict. The marker above is the verdict.
+		res.ExitCode = -1
 	}
 	return res, nil
 }
@@ -600,8 +659,37 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
-// attributed to one.
+// attributed to one. The wall-clock cap below is this adapter's phase backstop
+// instead — a TIME budget rather than a turn one, but classified separately so
+// this stays literally true and no log line calls an elapsed cap a turn cap.
 func (opencode) TurnCapped(Result) bool { return false }
+
+// wallClockReason is the terminal_reason the ADAPTER writes into a Result when
+// it ended the session for outliving Invocation.MaxSessionWallClock (CLA-368).
+// Like tokenCeilingReason it is deliberately not something the CLI emits: the
+// marker exists so the driver can tell an orderly cap from a genuine failure,
+// and opencode's stream carries no reason field a task could write into anyway.
+const wallClockReason = "wall_clock_capped"
+
+func (opencode) WallClockCapped(res Result) bool {
+	if res.Raw == nil {
+		return false
+	}
+	r, _ := res.Raw["terminal_reason"].(string)
+	return r == wallClockReason
+}
+
+// markWallClockCapped writes the adapter's own cap marker onto a Result,
+// PRESERVING the parsed usage already there: unlike the claude token-ceiling
+// kill, this session's spend was summed from step_finish events all the way to
+// the kill, and replacing Raw would throw the per-step breakdown away while the
+// budget still has to see what the session cost.
+func (r *Result) markWallClockCapped() {
+	if r.Raw == nil {
+		r.Raw = map[string]any{}
+	}
+	r.Raw["terminal_reason"] = wallClockReason
+}
 
 // No mid-stream token ceiling: opencode sums per-step usage but the adapter
 // never kills the process, so no exit of its can be attributed to one.
@@ -618,8 +706,12 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 // ReportsCost is true: opencode's step_finish parts carry a `cost` sibling to the
 // token counts, and opencodeParse sums it into Result.CostUSD, so
 // `budget.max_cost_usd` is a live ceiling here (CLA-288).
+//
+// HonoursSessionWallClock is true and HonoursMaxTurns is false, which is the
+// whole point of the pair: this is the adapter whose CLI takes no turn flag, so
+// its phase backstop is the elapsed-time cap Invoke enforces (CLA-368).
 func (opencode) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, ReportsCost: true}
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true}
 }
 
 func (opencode) IsTransient(res Result) bool {

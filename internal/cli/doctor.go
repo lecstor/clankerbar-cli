@@ -1641,6 +1641,37 @@ func checkBudget(cfg *config.Config) check {
 			config.DefaultMaxTurns))
 		guardDials = append(guardDials, "max_turns")
 	}
+	// A session wall-clock cap the configured harness never enforces is the same
+	// defect max_cost_usd-under-codex is (CLA-288): a dial the operator set as
+	// their backstop, doing nothing, discoverable only from a session that ran
+	// all night. Named here, before the run, rather than left to be inferred.
+	if dial := inertSessionWallClock(cfg); dial != "" {
+		// The advice rides in the NOTE, not in c.remedy: the remedy line is one
+		// per check and the guard block's generic "set <dials>" usually claims it,
+		// so advice parked there is advice an operator routinely never sees. The
+		// tail clause is gated on the harness actually HAVING a turn cap: under
+		// codex MaxTurns never reaches the CLI either, so telling a codex operator
+		// the turn cap is their live backstop is advice that WOULD BE FOLLOWED
+		// straight back into the inert-dial hole this note exists to warn about
+		// (the reasoning harnessReportsCost uses below).
+		backstop := "under " + cfg.Harness + " the turn cap is the backstop that does fire"
+		if !harnessHonoursMaxTurns(cfg.Harness) {
+			backstop = "under " + cfg.Harness + " there is NO per-session backstop at all - bound the run with max_iterations / max_tokens instead"
+		}
+		guardNotes = append(guardNotes, fmt.Sprintf(
+			"%s: set, but harness %q does not enforce a per-session wall-clock cap, so it is INERT here - drop it or run the harness that enforces it (opencode); %s",
+			dial, cfg.Harness, backstop))
+	}
+	// The complement, and the sharper case: the harness CAN enforce a session cap,
+	// takes no turn flag, has no mid-stream token ceiling — and the dial is unset.
+	// That run's sessions are bounded by nothing at all, which is the silently
+	// absent guard CLA-344 added this whole block for.
+	if noSessionBackstop(cfg) {
+		guardNotes = append(guardNotes, fmt.Sprintf(
+			"max_session_wall_clock: unset, and harness %q has no turn cap and no mid-session token ceiling - so nothing bounds a single session there; a run that works past its brief is stopped only by a run-level ceiling",
+			cfg.Harness))
+		guardDials = append(guardDials, "max_session_wall_clock")
+	}
 	if cfg.MaxRetries == 0 {
 		guardNotes = append(guardNotes,
 			fmt.Sprintf("max_retries: 0 - transient failures are retried forever (backoff capped at retry_cap), each retry a fresh paid session redoing the task; set a positive max_retries to bound a run window. Only a run of attempts reporting NO usage is bounded regardless, at max_zero_spend_attempts=%d", cfg.ZeroSpendAttemptBound()))
@@ -1737,7 +1768,7 @@ func checkBudget(cfg *config.Config) check {
 		if c.status == pass {
 			c.status = warn
 		}
-		if c.remedy == "" {
+		if c.remedy == "" && len(guardDials) > 0 {
 			// Named from the dials actually warned on, so a codex run (no
 			// max_turns note) is not told to set a dial that does nothing there.
 			c.remedy = "set " + strings.Join(guardDials, ", ") + " (see the guard lines), or accept the defaults"
@@ -1759,6 +1790,58 @@ func harnessReportsCost(name string) bool {
 		return true
 	}
 	return caps.ReportsCost
+}
+
+// inertSessionWallClock names the wall-clock dial this config sets that the
+// configured harness will not enforce, or "" when there is nothing to say. The
+// phase's own `max_wall_clock` is named in preference to the run-wide
+// `max_session_wall_clock`, so an operator is pointed at the line they wrote.
+//
+// An UNKNOWN harness says nothing, for the reason harnessReportsCost gives:
+// config.Validate has already refused the name, and a speculative inert-dial
+// warning would bury the real finding.
+func inertSessionWallClock(cfg *config.Config) string {
+	caps, ok := harness.CapabilitiesOf(cfg.Harness)
+	if !ok || caps.HonoursSessionWallClock {
+		return ""
+	}
+	for _, ph := range cfg.Phases {
+		if ph.MaxWallClock > 0 {
+			return "max_wall_clock (phases)"
+		}
+	}
+	if cfg.MaxSessionWallClock > 0 {
+		return "max_session_wall_clock"
+	}
+	return ""
+}
+
+// harnessHonoursMaxTurns asks the registry whether this harness takes a turn
+// flag at all. An UNKNOWN harness is treated as honouring one — the withheld
+// advice, for the reason harnessReportsCost gives.
+func harnessHonoursMaxTurns(name string) bool {
+	caps, ok := harness.CapabilitiesOf(name)
+	if !ok {
+		return true
+	}
+	return caps.HonoursMaxTurns
+}
+
+// noSessionBackstop reports a run whose sessions are bounded by NOTHING: a
+// harness that takes no turn flag and kills on no token ceiling, with the one
+// dial that could bound it left unset. Gated on the harness being able to
+// enforce the dial, so the advice ("set it") is advice that would work.
+func noSessionBackstop(cfg *config.Config) bool {
+	caps, ok := harness.CapabilitiesOf(cfg.Harness)
+	if !ok || caps.HonoursMaxTurns || !caps.HonoursSessionWallClock {
+		return false
+	}
+	for _, ph := range cfg.EffectivePhases() {
+		if ph.MaxWallClock > 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any

@@ -60,6 +60,26 @@ type Adapter interface {
 	// false for everything.
 	TokenCeilingHit(Result) bool
 
+	// WallClockCapped reports whether the adapter itself ended this session
+	// because it outlived Invocation.MaxSessionWallClock.
+	//
+	// It is the turn cap's stand-in for a harness whose CLI takes no turn flag,
+	// so the driver treats it exactly as it treats the other two: the phase
+	// ends, and nothing is retried or failed — the kill was the point.
+	//
+	// What it does NOT buy today is the salvage. That runs only on a session
+	// whose claim the adapter observed (Capabilities.TracksClaims), and the one
+	// adapter enforcing this cap does not observe claims — so a capped opencode
+	// session leaves its uncommitted work in the worktree, and the driver's log
+	// line says exactly that rather than claiming a salvage that never ran. The
+	// two capabilities are independent on purpose: the day an adapter has both,
+	// this same path hands it the checkpoint too. Like the token ceiling, the
+	// marker is
+	// the adapter's own, never text the CLI or an agent could emit, so a task
+	// body cannot forge one. An adapter with no wall-clock cap returns false for
+	// everything.
+	WallClockCapped(Result) bool
+
 	// Capabilities reports what this adapter can do that the DRIVER's behaviour
 	// depends on — as distinct from how it classifies a given Result.
 	Capabilities() Capabilities
@@ -165,6 +185,14 @@ type Capabilities struct {
 	// prompt alone.
 	HonoursMaxTurns bool
 
+	// HonoursSessionWallClock reports whether this adapter enforces
+	// Invocation.MaxSessionWallClock. False means `max_session_wall_clock` is
+	// INERT for this harness — the same class of fact as ReportsCost, and stated
+	// for the same reason: an operator who set the dial as their phase backstop
+	// has to hear before the run that nothing will enforce it, not discover it
+	// from a session that ran all night.
+	HonoursSessionWallClock bool
+
 	// ReportsCost reports whether this adapter ever populates Result.CostUSD.
 	// False means `budget.max_cost_usd` is INERT for this harness - not
 	// approximate, not late: no code path can ever reach it, because nothing
@@ -231,6 +259,19 @@ type Invocation struct {
 	// resolves it from Budget.SessionTokenCeiling, so an unset value never
 	// reaches here. 0 = no ceiling for this invocation (probes).
 	MaxSessionTokens int
+
+	// MaxSessionWallClock bounds this ONE session by elapsed time: when it is
+	// exceeded the ADAPTER kills the process and marks the Result so the driver
+	// treats the end like a turn cap (end the phase, salvage what it left, do
+	// not retry or fail). The driver resolves it per phase from
+	// Config.MaxSessionWallClock / Phase.MaxWallClock. 0 = no cap for this
+	// invocation, which is the default and every probe.
+	//
+	// It exists because MaxTurns reaches only the claude CLI: under a harness
+	// that takes no turn flag the phase backstop is otherwise nothing at all.
+	// Only an adapter reporting Capabilities.HonoursSessionWallClock enforces
+	// it; opencode is that adapter today.
+	MaxSessionWallClock time.Duration
 
 	// ResumeClaim is the claim a PREVIOUS phase left held, seeded into this
 	// session's Result before its stream is parsed.

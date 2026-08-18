@@ -795,7 +795,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// recording one for it and the PLANE accepting the record.
 		capped := d.h.TurnCapped(res)
 		ceiling := d.h.TokenCeilingHit(res)
-		checkpointable := res.ExitCode == 0 || ((capped || ceiling) && res.Claim.HasWIP)
+		// A session the adapter ended on its wall-clock cap is the third member of
+		// the same family: an orderly cut-off mid-thought, whose survivability rests
+		// on the salvage exactly as a turn cap's does — so it earns a checkpoint on
+		// the same terms, HasWIP and all (CLA-368).
+		wallclock := d.h.WallClockCapped(res)
+		checkpointable := res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
@@ -965,6 +970,34 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if ceiling {
 			log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d; cost not captured — killed mid-stream) — ending this phase; anything uncommitted was salvaged above",
 				drainNum, tokens)
+			return tokens, cost, false, end, nil
+		}
+
+		// A session the ADAPTER ended for outliving its wall-clock cap is the same
+		// shape again: the phase ends, and neither a retry nor a failure is right —
+		// a retry would spend the same hours over again and reach the same deadline,
+		// and failing would stop the run over a cap doing its job (CLA-368).
+		//
+		// Spend IS reported here, unlike the token-ceiling branch: opencode's usage
+		// arrives per step_finish and is summed all the way to the kill, so the
+		// figures are the honest cost of the session up to the moment it ended.
+		//
+		// What the line must NOT say is that the salvage handled the tree. The
+		// salvage returns immediately without a claim (see salvageStrandedWork),
+		// and the only adapter that enforces this cap today is the one that does
+		// not observe claims — so on every kill that can currently happen, nothing
+		// was committed and the work is still sitting in the worktree. Saying
+		// otherwise would be the reassuring falsehood doctor's own checks exist to
+		// remove (CLA-290). The claim-held wording is the one a claim-observing
+		// adapter will earn later; it is not what opencode gets today.
+		if wallclock {
+			if res.Claim.Held() {
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
+					drainNum, tokens, cost)
+			} else {
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase. NOTHING was salvaged: this harness does not observe the session's task claim, so whatever the session left uncommitted is still in the worktree",
+					drainNum, tokens, cost)
+			}
 			return tokens, cost, false, end, nil
 		}
 
@@ -1775,6 +1808,11 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// harness's own per_harness block derives the detector exactly as the global
 	// dial does, so moving a ceiling into a block does not loosen it.
 	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeilingFor(d.h.Name())
+	// The per-session wall-clock cap, resolved by EffectivePhases: this phase's
+	// own, else the run-wide one, else zero — and zero is OFF, which is the
+	// shipped default (CLA-368). Unlike the token ceiling this one HAS a disabled
+	// state, because no default number is honest across models and providers.
+	inv.MaxSessionWallClock = ph.MaxWallClock.Duration()
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the

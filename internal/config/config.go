@@ -136,6 +136,19 @@ type Phase struct {
 	// able to stop it), so the cap chain always resolves to a number.
 	MaxTurns int `json:"max_turns"`
 
+	// MaxWallClock caps this phase's SESSION by elapsed time (harness
+	// permitting), as the backstop for a harness whose CLI takes no turn flag —
+	// opencode is that harness today, where MaxTurns never reaches the process
+	// and a phase boundary rests on the prompt alone. 0 = defer upward to
+	// Config.MaxSessionWallClock; if that is unset too the cap is OFF.
+	//
+	// Unlike MaxTurns it has no built-in default, deliberately: turns are a
+	// harness-independent unit of work, while a wall-clock number that would be a
+	// runaway detector for one model/provider is a routine session for another,
+	// and clankerbar cannot know which the operator has. A default here would cut
+	// honest sessions off in the middle rather than catch a runaway.
+	MaxWallClock Duration `json:"max_wall_clock"`
+
 	// Tier names a bucket in Config.Models — which of the operator's models this
 	// phase's session runs on. Empty = the run-wide Model, and that empty = the
 	// harness default, so an untouched config is untouched behaviour.
@@ -352,6 +365,22 @@ type Config struct {
 	// upward to the built-in default; "uncapped" is not a value this config
 	// accepts.
 	MaxTurns int `json:"max_turns"`
+
+	// MaxSessionWallClock is the run-wide per-SESSION wall-clock cap any phase
+	// inherits when it sets none of its own (see Phase.MaxWallClock). It is the
+	// turn cap's stand-in for a harness whose CLI takes no turn flag: under
+	// opencode, Invocation.MaxTurns reaches nothing, so without this a session
+	// that works past its brief has no backstop at all and the CLA-314 salvage —
+	// which assumes a phase CAN be cut off — never gets its chance.
+	//
+	// 0 = OFF, and that is the default: see Phase.MaxWallClock for why this dial
+	// alone among the backstops ships without a built-in number.
+	//
+	// Measured per SESSION, never across the run: Budget.MaxWallClock is the
+	// run-wide elapsed ceiling and counts the hours a run spends WAITING OUT a
+	// usage limit, which is exactly why it cannot double as a runaway detector.
+	// A session's own clock starts when its process does.
+	MaxSessionWallClock Duration `json:"max_session_wall_clock"`
 
 	// PollInterval is how often, while paused on a usage limit, the loop re-probes
 	// to catch an early reset. 0 = a built-in default (see loop.supervisedWait).
@@ -715,6 +744,7 @@ func (c *Config) EffectivePhases() []Phase {
 			ph.Prompt = builtinPhasePrompts[ph.Name]
 		}
 		ph.MaxTurns = c.resolveMaxTurns(ph.MaxTurns)
+		ph.MaxWallClock = c.resolveWallClock(ph.MaxWallClock)
 		out[i] = ph
 	}
 	return out
@@ -731,6 +761,17 @@ func (c *Config) resolveMaxTurns(phase int) int {
 		return c.MaxTurns
 	}
 	return DefaultMaxTurns
+}
+
+// resolveWallClock is the session wall-clock chain: the phase's own cap wins,
+// then the run-wide one, then nothing. Unlike resolveMaxTurns this CAN resolve
+// to zero, and zero means off — the dial ships disabled because no default
+// number would be honest across harnesses (see Phase.MaxWallClock).
+func (c *Config) resolveWallClock(phase Duration) Duration {
+	if phase > 0 {
+		return phase
+	}
+	return c.MaxSessionWallClock
 }
 
 // ZeroSpendAttemptBound is the effective bound on consecutive no-usage attempts:
@@ -1129,6 +1170,12 @@ func (c *Config) Validate() error {
 	if c.Budget.MaxSessionTokens < 0 {
 		return errors.New("max_session_tokens is negative")
 	}
+	// A negative wall-clock cap would reach exec as an already-expired deadline,
+	// killing every session the instant it started — a config typo that looks
+	// like a broken harness. Refused here, where it reads as the typo it is.
+	if c.MaxSessionWallClock < 0 {
+		return errors.New("max_session_wall_clock is negative")
+	}
 	// Refused rather than clamped: a negative here would read as "set" in the
 	// config and resolve to the default anyway, which is the silent-inert shape
 	// doctor's negative-budget check exists to stop.
@@ -1178,6 +1225,9 @@ func (c *Config) Validate() error {
 		}
 		if ph.MaxTurns < 0 {
 			return fmt.Errorf("phases[%d]: max_turns is negative", i)
+		}
+		if ph.MaxWallClock < 0 {
+			return fmt.Errorf("phases[%d]: max_wall_clock is negative", i)
 		}
 		// The resume placeholders are filled from the claim the PREVIOUS phase left
 		// held, so the first phase has nothing to fill them from. The driver leaves
