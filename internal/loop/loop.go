@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -105,6 +107,15 @@ type Driver struct {
 	// newSalvager builds the stranded-work rescuer for a workdir (CLA-314). Same
 	// shape and the same reason as newVerifier.
 	newSalvager func(workdir string) workSalvager
+
+	// spentBy is this run's spend per harness name, for the per-harness breakers
+	// (CLA-367). It hangs off the Driver rather than riding in `spend` because it
+	// is the RUN's account: a per-harness total outlives the drain that produced
+	// it, while the drain-local accumulators threaded through `spend` do not. See
+	// charge and budgetTrip. Lazily built; a run that configures no per-harness
+	// block still fills it, which costs one map and keeps the accounting honest if
+	// a block is added mid-file.
+	spentBy map[string]harnessSpend
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -200,7 +211,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
 		}
-		if dim := d.cfg.Budget.ExceededBy(totalTokens, totalCost, time.Since(start)); dim != "" {
+		if dim := d.budgetTrip(totalTokens, totalCost, time.Since(start)); dim != "" {
 			log.Printf("budget reached: %s — stopping to leave headroom (tokens=%d cost=$%.2f elapsed=%s)",
 				dim, totalTokens, totalCost, time.Since(start).Round(time.Second))
 			return nil
@@ -370,6 +381,67 @@ type spend struct {
 	cost   float64
 }
 
+// harnessSpend is one harness's accumulated spend across a run, for the
+// per-harness breakers (config.Budget.PerHarness, CLA-367).
+type harnessSpend struct {
+	tokens int
+	cost   float64
+}
+
+// charge books a session's spend against the harness that ran it, in the ledger
+// the per-harness breakers read.
+//
+// It is charged at the two places a session's spend enters a run — a drain
+// attempt's result and a supervised wait's probe — which are the same two places
+// the run-wide accumulators are added to, so the two accounts cannot drift. The
+// run-wide ones stay exactly where they were, threaded through the drain as
+// locals: the global dials have to keep behaving byte for byte as they always
+// have, so this ledger is additive rather than a replacement for them.
+//
+// An UNTRUSTED session is charged to neither, for the reason endUntrustedDrain
+// gives: a figure parsed out of a stream with a hole in it is not a measurement.
+//
+// Today a run drives one harness, so the ledger holds one entry and it tracks the
+// run total. When a phase can name its own harness (CLA-366) these same two call
+// sites split the run's spend across entries with no change of shape — which is
+// the whole reason the ledger is keyed by name now rather than later.
+func (d *Driver) charge(harnessName string, tokens int, cost float64) {
+	if d.spentBy == nil {
+		d.spentBy = make(map[string]harnessSpend)
+	}
+	s := d.spentBy[harnessName]
+	s.tokens += tokens
+	s.cost += cost
+	d.spentBy[harnessName] = s
+}
+
+// budgetTrip names the ceiling that has stopped this run, or "" if none has: the
+// run-wide dials first, measured against the run totals the caller threads down,
+// then each harness's own block against that harness's own spend.
+//
+// Any trip stops the whole run, so the order only decides which ceiling gets
+// named in the log, and the global dials are named first because a config that
+// sets both wants the run-wide promise reported as the one that was broken.
+// Harnesses are consulted in name order so a run with two blocks reports the same
+// dial every time rather than whichever the map yielded first.
+func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) string {
+	if dim := d.cfg.Budget.ExceededBy(tokens, cost, elapsed); dim != "" {
+		return dim
+	}
+	for _, name := range slices.Sorted(maps.Keys(d.spentBy)) {
+		s := d.spentBy[name]
+		if dim := d.cfg.Budget.ExceededByHarness(name, s.tokens, s.cost); dim != "" {
+			// That harness's OWN totals ride along, because every caller prints
+			// the RUN's figures after the reason: in a mixed-harness run two
+			// dollar figures on one line read as a contradiction, which is the
+			// defect Budget.ExceededBy's doc comment exists to prevent, one level
+			// down.
+			return fmt.Sprintf("%s (%s so far: tokens=%d cost=$%.2f)", dim, name, s.tokens, s.cost)
+		}
+	}
+	return ""
+}
+
 // drainPhases runs ONE drain as its configured sequence of phase sessions —
 // each a separate harness process, so the context resets between them. With no
 // phases configured that sequence is one session and this is exactly the old
@@ -424,7 +496,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			// cannot see coming and cannot interrupt. A handoff respawn gets the
 			// same check, BEFORE the respawn: a session cannot spend its way past
 			// the ceiling by handing off to itself.
-			if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+			if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
 				boundary := "the " + ph.Label(i) + " phase boundary"
 				if isHandoff {
 					boundary = "the handoff respawn"
@@ -629,7 +701,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// an operator is least likely to have set. A drain that re-spawns a paid
 		// session on a loop is the expensive failure this stops, whatever put it
 		// there (CLA-258).
-		if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+		if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
 			log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
 				drainNum, dim, prior.tokens+tokens, prior.cost+cost, time.Since(prior.start).Round(time.Second))
 			return tokens, cost, true, end, nil
@@ -784,6 +856,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
+		d.charge(d.h.Name(), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
@@ -971,7 +1044,7 @@ func (d *Driver) endUntrustedDrain(drainNum int, res harness.Result, tokens int,
 	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
 	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%d), and not handing back any claim it appeared to hold",
 		drainNum, res.Tokens, res.CostUSD, res.ExitCode)
-	if !d.cfg.Budget.CountsSpend() {
+	if !d.cfg.Budget.CountsSpendFor(d.h.Name()) {
 		return tokens, cost, false, nil
 	}
 	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
@@ -1542,7 +1615,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target
 	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 
 	for {
-		if dim := d.cfg.Budget.ExceededBy(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
+		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
 			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
@@ -1560,6 +1633,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target
 		// of here — resume, stop, or another lap — carries it.
 		tokens += got.Tokens
 		cost += got.CostUSD
+		d.charge(d.h.Name(), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true
@@ -1570,7 +1644,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target
 			// never see the cost — the one shape this loop's breaker exists to end
 			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
 			// ceiling there is nothing to protect, so it waits on as before.
-			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpend() {
+			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpendFor(d.h.Name()) {
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
 				return tokens, cost, true
 			}
@@ -1697,7 +1771,10 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// 0 never reaches here — SessionTokenCeiling has no disabled state, because
 	// the whole point of CLA-343 is that nothing was able to stop the 285.9M
 	// session.
-	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeiling()
+	// Asked PER HARNESS since CLA-367: a token ceiling that lives in this
+	// harness's own per_harness block derives the detector exactly as the global
+	// dial does, so moving a ceiling into a block does not loosen it.
+	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeilingFor(d.h.Name())
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the

@@ -21,10 +21,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1519,6 +1521,19 @@ func checkBudget(cfg *config.Config) check {
 	if b.MaxWallClock < 0 {
 		bad = append(bad, "max_wall_clock")
 	}
+	// The same reading of a negative, one level down: a per-harness block's dials
+	// are guarded with `> 0` too (config.HarnessBudget.ExceededBy), so a negative
+	// there reads as a ceiling and is none. Sorted so the finding does not depend
+	// on map iteration order.
+	for _, name := range slices.Sorted(maps.Keys(b.PerHarness)) {
+		hb := b.PerHarness[name]
+		if hb.MaxTokens < 0 {
+			bad = append(bad, fmt.Sprintf("per_harness[%s].max_tokens", name))
+		}
+		if hb.MaxCostUSD < 0 {
+			bad = append(bad, fmt.Sprintf("per_harness[%s].max_cost_usd", name))
+		}
+	}
 	if len(bad) > 0 {
 		c.status = fail
 		c.detail = "negative budget " + plural(len(bad), "value", "values") + ": " + strings.Join(bad, ", ")
@@ -1553,6 +1568,58 @@ func checkBudget(cfg *config.Config) check {
 	if b.MaxWallClock > 0 {
 		set = append(set, "max_wall_clock="+b.MaxWallClock.Duration().String())
 	}
+
+	// Per-harness blocks (CLA-367), read the same way: what can FIRE, not what is
+	// written down. Two ways one cannot. Its cost dial may name a harness that
+	// never reports cost - the case above, one level down. Or the block may name a
+	// harness THIS config never runs: the run drives cfg.Harness and nothing can
+	// select another, so that block's ceilings are unreachable however sane the
+	// numbers are. Both are annotated in place, and neither counts toward the
+	// "there is a live ceiling" reasoning below.
+	runningBlock, _ := b.ForHarness(cfg.Harness)
+	// Set when the running harness's block sets a cost dial and NOTHING else -
+	// under a harness that never reports cost that block is a ceiling in name
+	// only, and the remedy has to name the unit rather than the placement.
+	runningBlockCostOnlyInert := runningBlock.MaxCostUSD > 0 && runningBlock.MaxTokens == 0 && !harnessReportsCost(cfg.Harness)
+	perHarnessLive := false
+	for _, name := range slices.Sorted(maps.Keys(b.PerHarness)) {
+		hb := b.PerHarness[name]
+		if !hb.CountsSpend() {
+			// A block with no dial at all - `"claude": {}`, or a mistyped key,
+			// since the config decoder ignores fields it does not know. Silence
+			// would leave an operator staring at a ceiling they wrote and doctor
+			// never mentioned, so it is named as the nothing it is.
+			set = append(set, fmt.Sprintf("per_harness[%s]: no ceiling set (INERT)", name))
+			continue
+		}
+		var dials []string
+		tokensLive := hb.MaxTokens > 0
+		costFires := hb.MaxCostUSD > 0 && harnessReportsCost(name)
+		if hb.MaxTokens > 0 {
+			dials = append(dials, fmt.Sprintf("max_tokens=%d", hb.MaxTokens))
+		}
+		if hb.MaxCostUSD > 0 {
+			dial := fmt.Sprintf("max_cost_usd=%g", hb.MaxCostUSD)
+			if !costFires {
+				dial += " (INERT: never reports cost)"
+			}
+			dials = append(dials, dial)
+		}
+		entry := fmt.Sprintf("per_harness[%s]: %s", name, strings.Join(dials, ", "))
+		runs := name == cfg.Harness
+		if !runs {
+			entry += fmt.Sprintf(" (INERT: this config runs the %s harness)", cfg.Harness)
+		}
+		set = append(set, entry)
+		if runs && (tokensLive || costFires) {
+			perHarnessLive = true
+		}
+	}
+	// Every ceiling this run has that can actually fire. The branches below ask
+	// this rather than "is anything configured", because a config whose only
+	// ceilings are inert has none at all - the CLA-288 reading, now including the
+	// two ways a per-harness block can be inert.
+	anyLive := b.MaxTokens > 0 || costLive || b.MaxWallClock > 0 || perHarnessLive
 
 	// The guards that were silently absent from the config that ran a 285.9M
 	// single session (CLA-344): doctor's job is preflight, so the dials most
@@ -1598,9 +1665,9 @@ func checkBudget(cfg *config.Config) check {
 		// only: the codex adapter has no mid-session ceiling (TokenCeilingHit
 		// never fires there), so claiming it is "still active" would be false.
 		if cfg.Harness == "claude" {
-			c.info = append(c.info, fmt.Sprintf("per-session runaway ceiling still active: max_session_tokens resolves to %d (the operator's own, else 2x max_tokens when set, else the floor)", b.SessionTokenCeiling()))
+			c.info = append(c.info, fmt.Sprintf("per-session runaway ceiling still active: max_session_tokens resolves to %d (the operator's own, else 2x a token ceiling when set, else the floor)", b.SessionTokenCeilingFor(cfg.Harness)))
 		}
-	} else if b.MaxWallClock > 0 && !costLive && b.MaxTokens == 0 {
+	} else if b.MaxWallClock > 0 && !costLive && b.MaxTokens == 0 && !perHarnessLive {
 		// Wall clock is the weakest proxy for spend of the three, because it counts
 		// the hours a run spends WAITING OUT a usage limit — time in which nothing is
 		// billed. A run capped at 8h can spend five of them asleep and stop having done
@@ -1619,7 +1686,7 @@ func checkBudget(cfg *config.Config) check {
 		} else {
 			c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
 		}
-	} else if inertCost && b.MaxTokens == 0 && b.MaxWallClock == 0 {
+	} else if inertCost && b.MaxTokens == 0 && b.MaxWallClock == 0 && !perHarnessLive {
 		// The sibling of the wall-clock-only warning, and the sharper case of the
 		// two: wall clock at least measures something, whereas this run's every
 		// configured ceiling is unreachable, so it has none at all. That cannot be
@@ -1628,13 +1695,35 @@ func checkBudget(cfg *config.Config) check {
 		c.status = warn
 		c.detail = strings.Join(set, ", ") + " - so this run has NO effective ceiling"
 		c.remedy = "set max_tokens (or max_wall_clock) beside it - under " + cfg.Harness + " those are the dials that can fire"
+	} else if !anyLive {
+		// The same finding reached the other way: every ceiling written down is a
+		// per-harness block this run cannot reach (a harness it never drives, or a
+		// cost dial that harness never reports), so the config LOOKS bounded and is
+		// not. Distinct from the branch above, which is the global cost dial's case
+		// and keeps its own wording.
+		c.status = warn
+		c.detail = strings.Join(set, ", ") + " - none of them can fire, so this run has NO effective ceiling"
+		// A remedy will be FOLLOWED, so it must not point at something the
+		// operator has already done. When the running harness HAS a block and its
+		// only dial is a cost one that harness never reports, the placement is
+		// right and the unit is wrong - saying "add a per_harness block" there
+		// would be a no-op dressed as advice.
+		if runningBlockCostOnlyInert {
+			c.remedy = "set per_harness[" + cfg.Harness + "].max_tokens - " + cfg.Harness + " reports tokens, never cost"
+		} else {
+			c.remedy = "put the ceiling where the run will reach it: a per_harness block for " + cfg.Harness + ", or the run-wide max_tokens / max_wall_clock"
+		}
 	} else {
 		c.detail = strings.Join(set, ", ")
 		// The run-wide breaker is checked BETWEEN sessions: it cannot see a single
 		// huge session coming, which is exactly what happened to the 285.9M run
 		// under max_tokens=75M. Say so on the line that reports it (CLA-344).
-		if b.MaxTokens > 0 {
-			c.detail += fmt.Sprintf(" — max_tokens is enforced BETWEEN sessions, so one session can overrun it (max_session_tokens=%d is the mid-session bound)", b.SessionTokenCeiling())
+		// Gated on a token ceiling from EITHER place: a run whose only token
+		// ceiling is in its harness's per_harness block is enforced between
+		// sessions in exactly the same way, so it needs the same warning and the
+		// same number (CLA-367).
+		if b.MaxTokens > 0 || runningBlock.MaxTokens > 0 {
+			c.detail += fmt.Sprintf(" — the token ceiling is enforced BETWEEN sessions, so one session can overrun it (max_session_tokens=%d is the mid-session bound)", b.SessionTokenCeilingFor(cfg.Harness))
 		}
 	}
 
