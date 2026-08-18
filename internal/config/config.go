@@ -150,6 +150,67 @@ type Phase struct {
 	// on the run's model. The policy is advice in prose, never a shipped
 	// assignment.
 	Tier string `json:"tier"`
+
+	// Harness selects which coding-agent CLI runs this phase. Empty = the
+	// run-wide Config.Harness, so an untouched config runs every phase on one
+	// harness exactly as before.
+	//
+	// It exists because the phases a task splits into are not equally demanding.
+	// The implement phase can run on a cheap provider-agnostic backend; the
+	// review phase runs the adversarial gate the repo's workflow mandates, which
+	// wants the harness carrying the subagent machinery. Nothing in the phase seam
+	// resists this: each phase is already a FRESH session, seeded from the
+	// observed claim through the {{taskId}}/{{runId}} placeholders and
+	// Invocation.ResumeClaim, so there is no session state to carry across a
+	// harness boundary — only a claim, and the claim lives on the plane.
+	//
+	// What a mixed sequence DOES change is that the harness-shaped fields stop
+	// being run-wide: a claude `config_dir` handed to opencode, or a claude model
+	// alias handed to opencode's `--model`, is a session that dies at startup.
+	// That is what Config.Harnesses is for, and why Validate refuses a phase
+	// naming a harness with no block of its own.
+	Harness string `json:"harness"`
+}
+
+// HarnessConfig is one harness's own invocation fields, for a run whose phases
+// are not all on the same harness (CLA-366).
+//
+// Every field here has a run-wide twin on Config, and the twins are NOT shared
+// across harnesses: they describe the top-level harness alone. That is the whole
+// reason this type exists rather than a deeper fallback chain. The fields are
+// harness dialects wearing generic names — `config_dir` is CLAUDE_CONFIG_DIR or
+// OPENCODE_CONFIG_DIR or CODEX_HOME, `mcp_config_path` is a Claude-shaped
+// `.mcp.json` for one adapter and an opencode-schema config for another (see
+// harness.MCPConfigUse, which records that opencode REFUSES TO START on the
+// Claude-shaped file), `model` is an alias only one provider has. So "inherit
+// whatever the top level said" is not a helpful default but a guaranteed startup
+// failure with the operator's own config as the cause. Better an empty field,
+// which the adapter falls back on and `doctor` can talk about.
+type HarnessConfig struct {
+	// Model is this harness's default model alias, and the fallback its tiers
+	// resolve to. Empty = the harness's own default.
+	Model string `json:"model"`
+
+	// Models is this harness's tier map (bucket name -> model alias), the
+	// per-harness twin of Config.Models. A phase's Tier resolves against the map
+	// belonging to the harness that phase runs on, because a bucket NAME is
+	// portable across harnesses and the alias inside it is not — which is what
+	// lets one `"tier": "strong"` mean opus here and something else there.
+	Models map[string]string `json:"models"`
+
+	// ConfigDir pins this harness's config dir (CLAUDE_CONFIG_DIR /
+	// OPENCODE_CONFIG_DIR / CODEX_HOME) so a headless session loads the same
+	// skills, plugins and auth as the interactive one.
+	ConfigDir string `json:"config_dir"`
+
+	// MCPConfigPath points this harness's sessions at the clankerbar MCP server,
+	// in THAT harness's schema. Held to the same trusted-origin check as the
+	// top-level field, because it points the same account key at a host.
+	MCPConfigPath string `json:"mcp_config_path"`
+
+	// SettingsPath is the extra settings file (Claude Code's --settings) carrying
+	// the headless permission policy. Claude-specific; other adapters ignore it.
+	SettingsPath string `json:"settings_path"`
 }
 
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
@@ -271,6 +332,24 @@ type Config struct {
 	// to Model, and Model empty resolves to the harness default. A mistyped tier
 	// therefore costs a line in the iteration log, not a stopped run.
 	Models map[string]string `json:"models"`
+
+	// Harnesses carries the per-harness invocation fields for a run whose phases
+	// are not all on one harness (CLA-366): harness name -> HarnessConfig. Empty
+	// on every single-harness config, which is every config written before this
+	// existed.
+	//
+	// Keyed by harness NAME, deliberately, so it composes with the other
+	// per-harness maps rather than nesting inside one of them — the budget's own
+	// per-harness breakers are keyed the same way, and neither has to know about
+	// the other.
+	//
+	// A block for the TOP-LEVEL harness is optional and its gaps are filled from
+	// the run-wide twins (Model, Models, ConfigDir, MCPConfigPath, SettingsPath),
+	// because those fields have always described that harness. A block for any
+	// OTHER harness is required and is filled from nothing — see HarnessConfig
+	// for why inheriting a harness dialect across harnesses is worse than an
+	// empty field.
+	Harnesses map[string]HarnessConfig `json:"harnesses"`
 
 	// Prompt is what each fresh session is asked to do. Default: work ONE task.
 	// It is not a per-task prompt - the backlog is the source of tasks - but it
@@ -455,6 +534,23 @@ type Project struct {
 	// at. Empty = `<workdir>/.mcp.json` when that file exists, else the top-level
 	// mcp_config_path.
 	MCPConfigPath string `json:"mcp_config_path"`
+
+	// MCPConfigPaths is this project's MCP config PER HARNESS (harness name ->
+	// path), for a run whose phases are not all on one harness (CLA-366). Empty
+	// on every single-harness config.
+	//
+	// It exists because the two axes multiply. MCPConfigPath above selects the
+	// PROJECT (its `/mcp/<slug>` URL is what the poll and the sessions agree on),
+	// while the file's SCHEMA belongs to a harness — opencode refuses to start on
+	// Claude's `mcpServers`. One file cannot be both for two harnesses, so a
+	// multi-project mixed-harness run needs one per pair, and Validate refuses the
+	// combination rather than letting every project's opencode phase quietly share
+	// whichever single file `harnesses.<name>.mcp_config_path` named — which would
+	// poll one queue and work another, the split-brain the slug check below exists
+	// to prevent.
+	//
+	// Each entry is held to the same origin and slug checks as MCPConfigPath.
+	MCPConfigPaths map[string]string `json:"mcp_config_paths"`
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
@@ -588,6 +684,11 @@ func (c *Config) EffectivePhases() []Phase {
 			ph.Prompt = builtinPhasePrompts[ph.Name]
 		}
 		ph.MaxTurns = c.resolveMaxTurns(ph.MaxTurns)
+		// Resolve the harness here too, so every phase the driver iterates NAMES
+		// the harness it runs on and nothing downstream has to re-derive it from
+		// the config. The synthesized single phase of an unphased run gets the
+		// run-wide harness by the same rule, which is what it always ran on.
+		ph.Harness = c.HarnessFor(ph)
 		out[i] = ph
 	}
 	return out
@@ -646,15 +747,125 @@ func BuiltinPhaseNames() []string {
 // unattended run at 3am. It is deliberately NOT reported for an unset tier,
 // which is the ordinary case and not a mistake.
 func (c *Config) ModelForTier(tier string) (model string, ok bool) {
-	runDefault := strings.TrimSpace(c.Model)
-	t := strings.TrimSpace(tier)
-	if t == "" {
-		return runDefault, true
+	return c.ModelForPhase(Phase{Tier: tier})
+}
+
+// HarnessFor names the harness one phase runs on: the phase's own, else the
+// run-wide one. Total, and the answer for an unphased run is the run-wide
+// harness, which is what every caller wants.
+func (c *Config) HarnessFor(ph Phase) string {
+	if h := strings.TrimSpace(ph.Harness); h != "" {
+		return h
 	}
-	if alias := strings.TrimSpace(c.Models[t]); alias != "" {
+	return c.Harness
+}
+
+// SessionFor resolves one harness's invocation fields.
+//
+// The run-wide fields fill the gaps for the TOP-LEVEL harness only. For any
+// other harness the block stands alone: every field in it is a dialect of that
+// harness (see HarnessConfig), so inheriting the top level's would hand a claude
+// config dir and a Claude-shaped `.mcp.json` to opencode, which does not ignore
+// the difference — it refuses to start. An unconfigured harness therefore
+// resolves to empty fields, and each adapter falls back to its own ambient
+// defaults, which is a session that may lack tools rather than one that dies on
+// somebody else's config. Validate refuses the unconfigured case up front; this
+// stays total so nothing downstream has a second error path.
+func (c *Config) SessionFor(name string) HarnessConfig {
+	hc := c.Harnesses[name]
+	if name != c.Harness {
+		return hc
+	}
+	if hc.Model == "" {
+		hc.Model = c.Model
+	}
+	if hc.Models == nil {
+		hc.Models = c.Models
+	}
+	if hc.ConfigDir == "" {
+		hc.ConfigDir = c.ConfigDir
+	}
+	if hc.MCPConfigPath == "" {
+		hc.MCPConfigPath = c.MCPConfigPath
+	}
+	if hc.SettingsPath == "" {
+		hc.SettingsPath = c.SettingsPath
+	}
+	return hc
+}
+
+// ModelForPhase resolves one phase's tier to the model alias its session runs
+// on, against the tier map of the harness THAT phase runs on.
+//
+// Same total fallback chain as the single-harness case it replaces — unset tier,
+// unknown bucket, and a bucket mapped to blank all resolve to that harness's
+// default model, and an empty default means the harness's own — with the
+// per-harness lookup being the whole difference. A bucket name is portable and
+// the alias in it is not, so "strong" on a claude phase and "strong" on an
+// opencode phase are two different aliases under one policy word.
+//
+// `ok` is false only when a tier was NAMED and resolved to nothing, exactly as
+// before: the caller logs it and runs on the default rather than stopping an
+// unattended run over a typo. A phase on a harness with no tier map at all
+// therefore reports the typo case for any tier it names, which is honest — the
+// bucket really does resolve to nothing there.
+func (c *Config) ModelForPhase(ph Phase) (model string, ok bool) {
+	hc := c.SessionFor(c.HarnessFor(ph))
+	dflt := strings.TrimSpace(hc.Model)
+	t := strings.TrimSpace(ph.Tier)
+	if t == "" {
+		return dflt, true
+	}
+	if alias := strings.TrimSpace(hc.Models[t]); alias != "" {
 		return alias, true
 	}
-	return runDefault, false
+	return dflt, false
+}
+
+// ResolveMCPConfig picks the MCP config file one session gets, given the harness
+// it runs on and the project scope it runs in.
+//
+// The file carries TWO facts at once — which project (its `/mcp/<slug>` URL) and
+// which schema (the harness's) — so the rule has to satisfy both, and it lives
+// here because two callers must agree on it: the driver building an invocation
+// and `doctor` reporting on what that invocation will be. A preflight that
+// resolved this differently from the loop would certify a file no session ever
+// reads, which is the exact failure MCPConfigUse was added to end.
+//
+// projectMCP / projectPerHarness are the project's own fields (empty and nil for
+// a single-project run). Precedence: the project's file FOR THIS HARNESS, else
+// the project's file when this is the top-level harness — it is that harness's
+// schema and no other's — else the harness block's own path.
+func (c *Config) ResolveMCPConfig(harnessName, projectMCP string, projectPerHarness map[string]string) string {
+	if p := projectPerHarness[harnessName]; p != "" {
+		return p
+	}
+	if harnessName == c.Harness && projectMCP != "" {
+		return projectMCP
+	}
+	return c.SessionFor(harnessName).MCPConfigPath
+}
+
+// PhaseHarnesses lists every harness this config will actually spawn — the
+// run-wide one and every phase's — deduplicated, with the run-wide one first and
+// the rest in sequence order.
+//
+// Callers are the ones that must reason about ALL of them rather than the
+// top-level name alone: `doctor` checking binaries, and Validate checking that
+// each is registered and configured. Reporting on `harness` alone is how a
+// mixed-harness config earns a green preflight and then dies on its second
+// phase.
+func (c *Config) PhaseHarnesses() []string {
+	out := []string{c.Harness}
+	seen := map[string]bool{c.Harness: true}
+	for _, ph := range c.Phases {
+		h := c.HarnessFor(ph)
+		if !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // Label names a phase for logs and log filenames: its name, or its 1-based
@@ -977,6 +1188,18 @@ func (c *Config) Validate() error {
 	c.SettingsPath = underWorkDir(c.SettingsPath, c.WorkDir)
 	c.ConfigDir = underWorkDir(c.ConfigDir, c.WorkDir)
 
+	// Per-harness blocks get exactly the same path treatment as their run-wide
+	// twins, and for the same reasons: a `~` that never expanded and a relative
+	// path resolved against whatever cwd the process had are bugs that do not
+	// care which block the field sat in. Written back through the map because
+	// HarnessConfig is a value type.
+	for name, hc := range c.Harnesses {
+		hc.ConfigDir = underWorkDir(expandHome(hc.ConfigDir), c.WorkDir)
+		hc.MCPConfigPath = underWorkDir(expandHome(hc.MCPConfigPath), c.WorkDir)
+		hc.SettingsPath = underWorkDir(expandHome(hc.SettingsPath), c.WorkDir)
+		c.Harnesses[name] = hc
+	}
+
 	// Validate against the harness registry (not a hand-kept switch) so the accepted
 	// set can never drift from what is actually registered — an unregistered value is
 	// rejected here before harness.Get is consulted, and a newly registered adapter is
@@ -1019,11 +1242,44 @@ func (c *Config) Validate() error {
 	// it would implement and push and then stop after phase 1 on EVERY task,
 	// reported by a log line that reads like an ordinary early finish. Refuse
 	// here instead, where an operator can see it, rather than at 3am.
+	// Every harness a phase names has to exist and, when it is not the top-level
+	// one, has to be configured. Checked before the claim-tracking rule below,
+	// which looks a phase's harness up in the registry.
+	for i, ph := range c.Phases {
+		h := c.HarnessFor(ph)
+		if !harness.Known(h) {
+			return fmt.Errorf("phases[%d] (%q): unknown harness %q (want: %s)",
+				i, ph.Label(i), h, strings.Join(harness.Names(), ", "))
+		}
+		// A phase on some OTHER harness inherits none of the run-wide
+		// harness-shaped fields, by design (see HarnessConfig), so with no block
+		// of its own it would spawn with no config dir, no MCP config and no
+		// settings — a session with no clankerbar tools, which looks from the log
+		// like a model that declined the work. Refuse here, where the operator can
+		// see it, rather than at 3am.
+		if h == c.Harness {
+			continue
+		}
+		if _, ok := c.Harnesses[h]; !ok {
+			return fmt.Errorf("phases[%d] (%q) runs on harness %q, but there is no `harnesses.%s` block: "+
+				"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
+				"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
+				i, ph.Label(i), h, h, h)
+		}
+	}
+	// Phases rest on the CLAIMING phase's adapter observing the session's claim:
+	// the handback across a seam, the salvage, the delivery check and the
+	// {{taskId}}/{{runId}} seed all come from Result.Claim of the phase that
+	// claimed. It is the FIRST phase's harness that must track claims, not the
+	// run's — a mixed sequence's later phases are seeded from that observation
+	// through Invocation.ResumeClaim and never claim anything themselves.
 	if len(c.Phases) > 1 {
-		if caps, ok := harness.CapabilitiesOf(c.Harness); ok && !caps.TracksClaims {
-			return fmt.Errorf("harness %q cannot run `phases`: it does not observe the session's task claim, "+
-				"so a phase could not hand its task to the next one (only the claim-tracking harnesses can: use one, or drop `phases`)",
-				c.Harness)
+		first := c.Phases[0]
+		h := c.HarnessFor(first)
+		if caps, ok := harness.CapabilitiesOf(h); ok && !caps.TracksClaims {
+			return fmt.Errorf("phases[0] (%q) claims the task, but harness %q does not observe the session's task claim, "+
+				"so it could not hand that task to the next phase (only the claim-tracking harnesses can: use one, or drop `phases`)",
+				first.Label(0), h)
 		}
 	}
 	for i, ph := range c.Phases {
@@ -1100,6 +1356,21 @@ func (c *Config) Validate() error {
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
+	// Each per-harness MCP config points the SAME account key at a host, so it is
+	// held to the same trusted origin. Sorted so a config with two bad blocks
+	// reports the same one every time rather than whichever the map iterated
+	// first — an error message that changes between runs on unchanged input reads
+	// as a flaky check.
+	for _, name := range sortedKeys(c.Harnesses) {
+		hc := c.Harnesses[name]
+		if err := c.checkMCPConfigOrigins(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
+			return err
+		}
+		if err := refuseInsecureMode(hc.SettingsPath, groupOtherWrite); err != nil {
+			return fmt.Errorf("harnesses.%s.settings_path: %w - it is the allow/deny policy the unattended session is gated by: chmod go-w %s",
+				name, err, hc.SettingsPath)
+		}
+	}
 
 	// The settings file IS the permission policy - the allow/deny rules that are
 	// the only thing gating what an unattended session may call, since there is no
@@ -1156,6 +1427,41 @@ func (c *Config) Validate() error {
 		if fromMCP := slugFromMCPURL(mcpURLFromConfig(p.MCPConfigPath)); fromMCP != "" && fromMCP != p.Slug {
 			return fmt.Errorf("projects[%d]: slug %q does not match its .mcp.json, which names /mcp/%s — the poll would gate on one project while sessions work another", i, p.Slug, fromMCP)
 		}
+		// The per-harness files get every check the project's own file just had:
+		// they are the same account key pointed at the same kind of host, and the
+		// same split-brain is available through any one of them.
+		for _, name := range sortedKeys(p.MCPConfigPaths) {
+			path := underWorkDir(expandHome(p.MCPConfigPaths[name]), effectiveWorkDir)
+			p.MCPConfigPaths[name] = path
+			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
+			if err := c.checkMCPConfigOrigins(path, label); err != nil {
+				return err
+			}
+			if fromMCP := slugFromMCPURL(mcpURLFromConfig(path)); fromMCP != "" && fromMCP != p.Slug {
+				return fmt.Errorf("%s: slug %q does not match that file, which names /mcp/%s — the poll would gate on one project while sessions work another", label, p.Slug, fromMCP)
+			}
+		}
+	}
+	// A phase on a harness other than the run's needs its own MCP config PER
+	// PROJECT, because that file carries both the schema (the harness's) and the
+	// slug (the project's). Falling back to the single
+	// `harnesses.<name>.mcp_config_path` would point every project's phase at one
+	// project's queue, which is the split-brain the slug check above refuses when
+	// it is written down — so refuse it here too, where it would otherwise be
+	// arrived at by omission.
+	for i, ph := range c.Phases {
+		h := c.HarnessFor(ph)
+		if h == c.Harness {
+			continue
+		}
+		for j := range c.Projects {
+			if c.Projects[j].MCPConfigPaths[h] == "" {
+				return fmt.Errorf("phases[%d] (%q) runs on harness %q, but projects[%d] (%q) declares no `mcp_config_paths.%s`: "+
+					"that file carries both the harness's schema and the project's /mcp/<slug>, so one per project is needed "+
+					"(the top-level `harnesses.%s.mcp_config_path` names a single project and cannot serve them all)",
+					i, ph.Label(i), h, j, c.Projects[j].Slug, h, h)
+			}
+		}
 	}
 
 	resolved, err := resolveEnv(c.Env)
@@ -1190,6 +1496,19 @@ func discoverMCPConfig(workdir string) string {
 // read the key that drives the whole backlog. Refused rather than warned: a WARN
 // in an overnight log is read after the fact, if at all, and the fix is one
 // chmod.
+// sortedKeys is map iteration made deterministic, for the checks whose ERROR
+// depends on which entry is reached first. A validation message that names a
+// different block on each run of the same file reads as a flaky check rather
+// than a config with two problems.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func resolveEnv(m map[string]string) ([]string, error) {
 	if len(m) == 0 {
 		return nil, nil

@@ -60,6 +60,14 @@ type Target struct {
 	// whose /mcp/<slug> URL selects the project). Empty = the config's path.
 	MCPConfigPath string
 
+	// MCPConfigPaths is this project's MCP config PER HARNESS, for a sequence
+	// whose phases are not all on one harness (CLA-366). MCPConfigPath above is
+	// the top-level harness's file; a phase on another harness needs the same
+	// project in that harness's schema, which is a different file. Empty on every
+	// single-harness run, and config.Validate refuses the combination that would
+	// need an entry here and lacks one.
+	MCPConfigPaths map[string]string
+
 	// Releaser hands back a claim a session left holding (CLA-242). Nil disables
 	// the handback for this target, which costs only the reclaim an expiring lease
 	// would have cost anyway — so a target without one degrades, it does not break.
@@ -105,6 +113,17 @@ type Driver struct {
 	// newSalvager builds the stranded-work rescuer for a workdir (CLA-314). Same
 	// shape and the same reason as newVerifier.
 	newSalvager func(workdir string) workSalvager
+
+	// newAdapter resolves a harness NAME to its adapter, for a sequence whose
+	// phases are not all on one harness (CLA-366). Production is harness.Get; a
+	// field so tests can hand out their own fakes per name.
+	//
+	// It is only consulted for a phase naming some OTHER harness — a phase on the
+	// run's own harness gets d.h, the adapter the caller constructed the Driver
+	// with. That is what keeps every existing test (which passes a fake and never
+	// names a harness on a phase) driving its fake rather than reaching for a real
+	// binary through the registry.
+	newAdapter func(name string) (harness.Adapter, error)
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -139,7 +158,28 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		skipUntil:   make([]time.Time, n),
 		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
+		newAdapter:  harness.Get,
 	}
+}
+
+// adapterFor resolves the harness that runs one phase.
+//
+// The run's own harness resolves to d.h without consulting the registry, which
+// is both cheaper and the thing that keeps a Driver built with a substituted
+// adapter honest: a phase that names nothing, or names the configured harness,
+// runs on exactly the adapter the caller handed over.
+//
+// An unresolvable name is an error rather than a fallback to d.h. config.Validate
+// has already refused an unregistered harness, so reaching here means the
+// registry and the config disagree, and quietly running the phase on the other
+// harness would be the wrong half of a mixed sequence — the review phase spawning
+// on the implement harness, with nothing in the log to say so.
+func (d *Driver) adapterFor(ph config.Phase) (harness.Adapter, error) {
+	name := ph.Harness
+	if name == "" || name == d.cfg.Harness {
+		return d.h, nil
+	}
+	return d.newAdapter(name)
 }
 
 // Run drives the daemon until STOP/HALT, a ceiling (max-iterations / budget), or
@@ -609,6 +649,14 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
 func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+	// The adapter for THIS phase, resolved once: everything below — the spawn, the
+	// classification of what came back, and the probe of any usage limit it hit —
+	// has to be the harness that actually ran, not the run's default. Resolved
+	// here rather than per attempt so a retry ladder cannot straddle two harnesses.
+	a, aerr := d.adapterFor(ph)
+	if aerr != nil {
+		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), aerr)
+	}
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -
 	// the spend the budget breaker above can never see (CLA-288).
@@ -646,7 +694,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if bound := d.cfg.ZeroSpendAttemptBound(); noUsage >= bound {
 			return tokens, cost, false, end, fmt.Errorf(
 				"iteration %d: %w: %d consecutive attempts died before %s reported any usage, so nothing the budget breaker reads was ever fed - the sessions are failing early rather than working (see the attempt logs in the state dir; raise max_zero_spend_attempts to allow more)",
-				drainNum, errZeroSpendLoop, noUsage, d.h.Name())
+				drainNum, errZeroSpendLoop, noUsage, a.Name())
 		}
 
 		// Each attempt streams live to the terminal and to its own logfile. The name
@@ -674,12 +722,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			log.Printf("could not open iteration log %s: %v", logPath, ferr)
 		}
 		if retries == 0 {
-			log.Printf("iteration %d %s— spawning %s (log: %s)", drainNum, labelOf(t), d.h.Name(), logPath)
+			log.Printf("iteration %d %s— spawning %s (log: %s)", drainNum, labelOf(t), a.Name(), logPath)
 		} else {
-			log.Printf("iteration %d %s— retry %d, spawning %s (log: %s)", drainNum, labelOf(t), retries, d.h.Name(), logPath)
+			log.Printf("iteration %d %s— retry %d, spawning %s (log: %s)", drainNum, labelOf(t), retries, a.Name(), logPath)
 		}
 
-		res, ierr := d.h.Invoke(ctx, inv)
+		res, ierr := a.Invoke(ctx, inv)
 		if f != nil {
 			_ = f.Close()
 		}
@@ -721,8 +769,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// HasWIP is exactly that signal: it is set by the only two things that make
 		// a checkpoint real — the phase recording its own branch, or the salvage
 		// recording one for it and the PLANE accepting the record.
-		capped := d.h.TurnCapped(res)
-		ceiling := d.h.TokenCeilingHit(res)
+		capped := a.TurnCapped(res)
+		ceiling := a.TokenCeilingHit(res)
 		checkpointable := res.ExitCode == 0 || ((capped || ceiling) && res.Claim.HasWIP)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
@@ -762,7 +810,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 				return tokens, cost, true, end, nil
 			}
 			// Couldn't launch the harness at all (bad PATH/flags/env) — not a blip.
-			return tokens, cost, false, end, fmt.Errorf("invoke %s: %w", d.h.Name(), ierr)
+			return tokens, cost, false, end, fmt.Errorf("invoke %s: %w", a.Name(), ierr)
 		}
 
 		// A session whose stream could not be read whole (CLA-262). Everything below
@@ -789,7 +837,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
 		// poll for, so the run stops cleanly and the operator resumes it once
 		// they've topped up.
-		if lim := d.h.DetectLimit(res); lim.Limited {
+		if lim := a.DetectLimit(res); lim.Limited {
 			if lim.Stop {
 				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved)",
 					drainNum, limitReason(lim))
@@ -828,7 +876,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// sessions', so it reaches the breaker at the top of this loop, the one in
 			// Run between drains, and the iteration's cost line — rather than a
 			// separate figure nothing is measured against (CLA-287).
-			ptokens, pcost, pstop := d.supervisedWait(ctx, lim, t, spend{
+			// Probed on the harness that hit the limit, in that harness's own
+			// session shape: a usage limit is a property of one provider's account,
+			// so probing the run's default harness would answer a question nobody
+			// asked, and spend on it.
+			ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, t, spend{
 				start:  prior.start,
 				tokens: prior.tokens + tokens,
 				cost:   prior.cost + cost,
@@ -897,7 +949,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 
 		// Non-zero exit, not the usage cap: a transient server/network blip backs
 		// off and retries; anything else is a genuine failure and stops.
-		if d.h.IsTransient(res) {
+		if a.IsTransient(res) {
 			// A RESUMED phase does not retry, for the same reason it does not wait
 			// out a usage limit — and this path is the more dangerous of the two,
 			// because MaxRetries defaults to 0, meaning never give up. Seeding the
@@ -938,7 +990,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// text is the harness's own diagnostic scope, never the raw stream, so
 		// the agent's narration is not quoted back at them (CLA-258).
 		return tokens, cost, false, end, fmt.Errorf("iteration %d: %s exited %d (non-retryable) — stopping%s%s",
-			drainNum, d.h.Name(), res.ExitCode, failureDetail(d.h.Diagnostic(res)), droppedNote(res.OutputDropped))
+			drainNum, a.Name(), res.ExitCode, failureDetail(a.Diagnostic(res)), droppedNote(res.OutputDropped))
 	}
 }
 
@@ -1537,7 +1589,7 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 // only be tripped by spend it can SEE was blind to exactly the spend this loop
 // generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
 // and this is the one loop with no other way out (CLA-287).
-func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target, sofar spend) (tokens int, cost float64, stop bool) {
+func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
 	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 
@@ -1554,7 +1606,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, t Target
 			log.Print("stated reset passed — resuming")
 			return tokens, cost, false
 		}
-		got, err := d.h.Probe(ctx, d.invocation(t, true))
+		got, err := a.Probe(ctx, d.invocationOn(t, d.cfg.HarnessFor(ph), true))
 		// Count the probe BEFORE reading its verdict, and before the error branch: a
 		// probe that failed still spawned the harness and still spent. Every path out
 		// of here — resume, stop, or another lap — carries it.
@@ -1690,7 +1742,7 @@ func droppedNote(dropped int64) string {
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
 func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result) harness.Invocation {
-	inv := d.invocation(t, false)
+	inv := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
 	inv.MaxTurns = ph.MaxTurns
 	// The per-session runaway ceiling, resolved once per drain from the budget:
 	// the operator's own dial, else 2x max_tokens, else the documented floor.
@@ -1711,10 +1763,16 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// sitting in it would send them looking in the wrong place — the more so
 	// because the whitespace is the thing they cannot see. Label(), not Name, so a
 	// phase carrying a custom prompt and no name is still identified.
-	model, ok := d.cfg.ModelForTier(ph.Tier)
+	//
+	// Resolved against the tier map of the harness THIS PHASE runs on, not the
+	// run's: a bucket name is policy and travels, the alias inside it is a
+	// provider's and does not. An opencode phase whose harness block names no
+	// models therefore runs on opencode's own configured model — which is where
+	// opencode's model lives — rather than on a claude alias its CLI would die on.
+	model, ok := d.cfg.ModelForPhase(ph)
 	if !ok {
-		log.Printf("%sphase %q names tier %q, which resolves to no model — running on the default model instead",
-			labelOf(t), ph.Label(phaseIdx), ph.Tier)
+		log.Printf("%sphase %q names tier %q, which resolves to no model on harness %q — running on that harness's default model instead",
+			labelOf(t), ph.Label(phaseIdx), ph.Tier, d.cfg.HarnessFor(ph))
 	}
 	inv.Model = model
 	if prev != nil && prev.Claim.Held() {
@@ -1735,21 +1793,37 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 // invocation builds the harness invocation for one target: the target's workdir
 // and .mcp.json (which select the project) over the config's global fields.
 func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
+	return d.invocationOn(t, d.cfg.Harness, probe)
+}
+
+// invocationOn builds the invocation for one target ON A NAMED HARNESS: the
+// project's workdir and MCP config over that harness's own fields.
+//
+// The harness-shaped fields (config dir, MCP config, settings, model) come from
+// config.SessionFor, which fills the run-wide values in for the top-level
+// harness only — so a single-harness run resolves to exactly what it always did,
+// and a phase on another harness gets that harness's block or nothing, never the
+// top level's claude-shaped paths.
+//
+// The MCP config is the one field with two claimants, because it carries two
+// facts at once: which PROJECT (its /mcp/<slug>) and which SCHEMA (the
+// harness's). The project's per-harness file answers both and wins; the
+// project's own file is the top-level harness's, so it only applies there; and
+// the harness block's path is the single-project fallback. config.Validate
+// refuses the combination that would silently resolve to the wrong project.
+func (d *Driver) invocationOn(t Target, harnessName string, probe bool) harness.Invocation {
 	workdir := t.WorkDir
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
-	mcp := t.MCPConfigPath
-	if mcp == "" {
-		mcp = d.cfg.MCPConfigPath
-	}
+	hc := d.cfg.SessionFor(harnessName)
 	return harness.Invocation{
 		Prompt:        d.cfg.Prompt,
-		Model:         d.cfg.Model,
+		Model:         hc.Model,
 		WorkDir:       workdir,
-		MCPConfigPath: mcp,
-		ConfigDir:     d.cfg.ConfigDir,
-		SettingsPath:  d.cfg.SettingsPath,
+		MCPConfigPath: d.cfg.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
+		ConfigDir:     hc.ConfigDir,
+		SettingsPath:  hc.SettingsPath,
 		Env:           d.cfg.EnvSlice(),
 		Probe:         probe,
 	}

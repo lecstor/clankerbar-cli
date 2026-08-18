@@ -188,6 +188,72 @@ error is visible immediately to whoever asked the closed question. Nothing is
 tiered by default: an untouched config runs every phase on the run's model, and
 these two shipped phases both produce durable artifacts.
 
+### Per-phase harnesses: implement on one, review on another
+
+A phase can name the **harness** it runs on, not only the model:
+
+```json
+"harness": "claude",
+"harnesses": {
+  "opencode": {
+    "config_dir": "~/.config/opencode",
+    "mcp_config_path": "~/.config/clankerbar/opencode-mcp.json"
+  }
+},
+"phases": [
+  { "name": "implement", "harness": "opencode" },
+  { "name": "review" }
+]
+```
+
+That runs the implementation on a cheap provider-agnostic backend and keeps the
+adversarial review on the harness with the subagent machinery. Nothing in the
+seam resists it: each phase is already a fresh session seeded from the observed
+claim, so what crosses the boundary is a task id and a run id, and both live on
+the plane rather than in a session.
+
+**The harness-shaped fields stop being run-wide, and that is the whole of the
+configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and
+`models` at the top level describe your `harness` and no other, because each is a
+dialect: `config_dir` is `CLAUDE_CONFIG_DIR` for one adapter and
+`OPENCODE_CONFIG_DIR` for another, `mcp_config_path` is Claude's `.mcp.json` for
+one and an opencode-schema config for another — and opencode does not ignore the
+difference, it **refuses to start** on `mcpServers`. So a phase on another
+harness inherits none of them and reads its own `harnesses.<name>` block instead.
+A phase naming a harness with no block is refused at validation, rather than
+spawning a session with no clankerbar tools that looks in the log like a model
+that declined the work.
+
+**Tiers are resolved per harness.** A phase's `tier` names a bucket in the tier
+map of *the harness that phase runs on*, so one `"tier": "strong"` can mean opus
+here and something else there — the bucket name is your policy and travels, the
+alias inside it is a provider's and does not. A harness whose block names no
+models runs on that harness's own configured default, which is where opencode's
+model lives; a claude alias is never handed to another harness's `--model`.
+
+**The first phase claims, so the rule about claim tracking is about it.** A
+multi-phase sequence needs the *claiming* phase's harness to observe the
+session's task claim (`claude` or `opencode`); later phases are handed that claim
+and never observe one, so they can run anywhere. Validation says which phase and
+which harness when it refuses.
+
+**Multi-project runs need one MCP file per project per harness.** That file
+carries two facts at once — which project (its `/mcp/<slug>`) and which schema
+(the harness's) — so a `projects` entry declares them under `mcp_config_paths`:
+
+```json
+"projects": [
+  { "slug": "clankerbar", "workdir": "~/dev",
+    "mcp_config_paths": { "opencode": "~/.config/clankerbar/opencode-clankerbar.json" } }
+]
+```
+
+Omitting one is refused rather than resolved: the single top-level
+`harnesses.<name>.mcp_config_path` names one project, so falling back to it would
+poll one queue while sessions worked another. `doctor` reports each
+project-and-harness pair separately, along with each harness's binary, config dir
+and permission policy.
+
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
 

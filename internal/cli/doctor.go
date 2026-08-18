@@ -201,15 +201,15 @@ func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overr
 // them: what am I configured as, can I run the agent, can I reach the backlog,
 // can I write my state, and what will I be allowed to do.
 func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
-	checks := []check{
-		checkConfig(cfg),
-		checkHarness(ctx, cfg, e),
-		checkConfigDir(cfg),
-	}
+	checks := []check{checkConfig(cfg)}
+	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
+	checks = append(checks, checkConfigDirs(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
-	return append(checks, checkMCPServers(cfg), checkPermissions(cfg), checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
+	checks = append(checks, checkMCPServers(cfg))
+	checks = append(checks, checkPermissionsAll(cfg)...)
+	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
 }
 
 func doctorFailed(n int) error {
@@ -233,6 +233,17 @@ func checkConfig(cfg *config.Config) check {
 		workdir = "(current directory)"
 	}
 	c.info = append(c.info, "harness: "+cfg.Harness, "workdir: "+workdir)
+	// Which phase runs where, but only when that is not the same answer twice: a
+	// mixed sequence is the one config where "harness: <x>" above is true and
+	// incomplete, and the pairing is what an operator wants to eyeball before an
+	// overnight run - not that two harnesses are involved, but which way round.
+	if len(cfg.PhaseHarnesses()) > 1 {
+		pairs := make([]string, 0, len(cfg.Phases))
+		for i, ph := range cfg.EffectivePhases() {
+			pairs = append(pairs, ph.Label(i)+" -> "+ph.Harness)
+		}
+		c.info = append(c.info, "phase harnesses: "+strings.Join(pairs, ", "))
+	}
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
@@ -273,11 +284,37 @@ func envKeyNames(env map[string]string) string {
 
 // --- 2. harness --------------------------------------------------------------
 
+// checkHarness reports on the run's own harness. Kept as the single-harness
+// entry point; checkHarnesses below is what doctorChecks calls, because a
+// sequence whose phases name other harnesses spawns binaries this one never
+// looks at.
 func checkHarness(ctx context.Context, cfg *config.Config, e doctorEnv) check {
-	c := check{name: "harness"}
+	return checkHarnessNamed(ctx, "harness", cfg.Harness, e)
+}
+
+// checkHarnesses reports on EVERY harness this config will spawn — the run's and
+// every phase's (CLA-366). Checking only `harness` is how a mixed-harness config
+// earns a green preflight and then dies at its second phase on a binary that was
+// never on PATH.
+func checkHarnesses(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	names := cfg.PhaseHarnesses()
+	out := make([]check, 0, len(names))
+	for i, n := range names {
+		// The first keeps the bare name, so a single-harness report reads exactly
+		// as it always has; the rest are qualified, so two lines cannot be confused.
+		label := "harness"
+		if i > 0 {
+			label = "harness[" + n + "]"
+		}
+		out = append(out, checkHarnessNamed(ctx, label, n, e))
+	}
+	return out
+}
+
+func checkHarnessNamed(ctx context.Context, label, bin string, e doctorEnv) check {
+	c := check{name: label}
 	// Every adapter execs its own name verbatim (see internal/harness), so the
 	// harness name IS the binary to look for.
-	bin := cfg.Harness
 
 	path, err := e.lookPath(bin)
 	if err != nil {
@@ -314,12 +351,34 @@ var authMarkers = map[string][]string{
 	"opencode": {"auth.json", "config.json"},
 }
 
+// checkConfigDir reports on the run harness's config dir. See checkConfigDirs,
+// which is what doctorChecks calls.
 func checkConfigDir(cfg *config.Config) check {
-	c := check{name: "config_dir"}
+	return checkConfigDirNamed("config_dir", cfg.Harness, cfg.SessionFor(cfg.Harness).ConfigDir)
+}
+
+// checkConfigDirs reports on the config dir of every harness this config will
+// spawn (CLA-366). A phase on another harness inherits nothing from the run-wide
+// `config_dir` — deliberately, since it is that harness's own dialect — so its
+// dir is a separate field that can be separately absent.
+func checkConfigDirs(cfg *config.Config) []check {
+	names := cfg.PhaseHarnesses()
+	out := make([]check, 0, len(names))
+	for i, n := range names {
+		label := "config_dir"
+		if i > 0 {
+			label = "config_dir[" + n + "]"
+		}
+		out = append(out, checkConfigDirNamed(label, n, cfg.SessionFor(n).ConfigDir))
+	}
+	return out
+}
+
+func checkConfigDirNamed(label, harnessName, dir string) check {
+	c := check{name: label}
 
 	// Validate has already expanded a leading ~, so what we stat is what the
 	// adapter will export.
-	dir := cfg.ConfigDir
 	if dir == "" {
 		// Unset is survivable interactively (the ambient environment carries it)
 		// and is exactly what bites an unattended cron/launchd run, whose bare
@@ -354,15 +413,15 @@ func checkConfigDir(cfg *config.Config) check {
 	if len(entries) == 0 {
 		c.status = warn
 		c.detail = dir + " is empty — no skills, plugins or auth state"
-		c.remedy = "initialise it by running " + cfg.Harness + " once with this config dir, or point it elsewhere"
+		c.remedy = "initialise it by running " + harnessName + " once with this config dir, or point it elsewhere"
 		return c
 	}
 	// A harness with no marker list is one doctor has no opinion about — a newly
 	// registered adapter, say. Asserting "no recognisable auth state" there would be
 	// a permanent, unfixable WARN about a table this file forgot to update.
-	if markers, known := authMarkers[cfg.Harness]; known && !hasAnyMarker(dir, markers) {
+	if markers, known := authMarkers[harnessName]; known && !hasAnyMarker(dir, markers) {
 		c.status = warn
-		c.detail = dir + " has no recognisable " + cfg.Harness + " auth state"
+		c.detail = dir + " has no recognisable " + harnessName + " auth state"
 		c.remedy = "confirm a headless run can authenticate (the credential may be in the OS keychain, which doctor cannot see)"
 		return c
 	}
@@ -788,15 +847,46 @@ var agentInstructionFiles = []string{"AGENTS.md", "CLAUDE.md"}
 // permissions beyond the ambient ones, then spends its opening minutes
 // rediscovering the layout. It still works, which is why nobody notices for
 // thirty iterations.
+// checkSessions reports on each session the loop will spawn: its workdir, and
+// what the harness running there makes of the MCP config it will be handed.
+//
+// One check per project PER HARNESS (CLA-366), because both axes change the
+// answer: the project decides which file (its `/mcp/<slug>`) and the harness
+// decides what that file MEANS — a Claude-shaped `.mcp.json` is the session's
+// tools for one adapter and a refusal to start for another. Qualified names only
+// when a second harness is in play, so a single-harness report is unchanged.
 func checkSessions(cfg *config.Config) []check {
-	if len(cfg.Projects) == 0 {
-		return []check{sessionCheck("workdir", cfg.WorkDir, cfg.MCPConfigPath, cfg.Harness)}
+	harnesses := cfg.PhaseHarnesses()
+	suffix := func(h string) string {
+		if len(harnesses) == 1 {
+			return ""
+		}
+		return ":" + h
 	}
-	out := make([]check, 0, len(cfg.Projects))
+	if len(cfg.Projects) == 0 {
+		out := make([]check, 0, len(harnesses))
+		for _, h := range harnesses {
+			out = append(out, sessionCheck("workdir"+bracket(suffix(h)), cfg.WorkDir, cfg.ResolveMCPConfig(h, "", nil), h))
+		}
+		return out
+	}
+	out := make([]check, 0, len(cfg.Projects)*len(harnesses))
 	for _, p := range cfg.Projects {
-		out = append(out, sessionCheck("workdir["+p.Slug+"]", projectWorkDir(cfg, p), projectMCPConfig(cfg, p), cfg.Harness))
+		for _, h := range harnesses {
+			out = append(out, sessionCheck("workdir["+p.Slug+suffix(h)+"]", projectWorkDir(cfg, p),
+				cfg.ResolveMCPConfig(h, projectMCPConfig(cfg, p), p.MCPConfigPaths), h))
+		}
 	}
 	return out
+}
+
+// bracket wraps a non-empty qualifier in the [] the check names use, and leaves
+// an empty one alone — so "workdir" stays "workdir" on a single-harness run.
+func bracket(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "[" + strings.TrimPrefix(s, ":") + "]"
 }
 
 // projectWorkDir and projectMCPConfig resolve a project entry EXACTLY as
@@ -1053,20 +1143,45 @@ func checkMCPServers(cfg *config.Config) check {
 
 // --- 8. permission policy ----------------------------------------------------
 
+// checkPermissions reports on the run harness's permission policy. See
+// checkPermissionsAll, which is what doctorChecks calls.
 func checkPermissions(cfg *config.Config) check {
-	c := check{name: "permissions"}
-	switch cfg.Harness {
+	return checkPermissionsNamed(cfg, "permissions", cfg.Harness)
+}
+
+// checkPermissionsAll reports on the policy of every harness this config will
+// spawn (CLA-366). The policy is per harness in both senses — a different
+// mechanism each (a settings file, a sandbox flag, an env var) and a different
+// file — so a mixed run that checked only `harness` would certify the policy of
+// one session and say nothing about the other.
+func checkPermissionsAll(cfg *config.Config) []check {
+	names := cfg.PhaseHarnesses()
+	out := make([]check, 0, len(names))
+	for i, n := range names {
+		label := "permissions"
+		if i > 0 {
+			label = "permissions[" + n + "]"
+		}
+		out = append(out, checkPermissionsNamed(cfg, label, n))
+	}
+	return out
+}
+
+func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check {
+	c := check{name: label}
+	settingsPath := cfg.SessionFor(harnessName).SettingsPath
+	switch harnessName {
 	case "claude":
-		if cfg.SettingsPath == "" {
+		if settingsPath == "" {
 			c.status = warn
 			c.detail = "no settings_path — the unattended session runs on the ambient allowlist"
 			c.remedy = "set settings_path to a headless permission policy (its deny rules win over the config dir's)"
 			return c
 		}
-		data, err := os.ReadFile(cfg.SettingsPath)
+		data, err := os.ReadFile(settingsPath)
 		if err != nil {
 			c.status = fail
-			c.detail = cfg.SettingsPath + " is unreadable: " + err.Error()
+			c.detail = settingsPath + " is unreadable: " + err.Error()
 			c.remedy = "create the settings file, or clear settings_path"
 			return c
 		}
@@ -1074,12 +1189,12 @@ func checkPermissions(cfg *config.Config) check {
 			// Claude rejects an unparseable --settings file at startup, so this kills
 			// the first session rather than degrading it.
 			c.status = fail
-			c.detail = cfg.SettingsPath + " is not valid JSON"
+			c.detail = settingsPath + " is not valid JSON"
 			c.remedy = "fix the JSON — the harness refuses to start with an unparseable --settings file"
 			return c
 		}
 		c.status = pass
-		c.detail = cfg.SettingsPath + " parses"
+		c.detail = settingsPath + " parses"
 
 	case "codex":
 		// The adapter pins both axes itself, so there is nothing an operator can
@@ -1101,7 +1216,7 @@ func checkPermissions(cfg *config.Config) check {
 
 	default:
 		c.status = pass
-		c.detail = "no permission-policy checks for " + cfg.Harness
+		c.detail = "no permission-policy checks for " + harnessName
 	}
 	return c
 }
