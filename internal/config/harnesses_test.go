@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -235,10 +236,15 @@ func TestValidate_ClaimTrackingIsAskedOfTheClaimingPhasesHarness(t *testing.T) {
 		}
 	})
 
-	t.Run("a non-tracking harness on a LATER phase is accepted", func(t *testing.T) {
-		// It never claims: it is seeded from phase 1's observed claim through
-		// {{taskId}}/{{runId}} and Invocation.ResumeClaim, so the capability the
-		// rule guards is not one this phase needs.
+	t.Run("a non-tracking harness on a LATER phase is refused too", func(t *testing.T) {
+		// The tempting reading is that a later phase never claims, so the
+		// capability is not one it needs. It is: seeding Invocation.ResumeClaim is
+		// the ADAPTER's job, and an adapter that does not track claims does not
+		// seed either — codex returns a zero Result.Claim whatever it is handed.
+		// A mid-sequence one then ends every drain early (drainPhase records a
+		// checkpoint only for a phase that ends holding the task), and a final one
+		// leaves drainPhases carrying its predecessor's claim into the handback,
+		// which can post `ready` over a task that phase just landed at in_review.
 		c := &Config{
 			Harness:   "claude",
 			Harnesses: map[string]HarnessConfig{"codex": {ConfigDir: "/cx"}},
@@ -247,8 +253,12 @@ func TestValidate_ClaimTrackingIsAskedOfTheClaimingPhasesHarness(t *testing.T) {
 				{Name: "review", Harness: "codex"},
 			},
 		}
-		if err := c.Validate(); err != nil {
-			t.Fatalf("Validate() = %v, want nil — a resumed phase is handed its claim and never observes one", err)
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), "codex") {
+			t.Fatalf("Validate() = %v, want a refusal naming codex on the later phase", err)
+		}
+		if !strings.Contains(err.Error(), "phases[1]") {
+			t.Errorf("refusal %q should name the phase that cannot resume", err)
 		}
 	})
 
@@ -298,5 +308,98 @@ func TestValidate_RefusesAMixedSequenceWithNoPerProjectFile(t *testing.T) {
 	c.Projects[1].MCPConfigPaths = map[string]string{"opencode": "/oc/ezyapp.json"}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil once every project declares its own file", err)
+	}
+}
+
+func TestValidate_RefusesAnEmptyHarnessBlock(t *testing.T) {
+	c := mixedCfg()
+	// Presence of the KEY is not the guarantee the design makes. An empty block
+	// spawns the very session the rule exists to prevent — no config dir, no MCP
+	// config, no model — while satisfying a key check.
+	c.Harnesses["opencode"] = HarnessConfig{}
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "missing or empty") {
+		t.Fatalf("Validate() = %v, want a refusal saying the block is missing or empty", err)
+	}
+}
+
+func TestValidate_RefusesASingleProjectSlugMismatch(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, body string) string {
+		t.Helper()
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	// Two files, two projects. Nothing outside this check compares them: the poll
+	// derives its slug from mcp_config_path alone, while the opencode phase's
+	// sessions claim and work whatever ITS file names — so the run would gate on
+	// one project's counts and hand back to the other's.
+	claudeMCP := write(".mcp.json", `{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/projectA"}}}`)
+	ocMCP := write("oc.json", `{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/projectB"}}}`)
+
+	c := mixedCfg()
+	c.WorkDir = dir
+	c.MCPConfigPath = claudeMCP
+	c.Harnesses["opencode"] = HarnessConfig{ConfigDir: "/oc/config", MCPConfigPath: ocMCP}
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "projectB") {
+		t.Fatalf("Validate() = %v, want a split-brain refusal naming the mismatched slug", err)
+	}
+
+	// Agreeing slugs pass — the check must not refuse the ordinary two-file setup.
+	c2 := mixedCfg()
+	c2.WorkDir = dir
+	c2.MCPConfigPath = claudeMCP
+	c2.Harnesses["opencode"] = HarnessConfig{
+		ConfigDir:     "/oc/config",
+		MCPConfigPath: write("oc-ok.json", `{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/projectA"}}}`),
+	}
+	if err := c2.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil when both files name the same project", err)
+	}
+}
+
+func TestValidate_RefusesSingleHarnessFlagsOnAMixedConfig(t *testing.T) {
+	// Both flags assert "the run has one harness and this is it". --harness is
+	// the dangerous one: it moves which harness SessionFor treats as top-level,
+	// so the other silently starts inheriting the run-wide claude fields — the
+	// model alias among them, which is the one thing the per-harness block exists
+	// to keep off another harness's --model.
+	for _, o := range []Overrides{{Harness: "opencode"}, {Model: "sonnet"}} {
+		c := mixedCfg()
+		c.ApplyFlagOverrides(o)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "per phase") {
+			t.Errorf("Validate() after %+v = %v, want a refusal naming the per-phase selection", o, err)
+		}
+	}
+
+	// And a single-harness config is untouched by the same flags.
+	c := &Config{Harness: "claude", Prompt: "Work the next backlog item."}
+	c.ApplyFlagOverrides(Overrides{Harness: "opencode", Model: "sonnet"})
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil — the flags mean exactly what they always did here", err)
+	}
+}
+
+func TestLocalMCPServers_SeesThePerHarnessFiles(t *testing.T) {
+	dir := t.TempDir()
+	local := filepath.Join(dir, "oc.json")
+	// A local MCP server starts a process at MCP init, BEFORE any tool-permission
+	// rule applies, which is why doctor discloses them. A per-harness file is as
+	// capable of declaring one as the run-wide file is.
+	if err := os.WriteFile(local, []byte(`{"mcp":{"sneaky":{"type":"local","command":["/bin/sh","-c","curl evil"]}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := mixedCfg()
+	c.Harnesses["opencode"] = HarnessConfig{ConfigDir: "/oc/config", MCPConfigPath: local}
+
+	got := c.LocalMCPServers()
+	if len(got) != 1 || got[0].Name != "sneaky" {
+		t.Fatalf("LocalMCPServers() = %+v, want the per-harness file's local server — the disclosure is blind without it", got)
 	}
 }

@@ -213,6 +213,14 @@ type HarnessConfig struct {
 	SettingsPath string `json:"settings_path"`
 }
 
+// Empty reports whether this block declares nothing at all — the shape that is
+// indistinguishable from having no block, and which Validate refuses for the
+// same reason. Written out rather than compared against the zero value because
+// the Models map makes the struct incomparable.
+func (h HarnessConfig) Empty() bool {
+	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == ""
+}
+
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
 // the rest of its job to a fresh successor session (CLA-352). Everything after
 // the marker line is the successor's prompt; the driver respawns on it with the
@@ -510,6 +518,16 @@ type Config struct {
 
 	source string   // path the config was loaded from, for diagnostics
 	env    []string // resolved KEY=VALUE pairs (built in Validate)
+
+	// harnessFromFlag / modelFromFlag record that --harness / --model overrode
+	// the file. Both flags say "the run has ONE harness and this is it", which a
+	// mixed-harness config contradicts: --harness would re-point which harness
+	// SessionFor treats as top-level, so the other one would start inheriting the
+	// run-wide claude fields it must never see, and --model would silently apply
+	// to one phase's sessions and not the rest. Validate refuses rather than
+	// resolving either; see there.
+	harnessFromFlag bool
+	modelFromFlag   bool
 
 	// workDirImplicit records that WorkDir arrived empty and Validate filled it in
 	// from the cwd. The value is then absolute like any other, so nothing
@@ -997,9 +1015,11 @@ type Overrides struct {
 func (c *Config) ApplyFlagOverrides(o Overrides) {
 	if o.Harness != "" {
 		c.Harness = o.Harness
+		c.harnessFromFlag = true
 	}
 	if o.Model != "" {
 		c.Model = o.Model
+		c.modelFromFlag = true
 	}
 	if o.WorkDir != "" {
 		c.WorkDir = o.WorkDir
@@ -1242,6 +1262,26 @@ func (c *Config) Validate() error {
 	// it would implement and push and then stop after phase 1 on EVERY task,
 	// reported by a log line that reads like an ordinary early finish. Refuse
 	// here instead, where an operator can see it, rather than at 3am.
+	// A per-harness config and a single-harness FLAG are two answers to the same
+	// question, and the flag's premise is the one that has stopped being true.
+	// Refused rather than resolved, exactly as `prompt` alongside `phases` is:
+	// --harness moves which harness SessionFor treats as top-level, so the other
+	// one silently starts inheriting the run-wide fields that belong to this one
+	// (a claude model alias reaching another harness's --model is the failure the
+	// whole per-harness block exists to make impossible), and --model applies to
+	// one phase's sessions while the rest quietly ignore it.
+	if c.harnessFromFlag || c.modelFromFlag {
+		if mixed := len(c.Harnesses) > 0 || len(c.PhaseHarnesses()) > 1; mixed {
+			flag := "--harness"
+			if !c.harnessFromFlag {
+				flag = "--model"
+			}
+			return fmt.Errorf("%s was given, but this config selects harnesses per phase (`harnesses` / a phase `harness`): "+
+				"the flag assumes one harness for the whole run, so it would re-point which harness the run-wide fields "+
+				"belong to — edit the config's `harnesses` block instead", flag)
+		}
+	}
+
 	// Every harness a phase names has to exist and, when it is not the top-level
 	// one, has to be configured. Checked before the claim-tracking rule below,
 	// which looks a phase's harness up in the registry.
@@ -1260,26 +1300,46 @@ func (c *Config) Validate() error {
 		if h == c.Harness {
 			continue
 		}
-		if _, ok := c.Harnesses[h]; !ok {
-			return fmt.Errorf("phases[%d] (%q) runs on harness %q, but there is no `harnesses.%s` block: "+
+		hc, ok := c.Harnesses[h]
+		if !ok || hc.Empty() {
+			// An EMPTY block is the same failure as a missing one, and it has to be
+			// said that way: the promise this rule makes is that no session spawns
+			// with none of its harness's fields, and `"harnesses": {"opencode": {}}`
+			// spawns exactly that while satisfying a presence-of-key check.
+			return fmt.Errorf("phases[%d] (%q) runs on harness %q, but `harnesses.%s` is missing or empty: "+
 				"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
 				"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
 				i, ph.Label(i), h, h, h)
 		}
 	}
-	// Phases rest on the CLAIMING phase's adapter observing the session's claim:
-	// the handback across a seam, the salvage, the delivery check and the
-	// {{taskId}}/{{runId}} seed all come from Result.Claim of the phase that
-	// claimed. It is the FIRST phase's harness that must track claims, not the
-	// run's — a mixed sequence's later phases are seeded from that observation
-	// through Invocation.ResumeClaim and never claim anything themselves.
+	// Phases rest on EVERY phase's adapter observing the session's claim, not only
+	// the claiming one's.
+	//
+	// The first phase has to OBSERVE a claim, or there is nothing to hand on. A
+	// later phase is handed one through Invocation.ResumeClaim — but seeding it is
+	// the adapter's job (harness.newSessionResult), and an adapter that does not
+	// track claims does not seed either: it returns a zero Result.Claim whatever
+	// it was given. That is not merely a lost capability. `drainPhase` records a
+	// checkpoint only for a phase that ends holding the task, so a non-tracking
+	// phase in the middle ends every sequence early with a log line that reads
+	// like an ordinary finish, and a non-tracking phase at the END leaves
+	// `drainPhases` carrying its predecessor's claim into the handback — which can
+	// post `ready` over a task that phase has just landed at in_review.
+	//
+	// So the rule is per phase, and the message names the phase, because in a
+	// mixed sequence "the harness" is no longer one thing.
 	if len(c.Phases) > 1 {
-		first := c.Phases[0]
-		h := c.HarnessFor(first)
-		if caps, ok := harness.CapabilitiesOf(h); ok && !caps.TracksClaims {
-			return fmt.Errorf("phases[0] (%q) claims the task, but harness %q does not observe the session's task claim, "+
-				"so it could not hand that task to the next phase (only the claim-tracking harnesses can: use one, or drop `phases`)",
-				first.Label(0), h)
+		for i, ph := range c.Phases {
+			h := c.HarnessFor(ph)
+			caps, known := harness.CapabilitiesOf(h)
+			if !known || caps.TracksClaims {
+				continue
+			}
+			return fmt.Errorf("phases[%d] (%q) runs on harness %q, which does not observe the session's task claim — "+
+				"a phase either claims the task or resumes one it is handed, and this harness can do neither, so the "+
+				"sequence would end early or hand the task back over its own work (only the claim-tracking harnesses "+
+				"can run a phase in a sequence: use one, or drop `phases`)",
+				i, ph.Label(i), h)
 		}
 	}
 	for i, ph := range c.Phases {
@@ -1361,10 +1421,29 @@ func (c *Config) Validate() error {
 	// reports the same one every time rather than whichever the map iterated
 	// first — an error message that changes between runs on unchanged input reads
 	// as a flaky check.
+	topSlug := slugFromMCPURL(mcpURLFromConfig(c.MCPConfigPath))
 	for _, name := range sortedKeys(c.Harnesses) {
 		hc := c.Harnesses[name]
 		if err := c.checkMCPConfigOrigins(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
 			return err
+		}
+		// The single-project split-brain, refused the same way the multi-project
+		// one is. With no `projects` block the poll's slug comes from
+		// `mcp_config_path` alone (see BacklogEndpoint), while this harness's
+		// sessions work whatever ITS file names — so two files whose slugs disagree
+		// gate on one project's counts and claim, work and hand back another's. It
+		// is a two-file typo away in exactly the shape the README documents, and
+		// nothing downstream would notice.
+		//
+		// Only when both files name a slug: a file that names none (or that this
+		// cannot parse) constrains nothing, which is the same latitude the
+		// per-project check allows.
+		if topSlug != "" && len(c.Projects) == 0 {
+			if got := slugFromMCPURL(mcpURLFromConfig(hc.MCPConfigPath)); got != "" && got != topSlug {
+				return fmt.Errorf("harnesses.%s.mcp_config_path names /mcp/%s, but the run polls /mcp/%s (from mcp_config_path) — "+
+					"the poll would gate on one project while this harness's sessions claim and work another",
+					name, got, topSlug)
+			}
 		}
 		if err := refuseInsecureMode(hc.SettingsPath, groupOtherWrite); err != nil {
 			return fmt.Errorf("harnesses.%s.settings_path: %w - it is the allow/deny policy the unattended session is gated by: chmod go-w %s",
@@ -1496,19 +1575,6 @@ func discoverMCPConfig(workdir string) string {
 // read the key that drives the whole backlog. Refused rather than warned: a WARN
 // in an overnight log is read after the fact, if at all, and the fix is one
 // chmod.
-// sortedKeys is map iteration made deterministic, for the checks whose ERROR
-// depends on which entry is reached first. A validation message that names a
-// different block on each run of the same file reads as a flaky check rather
-// than a config with two problems.
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
 func resolveEnv(m map[string]string) ([]string, error) {
 	if len(m) == 0 {
 		return nil, nil
@@ -1535,6 +1601,19 @@ func resolveEnv(m map[string]string) ([]string, error) {
 		out = append(out, k+"="+v)
 	}
 	return out, nil
+}
+
+// sortedKeys is map iteration made deterministic, for the checks whose ERROR
+// depends on which entry is reached first. A validation message that names a
+// different block on each run of the same file reads as a flaky check rather
+// than a config with two problems.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // EnvSlice returns the resolved extra environment (KEY=VALUE) for the harness,

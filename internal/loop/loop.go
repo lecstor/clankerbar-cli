@@ -209,7 +209,10 @@ func (d *Driver) Run(ctx context.Context) error {
 		log.Printf("config: %s", src)
 	}
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
-	log.Printf("driving %s; state in %s; idle poll every %s", d.h.Name(), d.state.Path(), idle)
+	// Every harness this run will spawn, not just the configured one: a mixed
+	// sequence's banner naming one of them is a log that disagrees with the
+	// sessions underneath it from the first line (CLA-366).
+	log.Printf("driving %s; state in %s; idle poll every %s", strings.Join(d.cfg.PhaseHarnesses(), "+"), d.state.Path(), idle)
 	// Say it once, loudly, if the pre-CLA-259 directory is still sitting in the
 	// workdir: an operator who touches STOP there would otherwise watch the loop
 	// ignore it and conclude the stop switch is broken.

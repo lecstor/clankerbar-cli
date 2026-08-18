@@ -231,11 +231,26 @@ alias inside it is a provider's and does not. A harness whose block names no
 models runs on that harness's own configured default, which is where opencode's
 model lives; a claude alias is never handed to another harness's `--model`.
 
-**The first phase claims, so the rule about claim tracking is about it.** A
-multi-phase sequence needs the *claiming* phase's harness to observe the
-session's task claim (`claude` or `opencode`); later phases are handed that claim
-and never observe one, so they can run anywhere. Validation says which phase and
-which harness when it refuses.
+**Every phase's harness has to observe the session's task claim** (`claude` or
+`opencode`), not only the first one's. The first phase has to *observe* a claim
+or there is nothing to hand on; a later phase is *handed* one - but seeding it is
+the adapter's job, and an adapter that does not track claims does not seed
+either. A non-tracking phase mid-sequence would end every drain early with a log
+line that reads like an ordinary finish, and one at the end would leave the
+driver handing the task back over its own work. Validation names the phase and
+the harness when it refuses.
+
+**A block that declares nothing is refused like a missing one**, since an empty
+one spawns exactly the session the rule exists to prevent. And `--harness` /
+`--model` are refused outright on a config that selects harnesses per phase: both
+flags assert the run has one harness, and `--harness` would silently re-point
+which harness the run-wide fields belong to. Edit the `harnesses` block instead.
+
+**A single-project run is slug-checked too.** With no `projects` block the poll's
+slug comes from the top-level `mcp_config_path` while each harness's sessions
+work whatever *its* file names, so two files naming different projects are
+refused the same way a mismatched `projects` entry is - the poll would gate on
+one project's counts while sessions claimed and worked another's.
 
 **Multi-project runs need one MCP file per project per harness.** That file
 carries two facts at once — which project (its `/mcp/<slug>`) and which schema
