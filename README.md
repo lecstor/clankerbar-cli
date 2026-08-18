@@ -843,8 +843,41 @@ alternatives, in order of preference:
 |---|---|
 | Claude Code (`claude`) | primary |
 | Codex (`codex`) | adapter present; parsing being hardened |
+| OpenCode (`opencode`) | adapter present; provider-agnostic (model comes from opencode's own config) |
 
 New harnesses are a small adapter (`internal/harness`). Contributions welcome.
+
+**Permissions are set per harness, and the loop fails closed under all of them.**
+`claude` gets its allowlist from the settings file (`--settings`), `codex` from
+`config.toml`, and `opencode` from `OPENCODE_PERMISSION` — a JSON policy baked
+into the spawned process env. The opencode policy is a **path-scoped
+PermissionConfig**: the run's workdir subtree (where the session's per-task
+worktrees live, e.g. `~/dev/clankerbar-cli-wt/<task>`) is allowed for
+`read`/`edit` (the workdir root's own listing included), `external_directory`
+— opencode's gate for any path-taking tool on a path outside the project
+boundary — allows the same subtree while **denying every other path** (so
+`bash cp ~/.ssh/...` stays blocked, exactly as before), and `bash` stays
+allowed tool-level (its permission patterns match parsed commands, not paths).
+Everything else — reads or edits outside the workdir, `glob`/`grep`/`lsp`/`task`/`skill`,
+and the network tools (`webfetch`, `websearch`) in every shape — is denied by
+a `*` catch-all rather than asked, and denied tools are hidden from the
+session's catalog entirely. Two exceptions keep the session alive inside that
+catch-all: `*_*` allows the MCP tools (tool names are `<server>_<tool>` in
+opencode — `clankerbar_get_backlog_summary`, `context7_query-docs`,
+`chrome-devtools_click` — and the plane itself is reached over MCP), and a
+probe/read-only run additionally denies `edit` and `bash` for zero writes. The
+policy is pinned by unit tests in `opencode_test.go`, including the JSON key
+order the catch-all depends on and a replica of opencode's rule evaluator over
+a table of effective decisions.
+
+**The workdir should be a multi-repo parent, not a git checkout.** The
+read/edit rules are emitted to match the patterns opencode asks for a session
+whose project is *not* inside a git repo (worktree `/`; the multi-repo-parent
+case, `~/dev`). Point the workdir at a git checkout and opencode asks with
+checkout-relative patterns the rules cannot express, locking the session's
+structured Read/Edit tools out with no error — the exact failure this change
+removes. A per-task worktree always lives *under* a parent workdir, so the
+parent is the correct setting.
 
 ## License
 
