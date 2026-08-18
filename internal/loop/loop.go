@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -124,6 +126,15 @@ type Driver struct {
 	// names a harness on a phase) driving its fake rather than reaching for a real
 	// binary through the registry.
 	newAdapter func(name string) (harness.Adapter, error)
+
+	// spentBy is this run's spend per harness name, for the per-harness breakers
+	// (CLA-367). It hangs off the Driver rather than riding in `spend` because it
+	// is the RUN's account: a per-harness total outlives the drain that produced
+	// it, while the drain-local accumulators threaded through `spend` do not. See
+	// charge and budgetTrip. Lazily built; a run that configures no per-harness
+	// block still fills it, which costs one map and keeps the accounting honest if
+	// a block is added mid-file.
+	spentBy map[string]harnessSpend
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -243,7 +254,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
 		}
-		if dim := d.cfg.Budget.ExceededBy(totalTokens, totalCost, time.Since(start)); dim != "" {
+		if dim := d.budgetTrip(totalTokens, totalCost, time.Since(start)); dim != "" {
 			log.Printf("budget reached: %s — stopping to leave headroom (tokens=%d cost=$%.2f elapsed=%s)",
 				dim, totalTokens, totalCost, time.Since(start).Round(time.Second))
 			return nil
@@ -413,6 +424,70 @@ type spend struct {
 	cost   float64
 }
 
+// harnessSpend is one harness's accumulated spend across a run, for the
+// per-harness breakers (config.Budget.PerHarness, CLA-367).
+type harnessSpend struct {
+	tokens int
+	cost   float64
+}
+
+// charge books a session's spend against the harness that ran it, in the ledger
+// the per-harness breakers read.
+//
+// It is charged at the two places a session's spend enters a run — a drain
+// attempt's result and a supervised wait's probe — which are the same two places
+// the run-wide accumulators are added to, so the two accounts cannot drift. The
+// run-wide ones stay exactly where they were, threaded through the drain as
+// locals: the global dials have to keep behaving byte for byte as they always
+// have, so this ledger is additive rather than a replacement for them.
+//
+// An UNTRUSTED session is charged to neither, for the reason endUntrustedDrain
+// gives: a figure parsed out of a stream with a hole in it is not a measurement.
+//
+// A run's phases can each name their own harness (CLA-366), so the caller charges
+// the PHASE's adapter, not the run's: on a mixed sequence the two call sites split
+// the run's spend across one entry per harness, and on a single-harness run they
+// both land on the same key and it tracks the run total exactly as before. That is
+// the whole reason the ledger is keyed by name — passing d.h.Name() from a phase
+// running on some other harness would bill opencode's tokens to claude's breaker,
+// which is precisely the mis-accounting the per-harness ceilings exist to prevent.
+func (d *Driver) charge(harnessName string, tokens int, cost float64) {
+	if d.spentBy == nil {
+		d.spentBy = make(map[string]harnessSpend)
+	}
+	s := d.spentBy[harnessName]
+	s.tokens += tokens
+	s.cost += cost
+	d.spentBy[harnessName] = s
+}
+
+// budgetTrip names the ceiling that has stopped this run, or "" if none has: the
+// run-wide dials first, measured against the run totals the caller threads down,
+// then each harness's own block against that harness's own spend.
+//
+// Any trip stops the whole run, so the order only decides which ceiling gets
+// named in the log, and the global dials are named first because a config that
+// sets both wants the run-wide promise reported as the one that was broken.
+// Harnesses are consulted in name order so a run with two blocks reports the same
+// dial every time rather than whichever the map yielded first.
+func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) string {
+	if dim := d.cfg.Budget.ExceededBy(tokens, cost, elapsed); dim != "" {
+		return dim
+	}
+	for _, name := range slices.Sorted(maps.Keys(d.spentBy)) {
+		s := d.spentBy[name]
+		if dim := d.cfg.Budget.ExceededByHarness(name, s.tokens, s.cost); dim != "" {
+			// That harness's OWN totals ride along, because every caller prints
+			// the RUN's figures after the reason: in a mixed-harness run two
+			// dollar figures on one line read as a contradiction, which is the
+			// defect Budget.ExceededBy's doc comment exists to prevent, one level
+			// down.
+			return fmt.Sprintf("%s (%s so far: tokens=%d cost=$%.2f)", dim, name, s.tokens, s.cost)
+		}
+	}
+	return ""
+}
+
 // drainPhases runs ONE drain as its configured sequence of phase sessions —
 // each a separate harness process, so the context resets between them. With no
 // phases configured that sequence is one session and this is exactly the old
@@ -467,7 +542,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			// cannot see coming and cannot interrupt. A handoff respawn gets the
 			// same check, BEFORE the respawn: a session cannot spend its way past
 			// the ceiling by handing off to itself.
-			if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+			if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
 				boundary := "the " + ph.Label(i) + " phase boundary"
 				if isHandoff {
 					boundary = "the handoff respawn"
@@ -680,7 +755,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// an operator is least likely to have set. A drain that re-spawns a paid
 		// session on a loop is the expensive failure this stops, whatever put it
 		// there (CLA-258).
-		if dim := d.cfg.Budget.ExceededBy(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+		if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
 			log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
 				drainNum, dim, prior.tokens+tokens, prior.cost+cost, time.Since(prior.start).Round(time.Second))
 			return tokens, cost, true, end, nil
@@ -774,7 +849,15 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// recording one for it and the PLANE accepting the record.
 		capped := a.TurnCapped(res)
 		ceiling := a.TokenCeilingHit(res)
-		checkpointable := res.ExitCode == 0 || ((capped || ceiling) && res.Claim.HasWIP)
+		// A session the adapter ended on its wall-clock cap is the third member of
+		// the same family: an orderly cut-off mid-thought, whose survivability rests
+		// on the salvage exactly as a turn cap's does — so it earns a checkpoint on
+		// the same terms, HasWIP and all (CLA-368). Classified by the PHASE's adapter
+		// (`a`), never the run's: "did this session end on its own wall clock" is a
+		// question only the harness that RAN it can answer, and under per-phase
+		// harnesses (CLA-366) that harness is not necessarily d.h.
+		wallclock := a.WallClockCapped(res)
+		checkpointable := res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
@@ -823,7 +906,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if res.Untrusted != "" {
 			// held is nil here by construction — an untrusted stream never holds a
 			// phase open — so the sequence ends and nothing is carried forward.
-			utokens, ucost, ustop, uerr := d.endUntrustedDrain(drainNum, res, tokens, cost)
+			utokens, ucost, ustop, uerr := d.endUntrustedDrain(drainNum, a.Name(), res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
 
@@ -835,6 +918,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
+		d.charge(a.Name(), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
@@ -950,6 +1034,34 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			return tokens, cost, false, end, nil
 		}
 
+		// A session the ADAPTER ended for outliving its wall-clock cap is the same
+		// shape again: the phase ends, and neither a retry nor a failure is right —
+		// a retry would spend the same hours over again and reach the same deadline,
+		// and failing would stop the run over a cap doing its job (CLA-368).
+		//
+		// Spend IS reported here, unlike the token-ceiling branch: opencode's usage
+		// arrives per step_finish and is summed all the way to the kill, so the
+		// figures are the honest cost of the session up to the moment it ended.
+		//
+		// What the line must NOT say is that the salvage handled the tree. The
+		// salvage returns immediately without a claim (see salvageStrandedWork),
+		// and the only adapter that enforces this cap today is the one that does
+		// not observe claims — so on every kill that can currently happen, nothing
+		// was committed and the work is still sitting in the worktree. Saying
+		// otherwise would be the reassuring falsehood doctor's own checks exist to
+		// remove (CLA-290). The claim-held wording is the one a claim-observing
+		// adapter will earn later; it is not what opencode gets today.
+		if wallclock {
+			if res.Claim.Held() {
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
+					drainNum, tokens, cost)
+			} else {
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase. NOTHING was salvaged: this harness does not observe the session's task claim, so whatever the session left uncommitted is still in the worktree",
+					drainNum, tokens, cost)
+			}
+			return tokens, cost, false, end, nil
+		}
+
 		// Non-zero exit, not the usage cap: a transient server/network blip backs
 		// off and retries; anything else is a genuine failure and stops.
 		if a.IsTransient(res) {
@@ -1022,11 +1134,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 // With no spend ceiling set there is nothing to break: the wall clock does not
 // depend on anything the child said, so the run carries on and the no-progress
 // back-off is what bounds a target that keeps producing these.
-func (d *Driver) endUntrustedDrain(drainNum int, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
+//
+// The harness NAME is the phase's own, not the run's: whether a spend ceiling is
+// live is a per-harness question since CLA-367, and under per-phase harnesses
+// (CLA-366) the session that went unreadable is not necessarily on d.h. Asking
+// d.h would let an unreadable opencode session be waved through on the grounds
+// that CLAUDE has no ceiling set.
+func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
 	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
 	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%d), and not handing back any claim it appeared to hold",
 		drainNum, res.Tokens, res.CostUSD, res.ExitCode)
-	if !d.cfg.Budget.CountsSpend() {
+	if !d.cfg.Budget.CountsSpendFor(harnessName) {
 		return tokens, cost, false, nil
 	}
 	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
@@ -1597,7 +1715,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 
 	for {
-		if dim := d.cfg.Budget.ExceededBy(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
+		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
 			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
@@ -1615,6 +1733,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// of here — resume, stop, or another lap — carries it.
 		tokens += got.Tokens
 		cost += got.CostUSD
+		d.charge(a.Name(), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true
@@ -1625,7 +1744,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			// never see the cost — the one shape this loop's breaker exists to end
 			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
 			// ceiling there is nothing to protect, so it waits on as before.
-			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpend() {
+			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpendFor(a.Name()) {
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
 				return tokens, cost, true
 			}
@@ -1752,7 +1871,18 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// 0 never reaches here — SessionTokenCeiling has no disabled state, because
 	// the whole point of CLA-343 is that nothing was able to stop the 285.9M
 	// session.
-	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeiling()
+	// Asked PER HARNESS since CLA-367: a token ceiling that lives in this
+	// harness's own per_harness block derives the detector exactly as the global
+	// dial does, so moving a ceiling into a block does not loosen it. And the
+	// harness asked about is THIS PHASE's (CLA-366), not the run's — the ceiling
+	// is compiled into the invocation that is about to spawn, so keying it on d.h
+	// would hand an opencode phase the ceiling derived from claude's block.
+	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeilingFor(d.cfg.HarnessFor(ph))
+	// The per-session wall-clock cap, resolved by EffectivePhases: this phase's
+	// own, else the run-wide one, else zero — and zero is OFF, which is the
+	// shipped default (CLA-368). Unlike the token ceiling this one HAS a disabled
+	// state, because no default number is honest across models and providers.
+	inv.MaxSessionWallClock = ph.MaxWallClock.Duration()
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the

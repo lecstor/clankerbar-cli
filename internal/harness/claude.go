@@ -990,6 +990,11 @@ func (claude) TokenCeilingHit(res Result) bool {
 	return r == tokenCeilingReason
 }
 
+// No wall-clock cap: claude's backstop is --max-turns, which reaches this CLI,
+// so a time cap here would be a second answer to a question already answered.
+// Capabilities reports HonoursSessionWallClock false for the same reason.
+func (claude) WallClockCapped(Result) bool { return false }
+
 // markCeilingHit writes the adapter's own kill marker onto a Result.
 func (r *Result) markCeilingHit() {
 	r.Raw = map[string]any{"terminal_reason": tokenCeilingReason}
@@ -999,7 +1004,7 @@ func (r *Result) markCeilingHit() {
 // opencode does too as of CLA-365; codex still does not. See
 // Capabilities.TracksClaims.
 func (claude) Capabilities() Capabilities {
-	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true}
+	return Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true, HasSessionTokenCeiling: true}
 }
 
 // Diagnostic returns the same CLI-authored text IsTransient judged, so a caller
