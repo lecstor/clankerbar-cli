@@ -2259,3 +2259,83 @@ func TestBudget_WallClockOnlyUnderClaudeStillRecommendsCost(t *testing.T) {
 		t.Errorf("claude reports cost, so the original remedy stands: %q", c.remedy)
 	}
 }
+
+// --- budget: per-harness blocks (CLA-367) ------------------------------------
+
+// A per-harness block is a real ceiling and belongs on the reported line, so an
+// operator reading doctor sees what will actually stop the run.
+func TestBudgetPerHarnessBlockIsReported(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "opencode"
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"opencode": {MaxCostUSD: 2},
+	}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "per_harness[opencode]") || !strings.Contains(c.detail, "max_cost_usd=2") {
+		t.Errorf("the per-harness ceiling is not on the reported line: %q", c.detail)
+	}
+	if strings.Contains(c.detail, "NO effective ceiling") {
+		t.Errorf("a live per-harness ceiling was reported as no ceiling at all: %q", c.detail)
+	}
+}
+
+// The wall-clock-only warning describes a run with nothing better holding the
+// line. A per-harness block for the harness this run drives IS something better,
+// so the warning must not fire — the same reasoning CLA-288 applied to the
+// global cost dial.
+func TestBudgetPerHarnessBlockSatisfiesTheWallClockOnlyWarning(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "opencode"
+	cfg.Budget = config.Budget{
+		MaxWallClock: config.Duration(8 * time.Hour),
+		PerHarness:   map[string]config.HarnessBudget{"opencode": {MaxCostUSD: 2}},
+	}
+
+	c := checkBudget(cfg)
+	if strings.Contains(c.detail, "wall clock is the only ceiling") {
+		t.Errorf("warned that wall clock is the only ceiling beside a live per-harness block: %q", c.detail)
+	}
+}
+
+// A block keyed to a harness this config never runs cannot be charged, so it is
+// a ceiling that cannot fire. Reporting it as a set budget is the reassuring
+// falsehood CLA-288 removed elsewhere; it is annotated in place, and a config
+// whose ONLY ceilings are unreachable is told it has none.
+func TestBudgetPerHarnessBlockForAnotherHarnessIsInert(t *testing.T) {
+	cfg := validCfg(t) // harness: claude
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"opencode": {MaxCostUSD: 2},
+	}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "INERT") {
+		t.Errorf("a block for a harness this run never drives was reported as a live ceiling: %q", c.detail)
+	}
+	if c.status != warn {
+		t.Errorf("status = %v, want WARN: every ceiling this config sets is unreachable", c.status)
+	}
+	if !strings.Contains(c.detail, "NO effective ceiling") {
+		t.Errorf("detail should say the run is unbounded: %q", c.detail)
+	}
+	if c.remedy == "" {
+		t.Error("a warn with no remedy leaves the operator nothing to do")
+	}
+}
+
+// The negative reading, one level down: a per-harness dial is guarded with `> 0`
+// too, so a negative there reads as a ceiling and is none.
+func TestBudgetPerHarnessNegativeValueFails(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"claude": {MaxTokens: -1},
+	}}
+
+	c := checkBudget(cfg)
+	if c.status != fail {
+		t.Errorf("negative per-harness ceiling: got %v, want FAIL", c.status)
+	}
+	if !strings.Contains(c.detail, "per_harness[claude].max_tokens") {
+		t.Errorf("detail should name the offending field, got %q", c.detail)
+	}
+}

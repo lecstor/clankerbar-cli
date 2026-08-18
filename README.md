@@ -642,7 +642,11 @@ the likely final format.)
     "max_tokens": 0,
     "max_cost_usd": 0,
     "max_wall_clock": "6h",
-    "max_session_tokens": 0
+    "max_session_tokens": 0,
+    "per_harness": {
+      "claude": { "max_tokens": 75000000 },
+      "opencode": { "max_cost_usd": 2 }
+    }
   }
 }
 ```
@@ -799,6 +803,33 @@ alternatives, in order of preference:
    effective ceiling at all, whatever the config says. Give it `max_tokens` (or
    `max_wall_clock`) alongside; `doctor` WARNs on the cost-only case rather than
    reporting a budget that cannot fire.
+
+   **A mixed-harness run needs one block per harness - `budget.per_harness`.**
+   The dials above are one ceiling over every session a run spends, and no single
+   number means the same thing on two backends: 75M tokens is a sane week of
+   Claude and roughly $2 on a DeepSeek-class backend, so the same `max_tokens`
+   that paces a week ends a metered drain after a task or two; and a dollar figure
+   is meaningless for a session billed to a subscription, which reports a price
+   nobody is charged. So each harness can carry its own block, keyed by harness
+   name, counted over **only that harness's own sessions** and measured in the
+   unit that harness understands - tokens for `claude`, dollars for a metered
+   backend. **Any block that trips stops the whole run**: these are circuit
+   breakers, not per-harness quotas.
+
+   The dials above keep working exactly as they always have, over the run's whole
+   spend, and a config that sets no `per_harness` block behaves as before. Set
+   both and both apply, whichever is reached first. Wall clock is deliberately not
+   available per harness: it measures the run, not a harness. The same goes for
+   the CLA-262 stop above - a session whose spend cannot be measured stops the run
+   when *that session's harness* is under a spend ceiling, its own block's or the
+   run-wide one.
+
+   `doctor` reads these the way it reads every other ceiling: what can actually
+   fire. A block naming a harness this config does not run, or a `max_cost_usd`
+   on a harness that never reports cost, is annotated `INERT`, and a config whose
+   only ceilings are unreachable is told it has none. A block keyed by a name no
+   adapter answers to is refused at load, since nothing could ever be charged to
+   it.
 
    **`max_tokens` counts about ten times more than it used to.** Token totals now
    include cache reads and writes, which `input_tokens` excludes and which

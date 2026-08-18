@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -449,6 +450,14 @@ func TestBudgetRemaining(t *testing.T) {
 	if _, bounded := (Budget{}).Remaining(time.Hour); bounded {
 		t.Error("an unset ceiling must report bounded=false")
 	}
+	// A per-harness block carries no wall clock, so it cannot make an unbounded
+	// run look bounded to waitPastBudget — which reads exactly this flag to decide
+	// whether waiting out a reset is worth anything (CLA-367 keeps the clock the
+	// RUN's, however many harnesses it is spent on).
+	perHarness := Budget{PerHarness: map[string]HarnessBudget{"opencode": {MaxCostUSD: 2}}}
+	if _, bounded := perHarness.Remaining(time.Hour); bounded {
+		t.Error("a per-harness spend block must not report a wall-clock bound")
+	}
 }
 
 // The default prompt decides how much ONE session takes on, and it silently
@@ -563,4 +572,183 @@ func TestZeroSpendAttemptBound(t *testing.T) {
 			t.Errorf("Validate() = %v, want an error naming max_zero_spend_attempts", err)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------
+// Per-harness breakers (CLA-367).
+//
+// A mixed-harness run cannot be bounded by one number: 75M tokens is a sane week
+// of Claude and roughly $2 on a DeepSeek-class backend, and a dollar figure is
+// meaningless for a session billed to a subscription (CLA-289). So each harness
+// carries its own block, measured in its own unit, over its own sessions.
+
+func TestHarnessBudgetExceededByNamesTheHarness(t *testing.T) {
+	cases := []struct {
+		name    string
+		block   HarnessBudget
+		harness string
+		tokens  int
+		cost    float64
+		want    string // substring; "" means not exceeded
+	}{
+		{
+			// The claude side: plan-calibrated tokens, unchanged semantics.
+			name:    "a token ceiling names the harness and the tokens",
+			block:   HarnessBudget{MaxTokens: 75_000_000},
+			harness: "claude",
+			tokens:  75_000_000,
+			want:    "claude tokens 75000000",
+		},
+		{
+			// The metered side: dollars, summed off the adapter's CostUSD.
+			name:    "a cost ceiling names the harness and the dollars",
+			block:   HarnessBudget{MaxCostUSD: 2},
+			harness: "opencode",
+			cost:    2.05,
+			want:    "opencode cost $2.05",
+		},
+		{
+			// The whole point of the split: a cheap backend's tokens never reach a
+			// dial measured in dollars, so a block only sees the unit it set.
+			name:    "the unit this block did not set is not measured against it",
+			block:   HarnessBudget{MaxCostUSD: 2},
+			harness: "opencode",
+			tokens:  400_000_000,
+			want:    "",
+		},
+		{
+			name:    "under the ceiling reports nothing",
+			block:   HarnessBudget{MaxTokens: 100, MaxCostUSD: 2},
+			harness: "claude",
+			tokens:  99,
+			cost:    1.99,
+			want:    "",
+		},
+		{
+			name:    "a zero block is disabled, not instantly exceeded",
+			block:   HarnessBudget{},
+			harness: "claude",
+			tokens:  1 << 30,
+			cost:    1e6,
+			want:    "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.block.ExceededBy(tc.harness, tc.tokens, tc.cost)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("ExceededBy = %q, want no breach", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Errorf("ExceededBy = %q, want it to name %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// Each block is counted over ONLY its own harness's spend, and either trip stops
+// the run: the mixed-harness case the feature exists for — implement on opencode
+// under a dollar ceiling, review on claude under a token ceiling.
+func TestBudgetExceededByHarnessIsIndependentPerHarness(t *testing.T) {
+	b := Budget{PerHarness: map[string]HarnessBudget{
+		"claude":   {MaxTokens: 75_000_000},
+		"opencode": {MaxCostUSD: 2},
+	}}
+
+	// The claude side trips on tokens...
+	if got := b.ExceededByHarness("claude", 80_000_000, 0); !strings.Contains(got, "claude tokens") {
+		t.Errorf("claude token ceiling did not trip: %q", got)
+	}
+	// ...and is untouched by dollars, the dial it has no meaning for.
+	if got := b.ExceededByHarness("claude", 1000, 500); got != "" {
+		t.Errorf("claude tripped on a dollar figure it never set: %q", got)
+	}
+	// The opencode side trips on dollars...
+	if got := b.ExceededByHarness("opencode", 0, 2.5); !strings.Contains(got, "opencode cost") {
+		t.Errorf("opencode cost ceiling did not trip: %q", got)
+	}
+	// ...and is untouched by a token count that would have ended the claude side
+	// twice over.
+	if got := b.ExceededByHarness("opencode", 200_000_000, 0); got != "" {
+		t.Errorf("opencode tripped on claude's unit: %q", got)
+	}
+	// A harness with no block of its own is unbounded HERE: the run-wide dials are
+	// the only thing over it, and ExceededByHarness is not asked about them.
+	if got := b.ExceededByHarness("codex", 1<<30, 1e6); got != "" {
+		t.Errorf("a harness with no block reported a breach: %q", got)
+	}
+}
+
+// The pre-CLA-367 configs are what must not move: with no per_harness block the
+// global dials behave exactly as they always have, and nothing new can trip.
+func TestBudgetWithoutPerHarnessIsUnchanged(t *testing.T) {
+	b := Budget{MaxTokens: 100}
+	if got := b.ExceededByHarness("claude", 1<<30, 1e6); got != "" {
+		t.Errorf("a budget with no per_harness block reported a per-harness breach: %q", got)
+	}
+	if got := b.ExceededBy(100, 0, 0); !strings.Contains(got, "tokens 100") {
+		t.Errorf("the global dial stopped naming its own dimension: %q", got)
+	}
+	if !b.CountsSpendFor("claude") || !b.CountsSpendFor("opencode") {
+		t.Error("a global spend dial covers every harness, as it always did")
+	}
+}
+
+// CountsSpend is what CLA-262's side effects turn on: a session whose spend
+// cannot be measured breaks a promise only where a promise was made. In a
+// mixed-harness run that promise follows the harness whose breaker is set.
+func TestBudgetCountsSpendForFollowsTheHarnessWhoseBreakerIsSet(t *testing.T) {
+	b := Budget{
+		MaxWallClock: Duration(8 * time.Hour), // not a spend ceiling, on either side
+		PerHarness:   map[string]HarnessBudget{"opencode": {MaxCostUSD: 2}},
+	}
+	if !b.CountsSpendFor("opencode") {
+		t.Error("opencode has a spend ceiling of its own; an unreadable opencode session breaks it")
+	}
+	if b.CountsSpendFor("claude") {
+		t.Error("claude is under no spend ceiling here, so an unreadable claude session breaks no promise")
+	}
+	if b.CountsSpend() {
+		t.Error("CountsSpend asks about the RUN-WIDE dials and must not be moved by a per-harness block")
+	}
+}
+
+// A block keyed by a name no adapter answers to can never be charged, so it is a
+// ceiling that cannot trip — the run is unbounded on exactly the side the
+// operator meant to bound. Refused at load rather than discovered at 3am.
+func TestValidateRejectsAnUnknownPerHarnessName(t *testing.T) {
+	c := defaults()
+	c.Budget.PerHarness = map[string]HarnessBudget{"nope-not-a-harness": {MaxCostUSD: 2}}
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("Validate() accepted a per_harness block for an unregistered harness")
+	}
+	if !strings.Contains(err.Error(), "per_harness") || !strings.Contains(err.Error(), "opencode") {
+		t.Errorf("rejection %q should name the field and list the registered harnesses", err.Error())
+	}
+
+	c = defaults()
+	c.Budget.PerHarness = map[string]HarnessBudget{"opencode": {MaxCostUSD: 2}, "claude": {MaxTokens: 75_000_000}}
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() rejected blocks for registered harnesses: %v", err)
+	}
+}
+
+// The blocks arrive from a JSON config file, so the field names an operator types
+// are part of the interface — a rename would silently disable their ceiling.
+func TestPerHarnessBudgetDecodesFromJSON(t *testing.T) {
+	var b Budget
+	const in = `{"max_wall_clock":"6h","per_harness":{"opencode":{"max_cost_usd":2},"claude":{"max_tokens":75000000}}}`
+	if err := json.Unmarshal([]byte(in), &b); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := b.PerHarness["opencode"].MaxCostUSD; got != 2 {
+		t.Errorf("per_harness.opencode.max_cost_usd = %v, want 2", got)
+	}
+	if got := b.PerHarness["claude"].MaxTokens; got != 75_000_000 {
+		t.Errorf("per_harness.claude.max_tokens = %d, want 75000000", got)
+	}
 }
