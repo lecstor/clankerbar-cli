@@ -24,7 +24,7 @@ func opencodeParsed(stdout string) Result {
 // Invoke uses, so deleting the seed there turns these red rather than leaving the
 // suite green.
 func opencodeParsedFrom(in Invocation, console io.Writer, stdout string) Result {
-	p := opencodeParse{observed: newSessionResult(in), console: console}
+	p := newOpencodeParse(in, console)
 	sink := newLineSink(p.line)
 	_, _ = io.WriteString(sink, stdout)
 	sink.Flush()
@@ -525,14 +525,60 @@ func TestOpencodeObservesAClaimInARecordedSession(t *testing.T) {
 }
 
 // A refused claim carries no ids and must leave the tracked claim exactly as it
-// was. opencode has no `is_error` flag — the terminal STATUS is the flag — so
-// this is the assertion that a status-blind reading would fail.
+// was — which the recording covers, since opencode puts a refusal's payload in
+// `state.error` and leaves `state.output` empty.
+//
+// That alone does NOT pin the status reading, and saying so is the point: with
+// the output empty, even a status-blind read hands noteClaimed nothing to parse
+// and gives up anyway. TestOpencodeRefusedSettleChangesNothing below is the one
+// that fails when the status stops being read as the error flag.
 func TestOpencodeRefusedClaimChangesNothing(t *testing.T) {
 	afterFirst := opencodeParsedFrom(Invocation{}, io.Discard, opencodeRecording(t, 3)).Claim
 	afterRefusal := opencodeParsedFrom(Invocation{}, io.Discard, opencodeRecording(t, 6)).Claim
 
 	if afterRefusal != afterFirst {
 		t.Errorf("the refused second claim_task changed the tracked claim: %+v, want it left at %+v", afterRefusal, afterFirst)
+	}
+}
+
+// opencode has no `is_error` flag: the terminal STATUS is the only thing saying
+// whether the plane accepted the call. A refused `update_task` is where reading it
+// wrong actually costs something — an `in_review` rejected for a missing Tests
+// header leaves the task HELD, and that session is exactly the one whose claim
+// needs handing back. Read blind, the driver would instead record the task as let
+// go (no handback, no salvage) and keep a delivery Report for a branch the plane
+// never recorded.
+func TestOpencodeRefusedSettleChangesNothing(t *testing.T) {
+	stream := opencodeRecording(t, 3) +
+		opencodeToolLine("call-refused", "clankerbar_update_task",
+			`{"taskId":"`+opencodeFixtureTask+`","status":"in_review","branch":"`+opencodeFixtureBranch+`"}`,
+			"error", `{"error":{"code":"evidence_required","message":"outcome needs a **Tests** section"}}`) + "\n"
+
+	res := opencodeParsedFrom(Invocation{}, io.Discard, stream)
+
+	if res.Claim.Settled {
+		t.Error("a REFUSED update_task settled the claim — the driver would read a task the session still holds as one it let go of, and hand nothing back")
+	}
+	if !res.Claim.Held() {
+		t.Errorf("Claim.Held() = false after a refused settle; Claim = %+v", res.Claim)
+	}
+	if len(res.Reports) != 0 {
+		t.Errorf("Reports = %+v, want none: the plane refused the call, so it recorded no branch and there is nothing to check", res.Reports)
+	}
+}
+
+// A terminal event re-delivered for a callID already acted on must not rebuild a
+// claim a later call has since settled — noteClaimed assigns Result.Claim
+// wholesale, so a replay would clear Settled and the driver would post `ready`
+// over a task in review. Insurance against a stream shape, not an observed bug.
+func TestOpencodeIgnoresAReplayedTerminalEvent(t *testing.T) {
+	recording := opencodeRecording(t, 0)
+	claimEvent := strings.Split(strings.TrimRight(recording, "\n"), "\n")[1]
+
+	res := opencodeParsedFrom(Invocation{}, io.Discard, recording+claimEvent+"\n")
+
+	if !res.Claim.Settled {
+		t.Error("a replayed claim_task event resurrected a settled claim; the driver would post `ready` over a task already in review")
 	}
 }
 

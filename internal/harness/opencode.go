@@ -83,11 +83,10 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if in.Probe {
 		console = nil
 	}
-	// The claim seed comes from the Invocation, not from the stream: a RESUMED
-	// phase never calls claim_task, so without it the phase that pushes the branch
-	// and opens the PR would look like a session that never held anything. Same
-	// reasoning, same helper, as claude's newSessionResult.
-	p := opencodeParse{observed: newSessionResult(in), console: console}
+	// Through the constructor, not a struct literal: it carries the resumed-phase
+	// claim seed, and the tests build the parser the same way so that dropping it
+	// here turns them red.
+	p := newOpencodeParse(in, console)
 	captured := newCapture(p.line)
 	captured.attach(cmd, console)
 	runErr := cmd.Run()
@@ -312,8 +311,9 @@ type opencodePart struct {
 // `output` is a STRING, not an object: an MCP tool's result arrives flattened to
 // its text content, which is the shape noteClaimed already parses.
 //
-// No spill envelope has been seen here. The `claim_task` result in the recorded
-// fixture was ~21 KB and arrived INLINE, where Claude Code substitutes a pointer
+// No spill envelope has been seen here. The `claim_task` result in the recording
+// was ~21 KB and arrived INLINE (the committed fixture is ~3 KB, because most of
+// that was a decisions block redacted out of it), where Claude Code substitutes a pointer
 // to a file above its own threshold and broke the phase seam doing it (CLA-330,
 // docs/large-tool-results.md). noteClaimed's rehydration still runs on this path,
 // so an opencode that grows the same behaviour with the same envelope is handled;
@@ -360,6 +360,19 @@ type opencodeParse struct {
 	// past, so anything written into it during the stream would be discarded.
 	observed Result
 	console  io.Writer
+	// settledCalls is the callIDs already acted on, so a re-delivered terminal
+	// event cannot rebuild a claim that a later call has since settled.
+	settledCalls map[string]bool
+}
+
+// newOpencodeParse builds the parser a session streams into. It exists so the
+// CLAIM SEED is exercised by tests: a resumed phase never calls claim_task, so
+// without newSessionResult here its Claim would be the zero value and
+// Claim.Held() — the gate on the handback, the salvage and the delivery check —
+// would be false for the phase that pushes the branch and opens the PR. Assigned
+// inline in Invoke, deleting it would leave the whole suite green.
+func newOpencodeParse(in Invocation, console io.Writer) opencodeParse {
+	return opencodeParse{observed: newSessionResult(in), console: console}
 }
 
 // diag is where a claim diagnostic goes. The zero opencodeParse has no console (a
@@ -414,16 +427,40 @@ func (p *opencodeParse) line(line []byte) {
 // noteTool feeds one tool event into the shared clankerbar observation, which is
 // what populates Result.Claim and the delivery Reports.
 //
-// Only a TERMINAL state is acted on. opencode emits the same part again as a call
-// advances (pending → running → completed/error), so acting on an earlier one
-// would record a claim from a call that had not returned yet — and, worse, read a
-// still-running call as a success, since the status is the only error flag there
-// is. An unrecognised status is therefore ignored rather than assumed benign: a
-// future opencode that adds one costs us an unobserved claim (the driver hands
-// the task back, the cost of an expiring lease) rather than a claim recorded for
-// a call that failed.
+// Only a TERMINAL state is acted on, and that is FUTURE-PROOFING rather than a
+// filter this stream needs today: `opencode run --format json` forwards a tool
+// part only once it has settled (cli/cmd/run.ts gates the emit on status
+// completed-or-error), which is why the recorded fixture carries exactly one
+// event per callID. The check is here because the status is the ONLY error flag
+// opencode gives — there is no is_error sibling — so a version that started
+// forwarding in-flight parts would otherwise have us read a call that had not
+// returned as a success. An unrecognised status is ignored for the same reason:
+// the cost of being wrong that way is an unobserved claim (the driver hands the
+// task back — one expiring lease), against a claim recorded for a call that
+// failed, which is a task the driver believes it holds and does not.
+//
+// A callID is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so a
+// re-delivered terminal event for a claim already settled by a later update_task
+// would resurrect it — and the driver would post `ready` over a task that is in
+// review. Upstream transitions a part to terminal only from `running`
+// (session/processor.ts), so this is insurance, not an observed bug.
+//
+// # What this shape cannot do, and what it costs
+//
+// claude sets Claim.HasWIP on the REQUEST (see noteToolUse), deliberately: a
+// session killed between issuing `update_task(branch: …)` and its result has
+// still pushed work, and erring towards "there is WIP" only costs the reclaim an
+// expiring lease already costs. opencode gives no request-side event at all — the
+// arguments arrive fused to the result — so that arm cannot fire early here. A
+// session killed mid-call (SIGTERM, a cancelled context) therefore records no
+// WIP, and releaseHeldClaim posts `ready` over a branch that was pushed. The
+// truncated-stream variant of this is caught by the capture's untrusted mark; the
+// killed-mid-call one is not, and it is a property of opencode's stream rather
+// than something this adapter can fix.
 func (p *opencodeParse) noteTool(part *opencodePart) {
 	st := part.State
+	// part.Type ("tool") is deliberately not checked: only a tool part carries a
+	// callID and a state, so the fields below are the discriminator.
 	if st == nil || part.CallID == "" {
 		return
 	}
@@ -434,13 +471,21 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	if name == "" {
 		return
 	}
-	noteToolUse(name, part.CallID, st.Input, &p.observed)
-	// The result text is handed over as JSON so it reaches noteClaimed by the same
-	// road claude's string-shaped tool_result content does.
-	content, err := json.Marshal(st.Output)
-	if err != nil {
+	if p.settledCalls[part.CallID] {
 		return
 	}
+	if p.settledCalls == nil {
+		p.settledCalls = map[string]bool{}
+	}
+	p.settledCalls[part.CallID] = true
+
+	noteToolUse(name, part.CallID, st.Input, &p.observed)
+	// The result text is handed over as JSON so it reaches noteClaimed by the same
+	// road claude's string-shaped tool_result content does. Marshalling a string
+	// cannot fail (invalid UTF-8 is replaced, not rejected), and the error is
+	// swallowed rather than returned on purpose: bailing here would strand the
+	// delivery Report noteToolUse just armed, unresolved and silently dropped.
+	content, _ := json.Marshal(st.Output)
 	noteToolResult(&p.observed, part.CallID, st.Status == "error", content, p.diag())
 }
 
@@ -449,11 +494,20 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 // clankerbar tool.
 //
 // opencode names an MCP tool `<server>_<tool>`, where the server is the key under
-// `mcp` in its config; claude names the same tool `mcp__<server>__<tool>`. Both
-// adapters hard-code the server as `clankerbar` — the driver's own config writes
-// that key, and a session whose config names the server something else is one the
-// driver never set up. Translating rather than matching a second set of constants
-// keeps ONE list of watched tools: add a tool there and both harnesses see it.
+// `mcp` in its config; claude names the same tool `mcp__<server>__<tool>`.
+// Translating rather than keeping a second set of constants leaves ONE list of
+// watched tools: add a tool there and both harnesses see it.
+//
+// The server name `clankerbar` is HARD-CODED, here as in claude's constants, and
+// that is an assumption the driver does not enforce: it never writes an MCP config
+// (the operator hand-writes opencode's, per the README), and config.Validate
+// deliberately accepts a clankerbar server under any key so long as it is handed
+// CLANKERBAR_API_KEY. So `mcp: {"cb": …}` validates, opencode names the tools
+// `cb_claim_task`, nothing here matches, and a phased run stops after phase 1 on
+// every task looking like an ordinary early finish — the exact silent half-run the
+// TracksClaims gate exists to prevent. Filed rather than fixed inside this
+// adapter, because the check belongs where the config is read (doctor, or a
+// Validate refusal under phases), not where the tool name is parsed.
 func opencodeClankerbarTool(name string) string {
 	const prefix = "clankerbar_"
 	if !strings.HasPrefix(name, prefix) {
