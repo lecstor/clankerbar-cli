@@ -1,12 +1,15 @@
 package loop
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
 // ---------------------------------------------------------------------------
@@ -239,5 +242,141 @@ func TestDrain_UntrustedFollowsThePerHarnessBreaker(t *testing.T) {
 				t.Errorf("stopped without saying why:\n%s", logs.String())
 			}
 		})
+	}
+}
+
+// The other half of the CLA-262 interaction, and the one the suite would not
+// have noticed being reverted: the supervised wait's probe. A probe is a paid
+// session, and one whose own output cannot be read reports no verdict AND no
+// spend — so polling on it under a spend ceiling re-spawns a paid session every
+// interval against a ceiling that can never see the cost. With per-harness
+// blocks, that promise follows the harness whose breaker is set.
+func TestSupervisedWait_UnreadableProbeFollowsThePerHarnessBreaker(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		harness  string
+		budget   config.Budget
+		wantStop bool
+		wantLog  string
+	}{
+		{
+			name:    "the running harness's own cost block cannot survive an unreadable probe",
+			harness: "opencode",
+			budget: config.Budget{PerHarness: map[string]config.HarnessBudget{
+				"opencode": {MaxCostUSD: 2},
+			}},
+			wantStop: true,
+			wantLog:  "cannot be counted",
+		},
+		{
+			// The block belongs to a harness these probes are not, so nothing
+			// promised about them has been broken: wait on, as with no ceiling.
+			name:    "another harness's block promises nothing about these probes",
+			harness: "opencode",
+			budget: config.Budget{PerHarness: map[string]config.HarnessBudget{
+				"claude": {MaxTokens: 75_000_000},
+			}},
+			wantStop: false,
+			wantLog:  "will retry next interval",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			cfg := fastCfg()
+			cfg.Harness = tc.harness
+			cfg.Budget = tc.budget
+
+			h := &fakeAdapter{name: tc.harness, probeErrs: []error{
+				fmt.Errorf("%w: the harness's stdout could not be read to the end", harness.ErrUntrusted),
+			}}
+			d := New(cfg, h, busyPoller())
+			openTestStateDir(t, d)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, _, stop := d.supervisedWait(ctx, harness.Limit{Limited: true}, d.targets[0], spend{start: time.Now()})
+
+			if stop != tc.wantStop {
+				t.Errorf("stop = %t, want %t", stop, tc.wantStop)
+			}
+			if !strings.Contains(logs.String(), tc.wantLog) {
+				t.Errorf("logs do not contain %q:\n%s", tc.wantLog, logs.String())
+			}
+		})
+	}
+}
+
+// The breaker has to be reachable from INSIDE a drain, not only between drains
+// (CLA-258): every path that loops back has just waited, and those waits can run
+// for hours. A per-harness block is checked at the same site, which this drives
+// directly — the retry ladder, with the block already over its ceiling.
+func TestDrainMidDrain_PerHarnessBlockStopsTheRetryLadder(t *testing.T) {
+	logs := captureLogs(t)
+	cfg := fastCfg()
+	cfg.Harness = "opencode"
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"opencode": {MaxCostUSD: 2},
+	}}
+	// A transient failure that still SPENT: without a ceiling this retries forever
+	// (max_retries defaults to 0), so the mid-drain check on the way round the
+	// ladder is the only thing that can end it. A failed attempt's spend counts —
+	// a "leave headroom" breaker must err toward seeing real spend.
+	spendyFailure := harness.Result{ExitCode: 1, CostUSD: 2.5, Raw: map[string]any{"kind": "transient"}}
+	h := &fakeAdapter{name: "opencode", steps: []invokeStep{{res: spendyFailure}}}
+	d := New(cfg, h, busyPoller())
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainOnce(t, d)
+	if err != nil {
+		t.Fatalf("drain returned error: %v", err)
+	}
+	if !stop {
+		t.Error("stop = false: an over-budget per-harness block must end the drain rather than re-spawn a paid session")
+	}
+	if out := logs.String(); !strings.Contains(out, "opencode cost") {
+		t.Errorf("the trip did not name the harness whose block stopped it:\n%s", out)
+	}
+}
+
+// A run-wide figure printed after a per-harness reason reads as a contradiction
+// in a mixed-harness run ("opencode cost $2.05 >= $2.00 ... cost=$4.50"), so the
+// tripped harness's own totals ride along with the reason.
+func TestBudgetTrip_NamesTheTrippedHarnessesOwnSpend(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"opencode": {MaxCostUSD: 2},
+	}}
+	d := New(cfg, &fakeAdapter{}, busyPoller())
+	d.charge("claude", 60_000_000, 0)
+	d.charge("opencode", 900_000, 2.5)
+
+	dim := d.budgetTrip(60_900_000, 2.5, time.Minute)
+	for _, want := range []string{"opencode cost", "opencode so far", "tokens=900000", "cost=$2.50"} {
+		if !strings.Contains(dim, want) {
+			t.Errorf("budgetTrip = %q, want it to carry %q", dim, want)
+		}
+	}
+}
+
+// Moving a token ceiling out of the global dial and into a per-harness block is
+// exactly what CLA-367 recommends, and it must not loosen the per-session
+// runaway detector CLA-343 exists to be: the derivation follows the ceiling.
+func TestInvocationDerivesTheSessionCeilingFromThePerHarnessBlock(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Harness = "opencode"
+	cfg.MaxIterations = 1
+	cfg.StateDir = t.TempDir()
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"opencode": {MaxTokens: 20_000_000},
+	}}
+	h := &fakeAdapter{name: "opencode"}
+	if err := runLoop(t, cfg, h, &fakePoller{sum: backlog.Summary{Claimable: 1}}); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	if len(h.invocations) == 0 {
+		t.Fatal("no session was spawned")
+	}
+	if got := h.invocations[0].MaxSessionTokens; got != 40_000_000 {
+		t.Errorf("MaxSessionTokens = %d, want 40000000 (2x the harness's own token ceiling), not the 150M floor", got)
 	}
 }

@@ -2339,3 +2339,53 @@ func TestBudgetPerHarnessNegativeValueFails(t *testing.T) {
 		t.Errorf("detail should name the offending field, got %q", c.detail)
 	}
 }
+
+// A token ceiling that lives in the running harness's block is enforced between
+// sessions exactly as the run-wide dial is, so it needs the same warning and the
+// same mid-session number (CLA-344's line, CLA-367's second home for it).
+func TestBudgetPerHarnessTokenCeilingCarriesTheBetweenSessionsNote(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"claude": {MaxTokens: 20_000_000},
+	}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "enforced BETWEEN sessions") {
+		t.Errorf("a per-harness token ceiling was reported without the between-sessions caveat: %q", c.detail)
+	}
+	if !strings.Contains(c.detail, "max_session_tokens=40000000") {
+		t.Errorf("the mid-session bound should derive from the block's own ceiling: %q", c.detail)
+	}
+}
+
+// A remedy will be FOLLOWED, so it must not tell an operator to do what they
+// have already done. With codex's own block set and only a cost dial in it, the
+// placement is right and the UNIT is wrong.
+func TestBudgetPerHarnessInertCostRemedyNamesTheUnitNotThePlacement(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"codex": {MaxCostUSD: 2},
+	}}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("status = %v, want WARN: codex never reports cost, so this run has no ceiling", c.status)
+	}
+	if !strings.Contains(c.remedy, "per_harness[codex].max_tokens") {
+		t.Errorf("remedy %q should name the dial that can fire, not repeat the block the operator already wrote", c.remedy)
+	}
+}
+
+// A block with no dial in it — or one whose key was mistyped, since the config
+// decoder ignores fields it does not know — is a ceiling the operator wrote and
+// doctor would otherwise never mention.
+func TestBudgetEmptyPerHarnessBlockIsNamed(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{"claude": {}}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "per_harness[claude]") || !strings.Contains(c.detail, "no ceiling set") {
+		t.Errorf("an empty per-harness block was passed over in silence: %q", c.detail)
+	}
+}

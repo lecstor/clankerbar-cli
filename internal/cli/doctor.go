@@ -1576,10 +1576,20 @@ func checkBudget(cfg *config.Config) check {
 	// select another, so that block's ceilings are unreachable however sane the
 	// numbers are. Both are annotated in place, and neither counts toward the
 	// "there is a live ceiling" reasoning below.
+	runningBlock, _ := b.ForHarness(cfg.Harness)
+	// Set when the running harness's block sets a cost dial and NOTHING else -
+	// under a harness that never reports cost that block is a ceiling in name
+	// only, and the remedy has to name the unit rather than the placement.
+	runningBlockCostOnlyInert := runningBlock.MaxCostUSD > 0 && runningBlock.MaxTokens == 0 && !harnessReportsCost(cfg.Harness)
 	perHarnessLive := false
 	for _, name := range slices.Sorted(maps.Keys(b.PerHarness)) {
 		hb := b.PerHarness[name]
 		if !hb.CountsSpend() {
+			// A block with no dial at all - `"claude": {}`, or a mistyped key,
+			// since the config decoder ignores fields it does not know. Silence
+			// would leave an operator staring at a ceiling they wrote and doctor
+			// never mentioned, so it is named as the nothing it is.
+			set = append(set, fmt.Sprintf("per_harness[%s]: no ceiling set (INERT)", name))
 			continue
 		}
 		var dials []string
@@ -1655,7 +1665,7 @@ func checkBudget(cfg *config.Config) check {
 		// only: the codex adapter has no mid-session ceiling (TokenCeilingHit
 		// never fires there), so claiming it is "still active" would be false.
 		if cfg.Harness == "claude" {
-			c.info = append(c.info, fmt.Sprintf("per-session runaway ceiling still active: max_session_tokens resolves to %d (the operator's own, else 2x max_tokens when set, else the floor)", b.SessionTokenCeiling()))
+			c.info = append(c.info, fmt.Sprintf("per-session runaway ceiling still active: max_session_tokens resolves to %d (the operator's own, else 2x a token ceiling when set, else the floor)", b.SessionTokenCeilingFor(cfg.Harness)))
 		}
 	} else if b.MaxWallClock > 0 && !costLive && b.MaxTokens == 0 && !perHarnessLive {
 		// Wall clock is the weakest proxy for spend of the three, because it counts
@@ -1693,14 +1703,27 @@ func checkBudget(cfg *config.Config) check {
 		// and keeps its own wording.
 		c.status = warn
 		c.detail = strings.Join(set, ", ") + " - none of them can fire, so this run has NO effective ceiling"
-		c.remedy = "put the ceiling where the run will reach it: a per_harness block for " + cfg.Harness + ", or the run-wide max_tokens / max_wall_clock"
+		// A remedy will be FOLLOWED, so it must not point at something the
+		// operator has already done. When the running harness HAS a block and its
+		// only dial is a cost one that harness never reports, the placement is
+		// right and the unit is wrong - saying "add a per_harness block" there
+		// would be a no-op dressed as advice.
+		if runningBlockCostOnlyInert {
+			c.remedy = "set per_harness[" + cfg.Harness + "].max_tokens - " + cfg.Harness + " reports tokens, never cost"
+		} else {
+			c.remedy = "put the ceiling where the run will reach it: a per_harness block for " + cfg.Harness + ", or the run-wide max_tokens / max_wall_clock"
+		}
 	} else {
 		c.detail = strings.Join(set, ", ")
 		// The run-wide breaker is checked BETWEEN sessions: it cannot see a single
 		// huge session coming, which is exactly what happened to the 285.9M run
 		// under max_tokens=75M. Say so on the line that reports it (CLA-344).
-		if b.MaxTokens > 0 {
-			c.detail += fmt.Sprintf(" — max_tokens is enforced BETWEEN sessions, so one session can overrun it (max_session_tokens=%d is the mid-session bound)", b.SessionTokenCeiling())
+		// Gated on a token ceiling from EITHER place: a run whose only token
+		// ceiling is in its harness's per_harness block is enforced between
+		// sessions in exactly the same way, so it needs the same warning and the
+		// same number (CLA-367).
+		if b.MaxTokens > 0 || runningBlock.MaxTokens > 0 {
+			c.detail += fmt.Sprintf(" — the token ceiling is enforced BETWEEN sessions, so one session can overrun it (max_session_tokens=%d is the mid-session bound)", b.SessionTokenCeilingFor(cfg.Harness))
 		}
 	}
 

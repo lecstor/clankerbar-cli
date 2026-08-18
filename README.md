@@ -643,10 +643,7 @@ the likely final format.)
     "max_cost_usd": 0,
     "max_wall_clock": "6h",
     "max_session_tokens": 0,
-    "per_harness": {
-      "claude": { "max_tokens": 75000000 },
-      "opencode": { "max_cost_usd": 2 }
-    }
+    "per_harness": {}
   }
 }
 ```
@@ -805,6 +802,14 @@ alternatives, in order of preference:
    reporting a budget that cannot fire.
 
    **A mixed-harness run needs one block per harness - `budget.per_harness`.**
+
+   ```json
+   "per_harness": {
+     "claude": { "max_tokens": 75000000 },
+     "opencode": { "max_cost_usd": 2 }
+   }
+   ```
+
    The dials above are one ceiling over every session a run spends, and no single
    number means the same thing on two backends: 75M tokens is a sane week of
    Claude and roughly $2 on a DeepSeek-class backend, so the same `max_tokens`
@@ -815,6 +820,10 @@ alternatives, in order of preference:
    unit that harness understands - tokens for `claude`, dollars for a metered
    backend. **Any block that trips stops the whole run**: these are circuit
    breakers, not per-harness quotas.
+
+   A token ceiling in a block derives the per-session runaway detector
+   (`max_session_tokens`) exactly as the run-wide `max_tokens` does, so moving a
+   ceiling into a block does not quietly loosen it.
 
    The dials above keep working exactly as they always have, over the run's whole
    spend, and a config that sets no `per_harness` block behaves as before. Set

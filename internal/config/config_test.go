@@ -752,3 +752,40 @@ func TestPerHarnessBudgetDecodesFromJSON(t *testing.T) {
 		t.Errorf("per_harness.claude.max_tokens = %d, want 75000000", got)
 	}
 }
+
+// The per-session runaway detector (CLA-343) derives from the run's token
+// ceiling, and CLA-367 gives that ceiling a second home. Following the
+// documented migration — moving claude's max_tokens into its own block — must
+// not silently loosen the detector to the 150M floor.
+func TestSessionTokenCeilingFollowsAPerHarnessTokenCeiling(t *testing.T) {
+	perHarness := Budget{PerHarness: map[string]HarnessBudget{
+		"claude": {MaxTokens: 20_000_000},
+	}}
+	if got := perHarness.SessionTokenCeilingFor("claude"); got != 40_000_000 {
+		t.Errorf("SessionTokenCeilingFor(claude) = %d, want 2x the block's own ceiling", got)
+	}
+	// A harness with no token ceiling anywhere still gets the floor, not another
+	// harness's derivation.
+	if got := perHarness.SessionTokenCeilingFor("opencode"); got != sessionTokenFloor {
+		t.Errorf("SessionTokenCeilingFor(opencode) = %d, want the floor", got)
+	}
+	// The run-wide dial is the tighter promise where both are set: it bounds the
+	// whole run, so it wins.
+	both := Budget{MaxTokens: 5_000_000, PerHarness: map[string]HarnessBudget{
+		"claude": {MaxTokens: 90_000_000},
+	}}
+	if got := both.SessionTokenCeilingFor("claude"); got != 10_000_000 {
+		t.Errorf("SessionTokenCeilingFor = %d, want the run-wide dial's derivation", got)
+	}
+	// The operator's own dial still wins over everything.
+	explicit := Budget{MaxSessionTokens: 7, PerHarness: map[string]HarnessBudget{
+		"claude": {MaxTokens: 90_000_000},
+	}}
+	if got := explicit.SessionTokenCeilingFor("claude"); got != 7 {
+		t.Errorf("SessionTokenCeilingFor = %d, want the operator's own max_session_tokens", got)
+	}
+	// The harness-blind form is unchanged for every pre-CLA-367 config.
+	if got := (Budget{MaxTokens: 75_000_000}).SessionTokenCeiling(); got != 150_000_000 {
+		t.Errorf("SessionTokenCeiling = %d, want 2x max_tokens as before", got)
+	}
+}

@@ -431,7 +431,12 @@ func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) str
 	for _, name := range slices.Sorted(maps.Keys(d.spentBy)) {
 		s := d.spentBy[name]
 		if dim := d.cfg.Budget.ExceededByHarness(name, s.tokens, s.cost); dim != "" {
-			return dim
+			// That harness's OWN totals ride along, because every caller prints
+			// the RUN's figures after the reason: in a mixed-harness run two
+			// dollar figures on one line read as a contradiction, which is the
+			// defect Budget.ExceededBy's doc comment exists to prevent, one level
+			// down.
+			return fmt.Sprintf("%s (%s so far: tokens=%d cost=$%.2f)", dim, name, s.tokens, s.cost)
 		}
 	}
 	return ""
@@ -1766,7 +1771,10 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// 0 never reaches here — SessionTokenCeiling has no disabled state, because
 	// the whole point of CLA-343 is that nothing was able to stop the 285.9M
 	// session.
-	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeiling()
+	// Asked PER HARNESS since CLA-367: a token ceiling that lives in this
+	// harness's own per_harness block derives the detector exactly as the global
+	// dial does, so moving a ceiling into a block does not loosen it.
+	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeilingFor(d.h.Name())
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the

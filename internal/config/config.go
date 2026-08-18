@@ -589,10 +589,41 @@ const (
 	sessionTokenFloor = 150_000_000
 )
 
+// SessionTokenCeilingFor resolves the per-session runaway ceiling for a session
+// on this harness: the operator's own dial, else 2x the run's max_tokens, else
+// 2x that harness's own per_harness max_tokens, else the floor.
+//
+// The per-harness rung exists because CLA-367 tells an operator to move claude's
+// token ceiling out of the global dial and into its own block — and without it,
+// doing exactly that would silently LOOSEN the runaway detector the global dial
+// was deriving: per_harness.claude.max_tokens=20M would give a 150M floor rather
+// than the 40M the old shape gave, 7.5x the run's own ceiling. A detector that
+// gets weaker when you follow the documented migration is the CLA-343 bug
+// reappearing by another door.
+//
+// The global dial still wins over the per-harness one where both are set: it
+// bounds the whole run, so it is the tighter promise about any one session.
+func (b Budget) SessionTokenCeilingFor(harness string) int {
+	if b.MaxSessionTokens > 0 {
+		return b.MaxSessionTokens
+	}
+	if b.MaxTokens > 0 {
+		return sessionTokenCeilingMultiplier * b.MaxTokens
+	}
+	if hb, ok := b.ForHarness(harness); ok && hb.MaxTokens > 0 {
+		return sessionTokenCeilingMultiplier * hb.MaxTokens
+	}
+	return sessionTokenFloor
+}
+
 // SessionTokenCeiling resolves the per-session runaway ceiling: the operator's
 // own dial, else 2x the run's max_tokens, else the floor. There is deliberately
 // no "disabled": the whole point of CLA-343 is that nothing was able to stop the
 // 285.9M session, so a ceiling that can be left unset by accident is the bug.
+//
+// This is the harness-blind form, kept for callers with no harness in hand; a
+// caller that knows which harness the session runs on asks
+// SessionTokenCeilingFor, which can also see a per-harness token ceiling.
 func (b Budget) SessionTokenCeiling() int {
 	if b.MaxSessionTokens > 0 {
 		return b.MaxSessionTokens
