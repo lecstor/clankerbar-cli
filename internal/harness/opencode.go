@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,12 +79,16 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// per-step usage across the whole session, so a capped copy of stdout walked
 	// afterwards would silently drop the early steps and under-count the budget by
 	// however much of the stream had scrolled away (CLA-262).
-	var p opencodeParse
-	captured := newCapture(p.line)
 	console := in.Console
 	if in.Probe {
 		console = nil
 	}
+	// The claim seed comes from the Invocation, not from the stream: a RESUMED
+	// phase never calls claim_task, so without it the phase that pushes the branch
+	// and opens the PR would look like a session that never held anything. Same
+	// reasoning, same helper, as claude's newSessionResult.
+	p := opencodeParse{observed: newSessionResult(in), console: console}
+	captured := newCapture(p.line)
 	captured.attach(cmd, console)
 	runErr := cmd.Run()
 
@@ -278,6 +283,47 @@ type opencodePart struct {
 	// REPORTED, and the driver's zero-spend bound counts silence, not zeroes
 	// (CLA-288).
 	Cost *float64 `json:"cost"`
+
+	// tool parts, which arrive on a "tool_use" event.
+	Tool   string             `json:"tool"`
+	CallID string             `json:"callID"`
+	State  *opencodeToolState `json:"state"`
+}
+
+// opencodeToolState is a tool call's lifecycle slot on its part. Where claude
+// splits a call across an `assistant` tool_use block and a later `user`
+// tool_result block, opencode re-emits the same part as its status advances and
+// carries the arguments and the result TOGETHER on the terminal one (recorded
+// against opencode 1.18.16, CLA-365):
+//
+//	{"type":"tool_use","part":{"type":"tool","tool":"clankerbar_claim_task",
+//	  "callID":"call_00_9Mb...","state":{"status":"completed",
+//	    "input":{"taskId":"e1d01dae-..."},
+//	    "output":"{\"task\":{\"id\":\"e1d01dae-...\",\"ref\":\"CLA-371\"},\"run\":{...}}"}}}
+//
+// A refusal takes the other terminal status and puts the plane's error where the
+// output would have been. There is no `is_error` flag to read — the STATUS is the
+// flag, which is why a status this adapter does not recognise must never be
+// treated as success:
+//
+//	{"state":{"status":"error","input":{...},
+//	  "error":"{\"error\":{\"code\":\"not_ready\",\"message\":\"...\"}}"}}
+//
+// `output` is a STRING, not an object: an MCP tool's result arrives flattened to
+// its text content, which is the shape noteClaimed already parses.
+//
+// No spill envelope has been seen here. The `claim_task` result in the recorded
+// fixture was ~21 KB and arrived INLINE, where Claude Code substitutes a pointer
+// to a file above its own threshold and broke the phase seam doing it (CLA-330,
+// docs/large-tool-results.md). noteClaimed's rehydration still runs on this path,
+// so an opencode that grows the same behaviour with the same envelope is handled;
+// one with a DIFFERENT envelope would be a new bug, and the diagnostic noteClaimed
+// prints on an unparseable result is what would surface it.
+type opencodeToolState struct {
+	Status string          `json:"status"`
+	Input  json.RawMessage `json:"input"`
+	Output string          `json:"output"`
+	Error  string          `json:"error"`
 }
 
 type opencodeTokens struct {
@@ -307,6 +353,24 @@ type opencodeParse struct {
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
+
+	// observed carries ONLY the claim/report observation state, which finish
+	// copies onto the real Result. It cannot be the real Result: that one is built
+	// by capture.result() after the process exits, long after the claim event went
+	// past, so anything written into it during the stream would be discarded.
+	observed Result
+	console  io.Writer
+}
+
+// diag is where a claim diagnostic goes. The zero opencodeParse has no console (a
+// probe passes none, and the parser tests build one directly), and noteClaimed
+// writes unconditionally — by design, since a claim that silently stops being
+// tracked is indistinguishable from a session that never claimed.
+func (p *opencodeParse) diag() io.Writer {
+	if p.console == nil {
+		return io.Discard
+	}
+	return p.console
 }
 
 func (p *opencodeParse) line(line []byte) {
@@ -342,12 +406,70 @@ func (p *opencodeParse) line(line []byte) {
 			p.cost += *c
 			p.sawUsage = true
 		}
+	case "tool_use":
+		p.noteTool(ev.Part)
 	}
+}
+
+// noteTool feeds one tool event into the shared clankerbar observation, which is
+// what populates Result.Claim and the delivery Reports.
+//
+// Only a TERMINAL state is acted on. opencode emits the same part again as a call
+// advances (pending → running → completed/error), so acting on an earlier one
+// would record a claim from a call that had not returned yet — and, worse, read a
+// still-running call as a success, since the status is the only error flag there
+// is. An unrecognised status is therefore ignored rather than assumed benign: a
+// future opencode that adds one costs us an unobserved claim (the driver hands
+// the task back, the cost of an expiring lease) rather than a claim recorded for
+// a call that failed.
+func (p *opencodeParse) noteTool(part *opencodePart) {
+	st := part.State
+	if st == nil || part.CallID == "" {
+		return
+	}
+	if st.Status != "completed" && st.Status != "error" {
+		return
+	}
+	name := opencodeClankerbarTool(part.Tool)
+	if name == "" {
+		return
+	}
+	noteToolUse(name, part.CallID, st.Input, &p.observed)
+	// The result text is handed over as JSON so it reaches noteClaimed by the same
+	// road claude's string-shaped tool_result content does.
+	content, err := json.Marshal(st.Output)
+	if err != nil {
+		return
+	}
+	noteToolResult(&p.observed, part.CallID, st.Status == "error", content, p.diag())
+}
+
+// opencodeClankerbarTool maps an opencode tool name onto the namespaced name the
+// shared observer switches on, and returns "" for anything that is not a
+// clankerbar tool.
+//
+// opencode names an MCP tool `<server>_<tool>`, where the server is the key under
+// `mcp` in its config; claude names the same tool `mcp__<server>__<tool>`. Both
+// adapters hard-code the server as `clankerbar` — the driver's own config writes
+// that key, and a session whose config names the server something else is one the
+// driver never set up. Translating rather than matching a second set of constants
+// keeps ONE list of watched tools: add a tool there and both harnesses see it.
+func opencodeClankerbarTool(name string) string {
+	const prefix = "clankerbar_"
+	if !strings.HasPrefix(name, prefix) {
+		return ""
+	}
+	return "mcp__clankerbar__" + strings.TrimPrefix(name, prefix)
 }
 
 // finish writes what the stream added up to onto res.
 func (p *opencodeParse) finish(res *Result) {
 	res.FinalMessage = p.lastText
+	// What the session did with the backlog. Copied rather than accumulated in
+	// place because res does not exist until the process has exited; see the
+	// `observed` field.
+	res.Claim = p.observed.Claim
+	res.Reports = p.observed.Reports
 	// Recorded whatever the figures come to: the driver bounds attempts that
 	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
 	res.UsageReported = p.sawUsage
@@ -431,14 +553,20 @@ func (opencode) TurnCapped(Result) bool { return false }
 // never kills the process, so no exit of its can be attributed to one.
 func (opencode) TokenCeilingHit(Result) bool { return false }
 
-// Like codex, this adapter does not populate Result.Claim, so `phases` is refused
-// for it in config.Validate rather than silently stopping after phase 1 on every
-// task. See Capabilities.TracksClaims.
+// TracksClaims is true as of CLA-365: opencode's `--format json` stream carries
+// each tool call's arguments AND its result on one terminal `tool_use` event, so
+// the adapter reads the claim off the session the same way claude does and
+// populates Result.Claim. That is what config.Validate gates `phases` on, so this
+// flag is what lets a mixed-harness queue run implement on opencode.
+//
+// HonoursMaxTurns stays false — Invocation.MaxTurns still never reaches the CLI.
 //
 // ReportsCost is true: opencode's step_finish parts carry a `cost` sibling to the
 // token counts, and opencodeParse sums it into Result.CostUSD, so
 // `budget.max_cost_usd` is a live ceiling here (CLA-288).
-func (opencode) Capabilities() Capabilities { return Capabilities{ReportsCost: true} }
+func (opencode) Capabilities() Capabilities {
+	return Capabilities{TracksClaims: true, ReportsCost: true}
+}
 
 func (opencode) IsTransient(res Result) bool {
 	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw
