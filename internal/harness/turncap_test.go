@@ -167,19 +167,22 @@ func TestAdaptersWithoutATokenCeilingNeverReportOne(t *testing.T) {
 // day an adapter starts observing claims, flipping the flag is what turns phases
 // on for it.
 func TestCapabilitiesMatchWhatTheAdaptersActuallyDo(t *testing.T) {
-	if !(claude{}).Capabilities().TracksClaims {
-		t.Error("claude does populate Result.Claim; TracksClaims must say so or phases are refused for the one harness that supports them")
+	for name, caps := range map[string]Capabilities{
+		"claude":   (claude{}).Capabilities(),
+		"opencode": (opencode{}).Capabilities(),
+	} {
+		if !caps.TracksClaims {
+			t.Errorf("%s does populate Result.Claim; TracksClaims must say so or phases are refused for a harness that supports them", name)
+		}
 	}
 	if !(claude{}).Capabilities().HonoursMaxTurns {
 		t.Error("claude passes --max-turns; HonoursMaxTurns must say so")
 	}
-	for name, caps := range map[string]Capabilities{
-		"codex":    (codex{}).Capabilities(),
-		"opencode": (opencode{}).Capabilities(),
-	} {
-		if caps.TracksClaims {
-			t.Errorf("%s claims to track claims, but it never assigns Result.Claim — phases would stop after phase 1 on every task", name)
-		}
+	if (opencode{}).Capabilities().HonoursMaxTurns {
+		t.Error("opencode claims to honour max_turns, but Invocation.MaxTurns never reaches its CLI")
+	}
+	if (codex{}).Capabilities().TracksClaims {
+		t.Error("codex claims to track claims, but it never assigns Result.Claim — phases would stop after phase 1 on every task")
 	}
 }
 

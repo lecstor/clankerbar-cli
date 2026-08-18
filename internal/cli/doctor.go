@@ -21,10 +21,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -201,15 +203,15 @@ func doctorRun(ctx context.Context, w io.Writer, cfgPath string, ov config.Overr
 // them: what am I configured as, can I run the agent, can I reach the backlog,
 // can I write my state, and what will I be allowed to do.
 func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
-	checks := []check{
-		checkConfig(cfg),
-		checkHarness(ctx, cfg, e),
-		checkConfigDir(cfg),
-	}
+	checks := []check{checkConfig(cfg)}
+	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
+	checks = append(checks, checkConfigDirs(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
-	return append(checks, checkMCPServers(cfg), checkPermissions(cfg), checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
+	checks = append(checks, checkMCPServers(cfg))
+	checks = append(checks, checkPermissionsAll(cfg)...)
+	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
 }
 
 func doctorFailed(n int) error {
@@ -233,6 +235,17 @@ func checkConfig(cfg *config.Config) check {
 		workdir = "(current directory)"
 	}
 	c.info = append(c.info, "harness: "+cfg.Harness, "workdir: "+workdir)
+	// Which phase runs where, but only when that is not the same answer twice: a
+	// mixed sequence is the one config where "harness: <x>" above is true and
+	// incomplete, and the pairing is what an operator wants to eyeball before an
+	// overnight run - not that two harnesses are involved, but which way round.
+	if len(cfg.PhaseHarnesses()) > 1 {
+		pairs := make([]string, 0, len(cfg.Phases))
+		for i, ph := range cfg.EffectivePhases() {
+			pairs = append(pairs, ph.Label(i)+" -> "+ph.Harness)
+		}
+		c.info = append(c.info, "phase harnesses: "+strings.Join(pairs, ", "))
+	}
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
@@ -273,11 +286,38 @@ func envKeyNames(env map[string]string) string {
 
 // --- 2. harness --------------------------------------------------------------
 
+// checkHarness reports on the run's own harness. Kept as the single-harness
+// entry point; checkHarnesses below is what doctorChecks calls, because a
+// sequence whose phases name other harnesses spawns binaries this one never
+// looks at.
 func checkHarness(ctx context.Context, cfg *config.Config, e doctorEnv) check {
-	c := check{name: "harness"}
+	return checkHarnessNamed(ctx, "harness", cfg.Harness, e)
+}
+
+// checkHarnesses reports on EVERY harness this config DECLARES — the run's and
+// every phase's (CLA-366) - every harness the config DECLARES, since a declared
+// harness must be usable whether or not today's phases reach it. Checking only
+// `harness` is how a mixed-harness config earns a green preflight and then dies at
+// its second phase on a binary that was never on PATH.
+func checkHarnesses(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	names := cfg.PhaseHarnesses()
+	out := make([]check, 0, len(names))
+	for i, n := range names {
+		// The first keeps the bare name, so a single-harness report reads exactly
+		// as it always has; the rest are qualified, so two lines cannot be confused.
+		label := "harness"
+		if i > 0 {
+			label = "harness[" + n + "]"
+		}
+		out = append(out, checkHarnessNamed(ctx, label, n, e))
+	}
+	return out
+}
+
+func checkHarnessNamed(ctx context.Context, label, bin string, e doctorEnv) check {
+	c := check{name: label}
 	// Every adapter execs its own name verbatim (see internal/harness), so the
 	// harness name IS the binary to look for.
-	bin := cfg.Harness
 
 	path, err := e.lookPath(bin)
 	if err != nil {
@@ -314,12 +354,34 @@ var authMarkers = map[string][]string{
 	"opencode": {"auth.json", "config.json"},
 }
 
+// checkConfigDir reports on the run harness's config dir. See checkConfigDirs,
+// which is what doctorChecks calls.
 func checkConfigDir(cfg *config.Config) check {
-	c := check{name: "config_dir"}
+	return checkConfigDirNamed("config_dir", cfg.Harness, cfg.SessionFor(cfg.Harness).ConfigDir)
+}
+
+// checkConfigDirs reports on the config dir of every harness this config will
+// spawn (CLA-366). A phase on another harness inherits nothing from the run-wide
+// `config_dir` — deliberately, since it is that harness's own dialect — so its
+// dir is a separate field that can be separately absent.
+func checkConfigDirs(cfg *config.Config) []check {
+	names := cfg.PhaseHarnesses()
+	out := make([]check, 0, len(names))
+	for i, n := range names {
+		label := "config_dir"
+		if i > 0 {
+			label = "config_dir[" + n + "]"
+		}
+		out = append(out, checkConfigDirNamed(label, n, cfg.SessionFor(n).ConfigDir))
+	}
+	return out
+}
+
+func checkConfigDirNamed(label, harnessName, dir string) check {
+	c := check{name: label}
 
 	// Validate has already expanded a leading ~, so what we stat is what the
 	// adapter will export.
-	dir := cfg.ConfigDir
 	if dir == "" {
 		// Unset is survivable interactively (the ambient environment carries it)
 		// and is exactly what bites an unattended cron/launchd run, whose bare
@@ -354,15 +416,15 @@ func checkConfigDir(cfg *config.Config) check {
 	if len(entries) == 0 {
 		c.status = warn
 		c.detail = dir + " is empty — no skills, plugins or auth state"
-		c.remedy = "initialise it by running " + cfg.Harness + " once with this config dir, or point it elsewhere"
+		c.remedy = "initialise it by running " + harnessName + " once with this config dir, or point it elsewhere"
 		return c
 	}
 	// A harness with no marker list is one doctor has no opinion about — a newly
 	// registered adapter, say. Asserting "no recognisable auth state" there would be
 	// a permanent, unfixable WARN about a table this file forgot to update.
-	if markers, known := authMarkers[cfg.Harness]; known && !hasAnyMarker(dir, markers) {
+	if markers, known := authMarkers[harnessName]; known && !hasAnyMarker(dir, markers) {
 		c.status = warn
-		c.detail = dir + " has no recognisable " + cfg.Harness + " auth state"
+		c.detail = dir + " has no recognisable " + harnessName + " auth state"
 		c.remedy = "confirm a headless run can authenticate (the credential may be in the OS keychain, which doctor cannot see)"
 		return c
 	}
@@ -788,15 +850,46 @@ var agentInstructionFiles = []string{"AGENTS.md", "CLAUDE.md"}
 // permissions beyond the ambient ones, then spends its opening minutes
 // rediscovering the layout. It still works, which is why nobody notices for
 // thirty iterations.
+// checkSessions reports on each session the loop will spawn: its workdir, and
+// what the harness running there makes of the MCP config it will be handed.
+//
+// One check per project PER HARNESS (CLA-366), because both axes change the
+// answer: the project decides which file (its `/mcp/<slug>`) and the harness
+// decides what that file MEANS — a Claude-shaped `.mcp.json` is the session's
+// tools for one adapter and a refusal to start for another. Qualified names only
+// when a second harness is in play, so a single-harness report is unchanged.
 func checkSessions(cfg *config.Config) []check {
-	if len(cfg.Projects) == 0 {
-		return []check{sessionCheck("workdir", cfg.WorkDir, cfg.MCPConfigPath, cfg.Harness)}
+	harnesses := cfg.PhaseHarnesses()
+	suffix := func(h string) string {
+		if len(harnesses) == 1 {
+			return ""
+		}
+		return ":" + h
 	}
-	out := make([]check, 0, len(cfg.Projects))
+	if len(cfg.Projects) == 0 {
+		out := make([]check, 0, len(harnesses))
+		for _, h := range harnesses {
+			out = append(out, sessionCheck("workdir"+bracket(suffix(h)), cfg.WorkDir, cfg.ResolveMCPConfig(h, "", nil), h))
+		}
+		return out
+	}
+	out := make([]check, 0, len(cfg.Projects)*len(harnesses))
 	for _, p := range cfg.Projects {
-		out = append(out, sessionCheck("workdir["+p.Slug+"]", projectWorkDir(cfg, p), projectMCPConfig(cfg, p), cfg.Harness))
+		for _, h := range harnesses {
+			out = append(out, sessionCheck("workdir["+p.Slug+suffix(h)+"]", projectWorkDir(cfg, p),
+				cfg.ResolveMCPConfig(h, projectMCPConfig(cfg, p), p.MCPConfigPaths), h))
+		}
 	}
 	return out
+}
+
+// bracket wraps a non-empty qualifier in the [] the check names use, and leaves
+// an empty one alone — so "workdir" stays "workdir" on a single-harness run.
+func bracket(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "[" + strings.TrimPrefix(s, ":") + "]"
 }
 
 // projectWorkDir and projectMCPConfig resolve a project entry EXACTLY as
@@ -929,7 +1022,15 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 		}
 		// Otherwise there is nothing here we can honestly verdict on: an absent
 		// path is normal for this harness, and a present non-Claude one we have no
-		// schema to judge.
+		// schema to judge. An absent one is NOT warned about here even though a
+		// mixed-harness phase could reach the backlog through neither this file
+		// nor its config dir (CLA-366): the config dir legitimately carries the
+		// server for this harness, doctor cannot parse that schema to find out,
+		// and TestSessionCheckDoesNotClaimMCPWiringForOpencode pins the resulting
+		// PASS-with-caveat deliberately. The guard for a phase harness that
+		// declares NOTHING is in config.Validate, which refuses an empty
+		// `harnesses.<name>` block outright - the right place for it, since it
+		// fires before a session is spawned rather than in a log at 3am.
 		c.info = append(c.info, mcpConfigNotCheckedNote(use))
 
 	case harness.MCPConfigClaudeJSON:
@@ -1053,20 +1154,45 @@ func checkMCPServers(cfg *config.Config) check {
 
 // --- 8. permission policy ----------------------------------------------------
 
+// checkPermissions reports on the run harness's permission policy. See
+// checkPermissionsAll, which is what doctorChecks calls.
 func checkPermissions(cfg *config.Config) check {
-	c := check{name: "permissions"}
-	switch cfg.Harness {
+	return checkPermissionsNamed(cfg, "permissions", cfg.Harness)
+}
+
+// checkPermissionsAll reports on the policy of every harness this config will
+// declares (CLA-366). The policy is per harness in both senses — a different
+// mechanism each (a settings file, a sandbox flag, an env var) and a different
+// file — so a mixed run that checked only `harness` would certify the policy of
+// one session and say nothing about the other.
+func checkPermissionsAll(cfg *config.Config) []check {
+	names := cfg.PhaseHarnesses()
+	out := make([]check, 0, len(names))
+	for i, n := range names {
+		label := "permissions"
+		if i > 0 {
+			label = "permissions[" + n + "]"
+		}
+		out = append(out, checkPermissionsNamed(cfg, label, n))
+	}
+	return out
+}
+
+func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check {
+	c := check{name: label}
+	settingsPath := cfg.SessionFor(harnessName).SettingsPath
+	switch harnessName {
 	case "claude":
-		if cfg.SettingsPath == "" {
+		if settingsPath == "" {
 			c.status = warn
 			c.detail = "no settings_path — the unattended session runs on the ambient allowlist"
 			c.remedy = "set settings_path to a headless permission policy (its deny rules win over the config dir's)"
 			return c
 		}
-		data, err := os.ReadFile(cfg.SettingsPath)
+		data, err := os.ReadFile(settingsPath)
 		if err != nil {
 			c.status = fail
-			c.detail = cfg.SettingsPath + " is unreadable: " + err.Error()
+			c.detail = settingsPath + " is unreadable: " + err.Error()
 			c.remedy = "create the settings file, or clear settings_path"
 			return c
 		}
@@ -1074,12 +1200,12 @@ func checkPermissions(cfg *config.Config) check {
 			// Claude rejects an unparseable --settings file at startup, so this kills
 			// the first session rather than degrading it.
 			c.status = fail
-			c.detail = cfg.SettingsPath + " is not valid JSON"
+			c.detail = settingsPath + " is not valid JSON"
 			c.remedy = "fix the JSON — the harness refuses to start with an unparseable --settings file"
 			return c
 		}
 		c.status = pass
-		c.detail = cfg.SettingsPath + " parses"
+		c.detail = settingsPath + " parses"
 
 	case "codex":
 		// The adapter pins both axes itself, so there is nothing an operator can
@@ -1101,7 +1227,7 @@ func checkPermissions(cfg *config.Config) check {
 
 	default:
 		c.status = pass
-		c.detail = "no permission-policy checks for " + cfg.Harness
+		c.detail = "no permission-policy checks for " + harnessName
 	}
 	return c
 }
@@ -1134,12 +1260,53 @@ var toolchainMarkers = []struct{ marker, tool string }{
 // Every finding here is a WARN, never a FAIL: doctor reads the settings files it
 // knows about, and a grant can also arrive by a rule form it does not parse or a
 // flag on the harness invocation. A false FAIL would block a run that works.
+// runsHarness reports whether the named harness will actually START A SESSION in
+// this config. SpawnedHarnesses, not PhaseHarnesses: a run-wide `harness` that
+// every phase overrides is declared and never spawned, and a check reasoning
+// about what the run DOES must not count it.
+func runsHarness(cfg *config.Config, name string) bool {
+	for _, h := range cfg.SpawnedHarnesses() {
+		if h == name {
+			return true
+		}
+	}
+	return false
+}
+
+// costBlindHarnesses names every harness this run spawns that cannot report what
+// a session cost, in the order SpawnedHarnesses lists them. Empty means a cost
+// ceiling can see the whole run.
+//
+// SPAWNED, not declared: a never-spawned cost-blind harness would make the run's
+// live `max_cost_usd` report as INERT and send the operator to fix a harness no
+// session ever runs on.
+func costBlindHarnesses(cfg *config.Config) []string {
+	var out []string
+	for _, h := range cfg.SpawnedHarnesses() {
+		if !harnessReportsCost(h) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
 func checkToolchains(cfg *config.Config) check {
 	c := check{name: "toolchains", status: pass}
-	if cfg.Harness != "claude" {
-		c.detail = "no allowlist to audit for " + cfg.Harness
+	// The allowlist is Claude's, but claude need not be the RUN's harness: a
+	// mixed sequence can implement elsewhere and review on claude, and it is the
+	// claude session that runs the verification verbs this check is about
+	// (CLA-366). So ask whether claude runs any phase at all, and audit the
+	// settings file THAT session gets.
+	if !runsHarness(cfg, "claude") {
+		// SpawnedHarnesses, to agree with the gate directly above it. Listing
+		// PhaseHarnesses here named the DECLARED harness too, so a config whose
+		// phases all override it printed "no allowlist to audit for claude,
+		// opencode" - a sentence naming claude among the harnesses it has just
+		// said have no claude allowlist.
+		c.detail = "no allowlist to audit for " + strings.Join(cfg.SpawnedHarnesses(), ", ")
 		return c
 	}
+	settingsPath := cfg.SessionFor("claude").SettingsPath
 
 	needed := detectToolchains(cfg)
 	if len(needed) == 0 {
@@ -1151,7 +1318,7 @@ func checkToolchains(cfg *config.Config) check {
 		tools = append(tools, t.tool)
 	}
 
-	if cfg.SettingsPath == "" {
+	if settingsPath == "" {
 		// checkPermissions already warns about running on the ambient allowlist; here
 		// the useful thing is to name what would have to be in it.
 		c.detail = "needs " + strings.Join(tools, ", ") + " — grants come from the ambient allowlist, which doctor does not audit"
@@ -1180,11 +1347,11 @@ func checkToolchains(cfg *config.Config) check {
 	case len(blocked) > 0:
 		c.status = warn
 		c.detail = "denied by policy: " + strings.Join(blocked, ", ")
-		c.remedy = "remove the deny rule in " + cfg.SettingsPath + ", or accept that tasks in those repos cannot be verified"
+		c.remedy = "remove the deny rule in " + settingsPath + ", or accept that tasks in those repos cannot be verified"
 	case len(missing) > 0:
 		c.status = warn
 		c.detail = "no grant for: " + strings.Join(missing, ", ")
-		c.remedy = "allow the verbs each one needs in " + cfg.SettingsPath +
+		c.remedy = "allow the verbs each one needs in " + settingsPath +
 			" (e.g. Bash(go build:*), Bash(go vet:*), Bash(go test:*)) — a headless session fails closed, so an ungranted tool is refused with no prompt and its task ships unverified"
 	default:
 		c.detail = "granted: " + strings.Join(tools, ", ")
@@ -1286,11 +1453,17 @@ func projectRepos(dir, slug string) []string {
 // and its `.local` sibling are the project layer, and are where an operator is
 // most likely to have put `Bash(go test:*)` in the first place.
 func policySettingsPaths(cfg *config.Config) []string {
-	paths := []string{cfg.SettingsPath}
-	if cfg.ConfigDir != "" {
+	// The claude SESSION's fields, not the run's: in a mixed sequence claude may
+	// be a phase rather than the top-level harness, and then the policy that
+	// gates it is the one in its own block (CLA-366). SessionFor collapses to the
+	// run-wide fields whenever claude IS the top-level harness, which is every
+	// single-harness config.
+	hc := cfg.SessionFor("claude")
+	paths := []string{hc.SettingsPath}
+	if hc.ConfigDir != "" {
 		paths = append(paths,
-			filepath.Join(cfg.ConfigDir, "settings.json"),
-			filepath.Join(cfg.ConfigDir, "settings.local.json"),
+			filepath.Join(hc.ConfigDir, "settings.json"),
+			filepath.Join(hc.ConfigDir, "settings.local.json"),
 		)
 	}
 	// config owns this list: it is the confinement boundary, and statedir.Open is
@@ -1519,6 +1692,19 @@ func checkBudget(cfg *config.Config) check {
 	if b.MaxWallClock < 0 {
 		bad = append(bad, "max_wall_clock")
 	}
+	// The same reading of a negative, one level down: a per-harness block's dials
+	// are guarded with `> 0` too (config.HarnessBudget.ExceededBy), so a negative
+	// there reads as a ceiling and is none. Sorted so the finding does not depend
+	// on map iteration order.
+	for _, name := range slices.Sorted(maps.Keys(b.PerHarness)) {
+		hb := b.PerHarness[name]
+		if hb.MaxTokens < 0 {
+			bad = append(bad, fmt.Sprintf("per_harness[%s].max_tokens", name))
+		}
+		if hb.MaxCostUSD < 0 {
+			bad = append(bad, fmt.Sprintf("per_harness[%s].max_cost_usd", name))
+		}
+	}
 	if len(bad) > 0 {
 		c.status = fail
 		c.detail = "negative budget " + plural(len(bad), "value", "values") + ": " + strings.Join(bad, ", ")
@@ -1533,7 +1719,12 @@ func checkBudget(cfg *config.Config) check {
 	// written down - otherwise a codex run whose only dial is cost reports a set
 	// budget while having none, and a codex run with cost plus wall clock escapes
 	// the wall-clock-only warning that in reality describes it exactly (CLA-288).
-	inertCost := b.MaxCostUSD > 0 && !harnessReportsCost(cfg.Harness)
+	// ANY harness the run spawns that cannot report cost makes a cost ceiling
+	// unreliable, not just the top-level one: in a mixed sequence a share of the
+	// run's spend never reaches the accumulator the ceiling reads, so a dial
+	// reported as live would be holding a line it cannot see past (CLA-366).
+	costBlind := costBlindHarnesses(cfg)
+	inertCost := b.MaxCostUSD > 0 && len(costBlind) > 0
 	costLive := b.MaxCostUSD > 0 && !inertCost
 
 	var set []string
@@ -1546,13 +1737,81 @@ func checkBudget(cfg *config.Config) check {
 			// Annotated wherever it appears, not only when it is the last ceiling
 			// standing: a dial that does nothing is worth saying out loud even
 			// when something else is holding the line.
-			entry += fmt.Sprintf(" (INERT: the %s harness never reports cost)", cfg.Harness)
+			entry += fmt.Sprintf(" (INERT: the %s harness never reports cost)", strings.Join(costBlind, "/"))
 		}
 		set = append(set, entry)
 	}
 	if b.MaxWallClock > 0 {
 		set = append(set, "max_wall_clock="+b.MaxWallClock.Duration().String())
 	}
+
+	// Per-harness blocks (CLA-367), read the same way: what can FIRE, not what is
+	// written down. Two ways one cannot. Its cost dial may name a harness that
+	// never reports cost - the case above, one level down. Or the block may name a
+	// harness THIS config never spawns, whose ceilings are then unreachable however
+	// sane the numbers are. Both are annotated in place, and neither counts toward
+	// the "there is a live ceiling" reasoning below.
+	// "Does this run SPAWN it" - not "is it THE harness". A phase names its own
+	// harness since CLA-366, so a block for the harness the implement phase runs on
+	// is perfectly reachable while not being cfg.Harness, and calling it inert would
+	// be a false statement about a ceiling that will fire.
+	spawned := cfg.SpawnedHarnesses()
+	// The spawned harness whose block sets a cost dial and NOTHING else - under a
+	// harness that never reports cost that block is a ceiling in name only, and the
+	// remedy has to name the unit rather than the placement. "" when no spawned
+	// harness is in that state.
+	costOnlyInertHarness := ""
+	// Whether any spawned harness's block carries a token ceiling, for the
+	// enforced-between-sessions warning further down.
+	spawnedBlockTokens := false
+	for _, name := range spawned {
+		hb, _ := b.ForHarness(name)
+		if hb.MaxTokens > 0 {
+			spawnedBlockTokens = true
+		}
+		if costOnlyInertHarness == "" && hb.MaxCostUSD > 0 && hb.MaxTokens == 0 && !harnessReportsCost(name) {
+			costOnlyInertHarness = name
+		}
+	}
+	perHarnessLive := false
+	for _, name := range slices.Sorted(maps.Keys(b.PerHarness)) {
+		hb := b.PerHarness[name]
+		if !hb.CountsSpend() {
+			// A block with no dial at all - `"claude": {}`, or a mistyped key,
+			// since the config decoder ignores fields it does not know. Silence
+			// would leave an operator staring at a ceiling they wrote and doctor
+			// never mentioned, so it is named as the nothing it is.
+			set = append(set, fmt.Sprintf("per_harness[%s]: no ceiling set (INERT)", name))
+			continue
+		}
+		var dials []string
+		tokensLive := hb.MaxTokens > 0
+		costFires := hb.MaxCostUSD > 0 && harnessReportsCost(name)
+		if hb.MaxTokens > 0 {
+			dials = append(dials, fmt.Sprintf("max_tokens=%d", hb.MaxTokens))
+		}
+		if hb.MaxCostUSD > 0 {
+			dial := fmt.Sprintf("max_cost_usd=%g", hb.MaxCostUSD)
+			if !costFires {
+				dial += " (INERT: never reports cost)"
+			}
+			dials = append(dials, dial)
+		}
+		entry := fmt.Sprintf("per_harness[%s]: %s", name, strings.Join(dials, ", "))
+		runs := runsHarness(cfg, name)
+		if !runs {
+			entry += fmt.Sprintf(" (INERT: this config runs %s)", strings.Join(spawned, " / "))
+		}
+		set = append(set, entry)
+		if runs && (tokensLive || costFires) {
+			perHarnessLive = true
+		}
+	}
+	// Every ceiling this run has that can actually fire. The branches below ask
+	// this rather than "is anything configured", because a config whose only
+	// ceilings are inert has none at all - the CLA-288 reading, now including the
+	// two ways a per-harness block can be inert.
+	anyLive := b.MaxTokens > 0 || costLive || b.MaxWallClock > 0 || perHarnessLive
 
 	// The guards that were silently absent from the config that ran a 285.9M
 	// single session (CLA-344): doctor's job is preflight, so the dials most
@@ -1568,11 +1827,49 @@ func checkBudget(cfg *config.Config) check {
 	// operator chose. The codex adapter has NO turn cap at all (its
 	// Invocation.MaxTurns never reaches the CLI), so for it the warning is
 	// skipped rather than claiming a guard that does not exist there.
-	if cfg.Harness == "claude" && anyPhaseRunsTheDefaultTurnCap(cfg) {
+	// runsHarness, not cfg.Harness == "claude": on a mixed sequence the claude phase
+	// is bounded by the built-in default turn cap exactly as a claude-only run is
+	// (CLA-366), and the opencode phase beside it does not make that untrue.
+	if runsHarness(cfg, "claude") && anyPhaseRunsTheDefaultTurnCap(cfg) {
 		guardNotes = append(guardNotes, fmt.Sprintf(
 			"max_turns: at the built-in default (%d turns): a runaway detector, not a budget, so a deep task that reaches it is cut off at the phase boundary (the salvage commits what it left); set max_turns (or a phase's) to tune",
 			config.DefaultMaxTurns))
 		guardDials = append(guardDials, "max_turns")
+	}
+	// A session wall-clock cap the configured harness never enforces is the same
+	// defect max_cost_usd-under-codex is (CLA-288): a dial the operator set as
+	// their backstop, doing nothing, discoverable only from a session that ran
+	// all night. Named here, before the run, rather than left to be inferred.
+	if dial, on := inertSessionWallClock(cfg); dial != "" {
+		// The advice rides in the NOTE, not in c.remedy: the remedy line is one
+		// per check and the guard block's generic "set <dials>" usually claims it,
+		// so advice parked there is advice an operator routinely never sees. The
+		// tail clause is gated on the harness actually HAVING a turn cap: under
+		// codex MaxTurns never reaches the CLI either, so telling a codex operator
+		// the turn cap is their live backstop is advice that WOULD BE FOLLOWED
+		// straight back into the inert-dial hole this note exists to warn about
+		// (the reasoning harnessReportsCost uses below).
+		// `on`, not cfg.Harness: the dial is inert on the harness of the PHASE that
+		// would have used it (CLA-366), which on a mixed sequence is routinely not
+		// the run-wide one - and the backstop advice that follows is that harness's
+		// too, so naming the wrong one is advice that would be FOLLOWED wrongly.
+		backstop := "under " + on + " the turn cap is the backstop that does fire"
+		if !harnessHonoursMaxTurns(on) {
+			backstop = "under " + on + " there is NO per-session backstop at all - bound the run with max_iterations / max_tokens instead"
+		}
+		guardNotes = append(guardNotes, fmt.Sprintf(
+			"%s: set, but harness %q does not enforce a per-session wall-clock cap, so it is INERT there - drop it or run the harness that enforces it (opencode); %s",
+			dial, on, backstop))
+	}
+	// The complement, and the sharper case: the harness CAN enforce a session cap,
+	// takes no turn flag, has no mid-stream token ceiling — and the dial is unset.
+	// That run's sessions are bounded by nothing at all, which is the silently
+	// absent guard CLA-344 added this whole block for.
+	if on := noSessionBackstop(cfg); on != "" {
+		guardNotes = append(guardNotes, fmt.Sprintf(
+			"max_session_wall_clock: unset, and harness %q has no turn cap and no mid-session token ceiling - so nothing bounds a single session there; a run that works past its brief is stopped only by a run-level ceiling",
+			on))
+		guardDials = append(guardDials, "max_session_wall_clock")
 	}
 	if cfg.MaxRetries == 0 {
 		guardNotes = append(guardNotes,
@@ -1594,13 +1891,17 @@ func checkBudget(cfg *config.Config) check {
 		// flag doctor cannot see, so the config's contribution is described alone.
 		c.detail = "no ceiling configured — the loop stops on a STOP/HALT marker or signal; a dry backlog idle-polls rather than exiting"
 		// The per-session runaway ceiling still applies whatever the run-level
-		// dials say, and the operator should know the number (CLA-343). Claude
-		// only: the codex adapter has no mid-session ceiling (TokenCeilingHit
-		// never fires there), so claiming it is "still active" would be false.
-		if cfg.Harness == "claude" {
-			c.info = append(c.info, fmt.Sprintf("per-session runaway ceiling still active: max_session_tokens resolves to %d (the operator's own, else 2x max_tokens when set, else the floor)", b.SessionTokenCeiling()))
+		// dials say, and the operator should know the number (CLA-343). Asked of
+		// the harnesses that RUN A PHASE rather than the run-wide name (CLA-366):
+		// a sequence implementing on opencode and reviewing on claude still has the
+		// ceiling active on its claude phase, and reporting on cfg.Harness alone
+		// would either hide that or claim it for a phase where TokenCeilingHit
+		// never fires. Harnesses with no mid-session ceiling are omitted, not
+		// listed as zero - claiming one is "still active" there would be false.
+		if bounds := sessionTokenBounds(cfg); bounds != "" {
+			c.info = append(c.info, "per-session runaway ceiling still active: "+bounds+" (the operator's own, else 2x a token ceiling when set, else the floor)")
 		}
-	} else if b.MaxWallClock > 0 && !costLive && b.MaxTokens == 0 {
+	} else if b.MaxWallClock > 0 && !costLive && b.MaxTokens == 0 && !perHarnessLive {
 		// Wall clock is the weakest proxy for spend of the three, because it counts
 		// the hours a run spends WAITING OUT a usage limit — time in which nothing is
 		// billed. A run capped at 8h can spend five of them asleep and stop having done
@@ -1614,12 +1915,12 @@ func checkBudget(cfg *config.Config) check {
 		// sibling branch below warns about. Gated on the HARNESS, not on
 		// inertCost: the commonest codex config is a bare wall clock with cost
 		// unset, and that is the one that needs the corrected advice most.
-		if !harnessReportsCost(cfg.Harness) {
-			c.remedy = "add max_tokens as the real ceiling; under " + cfg.Harness + " max_cost_usd cannot fire, and max_wall_clock is only the outer bound on how late a run may finish"
+		if len(costBlind) > 0 {
+			c.remedy = "add max_tokens as the real ceiling; under " + strings.Join(costBlind, "/") + " max_cost_usd cannot fire, and max_wall_clock is only the outer bound on how late a run may finish"
 		} else {
 			c.remedy = "add max_cost_usd as the real ceiling; keep max_wall_clock as the outer bound on how late a run may finish"
 		}
-	} else if inertCost && b.MaxTokens == 0 && b.MaxWallClock == 0 {
+	} else if inertCost && b.MaxTokens == 0 && b.MaxWallClock == 0 && !perHarnessLive {
 		// The sibling of the wall-clock-only warning, and the sharper case of the
 		// two: wall clock at least measures something, whereas this run's every
 		// configured ceiling is unreachable, so it has none at all. That cannot be
@@ -1627,14 +1928,57 @@ func checkBudget(cfg *config.Config) check {
 		// (CLA-288).
 		c.status = warn
 		c.detail = strings.Join(set, ", ") + " - so this run has NO effective ceiling"
-		c.remedy = "set max_tokens (or max_wall_clock) beside it - under " + cfg.Harness + " those are the dials that can fire"
+		// costBlind, not cfg.Harness: on a mixed sequence it is every harness the
+		// run spawns that cannot report cost which makes the global dial inert, so
+		// naming the run-wide harness alone would point the operator at the wrong
+		// one (CLA-366).
+		c.remedy = "set max_tokens (or max_wall_clock) beside it - under " + strings.Join(costBlind, "/") + " those are the dials that can fire"
+	} else if !anyLive {
+		// The same finding reached the other way: every ceiling written down is a
+		// per-harness block this run cannot reach (a harness it never drives, or a
+		// cost dial that harness never reports), so the config LOOKS bounded and is
+		// not. Distinct from the branch above, which is the global cost dial's case
+		// and keeps its own wording.
+		c.status = warn
+		c.detail = strings.Join(set, ", ") + " - none of them can fire, so this run has NO effective ceiling"
+		// A remedy will be FOLLOWED, so it must not point at something the
+		// operator has already done. When the running harness HAS a block and its
+		// only dial is a cost one that harness never reports, the placement is
+		// right and the unit is wrong - saying "add a per_harness block" there
+		// would be a no-op dressed as advice.
+		if costOnlyInertHarness != "" {
+			c.remedy = "set per_harness[" + costOnlyInertHarness + "].max_tokens - " + costOnlyInertHarness + " reports tokens, never cost"
+		} else {
+			c.remedy = "put the ceiling where the run will reach it: a per_harness block for " + strings.Join(spawned, " or ") + ", or the run-wide max_tokens / max_wall_clock"
+		}
 	} else {
 		c.detail = strings.Join(set, ", ")
 		// The run-wide breaker is checked BETWEEN sessions: it cannot see a single
 		// huge session coming, which is exactly what happened to the 285.9M run
 		// under max_tokens=75M. Say so on the line that reports it (CLA-344).
-		if b.MaxTokens > 0 {
-			c.detail += fmt.Sprintf(" — max_tokens is enforced BETWEEN sessions, so one session can overrun it (max_session_tokens=%d is the mid-session bound)", b.SessionTokenCeiling())
+		// Gated on a token ceiling from EITHER place: a run whose only token
+		// ceiling is in its harness's per_harness block is enforced between
+		// sessions in exactly the same way, so it needs the same warning and the
+		// same number (CLA-367).
+		if b.MaxTokens > 0 || spawnedBlockTokens {
+			c.detail += " — the token ceiling is enforced BETWEEN sessions, so one session can overrun it"
+			// sessionTokenBounds is EMPTY when no spawned harness has a mid-session
+			// ceiling, which is every opencode-only and codex-only run. Appending it
+			// unguarded printed a bare "()" there - a broken sentence in the one
+			// surface whose whole job is not making sloppy or false statements. The
+			// two cases need different sentences, not one sentence with a hole:
+			// with a bound, name it; without, say plainly that nothing bounds the
+			// overrun, which is the sharper finding and was previously unsaid.
+			if bounds := sessionTokenBounds(cfg); bounds != "" {
+				c.detail += " (" + bounds + ")"
+			} else {
+				// The singular verb is safe because this branch implies exactly ONE
+				// spawned harness today: claude is the only harness with a
+				// mid-session ceiling, so reaching here means claude is not among
+				// the spawned. If a second such harness is ever added, make this
+				// agree in number rather than letting the sentence go ungrammatical.
+				c.detail += " by any amount — " + strings.Join(spawned, "/") + " enforces no mid-session token ceiling"
+			}
 		}
 	}
 
@@ -1648,7 +1992,7 @@ func checkBudget(cfg *config.Config) check {
 		if c.status == pass {
 			c.status = warn
 		}
-		if c.remedy == "" {
+		if c.remedy == "" && len(guardDials) > 0 {
 			// Named from the dials actually warned on, so a codex run (no
 			// max_turns note) is not told to set a dial that does nothing there.
 			c.remedy = "set " + strings.Join(guardDials, ", ") + " (see the guard lines), or accept the defaults"
@@ -1672,6 +2016,151 @@ func harnessReportsCost(name string) bool {
 	return caps.ReportsCost
 }
 
+// inertSessionWallClock names the wall-clock dial this config sets that will not
+// be enforced, and the harness it is inert ON - two empty strings when there is
+// nothing to say. The phase's own `max_wall_clock` is named in preference to the
+// run-wide `max_session_wall_clock`, so an operator is pointed at the line they
+// wrote.
+//
+// Judged PER PHASE-HARNESS since CLA-366, because that is the level at which the
+// question has an answer. A phase's `max_wall_clock` is inert exactly when THAT
+// phase's harness will not enforce it - so a sequence implementing on opencode
+// and reviewing on claude gets the warning for its claude phase and not for the
+// opencode one, where the dial does fire. The run-wide `max_session_wall_clock`
+// reaches every phase, so it is only worth calling inert when NO harness the run
+// spawns honours it; if one does, the dial fires somewhere and saying otherwise
+// would be the reassuring falsehood this check exists to remove. Judging the
+// whole config by cfg.Harness would get both of those wrong in opposite
+// directions - a false INERT on a mixed run whose opencode phase honours the
+// dial, and silence on a claude phase where it truly does nothing.
+//
+// PARTIAL inertness of the run-wide dial is deliberately NOT reported, and this
+// is the one place the check chooses silence over a true statement. On the
+// implement-on-opencode / review-on-claude sequence the dial fires on the opencode
+// phase and is dead on the claude one - true, and not worth saying, because the
+// claude phase is bounded by its turn cap, so it is not the CLA-344 "bounded by
+// nothing" case that the sibling noSessionBackstop note exists for. Saying it
+// anyway would put a WARN on the shipped mixed-harness config that has no defect
+// and no action behind it, and a warning an operator learns to ignore costs more
+// than the sentence buys. If a harness ever appears with no turn cap AND no
+// session cap, noSessionBackstop is what catches it - per phase, by name.
+//
+// An UNKNOWN harness says nothing, for the reason harnessReportsCost gives:
+// config.Validate has already refused the name, and a speculative inert-dial
+// warning would bury the real finding.
+func inertSessionWallClock(cfg *config.Config) (dial, on string) {
+	// Phase dials first, so the operator is pointed at the line they wrote - and
+	// read off cfg.Phases, NOT EffectivePhases, for exactly that reason: the
+	// effective phases have the run-wide dial resolved into every one of them, so
+	// iterating those would report an operator's `max_session_wall_clock` back to
+	// them as `max_wall_clock (phases)`, a line they never wrote. The HARNESS still
+	// comes from the resolver, since that is what a phase inherits.
+	for _, ph := range cfg.Phases {
+		if ph.MaxWallClock == 0 {
+			continue
+		}
+		h := cfg.HarnessFor(ph)
+		caps, ok := harness.CapabilitiesOf(h)
+		if ok && !caps.HonoursSessionWallClock {
+			return "max_wall_clock (phases)", h
+		}
+	}
+	if cfg.MaxSessionWallClock == 0 {
+		return "", ""
+	}
+	// The run-wide dial: inert only if NOTHING this run spawns enforces it. The
+	// first such harness is named, since with none enforcing it they are all
+	// equally the answer and naming one keeps the note short.
+	named := ""
+	for _, h := range cfg.SpawnedHarnesses() {
+		caps, ok := harness.CapabilitiesOf(h)
+		if !ok {
+			return "", ""
+		}
+		if caps.HonoursSessionWallClock {
+			return "", ""
+		}
+		if named == "" {
+			named = h
+		}
+	}
+	if named == "" {
+		return "", ""
+	}
+	return "max_session_wall_clock", named
+}
+
+// harnessHonoursMaxTurns asks the registry whether this harness takes a turn
+// flag at all. An UNKNOWN harness is treated as honouring one — the withheld
+// advice, for the reason harnessReportsCost gives.
+func harnessHonoursMaxTurns(name string) bool {
+	caps, ok := harness.CapabilitiesOf(name)
+	if !ok {
+		return true
+	}
+	return caps.HonoursMaxTurns
+}
+
+// noSessionBackstop names a harness whose sessions in THIS run are bounded by
+// NOTHING - it takes no turn flag and kills on no token ceiling, and the phases
+// it runs leave unset the one dial that could bound it. "" when every spawned
+// harness has some backstop. Gated on the harness being able to enforce the
+// dial, so the advice ("set it") is advice that would work.
+//
+// Per phase-harness since CLA-366, and per phase within it: an unbounded
+// opencode implement phase is exactly as unbounded when a claude review phase
+// runs after it, so asking only about cfg.Harness would go silent on the very
+// sequence this warning is for. A phase carrying its own max_wall_clock is
+// bounded and does not count against its harness; the run-wide dial is resolved
+// into every phase by EffectivePhases, so setting it clears all of them at once.
+func noSessionBackstop(cfg *config.Config) string {
+	for _, ph := range cfg.EffectivePhases() {
+		if ph.MaxWallClock > 0 {
+			continue
+		}
+		caps, ok := harness.CapabilitiesOf(ph.Harness)
+		if !ok || caps.HonoursMaxTurns || !caps.HonoursSessionWallClock {
+			continue
+		}
+		return ph.Harness
+	}
+	return ""
+}
+
+// sessionTokenBounds renders the per-session runaway token ceiling for every
+// harness this run spawns that actually HAS one, or "" when none does.
+//
+// Per harness for two reasons since CLA-366. The ceiling itself is resolved per
+// harness (CLA-367's SessionTokenCeilingFor reads that harness's own block), so
+// one number cannot describe a mixed run; and whether the ceiling exists at all
+// is a capability - codex has no mid-session ceiling, so listing it with a number
+// would claim a guard that never fires. A harness without one is OMITTED rather
+// than shown as zero, which is the same choice the check makes everywhere else.
+func sessionTokenBounds(cfg *config.Config) string {
+	var parts, only []string
+	for _, h := range cfg.SpawnedHarnesses() {
+		caps, ok := harness.CapabilitiesOf(h)
+		if !ok || !caps.HasSessionTokenCeiling {
+			continue
+		}
+		only = append(only, h)
+		parts = append(parts, fmt.Sprintf("%s=%d", h, cfg.Budget.SessionTokenCeilingFor(h)))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	// Gated on the run spawning ONE harness, not on one harness having a ceiling.
+	// The bare number is only unambiguous when there is a single session kind for
+	// it to bound: on a mixed run it reads as a bound on every session, when in
+	// fact the opencode phase beside it has no mid-session ceiling at all. So the
+	// common unphased config's line is unchanged byte for byte, and a mixed run
+	// always names whose ceiling it is quoting.
+	if len(cfg.SpawnedHarnesses()) == 1 {
+		return fmt.Sprintf("max_session_tokens=%d is the mid-session bound", cfg.Budget.SessionTokenCeilingFor(only[0]))
+	}
+	return "max_session_tokens is the mid-session bound, per harness: " + strings.Join(parts, ", ")
+}
+
 // anyPhaseRunsTheDefaultTurnCap reports whether the effective config bounds any
 // session by the built-in default rather than an operator-chosen cap — i.e.
 // whether CLA-343's default is load-bearing for this run. The effective phases
@@ -1690,8 +2179,14 @@ func anyPhaseRunsTheDefaultTurnCap(cfg *config.Config) bool {
 
 // --- rendering ---------------------------------------------------------------
 
+// checkLabelWidth is the column the check names are padded to. Wide enough for
+// the qualified labels a mixed-harness run produces (`config_dir[opencode]`,
+// `workdir[clankerbar:opencode]`), because doctor output is read at a glance and
+// one over-long name used to push every following detail out of alignment.
+const checkLabelWidth = 28
+
 func printCheck(w io.Writer, c check) {
-	fmt.Fprintf(w, "%-4s  %-12s %s\n", c.status, c.name, c.detail)
+	fmt.Fprintf(w, "%-4s  %-*s %s\n", c.status, checkLabelWidth, c.name, c.detail)
 	for _, line := range c.info {
 		fmt.Fprintf(w, "                   %s\n", line)
 	}

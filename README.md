@@ -85,11 +85,16 @@ boundary too. Two other consequences worth knowing:
 - **`max_iterations` counts task sequences, not sessions.** A two-phase config
   spawns roughly twice the sessions for the same limit.
 - **A multi-phase config requires a harness that observes the session's task
-  claim**, which today means `claude`. The handback across a seam, the salvage and
-  the delivery check all depend on it, so a config naming `codex` or `opencode`
+  claim**, which today means `claude` or `opencode`. The handback across a seam,
+  the salvage and the delivery check all depend on it, so a config naming `codex`
   alongside two or more phases is refused at validation rather than quietly
   stopping after phase 1 on every task. A single phase hands off to nobody, so it
   is allowed anywhere.
+- **`max_turns` is a `claude`-only backstop.** `opencode` can now run phases, but
+  `Invocation.MaxTurns` never reaches its CLI and it has no mid-stream token
+  ceiling either, so a phased `opencode` config has no per-session cap at all —
+  only the budget breaker at the phase boundary and `max_wall_clock`. Set those
+  deliberately rather than assuming the `max_turns` you wrote is doing anything.
 - **A sequence that ends on the `implement` brief is refused**, on any harness:
   that brief tells its session to stop at the checkpoint and leave `in_review`
   alone, so with no phase after it every task would stop half-finished, forever,
@@ -182,6 +187,87 @@ compresses a large output into a small answer can take a cheap one, because the
 error is visible immediately to whoever asked the closed question. Nothing is
 tiered by default: an untouched config runs every phase on the run's model, and
 these two shipped phases both produce durable artifacts.
+
+### Per-phase harnesses: implement on one, review on another
+
+A phase can name the **harness** it runs on, not only the model:
+
+```json
+"harness": "claude",
+"harnesses": {
+  "opencode": {
+    "config_dir": "~/.config/opencode",
+    "mcp_config_path": "~/.config/clankerbar/opencode-mcp.json"
+  }
+},
+"phases": [
+  { "name": "implement", "harness": "opencode" },
+  { "name": "review" }
+]
+```
+
+That runs the implementation on a cheap provider-agnostic backend and keeps the
+adversarial review on the harness with the subagent machinery. Nothing in the
+seam resists it: each phase is already a fresh session seeded from the observed
+claim, so what crosses the boundary is a task id and a run id, and both live on
+the plane rather than in a session.
+
+**The harness-shaped fields stop being run-wide, and that is the whole of the
+configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and
+`models` at the top level describe your `harness` and no other, because each is a
+dialect: `config_dir` is `CLAUDE_CONFIG_DIR` for one adapter and
+`OPENCODE_CONFIG_DIR` for another, `mcp_config_path` is Claude's `.mcp.json` for
+one and an opencode-schema config for another — and opencode does not ignore the
+difference, it **refuses to start** on `mcpServers`. So a phase on another
+harness inherits none of them and reads its own `harnesses.<name>` block instead.
+A phase naming a harness with no block is refused at validation, rather than
+spawning a session with no clankerbar tools that looks in the log like a model
+that declined the work.
+
+**Tiers are resolved per harness.** A phase's `tier` names a bucket in the tier
+map of *the harness that phase runs on*, so one `"tier": "strong"` can mean opus
+here and something else there — the bucket name is your policy and travels, the
+alias inside it is a provider's and does not. A harness whose block names no
+models runs on that harness's own configured default, which is where opencode's
+model lives; a claude alias is never handed to another harness's `--model`.
+
+**Every phase's harness has to observe the session's task claim** (`claude` or
+`opencode`), not only the first one's. The first phase has to *observe* a claim
+or there is nothing to hand on; a later phase is *handed* one - but seeding it is
+the adapter's job, and an adapter that does not track claims does not seed
+either. A non-tracking phase mid-sequence would end every drain early with a log
+line that reads like an ordinary finish, and one at the end would leave the
+driver handing the task back over its own work. Validation names the phase and
+the harness when it refuses.
+
+**A block that declares nothing is refused like a missing one**, since an empty
+one spawns exactly the session the rule exists to prevent. And `--harness` /
+`--model` are refused outright on a config that selects harnesses per phase: both
+flags assert the run has one harness, and `--harness` would silently re-point
+which harness the run-wide fields belong to. Edit the `harnesses` block instead.
+
+**A single-project run is slug-checked too.** With no `projects` block the poll's
+slug comes from the top-level `mcp_config_path` while each harness's sessions
+work whatever *its* file names, so two files naming different projects are
+refused the same way a mismatched `projects` entry is - the poll would gate on
+one project's counts while sessions claimed and worked another's.
+
+**Multi-project runs need one MCP file per project per harness.** That file
+carries two facts at once — which project (its `/mcp/<slug>`) and which schema
+(the harness's) — so a `projects` entry declares them under `mcp_config_paths`:
+
+```json
+"projects": [
+  { "slug": "clankerbar", "workdir": "~/dev",
+    "mcp_config_paths": { "opencode": "~/.config/clankerbar/opencode-clankerbar.json" } }
+]
+```
+
+Omitting one is refused rather than resolved: the single top-level
+`harnesses.<name>.mcp_config_path` names one project, so falling back to it would
+poll one queue while sessions worked another. `doctor` reports each
+project-and-harness pair separately, along with each harness's binary, config dir
+and permission policy.
 
 On a usage limit the loop doesn't die — it pauses and polls for the reset (catching
 Anthropic's semi-random early resets), then continues.
@@ -626,6 +712,7 @@ the likely final format.)
   "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
   "prompt": "Work the next backlog item.",
   "max_turns": 400,
+  "max_session_wall_clock": 0,
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
   "idle_poll_interval": "60s",
@@ -637,7 +724,8 @@ the likely final format.)
     "max_tokens": 0,
     "max_cost_usd": 0,
     "max_wall_clock": "6h",
-    "max_session_tokens": 0
+    "max_session_tokens": 0,
+    "per_harness": {}
   }
 }
 ```
@@ -659,6 +747,27 @@ else to a 150M floor (~2.3x the largest legitimate session measured, CLA-309).
 It is deliberately always on — it is a detector, not a budget. Claude only
 today: the other harnesses' streams are parsed but never killed mid-session,
 so for them the dial is inert until an adapter grows the kill.
+
+`max_session_wall_clock` is the same backstop measured in TIME, for a harness
+whose CLI takes no turn flag: when a session outlives it the adapter ends the
+process and the driver treats that exactly like a hit turn cap — the session
+ends, nothing is retried, nothing fails, and the run carries on (CLA-368). A
+phase's own `max_wall_clock` wins over it, and **0 is off, which is the
+default**: unlike the turn cap it ships no built-in number, because a duration
+that catches a runaway on one model/provider is a routine session on another. It
+is measured per SESSION, so it is not `budget.max_wall_clock`, which is the
+run-wide ceiling and counts the hours a run spends *waiting out* a usage limit.
+
+**opencode only** today — it is the harness with no turn flag, so this is its
+backstop; under claude or codex the dial is inert and `doctor` says so. Two
+consequences of that pairing are worth knowing before you set it. The salvage
+that commits and pushes what a cut-off session left runs only for an adapter
+that observes the session's task claim, which opencode does not — so a capped
+session's uncommitted work stays **in the worktree**, and the driver's log says
+exactly that rather than claiming a salvage that never ran. And because
+`phases` is refused for opencode for that same reason, the per-phase
+`max_wall_clock` is reachable only in a single-phase config today; the run-wide
+dial is the one an unphased opencode run uses.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default
@@ -795,6 +904,45 @@ alternatives, in order of preference:
    `max_wall_clock`) alongside; `doctor` WARNs on the cost-only case rather than
    reporting a budget that cannot fire.
 
+   **A mixed-harness run needs one block per harness - `budget.per_harness`.**
+
+   ```json
+   "per_harness": {
+     "claude": { "max_tokens": 75000000 },
+     "opencode": { "max_cost_usd": 2 }
+   }
+   ```
+
+   The dials above are one ceiling over every session a run spends, and no single
+   number means the same thing on two backends: 75M tokens is a sane week of
+   Claude and roughly $2 on a DeepSeek-class backend, so the same `max_tokens`
+   that paces a week ends a metered drain after a task or two; and a dollar figure
+   is meaningless for a session billed to a subscription, which reports a price
+   nobody is charged. So each harness can carry its own block, keyed by harness
+   name, counted over **only that harness's own sessions** and measured in the
+   unit that harness understands - tokens for `claude`, dollars for a metered
+   backend. **Any block that trips stops the whole run**: these are circuit
+   breakers, not per-harness quotas.
+
+   A token ceiling in a block derives the per-session runaway detector
+   (`max_session_tokens`) exactly as the run-wide `max_tokens` does, so moving a
+   ceiling into a block does not quietly loosen it.
+
+   The dials above keep working exactly as they always have, over the run's whole
+   spend, and a config that sets no `per_harness` block behaves as before. Set
+   both and both apply, whichever is reached first. Wall clock is deliberately not
+   available per harness: it measures the run, not a harness. The same goes for
+   the CLA-262 stop above - a session whose spend cannot be measured stops the run
+   when *that session's harness* is under a spend ceiling, its own block's or the
+   run-wide one.
+
+   `doctor` reads these the way it reads every other ceiling: what can actually
+   fire. A block naming a harness this config does not run, or a `max_cost_usd`
+   on a harness that never reports cost, is annotated `INERT`, and a config whose
+   only ceilings are unreachable is told it has none. A block keyed by a name no
+   adapter answers to is refused at load, since nothing could ever be charged to
+   it.
+
    **`max_tokens` counts about ten times more than it used to.** Token totals now
    include cache reads and writes, which `input_tokens` excludes and which
    dominate a long agentic session — one run reported 140,387 tokens against
@@ -878,6 +1026,11 @@ checkout-relative patterns the rules cannot express, locking the session's
 structured Read/Edit tools out with no error — the exact failure this change
 removes. A per-task worktree always lives *under* a parent workdir, so the
 parent is the correct setting.
+
+## Docs
+
+- [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
+- [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
 
 ## License
 

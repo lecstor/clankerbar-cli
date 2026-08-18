@@ -3,11 +3,14 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 func init() { Register(opencode{}) }
@@ -64,11 +67,44 @@ func (opencode) MCPConfigUse() MCPConfigUse {
 func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	args := opencodeArgs(in)
 
-	cmd := exec.CommandContext(ctx, "opencode", args...)
+	// The per-session wall-clock cap, enforced on the exec context so the kill
+	// needs nothing from the stream: opencode reports no turn count and takes no
+	// turn flag, so elapsed time is the only backstop this adapter can offer a
+	// phase (CLA-368). The derived context is ALWAYS created, cap or no cap, so
+	// there is one cancellation path rather than two shapes of ctx below.
+	//
+	// Never on a PROBE: a probe is a one-word liveness check, not a session doing
+	// work, and a capped probe would report a phase-shaped cap for something no
+	// phase ran. The driver never sets the field on a probe either — this is the
+	// belt to that braces, so a future caller reusing an Invocation cannot turn a
+	// probe into a capped session by accident.
+	sctx := ctx
+	cancel := context.CancelFunc(func() {})
+	if in.MaxSessionWallClock > 0 && !in.Probe {
+		sctx, cancel = context.WithTimeout(ctx, in.MaxSessionWallClock)
+	}
+	defer cancel()
+
+	cmd := exec.CommandContext(sctx, "opencode", args...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = o.env(in)
+	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
+	// io.MultiWriter values, so os/exec makes its own pipes and cmd.Run waits for
+	// every WRITER of them to close — and CommandContext kills the direct child
+	// only. A runaway session is exactly the case with a bash-tool grandchild (a
+	// build, a test run) or an MCP server holding the inherited fd, which survives
+	// the SIGKILL and keeps the pipe open: without a delay, Invoke blocks past its
+	// own deadline in the one scenario the cap exists for. WaitDelay force-closes
+	// the pipes and lets Wait return.
+	//
+	// It does NOT kill the orphan itself — that needs a process group, which is
+	// platform-specific and is filed rather than smuggled in here. Set only with
+	// a cap in play, so an ordinary session's I/O is never cut short by it.
+	if sctx != ctx {
+		cmd.WaitDelay = 5 * time.Second
+	}
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text
 	// scans, and tee live to the console when one is set (the JSON event stream —
@@ -78,21 +114,48 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// per-step usage across the whole session, so a capped copy of stdout walked
 	// afterwards would silently drop the early steps and under-count the budget by
 	// however much of the stream had scrolled away (CLA-262).
-	var p opencodeParse
-	captured := newCapture(p.line)
 	console := in.Console
 	if in.Probe {
 		console = nil
 	}
+	// Through the constructor, not a struct literal: it carries the resumed-phase
+	// claim seed, and the tests build the parser the same way so that dropping it
+	// here turns them red.
+	p := newOpencodeParse(in, console)
+	captured := newCapture(p.line)
 	captured.attach(cmd, console)
 	runErr := cmd.Run()
 
 	res := captured.result("opencode")
 	p.finish(&res)
+
+	// Our own deadline, not the caller's: ctx.Err() distinguishes a session we
+	// cut off from a run-wide Ctrl-C / SIGTERM / supervised-wait cancellation,
+	// which cancels the parent too and is NOT this phase reaching its backstop.
+	// Marked after p.finish, which rewrites Raw wholesale when it saw usage.
+	//
+	// runErr is the third conjunct because the deadline is read AFTER Run
+	// returned: a session that exited cleanly a hair before it, with the deadline
+	// passing in the window while the output was parsed, would otherwise be
+	// marked as capped. Nothing would misbehave today — the driver takes its
+	// exit-0 branch first — but the Result would be lying about how the session
+	// ended, and the next reader of this marker inherits the lie.
+	timedOut := runErr != nil && sctx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+	if timedOut {
+		res.markWallClockCapped()
+		if console != nil {
+			fmt.Fprintf(console, "\n!! session outlived its wall-clock cap (%s) — ending it here; whatever it wrote is still in the worktree, uncommitted\n", in.MaxSessionWallClock)
+		}
+	}
+
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
-	} else if runErr != nil {
+	} else if runErr != nil && !timedOut {
 		return res, runErr // couldn't launch opencode at all
+	} else if runErr != nil {
+		// Our own kill: the child died on the cancel, so its error is the kill's
+		// and not a verdict. The marker above is the verdict.
+		res.ExitCode = -1
 	}
 	return res, nil
 }
@@ -278,6 +341,48 @@ type opencodePart struct {
 	// REPORTED, and the driver's zero-spend bound counts silence, not zeroes
 	// (CLA-288).
 	Cost *float64 `json:"cost"`
+
+	// tool parts, which arrive on a "tool_use" event.
+	Tool   string             `json:"tool"`
+	CallID string             `json:"callID"`
+	State  *opencodeToolState `json:"state"`
+}
+
+// opencodeToolState is a tool call's lifecycle slot on its part. Where claude
+// splits a call across an `assistant` tool_use block and a later `user`
+// tool_result block, opencode re-emits the same part as its status advances and
+// carries the arguments and the result TOGETHER on the terminal one (recorded
+// against opencode 1.18.16, CLA-365):
+//
+//	{"type":"tool_use","part":{"type":"tool","tool":"clankerbar_claim_task",
+//	  "callID":"call_00_9Mb...","state":{"status":"completed",
+//	    "input":{"taskId":"e1d01dae-..."},
+//	    "output":"{\"task\":{\"id\":\"e1d01dae-...\",\"ref\":\"CLA-371\"},\"run\":{...}}"}}}
+//
+// A refusal takes the other terminal status and puts the plane's error where the
+// output would have been. There is no `is_error` flag to read — the STATUS is the
+// flag, which is why a status this adapter does not recognise must never be
+// treated as success:
+//
+//	{"state":{"status":"error","input":{...},
+//	  "error":"{\"error\":{\"code\":\"not_ready\",\"message\":\"...\"}}"}}
+//
+// `output` is a STRING, not an object: an MCP tool's result arrives flattened to
+// its text content, which is the shape noteClaimed already parses.
+//
+// No spill envelope has been seen here. The `claim_task` result in the recording
+// was ~21 KB and arrived INLINE (the committed fixture is ~3 KB, because most of
+// that was a decisions block redacted out of it), where Claude Code substitutes a pointer
+// to a file above its own threshold and broke the phase seam doing it (CLA-330,
+// docs/large-tool-results.md). noteClaimed's rehydration still runs on this path,
+// so an opencode that grows the same behaviour with the same envelope is handled;
+// one with a DIFFERENT envelope would be a new bug, and the diagnostic noteClaimed
+// prints on an unparseable result is what would surface it.
+type opencodeToolState struct {
+	Status string          `json:"status"`
+	Input  json.RawMessage `json:"input"`
+	Output string          `json:"output"`
+	Error  string          `json:"error"`
 }
 
 type opencodeTokens struct {
@@ -307,6 +412,37 @@ type opencodeParse struct {
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
+
+	// observed carries ONLY the claim/report observation state, which finish
+	// copies onto the real Result. It cannot be the real Result: that one is built
+	// by capture.result() after the process exits, long after the claim event went
+	// past, so anything written into it during the stream would be discarded.
+	observed Result
+	console  io.Writer
+	// settledCalls is the callIDs already acted on, so a re-delivered terminal
+	// event cannot rebuild a claim that a later call has since settled.
+	settledCalls map[string]bool
+}
+
+// newOpencodeParse builds the parser a session streams into. It exists so the
+// CLAIM SEED is exercised by tests: a resumed phase never calls claim_task, so
+// without newSessionResult here its Claim would be the zero value and
+// Claim.Held() — the gate on the handback, the salvage and the delivery check —
+// would be false for the phase that pushes the branch and opens the PR. Assigned
+// inline in Invoke, deleting it would leave the whole suite green.
+func newOpencodeParse(in Invocation, console io.Writer) opencodeParse {
+	return opencodeParse{observed: newSessionResult(in), console: console}
+}
+
+// diag is where a claim diagnostic goes. The zero opencodeParse has no console (a
+// probe passes none, and the parser tests build one directly), and noteClaimed
+// writes unconditionally — by design, since a claim that silently stops being
+// tracked is indistinguishable from a session that never claimed.
+func (p *opencodeParse) diag() io.Writer {
+	if p.console == nil {
+		return io.Discard
+	}
+	return p.console
 }
 
 func (p *opencodeParse) line(line []byte) {
@@ -342,12 +478,111 @@ func (p *opencodeParse) line(line []byte) {
 			p.cost += *c
 			p.sawUsage = true
 		}
+	case "tool_use":
+		p.noteTool(ev.Part)
 	}
+}
+
+// noteTool feeds one tool event into the shared clankerbar observation, which is
+// what populates Result.Claim and the delivery Reports.
+//
+// Only a TERMINAL state is acted on, and that is FUTURE-PROOFING rather than a
+// filter this stream needs today: `opencode run --format json` forwards a tool
+// part only once it has settled (cli/cmd/run.ts gates the emit on status
+// completed-or-error), which is why the recorded fixture carries exactly one
+// event per callID. The check is here because the status is the ONLY error flag
+// opencode gives — there is no is_error sibling — so a version that started
+// forwarding in-flight parts would otherwise have us read a call that had not
+// returned as a success. An unrecognised status is ignored for the same reason:
+// the cost of being wrong that way is an unobserved claim (the driver hands the
+// task back — one expiring lease), against a claim recorded for a call that
+// failed, which is a task the driver believes it holds and does not.
+//
+// A callID is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so a
+// re-delivered terminal event for a claim already settled by a later update_task
+// would resurrect it — and the driver would post `ready` over a task that is in
+// review. Upstream transitions a part to terminal only from `running`
+// (session/processor.ts), so this is insurance, not an observed bug.
+//
+// # What this shape cannot do, and what it costs
+//
+// claude sets Claim.HasWIP on the REQUEST (see noteToolUse), deliberately: a
+// session killed between issuing `update_task(branch: …)` and its result has
+// still pushed work, and erring towards "there is WIP" only costs the reclaim an
+// expiring lease already costs. opencode gives no request-side event at all — the
+// arguments arrive fused to the result — so that arm cannot fire early here. A
+// session killed mid-call (SIGTERM, a cancelled context) therefore records no
+// WIP, and releaseHeldClaim posts `ready` over a branch that was pushed. The
+// truncated-stream variant of this is caught by the capture's untrusted mark; the
+// killed-mid-call one is not, and it is a property of opencode's stream rather
+// than something this adapter can fix.
+func (p *opencodeParse) noteTool(part *opencodePart) {
+	st := part.State
+	// part.Type ("tool") is deliberately not checked: only a tool part carries a
+	// callID and a state, so the fields below are the discriminator.
+	if st == nil || part.CallID == "" {
+		return
+	}
+	if st.Status != "completed" && st.Status != "error" {
+		return
+	}
+	name := opencodeClankerbarTool(part.Tool)
+	if name == "" {
+		return
+	}
+	if p.settledCalls[part.CallID] {
+		return
+	}
+	if p.settledCalls == nil {
+		p.settledCalls = map[string]bool{}
+	}
+	p.settledCalls[part.CallID] = true
+
+	noteToolUse(name, part.CallID, st.Input, &p.observed)
+	// The result text is handed over as JSON so it reaches noteClaimed by the same
+	// road claude's string-shaped tool_result content does. Marshalling a string
+	// cannot fail (invalid UTF-8 is replaced, not rejected), and the error is
+	// swallowed rather than returned on purpose: bailing here would strand the
+	// delivery Report noteToolUse just armed, unresolved and silently dropped.
+	content, _ := json.Marshal(st.Output)
+	noteToolResult(&p.observed, part.CallID, st.Status == "error", content, p.diag())
+}
+
+// opencodeClankerbarTool maps an opencode tool name onto the namespaced name the
+// shared observer switches on, and returns "" for anything that is not a
+// clankerbar tool.
+//
+// opencode names an MCP tool `<server>_<tool>`, where the server is the key under
+// `mcp` in its config; claude names the same tool `mcp__<server>__<tool>`.
+// Translating rather than keeping a second set of constants leaves ONE list of
+// watched tools: add a tool there and both harnesses see it.
+//
+// The server name `clankerbar` is HARD-CODED, here as in claude's constants, and
+// that is an assumption the driver does not enforce: it never writes an MCP config
+// (the operator hand-writes opencode's, per the README), and config.Validate
+// deliberately accepts a clankerbar server under any key so long as it is handed
+// CLANKERBAR_API_KEY. So `mcp: {"cb": …}` validates, opencode names the tools
+// `cb_claim_task`, nothing here matches, and a phased run stops after phase 1 on
+// every task looking like an ordinary early finish — the exact silent half-run the
+// TracksClaims gate exists to prevent. Filed rather than fixed inside this
+// adapter, because the check belongs where the config is read (doctor, or a
+// Validate refusal under phases), not where the tool name is parsed.
+func opencodeClankerbarTool(name string) string {
+	const prefix = "clankerbar_"
+	if !strings.HasPrefix(name, prefix) {
+		return ""
+	}
+	return "mcp__clankerbar__" + strings.TrimPrefix(name, prefix)
 }
 
 // finish writes what the stream added up to onto res.
 func (p *opencodeParse) finish(res *Result) {
 	res.FinalMessage = p.lastText
+	// What the session did with the backlog. Copied rather than accumulated in
+	// place because res does not exist until the process has exited; see the
+	// `observed` field.
+	res.Claim = p.observed.Claim
+	res.Reports = p.observed.Reports
 	// Recorded whatever the figures come to: the driver bounds attempts that
 	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
 	res.UsageReported = p.sawUsage
@@ -424,21 +659,60 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
-// attributed to one.
+// attributed to one. The wall-clock cap below is this adapter's phase backstop
+// instead — a TIME budget rather than a turn one, but classified separately so
+// this stays literally true and no log line calls an elapsed cap a turn cap.
 func (opencode) TurnCapped(Result) bool { return false }
+
+// wallClockReason is the terminal_reason the ADAPTER writes into a Result when
+// it ended the session for outliving Invocation.MaxSessionWallClock (CLA-368).
+// Like tokenCeilingReason it is deliberately not something the CLI emits: the
+// marker exists so the driver can tell an orderly cap from a genuine failure,
+// and opencode's stream carries no reason field a task could write into anyway.
+const wallClockReason = "wall_clock_capped"
+
+func (opencode) WallClockCapped(res Result) bool {
+	if res.Raw == nil {
+		return false
+	}
+	r, _ := res.Raw["terminal_reason"].(string)
+	return r == wallClockReason
+}
+
+// markWallClockCapped writes the adapter's own cap marker onto a Result,
+// PRESERVING the parsed usage already there: unlike the claude token-ceiling
+// kill, this session's spend was summed from step_finish events all the way to
+// the kill, and replacing Raw would throw the per-step breakdown away while the
+// budget still has to see what the session cost.
+func (r *Result) markWallClockCapped() {
+	if r.Raw == nil {
+		r.Raw = map[string]any{}
+	}
+	r.Raw["terminal_reason"] = wallClockReason
+}
 
 // No mid-stream token ceiling: opencode sums per-step usage but the adapter
 // never kills the process, so no exit of its can be attributed to one.
 func (opencode) TokenCeilingHit(Result) bool { return false }
 
-// Like codex, this adapter does not populate Result.Claim, so `phases` is refused
-// for it in config.Validate rather than silently stopping after phase 1 on every
-// task. See Capabilities.TracksClaims.
+// TracksClaims is true as of CLA-365: opencode's `--format json` stream carries
+// each tool call's arguments AND its result on one terminal `tool_use` event, so
+// the adapter reads the claim off the session the same way claude does and
+// populates Result.Claim. That is what config.Validate gates `phases` on, so this
+// flag is what lets a mixed-harness queue run implement on opencode.
+//
+// HonoursMaxTurns stays false — Invocation.MaxTurns still never reaches the CLI.
 //
 // ReportsCost is true: opencode's step_finish parts carry a `cost` sibling to the
 // token counts, and opencodeParse sums it into Result.CostUSD, so
 // `budget.max_cost_usd` is a live ceiling here (CLA-288).
-func (opencode) Capabilities() Capabilities { return Capabilities{ReportsCost: true} }
+//
+// HonoursSessionWallClock is true and HonoursMaxTurns is false, which is the
+// whole point of the pair: this is the adapter whose CLI takes no turn flag, so
+// its phase backstop is the elapsed-time cap Invoke enforces (CLA-368).
+func (opencode) Capabilities() Capabilities {
+	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true}
+}
 
 func (opencode) IsTransient(res Result) bool {
 	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw

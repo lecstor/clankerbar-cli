@@ -70,6 +70,15 @@ func turnCappedResult() harness.Result {
 func tokenCeilingResult() harness.Result {
 	return harness.Result{ExitCode: -1, Tokens: 90_000_000, Raw: map[string]any{"kind": "tokenCeiling"}}
 }
+
+// wallClockResult is a session the ADAPTER ended for outliving its per-session
+// wall-clock cap (CLA-368) — the third member of the orderly-end family, and
+// the one that carries its spend: opencode's usage is summed per step all the
+// way to the kill, unlike the token-ceiling case where the total is never seen.
+func wallClockResult() harness.Result {
+	return harness.Result{ExitCode: -1, Tokens: 120_000, CostUSD: 1.25, Raw: map[string]any{"kind": "wallClock"}}
+}
+
 func limitStopResult() harness.Result {
 	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "limitStop"}}
 }
@@ -83,6 +92,9 @@ func kindOf(r harness.Result) string {
 }
 
 type fakeAdapter struct {
+	// name overrides the adapter's harness name, for the per-harness budget
+	// breakers, which key a run's spend by it (CLA-367).
+	name         string
 	steps        []invokeStep
 	invokeCalls  int
 	invocations  []harness.Invocation // every Invoke's argument, for asserting routing (CLA-142)
@@ -109,7 +121,15 @@ type fakeAdapter struct {
 	tokens int
 }
 
-func (f *fakeAdapter) Name() string { return "fake" }
+// Name is what the driver charges this adapter's spend to, so the per-harness
+// breakers (CLA-367) need it to be settable. Empty keeps every pre-existing
+// test's harness name exactly as it was.
+func (f *fakeAdapter) Name() string {
+	if f.name != "" {
+		return f.name
+	}
+	return "fake"
+}
 
 // The fake carries the MCPConfigPath through to f.invocations for the delivery
 // tests to assert on, so the Claude reading is the honest one to declare.
@@ -155,6 +175,8 @@ func (f *fakeAdapter) Capabilities() harness.Capabilities {
 func (f *fakeAdapter) TurnCapped(r harness.Result) bool { return kindOf(r) == "turnCapped" }
 
 func (f *fakeAdapter) TokenCeilingHit(r harness.Result) bool { return kindOf(r) == "tokenCeiling" }
+
+func (f *fakeAdapter) WallClockCapped(r harness.Result) bool { return kindOf(r) == "wallClock" }
 
 // Diagnostic stands in for a real adapter's scoped text. Stderr is where every
 // adapter's scope starts, so returning it keeps the fake honest about what the

@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"log"
 
 	"strings"
 	"testing"
@@ -620,5 +621,145 @@ func TestDrainPhases_CarriesTheTurnCapToTheHarness(t *testing.T) {
 	// upward to the built-in default instead.
 	if got := h.invocations[1].MaxTurns; got != config.DefaultMaxTurns {
 		t.Errorf("phase 2 MaxTurns = %d, want the built-in default %d — a phase with no cap defers upward, never to uncapped", got, config.DefaultMaxTurns)
+	}
+}
+
+// A session ended by the adapter's wall-clock cap (CLA-368) is the third member
+// of the same family as the turn cap and the token ceiling: an orderly cut-off
+// whose survivability rests on the salvage, so it ends the PHASE and never the
+// run. With work pushed it is a legitimate checkpoint; with nothing pushed
+// there is no branch for a phase 2 to resume from, exactly as for the other
+// two.
+func TestDrainPhases_AWallClockCapIsACheckpointNotAFatalExit(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		claim       harness.Claim
+		wantInvokes int
+	}{
+		{
+			name:        "capped with work pushed: phase 2 resumes it",
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			wantInvokes: 2,
+		},
+		{
+			name:        "capped with nothing pushed: no checkpoint to hand on",
+			claim:       openClaim(),
+			wantInvokes: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: held(wallClockResult(), tc.claim)},
+				{res: okResult(1, 0)},
+			}}
+			d, _ := phaseDriver(t, h, []config.Phase{
+				{Name: "implement", MaxWallClock: config.Duration(time.Minute)},
+				{Name: "review"},
+			})
+
+			_, _, stop, err := drainPhasesOnce(t, d)
+			if err != nil {
+				t.Fatalf("a wall-clock-capped phase ended the RUN: %v — the cap is the phase ending, never the daemon failing", err)
+			}
+			if stop {
+				t.Error("a wall-clock-capped phase stopped the run")
+			}
+			if h.invokeCalls != tc.wantInvokes {
+				t.Errorf("spawned %d sessions, want %d", h.invokeCalls, tc.wantInvokes)
+			}
+		})
+	}
+}
+
+// The cap must not be retried in either direction the driver could go wrong:
+// not as a transient blip (a fresh session would spend the same hours over
+// again and reach the same deadline) and not as a launch failure. Its spend is
+// counted, unlike the token ceiling's: opencode's usage is summed per step all
+// the way to the kill.
+func TestDrainPhases_AWallClockCappedFinalPhaseEndsTheDrainWithoutFailingTheRun(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: held(wallClockResult(), openClaim())}}}
+	d, _ := phaseDriver(t, h, nil)
+	d.cfg.Prompt = "Work the next backlog item."
+
+	tokens, cost, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("a wall-clock-capped final phase ended the run: %v", err)
+	}
+	if stop {
+		t.Error("a wall-clock-capped final phase stopped the run")
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions; a wall-clock cap must never be retried", h.invokeCalls)
+	}
+	if tokens != 120_000 || cost != 1.25 {
+		t.Errorf("counted tokens=%d cost=%v, want the 120000/1.25 the session spent before the cap — a capped session's spend still hits the budget", tokens, cost)
+	}
+}
+
+// The resolved cap has to REACH the adapter, which is the link a config-only
+// test cannot see: the phase's own cap, and the run-wide one for a phase that
+// sets none.
+func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: "implement", MaxWallClock: config.Duration(20 * time.Minute)},
+		{Name: "review"},
+	})
+	d.cfg.MaxSessionWallClock = config.Duration(time.Hour)
+
+	phases := d.cfg.EffectivePhases()
+	if got := d.invocationFor(d.targets[0], 0, phases[0], nil).MaxSessionWallClock; got != 20*time.Minute {
+		t.Errorf("phase 1 invocation carries %s, want its own 20m", got)
+	}
+	if got := d.invocationFor(d.targets[0], 1, phases[1], nil).MaxSessionWallClock; got != time.Hour {
+		t.Errorf("phase 2 invocation carries %s, want the run-wide 1h it inherits", got)
+	}
+}
+
+// The operator-facing line has to be TRUE, and today it is true only in the
+// direction nobody can reach: the salvage runs on an observed claim, and the
+// only adapter that enforces the cap does not observe claims. Reporting a
+// salvage that never ran would be the reassuring falsehood CLA-290 removed from
+// doctor, in the one place a run leaves work behind.
+func TestDrainPhases_AWallClockCapDoesNotClaimASalvageThatCouldNotRun(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		claim    harness.Claim
+		want     string
+		unwanted string
+	}{
+		{
+			name:     "no claim observed: say the work is still in the worktree",
+			claim:    harness.Claim{},
+			want:     "NOTHING was salvaged",
+			unwanted: "was salvaged above",
+		},
+		{
+			name:     "claim held: the salvage really did run",
+			claim:    harness.Claim{TaskID: "t-1", RunID: "r-1"},
+			want:     "was salvaged above",
+			unwanted: "NOTHING was salvaged",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var logged strings.Builder
+			prev := log.Writer()
+			log.SetOutput(&logged)
+			t.Cleanup(func() { log.SetOutput(prev) })
+
+			h := &fakeAdapter{steps: []invokeStep{{res: held(wallClockResult(), tc.claim)}}}
+			d, _ := phaseDriver(t, h, nil)
+			d.cfg.Prompt = "Work the next backlog item."
+
+			if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+				t.Fatalf("drainPhases: %v", err)
+			}
+			if !strings.Contains(logged.String(), tc.want) {
+				t.Errorf("the cap line does not say %q: %s", tc.want, logged.String())
+			}
+			if strings.Contains(logged.String(), tc.unwanted) {
+				t.Errorf("the cap line says %q, which is not true here: %s", tc.unwanted, logged.String())
+			}
+		})
 	}
 }

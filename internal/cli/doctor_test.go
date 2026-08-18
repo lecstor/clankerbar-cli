@@ -2259,3 +2259,302 @@ func TestBudget_WallClockOnlyUnderClaudeStillRecommendsCost(t *testing.T) {
 		t.Errorf("claude reports cost, so the original remedy stands: %q", c.remedy)
 	}
 }
+
+// A wall-clock session cap under a harness that never enforces one is the same
+// defect as max_cost_usd under codex (CLA-288): a dial the operator set as
+// their backstop, doing nothing. doctor names it before the run rather than
+// leaving it to be inferred from a session that ran all night (CLA-368).
+func TestBudgetGuards_WarnWhenTheSessionWallClockCapIsInertForTheHarness(t *testing.T) {
+	t.Run("claude: the dial cannot fire", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		if c.status != warn {
+			t.Errorf("an inert wall-clock cap: got %v, want WARN", c.status)
+		}
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock") && strings.Contains(line, "INERT") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no info line says the cap is inert under this harness: %q", c.info)
+		}
+	})
+
+	t.Run("the phase's own dial is the one named", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Prompt = ""
+		cfg.Phases = []config.Phase{{Name: "implement", MaxWallClock: config.Duration(time.Minute)}}
+
+		c := checkBudget(cfg)
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_wall_clock (phases)") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("the phase's own dial is set, but the note does not name it: %q", c.info)
+		}
+	})
+
+	t.Run("opencode: the dial fires, so nothing is said", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "opencode"
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock") {
+				t.Errorf("a cap the harness DOES enforce was reported inert: %q", line)
+			}
+		}
+	})
+
+	t.Run("unset: nothing to warn about", func(t *testing.T) {
+		c := checkBudget(validCfg(t))
+		for _, line := range c.info {
+			if strings.Contains(line, "wall_clock") && strings.Contains(line, "INERT") {
+				t.Errorf("an unset dial was reported inert: %q", line)
+			}
+		}
+	})
+
+	// The remedy is advice that WILL be followed, so it must not send a codex
+	// operator to a turn cap codex does not have - that is the CLA-288 shape this
+	// note exists to warn about, handed back as the fix for itself.
+	t.Run("codex: the remedy does not promise a turn cap either", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "codex"
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		note := inertNote(t, c)
+		if strings.Contains(note, "the turn cap is the backstop that does fire") {
+			t.Errorf("the advice points a codex operator at a turn cap that never reaches its CLI: %q", note)
+		}
+		if !strings.Contains(note, "NO per-session backstop") {
+			t.Errorf("the advice does not say codex has no per-session backstop: %q", note)
+		}
+	})
+
+	t.Run("claude: the advice may name the turn cap", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		if note := inertNote(t, checkBudget(cfg)); !strings.Contains(note, "turn cap") {
+			t.Errorf("under claude the turn cap IS the live backstop; the advice does not say so: %q", note)
+		}
+	})
+}
+
+// The complement of the inert-dial note, and the sharper case: opencode takes no
+// turn flag and kills on no token ceiling, so with the wall-clock dial unset its
+// sessions are bounded by nothing at all - the silently absent guard the
+// surrounding block exists to name (CLA-344/CLA-368).
+func TestBudgetGuards_WarnWhenAnOpencodeRunHasNoSessionBackstopAtAll(t *testing.T) {
+	t.Run("unset: warns and names the dial to set", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "opencode"
+
+		c := checkBudget(cfg)
+		if c.status != warn {
+			t.Errorf("a run with no per-session backstop: got %v, want WARN", c.status)
+		}
+		found := false
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") && strings.Contains(line, "nothing bounds a single session") {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no info line says the run has no per-session bound: %q", c.info)
+		}
+		if !strings.Contains(c.remedy, "max_session_wall_clock") {
+			t.Errorf("the remedy does not name the dial to set: %q", c.remedy)
+		}
+	})
+
+	t.Run("codex: no dial to recommend, so no missing-backstop line", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "codex"
+
+		// codex cannot enforce the cap either, so "set max_session_wall_clock"
+		// would be advice that does nothing - the very thing this note warns about.
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") {
+				t.Errorf("codex was told to set a dial it cannot enforce: %q", line)
+			}
+		}
+	})
+
+	t.Run("set: nothing to warn about", func(t *testing.T) {
+		cfg := validCfg(t)
+		cfg.Harness = "opencode"
+		cfg.MaxSessionWallClock = config.Duration(30 * time.Minute)
+
+		c := checkBudget(cfg)
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") {
+				t.Errorf("a configured cap was reported missing: %q", line)
+			}
+		}
+	})
+
+	t.Run("claude: its turn cap is the backstop, so nothing is said", func(t *testing.T) {
+		c := checkBudget(validCfg(t))
+		for _, line := range c.info {
+			if strings.Contains(line, "max_session_wall_clock: unset") {
+				t.Errorf("claude was told it has no per-session backstop: %q", line)
+			}
+		}
+	})
+}
+
+// inertNote returns the check's inert-wall-clock info line, failing if there is
+// none: the advice lives in the note rather than the remedy, because the guard
+// block's generic "set <dials>" line routinely claims the remedy first.
+func inertNote(t *testing.T, c check) string {
+	t.Helper()
+	for _, line := range c.info {
+		if strings.Contains(line, "INERT") {
+			return line
+		}
+	}
+	t.Fatalf("no inert-dial info line in %q", c.info)
+	return ""
+}
+
+// --- budget: per-harness blocks (CLA-367) ------------------------------------
+
+// A per-harness block is a real ceiling and belongs on the reported line, so an
+// operator reading doctor sees what will actually stop the run.
+func TestBudgetPerHarnessBlockIsReported(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "opencode"
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"opencode": {MaxCostUSD: 2},
+	}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "per_harness[opencode]") || !strings.Contains(c.detail, "max_cost_usd=2") {
+		t.Errorf("the per-harness ceiling is not on the reported line: %q", c.detail)
+	}
+	if strings.Contains(c.detail, "NO effective ceiling") {
+		t.Errorf("a live per-harness ceiling was reported as no ceiling at all: %q", c.detail)
+	}
+}
+
+// The wall-clock-only warning describes a run with nothing better holding the
+// line. A per-harness block for the harness this run drives IS something better,
+// so the warning must not fire — the same reasoning CLA-288 applied to the
+// global cost dial.
+func TestBudgetPerHarnessBlockSatisfiesTheWallClockOnlyWarning(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "opencode"
+	cfg.Budget = config.Budget{
+		MaxWallClock: config.Duration(8 * time.Hour),
+		PerHarness:   map[string]config.HarnessBudget{"opencode": {MaxCostUSD: 2}},
+	}
+
+	c := checkBudget(cfg)
+	if strings.Contains(c.detail, "wall clock is the only ceiling") {
+		t.Errorf("warned that wall clock is the only ceiling beside a live per-harness block: %q", c.detail)
+	}
+}
+
+// A block keyed to a harness this config never runs cannot be charged, so it is
+// a ceiling that cannot fire. Reporting it as a set budget is the reassuring
+// falsehood CLA-288 removed elsewhere; it is annotated in place, and a config
+// whose ONLY ceilings are unreachable is told it has none.
+func TestBudgetPerHarnessBlockForAnotherHarnessIsInert(t *testing.T) {
+	cfg := validCfg(t) // harness: claude
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"opencode": {MaxCostUSD: 2},
+	}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "INERT") {
+		t.Errorf("a block for a harness this run never drives was reported as a live ceiling: %q", c.detail)
+	}
+	if c.status != warn {
+		t.Errorf("status = %v, want WARN: every ceiling this config sets is unreachable", c.status)
+	}
+	if !strings.Contains(c.detail, "NO effective ceiling") {
+		t.Errorf("detail should say the run is unbounded: %q", c.detail)
+	}
+	if c.remedy == "" {
+		t.Error("a warn with no remedy leaves the operator nothing to do")
+	}
+}
+
+// The negative reading, one level down: a per-harness dial is guarded with `> 0`
+// too, so a negative there reads as a ceiling and is none.
+func TestBudgetPerHarnessNegativeValueFails(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"claude": {MaxTokens: -1},
+	}}
+
+	c := checkBudget(cfg)
+	if c.status != fail {
+		t.Errorf("negative per-harness ceiling: got %v, want FAIL", c.status)
+	}
+	if !strings.Contains(c.detail, "per_harness[claude].max_tokens") {
+		t.Errorf("detail should name the offending field, got %q", c.detail)
+	}
+}
+
+// A token ceiling that lives in the running harness's block is enforced between
+// sessions exactly as the run-wide dial is, so it needs the same warning and the
+// same mid-session number (CLA-344's line, CLA-367's second home for it).
+func TestBudgetPerHarnessTokenCeilingCarriesTheBetweenSessionsNote(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"claude": {MaxTokens: 20_000_000},
+	}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "enforced BETWEEN sessions") {
+		t.Errorf("a per-harness token ceiling was reported without the between-sessions caveat: %q", c.detail)
+	}
+	if !strings.Contains(c.detail, "max_session_tokens=40000000") {
+		t.Errorf("the mid-session bound should derive from the block's own ceiling: %q", c.detail)
+	}
+}
+
+// A remedy will be FOLLOWED, so it must not tell an operator to do what they
+// have already done. With codex's own block set and only a cost dial in it, the
+// placement is right and the UNIT is wrong.
+func TestBudgetPerHarnessInertCostRemedyNamesTheUnitNotThePlacement(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "codex"
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{
+		"codex": {MaxCostUSD: 2},
+	}}
+
+	c := checkBudget(cfg)
+	if c.status != warn {
+		t.Errorf("status = %v, want WARN: codex never reports cost, so this run has no ceiling", c.status)
+	}
+	if !strings.Contains(c.remedy, "per_harness[codex].max_tokens") {
+		t.Errorf("remedy %q should name the dial that can fire, not repeat the block the operator already wrote", c.remedy)
+	}
+}
+
+// A block with no dial in it — or one whose key was mistyped, since the config
+// decoder ignores fields it does not know — is a ceiling the operator wrote and
+// doctor would otherwise never mention.
+func TestBudgetEmptyPerHarnessBlockIsNamed(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Budget = config.Budget{PerHarness: map[string]config.HarnessBudget{"claude": {}}}
+
+	c := checkBudget(cfg)
+	if !strings.Contains(c.detail, "per_harness[claude]") || !strings.Contains(c.detail, "no ceiling set") {
+		t.Errorf("an empty per-harness block was passed over in silence: %q", c.detail)
+	}
+}

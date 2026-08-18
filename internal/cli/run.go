@@ -120,6 +120,11 @@ func Run(ctx context.Context, args []string) error {
 				Releaser:      plane.New(cfg.ProjectEndpoint(p), apiKey),
 				WorkDir:       p.WorkDir,
 				MCPConfigPath: p.MCPConfigPath,
+				// The per-harness files for this project, for a sequence whose
+				// phases are not all on one harness (CLA-366). Nil for every
+				// single-harness config, which is what leaves the resolution above
+				// exactly as it was.
+				MCPConfigPaths: p.MCPConfigPaths,
 			})
 		}
 		return loop.NewMulti(cfg, adapter, targets).Run(ctx)
