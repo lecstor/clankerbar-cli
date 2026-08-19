@@ -138,12 +138,14 @@ func TestOpencodeDetectLimit(t *testing.T) {
 // stderr + {"type":"error"} events), NOT the agent's own {"type":"text"} narration.
 // So real provider/transport/stream errors — whether they arrive as an error event
 // or on stderr — trip it, but a session that merely *discusses* a rate limit before
-// exiting non-zero does not. Since CLA-381 there is ALSO a usage-gated fallback: an
-// unknown exit 1 AFTER reported usage is retryable, because a session that already
-// reported usage evidently authenticated and started doing paid work, while one
-// that reported nothing is the config/auth signature and stays a stop. Cases mark
-// where the signal lives (stdout error event vs. stderr) to match how opencode
-// actually emits it.
+// exiting non-zero does not. Since CLA-381 there is ALSO a usage-gated heuristic:
+// an unknown exit 1 AFTER reported usage is retryable, because a session that
+// already reported usage evidently authenticated and started doing paid work,
+// while one that reported nothing is the config/auth signature and stays a stop.
+// A NAMED stop (opencodeBudgetRe, opencodeFatalRe) beats both scans, so the
+// heuristic cannot launder an exhausted account or a revoked key into a retry.
+// Cases mark where the signal lives (stdout error event vs. stderr) to match how
+// opencode actually emits it.
 func TestOpencodeIsTransient(t *testing.T) {
 	cases := []struct {
 		name string
@@ -173,8 +175,24 @@ func TestOpencodeIsTransient(t *testing.T) {
 		// never got going), and a typed auth failure stays a stop.
 		{"unknown exit-1 with NO usage stays non-retryable", Result{ExitCode: 1, Stdout: `{"type":"error","error":{"type":"config","message":"bad token"}}`}, false},
 		{"auth failure is NOT transient", Result{ExitCode: 1, Stderr: "Error: authentication failed - invalid api key"}, false},
-		{"402 payment required is NOT transient", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":402,"isRetryable":false}}}`}, false},
-		{"budget exhaustion is NOT transient", Result{Stderr: "Your account is out of credits"}, false},
+		// The named stops, in the shape they REALLY arrive in. Each of these used
+		// to pass only because ExitCode was 0 and UsageReported false, so the
+		// heuristic's guard was unmet — the classifier was never asked the
+		// question the case name claims it answers. A 402 or a revoked key
+		// typically lands mid-session, AFTER paid steps, so that is how they are
+		// pinned now, and opencodeFatalRe/opencodeBudgetRe are what make them hold.
+		{"402 after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"data":{"statusCode":402,"isRetryable":false}}}`}, false},
+		{"budget exhaustion after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "Your account is out of credits"}, false},
+		{"auth failure after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "Error: authentication failed - invalid api key"}, false},
+		{"a key revoked mid-session is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"data":{"statusCode":401}}}`}, false},
+		// The bare-word `transport` regression. stderr carries text this adapter
+		// did not author, and the MCP SDK's class names all end in `Transport` —
+		// so a dead or misconfigured MCP server (a CONFIG fault that must stop the
+		// run) produces a Node stack trace full of the word. An unanchored arm
+		// read that as a provider blip and retried it; these pin that it does not.
+		{"MCP transport class in a stack trace is NOT transient", Result{ExitCode: 1, Stderr: "Error: MCP server \"clankerbar\" failed to start\n    at StdioClientTransport.start (/x/node_modules/@modelcontextprotocol/sdk/dist/client/stdio.js:88:19)"}, false},
+		{"gRPC transport auth handshake is NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "rpc error: code = Unavailable desc = transport: authentication handshake failed: x509: certificate signed by unknown authority"}, false},
+		{"an http2 transport GOAWAY carrying a 401 is NOT transient", Result{ExitCode: 1, Stderr: "http2: Transport received Server's graceful shutdown GOAWAY; 401 Unauthorized"}, false},
 		// Regression for finding #2: an assistant text part mentioning a rate limit
 		// must NOT be read as a transient error — only opencodeErrorText is scanned.
 		{"assistant narration mentioning a rate limit does NOT trip", Result{Stdout: `{"type":"text","text":"Earlier I hit a rate limit and connection error, so I paused before retrying."}`}, false},
@@ -185,7 +203,101 @@ func TestOpencodeIsTransient(t *testing.T) {
 			if got := (opencode{}).IsTransient(tc.res); got != tc.want {
 				t.Errorf("IsTransient = %v, want %v", got, tc.want)
 			}
+			// The heuristic reporter must never disagree with the verdict it is
+			// reporting on: it says HOW IsTransient said yes, so it cannot say yes
+			// where IsTransient said no. Checked on every case rather than in its
+			// own table, because the pairing is what the loop's bound relies on -
+			// a heuristic retry that reports itself as a pattern match is an
+			// unbounded ladder again.
+			if !tc.want && (opencode{}).IsUnclassifiedTransient(tc.res) {
+				t.Errorf("IsUnclassifiedTransient = true on a result IsTransient rejected")
+			}
 		})
+	}
+}
+
+// The loop bounds heuristic retries and lets pattern-matched ones run under the
+// operator's own dials (CLA-381), so which of the two answered has to be a fact
+// the adapter reports rather than one the caller infers. This pins the split:
+// the SAME exit-1-with-usage is unclassified when nothing recognises its text and
+// classified when something does.
+func TestOpencodeIsUnclassifiedTransient(t *testing.T) {
+	cases := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{"unrecognised text with usage is the heuristic's own case", Result{ExitCode: 1, UsageReported: true, Stderr: "opencode: some failure text no pattern recognises"}, true},
+		{"no text at all with usage is too", Result{ExitCode: 1, UsageReported: true}, true},
+		// Recognised: IsTransient still says yes, but by pattern, so this must NOT
+		// count against the bound - a provider genuinely flapping 503s is what
+		// max_retries and the budget are for.
+		{"a recognised 503 is classified, not a guess", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"data":{"statusCode":503}}}`}, false},
+		{"a recognised stream drop is classified", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"type":"unknown","message":"Transport"}}`}, false},
+		// The guard conditions. Without reported usage there is no evidence the
+		// session ever got going, and an exit code other than 1 is not the shape
+		// the heuristic was written for.
+		{"no usage reported", Result{ExitCode: 1, Stderr: "opencode: some failure text no pattern recognises"}, false},
+		{"exit 2 is out of scope", Result{ExitCode: 2, UsageReported: true, Stderr: "opencode: some failure text no pattern recognises"}, false},
+		{"a clean exit is never a retry", Result{ExitCode: 0, UsageReported: true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (opencode{}).IsUnclassifiedTransient(tc.res); got != tc.want {
+				t.Errorf("IsUnclassifiedTransient = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The contract every adapter owes, across all of them at once: a heuristic retry
+// is a SUBSET of a retry. An adapter reporting "I guessed" on a result it also
+// calls non-retryable would have the loop counting against a ceiling on a retry
+// that never happens, and one that guesses WITHOUT reporting it gets an unbounded
+// paid ladder - the CLA-381 defect itself. Membership on the interface is
+// compiler-checked; this is the part the compiler cannot ask about.
+func TestUnclassifiedTransientImpliesTransient(t *testing.T) {
+	// The shapes that separate the two: recognised vs unrecognised text, with and
+	// without the reported usage the one heuristic in the codebase turns on.
+	texts := []string{
+		"",
+		"opencode: some failure text no pattern recognises",
+		"Error: 429 Too Many Requests",
+		"Error: authentication failed - invalid api key",
+		"Your account is out of credits",
+		`{"type":"error","error":{"type":"unknown","message":"Transport"}}`,
+		"Error: MCP server failed to start\n    at StdioClientTransport.start (...)",
+	}
+	for _, name := range Names() {
+		a, err := Get(name)
+		if err != nil {
+			t.Fatalf("harness.Get(%s): %v", name, err)
+		}
+		for _, text := range texts {
+			for _, usage := range []bool{false, true} {
+				for _, exit := range []int{0, 1, 2} {
+					res := Result{ExitCode: exit, UsageReported: usage, Stderr: text}
+					if a.IsUnclassifiedTransient(res) && !a.IsTransient(res) {
+						t.Errorf("%s: IsUnclassifiedTransient reports a guess on a result IsTransient rejects (exit=%d usage=%v text=%q)", name, exit, usage, text)
+					}
+				}
+			}
+		}
+	}
+}
+
+// opencode is the only adapter that guesses, and the others say so by returning
+// false rather than by not being asked. Pinned because the day a second one grows
+// a heuristic, it has to be a deliberate edit here too - the loop's bound is
+// per-adapter and silently applies to whoever opts in.
+func TestOnlyOpencodeGuesses(t *testing.T) {
+	// The heuristic's own shape: exit 1, usage reported, text nothing recognises.
+	res := Result{ExitCode: 1, UsageReported: true, Stderr: "some failure text no pattern recognises"}
+	if !(opencode{}).IsUnclassifiedTransient(res) {
+		t.Error("opencode stopped reporting its heuristic - the loop can no longer bound it")
+	}
+	if (claude{}).IsUnclassifiedTransient(res) || (codex{}).IsUnclassifiedTransient(res) {
+		t.Error("a pattern-driven adapter reported a guess")
 	}
 }
 

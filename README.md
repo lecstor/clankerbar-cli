@@ -826,7 +826,7 @@ backoff** (30s → 60s → … capped at `retry_cap`), re-running the same itera
 fresh session reclaims any half-done task, so a retry costs minutes, not work.
 Detection is anchored (Claude's `API Error:` prefix, connection-error strings), so
 a task log that merely *mentions* an HTTP 500 isn't mistaken for a dead session,
-and a `400` still stops. `max_retries: 0` (the default) means **never give up** —
+and under Claude a `400` still stops. `max_retries: 0` (the default) means **never give up** —
 keep retrying at the ceiling until the API recovers, right for a daemon; set a
 positive number to bound it. A usage-limit pause and a transient retry both re-run
 the same iteration and neither advances the iteration count. `STOP` stays
@@ -850,12 +850,37 @@ all, and waiting out a quota overnight must not read as sessions failing to star
 The ladder is per phase, so a phased config allows the bound in each. Raise it if a
 harness of yours dies silently more often than that.
 
+**And one more thing is bounded: retries taken on a failure the harness could not
+name.** `opencode`'s error surface changes between versions, so beyond the anchored
+patterns it also *guesses*: an exit 1 from a session that had already reported
+usage is retried, on the reasoning that a session which authenticated and did paid
+work hit something mid-flight rather than a bad config. That guess is what carries
+a stream drop from a version the patterns haven't caught up with — but a
+**deterministic** fault satisfies it just as well, and every dial above is blind to
+that one. `max_retries` and `budget` are off unless you set them, and
+`max_zero_spend_attempts` cannot fire here at all, because the reported usage the
+guess requires is exactly what resets its counter. So a guessed retry is capped at
+**2 per phase**, after which the run stops with its own distinct error quoting the
+diagnostic nothing recognised. Retries the harness *did* recognise are not counted
+against it — a provider flapping 5xx is still yours to bound with `max_retries`.
+The cap is deliberately not configurable: the dials you set are for failures the
+tool understands, and the honest number of guesses is small at any budget. If you
+hit it, the error text is the thing to report — it is a failure shape the adapter
+should learn a pattern for.
+
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in
 the same bytes. So both classifications read only what the *harness* said: its
 stderr, its own non-event output, its typed error events, and Claude's
 `terminal_reason`. A task whose body happens to say "hit your", "usage limit" or
 "api error: 500" is narration, and narration is never a cap and never a blip.
+
+Scoping to the harness is necessary and not sufficient, which is why the patterns
+are anchored on JSON fields and word pairs rather than single words: a harness's
+stderr still carries text it did not write — a provider SDK's error prose, a Node
+stack trace — and the MCP SDK names its own classes `StdioClientTransport` and
+`SSEClientTransport`, so a bare `transport` would read a dead MCP server (a config
+fault that must stop the run) as a network blip to retry.
 
 **Handing the task back.** A claim carries a 30-minute lease that the session
 heartbeats. When a session ends mid-task, that lease is left ticking with nobody

@@ -678,20 +678,52 @@ func buildOpencodeErrorText(res Result) string {
 	return b.String()
 }
 
+// opencodeFatalRe: failures that are NEVER a blip, scanned before the transient
+// patterns and before the heuristic below so neither can overrule them.
+//
+// It exists because the transient scan reads all of stderr, which carries text
+// this adapter did not author — third-party stack traces, a provider SDK's own
+// error prose — and one word from that text used to be enough to call a stop a
+// blip. A revoked key or a dead MCP server must end the run loudly at the first
+// attempt: those are the failures an operator has to act on, and a daemon that
+// retries them at the backoff ceiling instead reports "transient failure (exit
+// 1) — retry 47" all night and never says what is actually wrong.
+//
+// Deliberately narrow: an auth/permission refusal or a hard 401/403. Anything
+// vaguer belongs in neither list, where the heuristic can weigh it under a
+// bound.
+// The `authentication( \w+)?` shape is not decoration: gRPC's phrasing is
+// "transport: authentication handshake failed", which is both the word that used
+// to trip the transient scan and a failure that must stop.
+var opencodeFatalRe = regexp.MustCompile(`(?i)authentication( \w+)? (failed|error|rejected)` +
+	`|unauthorized|forbidden|permission denied` +
+	`|invalid api key|api key (is )?(invalid|missing|not found|expired)` +
+	`|"status(code)?": ?40[13]`)
+
 // opencodeTransientRe: retryable server/network blips and API-level rate limits.
 // Honours opencode's own "isRetryable":true signal, plus HTTP 408/429/5xx and the
-// usual connection strings. `transport` and the stream arms are the CLA-381 shape:
+// usual connection strings. The transport and stream arms are the CLA-381 shape:
 // a stream drop arrives as a bare error event like {"type":"error",
 // "error":{"type":"unknown","message":"Transport"}} — a provider-side failure, not
 // a config/auth refusal, and retrying it under the existing backoff is exactly what
-// riding the blip out means. The scan is scoped to opencodeErrorText (stderr +
-// error events), so a bare word here never reads the agent's narration. The
-// budget-exhaustion stop (DetectLimit) is checked first by the loop and carries
-// isRetryable:false, so it never reaches here.
+// riding the blip out means.
+//
+// Every arm here is ANCHORED — on a JSON field, or on a word pair that only a
+// failure description produces. A bare `transport` alternation was tried and
+// reverted: scoping the scan to opencodeErrorText keeps the agent's narration
+// out, but stderr still carries library text the adapter did not write, and the
+// MCP SDK names its classes StdioClientTransport / SSEClientTransport /
+// StreamableHTTPClientTransport — so any Node stack trace from a misconfigured
+// MCP server (a config failure, and one this harness can now produce since
+// CLA-382 wired opencode to one) matched, and a stop became an unbounded retry.
+// The claude adapter anchors its provider arms on `api error:` for the same
+// reason.
 var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d\d)` +
 	`|"isretryable": ?true` +
 	`|overloaded|too many requests|rate ?limit` +
-	`|transport|stream (error|failed|closed|reset|ended)` +
+	`|"message": ?"transport` +
+	`|transport (error|failure|closed|reset|dropped)|transport-level` +
+	`|stream (error|failed|closed|reset|ended)` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
@@ -750,28 +782,62 @@ func (opencode) Capabilities() Capabilities {
 	return Capabilities{TracksClaims: true, ReportsCost: true, HonoursSessionWallClock: true}
 }
 
-func (opencode) IsTransient(res Result) bool {
+func (o opencode) IsTransient(res Result) bool {
 	// Scope the scan to opencodeErrorText (stderr + {"type":"error"} events), NOT raw
 	// Stdout+Stderr: the latter includes {"type":"text"} assistant narration, so a
 	// session that merely *discusses* a rate limit / connection error before exiting
 	// non-zero would be retried as transient instead of surfacing the real failure —
 	// the same reason DetectLimit scopes its scan this way.
-	if opencodeTransientRe.MatchString(opencodeErrorText(res)) {
+	text := opencodeErrorText(res)
+	// A named stop wins over every retry path below, including the heuristic. The
+	// loop already runs DetectLimit before IsTransient, so the budget arm is
+	// belt-and-braces there — but this function must not answer "retryable" about
+	// an exhausted account just because it happens to be asked out of that order,
+	// and nothing pins that ordering (see the loop test added with CLA-381).
+	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	if opencodeTransientRe.MatchString(text) {
 		return true
 	}
-	// CLA-381 fallback: an exit 1 whose cause no pattern has seen yet, on a session
-	// that REPORTED usage, is retryable. A usage event means the session
-	// authenticated and started doing paid work — so the failure came after the
-	// startup checks, and is more likely a version-shaped stream/transport blip
-	// than a config/auth/refusal error, which is exactly the kind that fails
-	// BEFORE any usage arrives. Retrying lands under the loop's existing
-	// backoff / max_retries / max_zero_spend_attempts machinery like any other
-	// transient. An exit 1 with no usage stays a stop: that silence is the
-	// config/auth signature.
-	return res.ExitCode == 1 && res.UsageReported
+	return o.IsUnclassifiedTransient(res)
 }
 
-// Diagnostic returns the same scoped text IsTransient judged. See the claude
+// IsUnclassifiedTransient is the CLA-381 heuristic, and it is separate from the
+// pattern scan because a caller has to be able to bound it — see
+// harness.UnclassifiedTransient for why that is a spending requirement and not a
+// tidiness one.
+//
+// The judgement: an exit 1 whose cause no pattern has seen yet, on a session that
+// REPORTED usage, leans retryable. A usage event means the session authenticated
+// and started doing paid work, so the failure came after the startup checks and
+// is more likely a version-shaped stream drop this adapter has no pattern for
+// than a config/auth refusal — that kind fails BEFORE any usage arrives, which is
+// why the no-usage case stays a stop. The opencode error surface moves between
+// versions (the CLA-381 incident was a nightly emitting an untyped event), so the
+// heuristic is what covers the shapes the patterns above have not caught up with.
+//
+// What it must NOT be read as is a bounded retry in its own right. It names no
+// failure, so a DETERMINISTIC post-usage crash satisfies it on every attempt, and
+// the caller's ordinary dials do not stop that: max_retries and budget are both
+// off by default, and max_zero_spend_attempts cannot fire at all here, since its
+// counter resets on exactly the reported usage this requires. The loop bounds it
+// separately.
+func (opencode) IsUnclassifiedTransient(res Result) bool {
+	if res.ExitCode != 1 || !res.UsageReported {
+		return false
+	}
+	text := opencodeErrorText(res)
+	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	return !opencodeTransientRe.MatchString(text)
+}
+
+// Diagnostic returns the scoped text IsTransient's PATTERN scans judged. On the
+// heuristic path there is no matching text to point at — the verdict came from
+// the exit code and whether usage was reported — so this is the text that was
+// searched, not in every case the evidence for the answer. See the claude
 // adapter's Diagnostic for why the scope must match exactly.
 func (opencode) Diagnostic(res Result) string { return opencodeErrorText(res) }
 
