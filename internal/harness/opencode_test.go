@@ -446,11 +446,19 @@ func opencodeEvaluate(t *testing.T, perm, permission, pattern string) string {
 }
 
 // wildcardMatch mirrors opencode's pattern matching (util/wildcard.ts): `*`
-// matches any run of characters (including "/"), `?` matches exactly one,
-// everything else is literal, anchored at both ends, backslashes normalized.
+// matches any run of characters (including "/" and ":"), `?` matches exactly one,
+// everything else is literal, anchored at both ends, backslashes normalized. The
+// one special case: a pattern ending in " *" also matches the input without the
+// trailing argument at all ("git status *" matches "git status"), which opencode
+// gets by rewriting that suffix to "( .*)?". No pattern this file emits ends that
+// way today, but a `bash` command pattern would, and the replica is only worth
+// having while it is faithful.
 func wildcardMatch(input, pattern string) bool {
 	input = strings.ReplaceAll(input, `\`, `/`)
 	pattern = strings.ReplaceAll(pattern, `\`, `/`)
+	if strings.HasSuffix(pattern, " *") && wildcardMatch(input, strings.TrimSuffix(pattern, " *")) {
+		return true
+	}
 	i, j := 0, 0
 	star, mark := -1, 0
 	for i < len(input) {

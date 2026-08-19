@@ -1020,10 +1020,17 @@ also allows `mcp:*`, because opencode's MCP **resource** tools
 so the catch-all denied every one of them and a session could call the plane's
 tools while being unable to read the protocol served over the same connection;
 and a probe/read-only run additionally denies `edit` and `bash` for zero
-writes. The
-policy is pinned by unit tests in `opencode_test.go`, including the JSON key
-order the catch-all depends on and a replica of opencode's rule evaluator over
-a table of effective decisions.
+writes. The policy is pinned by unit tests in `opencode_test.go`, including
+the JSON key order the catch-all depends on and a replica of opencode's rule
+evaluator over a table of effective decisions.
+
+**Verifying the policy against a live session.** The unit tests replicate
+opencode's evaluator; to watch the real one decide, run a session with the
+policy in `OPENCODE_PERMISSION` and read the `evaluated permission=... pattern=...
+action.action=...` lines in `~/.local/share/opencode/log/opencode.log` — one
+line per ask, naming the rule that won. That log is the cheapest live proof
+available, because it records the decision whether or not the session goes on
+to produce any output.
 
 **The workdir should be a multi-repo parent, not a git checkout.** The
 read/edit rules are emitted to match the patterns opencode asks for a session
