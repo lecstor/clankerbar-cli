@@ -946,7 +946,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// a zero Result from a failed launch releases nothing, and reporting it
 			// as released would erase a predecessor's claim that is still live.
 			end.released = res.Claim.Held()
-			d.releaseHeldClaim(ctx, t, res)
+			// last && a clean exit is the shape CLA-384 is about: the phase ran to
+			// completion, pushed, and simply did not declare. A non-zero exit reached
+			// the same place by crashing, which is a different failure with its own
+			// reporting, and an earlier phase reaching here did not have declaring as
+			// its job at all.
+			d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
 		}
 		// Then check what it said it delivered. After the handback, because a dead
 		// lease is time-sensitive and a git check is not; on every exit, because a
@@ -1352,7 +1357,7 @@ func (d *Driver) releaseCarried(ctx context.Context, t Target, carried *harness.
 	if carried == nil {
 		return nil
 	}
-	d.releaseHeldClaim(ctx, t, *carried)
+	d.releaseHeldClaim(ctx, t, *carried, false)
 	return nil
 }
 
@@ -1377,7 +1382,14 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 	return phaseEnd{released: held}
 }
 
-func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result) {
+// countUndeclared says whether THIS call site is the one where a held-with-work
+// claim means the CLA-384 failure: a phase that finished cleanly and did not hand
+// the task over. Only the seam's final-phase handback passes true. Every other
+// caller reaches the same branch for a reason that is not a failure to declare -
+// a budget trip between phases, a crash, a transient retry, a usage-limit wait, a
+// refused handoff - and counting those would make the number mean nothing, which
+// is the only thing it has going for it.
+func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) {
 	// A stream read only in part tells us which calls we SAW, never which the
 	// session made: the settle that released the task may simply be in the bytes
 	// that never arrived. Handing the task back on that reading posts `ready` over
@@ -1395,12 +1407,17 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		return
 	}
 	if !res.Claim.Releasable() {
-		// Leaving the lease alone is right — see Releasable — but this is also the
-		// signature of a phase that finished its work and never declared it, so say
-		// how often it has happened rather than letting it read as routine.
-		d.undeclared++
-		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the work is pushed but the task was never moved on, so the next clanker pays to rediscover it)",
-			labelOf(t), res.Claim.TaskID, d.undeclared)
+		// Leaving the lease alone is right — see Releasable. Whether it is also a
+		// FAILURE depends entirely on which call site got here; only that caller
+		// knows, so only that caller says so.
+		if countUndeclared {
+			d.undeclared++
+			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
+				labelOf(t), res.Claim.TaskID, d.undeclared)
+			return
+		}
+		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
+			labelOf(t), res.Claim.TaskID)
 		return
 	}
 	if t.Releaser == nil {

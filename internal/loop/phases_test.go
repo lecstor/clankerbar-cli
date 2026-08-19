@@ -763,3 +763,89 @@ func TestDrainPhases_AWallClockCapDoesNotClaimASalvageThatCouldNotRun(t *testing
 		})
 	}
 }
+
+// The undeclared counter is only worth having if it means ONE thing, so these pin
+// the cases that must NOT move it. They exist because the first cut of CLA-384
+// incremented inside releaseHeldClaim, which every session exit reaches: the §5
+// review of that commit demonstrated four non-failures inflating the count,
+// including a drain that settled its task and still logged "the task was never
+// moved on" twice. Direct unit tests on releaseHeldClaim could not have caught
+// that - the discrimination lives in the callers - so these drive whole phase
+// runs.
+func TestUndeclared_CountsOnlyACleanFinalPhaseThatDidNotDeclare(t *testing.T) {
+	wip := func() harness.Claim { return harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true} }
+
+	t.Run("the CLA-384 shape counts", func(t *testing.T) {
+		captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(10, 0.10), wip())},
+			{res: held(okResult(5, 0.05), wip())},
+		}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		drainPhasesOnce(t, d)
+		if d.undeclared != 1 {
+			t.Errorf("undeclared = %d, want 1 — a clean review phase that held a pushed task IS the failure", d.undeclared)
+		}
+	})
+
+	// Phase 1 checkpointing and the run then stopping on budget is phase 1 doing
+	// exactly what its brief says. Counting it would report an undeclared hand-off
+	// on every budget-limited run.
+	t.Run("a budget trip at the seam does not", func(t *testing.T) {
+		captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(10_000, 0.10), wip())},
+			{res: okResult(5, 0.05)},
+		}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		d.cfg.Budget = config.Budget{MaxTokens: 1_000}
+		drainPhasesOnce(t, d)
+		if d.undeclared != 0 {
+			t.Errorf("undeclared = %d on a budget trip between phases, want 0", d.undeclared)
+		}
+	})
+
+	// A crash is a different failure with its own reporting; folding it in here
+	// would make the number mean "something went wrong", which the log already says.
+	t.Run("a crashed phase does not", func(t *testing.T) {
+		captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{{res: held(nonRetryableResult(), wip())}}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		drainPhasesOnce(t, d)
+		if d.undeclared != 0 {
+			t.Errorf("undeclared = %d on a crashed phase, want 0", d.undeclared)
+		}
+	})
+
+	// The sharpest of the four the review found: the drain SETTLES the task, and
+	// the old code still announced twice that it had never been moved on.
+	t.Run("transient retries on a task that then settles do not", func(t *testing.T) {
+		captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(transientResult(), wip())},
+			{res: held(transientResult(), wip())},
+			{res: held(okResult(5, 0.05), harness.Claim{TaskID: "t-1", RunID: "r-1", Settled: true})},
+		}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		d.cfg.MaxRetries = 5
+		drainPhasesOnce(t, d)
+		if d.undeclared != 0 {
+			t.Errorf("undeclared = %d after retries on a task that settled, want 0", d.undeclared)
+		}
+	})
+
+	// A usage limit on the resumed phase is the driver's designed recovery, not a
+	// session declining to declare.
+	t.Run("a usage limit on the resumed phase does not", func(t *testing.T) {
+		captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(10, 0.10), wip())},
+			{res: held(limitResult(), wip())},
+		}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		drainPhasesOnce(t, d)
+		if d.undeclared != 0 {
+			t.Errorf("undeclared = %d on a usage limit mid-phases, want 0", d.undeclared)
+		}
+	})
+}

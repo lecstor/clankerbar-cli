@@ -465,4 +465,15 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 	if !strings.Contains(brief, "FINALLY, and this is the step that ENDS the phase:") {
 		t.Errorf("the terminal step is not set apart as its own instruction:\n%s", brief)
 	}
+
+	// Presence is not the property that failed - POSITION is. The old brief
+	// contained the instruction too; it was a trailing clause on a sentence about
+	// something else. So pin the step to the LAST position before the shared
+	// handoff guidance, which is exactly where the implement brief - the control in
+	// this experiment, and the one that never failed - puts its own. Without this,
+	// every assertion above still passes on a brief that buries the step in the
+	// middle or softens it in a later sentence.
+	if !strings.HasSuffix(brief, reviewTerminalStep+handoffGuidance) {
+		t.Errorf("the terminal step is not the last thing the brief says before the handoff guidance:\n%s", brief)
+	}
 }

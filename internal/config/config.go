@@ -279,6 +279,23 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 // deliberately EVENT-shaped — a session cannot measure its own context (there
 // is no token counter in its view), so "hand off when you feel big" is not
 // implementable; a pivot is an event the session can recognise.
+// reviewTerminalStep is the review phase's LAST instruction, kept as a constant so
+// its position can be pinned by a test and not only its wording.
+//
+// Position is the property that failed (CLA-384). The old brief said "Then push,
+// and hand the task to in_review" - the instruction was PRESENT, as a trailing
+// clause on a long sentence about scoping the follow-up re-verification. Three of
+// four review phases in one evening did the work and ended without it. The
+// implement brief, whose equivalent step is emphatic, names its call and its
+// arguments, and comes last, did not fail once over the same evening. So this is
+// written in that shape and pinned to that place.
+const reviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: hand the task over with " +
+	"update_task(taskId, runId, status: \"in_review\", outcome: ...), where the outcome MUST carry a " +
+	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
+	"session that leaves it out has not handed anything over. Ending this session while you still hold the " +
+	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
+	"second time by whoever takes it over. The ONLY exception is a declared handoff."
+
 const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine pivot mid-session - " +
 	"exploration finished and implementation about to start, or one distinct sub-goal landed and the next " +
 	"beginning - you may hand the REST of this session's job to a fresh successor session that starts without " +
@@ -313,12 +330,7 @@ var builtinPhasePrompts = map[string]string{
 		"point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
 		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception " +
 		"you state a reason for (a fix that had to reach outside its own area), never the default. Then COMMIT " +
-		"and PUSH the fixes. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
-		"update_task(taskId, runId, status: \"in_review\", outcome: ...), where the outcome MUST carry a " +
-		"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
-		"session that leaves it out has not handed anything over. Ending this session while you still hold the " +
-		"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
-		"second time by whoever takes it over. The ONLY exception is a declared handoff." + handoffGuidance,
+		"and PUSH the fixes." + reviewTerminalStep + handoffGuidance,
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
