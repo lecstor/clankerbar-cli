@@ -390,7 +390,7 @@ under anything that isn't a PASS, and **exits non-zero if any check FAILs** — 
 it composes with `&&` as above.
 
 ```
-PASS  config       loaded ./clankerbar.json
+PASS  config       loaded /Users/you/.config/clankerbar/config.json
                    harness: claude
                    workdir: /Users/you/dev
                    api key origin: https://clankerbar.com
@@ -815,10 +815,12 @@ pinned, not inferred, and the pin is your own `backlog_url`:
   from `~/.config/clankerbar/config.json` - the one file discovered
   automatically - or from a file you name with `--config`. A `clankerbar.json`
   sitting unnamed in the directory you launch from is **refused, not read**, and
-  the loop stops rather than falling back to your home config: that directory is
-  a checkout the spawned sessions edit, so a session could rewrite the field
-  that decides where tomorrow's key goes. Keeping your config in a checkout is
-  still fine - name it (`-c ./clankerbar.json`) and the refusal does not apply.
+  the loop stops rather than falling back to your home config: that directory is,
+  by default, the checkout the spawned sessions edit, so a session could rewrite
+  the field that decides where tomorrow's key goes. Naming it
+  (`-c ./clankerbar.json`) does lift the refusal - but it lifts only the
+  *implicit adoption* and guards the file no further, so keep `backlog_url`
+  itself in `~/.config/clankerbar/config.json`.
 - The scheme floor is TLS: `https` anywhere, or `http` only to loopback (a plane
   under local development).
 
