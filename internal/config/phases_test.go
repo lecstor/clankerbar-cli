@@ -422,3 +422,58 @@ func TestBuiltinPhaseBriefsCarryTheHandoffGuidance(t *testing.T) {
 		}
 	}
 }
+
+// The review phase's terminal step is the one the phase exists to reach, and on
+// 2026-08-19 three of four review phases in a single evening did all the work and
+// then ended without it — the branch pushed, the task still `in_progress`, the
+// next clanker paying to rediscover where the last one got to (CLA-384).
+//
+// The implement brief's equivalent step succeeded every time the same evening, and
+// the difference between them was salience: implement names the call, its
+// arguments and a stop condition in its own sentence; review said only "hand the
+// task to in_review", a trailing clause at the end of a long paragraph about
+// something else. So this pins the SHAPE that worked, not merely the topic.
+//
+// It pins wording, which is a weak test on its own — a brief can say all of this
+// and still be ignored. Its partner is the driver-side tally in internal/loop,
+// which counts the failures this brief is trying to prevent.
+func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
+	brief, ok := builtinPhasePrompts[reviewPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", reviewPhaseName)
+	}
+
+	for _, want := range []string{
+		// The call, by name, with the arguments the plane actually requires.
+		"update_task(taskId, runId, status: \"in_review\", outcome: ...)",
+		// The outcome requirement, which the brief omitted entirely before this —
+		// a second way to end one call short, since the plane refuses an outcome
+		// with no Tests section and a session can read that refusal as "done".
+		"**Tests**",
+		"REFUSES",
+		// Ending while still holding the task is a failure, said as such.
+		"FAILING, not finishing",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("review brief does not state %q — the terminal step is what CLA-384 was about:\n%s", want, brief)
+		}
+	}
+
+	// The step must not trail off the end of the re-verification sentence, which
+	// is the shape that failed. Requiring it to open its own sentence is the
+	// cheapest structural proxy available to a string test.
+	if !strings.Contains(brief, "FINALLY, and this is the step that ENDS the phase:") {
+		t.Errorf("the terminal step is not set apart as its own instruction:\n%s", brief)
+	}
+
+	// Presence is not the property that failed - POSITION is. The old brief
+	// contained the instruction too; it was a trailing clause on a sentence about
+	// something else. So pin the step to the LAST position before the shared
+	// handoff guidance, which is exactly where the implement brief - the control in
+	// this experiment, and the one that never failed - puts its own. Without this,
+	// every assertion above still passes on a brief that buries the step in the
+	// middle or softens it in a later sentence.
+	if !strings.HasSuffix(brief, reviewTerminalStep+handoffGuidance) {
+		t.Errorf("the terminal step is not the last thing the brief says before the handoff guidance:\n%s", brief)
+	}
+}
