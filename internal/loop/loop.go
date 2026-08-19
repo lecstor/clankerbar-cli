@@ -663,6 +663,37 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			carried = end.claim
 		}
 
+		// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
+		// not "ended without holding the task" either — it never finished the job
+		// it was spawned to do. The claim was released back in drainPhase (a retry
+		// re-claims, exactly like a transient one), so the only question left is
+		// retry vs park. First dead phase: retry the same phase once, so a silent
+		// death that was a one-off costs one session rather than handing a review
+		// brief a task with no branch on it. Second consecutive dead phase: park —
+		// a task that can kill two full sessions reaches the operator rather than
+		// a third (2026-08-20 operator decision).
+		//
+		// Deliberately BEFORE the error break below: the dead classification
+		// names a phase that produced nothing whatever its exit code, so a dead
+		// phase is retried-then-parked, never a run-failing error — the non-zero
+		// exit that would otherwise stop the daemon is itself part of the silent
+		// death, not a verdict.
+		if !last && end.dead {
+			if deadRetries >= 1 {
+				log.Printf("%siteration %d: the %s phase died producing nothing a second time — parking the task per the 2026-08-20 decision (retry once, then park)",
+					labelOf(t), drainNum, ph.Label(i))
+				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
+				// The task is parked for the operator and this drain is over; the
+				// daemon carries on with the next task. Not a stop: the run did
+				// not fail, one task reached a human.
+				break
+			}
+			deadRetries++
+			log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it once before any review brief sees the task",
+				labelOf(t), drainNum, ph.Label(i), deadReason(end.claim))
+			continue
+		}
+
 		if perr != nil {
 			err = perr
 			break
@@ -695,31 +726,6 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 		// This session ended without a respawn being accepted, so any chain is
 		// broken: a later handoff starts counting from a standard-brief session.
 		chain = 0
-
-		// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
-		// not "ended without holding the task" either — it never finished the job
-		// it was spawned to do. The claim was released back in drainPhase (a retry
-		// re-claims, exactly like a transient one), so the only question left is
-		// retry vs park. First dead phase: retry the same phase once, so a silent
-		// death that was a one-off costs one session rather than handing a review
-		// brief a task with no branch on it. Second consecutive dead phase: park —
-		// a task that can kill two full sessions reaches the operator rather than
-		// a third (2026-08-20 operator decision).
-		if !last && end.dead {
-			if deadRetries >= 1 {
-				log.Printf("%siteration %d: the %s phase died producing nothing a second time — parking the task per the 2026-08-20 decision (retry once, then park)",
-					labelOf(t), drainNum, ph.Label(i))
-				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
-				// The task is parked for the operator and this drain is over; the
-				// daemon carries on with the next task. Not a stop: the run did
-				// not fail, one task reached a human.
-				break
-			}
-			deadRetries++
-			log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it once before any review brief sees the task",
-				labelOf(t), drainNum, ph.Label(i), deadReason(end.claim))
-			continue
-		}
 
 		// A non-final phase that did not reach its checkpoint leaves the next one
 		// nothing to resume: the session settled the task itself (worked past its

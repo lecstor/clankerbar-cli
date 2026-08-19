@@ -981,3 +981,39 @@ func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 		t.Errorf("the operator's log does not say why the task was parked:\n%s", out)
 	}
 }
+
+// The dead classification names "produced nothing" whatever the exit code, so a
+// dead phase that ALSO exits non-zero is still retried once then parked — never
+// a run-failing error. The non-zero exit is part of the silent death, not a
+// verdict (CLA-386).
+func TestDrainPhases_ANonZeroExitDeadPhaseIsRetriedNotARunFailure(t *testing.T) {
+	dead := func() harness.Result {
+		return harness.Result{ExitCode: 1, Raw: map[string]any{
+			"kind": "fail", harness.FinishReasonKey: harness.FinishReasonUnknown,
+		}}
+	}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(dead(), openClaim())},
+		{res: held(dead(), openClaim())},
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v — a dead phase must be retried then parked, never fail the run", err)
+	}
+	if stop {
+		t.Error("a dead phase stopped the whole run")
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions, want 2 (dead phase + its one retry) — the dead classification must win over the non-retryable error", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 {
+		t.Errorf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
+	}
+}
