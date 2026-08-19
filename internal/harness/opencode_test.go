@@ -192,7 +192,35 @@ func TestOpencodeIsTransient(t *testing.T) {
 		// read that as a provider blip and retried it; these pin that it does not.
 		{"MCP transport class in a stack trace is NOT transient", Result{ExitCode: 1, Stderr: "Error: MCP server \"clankerbar\" failed to start\n    at StdioClientTransport.start (/x/node_modules/@modelcontextprotocol/sdk/dist/client/stdio.js:88:19)"}, false},
 		{"gRPC transport auth handshake is NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "rpc error: code = Unavailable desc = transport: authentication handshake failed: x509: certificate signed by unknown authority"}, false},
+		// This one is non-transient by falling through BOTH scans rather than by
+		// matching the fatal one - there is no `error:` prefix and no JSON status
+		// field for it to anchor on. That is the honest outcome and it is pinned
+		// here deliberately: the property under test is that the word `Transport`
+		// alone no longer buys a retry, not that every 401-shaped string is named.
+		// With usage reported this becomes a BOUNDED guess, which is the designed
+		// answer for text nothing recognises.
 		{"an http2 transport GOAWAY carrying a 401 is NOT transient", Result{ExitCode: 1, Stderr: "http2: Transport received Server's graceful shutdown GOAWAY; 401 Unauthorized"}, false},
+		// The fatal scan runs FIRST and therefore vetoes even a recognised blip, so
+		// it is anchored for the mirror-image reason the transport arm is: stderr
+		// carries text this adapter did not author in the STOP direction too. An
+		// unanchored fatal word turned a plain rate limit into a night-long outage
+		// because something unrelated upstream had logged a 403.
+		{"a WARN mentioning 403 does not veto a real 429", Result{ExitCode: 1, UsageReported: true, Stderr: "WARN mcp: github server replied 403 Forbidden (rate limited); continuing without it\nError: 429 Too Many Requests"}, true},
+		{"an INFO mentioning 401 does not veto a real stream drop", Result{ExitCode: 1, UsageReported: true, Stderr: "INFO auth: refreshing token after 401 Unauthorized\nError: stream closed unexpectedly"}, true},
+		// gRPC's commonest transient phrasing, and a stream drop shape the anchored
+		// arms would otherwise have to guess at.
+		{"transport is closing", Result{ExitCode: 1, Stderr: "rpc error: code = Unavailable desc = transport is closing"}, true},
+		{"stream disconnected", Result{ExitCode: 1, Stderr: "opencode: stream disconnected before the final event"}, true},
+		// The driver's OWN permission policy fails closed, so opencode refuses tools
+		// on every run by design - and if those refusals read as a fatal stop, our
+		// policy would be manufacturing the text that ends our own runs. Two things
+		// prevent it, and this pins the one that is a property of the words: opencode
+		// phrases its refusal "The user rejected permission to use this specific tool
+		// call" (verified against the shipped 1.18.18 binary), which matches no arm
+		// here. The other is structural - a refusal is delivered to the MODEL as a
+		// tool result, and opencodeErrorText reads only stderr and typed error
+		// events, so it never reaches this scan at all.
+		{"opencode's own permission refusal is not read as a fatal stop", Result{ExitCode: 1, UsageReported: true, Stderr: "The user rejected permission to use this specific tool call."}, true},
 		// Regression for finding #2: an assistant text part mentioning a rate limit
 		// must NOT be read as a transient error — only opencodeErrorText is scanned.
 		{"assistant narration mentioning a rate limit does NOT trip", Result{Stdout: `{"type":"text","text":"Earlier I hit a rate limit and connection error, so I paused before retrying."}`}, false},

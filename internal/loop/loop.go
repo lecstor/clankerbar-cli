@@ -46,7 +46,7 @@ var errZeroSpendLoop = errors.New("zero-spend attempt loop")
 
 // errUnclassifiedRetryLoop marks the other give-up no ceiling would have reached:
 // a ladder of retries taken on a failure the adapter could not NAME, only judge
-// by heuristic (harness.UnclassifiedTransient).
+// by heuristic (harness.Adapter.IsUnclassifiedTransient).
 //
 // It is the sibling of errZeroSpendLoop and exists for the mirror-image reason.
 // That one bounds attempts that spend NOTHING, so the budget breaker never sees
@@ -789,7 +789,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 	// under drainPhases' own chain cap.
 	noUsage := 0
 	// Retries this ladder has taken on a failure the adapter judged retryable
-	// WITHOUT recognising it (harness.UnclassifiedTransient) - see
+	// WITHOUT recognising it (harness.Adapter.IsUnclassifiedTransient) - see
 	// errUnclassifiedRetryLoop. Scoped per phase like noUsage, and for the same
 	// reason: the ladder is what has no other bound.
 	//

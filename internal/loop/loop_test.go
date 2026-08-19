@@ -1359,11 +1359,18 @@ func TestDrainWithRetries_ClassifiedTransientsAreNotBoundedByTheGuessCap(t *test
 	}
 }
 
-// The ordering the adapter's comments lean on, pinned at last: a hard budget stop
-// is read as a LIMIT before anything asks whether it was transient. Without this,
-// a refactor swapping the two calls would turn every exhausted account into a
-// retry ladder against a provider that will keep saying no, and the suite would
-// stay green.
+// An exhausted account stops at the FIRST attempt - the outcome that matters, and
+// the one the guessed-retry heuristic could most expensively have broken, since a
+// 402 typically lands after the session has already done paid work.
+//
+// What this does NOT pin is the loop's DetectLimit-before-IsTransient ordering,
+// and the distinction is worth stating because the obvious reading is the other
+// one: the test passes under a swapped order too. That is by construction rather
+// than by luck - IsTransient checks opencodeBudgetRe itself, so both classifiers
+// agree about an exhausted account and neither order can produce a retry. The
+// belt is what makes the braces untestable here; a test that pinned the ordering
+// would have to drive an adapter without the guard, which is not an adapter that
+// exists.
 func TestDrainWithRetries_BudgetExhaustionAfterUsageStopsRatherThanRetrying(t *testing.T) {
 	h := &realClassifierAdapter{Adapter: opencodeAdapterForTest(t), steps: []invokeStep{
 		{res: harness.Result{

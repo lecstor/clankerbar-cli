@@ -692,13 +692,26 @@ func buildOpencodeErrorText(res Result) string {
 // Deliberately narrow: an auth/permission refusal or a hard 401/403. Anything
 // vaguer belongs in neither list, where the heuristic can weigh it under a
 // bound.
+//
+// ANCHORED for the same reason the transient arms are, and it is the reason the
+// words below are never matched on their own. This scan runs FIRST, so a match
+// vetoes even a recognised blip — which means a bare word here fails in the
+// opposite direction to the `transport` bug: a WARN line mentioning "403
+// Forbidden" beside a real "Error: 429 Too Many Requests" would stop the daemon
+// for the night on a rate limit it should have ridden out. So a refusal counts
+// only where the failure is actually being REPORTED: in a typed error event's
+// status or message field, or after an `error:` prefix on the same line.
+//
 // The `authentication( \w+)?` shape is not decoration: gRPC's phrasing is
 // "transport: authentication handshake failed", which is both the word that used
 // to trip the transient scan and a failure that must stop.
-var opencodeFatalRe = regexp.MustCompile(`(?i)authentication( \w+)? (failed|error|rejected)` +
+const opencodeFatalWords = `(authentication( \w+)? (failed|error|rejected)` +
 	`|unauthorized|forbidden|permission denied` +
-	`|invalid api key|api key (is )?(invalid|missing|not found|expired)` +
-	`|"status(code)?": ?40[13]`)
+	`|invalid api key|api key (is )?(invalid|missing|not found|expired))`
+
+var opencodeFatalRe = regexp.MustCompile(`(?i)"status(code)?": ?40[13]` +
+	`|"message": ?"[^"]*` + opencodeFatalWords +
+	`|error: ?[^\n]*` + opencodeFatalWords)
 
 // opencodeTransientRe: retryable server/network blips and API-level rate limits.
 // Honours opencode's own "isRetryable":true signal, plus HTTP 408/429/5xx and the
@@ -722,8 +735,8 @@ var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d
 	`|"isretryable": ?true` +
 	`|overloaded|too many requests|rate ?limit` +
 	`|"message": ?"transport` +
-	`|transport (error|failure|closed|reset|dropped)|transport-level` +
-	`|stream (error|failed|closed|reset|ended)` +
+	`|transport (error|failure|reset|dropped)|transport (is )?clos(ed|ing)|transport-level` +
+	`|stream (error|failed|closed|reset|ended|disconnected|interrupted)` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
@@ -792,8 +805,10 @@ func (o opencode) IsTransient(res Result) bool {
 	// A named stop wins over every retry path below, including the heuristic. The
 	// loop already runs DetectLimit before IsTransient, so the budget arm is
 	// belt-and-braces there — but this function must not answer "retryable" about
-	// an exhausted account just because it happens to be asked out of that order,
-	// and nothing pins that ordering (see the loop test added with CLA-381).
+	// an exhausted account just because it happens to be asked out of that order.
+	// The braces are why the loop's ordering has no test of its own: with both
+	// classifiers agreeing, no order produces a retry, so there is nothing left for
+	// a test to distinguish (CLA-381).
 	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
 		return false
 	}
@@ -805,7 +820,7 @@ func (o opencode) IsTransient(res Result) bool {
 
 // IsUnclassifiedTransient is the CLA-381 heuristic, and it is separate from the
 // pattern scan because a caller has to be able to bound it — see
-// harness.UnclassifiedTransient for why that is a spending requirement and not a
+// harness.Adapter.IsUnclassifiedTransient for why that is a spending requirement and not a
 // tidiness one.
 //
 // The judgement: an exit 1 whose cause no pattern has seen yet, on a session that
