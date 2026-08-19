@@ -193,7 +193,7 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 	assertNetworkDenied(t, p)
 	// The path-scoped working set survives the probe shape: reads inside the
 	// workdir are allowed, but nothing writes.
-	if p["read"] != "Users/jason/dev/**:allow Users/jason/dev:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
+	if p["read"] != "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
 		t.Errorf("read-only policy must keep the path-scoped read/external_directory rules, got read=%q external_directory=%q",
 			p["read"], p["external_directory"])
 	}
@@ -229,7 +229,7 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 	p := parsePolicy(t, perm)
 
 	want := map[string]string{
-		"read":               "Users/jason/dev/**:allow Users/jason/dev:allow",
+		"read":               "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow",
 		"edit":               "Users/jason/dev/**:allow Users/jason/dev:allow",
 		"external_directory": "*:deny /Users/jason/dev/**:allow",
 	}
@@ -316,6 +316,9 @@ func TestOpencodePermissionEffective(t *testing.T) {
 		{"clankerbar_get_backlog_summary", "*", "allow"},
 		{"context7_query-docs", "*", "allow"},
 		{"chrome-devtools_navigate_page", "*", "allow"},
+		// MCP RESOURCE reads ask under `read`, not under their tool name.
+		{"read", "mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md", "allow"},
+		{"read", "mcp:clankerbar:*", "allow"},
 		// The exfil and hidden tools stay denied.
 		{"webfetch", "*", "deny"},
 		{"websearch", "*", "deny"},
@@ -326,6 +329,71 @@ func TestOpencodePermissionEffective(t *testing.T) {
 		if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != tc.want {
 			t.Errorf("ask(permission=%s, pattern=%q) = %s, want %s", tc.permission, tc.pattern, got, tc.want)
 		}
+	}
+}
+
+// The served protocol has to be REACHABLE, or an unattended session never learns
+// the loop it is supposed to run. CLA-382: every opencode session's
+// read_mcp_resource call was denied, so no session read the skill that carries
+// the heartbeat cadence, and leases expired mid-work while the session kept
+// editing. The mechanism is that opencode's MCP RESOURCE tools do not ask under
+// their own names — list_mcp_resources, list_mcp_resource_templates and
+// read_mcp_resource all ask under permission `read` with `mcp:<server>:<uri>`
+// patterns (1.18.x, session/tools.ts) — so the `*_*` MCP allow never saw them and
+// the `*` catch-all denied them. This pins that they resolve to allow in BOTH run
+// shapes, while the fail-closed posture the policy exists for is unchanged.
+func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
+	for _, shape := range []struct {
+		name     string
+		readOnly bool
+	}{{"drain", false}, {"probe", true}} {
+		t.Run(shape.name, func(t *testing.T) {
+			perm := opencodePermission(shape.readOnly, "/Users/jason/dev")
+
+			// The three asks the resource tools actually make. The read's URI
+			// is a URL, so the pattern has to span both "/" and ":".
+			allowed := []string{
+				"mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md",
+				"mcp:clankerbar:https://clankerbar.com/skills/clankerbar/finishing.md",
+				"mcp:clankerbar:*", // list_mcp_resources(server: "clankerbar")
+				"mcp:context7:*",   // ...and the same listing for any other server
+				"mcp:chrome-devtools:*",
+			}
+			for _, pattern := range allowed {
+				if got := opencodeEvaluate(t, perm, "read", pattern); got != "allow" {
+					t.Errorf("ask(permission=read, pattern=%q) = %s, want allow — the session cannot read the served protocol", pattern, got)
+				}
+			}
+
+			// Fail-closed elsewhere: the carve-out is one pattern on `read`,
+			// and it moves nothing else. A filesystem read outside the workdir
+			// is still denied, and the `mcp:` pattern cannot be reached by a
+			// filesystem ask (those carry worktree-relative paths).
+			denied := []struct{ permission, pattern string }{
+				{"read", "etc/hosts"},
+				{"read", "Users/jason/.ssh/id_ed25519"},
+				{"read", "Users/jason/.config/clankerbar/opencode.json"},
+				{"edit", "mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md"},
+				{"external_directory", "/etc/*"},
+				{"webfetch", "*"},
+				{"websearch", "*"},
+				{"glob", "**/*.go"},
+				{"grep", "TODO"},
+			}
+			for _, tc := range denied {
+				if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != "deny" {
+					t.Errorf("ask(permission=%s, pattern=%q) = %s, want deny — the MCP carve-out must not loosen anything else", tc.permission, tc.pattern, got)
+				}
+			}
+
+			// The carve-out must not hide the tools either: opencode drops a
+			// tool whose mapped permission's LAST matching rule is a `*`-pattern
+			// deny (read_mcp_resource maps onto `read`), so the emitted `read`
+			// entry must keep ending in a specific pattern, not a bare deny.
+			if got := opencodeEvaluate(t, perm, "read", "Users/jason/dev/x.go"); got != "allow" {
+				t.Errorf("workdir read = %s, want allow", got)
+			}
+		})
 	}
 }
 

@@ -216,9 +216,22 @@ func opencodeArgs(in Invocation) []string {
 //     after the `*_*` allow in the flattened ruleset, so an out-of-workdir ask
 //     still resolves to deny (the old flat `external_directory: deny`, restored);
 //     only an in-workdir ask reaches the allow. The other collisions are benign:
-//     list_mcp_resources/read_mcp_resource are read-only listings, apply_patch
-//     asks under "edit" (so the probe's edit:deny covers it), and doom_loop /
-//     plan_enter / plan_exit are loop/UI guards with no file side effects.
+//     apply_patch asks under "edit" (so the probe's edit:deny covers it), and
+//     doom_loop / plan_enter / plan_exit are loop/UI guards with no file side
+//     effects.
+//   - MCP RESOURCE reads do NOT ask under their own tool name, so `*_*` never
+//     reaches them: list_mcp_resources, list_mcp_resource_templates and
+//     read_mcp_resource all ask under permission **`read`**, with `mcp:`-prefixed
+//     patterns — `mcp:<server>:<uri>` for a read, `mcp:<server>:*` for a listing
+//     (opencode 1.18.x, session/tools.ts). Against a `read` entry scoped to
+//     workdir paths alone, no rule matched them and the `*` catch-all denied every
+//     one — which is why a session could call the plane's TOOLS but could not read
+//     the served skill that carries the heartbeat cadence (CLA-382). The `read`
+//     entry therefore also allows `mcp:*`. That is not a loosening of the
+//     fail-closed posture: it grants exactly what `*_*` already grants for the
+//     same servers — read-only data from an MCP server the operator configured —
+//     and it cannot widen filesystem reach, because a filesystem ask's pattern is
+//     a worktree-relative path that can never match the `mcp:` prefix.
 //   - read/edit asks carry the path RELATIVE TO THE GIT WORKTREE
 //     (path.relative(worktree, file)); a session whose cwd is not inside a git
 //     repo — the multi-repo-parent case, workdir=~/dev — gets worktree "/", so
@@ -226,6 +239,14 @@ func opencodeArgs(in Invocation) []string {
 //     ("Users/jason/dev/..."). The read/edit patterns are therefore emitted in
 //     that same root-relative form. external_directory patterns are absolute
 //     globs (path.join(dir, "*")), so that rule uses the absolute form.
+//
+// opencodeMCPResourcePattern is the pattern shape opencode's MCP resource tools
+// ask with under the `read` permission: "mcp:<server>:<uri>" for a read and
+// "mcp:<server>:*" for a listing. opencode's matcher (util/wildcard.ts) lets `*`
+// span "/" and ":", so one pattern covers every server and every URI — including
+// the URL-shaped resource URIs the clankerbar plane serves its protocol at.
+const opencodeMCPResourcePattern = "mcp:*"
+
 func opencodePermission(readOnly bool, workdir string) string {
 	rootRel, abs := opencodeWorkdirPatterns(workdir)
 	// The exact (non-wildcard) workdir pattern, so reading the workdir root
@@ -239,7 +260,10 @@ func opencodePermission(readOnly bool, workdir string) string {
 		// path OUTSIDE the subtree still resolves to deny — the old flat
 		// `external_directory: deny`, restored — while an in-subtree ask wins
 		// on the later absolute allow.
-		"read":               map[string]string{rootRel: "allow", exact: "allow"},
+		// `mcp:*` rides on "read" because that is the permission the MCP
+		// resource tools ask under — see the function doc. A read-only run
+		// keeps it: reaching the served protocol IS the point of the probe.
+		"read":               map[string]string{rootRel: "allow", exact: "allow", opencodeMCPResourcePattern: "allow"},
 		"edit":               map[string]string{rootRel: "allow", exact: "allow"},
 		"external_directory": map[string]string{"*": "deny", abs: "allow"},
 		// MCP tools must survive the `*` catch-all — see the function doc.

@@ -1009,11 +1009,18 @@ allowed tool-level (its permission patterns match parsed commands, not paths).
 Everything else — reads or edits outside the workdir, `glob`/`grep`/`lsp`/`task`/`skill`,
 and the network tools (`webfetch`, `websearch`) in every shape — is denied by
 a `*` catch-all rather than asked, and denied tools are hidden from the
-session's catalog entirely. Two exceptions keep the session alive inside that
+session's catalog entirely. Three exceptions keep the session alive inside that
 catch-all: `*_*` allows the MCP tools (tool names are `<server>_<tool>` in
 opencode — `clankerbar_get_backlog_summary`, `context7_query-docs`,
-`chrome-devtools_click` — and the plane itself is reached over MCP), and a
-probe/read-only run additionally denies `edit` and `bash` for zero writes. The
+`chrome-devtools_click` — and the plane itself is reached over MCP); `read`
+also allows `mcp:*`, because opencode's MCP **resource** tools
+(`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`) do
+*not* ask under their own names — they ask under `read`, with
+`mcp:<server>:<uri>` patterns that the path-scoped `read` rules never matched,
+so the catch-all denied every one of them and a session could call the plane's
+tools while being unable to read the protocol served over the same connection;
+and a probe/read-only run additionally denies `edit` and `bash` for zero
+writes. The
 policy is pinned by unit tests in `opencode_test.go`, including the JSON key
 order the catch-all depends on and a replica of opencode's rule evaluator over
 a table of effective decisions.
