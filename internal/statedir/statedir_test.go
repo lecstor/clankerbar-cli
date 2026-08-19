@@ -620,6 +620,124 @@ func TestOpenAnchorsAtTheShallowestSessionRoot(t *testing.T) {
 	}
 }
 
+// `doctor` (checkStateDir) has warned about a state dir that IS a session
+// workdir since CLA-283, and that WARN is only honest if Open still succeeds -
+// a FAIL here would silently turn "WARN, loop still runs" into "gates doctor &&
+// run". TestEnclosingSessionRootMatchesTheRootItself is what pins the anchor
+// choice CLA-284 actually changed; this pins the observable contract Open owes
+// its caller once that choice is made.
+func TestOpenAdoptsAStateDirThatIsExactlyASessionWorkdir(t *testing.T) {
+	workdir := t.TempDir()
+
+	d, err := Open(workdir, workdir)
+	if err != nil {
+		t.Fatalf("Open(workdir, workdir): %v", err)
+	}
+	defer func() { _ = d.Close() }()
+
+	if _, err := os.Lstat(filepath.Join(workdir, sentinelName)); err != nil {
+		t.Errorf("state dir was not adopted: sentinel missing: %v", err)
+	}
+}
+
+// enclosingSessionRoot at abs == cand: the equality case CLA-284 fixes. Before,
+// HasPrefix(abs, cand+"/") required cand to be a STRICT prefix, so a state dir
+// exactly equal to a session root matched nothing and fell through to the
+// trusting branch (see TestOpenAdoptsAStateDirThatIsExactlyASessionWorkdir for
+// what that costs).
+func TestEnclosingSessionRootMatchesTheRootItself(t *testing.T) {
+	root := t.TempDir()
+
+	if got := enclosingSessionRoot(root, []string{root}); got != root {
+		t.Errorf("enclosingSessionRoot(root, [root]) = %q, want %q", got, root)
+	}
+}
+
+// Pinned so a rewrite to filepath.Rel does not reintroduce the class of bug this
+// package already handles correctly: a sibling directory that merely SHARES a
+// string prefix with a session root ("/a/workdir-2" against "/a/workdir") is not
+// inside it, and no session spawned in the root can reach it.
+func TestEnclosingSessionRootDoesNotMatchASiblingSharingAPrefix(t *testing.T) {
+	base := t.TempDir()
+	root := filepath.Join(base, "workdir")
+	sibling := filepath.Join(base, "workdir-2")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := enclosingSessionRoot(sibling, []string{root}); got != "" {
+		t.Errorf("enclosingSessionRoot(sibling, [root]) = %q, want \"\"", got)
+	}
+}
+
+// The equality case participates in the shortest-root tie-break, not just
+// strict containment: a state dir equal to the INNER of two nested session
+// roots is enclosed by both (Rel(outer, inner) is the subpath "sub"; Rel(inner,
+// inner) is "."), and the shallower OUTER root must still win the
+// len(cand) >= len(best) comparison across both orderings - otherwise inner's
+// own name stops being a checked component and becomes the anchor itself,
+// which is exactly the escape the doc comment above walks through. Together
+// with TestEnclosingSessionRootMatchesTheRootItself (which confirms inner is a
+// candidate at all), this pins that inner loses the tie-break rather than never
+// competing in it.
+func TestEnclosingSessionRootPrefersTheOuterRootWhenStateDirIsTheInnerRootItself(t *testing.T) {
+	base := t.TempDir()
+	outer := filepath.Join(base, "repo")
+	inner := filepath.Join(outer, "sub")
+	if err := os.MkdirAll(inner, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, roots := range [][]string{{outer, inner}, {inner, outer}} {
+		if got := enclosingSessionRoot(inner, roots); got != outer {
+			t.Errorf("enclosingSessionRoot(inner, %v) = %q, want %q", roots, got, outer)
+		}
+	}
+}
+
+// state_dir set to literally BE the inner workdir, which a session in the
+// OUTER workdir has swapped for a symlink. Distinct coverage from
+// TestOpenAnchorsAtTheShallowestSessionRoot, which swaps the same inner root
+// but names a STATE DIR UNDER IT - refused there by makeChain's intermediate-
+// component check. Here inner is never a tie-break candidate at all (Lstat
+// sees a symlink, not a directory, before any length comparison runs), so
+// anchorFor falls back to the parent and the refusal comes from Open's own
+// final-component symlink check instead.
+func TestOpenRefusesASymlinkedSessionRootNamedAsTheStateDir(t *testing.T) {
+	base := t.TempDir()
+	outer := filepath.Join(base, "repo")
+	inner := filepath.Join(outer, "sub")
+	escape := filepath.Join(base, "escape")
+	for _, d := range []string{outer, escape} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Symlink(escape, inner); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Open(inner, outer, inner); err == nil {
+		t.Fatal("Open anchored at a swapped inner workdir named as state_dir itself: want an error, got nil")
+	}
+	if _, err := os.Lstat(filepath.Join(escape, sentinelName)); !os.IsNotExist(err) {
+		t.Errorf("%s was created through the swapped workdir", filepath.Join(escape, sentinelName))
+	}
+}
+
+// deepestExistingAncestor returns "/" for abs == "/" (filepath.Dir("/") == "/"),
+// which used to make anchorFor's rel == "." arm land there by an accident of
+// arithmetic rather than by the equality case this task adds. Guarded
+// separately so allowing rel == "." for a real state-dir-equals-workdir case
+// does not also open the filesystem root as a would-be state dir - reachable in
+// practice through an unvalidated state_dir config value (config.ResolveStateDir
+// does not reject it).
+func TestAnchorForRefusesTheFilesystemRoot(t *testing.T) {
+	if _, _, err := anchorFor("/", nil); err == nil {
+		t.Fatal(`anchorFor("/", nil): want an error, got nil`)
+	}
+}
+
 // `state_dir` back inside a workdir is supported, so the confined session can
 // write the state dir — and a DIRECTORY squatting on one of the two names we
 // insist on owning cannot simply be removed. Left unhandled that wedges every
