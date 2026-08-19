@@ -702,9 +702,12 @@ environment would otherwise have none of them.
 
 ## Config
 
-Flags override the config file, which overrides defaults. Default file locations:
-`./clankerbar.json`, then `~/.config/clankerbar/config.json`. (JSON today; TOML is
-the likely final format.)
+Flags override the config file, which overrides defaults. Exactly one file is
+discovered on its own: `~/.config/clankerbar/config.json`. Any other file has to
+be named - `clankerbar run -c ./clankerbar.json` - and an unnamed
+`clankerbar.json` sitting in the directory you launch from is **refused, not
+read**; [where the key may go](#where-the-account-scoped-key-is-allowed-to-go)
+says why. (JSON today; TOML is the likely final format.)
 
 ```json
 {
@@ -808,6 +811,14 @@ pinned, not inferred, and the pin is your own `backlog_url`:
   "https://plane.example.com"`). It is **no longer derived from `.mcp.json`** — a
   checkout's `.mcp.json` contributes at most a project slug, and never redirects
   the key.
+- **Set it in a config file the sessions cannot rewrite.** `backlog_url` is read
+  from `~/.config/clankerbar/config.json` - the one file discovered
+  automatically - or from a file you name with `--config`. A `clankerbar.json`
+  sitting unnamed in the directory you launch from is **refused, not read**, and
+  the loop stops rather than falling back to your home config: that directory is
+  a checkout the spawned sessions edit, so a session could rewrite the field
+  that decides where tomorrow's key goes. Keeping your config in a checkout is
+  still fine - name it (`-c ./clankerbar.json`) and the refusal does not apply.
 - The scheme floor is TLS: `https` anywhere, or `http` only to loopback (a plane
   under local development).
 
