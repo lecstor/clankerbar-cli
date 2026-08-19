@@ -196,12 +196,13 @@ func Open(path string, sessionRoots ...string) (*Dir, error) {
 // inspected through an [os.Root] on it; everything above is taken on trust.
 //
 // Inside a session root, trust is exactly what we do not have: pick the session
-// root itself, so every component between it and the state dir is ours to check.
-// Elsewhere, pick the deepest ancestor that already exists — nothing below it
-// exists yet, so there is nothing there to have been planted, and anchoring at
-// the deepest EXISTING one means a symlink the operator deliberately put
-// somewhere above (`~/.local` -> a data volume, `/var` on macOS) is resolved
-// normally instead of being refused.
+// root itself, so every component between it and the state dir is ours to
+// check - none, if the state dir IS the root. Elsewhere, pick the deepest
+// ancestor that already exists — nothing below it exists yet, so there is
+// nothing there to have been planted, and anchoring at the deepest EXISTING one
+// means a symlink the operator deliberately put somewhere above (`~/.local` ->
+// a data volume, `/var` on macOS) is resolved normally instead of being
+// refused.
 func anchorFor(abs string, sessionRoots []string) (anchor, rel string, err error) {
 	if r := enclosingSessionRoot(abs, sessionRoots); r != "" {
 		anchor = r
@@ -209,7 +210,19 @@ func anchorFor(abs string, sessionRoots []string) (anchor, rel string, err error
 		anchor = deepestExistingAncestor(abs)
 	}
 	rel, err = filepath.Rel(anchor, abs)
-	if err != nil || rel == "." || rel == "" || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", "", fmt.Errorf("state dir %s: cannot be created (no directory to create it in)", abs)
+	}
+	// rel == "." means abs IS the anchor, reachable in two shapes. Ordinarily
+	// abs is itself a session root - a valid case, now that enclosingSessionRoot
+	// matches equality and not just strict containment - and Open still runs
+	// every ownership and adoption check against it, with nothing below the
+	// anchor left to walk. But deepestExistingAncestor returns THIS for the
+	// filesystem root too (filepath.Dir("/") == "/"), which is never a valid
+	// state dir regardless of which branch produced it; a root with no parent
+	// is not a session root either, so the two are told apart by whether the
+	// anchor itself has one.
+	if rel == "." && filepath.Dir(anchor) == anchor {
 		return "", "", fmt.Errorf("state dir %s: cannot be created (no directory to create it in)", abs)
 	}
 	return anchor, rel, nil
@@ -219,11 +232,17 @@ func anchorFor(abs string, sessionRoots []string) (anchor, rel string, err error
 // under it — or "" if none does.
 //
 // "At" is the case that used to be missed: a state dir that IS a session
-// workdir. `HasPrefix(abs, cand+"/")` is false when abs == cand, so the most
-// extreme version of the layout this machinery exists to distrust slipped
-// through to the trusting branch. Enclosed means at or under, and the caller
-// (anchorFor) refuses the equality case on its own account — there is no
-// directory below the anchor to create the state dir in.
+// workdir. `HasPrefix(abs, cand+"/")` is false when abs == cand, so it matched
+// nothing and fell through to deepestExistingAncestor — anchored one level up,
+// at the workdir's own parent, rather than at the workdir itself. Enclosed means
+// at or under: the caller (anchorFor) now anchors AT abs in that case instead,
+// with nothing below the anchor left to walk. The untrusted component is
+// checked by the os.Lstat(cand) + IsDir call below, before os.OpenRoot ever
+// opens it, rather than through the pinned root handle every other component
+// gets — sound here only because abs can be the anchor only when it is the
+// SHORTEST enclosing root, so no root strictly contains abs's parent either
+// (a root that did would be shorter and would have won instead), and no
+// confined session can therefore write there to swap abs in the window.
 //
 // Shortest, not longest, and that choice is the security property. The anchor is
 // the point below which every component gets checked, so the SHALLOWEST
