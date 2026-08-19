@@ -411,8 +411,8 @@ PASS  budget       no ceiling configured — the loop stops on a STOP/HALT marke
 ```
 
 The checks: **config** (discovered, parses, validates — plus the resolved harness,
-workdir, api key origin and derived backlog URLs), **harness** (binary on PATH and runnable, with
-its version), **config_dir** (resolves, exists, looks initialised for the chosen
+workdir, api key origin and derived backlog URLs), **harness** (binary on PATH
+and runnable, with its version), **config_dir** (resolves, exists, looks initialised for the chosen
 harness), **backlog** (creds present and the summary read succeeds — distinguishing
 no creds, a rejected key, a `project_required` key/route mismatch, and an
 unreachable endpoint — plus whether the queue is gated on *your* open questions,
@@ -829,8 +829,8 @@ and `clankerbar doctor` prints the same origin as a preflight line:
 api key origin: https://clankerbar.com
 ```
 
-That line is the thing to check in an overnight log: if it names a host you did
-not choose, stop the run before it drains anything.
+That line is the thing to check in an overnight log: if it names an origin you
+did not choose, stop the run before it drains anything.
 
 **Refusals, each with its remedy.** A config or MCP file that would move the
 account key off that origin is refused at startup and flagged by `doctor` — never
