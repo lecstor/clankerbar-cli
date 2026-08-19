@@ -708,6 +708,7 @@ the likely final format.)
 ```json
 {
   "harness": "claude",
+  "backlog_url": "https://clankerbar.com",
   "model": "opus",
   "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
   "prompt": "Work the next backlog item.",
@@ -793,6 +794,52 @@ Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at t
 root here is the maintainers' own agent wiring and names the `clankerbar` project
 slug; running the loop from inside this checkout would have it poll a queue you
 cannot read, which it refuses rather than drains.
+
+### Where the account-scoped key is allowed to go
+
+`CLANKERBAR_API_KEY` is an **account-scoped bearer token** — one key covers every
+project you belong to, not just the one being drained. So *where* it may be sent is
+pinned, not inferred, and the pin is your own `backlog_url`:
+
+- **`backlog_url` is the one trusted origin.** It is the only host the driver ever
+  sends the key to. It defaults to `https://clankerbar.com`; to point at a
+  self-hosted plane, name it there instead (e.g. `"backlog_url":
+  "https://plane.example.com"`). It is **no longer derived from `.mcp.json`** — a
+  checkout's `.mcp.json` contributes at most a project slug, and never redirects
+  the key.
+- The scheme floor is TLS: `https` anywhere, or `http` only to loopback (a plane
+  under local development).
+
+Fixating on the origin is what makes the file-for-credential leak closeable. The
+MCP config is handed to the harness whole, and the harness's session carries the
+key in its environment, so a checkout's `.mcp.json` could name any host it liked;
+that is the exfil it refuses rather than silently polls.
+
+`clankerbar run` logs where the key will go, once, at startup:
+
+    sending the API key to https://clankerbar.com
+
+and `clankerbar doctor` prints the same origin as a preflight line:
+
+    api key origin: https://clankerbar.com
+
+That line is the thing to check in an overnight log: if it names a host you did
+not choose, stop the run before it drains anything.
+
+**Refusals, each with its remedy.** A config or MCP file that would move the
+account key off that origin is refused at startup and flagged by `doctor` — never
+silently dropped, because dropping the file would spawn a session with no
+clankerbar tools and read as "the backlog was empty":
+
+| Refusal | When | Remedy |
+| --- | --- | --- |
+| **Foreign origin** | an MCP server that carries the key points at a host other than `backlog_url` | set `backlog_url` to that origin if you mean it, or fix the file — a checkout's `.mcp.json` is not trusted to redirect an account-scoped key |
+| **Cleartext non-loopback** | `backlog_url` (or a server URL) is plain `http` to a host that is not loopback | use `https` — the key would cross the wire in cleartext |
+| **Local server handed the key** | a server entry that carries the key (`clankerbar`, or any entry whose headers/env reference the variable) is a local command with no URL | give the key only to an `http` server on `backlog_url` — a spawned process may send it anywhere |
+| **Unparseable MCP config** | the MCP config at `mcp_config_path` cannot be read or parsed, so its destination cannot be checked | make the file readable and valid JSON so the check can see where it points |
+
+Each of those errors is written to carry its own remedy, so they read as policy
+rather than as a bug.
 
 ### Multi-project: one instance, many queues
 
