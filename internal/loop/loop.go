@@ -44,6 +44,36 @@ import (
 // legible from "the run stopped".
 var errZeroSpendLoop = errors.New("zero-spend attempt loop")
 
+// errUnclassifiedRetryLoop marks the other give-up no ceiling would have reached:
+// a ladder of retries taken on a failure the adapter could not NAME, only judge
+// by heuristic (harness.Adapter.IsUnclassifiedTransient).
+//
+// It is the sibling of errZeroSpendLoop and exists for the mirror-image reason.
+// That one bounds attempts that spend NOTHING, so the budget breaker never sees
+// them. This one bounds attempts that spend NORMALLY on a failure that will
+// happen again: a deterministic post-usage crash satisfies the heuristic every
+// time, and none of the ordinary dials stop it — max_retries and budget are off
+// by default, and max_zero_spend_attempts is reset by the very usage the
+// heuristic requires. Left unbounded it re-spawns a full paid session on the
+// same task at the backoff ceiling, all night (CLA-381).
+//
+// Also distinct because the operator's next move is distinct: this one means the
+// adapter has no pattern for what went wrong, so the fix is to read the
+// diagnostic in the error and — if it is a real blip — teach the adapter's
+// transient patterns about it.
+var errUnclassifiedRetryLoop = errors.New("unclassified retry loop")
+
+// unclassifiedRetryBound is how many retries one phase's ladder may take on
+// heuristically-judged failures before it gives up.
+//
+// Deliberately a constant and not a config dial. The dials an operator sets are
+// about how much they are willing to spend on failures the tool UNDERSTANDS;
+// this bounds guesses, and the honest number of guesses is small at any budget.
+// Two leaves room for a genuine one-off blip the patterns have not caught up
+// with — the case the heuristic exists for — while a deterministic failure costs
+// three paid sessions instead of a night's worth.
+const unclassifiedRetryBound = 2
+
 // Target is one backlog a Driver drives: a project's cheap poller plus where that
 // project's drain sessions run (CLA-142). A single-project Driver has exactly one,
 // unnamed target; a multi-project Driver has one per configured project.
@@ -758,6 +788,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 	// claim, so a silently dying attempt cannot produce one) starts a fresh count
 	// under drainPhases' own chain cap.
 	noUsage := 0
+	// Retries this ladder has taken on a failure the adapter judged retryable
+	// WITHOUT recognising it (harness.Adapter.IsUnclassifiedTransient) - see
+	// errUnclassifiedRetryLoop. Scoped per phase like noUsage, and for the same
+	// reason: the ladder is what has no other bound.
+	//
+	// Never reset. A classified retry in between does not make the next guess any
+	// better informed, and resetting would let a failure that alternates between a
+	// recognised blip and an unrecognised one loop forever - which is the exact
+	// shape of a provider degrading: real 5xx blips interleaved with stream drops
+	// nothing has a pattern for.
+	unclassified := 0
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
 		// just waited — a supervised wait on a usage limit, an exponential backoff
@@ -1090,6 +1131,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 				log.Printf("iteration %d: a resumed phase hit a transient failure (exit %d) — ending the sequence rather than retrying on a 30-minute lease nothing renews; the task returns as a takeover with its branch recorded",
 					drainNum, res.ExitCode)
 				return tokens, cost, true, end, nil
+			}
+			// A retry the adapter could not NAME is bounded on its own, because
+			// nothing else bounds it: the dials are off by default and the
+			// zero-spend counter is reset by the usage this heuristic requires. The
+			// diagnostic goes in the error because it is the whole remedy - the
+			// adapter has no pattern for this text, so an operator who can see it
+			// can say whether one should be added (CLA-381).
+			if a.IsUnclassifiedTransient(res) {
+				unclassified++
+				if unclassified > unclassifiedRetryBound {
+					return tokens, cost, false, end, fmt.Errorf(
+						"iteration %d: %w: %d retries on %s failures that matched no known-transient pattern - retried because the session had reported usage, but the same unrecognised failure keeps happening, so this is a real fault rather than a blip%s",
+						drainNum, errUnclassifiedRetryLoop, unclassified-1, a.Name(), failureDetail(a.Diagnostic(res)))
+				}
 			}
 			// As in the limit branch: the retry is a fresh session that re-claims,
 			// so nothing may stay held open across it.

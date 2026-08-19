@@ -302,6 +302,10 @@ func (codex) IsTransient(res Result) bool {
 	return codexTransientRe.MatchString(codexErrorText(res))
 }
 
+// Never a guess: pattern-driven throughout, so an unrecognised exit is a stop.
+// See claude's for the reasoning; opencode is the only adapter that guesses.
+func (codex) IsUnclassifiedTransient(Result) bool { return false }
+
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
 // attributed to one.
 func (codex) TurnCapped(Result) bool { return false }

@@ -949,6 +949,12 @@ func (claude) IsTransient(res Result) bool {
 	return claudeTransientRe.MatchString(claudeText(res, claudeDiagnostic))
 }
 
+// Never a guess: every retry this adapter asks for is a pattern match anchored on
+// the CLI's own "API Error:" prefix, so an unrecognised exit is a stop and the
+// operator's own dials are the whole bound. Nothing for the loop's separate
+// ceiling on heuristic retries to count.
+func (claude) IsUnclassifiedTransient(Result) bool { return false }
+
 // claudeMaxTurnsReason is what `claude -p --max-turns N` reports when the cap
 // fires, verified against claude 2.1.226:
 //

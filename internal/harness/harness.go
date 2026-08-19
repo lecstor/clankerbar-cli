@@ -39,6 +39,29 @@ type Adapter interface {
 	// log that merely mentions an HTTP 500 is not mistaken for a dead session.
 	IsTransient(Result) bool
 
+	// IsUnclassifiedTransient reports that IsTransient said yes on a HEURISTIC
+	// rather than on a recognised pattern — "this exit looks more like a blip than
+	// a stop" — so a caller can bound those retries separately. It must be false
+	// whenever IsTransient is false, and false for an adapter whose IsTransient is
+	// entirely pattern-driven.
+	//
+	// The distinction is a spending one, not a taxonomic one. A pattern match NAMES
+	// the failure, so retrying it is a bet on a blip this adapter has seen before,
+	// and the operator's retry dials are the right bound. A heuristic match names
+	// nothing, so a DETERMINISTIC failure that satisfies it re-spawns a paid
+	// session every time, forever — and every dial that would have stopped that is
+	// either off by default (max_retries, budget) or structurally unable to fire
+	// (CLA-381: opencode's heuristic requires reported usage, which is exactly what
+	// resets the zero-spend counter). A caller cannot bound what it cannot
+	// distinguish, and both used to arrive as a bare `true`.
+	//
+	// On the interface rather than an optional one a caller type-asserts for, and
+	// for the reason MCPConfigUse gives below: an assertion is not coupled to the
+	// registry. An adapter that grew a heuristic and did not report it would earn
+	// an unbounded paid retry ladder with no test failing, and any wrapper that
+	// embeds Adapter would silently drop the assertion besides.
+	IsUnclassifiedTransient(Result) bool
+
 	// TurnCapped reports whether the session ended because it hit
 	// Invocation.MaxTurns, rather than finishing or failing.
 	//
