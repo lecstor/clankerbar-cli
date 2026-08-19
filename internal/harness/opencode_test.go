@@ -136,10 +136,14 @@ func TestOpencodeDetectLimit(t *testing.T) {
 
 // IsTransient must scan only the harness-level diagnostic text (opencodeErrorText:
 // stderr + {"type":"error"} events), NOT the agent's own {"type":"text"} narration.
-// So real provider/transport errors — whether they arrive as an error event or on
-// stderr — trip it, but a session that merely *discusses* a rate limit before
-// exiting non-zero does not. Cases mark where the signal lives (stdout error event
-// vs. stderr) to match how opencode actually emits it.
+// So real provider/transport/stream errors — whether they arrive as an error event
+// or on stderr — trip it, but a session that merely *discusses* a rate limit before
+// exiting non-zero does not. Since CLA-381 there is ALSO a usage-gated fallback: an
+// unknown exit 1 AFTER reported usage is retryable, because a session that already
+// reported usage evidently authenticated and started doing paid work, while one
+// that reported nothing is the config/auth signature and stays a stop. Cases mark
+// where the signal lives (stdout error event vs. stderr) to match how opencode
+// actually emits it.
 func TestOpencodeIsTransient(t *testing.T) {
 	cases := []struct {
 		name string
@@ -152,6 +156,23 @@ func TestOpencodeIsTransient(t *testing.T) {
 		{"too many requests on stderr", Result{Stderr: "Error: 429 Too Many Requests"}, true},
 		{"connection blip on stderr", Result{Stderr: "fetch failed"}, true},
 		{"overloaded on stderr", Result{Stderr: "provider overloaded"}, true},
+		// CLA-381: a stream drop arrives as a bare, untyped error event
+		// ({"type":"error","error":{"type":"unknown","message":"Transport"}}). The
+		// `transport` arm catches it by pattern, so it is retryable even with no
+		// usage to lean on; both the event and stderr shapes are pinned.
+		{"transport stream drop (error event)", Result{ExitCode: 1, Stdout: `{"type":"error","error":{"type":"unknown","message":"Transport"}}`}, true},
+		{"transport blip on stderr", Result{ExitCode: 1, Stderr: "opencode: transport error: connection to provider lost"}, true},
+		{"stream closed on stderr", Result{ExitCode: 1, Stderr: "opencode: stream closed: provider ended the response early"}, true},
+		// CLA-381 fallback: an unknown exit 1 AFTER reported usage is retryable —
+		// the session evidently authenticated and started doing paid work, so an
+		// unrecognised failure is a version-shaped blip no pattern has seen, not a
+		// config/auth refusal (those fail before any usage is reported).
+		{"unknown exit-1 after reported usage leans retryable", Result{ExitCode: 1, UsageReported: true, Stderr: "opencode: some failure text no pattern recognises"}, true},
+		// The non-retryable side of the same coin: the same unknown exit 1 with NO
+		// usage is the config/auth signature (nothing reported means the session
+		// never got going), and a typed auth failure stays a stop.
+		{"unknown exit-1 with NO usage stays non-retryable", Result{ExitCode: 1, Stdout: `{"type":"error","error":{"type":"config","message":"bad token"}}`}, false},
+		{"auth failure is NOT transient", Result{ExitCode: 1, Stderr: "Error: authentication failed - invalid api key"}, false},
 		{"402 payment required is NOT transient", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":402,"isRetryable":false}}}`}, false},
 		{"budget exhaustion is NOT transient", Result{Stderr: "Your account is out of credits"}, false},
 		// Regression for finding #2: an assistant text part mentioning a rate limit

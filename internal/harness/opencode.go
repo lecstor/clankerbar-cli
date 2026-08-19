@@ -651,11 +651,18 @@ func buildOpencodeErrorText(res Result) string {
 
 // opencodeTransientRe: retryable server/network blips and API-level rate limits.
 // Honours opencode's own "isRetryable":true signal, plus HTTP 408/429/5xx and the
-// usual connection strings. The budget-exhaustion stop (DetectLimit) is checked
-// first by the loop and carries isRetryable:false, so it never reaches here.
+// usual connection strings. `transport` and the stream arms are the CLA-381 shape:
+// a stream drop arrives as a bare error event like {"type":"error",
+// "error":{"type":"unknown","message":"Transport"}} — a provider-side failure, not
+// a config/auth refusal, and retrying it under the existing backoff is exactly what
+// riding the blip out means. The scan is scoped to opencodeErrorText (stderr +
+// error events), so a bare word here never reads the agent's narration. The
+// budget-exhaustion stop (DetectLimit) is checked first by the loop and carries
+// isRetryable:false, so it never reaches here.
 var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d\d)` +
 	`|"isretryable": ?true` +
 	`|overloaded|too many requests|rate ?limit` +
+	`|transport|stream (error|failed|closed|reset|ended)` +
 	`|connection error|fetch failed|econnreset|econnrefused|etimedout|eai_again|socket hang up|network (error|timeout)`)
 
 // No turn cap: Invocation.MaxTurns never reaches the CLI, so no exit can be
@@ -720,7 +727,19 @@ func (opencode) IsTransient(res Result) bool {
 	// session that merely *discusses* a rate limit / connection error before exiting
 	// non-zero would be retried as transient instead of surfacing the real failure —
 	// the same reason DetectLimit scopes its scan this way.
-	return opencodeTransientRe.MatchString(opencodeErrorText(res))
+	if opencodeTransientRe.MatchString(opencodeErrorText(res)) {
+		return true
+	}
+	// CLA-381 fallback: an exit 1 whose cause no pattern has seen yet, on a session
+	// that REPORTED usage, is retryable. A usage event means the session
+	// authenticated and started doing paid work — so the failure came after the
+	// startup checks, and is more likely a version-shaped stream/transport blip
+	// than a config/auth/refusal error, which is exactly the kind that fails
+	// BEFORE any usage arrives. Retrying lands under the loop's existing
+	// backoff / max_retries / max_zero_spend_attempts machinery like any other
+	// transient. An exit 1 with no usage stays a stop: that silence is the
+	// config/auth signature.
+	return res.ExitCode == 1 && res.UsageReported
 }
 
 // Diagnostic returns the same scoped text IsTransient judged. See the claude
