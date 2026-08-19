@@ -274,11 +274,6 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 	"do NOT claim anything: call heartbeat(\"" + PhaseRunPlaceholder + "\") first to resume the run, then stay " +
 	"within this phase's scope. What follows is the previous session's own continuation prompt:\n\n"
 
-// handoffGuidance rides on every built-in phase brief (CLA-352): when a session
-// may hand the rest of its job to a fresh successor, and how. The trigger is
-// deliberately EVENT-shaped — a session cannot measure its own context (there
-// is no token counter in its view), so "hand off when you feel big" is not
-// implementable; a pivot is an event the session can recognise.
 // reviewTerminalStep is the review phase's LAST instruction, kept as a constant so
 // its position can be pinned by a test and not only its wording.
 //
@@ -296,6 +291,11 @@ const reviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: 
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
+// handoffGuidance rides on every built-in phase brief (CLA-352): when a session
+// may hand the rest of its job to a fresh successor, and how. The trigger is
+// deliberately EVENT-shaped — a session cannot measure its own context (there
+// is no token counter in its view), so "hand off when you feel big" is not
+// implementable; a pivot is an event the session can recognise.
 const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine pivot mid-session - " +
 	"exploration finished and implementation about to start, or one distinct sub-goal landed and the next " +
 	"beginning - you may hand the REST of this session's job to a fresh successor session that starts without " +
