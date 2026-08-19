@@ -44,6 +44,36 @@ import (
 // legible from "the run stopped".
 var errZeroSpendLoop = errors.New("zero-spend attempt loop")
 
+// errUnclassifiedRetryLoop marks the other give-up no ceiling would have reached:
+// a ladder of retries taken on a failure the adapter could not NAME, only judge
+// by heuristic (harness.Adapter.IsUnclassifiedTransient).
+//
+// It is the sibling of errZeroSpendLoop and exists for the mirror-image reason.
+// That one bounds attempts that spend NOTHING, so the budget breaker never sees
+// them. This one bounds attempts that spend NORMALLY on a failure that will
+// happen again: a deterministic post-usage crash satisfies the heuristic every
+// time, and none of the ordinary dials stop it — max_retries and budget are off
+// by default, and max_zero_spend_attempts is reset by the very usage the
+// heuristic requires. Left unbounded it re-spawns a full paid session on the
+// same task at the backoff ceiling, all night (CLA-381).
+//
+// Also distinct because the operator's next move is distinct: this one means the
+// adapter has no pattern for what went wrong, so the fix is to read the
+// diagnostic in the error and — if it is a real blip — teach the adapter's
+// transient patterns about it.
+var errUnclassifiedRetryLoop = errors.New("unclassified retry loop")
+
+// unclassifiedRetryBound is how many retries one phase's ladder may take on
+// heuristically-judged failures before it gives up.
+//
+// Deliberately a constant and not a config dial. The dials an operator sets are
+// about how much they are willing to spend on failures the tool UNDERSTANDS;
+// this bounds guesses, and the honest number of guesses is small at any budget.
+// Two leaves room for a genuine one-off blip the patterns have not caught up
+// with — the case the heuristic exists for — while a deterministic failure costs
+// three paid sessions instead of a night's worth.
+const unclassifiedRetryBound = 2
+
 // Target is one backlog a Driver drives: a project's cheap poller plus where that
 // project's drain sessions run (CLA-142). A single-project Driver has exactly one,
 // unnamed target; a multi-project Driver has one per configured project.
@@ -85,6 +115,17 @@ type Driver struct {
 	cursor  int    // round-robin position over targets (last drained)
 	state   *statedir.Dir
 	blind   bool // no cheap backlog read available — drain then idle-poll
+
+	// undeclared counts the sessions this run that ended still holding a task
+	// whose work they had already pushed — the phase did its job and then did not
+	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a
+	// takeover resumes. What is lost is the money, twice, because the next clanker
+	// pays to rediscover where the last one got to. Measured 2026-08-19 on v0.8.1,
+	// this was 3 of 4 review phases in one evening and $31.30 of that run's spend,
+	// and the only way to notice was diffing task statuses against the log by hand.
+	// So it is counted and the count is said out loud, per occurrence: a run that
+	// is silently repeating its own work should be visible without forensics.
+	undeclared int
 
 	// Per-target no-progress state. `claimable > 0` is a claim that work is
 	// available, not that it can be DONE: a task can be claimable and still
@@ -758,6 +799,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 	// claim, so a silently dying attempt cannot produce one) starts a fresh count
 	// under drainPhases' own chain cap.
 	noUsage := 0
+	// Retries this ladder has taken on a failure the adapter judged retryable
+	// WITHOUT recognising it (harness.Adapter.IsUnclassifiedTransient) - see
+	// errUnclassifiedRetryLoop. Scoped per phase like noUsage, and for the same
+	// reason: the ladder is what has no other bound.
+	//
+	// Never reset. A classified retry in between does not make the next guess any
+	// better informed, and resetting would let a failure that alternates between a
+	// recognised blip and an unrecognised one loop forever - which is the exact
+	// shape of a provider degrading: real 5xx blips interleaved with stream drops
+	// nothing has a pattern for.
+	unclassified := 0
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
 		// just waited — a supervised wait on a usage limit, an exponential backoff
@@ -894,7 +946,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// a zero Result from a failed launch releases nothing, and reporting it
 			// as released would erase a predecessor's claim that is still live.
 			end.released = res.Claim.Held()
-			d.releaseHeldClaim(ctx, t, res)
+			// last && a clean exit is the shape CLA-384 is about: the phase ran to
+			// completion, pushed, and simply did not declare. A non-zero exit reached
+			// the same place by crashing, which is a different failure with its own
+			// reporting, and an earlier phase reaching here did not have declaring as
+			// its job at all.
+			d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
 		}
 		// Then check what it said it delivered. After the handback, because a dead
 		// lease is time-sensitive and a git check is not; on every exit, because a
@@ -1091,6 +1148,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 					drainNum, res.ExitCode)
 				return tokens, cost, true, end, nil
 			}
+			// A retry the adapter could not NAME is bounded on its own, because
+			// nothing else bounds it: the dials are off by default and the
+			// zero-spend counter is reset by the usage this heuristic requires. The
+			// diagnostic goes in the error because it is the whole remedy - the
+			// adapter has no pattern for this text, so an operator who can see it
+			// can say whether one should be added (CLA-381).
+			if a.IsUnclassifiedTransient(res) {
+				unclassified++
+				if unclassified > unclassifiedRetryBound {
+					return tokens, cost, false, end, fmt.Errorf(
+						"iteration %d: %w: %d retries on %s failures that matched no known-transient pattern - retried because the session had reported usage, but the same unrecognised failure keeps happening, so this is a real fault rather than a blip%s",
+						drainNum, errUnclassifiedRetryLoop, unclassified-1, a.Name(), failureDetail(a.Diagnostic(res)))
+				}
+			}
 			// As in the limit branch: the retry is a fresh session that re-claims,
 			// so nothing may stay held open across it.
 			end = d.releaseCarriedEnd(ctx, t, end)
@@ -1286,7 +1357,7 @@ func (d *Driver) releaseCarried(ctx context.Context, t Target, carried *harness.
 	if carried == nil {
 		return nil
 	}
-	d.releaseHeldClaim(ctx, t, *carried)
+	d.releaseHeldClaim(ctx, t, *carried, false)
 	return nil
 }
 
@@ -1311,7 +1382,14 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 	return phaseEnd{released: held}
 }
 
-func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result) {
+// countUndeclared says whether THIS call site is the one where a held-with-work
+// claim means the CLA-384 failure: a phase that finished cleanly and did not hand
+// the task over. Only the seam's final-phase handback passes true. Every other
+// caller reaches the same branch for a reason that is not a failure to declare -
+// a budget trip between phases, a crash, a transient retry, a usage-limit wait, a
+// refused handoff - and counting those would make the number mean nothing, which
+// is the only thing it has going for it.
+func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) {
 	// A stream read only in part tells us which calls we SAW, never which the
 	// session made: the settle that released the task may simply be in the bytes
 	// that never arrived. Handing the task back on that reading posts `ready` over
@@ -1329,6 +1407,15 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		return
 	}
 	if !res.Claim.Releasable() {
+		// Leaving the lease alone is right — see Releasable. Whether it is also a
+		// FAILURE depends entirely on which call site got here; only that caller
+		// knows, so only that caller says so.
+		if countUndeclared {
+			d.undeclared++
+			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
+				labelOf(t), res.Claim.TaskID, d.undeclared)
+			return
+		}
 		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
 			labelOf(t), res.Claim.TaskID)
 		return

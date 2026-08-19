@@ -338,3 +338,63 @@ func TestRun_CarriesOnAfterAnUntrustedDrain(t *testing.T) {
 		t.Errorf("Invoke called %d times, want 2 — the run should reach its max-iterations, not stop on the untrusted drain", h.invokeCalls)
 	}
 }
+
+// A session that pushed its work and then ended still holding the task is the
+// signature of a phase that did its job and never declared it (CLA-384). Leaving
+// the lease to expire is right — Releasable explains why — but the driver is the
+// only thing that sees it happen, and before this it said so in a line that reads
+// like routine bookkeeping. Measured 2026-08-19: three of four review phases in
+// one evening ended this way, $31.30 of that run's spend, and the only way to
+// notice was diffing task statuses against the daemon log by hand.
+//
+// So the count is per RUN and cumulative: one occurrence is unremarkable, three in
+// an evening is a run silently repeating its own work.
+func TestReleaseHeldClaim_CountsUndeclaredHandoffs(t *testing.T) {
+	logs := captureLogs(t)
+	rel := &fakeReleaser{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: rel}})
+	tgt := d.targets[0]
+
+	pushed := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}}
+	d.releaseHeldClaim(context.Background(), tgt, pushed, true)
+	d.releaseHeldClaim(context.Background(), tgt, harness.Result{
+		Claim: harness.Claim{TaskID: "t-2", RunID: "r-2", HasWIP: true},
+	}, true)
+
+	if d.undeclared != 2 {
+		t.Errorf("undeclared = %d, want 2", d.undeclared)
+	}
+	out := logs.String()
+	for _, want := range []string{
+		"undeclared hand-offs this run: 1",
+		"undeclared hand-offs this run: 2",
+		"pays to rediscover it",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the tally was not reported (%q):\n%s", want, out)
+		}
+	}
+	if len(rel.calls) != 0 {
+		t.Errorf("released %+v — a claim with pushed work must keep its hand-off", rel.calls)
+	}
+}
+
+// The counter must not fire on the ordinary case it sits next to: a held claim
+// with NOTHING pushed is handed straight back, which is the driver working, not a
+// phase failing. Counting it would bury the signal in noise.
+func TestReleaseHeldClaim_DoesNotCountAPlainHandback(t *testing.T) {
+	captureLogs(t)
+	rel := &fakeReleaser{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: rel}})
+
+	d.releaseHeldClaim(context.Background(), d.targets[0], harness.Result{
+		Claim: harness.Claim{TaskID: "t-3", RunID: "r-3"},
+	}, true)
+
+	if d.undeclared != 0 {
+		t.Errorf("undeclared = %d on a releasable claim, want 0", d.undeclared)
+	}
+	if len(rel.calls) != 1 {
+		t.Errorf("a releasable claim was not handed back: %+v", rel.calls)
+	}
+}

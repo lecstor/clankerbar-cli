@@ -161,6 +161,13 @@ func (f *fakeAdapter) DetectLimit(r harness.Result) harness.Limit {
 
 func (f *fakeAdapter) IsTransient(r harness.Result) bool { return kindOf(r) == "transient" }
 
+// The fake never GUESSES. Its verdicts come from Raw["kind"], which is a scripted
+// pattern by another name, so its "transient" kind is a classified one and the
+// loop's separate bound on heuristic retries must not fire on it — that would
+// silently cap every retry test in this file at unclassifiedRetryBound. The tests
+// that do exercise the bound drive the real opencode classifiers instead.
+func (f *fakeAdapter) IsUnclassifiedTransient(harness.Result) bool { return false }
+
 // The fake tracks claims — the loop tests script Result.Claim directly — so it
 // stands in for a claim-observing adapter and `phases` is allowed on it.
 func (f *fakeAdapter) Capabilities() harness.Capabilities {
@@ -1257,6 +1264,134 @@ func TestDrainWithRetries_BacklogTextCannotFakeALimit(t *testing.T) {
 	}
 	if h.probeCalls != 0 {
 		t.Errorf("the driver entered a supervised wait on faked backlog text; got %d probes", h.probeCalls)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// A retry taken on a GUESS has to be bounded by something (CLA-381).
+//
+// The opencode adapter calls an exit 1 retryable when the session had reported
+// usage, even where no pattern recognises the failure - which is what covers a
+// stream drop from an opencode version whose error shape the adapter has not
+// caught up with. Nothing among the operator's dials bounds that: max_retries and
+// budget are off by default, and max_zero_spend_attempts is reset by the very
+// usage the heuristic requires. So a DETERMINISTIC post-usage crash - a task that
+// reliably kills the session five minutes in - would re-spawn a full paid session
+// at the backoff ceiling all night. These drive the REAL opencode classifiers,
+// because the property under test is the pairing of the adapter's answer with the
+// loop's counter, and a fake returning a scripted bool would pin neither half.
+
+func opencodeAdapterForTest(t *testing.T) harness.Adapter {
+	t.Helper()
+	a, err := harness.Get("opencode")
+	if err != nil {
+		t.Fatalf("harness.Get(opencode): %v", err)
+	}
+	return a
+}
+
+// unrecognisedFailure is an exit 1 with real spend behind it and a diagnostic no
+// pattern matches - the heuristic's own case, and the one that must be bounded.
+func unrecognisedFailure() harness.Result {
+	return harness.Result{
+		ExitCode:      1,
+		UsageReported: true,
+		Tokens:        1000,
+		CostUSD:       0.25,
+		Stderr:        "opencode: FatalError: the session died in a way no pattern here recognises",
+	}
+}
+
+func TestDrainWithRetries_UnclassifiedRetriesAreBounded(t *testing.T) {
+	// More failures scripted than the bound allows, all identical: the shape of a
+	// deterministic fault, not a blip.
+	steps := make([]invokeStep, 0, 8)
+	for i := 0; i < 8; i++ {
+		steps = append(steps, invokeStep{res: unrecognisedFailure()})
+	}
+	h := &realClassifierAdapter{Adapter: opencodeAdapterForTest(t), steps: steps}
+	d := New(fastCfg(), h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainOnce(t, d)
+
+	if !errors.Is(err, errUnclassifiedRetryLoop) {
+		t.Fatalf("drain ended with stop=%v err=%v, want an error wrapping errUnclassifiedRetryLoop - an operator has to be able to tell a guess that kept failing from a budget or wall-clock stop", stop, err)
+	}
+	// The whole point is that it STOPS: one first attempt plus the bounded retries.
+	if want := unclassifiedRetryBound + 1; h.invokeCalls != want {
+		t.Errorf("the driver spawned %d paid sessions on an unrecognised failure, want %d", h.invokeCalls, want)
+	}
+	// The remedy is in the message or it is nowhere: nothing in the adapter knows
+	// this text, so the operator reading the error is the only route to a pattern
+	// for it.
+	if !strings.Contains(err.Error(), "FatalError: the session died") {
+		t.Errorf("the give-up must quote the diagnostic it could not classify; got: %v", err)
+	}
+}
+
+// The counter must not touch retries the adapter actually RECOGNISED. A provider
+// flapping 503s is what max_retries and the budget are for, and capping it at the
+// guess bound would turn a working retry ladder into a stop after two blips.
+func TestDrainWithRetries_ClassifiedTransientsAreNotBoundedByTheGuessCap(t *testing.T) {
+	const blips = unclassifiedRetryBound + 3
+	steps := make([]invokeStep, 0, blips+1)
+	for i := 0; i < blips; i++ {
+		steps = append(steps, invokeStep{res: harness.Result{
+			ExitCode:      1,
+			UsageReported: true,
+			Stdout:        `{"type":"error","error":{"data":{"statusCode":503}}}`,
+		}})
+	}
+	steps = append(steps, invokeStep{res: okResult(10, 0.01)})
+
+	h := &realClassifierAdapter{Adapter: opencodeAdapterForTest(t), steps: steps}
+	d := New(fastCfg(), h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainOnce(t, d)
+
+	if err != nil || stop {
+		t.Fatalf("recognised blips must ride out under the operator's own dials: stop=%v err=%v", stop, err)
+	}
+	if want := blips + 1; h.invokeCalls != want {
+		t.Errorf("driver made %d attempts, want %d - the guess bound leaked onto pattern-matched retries", h.invokeCalls, want)
+	}
+}
+
+// An exhausted account stops at the FIRST attempt - the outcome that matters, and
+// the one the guessed-retry heuristic could most expensively have broken, since a
+// 402 typically lands after the session has already done paid work.
+//
+// What this does NOT pin is the loop's DetectLimit-before-IsTransient ordering,
+// and the distinction is worth stating because the obvious reading is the other
+// one: the test passes under a swapped order too. That is by construction rather
+// than by luck - IsTransient checks opencodeBudgetRe itself, so both classifiers
+// agree about an exhausted account and neither order can produce a retry. The
+// belt is what makes the braces untestable here; a test that pinned the ordering
+// would have to drive an adapter without the guard, which is not an adapter that
+// exists.
+func TestDrainWithRetries_BudgetExhaustionAfterUsageStopsRatherThanRetrying(t *testing.T) {
+	h := &realClassifierAdapter{Adapter: opencodeAdapterForTest(t), steps: []invokeStep{
+		{res: harness.Result{
+			ExitCode:      1,
+			UsageReported: true,
+			Tokens:        5000,
+			CostUSD:       1.5,
+			Stderr:        "opencode: Your account is out of credits",
+		}},
+		{res: okResult(0, 0)}, // a re-spawn would land here - it must not happen
+	}}
+	d := New(fastCfg(), h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainOnce(t, d)
+
+	if err != nil || !stop {
+		t.Fatalf("an exhausted account must stop the run cleanly: stop=%v err=%v", stop, err)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("the driver re-spawned %d paid sessions against an account with no credit", h.invokeCalls-1)
 	}
 }
 
