@@ -393,6 +393,7 @@ it composes with `&&` as above.
 PASS  config       loaded ./clankerbar.json
                    harness: claude
                    workdir: /Users/you/dev
+                   api key origin: https://clankerbar.com
                    backlog: https://clankerbar.com/api/projects/acme/backlog-summary
 PASS  harness      /usr/local/bin/claude (2.1.0)
 WARN  config_dir   not set — the session inherits the ambient environment
@@ -410,7 +411,7 @@ PASS  budget       no ceiling configured — the loop stops on a STOP/HALT marke
 ```
 
 The checks: **config** (discovered, parses, validates — plus the resolved harness,
-workdir and derived backlog URLs), **harness** (binary on PATH and runnable, with
+workdir, api key origin and derived backlog URLs), **harness** (binary on PATH and runnable, with
 its version), **config_dir** (resolves, exists, looks initialised for the chosen
 harness), **backlog** (creds present and the summary read succeeds — distinguishing
 no creds, a rejected key, a `project_required` key/route mismatch, and an
@@ -801,8 +802,8 @@ cannot read, which it refuses rather than drains.
 project you belong to, not just the one being drained. So *where* it may be sent is
 pinned, not inferred, and the pin is your own `backlog_url`:
 
-- **`backlog_url` is the one trusted origin.** It is the only host the driver ever
-  sends the key to. It defaults to `https://clankerbar.com`; to point at a
+- **`backlog_url` is the one trusted origin.** It is the only origin the driver
+  ever sends the key to. It defaults to `https://clankerbar.com`; to point at a
   self-hosted plane, name it there instead (e.g. `"backlog_url":
   "https://plane.example.com"`). It is **no longer derived from `.mcp.json`** — a
   checkout's `.mcp.json` contributes at most a project slug, and never redirects
@@ -815,13 +816,18 @@ MCP config is handed to the harness whole, and the harness's session carries the
 key in its environment, so a checkout's `.mcp.json` could name any host it liked;
 that is the exfil it refuses rather than silently polls.
 
-`clankerbar run` logs where the key will go, once, at startup:
+`clankerbar run` logs where the key will go, once, at startup (with the usual
+`clankerbar: <time>` log prefix in front of it):
 
-    sending the API key to https://clankerbar.com
+```
+clankerbar: 12:54:24 sending the API key to https://clankerbar.com
+```
 
 and `clankerbar doctor` prints the same origin as a preflight line:
 
-    api key origin: https://clankerbar.com
+```
+api key origin: https://clankerbar.com
+```
 
 That line is the thing to check in an overnight log: if it names a host you did
 not choose, stop the run before it drains anything.
@@ -833,10 +839,10 @@ clankerbar tools and read as "the backlog was empty":
 
 | Refusal | When | Remedy |
 | --- | --- | --- |
-| **Foreign origin** | an MCP server that carries the key points at a host other than `backlog_url` | set `backlog_url` to that origin if you mean it, or fix the file — a checkout's `.mcp.json` is not trusted to redirect an account-scoped key |
+| **Foreign origin** | an MCP server that carries the key points at an origin other than `backlog_url` | set `backlog_url` to that origin if you mean it, or fix the file — a checkout's `.mcp.json` is not trusted to redirect an account-scoped key |
 | **Cleartext non-loopback** | `backlog_url` (or a server URL) is plain `http` to a host that is not loopback | use `https` — the key would cross the wire in cleartext |
-| **Local server handed the key** | a server entry that carries the key (`clankerbar`, or any entry whose headers/env reference the variable) is a local command with no URL | give the key only to an `http` server on `backlog_url` — a spawned process may send it anywhere |
-| **Unparseable MCP config** | the MCP config at `mcp_config_path` cannot be read or parsed, so its destination cannot be checked | make the file readable and valid JSON so the check can see where it points |
+| **Local server handed the key** | a server entry that carries the key (`clankerbar`, or any entry whose headers/env reference the variable) declares no `url` — a local/stdio server | give the key only to a URL-based (HTTP) server on `backlog_url` — a spawned process may send it anywhere |
+| **Unparseable MCP config** | an MCP config that exists (at `mcp_config_path`, or a per-harness/per-project equivalent) cannot be read or parsed, so its destination cannot be checked | make the file readable and valid JSON so the check can see where it points |
 
 Each of those errors is written to carry its own remedy, so they read as policy
 rather than as a bug.
