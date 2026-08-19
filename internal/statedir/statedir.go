@@ -215,8 +215,15 @@ func anchorFor(abs string, sessionRoots []string) (anchor, rel string, err error
 	return anchor, rel, nil
 }
 
-// enclosingSessionRoot is the SHORTEST session root that strictly contains abs,
-// or "" if none does.
+// enclosingSessionRoot is the SHORTEST session root that contains abs — at or
+// under it — or "" if none does.
+//
+// "At" is the case that used to be missed: a state dir that IS a session
+// workdir. `HasPrefix(abs, cand+"/")` is false when abs == cand, so the most
+// extreme version of the layout this machinery exists to distrust slipped
+// through to the trusting branch. Enclosed means at or under, and the caller
+// (anchorFor) refuses the equality case on its own account — there is no
+// directory below the anchor to create the state dir in.
 //
 // Shortest, not longest, and that choice is the security property. The anchor is
 // the point below which every component gets checked, so the SHALLOWEST
@@ -232,7 +239,10 @@ func anchorFor(abs string, sessionRoots []string) (anchor, rel string, err error
 // inspected; anchored at `/w/repo` it is an intermediate component makeChain
 // refuses. Same reason Lstat and not Stat below: Stat follows the link and
 // reports a perfectly good directory, which is precisely the answer that hides
-// the swap.
+// the swap. The equality case participates in the same tie-break: a state dir
+// equal to the inner root is enclosed by both roots, and the shallowest still
+// wins, so the inner root's path stays a checked component rather than the
+// anchor.
 //
 // A root is matched both as given and as EvalSymlinks resolves it, because
 // `state_dir` and `workdir` may name the same tree by different routes (macOS
@@ -250,7 +260,13 @@ func enclosingSessionRoot(abs string, roots []string) string {
 		}
 		for _, cand := range candidates {
 			cand, err := filepath.Abs(cand)
-			if err != nil || !strings.HasPrefix(abs, cand+string(filepath.Separator)) {
+			if err != nil {
+				continue
+			}
+			rel, err := filepath.Rel(cand, abs)
+			// Enclosed is rel "." (abs IS the root) or a proper subpath; a
+			// sibling sharing a prefix is "../workdir-2", which escapes.
+			if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 				continue
 			}
 			if best != "" && len(cand) >= len(best) {
