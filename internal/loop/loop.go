@@ -116,6 +116,17 @@ type Driver struct {
 	state   *statedir.Dir
 	blind   bool // no cheap backlog read available — drain then idle-poll
 
+	// undeclared counts the sessions this run that ended still holding a task
+	// whose work they had already pushed — the phase did its job and then did not
+	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a
+	// takeover resumes. What is lost is the money, twice, because the next clanker
+	// pays to rediscover where the last one got to. Measured 2026-08-19 on v0.8.1,
+	// this was 3 of 4 review phases in one evening and $31.30 of that run's spend,
+	// and the only way to notice was diffing task statuses against the log by hand.
+	// So it is counted and the count is said out loud, per occurrence: a run that
+	// is silently repeating its own work should be visible without forensics.
+	undeclared int
+
 	// Per-target no-progress state. `claimable > 0` is a claim that work is
 	// available, not that it can be DONE: a task can be claimable and still
 	// unworkable — gated on an unanswered question, needing a toolchain the
@@ -1384,8 +1395,12 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		return
 	}
 	if !res.Claim.Releasable() {
-		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
-			labelOf(t), res.Claim.TaskID)
+		// Leaving the lease alone is right — see Releasable — but this is also the
+		// signature of a phase that finished its work and never declared it, so say
+		// how often it has happened rather than letting it read as routine.
+		d.undeclared++
+		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the work is pushed but the task was never moved on, so the next clanker pays to rediscover it)",
+			labelOf(t), res.Claim.TaskID, d.undeclared)
 		return
 	}
 	if t.Releaser == nil {

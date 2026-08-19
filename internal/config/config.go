@@ -312,8 +312,13 @@ var builtinPhasePrompts = map[string]string{
 		"re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you fixed, by name, and " +
 		"point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
 		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception " +
-		"you state a reason for (a fix that had to reach outside its own area), never the default. Then push, " +
-		"and hand the task to in_review." + handoffGuidance,
+		"you state a reason for (a fix that had to reach outside its own area), never the default. Then COMMIT " +
+		"and PUSH the fixes. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
+		"update_task(taskId, runId, status: \"in_review\", outcome: ...), where the outcome MUST carry a " +
+		"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
+		"session that leaves it out has not handed anything over. Ending this session while you still hold the " +
+		"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
+		"second time by whoever takes it over. The ONLY exception is a declared handoff." + handoffGuidance,
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
