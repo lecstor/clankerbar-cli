@@ -150,6 +150,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
+		res.ExitSignal = exitSignal(ee)
 	} else if runErr != nil && !timedOut {
 		return res, runErr // couldn't launch opencode at all
 	} else if runErr != nil {
@@ -437,7 +438,13 @@ type opencodeTokens struct {
 // Because it sums, it has to see EVERY step — which is exactly why it runs on the
 // live stream instead of over the retained tail (see Invoke).
 type opencodeParse struct {
-	lastText                              string
+	lastText string
+	// lastReason is the reason of the MOST RECENT step_finish — the session's
+	// final step, once the stream ends. opencode writes "stop" when the session
+	// produced a final answer and "unknown" when it died without one (the
+	// CLA-386 dead-phase marker); the driver reads it off Result.Raw via
+	// FinishReasonKey.
+	lastReason                            string
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
@@ -492,6 +499,12 @@ func (p *opencodeParse) line(line []byte) {
 			p.lastText = t
 		}
 	case "step_finish":
+		// The reason rides on the same part as the usage. The LAST one wins: it
+		// is the step the session's stream ended on, which is the step that says
+		// whether a final answer was produced.
+		if ev.Part.Reason != "" {
+			p.lastReason = ev.Part.Reason
+		}
 		// tokens and cost are siblings on the part; count each independently so
 		// a step that reports one without the other still lands in the budget.
 		if tk := ev.Part.Tokens; tk != nil {
@@ -624,6 +637,15 @@ func (p *opencodeParse) finish(res *Result) {
 			"input_tokens": p.in, "output_tokens": p.out, "reasoning_tokens": p.reason,
 			"cache_write_tokens": p.cWrite, "cache_read_tokens": p.cRead,
 		}
+	}
+	// The finish reason is recorded even when the step carried no usage: a dead
+	// session's final step can report zero tokens, and that reason is exactly the
+	// CLA-386 signal the driver needs to refuse to hand the phase on.
+	if p.lastReason != "" {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[FinishReasonKey] = p.lastReason
 	}
 }
 

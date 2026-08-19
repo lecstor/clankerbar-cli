@@ -132,6 +132,7 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	res.scans = newScanCache()
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
+		res.ExitSignal = exitSignal(ee)
 	} else if waitErr != nil && !c.TokenCeilingHit(res) {
 		return res, waitErr // couldn't run claude at all
 	} else if waitErr != nil {

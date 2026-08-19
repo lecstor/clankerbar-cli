@@ -849,3 +849,135 @@ func TestUndeclared_CountsOnlyACleanFinalPhaseThatDidNotDeclare(t *testing.T) {
 		}
 	})
 }
+
+// --- the dead-phase signature (CLA-386) ------------------------------------
+
+// deadResult is a CLA-386 dead-phase result: the session's final step finished
+// with reason "unknown" — opencode's marker for a session that died without a
+// final answer — and (via the caller's claim) no branch recorded. Together they
+// mean the phase produced nothing.
+func deadResult() harness.Result {
+	return harness.Result{ExitCode: 0, Raw: map[string]any{harness.FinishReasonKey: harness.FinishReasonUnknown}}
+}
+
+// The seam must not advance to review on a dead phase: it would hand the review
+// brief a task with no branch on it and a false premise ("an earlier session has
+// already implemented, committed and pushed"). The dead phase is retried once;
+// only a retry that reaches a healthy checkpoint lets the sequence advance.
+func TestDrainPhases_ADeadPhaseIsRetriedNotAdvancedToReview(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		// Phase 1 dies producing nothing (no branch). Under the bug this was a
+		// checkpoint — exit 0, claim still held — so the review phase ran next on
+		// a task with nothing pushed.
+		{res: held(deadResult(), openClaim())},
+		// The retry is phase 1 again: a healthy checkpoint.
+		{res: checkpointed(1, 0)},
+		// And only now does the review phase run.
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (dead phase, its one retry, then review) — a dead phase must be retried before the review brief is ever spawned",
+			h.invokeCalls)
+	}
+	// The retry is the SAME phase's job, and the review brief only ever sees a
+	// task that a healthy phase handed over.
+	if !strings.Contains(h.invocations[1].Prompt, "PHASE 1") {
+		t.Errorf("the retry was not a phase-1 session: %q", h.invocations[1].Prompt)
+	}
+	if !strings.Contains(h.invocations[2].Prompt, "PHASE 2") {
+		t.Errorf("the review phase did not run after the healthy retry: %q", h.invocations[2].Prompt)
+	}
+}
+
+// The second conjunct of the signature is load-bearing: a phase that pushed work
+// and THEN died on an unknown reason has produced something, so it keeps its
+// checkpoint and the seam advances exactly as a healthy phase's does.
+func TestDrainPhases_DeadWithABranchRecordedStillAdvances(t *testing.T) {
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), wip)},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions, want 2 — an unknown finish reason with a branch recorded is still a checkpoint, so the review phase runs", h.invokeCalls)
+	}
+}
+
+// A session that completed its final answer ("stop") is untouched: whatever the
+// seam did before this feature is what it keeps doing.
+func TestDrainPhases_AStopReasonIsUntouched(t *testing.T) {
+	ok := okResult(1, 0)
+	ok.Raw[harness.FinishReasonKey] = "stop"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(ok, openClaim())},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions, want 2 — a reason: stop session is an ordinary checkpoint", h.invokeCalls)
+	}
+}
+
+// A task that can kill two full implement phases reaches the operator rather
+// than a third session — parked, with a decision naming the signature. The retry
+// budget is per task: this drain used its one retry, so the second dead phase
+// parks instead of retrying again.
+func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v — a parked task is the phase ending, not the run failing", err)
+	}
+	if stop {
+		t.Error("a parked task stopped the whole run; the daemon should carry on with the next task")
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions, want 2 (dead phase + its one retry) — the second dead phase must park, not retry a second time", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 {
+		t.Fatalf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
+	}
+	got := rel.parks[0]
+	if got.taskID != "t-1" || got.runID != "r-1" {
+		t.Errorf("parked %s/%s, want t-1/r-1", got.taskID, got.runID)
+	}
+	// The decision names the signature that triggered it, so the park is legible
+	// rather than a bare failure.
+	if !strings.Contains(got.decisionContext, harness.FinishReasonUnknown) || !strings.Contains(got.decisionContext, "no branch recorded") {
+		t.Errorf("the recorded decision does not name the signature: %q", got.decisionContext)
+	}
+	if !strings.Contains(got.outcome, "retry") {
+		t.Errorf("the park outcome does not reference the operator's retry-once-then-park ruling: %q", got.outcome)
+	}
+	if out := logs.String(); !strings.Contains(out, "died producing nothing a second time") {
+		t.Errorf("the operator's log does not say why the task was parked:\n%s", out)
+	}
+}
