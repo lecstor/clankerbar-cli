@@ -390,9 +390,10 @@ under anything that isn't a PASS, and **exits non-zero if any check FAILs** — 
 it composes with `&&` as above.
 
 ```
-PASS  config       loaded ./clankerbar.json
+PASS  config       loaded /Users/you/.config/clankerbar/config.json
                    harness: claude
                    workdir: /Users/you/dev
+                   api key origin: https://clankerbar.com
                    backlog: https://clankerbar.com/api/projects/acme/backlog-summary
 PASS  harness      /usr/local/bin/claude (2.1.0)
 WARN  config_dir   not set — the session inherits the ambient environment
@@ -410,8 +411,8 @@ PASS  budget       no ceiling configured — the loop stops on a STOP/HALT marke
 ```
 
 The checks: **config** (discovered, parses, validates — plus the resolved harness,
-workdir and derived backlog URLs), **harness** (binary on PATH and runnable, with
-its version), **config_dir** (resolves, exists, looks initialised for the chosen
+workdir, api key origin and derived backlog URLs), **harness** (binary on PATH
+and runnable, with its version), **config_dir** (resolves, exists, looks initialised for the chosen
 harness), **backlog** (creds present and the summary read succeeds — distinguishing
 no creds, a rejected key, a `project_required` key/route mismatch, and an
 unreachable endpoint — plus whether the queue is gated on *your* open questions,
@@ -701,13 +702,17 @@ environment would otherwise have none of them.
 
 ## Config
 
-Flags override the config file, which overrides defaults. Default file locations:
-`./clankerbar.json`, then `~/.config/clankerbar/config.json`. (JSON today; TOML is
-the likely final format.)
+Flags override the config file, which overrides defaults. Exactly one file is
+discovered on its own: `~/.config/clankerbar/config.json`. Any other file has to
+be named - `clankerbar run -c ./clankerbar.json` - and an unnamed
+`clankerbar.json` sitting in the directory you launch from is **refused, not
+read**; [where the key may go](#where-the-account-scoped-key-is-allowed-to-go)
+says why. (JSON today; TOML is the likely final format.)
 
 ```json
 {
   "harness": "claude",
+  "backlog_url": "https://clankerbar.com",
   "model": "opus",
   "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
   "prompt": "Work the next backlog item.",
@@ -793,6 +798,67 @@ Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at t
 root here is the maintainers' own agent wiring and names the `clankerbar` project
 slug; running the loop from inside this checkout would have it poll a queue you
 cannot read, which it refuses rather than drains.
+
+### Where the account-scoped key is allowed to go
+
+`CLANKERBAR_API_KEY` is an **account-scoped bearer token** — one key covers every
+project you belong to, not just the one being drained. So *where* it may be sent is
+pinned, not inferred, and the pin is your own `backlog_url`:
+
+- **`backlog_url` is the one trusted origin.** It is the only origin the driver
+  ever sends the key to. It defaults to `https://clankerbar.com`; to point at a
+  self-hosted plane, name it there instead (e.g. `"backlog_url":
+  "https://plane.example.com"`). It is **no longer derived from `.mcp.json`** — a
+  checkout's `.mcp.json` contributes at most a project slug, and never redirects
+  the key.
+- **Set it in a config file the sessions cannot rewrite.** `backlog_url` is read
+  from `~/.config/clankerbar/config.json` - the one file discovered
+  automatically - or from a file you name with `--config`. A `clankerbar.json`
+  sitting unnamed in the directory you launch from is **refused, not read**, and
+  the loop stops rather than falling back to your home config: that directory is,
+  by default, the checkout the spawned sessions edit, so a session could rewrite
+  the field that decides where tomorrow's key goes. Naming it
+  (`-c ./clankerbar.json`) does lift the refusal - but it lifts only the
+  *implicit adoption* and guards the file no further, so keep `backlog_url`
+  itself in `~/.config/clankerbar/config.json`.
+- The scheme floor is TLS: `https` anywhere, or `http` only to loopback (a plane
+  under local development).
+
+Fixating on the origin is what makes the file-for-credential leak closeable. The
+MCP config is handed to the harness whole, and the harness's session carries the
+key in its environment, so a checkout's `.mcp.json` could name any host it liked;
+that is the exfil it refuses rather than silently polls.
+
+`clankerbar run` logs where the key will go, once, at startup (with the usual
+`clankerbar: <time>` log prefix in front of it):
+
+```
+clankerbar: 12:54:24 sending the API key to https://clankerbar.com
+```
+
+and `clankerbar doctor` prints the same origin as a preflight line:
+
+```
+api key origin: https://clankerbar.com
+```
+
+That line is the thing to check in an overnight log: if it names an origin you
+did not choose, stop the run before it drains anything.
+
+**Refusals, each with its remedy.** A config or MCP file that would move the
+account key off that origin is refused at startup and flagged by `doctor` — never
+silently dropped, because dropping the file would spawn a session with no
+clankerbar tools and read as "the backlog was empty":
+
+| Refusal | When | Remedy |
+| --- | --- | --- |
+| **Foreign origin** | an MCP server that carries the key points at an origin other than `backlog_url` | set `backlog_url` to that origin if you mean it, or fix the file — a checkout's `.mcp.json` is not trusted to redirect an account-scoped key |
+| **Cleartext non-loopback** | `backlog_url` (or a server URL) is plain `http` to a host that is not loopback | use `https` — the key would cross the wire in cleartext |
+| **Local server handed the key** | a server entry that carries the key (`clankerbar`, or any entry whose headers/env reference the variable) declares no `url` — a local/stdio server | give the key only to a URL-based (HTTP) server on `backlog_url` — a spawned process may send it anywhere |
+| **Unparseable MCP config** | an MCP config that exists (at `mcp_config_path`, or a per-harness/per-project equivalent) cannot be read or parsed, so its destination cannot be checked | make the file readable and valid JSON so the check can see where it points |
+
+Each of those errors is written to carry its own remedy, so they read as policy
+rather than as a bug.
 
 ### Multi-project: one instance, many queues
 
@@ -1009,14 +1075,28 @@ allowed tool-level (its permission patterns match parsed commands, not paths).
 Everything else — reads or edits outside the workdir, `glob`/`grep`/`lsp`/`task`/`skill`,
 and the network tools (`webfetch`, `websearch`) in every shape — is denied by
 a `*` catch-all rather than asked, and denied tools are hidden from the
-session's catalog entirely. Two exceptions keep the session alive inside that
+session's catalog entirely. Three exceptions keep the session alive inside that
 catch-all: `*_*` allows the MCP tools (tool names are `<server>_<tool>` in
 opencode — `clankerbar_get_backlog_summary`, `context7_query-docs`,
-`chrome-devtools_click` — and the plane itself is reached over MCP), and a
-probe/read-only run additionally denies `edit` and `bash` for zero writes. The
-policy is pinned by unit tests in `opencode_test.go`, including the JSON key
-order the catch-all depends on and a replica of opencode's rule evaluator over
-a table of effective decisions.
+`chrome-devtools_click` — and the plane itself is reached over MCP); `read`
+also allows `mcp:*`, because opencode's MCP **resource** tools
+(`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`) do
+*not* ask under their own names — they ask under `read`, with
+`mcp:<server>:<uri>` patterns that the path-scoped `read` rules never matched,
+so the catch-all denied every one of them and a session could call the plane's
+tools while being unable to read the protocol served over the same connection;
+and a probe/read-only run additionally denies `edit` and `bash` for zero
+writes. The policy is pinned by unit tests in `opencode_test.go`, including
+the JSON key order the catch-all depends on and a replica of opencode's rule
+evaluator over a table of effective decisions.
+
+**Verifying the policy against a live session.** The unit tests replicate
+opencode's evaluator; to watch the real one decide, run a session with the
+policy in `OPENCODE_PERMISSION` and read the `evaluated permission=... pattern=...
+action.action=...` lines in `~/.local/share/opencode/log/opencode.log` — one
+line per ask, naming the rule that won. That log is the cheapest live proof
+available, because it records the decision whether or not the session goes on
+to produce any output.
 
 **The workdir should be a multi-repo parent, not a git checkout.** The
 read/edit rules are emitted to match the patterns opencode asks for a session
