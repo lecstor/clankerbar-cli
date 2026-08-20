@@ -939,6 +939,12 @@ tool understands, and the honest number of guesses is small at any budget. If yo
 hit it, the error text is the thing to report — it is a failure shape the adapter
 should learn a pattern for.
 
+**The quiet-death signature.** A session that dies with a final `step_finish`
+reason of `unknown` and all-zero usage on its own last step is the opencode-go
+quiet-death signature — see
+[`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) for
+the incident behind it and what the CLI does about a recurrence.
+
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in
 the same bytes. So both classifications read only what the *harness* said: its
@@ -1141,6 +1147,7 @@ parent is the correct setting.
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
+- [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence. Troubleshooting for a session that dies with `reason: "unknown"` and zero usage.
 
 ## License
 

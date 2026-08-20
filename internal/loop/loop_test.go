@@ -79,6 +79,19 @@ func wallClockResult() harness.Result {
 	return harness.Result{ExitCode: -1, Tokens: 120_000, CostUSD: 1.25, Raw: map[string]any{"kind": "wallClock"}}
 }
 
+// zeroUsageResult is a CLA-398 quiet-death session: exit 0 (the shape a dead
+// session wears), a final step_finish carrying reason "unknown" and all-zero
+// usage, so nothing was produced and no error event was ever emitted. The
+// adapter's own terminal_reason marker rides on the same Raw the finish reason
+// does, exactly as the real opencode parser writes it.
+func zeroUsageResult() harness.Result {
+	return harness.Result{ExitCode: 0, Raw: map[string]any{
+		"kind":                    "zeroUsage",
+		harness.FinishReasonKey:   harness.FinishReasonUnknown,
+		harness.TerminalReasonKey: harness.ZeroUsageReason,
+	}}
+}
+
 func limitStopResult() harness.Result {
 	return harness.Result{ExitCode: 1, Raw: map[string]any{"kind": "limitStop"}}
 }
@@ -184,6 +197,8 @@ func (f *fakeAdapter) TurnCapped(r harness.Result) bool { return kindOf(r) == "t
 func (f *fakeAdapter) TokenCeilingHit(r harness.Result) bool { return kindOf(r) == "tokenCeiling" }
 
 func (f *fakeAdapter) WallClockCapped(r harness.Result) bool { return kindOf(r) == "wallClock" }
+
+func (f *fakeAdapter) ZeroUsageUnknown(r harness.Result) bool { return kindOf(r) == "zeroUsage" }
 
 // Diagnostic stands in for a real adapter's scoped text. Stderr is where every
 // adapter's scope starts, so returning it keeps the fake honest about what the
@@ -1922,10 +1937,20 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 }
 
 // parkCall is one driver-side park: the task it moved, the run signing it, and
-// the outcome/decision prose the driver sent — so a test can assert the park was
-// legible, not just that it happened.
+// the outcome prose the driver sent — so a test can assert the park was legible,
+// not just that it happened. It carries NO decision: since CLA-395 the park's
+// record is the outcome plus the OPEN question, never a record_decision.
 type parkCall struct {
-	taskID, runID, outcome, decisionContext, decisionRuling string
+	taskID, runID, outcome string
+}
+
+// questionCall is the OPEN question filed alongside a park: what the driver
+// asked, and the exact shape (blocking, kind) that makes it reach the operator.
+type questionCall struct {
+	taskID, body string
+	options      []string
+	blocking     bool
+	kind         string
 }
 
 // parkingReleaser is a Releaser that can also park — the shape the real
@@ -1933,12 +1958,22 @@ type parkCall struct {
 // failure the dead session cannot.
 type parkingReleaser struct {
 	fakeReleaser
-	parks []parkCall
-	err   error
+	parks       []parkCall
+	questions   []questionCall
+	err         error // returned by Park
+	questionErr error // returned by AskQuestion; overrides err for the question
 }
 
-func (p *parkingReleaser) Park(_ context.Context, taskID, runID, outcome, decisionContext, decisionRuling string) error {
-	p.parks = append(p.parks, parkCall{taskID, runID, outcome, decisionContext, decisionRuling})
+func (p *parkingReleaser) Park(_ context.Context, taskID, runID, outcome string) error {
+	p.parks = append(p.parks, parkCall{taskID, runID, outcome})
+	return p.err
+}
+
+func (p *parkingReleaser) AskQuestion(_ context.Context, taskID, body string, options []string, blocking bool, kind string) error {
+	p.questions = append(p.questions, questionCall{taskID, body, options, blocking, kind})
+	if p.questionErr != nil {
+		return p.questionErr
+	}
 	return p.err
 }
 
