@@ -940,10 +940,12 @@ hit it, the error text is the thing to report — it is a failure shape the adap
 should learn a pattern for.
 
 **The quiet-death signature.** A session that dies with a final `step_finish`
-reason of `unknown` and all-zero usage on its own last step is the opencode-go
-quiet-death signature — see
-[`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) for
-the incident behind it and what the CLI does about a recurrence.
+reason of `unknown` and all-zero usage on its own last step is the quiet-death
+signature. The cause is an opencode client defect, not the provider - see
+[`docs/opencode-build.md`](./docs/opencode-build.md). The marker itself is
+described in
+[`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md),
+which is a separate failure with a separate cause.
 
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in
@@ -1147,7 +1149,8 @@ parent is the correct setting.
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
-- [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence. Troubleshooting for a session that dies with `reason: "unknown"` and zero usage.
+- [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence.
+- [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs and why not `opencode2`, how to tell which one actually ran, and the upstream defect that makes a session exit 0 having done nothing. Start here for a session that dies with `reason: "unknown"` and zero usage.
 
 ## License
 
