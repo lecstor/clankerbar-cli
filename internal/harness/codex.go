@@ -322,6 +322,10 @@ func (codex) TokenCeilingHit(Result) bool { return false }
 // `max_session_wall_clock` to be discovered inert at 3am.
 func (codex) WallClockCapped(Result) bool { return false }
 
+// No zero-usage-unknown marker: the CLA-398 quiet-death signature is opencode's
+// step_finish shape, and codex reports no per-step usage the parser could sum.
+func (codex) ZeroUsageUnknown(Result) bool { return false }
+
 // This adapter does not populate Result.Claim — it does not watch the session's
 // clankerbar tool calls at all — so the driver's handback, salvage and delivery
 // check are all inert under it, and `phases` is refused for it in config.Validate

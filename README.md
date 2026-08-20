@@ -932,7 +932,11 @@ that one. `max_retries` and `budget` are off unless you set them, and
 `max_zero_spend_attempts` cannot fire here at all, because the reported usage the
 guess requires is exactly what resets its counter. So a guessed retry is capped at
 **2 per phase**, after which the run stops with its own distinct error quoting the
-diagnostic nothing recognised. Retries the harness *did* recognise are not counted
+diagnostic nothing recognised. A session that dies with a final `step_finish`
+reason of `unknown` and all-zero usage is the opencode-go quiet-death signature —
+see [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md)
+for the incident behind it and what the CLI does about a recurrence. Retries the
+harness *did* recognise are not counted
 against it — a provider flapping 5xx is still yours to bound with `max_retries`.
 The cap is deliberately not configurable: the dials you set are for failures the
 tool understands, and the honest number of guesses is small at any budget. If you
@@ -1141,6 +1145,7 @@ parent is the correct setting.
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
+- [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence. Troubleshooting for a session that dies with `reason: "unknown"` and zero usage.
 
 ## License
 

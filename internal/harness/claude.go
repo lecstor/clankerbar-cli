@@ -1002,6 +1002,10 @@ func (claude) TokenCeilingHit(res Result) bool {
 // Capabilities reports HonoursSessionWallClock false for the same reason.
 func (claude) WallClockCapped(Result) bool { return false }
 
+// No zero-usage-unknown marker: claude's terminal_reason is a typed CLI field,
+// and the quiet-death signature (CLA-398) is opencode's step_finish shape.
+func (claude) ZeroUsageUnknown(Result) bool { return false }
+
 // markCeilingHit writes the adapter's own kill marker onto a Result.
 func (r *Result) markCeilingHit() {
 	r.Raw = map[string]any{"terminal_reason": tokenCeilingReason}

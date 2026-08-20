@@ -244,6 +244,148 @@ func TestOpencodeIsTransient(t *testing.T) {
 	}
 }
 
+// opencodeToolSchemaRejection returns the REAL 2026-08-19 rejection fixture:
+// three `{"type":"error"}` APIError events, one per iteration log (16:42 /
+// 16:52 / 17:54 local), captured verbatim — the source of anomalyco/opencode
+// #43374. Built from the logs rather than hand-written, per the task.
+func opencodeToolSchemaRejection(t *testing.T) []string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "opencode-tool-schema-rejection.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the 2026-08-19 tool-schema rejection fixture: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("fixture carries %d events, want 3 (one per 2026-08-19 log)", len(lines))
+	}
+	return lines
+}
+
+// The Console Go tool-schema rejection family (`unsupported_tool_schema` /
+// `tool_count_limit`, anomalyco/opencode#43374 and #43378) is classified as
+// TRANSIENT — the deliberate choice made for CLA-398, not a default: the
+// gateway's enforcement is inconsistent (the same catalog accepted and refused
+// seconds apart in #43374), so the identical retry often succeeds, which is
+// exactly what the transient path does. The three stdout cases are the REAL
+// 2026-08-19 events from the iteration logs; the stderr case is the same
+// provider message arriving as plain text; and the assistant-text case pins the
+// scoping rule IsTransient already documents — only opencodeErrorText (stderr +
+// typed error events) is scanned, so a session that merely QUOTES the family in
+// its narration is not classified as dead.
+func TestOpencodeToolSchemaRejectionFamilyIsTransient(t *testing.T) {
+	real := opencodeToolSchemaRejection(t)
+	cases := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{"real 2026-08-19 event, 16:42 log", Result{Stdout: real[0]}, true},
+		{"real 2026-08-19 event, 16:52 log", Result{Stdout: real[1]}, true},
+		{"real 2026-08-19 event, 17:54 log", Result{Stdout: real[2]}, true},
+		// The same provider message as plain stderr text.
+		{"rejection on stderr", Result{Stderr: "Error from provider (Console Go): Upstream request failed: [unsupported_tool_schema] The tool schema is not supported (tool_count_limit)."}, true},
+		// The scoping rule: assistant text merely quoting the family must NOT be
+		// classified. The 2026-08-20 logs carried exactly this shape — agents
+		// reading CLA-390's task body, which quotes the strings.
+		{"assistant text quoting the family is NOT classified", Result{Stdout: `{"type":"text","text":"Earlier I hit an unsupported_tool_schema (tool_count_limit) rejection, so I retried."}`}, false},
+		{"clean run", Result{Stdout: opencodeStream}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (opencode{}).IsTransient(tc.res); got != tc.want {
+				t.Errorf("IsTransient = %v, want %v", got, tc.want)
+			}
+			if !tc.want && (opencode{}).IsUnclassifiedTransient(tc.res) {
+				t.Errorf("IsUnclassifiedTransient = true on a result IsTransient rejected")
+			}
+		})
+	}
+}
+
+// The CLA-398 quiet-death marker: a FINAL step_finish with reason "unknown"
+// whose OWN usage was all-zero sets a distinct terminal_reason, so the driver
+// can log the end by name instead of reporting a cheap clean run. The exact
+// 2026-08-20 signature is a final step_finish carrying reason "unknown" with
+// tokens and cost all zero — no error event, no stderr, nothing produced.
+func TestOpencodeZeroUsageUnknownMarker(t *testing.T) {
+	// The 2026-08-20 dead-phase signature, byte-for-byte the shape in the task:
+	// reason "unknown", tokens all zero, cost 0. Note there is NO `total` field —
+	// only the per-part counts, all zero — exactly what the real dead sessions
+	// emitted.
+	const quietDeath = `{"type":"step_finish","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`
+
+	res := opencodeParsed(quietDeath)
+	if !(opencode{}).ZeroUsageUnknown(res) {
+		t.Errorf("ZeroUsageUnknown = false on the quiet-death signature; want true")
+	}
+	if got := res.Raw[TerminalReasonKey]; got != ZeroUsageReason {
+		t.Errorf("terminal_reason = %v, want %q", got, ZeroUsageReason)
+	}
+	if got := res.Raw[FinishReasonKey]; got != FinishReasonUnknown {
+		t.Errorf("finish_reason = %v, want %q (the marker rides on the unknown reason)", got, FinishReasonUnknown)
+	}
+
+	// The REAL incident shape: the 2026-08-20 dead sessions did hours of paid
+	// work across earlier steps (22k–33k tokens each) and THEN died on a final
+	// "unknown" step that reported nothing. The marker must fire on that shape —
+	// the session total is NOT the discriminator, the final step's own block is.
+	const paidThenQuiet = `{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":22588,"input":22259,"output":130,"reasoning":199,"cache":{"write":0,"read":0}},"cost":0.4}}
+{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":31119,"input":8498,"output":41,"reasoning":52,"cache":{"write":0,"read":22528}},"cost":0.5}}
+{"type":"step_finish","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`
+	real := opencodeParsed(paidThenQuiet)
+	if !(opencode{}).ZeroUsageUnknown(real) {
+		t.Error("ZeroUsageUnknown = false on the real 2026-08-20 shape (paid steps then a zero-usage unknown final step); want true")
+	}
+	// And the session total is genuinely non-zero, proving the marker reads the
+	// FINAL step's own block, not the budget sums.
+	if real.Tokens == 0 {
+		t.Error("the paid-then-quiet fixture reported zero session tokens; the fixture is wrong, not the marker")
+	}
+
+	// A session that ended "unknown" whose FINAL step still reported usage is a
+	// different death — the final step did work, so it is not the quiet shape.
+	paid := opencodeParsed(`{"type":"step_finish","part":{"type":"step-finish","reason":"unknown","tokens":{"total":1000,"input":500,"output":500,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.02}}`)
+	if (opencode{}).ZeroUsageUnknown(paid) {
+		t.Error("ZeroUsageUnknown = true on an unknown-finish session whose final step reported usage; the marker is for the ALL-ZERO final step")
+	}
+
+	// A healthy completion reports reason "stop" with real usage — not the marker.
+	ok := opencodeParsed(opencodeStream)
+	if (opencode{}).ZeroUsageUnknown(ok) {
+		t.Error("ZeroUsageUnknown = true on a healthy stop session")
+	}
+
+	// A session that ended cleanly with reason "stop" and ZERO usage is not the
+	// marker either: the reason is not "unknown", so nothing died.
+	cleanZero := opencodeParsed(`{"type":"step_finish","part":{"type":"step-finish","reason":"stop","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
+	if (opencode{}).ZeroUsageUnknown(cleanZero) {
+		t.Error("ZeroUsageUnknown = true on a reason:stop session with zero usage; the marker requires the unknown reason")
+	}
+
+	// An empty stream never saw a step_finish at all — no reason, no marker.
+	if (opencode{}).ZeroUsageUnknown(opencodeParsed("")) {
+		t.Error("ZeroUsageUnknown = true on an empty stream")
+	}
+}
+
+// The marker cannot be forged by stream text: the parser sets terminal_reason
+// only from a parsed FINAL step_finish whose reason is "unknown", so an agent
+// that merely QUOTES the marker value in its narration never writes it — the
+// same scoping rule IsTransient documents for its scans.
+func TestZeroUsageUnknownNotForgedByNarration(t *testing.T) {
+	// Assistant text quoting the exact marker value: the parser must not treat
+	// it as a terminal_reason, because a task body that discussed the CLA-398
+	// incident would otherwise read as a dead phase.
+	stream := `{"type":"text","text":"The session ended with zero_usage_unknown last time, so I retried."}`
+	res := opencodeParsed(stream)
+	if (opencode{}).ZeroUsageUnknown(res) {
+		t.Error("ZeroUsageUnknown = true after assistant text merely quoted the marker value")
+	}
+	if got := res.Raw[TerminalReasonKey]; got != nil {
+		t.Errorf("terminal_reason = %v, want unset — the marker is written only from a parsed final step_finish", got)
+	}
+}
+
 // The loop bounds heuristic retries and lets pattern-matched ones run under the
 // operator's own dials (CLA-381), so which of the two answered has to be a fact
 // the adapter reports rather than one the caller infers. This pins the split:

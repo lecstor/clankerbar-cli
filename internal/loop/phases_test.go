@@ -850,6 +850,75 @@ func TestUndeclared_CountsOnlyACleanFinalPhaseThatDidNotDeclare(t *testing.T) {
 	})
 }
 
+// --- the zero-usage-unknown marker (CLA-398) -------------------------------
+
+// The CLA-398 quiet-death signature — a final step_finish with reason "unknown"
+// and all-zero usage — used to be logged as "iteration done (tokens=0
+// cost=$0.00)", indistinguishable from a cheap clean run. The adapter now writes
+// its own terminal_reason marker for it, and the driver must log the end BY
+// NAME so a dead session stops reading as a successful one.
+func TestDrain_ZeroUsageUnknownEndIsLoggedByName(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: zeroUsageResult()},
+	}}
+	d := New(fastCfg(), h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()})
+	if err != nil || stop {
+		t.Fatalf("drainWithRetries: stop=%v err=%v", stop, err)
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "zero-usage-unknown signature") {
+		t.Errorf("the driver did not log the marker by name:\n%s", out)
+	}
+	if strings.Contains(out, "iteration 1 done (tokens=") {
+		t.Errorf("the quiet death was logged as an ordinary clean run:\n%s", out)
+	}
+}
+
+// The driver also names the marker in the dead-phase PARK path: when a phased
+// sequence's first phase dies twice with the quiet-death signature, the park
+// outcome and the question body must say which flavour of death this was.
+func TestDrainPhases_ZeroUsageUnknownParkNamesTheMarker(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(zeroUsageResult(), openClaim())},
+		{res: held(zeroUsageResult(), openClaim())},
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if stop {
+		t.Error("a parked task stopped the whole run")
+	}
+	if len(rel.parks) != 1 {
+		t.Fatalf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
+	}
+	// The park outcome names the marker, not the bare "unknown" finish reason —
+	// the operator sees which flavour of death this was.
+	got := rel.parks[0]
+	if !strings.Contains(got.outcome, harness.ZeroUsageReason) {
+		t.Errorf("the park outcome does not name the marker %q: %q", harness.ZeroUsageReason, got.outcome)
+	}
+	if !strings.Contains(got.outcome, harness.FinishReasonUnknown) {
+		t.Errorf("the park outcome does not carry the finish reason: %q", got.outcome)
+	}
+	if out := logs.String(); !strings.Contains(out, harness.ZeroUsageReason) {
+		t.Errorf("the driver log does not name the marker:\n%s", out)
+	}
+}
+
 // --- the dead-phase signature (CLA-386) ------------------------------------
 
 // deadResult is a CLA-386 dead-phase result: the session's final step finished

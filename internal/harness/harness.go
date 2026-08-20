@@ -103,6 +103,16 @@ type Adapter interface {
 	// everything.
 	WallClockCapped(Result) bool
 
+	// ZeroUsageUnknown reports whether the session ended with a FINAL
+	// step_finish carrying reason "unknown" and all-zero usage — the quiet-death
+	// signature (CLA-398): no error event, no tokens, no cost, nothing produced,
+	// which is otherwise indistinguishable from a cheap clean run. The marker is
+	// the adapter's own (a terminal_reason it writes, never text the CLI or an
+	// agent could emit), so it exists so the driver can NAME the end instead of
+	// logging "iteration done (tokens=0 cost=$0.00)". An adapter whose stream
+	// carries no such signature returns false for everything.
+	ZeroUsageUnknown(Result) bool
+
 	// Capabilities reports what this adapter can do that the DRIVER's behaviour
 	// depends on — as distinct from how it classifies a given Result.
 	Capabilities() Capabilities
@@ -348,10 +358,23 @@ func (in Invocation) ModelArg() string { return strings.TrimSpace(in.Model) }
 // died without producing anything (CLA-386).
 const FinishReasonKey = "finish_reason"
 
+// TerminalReasonKey is the Result.Raw key an adapter uses for its OWN end-of-
+// session marker — the wall-clock cap (wallClockReason) or the zero-usage-unknown
+// quiet-death signature (ZeroUsageReason). The value is always adapter-authored,
+// never text the CLI or an agent could emit, so the driver can read it by name.
+const TerminalReasonKey = "terminal_reason"
+
 // FinishReasonUnknown is opencode's step_finish reason for a session that ended
 // without a final answer — the marker of a silent death, as distinct from
 // "stop" on a healthy completion.
 const FinishReasonUnknown = "unknown"
+
+// ZeroUsageReason is the terminal_reason the opencode adapter writes into a
+// Result when the session's final step_finish carried reason "unknown" with
+// all-zero usage — the CLA-398 quiet-death signature, read back through
+// Adapter.ZeroUsageUnknown. Like the finish_reason key it lives on Result.Raw,
+// which is the adapter-to-driver channel the loop already reads.
+const ZeroUsageReason = "zero_usage_unknown"
 
 type Result struct {
 	ExitCode int
