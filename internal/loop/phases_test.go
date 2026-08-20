@@ -905,14 +905,15 @@ func TestDrainPhases_ZeroUsageUnknownParkNamesTheMarker(t *testing.T) {
 	if len(rel.parks) != 1 {
 		t.Fatalf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
 	}
-	// The park outcome names the marker, not the bare "unknown" finish reason —
-	// the operator sees which flavour of death this was.
+	// deadReason() prefers TerminalReasonKey over the bare FinishReasonKey, so
+	// the park outcome carries the marker in place of the bare "unknown" finish
+	// reason, not alongside it — the operator sees which flavour of death this
+	// was. (A second Contains(harness.FinishReasonUnknown) check would pass
+	// vacuously here since "unknown" is a substring of "zero_usage_unknown";
+	// it would not independently verify anything beyond the check below.)
 	got := rel.parks[0]
 	if !strings.Contains(got.outcome, harness.ZeroUsageReason) {
 		t.Errorf("the park outcome does not name the marker %q: %q", harness.ZeroUsageReason, got.outcome)
-	}
-	if !strings.Contains(got.outcome, harness.FinishReasonUnknown) {
-		t.Errorf("the park outcome does not carry the finish reason: %q", got.outcome)
 	}
 	if out := logs.String(); !strings.Contains(out, harness.ZeroUsageReason) {
 		t.Errorf("the driver log does not name the marker:\n%s", out)

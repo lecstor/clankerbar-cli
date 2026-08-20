@@ -932,16 +932,18 @@ that one. `max_retries` and `budget` are off unless you set them, and
 `max_zero_spend_attempts` cannot fire here at all, because the reported usage the
 guess requires is exactly what resets its counter. So a guessed retry is capped at
 **2 per phase**, after which the run stops with its own distinct error quoting the
-diagnostic nothing recognised. A session that dies with a final `step_finish`
-reason of `unknown` and all-zero usage is the opencode-go quiet-death signature —
-see [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md)
-for the incident behind it and what the CLI does about a recurrence. Retries the
-harness *did* recognise are not counted
+diagnostic nothing recognised. Retries the harness *did* recognise are not counted
 against it — a provider flapping 5xx is still yours to bound with `max_retries`.
 The cap is deliberately not configurable: the dials you set are for failures the
 tool understands, and the honest number of guesses is small at any budget. If you
 hit it, the error text is the thing to report — it is a failure shape the adapter
 should learn a pattern for.
+
+**The quiet-death signature.** A session that dies with a final `step_finish`
+reason of `unknown` and all-zero usage on its own last step is the opencode-go
+quiet-death signature — see
+[`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) for
+the incident behind it and what the CLI does about a recurrence.
 
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in

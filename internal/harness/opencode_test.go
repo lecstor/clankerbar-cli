@@ -246,7 +246,7 @@ func TestOpencodeIsTransient(t *testing.T) {
 
 // opencodeToolSchemaRejection returns the REAL 2026-08-19 rejection fixture:
 // three `{"type":"error"}` APIError events, one per iteration log (16:42 /
-// 16:52 / 17:54 local), captured verbatim — the source of anomalyco/opencode
+// 16:52 / 16:54 local), captured verbatim — the source of anomalyco/opencode
 // #43374. Built from the logs rather than hand-written, per the task.
 func opencodeToolSchemaRejection(t *testing.T) []string {
 	t.Helper()
@@ -281,7 +281,7 @@ func TestOpencodeToolSchemaRejectionFamilyIsTransient(t *testing.T) {
 	}{
 		{"real 2026-08-19 event, 16:42 log", Result{Stdout: real[0]}, true},
 		{"real 2026-08-19 event, 16:52 log", Result{Stdout: real[1]}, true},
-		{"real 2026-08-19 event, 17:54 log", Result{Stdout: real[2]}, true},
+		{"real 2026-08-19 event, 16:54 log", Result{Stdout: real[2]}, true},
 		// The same provider message as plain stderr text.
 		{"rejection on stderr", Result{Stderr: "Error from provider (Console Go): Upstream request failed: [unsupported_tool_schema] The tool schema is not supported (tool_count_limit)."}, true},
 		// The scoping rule: assistant text merely quoting the family must NOT be
@@ -325,16 +325,19 @@ func TestOpencodeZeroUsageUnknownMarker(t *testing.T) {
 		t.Errorf("finish_reason = %v, want %q (the marker rides on the unknown reason)", got, FinishReasonUnknown)
 	}
 
-	// The REAL incident shape: the 2026-08-20 dead sessions did hours of paid
-	// work across earlier steps (22k–33k tokens each) and THEN died on a final
-	// "unknown" step that reported nothing. The marker must fire on that shape —
-	// the session total is NOT the discriminator, the final step's own block is.
+	// The incident shape (illustrative, not a captured fixture — the task's
+	// doneWhen only requires a real fixture for the rejection-family test
+	// above): the 2026-08-20 dead sessions did hours of paid work across
+	// earlier steps (per the task detail, peak contexts 22k-33k tokens) and
+	// THEN died on a final "unknown" step that reported nothing. The marker
+	// must fire on that shape — the session total is NOT the discriminator,
+	// the final step's own block is.
 	const paidThenQuiet = `{"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":22588,"input":22259,"output":130,"reasoning":199,"cache":{"write":0,"read":0}},"cost":0.4}}
 {"type":"step_finish","part":{"type":"step-finish","reason":"tool-calls","tokens":{"total":31119,"input":8498,"output":41,"reasoning":52,"cache":{"write":0,"read":22528}},"cost":0.5}}
 {"type":"step_finish","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`
 	real := opencodeParsed(paidThenQuiet)
 	if !(opencode{}).ZeroUsageUnknown(real) {
-		t.Error("ZeroUsageUnknown = false on the real 2026-08-20 shape (paid steps then a zero-usage unknown final step); want true")
+		t.Error("ZeroUsageUnknown = false on the paid-then-quiet shape (paid steps then a zero-usage unknown final step); want true")
 	}
 	// And the session total is genuinely non-zero, proving the marker reads the
 	// FINAL step's own block, not the budget sums.

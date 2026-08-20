@@ -445,17 +445,13 @@ type opencodeParse struct {
 	// CLA-386 dead-phase marker); the driver reads it off Result.Raw via
 	// FinishReasonKey.
 	lastReason string
-	// lastTokens/lastCost are the USAGE OF THE MOST RECENT step_finish, reset
-	// for every step: the CLA-398 quiet-death signature is a FINAL step whose
-	// OWN usage is all-zero — a session can do hours of real paid work and then
-	// die with an "unknown" final step that reported nothing, so the session
-	// total (p.total/p.cost) is NOT the discriminator. Only the final step's
-	// own numbers are.
-	lastTokens int
-	lastCost   float64
 	// lastStepZeroUsage reports that the MOST RECENT step_finish's own usage
 	// summed to zero — no tokens block, an all-zero tokens block, or no cost
-	// are all the same quiet end.
+	// are all the same quiet end. Reset for every step: the CLA-398
+	// quiet-death signature is a FINAL step whose OWN usage is all-zero — a
+	// session can do hours of real paid work and then die with an "unknown"
+	// final step that reported nothing, so the session total (p.total/p.cost)
+	// is NOT the discriminator. Only the final step's own usage is.
 	lastStepZeroUsage                     bool
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
@@ -524,8 +520,7 @@ func (p *opencodeParse) line(line []byte) {
 		// the CLA-398 quiet-death signature is a final step that reported
 		// NOTHING (all-zero), whatever the earlier steps cost — so the sums that
 		// feed the budget are not the discriminator, the last step's own block
-		// is. Reset per step; the final values are the ones that survive.
-		p.lastTokens, p.lastCost = 0, 0
+		// is. Reset per step; the final value is the one that survives.
 		p.lastStepZeroUsage = true
 		if tk := ev.Part.Tokens; tk != nil {
 			p.total += tk.Total
@@ -534,7 +529,6 @@ func (p *opencodeParse) line(line []byte) {
 			p.reason += tk.Reasoning
 			p.cWrite += tk.Cache.Write
 			p.cRead += tk.Cache.Read
-			p.lastTokens += tk.Total
 			if tk.Total != 0 {
 				p.lastStepZeroUsage = false
 			}
@@ -542,7 +536,6 @@ func (p *opencodeParse) line(line []byte) {
 		}
 		if c := ev.Part.Cost; c != nil {
 			p.cost += *c
-			p.lastCost += *c
 			if *c != 0 {
 				p.lastStepZeroUsage = false
 			}
