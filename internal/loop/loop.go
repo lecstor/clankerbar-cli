@@ -566,11 +566,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 	chain := 0   // consecutive handoff respawns, against handoffChainCap
 	spawned := 0 // sessions this drain has launched, phase or respawn
 	// Consecutive dead phases this TASK has produced (CLA-386). The retry budget
-	// is per task, not per run: this counter lives here, on one task's drain,
-	// where the operator's 2026-08-20 decision puts it — a single silent death is
-	// plausibly transient, a second on the same task is not, and the same task
-	// reached fresh in a later run earns its retry again.
+	// is per task, not per run: a single silent death is plausibly transient, a
+	// second on the same task is not, and the same task reached fresh in a later
+	// run earns its retry again. deadTask names which task the counter counts for,
+	// because the retry is a fresh claiming session (the dead claim was handed
+	// back): if next_task hands it a DIFFERENT task, that task has died once, not
+	// twice, and must not be parked for a second death it did not have (review
+	// finding). A dead phase always holds a claim, so deadTask is set whenever the
+	// classification fires.
 	deadRetries := 0
+	deadTask := ""
 
 	for i := 0; i < len(phases); {
 		ph := phases[i]
@@ -663,23 +668,55 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			carried = end.claim
 		}
 
+		// A run-level stop wins over a dead phase. drainPhase returns stop=true
+		// for a budget trip, credit exhaustion (lim.Stop), and a resumed phase
+		// ending on a live lease — and on those paths end.dead can be set too (a
+		// credit-starved session is exactly the shape that dies on reason
+		// "unknown" with no branch). Retrying a dead phase against a stopped run
+		// burns another session into the same limit and, on the second, parks a
+		// task for what was actually a run-wide outage instead of stopping the
+		// daemon. A run stop is final; the dead branch only decides retry vs park
+		// when the run is continuing.
+		if pstop {
+			stop = true
+			break
+		}
+
 		// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
 		// not "ended without holding the task" either — it never finished the job
 		// it was spawned to do. The claim was released back in drainPhase (a retry
 		// re-claims, exactly like a transient one), so the only question left is
 		// retry vs park. First dead phase: retry the same phase once, so a silent
 		// death that was a one-off costs one session rather than handing a review
-		// brief a task with no branch on it. Second consecutive dead phase: park —
-		// a task that can kill two full sessions reaches the operator rather than
-		// a third (2026-08-20 operator decision).
+		// brief a task with no branch on it. Second consecutive dead phase on the
+		// SAME task: park — a task that can kill two full sessions reaches the
+		// operator rather than a third (2026-08-20 operator decision).
 		//
 		// Deliberately BEFORE the error break below: the dead classification
 		// names a phase that produced nothing whatever its exit code, so a dead
 		// phase is retried-then-parked, never a run-failing error — the non-zero
 		// exit that would otherwise stop the daemon is itself part of the silent
 		// death, not a verdict.
-		if !last && end.dead {
-			if deadRetries >= 1 {
+		//
+		// The retry is scoped to the FIRST phase (`i == 0`), the one that claimed
+		// its own task: a retry cannot re-seed a resumed phase — invocationFor
+		// only substitutes the task/run placeholders and sets ResumeClaim when the
+		// predecessor claim is present, which the dead handback cleared — so
+		// retrying a dead RESUMED phase would spawn a session whose brief still
+		// carries the literal {{taskId}}/{{runId}} and whose handback, salvage and
+		// delivery checks are all switched off. A resumed phase's dead signature
+		// still vetoes its checkpoint below (the false-premise guard applies to
+		// every phase); it just is not retried or parked here — the drain ends and
+		// the task returns to the queue, where a fresh claiming session retries it
+		// with a valid seed (review finding). The operator decision's "retry the
+		// implement phase once, then park" is exactly `i == 0` in the shipped
+		// [implement, review] sequence.
+		if !last && end.dead && i == 0 {
+			taskID := ""
+			if end.claim != nil {
+				taskID = end.claim.Claim.TaskID
+			}
+			if taskID != "" && taskID == deadTask && deadRetries >= 1 {
 				log.Printf("%siteration %d: the %s phase died producing nothing a second time — parking the task per the 2026-08-20 decision (retry once, then park)",
 					labelOf(t), drainNum, ph.Label(i))
 				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
@@ -688,7 +725,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 				// not fail, one task reached a human.
 				break
 			}
-			deadRetries++
+			// Either the first dead phase this task produced, or a dead phase on a
+			// task other than the one counted above: that task has died once, and
+			// earns its own single retry rather than being parked for a second
+			// death it did not have.
+			deadRetries = 1
+			deadTask = taskID
 			log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it once before any review brief sees the task",
 				labelOf(t), drainNum, ph.Label(i), deadReason(end.claim))
 			continue
@@ -696,10 +738,6 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 
 		if perr != nil {
 			err = perr
-			break
-		}
-		if pstop {
-			stop = true
 			break
 		}
 
@@ -744,6 +782,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 		// two dead phases separated by a healthy one are not "consecutive", and
 		// each phase earns its own single retry (CLA-386).
 		deadRetries = 0
+		deadTask = ""
 		i++
 	}
 
@@ -940,10 +979,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if f != nil {
 			_ = f.Close()
 		}
+		// The orderly-cap classifications, computed here (before the salvage) so
+		// the salvage can tell whether a clean tree means "produced nothing" — a
+		// question the caps answer: a capped session is an orderly end with its
+		// own marker, not a silent death, and an untrusted stream's finish reason
+		// cannot be read at all. Purely adapter reads of `res`, so moving them up
+		// changes nothing else (review finding).
+		capped := a.TurnCapped(res)
+		ceiling := a.TokenCeilingHit(res)
+		wallclock := a.WallClockCapped(res)
+		producedNothing := res.Untrusted == "" && !capped && !ceiling && !wallclock && deadPhase(res)
 		// Rescue whatever the session left uncommitted, FIRST — before the handback,
 		// because a successful salvage changes what the handback should do: a task
 		// with a branch recorded on it is no longer safe to release (CLA-314).
-		d.salvageStrandedWork(ctx, t, &res)
+		d.salvageStrandedWork(ctx, t, &res, producedNothing)
 		// Hand back anything the session was still holding, BEFORE deciding what to
 		// do next — every branch below either waits, retries or returns, and all of
 		// them leave the lease unattended. Above the ierr check too: Invoke returns
@@ -978,8 +1027,6 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// HasWIP is exactly that signal: it is set by the only two things that make
 		// a checkpoint real — the phase recording its own branch, or the salvage
 		// recording one for it and the PLANE accepting the record.
-		capped := a.TurnCapped(res)
-		ceiling := a.TokenCeilingHit(res)
 		// A session the adapter ended on its wall-clock cap is the third member of
 		// the same family: an orderly cut-off mid-thought, whose survivability rests
 		// on the salvage exactly as a turn cap's does — so it earns a checkpoint on
@@ -987,7 +1034,6 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// (`a`), never the run's: "did this session end on its own wall clock" is a
 		// question only the harness that RAN it can answer, and under per-phase
 		// harnesses (CLA-366) that harness is not necessarily d.h.
-		wallclock := a.WallClockCapped(res)
 		checkpointable := res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP)
 		// CLA-386: a session whose final step finished with reason "unknown" and
 		// left no branch recorded produced NOTHING — a dead phase, not a completed
@@ -1306,8 +1352,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 // that CLAUDE has no ceiling set.
 func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
 	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
-	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%d), and not handing back any claim it appeared to hold",
-		drainNum, res.Tokens, res.CostUSD, res.ExitCode)
+	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%s), and not handing back any claim it appeared to hold",
+		drainNum, res.Tokens, res.CostUSD, res.ExitString())
 	if !d.cfg.Budget.CountsSpendFor(harnessName) {
 		return tokens, cost, false, nil
 	}
@@ -1349,7 +1395,7 @@ func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness
 // stays a takeover and the hand-off survives. If the record failed, the task has
 // no branch on it, releasing to `ready` is still the better move, and the old
 // path runs unchanged.
-func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result) {
+func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result, producedNothing bool) {
 	if d.newSalvager == nil || !res.Claim.Held() {
 		return
 	}
@@ -1368,12 +1414,15 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 		// a clean tree, and a log line every iteration saying so would bury the ones
 		// that matter.
 		if out.Worktree != "" {
-			if deadPhase(*res) {
+			if producedNothing {
 				// CLA-386: the tree is clean because nothing was ever written, not
 				// because the work landed. The line must say so plainly — "nothing to
 				// salvage" reads identically either way, and the only other
 				// discriminator (a `verified <ref>: origin/<branch>` line) is an
-				// absence, which is the weakest possible signal.
+				// absence, which is the weakest possible signal. Gated on the driver's
+				// own classification (not the raw deadPhase predicate): a capped or
+				// untrusted session is an orderly end whose finish reason is its own
+				// marker or cannot be read, and must not be handed the emphatic line.
 				log.Printf("%sphase produced nothing for %s — the worktree is clean because no work was ever written to it, not because it was committed: %s",
 					labelOf(t), label, out.Detail)
 			} else {
@@ -1469,6 +1518,15 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 	pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 	defer pcancel()
 	if err := pk.Park(pctx, res.Claim.TaskID, res.Claim.RunID, outcome, decisionContext, decisionRuling); err != nil {
+		if errors.Is(err, plane.ErrDecisionNotRecorded) {
+			// The task IS parked — it will not be retried — so saying it was "left
+			// for the next claim" would be the opposite of what happened. The park
+			// stands; the missing decision is the failure the operator needs to
+			// know about (review finding).
+			log.Printf("%sparked %s — two consecutive dead phases, but the decision could not be recorded: %v",
+				labelOf(t), claimLabel(res.Claim), err)
+			return
+		}
 		log.Printf("%spark failed for %s: %v — the task is left for the next claim to retry it again",
 			labelOf(t), claimLabel(res.Claim), err)
 		return

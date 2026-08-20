@@ -1017,3 +1017,108 @@ func TestDrainPhases_ANonZeroExitDeadPhaseIsRetriedNotARunFailure(t *testing.T) 
 		t.Errorf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
 	}
 }
+
+// A run-level stop wins over a dead phase. A credit-starved session is exactly
+// the shape that dies on reason "unknown" with no branch — so under a provider
+// outage the dead retry and the hard-limit stop can fire together, and the retry
+// must not win: it would burn another session into the same limit and, on the
+// second, park a task for what was actually a run-wide outage instead of
+// stopping the daemon (review finding).
+func TestDrainPhases_ARunStopWinsOverADeadPhase(t *testing.T) {
+	deadStop := limitStopResult()
+	deadStop.Raw[harness.FinishReasonKey] = harness.FinishReasonUnknown
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadStop, openClaim())},
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if !stop {
+		t.Error("a phase that was both dead and a hard limit stop did not stop the run")
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions, want 1 — a dead phase on a stopped run must not be retried into the same limit", h.invokeCalls)
+	}
+	if len(rel.parks) != 0 {
+		t.Errorf("parked %d times, want 0 — a run-wide outage must not be recorded as a task that killed two sessions", len(rel.parks))
+	}
+}
+
+// The retry budget is PER TASK. The dead retry is a fresh claiming session (the
+// dead claim was handed back), and next_task can hand it a different task — so a
+// task that has died only once must not be parked because some OTHER task died
+// after it. The counter follows the task id: two dead phases on t-2 park t-2,
+// while t-1's single death earns t-1 no park and no false "twice in a row"
+// decision (review finding).
+func TestDrainPhases_ADeadOnADifferentTaskDoesNotParkTheSecondTask(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())},                                // t-1 dies once
+		{res: held(deadResult(), harness.Claim{TaskID: "t-2", RunID: "r-2"})}, // retry lands on t-2
+		{res: held(deadResult(), harness.Claim{TaskID: "t-2", RunID: "r-2"})}, // t-2 dies again: park t-2
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (t-1 dead, t-2 dead, t-2 retry) — the retry budget must reset for a different task", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 {
+		t.Fatalf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
+	}
+	if got := rel.parks[0]; got.taskID != "t-2" || got.runID != "r-2" {
+		t.Errorf("parked %s/%s, want t-2/r-2 — the task parked must be the one that died twice, not the one that died once", got.taskID, got.runID)
+	}
+}
+
+// A dead phase on a RESUMED middle phase is not retried: the retry cannot be
+// re-seeded — invocationFor only substitutes the task/run placeholders when the
+// predecessor claim is present, which the dead handback cleared — so retrying it
+// would spawn a session whose brief still carries the literal {{taskId}}/{{runId}}.
+// Its dead signature still vetoes the checkpoint (no false advance to the next
+// phase), so the drain ends and the task returns to the queue, where a fresh
+// claiming session retries it with a valid seed. Unreachable in the shipped
+// two-phase sequence (phase 2 is last and cannot be dead); a three-phase config
+// reaches it (review finding).
+func TestDrainPhases_AResumedPhaseDeathIsNotDeadClassified(t *testing.T) {
+	three := []config.Phase{{Name: "implement"}, {Name: "review"}, {Name: "publish"}}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},              // phase 1 checkpoints, holding the claim
+		{res: held(deadResult(), openClaim())}, // resumed phase 2 dies producing nothing
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = three
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if stop {
+		t.Error("a resumed phase dying producing nothing stopped the whole run")
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions, want 2 (phase 1, then the dead resumed phase) — a resumed dead phase must not be retried with a broken resume seed, and must not advance to phase 3", h.invokeCalls)
+	}
+	if len(rel.parks) != 0 {
+		t.Errorf("parked %d times, want 0 — the retry-then-park budget is the implement phase's", len(rel.parks))
+	}
+}

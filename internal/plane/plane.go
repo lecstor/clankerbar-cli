@@ -36,6 +36,13 @@ import (
 // stopping the run.
 var ErrNotWired = errors.New("plane writes not wired")
 
+// ErrDecisionNotRecorded wraps a park that moved the task to `parked` but then
+// failed to record the decision that explains it. The task IS parked — it will
+// not be retried by a clanker — so the caller must not report "the park failed,
+// the task is left to the next claim" (which is false) but "parked, and the
+// record is missing" (which the operator needs to know) (review finding).
+var ErrDecisionNotRecorded = errors.New("task parked but the decision was not recorded")
+
 // Releaser hands a claim back to the queue.
 type Releaser interface {
 	// Release ends the run holding taskID and returns the task to `ready`, so the
@@ -217,12 +224,15 @@ func (r *mcpReleaser) Park(ctx context.Context, taskID, runID, outcome, decision
 	}); err != nil {
 		return err
 	}
-	return r.call(ctx, "record_decision", map[string]any{
+	if err := r.call(ctx, "record_decision", map[string]any{
 		"taskId":  taskID,
 		"context": decisionContext,
 		"ruling":  decisionRuling,
 		"source":  "mcp_self",
-	})
+	}); err != nil {
+		return fmt.Errorf("%w: %v", ErrDecisionNotRecorded, err)
+	}
+	return nil
 }
 
 // AttestMergeVerified writes the driver's verdict onto the task's delivery record.

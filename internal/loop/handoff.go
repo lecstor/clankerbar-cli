@@ -111,8 +111,8 @@ func detectHandoff(drainNum int, t Target, res harness.Result) string {
 	}
 	switch {
 	case res.ExitCode != 0:
-		log.Printf("%siteration %d: handoff marker ignored — the session did not end cleanly (exit %d), so its final message is not a deliberate handoff",
-			labelOf(t), drainNum, res.ExitCode)
+		log.Printf("%siteration %d: handoff marker ignored — the session did not end cleanly (%s), so its final message is not a deliberate handoff",
+			labelOf(t), drainNum, res.ExitString())
 		return ""
 	case !res.Claim.Held():
 		log.Printf("%siteration %d: handoff marker ignored — the session no longer holds a task, so there is no run for a successor to resume",
