@@ -108,6 +108,7 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	p.finish(&res)
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
+		res.ExitSignal = exitSignal(ee)
 	} else if runErr != nil {
 		return res, runErr
 	}

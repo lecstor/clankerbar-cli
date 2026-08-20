@@ -345,3 +345,45 @@ func gitOut(t *testing.T, dir string, args ...string) string {
 	}
 	return strings.TrimSpace(string(out))
 }
+
+// The seam's empty-worktree line has to say WHICH clean it is. A clean tree
+// reads identically whether the phase committed everything (clean because the
+// work landed) or produced nothing at all (clean because nothing was ever
+// written) — and the only other discriminator, a `verified <ref>: origin/...`
+// line, is an absence, the weakest possible signal (CLA-386).
+func TestSalvage_TheEmptyWorktreeLineNamesWhichCase(t *testing.T) {
+	clean := salvage.Outcome{Status: salvage.Nothing, Worktree: "/w", Detail: "/w is clean"}
+
+	// A session that committed everything leaves the tree clean WITH a branch on
+	// the task — the ordinary "nothing to salvage" case.
+	committed := held(okResult(0, 0), harness.Claim{TaskID: heldClaim().TaskID, RunID: "r-1", HasWIP: true})
+	committed.Raw[harness.FinishReasonKey] = "stop"
+
+	// A dead phase leaves the tree clean with NO branch — the produced-nothing
+	// case, which is a failure the reader has to be able to spot.
+	producedNothing := held(deadResult(), heldClaim())
+
+	for _, tc := range []struct {
+		name    string
+		res     harness.Result
+		want    string
+		notWant string
+	}{
+		{"committed everything", committed, "nothing to salvage", "produced nothing"},
+		{"produced nothing", producedNothing, "produced nothing", "nothing to salvage"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			h := &fakeAdapter{steps: []invokeStep{{res: tc.res}}}
+			drainWithSalvager(t, h, &recordingReleaser{}, &fakeSalvager{out: clean})
+
+			out := logs.String()
+			if !strings.Contains(out, tc.want) {
+				t.Errorf("the log does not say the phase %q:\n%s", tc.want, out)
+			}
+			if tc.notWant != "" && strings.Contains(out, tc.notWant) {
+				t.Errorf("the log says %q in the %s case — the two clean trees must read differently:\n%s", tc.notWant, tc.name, out)
+			}
+		})
+	}
+}
