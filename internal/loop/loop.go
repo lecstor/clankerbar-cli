@@ -591,8 +591,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			// carry that forward on its own. promptBytes is the session's own
 			// prompt alone — what the size cap was measured against — not the
 			// preamble-inflated total, so the log line stays comparable to it.
+			//
+			// config.HandoffContinuation (CLA-353) is appended after it for the
+			// same reason: the phase's OWN brief — not only the preamble's
+			// contract — is otherwise dropped on a handoff, since ph.Prompt is
+			// replaced wholesale rather than framing the built-in text. For the
+			// review phase that would silently drop the PR-then-update_task
+			// terminal step the moment a session hands off mid-review.
 			promptBytes = len(nextPrompt)
-			ph.Prompt = config.HandoffPreamble + nextPrompt
+			ph.Prompt = config.HandoffPreamble + nextPrompt + config.HandoffContinuation(ph.Name)
 			nextPrompt = ""
 		}
 

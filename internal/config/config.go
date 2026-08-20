@@ -284,12 +284,44 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 // implement brief, whose equivalent step is emphatic, names its call and its
 // arguments, and comes last, did not fail once over the same evening. So this is
 // written in that shape and pinned to that place.
-const reviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: hand the task over with " +
+//
+// CLA-353: the terminal sequence is push, then open a PR, then update_task - in
+// that order, and now all three live here rather than "push" sitting one sentence
+// earlier. An overnight forensic drain found `gh pr create` appearing ZERO times
+// across four review-phase transcripts, and two tasks committed straight onto
+// `staging` because a session's cwd was already sitting there and nothing told it
+// that was wrong - so a task closed at in_review with no PR, and the close-out
+// flow's "merge its PR into staging" had nothing to merge. CLA-384 made
+// update_task the phase's emphatic final call, which if the PR step were bolted on
+// earlier would make it LESS likely to survive, not more - a step mentioned before
+// an emphatic final call loses to it. So the PR step is folded into this same
+// terminal block, before the update_task sentence, not left in the paragraph above.
+const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's integration " +
+	"branch (staging) if none exists yet for this branch - push, then the PR, in that order, before the " +
+	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
 	"update_task(taskId, runId, status: \"in_review\", outcome: ...), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
 	"session that leaves it out has not handed anything over. Ending this session while you still hold the " +
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
+
+// HandoffContinuation is appended, by the driver, to a handoff respawn's prompt
+// (CLA-353) so a phase's own terminal step survives a session-authored hand-off.
+// HandoffPreamble carries the "resume, don't claim" contract forward on every
+// handoff; the ORIGINAL phase brief's own instructions do not — a handoff
+// respawn's prompt is HandoffPreamble plus the predecessor's self-authored
+// nextPrompt alone, so anything the built-in brief said is otherwise gone the
+// moment a session hands off instead of finishing itself. For the review phase
+// that includes reviewTerminalStep - the PR-then-update_task sequence CLA-353
+// exists to make land - so a handoff mid-review must not be a way to lose it.
+// Empty for a phase with no such step: the implement phase stops rather than
+// hands its task to in_review, so it has none to carry forward.
+func HandoffContinuation(phaseName string) string {
+	if phaseName == reviewPhaseName {
+		return "\n\nThe phase's terminal step is unchanged by handing off:" + reviewTerminalStep
+	}
+	return ""
+}
 
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
 // may hand the rest of its job to a fresh successor, and how. The trigger is
@@ -324,13 +356,16 @@ var builtinPhasePrompts = map[string]string{
 	reviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
 		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
 		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
-		"then get_task with includeDecisions: true to re-read the bar and the standing decisions, and read the diff " +
-		"on the branch recorded on the task. Then run the adversarial review gate, fix what it finds, and " +
-		"re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you fixed, by name, and " +
-		"point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
-		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception " +
-		"you state a reason for (a fix that had to reach outside its own area), never the default. Then COMMIT " +
-		"and PUSH the fixes." + reviewTerminalStep + handoffGuidance,
+		"then get_task with includeDecisions: true to re-read the bar and the standing decisions. An empty branch " +
+		"field on the task is a FAILED hand-off to report, not work to silently adopt and implement. Work in the " +
+		"worktree for the branch recorded on the task, and never commit to the integration branch (staging) - a " +
+		"session whose cwd is already the main checkout sitting on staging is not a decision to commit where you " +
+		"are, it is this failure mode. Read the diff on that branch. Then run the adversarial review gate, fix " +
+		"what it finds, and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you " +
+		"fixed, by name, and point it at the fix commits (or, if not yet committed, the fix diff) and the " +
+		"regression surface they touch - not at the whole diff, whose full pass already happened. A full second " +
+		"pass is the exception you state a reason for (a fix that had to reach outside its own area), never the " +
+		"default." + reviewTerminalStep + handoffGuidance,
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
