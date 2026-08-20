@@ -14,13 +14,15 @@ import (
 const okBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`
 
 // capture records what the driver actually put on the wire, so the request shape
-// is asserted rather than assumed.
+// is asserted rather than assumed. bodies holds EVERY request, in order — a call
+// that makes two writes (Park: update_task then record_decision) needs both.
 type capture struct {
 	method string
 	path   string
 	auth   string
 	accept string
-	body   map[string]any
+	body   map[string]any // the LAST request's body, for the one-call tests
+	bodies []map[string]any
 }
 
 func serve(t *testing.T, status int, body string) (*httptest.Server, *capture) {
@@ -30,7 +32,10 @@ func serve(t *testing.T, status int, body string) (*httptest.Server, *capture) {
 		raw, _ := io.ReadAll(r.Body)
 		got.method, got.path = r.Method, r.URL.Path
 		got.auth, got.accept = r.Header.Get("Authorization"), r.Header.Get("Accept")
-		_ = json.Unmarshal(raw, &got.body)
+		var parsed map[string]any
+		_ = json.Unmarshal(raw, &parsed)
+		got.bodies = append(got.bodies, parsed)
+		got.body = parsed
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, body)
 	}))
@@ -241,5 +246,63 @@ func TestRecordBranch_RefusesAnEmptyBranch(t *testing.T) {
 func TestRecordBranch_NotWiredIsNotARecorder(t *testing.T) {
 	if _, ok := New("", "").(Recorder); ok {
 		t.Error("the not-wired client claims to record branches")
+	}
+}
+
+// Park is the driver's only task-STATUS write, and it makes two calls in order —
+// the status write first, then the decision that explains it. Both must carry
+// exactly the keys the MCP tool schemas name, or a park fails silently at 3am as
+// "left for the next claim" while the task never actually moves (review finding).
+func TestPark_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	p, ok := New(srv.URL+"/mcp/demo", "k-1").(ParkAPI)
+	if !ok {
+		t.Fatal("the wired plane client does not implement ParkAPI, so no task can ever be parked")
+	}
+	const (
+		outcome = "Parked after two consecutive dead phases"
+		drvCtx  = "the implement phase died producing nothing (final step reason \"unknown\", no branch recorded) twice in a row"
+		ruling  = "Parked per the 2026-08-20 operator decision: retry once, then park"
+	)
+	if err := p.Park(context.Background(), "t-1", "r-1", outcome, drvCtx, ruling); err != nil {
+		t.Fatalf("Park: %v", err)
+	}
+
+	if len(got.bodies) != 2 {
+		t.Fatalf("Park made %d calls, want 2 (update_task then record_decision): %+v", len(got.bodies), got.bodies)
+	}
+
+	first, _ := got.bodies[0]["params"].(map[string]any)
+	if first["name"] != "update_task" {
+		t.Errorf("first tool = %v, want update_task", first["name"])
+	}
+	args, _ := first["arguments"].(map[string]any)
+	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
+		t.Errorf("first arguments = %+v, want taskId=t-1 runId=r-1", args)
+	}
+	if args["status"] != "parked" {
+		t.Errorf("status = %v, want parked", args["status"])
+	}
+	if args["outcome"] != outcome {
+		t.Errorf("outcome = %v, want the park outcome", args["outcome"])
+	}
+
+	second, _ := got.bodies[1]["params"].(map[string]any)
+	if second["name"] != "record_decision" {
+		t.Errorf("second tool = %v, want record_decision", second["name"])
+	}
+	dargs, _ := second["arguments"].(map[string]any)
+	if dargs["taskId"] != "t-1" {
+		t.Errorf("decision taskId = %v, want t-1", dargs["taskId"])
+	}
+	if dargs["context"] != drvCtx || dargs["ruling"] != ruling {
+		t.Errorf("decision context/ruling = %+v", dargs)
+	}
+	// The decision is the driver's own application of the operator's standing
+	// ruling, so it is signed mcp_self — never relayed as a human's call it did
+	// not make, and never left unsigned where the plane would drop it.
+	if dargs["source"] != "mcp_self" {
+		t.Errorf("decision source = %v, want mcp_self", dargs["source"])
 	}
 }

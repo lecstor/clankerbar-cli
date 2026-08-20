@@ -1921,6 +1921,27 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 	return f.err
 }
 
+// parkCall is one driver-side park: the task it moved, the run signing it, and
+// the outcome/decision prose the driver sent — so a test can assert the park was
+// legible, not just that it happened.
+type parkCall struct {
+	taskID, runID, outcome, decisionContext, decisionRuling string
+}
+
+// parkingReleaser is a Releaser that can also park — the shape the real
+// mcpReleaser has since CLA-386, when the driver became able to declare a
+// failure the dead session cannot.
+type parkingReleaser struct {
+	fakeReleaser
+	parks []parkCall
+	err   error
+}
+
+func (p *parkingReleaser) Park(_ context.Context, taskID, runID, outcome, decisionContext, decisionRuling string) error {
+	p.parks = append(p.parks, parkCall{taskID, runID, outcome, decisionContext, decisionRuling})
+	return p.err
+}
+
 // held is a scripted Result carrying the claim a session ended still holding.
 func held(base harness.Result, c harness.Claim) harness.Result {
 	base.Claim = c
@@ -2695,5 +2716,42 @@ func TestInvocationCarriesTheConfiguredPromptVerbatim(t *testing.T) {
 	}
 	if got := h.invocations[0].Prompt; got != cfg.Prompt {
 		t.Errorf("harness got prompt %q, want the configured %q verbatim", got, cfg.Prompt)
+	}
+}
+
+// The exit code cannot tell a post-mortem anything on its own: a process that
+// dies on a signal reads as -1 either way, and "the runner signalled it, the OS
+// did (OOM), or the child crashed" are three different failures. The signal is
+// the discriminator, and it must reach the line that says how the phase ended
+// (CLA-386).
+func TestDrainExitLine_NamesTheSignalNotJustTheCode(t *testing.T) {
+	signalled := harness.Result{ExitCode: -1, ExitSignal: 9, Raw: map[string]any{"kind": "fail"}}
+	for _, tc := range []struct {
+		name    string
+		res     harness.Result
+		want    string
+		notWant string
+	}{
+		{"a normal exit names the code", nonRetryableResult(), "exit 2", "killed by"},
+		{"a signalled exit names the signal", signalled, "killed by SIGKILL (signal 9)", "exit 2"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{{res: tc.res}}}
+			cfg := fastCfg()
+			cfg.StateDir = t.TempDir()
+			d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
+			openTestStateDir(t, d)
+
+			_, _, _, err := drainOnce(t, d)
+			if err == nil {
+				t.Fatal("a non-retryable exit must stop the drain with an error")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error = %q, want it to say %q", err, tc.want)
+			}
+			if tc.notWant != "" && strings.Contains(err.Error(), tc.notWant) {
+				t.Errorf("error = %q, must not say %q", err, tc.notWant)
+			}
+		})
 	}
 }

@@ -36,6 +36,13 @@ import (
 // stopping the run.
 var ErrNotWired = errors.New("plane writes not wired")
 
+// ErrDecisionNotRecorded wraps a park that moved the task to `parked` but then
+// failed to record the decision that explains it. The task IS parked — it will
+// not be retried by a clanker — so the caller must not report "the park failed,
+// the task is left to the next claim" (which is false) but "parked, and the
+// record is missing" (which the operator needs to know) (review finding).
+var ErrDecisionNotRecorded = errors.New("task parked but the decision was not recorded")
+
 // Releaser hands a claim back to the queue.
 type Releaser interface {
 	// Release ends the run holding taskID and returns the task to `ready`, so the
@@ -100,6 +107,27 @@ type Recorder interface {
 	// one laptop sends the next clanker - routinely on another machine - to fetch
 	// nothing.
 	RecordBranch(ctx context.Context, taskID, runID, branch string) error
+}
+
+// ParkAPI is the optional interface a Releaser may implement to let the driver
+// declare a failure the SESSION cannot: a phase that dies producing nothing is
+// dead, so nobody is left to move the task — the driver has to (CLA-386).
+//
+// It is the one write the driver makes about a task's STATUS, and it is kept
+// deliberately narrow. Release returns a held claim to the queue; this parks a
+// task that should reach the operator rather than be retried by the next clanker
+// — the two consecutive-dead-phase case. The decision it records is what makes
+// the park legible instead of a bare failure: it names the signature that
+// triggered it, so the operator reads why without digging through iteration logs.
+//
+// A separate interface, like Recorder, so a not-wired plane or a test double
+// degrades to a loud log line rather than failing to compile.
+type ParkAPI interface {
+	// Park moves taskID to `parked` with outcome, then records a decision on it
+	// with the given context and ruling. Both are signed with runID; the decision
+	// is recorded as the driver's own (mcp_self), since it is executing the
+	// operator's standing ruling, not relaying a new one.
+	Park(ctx context.Context, taskID, runID, outcome, decisionContext, decisionRuling string) error
 }
 
 type notWired struct{}
@@ -172,6 +200,39 @@ func (r *mcpReleaser) RecordBranch(ctx context.Context, taskID, runID, branch st
 		"runId":  runID,
 		"branch": branch,
 	})
+}
+
+// Park parks a task the driver has decided should reach the operator, recording
+// the decision that explains why (CLA-386). Unlike Release — which returns a
+// held claim to the ready queue — this moves the task to `parked`, the status a
+// human reviews, because a task that has killed two consecutive sessions must
+// not be offered to a third.
+//
+// The decision is recorded with source "mcp_self": the driver is applying the
+// operator's standing ruling (retry once, then park) to this specific task, and
+// the recorded decision is its own application of that ruling, not a new one the
+// operator made.
+func (r *mcpReleaser) Park(ctx context.Context, taskID, runID, outcome, decisionContext, decisionRuling string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("park: taskId and runId are both required")
+	}
+	if err := r.call(ctx, "update_task", map[string]any{
+		"taskId":  taskID,
+		"runId":   runID,
+		"status":  "parked",
+		"outcome": outcome,
+	}); err != nil {
+		return err
+	}
+	if err := r.call(ctx, "record_decision", map[string]any{
+		"taskId":  taskID,
+		"context": decisionContext,
+		"ruling":  decisionRuling,
+		"source":  "mcp_self",
+	}); err != nil {
+		return fmt.Errorf("%w: %v", ErrDecisionNotRecorded, err)
+	}
+	return nil
 }
 
 // AttestMergeVerified writes the driver's verdict onto the task's delivery record.

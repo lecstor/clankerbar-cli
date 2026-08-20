@@ -341,8 +341,26 @@ func (in Invocation) ModelArg() string { return strings.TrimSpace(in.Model) }
 // output.go). Everything parsed here is taken from the stream as it arrives, so
 // the trimming costs the classifiers context they do not use — unless a single
 // line overran maxStreamLine, which is what Untrusted is for.
+
+// FinishReasonKey is the Result.Raw key an adapter uses to record the reason its
+// session's final step finished — opencode's step_finish `reason` field. The
+// loop reads it to tell a session that completed a final answer from one that
+// died without producing anything (CLA-386).
+const FinishReasonKey = "finish_reason"
+
+// FinishReasonUnknown is opencode's step_finish reason for a session that ended
+// without a final answer — the marker of a silent death, as distinct from
+// "stop" on a healthy completion.
+const FinishReasonUnknown = "unknown"
+
 type Result struct {
-	ExitCode     int
+	ExitCode int
+	// ExitSignal is the number of the signal that killed the child, 0 when the
+	// process exited on its own (or the platform reports no signal). It is the
+	// evidence a post-mortem needs to tell a runner/OS kill (SIGKILL, SIGTERM)
+	// from a crash (SIGSEGV, SIGABRT) — a distinction no exit code makes, since
+	// a signalled process reads as -1 (CLA-386).
+	ExitSignal   int
 	Stdout       string
 	Stderr       string
 	FinalMessage string         // the agent's final message, when parseable
@@ -444,6 +462,20 @@ func (r *Result) markUntrusted(reason string) {
 	if r.Untrusted == "" {
 		r.Untrusted = reason
 	}
+}
+
+// ExitString renders the child process's exit for a log line: "exit 1" for a
+// normal exit, "killed by SIGKILL (signal 9)" for a signalled one. The two
+// shapes have to be told apart in prose because they mean different things to a
+// post-mortem — a code is a verdict, a signal is a death (CLA-386).
+func (r Result) ExitString() string {
+	if r.ExitSignal != 0 {
+		if name := SignalName(r.ExitSignal); name != "" {
+			return fmt.Sprintf("killed by %s (signal %d)", name, r.ExitSignal)
+		}
+		return fmt.Sprintf("killed by signal %d", r.ExitSignal)
+	}
+	return fmt.Sprintf("exit %d", r.ExitCode)
 }
 
 // scanErrorText is the scan key for the adapters with a single classification
