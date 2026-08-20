@@ -477,3 +477,93 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 		t.Errorf("the terminal step is not the last thing the brief says before the handoff guidance:\n%s", brief)
 	}
 }
+
+// CLA-353: an overnight forensic drain found `gh pr create` appearing ZERO times
+// across four review-phase transcripts, and two tasks committed straight onto
+// `staging` because a session's cwd was already sitting there and nothing told it
+// that was wrong. This pins the fix's three parts: the PR step itself, its
+// position relative to the terminal update_task call (CLA-384 made that call
+// emphatic and final, which pulls harder on anything mentioned before it), and
+// the worktree/never-commit-to-staging rule that names the failure mode rather
+// than leaving "commit where I am" looking like no decision at all.
+func TestReviewBriefStatesThePRStep(t *testing.T) {
+	brief, ok := builtinPhasePrompts[reviewPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", reviewPhaseName)
+	}
+
+	prIdx := strings.Index(brief, "PR")
+	if prIdx == -1 {
+		t.Fatalf("the review brief never mentions opening a PR:\n%s", brief)
+	}
+	if !strings.Contains(brief, "staging") {
+		t.Errorf("the review brief never names staging as the PR's target:\n%s", brief)
+	}
+	if !strings.Contains(brief, "if no PR exists") {
+		t.Errorf("the review brief does not say the PR step is a no-op when a PR already exists for the branch:\n%s", brief)
+	}
+
+	// Position: push -> PR -> update_task, in that order, matching the doneWhen's
+	// explicit sequencing. Presence alone would pass on a brief that mentions a
+	// PR somewhere far from the terminal step, which is exactly the shape CLA-384
+	// warned would happen to anything not folded into the same emphatic block.
+	pushIdx := strings.Index(brief, "COMMIT and PUSH")
+	updateTaskIdx := strings.Index(brief, "update_task(taskId, runId, status: \"in_review\"")
+	if pushIdx == -1 || updateTaskIdx == -1 {
+		t.Fatalf("push (%d) or update_task (%d) not found in the brief:\n%s", pushIdx, updateTaskIdx, brief)
+	}
+	if !(pushIdx < prIdx && prIdx < updateTaskIdx) {
+		t.Errorf("the brief's terminal sequence is not push (%d) -> PR (%d) -> update_task (%d), in that order:\n%s",
+			pushIdx, prIdx, updateTaskIdx, brief)
+	}
+
+	// The PR step lives in the same pinned terminal block as the update_task call,
+	// not one paragraph earlier where CLA-384 showed salience is lost.
+	if !strings.Contains(reviewTerminalStep, "PR") {
+		t.Errorf("the PR step is not part of reviewTerminalStep, so it does not share the position pinned by TestReviewBriefStatesItsTerminalStep:\n%s", reviewTerminalStep)
+	}
+}
+
+// The two failure modes named in the 2026-08-19/20 evidence: a session whose cwd
+// is already the main checkout committing straight to staging because nothing
+// told it that was wrong, and an empty branch field silently adopted as work to
+// implement rather than reported as a failed hand-off.
+func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
+	brief, ok := builtinPhasePrompts[reviewPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", reviewPhaseName)
+	}
+
+	for _, want := range []string{
+		"worktree for the branch recorded on the task",
+		"never commit to the integration branch",
+		"empty branch",
+		"FAILED hand-off",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the review brief does not say %q:\n%s", want, brief)
+		}
+	}
+}
+
+// CLA-353: a handoff respawn replaces ph.Prompt wholesale with
+// config.HandoffPreamble plus the predecessor's self-authored prompt (CLA-352) —
+// the built-in brief text, including reviewTerminalStep, is not otherwise part of
+// it. Without HandoffContinuation a session that hands off mid-review drops the
+// PR-then-update_task sequence for its successor, silently reintroducing the bug
+// this task fixes on the one path a wording change in the brief cannot reach.
+func TestHandoffContinuation_CarriesTheReviewTerminalStepForward(t *testing.T) {
+	got := HandoffContinuation(reviewPhaseName)
+	if !strings.Contains(got, reviewTerminalStep) {
+		t.Errorf("HandoffContinuation(%q) does not carry reviewTerminalStep forward:\n%s", reviewPhaseName, got)
+	}
+
+	// The implement phase hands off nothing at in_review - it stops, and a later
+	// phase owns the resume brief - so it has no terminal step to lose.
+	if got := HandoffContinuation(implementPhaseName); got != "" {
+		t.Errorf("HandoffContinuation(%q) = %q, want empty — the implement phase has no terminal step to carry forward", implementPhaseName, got)
+	}
+	if got := HandoffContinuation("not-a-real-phase"); got != "" {
+		t.Errorf("HandoffContinuation of an unknown phase = %q, want empty", got)
+	}
+}

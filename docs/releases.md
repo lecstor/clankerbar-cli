@@ -14,8 +14,10 @@ task PR  ──merge──▶  staging  ──standing promotion PR──▶  ma
 
 Three rules carry the whole model:
 
-1. **Task PRs target `staging`**, never `main`. A clanker servicing its close-out
-   queue merges approved task PRs there.
+1. **Task PRs target `staging`**, never `main`. The task's own review phase opens
+   the PR when it hands the task to `in_review` (see the README's Phases
+   section); a clanker servicing its close-out queue merges it there only once a
+   human has approved it.
 2. **A standing `staging -> main` promotion PR** stays open and current. It is
    created and updated automatically on every push to `staging`.
 3. **Only the operator merges that promotion**, and merging it is what publishes.
