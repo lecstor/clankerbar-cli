@@ -36,12 +36,13 @@ import (
 // stopping the run.
 var ErrNotWired = errors.New("plane writes not wired")
 
-// ErrDecisionNotRecorded wraps a park that moved the task to `parked` but then
-// failed to record the decision that explains it. The task IS parked — it will
-// not be retried by a clanker — so the caller must not report "the park failed,
-// the task is left to the next claim" (which is false) but "parked, and the
-// record is missing" (which the operator needs to know) (review finding).
-var ErrDecisionNotRecorded = errors.New("task parked but the decision was not recorded")
+// ErrQuestionNotFiled wraps a park that moved the task to `parked` but then
+// failed to file the question that raises it to the operator. The task IS
+// parked — it will not be retried by a clanker — so the caller must not report
+// "the park failed, the task is left to the next claim" (which is false) but
+// "parked, and the question is missing" (which the operator needs to know)
+// (review finding).
+var ErrQuestionNotFiled = errors.New("task parked but the question was not filed")
 
 // Releaser hands a claim back to the queue.
 type Releaser interface {
@@ -116,18 +117,29 @@ type Recorder interface {
 // It is the one write the driver makes about a task's STATUS, and it is kept
 // deliberately narrow. Release returns a held claim to the queue; this parks a
 // task that should reach the operator rather than be retried by the next clanker
-// — the two consecutive-dead-phase case. The decision it records is what makes
-// the park legible instead of a bare failure: it names the signature that
-// triggered it, so the operator reads why without digging through iteration logs.
+// — the two consecutive-dead-phase case. The park files an OPEN question
+// alongside the status write, so the operator actually sees the park: a
+// recorded decision is born answered and raises nothing (CLA-395). The question
+// is deliberately a non-blocking `clarification`, not a blocking `decision`:
+// the task is already parked, so there is nothing left to block (and a blocking
+// question would un-block to `ready` on any answer, handing the task straight
+// back to the fleet the guard just withheld it from), and `decision` questions
+// are the project's STANDING DECISIONS — filed as a ruling it would push real
+// standing decisions out of that window and read as project-wide law.
 //
 // A separate interface, like Recorder, so a not-wired plane or a test double
 // degrades to a loud log line rather than failing to compile.
 type ParkAPI interface {
-	// Park moves taskID to `parked` with outcome, then records a decision on it
-	// with the given context and ruling. Both are signed with runID; the decision
-	// is recorded as the driver's own (mcp_self), since it is executing the
-	// operator's standing ruling, not relaying a new one.
-	Park(ctx context.Context, taskID, runID, outcome, decisionContext, decisionRuling string) error
+	// Park moves taskID to `parked` with outcome. Signed with runID. The
+	// outcome is the standalone record for when the question insert below fails:
+	// it must say what happened and that the call is the operator's.
+	Park(ctx context.Context, taskID, runID, outcome string) error
+
+	// AskQuestion files an OPEN question on taskID — the thing that makes a
+	// parked task reach the operator instead of vanishing into the Done tab.
+	// The caller passes blocking and kind explicitly so the dead-phase park can
+	// file a non-blocking clarification; the wire shape is asserted in tests.
+	AskQuestion(ctx context.Context, taskID, body string, options []string, blocking bool, kind string) error
 }
 
 type notWired struct{}
@@ -202,35 +214,55 @@ func (r *mcpReleaser) RecordBranch(ctx context.Context, taskID, runID, branch st
 	})
 }
 
-// Park parks a task the driver has decided should reach the operator, recording
-// the decision that explains why (CLA-386). Unlike Release — which returns a
-// held claim to the ready queue — this moves the task to `parked`, the status a
-// human reviews, because a task that has killed two consecutive sessions must
-// not be offered to a third.
+// Park parks a task the driver has decided should reach the operator (CLA-386).
+// Unlike Release — which returns a held claim to the ready queue — this moves
+// the task to `parked`, the status a human reviews, because a task that has
+// killed two consecutive sessions must not be offered to a third.
 //
-// The decision is recorded with source "mcp_self": the driver is applying the
-// operator's standing ruling (retry once, then park) to this specific task, and
-// the recorded decision is its own application of that ruling, not a new one the
-// operator made.
-func (r *mcpReleaser) Park(ctx context.Context, taskID, runID, outcome, decisionContext, decisionRuling string) error {
+// The OUTCOME is the standalone record: the park commits before any question is
+// filed (the caller files it with AskQuestion), so if that insert fails this
+// text is all the operator gets, and it must still say what happened and that
+// the call is theirs — exactly as the plane's own escalateExhausted reasons
+// about its ordering (CLA-186).
+func (r *mcpReleaser) Park(ctx context.Context, taskID, runID, outcome string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("park: taskId and runId are both required")
 	}
-	if err := r.call(ctx, "update_task", map[string]any{
+	return r.call(ctx, "update_task", map[string]any{
 		"taskId":  taskID,
 		"runId":   runID,
 		"status":  "parked",
 		"outcome": outcome,
-	}); err != nil {
-		return err
+	})
+}
+
+// AskQuestion files an OPEN question on a task (CLA-395). It is what makes a
+// park reach the operator: a recorded decision is born answered and raises no
+// open question, so a task parked with only a decision never surfaces anywhere.
+//
+// blocking and kind are passed through deliberately — the dead-phase park files
+// a non-blocking `clarification`, and the caller's choice is asserted in tests
+// rather than buried in the client. multiSelect is not sent: the plane defaults
+// it to false (single pick), and the park's options are one-of-four.
+//
+// A failure here wraps ErrQuestionNotFiled: the task IS parked — it will not be
+// retried — so the caller must report "parked, and the question is missing"
+// rather than "the park failed".
+func (r *mcpReleaser) AskQuestion(ctx context.Context, taskID, body string, options []string, blocking bool, kind string) error {
+	if taskID == "" || body == "" {
+		return errors.New("ask question: taskId and body are both required")
 	}
-	if err := r.call(ctx, "record_decision", map[string]any{
-		"taskId":  taskID,
-		"context": decisionContext,
-		"ruling":  decisionRuling,
-		"source":  "mcp_self",
-	}); err != nil {
-		return fmt.Errorf("%w: %v", ErrDecisionNotRecorded, err)
+	args := map[string]any{
+		"taskId":   taskID,
+		"body":     body,
+		"blocking": blocking,
+		"kind":     kind,
+	}
+	if len(options) > 0 {
+		args["options"] = options
+	}
+	if err := r.call(ctx, "ask_question", args); err != nil {
+		return fmt.Errorf("%w: %v", ErrQuestionNotFiled, err)
 	}
 	return nil
 }

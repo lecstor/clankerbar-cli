@@ -15,7 +15,7 @@ const okBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","tex
 
 // capture records what the driver actually put on the wire, so the request shape
 // is asserted rather than assumed. bodies holds EVERY request, in order — a call
-// that makes two writes (Park: update_task then record_decision) needs both.
+// that makes two writes (a park: update_task then ask_question) needs both.
 type capture struct {
 	method string
 	path   string
@@ -249,10 +249,14 @@ func TestRecordBranch_NotWiredIsNotARecorder(t *testing.T) {
 	}
 }
 
-// Park is the driver's only task-STATUS write, and it makes two calls in order —
-// the status write first, then the decision that explains it. Both must carry
-// exactly the keys the MCP tool schemas name, or a park fails silently at 3am as
-// "left for the next claim" while the task never actually moves (review finding).
+// A dead-phase park makes two calls in order — the status write first, then the
+// OPEN question that raises the park to the operator. Both must carry exactly
+// the keys the MCP tool schemas name, or a park fails silently at 3am as "left
+// for the next claim" while the task never actually moves (review finding). The
+// question must be a non-blocking `clarification`: a `decision` is born answered
+// and raises nothing, and a blocking question would un-block to `ready` on any
+// answer, handing the task straight back to the fleet the guard just withheld it
+// from (CLA-395).
 func TestPark_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 
@@ -262,15 +266,17 @@ func TestPark_RequestShape(t *testing.T) {
 	}
 	const (
 		outcome = "Parked after two consecutive dead phases"
-		drvCtx  = "the implement phase died producing nothing (final step reason \"unknown\", no branch recorded) twice in a row"
-		ruling  = "Parked per the 2026-08-20 operator decision: retry once, then park"
+		body    = "**t-1 has defeated two sessions and is now parked.**"
 	)
-	if err := p.Park(context.Background(), "t-1", "r-1", outcome, drvCtx, ruling); err != nil {
+	if err := p.Park(context.Background(), "t-1", "r-1", outcome); err != nil {
 		t.Fatalf("Park: %v", err)
+	}
+	if err := p.AskQuestion(context.Background(), "t-1", body, []string{"a", "b"}, false, "clarification"); err != nil {
+		t.Fatalf("AskQuestion: %v", err)
 	}
 
 	if len(got.bodies) != 2 {
-		t.Fatalf("Park made %d calls, want 2 (update_task then record_decision): %+v", len(got.bodies), got.bodies)
+		t.Fatalf("park made %d calls, want 2 (update_task then ask_question): %+v", len(got.bodies), got.bodies)
 	}
 
 	first, _ := got.bodies[0]["params"].(map[string]any)
@@ -289,20 +295,57 @@ func TestPark_RequestShape(t *testing.T) {
 	}
 
 	second, _ := got.bodies[1]["params"].(map[string]any)
-	if second["name"] != "record_decision" {
-		t.Errorf("second tool = %v, want record_decision", second["name"])
+	if second["name"] != "ask_question" {
+		t.Errorf("second tool = %v, want ask_question", second["name"])
 	}
-	dargs, _ := second["arguments"].(map[string]any)
-	if dargs["taskId"] != "t-1" {
-		t.Errorf("decision taskId = %v, want t-1", dargs["taskId"])
+	qargs, _ := second["arguments"].(map[string]any)
+	if qargs["taskId"] != "t-1" {
+		t.Errorf("question taskId = %v, want t-1", qargs["taskId"])
 	}
-	if dargs["context"] != drvCtx || dargs["ruling"] != ruling {
-		t.Errorf("decision context/ruling = %+v", dargs)
+	if qargs["body"] != body {
+		t.Errorf("question body = %+v, want the park body", qargs["body"])
 	}
-	// The decision is the driver's own application of the operator's standing
-	// ruling, so it is signed mcp_self — never relayed as a human's call it did
-	// not make, and never left unsigned where the plane would drop it.
-	if dargs["source"] != "mcp_self" {
-		t.Errorf("decision source = %v, want mcp_self", dargs["source"])
+	opts, _ := qargs["options"].([]any)
+	if len(opts) != 2 || opts[0] != "a" || opts[1] != "b" {
+		t.Errorf("question options = %+v, want the driver's options", qargs["options"])
+	}
+	// The shape that makes the park reach the operator: an OPEN question, not a
+	// born-answered decision. A blocking question would un-block to `ready` on
+	// any answer; a `decision` would read as project-wide standing law.
+	if qargs["blocking"] != false {
+		t.Errorf("question blocking = %v, want false", qargs["blocking"])
+	}
+	if qargs["kind"] != "clarification" {
+		t.Errorf("question kind = %v, want clarification", qargs["kind"])
+	}
+
+	// No decision is recorded anywhere: the park's record is the outcome plus
+	// the open question, never a record_decision call.
+	for i, b := range got.bodies {
+		params, _ := b["params"].(map[string]any)
+		if params["name"] == "record_decision" {
+			t.Errorf("call %d recorded a decision; the park must raise a question instead", i)
+		}
+	}
+}
+
+// A not-wired plane must not be a ParkAPI that silently does nothing: the driver
+// type-asserts, and a no-op park would log "parked" for a task still in the queue.
+func TestPark_NotWiredIsNotAParker(t *testing.T) {
+	if _, ok := New("", "").(ParkAPI); ok {
+		t.Error("the not-wired client claims to park tasks")
+	}
+}
+
+// A failed question insert is ErrQuestionNotFiled — the sentinel that tells the
+// driver the task IS parked and must be reported "parked, and the question is
+// missing", never "the park failed, the task is left to the next claim".
+func TestAskQuestion_FailureIsQuestionNotFiled(t *testing.T) {
+	srv, _ := serve(t, http.StatusInternalServerError, "boom")
+	p := New(srv.URL+"/mcp/demo", "k-1").(ParkAPI)
+
+	err := p.AskQuestion(context.Background(), "t-1", "body", nil, false, "clarification")
+	if !errors.Is(err, ErrQuestionNotFiled) {
+		t.Errorf("err = %v, want ErrQuestionNotFiled", err)
 	}
 }

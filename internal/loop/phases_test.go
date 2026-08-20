@@ -936,9 +936,9 @@ func TestDrainPhases_AStopReasonIsUntouched(t *testing.T) {
 }
 
 // A task that can kill two full implement phases reaches the operator rather
-// than a third session — parked, with a decision naming the signature. The retry
-// budget is per task: this drain used its one retry, so the second dead phase
-// parks instead of retrying again.
+// than a third session — parked, with an OPEN question so the operator actually
+// sees it. The retry budget is per task: this drain used its one retry, so the
+// second dead phase parks instead of retrying again.
 func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 	logs := captureLogs(t)
 	h := &fakeAdapter{steps: []invokeStep{
@@ -969,16 +969,85 @@ func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 	if got.taskID != "t-1" || got.runID != "r-1" {
 		t.Errorf("parked %s/%s, want t-1/r-1", got.taskID, got.runID)
 	}
-	// The decision names the signature that triggered it, so the park is legible
-	// rather than a bare failure.
-	if !strings.Contains(got.decisionContext, harness.FinishReasonUnknown) || !strings.Contains(got.decisionContext, "no branch recorded") {
-		t.Errorf("the recorded decision does not name the signature: %q", got.decisionContext)
+	// The park carries NO decision: since CLA-395 the record is the outcome plus
+	// the open question. The outcome must still stand alone, naming the signature.
+	if !strings.Contains(got.outcome, harness.FinishReasonUnknown) {
+		t.Errorf("the park outcome does not name the signature: %q", got.outcome)
 	}
 	if !strings.Contains(got.outcome, "retry") {
 		t.Errorf("the park outcome does not reference the operator's retry-once-then-park ruling: %q", got.outcome)
 	}
+
+	// The park filed ONE open question: non-blocking, a clarification, carrying
+	// the signature, the task ref, the two sessions it cost, and where the logs
+	// are — the shape that makes the park reach the operator.
+	if len(rel.questions) != 1 {
+		t.Fatalf("filed %d questions, want 1: %+v", len(rel.questions), rel.questions)
+	}
+	q := rel.questions[0]
+	if q.taskID != "t-1" {
+		t.Errorf("question taskId = %s, want t-1", q.taskID)
+	}
+	if q.blocking {
+		t.Error("question is blocking; the task is already parked, so a blocking question would un-block to ready on any answer")
+	}
+	if q.kind != "clarification" {
+		t.Errorf("question kind = %q, want clarification — a decision would read as project-wide standing law", q.kind)
+	}
+	for _, want := range []string{harness.FinishReasonUnknown, "no branch recorded", "two", "t-1", "iteration logs"} {
+		if !strings.Contains(q.body, want) {
+			t.Errorf("question body does not carry %q: %q", want, q.body)
+		}
+	}
+	// Options cover retry / leave parked / re-scope / drop, like the plane's own
+	// escalation options.
+	if len(q.options) != 4 {
+		t.Fatalf("question options = %+v, want the four operator choices", q.options)
+	}
+	var joined = strings.Join(q.options, "\n")
+	for _, want := range []string{"ready", "parked", "re-scop", "Drop"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("question options do not cover %q: %+v", want, q.options)
+		}
+	}
+
 	if out := logs.String(); !strings.Contains(out, "died producing nothing a second time") {
 		t.Errorf("the operator's log does not say why the task was parked:\n%s", out)
+	}
+}
+
+// The park's outcome stands ALONE if the question insert fails: the status write
+// commits first, so a task that could not raise a question is still parked — the
+// log must say "parked, and the question is missing", never "left for the next
+// claim" (the same ordering the plane's escalateExhausted reasons about).
+func TestDrainPhases_AParkOutcomeStandsAloneWhenTheQuestionFails(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
+	}}
+	rel := &parkingReleaser{questionErr: errors.New("ask_question refused")}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if stop {
+		t.Error("a parked task stopped the whole run")
+	}
+	if len(rel.parks) != 1 {
+		t.Fatalf("parked %d times, want 1 — the park must commit even when the question insert fails: %+v", len(rel.parks), rel.parks)
+	}
+	if out := logs.String(); !strings.Contains(out, "parked t-1 — two consecutive dead phases, but the question for the operator could not be filed") {
+		t.Errorf("the log does not say the task IS parked with a missing question:\n%s", out)
+	}
+	if out := logs.String(); strings.Contains(out, "left for the next claim") {
+		t.Errorf("the log says the task was left for the next claim when it is actually parked:\n%s", out)
 	}
 }
 

@@ -1508,15 +1508,21 @@ func deadReason(res *harness.Result) string {
 	return harness.FinishReasonUnknown
 }
 
-// parkDeadPhase parks the task after two consecutive dead phases, recording the
-// decision that triggered the park so it is legible rather than a bare failure
-// (CLA-386, per the 2026-08-20 operator decision: retry the implement phase
-// once, then park; the budget is per task).
+// parkDeadPhase parks the task after two consecutive dead phases, filing an
+// OPEN question so the park reaches the operator instead of vanishing into the
+// Done tab (CLA-395). The question is a non-blocking `clarification` — the task
+// is already parked, so there is nothing left to block, and a `decision` would
+// read as project-wide standing law rather than one task's triage. Its body and
+// options are modelled on the plane's own escalateExhausted shape: what
+// happened, the dead-phase signature, how many sessions it cost, where the
+// iteration logs are, and options covering retry / re-scope / leave parked /
+// drop (CLA-386, per the 2026-08-20 operator decision: retry the implement
+// phase once, then park; the budget is per task).
 //
 // The phase is dead — its sessions are gone — so nobody is left to declare the
 // failure; the driver must. The claim was released before this ran (the retry
 // re-claimed, then died again), so the park is a plain status write signed by
-// the dead phase's own run, and the decision names the signature that earned it.
+// the dead phase's own run.
 func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string, res *harness.Result) {
 	if res == nil || res.Claim.TaskID == "" {
 		log.Printf("%sdead-phase park: no claim observed, so there is no task to park", labelOf(t))
@@ -1524,36 +1530,43 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 	}
 	pk, ok := t.Releaser.(plane.ParkAPI)
 	if !ok {
-		log.Printf("%sCANNOT PARK %s — two consecutive dead phases (final step reason %q, no branch recorded), but the releaser cannot park or record the decision; the task stays in the queue and the next claim will retry it again",
+		log.Printf("%sCANNOT PARK %s — two consecutive dead phases (final step reason %q, no branch recorded), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
 			labelOf(t), claimLabel(res.Claim), deadReason(res))
 		return
 	}
 	sig := deadReason(res)
+	ref := claimLabel(res.Claim)
 	outcome := fmt.Sprintf(
-		"Parked after two consecutive dead phases: the %s session died producing nothing (final step reason %q, no branch recorded) on each attempt. Per the 2026-08-20 operator decision, a task that can kill two full sessions reaches the operator rather than a third; the retry budget is per task. Iteration logs are in the state dir.",
-		phaseLabel, sig)
-	decisionContext := fmt.Sprintf(
-		"CLA-386: the %s phase died producing nothing (final step reason %q, no branch recorded) twice in a row on %s.",
-		phaseLabel, sig, claimLabel(res.Claim))
-	decisionRuling := "Parked per the 2026-08-20 operator decision: retry the implement phase once, then park. Two consecutive dead phases mean the task reached the operator rather than a third retry; the retry budget is per task, so this ruling applies to this task's processing only."
+		"Parked after two consecutive dead phases: the %s session died producing nothing (final step reason %q, no branch recorded) on each attempt. Per the 2026-08-20 operator decision, a task that can kill two full sessions reaches the operator rather than a third; the retry budget is per task. Iteration logs are in %s.",
+		phaseLabel, sig, d.state.Path())
+	body := fmt.Sprintf(
+		"**%s has defeated two sessions and is now parked.** The %s phase died producing nothing (final step reason %q, no branch recorded) on two consecutive attempts, so the driver stopped rather than spending a third session on it.\n\n"+
+			"The task is `parked` — nothing will pick it up until an operator decides what to do with it. The iteration logs are in %s.",
+		ref, phaseLabel, sig, d.state.Path())
+	options := []string{
+		"Set it back to `ready` — the blocker is gone, let the fleet try again",
+		"Leave it parked — I will work it myself",
+		"It needs re-scoping before anyone tries again",
+		"Drop it — this is not worth another attempt",
+	}
 
 	pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
 	defer pcancel()
-	if err := pk.Park(pctx, res.Claim.TaskID, res.Claim.RunID, outcome, decisionContext, decisionRuling); err != nil {
-		if errors.Is(err, plane.ErrDecisionNotRecorded) {
-			// The task IS parked — it will not be retried — so saying it was "left
-			// for the next claim" would be the opposite of what happened. The park
-			// stands; the missing decision is the failure the operator needs to
-			// know about (review finding).
-			log.Printf("%sparked %s — two consecutive dead phases, but the decision could not be recorded: %v",
-				labelOf(t), claimLabel(res.Claim), err)
-			return
-		}
+	if err := pk.Park(pctx, res.Claim.TaskID, res.Claim.RunID, outcome); err != nil {
 		log.Printf("%spark failed for %s: %v — the task is left for the next claim to retry it again",
 			labelOf(t), claimLabel(res.Claim), err)
 		return
 	}
-	log.Printf("%sparked %s — two consecutive dead phases, recorded as a decision on the task",
+	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
+		// The task IS parked — it will not be retried — so saying it was "left
+		// for the next claim" would be the opposite of what happened. The park
+		// outcome stands alone; the missing question is the failure the operator
+		// needs to know about (review finding).
+		log.Printf("%sparked %s — two consecutive dead phases, but the question for the operator could not be filed: %v",
+			labelOf(t), claimLabel(res.Claim), err)
+		return
+	}
+	log.Printf("%sparked %s — two consecutive dead phases, question filed for the operator",
 		labelOf(t), claimLabel(res.Claim))
 }
 
