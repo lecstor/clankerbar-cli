@@ -803,32 +803,30 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// implement phase N times, then park" is exactly `i == 0` in the shipped
 		// [implement, review] sequence.
 		//
-		// CLA-396: a dead phase feeds BOTH counters. The fleet counter (consecutive
-		// dead phases across ALL tasks on this target) is incremented FIRST and
-		// checked for its trip BEFORE the per-task park, so a fleet trip never
-		// parks the in-flight task: it is a bystander — the deaths are the
-		// provider's fault, not the task's — and goes back to the queue like any
-		// released claim. A session that never got past its claim is excluded by
-		// construction: `end.dead` requires `res.Claim.Held()`, and a refused
-		// claim (lease_live, a lost race) observes no task id, so its death counts
-		// toward neither counter. This is the discriminator CLA-402's
-		// retrospective scan must agree with.
+		// CLA-396: a dead phase feeds BOTH counters, but the per-task park is
+		// checked and taken FIRST — before the fleet counter's trip is even
+		// consulted. The fleet counter persists on the Driver across drains and
+		// only resets on a successful implement phase, so it can carry a residual
+		// count left over from an earlier, unrelated task's death into THIS
+		// task's own run of deaths. Checking fleet first would let that leftover
+		// tip the fleet bound one death before this task reaches its own —
+		// pre-empting a park this task legitimately earned with a fleet-wide
+		// pause that blames the provider for what is, this time, actually the
+		// task. Per-task takes priority: a task that has itself earned a park is
+		// parked, full stop; only once that is ruled out does a fleet-wide run
+		// of deaths across DIFFERENT tasks get to trip the fleet pause. A session
+		// that never got past its claim is excluded from both by construction:
+		// `end.dead` requires `res.Claim.Held()`, and a refused claim (lease_live,
+		// a lost race) observes no task id, so its death counts toward neither
+		// counter. This is the discriminator CLA-402's retrospective scan must
+		// agree with.
 		if end.dead {
-			d.fleetDead[ti]++
-			if d.fleetDead[ti] >= fleetDeadBound {
-				d.fleetTrip(ctx, t, ti, drainNum, end.claim)
-				// The fleet trip pauses this target and this drain is over; the
-				// in-flight task was already released with the dead phase. Not a
-				// stop: the run itself did not fail.
-				break
-			}
-		}
-		if !last && end.dead && i == 0 {
 			taskID := ""
 			if end.claim != nil {
 				taskID = end.claim.Claim.TaskID
 			}
-			if taskID != "" && taskID == deadTask && deadRetries >= perTaskDeadBound-1 {
+
+			if !last && i == 0 && taskID != "" && taskID == deadTask && deadRetries >= perTaskDeadBound-1 {
 				log.Printf("%siteration %d: the %s phase died producing nothing for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
 					labelOf(t), drainNum, ph.Label(i), deadRetries+1, perTaskDeadBound)
 				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
@@ -837,19 +835,31 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// not fail, one task reached a human.
 				break
 			}
-			// Either the first dead phase this task produced, or a dead phase on a
-			// task other than the one counted above: that task has died once, and
-			// earns its own retry ladder rather than being parked for deaths it
-			// did not have.
-			if taskID != deadTask {
-				deadRetries = 1
-				deadTask = taskID
-			} else {
-				deadRetries++
+
+			d.fleetDead[ti]++
+			if d.fleetDead[ti] >= fleetDeadBound {
+				d.fleetTrip(ctx, t, ti, drainNum, end.claim)
+				// The fleet trip pauses this target and this drain is over; the
+				// in-flight task was already released with the dead phase. Not a
+				// stop: the run itself did not fail.
+				break
 			}
-			log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
-				labelOf(t), drainNum, ph.Label(i), deadReason(end.claim), deadRetries, perTaskDeadBound)
-			continue
+
+			if !last && i == 0 {
+				// Either the first dead phase this task produced, or a dead phase
+				// on a task other than the one counted above: that task has died
+				// once, and earns its own retry ladder rather than being parked
+				// for deaths it did not have.
+				if taskID != deadTask {
+					deadRetries = 1
+					deadTask = taskID
+				} else {
+					deadRetries++
+				}
+				log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
+					labelOf(t), drainNum, ph.Label(i), deadReason(end.claim), deadRetries, perTaskDeadBound)
+				continue
+			}
 		}
 
 		if perr != nil {
@@ -1662,7 +1672,7 @@ func deadReason(res *harness.Result) string {
 func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res *harness.Result) {
 	pk, ok := t.Releaser.(plane.ParkAPI)
 	if !ok {
-		log.Printf("%siteration %d: %d consecutive dead phases across tasks, but the releaser cannot file a project question — NOT pausing (the operator could never resume it); falling back to per-task parking",
+		log.Printf("%siteration %d: %d consecutive dead phases across tasks, but the releaser cannot file a project question — NOT pausing (the operator could never resume it); the per-task budget still bounds each individual task",
 			d.prefix(ti), drainNum, d.fleetDead[ti])
 		return
 	}
@@ -1673,7 +1683,7 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		d.fleetOpenQ[ti] = d.openQs[ti]
 		body := fmt.Sprintf(
 			"**%d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks.** Each task died producing nothing (final step reason %q, no branch recorded) before this, so the driver paused this project rather than burning more sessions against a provider that is already known to be failing.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
-			d.fleetDead[ti], harness.FinishReasonUnknown, d.state.Path())
+			d.fleetDead[ti], deadReason(res), d.state.Path())
 		options := []string{
 			"The provider recovered — resume draining this project",
 			"Still investigating — I will answer when it is safe to resume",

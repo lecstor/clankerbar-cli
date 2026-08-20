@@ -68,6 +68,46 @@ func TestDrainPhases_PerTaskBudgetDoesNotParkAtThree(t *testing.T) {
 	}
 }
 
+// A residual fleet count left over from an EARLIER, unrelated task's death must
+// not pre-empt a park this task has legitimately earned. The fleet counter
+// persists on the Driver across drains and only resets on a successful implement
+// phase, so a task dying its fourth consecutive time can find the fleet counter
+// already primed by someone else's death. The per-task park must still win: a
+// task that has itself earned a park is parked, not swept into a project-wide
+// fleet pause that blames the provider for what is, this time, actually the task.
+func TestDrainPhases_PerTaskParkTakesPriorityOverAResidualFleetCount(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
+	}}
+	d, rel := deadReleaserDriver(t, h)
+	// A death on some other task earlier left the fleet counter at 1 — one death
+	// short of tipping the fleet bound on this task's own fourth death, if the
+	// fleet check were consulted before the per-task one.
+	d.fleetDead[0] = 1
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Errorf("spawned %d sessions, want 4 (three retries, then the fourth dead phase parks)", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 {
+		t.Fatalf("parked %d times, want 1 — the per-task budget must win over a residual fleet count: %+v", len(rel.parks), rel.parks)
+	}
+	if len(rel.questions) != 1 {
+		t.Fatalf("filed %d questions, want 1 — a per-task park's own clarification, not a fleet-level decision: %+v", len(rel.questions), rel.questions)
+	}
+	if rel.questions[0].taskID == "" {
+		t.Error("the filed question has no taskId — this was a per-task park, not a project-level fleet trip")
+	}
+	if d.fleetPaused[0] {
+		t.Error("the fleet pause was set — a residual count must not let the fleet trip pre-empt a task's own earned park")
+	}
+}
+
 // The per-task counter resets on a successful phase of that task. A task that
 // dies ONCE per drain and succeeds between drains is retried every time and
 // never accumulates toward the park — four separate drains each carrying one
