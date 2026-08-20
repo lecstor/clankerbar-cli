@@ -497,6 +497,13 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 		}
 	}
 	assertNetworkDenied(t, p)
+	// The read-only search tools survive the probe shape too: they read the
+	// workdir subtree and write nothing, the same class as `read`.
+	for _, tool := range []string{"grep", "glob", "list"} {
+		if p[tool] != "**:allow" {
+			t.Errorf("read-only policy: %s = %q, want **:allow (read-only search must stay available)", tool, p[tool])
+		}
+	}
 	// The path-scoped working set survives the probe shape: reads inside the
 	// workdir are allowed, but nothing writes.
 	if p["read"] != "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
@@ -538,6 +545,14 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 		"read":               "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow",
 		"edit":               "Users/jason/dev/**:allow Users/jason/dev:allow",
 		"external_directory": "*:deny /Users/jason/dev/**:allow",
+		// The read-only search tools carry a flat `**` pattern allow: their
+		// asks hold the search pattern (regex/glob/directory), never a
+		// workdir-relative path, so path rules cannot scope them — the
+		// filesystem boundary lives in external_directory instead (see
+		// opencodePermission's doc, CLA-390).
+		"grep": "**:allow",
+		"glob": "**:allow",
+		"list": "**:allow",
 	}
 	for tool, folded := range want {
 		if got := p[tool]; got != folded {
@@ -556,7 +571,7 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 
 	// Last-match-wins: the catch-all must sort before every specific rule.
 	star := strings.Index(perm, `"*"`)
-	for _, key := range []string{"*_*", "bash", "edit", "external_directory", "read", "webfetch", "websearch"} {
+	for _, key := range []string{"*_*", "bash", "edit", "external_directory", "glob", "grep", "list", "read", "webfetch", "websearch"} {
 		if i := strings.Index(perm, `"`+key+`"`); i == -1 {
 			t.Errorf("policy JSON missing key %q", key)
 		} else if i < star {
@@ -628,8 +643,24 @@ func TestOpencodePermissionEffective(t *testing.T) {
 		// The exfil and hidden tools stay denied.
 		{"webfetch", "*", "deny"},
 		{"websearch", "*", "deny"},
-		{"glob", "**/*.go", "deny"},
-		{"grep", "TODO", "deny"},
+		// grep/glob/list are read-only search tools and their asks carry the
+		// SEARCH PATTERN, not a path — grep asks with the regex, glob with the
+		// glob, list (newer opencode) with the resolved directory — so the
+		// pattern ask is allowed flat and the workdir boundary lives in the
+		// external_directory gate each tool runs before searching. The asks
+		// below are the shapes the tools actually make; the boundary cases
+		// above ("/etc/*" and "~/.config/..." denied) are the gate that stops a
+		// search whose target is outside the subtree (CLA-390).
+		{"grep", "TODO", "allow"},
+		{"grep", "func main", "allow"},
+		{"glob", "**/*.go", "allow"},
+		{"glob", "{src,test}/**", "allow"},
+		{"list", "Users/jason/dev/clankerbar-cli-wt/643a681b", "allow"},
+		// lsp/task/skill stay denied by the catch-all: they are not read-only
+		// search and are out of scope for this change.
+		{"lsp", "*", "deny"},
+		{"task", "*", "deny"},
+		{"skill", "*", "deny"},
 	}
 	for _, tc := range cases {
 		if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != tc.want {
@@ -674,7 +705,9 @@ func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 			// Fail-closed elsewhere: the carve-out is one pattern on `read`,
 			// and it moves nothing else. A filesystem read outside the workdir
 			// is still denied, and the `mcp:` pattern cannot be reached by a
-			// filesystem ask (those carry worktree-relative paths).
+			// filesystem ask (those carry worktree-relative paths). grep/glob
+			// are NOT in this list: they are allowed by their own separate
+			// pattern entries (CLA-390), never by this carve-out.
 			denied := []struct{ permission, pattern string }{
 				{"read", "etc/hosts"},
 				{"read", "Users/jason/.ssh/id_ed25519"},
@@ -683,8 +716,6 @@ func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 				{"external_directory", "/etc/*"},
 				{"webfetch", "*"},
 				{"websearch", "*"},
-				{"glob", "**/*.go"},
-				{"grep", "TODO"},
 			}
 			for _, tc := range denied {
 				if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != "deny" {

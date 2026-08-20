@@ -940,10 +940,12 @@ hit it, the error text is the thing to report — it is a failure shape the adap
 should learn a pattern for.
 
 **The quiet-death signature.** A session that dies with a final `step_finish`
-reason of `unknown` and all-zero usage on its own last step is the opencode-go
-quiet-death signature — see
-[`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) for
-the incident behind it and what the CLI does about a recurrence.
+reason of `unknown` and all-zero usage on its own last step is the quiet-death
+signature. The cause is an opencode client defect, not the provider - see
+[`docs/opencode-build.md`](./docs/opencode-build.md). The marker itself is
+described in
+[`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md),
+which is a separate failure with a separate cause.
 
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in
@@ -1108,14 +1110,22 @@ worktrees live, e.g. `~/dev/clankerbar-cli-wt/<task>`) is allowed for
 boundary — allows the same subtree while **denying every other path** (so
 `bash cp ~/.ssh/...` stays blocked, exactly as before), and `bash` stays
 allowed tool-level (its permission patterns match parsed commands, not paths).
-Everything else — reads or edits outside the workdir, `glob`/`grep`/`lsp`/`task`/`skill`,
+Everything else — reads or edits outside the workdir, `lsp`/`task`/`skill`,
 and the network tools (`webfetch`, `websearch`) in every shape — is denied by
 a `*` catch-all rather than asked, and denied tools are hidden from the
-session's catalog entirely. Three exceptions keep the session alive inside that
-catch-all: `*_*` allows the MCP tools (tool names are `<server>_<tool>` in
-opencode — `clankerbar_get_backlog_summary`, `context7_query-docs`,
-`chrome-devtools_click` — and the plane itself is reached over MCP); `read`
-also allows `mcp:*`, because opencode's MCP **resource** tools
+session's catalog entirely. The read-only search tools are an exception
+(CLA-390): `grep`, `glob` and `list` are allowed so a session can search the
+code it is editing instead of burning turns on `bash` fallbacks. Their asks
+carry the search pattern (a regex, a glob, a directory) rather than a
+workdir-relative path, so the workdir boundary cannot live in the ask for
+them — it lives in `external_directory`, which each tool runs before
+searching and which stays scoped to the workdir subtree, so they reach
+exactly what `read` already can and nothing more. Three more exceptions keep
+the session alive inside that catch-all: `*_*` allows the MCP tools (tool
+names are `<server>_<tool>` in opencode — `clankerbar_get_backlog_summary`,
+`context7_query-docs`, `chrome-devtools_click` — and the plane itself is
+reached over MCP); `read` also allows `mcp:*`, because opencode's MCP
+**resource** tools
 (`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`) do
 *not* ask under their own names — they ask under `read`, with
 `mcp:<server>:<uri>` patterns that the path-scoped `read` rules never matched,
@@ -1147,7 +1157,8 @@ parent is the correct setting.
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
-- [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence. Troubleshooting for a session that dies with `reason: "unknown"` and zero usage.
+- [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence.
+- [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs and why not `opencode2`, how to tell which one actually ran, and the upstream defect that makes a session exit 0 having done nothing. Start here for a session that dies with `reason: "unknown"` and zero usage.
 
 ## License
 

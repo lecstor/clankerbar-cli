@@ -103,9 +103,12 @@ sessions died producing nothing, and the marker above is what makes any such
 death self-describing. What is **unconfirmed**: that the tool-schema rejection
 caused them. On 2026-08-20 the rejection strings appeared in the iteration logs
 only as task-body text an agent read, never as an error event, and the direct
-probes all returned 200. The live hypothesis for the dead phases is a different
-gateway failure — streams ending with no terminal `finish_reason`
-([#40420](https://github.com/anomalyco/opencode/issues/40420),
-[#43379](https://github.com/anomalyco/opencode/issues/43379)) — tracked as
-CLA-401. The tool-schema work here stands as hardening against a recurrence the
+probes all returned 200. **That question is now settled, and not in this page's favour.** CLA-401
+disconfirmed the gateway entirely: 40 of 40 streams carried a terminal
+`finish_reason`, against both this gateway and the official DeepSeek API. The
+cause is an opencode client defect - `prompt.ts:1113` treats an indeterminate
+finish as a completed turn and exits 0 - filed as
+[#43622](https://github.com/anomalyco/opencode/issues/43622) and written up in
+[`opencode-build.md`](./opencode-build.md), with our mitigation as CLA-406.
+**Do not reason from this page about a quiet death.** The tool-schema work here stands as hardening against a recurrence the
 2026-08-19 logs prove is real.
