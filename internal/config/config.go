@@ -297,7 +297,7 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 // an emphatic final call loses to it. So the PR step is folded into this same
 // terminal block, before the update_task sentence, not left in the paragraph above.
 const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's integration " +
-	"branch (staging) if none exists yet for this branch - push, then the PR, in that order, before the " +
+	"branch (staging) if no PR exists yet for this branch - push, then the PR, in that order, before the " +
 	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
 	"update_task(taskId, runId, status: \"in_review\", outcome: ...), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +

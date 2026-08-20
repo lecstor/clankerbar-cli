@@ -216,6 +216,35 @@ func TestDrainPhases_AHandoffDuringReviewCarriesTheTerminalStepForward(t *testin
 	}
 }
 
+// CLA-353 review finding: HandoffContinuation matches on phase NAME alone, so
+// without this gate an operator who reuses the name "review" for a phase
+// carrying their own custom Prompt would get the shipped brief's terminal step
+// (its own update_task/PR contract) force-injected into a handoff respawn of a
+// brief that never established that contract — clashing with whatever terminal
+// step, if any, the operator's own prompt names. Only a phase actually running
+// the BUILT-IN brief (no configured Prompt of its own) may carry it forward.
+func TestDrainPhases_ACustomPromptNamedReviewGetsNoInjectedTerminalStep(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: handoffResult("Handing off my own custom review-shaped work.")},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: "review", Prompt: "Do your own custom review-shaped job, whatever that means here."},
+	})
+
+	_, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	successor := h.invocations[1].Prompt
+	if strings.Contains(successor, "update_task(taskId, runId, status: \"in_review\"") {
+		t.Errorf("a phase named %q running its OWN custom prompt got the shipped review brief's terminal step force-injected on handoff: %q", "review", successor)
+	}
+	if handoffs != 1 {
+		t.Errorf("handoffs = %d, want 1", handoffs)
+	}
+}
+
 // The runaway-chain cap: a session cannot chain itself indefinitely. At the cap
 // the emitted prompt is refused and the sequence falls back to the standard
 // path.

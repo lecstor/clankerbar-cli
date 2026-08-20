@@ -499,7 +499,7 @@ func TestReviewBriefStatesThePRStep(t *testing.T) {
 	if !strings.Contains(brief, "staging") {
 		t.Errorf("the review brief never names staging as the PR's target:\n%s", brief)
 	}
-	if !strings.Contains(brief, "if none exists") {
+	if !strings.Contains(brief, "if no PR exists") {
 		t.Errorf("the review brief does not say the PR step is a no-op when a PR already exists for the branch:\n%s", brief)
 	}
 

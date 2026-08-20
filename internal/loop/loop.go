@@ -598,8 +598,23 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			// replaced wholesale rather than framing the built-in text. For the
 			// review phase that would silently drop the PR-then-update_task
 			// terminal step the moment a session hands off mid-review.
+			//
+			// Gated on the phase actually RUNNING the built-in brief (review
+			// finding): HandoffContinuation matches on name alone, so an
+			// operator who reuses the name "review" for a phase carrying their
+			// own custom Prompt would otherwise have the shipped terminal step
+			// force-injected into a handoff respawn of a brief that never
+			// established that contract in the first place — clashing with
+			// whatever terminal step their own prompt names, if any.
+			// d.cfg.Phases (the unresolved config, not EffectivePhases' output)
+			// is index-aligned with phases: EffectivePhases builds its slice
+			// 1:1 from c.Phases, never adding or dropping an entry.
 			promptBytes = len(nextPrompt)
-			ph.Prompt = config.HandoffPreamble + nextPrompt + config.HandoffContinuation(ph.Name)
+			continuation := ""
+			if i < len(d.cfg.Phases) && d.cfg.Phases[i].Prompt == "" {
+				continuation = config.HandoffContinuation(ph.Name)
+			}
+			ph.Prompt = config.HandoffPreamble + nextPrompt + continuation
 			nextPrompt = ""
 		}
 
