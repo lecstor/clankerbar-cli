@@ -205,7 +205,7 @@ const opencodeMCPResourcePattern = "mcp:*"
 // external_directory, which IS scoped above — that is the carve-out that fixes
 // the old heuristic denials ("cp is denied but sed -i works").
 //
-// Four opencode quirks the emitted shape is fitted to (verified against opencode
+// Five opencode quirks the emitted shape is fitted to (verified against opencode
 // 1.18.16 source, and the MCP-resource one re-verified against the shipped 1.18.18
 // bundle: permission/index.ts, session/tools.ts, tool/read.ts, tool/edit.ts,
 // tool/external-directory.ts):
@@ -247,20 +247,29 @@ const opencodeMCPResourcePattern = "mcp:*"
 //     outside the workdir is refused before `mcp:*` is ever consulted, and a
 //     relative path that did start with "mcp:" is inside the working set already.
 //   - grep/glob (and list, in newer opencode) are read-only SEARCH tools, and
-//     their asks are NOT path-scoped the way read/edit are — verified against
-//     opencode 1.18.18 source (tool/grep.ts, tool/glob.ts): grep asks with the
-//     REGEX itself (`patterns: [pattern]`), glob asks with the GLOB itself, and
-//     the newer opencode's list asks with the resolved absolute directory. A
-//     path rule could never match those asks, so for these tools the workdir
-//     boundary cannot live in the ask; it lives in `external_directory`, which
-//     every one of them runs BEFORE searching — containsPath returns without
-//     asking for an in-workdir target, and an out-of-workdir target asks
-//     external_directory, denied here. Allowing the pattern `**` therefore
-//     grants no reach `read` does not already have: the ask governs the search
-//     pattern, the reach is still the workdir subtree (CLA-390). `list` is not
-//     a builtin in 1.18.18 (the run path's registry carries no list tool); it is
-//     allowed for the same read-only reason so a future opencode upgrade does
-//     not re-break directory listing the way grep/glob broke.
+//     their asks are NOT path-scoped the way read/edit are. grep and glob are
+//     verified against opencode 1.18.18 source (tool/grep.ts, tool/glob.ts):
+//     grep asks with the REGEX itself (`patterns: [pattern]`), glob asks with
+//     the GLOB itself. `list` is NOT a builtin in 1.18.18 - the run path's
+//     registry carries no list tool, so there is no tool/list.ts to verify
+//     against - its ask shape (the resolved absolute directory) is inferred by
+//     analogy with grep/glob/read, not source-confirmed. A path rule could
+//     never match any of these asks, so for these tools the workdir boundary
+//     cannot live in the ask; it lives in `external_directory`, which every one
+//     of them is claimed to run BEFORE searching - containsPath returns
+//     without asking for an in-workdir target, and an out-of-workdir target
+//     asks external_directory, denied here. That claim about grep.ts/glob.ts's
+//     internal call order is verified against source and is NOT re-checked by
+//     any test in this repo (a future opencode release changing it would not
+//     go red here); confirm it holds after an opencode upgrade by checking
+//     `~/.local/share/opencode/log/opencode.log` for an `external_directory`
+//     deny on an out-of-workdir grep/glob/list call in a live session (see the
+//     README's "Verifying the policy against a live session"). Allowing the
+//     pattern `**` therefore grants no reach `read` does not already have: the
+//     ask governs the search pattern, the reach is still the workdir subtree
+//     (CLA-390). `list` is allowed for the same read-only reason so a future
+//     opencode upgrade does not re-break directory listing the way grep/glob
+//     broke.
 //   - read/edit asks carry the path RELATIVE TO THE GIT WORKTREE
 //     (path.relative(worktree, file)); a session whose cwd is not inside a git
 //     repo — the multi-repo-parent case, workdir=~/dev — gets worktree "/", so
