@@ -1108,14 +1108,22 @@ worktrees live, e.g. `~/dev/clankerbar-cli-wt/<task>`) is allowed for
 boundary — allows the same subtree while **denying every other path** (so
 `bash cp ~/.ssh/...` stays blocked, exactly as before), and `bash` stays
 allowed tool-level (its permission patterns match parsed commands, not paths).
-Everything else — reads or edits outside the workdir, `glob`/`grep`/`lsp`/`task`/`skill`,
+Everything else — reads or edits outside the workdir, `lsp`/`task`/`skill`,
 and the network tools (`webfetch`, `websearch`) in every shape — is denied by
 a `*` catch-all rather than asked, and denied tools are hidden from the
-session's catalog entirely. Three exceptions keep the session alive inside that
-catch-all: `*_*` allows the MCP tools (tool names are `<server>_<tool>` in
-opencode — `clankerbar_get_backlog_summary`, `context7_query-docs`,
-`chrome-devtools_click` — and the plane itself is reached over MCP); `read`
-also allows `mcp:*`, because opencode's MCP **resource** tools
+session's catalog entirely. The read-only search tools are an exception
+(CLA-390): `grep`, `glob` and `list` are allowed so a session can search the
+code it is editing instead of burning turns on `bash` fallbacks. Their asks
+carry the search pattern (a regex, a glob, a directory) rather than a
+workdir-relative path, so the workdir boundary cannot live in the ask for
+them — it lives in `external_directory`, which each tool runs before
+searching and which stays scoped to the workdir subtree, so they reach
+exactly what `read` already can and nothing more. Three more exceptions keep
+the session alive inside that catch-all: `*_*` allows the MCP tools (tool
+names are `<server>_<tool>` in opencode — `clankerbar_get_backlog_summary`,
+`context7_query-docs`, `chrome-devtools_click` — and the plane itself is
+reached over MCP); `read` also allows `mcp:*`, because opencode's MCP
+**resource** tools
 (`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`) do
 *not* ask under their own names — they ask under `read`, with
 `mcp:<server>:<uri>` patterns that the path-scoped `read` rules never matched,

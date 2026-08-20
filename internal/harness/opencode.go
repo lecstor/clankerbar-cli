@@ -246,6 +246,21 @@ const opencodeMCPResourcePattern = "mcp:*"
 //     read tool runs its external_directory gate BEFORE the read ask: a path
 //     outside the workdir is refused before `mcp:*` is ever consulted, and a
 //     relative path that did start with "mcp:" is inside the working set already.
+//   - grep/glob (and list, in newer opencode) are read-only SEARCH tools, and
+//     their asks are NOT path-scoped the way read/edit are — verified against
+//     opencode 1.18.18 source (tool/grep.ts, tool/glob.ts): grep asks with the
+//     REGEX itself (`patterns: [pattern]`), glob asks with the GLOB itself, and
+//     the newer opencode's list asks with the resolved absolute directory. A
+//     path rule could never match those asks, so for these tools the workdir
+//     boundary cannot live in the ask; it lives in `external_directory`, which
+//     every one of them runs BEFORE searching — containsPath returns without
+//     asking for an in-workdir target, and an out-of-workdir target asks
+//     external_directory, denied here. Allowing the pattern `**` therefore
+//     grants no reach `read` does not already have: the ask governs the search
+//     pattern, the reach is still the workdir subtree (CLA-390). `list` is not
+//     a builtin in 1.18.18 (the run path's registry carries no list tool); it is
+//     allowed for the same read-only reason so a future opencode upgrade does
+//     not re-break directory listing the way grep/glob broke.
 //   - read/edit asks carry the path RELATIVE TO THE GIT WORKTREE
 //     (path.relative(worktree, file)); a session whose cwd is not inside a git
 //     repo — the multi-repo-parent case, workdir=~/dev — gets worktree "/", so
@@ -274,6 +289,17 @@ func opencodePermission(readOnly bool, workdir string) string {
 		"external_directory": map[string]string{"*": "deny", abs: "allow"},
 		// MCP tools must survive the `*` catch-all — see the function doc.
 		"*_*": "allow",
+		// The read-only search tools: grep/glob/list. Their asks carry the
+		// search pattern (a regex, a glob, or the resolved directory), never a
+		// workdir-relative path, so a path-scoped rule could not match them and
+		// the catch-all would leave the tools denied — the CLA-390 bug. The
+		// pattern `**` is a flat allow of the ASK; the filesystem boundary
+		// stays in `external_directory`, which each tool runs before searching
+		// and which is scoped to the workdir subtree above. See the function
+		// doc's grep/glob/list bullet for the verification.
+		"grep": map[string]string{"**": "allow"},
+		"glob": map[string]string{"**": "allow"},
+		"list": map[string]string{"**": "allow"},
 		// The exfil guards, explicit in both shapes.
 		"webfetch":  "deny",
 		"websearch": "deny",
@@ -284,9 +310,9 @@ func opencodePermission(readOnly bool, workdir string) string {
 	} else {
 		perm["bash"] = "allow"
 	}
-	// The catch-all: anything not named above — glob/grep/lsp/task/skill, reads
-	// or edits outside the workdir — is denied rather than asked. Sorts first
-	// (see the doc), so every specific rule wins the last-match-wins evaluation.
+	// The catch-all: anything not named above — lsp/task/skill, reads or edits
+	// outside the workdir — is denied rather than asked. Sorts first (see the
+	// doc), so every specific rule wins the last-match-wins evaluation.
 	perm["*"] = "deny"
 	b, _ := json.Marshal(perm)
 	return string(b)
