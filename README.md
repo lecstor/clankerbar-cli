@@ -68,7 +68,7 @@ substitutes the task and run ids into its brief, so it calls `heartbeat` instead
 of claiming), re-reads the bar and the standing decisions from the plane, works
 in that same worktree — never on the integration branch itself — runs the
 adversarial review, fixes what it finds, pushes, opens a PR targeting the
-integration branch if none exists yet for the branch, and hands the task to
+integration branch if no PR exists yet for the branch, and hands the task to
 `in_review`. The claim is held across the seam, so the task is never posted back
 to the queue mid-sequence. See [`docs/releases.md`](./docs/releases.md) for what
 happens to that PR after `in_review` — merged by a clanker only once a human
