@@ -74,6 +74,30 @@ var errUnclassifiedRetryLoop = errors.New("unclassified retry loop")
 // three paid sessions instead of a night's worth.
 const unclassifiedRetryBound = 2
 
+// perTaskDeadBound is how many consecutive dead phases on the SAME task park it
+// (CLA-396, raised from 2 by the 2026-08-20 operator decision). A task really
+// can be cursed — a brief that reliably kills every session sent at it — but at
+// 2 the budget fired on ordinary bad luck: at the observed 37.5% per-session
+// death rate, two consecutive deaths is a 14% roll, and CLA-390 was parked on
+// exactly that and had to be un-parked by hand. Four consecutive deaths is a
+// ~2% roll — a signal rather than noise — while a task that dies once per drain
+// and succeeds between (the retry re-claims the same task within the drain)
+// never accumulates past one here, because the counter resets when a phase of
+// the task advances (see the reset below).
+const perTaskDeadBound = 4
+
+// fleetDeadBound is how many consecutive dead phases ACROSS tasks pause the
+// loop for that target and raise one project-level question (CLA-396). One
+// more than the per-task bound, on purpose: a single cursed task parks at 4
+// (its own counter fires first, and the drain breaks before any fifth death),
+// so the fleet counter can only reach 5 across DIFFERENT tasks — the shape
+// only a fleet-wide fault produces. A task that dies once looks identical to
+// a healthy task hit by a provider outage, and only a run of deaths spanning
+// tasks distinguishes the two; 5 consecutive deaths at the observed 37.5% rate
+// is a ~0.7% roll, and it stays conservative after CLA-406 removes the
+// retryable class from the numerator.
+const fleetDeadBound = 5
+
 // Target is one backlog a Driver drives: a project's cheap poller plus where that
 // project's drain sessions run (CLA-142). A single-project Driver has exactly one,
 // unnamed target; a multi-project Driver has one per configured project.
@@ -149,6 +173,38 @@ type Driver struct {
 	pending     []bool      // a drain of this target is awaiting its progress verdict
 	skipUntil   []time.Time // a backed-off target is ineligible until this time
 
+	// The fleet dead-phase counter (CLA-396). Per-target because a multi-target
+	// driver runs several projects, and "the fleet" is one project's sessions:
+	// a run of dead phases on project A must not pause project B. The per-task
+	// budget in drainPhases cannot see a provider failing for every task — each
+	// individual task dies only once, so no per-task counter ever trips — and
+	// these exist to catch exactly that: consecutive dead phases across
+	// DIFFERENT tasks mean the harness or provider is broken, not the tasks.
+	// The counter resets ONLY on a successful implement phase (see the reset in
+	// drainPhases), because review phases run on the claude harness and cannot
+	// exhibit the zero-usage death: a claude success vouching for the opencode
+	// gateway would hide the very fault the detector exists to find.
+	fleetDead []int // consecutive dead phases across all tasks on this target
+
+	// fleetPaused marks a target whose fleet counter has tripped: the loop stops
+	// spawning sessions for it until the operator answers the raised question —
+	// a known-failing provider must stop burning sessions. Measured as the
+	// open-question count falling back to what it was at the raise (fleetOpenQ),
+	// the same "something was resolved" signal judgeProgress uses.
+	fleetPaused []bool
+
+	// fleetRaised records that this target's fleet question is OPEN, so a trip
+	// raises exactly ONE project-level question rather than one per poll while
+	// the pause is in force. Cleared when the pause clears, so a later trip —
+	// a new episode — raises a fresh question.
+	fleetRaised []bool
+
+	// fleetOpenQ is the open-question count at the raise: the baseline the
+	// resume signal is measured against. Captured from the last poll (d.openQs)
+	// at trip time, so it does not include the question just raised; the pause
+	// clears once the count falls back to it or below.
+	fleetOpenQ []int
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery.
 	newVerifier func(workdir string) deliveryVerifier
@@ -208,6 +264,10 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		openQs:      make([]int, n),
 		pending:     make([]bool, n),
 		skipUntil:   make([]time.Time, n),
+		fleetDead:   make([]int, n),
+		fleetPaused: make([]bool, n),
+		fleetRaised: make([]bool, n),
+		fleetOpenQ:  make([]int, n),
 		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
@@ -372,7 +432,17 @@ func (d *Driver) Run(ctx context.Context) error {
 							log.Printf("%sconsole pause cleared — resuming", d.prefix(i))
 						}
 						d.judgeProgress(i, sum)
-						if sum.Spawnable() && !d.backedOff(i) {
+						// CLA-396: a target the fleet counter paused stays
+						// paused until the operator answers the raised question
+						// — the open-question count falls back to what it was at
+						// the raise (the same "something was resolved" signal
+						// judgeProgress uses for the quiet back-off).
+						if d.fleetPaused[i] && sum.OpenQuestions <= d.fleetOpenQ[i] {
+							d.fleetPaused[i] = false
+							d.fleetRaised[i] = false
+							log.Printf("%sfleet pause cleared — the operator answered the dead-phase question; resuming", d.prefix(i))
+						}
+						if sum.Spawnable() && !d.backedOff(i) && !d.fleetPaused[i] {
 							candidates[i] = true
 							anyCandidate = true
 						}
@@ -412,7 +482,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, handoffs, stop, err := d.drainPhases(ctx, drains, target,
+		tokens, cost, handoffs, stop, err := d.drainPhases(ctx, drains, d.cursor, target,
 			spend{start: start, tokens: totalTokens, cost: totalCost})
 		// Count the spend BEFORE deciding what to do with the outcome: a drain that
 		// stopped or failed still burned what it burned, and the accumulator is what
@@ -553,7 +623,7 @@ func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) str
 //     A handback here would put the task in the queue while we are still on it.
 //  2. If the next phase will never run, the handback skipped at the seam happens
 //     here instead — otherwise a budget stop leaves the task leased to nobody.
-func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, handoffs int, stop bool, err error) {
+func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, handoffs int, stop bool, err error) {
 	phases := d.cfg.EffectivePhases()
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
@@ -708,11 +778,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 		// not "ended without holding the task" either — it never finished the job
 		// it was spawned to do. The claim was released back in drainPhase (a retry
 		// re-claims, exactly like a transient one), so the only question left is
-		// retry vs park. First dead phase: retry the same phase once, so a silent
-		// death that was a one-off costs one session rather than handing a review
-		// brief a task with no branch on it. Second consecutive dead phase on the
-		// SAME task: park — a task that can kill two full sessions reaches the
-		// operator rather than a third (2026-08-20 operator decision).
+		// retry vs park. Consecutive dead phases on the SAME task: retry up to the
+		// per-task budget, then park — a task that can kill four full sessions
+		// reaches the operator rather than a fifth (CLA-396, raised from two by
+		// the 2026-08-20 operator decision).
 		//
 		// Deliberately BEFORE the error break below: the dead classification
 		// names a phase that produced nothing whatever its exit code, so a dead
@@ -731,16 +800,37 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 		// every phase); it just is not retried or parked here — the drain ends and
 		// the task returns to the queue, where a fresh claiming session retries it
 		// with a valid seed (review finding). The operator decision's "retry the
-		// implement phase once, then park" is exactly `i == 0` in the shipped
+		// implement phase N times, then park" is exactly `i == 0` in the shipped
 		// [implement, review] sequence.
+		//
+		// CLA-396: a dead phase feeds BOTH counters. The fleet counter (consecutive
+		// dead phases across ALL tasks on this target) is incremented FIRST and
+		// checked for its trip BEFORE the per-task park, so a fleet trip never
+		// parks the in-flight task: it is a bystander — the deaths are the
+		// provider's fault, not the task's — and goes back to the queue like any
+		// released claim. A session that never got past its claim is excluded by
+		// construction: `end.dead` requires `res.Claim.Held()`, and a refused
+		// claim (lease_live, a lost race) observes no task id, so its death counts
+		// toward neither counter. This is the discriminator CLA-402's
+		// retrospective scan must agree with.
+		if end.dead {
+			d.fleetDead[ti]++
+			if d.fleetDead[ti] >= fleetDeadBound {
+				d.fleetTrip(ctx, t, ti, drainNum, end.claim)
+				// The fleet trip pauses this target and this drain is over; the
+				// in-flight task was already released with the dead phase. Not a
+				// stop: the run itself did not fail.
+				break
+			}
+		}
 		if !last && end.dead && i == 0 {
 			taskID := ""
 			if end.claim != nil {
 				taskID = end.claim.Claim.TaskID
 			}
-			if taskID != "" && taskID == deadTask && deadRetries >= 1 {
-				log.Printf("%siteration %d: the %s phase died producing nothing a second time — parking the task per the 2026-08-20 decision (retry once, then park)",
-					labelOf(t), drainNum, ph.Label(i))
+			if taskID != "" && taskID == deadTask && deadRetries >= perTaskDeadBound-1 {
+				log.Printf("%siteration %d: the %s phase died producing nothing for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
+					labelOf(t), drainNum, ph.Label(i), deadRetries+1, perTaskDeadBound)
 				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
 				// The task is parked for the operator and this drain is over; the
 				// daemon carries on with the next task. Not a stop: the run did
@@ -749,12 +839,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 			}
 			// Either the first dead phase this task produced, or a dead phase on a
 			// task other than the one counted above: that task has died once, and
-			// earns its own single retry rather than being parked for a second
-			// death it did not have.
-			deadRetries = 1
-			deadTask = taskID
-			log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it once before any review brief sees the task",
-				labelOf(t), drainNum, ph.Label(i), deadReason(end.claim))
+			// earns its own retry ladder rather than being parked for deaths it
+			// did not have.
+			if taskID != deadTask {
+				deadRetries = 1
+				deadTask = taskID
+			} else {
+				deadRetries++
+			}
+			log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
+				labelOf(t), drainNum, ph.Label(i), deadReason(end.claim), deadRetries, perTaskDeadBound)
 			continue
 		}
 
@@ -802,9 +896,20 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum int, t Target, prior 
 		// parked or advanced — either way this phase's dead-phase budget is spent.
 		// Resetting on the advance keeps the retry per-PHASE rather than per-run:
 		// two dead phases separated by a healthy one are not "consecutive", and
-		// each phase earns its own single retry (CLA-386).
+		// each phase earns its own retry ladder (CLA-386).
 		deadRetries = 0
 		deadTask = ""
+		// CLA-396: a successful IMPLEMENT phase resets the FLEET-wide dead-phase
+		// counter. Only the implement phase runs the harness that can exhibit the
+		// zero-usage death — the review phase runs on the claude harness, which
+		// cannot — so a claude success must not vouch for the opencode gateway:
+		// letting any success reset the counter would hide a fleet fault from the
+		// detector that exists to find it. Reaching here means this phase did not
+		// die and did not fail, so for the implement phase it is the "successful
+		// implement" the reset is keyed to.
+		if ph.Name == config.ImplementPhaseName {
+			d.fleetDead[ti] = 0
+		}
 		i++
 	}
 
@@ -1529,7 +1634,67 @@ func deadReason(res *harness.Result) string {
 	return harness.FinishReasonUnknown
 }
 
-// parkDeadPhase parks the task after two consecutive dead phases, filing an
+// fleetTrip pauses a target whose fleet dead-phase counter has reached
+// fleetDeadBound (CLA-396): that many consecutive dead phases across tasks mean
+// the harness or provider is broken right now, not the tasks, and every further
+// session would pay the same death rate for nothing. The target stops spawning
+// until the operator answers the raised project-level question (the open-question
+// count falls back to what it was at the raise — see the poll gate in Run).
+//
+// The question is PROJECT-level — ask_question with no taskId — because a fleet
+// trip is not one task's triage: pinning it to whichever task happened to be in
+// flight would make the operator answer about a bystander. It is filed as a
+// non-blocking `decision` — there is no task to block (the loop's pause is the
+// enforcement), and the operator's ruling on a fleet incident is a project-level
+// judgment worth standing in the decision log, unlike the park's one-task
+// clarification.
+//
+// "Exactly one" is guaranteed by fleetRaised: while the pause is in force the
+// flag is set, so a later trip in the same episode does not re-raise. The flag
+// clears with the pause, so a NEW episode — the operator answered, the loop
+// resumed, and the fleet died again — raises a fresh question.
+//
+// If the question cannot be filed, the pause is NOT set: a pause the operator
+// can never be told about and can never resume is a permanent stall, which is
+// worse than the fall-through (per-task parking still bounds each task). The
+// dead-phase counter stays at the bound, so the next dead phase tries again —
+// loudly.
+func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res *harness.Result) {
+	pk, ok := t.Releaser.(plane.ParkAPI)
+	if !ok {
+		log.Printf("%siteration %d: %d consecutive dead phases across tasks, but the releaser cannot file a project question — NOT pausing (the operator could never resume it); falling back to per-task parking",
+			d.prefix(ti), drainNum, d.fleetDead[ti])
+		return
+	}
+	if !d.fleetRaised[ti] {
+		d.fleetRaised[ti] = true
+		// The baseline the resume signal is measured against: the open-question
+		// count at the last poll, BEFORE the question below raises it by one.
+		d.fleetOpenQ[ti] = d.openQs[ti]
+		body := fmt.Sprintf(
+			"**%d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks.** Each task died producing nothing (final step reason %q, no branch recorded) before this, so the driver paused this project rather than burning more sessions against a provider that is already known to be failing.\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next dead phase will pause it again and raise a fresh question. Iteration logs are in %s.",
+			d.fleetDead[ti], harness.FinishReasonUnknown, d.state.Path())
+		options := []string{
+			"The provider recovered — resume draining this project",
+			"Still investigating — I will answer when it is safe to resume",
+			"Switch or restart the harness — try again",
+			"Something else is wrong — stop the daemon",
+		}
+		pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+		defer pcancel()
+		if err := pk.AskProjectQuestion(pctx, body, options, "decision"); err != nil {
+			log.Printf("%siteration %d: the fleet dead-phase question could not be filed: %v — NOT pausing (the operator could never resume it); the next dead phase will retry the raise",
+				d.prefix(ti), drainNum, err)
+			d.fleetRaised[ti] = false
+			return
+		}
+	}
+	d.fleetPaused[ti] = true
+	log.Printf("%siteration %d: %d consecutive dead phases across tasks — the provider or harness looks broken, not the tasks; pausing this project until the operator answers the raised question",
+		d.prefix(ti), drainNum, d.fleetDead[ti])
+}
+
+// parkDeadPhase parks the task after four consecutive dead phases, filing an
 // OPEN question so the park reaches the operator instead of vanishing into the
 // Done tab (CLA-395). The question is a non-blocking `clarification` — the task
 // is already parked, so there is nothing left to block, and a `decision` would
@@ -1538,7 +1703,7 @@ func deadReason(res *harness.Result) string {
 // happened, the dead-phase signature, how many sessions it cost, where the
 // iteration logs are, and options covering retry / re-scope / leave parked /
 // drop (CLA-386, per the 2026-08-20 operator decision: retry the implement
-// phase once, then park; the budget is per task).
+// phase four times, then park; the budget is per task).
 //
 // The phase is dead — its sessions are gone — so nobody is left to declare the
 // failure; the driver must. The claim was released before this ran (the retry
@@ -1551,17 +1716,17 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 	}
 	pk, ok := t.Releaser.(plane.ParkAPI)
 	if !ok {
-		log.Printf("%sCANNOT PARK %s — two consecutive dead phases (final step reason %q, no branch recorded), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
+		log.Printf("%sCANNOT PARK %s — four consecutive dead phases (final step reason %q, no branch recorded), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
 			labelOf(t), claimLabel(res.Claim), deadReason(res))
 		return
 	}
 	sig := deadReason(res)
 	ref := claimLabel(res.Claim)
 	outcome := fmt.Sprintf(
-		"Parked after two consecutive dead phases: the %s session died producing nothing (final step reason %q, no branch recorded) on each attempt. Per the 2026-08-20 operator decision, a task that can kill two full sessions reaches the operator rather than a third; the retry budget is per task. Iteration logs are in %s.",
+		"Parked after four consecutive dead phases: the %s session died producing nothing (final step reason %q, no branch recorded) on each attempt. Per the 2026-08-20 operator decision, a task that can kill four full sessions reaches the operator rather than a fifth; the retry budget is per task. Iteration logs are in %s.",
 		phaseLabel, sig, d.state.Path())
 	body := fmt.Sprintf(
-		"**%s has defeated two sessions and is now parked.** The %s phase died producing nothing (final step reason %q, no branch recorded) on two consecutive attempts, so the driver stopped rather than spending a third session on it.\n\n"+
+		"**%s has defeated four sessions and is now parked.** The %s phase died producing nothing (final step reason %q, no branch recorded) on four consecutive attempts, so the driver stopped rather than spending a fifth session on it.\n\n"+
 			"The task is `parked` — nothing will pick it up until an operator decides what to do with it. The iteration logs are in %s.",
 		ref, phaseLabel, sig, d.state.Path())
 	options := []string{
@@ -1583,11 +1748,11 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 		// for the next claim" would be the opposite of what happened. The park
 		// outcome stands alone; the missing question is the failure the operator
 		// needs to know about (review finding).
-		log.Printf("%sparked %s — two consecutive dead phases, but the question for the operator could not be filed: %v",
+		log.Printf("%sparked %s — four consecutive dead phases, but the question for the operator could not be filed: %v",
 			labelOf(t), claimLabel(res.Claim), err)
 		return
 	}
-	log.Printf("%sparked %s — two consecutive dead phases, question filed for the operator",
+	log.Printf("%sparked %s — four consecutive dead phases, question filed for the operator",
 		labelOf(t), claimLabel(res.Claim))
 }
 

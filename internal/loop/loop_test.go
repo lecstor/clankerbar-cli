@@ -1977,6 +1977,16 @@ func (p *parkingReleaser) AskQuestion(_ context.Context, taskID, body string, op
 	return p.err
 }
 
+func (p *parkingReleaser) AskProjectQuestion(_ context.Context, body string, options []string, kind string) error {
+	// A project-level question has no taskId: the empty taskID on the record
+	// is the wire shape, not an omission.
+	p.questions = append(p.questions, questionCall{"", body, options, false, kind})
+	if p.questionErr != nil {
+		return p.questionErr
+	}
+	return p.err
+}
+
 // held is a scripted Result carrying the claim a session ended still holding.
 func held(base harness.Result, c harness.Claim) harness.Result {
 	base.Claim = c

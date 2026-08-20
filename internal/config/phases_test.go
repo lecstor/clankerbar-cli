@@ -228,8 +228,8 @@ func TestValidate_AllowsASinglePhaseOnAnyHarness(t *testing.T) {
 // every night, with nothing in the logs reading as an error.
 func TestValidate_RefusesASequenceThatEndsOnTheImplementBrief(t *testing.T) {
 	for _, phases := range [][]Phase{
-		{{Name: implementPhaseName}},
-		{{Name: reviewPhaseName, Prompt: "something"}, {Name: implementPhaseName}},
+		{{Name: ImplementPhaseName}},
+		{{Name: ReviewPhaseName, Prompt: "something"}, {Name: ImplementPhaseName}},
 	} {
 		c := defaults()
 		c.Prompt = ""
@@ -237,10 +237,10 @@ func TestValidate_RefusesASequenceThatEndsOnTheImplementBrief(t *testing.T) {
 
 		err := c.Validate()
 		if err == nil {
-			t.Errorf("Validate accepted a sequence ending on the %q brief (%d phases); nothing would ever hand a task to review", implementPhaseName, len(phases))
+			t.Errorf("Validate accepted a sequence ending on the %q brief (%d phases); nothing would ever hand a task to review", ImplementPhaseName, len(phases))
 			continue
 		}
-		if !strings.Contains(err.Error(), reviewPhaseName) {
+		if !strings.Contains(err.Error(), ReviewPhaseName) {
 			t.Errorf("the rejection does not point at the fix: %v", err)
 		}
 	}
@@ -252,7 +252,7 @@ func TestValidate_RefusesASequenceThatEndsOnTheImplementBrief(t *testing.T) {
 func TestValidate_RefusesAResumeBriefInFirstPosition(t *testing.T) {
 	c := defaults()
 	c.Prompt = ""
-	c.Phases = []Phase{{Name: reviewPhaseName}, {Name: "closer", Prompt: "finish up"}}
+	c.Phases = []Phase{{Name: ReviewPhaseName}, {Name: "closer", Prompt: "finish up"}}
 
 	err := c.Validate()
 	if err == nil {
@@ -438,9 +438,9 @@ func TestBuiltinPhaseBriefsCarryTheHandoffGuidance(t *testing.T) {
 // and still be ignored. Its partner is the driver-side tally in internal/loop,
 // which counts the failures this brief is trying to prevent.
 func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
-	brief, ok := builtinPhasePrompts[reviewPhaseName]
+	brief, ok := builtinPhasePrompts[ReviewPhaseName]
 	if !ok {
-		t.Fatalf("no built-in brief for phase %q", reviewPhaseName)
+		t.Fatalf("no built-in brief for phase %q", ReviewPhaseName)
 	}
 
 	for _, want := range []string{
@@ -487,9 +487,9 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 // the worktree/never-commit-to-staging rule that names the failure mode rather
 // than leaving "commit where I am" looking like no decision at all.
 func TestReviewBriefStatesThePRStep(t *testing.T) {
-	brief, ok := builtinPhasePrompts[reviewPhaseName]
+	brief, ok := builtinPhasePrompts[ReviewPhaseName]
 	if !ok {
-		t.Fatalf("no built-in brief for phase %q", reviewPhaseName)
+		t.Fatalf("no built-in brief for phase %q", ReviewPhaseName)
 	}
 
 	prIdx := strings.Index(brief, "PR")
@@ -529,9 +529,9 @@ func TestReviewBriefStatesThePRStep(t *testing.T) {
 // told it that was wrong, and an empty branch field silently adopted as work to
 // implement rather than reported as a failed hand-off.
 func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
-	brief, ok := builtinPhasePrompts[reviewPhaseName]
+	brief, ok := builtinPhasePrompts[ReviewPhaseName]
 	if !ok {
-		t.Fatalf("no built-in brief for phase %q", reviewPhaseName)
+		t.Fatalf("no built-in brief for phase %q", ReviewPhaseName)
 	}
 
 	for _, want := range []string{
@@ -553,15 +553,15 @@ func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
 // PR-then-update_task sequence for its successor, silently reintroducing the bug
 // this task fixes on the one path a wording change in the brief cannot reach.
 func TestHandoffContinuation_CarriesTheReviewTerminalStepForward(t *testing.T) {
-	got := HandoffContinuation(reviewPhaseName)
+	got := HandoffContinuation(ReviewPhaseName)
 	if !strings.Contains(got, reviewTerminalStep) {
-		t.Errorf("HandoffContinuation(%q) does not carry reviewTerminalStep forward:\n%s", reviewPhaseName, got)
+		t.Errorf("HandoffContinuation(%q) does not carry reviewTerminalStep forward:\n%s", ReviewPhaseName, got)
 	}
 
 	// The implement phase hands off nothing at in_review - it stops, and a later
 	// phase owns the resume brief - so it has no terminal step to lose.
-	if got := HandoffContinuation(implementPhaseName); got != "" {
-		t.Errorf("HandoffContinuation(%q) = %q, want empty — the implement phase has no terminal step to carry forward", implementPhaseName, got)
+	if got := HandoffContinuation(ImplementPhaseName); got != "" {
+		t.Errorf("HandoffContinuation(%q) = %q, want empty — the implement phase has no terminal step to carry forward", ImplementPhaseName, got)
 	}
 	if got := HandoffContinuation("not-a-real-phase"); got != "" {
 		t.Errorf("HandoffContinuation of an unknown phase = %q, want empty", got)

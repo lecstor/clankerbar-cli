@@ -349,3 +349,60 @@ func TestAskQuestion_FailureIsQuestionNotFiled(t *testing.T) {
 		t.Errorf("err = %v, want ErrQuestionNotFiled", err)
 	}
 }
+
+// A project-level question (CLA-396) goes to ask_question with NO taskId: a
+// fleet trip is not one task's triage, so pinning it to whichever task happened
+// to be in flight would make the operator answer about a bystander. It is
+// non-blocking — there is no task to block, and the loop's own pause is the
+// enforcement the driver clears when this question is answered.
+func TestAskProjectQuestion_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+	p, ok := New(srv.URL+"/mcp/demo", "k-1").(ParkAPI)
+	if !ok {
+		t.Fatal("the wired plane client does not implement ParkAPI, so no fleet trip can ever raise a question")
+	}
+
+	const body = "**5 consecutive dead phases across tasks.**"
+	if err := p.AskProjectQuestion(context.Background(), body, []string{"resume", "paused"}, "decision"); err != nil {
+		t.Fatalf("AskProjectQuestion: %v", err)
+	}
+
+	if len(got.bodies) != 1 {
+		t.Fatalf("made %d calls, want 1: %+v", len(got.bodies), got.bodies)
+	}
+	params, _ := got.bodies[0]["params"].(map[string]any)
+	if params["name"] != "ask_question" {
+		t.Fatalf("tool = %v, want ask_question", params["name"])
+	}
+	args, _ := params["arguments"].(map[string]any)
+	// The whole point: no taskId key at all, not an empty one the server would
+	// have to special-case.
+	if _, has := args["taskId"]; has {
+		t.Errorf("arguments carry a taskId (%v); a project-level question must not be pinned to a task", args["taskId"])
+	}
+	if args["body"] != body {
+		t.Errorf("body = %+v, want the fleet body", args["body"])
+	}
+	opts, _ := args["options"].([]any)
+	if len(opts) != 2 || opts[0] != "resume" || opts[1] != "paused" {
+		t.Errorf("options = %+v, want the driver's options", args["options"])
+	}
+	if args["blocking"] != false {
+		t.Errorf("blocking = %v, want false — there is no task to block", args["blocking"])
+	}
+	if args["kind"] != "decision" {
+		t.Errorf("kind = %v, want decision — a fleet incident is a project-level judgment", args["kind"])
+	}
+}
+
+// A failed project question insert is ErrQuestionNotFiled too: the caller must
+// report "paused, and the question is missing", never "the pause failed".
+func TestAskProjectQuestion_FailureIsQuestionNotFiled(t *testing.T) {
+	srv, _ := serve(t, http.StatusInternalServerError, "boom")
+	p := New(srv.URL+"/mcp/demo", "k-1").(ParkAPI)
+
+	err := p.AskProjectQuestion(context.Background(), "body", nil, "decision")
+	if !errors.Is(err, ErrQuestionNotFiled) {
+		t.Errorf("err = %v, want ErrQuestionNotFiled", err)
+	}
+}
