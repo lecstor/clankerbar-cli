@@ -444,7 +444,15 @@ type opencodeParse struct {
 	// produced a final answer and "unknown" when it died without one (the
 	// CLA-386 dead-phase marker); the driver reads it off Result.Raw via
 	// FinishReasonKey.
-	lastReason                            string
+	lastReason string
+	// lastStepZeroUsage reports that the MOST RECENT step_finish's own usage
+	// summed to zero — no tokens block, an all-zero tokens block, or no cost
+	// are all the same quiet end. Reset for every step: the CLA-398
+	// quiet-death signature is a FINAL step whose OWN usage is all-zero — a
+	// session can do hours of real paid work and then die with an "unknown"
+	// final step that reported nothing, so the session total (p.total/p.cost)
+	// is NOT the discriminator. Only the final step's own usage is.
+	lastStepZeroUsage                     bool
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
@@ -507,6 +515,13 @@ func (p *opencodeParse) line(line []byte) {
 		}
 		// tokens and cost are siblings on the part; count each independently so
 		// a step that reports one without the other still lands in the budget.
+		//
+		// The LAST step's OWN usage is tracked separately from the session sum:
+		// the CLA-398 quiet-death signature is a final step that reported
+		// NOTHING (all-zero), whatever the earlier steps cost — so the sums that
+		// feed the budget are not the discriminator, the last step's own block
+		// is. Reset per step; the final value is the one that survives.
+		p.lastStepZeroUsage = true
 		if tk := ev.Part.Tokens; tk != nil {
 			p.total += tk.Total
 			p.in += tk.Input
@@ -514,10 +529,16 @@ func (p *opencodeParse) line(line []byte) {
 			p.reason += tk.Reasoning
 			p.cWrite += tk.Cache.Write
 			p.cRead += tk.Cache.Read
+			if tk.Total != 0 {
+				p.lastStepZeroUsage = false
+			}
 			p.sawUsage = true
 		}
 		if c := ev.Part.Cost; c != nil {
 			p.cost += *c
+			if *c != 0 {
+				p.lastStepZeroUsage = false
+			}
 			p.sawUsage = true
 		}
 	case "tool_use":
@@ -646,6 +667,20 @@ func (p *opencodeParse) finish(res *Result) {
 			res.Raw = map[string]any{}
 		}
 		res.Raw[FinishReasonKey] = p.lastReason
+		// The CLA-398 quiet-death signature: a FINAL "unknown" step whose OWN
+		// usage was all-zero. The reason alone is the CLA-386 dead-phase marker,
+		// but a session can end "unknown" after doing real paid work; the final
+		// step reporting nothing is what makes this the shape that dies with NO
+		// error event, NO stderr, and nothing produced — indistinguishable from a
+		// cheap clean run until the adapter names it. The marker is the adapter's
+		// own (see ZeroUsageUnknown), so the driver can log the end by name.
+		//
+		// The step's OWN usage, never the session total: the 2026-08-20 dead
+		// sessions had done hours of paid work across earlier steps before the
+		// final "unknown" step that reported nothing.
+		if p.lastReason == FinishReasonUnknown && p.lastStepZeroUsage {
+			res.Raw[TerminalReasonKey] = ZeroUsageReason
+		}
 	}
 }
 
@@ -743,6 +778,20 @@ var opencodeFatalRe = regexp.MustCompile(`(?i)"status(code)?": ?40[13]` +
 // a config/auth refusal, and retrying it under the existing backoff is exactly what
 // riding the blip out means.
 //
+// The Console Go tool-schema rejection family (`unsupported_tool_schema` /
+// `tool_count_limit`, anomalyco/opencode#43374 and #43378) is classified HERE,
+// deliberately, rather than as a dedicated class with its own retry ladder: the
+// gateway's enforcement is INCONSISTENT — #43374 records the same catalog
+// accepted and refused seconds apart — so the identical retry often succeeds,
+// which is exactly what the transient path does. The two codes are opaque
+// gateway error names, not words a Node stack trace or agent narration would
+// emit, so unlike the `transport` arm they need no word-pair anchor, and the
+// assistant-text scoping below keeps a task body that merely QUOTES them out of
+// the scan entirely. A persistent run of rejections is bounded separately: each
+// rejected session reports no usage (the 400 fires at request time), so the
+// driver's zero-spend bound stops the run after a few attempts rather than
+// retrying forever.
+//
 // Every arm here is ANCHORED — on a JSON field, or on a word pair that only a
 // failure description produces. A bare `transport` alternation was tried and
 // reverted: scoping the scan to opencodeErrorText keeps the agent's narration
@@ -756,6 +805,7 @@ var opencodeFatalRe = regexp.MustCompile(`(?i)"status(code)?": ?40[13]` +
 var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d\d)` +
 	`|"isretryable": ?true` +
 	`|overloaded|too many requests|rate ?limit` +
+	`|unsupported_tool_schema|tool_count_limit` +
 	`|"message": ?"transport` +
 	`|transport (error|failure|reset|dropped)|transport (is )?clos(ed|ing)|transport-level` +
 	`|stream (error|failed|closed|reset|ended|disconnected|interrupted)` +
@@ -792,6 +842,22 @@ func (r *Result) markWallClockCapped() {
 		r.Raw = map[string]any{}
 	}
 	r.Raw["terminal_reason"] = wallClockReason
+}
+
+// ZeroUsageUnknown reports whether this session ended with the CLA-398
+// quiet-death signature: a FINAL step_finish carrying reason "unknown" whose
+// OWN usage was all-zero — whatever the earlier steps cost (the 2026-08-20 dead
+// sessions had done real paid work before the silent final step). The marker is
+// the adapter's own (a terminal_reason it writes, never text the CLI or an
+// agent could emit), and it exists so the driver can NAME the end instead of
+// logging "iteration done (tokens=0 cost=$0.00)" over a session that produced
+// nothing.
+func (opencode) ZeroUsageUnknown(res Result) bool {
+	if res.Raw == nil {
+		return false
+	}
+	r, _ := res.Raw[TerminalReasonKey].(string)
+	return r == ZeroUsageReason
 }
 
 // No mid-stream token ceiling: opencode sums per-step usage but the adapter

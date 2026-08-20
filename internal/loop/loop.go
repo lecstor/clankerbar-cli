@@ -1010,6 +1010,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		capped := a.TurnCapped(res)
 		ceiling := a.TokenCeilingHit(res)
 		wallclock := a.WallClockCapped(res)
+		zeroUsage := a.ZeroUsageUnknown(res)
 		producedNothing := res.Untrusted == "" && !capped && !ceiling && !wallclock && deadPhase(res)
 		// Rescue whatever the session left uncommitted, FIRST — before the handback,
 		// because a successful salvage changes what the handback should do: a task
@@ -1221,7 +1222,19 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		}
 
 		if res.ExitCode == 0 {
-			log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drainNum, tokens, cost)
+			// A clean exit is the shape the CLA-398 quiet death wears, so the
+			// marker gets named here rather than inferred downstream: a final
+			// step_finish with reason "unknown" and all-zero usage used to read
+			// as "iteration done (tokens=0 cost=$0.00)" — indistinguishable from
+			// a cheap clean run, which is exactly what made these deaths
+			// invisible. The adapter's own marker is the only thing that can
+			// tell them apart.
+			if zeroUsage {
+				log.Printf("iteration %d: the session ended with the zero-usage-unknown signature (final step reason %q, all-zero usage) — a quiet death, not a clean run",
+					drainNum, harness.FinishReasonUnknown)
+			} else {
+				log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drainNum, tokens, cost)
+			}
 			return tokens, cost, false, end, nil
 		}
 
@@ -1499,8 +1512,16 @@ func claimLabel(c harness.Claim) string {
 // deadReason renders the finish reason a dead phase was classified on, for a log
 // line. The classification fired on FinishReasonUnknown, so a nil claim — a
 // session that observed no task — still has a reason to name.
+//
+// The adapter's OWN terminal_reason marker wins when present: ZeroUsageReason
+// (CLA-398) names the quiet-death signature more precisely than the bare
+// "unknown" it rides on, so the operator's log says which flavour of death this
+// was instead of the driver re-inferring it from the zero usage downstream.
 func deadReason(res *harness.Result) string {
 	if res != nil {
+		if r, ok := res.Raw[harness.TerminalReasonKey].(string); ok && r != "" {
+			return r
+		}
 		if r, ok := res.Raw[harness.FinishReasonKey].(string); ok && r != "" {
 			return r
 		}
