@@ -1255,13 +1255,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// failure is either a launch failure (nothing emitted, nothing parsed —
 			// adding zeroes changes nothing) or a session that ran, announced its
 			// spend and died in Wait (CLA-299): the Result was parsed precisely so
-			// the budget would not lose what the attempt actually cost. The figures
-			// are complete here — parsing ran to completion over a stream that
-			// reached its end — which is why this arm counts them while the
-			// untrusted branch below deliberately does not.
-			tokens += res.Tokens
-			cost += res.CostUSD
-			d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
+			// the budget would not lose what the attempt actually cost. That holds
+			// only while the stream was read whole, which is what the guard below
+			// makes binding: a failure whose stream ALSO came back untrusted
+			// carries a floor, not a total, and gets the same refusal as the
+			// untrusted branch below and endUntrustedDrain (CLA-262) - counted
+			// nowhere, so no breaker ever acts on a figure that cannot be known.
+			if res.Untrusted == "" {
+				tokens += res.Tokens
+				cost += res.CostUSD
+				d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
+			}
 			// A run failure that was not an exit status — a launch failure, or one
 			// of the deaths in Wait above — ends the attempt without any retry
 			// classification. Not a blip.
