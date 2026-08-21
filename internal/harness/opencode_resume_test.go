@@ -3,6 +3,8 @@ package harness
 import (
 	"bytes"
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -60,9 +62,16 @@ func TestResumeTargets(t *testing.T) {
 }
 
 func TestResurrectionProbePrompt(t *testing.T) {
-	p := resurrectionProbePrompt("EZY-196")
-	if !strings.Contains(p, "EZY-196") {
-		t.Error("probe prompt does not name the expected task ref")
+	p := resurrectionProbePrompt
+	// The real ref must NOT appear in the question: the probe exists to prove
+	// the reply comes from the session's memory of its own claim_task call,
+	// and naming the answer inside the question would let any model that can
+	// parrot its prompt pass with no surviving transcript.
+	if strings.Contains(p, "EZY-196") {
+		t.Error("probe prompt names the real task ref - the coherence check is testing parroting, not recall")
+	}
+	if !strings.Contains(p, `"ABC-123"`) {
+		t.Error("probe prompt should carry a fixed placeholder example instead")
 	}
 	// The informing half is load-bearing (operator decision 2026-08-21): the
 	// agent is told WHAT happened and THAT it resumes in place, mirroring the
@@ -162,6 +171,10 @@ func TestMergeResumeQuietContinuationKeepsMark(t *testing.T) {
 }
 
 func TestMergeResumeUnobservedContinuationKeepsClaim(t *testing.T) {
+	// A pure mergeResume unit test: Invoke no longer produces UNSEEDED
+	// continuations (it seeds from the dead run's live claim), but an
+	// unobserved one - seeded, yet seeing no clankerbar tool events in its
+	// turn - is still the shape this guard exists for.
 	base := quietDeathResult("ses_dead")
 	base.Claim = Claim{TaskID: "uuid-1", Ref: "EZY-196"}
 
@@ -173,6 +186,30 @@ func TestMergeResumeUnobservedContinuationKeepsClaim(t *testing.T) {
 
 	if !base.Claim.Held() || base.Claim.Ref != "EZY-196" {
 		t.Errorf("Claim = %+v, want the original claim kept when the continuation observed nothing", base.Claim)
+	}
+}
+
+// Review WARN (finish_reason asymmetry): a continuation that names NO finish
+// reason must clear the corpse's, symmetrically with terminal_reason. The
+// parser writes finish_reason only when the stream carried a step_finish
+// reason, so blind inheritance would leave the merged Result asserting the
+// dead run's "unknown" while the mark cleared - ZeroUsageUnknown says
+// recovered, deadPhase/tallyDead (which read THIS key) say dead, and the phase
+// parks despite a successful resurrection.
+func TestMergeResumeReasonlessContinuationClearsFinishReason(t *testing.T) {
+	base := quietDeathResult("ses_dead")
+	if base.Raw[FinishReasonKey] != FinishReasonUnknown {
+		t.Fatalf("test precondition: the quiet-death result carries finish_reason %v", base.Raw[FinishReasonKey])
+	}
+
+	cont := opencodeParsed(`{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"killed mid-turn, no step_finish ever landed"}}`)
+	mergeResume(&base, cont)
+
+	if _, ok := base.Raw[FinishReasonKey]; ok {
+		t.Errorf("Raw[finish_reason] = %v survived a continuation that named none - a recovered phase would still classify as dead", base.Raw[FinishReasonKey])
+	}
+	if (opencode{}).ZeroUsageUnknown(base) {
+		t.Error("the quiet-death mark must be cleared alongside it")
 	}
 }
 
@@ -231,6 +268,14 @@ esac
 	if (opencode{}).ZeroUsageUnknown(res) {
 		t.Error("a resurrected-and-completed session must not carry the quiet-death mark")
 	}
+	// Adjudication 1 (review): nothing else pins that a RECOVERED result stops
+	// looking like a dead phase to the DRIVER, which classifies on
+	// finish_reason - not on the terminal_reason marker the merge is careful
+	// with. Inheriting the corpse's "unknown" here would park a recovered
+	// phase despite the clean mark.
+	if res.Raw[FinishReasonKey] != "stop" {
+		t.Errorf("Raw[finish_reason] = %v, want the continuation's \"stop\" - a recovered result must not classify as a dead phase", res.Raw[FinishReasonKey])
+	}
 	if n := res.Raw[opencodeResurrectionsKey]; n != 1 {
 		t.Errorf("resurrections = %v, want 1", n)
 	}
@@ -260,10 +305,10 @@ func TestResurrectionInvokeWrongRefBreaksAfterOneProbe(t *testing.T) {
 	opencodeResumeBackoff = time.Millisecond
 	defer func() { opencodeResumeBackoff = old }()
 
-	invocations := 0
+	dir := t.TempDir()
 	console := &bytes.Buffer{}
 	opencodeStub(t, `#!/bin/sh
-echo "$*" >> "`+t.TempDir()+`/log"
+echo "$*" >> "`+dir+`/log"
 case "$*" in
   *"Confirm you are intact"*)
     echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-260 - continuing that one."}}'
@@ -275,11 +320,19 @@ case "$*" in
     ;;
 esac
 `)
-	_ = invocations
 
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work.", Console: console})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
+	}
+	// ONE probe per death: the original session plus the failed probe, and no
+	// continuation - the incoherent answer ends it there.
+	log, err := os.ReadFile(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatalf("stub log: %v", err)
+	}
+	if n := strings.Count(string(log), "\n"); n != 2 {
+		t.Errorf("stub ran %d times, want exactly 2 (original session + one probe, no continuation)", n)
 	}
 	if _, ok := res.Raw[opencodeResurrectionsKey]; ok {
 		t.Error("a failed probe must not record a resurrection")
@@ -322,6 +375,78 @@ esac
 	}
 	if !(opencode{}).ZeroUsageUnknown(res) {
 		t.Error("past the cap the last quiet death stands")
+	}
+}
+
+// doneWhen clause 4, proven at Invoke level: a final step that is "unknown"
+// but PAID is not a quiet death - the ZeroUsageUnknown predicate is false, so
+// the existing path takes over untouched: exactly ONE process runs, no probe,
+// no continuation, no resurrection recorded.
+func TestResurrectionInvokePaidUnknownNotResurrected(t *testing.T) {
+	dir := t.TempDir()
+	console := &bytes.Buffer{}
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+dir+`/log"
+echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work.", Console: console})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	log, err := os.ReadFile(filepath.Join(dir, "log"))
+	if err != nil {
+		t.Fatalf("stub log: %v", err)
+	}
+	if n := strings.Count(string(log), "\n"); n != 1 {
+		t.Errorf("stub ran %d times, want exactly 1 - a paid unknown is not a quiet death and must not be resurrected", n)
+	}
+	if _, ok := res.Raw[opencodeResurrectionsKey]; ok {
+		t.Error("a paid unknown must not record a resurrection")
+	}
+	if strings.Contains(console.String(), "quiet death detected") {
+		t.Error("console announced a resurrection for a paid unknown - the existing path must take over untouched")
+	}
+}
+
+// Review WARN (probe observations discarded): the probe turn runs with MCP
+// tools available, so it can settle or advance the claim exactly as the
+// continuation could. A probe that moved the task must not be invisible to
+// the driver - that is ERROR 1 one turn earlier: without the fold, a probe
+// that declared in_review followed by an unobserved continuation merges into
+// Held()+unsettled, and releaseHeldClaim posts ready over the in_review task.
+func TestResurrectionInvokeProbeObservationSurvives(t *testing.T) {
+	old := opencodeResumeBackoff
+	opencodeResumeBackoff = time.Millisecond
+	defer func() { opencodeResumeBackoff = old }()
+
+	opencodeStub(t, `#!/bin/sh
+case "$*" in
+  *"Confirm you are intact"*)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    ;;
+  *"Continue exactly where you left off"*)
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"Done."}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+  *)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work."})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if !res.Claim.Settled {
+		t.Error("Claim.Settled = false; the PROBE's update_task was dropped - probe observations must fold into the merged result")
+	}
+	if !res.Claim.HasWIP {
+		t.Error("Claim.HasWIP = false; the probe's branch recording was dropped")
 	}
 }
 

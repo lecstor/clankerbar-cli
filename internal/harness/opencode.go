@@ -95,12 +95,28 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		return res, nil
 	}
 	console := in.Console
-	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res); attempt++ {
+	// An UNTRUSTED stream is never resurrected: CLA-262 forbids reading claim
+	// state off an over-run capture, and both the coherence ref and the
+	// continuation's seed come from exactly that state - while the driver's
+	// own untrusted path declines to count further spend, so probing would
+	// enlarge the accounting blind spot endUntrustedDrain exists to bound.
+	// The conjunct mirrors the driver's own gate (!capped && !ceiling &&
+	// !wallclock && untrusted) so adapter and tallyDead agree on what is dead.
+	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res) && res.Untrusted == ""; attempt++ {
 		sid, ref := resumeTargets(res)
 		if sid == "" || ref == "" {
 			// No session to resume into (died before its first event) or no
 			// claim to verify against (died before claiming — no work at
 			// stake). The quiet death stands.
+			break
+		}
+		// Budget check BEFORE the round spends anything: a resume re-sends the
+		// whole transcript ("real money", below), so a slice too small to act
+		// on must not buy a probe it can never follow with a continuation.
+		if !deadline.IsZero() && time.Until(deadline) < opencodeResumeWallClockFloor {
+			if console != nil {
+				fmt.Fprintf(console, "!! wall-clock budget exhausted across resurrections - counting the death\n")
+			}
 			break
 		}
 		if console != nil {
@@ -125,20 +141,23 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		probeIn := in
 		probeIn.Probe = true // no wall-clock double-cap, no console tee
 		// Seed the probe's parser with the dead run's live claim, so a probe
-		// turn that happens to touch the backlog is observed on the same terms
-		// as the session it belongs to.
+		// turn that touches the backlog is observed on the same terms as the
+		// session it belongs to - and folded back in below, so the observation
+		// actually reaches the driver.
 		probeIn.ResumeClaim = res.Claim
 		probeRes, probeErr := o.runSession(pctx, probeIn,
-			opencodeResumeArgs(in, sid, resurrectionProbePrompt(ref)))
+			opencodeResumeArgs(in, sid, resurrectionProbePrompt))
 		pcancel()
 		// Charge the probe's spend UNCONDITIONALLY, before any verdict: a
 		// resume re-sends the whole transcript, so this is real money even when
 		// the answer is garbage. Under-counting is the one direction a budget
 		// breaker must not err in. Deliberately NOT via mergeResume — a probe
-		// we are about to judge must not donate claim/raw state.
+		// must never donate raw/terminal state or a process outcome; its CLAIM
+		// observation folds separately, just as unconditionally.
 		res.Tokens += probeRes.Tokens
 		res.CostUSD += probeRes.CostUSD
 		res.UsageReported = res.UsageReported || probeRes.UsageReported
+		mergeObservation(&res, probeRes)
 		coherent := probeErr == nil && probeCoherent(probeRes.FinalMessage, ref)
 		if !coherent {
 			if console != nil {
@@ -157,8 +176,11 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		contIn := in
 		contIn.ResumeClaim = res.Claim
 		if !deadline.IsZero() {
+			// Re-checked here, not just at the top of the round: the probe
+			// just consumed up to its own time-box, and a continuation that
+			// could only be cap-killed on arrival must not be started.
 			remaining := time.Until(deadline)
-			if remaining <= 0 {
+			if remaining < opencodeResumeWallClockFloor {
 				if console != nil {
 					fmt.Fprintf(console, "!! wall-clock budget exhausted across resurrections — counting the death\n")
 				}

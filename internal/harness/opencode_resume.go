@@ -1,7 +1,6 @@
 package harness
 
 import (
-	"fmt"
 	"strings"
 	"time"
 )
@@ -65,6 +64,15 @@ const (
 	// death, not a pause — the alternative (waiting longer) is indistinguishable
 	// from prodding a corpse.
 	opencodeProbeTimeout = 30 * time.Second
+
+	// opencodeResumeWallClockFloor is the smallest slice of the Invoke's
+	// wall-clock budget worth starting a resurrection round against. A resume
+	// re-sends the whole transcript (real money), and a round needs backoff
+	// plus a probe before any continuation runs, so a remaining slice under
+	// this floor can only buy a continuation that is cap-killed on arrival -
+	// and the check runs BEFORE the round's spend, so it also stops the
+	// adapter paying for a probe it can never act on.
+	opencodeResumeWallClockFloor = time.Minute
 )
 
 // opencodeResumeBackoff is the pause between noticing a quiet death and
@@ -107,13 +115,16 @@ func resumeTargets(res Result) (sid, ref string) {
 //     agent actually resumed?" into a mechanical string match instead of a
 //     judgement call. The ref is knowable only from the intact transcript: a
 //     session that lost its context cannot produce it.
-func resurrectionProbePrompt(ref string) string {
-	return fmt.Sprintf(`Your previous response was interrupted mid-stream by the provider; your `+
-		`session transcript is intact up to the interruption, and you are being resumed `+
-		`in place. Confirm you are intact before continuing: reply with ONE line naming `+
-		`the task ref you are working on (for example %q) and your last completed action. `+
-		`Then stop — you will be told to continue.`, ref)
-}
+//
+// The worked example is a FIXED placeholder, never the real ref: the probe
+// exists to prove the reply comes from the session's memory of its own
+// claim_task call, and naming the real ref inside the question would let any
+// model that can parrot its prompt pass with no transcript at all.
+const resurrectionProbePrompt = `Your previous response was interrupted mid-stream by the provider; your ` +
+	`session transcript is intact up to the interruption, and you are being resumed ` +
+	`in place. Confirm you are intact before continuing: reply with ONE line naming ` +
+	`the task ref you are working on (for example "ABC-123") and your last completed action. ` +
+	`Then stop - you will be told to continue.`
 
 // continuePrompt is sent once the probe has verified coherence. Deliberately
 // terse: everything the agent needs is already in its transcript.
@@ -169,6 +180,7 @@ func opencodeResumeArgs(in Invocation, sid, prompt string) []string {
 //     must not wipe the dead run's. Reports APPEND with sameClaim dedupe for
 //     the same reason: neither run saw strictly more of the session than the
 //     other, so both halves' delivery reports deserve to reach verification.
+//     Both rules live in mergeObservation, shared with the probe's fold;
 //   - Raw copies the continuation's (summing the numeric usage-breakdown keys
 //     rather than overwriting them — Tokens sums, so the breakdown should too),
 //     and TerminalReasonKey is RECOMPUTED rather than inherited: the key is
@@ -196,6 +208,51 @@ func mergeResume(base *Result, add Result) {
 	if add.FinalMessage != "" {
 		base.FinalMessage = add.FinalMessage
 	}
+	mergeObservation(base, add)
+	if base.Raw == nil {
+		base.Raw = map[string]any{}
+	}
+	for k, v := range add.Raw {
+		if k == TerminalReasonKey || k == FinishReasonKey {
+			continue // both recomputed below, never inherited blind
+		}
+		if nv, ok := v.(int); ok {
+			if bv, ok := base.Raw[k].(int); ok {
+				base.Raw[k] = bv + nv
+				continue
+			}
+		}
+		base.Raw[k] = v
+	}
+	if tr, _ := add.Raw[TerminalReasonKey].(string); tr != "" {
+		base.Raw[TerminalReasonKey] = tr
+	} else {
+		delete(base.Raw, TerminalReasonKey)
+	}
+	// finish_reason recomputed SYMMETRICALLY with terminal_reason: the parser
+	// writes the key only when the stream carried a step_finish reason, so
+	// inheriting the corpse's would leave a merged Result asserting the dead
+	// run's "unknown" while the mark above cleared - ZeroUsageUnknown says
+	// recovered while deadPhase/tallyDead/deadscan (which read THIS key) say
+	// dead, and the phase parks despite a successful resurrection. No
+	// continuation verdict, no key.
+	if fr, _ := add.Raw[FinishReasonKey].(string); fr != "" {
+		base.Raw[FinishReasonKey] = fr
+	} else {
+		delete(base.Raw, FinishReasonKey)
+	}
+}
+
+// mergeObservation folds one run's CLAIM OBSERVATION - claim state plus
+// delivery reports - into a base Result, by mergeResume's rules: an unobserved
+// claim wipes nothing (`run -s` streams only the new turn, so a run that saw
+// no clankerbar tool events knows nothing), reports append with later-wins
+// dedupe. Split from mergeResume so the PROBE's observations can take the same
+// road: the probe turn runs with MCP tools available, so it can settle or
+// advance the claim exactly as the continuation could, and dropping what it
+// observed would re-create ERROR 1 one turn earlier - releaseHeldClaim posting
+// ready over a task the probe just moved.
+func mergeObservation(base *Result, add Result) {
 	if add.Claim.Held() || add.Claim.Settled {
 		base.Claim = add.Claim
 	}
@@ -217,25 +274,5 @@ func mergeResume(base *Result, add Result) {
 		if !dup {
 			base.Reports = append(base.Reports, rep)
 		}
-	}
-	if base.Raw == nil {
-		base.Raw = map[string]any{}
-	}
-	for k, v := range add.Raw {
-		if k == TerminalReasonKey {
-			continue // recomputed below, never inherited blind
-		}
-		if nv, ok := v.(int); ok {
-			if bv, ok := base.Raw[k].(int); ok {
-				base.Raw[k] = bv + nv
-				continue
-			}
-		}
-		base.Raw[k] = v
-	}
-	if tr, _ := add.Raw[TerminalReasonKey].(string); tr != "" {
-		base.Raw[TerminalReasonKey] = tr
-	} else {
-		delete(base.Raw, TerminalReasonKey)
 	}
 }
