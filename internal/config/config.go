@@ -75,10 +75,13 @@ const DefaultMaxTurns = 400
 const DefaultMaxZeroSpendAttempts = 3
 
 // The built-in phase names, as constants because Validate reasons about them: a
-// sequence that ENDS on the implement brief can never reach review.
+// sequence that ENDS on the implement brief can never reach review. Exported so
+// the driver can name the implement phase for the fleet dead-phase counter
+// (CLA-396): only a successful IMPLEMENT phase resets it, because only the
+// implement phase runs the harness that can exhibit the zero-usage death.
 const (
-	implementPhaseName = "implement"
-	reviewPhaseName    = "review"
+	ImplementPhaseName = "implement"
+	ReviewPhaseName    = "review"
 )
 
 // Phase is one session in a task's sequence. A task runs as an ordered list of
@@ -317,7 +320,7 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 // Empty for a phase with no such step: the implement phase stops rather than
 // hands its task to in_review, so it has none to carry forward.
 func HandoffContinuation(phaseName string) string {
-	if phaseName == reviewPhaseName {
+	if phaseName == ReviewPhaseName {
 		return "\n\nThe phase's terminal step is unchanged by handing off:" + reviewTerminalStep
 	}
 	return ""
@@ -347,13 +350,13 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 // workflow puts implementation and fix in ONE actor and the review in a separate
 // read-only one. Splitting where that workflow already splits is the whole idea.
 var builtinPhasePrompts = map[string]string{
-	implementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
 		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + handoffGuidance,
 
-	reviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
+	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
 		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
 		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
 		"then get_task with includeDecisions: true to re-read the bar and the standing decisions. An empty branch " +
@@ -1671,9 +1674,9 @@ func (c *Config) Validate() error {
 	// to discover a night later.
 	if n := len(c.Phases); n > 0 {
 		lastPh := c.Phases[n-1]
-		if lastPh.Prompt == "" && lastPh.Name == implementPhaseName {
+		if lastPh.Prompt == "" && lastPh.Name == ImplementPhaseName {
 			return fmt.Errorf("phases[%d]: the sequence ends on the %q brief, which tells its session to stop at the checkpoint — nothing would ever hand a task to review (add a %q phase, or give this one its own prompt)",
-				n-1, implementPhaseName, reviewPhaseName)
+				n-1, ImplementPhaseName, ReviewPhaseName)
 		}
 	}
 
@@ -2028,6 +2031,19 @@ func (c *Config) SessionWorkDirs() []string {
 		}
 	}
 	return out
+}
+
+// StateRoot is the loop state root: the directory holding one per-workdir
+// state directory (each named `<basename>-<hash>`, see stateSlug), which in
+// turn holds that workdir's iteration logs. The retrospective dead-phase scan
+// (`clankerbar dead-rate`) walks it. It is the parent of the per-workdir state
+// dir that ResolveStateDir returns.
+func StateRoot() (string, error) {
+	home, err := stateHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "clankerbar", "loop"), nil
 }
 
 // stateHome is $XDG_STATE_HOME, or ~/.local/state. A relative XDG_STATE_HOME is

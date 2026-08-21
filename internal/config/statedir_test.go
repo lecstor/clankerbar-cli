@@ -33,6 +33,27 @@ func TestDefaultStateDirIsOutsideTheWorkDir(t *testing.T) {
 	}
 }
 
+// StateRoot is the parent of the per-workdir state dirs: the `loop` root the
+// retrospective dead-phase scan walks, one level above ResolveStateDir's answer.
+func TestStateRootIsTheLoopParentOfTheStateDirs(t *testing.T) {
+	state := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", state)
+	work := t.TempDir()
+
+	root, err := StateRoot()
+	if err != nil {
+		t.Fatalf("StateRoot: %v", err)
+	}
+	want := filepath.Join(state, "clankerbar", "loop")
+	if root != want {
+		t.Errorf("StateRoot = %s, want %s", root, want)
+	}
+	// And the per-workdir state dir sits directly under it.
+	if got := resolve(t, &Config{WorkDir: work}); filepath.Dir(got) != root {
+		t.Errorf("ResolveStateDir = %s, want it directly under StateRoot %s", got, root)
+	}
+}
+
 // The old location is not merely unused — a leftover one is reported so the
 // operator learns their markers there are dead, and is never read.
 func TestLegacyStateDirIsReportedOnlyWhenItExists(t *testing.T) {

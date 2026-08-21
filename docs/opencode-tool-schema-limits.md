@@ -55,11 +55,43 @@ re-adding them returned 400, and the identical payload to `api.deepseek.com`
 succeeded with the bounds intact. The reported "16 tools OK, 17 tools rejected"
 boundary was an artefact of which tool happened to be 17th, not a count cap.
 
-A day later (2026-08-20) that finding could NOT be reproduced: 14 direct
-requests to the gateway (1 to 64 tools, each with and without
+A day later (2026-08-20, ~05:27Z) that finding could NOT be reproduced: 14
+direct requests to the gateway (1 to 64 tools, each with and without
 `minimum`/`maximum`, on `deepseek-v4-flash`) all returned 200. So enforcement is
 **inconsistent** — #43374 itself records the same catalog accepted and refused
 seconds apart. "Not enforced today" is not "cannot return".
+
+**Closed upstream on 2026-08-20.** A collaborator closed
+[#43374](https://github.com/anomalyco/opencode/issues/43374) at 14:27:32Z with
+"should be fixed now" - no detail, no test named, and no statement of what
+changed. The same account closed
+[#43378](https://github.com/anomalyco/opencode/issues/43378), the root-cause
+thread above, six seconds earlier with the same line. A fix would have to be
+gateway-side, per *Gateway, not client* below, but that is our inference from
+this page; nothing in either thread says so.
+
+Three things that closure does not do:
+
+1. **It does not date the fix**, so it cannot tell you what the clean probes
+   above mean. They ran nine hours before the comment - but a gateway change
+   carries no announced deploy time, and the last logged rejection was 07:04Z
+   the previous day, leaving a ~22h window it could have landed in. *Enforcement
+   is inconsistent* and *the fix was already live* both survive those 14
+   requests, so the probes corroborate neither. (The independent leg of the
+   inconsistency finding - #43374 recording the same catalog accepted and
+   refused seconds apart - is untouched by this and still stands.)
+2. **It is not something the CLI can depend on.** A gateway carries no version
+   we can pin from here, so "fixed" is an assertion with nothing to re-check it
+   against.
+3. **It is not a fix for our dead phases** - a separate, still-open client
+   defect. See *Confirmed vs unconfirmed: the link to our own dead phases*
+   below.
+
+So everything under *What the CLI does about a recurrence* stays exactly as it
+is: the classifier costs one regex and buys back the day enforcement returns. If
+a re-probe ever matters, the recipe is the one above - N tools with and without
+the four numeric-bounds keywords, `deepseek-v4-flash`, direct HTTPS to
+`opencode.ai/zen/go/v1/chat/completions`.
 
 ## Gateway, not client
 
