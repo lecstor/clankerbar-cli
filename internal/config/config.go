@@ -2030,6 +2030,19 @@ func (c *Config) SessionWorkDirs() []string {
 	return out
 }
 
+// StateRoot is the loop state root: the directory holding one per-workdir
+// state directory (each named `<basename>-<hash>`, see stateSlug), which in
+// turn holds that workdir's iteration logs. The retrospective dead-phase scan
+// (`clankerbar dead-rate`) walks it. It is the parent of the per-workdir state
+// dir that ResolveStateDir returns.
+func StateRoot() (string, error) {
+	home, err := stateHome()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, "clankerbar", "loop"), nil
+}
+
 // stateHome is $XDG_STATE_HOME, or ~/.local/state. A relative XDG_STATE_HOME is
 // ignored rather than honoured: the spec says the variable must hold an absolute
 // path, and a relative one would resolve against whatever cwd the daemon happens

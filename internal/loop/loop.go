@@ -176,6 +176,13 @@ type Driver struct {
 	// block still fills it, which costs one map and keeps the accounting honest if
 	// a block is added mid-file.
 	spentBy map[string]harnessSpend
+
+	// deadTally is this run's dead-phase tally, keyed by phase label and harness
+	// name (CLA-402): how many phase sessions ran and how many of those died
+	// producing nothing. Like spentBy it is the RUN's account — the rate is
+	// measured over a run, not a drain — so it hangs off the Driver and is
+	// reported from Run. Lazily built; see tallyDead and logDeadTally.
+	deadTally map[tallyKey]*phaseTally
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -431,6 +438,10 @@ func (d *Driver) Run(ctx context.Context) error {
 		// Handoff respawns consume iterations of the operator's ceiling too
 		// (CLA-352) — see the comment above the accumulator.
 		drains += handoffs
+		// CLA-402: report the run's dead-phase tally with its denominator, so
+		// the operator watching the daemon log sees the rate the run is
+		// producing (the last line before the run ends IS the run total).
+		d.logDeadTally()
 		if err != nil {
 			return err
 		}
@@ -1071,6 +1082,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// own marker — retrying it would re-spend against the same cap and parking
 		// it would read a doing-its-job backstop as a silent death.
 		dead := !last && res.Untrusted == "" && res.Claim.Held() && !capped && !ceiling && !wallclock && deadPhase(res)
+		// CLA-402: book this session into the run's dead-phase tally, per phase
+		// label and harness, whatever the seam decided about retrying it. The
+		// tally's dead classification deliberately drops the `!last` conjunct
+		// that guards the checkpoint veto — a dead LAST phase is still a dead
+		// phase, and the rate is a measurement, not a seam decision (see
+		// deadtally.go).
+		d.tallyDead(ph.Label(phaseIdx), d.cfg.HarnessFor(ph), res, capped, ceiling, wallclock)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
