@@ -41,6 +41,8 @@ func main() {
 		err = cli.Run(ctx, os.Args[2:])
 	case "doctor":
 		err = cli.Doctor(ctx, os.Args[2:])
+	case "dead-rate":
+		err = cli.DeadRate(ctx, os.Args[2:])
 	case "version", "--version", "-v":
 		fmt.Println("clankerbar", version)
 	case "help", "--help", "-h":

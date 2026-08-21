@@ -18,6 +18,10 @@ Usage:
   clankerbar doctor [flags]  Preflight the setup — config, harness, backlog
                              wiring, workdir, permissions. Exits non-zero on any
                              FAIL, so it gates a run: doctor && run.
+  clankerbar dead-rate       Scan the iteration logs and report, per day, per
+                             phase and per harness, how many sessions ran and
+                             how many died producing nothing (the dead-phase
+                             rate).
   clankerbar version         Print the version.
   clankerbar help            Show this help.
 

@@ -464,6 +464,43 @@ whole iterations:
   wait stops mid-flight and the loop goes silent exactly like a hang. One run lost
   5h31m of a 10h window this way, waking only in 45-second Power Nap bursts.
 
+### The dead-phase rate: `clankerbar dead-rate`
+
+The opencode implement phase has been observed dying silently — a session whose
+final step finishes with reason `unknown` and no branch recorded, so it produced
+nothing. That rate is the number that decides whether a fix to the harness or
+provider worked, and the driver now tallies it **live**: each phase session that
+got past its claim counts as a phase run, and one that then died producing
+nothing counts as dead, broken down by phase name and harness, and reported
+after every drain with its denominator:
+
+```
+dead-phase tally: implement/opencode: 6 dead of 23 (26.1%); review/claude: 0 dead of 4 (0.0%)
+```
+
+A session that never got past its claim — a correctly refused takeover — counts
+toward **neither** counter, because it satisfies both conjuncts of the dead
+signature while being a correct refusal, not a death.
+
+The same predicate, applied to the existing iteration logs, is available as a
+subcommand — the retrospective view over the logs the driver has already
+written, per day, per phase and per harness:
+
+```sh
+clankerbar dead-rate
+clankerbar dead-rate --error tool_count_limit   # logs whose APIError events match
+```
+
+The scan is verified against known-positive controls. `--error tool_count_limit`
+finds exactly the three 2026-08-19 logs that carry it as an APIError event, not
+the later logs where the same string appears as task-body text an agent merely
+read. Against the recorded 2026-08-20 hand count (6 dead of 16 implement
+sessions, taken mid-day) it reconciles session by session: three of the six are
+dead; the CLA-386 takeover held WIP inherited through its own claim result, so
+it ran but did not die; the two CLA-390 sessions never got past their claim and
+count toward neither counter; and two further deaths fall after the mid-day
+snapshot. Over the full day the scan reports 5 dead of 23.
+
 ### Sleep, on laptops
 
 `clankerbar run` now holds a no-idle-sleep assertion for its own lifetime (macOS;
