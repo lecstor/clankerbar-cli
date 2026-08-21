@@ -2261,7 +2261,29 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 // and this is the one loop with no other way out (CLA-287).
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
-	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+	grace := 1 * time.Minute
+
+	waitUntilReset := func() time.Duration {
+		if lim.ResetAt.IsZero() || time.Now().After(lim.ResetAt) || time.Now().Equal(lim.ResetAt) {
+			return interval
+		}
+		// A known reset in the future: wait until ResetAt + grace, capped at now+
+		// interval so STOP stays responsive (a multi-hour uninterrupted sleep makes
+		// the stop switch feel dead). The cap is only when reset is in the future.
+		untilReset := time.Until(lim.ResetAt.Add(grace))
+		untilInterval := interval
+		if untilReset < untilInterval {
+			return untilReset
+		}
+		return untilInterval
+	}
+
+	waitingForReset := !lim.ResetAt.IsZero() && time.Now().Before(lim.ResetAt)
+	if waitingForReset {
+		log.Printf("paused%s — waiting until that reset (with grace), capped at poll interval", resetSuffix(lim.ResetAt))
+	} else {
+		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+	}
 
 	for {
 		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
@@ -2269,11 +2291,22 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
 		}
-		if d.waitOrStop(ctx, interval) {
+		waitDur := waitUntilReset()
+		if d.waitOrStop(ctx, waitDur) {
 			return tokens, cost, true
 		}
-		if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) {
-			log.Print("stated reset passed — resuming")
+	// Only fall back to interval polling (instead of resuming immediately) when
+		// the reset actually passed during this supervised wait. When the reset was
+		// already past at entry (e.g. a resumed session whose reset expired during the
+		// previous phase), keep the old behaviour: resume straight away without
+		// requiring a probe to confirm it.
+		if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) && waitingForReset {
+			log.Print("stated reset passed — falling back to interval polling (reset claim is not a guarantee)")
+			waitingForReset = false
+		} else if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) && !waitingForReset {
+			// Reset was already past at entry: resume immediately, preserving the
+			// existing behaviour (see TestDrainWithRetries_StatedResetPassed).
+			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
 		got, err := a.Probe(ctx, d.invocationOn(t, d.cfg.HarnessFor(ph), true))
