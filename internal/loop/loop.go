@@ -1144,10 +1144,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		d.salvageStrandedWork(ctx, t, &res, producedNothing)
 		// Hand back anything the session was still holding, BEFORE deciding what to
 		// do next — every branch below either waits, retries or returns, and all of
-		// them leave the lease unattended. Above the ierr check too: Invoke returns
-		// a fully parsed Result alongside a Wait failure, so a claim observed on
-		// that stream is real and must not be dropped just because the process died
-		// untidily. A launch failure yields a zero Result, which releases nothing.
+		// them leave the lease unattended. Above the ierr check too: on every
+		// adapter, an Invoke whose run failed with something other than an exit
+		// status returns whatever the stream had announced by then, fully parsed,
+		// alongside the error (CLA-299) — claude's drain path parses its stream as
+		// it arrives; codex and opencode run their parsers to completion before
+		// classifying the failure — so a claim observed there is real and must not
+		// be dropped just because the process died untidily. A launch failure
+		// yields a zero Result, which releases nothing.
 		//
 		// UNLESS this phase reached its checkpoint with another phase still to run.
 		// Then the sequence is not over: the next phase resumes THIS run with
@@ -1247,7 +1251,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			if ctx.Err() != nil {
 				return tokens, cost, true, end, nil
 			}
-			// Couldn't launch the harness at all (bad PATH/flags/env) — not a blip.
+			// Count this attempt's spend before giving up on it. A non-exit run
+			// failure is either a launch failure (nothing emitted, nothing parsed —
+			// adding zeroes changes nothing) or a session that ran, announced its
+			// spend and died in Wait (CLA-299): the Result was parsed precisely so
+			// the budget would not lose what the attempt actually cost. The figures
+			// are complete here — parsing ran to completion over a stream that
+			// reached its end — which is why this arm counts them while the
+			// untrusted branch below deliberately does not.
+			tokens += res.Tokens
+			cost += res.CostUSD
+			d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
+			// A run failure that was not an exit status — a launch failure, or one
+			// of the deaths in Wait above — ends the attempt without any retry
+			// classification. Not a blip.
 			return tokens, cost, false, end, fmt.Errorf("invoke %s: %w", a.Name(), ierr)
 		}
 
