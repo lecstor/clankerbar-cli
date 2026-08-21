@@ -2055,6 +2055,30 @@ func TestPowerFieldMissingWarnsRatherThanPasses(t *testing.T) {
 	}
 }
 
+// An assertions output doctor does not recognise must not buy a PASS from that
+// read. The old fail-open returned true for any PreventUserIdleSystemSleep line
+// whose last token was not an integer, so checkPower reported PASS without ever
+// consulting `pmset -g` — short-circuiting exactly the branches CLA-250 added.
+// Falling through is strictly safer: with idle sleep enabled this lands in the
+// WARN, and with it disabled in the correct PASS — it cannot invent a problem.
+func TestPowerUnrecognisedAssertionLineFallsThroughToSettings(t *testing.T) {
+	assertions := "   PreventUserIdleSystemSleep       0 (inactive)\n"
+
+	c := checkPower(context.Background(), pmsetEnv(assertions, " sleep                10\n"))
+	if c.status != warn {
+		t.Fatalf("unrecognised assertion line, idle sleep enabled: got %v, want the settings-read WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "10 min") {
+		t.Errorf("should reach CLA-250's settings branch naming the timeout, got %q", c.detail)
+	}
+
+	// Same unrecognised assertions, sleep disabled: the fall-through yields the
+	// correct PASS from the settings read rather than a PASS guessed at upstream.
+	if c := checkPower(context.Background(), pmsetEnv(assertions, " sleep                0\n")); c.status != pass {
+		t.Errorf("unrecognised assertion line, sleep disabled: got %v, want PASS from the settings read (%s)", c.status, c.detail)
+	}
+}
+
 func TestPowerSkippedOffDarwin(t *testing.T) {
 	e := okEnv()
 	e.goos = "linux"
@@ -2067,8 +2091,17 @@ func TestPowerSkippedOffDarwin(t *testing.T) {
 	}
 }
 
-// The summary row lists the assertion name with a count even when nothing holds
-// it, so presence of the NAME proves nothing — only a non-zero count does.
+// Only two shapes are evidence of a held assertion: the summary row (the
+// assertion name as FIRST field, an integer count as SECOND) and a per-process
+// detail line beginning `pid <n>(<proc>):`. Both fixtures below were captured
+// live from `pmset -g assertions` on 2026-08-22 rather than invented — the point
+// of CLA-306 is precisely that a guessed-at format is how the fail-open got in.
+//
+// Everything else mentioning the name is NOT proven held and falls through: the
+// previous test (a last token that failed Atoi meant "held") answered YES for
+// every shape it did not recognise, including Apple appending a token to the
+// summary row — which turned into an unconditional PASS ahead of the branch
+// CLA-250 had just hardened.
 func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -2076,9 +2109,12 @@ func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 		want bool
 	}{
 		{"zero count is not held", "   PreventUserIdleSystemSleep       0\n", false},
-		{"non-zero count is held", "   PreventUserIdleSystemSleep       1\n", true},
-		{"named holder is held", `   PreventUserIdleSystemSleep       1
-       pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"non-zero count is held", "   PreventUserIdleSystemSleep     1\n", true},
+		{"real detail line is held", "   pid 33594(caffeinate): [0x0029efa0000196db] 00:00:01 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"  \n", true},
+		{"minimal detail line is held", `   pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"summary row with appended token is not proven held", "   PreventUserIdleSystemSleep       0 (inactive)\n", false},
+		{"summary row with unparseable count is not proven held", "   PreventUserIdleSystemSleep      ?? \n", false},
+		{"name alone is not proven held", "PreventUserIdleSystemSleep\n", false},
 		{"absent entirely", "   PreventUserIdleDisplaySleep      0\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

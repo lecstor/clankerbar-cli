@@ -1637,21 +1637,40 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 }
 
 // holdsNoIdleSleep reports whether `pmset -g assertions` shows a live
-// PreventUserIdleSystemSleep. The count matters: the header line lists the
-// assertion name with a `0` when nothing holds it.
+// PreventUserIdleSystemSleep. Only two line shapes count as evidence, because
+// they are the only two pmset actually emits for this assertion (verified against
+// live output on 2026-08-22):
+//
+//   - the summary row, whose FIRST field is exactly the assertion name and whose
+//     SECOND field is an integer count — held only when that count is non-zero;
+//   - a per-process detail line under "Listed by owning process:", which begins
+//     `pid <n>(<proc>):` and names the holder — held whenever one appears.
+//
+// Anything else mentioning the name is NOT PROVEN HELD and falls through, so
+// checkPower goes on to the `pmset -g` settings read rather than reporting PASS
+// from a shape it does not recognise. Falling through cannot invent a problem —
+// it only defers to the more direct question — whereas the previous test ("the
+// last token is not an integer means a detail line") answered YES, held for every
+// unrecognised shape, including Apple appending a token to the summary row or a
+// locale shifting its number format (CLA-306).
 func holdsNoIdleSleep(out string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.Contains(line, "PreventUserIdleSystemSleep") {
 			continue
 		}
 		fields := strings.Fields(line)
-		n, err := strconv.Atoi(fields[len(fields)-1])
-		if err != nil {
-			// A detail line rather than the summary row (those name the holding
-			// process); its presence means something holds it.
-			return true
-		}
-		if n > 0 {
+		switch {
+		case len(fields) >= 2 && fields[0] == "PreventUserIdleSystemSleep":
+			// Summary-row shape. Parse the COUNT position, not the tail: trailing
+			// tokens are exactly the unknown we must not guess from. A count here
+			// that will not parse is an unrecognised variant of the row — fall
+			// through rather than answer either way.
+			if n, err := strconv.Atoi(fields[1]); err == nil && n > 0 {
+				return true
+			}
+		case len(fields) >= 2 && fields[0] == "pid" && strings.HasSuffix(fields[1], ":") && strings.Contains(fields[1], "("):
+			// Per-process detail line: `pid 81237(caffeinate): … named: "…"`. Its
+			// presence means a live process holds the assertion.
 			return true
 		}
 	}
