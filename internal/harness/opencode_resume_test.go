@@ -370,3 +370,35 @@ func TestMergeResumeUntrustedContinuationMarksMerged(t *testing.T) {
 		t.Error("an untrusted continuation must make the merged result untrusted (CLA-262 gates read this)")
 	}
 }
+
+// Second-review finding 2 regression: escalate_question arms a settle WITHOUT a
+// Names() check, so even a bare parse ends with Claim{Settled: true}. On an
+// UNSEEDED continuation that zero-identity settled claim used to pass
+// mergeResume's guard and wipe the dead run's held claim (TaskID/Ref/RunID all
+// gone — no handback, no salvage, no attribution). With the ResumeClaim seed
+// the Invoke now applies, Settled lands on the REAL claim instead: identity
+// preserved, held correctly false.
+func TestMergeResumeEscalatedContinuationKeepsClaimIdentity(t *testing.T) {
+	base := quietDeathResult("ses_dead")
+	base.Claim = Claim{TaskID: "uuid-1", Ref: "EZY-196", RunID: "run-1"}
+
+	seeded := Invocation{Prompt: "Work."}
+	seeded.ResumeClaim = base.Claim
+	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_escalate_question","callID":"c2","state":{"status":"completed","input":{"questionId":"q1"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
+
+	if !cont.Claim.Settled {
+		t.Fatal("test precondition: the escalated continuation must observe Settled")
+	}
+	mergeResume(&base, cont)
+
+	if base.Claim.TaskID != "uuid-1" || base.Claim.Ref != "EZY-196" || base.Claim.RunID != "run-1" {
+		t.Errorf("Claim identity wiped by the escalated continuation: %+v", base.Claim)
+	}
+	if !base.Claim.Settled {
+		t.Error("Settled must survive the merge — escalation deliberately ends the run")
+	}
+	if base.Claim.Held() {
+		t.Error("an escalated claim is settled, not held")
+	}
+}
