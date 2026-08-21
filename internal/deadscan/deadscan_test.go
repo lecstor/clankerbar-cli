@@ -83,6 +83,16 @@ const takeoverWipThenDeadLog = `{"type":"step_start","timestamp":1,"sessionID":"
 {"type":"step_finish","timestamp":3,"sessionID":"ses_takeover","part":{"id":"p2","reason":"unknown","tokens":{"total":0,"input":0,"output":0}}}
 `
 
+// The other half of the same WIP check: hasWip false but task.branch set — the
+// real wire shape nests branch INSIDE task (internal/harness/claude.go's
+// Task.Branch, which the fixed noteTool mirrors via res.Task.Branch), unlike
+// takeoverWipThenDeadLog's top-level hasWip, so this exercises the
+// res.Task.Branch != "" arm of the check on its own.
+const takeoverBranchOnlyThenDeadLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_takeover2","part":{"id":"p1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_takeover2","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c1","state":{"status":"completed","input":{"taskId":"t8","takeover":true},"output":"{\"task\":{\"id\":\"t8\",\"ref\":\"CLA-8\",\"branch\":\"clanker/v\"},\"hasWip\":false}"}}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_takeover2","part":{"id":"p2","reason":"unknown","tokens":{"total":0,"input":0,"output":0}}}
+`
+
 // A codex session that died before ever reporting usage — the real shape from
 // internal/harness/usagereported_test.go's died-early fixture: thread.started
 // then item.completed, no turn.completed at all. Codex emits no claim state
@@ -260,6 +270,24 @@ func TestScan_TakeoverInheritsWipFromClaimResultItself(t *testing.T) {
 	}
 	if l.Dead {
 		t.Errorf("takeover fixture: Dead = true, want false — inherited WIP makes this a run, not a death")
+	}
+}
+
+// The res.Task.Branch != "" arm of the same check, on its own: hasWip false
+// but the branch nested inside task (the real wire shape) must still be read.
+func TestScan_TakeoverInheritsBranchNestedInTask(t *testing.T) {
+	files := map[string]string{
+		"w1/iteration-20260820-051000-d2-pimplement-a0-e2b06c32.log": takeoverBranchOnlyThenDeadLog,
+	}
+	l := byName(t, scanFixtures(t, files), "iteration-20260820-051000-d2-pimplement-a0-e2b06c32.log")
+	if !l.GotPastClaim {
+		t.Fatalf("takeover fixture: GotPastClaim = false, want true")
+	}
+	if !l.BranchRecorded {
+		t.Errorf("takeover fixture: BranchRecorded = false, want true — task.branch on claim_task's own result must be read even when hasWip is false")
+	}
+	if l.Dead {
+		t.Errorf("takeover fixture: Dead = true, want false — inherited branch makes this a run, not a death")
 	}
 }
 
