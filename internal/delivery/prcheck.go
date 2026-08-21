@@ -141,6 +141,27 @@ func (c ghCheck) succeeded() bool {
 	return strings.EqualFold(strings.TrimSpace(c.State), "SUCCESS")
 }
 
+// neutral reports a check run that COMPLETED WITHOUT FAILING and will never
+// go green either: SKIPPED (a path-filtered workflow had nothing to do on
+// this push) and NEUTRAL (the run decided its result does not count).
+// Classifying these as failures would refuse every delivery in repos that
+// use either - forever, because a skipped check never turns green - which is
+// the same wedge the no-CI opt-out exists to prevent, narrowed to one shape.
+// They are still named in a passing detail, so a human reading the log knows
+// the rollup was not all-green-on-the-merits. Any OTHER completed conclusion
+// that is not SUCCESS stays in the failure bucket: a conclusion this package
+// does not recognise is a finding, not a pass.
+func (c ghCheck) neutral() bool {
+	if !c.isCheckRun() {
+		return false // commit statuses have no neutral shape
+	}
+	switch strings.ToUpper(strings.TrimSpace(c.Conclusion)) {
+	case "SKIPPED", "NEUTRAL":
+		return true
+	}
+	return false
+}
+
 // ghPR is the slice of `gh pr view --json ...` the gate reads.
 type ghPR struct {
 	Mergeable         string    `json:"mergeable"`         // MERGEABLE | CONFLICTING | UNKNOWN
@@ -168,6 +189,7 @@ const (
 type prJudgement struct {
 	verdict prVerdict
 	passed  int // rollup entries that completed successfully (prPass)
+	neutral int // completed without failing and never going green: SKIPPED/NEUTRAL
 	failing []string
 	pending []string
 }
@@ -204,10 +226,12 @@ func judgePR(v ghPR) prJudgement {
 		switch {
 		case !c.completed():
 			j.pending = append(j.pending, c.label())
-		case !c.succeeded():
-			j.failing = append(j.failing, c.label())
-		default:
+		case c.succeeded():
 			j.passed++
+		case c.neutral():
+			j.neutral++
+		default:
+			j.failing = append(j.failing, c.label())
 		}
 	}
 	switch {
@@ -229,9 +253,16 @@ func settlePR(j prJudgement, prNum, slug string, waited time.Duration, allowUnch
 	name := func(labels []string) string { return strings.Join(labels, ", ") }
 	switch j.verdict {
 	case prPass:
+		skipped := ""
+		if j.neutral > 0 {
+			// Named, not averaged in: a rollup that "passed" with a skipped
+			// job is not the same fact as an all-green one, and the reader of
+			// a 3am log should not have to guess which happened.
+			skipped = fmt.Sprintf(" (%s skipped/neutral)", plural(j.neutral, "check"))
+		}
 		return Check{Kind: PRVerified, Status: Pass, Detail: fmt.Sprintf(
-			"PR %s (%s) is MERGEABLE and its %s passed",
-			prNum, slug, plural(j.passed, "check"))}
+			"PR %s (%s) is MERGEABLE and its %s passed%s",
+			prNum, slug, plural(j.passed, "check"), skipped)}
 	case prConflict:
 		return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
 			"PR %s (%s) is CONFLICTING with its base — the delivery is refused. "+
@@ -305,6 +336,25 @@ type ghNotFoundError struct{ detail string }
 
 func (e *ghNotFoundError) Error() string { return e.detail }
 
+// normalizePR accepts the shapes a session actually reports - "42", "#42" -
+// and rejects everything else BEFORE gh sees it. The rejection is the point:
+// gh resolves a non-number argument as a BRANCH name, so an unvalidated
+// string would make this check verify whichever pull request happens to be
+// open for some unrelated branch - and could pass a delivery on it. A PR is
+// a number; anything else is not evidence about THIS delivery.
+func normalizePR(pr string) string {
+	p := strings.TrimPrefix(strings.TrimSpace(pr), "#")
+	if p == "" {
+		return ""
+	}
+	for _, r := range p {
+		if r < '0' || r > '9' {
+			return ""
+		}
+	}
+	return p
+}
+
 // prCheck verifies the PR named in a delivery: mergeable, with a check rollup
 // that actually ran and passed. See the file comment for the two conditions,
 // the bounded wait, and the no-CI decision.
@@ -314,6 +364,14 @@ func (e *ghNotFoundError) Error() string { return e.detail }
 // PR number belongs to whoever owns that remote, which is the only guess this
 // check allows itself, and only under the ordinary layout.
 func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, rep *Report) Check {
+	num := normalizePR(prNum)
+	if num == "" {
+		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+			"PR %q is not a pull request NUMBER - the delivery's pull request goes unverified, which is not a pass. "+
+				"Report the bare number (42 or #42), not a branch or URL", prNum)}
+	}
+	prNum = num
+
 	if _, err := exec.LookPath(v.ghBin); err != nil {
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
 			"PR %s cannot be verified: %s is not on PATH — the delivery's pull request goes unchecked, which is not a pass. Install the GitHub CLI so this gate can run", prNum, v.ghBin)}

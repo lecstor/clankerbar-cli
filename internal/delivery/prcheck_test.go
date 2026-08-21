@@ -186,6 +186,100 @@ func TestFailingCheckIsRefused(t *testing.T) {
 	}
 }
 
+// --- skipped and neutral conclusions are not failures (review finding F1) ----
+
+// SKIPPED and NEUTRAL mean a check RAN and did not fail - a path-filtered
+// workflow had nothing to do, or the run decided its result does not count.
+// Neither ever turns green, so calling them failures would refuse every
+// delivery in repos that use either, forever: the wedge the no-CI opt-out
+// exists to prevent, one shape narrower. They pass the gate and are named in
+// the detail, so the pass never reads as all-green-on-the-merits.
+func TestSkippedAndNeutralChecksAreNotFailures(t *testing.T) {
+	j := judgePR(ghPR{
+		Mergeable: "MERGEABLE",
+		StatusCheckRollup: []ghCheck{
+			{Name: "ci", Status: "COMPLETED", Conclusion: "SUCCESS"},
+			{Name: "docs", Status: "COMPLETED", Conclusion: "SKIPPED"},
+			{Name: "lint", Status: "COMPLETED", Conclusion: "NEUTRAL"},
+		},
+	})
+	if j.verdict != prPass || j.passed != 1 || j.neutral != 2 {
+		t.Fatalf("skipped/neutral rollup: got %+v, want prPass with 1 passed, 2 neutral", j)
+	}
+	if len(j.failing) != 0 {
+		t.Errorf("skipped/neutral must not land in the failing bucket: %+v", j.failing)
+	}
+}
+
+// The carve-out is narrow: every other completed-but-not-SUCCESS conclusion -
+// including ones this package has never seen - stays a refusal, because an
+// unrecognised verdict is a finding, not a pass.
+func TestGenuineFailureConclusionsStillRefuse(t *testing.T) {
+	for _, conclusion := range []string{"FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "CANCELLED", "STARTUP_FAILURE", "SOMETHING_NEW"} {
+		j := judgePR(ghPR{
+			Mergeable: "MERGEABLE",
+			StatusCheckRollup: []ghCheck{
+				{Name: "ci", Status: "COMPLETED", Conclusion: conclusion},
+			},
+		})
+		if j.verdict != prChecksFailed {
+			t.Errorf("conclusion %s: got %+v, want prChecksFailed", conclusion, j)
+		}
+	}
+}
+
+func TestSkippedCheckDoesNotWedgeADelivery(t *testing.T) {
+	dir := prEnv(t)
+	rollup := `{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[` +
+		`{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"},` +
+		`{"__typename":"CheckRun","name":"docs","status":"COMPLETED","conclusion":"SKIPPED"}]}`
+	v := prVerifier(t, dir, fakeGH(t, rollup))
+
+	rep := verifyWith(t, v, Claim{Label: "CLA-310", PR: "7"})
+	c := mustStatus(t, rep, PRVerified, Pass)
+	if !strings.Contains(c.Detail, "1 check skipped/neutral") {
+		t.Errorf("pass detail should name the skipped check rather than average it in: %s", c.Detail)
+	}
+}
+
+// --- the PR field is a NUMBER before gh ever sees it (review finding F2) -----
+
+// gh resolves a non-number argument as a BRANCH name, so a garbage or hostile
+// PR field could make the gate verify whichever pull request is open for some
+// unrelated branch and pass the delivery on it. Anything that is not a number
+// (after the "#" a session likes to lead with) is refused without gh being
+// consulted - this fake gh exits 42, so any invocation would show.
+func TestPRFieldMustBeANumber(t *testing.T) {
+	dir := prEnv(t)
+	v := prVerifier(t, dir, writeGH(t, "exit 42\n"))
+
+	for _, garbage := range []string{"staging", "main", "https://github.com/acme/widgets/pull/7"} {
+		rep := verifyWith(t, v, Claim{Label: "CLA-310", PR: garbage})
+		c := mustStatus(t, rep, PRVerified, Unknown)
+		if !strings.Contains(c.Detail, "not a pull request NUMBER") {
+			t.Errorf("PR field %q: detail should name the validation, not an outage: %s", garbage, c.Detail)
+		}
+	}
+}
+
+func TestHashPrefixedPRNumberIsAcceptedAndNormalized(t *testing.T) {
+	dir := prEnv(t)
+	argsFile := filepath.Join(t.TempDir(), "args")
+	gh := writeGH(t, "printf '%s\\n' \"$@\" > "+argsFile+"\ncat <<'J'\n"+jsonMergeablePassing+"\nJ\n")
+	v := prVerifier(t, dir, gh)
+
+	rep := verifyWith(t, v, Claim{Label: "CLA-310", PR: "#7"})
+	mustStatus(t, rep, PRVerified, Pass)
+
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatalf("fake gh was not invoked: %v", err)
+	}
+	if !strings.Contains(string(args), "\n7\n") {
+		t.Errorf("gh should receive the bare number, got args: %q", string(args))
+	}
+}
+
 // mergeable: null must never read as MERGEABLE. A bounded wait that never
 // resolves refuses, rather than hanging or assuming.
 func TestUnresolvedMergeabilityRefusesAfterTheBound(t *testing.T) {
