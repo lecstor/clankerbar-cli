@@ -2091,17 +2091,21 @@ func TestPowerSkippedOffDarwin(t *testing.T) {
 	}
 }
 
-// Only two shapes are evidence of a held assertion: the summary row (the
-// assertion name as FIRST field, an integer count as SECOND) and a per-process
-// detail line beginning `pid <n>(<proc>):`. Both fixtures below were captured
-// live from `pmset -g assertions` on 2026-08-22 rather than invented — the point
-// of CLA-306 is precisely that a guessed-at format is how the fail-open got in.
+// Only two shapes are evidence of a held assertion: the summary row (exactly
+// the assertion name and an integer count, nothing else) and a per-process
+// detail line beginning `pid <n>(<proc>):`. The detail-line fixtures were
+// captured live from `pmset -g assertions` on 2026-08-22 rather than invented —
+// the point of CLA-306 is precisely that a guessed-at format is how the
+// fail-open got in.
 //
 // Everything else mentioning the name is NOT proven held and falls through: the
 // previous test (a last token that failed Atoi meant "held") answered YES for
 // every shape it did not recognise, including Apple appending a token to the
 // summary row — which turned into an unconditional PASS ahead of the branch
-// CLA-250 had just hardened.
+// CLA-250 had just hardened. The trailing-token rule cuts both ways: a row that
+// carries anything beyond name-plus-count is unknown whether the count reads
+// zero or non-zero. And the detail line is matched on the raw line because the
+// process name inside the parens may itself contain spaces.
 func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -2112,7 +2116,10 @@ func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 		{"non-zero count is held", "   PreventUserIdleSystemSleep     1\n", true},
 		{"real detail line is held", "   pid 33594(caffeinate): [0x0029efa0000196db] 00:00:01 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"  \n", true},
 		{"minimal detail line is held", `   pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"detail line with spaces in the process name is held", `   pid 123(Google Chrome Helper): [0x0001] 00:00:01 PreventUserIdleSystemSleep named: "Helper"  `, true},
+		{"detail line with a non-numeric pid is not proven held", `   pid abc(caffeinate): PreventUserIdleSystemSleep`, false},
 		{"summary row with appended token is not proven held", "   PreventUserIdleSystemSleep       0 (inactive)\n", false},
+		{"summary row with non-zero count and appended token is not proven held", "   PreventUserIdleSystemSleep       1 (inactive)\n", false},
 		{"summary row with unparseable count is not proven held", "   PreventUserIdleSystemSleep      ?? \n", false},
 		{"name alone is not proven held", "PreventUserIdleSystemSleep\n", false},
 		{"absent entirely", "   PreventUserIdleDisplaySleep      0\n", false},

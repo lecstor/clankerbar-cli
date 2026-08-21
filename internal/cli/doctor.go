@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -1641,8 +1642,8 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 // they are the only two pmset actually emits for this assertion (verified against
 // live output on 2026-08-22):
 //
-//   - the summary row, whose FIRST field is exactly the assertion name and whose
-//     SECOND field is an integer count — held only when that count is non-zero;
+//   - the summary row: exactly the assertion name followed by an integer count
+//     and nothing else — held only when that count is non-zero;
 //   - a per-process detail line under "Listed by owning process:", which begins
 //     `pid <n>(<proc>):` and names the holder — held whenever one appears.
 //
@@ -1653,6 +1654,16 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 // last token is not an integer means a detail line") answered YES, held for every
 // unrecognised shape, including Apple appending a token to the summary row or a
 // locale shifting its number format (CLA-306).
+//
+// Both branches match structure, not whitespace-split tokens, because splitting
+// is where the original guess went wrong: the detail-line regex runs on the raw
+// line since pmset prints the holding process's name verbatim inside the parens,
+// and a name containing spaces ("Google Chrome Helper") leaves no single field
+// carrying the `<n>(<proc>):` tail; the summary row demands exactly two fields
+// because any token beyond name-plus-count is an unknown in BOTH directions —
+// "1 (inactive)" no less than "0" (CLA-306 review).
+var pidDetailLine = regexp.MustCompile(`^\s*pid\s+\d+\([^)]*\):(?:\s|$)`)
+
 func holdsNoIdleSleep(out string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.Contains(line, "PreventUserIdleSystemSleep") {
@@ -1660,17 +1671,19 @@ func holdsNoIdleSleep(out string) bool {
 		}
 		fields := strings.Fields(line)
 		switch {
-		case len(fields) >= 2 && fields[0] == "PreventUserIdleSystemSleep":
+		case len(fields) == 2 && fields[0] == "PreventUserIdleSystemSleep":
 			// Summary-row shape. Parse the COUNT position, not the tail: trailing
-			// tokens are exactly the unknown we must not guess from. A count here
-			// that will not parse is an unrecognised variant of the row — fall
-			// through rather than answer either way.
+			// tokens are exactly the unknown we must not guess from, so a row with
+			// anything after the count — or a count that will not parse — is an
+			// unrecognised variant and falls through rather than answer either way.
 			if n, err := strconv.Atoi(fields[1]); err == nil && n > 0 {
 				return true
 			}
-		case len(fields) >= 2 && fields[0] == "pid" && strings.HasSuffix(fields[1], ":") && strings.Contains(fields[1], "("):
+		case pidDetailLine.MatchString(line):
 			// Per-process detail line: `pid 81237(caffeinate): … named: "…"`. Its
-			// presence means a live process holds the assertion.
+			// presence means a live process holds the assertion. Matched on the raw
+			// line so a process name containing spaces still reads as one
+			// `<pid>(<name>):` head.
 			return true
 		}
 	}
