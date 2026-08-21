@@ -201,8 +201,15 @@ func mergeResume(base *Result, add Result) {
 	}
 	for _, rep := range add.Reports {
 		dup := false
-		for _, have := range base.Reports {
+		for i, have := range base.Reports {
 			if have.sameClaim(rep) {
+				// LATER WINS, matching settleReport's own rule: sameClaim
+				// ignores Status, and the most recent status is the one that
+				// says whether the work is headed to review or declared
+				// landed. Keeping the earlier duplicate would drop exactly
+				// that upgrade — an in_review declaration superseded by a
+				// done — and skip merge attestation.
+				base.Reports[i] = rep
 				dup = true
 				break
 			}

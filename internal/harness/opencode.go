@@ -77,6 +77,15 @@ func (opencode) MCPConfigUse() MCPConfigUse {
 // cap bounds the whole loop; after it, the last Result falls through to the
 // driver's existing dead-phase path unchanged.
 func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
+	// The wall-clock cap bounds the WHOLE Invoke, not each process: the
+	// deadline is computed BEFORE the first run so the original run's time
+	// counts against the budget the continuations inherit. Computing it after
+	// would hand every resurrection a fresh full cap — worst case 2x the
+	// configured dial before any probe overhead.
+	var deadline time.Time
+	if in.MaxSessionWallClock > 0 {
+		deadline = time.Now().Add(in.MaxSessionWallClock)
+	}
 	res, err := o.runSession(ctx, in, opencodeArgs(in))
 	if err != nil {
 		return res, err
@@ -86,14 +95,6 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		return res, nil
 	}
 	console := in.Console
-	// The wall-clock cap bounds the WHOLE Invoke, not each process: computed
-	// once here and spent down round by round below. Per-round fresh caps would
-	// let one phase run maxResurrections+1 times the configured cap, which is
-	// not what an operator setting the dial for an overnight run expects.
-	var deadline time.Time
-	if in.MaxSessionWallClock > 0 {
-		deadline = time.Now().Add(in.MaxSessionWallClock)
-	}
 	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res); attempt++ {
 		sid, ref := resumeTargets(res)
 		if sid == "" || ref == "" {
