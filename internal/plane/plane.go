@@ -140,6 +140,16 @@ type ParkAPI interface {
 	// The caller passes blocking and kind explicitly so the dead-phase park can
 	// file a non-blocking clarification; the wire shape is asserted in tests.
 	AskQuestion(ctx context.Context, taskID, body string, options []string, blocking bool, kind string) error
+
+	// AskProjectQuestion files an OPEN question at PROJECT level — no taskId —
+	// the shape a fleet-wide event raises (CLA-396). The fleet dead-phase
+	// counter tripping is not one task's triage but a project-level condition
+	// ("the provider is broken right now"), so the question must not be pinned
+	// to the bystander task that happened to be in flight. It is always
+	// non-blocking: there is no task to block, and the loop's pause — not a
+	// blocking flag — is what stops the work. The kind is the caller's call,
+	// so the driver can file a project-level decision.
+	AskProjectQuestion(ctx context.Context, body string, options []string, kind string) error
 }
 
 type notWired struct{}
@@ -256,6 +266,36 @@ func (r *mcpReleaser) AskQuestion(ctx context.Context, taskID, body string, opti
 		"taskId":   taskID,
 		"body":     body,
 		"blocking": blocking,
+		"kind":     kind,
+	}
+	if len(options) > 0 {
+		args["options"] = options
+	}
+	if err := r.call(ctx, "ask_question", args); err != nil {
+		return fmt.Errorf("%w: %v", ErrQuestionNotFiled, err)
+	}
+	return nil
+}
+
+// AskProjectQuestion files an OPEN question with NO taskId — the project-level
+// sibling of AskQuestion (CLA-396). A fleet trip is not one task's triage: the
+// dead-phase counter tripping across tasks means the provider or harness is
+// broken right now, and pinning the question to whichever task was in flight
+// would make the operator answer about a bystander. The plane's ask_question
+// takes taskId optionally, so omitting it is the wire shape; non-blocking is
+// hard-coded because there is no task to block (the loop's own pause is the
+// enforcement, and the driver clears it when this question is answered).
+//
+// A failure here wraps ErrQuestionNotFiled, exactly like AskQuestion: the
+// caller must report "paused, and the question is missing" rather than "the
+// pause failed".
+func (r *mcpReleaser) AskProjectQuestion(ctx context.Context, body string, options []string, kind string) error {
+	if body == "" {
+		return errors.New("ask project question: body is required")
+	}
+	args := map[string]any{
+		"body":     body,
+		"blocking": false,
 		"kind":     kind,
 	}
 	if len(options) > 0 {

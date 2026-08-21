@@ -49,7 +49,7 @@ func drainPhasesHandoffs(t *testing.T, d *Driver, drainNum int) (int, float64, i
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return d.drainPhases(ctx, drainNum, d.targets[0], spend{start: time.Now()})
+	return d.drainPhases(ctx, drainNum, 0, d.targets[0], spend{start: time.Now()})
 }
 
 // twoPhases is the shipped sequence, by name, so the tests exercise the built-in
@@ -887,6 +887,8 @@ func TestDrainPhases_ZeroUsageUnknownParkNamesTheMarker(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(zeroUsageResult(), openClaim())},
 		{res: held(zeroUsageResult(), openClaim())},
+		{res: held(zeroUsageResult(), openClaim())},
+		{res: held(zeroUsageResult(), openClaim())},
 	}}
 	rel := &parkingReleaser{}
 	cfg := fastCfg()
@@ -1005,13 +1007,16 @@ func TestDrainPhases_AStopReasonIsUntouched(t *testing.T) {
 	}
 }
 
-// A task that can kill two full implement phases reaches the operator rather
-// than a third session — parked, with an OPEN question so the operator actually
-// sees it. The retry budget is per task: this drain used its one retry, so the
-// second dead phase parks instead of retrying again.
-func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
+// A task that can kill four full implement phases reaches the operator rather
+// than a fifth session — parked, with an OPEN question so the operator actually
+// sees it. The retry budget is per task: three deaths earn three retries, and
+// the FOURTH consecutive dead phase parks instead of retrying again (CLA-396,
+// raised from two by the 2026-08-20 operator decision).
+func TestDrainPhases_AFourthConsecutiveDeadPhaseParks(t *testing.T) {
 	logs := captureLogs(t)
 	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
 		{res: held(deadResult(), openClaim())},
 		{res: held(deadResult(), openClaim())},
 	}}
@@ -1029,8 +1034,8 @@ func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 	if stop {
 		t.Error("a parked task stopped the whole run; the daemon should carry on with the next task")
 	}
-	if h.invokeCalls != 2 {
-		t.Errorf("spawned %d sessions, want 2 (dead phase + its one retry) — the second dead phase must park, not retry a second time", h.invokeCalls)
+	if h.invokeCalls != 4 {
+		t.Errorf("spawned %d sessions, want 4 (three retries, then the fourth dead phase parks)", h.invokeCalls)
 	}
 	if len(rel.parks) != 1 {
 		t.Fatalf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
@@ -1045,11 +1050,11 @@ func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 		t.Errorf("the park outcome does not name the signature: %q", got.outcome)
 	}
 	if !strings.Contains(got.outcome, "retry") {
-		t.Errorf("the park outcome does not reference the operator's retry-once-then-park ruling: %q", got.outcome)
+		t.Errorf("the park outcome does not reference the operator's retry-then-park ruling: %q", got.outcome)
 	}
 
 	// The park filed ONE open question: non-blocking, a clarification, carrying
-	// the signature, the task ref, the two sessions it cost, and where the logs
+	// the signature, the task ref, the four sessions it cost, and where the logs
 	// are — the shape that makes the park reach the operator.
 	if len(rel.questions) != 1 {
 		t.Fatalf("filed %d questions, want 1: %+v", len(rel.questions), rel.questions)
@@ -1064,7 +1069,7 @@ func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 	if q.kind != "clarification" {
 		t.Errorf("question kind = %q, want clarification — a decision would read as project-wide standing law", q.kind)
 	}
-	for _, want := range []string{harness.FinishReasonUnknown, "no branch recorded", "two", "t-1", "iteration logs"} {
+	for _, want := range []string{harness.FinishReasonUnknown, "no branch recorded", "four", "t-1", "iteration logs"} {
 		if !strings.Contains(q.body, want) {
 			t.Errorf("question body does not carry %q: %q", want, q.body)
 		}
@@ -1081,7 +1086,7 @@ func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 		}
 	}
 
-	if out := logs.String(); !strings.Contains(out, "died producing nothing a second time") {
+	if out := logs.String(); !strings.Contains(out, "died producing nothing for the 4th consecutive time") {
 		t.Errorf("the operator's log does not say why the task was parked:\n%s", out)
 	}
 }
@@ -1093,6 +1098,8 @@ func TestDrainPhases_ASecondConsecutiveDeadPhaseParks(t *testing.T) {
 func TestDrainPhases_AParkOutcomeStandsAloneWhenTheQuestionFails(t *testing.T) {
 	logs := captureLogs(t)
 	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
 		{res: held(deadResult(), openClaim())},
 		{res: held(deadResult(), openClaim())},
 	}}
@@ -1113,7 +1120,7 @@ func TestDrainPhases_AParkOutcomeStandsAloneWhenTheQuestionFails(t *testing.T) {
 	if len(rel.parks) != 1 {
 		t.Fatalf("parked %d times, want 1 — the park must commit even when the question insert fails: %+v", len(rel.parks), rel.parks)
 	}
-	if out := logs.String(); !strings.Contains(out, "parked t-1 — two consecutive dead phases, but the question for the operator could not be filed") {
+	if out := logs.String(); !strings.Contains(out, "parked t-1 — four consecutive dead phases, but the question for the operator could not be filed") {
 		t.Errorf("the log does not say the task IS parked with a missing question:\n%s", out)
 	}
 	if out := logs.String(); strings.Contains(out, "left for the next claim") {
@@ -1134,6 +1141,8 @@ func TestDrainPhases_ANonZeroExitDeadPhaseIsRetriedNotARunFailure(t *testing.T) 
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(dead(), openClaim())},
 		{res: held(dead(), openClaim())},
+		{res: held(dead(), openClaim())},
+		{res: held(dead(), openClaim())},
 	}}
 	rel := &parkingReleaser{}
 	cfg := fastCfg()
@@ -1149,8 +1158,8 @@ func TestDrainPhases_ANonZeroExitDeadPhaseIsRetriedNotARunFailure(t *testing.T) 
 	if stop {
 		t.Error("a dead phase stopped the whole run")
 	}
-	if h.invokeCalls != 2 {
-		t.Errorf("spawned %d sessions, want 2 (dead phase + its one retry) — the dead classification must win over the non-retryable error", h.invokeCalls)
+	if h.invokeCalls != 4 {
+		t.Errorf("spawned %d sessions, want 4 (three retries, then the fourth dead phase parks) — the dead classification must win over the non-retryable error", h.invokeCalls)
 	}
 	if len(rel.parks) != 1 {
 		t.Errorf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
@@ -1194,14 +1203,21 @@ func TestDrainPhases_ARunStopWinsOverADeadPhase(t *testing.T) {
 // The retry budget is PER TASK. The dead retry is a fresh claiming session (the
 // dead claim was handed back), and next_task can hand it a different task — so a
 // task that has died only once must not be parked because some OTHER task died
-// after it. The counter follows the task id: two dead phases on t-2 park t-2,
-// while t-1's single death earns t-1 no park and no false "twice in a row"
-// decision (review finding).
+// after it. The counter follows the task id: t-1's single death counts for t-1
+// alone, and when the retry lands on t-2 the count starts fresh for t-2 (review
+// finding, updated for the CLA-396 budget of four). Under the new budget the
+// discriminating shape is t-1 dying once then t-2 dying THREE times — four
+// consecutive deaths, below the fleet bound of five, so the fleet does not trip
+// — and t-2's third death must still be RETRIED, not parked: had the counter
+// carried t-1's death forward, t-2 would sit at four and park here.
 func TestDrainPhases_ADeadOnADifferentTaskDoesNotParkTheSecondTask(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(deadResult(), openClaim())},                                // t-1 dies once
 		{res: held(deadResult(), harness.Claim{TaskID: "t-2", RunID: "r-2"})}, // retry lands on t-2
-		{res: held(deadResult(), harness.Claim{TaskID: "t-2", RunID: "r-2"})}, // t-2 dies again: park t-2
+		{res: held(deadResult(), harness.Claim{TaskID: "t-2", RunID: "r-2"})}, // t-2's second death
+		{res: held(deadResult(), harness.Claim{TaskID: "t-2", RunID: "r-2"})}, // t-2's third death: RETRY, not park
+		{res: checkpointed(1, 0)},                                             // the retry succeeds and the phase advances
+		{res: okResult(1, 0)},                                                 // review runs normally
 	}}
 	rel := &parkingReleaser{}
 	cfg := fastCfg()
@@ -1214,14 +1230,14 @@ func TestDrainPhases_ADeadOnADifferentTaskDoesNotParkTheSecondTask(t *testing.T)
 	if err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
-	if h.invokeCalls != 3 {
-		t.Fatalf("spawned %d sessions, want 3 (t-1 dead, t-2 dead, t-2 retry) — the retry budget must reset for a different task", h.invokeCalls)
+	if h.invokeCalls != 6 {
+		t.Fatalf("spawned %d sessions, want 6 (t-1 dead, t-2 dead x3 with three retries, then implement success + review) — the retry budget must reset for a different task", h.invokeCalls)
 	}
-	if len(rel.parks) != 1 {
-		t.Fatalf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
+	if len(rel.parks) != 0 {
+		t.Fatalf("parked %d times, want 0 — t-2 inherited no deaths from t-1: %+v", len(rel.parks), rel.parks)
 	}
-	if got := rel.parks[0]; got.taskID != "t-2" || got.runID != "r-2" {
-		t.Errorf("parked %s/%s, want t-2/r-2 — the task parked must be the one that died twice, not the one that died once", got.taskID, got.runID)
+	if got := d.fleetDead[0]; got != 0 {
+		t.Errorf("fleet counter = %d, want 0 — the implement success after the retry must reset it", got)
 	}
 }
 
