@@ -804,6 +804,9 @@ default**: unlike the turn cap it ships no built-in number, because a duration
 that catches a runaway on one model/provider is a routine session on another. It
 is measured per SESSION, so it is not `budget.max_wall_clock`, which is the
 run-wide ceiling and counts the hours a run spends *waiting out* a usage limit.
+Since v0.9.1 the cap bounds an opencode session's WHOLE life including any
+quiet-death resurrections: the budget is computed once at spawn and spent down
+across the original run plus up to 5 resume rounds, not refreshed per round.
 
 **opencode only** today — it is the harness with no turn flag, so this is its
 backstop; under claude or codex the dial is inert and `doctor` says so. Two
@@ -983,6 +986,12 @@ signature. The cause is an opencode client defect, not the provider - see
 described in
 [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md),
 which is a separate failure with a separate cause.
+
+Since v0.9.1 the adapter does not accept the signature as terminal: it backs off,
+resumes the SAME session in place (`opencode run --session <id>`), and asks the
+agent to prove it is intact by naming its task ref. A mechanical match continues
+the session where it left off (bounded at 5 resurrections per session, one probe
+per death); a failed probe falls through to the dead-phase path unchanged.
 
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in

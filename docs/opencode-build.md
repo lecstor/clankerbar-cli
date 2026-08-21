@@ -66,7 +66,12 @@ missing feature.
 For us that failure looks like a session that ended with no branch and no error (it had
 usually done paid work first - only the final step is empty) -
 what the driver calls a dead phase. It hit 6 of 16 implement sessions on 2026-08-20.
-**CLA-406** covers treating it as a discarded turn to retry rather than a task failure.
+**CLA-406** shipped the mitigation (v0.9.1+): on the quiet-death signature the
+adapter RESUMES the same session in place (`opencode run --session <id>`) after a
+25s backoff, probes the agent with an informed coherence check (name your task ref),
+and continues it on a mechanical match - bounded at 5 resurrections per Invoke, one
+probe per death, falling through to the dead-phase path unchanged when a probe fails.
+The upstream loop-exit bug still stands; this catches its victims instead.
 
 If we ever pin a patched build rather than waiting for upstream: **do not vendor the
 one-line fix**. Adding `"unknown"` to the list at `:1113` removes the silent exit but

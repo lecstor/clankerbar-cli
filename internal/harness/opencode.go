@@ -64,8 +64,142 @@ func (opencode) MCPConfigUse() MCPConfigUse {
 	}
 }
 
+// Invoke runs one opencode session for the driver, and — CLA-406 — when that
+// session dies the quiet death (stream dropped mid-generation, no terminal
+// chunk, no usage), tries to RESURRECT it in place rather than hand the driver
+// a corpse: back off, probe the session with a coherence question, and on a
+// mechanical match continue it where it left off. See opencode_resume.go for
+// the rules and their rationale; the loop here is only their orchestration.
+//
+// Every round re-checks ZeroUsageUnknown on the MERGED result, so a
+// continuation that itself dies quietly takes another round (a fresh probe per
+// death), while a clean continuation clears the marker and exits the loop. The
+// cap bounds the whole loop; after it, the last Result falls through to the
+// driver's existing dead-phase path unchanged.
 func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
-	args := opencodeArgs(in)
+	res, err := o.runSession(ctx, in, opencodeArgs(in))
+	if err != nil {
+		return res, err
+	}
+	if in.Probe {
+		// Never resurrect a probe: a probe IS the liveness check.
+		return res, nil
+	}
+	console := in.Console
+	// The wall-clock cap bounds the WHOLE Invoke, not each process: computed
+	// once here and spent down round by round below. Per-round fresh caps would
+	// let one phase run maxResurrections+1 times the configured cap, which is
+	// not what an operator setting the dial for an overnight run expects.
+	var deadline time.Time
+	if in.MaxSessionWallClock > 0 {
+		deadline = time.Now().Add(in.MaxSessionWallClock)
+	}
+	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res); attempt++ {
+		sid, ref := resumeTargets(res)
+		if sid == "" || ref == "" {
+			// No session to resume into (died before its first event) or no
+			// claim to verify against (died before claiming — no work at
+			// stake). The quiet death stands.
+			break
+		}
+		if console != nil {
+			fmt.Fprintf(console, "\n!! quiet death detected — resurrecting session %s (attempt %d of %d): backing off %s, then probing for coherence against %s\n",
+				sid, attempt, opencodeMaxResurrections, opencodeResumeBackoff, ref)
+		}
+		select {
+		case <-ctx.Done():
+			// Run-wide cancellation (Ctrl-C / supervised wait): not this
+			// phase's verdict. Hand back what we have; the driver reads the
+			// parent context itself.
+			return res, nil
+		case <-time.After(opencodeResumeBackoff):
+		}
+
+		// The probe: same session, informed of the convention, asked to prove
+		// it is intact by naming its task ref. Time-boxed — silence past the
+		// window is a death, not a pause. (A partially-streamed reply killed by
+		// the box is judged on whatever text landed: if it already named the
+		// ref, the session genuinely resumed and continuing is correct.)
+		pctx, pcancel := context.WithTimeout(ctx, opencodeProbeTimeout)
+		probeIn := in
+		probeIn.Probe = true // no wall-clock double-cap, no console tee
+		// Seed the probe's parser with the dead run's live claim, so a probe
+		// turn that happens to touch the backlog is observed on the same terms
+		// as the session it belongs to.
+		probeIn.ResumeClaim = res.Claim
+		probeRes, probeErr := o.runSession(pctx, probeIn,
+			opencodeResumeArgs(in, sid, resurrectionProbePrompt(ref)))
+		pcancel()
+		// Charge the probe's spend UNCONDITIONALLY, before any verdict: a
+		// resume re-sends the whole transcript, so this is real money even when
+		// the answer is garbage. Under-counting is the one direction a budget
+		// breaker must not err in. Deliberately NOT via mergeResume — a probe
+		// we are about to judge must not donate claim/raw state.
+		res.Tokens += probeRes.Tokens
+		res.CostUSD += probeRes.CostUSD
+		res.UsageReported = res.UsageReported || probeRes.UsageReported
+		coherent := probeErr == nil && probeCoherent(probeRes.FinalMessage, ref)
+		if !coherent {
+			if console != nil {
+				fmt.Fprintf(console, "!! resurrection probe FAILED (err=%v, reply=%.200q) — counting the death\n",
+					probeErr, probeRes.FinalMessage)
+			}
+			break
+		}
+
+		// Coherent: continue the session for real. The continuation's parser is
+		// seeded with the DEAD RUN'S live claim (not in.ResumeClaim, which on a
+		// phase 2+ holds the staler predecessor): `opencode run -s` streams only
+		// the new turn, so without the seed every update_task the continuation
+		// makes would go unobserved — no settle, no HasWIP, no delivery report —
+		// and releaseHeldClaim would post ready over work the session pushed.
+		contIn := in
+		contIn.ResumeClaim = res.Claim
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				if console != nil {
+					fmt.Fprintf(console, "!! wall-clock budget exhausted across resurrections — counting the death\n")
+				}
+				break
+			}
+			contIn.MaxSessionWallClock = remaining
+		}
+		contRes, contErr := o.runSession(ctx, contIn,
+			opencodeResumeArgs(in, sid, continuePrompt))
+		if contErr != nil {
+			// Spend first, even on the error path.
+			res.Tokens += contRes.Tokens
+			res.CostUSD += contRes.CostUSD
+			res.UsageReported = res.UsageReported || contRes.UsageReported
+			if console != nil {
+				fmt.Fprintf(console, "!! resurrection continuation errored (%v) — counting the death\n", contErr)
+			}
+			break
+		}
+		n := 0
+		if nRaw, ok := res.Raw[opencodeResurrectionsKey].(int); ok {
+			n = nRaw
+		}
+		mergeResume(&res, contRes)
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[opencodeResurrectionsKey] = n + 1
+		if console != nil {
+			fmt.Fprintf(console, "!! resurrection %d succeeded — session continued in place\n", n+1)
+		}
+	}
+	return res, nil
+}
+
+// runSession executes ONE `opencode run` process end-to-end and parses its
+// stream. Split out of Invoke so the CLA-406 resurrection loop can run the
+// probe and the continuation through exactly the same exec/parse machinery as
+// the original session — same env, same permission policy, same capture — and
+// merge the results, rather than maintaining a second code path that would
+// drift the first time either half changed.
+func (o opencode) runSession(ctx context.Context, in Invocation, args []string) (Result, error) {
 
 	// The per-session wall-clock cap, enforced on the exec context so the kill
 	// needs nothing from the stream: opencode reports no turn count and takes no
@@ -100,9 +234,14 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// the pipes and lets Wait return.
 	//
 	// It does NOT kill the orphan itself — that needs a process group, which is
-	// platform-specific and is filed rather than smuggled in here. Set only with
-	// a cap in play, so an ordinary session's I/O is never cut short by it.
-	if sctx != ctx {
+	// platform-specific and is filed rather than smuggled in here. Set whenever
+	// the exec context carries ANY deadline — one this function created, or one
+	// a caller handed in (the CLA-406 probe's 30s box arrives that way, and the
+	// old `sctx != ctx` test missed exactly that case): an MCP server holding
+	// the inherited fd would otherwise keep the pipe open past the kill and
+	// hang Run past its own box. An ordinary uncapped session's I/O is never
+	// cut short by it.
+	if _, hasDeadline := sctx.Deadline(); hasDeadline {
 		cmd.WaitDelay = 5 * time.Second
 	}
 
@@ -395,6 +534,12 @@ func (opencode) env(in Invocation) []string {
 type opencodeEvent struct {
 	Type string        `json:"type"`
 	Part *opencodePart `json:"part"`
+
+	// SessionID is the opencode session every event of one run belongs to. It
+	// rides at the TOP level of each event, not on the part, and is constant for
+	// a run — captured once and used by the CLA-406 resurrection path as the
+	// handle a follow-up `opencode run --session <id>` continues.
+	SessionID string `json:"sessionID"`
 }
 
 type opencodePart struct {
@@ -492,6 +637,12 @@ type opencodeParse struct {
 	cost                                  float64
 	sawUsage                              bool
 
+	// sessionID is the opencode session this stream belongs to, taken from the
+	// top-level sessionID field every event carries. Constant for a run; the
+	// CLA-406 resurrection path needs it as the handle a follow-up
+	// `opencode run --session <id>` continues into.
+	sessionID string
+
 	// observed carries ONLY the claim/report observation state, which finish
 	// copies onto the real Result. It cannot be the real Result: that one is built
 	// by capture.result() after the process exits, long after the claim event went
@@ -535,6 +686,12 @@ func (p *opencodeParse) line(line []byte) {
 	}
 	if ev.Part == nil {
 		return
+	}
+	// Every event names its session; the first one seen wins (they all agree
+	// within a run). Empty on malformed events, which the Part check above
+	// already mostly filters.
+	if p.sessionID == "" && ev.SessionID != "" {
+		p.sessionID = ev.SessionID
 	}
 	switch ev.Type {
 	case "text":
@@ -716,6 +873,16 @@ func (p *opencodeParse) finish(res *Result) {
 		if p.lastReason == FinishReasonUnknown && p.lastStepZeroUsage {
 			res.Raw[TerminalReasonKey] = ZeroUsageReason
 		}
+	}
+	// The opencode session id, when the stream named one: the CLA-406
+	// resurrection path resumes INTO this session via `opencode run --session`,
+	// and needs the handle to survive onto the Result. Absent from a stream that
+	// died before its first parseable event — nothing there to resume.
+	if p.sessionID != "" {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[opencodeSessionIDKey] = p.sessionID
 	}
 }
 
