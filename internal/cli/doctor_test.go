@@ -2117,6 +2117,7 @@ func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 		{"real detail line is held", "   pid 33594(caffeinate): [0x0029efa0000196db] 00:00:01 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"  \n", true},
 		{"minimal detail line is held", `   pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
 		{"detail line with spaces in the process name is held", `   pid 123(Google Chrome Helper): [0x0001] 00:00:01 PreventUserIdleSystemSleep named: "Helper"  `, true},
+		{"detail line with nested parens in the process name is held", `   pid 123(Google Chrome Helper (Renderer)): [0x0002] 00:00:01 PreventUserIdleSystemSleep named: "Helper"  `, true},
 		{"detail line with a non-numeric pid is not proven held", `   pid abc(caffeinate): PreventUserIdleSystemSleep`, false},
 		{"summary row with appended token is not proven held", "   PreventUserIdleSystemSleep       0 (inactive)\n", false},
 		{"summary row with non-zero count and appended token is not proven held", "   PreventUserIdleSystemSleep       1 (inactive)\n", false},

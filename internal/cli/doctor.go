@@ -1662,7 +1662,7 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 // carrying the `<n>(<proc>):` tail; the summary row demands exactly two fields
 // because any token beyond name-plus-count is an unknown in BOTH directions —
 // "1 (inactive)" no less than "0" (CLA-306 review).
-var pidDetailLine = regexp.MustCompile(`^\s*pid\s+\d+\([^)]*\):(?:\s|$)`)
+var pidDetailLine = regexp.MustCompile(`^\s*pid\s+\d+\(.+\):(?:\s|$)`)
 
 func holdsNoIdleSleep(out string) bool {
 	for _, line := range strings.Split(out, "\n") {
@@ -1682,8 +1682,11 @@ func holdsNoIdleSleep(out string) bool {
 		case pidDetailLine.MatchString(line):
 			// Per-process detail line: `pid 81237(caffeinate): … named: "…"`. Its
 			// presence means a live process holds the assertion. Matched on the raw
-			// line so a process name containing spaces still reads as one
-			// `<pid>(<name>):` head.
+			// line so a process name containing spaces or even nested parens
+			// ("Google Chrome Helper (Renderer)") still reads as one
+			// `<pid>(<name>):` head; greedy to the LAST `):` is safe because the
+			// anchored pid head and the assertion-name pre-filter above already
+			// exclude every other line shape.
 			return true
 		}
 	}
