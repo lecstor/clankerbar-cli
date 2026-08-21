@@ -1,0 +1,432 @@
+package delivery
+
+// prcheck.go — the delivery path's check on the pull request a session names
+// (CLA-310).
+//
+// CLA-309 documented the disease: a PR that CONFLICTS with its base gets no
+// `pull_request` event at all, because GitHub cannot compute
+// `refs/pull/<n>/merge` — so it reports ZERO checks rather than a failing one,
+// and every reader sees quiet rather than broken. PR #208 shipped to in_review
+// in exactly that state, concluded "no CI runs here", and turned out to have
+// skipped 78 tests. The clankerbar repo's CI now guards the conflict case
+// itself; this check is the side that does not depend on any workflow being
+// configured correctly, because it runs in every repo the driver works.
+//
+// # The two conditions
+//
+// A delivery naming a PR is verified only when BOTH hold:
+//
+//  1. The PR is MERGEABLE. CONFLICTING is a refusal — it is the state that
+//     produces the silence, and independently a reason not to hand the work to
+//     a human.
+//  2. The PR carries a check rollup that actually ran and passed. An EMPTY
+//     rollup is a refusal, not a pass. That inversion is the whole point: the
+//     natural implementation (`any(check.conclusion == FAILURE)`) returns
+//     false for a PR with no checks and waves it through — the exact bug. See
+//     TestNaiveAnyFailurePredicateWavesThroughAnEmptyRollup, which pins what
+//     the naive predicate would have said about the same input.
+//
+// # Laziness, and the bounded wait
+//
+// GitHub computes `mergeable` in the background; the first read is often
+// UNKNOWN, and treating that as MERGEABLE reintroduces the hole. The check
+// polls until it resolves, within prPollBudget; a wait that exhausts is an
+// explicit refusal, never an assumption and never a hang. The same window
+// absorbs a rollup whose checks are still registering or running.
+//
+// # The no-CI repo
+//
+// A repo may legitimately have no CI at all, and refusing every delivery
+// there would wedge the driver shut. The shipped decision (operator-answered
+// on CLA-310): the empty-rollup condition is a HARD refusal by default, with
+// the per-project config opt-out `allow_unchecked_pr: true` downgrading it to
+// a WARN; the MERGEABLE condition is NEVER relaxed. Silence-reads-as-pass is
+// the bug this family exists to kill, so the safe state is the default and
+// the loose state is a visible, operator-owned config line. Pinned by
+// TestAllowUncheckedPRDowngradesOnlyTheEmptyRollup.
+//
+// # Mechanism
+//
+// The stated default for API access is the `gh` CLI: operator machines
+// already authenticate GitHub through it, and it inherits that auth for free.
+// When `gh` is absent the check degrades to an explicit refusal-to-verify
+// (Unknown), never a pass — the same three-way discipline as every other
+// check in this package. `doctor` reports `gh` availability so the gate's
+// prerequisite is seen before it fires.
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
+
+// PRVerified is the check on the pull request a session named in a delivery:
+// mergeable, and carrying a check rollup that actually ran and passed.
+const PRVerified Kind = "pr"
+
+// The polling window. Budgeted well inside the loop's deliveryCheckTimeout so
+// one slow PR cannot starve the git checks that share the report's deadline;
+// long enough to ride out `mergeable`'s lazy first read and a CI that is
+// seconds behind the push.
+const (
+	prPollBudget   = 30 * time.Second
+	prPollInterval = 2 * time.Second
+
+	// ghWaitDelay matches the git runner's cut-off discipline: os/exec's Wait
+	// blocks until every child holding the pipes closes them, so an explicit
+	// WaitDelay is what actually bounds a wedged helper.
+	ghWaitDelay = 5 * time.Second
+)
+
+// ghCheck is one entry of `gh pr view --json statusCheckRollup`. The rollup
+// mixes two shapes: legacy StatusContext entries (commit statuses, with
+// `context` and `state`) and CheckRun entries (actions checks, with `name`,
+// `status` and `conclusion`). Both must be understood, because a repo using
+// either alone is normal.
+type ghCheck struct {
+	Typename   string `json:"__typename"`
+	Name       string `json:"name"`
+	Context    string `json:"context"`
+	Status     string `json:"status"`
+	Conclusion string `json:"conclusion"`
+	State      string `json:"state"`
+}
+
+func (c ghCheck) label() string {
+	switch {
+	case c.Name != "":
+		return c.Name
+	case c.Context != "":
+		return c.Context
+	default:
+		return c.Typename
+	}
+}
+
+// isCheckRun distinguishes the two rollup shapes. __typename decides when it
+// is present (real gh always sends it); without it, a legacy-shaped entry —
+// a state and nothing else — is a StatusContext. An unrecognised __typename
+// is treated as a CheckRun, whose fields are the ones a future shape most
+// likely keeps.
+func (c ghCheck) isCheckRun() bool {
+	if strings.EqualFold(c.Typename, "StatusContext") {
+		return false
+	}
+	if c.Typename == "" && c.State != "" && c.Status == "" && c.Conclusion == "" {
+		return false
+	}
+	return true
+}
+
+// completed reports whether this entry has reached a verdict at all.
+func (c ghCheck) completed() bool {
+	if c.isCheckRun() {
+		return strings.EqualFold(c.Status, "COMPLETED")
+	}
+	s := strings.ToUpper(strings.TrimSpace(c.State))
+	return s != "PENDING" && s != "EXPECTED"
+}
+
+// succeeded reports whether the verdict, once reached, was success.
+func (c ghCheck) succeeded() bool {
+	if c.isCheckRun() {
+		return strings.EqualFold(c.Conclusion, "SUCCESS")
+	}
+	return strings.EqualFold(strings.TrimSpace(c.State), "SUCCESS")
+}
+
+// ghPR is the slice of `gh pr view --json ...` the gate reads.
+type ghPR struct {
+	Mergeable         string    `json:"mergeable"`         // MERGEABLE | CONFLICTING | UNKNOWN
+	MergeStateStatus  string    `json:"mergeStateStatus"`  // CLEAN | DIRTY | BLOCKED | ...
+	StatusCheckRollup []ghCheck `json:"statusCheckRollup"` // null when none
+	URL               string    `json:"url"`
+}
+
+// prVerdict is the classified outcome of one read of the PR. prConflict,
+// prChecksFailed and prPass settle immediately; the rest are WAITING verdicts
+// — each names why the PR is not yet decidable, which is what the
+// exhausted-wait settlement reports.
+type prVerdict int
+
+const (
+	prPass prVerdict = iota
+	prConflict
+	prChecksFailed
+	prChecksPending // rollup present but not finished; poll
+	prNoChecks      // mergeable but empty rollup; poll (CI may not have registered)
+	prMergeableUnknown
+)
+
+// prJudgement is a verdict plus the labels and counts its message names.
+type prJudgement struct {
+	verdict prVerdict
+	passed  int // rollup entries that completed successfully (prPass)
+	failing []string
+	pending []string
+}
+
+// judgePR classifies one read. Pure, so the inversion at its heart is unit-
+// testable without a gh process: judgePR(ghPR{Mergeable: "MERGEABLE"}).verdict
+// is prNoChecks, the refusal the naive any-failure predicate would have missed.
+//
+// Three verdicts WAIT rather than settle: an uncomputed `mergeable`, a rollup
+// whose checks have not finished, and a MERGEABLE PR with no rollup yet (a
+// just-pushed CI registers late). Each is polled within the budget and only
+// becomes its refusal when the window closes — but they are distinct verdicts,
+// because the refusal must say which of the three it was.
+func judgePR(v ghPR) prJudgement {
+	state := strings.ToUpper(strings.TrimSpace(v.Mergeable))
+	dirty := strings.ToUpper(strings.TrimSpace(v.MergeStateStatus)) == "DIRTY"
+	// DIRTY is honoured even while `mergeable` still reads UNKNOWN: it is the
+	// same fact arrived from the other field, and a conflict needs no second
+	// opinion.
+	if state == "CONFLICTING" || dirty {
+		return prJudgement{verdict: prConflict}
+	}
+	if state != "MERGEABLE" {
+		// UNKNOWN, empty, or anything unrecognised: GitHub has not answered.
+		// Assuming MERGEABLE here is the hole this gate exists to close.
+		return prJudgement{verdict: prMergeableUnknown}
+	}
+	if len(v.StatusCheckRollup) == 0 {
+		// THE inversion: no checks is a finding, not an absence of findings.
+		return prJudgement{verdict: prNoChecks}
+	}
+	j := prJudgement{}
+	for _, c := range v.StatusCheckRollup {
+		switch {
+		case !c.completed():
+			j.pending = append(j.pending, c.label())
+		case !c.succeeded():
+			j.failing = append(j.failing, c.label())
+		default:
+			j.passed++
+		}
+	}
+	switch {
+	case len(j.failing) > 0:
+		j.verdict = prChecksFailed
+	case len(j.pending) > 0:
+		j.verdict = prChecksPending
+	default:
+		j.verdict = prPass
+	}
+	return j
+}
+
+// settlePR renders a judgement as the check the driver records. Every refusal
+// names WHICH condition failed and the action that clears it — "delivery
+// rejected" sends an agent hunting through settings files, which four runs
+// have already burned whole iterations on.
+func settlePR(j prJudgement, prNum, slug string, waited time.Duration, allowUnchecked bool) Check {
+	name := func(labels []string) string { return strings.Join(labels, ", ") }
+	switch j.verdict {
+	case prPass:
+		return Check{Kind: PRVerified, Status: Pass, Detail: fmt.Sprintf(
+			"PR %s (%s) is MERGEABLE and its %s passed",
+			prNum, slug, plural(j.passed, "check"))}
+	case prConflict:
+		return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+			"PR %s (%s) is CONFLICTING with its base — the delivery is refused. "+
+				"A conflicted PR runs NO checks (GitHub cannot compute the merge ref), so quiet CI proves nothing. "+
+				"Resolve the conflict, push, and confirm CI runs and goes green before declaring the delivery again",
+			prNum, slug)}
+	case prChecksFailed:
+		return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+			"PR %s (%s) has FAILING checks (%s) — the delivery is refused. "+
+				"Fix what failed, push, and let CI go green before declaring the delivery again",
+			prNum, slug, name(j.failing))}
+	case prChecksPending:
+		return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+			"PR %s (%s) has checks that have NOT finished (%s) — the delivery is refused: a rollup that has not run is not a passing one. "+
+				"Wait for CI to complete and go green, then declare the delivery again",
+			prNum, slug, name(j.pending))}
+	case prNoChecks:
+		if allowUnchecked {
+			return Check{Kind: PRVerified, Status: Warn, Detail: fmt.Sprintf(
+				"PR %s (%s) carries NO checks — WARNING only (allow_unchecked_pr: true). "+
+					"Confirm CI actually ran on this PR: a conflicted PR starts none, and silence is not a pass",
+				prNum, slug)}
+		}
+		return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+			"PR %s (%s) carries NO checks — the delivery is REFUSED: an empty check rollup is not a pass. "+
+				"Confirm CI runs on this PR (a conflicted PR starts none), wait for it to go green, then declare again. "+
+				"To accept unchecked PRs for this project, set allow_unchecked_pr: true",
+			prNum, slug)}
+	case prMergeableUnknown:
+		return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+			"GitHub did not report whether PR %s (%s) is mergeable (still UNKNOWN after ~%s) — the delivery is refused rather than assumed. "+
+				"This is normally GitHub still computing; try again shortly",
+			prNum, slug, waited.Round(time.Second))}
+	default:
+		// Unreachable while every verdict has a case; kept because this
+		// package never guesses.
+		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf("PR %s could not be judged", prNum)}
+	}
+}
+
+// githubSlug extracts owner/name from a git remote URL, or reports that the
+// remote is not a github.com one. The known prefix forms are matched
+// explicitly rather than searching for "github.com" anywhere in the string —
+// a host like "mygithub.example.com" contains the needle and must not match.
+func githubSlug(remoteURL string) (string, bool) {
+	u := strings.TrimSpace(remoteURL)
+	u = strings.TrimSuffix(u, ".git")
+	for _, p := range []string{
+		"https://github.com/",
+		"http://github.com/",
+		"ssh://git@github.com/",
+		"git@github.com:",
+		"github.com:",
+	} {
+		if i := strings.Index(u, p); i >= 0 {
+			rest := strings.TrimLeft(u[i+len(p):], "/")
+			parts := strings.Split(rest, "/")
+			if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+				return parts[0] + "/" + parts[1], true
+			}
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// ghNotFoundError marks a `gh` failure that means THE PR IS NOT THERE, rather
+// than that the tool could not run. A delivery naming a PR that does not
+// exist is a false claim to refuse, not an outage to ride through.
+type ghNotFoundError struct{ detail string }
+
+func (e *ghNotFoundError) Error() string { return e.detail }
+
+// prCheck verifies the PR named in a delivery: mergeable, with a check rollup
+// that actually ran and passed. See the file comment for the two conditions,
+// the bounded wait, and the no-CI decision.
+//
+// The repository is the one the earlier checks resolved (they share this
+// Report), or the first candidate whose origin is a github.com remote — the
+// PR number belongs to whoever owns that remote, which is the only guess this
+// check allows itself, and only under the ordinary layout.
+func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, rep *Report) Check {
+	if _, err := exec.LookPath(v.ghBin); err != nil {
+		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+			"PR %s cannot be verified: %s is not on PATH — the delivery's pull request goes unchecked, which is not a pass. Install the GitHub CLI so this gate can run", prNum, v.ghBin)}
+	}
+
+	repo := rep.Repo
+	if repo == "" {
+		for _, r := range repos {
+			if url, err := v.remoteURL(ctx, r); err == nil {
+				if _, ok := githubSlug(url); ok {
+					repo = r
+					break
+				}
+			}
+		}
+	}
+	if repo == "" && len(repos) > 0 {
+		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+			"PR %s cannot be verified: no repository at or below %s has a github.com remote, so where the pull request lives cannot be told", prNum, v.workdir)}
+	}
+	if repo == "" {
+		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+			"PR %s cannot be verified: no repository at or below %s could be located", prNum, v.workdir)}
+	}
+	url, err := v.remoteURL(ctx, repo)
+	if err != nil {
+		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+			"PR %s cannot be verified: could not read the remote of %s: %v", prNum, repo, err)}
+	}
+	slug, ok := githubSlug(url)
+	if !ok {
+		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+			"PR %s cannot be verified: the remote of %s (%s) is not a github.com repository", prNum, repo, url)}
+	}
+
+	start := time.Now()
+	deadline := start.Add(v.prBudget)
+	for {
+		j, err := v.readPR(ctx, repo, slug, prNum)
+		if err != nil {
+			var nf *ghNotFoundError
+			if errors.As(err, &nf) {
+				return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+					"PR %s was not found in %s — the delivery names a pull request that does not exist; correct the number and declare again", prNum, slug)}
+			}
+			return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+				"PR %s could not be verified: %v", prNum, err)}
+		}
+		switch j.verdict {
+		case prPass, prConflict, prChecksFailed:
+			// Decidable now: settle on what this read said.
+			return settlePR(j, prNum, slug, time.Since(start), v.allowUncheckedPR)
+		}
+		// A waiting verdict. Once the window closes it becomes the refusal it
+		// now names — never an assumption.
+		if !time.Now().Before(deadline) || ctx.Err() != nil {
+			return settlePR(j, prNum, slug, time.Since(start), v.allowUncheckedPR)
+		}
+		select {
+		case <-ctx.Done():
+			return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+				"PR %s verification was interrupted: %v", prNum, ctx.Err())}
+		case <-time.After(v.prInterval):
+		}
+	}
+}
+
+// readPR makes one `gh pr view` call and classifies what came back. The
+// waiting verdicts (prMergeableUnknown, prNoChecks, prChecksPending) mean
+// "true so far as it went, but not yet decidable" — the caller polls within
+// its budget.
+func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string) (prJudgement, error) {
+	out, err := v.runGH(ctx, dir, "pr", "view", prNum,
+		"--repo", slug,
+		"--json", "mergeable,mergeStateStatus,statusCheckRollup,url")
+	if err != nil {
+		return prJudgement{verdict: prMergeableUnknown}, err
+	}
+	var view ghPR
+	if jerr := json.Unmarshal([]byte(out), &view); jerr != nil {
+		return prJudgement{verdict: prMergeableUnknown}, fmt.Errorf("could not parse gh pr view output: %v", jerr)
+	}
+	return judgePR(view), nil
+}
+
+// runGH executes one gh command in dir and returns its trimmed stdout, with
+// the same interaction-hostile environment and cut-off discipline as the git
+// runner: an unattended run has no terminal to answer prompts with, and a
+// wedged helper must not hold the check past its WaitDelay.
+func (v *Verifier) runGH(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, v.ghBin, args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(),
+		"GH_NO_UPDATE_NOTIFIER=1",
+		"GH_FORCE_TTY=0",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+	cmd.WaitDelay = ghWaitDelay
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		low := strings.ToLower(msg)
+		if strings.Contains(low, "could not resolve to a pullrequest") ||
+			strings.Contains(low, "not found") ||
+			strings.Contains(low, "no pull requests") {
+			return "", &ghNotFoundError{detail: fmt.Sprintf("gh %s: %s", args[0], firstLine(msg))}
+		}
+		if msg != "" {
+			return "", fmt.Errorf("gh %s: %w: %s", args[0], err, firstLine(msg))
+		}
+		return "", fmt.Errorf("gh %s: %w", args[0], err)
+	}
+	return strings.TrimSpace(stdout.String()), nil
+}

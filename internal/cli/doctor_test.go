@@ -1560,6 +1560,75 @@ func TestBudgetSetIsReported(t *testing.T) {
 	}
 }
 
+// --- pr_gate (CLA-310) -------------------------------------------------------
+
+// The gate's prerequisite must be seen before it fires: without gh on PATH
+// every delivery naming a PR goes out as could-not-verify. That degrades the
+// run rather than stopping it, so it is a WARN — but a doctor that passed it
+// in silence would be exactly the quiet gap this task exists to close.
+func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
+	e := okEnv()
+	e.lookPath = func(file string) (string, error) {
+		if file == "gh" {
+			return "", errors.New("not found")
+		}
+		return "/usr/local/bin/" + file, nil
+	}
+
+	c := checkPRGate(validCfg(t), e)
+	if c.status != warn {
+		t.Errorf("missing gh: got %v, want WARN", c.status)
+	}
+	if !strings.Contains(c.detail, "gh is not on PATH") || c.remedy == "" {
+		t.Errorf("detail should name the missing prerequisite with a remedy: %q / %q", c.detail, c.remedy)
+	}
+}
+
+func TestPRGateWithGHPassesAndNamesTheDefault(t *testing.T) {
+	cfg := validCfg(t)
+
+	c := checkPRGate(cfg, okEnv())
+	if c.status != pass {
+		t.Errorf("gh present, default config: got %v, want PASS", c.status)
+	}
+	found := false
+	for _, line := range c.info {
+		if strings.Contains(line, "REFUSED") && strings.Contains(line, "allow_unchecked_pr") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("an untouched config should be told the default refuses empty rollups: %q", c.info)
+	}
+}
+
+// The opt-out is per project, so a multi-project config gets one line each:
+// the loose project must be visible by name, not averaged into one aggregate.
+func TestPRGateNamesPerProjectOptOut(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Projects = []config.Project{
+		{Slug: "strict"},
+		{Slug: "loose", AllowUncheckedPR: true},
+	}
+
+	c := checkPRGate(cfg, okEnv())
+	if c.status != pass {
+		t.Errorf("gh present: got %v, want PASS", c.status)
+	}
+	var strict, loose bool
+	for _, line := range c.info {
+		if strings.Contains(line, "[strict]") && strings.Contains(line, "REFUSED") {
+			strict = true
+		}
+		if strings.Contains(line, "[loose]") && strings.Contains(line, "WARNED") {
+			loose = true
+		}
+	}
+	if !strict || !loose {
+		t.Errorf("per-project lines missing: %q", c.info)
+	}
+}
+
 // --- CLA-344: the guards that were silently absent --------------------------
 //
 // The config that ran a 285.9M-token single session passed doctor with a clean
