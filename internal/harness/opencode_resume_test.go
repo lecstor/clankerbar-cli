@@ -70,8 +70,18 @@ func TestResurrectionProbePrompt(t *testing.T) {
 	if strings.Contains(p, "EZY-196") {
 		t.Error("probe prompt names the real task ref - the coherence check is testing parroting, not recall")
 	}
-	if !strings.Contains(p, `"ABC-123"`) {
-		t.Error("probe prompt should carry a fixed placeholder example instead")
+	// NO example of ANY kind, fixed placeholder included: an example is a
+	// string a parroting model can echo back, and the instruction already
+	// says exactly where the answer lives ("the ref your claim_task call
+	// returned"). A ref-shaped token like ABC-123 in the question would let
+	// a model fake the SHAPE of recall it cannot have.
+	for _, leak := range []string{"ABC-123", "EZY-", "CLA-", "for example"} {
+		if strings.Contains(p, leak) {
+			t.Errorf("probe prompt carries an example (%q) - it must describe only the answer's shape", leak)
+		}
+	}
+	if !strings.Contains(p, "claim_task") {
+		t.Error("probe prompt must point at where the ref lives (the session's own claim_task call) now that no example shows its shape")
 	}
 	// The informing half is load-bearing (operator decision 2026-08-21): the
 	// agent is told WHAT happened and THAT it resumes in place, mirroring the
@@ -447,6 +457,58 @@ esac
 	}
 	if !res.Claim.HasWIP {
 		t.Error("Claim.HasWIP = false; the probe's branch recording was dropped")
+	}
+}
+
+// An UNTRUSTED probe capture cannot prove coherence: its text survived an
+// over-cap event discard, so a ref in FinalMessage may be debris. The verdict
+// must be death - not a continuation sent on evidence the adapter itself says
+// is unreadable (the same CLA-262 reasoning as the fold guard and the loop
+// conjunct). Today the discard empties the whole parse, so the bare coherence
+// check already fails; this test pins the OUTCOME either way, so a future
+// parser that keeps good lines after a bad one cannot quietly resurrect on a
+// capture marked unreadable.
+func TestResurrectionInvokeUntrustedProbeCountsDeath(t *testing.T) {
+	old := opencodeResumeBackoff
+	opencodeResumeBackoff = time.Millisecond
+	defer func() { opencodeResumeBackoff = old }()
+
+	console := &bytes.Buffer{}
+	opencodeStub(t, `#!/bin/sh
+case "$*" in
+  *"Confirm you are intact"*)
+    # One event over the 16 MiB line cap: the capture is discarded and the
+    # Result marked untrusted, even though a coherent reply follows it.
+    head -c 17000000 /dev/zero | tr '\0' 'x'
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-196 - last action: ran go test."}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    ;;
+  *)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work.", Console: console})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	// The quiet death STANDS: an untrusted probe is not evidence of a live
+	// session, so no continuation may run and the dead-phase path takes over.
+	if !(opencode{}).ZeroUsageUnknown(res) {
+		t.Error("an untrusted probe reply must count as a death - ZeroUsageUnknown mark lost")
+	}
+	if n := res.Raw[opencodeResurrectionsKey]; n != nil {
+		t.Errorf("resurrections = %v, want none recorded - the round never earned a continuation", n)
+	}
+	if !strings.Contains(console.String(), "resurrection probe FAILED") {
+		t.Errorf("console missing probe-failure line; got:\n%s", console.String())
+	}
+	// Spend first: the probe ran and its figures are charged even though its
+	// answer was rejected.
+	if res.Tokens != 900 {
+		t.Errorf("Tokens = %d, want 900 charged from the rejected probe", res.Tokens)
 	}
 }
 

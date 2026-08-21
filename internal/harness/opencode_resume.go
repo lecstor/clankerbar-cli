@@ -66,14 +66,31 @@ const (
 	opencodeProbeTimeout = 30 * time.Second
 
 	// opencodeResumeWallClockFloor is the smallest slice of the Invoke's
-	// wall-clock budget worth starting a resurrection round against. A resume
-	// re-sends the whole transcript (real money), and a round needs backoff
-	// plus a probe before any continuation runs, so a remaining slice under
-	// this floor can only buy a continuation that is cap-killed on arrival -
-	// and the check runs BEFORE the round's spend, so it also stops the
-	// adapter paying for a probe it can never act on.
+	// wall-clock budget worth CONTINUING a resurrection round against,
+	// re-checked after the probe: a continuation that could only be cap-killed
+	// on arrival must not be started.
 	opencodeResumeWallClockFloor = time.Minute
+
+	// opencodeWallClockExhaustedMsg is the console line for BOTH places the
+	// wall-clock gate ends a resurrection attempt — before a round starts and
+	// between its probe and its continuation — so greps and tests see one
+	// string. One message has to fit both sites, hence "exhausted" rather than
+	// site-precise wording: at either point there is no budget left worth
+	// resurrecting against.
+	opencodeWallClockExhaustedMsg = "!! wall-clock budget exhausted across resurrections - counting the death\n"
 )
+
+// opencodeResumeRoundFloor is the smallest slice of the Invoke's wall-clock
+// budget worth STARTING a resurrection round against. A round's own uncharged
+// overhead is opencodeResumeBackoff plus up to opencodeProbeTimeout BEFORE any
+// continuation runs, and the continuation itself wants
+// opencodeResumeWallClockFloor — so a slice under their sum can only buy a
+// probe whose answer is never acted on. Checked BEFORE the round spends
+// anything; the pre-continuation check re-verifies with the bare floor.
+//
+// A var purely so Invoke-level tests can shrink it (the production value above
+// is the tested-against-default value), same as opencodeResumeBackoff.
+var opencodeResumeRoundFloor = opencodeResumeBackoff + opencodeProbeTimeout + opencodeResumeWallClockFloor
 
 // opencodeResumeBackoff is the pause between noticing a quiet death and
 // sending the probe. The gateway is dropping streams under load; prodding it
@@ -114,17 +131,15 @@ func resumeTargets(res Result) (sid, ref string) {
 //   - it demands a one-line answer naming the task ref, which turns "is this
 //     agent actually resumed?" into a mechanical string match instead of a
 //     judgement call. The ref is knowable only from the intact transcript: a
-//     session that lost its context cannot produce it.
-//
-// The worked example is a FIXED placeholder, never the real ref: the probe
-// exists to prove the reply comes from the session's memory of its own
-// claim_task call, and naming the real ref inside the question would let any
-// model that can parrot its prompt pass with no transcript at all.
+//     session that lost its context cannot produce it. The prompt deliberately
+//     carries NO concrete example of the answer - real ref or placeholder, any
+//     example is something a parroting model can echo back - so it describes
+//     only the answer's SHAPE: "the ref your claim_task call returned".
 const resurrectionProbePrompt = `Your previous response was interrupted mid-stream by the provider; your ` +
 	`session transcript is intact up to the interruption, and you are being resumed ` +
 	`in place. Confirm you are intact before continuing: reply with ONE line naming ` +
-	`the task ref you are working on (for example "ABC-123") and your last completed action. ` +
-	`Then stop - you will be told to continue.`
+	`the task ref you are working on (the ref your claim_task call returned) and your ` +
+	`last completed action. Then stop - you will be told to continue.`
 
 // continuePrompt is sent once the probe has verified coherence. Deliberately
 // terse: everything the agent needs is already in its transcript.

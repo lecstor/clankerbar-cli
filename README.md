@@ -807,11 +807,11 @@ run-wide ceiling and counts the hours a run spends *waiting out* a usage limit.
 Since CLA-406 the cap bounds an opencode session's WHOLE life including any
 quiet-death resurrections: the budget is computed once at spawn and spent down
 across the original run plus up to 5 resume rounds, not refreshed per round.
-The inter-round overhead (25s backoff plus a 30s probe box per round) is not
-charged against it, so a fully-capped session can outlive the dial by up to
-about 4m35s; a resurrection round is not started unless the remaining slice
-covers that overhead plus a minute, and a continuation is not started on a
-remaining slice under a minute.
+The inter-round overhead (25s backoff plus a 30s probe box per round) is
+charged against it like any other time, so a fully-capped session does not
+materially outlive the dial; a resurrection round is not started unless the
+remaining slice covers that overhead plus a minute, and a continuation is not
+started on a remaining slice under a minute.
 
 **opencode only** today — it is the harness with no turn flag, so this is its
 backstop; under claude or codex the dial is inert and `doctor` says so. Two
