@@ -1,8 +1,11 @@
 package harness
 
 import (
+	"bytes"
+	"context"
 	"strings"
 	"testing"
+	"time"
 )
 
 // A quiet-death stream that also names its session — the shape the CLA-406
@@ -170,5 +173,200 @@ func TestMergeResumeUnobservedContinuationKeepsClaim(t *testing.T) {
 
 	if !base.Claim.Held() || base.Claim.Ref != "EZY-196" {
 		t.Errorf("Claim = %+v, want the original claim kept when the continuation observed nothing", base.Claim)
+	}
+}
+
+// ---- Invoke-level tests (CLA-406 review WARN 6) ----
+//
+// These exec a stub `opencode` through the REAL Invoke, so the loop's
+// orchestration — backoff, probe, coherence gate, continuation, merge — is
+// exercised end-to-end, not just its helpers.
+
+const (
+	// The first call: the session claims EZY-196, then dies the quiet death.
+	resumeClaimEvent = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}` + "\n" + `{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`
+	// A coherent probe reply: names the claimed ref.
+	resumeProbeOK = `{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-196 — last action: ran go test."}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}`
+	// An incoherent probe reply: names some OTHER task.
+	resumeProbeWrong = `{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-260 — continuing that one."}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}`
+	// The continuation: does the work (update_task settle + branch), ends clean.
+	resumeContinuation = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`
+)
+
+// resumeStub branches on the prompt the way the real loop drives it: no `-s` is
+// the original session; the probe and the continuation are told apart by their
+// prompts. Each test below writes its own stub script inline via opencodeStub,
+// because the assertions differ per case.
+
+func TestResurrectionInvokeHappyPath(t *testing.T) {
+	old := opencodeResumeBackoff
+	opencodeResumeBackoff = time.Millisecond
+	defer func() { opencodeResumeBackoff = old }()
+
+	console := &bytes.Buffer{}
+	opencodeStub(t, `#!/bin/sh
+case "$*" in
+  *"Confirm you are intact"*)
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-196 - last action: ran go test."}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    ;;
+  *"Continue exactly where you left off"*)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
+    ;;
+  *)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work.", Console: console})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if (opencode{}).ZeroUsageUnknown(res) {
+		t.Error("a resurrected-and-completed session must not carry the quiet-death mark")
+	}
+	if n := res.Raw[opencodeResurrectionsKey]; n != 1 {
+		t.Errorf("resurrections = %v, want 1", n)
+	}
+	// ERROR 1 regression: the settle observed by the CONTINUATION must survive
+	// into the merged Claim. Unseeded, the continuation's parser starts with a
+	// zero claim, update_task goes unobserved, Settled stays false, and
+	// releaseHeldClaim posts ready over an in_review task.
+	if !res.Claim.Settled {
+		t.Errorf("Claim.Settled = false; the continuation's update_task was not observed — ResumeClaim seed missing")
+	}
+	if !res.Claim.HasWIP {
+		t.Errorf("Claim.HasWIP = false; the continuation's branch recording was not observed")
+	}
+	// Spend sums across all three runs (dead + probe + continuation). The dead
+	// run itself reports ZERO — that is the quiet death — so the honest sum is
+	// the probe's 900 plus the continuation's 5000.
+	if res.Tokens != 5900 {
+		t.Errorf("Tokens = %d, want 5900 summed across probe and continuation (the dead run reports nothing)", res.Tokens)
+	}
+	if !strings.Contains(console.String(), "resurrection 1 succeeded") {
+		t.Errorf("console missing success line; got:\n%s", console.String())
+	}
+}
+
+func TestResurrectionInvokeWrongRefBreaksAfterOneProbe(t *testing.T) {
+	old := opencodeResumeBackoff
+	opencodeResumeBackoff = time.Millisecond
+	defer func() { opencodeResumeBackoff = old }()
+
+	invocations := 0
+	console := &bytes.Buffer{}
+	opencodeStub(t, `#!/bin/sh
+echo "$*" >> "`+t.TempDir()+`/log"
+case "$*" in
+  *"Confirm you are intact"*)
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-260 - continuing that one."}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    ;;
+  *)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+esac
+`)
+	_ = invocations
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work.", Console: console})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if _, ok := res.Raw[opencodeResurrectionsKey]; ok {
+		t.Error("a failed probe must not record a resurrection")
+	}
+	if !(opencode{}).ZeroUsageUnknown(res) {
+		t.Error("after a failed probe the death must stand (quiet-death mark kept)")
+	}
+	if !strings.Contains(console.String(), "resurrection probe FAILED") {
+		t.Errorf("console missing failure line; got:\n%s", console.String())
+	}
+	if !strings.Contains(console.String(), "EZY-260") {
+		t.Error("failure line should include the probe's actual reply (NIT 9)")
+	}
+}
+
+func TestResurrectionInvokeCapStopsTheLoop(t *testing.T) {
+	old := opencodeResumeBackoff
+	opencodeResumeBackoff = time.Millisecond
+	defer func() { opencodeResumeBackoff = old }()
+
+	opencodeStub(t, `#!/bin/sh
+case "$*" in
+  *"Confirm you are intact"*)
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-196 - still here."}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+  *)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work."})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if n := res.Raw[opencodeResurrectionsKey]; n != opencodeMaxResurrections {
+		t.Errorf("resurrections = %v, want %d (the cap stops the loop)", n, opencodeMaxResurrections)
+	}
+	if !(opencode{}).ZeroUsageUnknown(res) {
+		t.Error("past the cap the last quiet death stands")
+	}
+}
+
+// mergeResume table rows for the review's ERROR 2 / ERROR 3 cases.
+
+func TestMergeResumeCappedContinuationKeepsCapMarker(t *testing.T) {
+	base := quietDeathResult("ses_dead")
+	cont := Result{
+		ExitCode: -1,
+		Raw:      map[string]any{TerminalReasonKey: wallClockReason, FinishReasonKey: "tool-calls"},
+	}
+	mergeResume(&base, cont)
+	if !(opencode{}).WallClockCapped(base) {
+		t.Error("a wall-clock-capped continuation must keep the cap marker on the merged result")
+	}
+	if (opencode{}).ZeroUsageUnknown(base) {
+		t.Error("the cap marker must replace the quiet-death mark, not stack beside it")
+	}
+}
+
+func TestMergeResumeFailedContinuationCarriesOutcome(t *testing.T) {
+	base := quietDeathResult("ses_dead")
+	cont := Result{
+		ExitCode: 1,
+		Stderr:   `{"type":"error"} Error: 402 payment required, out of credits`,
+		Tokens:   777,
+	}
+	mergeResume(&base, cont)
+	if base.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want the continuation's non-zero exit", base.ExitCode)
+	}
+	if lim := (opencode{}).DetectLimit(base); !lim.Limited || !lim.Stop {
+		t.Errorf("DetectLimit = %+v; a budget-exhausted continuation must trip the hard stop through the merged streams", lim)
+	}
+	if base.Tokens != 777 {
+		t.Errorf("Tokens = %d, want the continuation's spend charged even on the error path", base.Tokens)
+	}
+}
+
+func TestMergeResumeUntrustedContinuationMarksMerged(t *testing.T) {
+	base := quietDeathResult("ses_dead")
+	cont := Result{Tokens: 5}
+	cont.markUntrusted("tool_result line exceeded the retained tail")
+	mergeResume(&base, cont)
+	if base.Untrusted == "" {
+		t.Error("an untrusted continuation must make the merged result untrusted (CLA-262 gates read this)")
 	}
 }

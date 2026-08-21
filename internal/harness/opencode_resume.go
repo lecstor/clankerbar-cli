@@ -45,7 +45,11 @@ const (
 	opencodeSessionIDKey = "opencode_session_id"
 
 	// opencodeResurrectionsKey is the Raw key counting completed resurrections
-	// on the final Result, for the driver's log line and the iteration record.
+	// on the final Result. Nothing in the driver reads it today — the operator-
+	// visible record is the `!! resurrection …` console lines, which land in
+	// the iteration log — so this is correlation/debugging state, kept because
+	// a merged Result that does not say it was stitched together invites the
+	// next reader to assume one process ran.
 	opencodeResurrectionsKey = "resurrections"
 
 	// opencodeMaxResurrections caps the WHOLE loop per Invoke: after this many
@@ -55,13 +59,6 @@ const (
 	// a gateway that is, by hypothesis, currently failing.
 	opencodeMaxResurrections = 5
 
-	// opencodeResumeBackoff is the pause between noticing a quiet death and
-	// sending the probe. The gateway is dropping streams under load; prodding
-	// it the same instant the corpse lands rolls the dice against the same
-	// congestion. Short enough not to matter when it works, long enough to
-	// step over the worst of a burst.
-	opencodeResumeBackoff = 25 * time.Second
-
 	// opencodeProbeTimeout time-boxes the probe itself. A healthy model answers
 	// the one-line confirmation in single-digit seconds; 30s covers a slow one
 	// plus gateway latency. A probe that cannot answer inside this window is a
@@ -69,6 +66,16 @@ const (
 	// from prodding a corpse.
 	opencodeProbeTimeout = 30 * time.Second
 )
+
+// opencodeResumeBackoff is the pause between noticing a quiet death and
+// sending the probe. The gateway is dropping streams under load; prodding it
+// the same instant the corpse lands rolls the dice against the same
+// congestion. Short enough not to matter when it works, long enough to step
+// over the worst of a burst.
+//
+// A var rather than a const purely so the Invoke-level tests can shorten it:
+// the production value above is the tested-against-default value.
+var opencodeResumeBackoff = 25 * time.Second
 
 // resumeTargets extracts what a resurrection needs from a quietly-dead Result:
 // the session id to resume INTO, and the claimed task's ref to verify the
@@ -138,42 +145,89 @@ func opencodeResumeArgs(in Invocation, sid, prompt string) []string {
 //
 // Field by field:
 //
+//   - Process outcome takes the CONTINUATION's wholesale: it is the run that
+//     actually ended the merged session, and the dead run exited 0 with empty
+//     stderr by definition of the quiet death. Keeping the dead run's zeroes
+//     would hide a continuation that hit budget exhaustion (DetectLimit's scan
+//     reads these streams), died non-zero, or was killed by a cap.
+//   - Stdout/Stderr APPEND rather than replace: a post-mortem wants both halves
+//     of the session. Each run's capture is already tail-bounded on its own, so
+//     the sum stays bounded by two tails, not by the whole session.
+//   - scans is reset: the classifier text just changed under any memoized
+//     cache, and stale cache would feed DetectLimit/IsTransient pre-merge text.
+//     Nil is a fully working, simply uncached Result.
+//   - Untrusted/OutputDropped: an untrusted continuation makes the MERGED
+//     result untrusted (the CLA-262 gates read this); dropped-output counts add.
 //   - Tokens/CostUSD SUM: the budget must see every request the fleet made,
 //     including the ones around the hole;
 //   - UsageReported ORs: either run reporting is enough to count spend;
 //   - FinalMessage takes the continuation's (the latest text wins, matching
 //     the parser's own last-text-wins rule);
-//   - Claim/Reports take the continuation's wholesale when it observed anything
-//     (the parser rebuilds claim state from tool events; the continuation saw
-//     strictly more of the session than the dead run did). When it observed
-//     nothing at all — a bare text reply — the original stands;
-//   - FinishReasonKey refreshes to the continuation's final step, and the
-//     quiet-death marker is RECOMPUTED rather than inherited: a continuation
-//     that ended cleanly clears the mark (the loop and the driver both read
-//     it), while a continuation that itself died quietly keeps it — which is
-//     what lets the caller's loop take its next round.
+//   - Claim: the continuation's claim state stands only when it OBSERVED
+//     something (held or settled) — `opencode run -s` streams only the new
+//     turn, so an unobserved continuation knows NOTHING about the claim and
+//     must not wipe the dead run's. Reports APPEND with sameClaim dedupe for
+//     the same reason: neither run saw strictly more of the session than the
+//     other, so both halves' delivery reports deserve to reach verification.
+//   - Raw copies the continuation's (summing the numeric usage-breakdown keys
+//     rather than overwriting them — Tokens sums, so the breakdown should too),
+//     and TerminalReasonKey is RECOMPUTED rather than inherited: the key is
+//     SHARED between the quiet-death marker and wall_clock_capped, so the
+//     continuation's own terminal verdict — whatever it is — stands, and its
+//     absence clears the dead run's. A clean continuation therefore clears the
+//     quiet-death mark (the loop and the driver both read it), while a
+//     continuation that itself died quietly keeps it — which is what lets the
+//     caller's loop take its next round.
 func mergeResume(base *Result, add Result) {
+	base.ExitCode = add.ExitCode
+	base.ExitSignal = add.ExitSignal
+	base.Stdout += add.Stdout
+	base.Stderr += add.Stderr
+	base.scans = nil
+	if add.OutputDropped > 0 {
+		base.OutputDropped += add.OutputDropped
+	}
+	if add.Untrusted != "" {
+		base.markUntrusted(add.Untrusted)
+	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
 	base.UsageReported = base.UsageReported || add.UsageReported
 	if add.FinalMessage != "" {
 		base.FinalMessage = add.FinalMessage
 	}
-	if add.Claim.Held() || add.Claim.Settled || len(add.Reports) > 0 {
+	if add.Claim.Held() || add.Claim.Settled {
 		base.Claim = add.Claim
-		base.Reports = add.Reports
+	}
+	for _, rep := range add.Reports {
+		dup := false
+		for _, have := range base.Reports {
+			if have.sameClaim(rep) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			base.Reports = append(base.Reports, rep)
+		}
 	}
 	if base.Raw == nil {
 		base.Raw = map[string]any{}
 	}
 	for k, v := range add.Raw {
 		if k == TerminalReasonKey {
-			continue // recomputed below, never inherited
+			continue // recomputed below, never inherited blind
+		}
+		if nv, ok := v.(int); ok {
+			if bv, ok := base.Raw[k].(int); ok {
+				base.Raw[k] = bv + nv
+				continue
+			}
 		}
 		base.Raw[k] = v
 	}
-	if add.Raw[TerminalReasonKey] == ZeroUsageReason {
-		base.Raw[TerminalReasonKey] = ZeroUsageReason
+	if tr, _ := add.Raw[TerminalReasonKey].(string); tr != "" {
+		base.Raw[TerminalReasonKey] = tr
 	} else {
 		delete(base.Raw, TerminalReasonKey)
 	}

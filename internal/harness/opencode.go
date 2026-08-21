@@ -86,6 +86,14 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		return res, nil
 	}
 	console := in.Console
+	// The wall-clock cap bounds the WHOLE Invoke, not each process: computed
+	// once here and spent down round by round below. Per-round fresh caps would
+	// let one phase run maxResurrections+1 times the configured cap, which is
+	// not what an operator setting the dial for an overnight run expects.
+	var deadline time.Time
+	if in.MaxSessionWallClock > 0 {
+		deadline = time.Now().Add(in.MaxSessionWallClock)
+	}
 	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res); attempt++ {
 		sid, ref := resumeTargets(res)
 		if sid == "" || ref == "" {
@@ -109,26 +117,61 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 
 		// The probe: same session, informed of the convention, asked to prove
 		// it is intact by naming its task ref. Time-boxed — silence past the
-		// window is a death, not a pause.
+		// window is a death, not a pause. (A partially-streamed reply killed by
+		// the box is judged on whatever text landed: if it already named the
+		// ref, the session genuinely resumed and continuing is correct.)
 		pctx, pcancel := context.WithTimeout(ctx, opencodeProbeTimeout)
 		probeIn := in
 		probeIn.Probe = true // no wall-clock double-cap, no console tee
+		// Seed the probe's parser with the dead run's live claim, so a probe
+		// turn that happens to touch the backlog is observed on the same terms
+		// as the session it belongs to.
+		probeIn.ResumeClaim = res.Claim
 		probeRes, probeErr := o.runSession(pctx, probeIn,
 			opencodeResumeArgs(in, sid, resurrectionProbePrompt(ref)))
 		pcancel()
-		if probeErr != nil || !probeCoherent(probeRes.FinalMessage, ref) {
+		// Charge the probe's spend UNCONDITIONALLY, before any verdict: a
+		// resume re-sends the whole transcript, so this is real money even when
+		// the answer is garbage. Under-counting is the one direction a budget
+		// breaker must not err in. Deliberately NOT via mergeResume — a probe
+		// we are about to judge must not donate claim/raw state.
+		res.Tokens += probeRes.Tokens
+		res.CostUSD += probeRes.CostUSD
+		res.UsageReported = res.UsageReported || probeRes.UsageReported
+		coherent := probeErr == nil && probeCoherent(probeRes.FinalMessage, ref)
+		if !coherent {
 			if console != nil {
-				fmt.Fprintf(console, "!! resurrection probe FAILED (err=%v coherent=%t) — counting the death\n",
-					probeErr, probeCoherent(probeRes.FinalMessage, ref))
+				fmt.Fprintf(console, "!! resurrection probe FAILED (err=%v, reply=%.200q) — counting the death\n",
+					probeErr, probeRes.FinalMessage)
 			}
 			break
 		}
 
-		// Coherent: continue the session for real, under the original
-		// invocation's own limits (its wall-clock cap still applies).
-		contRes, contErr := o.runSession(ctx, in,
+		// Coherent: continue the session for real. The continuation's parser is
+		// seeded with the DEAD RUN'S live claim (not in.ResumeClaim, which on a
+		// phase 2+ holds the staler predecessor): `opencode run -s` streams only
+		// the new turn, so without the seed every update_task the continuation
+		// makes would go unobserved — no settle, no HasWIP, no delivery report —
+		// and releaseHeldClaim would post ready over work the session pushed.
+		contIn := in
+		contIn.ResumeClaim = res.Claim
+		if !deadline.IsZero() {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				if console != nil {
+					fmt.Fprintf(console, "!! wall-clock budget exhausted across resurrections — counting the death\n")
+				}
+				break
+			}
+			contIn.MaxSessionWallClock = remaining
+		}
+		contRes, contErr := o.runSession(ctx, contIn,
 			opencodeResumeArgs(in, sid, continuePrompt))
 		if contErr != nil {
+			// Spend first, even on the error path.
+			res.Tokens += contRes.Tokens
+			res.CostUSD += contRes.CostUSD
+			res.UsageReported = res.UsageReported || contRes.UsageReported
 			if console != nil {
 				fmt.Fprintf(console, "!! resurrection continuation errored (%v) — counting the death\n", contErr)
 			}
@@ -191,9 +234,14 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// the pipes and lets Wait return.
 	//
 	// It does NOT kill the orphan itself — that needs a process group, which is
-	// platform-specific and is filed rather than smuggled in here. Set only with
-	// a cap in play, so an ordinary session's I/O is never cut short by it.
-	if sctx != ctx {
+	// platform-specific and is filed rather than smuggled in here. Set whenever
+	// the exec context carries ANY deadline — one this function created, or one
+	// a caller handed in (the CLA-406 probe's 30s box arrives that way, and the
+	// old `sctx != ctx` test missed exactly that case): an MCP server holding
+	// the inherited fd would otherwise keep the pipe open past the kill and
+	// hang Run past its own box. An ordinary uncapped session's I/O is never
+	// cut short by it.
+	if _, hasDeadline := sctx.Deadline(); hasDeadline {
 		cmd.WaitDelay = 5 * time.Second
 	}
 
