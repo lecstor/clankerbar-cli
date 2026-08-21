@@ -491,12 +491,15 @@ clankerbar dead-rate
 clankerbar dead-rate --error tool_count_limit   # logs whose APIError events match
 ```
 
-The scan is verified against known-positive controls: on the recorded 2026-08-20
-corpus it reproduces the 6 dead opencode implement sessions (the numerator; the
-denominator is the full day's run count, larger than the mid-day snapshot the
-figure was originally taken from), and `--error tool_count_limit` finds exactly
-the three 2026-08-19 logs that carry it as an APIError event — not the later
-logs where the same string appears as task-body text an agent merely read.
+The scan is verified against known-positive controls. `--error tool_count_limit`
+finds exactly the three 2026-08-19 logs that carry it as an APIError event, not
+the later logs where the same string appears as task-body text an agent merely
+read. Against the recorded 2026-08-20 hand count (6 dead of 16 implement
+sessions, taken mid-day) it reconciles session by session: three of the six are
+dead; the CLA-386 takeover held WIP inherited through its own claim result, so
+it ran but did not die; the two CLA-390 sessions never got past their claim and
+count toward neither counter; and two further deaths fall after the mid-day
+snapshot. Over the full day the scan reports 5 dead of 23.
 
 ### Sleep, on laptops
 
