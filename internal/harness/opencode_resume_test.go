@@ -402,3 +402,35 @@ func TestMergeResumeEscalatedContinuationKeepsClaimIdentity(t *testing.T) {
 		t.Error("an escalated claim is settled, not held")
 	}
 }
+
+// Re-review finding 1: sameClaim ignores Status, and Status decides
+// ClaimsMerge(). A dead run that declared in_review, then a continuation that
+// re-declares done on the identical delivery, is a status UPGRADE — keeping the
+// earlier report would leave ClaimsMerge() false and skip merge attestation.
+// Later wins, matching settleReport's own rule.
+func TestMergeResumeLaterReportWinsStatusUpgrade(t *testing.T) {
+	base := quietDeathResult("ses_dead")
+	base.Reports = []Report{{
+		TaskID: "uuid-1", Ref: "EZY-196", RunID: "run-1",
+		Status: "in_review", Branch: "clanker/x",
+		Commit: "abc123", IntegrationBranch: "staging",
+	}}
+
+	// The continuation runs SEEDED (as Invoke now seeds it) — without the seed
+	// its update_task would be unobserved and there would be nothing to dedupe.
+	seeded := Invocation{Prompt: "Work."}
+	seeded.ResumeClaim = Claim{TaskID: "uuid-1", Ref: "EZY-196", RunID: "run-1"}
+	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"done","branch":"clanker/x","delivery":{"commit":"abc123","integrationBranch":"staging"}},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
+	mergeResume(&base, cont)
+
+	if len(base.Reports) != 1 {
+		t.Fatalf("Reports = %d entries, want 1 deduped", len(base.Reports))
+	}
+	if got := base.Reports[0].Status; got != "done" {
+		t.Errorf("Report.Status = %q, want the later 'done' (the upgrade must not be dropped)", got)
+	}
+	if !base.Reports[0].ClaimsMerge() {
+		t.Error("the upgraded report must claim the merge landed - attestation depends on it")
+	}
+}
