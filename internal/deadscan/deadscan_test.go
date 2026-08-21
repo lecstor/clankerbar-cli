@@ -72,6 +72,27 @@ const claudeLog = `I'll work the next task.
   → Bash
 `
 
+// A TAKEOVER of a task that already carried WIP: claim_task's own result — an
+// MCP tool result, flattened by the opencode adapter to a STRING (see
+// opencodeToolState.Output, internal/harness/opencode.go) — reports
+// "hasWip":true, and the session then dies with reason "unknown" WITHOUT ever
+// calling update_task again. It must be a run, not dead: the inherited WIP is
+// the driver's own Claim.HasWIP signal, carried on the claim itself.
+const takeoverWipThenDeadLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_takeover","part":{"id":"p1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_takeover","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c1","state":{"status":"completed","input":{"taskId":"t7","takeover":true},"output":"{\"task\":{\"id\":\"t7\",\"ref\":\"CLA-7\"},\"branch\":\"clanker/w\",\"hasWip\":true}"}}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_takeover","part":{"id":"p2","reason":"unknown","tokens":{"total":0,"input":0,"output":0}}}
+`
+
+// A codex session that died before ever reporting usage — the real shape from
+// internal/harness/usagereported_test.go's died-early fixture: thread.started
+// then item.completed, no turn.completed at all. Codex emits no claim state
+// the scan can read (classifyEvents' doc comment), so this never lands in any
+// cell either way — but it MUST be labelled harness "codex", not misclassified
+// as "claude" by harnessOf falling through its default.
+const codexDiedEarlyLog = `{"type":"thread.started","thread_id":"t1"}
+{"type":"item.completed","item":{"type":"agent_message","text":"died early"}}
+`
+
 // The tool_count_limit APIError known-positive: a genuine error EVENT. This is
 // what the three 2026-08-19 logs carry, and what the scan must find — while
 // ignoring the same string when it appears as task-body TEXT an agent read.
@@ -219,5 +240,39 @@ func TestScan_WalksSlugDirs(t *testing.T) {
 	logs := scanFixtures(t, files)
 	if len(logs) != 2 {
 		t.Fatalf("Scan found %d logs, want 2 (sentinel/gitignore must not be classified): %v", len(logs), logs)
+	}
+}
+
+// A takeover that inherits WIP off claim_task's OWN result must not be
+// misread as dead: the opencode adapter flattens an MCP tool result to a
+// STRING (opencodeToolState.Output), so noteTool must double-unwrap it the way
+// noteClaimed does, not unmarshal the still-quoted bytes directly.
+func TestScan_TakeoverInheritsWipFromClaimResultItself(t *testing.T) {
+	files := map[string]string{
+		"w1/iteration-20260820-050000-d2-pimplement-a0-c1a95b21.log": takeoverWipThenDeadLog,
+	}
+	l := byName(t, scanFixtures(t, files), "iteration-20260820-050000-d2-pimplement-a0-c1a95b21.log")
+	if !l.GotPastClaim {
+		t.Fatalf("takeover fixture: GotPastClaim = false, want true")
+	}
+	if !l.BranchRecorded {
+		t.Errorf("takeover fixture: BranchRecorded = false, want true — hasWip:true on claim_task's own result must be read")
+	}
+	if l.Dead {
+		t.Errorf("takeover fixture: Dead = true, want false — inherited WIP makes this a run, not a death")
+	}
+}
+
+// A codex session must be labelled harness "codex", not fall through
+// harnessOf's default to "claude" because its event types don't match any
+// case — the real codex vocabulary is thread./item./turn.-prefixed, not
+// stream_start/exec_result.
+func TestScan_ClassifiesCodexHarness(t *testing.T) {
+	files := map[string]string{
+		"w1/iteration-20260819-070000-d1-pimplement-a0-9b3f1d44.log": codexDiedEarlyLog,
+	}
+	l := byName(t, scanFixtures(t, files), "iteration-20260819-070000-d1-pimplement-a0-9b3f1d44.log")
+	if l.Harness != "codex" {
+		t.Errorf("codex fixture: Harness = %q, want %q", l.Harness, "codex")
 	}
 }

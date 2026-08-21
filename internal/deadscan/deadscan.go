@@ -233,8 +233,11 @@ func classify(path string) (Log, error) {
 }
 
 // harnessOf classifies a log's harness from its content: opencode emits JSON
-// step events (step_start/step_finish/tool_use); codex emits stream/turn JSON;
-// opencode2 emits only text-part JSON; claude emits rendered text.
+// step events (step_start/step_finish/tool_use); codex emits `thread.`/`item.`/
+// `turn.`-prefixed JSON (internal/harness/codex.go: thread.started,
+// item.started/item.completed, turn.completed — verified against codex.go's
+// own test fixtures, not guessed); opencode2 emits only text-part JSON; claude
+// emits rendered text.
 func harnessOf(data []byte) string {
 	for _, line := range splitLines(data) {
 		var ev struct {
@@ -243,12 +246,12 @@ func harnessOf(data []byte) string {
 		if json.Unmarshal(line, &ev) != nil {
 			continue
 		}
-		switch ev.Type {
-		case "step_start", "step_finish", "tool_use":
+		switch {
+		case ev.Type == "step_start" || ev.Type == "step_finish" || ev.Type == "tool_use":
 			return "opencode"
-		case "stream_start", "turn.completed", "exec_result":
+		case strings.HasPrefix(ev.Type, "thread.") || strings.HasPrefix(ev.Type, "item.") || strings.HasPrefix(ev.Type, "turn."):
 			return "codex"
-		case "text":
+		case ev.Type == "text":
 			return "opencode2"
 		}
 	}
@@ -350,7 +353,7 @@ func noteTool(part json.RawMessage, gotPastClaim, branchRecorded bool) (bool, bo
 		State *struct {
 			Status string          `json:"status"`
 			Input  json.RawMessage `json:"input"`
-			Output json.RawMessage `json:"output"`
+			Output string          `json:"output"`
 		} `json:"state"`
 	}
 	if json.Unmarshal(part, &p) != nil || p.State == nil {
@@ -362,14 +365,18 @@ func noteTool(part json.RawMessage, gotPastClaim, branchRecorded bool) (bool, bo
 		if completed {
 			gotPastClaim = true
 			// A takeover of a task that already had a branch records WIP on
-			// claim: noteClaimed reads hasWip / task.branch off the result.
+			// claim: noteClaimed reads hasWip / task.branch off the result. The
+			// opencode adapter flattens an MCP tool's result to a STRING
+			// (opencodeToolState.Output, internal/harness/opencode.go), so this
+			// needs the same double-unwrap noteClaimed does, not a direct
+			// json.RawMessage unmarshal.
 			var res struct {
 				HasWip bool `json:"hasWip"`
 				Task   *struct {
 					Branch string `json:"branch"`
 				} `json:"task"`
 			}
-			if json.Unmarshal(p.State.Output, &res) == nil {
+			if json.Unmarshal([]byte(p.State.Output), &res) == nil {
 				if res.HasWip || (res.Task != nil && res.Task.Branch != "") {
 					branchRecorded = true
 				}
