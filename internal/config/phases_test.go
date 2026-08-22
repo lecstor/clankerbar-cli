@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
@@ -557,6 +558,12 @@ func TestHandoffContinuation_CarriesTheReviewTerminalStepForward(t *testing.T) {
 	if !strings.Contains(got, reviewTerminalStep) {
 		t.Errorf("HandoffContinuation(%q) does not carry reviewTerminalStep forward:\n%s", ReviewPhaseName, got)
 	}
+	// And the rerun bound rides along (phase-2 review of CLA-391): the
+	// successor inheriting a half-fixed finding list is the loopiest session
+	// there is, and a handoff must not be how it arrives unbounded.
+	if !strings.Contains(got, rerunGuidance) {
+		t.Errorf("HandoffContinuation(%q) does not carry the rerun bound forward:\n%s", ReviewPhaseName, got)
+	}
 
 	// The implement phase hands off nothing at in_review - it stops, and a later
 	// phase owns the resume brief - so it has no terminal step to lose.
@@ -592,9 +599,25 @@ func TestBuiltinPhaseBriefsCarryTheRerunBound(t *testing.T) {
 			// case differed only by its filter, so a bound phrased only as
 			// "the same command" would not have caught it.
 			"different selector, filter or flag",
+			// The CLAIM that a narrowed rerun counts, not just its vocabulary:
+			// inverting the sentence around "different selector, filter or flag"
+			// used to leave every pinned fragment verbatim intact while
+			// asserting the opposite of the doneWhen (phase-2 review).
+			"counts against the same command's bound",
+			"not a change to what is under test",
+			// Consecutiveness defined: other tool calls cannot reset the count,
+			// or interleaved reads and greps defeat the bound entirely.
+			"do not reset the count",
+			// The arithmetic past a stated reason, which the first wording left
+			// to the reader: a reason buys one run, not a fresh pair.
+			"buys one run, not a fresh pair",
 			// The idle-polling case points at the served waiting reference
 			// rather than restating its rules.
 			"clankerbar.com/skills/clankerbar/waiting.md",
+			// ...and the pointer is scoped to KEEPING the task, because Rule 1
+			// of that reference read unscoped tells a mid-phase session to
+			// release.
+			"keeping hold of this task",
 		} {
 			if !strings.Contains(brief, want) {
 				t.Errorf("the %q brief never says %q; the rerun bound is not pinned in it:\n%s", name, want, brief)
@@ -610,16 +633,22 @@ func TestBuiltinPhaseBriefsCarryTheRerunBound(t *testing.T) {
 // leaving the review brief's terminal-step-then-handoff suffix untouched
 // (TestReviewBriefStatesItsTerminalStep pins that suffix exactly).
 func TestRerunGuidanceSitsBeforeEachBriefsEnding(t *testing.T) {
+	// Both directions of CLA-384's position lesson: LATE enough to ride with
+	// the brief's tail (prefixing it ahead of the working instructions would
+	// bury it at the front, which the first version of this test permitted),
+	// and never displacing the emphatic ending each brief must keep.
 	impl := builtinPhasePrompts[ImplementPhaseName]
+	ci := strings.Index(impl, "update_task(taskId, runId, branch)")
 	ri, hi := strings.Index(impl, rerunGuidance), strings.Index(impl, handoffGuidance)
-	if ri == -1 || hi == -1 || ri > hi {
-		t.Errorf("the implement brief does not carry the rerun bound before its handoff guidance (rerun at %d, handoff at %d):\n%s", ri, hi, impl)
+	if ri == -1 || hi == -1 || ci == -1 || ri < ci || ri > hi {
+		t.Errorf("the implement brief does not carry the rerun bound after its checkpoint instruction (%d) and before its handoff guidance (%d); got rerun at %d:\n%s", ci, hi, ri, impl)
 	}
 
 	rev := builtinPhasePrompts[ReviewPhaseName]
+	gi := strings.Index(rev, "adversarial review gate")
 	rr, ti := strings.Index(rev, rerunGuidance), strings.Index(rev, reviewTerminalStep)
-	if rr == -1 || ti == -1 || rr > ti {
-		t.Errorf("the review brief does not carry the rerun bound before its terminal step (rerun at %d, terminal at %d):\n%s", rr, ti, rev)
+	if rr == -1 || ti == -1 || gi == -1 || rr < gi || rr > ti {
+		t.Errorf("the review brief does not carry the rerun bound after its gate paragraph (%d) and before its terminal step (%d); got rerun at %d:\n%s", gi, ti, rr, rev)
 	}
 }
 
@@ -632,9 +661,26 @@ func TestRerunGuidancePointsAtWaitingRatherThanRestatingIt(t *testing.T) {
 	if !strings.Contains(rerunGuidance, "clankerbar.com/skills/clankerbar/waiting.md") {
 		t.Errorf("rerunGuidance does not name the served waiting reference:\n%s", rerunGuidance)
 	}
+	// Whole words, not substrings: the substring match fired on "release"
+	// containing "lease", failing a future edit that was doing the right
+	// thing and pointing its author at the wrong repair. The ban remains a
+	// heuristic against copying the reference's mechanics vocabulary - it
+	// cannot prove a restatement absent, only make the cheap drifts loud.
+	words := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(rerunGuidance), func(r rune) bool { return !unicode.IsLetter(r) }) {
+		words[w] = true
+	}
 	for _, banned := range []string{"heartbeat", "lease", "sleep"} {
-		if strings.Contains(strings.ToLower(rerunGuidance), banned) {
+		if words[banned] {
 			t.Errorf("rerunGuidance says %q - it is restating the waiting reference's mechanics, which live at the address it should point at and would drift here:\n%s", banned, rerunGuidance)
 		}
+	}
+	// The pointer is scoped as well as pointed (phase-2 review): Rule 1 of the
+	// waiting reference tells a claim-holder to let go, and read unscoped it
+	// directs a mid-phase session to release - the exact failure the briefs'
+	// own endings forbid. The session takes the polling discipline and keeps
+	// the task.
+	if !strings.Contains(rerunGuidance, "keeping hold of this task") {
+		t.Errorf("rerunGuidance does not scope the waiting pointer to keeping the task; unscoped, Rule 1 reads as permission to release mid-phase:\n%s", rerunGuidance)
 	}
 }

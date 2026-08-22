@@ -317,11 +317,15 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 // moment a session hands off instead of finishing itself. For the review phase
 // that includes reviewTerminalStep - the PR-then-update_task sequence CLA-353
 // exists to make land - so a handoff mid-review must not be a way to lose it.
+// The rerun bound rides along with it (the phase-2 review of CLA-391): the
+// successor inheriting a half-fixed finding list is the session most likely
+// to rerun its way into the drain waste, and a handoff must not be how it
+// arrives unbounded.
 // Empty for a phase with no such step: the implement phase stops rather than
 // hands its task to in_review, so it has none to carry forward.
 func HandoffContinuation(phaseName string) string {
 	if phaseName == ReviewPhaseName {
-		return "\n\nThe phase's terminal step is unchanged by handing off:" + reviewTerminalStep
+		return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + reviewTerminalStep
 	}
 	return ""
 }
@@ -347,27 +351,57 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 // the grep filter; another ran twelve identical `go test -race ./...` on a
 // two-file diff; a third managed seven full-suite runs, eight typechecks and
 // ten lints inside one phase. Cost is turns times context, and every rerun is
-// a whole turn at full context, so the brief bounds CONSECUTIVE reruns of the
-// same command and demands a stated reason past the bound - which keeps the
-// honest "I changed something, re-run it" open while leaving a loop of
-// identical runs nowhere to hide. Two readings are pinned in the wording
-// because each was a misreading waiting to happen: the bound is per command,
-// not on verification overall (typecheck, then tests, then lint is three
-// commands run once each); and a narrowed rerun is still a rerun (same suite,
-// different selector or filter - the fourteen-run case differed ONLY by its
-// filter). The sibling failure, consecutive turns idling on a background job
-// and re-polling its output, is the waiting problem the served skill already
-// carries a reference for - so the brief POINTS at it rather than restating
-// rules that live there and would drift here.
-const rerunGuidance = " RERUN BOUND: every rerun of a verification command is a full turn at full context, so " +
-	"bound them - two consecutive reruns of the same command is the ceiling, and a third needs a stated reason " +
-	"first: one line naming what changed since the last run and why the result should differ now. The bound is " +
-	"per command, not on verification overall - typecheck, then tests, then lint is three commands run once " +
-	"each. A narrowed rerun is still a rerun: re-running the same suite with a different selector, filter or " +
-	"flag counts against the same command's bound. Nothing changed since the last run means the result cannot " +
-	"differ - read the previous output instead of paying for it again. Consecutive turns spent idling on a " +
-	"background job or re-polling its output are the WAITING problem, not the rerun problem: read " +
-	"https://clankerbar.com/skills/clankerbar/waiting.md before your next poll."
+// another turn over everything the session holds, so the brief bounds
+// CONSECUTIVE reruns of the same command and demands a stated reason past the
+// bound.
+//
+// The phase-2 adversarial review found three ways the first wording still let
+// the fourteen-run loop through, and the wording closes each:
+//
+//   - A reason phrased as "name what changed since the last run" was satisfied
+//     by the selector change ITSELF - "narrowed the grep" is a change, and it
+//     does make the output differ, so fourteen compliant runs each carried a
+//     truthful-looking reason line. The reason must name a change to what is
+//     UNDER TEST, or say why the last result may not reproduce; a narrower
+//     selector is neither.
+//   - "Consecutive" was undefined, so any interleaved call (read, grep, diff -
+//     the shape real sessions actually produce) reset the count every turn and
+//     the ceiling never engaged. Only a change to what the command tests
+//     resets it now; other tool calls do not.
+//   - The arithmetic past a reason was unstated: a reason buying a fresh pair
+//     makes fourteen runs four cheap lines, while an absolute ceiling collides
+//     with the review brief's own fix-and-reverify demand. A reason buys ONE
+//     run, and the count restarts only when the thing under test changed -
+//     which is exactly what happens each time a fix lands, so honest
+//     re-verification never reaches the bound at all.
+//
+// Two readings the task called out stay pinned in the wording: the bound is
+// per command, not on verification overall (typecheck, then tests, then lint
+// is three commands run once each); and a narrowed rerun is still a rerun
+// (same suite, different selector or filter - the fourteen-run case differed
+// ONLY by its filter). The sibling failure, consecutive turns idling on a
+// background job and re-polling its output, is the waiting problem the served
+// skill already carries a reference for - so the brief POINTS at it rather
+// than restating rules that live there and would drift here. That pointer is
+// SCOPED as well as pointed: waiting.md's Rule 1 tells a claim-holder to let
+// go, and read unscoped it directs a mid-phase session to release - the exact
+// failure the briefs' own endings forbid - so the session takes the polling
+// discipline and keeps hold of the task.
+const rerunGuidance = " RERUN BOUND: every rerun of a verification command is another turn over everything the " +
+	"session holds, so bound them - two consecutive reruns of the same command is the ceiling, and a third " +
+	"needs a stated reason first: one line saying either what changed in the code or environment UNDER TEST " +
+	"since the last run, or why the last result may not reproduce (flakiness, timing, state outside this " +
+	"checkout). A narrowed rerun is still a rerun: re-running the same suite with a different selector, filter " +
+	"or flag counts against the same command's bound, because a different selector is not a change to what is " +
+	"under test. Tool calls in between do not reset the count either, and a stated reason buys one run, not a " +
+	"fresh pair - the count starts over only when what the command tests actually changed, which for a " +
+	"fix-and-reverify loop is every fix landing, so honest re-verification never reaches the bound. Nothing " +
+	"changed means the result cannot differ - read the previous output instead of paying for it again. The " +
+	"bound is per command, not on verification overall - typecheck, then tests, then lint is three commands " +
+	"run once each. Consecutive turns spent idling on a background job or re-polling its output are the " +
+	"WAITING problem, not the rerun problem: read " +
+	"https://clankerbar.com/skills/clankerbar/waiting.md before your next poll and take from it the polling " +
+	"discipline while keeping hold of this task. This bound governs every verification command this phase runs."
 
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
