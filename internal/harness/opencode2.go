@@ -256,11 +256,11 @@ func (opencode2) ZeroUsageUnknown(Result) bool { return false }
 
 func (opencode2) Capabilities() Capabilities {
 	return Capabilities{
-		TracksClaims:           false, // no tool events on the stream → a phased run is refused by config.Validate
-		HonoursMaxTurns:        false,
-		HonoursSessionWallClock: true, // the process kill in Invoke is the phase backstop
-		ReportsCost:            false, // no usage/cost event on the stream → budget.max_cost_usd is inert
-		HasSessionTokenCeiling: false,
+		TracksClaims:            false, // no tool events on the stream → a phased run is refused by config.Validate
+		HonoursMaxTurns:         false,
+		HonoursSessionWallClock: true,  // the process kill in Invoke is the phase backstop
+		ReportsCost:             false, // no usage/cost event on the stream → budget.max_cost_usd is inert
+		HasSessionTokenCeiling:  false,
 	}
 }
 
@@ -279,4 +279,3 @@ func (o opencode2) Probe(ctx context.Context, in Invocation) (ProbeResult, error
 func (opencode2) ReadUsage(context.Context, Invocation) (Usage, error) {
 	return Usage{}, ErrUsageUnsupported
 }
-

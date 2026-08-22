@@ -38,18 +38,26 @@ test, just pointed at a real provider. Neither runs without its env var, so
   (`finish_reason: "stop"` plus a usage block) makes the adapter report a
   clean, spend-accounted, NOT-silent session — exit 0, `finish_reason: "stop"`,
   `UsageReported` true, `ZeroUsageUnknown` false.
-- **Quiet death** (`quiet` script): the
+- **Quiet death** (`quiet` script), opencode up to and including **v1.18.18**: the
   [#43622](https://github.com/anomalyco/opencode/issues/43622) shape, where no
   chunk ever carries a non-null `finish_reason`. opencode hands the CLI
   `reason: "unknown"`, all-zero tokens/cost, **exit 0 with no error** — which
-  reads as a clean completion unless the adapter names it. The assertion is
-  **signature-consistent**: while opencode still produces that shape the test
-  asserts the adapter DOES name it (`ZeroUsageUnknown` true); the day upstream
-  fixes the bug the session stops carrying the signature, the test turns **green
-  with a loud "the scenario changed, re-pin" log** instead of a false red, and
-  it turns red only for a real regression — the adapter stops naming a death
-  opencode still produces, or opencode lands the unbounded-retry "fix" we told
-  them not to ship (which hangs past the conformance timeout).
+  reads as a clean completion unless the adapter names it. The test is
+  **world-aware**: on that build it asserts the adapter names the death
+  (`ZeroUsageUnknown` true).
+- **The retry world, opencode >= v1.18.20**: the silent exit is fixed upstream
+  by RETRYING the empty stream, which against a persistently-empty stream
+  never terminates on its own (the hazard #43622 warned about; #43881 remains
+  open). The test bounds the provocation with a **15-second wall-clock cap** and
+  asserts the CLI's operational contract for the new world: the cap ends the
+  session, and the raw death signature (reason `"unknown"`, all-zero usage) is
+  preserved on the Result. Note for maintainers: on a capped end the composite
+  `ZeroUsageUnknown` marker cedes to `wall_clock_capped` (a single
+  `terminal_reason` key), so a capped spin is not counted in the dead-phase
+  tally today — whether it should be is an open decision for the 1.18.20+ world.
+- **A proper-fix world**: if upstream ever lands an error-surfacing fix, the
+  session ends on its own with neither signature and the test turns green with
+  a loud "re-pin" log — never a false red.
 - **That the fake was actually hit.** Each run asserts `/v1/chat/completions`
   reached the fake provider. Open code silently runs its own default provider
   (`opencode-go`) when it cannot resolve the configured model, so without this
@@ -67,14 +75,16 @@ test, just pointed at a real provider. Neither runs without its env var, so
   be running on the same machine and are in no way products of, or affected by,
   the suite.
 
-Upstream will eventually fix the silent exit. When it does, this test does **not**
-go red — a properly-fixed opencode stops producing the signature, the CLI
-correctly stops flagging it, and the test turns green with a log line announcing
-the scenario changed so the fixture and `CLA-406`/`ZeroUsageUnknown` handling
-get re-pinned instead of silently going stale. Red, when it comes, means a real
-regression: the adapter stops naming a death opencode still produces, or opencode
-lands the unbounded-retry "fix" we told upstream not to ship (which hangs and
-trips the conformance timeout).
+Upstream's fix landed as v1.18.20 (retry the empty stream instead of exiting
+silently; the anomalyco issue's PRs #41466/#43881 describe the same family).
+The daemons now run v1.18.21. Two things changed with it: the silent exit-0 is
+gone (a transiently-empty stream recovers instead of dying), and a
+PERSISTENTLY-empty stream now spins in an unbounded retry instead — which is
+why the wall-clock cap (`max_session_wall_clock` / per-phase `max_wall_clock`)
+is no longer optional for opencode runs: it is the only backstop that can end
+such a session, and the loop's salvage preserves everything it wrote when the
+cap fires. The harness-conformance quiet-death test documents the exact
+observable contract per build.
 
 ## How the hermetic harness works (verified against opencode 1.18.18)
 

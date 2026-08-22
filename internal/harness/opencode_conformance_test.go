@@ -7,8 +7,12 @@ package harness
 // pointed at a hermetic fake OpenAI-compatible provider that scripts exactly
 // what "the model" returns — including the shape from
 // https://github.com/anomalyco/opencode/issues/43622 that makes opencode
-// process a response and hand the CLI a GARBLED/BROKEN result: a final step
-// that reads `reason: "unknown"` with all-zero usage, and a silent exit 0.
+// process a response and hand the CLI a GARBLED/BROKEN result. Which garbled
+// shape depends on the build: <= v1.18.18 it is a final step reading
+// `reason: "unknown"` with all-zero usage and a silent exit 0; >= v1.18.20 the
+// same stream retries in a tight unbounded loop instead of exiting, and the
+// quiet-death test bounds that world with a wall-clock cap (see
+// TestOpencodeConformance_quietDeath).
 //
 // Everything else in this package parses SAVED opencode output; these tests
 // are the only ones that exec the binary, so they are opt-in:
@@ -87,11 +91,11 @@ type fakeOpenAI struct {
 // scripts is whether any chunk carries a non-null finish_reason:
 //
 //   - stop:  a terminal chunk with finish_reason "stop" plus a usage block →
-//            opencode reports reason "stop" and the usage.
+//     opencode reports reason "stop" and the usage.
 //   - quiet: NO chunk ever carries a non-null finish_reason, no usage →
-//            opencode's final step reads reason "unknown", all-zero usage, and
-//            the process exits 0 with no error — the silent-death signature
-//            (anomalyco/opencode#43622, our CLA-398/401/406 family).
+//     opencode's final step reads reason "unknown", all-zero usage, and
+//     the process exits 0 with no error — the silent-death signature
+//     (anomalyco/opencode#43622, our CLA-398/401/406 family).
 func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/v1/models":
@@ -190,17 +194,20 @@ func opencodeIsolateEnv(t *testing.T) []string {
 // exactly the way production does, on the caller's PATH, with the adapter's own
 // env (permission policy, config dir, OPENCODE_CONFIG) plus the isolate env. A
 // session that outlives conformanceTimeout is killed and the test fails rather
-// than hanging.
-func invokeOpencode(t *testing.T, cfgPath, workdir string, extraEnv []string) (Result, error) {
+// than hanging. maxWC bounds the session via Invocation.MaxSessionWallClock —
+// the quiet-death test needs it: on opencode >= 1.18.20 an empty stream RETRIES
+// instead of exiting, so without a cap the provocation never ends.
+func invokeOpencode(t *testing.T, cfgPath, workdir string, extraEnv []string, maxWC time.Duration) (Result, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
 	defer cancel()
 	in := Invocation{
-		Prompt:        conformancePrompt,
-		WorkDir:       workdir,
-		MCPConfigPath: cfgPath, // → OPENCODE_CONFIG
-		ConfigDir:     t.TempDir(),
-		Env:           extraEnv,
+		Prompt:              conformancePrompt,
+		WorkDir:             workdir,
+		MCPConfigPath:       cfgPath, // → OPENCODE_CONFIG
+		ConfigDir:           t.TempDir(),
+		Env:                 extraEnv,
+		MaxSessionWallClock: maxWC,
 	}
 	return (opencode{}).Invoke(ctx, in)
 }
@@ -256,7 +263,7 @@ func TestOpencodeConformance_control(t *testing.T) {
 	defer srv.Close()
 	cfg := opencodeFakeConfig(t, srv.URL)
 
-	res, err := invokeOpencode(t, cfg, t.TempDir(), opencodeIsolateEnv(t))
+	res, err := invokeOpencode(t, cfg, t.TempDir(), opencodeIsolateEnv(t), 0)
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
@@ -285,22 +292,22 @@ func TestOpencodeConformance_control(t *testing.T) {
 
 // TestOpencodeConformance_quietDeath pins the CLI's handling of the #43622
 // shape: opencode processes a model response whose stream never carries a
-// finish reason, and hands the CLI a silent exit-0, reason "unknown",
-// all-zero-usage end. The CLI's job is to NAME that death rather than read it
-// as a clean completion.
+// finish reason. What the CLI must do depends on which WORLD the binary on PATH
+// lives in, and the test is world-aware rather than world-anchored:
 //
-// The assertion is SIGNATURE-CONSISTENT, deliberately, so a fix upstream does
-// not produce a false red:
-//
-//   - If the session that just ran carried the signature (opencode still has
-//     the bug), the CLI MUST flag it — that is the regression this test
-//     catches (the adapter stops naming a death opencode still produces).
-//   - If the session did NOT carry the signature (upstream fixed it), the CLI
-//     must NOT flag it, and the test turns GREEN with a loud log that the
-//     scenario changed and needs re-pinning — never a red for working code.
-//   - If upstream lands the "fix" we told them not to ship (the unbounded
-//     retry loop), the session never finishes and conformanceTimeout trips:
-//     a targeted red.
+//   - v1.18.18 and older (the guillotine world): the session exits 0 silently
+//     with a final step reading reason "unknown" and all-zero usage, and the
+//     CLI MUST name it (ZeroUsageUnknown) rather than read it as a clean run.
+//   - v1.18.20+ (the retry world): the silent exit is fixed upstream by
+//     RETRYING the empty stream — which, against a persistently-empty stream,
+//     never terminates on its own (the hazard upstream #43622 warned about).
+//     The test bounds the provocation with a short wall-clock cap; the CLI must
+//     then BOTH name the death it saw on step 1 (ZeroUsageUnknown) AND end the
+//     session via its own cap (WallClockCapped) — which is the operational
+//     contract the fleet relies on: bounded, salvaged, never dropped.
+//   - A hypothetical proper-fix world (upstream lands an error-surfacing fix):
+//     the session ends on its own with neither signature, and the CLI must not
+//     fabricate the marker — the test turns green with a loud re-pin log.
 func TestOpencodeConformance_quietDeath(t *testing.T) {
 	requireOpencodeConformance(t)
 	logOpencodeBuild(t)
@@ -310,7 +317,7 @@ func TestOpencodeConformance_quietDeath(t *testing.T) {
 	defer srv.Close()
 	cfg := opencodeFakeConfig(t, srv.URL)
 
-	res, err := invokeOpencode(t, cfg, t.TempDir(), opencodeIsolateEnv(t))
+	res, err := invokeOpencode(t, cfg, t.TempDir(), opencodeIsolateEnv(t), quietDeathCap)
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
@@ -318,28 +325,62 @@ func TestOpencodeConformance_quietDeath(t *testing.T) {
 		t.Fatal("fake provider was never hit — opencode used a different (real) provider instead of fake/fake-model. NOTE: if the model id failed to resolve, that real run may have spent a real paid token before this failure")
 	}
 
-	if observedQuietDeath(res) {
-		// The broken-world branch: this build still emits the #43622 death.
-		// Note UsageReported is deliberately not asserted — opencode emits a
-		// (all-zero) tokens block even on the quiet shape, and the adapter
-		// correctly counts "the event existed" as reported (CLA-288); the
-		// discriminator is the all-zero SUM plus the unknown reason.
-		if (opencode{}).ZeroUsageUnknown(res) {
-			t.Logf("reproduced the #43622 silent-death signature (exit 0, reason unknown, all-zero usage) and the CLI names it (ZeroUsageUnknown true)")
-		} else {
+	switch {
+	case (opencode{}).WallClockCapped(res):
+		// The retry world (opencode >= 1.18.20), bounded by our own cap. The
+		// session spun against the silently-empty stream, and the adapter
+		// killed it at the wall-clock dial. The composite marker
+		// (ZeroUsageUnknown) deliberately cedes to the cap marker — the driver
+		// keys its control flow off terminal_reason, which holds ONE value, and
+		// "capped" is the stronger fact for how to end the phase. What the test
+		// pins instead is the RAW signature, which markWallClockCapped
+		// preserves: the death must still be readable on the Result (finish
+		// reason unknown, all-zero usage) even on a capped end.
+		if fake.hit.Load() < 5 {
+			// A capped session that made almost no provider calls is NOT
+			// evidence of a spin — it may never have completed its FIRST
+			// request before the cap fired (cold start on a slow machine, or a
+			// build whose emptiness handling changed). Red either way, but name
+			// both readings rather than diagnosing the retry world by default.
+			t.Errorf("session was capped with only %d provider calls in %s — either the empty-stream retry never spun this fast (open >= 1.18.20) or the session never completed its first request (cap too tight on this machine)", fake.hit.Load(), quietDeathCap)
+		}
+		if reason, _ := res.Raw[FinishReasonKey].(string); reason != FinishReasonUnknown {
+			t.Errorf("capped retry-world session lost the death signature: finish_reason = %q, want %q", reason, FinishReasonUnknown)
+		}
+		if res.Tokens != 0 || res.CostUSD != 0 {
+			t.Errorf("capped retry-world session: Tokens/CostUSD = %d/$%.4f, want 0/0 (all-zero usage)", res.Tokens, res.CostUSD)
+		}
+		t.Logf("retry world bounded: opencode >=1.18.20 spun the empty stream (%d provider calls in %s); the CLI capped it and the raw death signature (reason unknown, all-zero usage) is preserved on the Result", fake.hit.Load(), quietDeathCap)
+		t.Log("NOTE for maintainers: on a capped end the composite ZeroUsageUnknown marker cedes to wall_clock_capped (one terminal_reason key). Whether a capped SPIN should also count in the dead-phase tally is an open decision for the 1.18.20+ world.")
+
+	case observedQuietDeath(res):
+		// The guillotine world (v1.18.18 and older): exit 0, reason unknown,
+		// all-zero usage, no retry. The CLI must name it. UsageReported is
+		// deliberately not asserted — opencode emits a (all-zero) tokens block
+		// even on this shape, and the adapter counts "the event existed" as
+		// reported (CLA-288); the discriminator is the all-zero SUM plus the
+		// unknown reason.
+		if !(opencode{}).ZeroUsageUnknown(res) {
 			t.Error("session carried the #43622 silent-death signature (exit 0, reason unknown, all-zero usage) but ZeroUsageUnknown is false — the CLI would read this death as a clean completion")
 		}
-		return
-	}
+		t.Log("reproduced the #43622 silent-death signature (exit 0, reason unknown, all-zero usage) and the CLI names it (ZeroUsageUnknown true)")
 
-	// The post-fix branch. Green, because the CLI is not misclassifying
-	// anything — but it is a changed world the fixture was built for, so say so
-	// out loud rather than quietly passing.
-	if (opencode{}).ZeroUsageUnknown(res) {
-		t.Error("session did NOT carry the #43622 signature but ZeroUsageUnknown is true — a false positive")
+	default:
+		// Some proper-fix world: the session ended on its own with neither
+		// signature. Green, because the CLI is not misclassifying anything —
+		// but it is a changed world the fixture was built for, so say so out
+		// loud rather than quietly passing.
+		if (opencode{}).ZeroUsageUnknown(res) {
+			t.Error("session carried neither the quiet-death nor the retry-world signature but ZeroUsageUnknown is true — a false positive")
+		}
+		t.Logf("WARNING: neither the #43622 signature nor the empty-stream retry reproduced with this opencode build (exit %d, finish %v) — re-pin docs/harness-conformance.md and reconsider CLA-406/ZeroUsageUnknown; this PASS is no longer coverage of the old bug", res.ExitCode, res.Raw[FinishReasonKey])
 	}
-	t.Logf("WARNING: the #43622 silent-death signature (exit 0, reason unknown, all-zero usage) no longer reproduced with this opencode build — upstream likely fixed it. re-pin docs/harness-conformance.md and reconsider CLA-406/ZeroUsageUnknown; this PASS is no longer coverage of the old bug")
 }
+
+// quietDeathCap bounds the empty-stream retry provocation so the test cannot
+// hang on an opencode that fixed the silent exit by retrying (v1.18.20+).
+// Fifteen seconds is plenty: the measured spin is ~18 requests/sec.
+const quietDeathCap = 15 * time.Second
 
 // observedQuietDeath reports whether THIS session, as produced by whatever
 // `opencode` binary just ran, carried the #43622 signature: exit 0 with a final

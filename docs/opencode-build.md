@@ -52,31 +52,46 @@ Delete it, or if you keep it, say here what it is for.
 
 ## Stable is not free of defects either
 
-The line we run has a known one, and upgrading within 1.18.x does not escape it: a turn that
-returns an indeterminate finish reason makes opencode **exit 0 with no error**, discarding the
-turn - `packages/opencode/src/session/prompt.ts:1113` omits `"unknown"` from the loop-exit
-exclusion that the same file applies ~180 lines later at `:1295`. Reproduced against a local
-fake provider by patching v1.18.19 and watching the behaviour flip.
+The 1.18 line had a known one through **v1.18.18**: a turn that returns an
+indeterminate finish reason made opencode **exit 0 with no error**, discarding
+the turn - `packages/opencode/src/session/prompt.ts:1113` omits `"unknown"`
+from the loop-exit exclusion that the same file applies ~180 lines later at
+`:1295`. Reproduced against a local fake provider by patching v1.18.19 and
+watching the behaviour flip. Filed upstream as **anomalyco/opencode#43622**;
+it read as a guard dropped in a refactor rather than a missing feature.
 
-Filed upstream as **anomalyco/opencode#43622**. Absent from every release checked (v1.15.0
-through v1.18.19, the current latest), and present in the one older checkout available here
-(1.2.27, at `prompt.ts:323`), so it reads as a guard dropped in a refactor rather than a
-missing feature.
+**That silent exit is fixed as of v1.18.20** (we run v1.18.21): upstream changed
+the behaviour to RETRY the silently-empty stream instead of ending the turn —
+the shape an anomalyco maintainer credits in the #43622 thread, part of the same
+family as still-open PR #43881. What that leaves us is the *other* half of the
+original warning: against a **persistently** empty stream the retry never
+terminates on its own (verified empirically: ~18 provider requests/second with
+no backoff, no halt, the message history growing one empty turn per attempt).
+The wall-clock cap (`max_session_wall_clock` / per-phase `max_wall_clock`) is
+therefore now **load-bearing for every opencode run**: it is the only backstop
+that can end such a session, and the loop's salvage preserves everything it
+wrote when the cap fires. See `docs/harness-conformance.md` for the observable
+per-build contract and the "capped spin" marker-precedence note.
 
-For us that failure looks like a session that ended with no branch and no error (it had
-usually done paid work first - only the final step is empty) -
-what the driver calls a dead phase. It hit 6 of 16 implement sessions on 2026-08-20.
-**CLA-406** shipped the mitigation (v0.9.1+): on the quiet-death signature the
-adapter RESUMES the same session in place (`opencode run --session <id>`) after a
-25s backoff, probes the agent with an informed coherence check (name your task ref),
-and continues it on a mechanical match - bounded at 5 resurrections per Invoke, one
-probe per death, falling through to the dead-phase path unchanged when a probe fails.
-The upstream loop-exit bug still stands; this catches its victims instead.
+For the fleet before v1.18.20, the silent exit looked like a session that ended
+with no branch and no error (it had usually done paid work first - only the
+final step is empty) - what the driver calls a dead phase. It hit 6 of 16
+implement sessions on 2026-08-20. **CLA-406** shipped the mitigation (v0.9.1+):
+on the quiet-death signature the adapter RESUMES the same session in place
+(`opencode run --session <id>`) after a 25s backoff, probes the agent with an
+informed coherence check (name your task ref), and continues it on a mechanical
+match - bounded at 5 resurrections per Invoke, one probe per death, falling
+through to the dead-phase path unchanged when a probe fails. On v1.18.20+ a
+spin no longer *ends* with the quiet-death signature (it ends by wall-clock
+cap if at all), so the resurrection path is dormant there; it stays live for
+older builds and as the last line of defence if a build regresses.
 
-If we ever pin a patched build rather than waiting for upstream: **do not vendor the
-one-line fix**. Adding `"unknown"` to the list at `:1113` removes the silent exit but
-produces an unbounded retry loop - 138 steps and climbing in the test, with no cap observed.
-The shape that works is `:1301`, where a `content-filter` finish is surfaced as an error.
+If we ever pin a patched build rather than relying on the tap: **do not vendor
+the one-line fix**. Adding `"unknown"` to the list at `:1113` removes the silent
+exit but produces an unbounded retry loop - 138 steps and climbing in the test,
+with no cap observed; the shipped v1.18.20 change is the same family, bounded
+only by a provider that eventually answers. The shape that works is `:1301`,
+where a `content-filter` finish is surfaced as an error.
 
 ## See also
 
