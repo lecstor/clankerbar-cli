@@ -341,6 +341,34 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 	"already lives in the repo or on the task, and under 4KB. The successor resumes this same run under this " +
 	"same brief's scope, so do NOT settle, release or hand back the task first."
 
+// rerunGuidance rides on every built-in phase brief (CLA-391). Repeated
+// verification was the dominant measured waste of the 2026-08-19/20 drain: one
+// review phase ran the same Playwright spec fourteen times differing only in
+// the grep filter; another ran twelve identical `go test -race ./...` on a
+// two-file diff; a third managed seven full-suite runs, eight typechecks and
+// ten lints inside one phase. Cost is turns times context, and every rerun is
+// a whole turn at full context, so the brief bounds CONSECUTIVE reruns of the
+// same command and demands a stated reason past the bound - which keeps the
+// honest "I changed something, re-run it" open while leaving a loop of
+// identical runs nowhere to hide. Two readings are pinned in the wording
+// because each was a misreading waiting to happen: the bound is per command,
+// not on verification overall (typecheck, then tests, then lint is three
+// commands run once each); and a narrowed rerun is still a rerun (same suite,
+// different selector or filter - the fourteen-run case differed ONLY by its
+// filter). The sibling failure, consecutive turns idling on a background job
+// and re-polling its output, is the waiting problem the served skill already
+// carries a reference for - so the brief POINTS at it rather than restating
+// rules that live there and would drift here.
+const rerunGuidance = " RERUN BOUND: every rerun of a verification command is a full turn at full context, so " +
+	"bound them - two consecutive reruns of the same command is the ceiling, and a third needs a stated reason " +
+	"first: one line naming what changed since the last run and why the result should differ now. The bound is " +
+	"per command, not on verification overall - typecheck, then tests, then lint is three commands run once " +
+	"each. A narrowed rerun is still a rerun: re-running the same suite with a different selector, filter or " +
+	"flag counts against the same command's bound. Nothing changed since the last run means the result cannot " +
+	"differ - read the previous output instead of paying for it again. Consecutive turns spent idling on a " +
+	"background job or re-polling its output are the WAITING problem, not the rerun problem: read " +
+	"https://clankerbar.com/skills/clankerbar/waiting.md before your next poll."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
 // The split is implement, then review-and-fix, and that grouping is deliberate:
@@ -354,7 +382,7 @@ var builtinPhasePrompts = map[string]string{
 		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
-		"Ending there is this task going to plan, not the task being abandoned." + handoffGuidance,
+		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,
 
 	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
 		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
@@ -368,7 +396,7 @@ var builtinPhasePrompts = map[string]string{
 		"fixed, by name, and point it at the fix commits (or, if not yet committed, the fix diff) and the " +
 		"regression surface they touch - not at the whole diff, whose full pass already happened. A full second " +
 		"pass is the exception you state a reason for (a fix that had to reach outside its own area), never the " +
-		"default." + reviewTerminalStep + handoffGuidance,
+		"default." + rerunGuidance + reviewTerminalStep + handoffGuidance,
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an

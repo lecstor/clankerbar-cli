@@ -567,3 +567,74 @@ func TestHandoffContinuation_CarriesTheReviewTerminalStepForward(t *testing.T) {
 		t.Errorf("HandoffContinuation of an unknown phase = %q, want empty", got)
 	}
 }
+
+// CLA-391: repeated verification was the dominant measured waste of the
+// 2026-08-19/20 drain - fourteen near-identical Playwright runs differing only
+// in the grep filter, twelve identical `go test -race ./...` on a two-file
+// diff. The built-in briefs bound consecutive reruns of the same command and
+// demand a stated reason past the bound. Pinned per brief, in the shape
+// TestBuiltinPhaseBriefsCarryTheHandoffGuidance established, so a rewrite
+// cannot drop the bound from one brief silently.
+func TestBuiltinPhaseBriefsCarryTheRerunBound(t *testing.T) {
+	for name, brief := range builtinPhasePrompts {
+		for _, want := range []string{
+			// The bound itself, on consecutive reruns of one command.
+			"two consecutive reruns of the same command",
+			// The escape hatch has a price: a stated reason, which is what
+			// keeps "I changed something, re-run it" open while a loop of
+			// identical runs has nothing to say.
+			"a third needs a stated reason",
+			// Reading 1 the task called out: the bound is per command, not on
+			// verification overall - typecheck, tests, lint is three commands
+			// run once each.
+			"per command, not on verification overall",
+			// Reading 2: a narrowed rerun is still a rerun. The fourteen-run
+			// case differed only by its filter, so a bound phrased only as
+			// "the same command" would not have caught it.
+			"different selector, filter or flag",
+			// The idle-polling case points at the served waiting reference
+			// rather than restating its rules.
+			"clankerbar.com/skills/clankerbar/waiting.md",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("the %q brief never says %q; the rerun bound is not pinned in it:\n%s", name, want, brief)
+			}
+		}
+	}
+}
+
+// The rerun guidance must not dilute the endings. CLA-384's lesson was
+// position, not presence: an emphatic final block works, a trailing clause
+// does not. So the bound rides BEFORE each brief's ending - the handoff
+// guidance for the implement phase, the terminal step for the review phase -
+// leaving the review brief's terminal-step-then-handoff suffix untouched
+// (TestReviewBriefStatesItsTerminalStep pins that suffix exactly).
+func TestRerunGuidanceSitsBeforeEachBriefsEnding(t *testing.T) {
+	impl := builtinPhasePrompts[ImplementPhaseName]
+	ri, hi := strings.Index(impl, rerunGuidance), strings.Index(impl, handoffGuidance)
+	if ri == -1 || hi == -1 || ri > hi {
+		t.Errorf("the implement brief does not carry the rerun bound before its handoff guidance (rerun at %d, handoff at %d):\n%s", ri, hi, impl)
+	}
+
+	rev := builtinPhasePrompts[ReviewPhaseName]
+	rr, ti := strings.Index(rev, rerunGuidance), strings.Index(rev, reviewTerminalStep)
+	if rr == -1 || ti == -1 || rr > ti {
+		t.Errorf("the review brief does not carry the rerun bound before its terminal step (rerun at %d, terminal at %d):\n%s", rr, ti, rev)
+	}
+}
+
+// The waiting pointer must stay a pointer. The served waiting reference owns
+// the mechanics - lease cadence, blocking inside one tool call - and a second
+// copy in the brief would drift, the same way a test carrying its own copy of
+// a string just moves the rot. Naming the problem and naming the address is
+// the brief's whole obligation here.
+func TestRerunGuidancePointsAtWaitingRatherThanRestatingIt(t *testing.T) {
+	if !strings.Contains(rerunGuidance, "clankerbar.com/skills/clankerbar/waiting.md") {
+		t.Errorf("rerunGuidance does not name the served waiting reference:\n%s", rerunGuidance)
+	}
+	for _, banned := range []string{"heartbeat", "lease", "sleep"} {
+		if strings.Contains(strings.ToLower(rerunGuidance), banned) {
+			t.Errorf("rerunGuidance says %q - it is restating the waiting reference's mechanics, which live at the address it should point at and would drift here:\n%s", banned, rerunGuidance)
+		}
+	}
+}
