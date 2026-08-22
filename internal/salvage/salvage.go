@@ -250,7 +250,31 @@ func (s *Salvager) commitAndPush(ctx context.Context, wt worktree, taskID, label
 	// No --force, and no lease variant either: this branch belongs to the run that
 	// created it, and a push the remote refuses is a fact to report, never one to
 	// overrule. --no-verify for the same reason the commit has it.
-	if _, err := s.run(ctx, wt.path, "push", "--no-verify", "--", remote, ref+":"+ref); err != nil {
+	pushArgs := []string{"push", "--no-verify", "--", remote, ref + ":" + ref}
+	_, stderr, err := s.runFull(ctx, wt.path, pushArgs...)
+	if err != nil && http2PushFailure(stderr) {
+		// The known git-over-HTTP/2 transport failure against GitHub's smart HTTP
+		// endpoint (CLA-354): the pack uploads and is rejected mid-stream, and the
+		// identical push succeeds forced onto HTTP/1.1. Retry exactly once, with
+		// the spell that worked in the field; only when the retry fails too does
+		// the work stay unreachable. Both attempts are named in the detail, which
+		// is what the driver logs either way.
+		retryArgs := append([]string{"-c", "http.version=HTTP/1.1", "-c", "http.postBuffer=" + httpPostBuffer}, pushArgs...)
+		_, retryStderr, retryErr := s.runFull(ctx, wt.path, retryArgs...)
+		if retryErr == nil {
+			out.Status, out.Branch = Saved, wt.branch
+			out.Detail = fmt.Sprintf(
+				"committed the uncommitted work in %s as %s: the first push to %s failed (%s), the retry with http.version=HTTP/1.1 succeeded, and it is pushed to %s/%s",
+				wt.path, short(sha), remote, errorLine(stderr), remote, wt.branch)
+			return out
+		}
+		out.Status, out.Detail = Failed, fmt.Sprintf(
+			"committed %s in %s, but pushing %s to %s failed twice - first attempt (%v): %s; retry with http.version=HTTP/1.1 (%v): %s - the work is safe on this machine and NOT reachable from another, so no branch was recorded",
+			short(sha), wt.path, wt.branch, remote,
+			err, errorLine(stderr), retryErr, errorLine(retryStderr))
+		return out
+	}
+	if err != nil {
 		out.Status, out.Detail = Failed, fmt.Sprintf(
 			"committed %s in %s, but pushing %s to %s failed: %v - the work is safe on this machine and NOT reachable from another, so no branch was recorded",
 			short(sha), wt.path, wt.branch, remote, err)
@@ -262,6 +286,31 @@ func (s *Salvager) commitAndPush(ctx context.Context, wt worktree, taskID, label
 		wt.path, short(sha), remote, wt.branch)
 	return out
 }
+
+// http2PushFailure reports whether a failed `git push`'s stderr matches the known
+// git-over-HTTP/2 transport failure against GitHub's smart HTTP endpoint
+// (CLA-354). Observed in the field as:
+//
+//	error: RPC failed; HTTP 400 curl 22 The requested URL returned error: 400
+//	send-pack: unexpected disconnect while reading sideband packet
+//	fatal: the remote end hung up unexpectedly
+//
+// The match needs BOTH tokens: "RPC failed" pins it to the smart-HTTP transport's
+// pack upload, and "curl 22" says the transfer itself died there rather than the
+// remote refusing the ref - so an ordinary rejection (non-fast-forward, a missing
+// repository, an auth failure) never earns a retry. Sibling status codes of the
+// same failure mode (HTTP 502/503 curl 22) carry both tokens too and are caught;
+// the pure-HTTP/2 stream variant ("curl 92 ... not closed cleanly") deliberately
+// is not - it was not observed here, and widening the signature is cheap later.
+func http2PushFailure(stderr string) bool {
+	l := strings.ToLower(stderr)
+	return strings.Contains(l, "rpc failed") && strings.Contains(l, "curl 22")
+}
+
+// httpPostBuffer is the raised `http.postBuffer` the field fix used alongside the
+// HTTP/1.1 downgrade (150 MiB). Applied only on the signature-matched retry, so
+// it cannot mask any other push failure.
+const httpPostBuffer = "157286400"
 
 // commitMessage writes the commit a later reader has to be able to judge. It says
 // what this is in the subject, because a one-line log is all most readers see,
@@ -416,6 +465,21 @@ func (s *Salvager) inProgressOp(ctx context.Context, dir string) string {
 // inheritor closes its write end - so a killed git can still leave the call
 // sitting there. Same reasoning, and the same numbers, as internal/delivery.
 func (s *Salvager) run(ctx context.Context, dir string, args ...string) (string, error) {
+	stdout, stderr, err := s.runFull(ctx, dir, args...)
+	if err != nil {
+		if msg := strings.TrimSpace(stderr); msg != "" {
+			return "", fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
+		}
+		return "", fmt.Errorf("git %s: %w", args[0], err)
+	}
+	return stdout, nil
+}
+
+// runFull is run's engine, handing back the FULL stderr as well. run keeps only
+// its first line, and git writes its progress to stderr - so on a failed push
+// the first line is usually "Enumerating objects" rather than the error, and the
+// HTTP/2 signature (CLA-354) sits further down where run would drop it.
+func (s *Salvager) runFull(ctx context.Context, dir string, args ...string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, s.gitBin, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -426,16 +490,11 @@ func (s *Salvager) run(ctx context.Context, dir string, args ...string) (string,
 		"GCM_INTERACTIVE=never",
 	)
 	cmd.WaitDelay = 5 * time.Second
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
-		}
-		return "", fmt.Errorf("git %s: %w", args[0], err)
-	}
-	return strings.TrimSpace(stdout.String()), nil
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err = cmd.Run()
+	return strings.TrimSpace(outBuf.String()), strings.TrimSpace(errBuf.String()), err
 }
 
 func realPath(p string) string {
@@ -465,4 +524,26 @@ func firstLine(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// errorLine picks the line of a failed git command's stderr that says WHY.
+// git writes its progress to stderr too, so the first line of a failed push is
+// usually "Enumerating objects" and the reason sits further down; the detail
+// lines this feeds are read by an operator, so they carry the reason or nothing
+// worth quoting at all.
+func errorLine(stderr string) string {
+	lines := strings.Split(stderr, "\n")
+	for _, want := range []string{"error:", "fatal:"} {
+		for _, line := range lines {
+			if trimmed := strings.TrimSpace(line); trimmed != "" && strings.Contains(trimmed, want) {
+				return trimmed
+			}
+		}
+	}
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
