@@ -2085,31 +2085,7 @@ func StateRoot() (string, error) {
 // ignored rather than honoured: the spec says the variable must hold an absolute
 // path, and a relative one would resolve against whatever cwd the daemon happens
 // to have been started in — the exact ambiguity underWorkDir exists to stamp out.
-// testStateDirOverride is injectable for test isolation (CLA-361 phase 2).
-// When set to a non-empty absolute path, stateHome() uses it instead of
-// $XDG_STATE_HOME / ~/.local/state. Tests may set it via SetTestStateDir
-// and clear it with ClearTestStateDir; it is never read from the environment.
-var testStateDirOverride string
-
-// SetTestStateDir overrides the loop's state-dir base for the duration of a
-// test, so fixtures and fixtures-derived configs cannot write under the real
-// loop state path (~/.local/state/clankerbar/loop).
-func SetTestStateDir(path string) {
-	testStateDirOverride = path
-}
-
-// ClearTestStateDir removes the override (restores real state-dir derivation).
-func ClearTestStateDir() {
-	testStateDirOverride = ""
-}
-
 func stateHome() (string, error) {
-	if testStateDirOverride != "" {
-		if !filepath.IsAbs(testStateDirOverride) {
-			return "", fmt.Errorf("test state dir override is not absolute: %s", testStateDirOverride)
-		}
-		return filepath.Clean(testStateDirOverride), nil
-	}
 	if v := os.Getenv("XDG_STATE_HOME"); filepath.IsAbs(v) {
 		return filepath.Clean(v), nil
 	}

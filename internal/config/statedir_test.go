@@ -258,40 +258,7 @@ func TestSessionWorkDirsAreAbsoluteAndCoverEveryProject(t *testing.T) {
 	}
 }
 
-// CLA-361: suite-level guard that fails if any test writes under the real
-// loop state path. A test that leaks there creates orphaned state dirs that
-// accumulate without bound.
-func TestNoTestWritesUnderRealLoopStatePath(t *testing.T) {
-	stateDir, err := StateRoot()
-	if err != nil {
-		t.Skip("cannot resolve state root:", err)
-	}
-	// Before the suite runs, record what directories exist there.
-	before := make(map[string]bool)
-	if info, err := os.Stat(stateDir); err == nil && info.IsDir() {
-		entries, _ := os.ReadDir(stateDir)
-		for _, entry := range entries {
-			before[entry.Name()] = true
-		}
-	}
-	// After the suite finishes, any NEW directory is pollution from this test run.
-	t.Cleanup(func() {
-		if info, err := os.Stat(stateDir); err == nil && info.IsDir() {
-			entries, err := os.ReadDir(stateDir)
-			if err != nil {
-				t.Logf("guard: cannot read state dir %s: %v", stateDir, err)
-				return
-			}
-			newEntries := 0
-			for _, entry := range entries {
-				if !before[entry.Name()] {
-					newEntries++
-					t.Errorf("pollution: new directory %q created under real state path %s", entry.Name(), stateDir)
-				}
-			}
-			if newEntries == 0 {
-				t.Logf("guard: no pollution detected under %s", stateDir)
-			}
-		}
-	})
-}
+// Package-wide test isolation and the pollution guard live in TestMain
+// (main_test.go, via internal/teststate): a single guard TEST only sees
+// pollution made between its own start and cleanup, while the derivation can be
+// reached from any test in the binary. CLA-361.
