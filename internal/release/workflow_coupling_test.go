@@ -91,12 +91,15 @@ func TestCIWorkflowHasNoMatrix(t *testing.T) {
 //     `ci` check on the merge commit ON MAIN. Drop it and both wait for a check
 //     nothing produces.
 //   - `staging` - it is what keeps the standing promotion PR MERGEABLE. promote.yml
-//     opens that PR with GITHUB_TOKEN, which triggers no `pull_request` run, so
-//     the `ci` check `main` requires can only come from the push run on the head
-//     SHA.
+//     opens that PR with GITHUB_TOKEN, which triggers a `pull_request` run that
+//     parks at `action_required`, contributing no check run until a human approves
+//     it - but the PR merges WITHOUT that approval, because the push run on the
+//     staging commit already satisfies the required `ci` check against the PR's
+//     head SHA.
 //
 // The `staging` half has no other protection: nothing fails until a human opens
-// the promotion PR and finds a required check that never arrives.
+// the promotion PR and finds it reading UNSTABLE over a parked run rather than
+// CLEAN.
 func TestCIWorkflowRunsOnBothIntegrationBranches(t *testing.T) {
 	path := filepath.Join("..", "..", ".github", "workflows", "ci.yml")
 	raw, err := os.ReadFile(path)
@@ -124,8 +127,9 @@ func TestCIWorkflowRunsOnBothIntegrationBranches(t *testing.T) {
 		if !slices.Contains(listed, want) {
 			t.Errorf("%s does not run on push to %q (push branches: %q). See this "+
 				"test's doc comment for what breaks - `main` starves the release "+
-				"gate and the staging realign; `staging` strands the standing "+
-				"promotion PR behind a required check that is never produced.",
+				"gate and the staging realign; `staging` leaves the standing "+
+				"promotion PR with no satisfying check - its pull_request run parks "+
+				"at action_required contributing none - until a human approves it.",
 				path, want, listed)
 		}
 	}

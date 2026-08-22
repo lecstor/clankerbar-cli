@@ -165,10 +165,11 @@ gh attestation verify clankerbar_0.4.0_darwin_arm64.tar.gz -R lecstor/clankerbar
 - **`ci.yml` running on push to `staging`.** Not a convenience: it is what makes
   the promotion PR mergeable at all. A PR created by `GITHUB_TOKEN` triggers a
   `pull_request` run that parks at `action_required`, contributing no check run
-  until approved; the required `ci` check `main` requires is satisfied by the push
-  run on the head commit, which a required check resolves against. See the
-  comment in `ci.yml`, where each branch in the push list is load-bearing for a
-  different reason.
+  until approved - unlike the tag trap above, nothing is suppressed here, the
+  run just parks. The `ci` check `main` requires is satisfied by the push run on
+  the head commit, which a required check resolves against. See the comment in
+  `ci.yml`, where each branch in the push list is load-bearing for a different
+  reason.
 
 ## Two exposures this model creates, named rather than left implicit
 
@@ -232,17 +233,22 @@ Approving the parked run is nonetheless **usually the right call**. Only the
 `pull_request` run tests the actual merge (`refs/pull/<n>/merge`); the push run
 tests the `staging` tip. When `main` and `staging` have diverged (as on the
 2026-08-11 cycle, where `main` still carried the CLA-326 lineage that `staging`
-lacked), the two compile different combinations. The only way to confirm the
-merge is safe is for both runs to be green. Before merging, check whether the
-branches have diverged (`git log --graph --oneline --left-right main...staging`);
-if they have, approve the run.
+lacked), the two compile different combinations. Both runs green is the
+strongest signal available before merging - though per the gate above, even a
+green `pull_request` run is a snapshot of its moment, and the final word is
+`ci` on the merge commit that actually lands on `main`. Before merging, check
+whether the branches have diverged
+(`git fetch origin && git log --graph --oneline --left-right origin/main...origin/staging`);
+if they have, approve the run. Approving has its own visible effect: the run
+starts executing and reports pending under the required `ci` context, so the
+PR stops reading mergeable until it finishes.
 
 Evidence: verified live on 2026-08-22 against the standing promotion PR #91
 (open at the time) - its `pull_request` run sat parked at `action_required`,
-the check rollup carried no `ci (pull_request)` entry, and the PR read
+the check rollup carried a single `ci` entry (the push run's), and the PR read
 `MERGEABLE` and `UNSTABLE` at once - and against the 2026-08-11 cycle (PR #36:
-the same parked run, an approval, then a second green `ci (pull_request)`
-check alongside the push run).
+the same parked run, an approval, then a second green `ci` check from the
+`pull_request` event alongside the push run).
 
 ## Break glass
 

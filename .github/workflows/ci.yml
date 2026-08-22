@@ -16,13 +16,15 @@ name: ci
 # this list; drop it and each waits, finds nothing, and (correctly) refuses.
 #
 # `staging`: it is what keeps the standing promotion PR MERGEABLE. `promote.yml`
-# opens that PR with GITHUB_TOKEN, and a PR created by GITHUB_TOKEN triggers a
-# `pull_request` run that parks at `action_required`, contributing NO check run
-# until a human approves it, at which point it runs and becomes a second `ci`
-# check under the same required `ci` context. Drop `staging` and the promotion
-# PR is stuck behind a required check that only arrives on approval - or, on
-# the NEXT commit's push (which carries a clanker's own credentials, not
-# suppressed), which heals a two-merge batch but not a single-merge one.
+# opens that PR with GITHUB_TOKEN, which triggers a `pull_request` run that
+# parks at `action_required`, contributing NO check run until a human approves
+# it, at which point it runs and becomes a second `ci` check under the same
+# required `ci` context. That approval is not needed for the merge: `main`
+# requires the `ci` check against the PR's head SHA, and this very trigger -
+# the push run on that SHA - already satisfies it. Drop `staging` from the
+# push list and nothing does: the only run left is the parked one, so every
+# promotion sits UNSTABLE until someone approves by hand instead of being
+# mergeable outright.
 on:
   pull_request:
   push:
