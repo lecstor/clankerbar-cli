@@ -12,17 +12,43 @@ import (
 // A stub that backgrounds a child which outlives its parent and writes a
 // file after a delay. The kill mechanism must terminate both the parent
 // and the descendant, so the file is never created.
+//
+// Two hardening choices, both earned by observed failures:
+//
+//   - The stub emits an over-ceiling assistant event every 200ms instead
+//     of a single one. The ceiling kill fires from consume(), so it only
+//     happens when that goroutine makes progress; under a loaded machine
+//     (loadavg 10 was watched) a single early event can sit unread past
+//     the parent's natural lifetime and the session dies of old age
+//     instead of the kill. A steady stream means the kill lands the
+//     moment the consumer is scheduled, however late.
+//   - The descendant's marker is POLLED FOR after Invoke returns, not
+//     checked once immediately. A direct-child-only kill regression
+//     leaves the descendant alive holding the inherited stdout fd; the
+//     old immediate check ran while it was still asleep, saw no marker,
+//     and passed — pinned by nothing. Waiting past the descendant's
+//     lifetime makes survival observable: if the marker ever appears,
+//     something escaped the kill.
 func TestProcessGroupKillTerminatesAGrandchild(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "claude")
 	marker := filepath.Join(dir, "grandchild_alive")
+	event := `{"type":"assistant","message":{"content":[{"type":"text","text":"work"}],"usage":{"input_tokens":60000000,"output_tokens":0}}}`
 	script := `#!/bin/sh
-# Emit a stream event that crosses the token ceiling immediately.
-echo '{"type":"assistant","message":{"content":[{"type":"text","text":"work"}],"usage":{"input_tokens":60000000,"output_tokens":0}}}'
-# Background a grandchild that outlives the parent session.
-(sleep 60; touch ` + marker + `) &
-# Parent continues so the adapter kills it mid-stream.
-exec sleep 60
+# Background a grandchild that outlives the parent session and marks the
+# world if it survived the kill. First, so its 2s clock starts now.
+( sleep 2; touch "` + marker + `" ) &
+# Stream events that cross the token ceiling immediately, so the kill
+# fires whenever the consumer first reads — never of natural old age.
+i=0
+while [ $i -lt 250 ]; do
+  echo '` + event + `'
+  sleep 0.2
+  i=$((i+1))
+done
+# Outlive any plausible scheduling delay, then stop: if the kill has not
+# fired by here the session died of old age and the elapsed bound fails.
+exec sleep 120
 `
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 		t.Fatalf("writing stub: %v", err)
@@ -38,8 +64,10 @@ exec sleep 60
 	elapsed := time.Since(start)
 
 	// The adapter must return promptly, not hang on the grandchild's
-	// inherited stdout pipe.
-	if elapsed > 10*time.Second {
+	// inherited stdout pipe. (claude's session path sets no WaitDelay, so
+	// a surviving holder blocks Wait outright — which is itself the
+	// failure being asserted against.)
+	if elapsed > 20*time.Second {
 		t.Fatalf("Invoke blocked for %s: the kill did not reach the grandchild holding the stream", elapsed)
 	}
 	if err != nil {
@@ -52,10 +80,9 @@ exec sleep 60
 		t.Error("ExitCode = 0 — the child was not killed; the group kill did not fire")
 	}
 
-	// The grandchild must be dead: the marker file must never appear.
-	if _, exists := os.Stat(marker); !os.IsNotExist(exists) {
-		t.Errorf("grandchild marker file %s exists — the descendant survived the group kill", marker)
-	}
+	// The grandchild must be dead: poll past its 2s lifetime and fail the
+	// moment the marker proves a survivor.
+	waitForGrandchildMarker(t, marker)
 }
 
 // The same shape for the opencode adapter: a wall-clock cap kills the
@@ -68,8 +95,9 @@ func TestOpencodeProcessGroupKillTerminatesAGrandchild(t *testing.T) {
 echo '{"type":"step_start","sessionID":"s1","part":{"type":"step-start"}}'
 echo '{"type":"text","sessionID":"s1","part":{"type":"text","text":"working"}}'
 echo '{"type":"step_finish","sessionID":"s1","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
-# Background a grandchild that outlives the parent.
-(sleep 60; touch `+marker+`) &
+# Background a grandchild that outlives the parent and marks the world
+# if it survived the kill.
+( sleep 2; touch "`+marker+`" ) &
 # Parent continues so the adapter kills it mid-session.
 exec sleep 60
 `)
@@ -92,7 +120,20 @@ exec sleep 60
 		t.Error("the session was not reported as wall-clock capped")
 	}
 
-	if _, exists := os.Stat(marker); !os.IsNotExist(exists) {
-		t.Errorf("grandchild marker file %s exists — the descendant survived the group kill", marker)
+	waitForGrandchildMarker(t, marker)
+}
+
+// waitForGrandchildMarker polls past a 2s-lifetime descendant and fails as
+// soon as the marker appears — i.e. the moment anything is proven to have
+// survived the kill. Absent after the window, the group kill reached the
+// whole tree.
+func waitForGrandchildMarker(t *testing.T, marker string) {
+	t.Helper()
+	deadline := time.Now().Add(3500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatalf("grandchild marker file %s appeared — the descendant survived the group kill", marker)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
