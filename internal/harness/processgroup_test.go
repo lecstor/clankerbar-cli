@@ -65,7 +65,7 @@ exec sleep 120
 	// regression it guards would hang to the package timeout instead of
 	// failing here. The stub streams for ~50s then sleeps 120s, so an
 	// unfired kill blows the 30s bound long before that.
-	res, err, _ := invokeWithBound(t, 30*time.Second, func() (Result, error) {
+	res, err := invokeWithBound(t, 30*time.Second, func() (Result, error) {
 		return (claude{}).Invoke(context.Background(), Invocation{
 			Prompt:           "work",
 			MaxSessionTokens: 10, // any positive ceiling kills quickly
@@ -109,7 +109,7 @@ exec sleep 60
 	// regression this test's real pin is the MARKER POLL below, not the
 	// bound: cmd.WaitDelay (set for any capped session) force-closes the
 	// pipes and returns Wait in ~5s even with the descendant still alive.
-	res, err, _ := invokeWithBound(t, 30*time.Second, func() (Result, error) {
+	res, err := invokeWithBound(t, 30*time.Second, func() (Result, error) {
 		return (opencode{}).Invoke(context.Background(), Invocation{
 			Prompt:              "work",
 			MaxSessionWallClock: 500 * time.Millisecond,
