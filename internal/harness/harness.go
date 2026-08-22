@@ -99,12 +99,11 @@ type Adapter interface {
 	// a capped session left its uncommitted work in the worktree; that is the
 	// historical reason this path says what it says, not its present behaviour.
 	// The two capabilities are independent on purpose: the day an adapter has
-	// both, this same path hands it the checkpoint too — exactly the shipped
-	// present since CLA-365, when opencode gained claim observation.
-	// marker is
-	// the adapter's own, never text the CLI or an agent could emit, so a task
-	// body cannot forge one. An adapter with no wall-clock cap returns false for
-	// everything.
+	// both, this same path hands it the checkpoint too - exactly the shipped
+	// present since CLA-365, when opencode gained claim observation. Like the
+	// token ceiling, the marker is the adapter's own, never text the CLI or an
+	// agent could emit, so a task body cannot forge one. An adapter with no
+	// wall-clock cap returns false for everything.
 	WallClockCapped(Result) bool
 
 	// ZeroUsageUnknown reports whether the session ended with a FINAL
