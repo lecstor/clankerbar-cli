@@ -75,6 +75,75 @@ func TestBuiltinImplementPhaseTellsTheSessionToStopAtTheCheckpoint(t *testing.T)
 	}
 }
 
+// CLA-378: a resumed branch is a liability until it has been synced and
+// re-proven. EZY-199 was a recovered stale claim whose implement phase verified
+// the found tip faithfully (build, unit suite, 60 e2e executions, push) without
+// ever syncing staging in - staging had superseded the branch's whole fix a day
+// earlier, and the review phase paid for the archaeology and salvage a cheap
+// up-front check would have made unnecessary. The brief must carry all three
+// parts of the rule: merge the integration branch (never rebase), re-validate
+// the task against the merged tip before working, and on supersession record
+// and salvage instead of pushing stale work.
+func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
+	brief, ok := builtinPhasePrompts[ImplementPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
+	}
+	if !strings.Contains(brief, implementResumedBranchRule) {
+		t.Fatalf("the implement brief does not carry the resumed-branch rule:\n%s", brief)
+	}
+
+	lower := strings.ToLower(brief)
+	for _, want := range []string{
+		"existing branch or worktree",
+		"haswip",
+		"merge the project's integration branch",
+		"a merge, never a rebase",
+		"phase-boundary check",
+		"re-validate the task against the merged tip",
+		"doing or verifying",
+		"silently revert a newer fix",
+		"the task's own bar",
+		"conflict markers",
+		"record_decision",
+		"salvage",
+		"stale work",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the resumed-branch rule never says %q:\n%s", want, brief)
+		}
+	}
+
+	// Order is part of the rule: sync, then re-prove, and only then the
+	// supersession path. Presence alone would pass a brief listing them in an
+	// order a session could read as verify-first, the exact behaviour being
+	// removed.
+	mergeIdx := strings.Index(lower, "merge the project's integration branch")
+	revalidateIdx := strings.Index(lower, "re-validate the task against the merged tip")
+	supersededIdx := strings.Index(lower, "supersedes the task")
+	if mergeIdx == -1 || revalidateIdx == -1 || supersededIdx == -1 {
+		t.Fatalf("merge (%d), re-validate (%d) or supersession (%d) missing from the brief:\n%s",
+			mergeIdx, revalidateIdx, supersededIdx, brief)
+	}
+	if !(mergeIdx < revalidateIdx && revalidateIdx < supersededIdx) {
+		t.Errorf("the rule is not sync (%d) -> re-validate (%d) -> supersede (%d) in that order:\n%s",
+			mergeIdx, revalidateIdx, supersededIdx, brief)
+	}
+
+	// It rides before the shared handoff guidance, so it reads as part of the
+	// brief's own instructions rather than an afterthought.
+	if !strings.HasSuffix(brief, implementResumedBranchRule+handoffGuidance) {
+		t.Errorf("the resumed-branch rule is not the last instruction before the handoff guidance:\n%s", brief)
+	}
+
+	// Harness-neutral: one wording serves every harness's implement phase.
+	for _, name := range []string{"claude", "opencode", "codex"} {
+		if strings.Contains(lower, name) {
+			t.Errorf("the implement brief names harness %q; its wording must hold for every harness:\n%s", name, brief)
+		}
+	}
+}
+
 // The resume brief is useless without the ids, and they are substituted by the
 // driver — so the placeholders have to actually be in the shipped text.
 func TestBuiltinReviewPhaseCarriesTheResumePlaceholders(t *testing.T) {
