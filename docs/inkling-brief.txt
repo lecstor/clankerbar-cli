@@ -1,0 +1,48 @@
+You are a senior engineer asked to critique and improve a design proposal
+before any implementation happens. You are one of two models being compared
+for this exact kind of contribution, so the most useful thing you can be is
+concrete, critical, and honest - including about your own limitations.
+
+CONTEXT. A fleet of four unattended coding-agent daemons ("clankerbar")
+implements and reviews backlog tasks via the opencode CLI on free model
+routes. Today every review is a single adversarial pass performed inline by
+the reviewing session (an ox-alpha variant). The proposal wants TWO
+independent adversarial reviews of the SAME pre-fix diff on each task -
+ox-alpha AND inkling - with dispatch order alternating across tasks so
+position bias cancels, and both findings lists recorded verbatim to build a
+who-found-what / who-missed-what dataset.
+
+The full plan lives at docs/dual-review-plan.md in this directory - read it
+first. It contains verified architecture findings: what the driver's config
+already supports (per-phase tier->model routing, custom phase prompts),
+what it cannot do (same-artifact dual review via phases, because review
+phases fix what they find; per-task dynamic ordering), and three tiers of
+solution (guidance-level pilot using a one-shot `opencode run` subprocess;
+a ~300-500 line driver feature; protocol-level coordination).
+
+YOUR TASKS, in order:
+
+1. ATTACK THE DESIGN. Find the flaws in the Tier 0 pilot as specified:
+   instruction-following risk, diff-size handling, outcome size caps,
+   blindness between reviewers, anything it quietly assumes.
+2. IMPROVE THE INVOCATION. Draft the actual adversarial-review template the
+   subprocess would receive: the fixed prompt given to inkling along with a
+   branch diff. Requirements: blind to author identity; severity-rated
+   findings; explicit "no findings" option; output shaped for later parsing
+   (fixed headings). Keep it under 250 words.
+3. BETTER ALTERNATIVES. If you know a structurally better way to get
+   independent multi-model review from unattended CLI sessions, describe it -
+   including ones that need no driver changes at all.
+4. METRICS. Propose up to five comparison metrics for the ledger that would
+   actually separate reviewer quality from verbosity and from luck, given
+   ground truth arrives only after fixes land.
+5. VERDICT. Would you trust this mechanism's data enough to decide whether
+   inkling earns a permanent reviewer slot? What sample size and what result
+   would change your mind?
+
+Constraints to respect: Tier 0 must not require driver code changes; the
+served clankerbar protocol documents must not be edited; free-route request
+quotas are finite; outcome text fields are small.
+
+Return: numbered sections matching the five tasks. Be specific and terse -
+file paths, key names, and wording over generalities.
