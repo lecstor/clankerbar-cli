@@ -241,7 +241,7 @@ whether the branches have diverged
 (`git fetch origin && git log --graph --oneline --left-right origin/main...origin/staging`);
 if they have, approve the run. Approving has its own visible effect: the run
 starts executing and reports pending under the required `ci` context, so the
-PR stops reading mergeable until it finishes.
+PR stops reading CLEAN until it finishes.
 
 Evidence: verified live on 2026-08-22 against the standing promotion PR #91
 (open at the time) - its `pull_request` run sat parked at `action_required`,

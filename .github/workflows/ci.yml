@@ -23,7 +23,7 @@ name: ci
 # requires the `ci` check against the PR's head SHA, and this very trigger -
 # the push run on that SHA - already satisfies it. Drop `staging` from the
 # push list and nothing does: the only run left is the parked one, so every
-# promotion sits UNSTABLE until someone approves by hand instead of being
+# promotion sits BLOCKED until someone approves by hand instead of being
 # mergeable outright.
 on:
   pull_request:

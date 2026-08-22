@@ -98,8 +98,8 @@ func TestCIWorkflowHasNoMatrix(t *testing.T) {
 //     head SHA.
 //
 // The `staging` half has no other protection: nothing fails until a human opens
-// the promotion PR and finds it reading UNSTABLE over a parked run rather than
-// CLEAN.
+// the promotion PR and finds it BLOCKED behind its own parked run instead of
+// mergeable.
 func TestCIWorkflowRunsOnBothIntegrationBranches(t *testing.T) {
 	path := filepath.Join("..", "..", ".github", "workflows", "ci.yml")
 	raw, err := os.ReadFile(path)
