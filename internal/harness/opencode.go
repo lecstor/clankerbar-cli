@@ -267,6 +267,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	defer cancel()
 
 	cmd := exec.CommandContext(sctx, "opencode", args...)
+	setupProcessGroup(cmd)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
@@ -290,6 +291,16 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// cut short by it.
 	if _, hasDeadline := sctx.Deadline(); hasDeadline {
 		cmd.WaitDelay = 5 * time.Second
+	}
+
+	// Monitor the deadline and kill the whole process group (not just the
+	// direct child) so descendants holding inherited pipes — a grandchild
+	// build/test or an MCP server — are terminated and Wait can return.
+	if _, hasDeadline := sctx.Deadline(); hasDeadline {
+		go func() {
+			<-sctx.Done()
+			killProcessGroup(cmd)
+		}()
 	}
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text

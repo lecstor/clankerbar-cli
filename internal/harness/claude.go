@@ -93,6 +93,7 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(sctx, "claude", claudeArgs(in)...)
+	setupProcessGroup(cmd)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
@@ -120,7 +121,14 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// mid-stream, instead of running to the end and being judged after.
 	stdoutTail := newTail()
 	res := newSessionResult(in)
-	c.consume(stdoutPipe, console, stdoutTail, &res, in.MaxSessionTokens, cancel)
+	// Kill the whole process group (descendants holding inherited pipes)
+	// rather than only the direct child, so a ceiling kill actually stops
+	// the session and lets Wait return promptly.
+	groupKill := func() {
+		killProcessGroup(cmd)
+		cancel()
+	}
+	c.consume(stdoutPipe, console, stdoutTail, &res, in.MaxSessionTokens, groupKill)
 	waitErr := cmd.Wait()
 
 	res.Stdout = stdoutTail.String()
