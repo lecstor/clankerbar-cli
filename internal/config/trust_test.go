@@ -512,6 +512,34 @@ func TestLocalMCPServersAreNamed(t *testing.T) {
 	}
 }
 
+// The disclosure and CLA-266's gate must answer "does this entry start a
+// process" the SAME way. An entry carrying `args` but no `command`, or a
+// `"command": null`, starts nothing - readMCPServers used to report both as
+// local processes (one with a command that read "null --serve"), so doctor's
+// WARN named entries that never run. A WARN listing entries that cannot run
+// trains the operator to skim it, which is how the real one gets missed.
+func TestLocalMCPServersDoNotReportEntriesThatStartNothing(t *testing.T) {
+	workdir := t.TempDir()
+	body := `{"mcpServers":{
+		"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"},
+		"argsonly":{"args":["-c","echo hi"]}},
+	 "mcp":{"nullcmd":{"command":null,"args":["--serve"]}}}`
+	path := filepath.Join(workdir, ".mcp.json")
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := defaults()
+	c.WorkDir = workdir
+	c.MCPConfigPath = path // named: past the discovered-file rule, into disclosure alone
+	if err := c.Validate(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	local := c.LocalMCPServers()
+	if len(local) != 0 {
+		t.Fatalf("entries that start no process must not be disclosed as local servers, got %+v", local)
+	}
+}
+
 // Unix permission bits do not mean what this code assumes on Windows, and a
 // refusal there would be a rejection with no fix - so the code skips the checks
 // there too (see filemode_other.go), and these tests skip with it.

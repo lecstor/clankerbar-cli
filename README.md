@@ -878,6 +878,32 @@ so a workdir that carries a Claude `.mcp.json` hands it over no matter what. Run
 `clankerbar doctor` - it prints the caveat instead of a verdict where the file is not
 read, and FAILs the workdir check when `opencode` is pointed at a Claude-shaped one.
 
+#### A discovered `.mcp.json` may not choose what runs
+
+A file that arrives through the default above was FOUND, not named - and a checkout
+can write it as easily as you did (sessions run with edit permission in that
+directory, and the damage would land on the next unattended start). Since it is
+handed to the harness whole, a config nobody pointed at is held to three rules:
+
+1. **An MCP entry carrying a `command` - a locally spawned server - is refused.**
+   It starts at session init, before any permission rule applies, running as you
+   with the session's whole environment (`CLANKERBAR_API_KEY` included). Entries
+   you meant go under `"allow_local_mcp_servers": ["docs"]` - top level, or on a
+   `projects[]` entry (which replaces the top-level list for that project). The
+   other way out is naming the file: an explicit `mcp_config_path` adopts it
+   wholesale.
+2. **Keys that decide what a session IS are refused outright.** Under opencode the
+   file is the session's ENTIRE config, so a discovered one may not set
+   `permission` (it would replace the fail-closed policy the driver pins),
+   `plugin`, or `agent`. No allowlist reaches these; name the file if you mean them.
+3. **A discovered file that cannot be read is refused**, not passed through.
+
+`allow_local_mcp_servers` gets the same visibility as every other loose state:
+`doctor`'s `mcp_servers` check reports the list beside the entries it admits. A
+file you NAMED with `mcp_config_path` is exempt from all three rules - naming it
+is the statement that you vetted it - and its local servers are still disclosed
+by doctor's WARN as they always were.
+
 Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at the
 root here is the maintainers' own agent wiring and names the `clankerbar` project
 slug; running the loop from inside this checkout would have it poll a queue you

@@ -160,12 +160,22 @@ func readMCPServers(path string) ([]mcpServer, error) {
 	out := make([]mcpServer, 0, len(f.MCPServers)+len(f.MCP))
 	for _, block := range []map[string]mcpEntry{f.MCPServers, f.MCP} {
 		for name, s := range block {
-			out = append(out, mcpServer{
+			server := mcpServer{
 				name:    name,
 				url:     s.URL,
 				usesKey: referencesKey(s.Headers) || referencesKey(s.Env) || referencesKey(s.Environment),
-				command: strings.TrimSpace(strings.TrimSpace(string(s.Command)) + " " + strings.TrimSpace(string(s.Args))),
-			})
+			}
+			// Only an entry that would actually START something carries a command.
+			// Raw "null", and args-without-command, used to be reported as a
+			// process (doctor named an entry whose command read "null --serve"),
+			// which made this disclosure disagree with startsProcess — the same
+			// predicate CLA-266's gate applies to the very same entry. Disclosure
+			// and gate must answer "does this start a process" identically: a WARN
+			// listing entries that never run trains the operator to skim it.
+			if s.startsProcess() {
+				server.command = strings.TrimSpace(strings.TrimSpace(string(s.Command)) + " " + strings.TrimSpace(string(s.Args)))
+			}
+			out = append(out, server)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
