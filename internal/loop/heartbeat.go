@@ -106,6 +106,13 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, t Target, inv *harness.I
 // observe receives one claim snapshot from an adapter's parser. Latest wins:
 // if the renewer has not drained the previous snapshot yet, it is dropped in
 // favour of this one - only the newest claim state can be true.
+//
+// Invocation.OnClaim asks for a non-blocking implementation, and this is one
+// except at one bound: if FOUR snapshots pile up undrained - which takes the
+// renewer stuck inside one Heartbeat call while four claim transitions stream
+// past - the fifth waits for that call's heartbeatBeatTimeout rather than drop
+// the newest state. Dropping the newest is the one loss this channel cannot
+// tolerate; the wait is bounded by stop() regardless.
 func (r *leaseRenewer) observe(c harness.Claim) {
 	if r == nil {
 		return
@@ -132,9 +139,16 @@ func (r *leaseRenewer) observe(c harness.Claim) {
 }
 
 // run is the renewer's loop: beat every interval for as long as the current
-// claim carries a run id, follow the claim as the session settles one task and
-// claims the next, and stand down on cancellation, stop(), a not-wired plane,
-// or heartbeatGiveUp consecutive failures.
+// claim is HELD (Claim.Held: a task held and not yet settled by the session
+// itself), follow the claim as the session settles one task and claims the
+// next, and stand down on cancellation, stop(), a not-wired plane, or
+// heartbeatGiveUp consecutive failures.
+//
+// Held is the gate, not RunID != "": a settle keeps the run id on the tracked
+// claim (the driver reads it after exit) and flips Settled instead, so a
+// settle arrives as a snapshot whose RunID is unchanged. Keying the pause off
+// RunID would make it unreachable and keep beating a lease the plane already
+// released.
 func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 	defer close(r.stopped)
 	ticker := time.NewTicker(r.interval)
@@ -151,16 +165,15 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 			}
 			return
 		case c := <-r.claims:
-			if c.RunID != current.RunID {
-				if c.RunID == "" {
-					log.Printf("%sthe session settled %s - pausing lease renewal until it holds a task again", r.prefix, claimName(current))
-				} else {
-					log.Printf("%srenewing the lease of %s every %s while the session runs", r.prefix, claimName(c), r.interval)
-				}
+			switch {
+			case c.Settled && !current.Settled:
+				log.Printf("%sthe session settled %s - pausing lease renewal until it holds a task again", r.prefix, claimName(c))
+			case !c.Settled && c.RunID != "" && c.RunID != current.RunID:
+				log.Printf("%srenewing the lease of %s every %s while the session runs", r.prefix, claimName(c), r.interval)
 			}
 			current = c
 		case <-ticker.C:
-			if current.RunID == "" {
+			if !current.Held() {
 				continue
 			}
 			bctx, cancel := context.WithTimeout(ctx, heartbeatBeatTimeout)

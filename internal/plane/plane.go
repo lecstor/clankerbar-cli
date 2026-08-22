@@ -163,7 +163,7 @@ type ParkAPI interface {
 type notWired struct{}
 
 func (notWired) Release(context.Context, string, string) error { return ErrNotWired }
-func (notWired) Heartbeat(context.Context, string) error { return ErrNotWired }
+func (notWired) Heartbeat(context.Context, string) error       { return ErrNotWired }
 
 // New builds a Releaser. Missing either the endpoint or the key yields a
 // not-wired one, so an operator running without a configured plane is degraded
