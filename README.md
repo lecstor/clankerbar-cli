@@ -63,10 +63,17 @@ checkpoint:
 
 Phase 1 claims the task, implements it in a worktree cut from the repo's
 integration branch, self-verifies, commits, pushes and records the branch — then
-stops. Phase 2 starts on a **fresh context**, resumes the *same* run (the driver
-substitutes the task and run ids into its brief, so it calls `heartbeat` instead
-of claiming), re-reads the bar and the standing decisions from the plane, works
-in that same worktree — never on the integration branch itself — runs the
+stops. When phase 1 instead finds an existing branch or worktree already
+carrying the task's work (a recovered claim, a prior session's WIP), its first
+step is to merge the integration branch into it - a merge, never a rebase,
+since rewriting pushed history breaks tip comparison - and re-validate the task
+against the merged tip before touching what it found: superseded means record
+the decision and park the task with an outcome saying so, or salvage only what
+still adds value - never verify-and-push stale work. Phase 2 starts on a
+**fresh context**, resumes the *same* run (the driver substitutes the task and
+run ids into its brief, so it calls `heartbeat` instead of claiming), re-reads
+the bar and the standing decisions from the plane, works in
+that same worktree — never on the integration branch itself — runs the
 adversarial review, fixes what it finds, pushes, opens a PR targeting the
 integration branch if no PR exists yet for the branch, and hands the task to
 `in_review`. The claim is held across the seam, so the task is never posted back

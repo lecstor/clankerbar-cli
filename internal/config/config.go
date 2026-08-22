@@ -341,6 +341,37 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 	"already lives in the repo or on the task, and under 4KB. The successor resumes this same run under this " +
 	"same brief's scope, so do NOT settle, release or hand back the task first."
 
+// implementResumedBranchRule is the implement brief's rule for resuming an EXISTING branch or
+// worktree (CLA-378). EZY-199 was a recovered stale claim whose implement phase followed the
+// rest of this brief faithfully - it verified the found tip with a build, the unit suite and
+// 60 e2e executions, then pushed - and never synced against staging, which had superseded the
+// branch's whole fix a day earlier. The review phase then paid $11.70 for the archaeology,
+// merge and salvage that an up-front check costing cents would have made unnecessary.
+//
+// Three parts, each load-bearing. SYNC first, as a merge and never a rebase: the branch may
+// already be pushed, and the daemon's phase-boundary check compares the pushed origin tip to
+// the local tip, which a rebase invalidates. RE-VALIDATE against the MERGED tip before doing
+// or verifying anything: a clean merge proves nothing - it can silently revert a newer fix -
+// so the check is the task's own bar, not conflict markers. On SUPERSESSION, record the
+// decision and PARK the task with an outcome citing it - a bare stop leaves the recorded
+// branch reading as checkpointed WIP, which spends a review phase rediscovering the stale
+// tip - or salvage only what still adds value; never re-verify and push stale work.
+//
+// Harness-neutral on purpose: one wording serves every harness's implement phase.
+const implementResumedBranchRule = "RESUMED WORK comes first when you find it: if the claim hands you an EXISTING branch or " +
+	"worktree for this task (a recovered stale claim, a prior session's WIP - check the repo yourself whatever " +
+	"the claim's hasWip flag said), your FIRST step is to merge the project's integration branch into it - a " +
+	"merge, NEVER a rebase: the branch may already be pushed, and rewriting pushed history invalidates the " +
+	"daemon's phase-boundary check, which compares the pushed origin tip to your local tip. THEN re-validate " +
+	"the task against the merged tip BEFORE doing or verifying any of the found work: a clean merge is not " +
+	"proof the task still needs doing - a non-conflicting merge can silently revert a newer fix - so the " +
+	"check is the task's own bar (for a bug: does it still reproduce?), not the absence of conflict markers. " +
+	"If the merged tip supersedes the task, record the decision (record_decision), then PARK the task with an " +
+	"outcome citing it (update_task status: parked) - task.branch is already set on a resumed branch, so a bare " +
+	"stop reads as checkpointed WIP and spends a phase 2 rediscovering the staleness - or salvage only what " +
+	"still adds value and carry on with the normal flow; either way do NOT spend the run re-verifying and " +
+	"pushing stale work."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
 // The split is implement, then review-and-fix, and that grouping is deliberate:
@@ -350,8 +381,9 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 // workflow puts implementation and fix in ONE actor and the review in a separate
 // read-only one. Splitting where that workflow already splits is the whole idea.
 var builtinPhasePrompts = map[string]string{
-	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
-		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work disposition below): " +
+		implementResumedBranchRule +
+		" Unless you parked above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + handoffGuidance,
