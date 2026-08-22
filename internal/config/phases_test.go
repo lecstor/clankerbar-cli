@@ -83,62 +83,99 @@ func TestBuiltinImplementPhaseTellsTheSessionToStopAtTheCheckpoint(t *testing.T)
 // up-front check would have made unnecessary. The brief must carry all three
 // parts of the rule: merge the integration branch (never rebase), re-validate
 // the task against the merged tip before working, and on supersession record
-// and salvage instead of pushing stale work.
+// the decision and park the task instead of re-verifying stale work.
+//
+// The content assertions are FULL directional phrases, not fragments: an
+// earlier draft pinned "doing or verifying" alone, and a mutation flipping the
+// rule's BEFORE to AFTER - the exact behaviour this rule exists to remove -
+// shipped green because the fragment survived the inversion. Every phrase here
+// fails when its direction or disposition is edited away.
 func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 	brief, ok := builtinPhasePrompts[ImplementPhaseName]
 	if !ok {
 		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
-	}
-	if !strings.Contains(brief, implementResumedBranchRule) {
-		t.Fatalf("the implement brief does not carry the resumed-branch rule:\n%s", brief)
 	}
 
 	lower := strings.ToLower(brief)
 	for _, want := range []string{
 		"existing branch or worktree",
 		"haswip",
-		"merge the project's integration branch",
+		"your first step is to merge the project's integration branch into it",
 		"a merge, never a rebase",
 		"phase-boundary check",
-		"re-validate the task against the merged tip",
-		"doing or verifying",
-		"silently revert a newer fix",
+		"then re-validate the task against the merged tip before doing or verifying any of the found work",
+		"can silently revert a newer fix",
 		"the task's own bar",
-		"conflict markers",
+		"not the absence of conflict markers",
+		"if the merged tip supersedes the task",
 		"record_decision",
-		"salvage",
-		"stale work",
+		"park the task with an outcome citing it",
+		"do not spend the run re-verifying and pushing stale work",
+		"unless you parked above, the rest of the flow is unchanged",
 	} {
 		if !strings.Contains(lower, want) {
 			t.Errorf("the resumed-branch rule never says %q:\n%s", want, brief)
 		}
 	}
 
-	// Order is part of the rule: sync, then re-prove, and only then the
-	// supersession path. Presence alone would pass a brief listing them in an
-	// order a session could read as verify-first, the exact behaviour being
-	// removed.
-	mergeIdx := strings.Index(lower, "merge the project's integration branch")
-	revalidateIdx := strings.Index(lower, "re-validate the task against the merged tip")
+	// The join back into the normal flow must be NON-exclusive: an earlier
+	// draft said "Otherwise, claim the task...", which read as exempting a
+	// resumed-and-still-valid session from commit/push/record-branch/STOP -
+	// the exact phase-1 contract phase 2 depends on.
+	if strings.Contains(lower, "otherwise, claim") {
+		t.Errorf("the resumed-branch rule excludes the found-work case from the normal flow with 'Otherwise, claim'; the join must carry every path into the checkpoint instructions:\n%s", brief)
+	}
+
+	// Order is part of the rule: sync, then re-prove, then the supersession
+	// disposition ending in the stale-work prohibition. Presence alone would
+	// pass a brief listing them in an order a session could read as
+	// verify-first, the exact behaviour being removed.
+	mergeIdx := strings.Index(lower, "your first step is to merge")
+	revalidateIdx := strings.Index(lower, "before doing or verifying any of the found work")
 	supersededIdx := strings.Index(lower, "supersedes the task")
-	if mergeIdx == -1 || revalidateIdx == -1 || supersededIdx == -1 {
-		t.Fatalf("merge (%d), re-validate (%d) or supersession (%d) missing from the brief:\n%s",
-			mergeIdx, revalidateIdx, supersededIdx, brief)
+	parkIdx := strings.Index(lower, "park the task with an outcome citing it")
+	staleIdx := strings.Index(lower, "re-verifying and pushing stale work")
+	joinIdx := strings.Index(lower, "unless you parked above, the rest of the flow is unchanged")
+	if mergeIdx == -1 || revalidateIdx == -1 || supersededIdx == -1 || parkIdx == -1 || staleIdx == -1 || joinIdx == -1 {
+		t.Fatalf("merge (%d), re-validate (%d), supersession (%d), parking (%d), stale-work end (%d) or flow join (%d) missing from the brief:\n%s",
+			mergeIdx, revalidateIdx, supersededIdx, parkIdx, staleIdx, joinIdx, brief)
 	}
-	if !(mergeIdx < revalidateIdx && revalidateIdx < supersededIdx) {
-		t.Errorf("the rule is not sync (%d) -> re-validate (%d) -> supersede (%d) in that order:\n%s",
-			mergeIdx, revalidateIdx, supersededIdx, brief)
-	}
-
-	// It rides before the shared handoff guidance, so it reads as part of the
-	// brief's own instructions rather than an afterthought.
-	if !strings.HasSuffix(brief, implementResumedBranchRule+handoffGuidance) {
-		t.Errorf("the resumed-branch rule is not the last instruction before the handoff guidance:\n%s", brief)
+	if !(mergeIdx < revalidateIdx && revalidateIdx < supersededIdx && supersededIdx < parkIdx && parkIdx < staleIdx && staleIdx < joinIdx) {
+		t.Errorf("the rule is not sync (%d) -> re-validate (%d) -> supersede/park (%d, %d) -> stale-work end (%d) -> flow join (%d) in that order:\n%s",
+			mergeIdx, revalidateIdx, supersededIdx, parkIdx, staleIdx, joinIdx, brief)
 	}
 
-	// Harness-neutral: one wording serves every harness's implement phase.
-	for _, name := range []string{"claude", "opencode", "codex"} {
-		if strings.Contains(lower, name) {
+	// The rule is entry guidance, so it rides BEFORE the terminal checkpoint
+	// instruction: this file's own field history (reviewTerminalStep) credits
+	// the brief's emphatic, named LAST instruction for never failing, and the
+	// first draft broke that shape by wedging the rule between STOP and the
+	// handoff guidance.
+	stopIdx := strings.Index(lower, "then stop and end the session")
+	ruleIdx := strings.Index(lower, strings.ToLower(implementResumedBranchRule))
+	if stopIdx == -1 || ruleIdx == -1 {
+		t.Fatalf("the stop instruction (%d) or the resumed-branch rule (%d) is missing:\n%s", stopIdx, ruleIdx, brief)
+	}
+	if ruleIdx > stopIdx {
+		t.Errorf("the resumed-branch rule (%d) sits after the terminal checkpoint instruction (%d); entry guidance must precede the work/stop sequence so the brief keeps its emphatic last instruction:\n%s", ruleIdx, stopIdx, brief)
+	}
+	if !strings.HasSuffix(brief, handoffGuidance) {
+		t.Errorf("the implement brief does not end with the shared handoff guidance:\n%s", brief)
+	}
+	// The join must sit in front of the work sequence it introduces: a join
+	// after the STOP instruction leaves the flow with no path statement
+	// before it (mutation-proven escapable before this pin existed).
+	if joinIdx > stopIdx {
+		t.Errorf("the flow join (%d) sits after the STOP instruction (%d); it must introduce the work sequence, not follow it:\n%s", joinIdx, stopIdx, brief)
+	}
+
+	// Harness-neutral: one wording serves every harness's implement phase. The
+	// registry, not a hardcoded list, is the source of truth for the name set.
+	names := harness.Names()
+	if len(names) == 0 {
+		t.Fatal("no harnesses registered; the neutrality check would be vacuous")
+	}
+	for _, name := range names {
+		if strings.Contains(lower, strings.ToLower(name)) {
 			t.Errorf("the implement brief names harness %q; its wording must hold for every harness:\n%s", name, brief)
 		}
 	}
