@@ -328,6 +328,18 @@ type Invocation struct {
 	// and it is the phase that does the pushing. Seeding restores them, and
 	// leaves Settled/HasWIP to be observed from the stream as usual.
 	ResumeClaim Claim
+
+	// OnClaim, when non-nil, is called by the adapter's parser the moment it
+	// observes the session's clankerbar claim state change: a claim_task whose
+	// result carried both ids (the tracked claim), and a settle of that claim.
+	// It exists for driver-side lease renewal (CLA-358): the loop starts a
+	// renewer around Invoke and learns the run id to renew from this callback
+	// mid-session, instead of only reading Result.Claim after the child exits.
+	//
+	// A claim that LOST its race fires nothing - its result recorded no ids,
+	// so there is nothing to announce. Called on the parser's goroutine;
+	// implementations must not block.
+	OnClaim func(Claim)
 }
 
 // ModelArg is the alias to put after an adapter's model flag, or "" for "emit no
@@ -434,6 +446,13 @@ type Result struct {
 	// Claim is the backlog task this session was still holding when it ended, so
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
+
+	// onClaim is the Invocation.OnClaim callback bound into this Result at
+	// construction (newSessionResult), so the shared observer can notify it
+	// without threading the Invocation through every parse helper. Unexported,
+	// and deliberately not copied onto the final Result by opencodeParse.finish,
+	// which builds that field-by-field: stream-side state stays stream-side.
+	onClaim func(Claim)
 
 	// Reports are the delivery claims this session got the plane to ACCEPT — a
 	// branch recorded as the hand-off, a commit declared landed — for the driver
@@ -732,6 +751,16 @@ func (c Claim) Names(id string) bool {
 		return false
 	}
 	return id == c.TaskID || (c.Ref != "" && strings.EqualFold(id, c.Ref))
+}
+
+// notifyClaim reports a claim-state change the shared observer just applied to
+// r - a claim recorded by noteClaimed, or the tracked claim settled - to the
+// Invocation's OnClaim watcher. Nil is the ordinary case: every caller that is
+// not the driver's lease renewer wires no watcher at all.
+func (r *Result) notifyClaim() {
+	if r.onClaim != nil {
+		r.onClaim(r.Claim)
+	}
 }
 
 // settlesTask reports whether an update_task carrying this status would release
