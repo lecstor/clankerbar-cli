@@ -109,8 +109,9 @@ func parseHandoff(final string) (prompt string, found bool, refusal string) {
 //     that happens are logged as themselves (CLA-421), because they are
 //     different situations with different consequences.
 //
-//     A SETTLED task means the session moved it to a terminal status itself -
-//     done, in_review, parked - and there is genuinely no run to resume. The
+//     A SETTLED task means the session moved it off in_progress itself -
+//     done, in_review, parked, blocked (settlesTask: any status but
+//     in_progress) - and there is genuinely no run to resume. The
 //     refusal is final and correct.
 //
 //     NO OBSERVED CLAIM means the adapter never saw this session claim anything,
