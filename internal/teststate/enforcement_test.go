@@ -3,6 +3,7 @@ package teststate
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"os/exec"
@@ -13,62 +14,68 @@ import (
 
 // The "MUST install this" rule in the package comment is enforced here, not
 // left to whoever adds the next package remembering a doc comment. A package
-// whose tests can reach internal/config - directly or through anything it
-// imports - compiles those tests into a binary that can derive and open the
-// real loop state root; without TestMain(teststate.Isolate) that binary can
-// neither isolate its tests nor be guarded, and a future doctor-style test
-// leaks silently (the CLA-361 failure shape). This test fails the suite the
-// moment such a package appears, instead of failing the operator's disk later.
+// whose TEST BINARY can reach internal/config - through the package under
+// test, a direct test-file import, or a test-only helper - links a binary
+// that can derive and open the real loop state root; without
+// TestMain(teststate.Isolate) that binary can neither isolate its tests nor
+// be guarded, and a future doctor-style test leaks silently (the CLA-361
+// failure shape). This test fails the suite the moment such a binary appears,
+// instead of failing the operator's disk later.
+//
+// The check runs over `go list -json -test ./...` and inspects each
+// synthesised `<pkg>.test` entry, because that is the only view whose Deps is
+// the closure actually linked into a test binary. Plain per-package listings
+// miss two shapes: internal/config itself never appears in its own deps or
+// in-package test imports, and a test file's imports are listed directly
+// only, so a helper that reaches config transitively would slip past.
 func TestEnforcedEverywhereConfigIsImported(t *testing.T) {
 	const configPkg = "github.com/lecstor/clankerbar-cli/internal/config"
 	const teststatePkg = "github.com/lecstor/clankerbar-cli/internal/teststate"
 
-	cmd := exec.Command("go", "list", "-json", "./...")
+	cmd := exec.Command("go", "list", "-json", "-test", "./...")
 	cmd.Dir = moduleRoot(t) // the test binary's cwd is this package; sweep the whole module
 	out, err := cmd.Output()
 	if err != nil {
-		if ee, ok := err.(*exec.ExitError); ok {
-			t.Fatalf("go list -json ./... failed: %v\n%s", err, ee.Stderr)
+		var lookErr *exec.Error
+		if errors.As(err, &lookErr) && errors.Is(lookErr.Err, exec.ErrNotFound) {
+			t.Fatalf("go toolchain unavailable, so the isolation rule cannot be enforced: %v", err)
 		}
-		t.Fatalf("go list -json ./... failed: %v", err)
+		if ee, ok := err.(*exec.ExitError); ok {
+			t.Fatalf("go list -json -test ./... failed: %v\n%s", err, ee.Stderr)
+		}
+		t.Fatalf("go list -json -test ./... failed: %v", err)
 	}
 
 	var violations []string
 	dec := json.NewDecoder(bytes.NewReader(out))
 	for {
 		var p struct {
-			ImportPath   string
-			Deps         []string
-			TestGoFiles  []string
-			XTestGoFiles []string
-			TestImports  []string
-			XTestImports []string
+			ImportPath string
+			Deps       []string
 		}
 		if err := dec.Decode(&p); err == io.EOF {
 			break
 		} else if err != nil {
 			t.Fatalf("decoding go list output: %v", err)
 		}
-		if p.ImportPath == teststatePkg {
-			continue // the mechanism itself; its own tests need no import of it
+		if !strings.HasSuffix(p.ImportPath, ".test") {
+			continue // not a synthesised test binary; plain entries carry no test closure
 		}
-		if len(p.TestGoFiles) == 0 && len(p.XTestGoFiles) == 0 {
-			continue // no test binary, nothing to isolate or guard
+		deps := make([]string, 0, len(p.Deps))
+		for _, d := range p.Deps {
+			// Inside a .test entry, packages built from test variants are
+			// named "<import path> [<variant>]" - strip back to the path.
+			if i := strings.Index(d, " ["); i >= 0 {
+				d = d[:i]
+			}
+			deps = append(deps, d)
 		}
-		reaches := contains(p.Deps, configPkg) ||
-			contains(p.TestImports, configPkg) ||
-			contains(p.XTestImports, configPkg)
-		if !reaches {
-			continue
-		}
-		installs := contains(p.TestImports, teststatePkg) ||
-			contains(p.XTestImports, teststatePkg)
-		if !installs {
-			violations = append(violations, p.ImportPath)
+		if contains(deps, configPkg) && !contains(deps, teststatePkg) {
+			violations = append(violations, strings.TrimSuffix(p.ImportPath, ".test"))
 		}
 	}
 	if len(violations) > 0 {
-		t.Errorf("these packages' tests can reach %s but install no TestMain(teststate.Isolate); add\n\n\tfunc TestMain(m *testing.M) { os.Exit(teststate.Isolate(m)) }\n\nto each (see package internal/teststate):\n\t%s",
+		t.Errorf("these packages' tests can reach %s but install no TestMain(teststate.Isolate); add\n\n\tfunc TestMain(m *testing.M) { os.Exit(teststate.Isolate(m)) }\n\nto each (see package internal/teststate). If an in-package TestMain closes as an import cycle, put it in the package's external _test package instead - that is what internal/config does:\n\t%s",
 			configPkg, strings.Join(violations, "\n\t"))
 	}
 }

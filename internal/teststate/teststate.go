@@ -47,16 +47,18 @@ import (
 func Isolate(m *testing.M) int {
 	// The real root must be resolved BEFORE the environment is overridden:
 	// config.StateRoot reads the live process environment, and after Setenv it
-	// would answer with the isolated directory instead.
-	realRoot, err := config.StateRoot()
-	guard := true
-	if err != nil {
+	// would answer with the isolated directory instead. The resolve error gets
+	// its own variable: every error below shares one name otherwise, and the
+	// degraded-mode warning at the bottom would read whatever assignment last
+	// touched it (nil, after a successful MkdirTemp).
+	realRoot, rootErr := config.StateRoot()
+	guard := rootErr == nil
+	if !guard {
 		// Nowhere real to guard against (HOME unset in a hermetic sandbox,
 		// for example). Degrade to isolation alone rather than failing every
 		// guarded package before a single test has run - isolation without
 		// the guard still keeps tests off the operator's machine.
 		realRoot = ""
-		guard = false
 	}
 
 	var beforeRoot, beforeParent []string
@@ -65,9 +67,9 @@ func Isolate(m *testing.M) int {
 		beforeParent = readDirNames(filepath.Dir(realRoot))
 	}
 
-	iso, err := os.MkdirTemp("", "clankerbar-test-state-")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "teststate: cannot create an isolated state home:", err)
+	iso, mkErr := os.MkdirTemp("", "clankerbar-test-state-")
+	if mkErr != nil {
+		fmt.Fprintln(os.Stderr, "teststate: cannot create an isolated state home:", mkErr)
 		return 1
 	}
 	defer os.RemoveAll(iso)
@@ -80,11 +82,11 @@ func Isolate(m *testing.M) int {
 
 	if !guard {
 		fmt.Fprintln(os.Stderr, "teststate: WARNING: pollution guard disabled for this run: the real loop state root could not be resolved ("+
-			err.Error()+"); XDG_STATE_HOME isolation was still active")
+			rootErr.Error()+"); XDG_STATE_HOME isolation was still active")
 		return code
 	}
 	if added := addedNames(beforeRoot, readDirNames(realRoot)); len(added) > 0 {
-		reportAdded(realRoot, added)
+		reportAdded(realRoot, added, true)
 		if code == 0 {
 			code = 1
 		}
@@ -92,7 +94,7 @@ func Isolate(m *testing.M) int {
 	// One level up as well: entries created next to loop/ under clankerbar/
 	// are the same leak wearing a different parent.
 	if added := addedNames(beforeParent, readDirNames(filepath.Dir(realRoot))); len(added) > 0 {
-		reportAdded(filepath.Dir(realRoot), added)
+		reportAdded(filepath.Dir(realRoot), added, false)
 		if code == 0 {
 			code = 1
 		}
@@ -101,14 +103,20 @@ func Isolate(m *testing.M) int {
 }
 
 // reportAdded prints the guard failure for one watched directory, including
-// the way out of the one known false positive: a live loop starting mid-run.
-func reportAdded(dir string, added []string) {
+// the way out of the known false positive: a live loop starting mid-run. Only
+// a loop start under loop/ mints a statedir, so the sibling directory gets a
+// plainer explanation.
+func reportAdded(dir string, added []string, isLoopDir bool) {
 	fmt.Fprintf(os.Stderr, "teststate: GUARD: %d entries were created under %s during this test run:\n", len(added), dir)
 	for _, name := range added {
 		fmt.Fprintf(os.Stderr, "teststate: GUARD:   %s\n", filepath.Join(dir, name))
 	}
 	fmt.Fprintln(os.Stderr, "teststate: GUARD: a test is deriving or writing state dirs without isolation - see package internal/teststate")
-	fmt.Fprintln(os.Stderr, "teststate: GUARD: not test pollution? A clankerbar loop that STARTED while this suite ran creates exactly such an entry; it joins the next run's baseline, so re-run before investigating.")
+	if isLoopDir {
+		fmt.Fprintln(os.Stderr, "teststate: GUARD: not test pollution? A clankerbar loop that STARTED while this suite ran creates exactly such an entry; it joins the next run's baseline, so re-run before investigating.")
+	} else {
+		fmt.Fprintln(os.Stderr, "teststate: GUARD: not test pollution? An external clankerbar process may have created this while the suite ran; it joins the next run's baseline, so re-run before investigating.")
+	}
 }
 
 // readDirNames lists one level of dir; a missing directory reads as empty.
