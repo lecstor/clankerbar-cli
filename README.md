@@ -112,9 +112,12 @@ boundary too. Two other consequences worth knowing:
   alone, so with no phase after it every task would stop half-finished, forever,
   with nothing in the logs reading as an error.
 
-The saving is **projected** at 20-28% for a two-way cut — modelled off one real
-task's decile curve, not measured from a phased run, and stated that way
-deliberately until a phased run has been measured. Splitting thinner earns less
+The saving is **still unmeasured**: a phased run has now happened, but it is not
+comparable evidence - its implement phase reached the checkpoint over an
+implementation that already existed, so its totals capture a checkpoint plus a
+review rather than a from-scratch split, and quoting them as a saving would
+overstate the effect by a wide margin. A like-for-like measurement still does
+not exist, and it costs a full task run to get. Splitting thinner earns less
 each time while every extra boundary still pays a session's full startup cost.
 
 ### Session-initiated handoff: a boundary the session chooses
