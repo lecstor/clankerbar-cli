@@ -292,7 +292,18 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
 	} else if runErr != nil && !timedOut {
-		return res, runErr // couldn't launch opencode at all
+		// p.finish has already run, so res carries everything the stream announced
+		// (the CLA-299 ordering: parse whatever arrived, THEN classify). Two shapes
+		// land here: a launch failure (bad PATH, unreadable config — nothing was
+		// emitted, so res is an honest zero), and — because any deadline context
+		// sets cmd.WaitDelay above — exec.ErrWaitDelay, where the process exited
+		// CLEANLY but a grandchild held its output pipes open past the delay.
+		// ErrWaitDelay therefore carries a fully parsed Result of a session that
+		// finished successfully; returning it as an error makes the driver fail a
+		// completed attempt. Reclassifying that as the clean end it is, is filed
+		// separately as CLA-414 — a classification question, not a parsing one;
+		// the figures survive either way.
+		return res, runErr
 	} else if runErr != nil {
 		// Our own kill: the child died on the cancel, so its error is the kill's
 		// and not a verdict. The marker above is the verdict.

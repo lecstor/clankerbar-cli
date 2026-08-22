@@ -718,9 +718,38 @@ func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	stdout, stderr := newTail(), newTail()
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
+	return c.probeResult(stdout, stderr, runErr)
+}
 
+// probeResult turns a finished probe run into its Result: parse whatever the CLI
+// managed to emit, THEN classify how the run ended (CLA-299).
+//
+// The order is the whole point. Run can fail with something other than an exit
+// status after the process has already printed its answer — the JSON object is
+// then sitting in stdout, and only the wait fell over. Parsing first means the
+// spend figures survive alongside the error, which is what Probe owes the budget,
+// since it charges on every path; the old order parsed AFTER the branch, so a
+// probe that emitted and died returned raw Stdout/Stderr and zeroes — exactly
+// the structurally-zero-on-error figures CLA-287 documents reading.
+//
+// Reachability, established rather than assumed: the streams are memory-backed
+// tails (they never fail a write), the probe tees to no console, and it sets no
+// WaitDelay — so no stub behaviour reachable on darwin or linux produces a
+// non-exit Run error after output. A signal death and every context kill arrive
+// as *exec.ExitError; a Start failure emits nothing and the zero Result is
+// correct there. The realistic carriers are exotic pipe/IO faults, which makes
+// the branch rare but not optional: both stream-path adapters parse whatever
+// arrived before classifying the failure, and this seam is where the probe does
+// the same. Pinned by TestClaudeProbeParsesBeforeClassifyingTheRunError, which
+// drives this seam directly because no stub can produce the error end to end.
+func (c claude) probeResult(stdout, stderr *tail, runErr error) (Result, error) {
 	dropped := stdout.Dropped() + stderr.Dropped()
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), OutputDropped: dropped, scans: newScanCache()}
+	res := Result{
+		Stdout:        stdout.String(),
+		Stderr:        stderr.String(),
+		OutputDropped: dropped,
+		scans:         newScanCache(),
+	}
 	// `--output-format json` is ONE object, so a trimmed tail does not merely lose
 	// context here — it loses the answer, and parse would fail into a Result that
 	// reads exactly like "no limit found". A few hundred bytes never reaches the
@@ -732,12 +761,12 @@ func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	if dropped > 0 {
 		res.markUntrusted(fmt.Sprintf("the probe's output overran the retained window (%d bytes dropped), so its verdict cannot be read", dropped))
 	}
+	c.parse(&res)
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
 		return res, runErr
 	}
-	c.parse(&res)
 	return res, nil
 }
 
@@ -1031,8 +1060,10 @@ func (c claude) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	res, err := c.Invoke(ctx, in)
 	// Spend first, and off the Result on every path: a probe that exited non-zero
 	// still cost what it cost, and under-counting is the one direction a budget
-	// breaker must not err in. On the error return this is whatever got parsed,
-	// which today is nothing — see ProbeResult and CLA-299.
+	// breaker must not err in. On the error return this is whatever the probe
+	// managed to parse from its output before the run error was classified
+	// (probeResult, CLA-299): a probe that emitted its answer and then died in
+	// Wait reports the spend it announced, not zero.
 	out := ProbeResult{Tokens: res.Tokens, CostUSD: res.CostUSD}
 	if err != nil {
 		return out, err
