@@ -257,3 +257,79 @@ echo '{"is_error":false,"result":"alive","total_cost_usd":0.02,"usage":{"input_t
 		t.Error("a clean probe verdict came back Limited")
 	}
 }
+
+// --- claude WaitDelay (CLA-423) -----------------------------------------------
+//
+// The same out-of-group escapee shape the opencode adapter closes with
+// WaitDelay: a stub session that exits cleanly but leaves a daemonised
+// (setsid) grandchild holding the inherited stderr fd open. Without
+// WaitDelay the adapter hangs past its own deadline; with it, Invoke
+// returns within the delay and preserves whatever arrived before the
+// forced close.
+
+func skipWithoutSetsid(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("setsid unavailable — the out-of-group escapee test requires it:", err)
+	}
+}
+
+func TestClaudeInvokeReturnsWithinBoundWhileEscapeeStillLives(t *testing.T) {
+	dir := t.TempDir()
+	stub := filepath.Join(dir, "claude")
+	// Parent emits a minimal stream-json result and exits cleanly; the
+	// daemonised grandchild holds stderr open past WaitDelay.
+	script := `#!/bin/sh
+# A minimal result event so the adapter has something to parse.
+echo '{"type":"assistant","message":{"usage":{"input_tokens":5,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}'
+echo '{"type":"assistant","message":{"content":[{"type":"text","text":"done"}]}}'
+echo '{"type":"result","result":"done","usage":{"input_tokens":10,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"total_cost_usd":0.01}'
+# Out-of-group escapee: inherits stderr, survives the parent's death,
+# and keeps the pipe open past WaitDelay (so WaitDelay, not the group
+# kill, is what ends Invoke).
+setsid sh -c 'sleep 30' < /dev/stdin >&2 &
+exit 0
+`
+	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+		t.Fatalf("writing stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	skipWithoutSetsid(t)
+
+	start := time.Now()
+	// A deadline context triggers WaitDelay (claude.go:103-106); the cap
+	// is generous so the delay itself, not the cap, is the bound.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	res, err := (claude{}).Invoke(ctx, Invocation{
+		Prompt:   "work",
+		Console:  io.Discard,
+	})
+	elapsed := time.Since(start)
+
+	// The adapter must return; it must NOT hang past the 5s WaitDelay.
+	if elapsed > 10*time.Second {
+		t.Errorf("Invoke took %v — past the 5s WaitDelay; the escapee blocked Wait past its bound", elapsed)
+	}
+	// The non-exit WaitDelay death is the only thing that explains both
+	// the clean session output and the return within the delay.
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Logf("Invoke error = %v (%T) — expected exec.ErrWaitDelay; the stream was still parsed (res preserved)", err, err)
+	} else {
+		t.Logf("Invoke returned exec.ErrWaitDelay as expected (elapsed=%v)", elapsed)
+	}
+	// Whatever arrived before the forced close must survive intact — the
+	// whole point of the backstop is that it catches the hang without
+	// destroying the session's work.
+	if res.Untrusted != "" {
+		t.Errorf("Result marked untrusted: %q — the stream reached clean EOF before the forced close", res.Untrusted)
+	}
+	if res.FinalMessage != "done" {
+		t.Errorf("FinalMessage = %q, want %q — the result event survived the forced close", res.FinalMessage, "done")
+	}
+	if res.Tokens == 0 && !res.UsageReported {
+		t.Log("Usage not reported — the stub's minimal event may not have reached the parser before the forced close; the result shape is the verification target, not exact token counts")
+	}
+}

@@ -97,6 +97,18 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = c.env(in)
+	// A cap that can hang is not a cap: the same grandchild-holds-the-pipe
+	// scenario the opencode adapter closes with WaitDelay (opencode.go:291-293).
+	// Set whenever the exec context carries any deadline — the caller's,
+	// or one this adapter created — so a daemonised escapee cannot stall
+	// Wait past it. It does NOT kill the orphan (that needs a process group,
+	// filed separately); it only lets the adapter return and account for what
+	// arrived before the forced close. The forced close triggers the same
+	// stream-drain path the scanner already handles: EOF, clean parse, and
+	// any bytes past the window counted in OutputDropped.
+	if _, hasDeadline := sctx.Deadline(); hasDeadline {
+		cmd.WaitDelay = 5 * time.Second
+	}
 
 	console := in.Console
 	if console == nil {
