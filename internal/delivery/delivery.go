@@ -13,13 +13,16 @@
 //
 // # Fail open, not closed
 //
-// Every check has three outcomes, not two: Pass, Fail, and Unknown. Unknown is
-// load-bearing. If the check cannot run — no git on PATH, no remote, a workdir
-// that is not a repository, a remote tip we do not have locally — the answer is
-// "could not verify", never "verified". A driver that reported a false pass would
-// be worse than the gap it replaces, and one that blocked a legitimate closure
-// because it could not find the tree would be worse still. Not knowing is not the
-// same as knowing it is fine, and neither is grounds for overriding the session.
+// Every check has four outcomes, not two: Pass, Fail, Unknown, and Warn.
+// Unknown is load-bearing. If the check cannot run — no git on PATH, no
+// remote, a workdir that is not a repository, a remote tip we do not have
+// locally — the answer is "could not verify", never "verified". A driver that
+// reported a false pass would be worse than the gap it replaces, and one that
+// blocked a legitimate closure because it could not find the tree would be
+// worse still. Not knowing is not the same as knowing it is fine, and neither
+// is grounds for overriding the session. Warn is CLA-310's: a check that ran
+// and found only the loose side of an operator's explicit opt-out — never
+// emitted by default.
 //
 // # Which working tree
 //
@@ -59,6 +62,10 @@ const (
 	Fail Status = "fail"
 	// Unknown: the check could not run. NOT a pass.
 	Unknown Status = "unknown"
+	// Warn: the check ran and found the loose side of an explicit operator
+	// opt-out (CLA-310's allow_unchecked_pr). It is neither a pass — the detail
+	// says what to confirm — nor a failure, because the operator chose it.
+	Warn Status = "warn"
 )
 
 // Kind names which claim a check was about.
@@ -85,11 +92,17 @@ type Claim struct {
 	// carried the work, and the branch it is claimed to have landed on.
 	Commit            string
 	IntegrationBranch string
+
+	// PR is the pull request the session named as carrying the delivery
+	// (CLA-310). Verified through the `gh` CLI — mergeable, with a check
+	// rollup that actually ran and passed; see prcheck.go for the two
+	// conditions, the bounded wait, and the no-CI decision.
+	PR string
 }
 
 // Empty reports that there is nothing here to check.
 func (c Claim) Empty() bool {
-	return c.Branch == "" && (c.Commit == "" || c.IntegrationBranch == "")
+	return c.Branch == "" && (c.Commit == "" || c.IntegrationBranch == "") && c.PR == ""
 }
 
 // Check is one verified (or unverifiable) assertion.
@@ -170,6 +183,18 @@ type Verifier struct {
 	workdir string
 	gitBin  string
 	remote  string
+
+	// allowUncheckedPR is CLA-310's operator opt-out: an empty check rollup on
+	// a named PR is downgraded from a refusal to a Warn. The MERGEABLE
+	// condition is never relaxed by it.
+	allowUncheckedPR bool
+
+	// ghBin and the polling window drive the PR check (prcheck.go). Fields so
+	// tests can substitute a fake gh and shrink the wait; New fills the
+	// production values.
+	ghBin      string
+	prBudget   time.Duration
+	prInterval time.Duration
 }
 
 // New builds a Verifier rooted at a session's workdir. remote is the git remote
@@ -178,7 +203,23 @@ func New(workdir, remote string) *Verifier {
 	if remote == "" {
 		remote = "origin"
 	}
-	return &Verifier{workdir: workdir, gitBin: "git", remote: remote}
+	return &Verifier{
+		workdir:    workdir,
+		gitBin:     "git",
+		remote:     remote,
+		ghBin:      "gh",
+		prBudget:   prPollBudget,
+		prInterval: prPollInterval,
+	}
+}
+
+// AllowUncheckedPR applies the no-CI opt-out (CLA-310): an empty check rollup
+// on a delivery's PR becomes a WARN instead of a refusal. It never relaxes
+// the mergeability condition, and it changes nothing for repos whose PRs do
+// carry checks. Returns the verifier, for chaining off New.
+func (v *Verifier) AllowUncheckedPR() *Verifier {
+	v.allowUncheckedPR = true
+	return v
 }
 
 // Verify checks a claim and returns what it found. It never returns an error:
@@ -213,6 +254,12 @@ func (v *Verifier) Verify(ctx context.Context, c Claim) Report {
 	}
 	if c.Commit != "" && c.IntegrationBranch != "" {
 		rep.Checks = append(rep.Checks, v.mergeCheck(ctx, repos, c.Commit, c.IntegrationBranch, &rep))
+	}
+	if c.PR != "" {
+		// Runs after the git checks so it can prefer the repository they
+		// resolved (rep.Repo); a PR number belongs to a repository, and the
+		// branch/commit checks are what identify it.
+		rep.Checks = append(rep.Checks, v.prCheck(ctx, repos, c.PR, &rep))
 	}
 	return rep
 }
@@ -302,6 +349,9 @@ func (v *Verifier) allUnknown(c Claim, reason string) []Check {
 	}
 	if c.Commit != "" && c.IntegrationBranch != "" {
 		out = append(out, Check{Kind: CommitMerged, Status: Unknown, Detail: reason})
+	}
+	if c.PR != "" {
+		out = append(out, Check{Kind: PRVerified, Status: Unknown, Detail: reason})
 	}
 	return out
 }
@@ -507,6 +557,14 @@ func (v *Verifier) resolveRemote(ctx context.Context, repo string) string {
 		return names[0]
 	}
 	return v.remote
+}
+
+// remoteURL reads the URL of the repository's resolved remote, for callers
+// that need to know WHERE the remote points (the PR check derives the GitHub
+// owner/name from it). Empty with a nil error is not possible here: a remote
+// always has a URL or cannot be read.
+func (v *Verifier) remoteURL(ctx context.Context, repo string) (string, error) {
+	return v.run(ctx, repo, "remote", "get-url", v.resolveRemote(ctx, repo))
 }
 
 // lsRemote reads the remote's tip for a branch WITHOUT mutating anything. Empty

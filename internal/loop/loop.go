@@ -206,8 +206,11 @@ type Driver struct {
 	fleetOpenQ []int
 
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
-	// tests can substitute one; production always gets internal/delivery.
-	newVerifier func(workdir string) deliveryVerifier
+	// tests can substitute one; production always gets internal/delivery. The
+	// second argument is CLA-310's empty-check-rollup opt-out for the target
+	// being verified — resolved from config by the caller, which knows the
+	// target, so the verifier itself stays project-blind.
+	newVerifier func(workdir string, allowUncheckedPR bool) deliveryVerifier
 
 	// newSalvager builds the stranded-work rescuer for a workdir (CLA-314). Same
 	// shape and the same reason as newVerifier.
@@ -275,7 +278,13 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		fleetPaused: make([]bool, n),
 		fleetRaised: make([]bool, n),
 		fleetOpenQ:  make([]int, n),
-		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
+		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
+			v := delivery.New(workdir, "")
+			if allowUncheckedPR {
+				v.AllowUncheckedPR()
+			}
+			return v
+		},
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
 	}
@@ -1928,6 +1937,11 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 // looking at. Loud logging is the floor, it is cheap, and it is reversible.
 // Recorded as a decision on CLA-253.
 //
+// "Refusing the delivery" (CLA-310) lives inside that shape: a PR check that
+// fails is a Fail with the failing condition and its remedy named in the log,
+// and no verified attestation behind it — the driver's verdict on the delivery
+// is refusal, not a rewrite of what the session told the plane.
+//
 // # Fail open
 //
 // A check that could not run reports "could not verify" and the run carries on.
@@ -1946,16 +1960,18 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 		return
 	}
 
-	v := d.newVerifier(d.invocation(t, false).WorkDir)
+	v := d.newVerifier(d.invocation(t, false).WorkDir, d.cfg.AllowUncheckedPRFor(t.Name))
 	for _, rep := range res.Reports {
-		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch}
+		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch, PR: rep.PR}
 		if rep.ClaimsMerge() {
 			claim.Commit, claim.IntegrationBranch = rep.Commit, rep.IntegrationBranch
 		}
 		// Detached and bounded PER REPORT: a shared deadline would silently degrade
 		// every claim after the first slow one to "cannot check". Detached because a
 		// cancel arriving mid-check should not turn a real answer into a half one —
-		// the guard above is what makes cancellation prompt.
+		// the guard above is what makes cancellation prompt. The PR check's own
+		// polling budget sits well inside this deadline, so one slow GitHub read
+		// cannot starve the git checks that share the report.
 		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
 		out := v.Verify(vctx, claim)
 		cancel()
@@ -1964,6 +1980,8 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 			switch c.Status {
 			case delivery.Fail:
 				log.Printf("%sDELIVERY UNVERIFIED — %s: %s", labelOf(t), rep.Label(), c.Detail)
+			case delivery.Warn:
+				log.Printf("%sDELIVERY WARN — %s: %s", labelOf(t), rep.Label(), c.Detail)
 			case delivery.Unknown:
 				log.Printf("%scould not verify %s: %s — carrying on", labelOf(t), rep.Label(), c.Detail)
 			default:

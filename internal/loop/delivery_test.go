@@ -115,7 +115,7 @@ func runWithVerifier(t *testing.T, h harness.Adapter, rel plane.Releaser, v deli
 
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	if v != nil {
-		d.newVerifier = func(string) deliveryVerifier { return v }
+		d.newVerifier = func(string, bool) deliveryVerifier { return v }
 	}
 	if err := d.Run(ctx); err != nil {
 		t.Fatalf("Run returned error: %v", err)
@@ -141,6 +141,63 @@ func TestVerifyDeliveries_ChecksEveryClaimInTheSessionsWorkdir(t *testing.T) {
 	if v.claims[1].Commit != "abc1234" || v.claims[1].IntegrationBranch != "main" {
 		t.Errorf("delivery claim = %+v", v.claims[1])
 	}
+	if v.claims[1].PR != "#42" {
+		t.Errorf("delivery claim lost the session's PR (CLA-310): %+v", v.claims[1])
+	}
+}
+
+// The empty-rollup opt-out is per project: the flag the driver resolves from
+// config must reach the verifier it builds for THAT target, not the run-wide
+// default.
+func TestVerifyDeliveries_ResolvesTheUncheckedPROptOutPerTarget(t *testing.T) {
+	captureLogs(t)
+	for _, tc := range []struct {
+		slug string
+		want bool
+	}{{"strict", false}, {"loose", true}} {
+		cfg := fastCfg()
+		cfg.StateDir = t.TempDir()
+		cfg.WorkDir = t.TempDir()
+		cfg.MaxIterations = 1
+		cfg.Projects = []config.Project{{Slug: "strict"}, {Slug: "loose", AllowUncheckedPR: true}}
+		h := &fakeAdapter{steps: []invokeStep{{res: reported(okResult(0, 0), branchReport())}}}
+		d := NewMulti(cfg, h, []Target{{Name: tc.slug, Poller: busyPoller()}})
+		var seen bool
+		d.newVerifier = func(_ string, allowUncheckedPR bool) deliveryVerifier {
+			seen = allowUncheckedPR
+			return &fakeVerifier{}
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if err := d.Run(ctx); err != nil {
+			t.Fatalf("Run (%s) returned error: %v", tc.slug, err)
+		}
+		cancel()
+		if seen != tc.want {
+			t.Errorf("target %s: verifier got allowUncheckedPR=%t, want %t", tc.slug, seen, tc.want)
+		}
+	}
+}
+
+// A Warn-status check is neither "verified" nor "unverified": it gets its own
+// line, so an operator skimming for refusals does not read the loose side of
+// their own opt-out as green (CLA-310).
+func TestVerifyDeliveries_WarnGetsItsOwnLine(t *testing.T) {
+	logs := captureLogs(t)
+	v := &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{
+		Kind: delivery.PRVerified, Status: delivery.Warn,
+		Detail: "PR #7 carries NO checks — WARNING only (allow_unchecked_pr: true)",
+	}}}}
+	h := &fakeAdapter{steps: []invokeStep{{res: reported(okResult(0, 0), mergeReport())}}}
+
+	runWithVerifier(t, h, &fakeReleaser{}, v)
+
+	out := logs.String()
+	if !strings.Contains(out, "DELIVERY WARN") || !strings.Contains(out, "allow_unchecked_pr") {
+		t.Errorf("logs missing the WARN line:\n%s", out)
+	}
+	if strings.Contains(out, "DELIVERY UNVERIFIED") || strings.Contains(out, "verified ") {
+		t.Errorf("a WARN must not read as a refusal or a pass:\n%s", out)
+	}
 }
 
 func TestVerifyDeliveries_UsesTheTargetsWorkdir(t *testing.T) {
@@ -154,7 +211,7 @@ func TestVerifyDeliveries_UsesTheTargetsWorkdir(t *testing.T) {
 
 	h := &fakeAdapter{steps: []invokeStep{{res: reported(okResult(0, 0), branchReport())}}}
 	d := NewMulti(cfg, h, []Target{{Name: "acme", Poller: busyPoller(), WorkDir: projectDir}})
-	d.newVerifier = func(workdir string) deliveryVerifier {
+	d.newVerifier = func(workdir string, _ bool) deliveryVerifier {
 		gotWorkdir = workdir
 		return &fakeVerifier{}
 	}

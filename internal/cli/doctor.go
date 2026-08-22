@@ -212,7 +212,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkSessions(cfg)...)
 	checks = append(checks, checkMCPServers(cfg))
 	checks = append(checks, checkPermissionsAll(cfg)...)
-	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
+	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(cfg, e))
 }
 
 func doctorFailed(n int) error {
@@ -2210,6 +2210,45 @@ func anyPhaseRunsTheDefaultTurnCap(cfg *config.Config) bool {
 		}
 	}
 	return false
+}
+
+// --- 12. delivery PR gate ----------------------------------------------------
+
+// checkPRGate reports CLA-310's delivery gate and its one prerequisite: the
+// driver's verifier reaches GitHub through the `gh` CLI, and a delivery whose
+// PR is CONFLICTING or carries NO checks is refused when it runs. A missing
+// `gh` is a WARN, not a FAIL — the check degrades to an explicit
+// refusal-to-verify and the run carries on, which is the package's fail-open
+// discipline — but the operator should see the gate's prerequisite BEFORE the
+// first delivery goes out unchecked.
+func checkPRGate(cfg *config.Config, e doctorEnv) check {
+	c := check{name: "pr_gate", status: pass}
+	path, err := e.lookPath("gh")
+	if err != nil {
+		c.status = warn
+		c.detail = "gh is not on PATH — deliveries naming a PR cannot be verified (an unchecked PR is not caught)"
+		c.remedy = "install the GitHub CLI (https://cli.github.com) so the driver can check mergeability and CI before accepting a delivery"
+		return c
+	}
+	c.detail = path + " present; a delivery's PR must be MERGEABLE with a passing check rollup"
+	if len(cfg.Projects) == 0 {
+		if cfg.AllowUncheckedPR {
+			c.info = append(c.info, "empty check rollups: WARNED, not refused (allow_unchecked_pr: true)")
+		} else {
+			c.info = append(c.info, "empty check rollups: REFUSED (the default; allow_unchecked_pr opts out for a repo with no CI)")
+		}
+		return c
+	}
+	// Per project, because the opt-out is per project: one line each, so a
+	// loose project is visible without grepping the config.
+	for _, p := range cfg.Projects {
+		state := "REFUSED"
+		if cfg.AllowUncheckedPRFor(p.Slug) {
+			state = "WARNED"
+		}
+		c.info = append(c.info, "empty rollups["+p.Slug+"]: "+state+" (allow_unchecked_pr)")
+	}
+	return c
 }
 
 // --- rendering ---------------------------------------------------------------

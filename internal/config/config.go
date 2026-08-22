@@ -579,6 +579,22 @@ type Config struct {
 	// allowlist leaves open. Claude-specific; other harnesses ignore it. ~ expands.
 	SettingsPath string `json:"settings_path"`
 
+	// AllowUncheckedPR opts this project out of CLA-310's empty-check-rollup
+	// refusal: a delivery whose PR carries NO checks is logged as a WARNING
+	// instead of refused. It exists for repos with NO CI at all, where refusing
+	// every delivery would wedge the driver shut; both clankerbar repos have
+	// CI, so for them the default (refuse) costs nothing.
+	//
+	// The mergeability half of the gate is NEVER relaxed by it: a CONFLICTING
+	// PR is refused either way, because a conflicted PR is exactly the state
+	// that produces an empty rollup, and silence-reads-as-pass is the bug the
+	// gate exists to kill. The safe state is the default; the loose state is
+	// this visible, operator-owned line, which `doctor` reports so it is seen
+	// before it fires. In single-project mode set it here; in multi-project
+	// mode set it per project (see Project.AllowUncheckedPR), which overrides
+	// the top-level value for that project only.
+	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
 	// original single-project mode, driven by the top-level fields, exactly as
@@ -655,6 +671,25 @@ type Project struct {
 	//
 	// Each entry is held to the same origin and slug checks as MCPConfigPath.
 	MCPConfigPaths map[string]string `json:"mcp_config_paths"`
+
+	// AllowUncheckedPR is this project's CLA-310 opt-out, overriding the
+	// top-level field of the same name for this project only. See
+	// Config.AllowUncheckedPR for what it does and why the default refuses.
+	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+}
+
+// AllowUncheckedPRFor resolves the CLA-310 empty-rollup opt-out for one
+// project: a matching projects[] entry's own value wins, and everything else
+// — including an unmatched slug, which is how a single-project run reaches
+// here with an empty one — falls back to the top-level field. Total, so no
+// caller has a second error path.
+func (c *Config) AllowUncheckedPRFor(slug string) bool {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return p.AllowUncheckedPR
+		}
+	}
+	return c.AllowUncheckedPR
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
