@@ -280,27 +280,38 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// the SIGKILL and keeps the pipe open: without a delay, Invoke blocks past its
 	// own deadline in the one scenario the cap exists for. WaitDelay force-closes
 	// the pipes and lets Wait return.
-	//
-	// It does NOT kill the orphan itself — that needs a process group, which is
-	// platform-specific and is filed rather than smuggled in here. Set whenever
-	// the exec context carries ANY deadline — one this function created, or one
-	// a caller handed in (the CLA-406 probe's 30s box arrives that way, and the
-	// old `sctx != ctx` test missed exactly that case): an MCP server holding
-	// the inherited fd would otherwise keep the pipe open past the kill and
-	// hang Run past its own box. An ordinary uncapped session's I/O is never
-	// cut short by it.
+	// The orphan itself is killed by the process-group Cancel below; this is
+	// the backstop BEHIND that kill, for a descendant that escaped the group —
+	// a daemonised child (setsid) lands in a group of its own that no signal
+	// of ours reaches (the same escapee claude's session path has no backstop
+	// for at all, CLA-423). Set whenever the exec context carries ANY deadline —
+	// one this function created, or one a caller handed in (the CLA-406
+	// probe's 30s box arrives that way, and the old `sctx != ctx` test missed
+	// exactly that case): an fd holder would otherwise keep the pipe open past
+	// the kill and hang Run past its own box. An ordinary uncapped session's
+	// I/O is never cut short by it.
 	if _, hasDeadline := sctx.Deadline(); hasDeadline {
 		cmd.WaitDelay = 5 * time.Second
 	}
 
-	// Monitor the deadline and kill the whole process group (not just the
-	// direct child) so descendants holding inherited pipes — a grandchild
-	// build/test or an MCP server — are terminated and Wait can return.
-	if _, hasDeadline := sctx.Deadline(); hasDeadline {
-		go func() {
-			<-sctx.Done()
-			killProcessGroup(cmd)
-		}()
+	// Kill the whole process group on ANY cancellation of sctx — the
+	// wall-clock cap, or the caller's own cancellation (a Ctrl-C that stopped
+	// reaching the session subtree through the tty the moment Setpgid moved
+	// it out of the foreground group). Through exec.Cmd.Cancel, not a monitor
+	// goroutine: os/exec calls Cancel under its own synchronisation once
+	// Start has published Process, so it cannot race on that field. The
+	// post-reap window shrinks from "every capped session" to an instant
+	// between Process.Wait returning and the watchdog's handshake — os/exec
+	// calls Cancel only while it still considers the process live, and its
+	// own Kill there reads os.ErrProcessDone; killProcessGroup's raw
+	// syscall.Kill narrows the recycled-pid hazard by orders of magnitude
+	// without eliminating it. The direct child is killed too (the trailing
+	// Kill mirrors CommandContext's own default Cancel), and a Kill on an
+	// already-dead child reads as os.ErrProcessDone, which os/exec treats as
+	// nothing to report.
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return cmd.Process.Kill()
 	}
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text

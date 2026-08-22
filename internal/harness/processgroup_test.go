@@ -24,8 +24,8 @@ import (
 //     moment the consumer is scheduled, however late.
 //   - The descendant's marker is POLLED FOR after Invoke returns, not
 //     checked once immediately. A direct-child-only kill regression
-//     leaves the descendant alive holding the inherited stdout fd; the
-//     old immediate check ran while it was still asleep, saw no marker,
+//     leaves the descendant alive holding an inherited fd; the old
+//     immediate check ran while it was still asleep, saw no marker,
 //     and passed — pinned by nothing. Waiting past the descendant's
 //     lifetime makes survival observable: if the marker ever appears,
 //     something escaped the kill.
@@ -55,21 +55,24 @@ exec sleep 120
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	start := time.Now()
-	res, err := (claude{}).Invoke(context.Background(), Invocation{
-		Prompt:           "work",
-		MaxSessionTokens: 10, // any positive ceiling kills quickly
-		Console:          io.Discard,
+	// Invoke must return promptly, not hang on a descendant holding an
+	// exec-owned pipe: cmd.Stderr is an io.MultiWriter, so os/exec makes its
+	// own pipe and Wait waits on its writer past the kill. (claude's session
+	// path sets no WaitDelay, so a surviving holder blocks Wait outright —
+	// which is itself the failure being asserted against.) Running Invoke on
+	// its own goroutine makes that bound REAL: checked after the fact, an
+	// elapsed comparison cannot fire while Invoke is still blocked, and the
+	// regression it guards would hang to the package timeout instead of
+	// failing here. The stub streams for ~50s then sleeps 120s, so an
+	// unfired kill blows the 30s bound long before that.
+	res, err, _ := invokeWithBound(t, 30*time.Second, func() (Result, error) {
+		return (claude{}).Invoke(context.Background(), Invocation{
+			Prompt:           "work",
+			MaxSessionTokens: 10, // any positive ceiling kills quickly
+			Console:          io.Discard,
+		})
 	})
-	elapsed := time.Since(start)
 
-	// The adapter must return promptly, not hang on the grandchild's
-	// inherited stdout pipe. (claude's session path sets no WaitDelay, so
-	// a surviving holder blocks Wait outright — which is itself the
-	// failure being asserted against.)
-	if elapsed > 20*time.Second {
-		t.Fatalf("Invoke blocked for %s: the kill did not reach the grandchild holding the stream", elapsed)
-	}
 	if err != nil {
 		t.Fatalf("Invoke returned an error for the ceiling kill: %v — must be orderly", err)
 	}
@@ -102,17 +105,18 @@ echo '{"type":"step_finish","sessionID":"s1","part":{"type":"step-finish","reaso
 exec sleep 60
 `)
 
-	start := time.Now()
-	res, err := (opencode{}).Invoke(context.Background(), Invocation{
-		Prompt:              "work",
-		MaxSessionWallClock: 500 * time.Millisecond,
-		Console:             io.Discard,
+	// Same bound discipline as the claude test. Note that under a group-kill
+	// regression this test's real pin is the MARKER POLL below, not the
+	// bound: cmd.WaitDelay (set for any capped session) force-closes the
+	// pipes and returns Wait in ~5s even with the descendant still alive.
+	res, err, _ := invokeWithBound(t, 30*time.Second, func() (Result, error) {
+		return (opencode{}).Invoke(context.Background(), Invocation{
+			Prompt:              "work",
+			MaxSessionWallClock: 500 * time.Millisecond,
+			Console:             io.Discard,
+		})
 	})
-	elapsed := time.Since(start)
 
-	if elapsed > 20*time.Second {
-		t.Fatalf("Invoke blocked for %s: the group kill did not reach the grandchild", elapsed)
-	}
 	if err != nil {
 		t.Fatalf("Invoke returned an error for the cap: %v", err)
 	}
@@ -135,5 +139,31 @@ func waitForGrandchildMarker(t *testing.T, marker string) {
 			t.Fatalf("grandchild marker file %s appeared — the descendant survived the group kill", marker)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// invokeOutcome carries an Invoke result back from the goroutine that ran it.
+type invokeOutcome struct {
+	res Result
+	err error
+}
+
+// invokeWithBound runs fn on its own goroutine and fails the test if it has
+// not returned within bound. A promptness requirement checked AFTER Invoke
+// returns is not a bound at all — while Invoke is blocked the check never
+// runs — so the wait itself is what enforces it.
+func invokeWithBound(t *testing.T, bound time.Duration, fn func() (Result, error)) (Result, error) {
+	t.Helper()
+	done := make(chan invokeOutcome, 1)
+	go func() {
+		res, err := fn()
+		done <- invokeOutcome{res, err}
+	}()
+	select {
+	case o := <-done:
+		return o.res, o.err
+	case <-time.After(bound):
+		t.Fatalf("Invoke did not return within %s — something survived the kill and is holding the stream", bound)
+		return Result{}, nil // unreachable; Fatalf exits the test
 	}
 }

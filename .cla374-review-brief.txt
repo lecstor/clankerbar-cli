@@ -1,0 +1,13 @@
+Review ONE change adversarially against the bar below, then stop. Your final message is the review.
+
+Repo worktree: /Users/jason/dev/clankerbar-cli-wt/3adf35f6 (Go repo github.com/lecstor/clankerbar-cli).
+
+The change under review is commits a2338d5 and ef349af on branch clanker/3adf35f6-a-killed-session-s-grandchildren-survive. Get the diff with:
+git -C /Users/jason/dev/clankerbar-cli-wt/3adf35f6 diff 30bd9c5..ef349af
+(The branch also carries merge commit e171655, which only syncs origin/staging; that merge is not part of the change under review.)
+
+The bar (the task's doneWhen): After an adapter-side kill - opencode's wall-clock cap and claude's token-ceiling kill - no descendant process of the killed session is still running: a test starts a stub that backgrounds a child outliving its parent, and asserts that child is gone once Invoke returns. Both adapters go through the same helper, and the existing WaitDelay hang test still passes.
+
+Read the surrounding code the diff does not show (internal/harness/claude.go, internal/harness/opencode.go, and what they call), not just the changed lines. Verify claims by running things where useful (for example: cd /Users/jason/dev/clankerbar-cli-wt/3adf35f6 && go test ./internal/harness/ -run TestProcessGroup -count=1).
+
+Report findings: each with a severity (high / medium / low), file and line, what is actually wrong, and what would fix it. Say plainly when you found nothing at a severity instead of padding the list. Distinguish what you verified from what you suspect.
