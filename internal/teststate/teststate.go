@@ -86,7 +86,7 @@ func Isolate(m *testing.M) int {
 		return code
 	}
 	if added := addedNames(beforeRoot, readDirNames(realRoot)); len(added) > 0 {
-		reportAdded(realRoot, added, true)
+		reportAdded(realRoot, added, loopDir)
 		if code == 0 {
 			code = 1
 		}
@@ -94,7 +94,7 @@ func Isolate(m *testing.M) int {
 	// One level up as well: entries created next to loop/ under clankerbar/
 	// are the same leak wearing a different parent.
 	if added := addedNames(beforeParent, readDirNames(filepath.Dir(realRoot))); len(added) > 0 {
-		reportAdded(filepath.Dir(realRoot), added, false)
+		reportAdded(filepath.Dir(realRoot), added, siblingDir)
 		if code == 0 {
 			code = 1
 		}
@@ -102,17 +102,22 @@ func Isolate(m *testing.M) int {
 	return code
 }
 
+// Which watched directory a guard report came from: only a loop start under
+// loop/ mints a statedir, so the sibling directory gets a plainer explanation.
+const (
+	loopDir    = true
+	siblingDir = false
+)
+
 // reportAdded prints the guard failure for one watched directory, including
-// the way out of the known false positive: a live loop starting mid-run. Only
-// a loop start under loop/ mints a statedir, so the sibling directory gets a
-// plainer explanation.
-func reportAdded(dir string, added []string, isLoopDir bool) {
+// the way out of the known false positive: a live loop starting mid-run.
+func reportAdded(dir string, added []string, which bool) {
 	fmt.Fprintf(os.Stderr, "teststate: GUARD: %d entries were created under %s during this test run:\n", len(added), dir)
 	for _, name := range added {
 		fmt.Fprintf(os.Stderr, "teststate: GUARD:   %s\n", filepath.Join(dir, name))
 	}
 	fmt.Fprintln(os.Stderr, "teststate: GUARD: a test is deriving or writing state dirs without isolation - see package internal/teststate")
-	if isLoopDir {
+	if which == loopDir {
 		fmt.Fprintln(os.Stderr, "teststate: GUARD: not test pollution? A clankerbar loop that STARTED while this suite ran creates exactly such an entry; it joins the next run's baseline, so re-run before investigating.")
 	} else {
 		fmt.Fprintln(os.Stderr, "teststate: GUARD: not test pollution? An external clankerbar process may have created this while the suite ran; it joins the next run's baseline, so re-run before investigating.")

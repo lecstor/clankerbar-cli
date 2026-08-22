@@ -46,11 +46,12 @@ func TestEnforcedEverywhereConfigIsImported(t *testing.T) {
 		t.Fatalf("go list -json -test ./... failed: %v", err)
 	}
 
-	var violations []string
+	var violations, prodImports []string
 	dec := json.NewDecoder(bytes.NewReader(out))
 	for {
 		var p struct {
 			ImportPath string
+			Imports    []string
 			Deps       []string
 		}
 		if err := dec.Decode(&p); err == io.EOF {
@@ -59,6 +60,19 @@ func TestEnforcedEverywhereConfigIsImported(t *testing.T) {
 			t.Fatalf("decoding go list output: %v", err)
 		}
 		if !strings.HasSuffix(p.ImportPath, ".test") {
+			// Variant listings ("<pkg> [<pkg>.test]") are the TEST builds of
+			// ordinary packages; their Imports rightly include teststate. Only
+			// a true non-test package (no variant suffix) counts here.
+			if strings.Contains(p.ImportPath, " [") {
+				continue
+			}
+			// The "installs" half of the rule is satisfied by teststate being
+			// LINKED into a test binary, which any non-test import of the
+			// package would also satisfy - vacuously. Production code has no
+			// business importing a TestMain helper, so name that directly.
+			if contains(p.Imports, teststatePkg) {
+				prodImports = append(prodImports, p.ImportPath)
+			}
 			continue // not a synthesised test binary; plain entries carry no test closure
 		}
 		deps := make([]string, 0, len(p.Deps))
@@ -73,6 +87,10 @@ func TestEnforcedEverywhereConfigIsImported(t *testing.T) {
 		if contains(deps, configPkg) && !contains(deps, teststatePkg) {
 			violations = append(violations, strings.TrimSuffix(p.ImportPath, ".test"))
 		}
+	}
+	if len(prodImports) > 0 {
+		t.Errorf("internal/teststate is a test-only helper; these non-test packages must not import it:\n\t%s",
+			strings.Join(prodImports, "\n\t"))
 	}
 	if len(violations) > 0 {
 		t.Errorf("these packages' tests can reach %s but install no TestMain(teststate.Isolate); add\n\n\tfunc TestMain(m *testing.M) { os.Exit(teststate.Isolate(m)) }\n\nto each (see package internal/teststate). If an in-package TestMain closes as an import cycle, put it in the package's external _test package instead - that is what internal/config does:\n\t%s",
