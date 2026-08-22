@@ -853,9 +853,12 @@ consequences of that pairing are worth knowing before you set it. First, the
 salvage applies here: since CLA-365 opencode observes the session's task claim,
 so when a capped session ends, whatever it left uncommitted is committed and
 pushed by the salvage, the same as for a turn-capped `claude` session - unless
-the salvage refuses (a tree mid-merge, unresolved conflicts, an ambiguous
-worktree match) and leaves the work untouched, or the push is rejected and
-the work stays committed locally only; either way the log names what happened.
+the salvage refuses (an interrupted merge, rebase, cherry-pick or revert;
+unresolved conflicts; an ambiguous worktree match) and leaves the work
+untouched, or the push is rejected and the work stays committed locally only.
+Both of those are named in the log. If instead no worktree at or below the
+run's workdir has a branch starting `clanker/<first 8 characters of the task
+id>`, the salvage finds nothing to act on and stays silent.
 Second, `phases` runs on opencode on that same claim-tracking basis (a
 multi-phase sequence is refused over a harness that observes no claim, which
 is codex today), so the per-phase `max_wall_clock` is reachable in a phased
