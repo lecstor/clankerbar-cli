@@ -52,7 +52,7 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // first cut of this shipped with the seed untested and a mutation of it surviving
 // the whole suite.
 func newSessionResult(in Invocation) Result {
-	return Result{Claim: in.ResumeClaim}
+	return Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
 }
 
 // claudeArgs builds the session's argv. Extracted from Invoke so it can be
@@ -346,6 +346,7 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 		noteClaimed(content, toolUseID, res, console)
 	case pendingSettle:
 		res.Claim.Settled = true
+		res.notifyClaim()
 	}
 }
 
@@ -513,6 +514,9 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		RunID:  payload.Run.ID,
 		HasWIP: payload.HasWip || payload.Task.Branch != "",
 	}
+	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
+	// claim the moment the stream carries it, not when the process exits.
+	res.notifyClaim()
 	// Say it out loud. Everything downstream is silent by design — a claim that is
 	// never observed produces no handback and no complaint, so without this line
 	// the feature could quietly stop working (a stream-shape change under a
