@@ -1132,7 +1132,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			log.Printf("iteration %d %s— retry %d, spawning %s (log: %s)", drainNum, labelOf(t), retries, a.Name(), logPath)
 		}
 
+		// CLA-358: while THIS child runs, renew whatever task-lease it holds.
+		// Started before Invoke so a resumed phase's seeded claim renews from
+		// the first tick; stopped the moment Invoke returns, which is what makes
+		// renewal pause whenever no child process is running - between attempts,
+		// across supervised waits, after exit. Inside the window the adapter may
+		// run its own resurrection machinery (opencode CLA-406): those processes
+		// continue the SAME session on the SAME claim, so renewal spans them.
+		renewer := d.startLeaseRenewal(ctx, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
 		res, ierr := a.Invoke(ctx, inv)
+		renewer.stop()
 		if f != nil {
 			_ = f.Close()
 		}
