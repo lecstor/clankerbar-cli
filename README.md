@@ -853,13 +853,15 @@ consequences of that pairing are worth knowing before you set it. First, the
 salvage applies here: since CLA-365 opencode observes the session's task claim,
 so when a capped session ends, whatever it left uncommitted is committed and
 pushed by the salvage, the same as for a turn-capped `claude` session - unless
-the salvage refuses (a diverged remote or a tree mid-merge) and leaves the
-work in place, saying so in the log. Second, `phases` runs on opencode on that
-same claim-tracking basis (a multi-phase sequence is refused over a harness
-that observes no claim, which is codex today), so the per-phase
-`max_wall_clock` is reachable in a phased config too - though such a run still
-has no per-session turn or token cap (see `max_turns` and
-`budget.max_session_tokens` above), so set this dial deliberately.
+the salvage refuses (a tree mid-merge, unresolved conflicts, an ambiguous
+worktree match) and leaves the work untouched, or the push is rejected and
+the work stays committed locally only; either way the log names what happened.
+Second, `phases` runs on opencode on that same claim-tracking basis (a
+multi-phase sequence is refused over a harness that observes no claim, which
+is codex today), so the per-phase `max_wall_clock` is reachable in a phased
+config too - though such a run still has no per-session turn or token cap (see
+`max_turns` and `budget.max_session_tokens` above), so set this dial
+deliberately.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default
