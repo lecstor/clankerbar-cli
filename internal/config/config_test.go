@@ -228,6 +228,18 @@ func TestProjectsValidation(t *testing.T) {
 	})
 
 	t.Run("a valid projects list normalizes paths and passes", func(t *testing.T) {
+		// A fake HOME keeps the verdict off machine state: "~/dev" expands through
+		// $HOME, and discovery reads <workdir>/.mcp.json — on the real machine
+		// that would make this test depend on whatever the operator's own file
+		// declares (CLA-266 made that load-bearing).
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		if err := os.MkdirAll(filepath.Join(home, "dev"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "dev", ".mcp.json"), []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/clankerbar"}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		c := base()
 		c.Projects = []Project{
 			{Slug: "clankerbar", WorkDir: "~/dev"},
