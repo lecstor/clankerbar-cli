@@ -13,5 +13,9 @@ import (
 //
 // This lives in package config_test because internal/teststate imports
 // internal/config for its guard, and an in-package test file would close that
-// as an import cycle.
+// as an import cycle. One compiled test binary covers both this external test
+// package and the in-package one (statedir_test.go et al), so a single
+// TestMain guards them all: a guard TEST would only see pollution made between
+// its own start and cleanup, while the derivation is reachable from any test
+// in the binary.
 func TestMain(m *testing.M) { os.Exit(teststate.Isolate(m)) }

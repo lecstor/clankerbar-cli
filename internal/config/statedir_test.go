@@ -134,6 +134,13 @@ func TestExplicitStateDirWinsAndIsAbsolute(t *testing.T) {
 // XDG_STATE_HOME must be absolute per the spec. A relative one would resolve
 // against whatever cwd the daemon was started in — the ambiguity underWorkDir
 // exists to stamp out — so it is ignored rather than honoured.
+//
+// This test deliberately defeats the binary's teststate.Isolate isolation: a
+// relative XDG_STATE_HOME is ignored, so for its duration the derivation
+// points back at the operator's real ~/.local/state. That is safe ONLY while
+// the derived path is never opened or created here - the assertion compares
+// strings. If this test ever needs to touch the filesystem at the derived
+// path, it must first set an absolute XDG_STATE_HOME of its own.
 func TestRelativeXDGStateHomeIsIgnored(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "relative/state")
 	home, err := os.UserHomeDir()
@@ -257,8 +264,3 @@ func TestSessionWorkDirsAreAbsoluteAndCoverEveryProject(t *testing.T) {
 		t.Errorf("SessionWorkDirs() with no projects = %v, want [%s]", got, top)
 	}
 }
-
-// Package-wide test isolation and the pollution guard live in TestMain
-// (main_test.go, via internal/teststate): a single guard TEST only sees
-// pollution made between its own start and cleanup, while the derivation can be
-// reached from any test in the binary. CLA-361.

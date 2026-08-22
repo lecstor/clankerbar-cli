@@ -12,19 +12,21 @@
 // TestMain; it points XDG_STATE_HOME at a fresh temporary directory for every
 // test in the binary (stateHome honours it, spawned subprocesses inherit it,
 // and a per-test t.Setenv still overrides it where a test wants its own), and
-// afterwards compares the REAL root against a snapshot taken before the run,
-// failing the binary if the run added anything there. A leak therefore cannot
-// return quietly: it turns into a red suite naming the directories created.
+// afterwards compares the REAL root - and its parent clankerbar dir - against
+// snapshots taken before the run, failing the binary if the run added anything
+// there. A leak therefore cannot return quietly: it turns into a red suite
+// naming the directories created. TestEnforcedEverywhereConfigIsImported pins
+// the other half: every package whose tests can reach this derivation MUST
+// install Isolate, and that is checked mechanically rather than by comment.
 //
 // Every package whose tests can reach config.ResolveStateDir or
 // config.StateRoot MUST install this:
 //
 //	func TestMain(m *testing.M) { os.Exit(teststate.Isolate(m)) }
 //
-// A package without it can neither isolate its tests nor be guarded by this
-// guard; add it before adding a test that derives a state dir. Today that is
-// internal/config, internal/cli and internal/loop - the only importers of
-// internal/config, which owns the derivation.
+// Today that is internal/config, internal/cli and internal/loop; the
+// enforcement test fails the suite if a new package reaches internal/config
+// without installing it.
 package teststate
 
 import (
@@ -39,19 +41,29 @@ import (
 
 // Isolate runs m as an isolated test binary and returns its exit code, forced
 // non-zero if the post-run guard finds new entries under the real loop state
-// root. Call it from TestMain and os.Exit the result:
+// root or beside it. Call it from TestMain and os.Exit the result:
 //
 //	func TestMain(m *testing.M) { os.Exit(teststate.Isolate(m)) }
 func Isolate(m *testing.M) int {
 	// The real root must be resolved BEFORE the environment is overridden:
 	// config.StateRoot reads the live process environment, and after Setenv it
 	// would answer with the isolated directory instead.
-	real, err := config.StateRoot()
+	realRoot, err := config.StateRoot()
+	guard := true
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "teststate: cannot resolve the real loop state root:", err)
-		return 1
+		// Nowhere real to guard against (HOME unset in a hermetic sandbox,
+		// for example). Degrade to isolation alone rather than failing every
+		// guarded package before a single test has run - isolation without
+		// the guard still keeps tests off the operator's machine.
+		realRoot = ""
+		guard = false
 	}
-	before := readDirNames(real)
+
+	var beforeRoot, beforeParent []string
+	if guard {
+		beforeRoot = readDirNames(realRoot)
+		beforeParent = readDirNames(filepath.Dir(realRoot))
+	}
 
 	iso, err := os.MkdirTemp("", "clankerbar-test-state-")
 	if err != nil {
@@ -66,17 +78,37 @@ func Isolate(m *testing.M) int {
 
 	code := m.Run()
 
-	if added := addedNames(before, readDirNames(real)); len(added) > 0 {
-		fmt.Fprintf(os.Stderr, "teststate: GUARD: %d entries were created under the REAL loop state root %s during this test run:\n", len(added), real)
-		for _, name := range added {
-			fmt.Fprintf(os.Stderr, "teststate: GUARD:   %s\n", filepath.Join(real, name))
+	if !guard {
+		fmt.Fprintln(os.Stderr, "teststate: WARNING: pollution guard disabled for this run: the real loop state root could not be resolved ("+
+			err.Error()+"); XDG_STATE_HOME isolation was still active")
+		return code
+	}
+	if added := addedNames(beforeRoot, readDirNames(realRoot)); len(added) > 0 {
+		reportAdded(realRoot, added)
+		if code == 0 {
+			code = 1
 		}
-		fmt.Fprintln(os.Stderr, "teststate: GUARD: a test is deriving or writing state dirs without isolation - see package internal/teststate")
+	}
+	// One level up as well: entries created next to loop/ under clankerbar/
+	// are the same leak wearing a different parent.
+	if added := addedNames(beforeParent, readDirNames(filepath.Dir(realRoot))); len(added) > 0 {
+		reportAdded(filepath.Dir(realRoot), added)
 		if code == 0 {
 			code = 1
 		}
 	}
 	return code
+}
+
+// reportAdded prints the guard failure for one watched directory, including
+// the way out of the one known false positive: a live loop starting mid-run.
+func reportAdded(dir string, added []string) {
+	fmt.Fprintf(os.Stderr, "teststate: GUARD: %d entries were created under %s during this test run:\n", len(added), dir)
+	for _, name := range added {
+		fmt.Fprintf(os.Stderr, "teststate: GUARD:   %s\n", filepath.Join(dir, name))
+	}
+	fmt.Fprintln(os.Stderr, "teststate: GUARD: a test is deriving or writing state dirs without isolation - see package internal/teststate")
+	fmt.Fprintln(os.Stderr, "teststate: GUARD: not test pollution? A clankerbar loop that STARTED while this suite ran creates exactly such an entry; it joins the next run's baseline, so re-run before investigating.")
 }
 
 // readDirNames lists one level of dir; a missing directory reads as empty.

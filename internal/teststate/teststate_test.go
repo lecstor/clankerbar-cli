@@ -1,9 +1,14 @@
 package teststate
 
 import (
+	"os"
 	"reflect"
 	"testing"
 )
+
+// The exemplar package follows its own rule (CLA-361): this binary installs
+// the same isolation and guard every config-reaching test binary must carry.
+func TestMain(m *testing.M) { os.Exit(Isolate(m)) }
 
 // The guard's arithmetic is the whole detection: entries in the after snapshot
 // that the before snapshot lacks are pollution, whatever else changed. Pinned
