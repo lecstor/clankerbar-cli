@@ -1126,10 +1126,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			inv.Console = os.Stderr
 			log.Printf("could not open iteration log %s: %v", logPath, ferr)
 		}
+		// The spawn line stamps what the session was actually spawned WITH:
+		// phase and the resolved model id inv.Model carries (ModelForPhase's
+		// output, never the tier alias). A token/cost line in an old log is then
+		// attributable to the settings of THAT day rather than inferred from
+		// whatever the config file says now (CLA-345). An empty model= is itself
+		// evidence: no explicit model was configured at spawn time, and the
+		// harness ran its own default.
 		if retries == 0 {
-			log.Printf("iteration %d %s— spawning %s (log: %s)", drainNum, labelOf(t), a.Name(), logPath)
+			log.Printf("iteration %d %s- spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
 		} else {
-			log.Printf("iteration %d %s— retry %d, spawning %s (log: %s)", drainNum, labelOf(t), retries, a.Name(), logPath)
+			log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), retries, a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
 		}
 
 		res, ierr := a.Invoke(ctx, inv)
