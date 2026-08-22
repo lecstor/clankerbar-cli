@@ -671,6 +671,33 @@ wrong tree is worse than not checking.
 This covers **unattended runs only**, by design: an interactive session bypasses
 the driver entirely.
 
+#### The PR a delivery names
+
+When a session's delivery names a pull request, the driver also checks it through
+the `gh` CLI - the one part of the check that reaches GitHub rather than your
+local tree. Two conditions, both required:
+
+- **The PR is MERGEABLE.** A `CONFLICTING` PR is refused: a conflicted branch
+  gets no `pull_request` event at all (GitHub cannot compute the merge ref), so
+  it reports zero checks rather than a failing one, and quiet CI proves nothing.
+- **The check rollup actually ran and passed.** An **empty** rollup is a
+  refusal, not a pass - "no checks found" is the exact signature of the
+  conflicted PR above, so silence never reads as green. Skipped/neutral checks
+  (path-filtered jobs) pass but are named in the log.
+
+GitHub computes mergeability lazily, so an UNKNOWN first read is polled within
+a bounded window (30s) and then **refused**, never assumed. Failing or
+unfinished checks refuse by name. If `gh` is not installed the check degrades
+to an explicit could-not-verify - never a pass - and `clankerbar doctor`'s
+`pr_gate` line warns about it up front.
+
+**Repos with no CI at all:** refusing every delivery there would wedge the
+driver shut, so a per-project opt-out exists - set `"allow_unchecked_pr": true`
+(top level, or on a `projects[]` entry) and an empty rollup is logged as a
+WARNING instead of a refusal. The mergeability condition is never relaxed: a
+conflicted PR refuses either way. `doctor` prints the resolved state per
+project, so a loose project is visible before it fires.
+
 ### Rescuing work a killed session left behind
 
 A usage limit kills a session mid-turn. There is no graceful shutdown, so the
@@ -804,9 +831,14 @@ default**: unlike the turn cap it ships no built-in number, because a duration
 that catches a runaway on one model/provider is a routine session on another. It
 is measured per SESSION, so it is not `budget.max_wall_clock`, which is the
 run-wide ceiling and counts the hours a run spends *waiting out* a usage limit.
-Since v0.9.1 the cap bounds an opencode session's WHOLE life including any
+Since CLA-406 the cap bounds an opencode session's WHOLE life including any
 quiet-death resurrections: the budget is computed once at spawn and spent down
 across the original run plus up to 5 resume rounds, not refreshed per round.
+The inter-round overhead (25s backoff plus a 30s probe box per round) is
+charged against it like any other time, so a fully-capped session does not
+materially outlive the dial; a resurrection round is not started unless the
+remaining slice covers that overhead plus a minute, and a continuation is not
+started on a remaining slice under a minute.
 
 **opencode only** today — it is the harness with no turn flag, so this is its
 backstop; under claude or codex the dial is inert and `doctor` says so. Two
@@ -987,7 +1019,7 @@ described in
 [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md),
 which is a separate failure with a separate cause.
 
-Since v0.9.1 the adapter does not accept the signature as terminal: it backs off,
+Since v0.10.1 the adapter does not accept the signature as terminal: it backs off,
 resumes the SAME session in place (`opencode run --session <id>`), and asks the
 agent to prove it is intact by naming its task ref. A mechanical match continues
 the session where it left off (bounded at 5 resurrections per session, one probe

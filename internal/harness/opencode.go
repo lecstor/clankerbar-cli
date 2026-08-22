@@ -95,12 +95,29 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		return res, nil
 	}
 	console := in.Console
-	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res); attempt++ {
+	// An UNTRUSTED stream is never resurrected: CLA-262 forbids reading claim
+	// state off an over-run capture, and both the coherence ref and the
+	// continuation's seed come from exactly that state - while the driver's
+	// own untrusted path declines to count further spend, so probing would
+	// enlarge the accounting blind spot endUntrustedDrain exists to bound.
+	// The conjunct mirrors the driver's own gate (!capped && !ceiling &&
+	// !wallclock && untrusted) so adapter and tallyDead agree on what is dead.
+	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res) && res.Untrusted == ""; attempt++ {
 		sid, ref := resumeTargets(res)
 		if sid == "" || ref == "" {
 			// No session to resume into (died before its first event) or no
 			// claim to verify against (died before claiming — no work at
 			// stake). The quiet death stands.
+			break
+		}
+		// Budget check BEFORE the round spends anything: a round's backoff
+		// plus probe box come off the clock before any continuation could,
+		// so a slice under the round floor can only buy a probe whose answer
+		// is never acted on.
+		if !deadline.IsZero() && time.Until(deadline) < opencodeResumeRoundFloor {
+			if console != nil {
+				fmt.Fprint(console, opencodeWallClockExhaustedMsg)
+			}
 			break
 		}
 		if console != nil {
@@ -125,21 +142,47 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		probeIn := in
 		probeIn.Probe = true // no wall-clock double-cap, no console tee
 		// Seed the probe's parser with the dead run's live claim, so a probe
-		// turn that happens to touch the backlog is observed on the same terms
-		// as the session it belongs to.
+		// turn that touches the backlog is observed on the same terms as the
+		// session it belongs to - and folded back in below, so the observation
+		// actually reaches the driver.
 		probeIn.ResumeClaim = res.Claim
 		probeRes, probeErr := o.runSession(pctx, probeIn,
-			opencodeResumeArgs(in, sid, resurrectionProbePrompt(ref)))
+			opencodeResumeArgs(in, sid, resurrectionProbePrompt))
 		pcancel()
 		// Charge the probe's spend UNCONDITIONALLY, before any verdict: a
 		// resume re-sends the whole transcript, so this is real money even when
 		// the answer is garbage. Under-counting is the one direction a budget
 		// breaker must not err in. Deliberately NOT via mergeResume — a probe
-		// we are about to judge must not donate claim/raw state.
+		// must never donate raw/terminal state or a process outcome; its CLAIM
+		// observation folds separately, just as unconditionally.
 		res.Tokens += probeRes.Tokens
 		res.CostUSD += probeRes.CostUSD
 		res.UsageReported = res.UsageReported || probeRes.UsageReported
-		coherent := probeErr == nil && probeCoherent(probeRes.FinalMessage, ref)
+		// The claim observation folds ONLY when it is still about THIS task
+		// and arrived on a capture we may read: noteClaimed replaces a parser's
+		// claim WHOLESALE, so a decohered probe that re-claimed a different
+		// task would otherwise redirect the merged Result's identity — the
+		// real lease expiring while release/salvage/tally all fire against a
+		// task the dead session never held. An untrusted probe capture is
+		// skipped for the CLA-262 reason the loop conjunct below spells out.
+		// A probe that kept its seed (did nothing, or settled/advanced ITS OWN
+		// task) always passes both gates — that is finding 6's fix standing.
+		if probeRes.Untrusted == "" && probeRes.Claim.Names(res.Claim.TaskID) {
+			mergeObservation(&res, probeRes)
+		}
+		// An UNTRUSTED probe capture proves nothing: its text survived an
+		// over-cap event discard (output.go), so a ref found in FinalMessage
+		// may be debris rather than recall. Counting it coherent would send
+		// Continue into a session whose state was just misread - the same
+		// CLA-262 reasoning that gates the fold above and the loop conjunct.
+		// An UNTRUSTED probe capture proves nothing: its text survived an
+		// over-cap event discard (output.go), so a ref found in FinalMessage
+		// may be debris rather than recall. Today the discard already empties
+		// the parse, so this conjunct and probeCoherent agree by accident -
+		// the conjunct makes "untrusted reply is not evidence" hold BY RULE,
+		// so a future parser that survives a bad line cannot quietly start
+		// continuations on debris. Same CLA-262 reasoning as the fold above.
+		coherent := probeErr == nil && probeRes.Untrusted == "" && probeCoherent(probeRes.FinalMessage, ref)
 		if !coherent {
 			if console != nil {
 				fmt.Fprintf(console, "!! resurrection probe FAILED (err=%v, reply=%.200q) — counting the death\n",
@@ -157,10 +200,13 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		contIn := in
 		contIn.ResumeClaim = res.Claim
 		if !deadline.IsZero() {
+			// Re-checked here, not just at the top of the round: the probe
+			// just consumed up to its own time-box, and a continuation that
+			// could only be cap-killed on arrival must not be started.
 			remaining := time.Until(deadline)
-			if remaining <= 0 {
+			if remaining < opencodeResumeWallClockFloor {
 				if console != nil {
-					fmt.Fprintf(console, "!! wall-clock budget exhausted across resurrections — counting the death\n")
+					fmt.Fprint(console, opencodeWallClockExhaustedMsg)
 				}
 				break
 			}
@@ -292,7 +338,18 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
 	} else if runErr != nil && !timedOut {
-		return res, runErr // couldn't launch opencode at all
+		// p.finish has already run, so res carries everything the stream announced
+		// (the CLA-299 ordering: parse whatever arrived, THEN classify). Two shapes
+		// land here: a launch failure (bad PATH, unreadable config — nothing was
+		// emitted, so res is an honest zero), and — because any deadline context
+		// sets cmd.WaitDelay above — exec.ErrWaitDelay, where the process exited
+		// CLEANLY but a grandchild held its output pipes open past the delay.
+		// ErrWaitDelay therefore carries a fully parsed Result of a session that
+		// finished successfully; returning it as an error makes the driver fail a
+		// completed attempt. Reclassifying that as the clean end it is, is filed
+		// separately as CLA-414 — a classification question, not a parsing one;
+		// the figures survive either way.
+		return res, runErr
 	} else if runErr != nil {
 		// Our own kill: the child died on the cancel, so its error is the kill's
 		// and not a verdict. The marker above is the verdict.

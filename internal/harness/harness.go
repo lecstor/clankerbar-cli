@@ -630,9 +630,9 @@ type Report struct {
 	Branch string
 
 	// Commit and IntegrationBranch are a declared delivery, and PR is the pull
-	// request that carried it. PR is captured only so the driver can echo the whole
-	// declaration back when it attests to the merge, rather than posting a partial
-	// `delivery` object that could drop it.
+	// request that carried it. PR is echoed back in the plane attestation, and
+	// since CLA-310 it is also verified by the driver's delivery check: the
+	// named PR must be mergeable and carry a check rollup that ran and passed.
 	Commit            string
 	IntegrationBranch string
 	PR                string

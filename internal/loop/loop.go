@@ -206,8 +206,11 @@ type Driver struct {
 	fleetOpenQ []int
 
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
-	// tests can substitute one; production always gets internal/delivery.
-	newVerifier func(workdir string) deliveryVerifier
+	// tests can substitute one; production always gets internal/delivery. The
+	// second argument is CLA-310's empty-check-rollup opt-out for the target
+	// being verified — resolved from config by the caller, which knows the
+	// target, so the verifier itself stays project-blind.
+	newVerifier func(workdir string, allowUncheckedPR bool) deliveryVerifier
 
 	// newSalvager builds the stranded-work rescuer for a workdir (CLA-314). Same
 	// shape and the same reason as newVerifier.
@@ -275,7 +278,13 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		fleetPaused: make([]bool, n),
 		fleetRaised: make([]bool, n),
 		fleetOpenQ:  make([]int, n),
-		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
+		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
+			v := delivery.New(workdir, "")
+			if allowUncheckedPR {
+				v.AllowUncheckedPR()
+			}
+			return v
+		},
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
 	}
@@ -1144,10 +1153,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		d.salvageStrandedWork(ctx, t, &res, producedNothing)
 		// Hand back anything the session was still holding, BEFORE deciding what to
 		// do next — every branch below either waits, retries or returns, and all of
-		// them leave the lease unattended. Above the ierr check too: Invoke returns
-		// a fully parsed Result alongside a Wait failure, so a claim observed on
-		// that stream is real and must not be dropped just because the process died
-		// untidily. A launch failure yields a zero Result, which releases nothing.
+		// them leave the lease unattended. Above the ierr check too: on every
+		// adapter, an Invoke whose run failed with something other than an exit
+		// status returns whatever the stream had announced by then, fully parsed,
+		// alongside the error (CLA-299) — claude's drain path parses its stream as
+		// it arrives; codex and opencode run their parsers to completion before
+		// classifying the failure — so a claim observed there is real and must not
+		// be dropped just because the process died untidily. A launch failure
+		// yields a zero Result, which releases nothing.
 		//
 		// UNLESS this phase reached its checkpoint with another phase still to run.
 		// Then the sequence is not over: the next phase resumes THIS run with
@@ -1247,7 +1260,24 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			if ctx.Err() != nil {
 				return tokens, cost, true, end, nil
 			}
-			// Couldn't launch the harness at all (bad PATH/flags/env) — not a blip.
+			// Count this attempt's spend before giving up on it. A non-exit run
+			// failure is either a launch failure (nothing emitted, nothing parsed —
+			// adding zeroes changes nothing) or a session that ran, announced its
+			// spend and died in Wait (CLA-299): the Result was parsed precisely so
+			// the budget would not lose what the attempt actually cost. That holds
+			// only while the stream was read whole, which is what the guard below
+			// makes binding: a failure whose stream ALSO came back untrusted
+			// carries a floor, not a total, and gets the same refusal as the
+			// untrusted branch below and endUntrustedDrain (CLA-262) - counted
+			// nowhere, so no breaker ever acts on a figure that cannot be known.
+			if res.Untrusted == "" {
+				tokens += res.Tokens
+				cost += res.CostUSD
+				d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
+			}
+			// A run failure that was not an exit status — a launch failure, or one
+			// of the deaths in Wait above — ends the attempt without any retry
+			// classification. Not a blip.
 			return tokens, cost, false, end, fmt.Errorf("invoke %s: %w", a.Name(), ierr)
 		}
 
@@ -1907,6 +1937,11 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 // looking at. Loud logging is the floor, it is cheap, and it is reversible.
 // Recorded as a decision on CLA-253.
 //
+// "Refusing the delivery" (CLA-310) lives inside that shape: a PR check that
+// fails is a Fail with the failing condition and its remedy named in the log,
+// and no verified attestation behind it — the driver's verdict on the delivery
+// is refusal, not a rewrite of what the session told the plane.
+//
 // # Fail open
 //
 // A check that could not run reports "could not verify" and the run carries on.
@@ -1925,16 +1960,18 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 		return
 	}
 
-	v := d.newVerifier(d.invocation(t, false).WorkDir)
+	v := d.newVerifier(d.invocation(t, false).WorkDir, d.cfg.AllowUncheckedPRFor(t.Name))
 	for _, rep := range res.Reports {
-		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch}
+		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch, PR: rep.PR}
 		if rep.ClaimsMerge() {
 			claim.Commit, claim.IntegrationBranch = rep.Commit, rep.IntegrationBranch
 		}
 		// Detached and bounded PER REPORT: a shared deadline would silently degrade
 		// every claim after the first slow one to "cannot check". Detached because a
 		// cancel arriving mid-check should not turn a real answer into a half one —
-		// the guard above is what makes cancellation prompt.
+		// the guard above is what makes cancellation prompt. The PR check's own
+		// polling budget sits well inside this deadline, so one slow GitHub read
+		// cannot starve the git checks that share the report.
 		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
 		out := v.Verify(vctx, claim)
 		cancel()
@@ -1943,6 +1980,8 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 			switch c.Status {
 			case delivery.Fail:
 				log.Printf("%sDELIVERY UNVERIFIED — %s: %s", labelOf(t), rep.Label(), c.Detail)
+			case delivery.Warn:
+				log.Printf("%sDELIVERY WARN — %s: %s", labelOf(t), rep.Label(), c.Detail)
 			case delivery.Unknown:
 				log.Printf("%scould not verify %s: %s — carrying on", labelOf(t), rep.Label(), c.Detail)
 			default:

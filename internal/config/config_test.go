@@ -341,6 +341,34 @@ func TestProjectSummaryURL(t *testing.T) {
 	})
 }
 
+// The CLA-310 empty-rollup opt-out resolves per project: a matching entry's
+// own value wins; an unmatched slug (the single-project shape reaching the
+// resolver with an empty one) falls back to the top level.
+func TestAllowUncheckedPRFor(t *testing.T) {
+	c := &Config{
+		AllowUncheckedPR: false,
+		Projects: []Project{
+			{Slug: "strict"},
+			{Slug: "loose", AllowUncheckedPR: true},
+		},
+	}
+
+	if c.AllowUncheckedPRFor("strict") {
+		t.Errorf("strict project inherited nothing and should refuse")
+	}
+	if !c.AllowUncheckedPRFor("loose") {
+		t.Errorf("loose project opted out and should warn")
+	}
+	if c.AllowUncheckedPRFor("") {
+		t.Errorf("unmatched slug should fall back to the top-level value (false here)")
+	}
+
+	top := &Config{AllowUncheckedPR: true}
+	if !top.AllowUncheckedPRFor("anything") {
+		t.Errorf("single-project mode should read the top-level field")
+	}
+}
+
 func TestProjectsSlugMCPMismatchRefused(t *testing.T) {
 	// The slug decides which queue is polled; the .mcp.json decides which project
 	// sessions work. A disagreement is a silent split-brain — Validate must refuse.
