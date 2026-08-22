@@ -72,6 +72,14 @@ type Releaser interface {
 // It is a SEPARATE interface from Releaser on purpose. The driver type-asserts for
 // it, so a Releaser that cannot attest (a not-wired plane, a test double) degrades
 // to warn-only rather than failing to compile or failing to run.
+
+// Heartbeat renews an active claim's lease. The loop calls it periodically
+// while a session holds a claim, so the 30-minute lease does not expire
+// mid-session (CLA-358).
+type Heartbeat interface {
+	Heartbeat(ctx context.Context, runID string) error
+}
+
 type Attester interface {
 	AttestMergeVerified(ctx context.Context, taskID, runID string, d Delivery, verified bool) error
 }
@@ -155,6 +163,7 @@ type ParkAPI interface {
 type notWired struct{}
 
 func (notWired) Release(context.Context, string, string) error { return ErrNotWired }
+func (notWired) Heartbeat(context.Context, string) error { return ErrNotWired }
 
 // New builds a Releaser. Missing either the endpoint or the key yields a
 // not-wired one, so an operator running without a configured plane is degraded
@@ -436,4 +445,16 @@ func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
 		return fmt.Errorf("refusing redirect: %w", err)
 	}
 	return nil
+}
+
+// Heartbeat renews a live claim's lease. It is the driver-side renewal (CLA-358):
+// the loop calls it periodically while a session lives, so a >30-minute session
+// does not have its lease expire and become a stale take-over offer.
+func (r *mcpReleaser) Heartbeat(ctx context.Context, runID string) error {
+	if runID == "" {
+		return errors.New("heartbeat: runId is required")
+	}
+	return r.call(ctx, "heartbeat", map[string]any{
+		"runId": runID,
+	})
 }
