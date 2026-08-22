@@ -100,10 +100,30 @@ func parseHandoff(final string) (prompt string, found bool, refusal string) {
 //     it is not read for claim state (CLA-262): the block may be cut mid-prompt,
 //     and half a session-authored prompt is worse than none. The untrusted path
 //     already logs loudly, so nothing is added here.
+//
 //   - only a CLEAN exit hands off. A turn-capped or failed session's final
 //     message is wherever it happened to stop, not a deliberate ending.
+//
 //   - the session must still HOLD its task: the successor resumes the same run,
-//     so a settled or never-claimed task leaves nothing to resume.
+//     so a settled or never-claimed task leaves nothing to resume. The two ways
+//     that happens are logged as themselves (CLA-421), because they are
+//     different situations with different consequences.
+//
+//     A SETTLED task means the session moved it to a terminal status itself -
+//     done, in_review, parked - and there is genuinely no run to resume. The
+//     refusal is final and correct.
+//
+//     NO OBSERVED CLAIM means the adapter never saw this session claim anything,
+//     so the driver holds no task/run ids - and without them the resume
+//     preamble cannot be seeded: handing the successor a brief carrying literal
+//     placeholders is worse than refusing. The driver cannot recover the ids by
+//     asking the plane either: attributing an unobserved claim to a task would
+//     be a guess, and a wrong guess heartbeats another instance's live run
+//     while its own session is still working it. So the marker is refused for
+//     THAT stated reason, and any lease the session did take is left to
+//     expire. The plane's expiry sweep is the one path that still gets the
+//     work picked up with its context intact: it keeps a recorded branch
+//     attached as the takeover hand-off.
 func detectHandoff(drainNum int, t Target, res harness.Result) string {
 	prompt, found, refusal := parseHandoff(res.FinalMessage)
 	if !found || res.Untrusted != "" {
@@ -114,9 +134,13 @@ func detectHandoff(drainNum int, t Target, res harness.Result) string {
 		log.Printf("%siteration %d: handoff marker ignored — the session did not end cleanly (%s), so its final message is not a deliberate handoff",
 			labelOf(t), drainNum, res.ExitString())
 		return ""
-	case !res.Claim.Held():
-		log.Printf("%siteration %d: handoff marker ignored — the session no longer holds a task, so there is no run for a successor to resume",
+	case res.Claim.TaskID == "":
+		log.Printf("%siteration %d: handoff marker ignored — the driver observed no claim from this session, so it has no task/run ids to seed a successor's resume from; any lease the session took is left to expire, where the plane keeps a recorded branch attached as the takeover hand-off",
 			labelOf(t), drainNum)
+		return ""
+	case res.Claim.Settled:
+		log.Printf("%siteration %d: handoff marker ignored — the session settled %s itself (moved it off in_progress), so there is no run for a successor to resume",
+			labelOf(t), drainNum, res.Claim.TaskID)
 		return ""
 	case refusal != "":
 		log.Printf("%siteration %d: handoff refused — %s; falling back to the normal path",
