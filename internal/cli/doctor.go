@@ -1014,10 +1014,12 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 		if mcpConfigIsClaudeShaped(mcpConfigPath) {
 			c.status = fail
 			c.detail = mcpConfigPath + " is a Claude-shaped .mcp.json (`mcpServers`), which " + harnessName + " cannot read"
-			// Deliberately not "or unset it": an empty mcp_config_path re-runs the
-			// <workdir>/.mcp.json discovery (config.discoverMCPConfig), which is
-			// harness-blind, so removing the setting hands the same file over again.
-			// Naming a config the harness can read is the only remedy that works.
+			// Reachable only through a file the OPERATOR named (mcp_config_path, or
+			// a per-harness/per-project equivalent): since CLA-318 the auto-discovered
+			// <workdir>/.mcp.json is gated out of the hand-off itself (config's
+			// mcpConfigHandedTo), so unsetting now genuinely unwires instead of
+			// re-handing the same file. Naming a config the harness can read is still
+			// the remedy that wires clankerbar tools back on.
 			c.remedy = "point mcp_config_path at a " + harnessName + " config - " + use.Note
 			return c
 		}

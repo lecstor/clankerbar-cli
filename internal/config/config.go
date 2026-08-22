@@ -1112,14 +1112,78 @@ func (c *Config) ModelForPhase(ph Phase) (model string, ok bool) {
 // a single-project run). Precedence: the project's file FOR THIS HARNESS, else
 // the project's file when this is the top-level harness — it is that harness's
 // schema and no other's — else the harness block's own path.
+//
+// The winner is then narrowed by mcpConfigHandedTo: a file this harness cannot
+// be handed (a Claude-shaped .mcp.json under opencode, anything under codex, or
+// the explicit "none" opt-out) resolves to "" rather than reaching the session
+// (CLA-318). The slug the driver's poll derives from the raw field is untouched
+// by this gate - splitting which-project from which-schema is the whole point -
+// see BacklogEndpoint.
 func (c *Config) ResolveMCPConfig(harnessName, projectMCP string, projectPerHarness map[string]string) string {
-	if p := projectPerHarness[harnessName]; p != "" {
-		return p
+	p := projectPerHarness[harnessName]
+	if p == "" && harnessName == c.Harness {
+		p = projectMCP
 	}
-	if harnessName == c.Harness && projectMCP != "" {
-		return projectMCP
+	if p == "" {
+		p = c.SessionFor(harnessName).MCPConfigPath
 	}
-	return c.SessionFor(harnessName).MCPConfigPath
+	// Selected first, gated second: a candidate this harness cannot be handed
+	// ends the search rather than falling through to a lower-precedence file -
+	// silently substituting a different config would hide the misconfiguration
+	// the operator wrote.
+	return mcpConfigHandedTo(harnessName, p)
+}
+
+// MCPConfigNone is the mcp_config_path value that means "no MCP config": set it
+// at any level (run-wide, per-harness, per-project) to opt out explicitly. It
+// exists because an empty value cannot opt out - empty re-runs the harness-blind
+// <workdir>/.mcp.json discovery, which is what handed opencode a file it refuses
+// to start on (CLA-318). "none" survives Validate untouched, skips the origin
+// checks (there is no file to check), and resolves to nothing at invocation time
+// for every harness. A single-project run that sets it loses the slug its poll
+// would otherwise derive from .mcp.json, so name the project in backlog_url
+// (/mcp/<slug>) to keep the poll project-scoped.
+const MCPConfigNone = "none"
+
+// mcpConfigHandedTo narrows a resolved MCP config path to what one harness may
+// actually be handed (CLA-318).
+//
+// The auto-discovered file is always named .mcp.json - Claude Code's project MCP
+// config, whose schema opencode refuses to start on and whose wiring codex never
+// sees. That one discovery feeds two consumers with conflicting needs: the
+// driver's poll reads the slug out of the file whatever harness runs, while a
+// SESSION should receive only a file in ITS schema. So Validate keeps filling
+// the field for everyone, and this gate decides at hand-off whether the file
+// reaches the session:
+//
+//   - codex (MCPConfigUnused): nothing is ever handed - the adapter drops the
+//     path anyway, so handing it nothing costs nothing.
+//   - opencode (MCPConfigNative): a file named .mcp.json is Claude-shaped by
+//     convention and is refused here rather than passed as OPENCODE_CONFIG;
+//     any other path passes verbatim, because the operator named that file
+//     themselves and doctor still reports on its shape.
+//   - claude (MCPConfigClaudeJSON): everything passes, exactly as before.
+//
+// An unknown harness returns the path unchanged: Validate refuses those long
+// before this runs, and refusing to guess beats inventing policy here.
+func mcpConfigHandedTo(harnessName, path string) string {
+	switch {
+	case path == "", path == MCPConfigNone:
+		return ""
+	}
+	adapter, err := harness.Get(harnessName)
+	if err != nil {
+		return path
+	}
+	switch adapter.MCPConfigUse().Schema {
+	case harness.MCPConfigUnused:
+		return ""
+	case harness.MCPConfigNative:
+		if filepath.Base(path) == ".mcp.json" {
+			return ""
+		}
+	}
+	return path
 }
 
 // PhaseHarnesses lists every harness this config DECLARES — the run-wide one and
@@ -1476,6 +1540,17 @@ func underWorkDir(p, workdir string) string {
 	return filepath.Join(workdir, p)
 }
 
+// mcpUnderWorkDir normalizes an MCP config path the way every other path field
+// is normalized (expandHome, then resolve relative against the workdir), except
+// that the "none" opt-out passes through untouched: it is a word the resolution
+// layer interprets, not a path (see MCPConfigNone).
+func mcpUnderWorkDir(p, workdir string) string {
+	if p == MCPConfigNone {
+		return p
+	}
+	return underWorkDir(expandHome(p), workdir)
+}
+
 // Validate normalizes path fields and checks the resolved config is runnable.
 func (c *Config) Validate() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
@@ -1509,7 +1584,7 @@ func (c *Config) Validate() error {
 	}
 	c.WorkDir = absWorkDir
 
-	c.MCPConfigPath = underWorkDir(c.MCPConfigPath, c.WorkDir)
+	c.MCPConfigPath = mcpUnderWorkDir(c.MCPConfigPath, c.WorkDir)
 	c.SettingsPath = underWorkDir(c.SettingsPath, c.WorkDir)
 	c.ConfigDir = underWorkDir(c.ConfigDir, c.WorkDir)
 
@@ -1520,7 +1595,7 @@ func (c *Config) Validate() error {
 	// HarnessConfig is a value type.
 	for name, hc := range c.Harnesses {
 		hc.ConfigDir = underWorkDir(expandHome(hc.ConfigDir), c.WorkDir)
-		hc.MCPConfigPath = underWorkDir(expandHome(hc.MCPConfigPath), c.WorkDir)
+		hc.MCPConfigPath = mcpUnderWorkDir(hc.MCPConfigPath, c.WorkDir)
 		hc.SettingsPath = underWorkDir(expandHome(hc.SettingsPath), c.WorkDir)
 		c.Harnesses[name] = hc
 	}
@@ -1819,7 +1894,7 @@ func (c *Config) Validate() error {
 		if effectiveWorkDir == "" {
 			effectiveWorkDir = c.WorkDir
 		}
-		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
+		p.MCPConfigPath = mcpUnderWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
 		}
@@ -1836,7 +1911,7 @@ func (c *Config) Validate() error {
 		// they are the same account key pointed at the same kind of host, and the
 		// same split-brain is available through any one of them.
 		for _, name := range sortedKeys(p.MCPConfigPaths) {
-			path := underWorkDir(expandHome(p.MCPConfigPaths[name]), effectiveWorkDir)
+			path := mcpUnderWorkDir(p.MCPConfigPaths[name], effectiveWorkDir)
 			p.MCPConfigPaths[name] = path
 			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
 			if err := c.checkMCPConfigOrigins(path, label); err != nil {
@@ -2138,6 +2213,10 @@ func (c *Config) Source() string { return c.source }
 // origin always comes from CredentialOrigin, because this URL carries the API key
 // (CLA-257): a file inside the workdir may say which project, never which host.
 // An explicit backlog_url that already names a `/mcp/<project>` path wins outright.
+//
+// The raw field is read, not the harness-gated resolution (ResolveMCPConfig):
+// since CLA-318 the file stays every run's slug source even when the running
+// harness would not be handed it.
 //
 // Returns "" when no usable project-scoped endpoint can be resolved (a bare base
 // and no slug). That is deliberate: New("") yields a not-wired poller, so the loop

@@ -171,7 +171,7 @@ func (c *Config) LocalMCPServers() []LocalMCPServer {
 		}
 	}
 	for _, path := range paths {
-		if path == "" || seen[path] {
+		if path == "" || path == MCPConfigNone || seen[path] {
 			continue
 		}
 		seen[path] = true
@@ -220,6 +220,11 @@ func referencesKey(m map[string]string) bool {
 // clankerbar tools at all, which burns an iteration and reads as "the backlog was
 // empty". The operator gets a named host and a remedy instead.
 func (c *Config) checkMCPConfigOrigins(path, label string) error {
+	if path == "" || path == MCPConfigNone {
+		// Nothing configured, or the explicit "none" opt-out (CLA-318): there is
+		// no file whose destinations could be checked.
+		return nil
+	}
 	servers, err := readMCPServers(path)
 	if err != nil {
 		return fmt.Errorf("%s: unreadable, so what it points the API key at cannot be checked: %w", label, err)
