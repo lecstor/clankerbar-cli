@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -1637,21 +1638,55 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 }
 
 // holdsNoIdleSleep reports whether `pmset -g assertions` shows a live
-// PreventUserIdleSystemSleep. The count matters: the header line lists the
-// assertion name with a `0` when nothing holds it.
+// PreventUserIdleSystemSleep. Only two line shapes count as evidence, because
+// they are the only two pmset actually emits for this assertion (verified against
+// live output on 2026-08-22):
+//
+//   - the summary row: exactly the assertion name followed by an integer count
+//     and nothing else — held only when that count is non-zero;
+//   - a per-process detail line under "Listed by owning process:", which begins
+//     `pid <n>(<proc>):` and names the holder — held whenever one appears.
+//
+// Anything else mentioning the name is NOT PROVEN HELD and falls through, so
+// checkPower goes on to the `pmset -g` settings read rather than reporting PASS
+// from a shape it does not recognise. Falling through cannot invent a problem —
+// it only defers to the more direct question — whereas the previous test ("the
+// last token is not an integer means a detail line") answered YES, held for every
+// unrecognised shape, including Apple appending a token to the summary row or a
+// locale shifting its number format (CLA-306).
+//
+// Both branches match structure, not whitespace-split tokens, because splitting
+// is where the original guess went wrong: the detail-line regex runs on the raw
+// line since pmset prints the holding process's name verbatim inside the parens,
+// and a name containing spaces ("Google Chrome Helper") leaves no single field
+// carrying the `<n>(<proc>):` tail; the summary row demands exactly two fields
+// because any token beyond name-plus-count is an unknown in BOTH directions —
+// "1 (inactive)" no less than "0" (CLA-306 review).
+var pidDetailLine = regexp.MustCompile(`^\s*pid\s+\d+\(.+\):(?:\s|$)`)
+
 func holdsNoIdleSleep(out string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.Contains(line, "PreventUserIdleSystemSleep") {
 			continue
 		}
 		fields := strings.Fields(line)
-		n, err := strconv.Atoi(fields[len(fields)-1])
-		if err != nil {
-			// A detail line rather than the summary row (those name the holding
-			// process); its presence means something holds it.
-			return true
-		}
-		if n > 0 {
+		switch {
+		case len(fields) == 2 && fields[0] == "PreventUserIdleSystemSleep":
+			// Summary-row shape. Parse the COUNT position, not the tail: trailing
+			// tokens are exactly the unknown we must not guess from, so a row with
+			// anything after the count — or a count that will not parse — is an
+			// unrecognised variant and falls through rather than answer either way.
+			if n, err := strconv.Atoi(fields[1]); err == nil && n > 0 {
+				return true
+			}
+		case pidDetailLine.MatchString(line):
+			// Per-process detail line: `pid 81237(caffeinate): … named: "…"`. Its
+			// presence means a live process holds the assertion. Matched on the raw
+			// line so a process name containing spaces or even nested parens
+			// ("Google Chrome Helper (Renderer)") still reads as one
+			// `<pid>(<name>):` head; greedy to the LAST `):` is safe because the
+			// anchored pid head and the assertion-name pre-filter above already
+			// exclude every other line shape.
 			return true
 		}
 	}
