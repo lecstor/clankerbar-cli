@@ -38,7 +38,7 @@ func TestIntegrationBranchForProjectOverridesTopLevel(t *testing.T) {
 }
 
 // The branch is standing project configuration, NOT whatever a session
-// declared in its delivery claim — that is a per-session fact about one commit.
+// declared in its delivery claim - that is a per-session fact about one commit.
 func TestIntegrationBranchIsNotDerivedFromAnythingElse(t *testing.T) {
 	c := &Config{}
 	if got := c.IntegrationBranchFor(""); got != DefaultIntegrationBranch {

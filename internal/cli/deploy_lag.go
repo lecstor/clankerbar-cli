@@ -1,6 +1,6 @@
 package cli
 
-// deploy_lag.go — CLA-322: doctor's deploy_lag check.
+// deploy_lag.go - CLA-322: doctor's deploy_lag check.
 //
 // The plane stamps version.commit into /health at BUILD time (CLA-313), which
 // makes "is commit X live?" one request and a string compare. What nothing did
@@ -14,7 +14,7 @@ package cli
 //
 //   - what is deployed: /health's version.commit, read from health_url;
 //   - what should be deployed next: the REMOTE tip of the integration branch
-//     (integration_branch, default staging), read with ls-remote — never a
+//     (integration_branch, default staging), read with ls-remote - never a
 //     local ref, which is routinely stale by exactly the commits in question.
 //
 // The local clone under the project's workdir settles ancestry and counts the
@@ -25,9 +25,9 @@ package cli
 //
 // Fail open, like every other check here.
 //
-// Anything doctor cannot establish — /health unreachable, the commit absent
+// Anything doctor cannot establish - /health unreachable, the commit absent
 // from every local clone even after a bounded fetch, a remote that will not
-// answer — is a WARN saying what could not be learned, never a PASS that
+// answer - is a WARN saying what could not be learned, never a PASS that
 // implies the deployment is current. A green line is only allowed when the
 // comparison actually happened.
 
@@ -56,8 +56,8 @@ const (
 	// DeployLagWarnAfter is the firing threshold, recorded as a decision on
 	// CLA-322 rather than left to fall out of the code: a gap is warned about
 	// only when it is behind AND its oldest undeployed commit is older than
-	// this. One commit for ten minutes is normal and healthy — deploys happen
-	// continuously while work lands — and a check that fires on that gets
+	// this. One commit for ten minutes is normal and healthy - deploys happen
+	// continuously while work lands - and a check that fires on that gets
 	// skimmed past by the time 21 commits have sat undeployed overnight, which
 	// is precisely the case it exists to catch. Age is the discriminator; the
 	// commit count is always reported either way.
@@ -73,7 +73,7 @@ const (
 
 // deployVersion mirrors the plane's `version` block from CLA-313:
 //
-//	{"commit": "732d0be…", "builtAt": "2026-08-10T10:40:00.217Z"}
+//	{"commit": "732d0be...", "builtAt": "2026-08-10T10:40:00.217Z"}
 type deployVersion struct {
 	Commit  string `json:"commit"`
 	BuiltAt string `json:"builtAt"`
@@ -87,8 +87,8 @@ type deployHealth struct {
 
 var deployHTTPClient = &http.Client{Timeout: deployHealthTimeout}
 
-// fetchDeployHealth GETs a /health endpoint. No credentials are sent — the
-// endpoint is public — and the read is bounded twice over (client timeout plus
+// fetchDeployHealth GETs a /health endpoint. No credentials are sent - the
+// endpoint is public - and the read is bounded twice over (client timeout plus
 // request context) because a cron gate has nobody to Ctrl-C it.
 func fetchDeployHealth(ctx context.Context, rawURL string) (deployHealth, error) {
 	ctx, cancel := context.WithTimeout(ctx, deployHealthTimeout)
@@ -127,7 +127,7 @@ type gitRunner func(ctx context.Context, dir string, args ...string) (string, er
 // imported for the same reason Repos is shared rather than reimplemented there:
 // an unattended run has no terminal, and a git that asks for a password would
 // hang the preflight instead of answering. WaitDelay is load-bearing for the
-// same reason it is there — ls-remote spawns helpers that inherit the pipes,
+// same reason it is there - ls-remote spawns helpers that inherit the pipes,
 // and a killed git can otherwise leave the call sitting past its deadline.
 func deployGitRun(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "git", args...)
@@ -279,7 +279,7 @@ func shortSHA(sha string) string {
 // checkDeployLags runs one deploy_lag check per project. In single-project
 // mode there is one, driven by the top-level fields; in multi-project mode
 // each project's own health_url wins when set, and projects that resolve to no
-// URL are skipped — they opted out per project rather than being forgotten.
+// URL are skipped - they opted out per project rather than being forgotten.
 func checkDeployLags(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	if len(cfg.Projects) == 0 {
 		return []check{deployLagCheck(ctx, "deploy_lag",
@@ -465,12 +465,12 @@ func deployLagCheck(ctx context.Context, name, healthURL, integration, workdir s
 
 // locateDeployRepo finds the repository whose object database holds the
 // deployed commit, so ancestry can be judged locally. It searches the same
-// candidate set delivery.Repos produces for the session workdir — linked
+// candidate set delivery.Repos produces for the session workdir - linked
 // worktrees share a ref database and are deduplicated there, so the search
 // reaches `<workdir>/<repo>` and `<workdir>/<repo>-wt/<task>` alike.
 //
-// When no clone has the object — usually one that simply has not fetched since
-// the build went out, which is exactly when the check matters most — it
+// When no clone has the object - usually one that simply has not fetched since
+// the build went out, which is exactly when the check matters most - it
 // fetches the INTEGRATION BRANCH into up to maxDeployLagFetches candidates and
 // re-probes. Fetching the bare SHA would need allow-any-SHA uploadpack on the
 // server, which GitHub does not enable by default; fetching the branch brings

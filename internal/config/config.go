@@ -596,7 +596,7 @@ type Config struct {
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
 
 	// HealthURL is the deployment health endpoint (`/health`) doctor's deploy_lag
-	// check reads to learn WHICH commit is running out there — CLA-322. The plane
+	// check reads to learn WHICH commit is running out there - CLA-322. The plane
 	// stamps version.commit at BUILD time, so "is commit X live?" is one request
 	// and a string compare; this URL names where to ask. It is an operator-set
 	// value with no derived default, because a deployment can live anywhere
@@ -604,13 +604,13 @@ type Config struct {
 	// would answer about whichever environment the guess happened to hit. Empty =
 	// not monitored: the check says so once, quietly, and moves on.
 	//
-	// The endpoint is read WITHOUT credentials — /health is public — so unlike
+	// The endpoint is read WITHOUT credentials - /health is public - so unlike
 	// backlog_url it is held only to "parses as an absolute URL", not to the
 	// bearer-token TLS floor.
 	HealthURL string `json:"health_url"`
 
 	// IntegrationBranch is the branch deployments are built from and promoted
-	// along — the branch whose tip a healthy deployed build should be an ancestor
+	// along - the branch whose tip a healthy deployed build should be an ancestor
 	// of. Doctor's deploy_lag check compares /health's version.commit against its
 	// REMOTE tip. Default: staging (the convention both of this project's repos
 	// use); override where your project integrates elsewhere. It deliberately does
@@ -739,7 +739,7 @@ const DefaultIntegrationBranch = "staging"
 // HealthURLFor resolves the deploy_lag check's /health endpoint for one
 // project: a matching projects[] entry's value wins when it is set, and
 // everything else falls back to the top-level field. Empty means not
-// monitored — there is deliberately no derived default, because a guessed
+// monitored - there is deliberately no derived default, because a guessed
 // environment would answer about the wrong deployment.
 func (c *Config) HealthURLFor(slug string) string {
 	for _, p := range c.Projects {
@@ -777,7 +777,7 @@ func firstNonEmpty(values ...string) string {
 // host". It is deliberately weaker than backlog_url's TLS floor: /health is a
 // public endpoint read without credentials, so there is no bearer token to
 // keep off the wire, and a plain-http internal plane is a legitimate thing to
-// point at. What it refuses is the value that could never be fetched at all —
+// point at. What it refuses is the value that could never be fetched at all -
 // which otherwise surfaces as an opaque client error from doctor instead of as
 // the misfiled config line it is.
 func validateHealthURL(raw, label string) error {
@@ -1842,7 +1842,7 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("backlog_url: %w", err)
 	}
 	// health_url is read WITHOUT credentials (/health is public), so unlike
-	// backlog_url it is not held to the bearer-token TLS floor — only to being
+	// backlog_url it is not held to the bearer-token TLS floor - only to being
 	// a usable absolute URL. A value that cannot be fetched would otherwise
 	// surface as an opaque HTTP-client error from doctor's deploy_lag check
 	// instead of as the misfiled config it is.

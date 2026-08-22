@@ -430,13 +430,27 @@ project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **permissions**
 (harness-specific policy sanity), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
-long enough to do the work), and **budget** (ceilings parse and are sane).
+long enough to do the work), **deploy_lag** (how far the deployed build lags the
+project's integration branch), and **budget** (ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
 entry that omits `workdir` or `mcp_config_path` inherits the top-level one, and
 doctor resolves it **exactly the way the loop does**, so it never reports on a
 directory your sessions will not use.
+
+`deploy_lag` reads the plane's `/health` (`health_url`, top level or per
+project) to learn WHICH commit is deployed, and compares it against the REMOTE
+tip of `integration_branch` (default `staging`). A gap is warned about only once
+its oldest undeployed commit is older than an hour - one fresh commit is normal
+deploy cadence, 21 overnight is not - and the count and age are named either
+way. A deployment AHEAD of the branch (a hotfix, or work not yet merged) passes:
+it is newer than the shared line, not a stale deploy. The sentinel stamps
+`unknown` and `<sha>-dirty` each get their own warning naming what they mean,
+and anything doctor cannot establish (endpoint down; the commit held by no local
+clone even after fetching the branch into them) is an honest WARN, never a green
+line. Unconfigured it prints one quiet PASS naming `health_url`, so the feature
+is discoverable without nagging anyone who opted out.
 
 The `toolchains` audit reads every settings file Claude merges — the `--settings`
 policy, the config dir's `settings.json`/`settings.local.json`, and each session
