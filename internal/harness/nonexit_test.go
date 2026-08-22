@@ -304,8 +304,8 @@ exit 0
 	defer cancel()
 
 	res, err := (claude{}).Invoke(ctx, Invocation{
-		Prompt:   "work",
-		Console:  io.Discard,
+		Prompt:  "work",
+		Console: io.Discard,
 	})
 	elapsed := time.Since(start)
 
