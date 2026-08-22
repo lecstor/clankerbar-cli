@@ -1,0 +1,214 @@
+package loop
+
+import (
+	"context"
+	"errors"
+	"log"
+	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
+)
+
+// planeLeaseDuration is the lease the plane grants a claim_task: thirty
+// minutes, per the served clankerbar protocol ("The lease is 30 minutes"). The
+// driver does not read it off the plane; it is protocol furniture, like the
+// third-of-lease cadence the same protocol prescribes for renewals.
+const planeLeaseDuration = 30 * time.Minute
+
+// heartbeatBeatTimeout bounds ONE renewal call. A renewal that hangs must not
+// outlive its usefulness by much: the renewer holds no state a late response
+// would corrupt, but a stuck call would otherwise pin the goroutine past
+// stop() and delay the attempt ladder behind it.
+const heartbeatBeatTimeout = 20 * time.Second
+
+// heartbeatGiveUp is how many consecutive failed renewals the renewer
+// tolerates before standing down. One failure is a blip (the plane restarting,
+// a network blip); three in a row across a third-of-lease cadence means the
+// plane is unreachable for this session's remaining lifetime, and retrying
+// every tick would only fill the log. The lease may then expire mid-session -
+// which is the pre-CLA-358 behaviour, not a worse one.
+const heartbeatGiveUp = 3
+
+// heartbeatInterval reports how often a live claim's lease should be renewed:
+// a third of the lease, the cadence the served clankerbar protocol itself
+// prescribes ("heartbeat every ~10 minutes - a third of the 30-minute lease").
+// Beating faster costs a round-trip per tick and buys nothing; beating slower
+// spends the margin the protocol built in. A lease under three ticks wide
+// degrades to one millisecond rather than zero, so a degenerate value still
+// renews (and a test can pin the arithmetic without waiting).
+func heartbeatInterval(lease time.Duration) time.Duration {
+	if lease < 3 {
+		return time.Millisecond
+	}
+	return lease / 3
+}
+
+// leaseRenewer renews the lease of whatever backlog task the spawned session
+// is holding, for exactly as long as the session's Invoke runs (CLA-358).
+//
+// The run id to renew is learned one of two ways: seeded from the invocation's
+// ResumeClaim (a resumed phase continues a live run it never claimed), or
+// observed live as the session's own claim_task lands - both adapters that
+// track claims fire Invocation.OnClaim the moment the stream carries the ids,
+// so an opencode session that claims twenty minutes in is renewed from that
+// moment, which is the exact gap that used to kill its lease (the CLA-331
+// measurement this task exists for).
+//
+// The lifecycle is the point. The renewer lives from just before Invoke to
+// just after it returns, so renewal PAUSES whenever no child process is
+// running - between attempts, across supervised waits, after exit - and never
+// beats on a lease the driver is about to release or hand to the next phase.
+// Within the window, the adapter's own resurrection machinery (opencode
+// CLA-406) is spanned deliberately: those processes continue the SAME session
+// on the SAME claim, and the claim's lease does not pause just because the
+// child between them died.
+type leaseRenewer struct {
+	hb       plane.Heartbeat
+	interval time.Duration
+	prefix   string
+	// claims carries the latest observed claim snapshot; observe keeps only
+	// the newest if the renewer has not caught up.
+	claims  chan harness.Claim
+	done    chan struct{}
+	stopped chan struct{}
+}
+
+// startLeaseRenewal begins renewing the spawned session's claim lease and
+// wires the observation callback into inv. It returns nil - and touches
+// nothing - when there is nothing to renew with: no Releaser on the target,
+// or one that cannot heartbeat. A probe invocation is skipped too: a probe
+// never claims, so there is nothing to renew and the callback would be dead
+// weight on a liveness check.
+//
+// The returned renewer's stop() must be called when Invoke returns.
+func (d *Driver) startLeaseRenewal(ctx context.Context, t Target, inv *harness.Invocation, prefix string) *leaseRenewer {
+	if t.Releaser == nil || inv.Probe {
+		return nil
+	}
+	hb, ok := t.Releaser.(plane.Heartbeat)
+	if !ok {
+		return nil
+	}
+	r := &leaseRenewer{
+		hb:       hb,
+		interval: heartbeatInterval(planeLeaseDuration),
+		prefix:   prefix,
+		claims:   make(chan harness.Claim, 4),
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+	}
+	inv.OnClaim = r.observe
+	go r.run(ctx, inv.ResumeClaim)
+	return r
+}
+
+// observe receives one claim snapshot from an adapter's parser. Latest wins:
+// if the renewer has not drained the previous snapshot yet, it is dropped in
+// favour of this one - only the newest claim state can be true.
+func (r *leaseRenewer) observe(c harness.Claim) {
+	if r == nil {
+		return
+	}
+	select {
+	case <-r.done:
+		return
+	default:
+	}
+	select {
+	case r.claims <- c:
+		return
+	default:
+	}
+	// Full: shed the stale snapshot, then try once more.
+	select {
+	case <-r.claims:
+	default:
+	}
+	select {
+	case r.claims <- c:
+	case <-r.done:
+	}
+}
+
+// run is the renewer's loop: beat every interval for as long as the current
+// claim carries a run id, follow the claim as the session settles one task and
+// claims the next, and stand down on cancellation, stop(), a not-wired plane,
+// or heartbeatGiveUp consecutive failures.
+func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
+	defer close(r.stopped)
+	ticker := time.NewTicker(r.interval)
+	defer ticker.Stop()
+	beats := 0
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-r.done:
+			if beats > 0 {
+				log.Printf("%slease renewal stopping after %d beat(s)", r.prefix, beats)
+			}
+			return
+		case c := <-r.claims:
+			if c.RunID != current.RunID {
+				if c.RunID == "" {
+					log.Printf("%sthe session settled %s - pausing lease renewal until it holds a task again", r.prefix, claimName(current))
+				} else {
+					log.Printf("%srenewing the lease of %s every %s while the session runs", r.prefix, claimName(c), r.interval)
+				}
+			}
+			current = c
+		case <-ticker.C:
+			if current.RunID == "" {
+				continue
+			}
+			bctx, cancel := context.WithTimeout(ctx, heartbeatBeatTimeout)
+			err := r.hb.Heartbeat(bctx, current.RunID)
+			cancel()
+			switch {
+			case err == nil:
+				beats++
+				failures = 0
+			case errors.Is(err, plane.ErrNotWired):
+				// A not-wired plane cannot renew anything, ever. Said once,
+				// then the renewer stands down rather than log the same
+				// refusal every tick for the rest of the session.
+				log.Printf("%slease renewal unavailable: %v - standing down (the lease behaves as before CLA-358: it expires if the session outlives it)", r.prefix, err)
+				return
+			case ctx.Err() != nil:
+				return
+			default:
+				failures++
+				log.Printf("%slease renewal failed (%d in a row): %v", r.prefix, failures, err)
+				if failures >= heartbeatGiveUp {
+					log.Printf("%sgiving up on lease renewal after %d consecutive failures - the lease may expire mid-session", r.prefix, failures)
+					return
+				}
+			}
+		}
+	}
+}
+
+// stop ends the renewer and waits - bounded, so a wedged renewal call cannot
+// stall the attempt ladder - for the goroutine to exit. Nil-safe, so the
+// Invoke call site needs no conditional.
+func (r *leaseRenewer) stop() {
+	if r == nil {
+		return
+	}
+	close(r.done)
+	select {
+	case <-r.stopped:
+	case <-time.After(heartbeatBeatTimeout + 5*time.Second):
+	}
+}
+
+// claimName is the human name for a claim in the renewer's log lines: the
+// qualified ref when the plane supplied one, the bare task id when not.
+func claimName(c harness.Claim) string {
+	if c.Ref != "" {
+		return c.Ref
+	}
+	return c.TaskID
+}
