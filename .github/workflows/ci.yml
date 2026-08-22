@@ -20,7 +20,7 @@ name: ci
 # `pull_request` run that parks at `action_required`, contributing NO check run
 # until a human approves it, at which point it runs and becomes a second `ci`
 # check under the same required `ci` context. Drop `staging` and the promotion
-# PR is stuck behind a required check that only arrives on approval — or, on
+# PR is stuck behind a required check that only arrives on approval - or, on
 # the NEXT commit's push (which carries a clanker's own credentials, not
 # suppressed), which heals a two-merge batch but not a single-merge one.
 on:

@@ -61,7 +61,7 @@ jobs:
         # after the next publish, not immediately.
         #
         # The trade-off this choice accepts, and why it is safe HERE. A PR created
-        # by GITHUB_TOKEN DOES trigger a `pull_request` run — it is created but
+        # by GITHUB_TOKEN DOES trigger a `pull_request` run - it is created but
         # parks at `action_required`, so it contributes NO check run until a
         # human approves it, at which point it runs and becomes a second `ci`
         # check under the same required `ci` context. `main` requires the `ci`

@@ -219,15 +219,14 @@ readable by that same agent-mergeable tree - a narrower capability guarded by a
 thing that can leak, versus a broader one that cannot. The operator took the
 second. Revisit it if a review requirement ever lands on `main`.
 
-
 ## What the operator sees on the promotion PR
 
 When the promotion PR is open but the `pull_request` run sits parked at
 `action_required`, the PR reads `mergeStateStatus: UNSTABLE` rather than
 `CLEAN`. This is **expected**, not a fault: the parked run has not executed,
-so it contributes no check result. Merging is permitted anyway — the push-to-
-`staging` `ci` run already satisfies the required check against the PR's head
-SHA.
+so it contributes no check result. Merging is permitted anyway - the
+push-to-`staging` `ci` run already satisfies the required check against the
+PR's head SHA.
 
 Approving the parked run is nonetheless **usually the right call**. Only the
 `pull_request` run tests the actual merge (`refs/pull/<n>/merge`); the push run
@@ -238,11 +237,13 @@ merge is safe is for both runs to be green. Before merging, check whether the
 branches have diverged (`git log --graph --oneline --left-right main...staging`);
 if they have, approve the run.
 
-Evidence for the mechanism: the 2026-08-11 observations on PR #36 (the parked
-`action_required` run, `UNSTABLE`, approval, and the second green `ci
-(pull_request)` check). No live PR is required: the PR body records the
-verification against that record, and the YAML says the mechanism is tested,
-not pinned by observation.
+Evidence: verified live on 2026-08-22 against the standing promotion PR #91
+(open at the time) - its `pull_request` run sat parked at `action_required`,
+the check rollup carried no `ci (pull_request)` entry, and the PR read
+`MERGEABLE` and `UNSTABLE` at once - and against the 2026-08-11 cycle (PR #36:
+the same parked run, an approval, then a second green `ci (pull_request)`
+check alongside the push run).
+
 ## Break glass
 
 Cut a release by hand:
