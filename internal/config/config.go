@@ -595,6 +595,30 @@ type Config struct {
 	// the top-level value for that project only.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
 
+	// HealthURL is the deployment health endpoint (`/health`) doctor's deploy_lag
+	// check reads to learn WHICH commit is running out there — CLA-322. The plane
+	// stamps version.commit at BUILD time, so "is commit X live?" is one request
+	// and a string compare; this URL names where to ask. It is an operator-set
+	// value with no derived default, because a deployment can live anywhere
+	// (staging, production, a self-hosted plane) and deriving it from backlog_url
+	// would answer about whichever environment the guess happened to hit. Empty =
+	// not monitored: the check says so once, quietly, and moves on.
+	//
+	// The endpoint is read WITHOUT credentials — /health is public — so unlike
+	// backlog_url it is held only to "parses as an absolute URL", not to the
+	// bearer-token TLS floor.
+	HealthURL string `json:"health_url"`
+
+	// IntegrationBranch is the branch deployments are built from and promoted
+	// along — the branch whose tip a healthy deployed build should be an ancestor
+	// of. Doctor's deploy_lag check compares /health's version.commit against its
+	// REMOTE tip. Default: staging (the convention both of this project's repos
+	// use); override where your project integrates elsewhere. It deliberately does
+	// NOT come from delivery.Claim.IntegrationBranch: that is a per-session
+	// declaration of where one commit landed, while this is standing per-project
+	// configuration about how releases flow.
+	IntegrationBranch string `json:"integration_branch"`
+
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
 	// original single-project mode, driven by the top-level fields, exactly as
@@ -676,6 +700,18 @@ type Project struct {
 	// top-level field of the same name for this project only. See
 	// Config.AllowUncheckedPR for what it does and why the default refuses.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// HealthURL is this project's deployment health endpoint (`/health`),
+	// overriding the top-level field of the same name for this project only.
+	// See Config.HealthURL. Each project is a distinct backlog with its own
+	// deployment, so in multi-project mode each one names where ITS plane
+	// answers.
+	HealthURL string `json:"health_url"`
+
+	// IntegrationBranch is this project's integration branch, overriding the
+	// top-level field of the same name for this project only. See
+	// Config.IntegrationBranch for what it means; the default is staging.
+	IntegrationBranch string `json:"integration_branch"`
 }
 
 // AllowUncheckedPRFor resolves the CLA-310 empty-rollup opt-out for one
@@ -690,6 +726,72 @@ func (c *Config) AllowUncheckedPRFor(slug string) bool {
 		}
 	}
 	return c.AllowUncheckedPR
+}
+
+// DefaultIntegrationBranch is the branch whose tip doctor's deploy_lag check
+// (CLA-322) judges the deployed build against when neither the project nor the
+// top-level config names one. Both of this project's repos integrate through
+// `staging`, so that is the convention the default encodes; an operator whose
+// project integrates elsewhere sets integration_branch explicitly rather than
+// getting an answer about a branch they do not have.
+const DefaultIntegrationBranch = "staging"
+
+// HealthURLFor resolves the deploy_lag check's /health endpoint for one
+// project: a matching projects[] entry's value wins when it is set, and
+// everything else falls back to the top-level field. Empty means not
+// monitored — there is deliberately no derived default, because a guessed
+// environment would answer about the wrong deployment.
+func (c *Config) HealthURLFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return firstNonEmpty(p.HealthURL, c.HealthURL)
+		}
+	}
+	return c.HealthURL
+}
+
+// IntegrationBranchFor resolves the branch the deployed build is judged
+// against for one project: a matching projects[] entry's value wins when it is
+// set, then the top-level field, then DefaultIntegrationBranch. Total, so the
+// check never has to carry its own fallback.
+func (c *Config) IntegrationBranchFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return firstNonEmpty(p.IntegrationBranch, c.IntegrationBranch, DefaultIntegrationBranch)
+		}
+	}
+	return firstNonEmpty(c.IntegrationBranch, DefaultIntegrationBranch)
+}
+
+// firstNonEmpty returns the first argument that is not "", or "" if none is.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// validateHealthURL holds a health_url to "an absolute URL with a scheme and
+// host". It is deliberately weaker than backlog_url's TLS floor: /health is a
+// public endpoint read without credentials, so there is no bearer token to
+// keep off the wire, and a plain-http internal plane is a legitimate thing to
+// point at. What it refuses is the value that could never be fetched at all —
+// which otherwise surfaces as an opaque client error from doctor instead of as
+// the misfiled config line it is.
+func validateHealthURL(raw, label string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a URL: %w", label, raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("%s: %q is not an absolute URL with a scheme and host", label, raw)
+	}
+	return nil
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
@@ -1739,6 +1841,14 @@ func (c *Config) Validate() error {
 	if _, err := secureurl.Origin(c.BacklogURL); err != nil {
 		return fmt.Errorf("backlog_url: %w", err)
 	}
+	// health_url is read WITHOUT credentials (/health is public), so unlike
+	// backlog_url it is not held to the bearer-token TLS floor — only to being
+	// a usable absolute URL. A value that cannot be fetched would otherwise
+	// surface as an opaque HTTP-client error from doctor's deploy_lag check
+	// instead of as the misfiled config it is.
+	if err := validateHealthURL(c.HealthURL, "health_url"); err != nil {
+		return err
+	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
@@ -1824,6 +1934,9 @@ func (c *Config) Validate() error {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
 		}
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+			return err
+		}
+		if err := validateHealthURL(p.HealthURL, fmt.Sprintf("projects[%d].health_url", i)); err != nil {
 			return err
 		}
 		// The slug decides which queue is POLLED; the .mcp.json decides which

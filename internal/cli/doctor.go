@@ -38,6 +38,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
@@ -87,6 +88,12 @@ type doctorEnv struct {
 	apiKey     string
 	goos       string
 	pmset      func(ctx context.Context, args ...string) (string, error)
+
+	// The deploy_lag check's three seams (CLA-322): the /health read,
+	// repository discovery under a workdir, and every git exec it runs.
+	fetchHealth func(ctx context.Context, healthURL string) (deployHealth, error)
+	repos       func(ctx context.Context, workdir string) []string
+	gitRun      func(ctx context.Context, dir string, args ...string) (string, error)
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -114,6 +121,9 @@ func defaultDoctorEnv() doctorEnv {
 			out, err := exec.CommandContext(ctx, "pmset", args...).Output()
 			return string(out), err
 		},
+		fetchHealth: fetchDeployHealth,
+		repos:       delivery.Repos,
+		gitRun:      deployGitRun,
 	}
 }
 
@@ -208,6 +218,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
 	checks = append(checks, checkConfigDirs(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
+	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
 	checks = append(checks, checkMCPServers(cfg))
