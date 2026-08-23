@@ -63,10 +63,17 @@ checkpoint:
 
 Phase 1 claims the task, implements it in a worktree cut from the repo's
 integration branch, self-verifies, commits, pushes and records the branch — then
-stops. Phase 2 starts on a **fresh context**, resumes the *same* run (the driver
-substitutes the task and run ids into its brief, so it calls `heartbeat` instead
-of claiming), re-reads the bar and the standing decisions from the plane, works
-in that same worktree — never on the integration branch itself — runs the
+stops. When phase 1 instead finds an existing branch or worktree already
+carrying the task's work (a recovered claim, a prior session's WIP), its first
+step is to merge the integration branch into it - a merge, never a rebase,
+since rewriting pushed history breaks tip comparison - and re-validate the task
+against the merged tip before touching what it found: superseded means record
+the decision and park the task with an outcome saying so, or salvage only what
+still adds value - never verify-and-push stale work. Phase 2 starts on a
+**fresh context**, resumes the *same* run (the driver substitutes the task and
+run ids into its brief, so it calls `heartbeat` instead of claiming), re-reads
+the bar and the standing decisions from the plane, works in
+that same worktree — never on the integration branch itself — runs the
 adversarial review, fixes what it finds, pushes, opens a PR targeting the
 integration branch if no PR exists yet for the branch, and hands the task to
 `in_review`. The claim is held across the seam, so the task is never posted back
@@ -105,9 +112,12 @@ boundary too. Two other consequences worth knowing:
   alone, so with no phase after it every task would stop half-finished, forever,
   with nothing in the logs reading as an error.
 
-The saving is **projected** at 20-28% for a two-way cut — modelled off one real
-task's decile curve, not measured from a phased run, and stated that way
-deliberately until a phased run has been measured. Splitting thinner earns less
+The saving is **still unmeasured**: a phased run has now happened, but it is not
+comparable evidence - its implement phase reached the checkpoint over an
+implementation that already existed, so its totals capture a checkpoint plus a
+review rather than a from-scratch split, and quoting them as a saving would
+overstate the effect by a wide margin. A like-for-like measurement still does
+not exist, and it costs a full task run to get. Splitting thinner earns less
 each time while every extra boundary still pays a session's full startup cost.
 
 ### Session-initiated handoff: a boundary the session chooses
@@ -870,6 +880,32 @@ it out does not opt out: an empty value re-runs the `<workdir>/.mcp.json` discov
 so a workdir that carries a Claude `.mcp.json` hands it over no matter what. Run
 `clankerbar doctor` - it prints the caveat instead of a verdict where the file is not
 read, and FAILs the workdir check when `opencode` is pointed at a Claude-shaped one.
+
+#### A discovered `.mcp.json` may not choose what runs
+
+A file that arrives through the default above was FOUND, not named - and a checkout
+can write it as easily as you did (sessions run with edit permission in that
+directory, and the damage would land on the next unattended start). Since it is
+handed to the harness whole, a config nobody pointed at is held to three rules:
+
+1. **An MCP entry carrying a `command` - a locally spawned server - is refused.**
+   It starts at session init, before any permission rule applies, running as you
+   with the session's whole environment (`CLANKERBAR_API_KEY` included). Entries
+   you meant go under `"allow_local_mcp_servers": ["docs"]` - top level, or on a
+   `projects[]` entry (which replaces the top-level list for that project). The
+   other way out is naming the file: an explicit `mcp_config_path` adopts it
+   wholesale.
+2. **Keys that decide what a session IS are refused outright.** Under opencode the
+   file is the session's ENTIRE config, so a discovered one may not set
+   `permission` (it would replace the fail-closed policy the driver pins),
+   `plugin`, or `agent`. No allowlist reaches these; name the file if you mean them.
+3. **A discovered file that cannot be read is refused**, not passed through.
+
+`allow_local_mcp_servers` gets the same visibility as every other loose state:
+`doctor`'s `mcp_servers` check reports the list beside the entries it admits. A
+file you NAMED with `mcp_config_path` is exempt from all three rules - naming it
+is the statement that you vetted it - and its local servers are still disclosed
+by doctor's WARN as they always were.
 
 Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at the
 root here is the maintainers' own agent wiring and names the `clankerbar` project

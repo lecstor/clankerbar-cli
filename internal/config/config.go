@@ -341,6 +341,37 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 	"already lives in the repo or on the task, and under 4KB. The successor resumes this same run under this " +
 	"same brief's scope, so do NOT settle, release or hand back the task first."
 
+// implementResumedBranchRule is the implement brief's rule for resuming an EXISTING branch or
+// worktree (CLA-378). EZY-199 was a recovered stale claim whose implement phase followed the
+// rest of this brief faithfully - it verified the found tip with a build, the unit suite and
+// 60 e2e executions, then pushed - and never synced against staging, which had superseded the
+// branch's whole fix a day earlier. The review phase then paid $11.70 for the archaeology,
+// merge and salvage that an up-front check costing cents would have made unnecessary.
+//
+// Three parts, each load-bearing. SYNC first, as a merge and never a rebase: the branch may
+// already be pushed, and the daemon's phase-boundary check compares the pushed origin tip to
+// the local tip, which a rebase invalidates. RE-VALIDATE against the MERGED tip before doing
+// or verifying anything: a clean merge proves nothing - it can silently revert a newer fix -
+// so the check is the task's own bar, not conflict markers. On SUPERSESSION, record the
+// decision and PARK the task with an outcome citing it - a bare stop leaves the recorded
+// branch reading as checkpointed WIP, which spends a review phase rediscovering the stale
+// tip - or salvage only what still adds value; never re-verify and push stale work.
+//
+// Harness-neutral on purpose: one wording serves every harness's implement phase.
+const implementResumedBranchRule = "RESUMED WORK comes first when you find it: if the claim hands you an EXISTING branch or " +
+	"worktree for this task (a recovered stale claim, a prior session's WIP - check the repo yourself whatever " +
+	"the claim's hasWip flag said), your FIRST step is to merge the project's integration branch into it - a " +
+	"merge, NEVER a rebase: the branch may already be pushed, and rewriting pushed history invalidates the " +
+	"daemon's phase-boundary check, which compares the pushed origin tip to your local tip. THEN re-validate " +
+	"the task against the merged tip BEFORE doing or verifying any of the found work: a clean merge is not " +
+	"proof the task still needs doing - a non-conflicting merge can silently revert a newer fix - so the " +
+	"check is the task's own bar (for a bug: does it still reproduce?), not the absence of conflict markers. " +
+	"If the merged tip supersedes the task, record the decision (record_decision), then PARK the task with an " +
+	"outcome citing it (update_task status: parked) - task.branch is already set on a resumed branch, so a bare " +
+	"stop reads as checkpointed WIP and spends a phase 2 rediscovering the staleness - or salvage only what " +
+	"still adds value and carry on with the normal flow; either way do NOT spend the run re-verifying and " +
+	"pushing stale work."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
 // The split is implement, then review-and-fix, and that grouping is deliberate:
@@ -350,8 +381,9 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 // workflow puts implementation and fix in ONE actor and the review in a separate
 // read-only one. Splitting where that workflow already splits is the whole idea.
 var builtinPhasePrompts = map[string]string{
-	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
-		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work disposition below): " +
+		implementResumedBranchRule +
+		" Unless you parked above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + handoffGuidance,
@@ -595,6 +627,26 @@ type Config struct {
 	// the top-level value for that project only.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
 
+	// AllowLocalMCPServers names the MCP server entries an operator means to run
+	// from a DISCOVERED `<workdir>/.mcp.json` — the file Validate adopts by
+	// default when mcp_config_path is empty. Any local-command entry whose name
+	// is on this list is accepted from a discovered file; every other command
+	// entry in one is refused (CLA-266: such an entry starts a process at session
+	// init, before any permission rule applies, and a workdir default is not
+	// where that decision belongs). It reaches nothing else: opencode-schema
+	// policy keys (`permission`, `plugin`, `agent`) in a discovered file are
+	// refused regardless of this list — naming servers never approves policy.
+	//
+	// The safe state is the default (refuse); the loose state is this visible,
+	// operator-owned list, which `doctor` reports. A file the operator NAMES via
+	// mcp_config_path needs no entry here — naming it IS the statement, and its
+	// local servers are disclosed by doctor's WARN as they always were.
+	//
+	// In single-project mode set it here; in multi-project mode set it per
+	// project (see Project.AllowLocalMCPServers) to replace the top-level list
+	// for that project only.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
+
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
 	// original single-project mode, driven by the top-level fields, exactly as
@@ -676,6 +728,12 @@ type Project struct {
 	// top-level field of the same name for this project only. See
 	// Config.AllowUncheckedPR for what it does and why the default refuses.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// AllowLocalMCPServers is this project's CLA-266 allowlist, REPLACING the
+	// top-level list of the same name for this project's discovered MCP config
+	// when it names anything; an entry that sets none inherits the top-level
+	// one. See Config.AllowLocalMCPServers and AllowLocalMCPServersFor.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
 }
 
 // AllowUncheckedPRFor resolves the CLA-310 empty-rollup opt-out for one
@@ -690,6 +748,23 @@ func (c *Config) AllowUncheckedPRFor(slug string) bool {
 		}
 	}
 	return c.AllowUncheckedPR
+}
+
+// AllowLocalMCPServersFor resolves the CLA-266 discovered-file allowlist for
+// one project: a matching projects[] entry's own NON-EMPTY list replaces the
+// top-level one, and everything else — an unmatched slug (how a single-project
+// run reaches here with no projects at all), or an entry that set none — falls
+// back to the top-level list. There is deliberately no way to say "none here"
+// while the top level allows names: an empty allowlist is indistinguishable
+// from not having configured one, and pretending otherwise would let a project
+// line look tighter than it runs. Total, so no caller has a second error path.
+func (c *Config) AllowLocalMCPServersFor(slug string) []string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.AllowLocalMCPServers) > 0 {
+			return p.AllowLocalMCPServers
+		}
+	}
+	return c.AllowLocalMCPServers
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
@@ -1719,8 +1794,17 @@ func (c *Config) Validate() error {
 	// -p mode does NOT auto-discover .mcp.json, so without this a bare `clankerbar
 	// run` from a workdir that carries one would spawn sessions with no clankerbar
 	// tools at all — and the poller could derive no slug. Explicit config still wins.
+	//
+	// A file that arrives THIS way was found, not named, and is held to the
+	// discovered-file rule before anything else reads it (CLA-266): it may not
+	// declare local-process servers nor carry opencode-schema policy keys.
+	// checkMCPConfigOrigins below still applies to it either way — a discovered
+	// file can pass this gate and still fail the origin one.
 	if c.MCPConfigPath == "" {
 		c.MCPConfigPath = discoverMCPConfig(c.WorkDir)
+		if err := c.checkDiscoveredMCPConfig(c.MCPConfigPath, "mcp_config_path", c.AllowLocalMCPServers); err != nil {
+			return err
+		}
 	}
 
 	// Where the account-scoped API key is allowed to go, settled once, here
@@ -1822,6 +1906,13 @@ func (c *Config) Validate() error {
 		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
+			// Discovered, not named, exactly like the top-level default above —
+			// same rule, labelled with THIS field so the remedy names the line
+			// the operator actually adds, and allowlisted per THIS project
+			// (CLA-266).
+			if err := c.checkDiscoveredMCPConfig(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i), c.AllowLocalMCPServersFor(p.Slug)); err != nil {
+				return err
+			}
 		}
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
 			return err
