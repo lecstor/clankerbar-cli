@@ -1465,7 +1465,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		}
 
 		// A session the ADAPTER ended for outliving its wall-clock cap is the same
-		// shape again: the phase ends, and neither a retry nor a failure is right —
+		// shape again: the phase ends, and neither a retry nor a failure is right -
 		// a retry would spend the same hours over again and reach the same deadline,
 		// and failing would stop the run over a cap doing its job (CLA-368).
 		//
@@ -1475,7 +1475,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		//
 		// Since CLA-365 opencode has BOTH HonoursSessionWallClock and
 		// TracksClaims (Capabilities.TracksClaims: true), so a capped opencode
-		// session holding its claim IS salvaged — the res.Claim.Held() arm above
+		// session holding its claim IS salvaged - the res.Claim.Held() arm above
 		// is the one that fires today. The else branch (nothing salvaged) applies
 		// only if an adapter enforcing this cap ever lacks claim observation
 		// again; it is kept defensive, not descriptive of the present. The claim-held

@@ -716,10 +716,11 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	}
 }
 
-// The operator-facing line has to be TRUE, and today it is true only in the
-// direction nobody can reach: the salvage runs on an observed claim, and the
-// only adapter that enforces the cap does not observe claims. Reporting a
-// salvage that never ran would be the reassuring falsehood CLA-290 removed from
+// The operator-facing line has to be TRUE, so the driver branches on the claim
+// it actually observed rather than asserting a salvage: since CLA-365 the only
+// adapter that enforces this cap (opencode) also observes claims, so BOTH arms
+// below are reachable today and each pins its own wording. Reporting a salvage
+// that never ran would be the reassuring falsehood CLA-290 removed from
 // doctor, in the one place a run leaves work behind.
 func TestDrainPhases_AWallClockCapDoesNotClaimASalvageThatCouldNotRun(t *testing.T) {
 	for _, tc := range []struct {
