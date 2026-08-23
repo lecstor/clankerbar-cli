@@ -619,7 +619,20 @@ func scopeExtraDirs(read, edit, ext map[string]string, worktree string, extraDir
 			// Sibling trees come out with a "../" prefix, which the blanket
 			// "../**" deny scopeInstanceDir laid down covers and this specific
 			// allow re-opens on last-match-wins.
-			if rel, err := filepath.Rel(worktree, dir); err == nil && rel != "." {
+			//
+			// A tree that CONTAINS the worktree is skipped, and that skip is
+			// load-bearing rather than tidy. filepath.Rel returns a pure
+			// dot-dot chain for an ancestor ("..", "../.."), and opencode's
+			// matcher reads `*` as any run of characters including "/", so
+			// "../**" is not "that directory" - it is everything outside the
+			// worktree. Emitting it would either overwrite the "../**" deny
+			// with an allow (a declared parent of a submodule) or sort after it
+			// and beat it ("../../**"), turning the policy's only stated escape
+			// boundary into an allow of the whole filesystem. Such a tree stays
+			// reachable through the root-relative allow and the
+			// external_directory allow written just above; what is dropped is
+			// only the ask form that cannot be bounded (CLA-441 review).
+			if rel, err := filepath.Rel(worktree, dir); err == nil && rel != "." && !isDotDotChain(rel) {
 				relGlob := filepath.ToSlash(rel) + "/**"
 				read[relGlob] = "allow"
 				edit[relGlob] = "allow"
@@ -643,9 +656,19 @@ func scopeExtraDirs(read, edit, ext map[string]string, worktree string, extraDir
 //   - The session starts in a SUBDIRECTORY of a checkout. The worktree root is
 //     an ancestor, so asks for the working set carry the subdirectory's own
 //     prefix, and a bare "**" allow would hand the session the whole repo above
-//     it. "**" is denied instead and the prefixed form allowed - which sorts
-//     after it, whatever the subdirectory is named, since every path character
-//     that can start one sorts above "*".
+//     it. Only the prefixed form is allowed, and NOTHING is denied here: the
+//     policy's own `*` catch-all already denies every ask no rule allows, so an
+//     in-repo path outside the workdir falls to it untouched.
+//
+// Writing no deny in that second case is deliberate, and the first draft did
+// write one ("**": "deny", beaten by the prefixed allow on last-match-wins).
+// That put a DIRECTORY NAME into a sort-order argument, and the argument is
+// false: ten byte values that can legally start a path component (space, and
+// `!"#$%&'()`) sort BELOW "*" (0x2a), so a workdir named `!important` emitted
+// its allow before the deny and locked the session out of its own tree - the
+// same silent total denial CLA-441 spent four tasks on, in a new dress. The
+// deny that remains, "../**" in the worktree-root case, is a fixed string
+// beaten by nothing that depends on a name (CLA-441 review).
 //
 // It mutates the maps in place so the base construction stays the single
 // description of the non-repo shape.
@@ -664,12 +687,23 @@ func scopeInstanceDir(read, edit map[string]string, worktree, workdir string, in
 		edit["../**"] = "deny"
 		return
 	}
-	read["**"] = "deny"
-	edit["**"] = "deny"
 	read[rel+"/**"] = "allow"
 	edit[rel+"/**"] = "allow"
 	read[rel] = "allow"
 	edit[rel] = "allow"
+}
+
+// isDotDotChain reports whether a slash-separated relative path is nothing but
+// ".." components - what filepath.Rel returns for a directory that CONTAINS the
+// base. Such a path has no bounded glob form in opencode's worktree-relative ask
+// shape, which is why scopeExtraDirs refuses to emit one.
+func isDotDotChain(rel string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if seg != ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // opencodeWorktreeRoot resolves the git worktree opencode will discover for an
@@ -773,20 +807,36 @@ func (opencode) env(in Invocation) ([]string, error) {
 	if in.MCPConfigPath != "" {
 		env = append(env, "OPENCODE_CONFIG="+in.MCPConfigPath)
 		// ...and hand the SAME bytes over again as OPENCODE_CONFIG_CONTENT,
-		// which opencode merges LAST (CLA-441). OPENCODE_CONFIG is an early
-		// layer: opencode merges the global config, then this file, then every
-		// project-level opencode.json it discovers from the instance directory,
-		// then the OPENCODE_CONFIG_DIR directory again. Both later layers have
-		// been observed redirecting `mcp.clankerbar` at ANOTHER project - a
-		// global block did it for sessions whose instance dir was ~/dev, a
-		// checked-in repo-level opencode.json did it for sessions whose instance
-		// dir was a repo - so naming the file does not pin which backlog an
-		// unattended session works. The content layer does, and it costs one
-		// read of a file this process already trusts.
+		// which opencode merges after every layer this driver or a checkout can
+		// write (CLA-441). OPENCODE_CONFIG is an early layer: opencode merges
+		// the global config, then this file, then every project-level
+		// opencode.json it discovers from the instance directory, then the
+		// OPENCODE_CONFIG_DIR directory again, THEN this. Both of those later
+		// layers have been observed redirecting `mcp.clankerbar` at ANOTHER
+		// project - a global block did it for sessions whose instance dir was
+		// ~/dev, a checked-in repo-level opencode.json did it for sessions whose
+		// instance dir was a repo - so naming the file does not pin which
+		// backlog an unattended session works. The content layer does, and it
+		// costs one read of a file this process already trusts.
+		//
+		// "Merged last" is deliberately not said: read out of 1.18.19's
+		// Config.loadInstanceState, THREE layers still follow it - the console
+		// active-org remote config, a managed (MDM) config dir, and managed
+		// preferences. None is reachable on an ordinary developer machine, and
+		// none is anything a repo or this driver can write, so the pin holds;
+		// but a future reader should not be told a false absolute.
 		//
 		// This does not make the PWD pin redundant, nor it this: the content
 		// layer settles which MCP server the session talks to, the instance
 		// directory settles which repo it reads, edits and asks permission for.
+		//
+		// Two costs of moving a file's bytes into the environment, neither
+		// large enough to change the call: a credential written LITERALLY into
+		// the mcp config (rather than as `{env:CLANKERBAR_API_KEY}`) is now in
+		// the child's environment, where a process listing or a crash dump
+		// reaches it and a 0600 file did not; and environment plus argv is
+		// capped around 1 MB on macOS, so an enormous config would fail the
+		// spawn with E2BIG rather than merely being ignored.
 		content, err := os.ReadFile(in.MCPConfigPath)
 		if err != nil {
 			// FAIL CLOSED. The alternative - spawn with OPENCODE_CONFIG alone -

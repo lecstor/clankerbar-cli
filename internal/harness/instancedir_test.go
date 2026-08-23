@@ -129,7 +129,13 @@ func TestPolicyScopesASubdirectoryOfACheckout(t *testing.T) {
 // a plain relative ask there is not a thing the policy should have started
 // allowing.
 func TestPolicyKeepsTheNonRepoShape(t *testing.T) {
-	dir := t.TempDir() // a real directory carrying no .git, with none above it
+	// A real directory carrying no .git. That NONE of its ancestors carries one
+	// either is an assumption about TMPDIR, not something this test can
+	// establish - opencodeWorktreeRoot walks to "/" and there is no
+	// GIT_CEILING_DIRECTORIES hook here. True on macOS and on CI; false for
+	// anyone whose TMPDIR sits inside a checkout, where this test would report
+	// the in-checkout shape and be right to (CLA-441 review).
+	dir := t.TempDir()
 	perm := opencodePermission(false, dir, nil)
 
 	if got := opencodeEvaluate(t, perm, "read", rootRelOf(dir)+"/clankerbar-cli/AGENTS.md"); got != "allow" {
@@ -208,5 +214,96 @@ func TestTheAsksALiveSessionWasDeniedNowResolveAllow(t *testing.T) {
 	parent := opencodePermission(false, "/Users/jason/dev", nil)
 	if got := opencodeEvaluate(t, parent, "read", "Users/jason/dev/clankerbar-worktrees/ea1f319a/apps/web/src/server/mcp/server.ts"); got != "allow" {
 		t.Errorf("root-relative read = %s, want allow - transcribed from run=2065bd6d, which matched action.pattern=Users/jason/dev/**", got)
+	}
+}
+
+// The extra-dir ask form is computed against the WORKTREE ROOT, not the
+// workdir, and those differ exactly when the session starts below the top of
+// its checkout. Without this case the two never met: the two-repo test spawns at
+// a worktree root, and the subdirectory test declares no extra dirs - so
+// reverting scopeExtraDirs to take the workdir left the suite green (CLA-441
+// review).
+func TestExtraDirFormIsRelativeToTheWorktreeNotTheWorkdir(t *testing.T) {
+	parent := t.TempDir()
+	repo := checkoutAt(t, filepath.Join(parent, "repo"), "dir")
+	sub := filepath.Join(repo, "services", "api")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	sibling := checkoutAt(t, filepath.Join(parent, "repo-b"), "dir")
+
+	read := rules(parsePolicy(t, opencodePermission(false, sub, []string{sibling})), "read")
+	if !has(read, "../repo-b/**:allow") {
+		t.Errorf("read = %v; the sibling's ask form is path.relative(worktree, dir) = ../repo-b, not workdir-relative ../../../repo-b", read)
+	}
+	if has(read, "../../../repo-b/**:allow") {
+		t.Errorf("read = %v; a workdir-relative form is a pattern no session ever asks with", read)
+	}
+}
+
+// An extra dir that CONTAINS the worktree has no bounded ask form: filepath.Rel
+// gives a pure dot-dot chain, and opencode's `*` spans "/", so "../**" means
+// everything outside the tree rather than that directory. Two live layouts
+// produce it - a declared parent of a submodule, and a linked worktree created
+// under its own repo - and before the CLA-441 review both handed read/edit an
+// escape: the first OVERWROTE the "../**" deny with an allow, the second sorted
+// after it and beat it.
+func TestAnExtraDirAboveTheWorktreeCannotOpenAnEscape(t *testing.T) {
+	for name, layout := range map[string]struct{ workdir, extra func(base string) string }{
+		"declared parent of a submodule": {
+			workdir: func(b string) string { return filepath.Join(b, "super", "sub") },
+			extra:   func(b string) string { return filepath.Join(b, "super") },
+		},
+		"worktree created under its own repo": {
+			workdir: func(b string) string { return filepath.Join(b, "repo", "worktrees", "task1") },
+			extra:   func(b string) string { return filepath.Join(b, "repo") },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := t.TempDir()
+			workdir := checkoutAt(t, layout.workdir(base), "file")
+			extra := checkoutAt(t, layout.extra(base), "dir")
+			perm := opencodePermission(false, workdir, []string{extra})
+
+			for _, ask := range []string{"../../etc/passwd", "../secret", "../../../Users/someone/.ssh/id_rsa"} {
+				if got := opencodeEvaluate(t, perm, "read", ask); got != "deny" {
+					t.Errorf("read %q = %s, want deny - an ancestor tree's dot-dot chain must not be emitted as a glob", ask, got)
+				}
+				if got := opencodeEvaluate(t, perm, "edit", ask); got != "deny" {
+					t.Errorf("edit %q = %s, want deny", ask, got)
+				}
+			}
+			// The declared tree is still reachable, through the two forms that
+			// CAN bound it - so this is a narrowing of the ask shapes, not a
+			// withdrawal of the grant.
+			p := parsePolicy(t, perm)
+			if !hasRelFormAllow(rules(p, "read"), extra) {
+				t.Errorf("read = %v; the declared tree's root-relative allow must survive", p["read"])
+			}
+			if !hasAbsAllow(rules(p, "external_directory"), extra) {
+				t.Errorf("external_directory = %v; the declared tree's absolute allow must survive", p["external_directory"])
+			}
+		})
+	}
+}
+
+// The subdirectory shape must not depend on a directory NAME sorting after a
+// deny: ten byte values that can legally start a path component sort below "*"
+// (0x2a), so a "**" deny beaten by the prefixed allow locks such a workdir out
+// of its own tree. Nothing is denied there now - the policy's `*` catch-all
+// already covers everything no rule allows (CLA-441 review).
+func TestASubdirectoryWhoseNameSortsLowIsNotLockedOut(t *testing.T) {
+	repo := checkoutAt(t, filepath.Join(t.TempDir(), "repo"), "dir")
+	sub := filepath.Join(repo, "!important")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	perm := opencodePermission(false, sub, nil)
+
+	if got := opencodeEvaluate(t, perm, "read", "!important/main.go"); got != "allow" {
+		t.Errorf("read = %s, want allow - a session locked out of its own workdir is the exact failure this task exists to end", got)
+	}
+	if got := opencodeEvaluate(t, perm, "read", "AGENTS.md"); got != "deny" {
+		t.Errorf("read = %s, want deny - the repo above the workdir is still out of scope", got)
 	}
 }

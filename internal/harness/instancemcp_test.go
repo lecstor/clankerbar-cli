@@ -45,7 +45,9 @@ func mcpConfigNaming(t *testing.T, dir, name, slug string) string {
 //  5. OPENCODE_CONFIG_CONTENT
 //
 // Layers 3 and 4 are the two that beat the driver's file; layer 5 is the one the
-// driver now uses. Later layers overwrite earlier ones KEY BY KEY, which is why
+// driver now uses. Three further layers exist below it in loadInstanceState (the
+// console active-org config, a managed config dir, managed preferences); they are
+// not modelled because nothing a repo or this driver writes can reach them. Later layers overwrite earlier ones KEY BY KEY, which is why
 // only a block named `clankerbar` can displace ours.
 func opencodeResolveClankerbarURL(t *testing.T, env []string, skipContent bool) string {
 	t.Helper()

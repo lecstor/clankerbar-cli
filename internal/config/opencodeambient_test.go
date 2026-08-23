@@ -38,6 +38,7 @@ func opencodeRun(t *testing.T, slug, workdir, configDir string) *Config {
 	// OPENCODE_CONFIG_DIR says, so HOME is isolated: without this these tests
 	// would pass or fail on what happens to be in the developer's home.
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	mcp := writeAmbientFile(t, filepath.Join(t.TempDir(), "opencode-mcp.json"), clankerbarBlock(slug))
 	return &Config{
 		Harness:       "opencode",
@@ -243,5 +244,61 @@ func TestConfigJSONIsAGlobalNameOnly(t *testing.T) {
 	writeAmbientFile(t, filepath.Join(configDir, "config.json"), clankerbarBlock("clankerbar"))
 	if got := opencodeRun(t, "ezyapp", t.TempDir(), configDir).OpencodeAmbientConflicts(); len(got) != 1 {
 		t.Errorf("conflicts = %v, want one: opencode DOES load config.json in its config dir", got)
+	}
+}
+
+// $XDG_CONFIG_HOME/opencode (default ~/.config/opencode) is opencode's real
+// global config directory, and OPENCODE_CONFIG_DIR does NOT move it - that
+// variable only appends a directory to a later merge layer. So the scan cannot
+// be "whatever config_dir names": a run with config_dir unset, or pointed
+// elsewhere, still loads this file into every session (CLA-441 review).
+func TestGlobalScanCoversXDGConfigHomeWithNoConfigDir(t *testing.T) {
+	c := opencodeRun(t, "ezyapp", t.TempDir(), "") // no config_dir at all
+	xdg := os.Getenv("XDG_CONFIG_HOME")
+	writeAmbientFile(t, filepath.Join(xdg, "opencode", "opencode.jsonc"), clankerbarBlock("clankerbar"))
+
+	got := onlyConflict(t, c.OpencodeAmbientConflicts())
+	if got.Scope != "global" || got.Got != "clankerbar" {
+		t.Errorf("conflict = %+v, want the XDG global file flagged with no config_dir set", got)
+	}
+}
+
+// ...and its default location when XDG_CONFIG_HOME is unset.
+func TestGlobalScanCoversDotConfigWhenXDGIsUnset(t *testing.T) {
+	c := opencodeRun(t, "ezyapp", t.TempDir(), "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	writeAmbientFile(t, filepath.Join(os.Getenv("HOME"), ".config", "opencode", "opencode.json"), clankerbarBlock("clankerbar"))
+
+	got := onlyConflict(t, c.OpencodeAmbientConflicts())
+	if got.Scope != "global" {
+		t.Errorf("conflict = %+v, want ~/.config/opencode checked when XDG_CONFIG_HOME is unset", got)
+	}
+}
+
+// A discovered opencode config is merged into every session that loads it, and
+// checkDiscoveredMCPConfig's refusal never sees one - it gates only the file
+// mcp_config_path resolved to. So `plugin` (code opencode runs at session start)
+// and `agent` (agent definitions and their modes) are reported through the same
+// channel. `permission` is NOT: OPENCODE_PERMISSION is merged after every config
+// layer and wins, so warning about it would be warning about something that
+// cannot happen (CLA-441 review).
+func TestAmbientConfigDeclaringPluginOrAgentIsReported(t *testing.T) {
+	configDir := t.TempDir()
+	writeAmbientFile(t, filepath.Join(configDir, "opencode.json"),
+		`{"plugin":["./evil.js"],"agent":{"build":{"mode":"all"}},"mcp":{"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"}}}`)
+	c := opencodeRun(t, "ezyapp", t.TempDir(), configDir)
+
+	got := onlyConflict(t, c.OpencodeAmbientConflicts()) // the slug agrees, so only the override finding
+	if len(got.Overrides) != 2 {
+		t.Fatalf("overrides = %v, want plugin and agent", got.Overrides)
+	}
+	if !strings.Contains(got.String(), "plugin") || !strings.Contains(got.String(), "agent") {
+		t.Errorf("message must name the keys: %q", got.String())
+	}
+
+	writeAmbientFile(t, filepath.Join(configDir, "opencode.json"),
+		`{"permission":{"read":"allow"},"mcp":{"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"}}}`)
+	if got := opencodeRun(t, "ezyapp", t.TempDir(), configDir).OpencodeAmbientConflicts(); len(got) != 0 {
+		t.Errorf("conflicts = %v, want none: the adapter's OPENCODE_PERMISSION is merged after every config layer and wins", got)
 	}
 }

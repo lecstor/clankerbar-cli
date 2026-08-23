@@ -1300,8 +1300,11 @@ the instance directory, then the `OPENCODE_CONFIG_DIR` directory again, then
 and both were observed redirecting the `clankerbar` server at another project -
 a global block for sessions running in `~/dev`, a committed repo-level
 `opencode.json` for sessions running in a checkout. The named file's bytes are
-therefore also sent as `OPENCODE_CONFIG_CONTENT`, which nothing merges after, so
-a drain session reaches the backlog it polls. A file that still names another
+therefore also sent as `OPENCODE_CONFIG_CONTENT`, which opencode merges after
+every layer this driver or a checkout can write, so a drain session reaches the
+backlog it polls. (Three layers do follow it - the console active-org config, a
+managed config directory, and managed preferences - none of them writable by a
+repo or by us.) A file that still names another
 project is reported by `doctor`'s `opencode_ambient_config` check and logged once
 at startup - a warning, not a refusal, since spawned sessions are pinned past it
 and the file is often a checked-in artifact of somebody else's repo, but every

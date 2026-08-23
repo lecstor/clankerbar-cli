@@ -86,7 +86,15 @@ func (c *Config) checkDiscoveredMCPConfig(path, label string, allow []string) er
 		raw  json.RawMessage
 		what string
 	}{
-		{"permission", f.Permission, "the fail-closed permission policy this driver's adapter exports"},
+		// One word of this entry is now known to be wrong, and it is left
+		// refusing anyway. A file's `permission` block does NOT override the
+		// exported policy: read out of 1.18.19's Config.loadInstanceState,
+		// OPENCODE_PERMISSION is parsed and merged in AFTER every config layer,
+		// and the merge's later argument wins (CLA-441 review). The refusal
+		// stands because a discovered file declaring policy at all is not the
+		// document this gate assumed it was, and that ordering is opencode's to
+		// change rather than ours - but the reason is no longer "it would win".
+		{"permission", f.Permission, "a permission policy, which this driver's adapter pins in the environment instead"},
 		{"plugin", f.Plugin, "code loaded and run at startup"},
 		{"agent", f.Agent, "agent definitions, including their modes and permissions"},
 	} {

@@ -23,8 +23,10 @@ import (
 // sessions labelled [ezyapp], and no ezyapp task ever worked (CLA-441).
 //
 // harness/opencode.go now pins the driver's own block through
-// OPENCODE_CONFIG_CONTENT, which opencode merges LAST, so none of these files
-// can redirect a spawned session any more. This check is what stops the fix from
+// OPENCODE_CONFIG_CONTENT, which opencode merges after every layer this driver
+// or a checkout can write (three managed/console layers follow it and none is
+// either of those - see that file), so none of these files can redirect a
+// spawned session any more. This check is what stops the fix from
 // being invisible: a file that still names the wrong project is a live trap for
 // every interactive session and for any future path that loses the content pin,
 // and it is one line of output to say so.
@@ -50,11 +52,36 @@ var (
 	opencodeProjectConfigNames = []string{"opencode.json", "opencode.jsonc"}
 )
 
-// opencodeHomeConfigDir is opencode's OTHER global directory. It is read whatever
-// OPENCODE_CONFIG_DIR says - the live log above shows both being loaded in one
-// run - so a `clankerbar` block parked here is discovered by every session even
-// on a config whose `config_dir` points elsewhere.
-const opencodeHomeConfigDir = "~/.opencode"
+// opencode's two ALWAYS-READ global directories, neither of which is
+// OPENCODE_CONFIG_DIR. Read out of 1.18.19's Config.getGlobal and confirmed by
+// the live log above, which shows both being loaded in one run:
+//
+//   - $XDG_CONFIG_HOME/opencode, defaulting to ~/.config/opencode. This is the
+//     one an operator actually edits, and it is NOT derived from
+//     OPENCODE_CONFIG_DIR - that variable only appends a directory to a later
+//     merge layer. A `config_dir` that is unset (it has no default here, and a
+//     mixed-harness run's opencode block often carries none) or pointed
+//     somewhere else does not move it, so scanning only what `config_dir` names
+//     would miss exactly the file the operator has (CLA-441 review).
+//   - ~/.opencode, its older sibling, read on top of that.
+//
+// The run's own `config_dir` is scanned as well, because it IS merged - just at
+// a later layer - and because an operator who sets it has put config there.
+var opencodeHomeConfigDirs = []string{"$XDG_CONFIG_HOME/opencode", "~/.config/opencode", "~/.opencode"}
+
+// expandOpencodeGlobalDir resolves one entry of opencodeHomeConfigDirs. The
+// XDG entry disappears when the variable is unset rather than resolving to
+// "/opencode", and its default is the ~/.config entry beside it.
+func expandOpencodeGlobalDir(dir string) string {
+	if strings.HasPrefix(dir, "$XDG_CONFIG_HOME/") {
+		base := os.Getenv("XDG_CONFIG_HOME")
+		if base == "" {
+			return ""
+		}
+		return filepath.Join(base, strings.TrimPrefix(dir, "$XDG_CONFIG_HOME/"))
+	}
+	return expandHome(dir)
+}
 
 // OpencodeAmbientConflict is one discovered opencode config whose `clankerbar`
 // MCP server names a project that the sessions loading it do not work.
@@ -68,11 +95,21 @@ type OpencodeAmbientConflict struct {
 	// Want is the slug those sessions poll and are meant to work - more than
 	// one, comma-joined, for the global file of a multi-project run.
 	Want string
-	// Got is the slug the file's clankerbar server actually names.
+	// Got is the slug the file's clankerbar server actually names. Empty on an
+	// Overrides finding, which is about the file's other keys rather than its
+	// backlog.
 	Got string
+	// Overrides names the opencode keys this file carries that decide what a
+	// session IS rather than what it talks to - `plugin` (code opencode loads
+	// and runs at startup) and `agent` (agent definitions and their modes).
+	// Empty on a slug finding.
+	Overrides []string
 }
 
 func (c OpencodeAmbientConflict) String() string {
+	if len(c.Overrides) > 0 {
+		return fmt.Sprintf("%s (%s) declares %s, which every session loading it inherits", c.Path, c.Scope, strings.Join(c.Overrides, " and "))
+	}
 	return fmt.Sprintf("%s (%s) names /mcp/%s, but the sessions that load it work /mcp/%s", c.Path, c.Scope, c.Got, c.Want)
 }
 
@@ -111,16 +148,21 @@ func (c *Config) OpencodeAmbientConflicts() []OpencodeAmbientConflict {
 	for _, scope := range c.opencodeAmbientScopes() {
 		for _, name := range scope.names {
 			path := filepath.Join(scope.dir, name)
-			got := opencodeConfigClankerbarSlug(path)
-			if got == "" || containsString(scope.wantSlugs, got) {
+			f, ok := readOpencodeConfig(path)
+			if !ok {
 				continue
 			}
-			out = append(out, OpencodeAmbientConflict{
-				Path:  path,
-				Scope: scope.label,
-				Want:  strings.Join(scope.wantSlugs, ", "),
-				Got:   got,
-			})
+			if got := clankerbarSlugIn(f); got != "" && !containsString(scope.wantSlugs, got) {
+				out = append(out, OpencodeAmbientConflict{
+					Path:  path,
+					Scope: scope.label,
+					Want:  strings.Join(scope.wantSlugs, ", "),
+					Got:   got,
+				})
+			}
+			if keys := sessionShapingKeys(f); len(keys) > 0 {
+				out = append(out, OpencodeAmbientConflict{Path: path, Scope: scope.label, Overrides: keys})
+			}
 		}
 	}
 	return out
@@ -148,14 +190,14 @@ type ambientScope struct {
 func (c *Config) opencodeAmbientScopes() []ambientScope {
 	var scopes []ambientScope
 	if all := c.drainedSlugs(); len(all) > 0 {
-		globals := []string{opencodeHomeConfigDir}
+		globals := append([]string{}, opencodeHomeConfigDirs...)
 		if dir := c.SessionFor("opencode").ConfigDir; dir != "" {
 			globals = append(globals, dir)
 		}
 		seen := map[string]bool{}
 		for _, dir := range globals {
-			dir = expandHome(dir)
-			if seen[dir] {
+			dir = expandOpencodeGlobalDir(dir)
+			if dir == "" || seen[dir] {
 				continue
 			}
 			seen[dir] = true
@@ -240,14 +282,57 @@ func (c *Config) spawnsOpencode() bool {
 // merely CLAIMS is disabled is still an entry the operator should see disclosed,
 // and a later merge layer can flip the flag back.
 func opencodeConfigClankerbarSlug(path string) string {
+	f, ok := readOpencodeConfig(path)
+	if !ok {
+		return ""
+	}
+	return clankerbarSlugIn(f)
+}
+
+// readOpencodeConfig reads and JSONC-parses one discovered opencode config. ok
+// is false for a file that is absent, unreadable or unparseable - a diagnostic
+// that failed closed would be a startup outage on a malformed file opencode
+// itself tolerates.
+func readOpencodeConfig(path string) (mcpFile, bool) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		return mcpFile{}, false
 	}
 	f, err := parseJSONCInto(data)
 	if err != nil {
-		return ""
+		return mcpFile{}, false
 	}
+	return f, true
+}
+
+// sessionShapingKeys names the keys a discovered opencode config carries that
+// decide what a session IS rather than what it talks to. checkDiscoveredMCPConfig
+// REFUSES these, but only on the file `mcp_config_path` resolved to - a file
+// opencode discovers by itself never reaches that gate, and it is merged into
+// every session all the same. `plugin` is code opencode loads and runs at
+// startup; `agent` replaces agent definitions and their modes.
+//
+// `permission` is deliberately NOT reported. It is in the same family and the
+// same gate refuses it, but on the question this check answers - can this file
+// change what a spawned session may do - the answer is measurably no:
+// OPENCODE_PERMISSION is merged in after every config layer and wins (1.18.19
+// Config.loadInstanceState). Reporting it would put a WARN in front of the
+// operator that is not true (CLA-441 review).
+func sessionShapingKeys(f mcpFile) []string {
+	var out []string
+	if rawSet(f.Plugin) {
+		out = append(out, "`plugin` (code run at session start)")
+	}
+	if rawSet(f.Agent) {
+		out = append(out, "`agent` (agent definitions and their modes)")
+	}
+	return out
+}
+
+// clankerbarSlugIn returns the project slug the file's `clankerbar` MCP server
+// names, or "" when it carries no such server, has it DISABLED, or gives it a
+// URL that is not an /mcp/<slug> endpoint.
+func clankerbarSlugIn(f mcpFile) string {
 	for _, block := range []map[string]mcpEntry{f.MCP, f.MCPServers} {
 		entry, ok := block["clankerbar"]
 		if !ok || entry.disabled() {
