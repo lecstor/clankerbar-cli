@@ -86,15 +86,28 @@ func codexArgs(in Invocation) []string {
 	return append(args, "--", in.Prompt)
 }
 
+// env builds the child environment. Split out of Invoke - where it was three
+// inline lines - so this adapter's environment is testable the way claude's and
+// opencode's already were, which is what the CLA-441 PWD pin is asserted
+// against: a fix "every adapter" has to carry needs every adapter's env to be
+// reachable from a test.
+func (c codex) env(in Invocation) []string {
+	// Pin the child's PWD to the directory Invoke sets as cmd.Dir, dropping the
+	// daemon's inherited value - see pinPWD. Applied to the INHERITED
+	// environment, before in.Env, so an explicit caller value still wins.
+	env := append(pinPWD(os.Environ(), in.WorkDir), in.Env...)
+	if in.ConfigDir != "" {
+		env = append(env, "CODEX_HOME="+in.ConfigDir)
+	}
+	return env
+}
+
 func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	cmd := exec.CommandContext(ctx, "codex", codexArgs(in)...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
-	cmd.Env = append(os.Environ(), in.Env...)
-	if in.ConfigDir != "" {
-		cmd.Env = append(cmd.Env, "CODEX_HOME="+in.ConfigDir)
-	}
+	cmd.Env = c.env(in)
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text
 	// scans, and tee live to the console when one is set (the JSONL event stream —
