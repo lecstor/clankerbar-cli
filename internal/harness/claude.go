@@ -105,24 +105,24 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	cmd := exec.CommandContext(sctx, "claude", claudeArgs(in)...)
 	setupProcessGroup(cmd)
 	// Kill the whole process group (descendants holding inherited pipes)
-	// rather than only the direct child, on ANY cancellation of sctx — the
+	// rather than only the direct child, on ANY cancellation of sctx - the
 	// token-ceiling kill from consume(), or the caller's own cancellation
 	// (a Ctrl-C that stopped reaching the session subtree through the tty
 	// the moment Setpgid moved it out of the foreground group). Through
-	// exec.Cmd.Cancel, not a monitor goroutine: os/exec calls Cancel under
-	// its own synchronisation once Start has published Process, and only
+	// exec.Cmd.Cancel, not a monitor goroutine: os/exec calls Cancel only
 	// while it still considers the process live. The trailing Kill mirrors
 	// CommandContext's own default Cancel, so the direct child still dies
 	// even if it already left the group.
 	//
-	// Assigned BEFORE Start, deliberately: Start launches os/exec's watchdog
-	// goroutine (Cancel is already non-nil from CommandContext), and that
-	// goroutine reads this field — a write after Start races with it, and a
-	// cancellation landing in the window would run the old default Cancel,
-	// killing the direct child only.
+	// Assigned BEFORE Start, deliberately: os/exec documents that the caller
+	// sets Cancel and the other cancellation fields before starting the
+	// command, and the watchdog goroutine Start launches reads the field at
+	// cancellation time without synchronising on it - a post-Start write is
+	// a data race (-race catches it) even where it would happen to take
+	// effect.
 	//
 	// Known gap, deliberate: a descendant that ESCAPED the group (daemonised
-	// with setsid) survives this kill and can hold cmd.Stderr's pipe open —
+	// with setsid) survives this kill and can hold cmd.Stderr's pipe open -
 	// this path sets no WaitDelay, so Wait would block for that escapee's
 	// lifetime. Every in-group descendant dies, which is the bar; the
 	// setsid escapee is filed as CLA-423.

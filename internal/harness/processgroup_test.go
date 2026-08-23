@@ -10,10 +10,10 @@ import (
 )
 
 // A stub that backgrounds a child which outlives its parent and writes a
-// file after a delay. The kill mechanism must terminate both the parent
-// and the descendant, so the file is never created.
+// marker file once it notices the parent is gone. The kill mechanism must
+// terminate both the parent and the descendant, so the file is never created.
 //
-// Two hardening choices, both earned by observed failures:
+// Three hardening choices, each earned by an observed or demonstrated failure:
 //
 //   - The stub emits an over-ceiling assistant event every 200ms instead
 //     of a single one. The ceiling kill fires from consume(), so it only
@@ -26,18 +26,27 @@ import (
 //     checked once immediately. A direct-child-only kill regression
 //     leaves the descendant alive holding an inherited fd; the old
 //     immediate check ran while it was still asleep, saw no marker,
-//     and passed — pinned by nothing. Waiting past the descendant's
-//     lifetime makes survival observable: if the marker ever appears,
-//     something escaped the kill.
+//     and passed - pinned by nothing. Waiting makes survival observable:
+//     if the marker ever appears, something escaped the kill.
+//   - The marker is CONDITIONAL on the parent's death (`while kill -0
+//     $PPID`), never a bare timed touch. A fixed sleep would write the
+//     marker even under a CORRECT group kill that merely landed late (a
+//     starved consumer on a loaded box), failing the test spuriously;
+//     gated on the parent being gone, the marker can exist only when the
+//     parent died AND the grandchild survived - precisely the bar's
+//     violation - and it appears ~0.3s after the reap instead of whenever
+//     a timer happens to expire, tightening the regression catch too.
 func TestProcessGroupKillTerminatesAGrandchild(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "claude")
 	marker := filepath.Join(dir, "grandchild_alive")
 	event := `{"type":"assistant","message":{"content":[{"type":"text","text":"work"}],"usage":{"input_tokens":60000000,"output_tokens":0}}}`
 	script := `#!/bin/sh
-# Background a grandchild that outlives the parent session and marks the
-# world if it survived the kill. First, so its 2s clock starts now.
-( sleep 2; touch "` + marker + `" ) &
+# Background a grandchild that marks the world ONLY once its parent is
+# gone: while the parent lives it just polls. A correct group kill takes
+# the grandchild with the parent, so nothing is ever written; a
+# direct-child-only kill leaves it alive to notice the death and mark.
+( while kill -0 $PPID 2>/dev/null; do sleep 0.2; done; touch "` + marker + `" ) &
 # Stream events that cross the token ceiling immediately, so the kill
 # fires whenever the consumer first reads — never of natural old age.
 i=0
@@ -58,7 +67,7 @@ exec sleep 120
 	// Invoke must return promptly, not hang on a descendant holding an
 	// exec-owned pipe: cmd.Stderr is an io.MultiWriter, so os/exec makes its
 	// own pipe and Wait waits on its writer past the kill. (claude's session
-	// path sets no WaitDelay, so a surviving holder blocks Wait outright —
+	// path sets no WaitDelay, so a surviving holder blocks Wait outright -
 	// which is itself the failure being asserted against.) Running Invoke on
 	// its own goroutine makes that bound REAL: checked after the fact, an
 	// elapsed comparison cannot fire while Invoke is still blocked, and the
@@ -83,8 +92,8 @@ exec sleep 120
 		t.Error("ExitCode = 0 — the child was not killed; the group kill did not fire")
 	}
 
-	// The grandchild must be dead: poll past its 2s lifetime and fail the
-	// moment the marker proves a survivor.
+	// The grandchild must be dead: poll past any plausible notice-and-mark
+	// delay and fail the moment the marker proves a survivor.
 	waitForGrandchildMarker(t, marker)
 }
 
@@ -98,9 +107,11 @@ func TestOpencodeProcessGroupKillTerminatesAGrandchild(t *testing.T) {
 echo '{"type":"step_start","sessionID":"s1","part":{"type":"step-start"}}'
 echo '{"type":"text","sessionID":"s1","part":{"type":"text","text":"working"}}'
 echo '{"type":"step_finish","sessionID":"s1","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
-# Background a grandchild that outlives the parent and marks the world
-# if it survived the kill.
-( sleep 2; touch "`+marker+`" ) &
+# Background a grandchild that marks the world ONLY once its parent is
+# gone: while the parent lives it just polls. A correct group kill takes
+# the grandchild with the parent, so nothing is ever written; a
+# direct-child-only kill leaves it alive to notice the death and mark.
+( while kill -0 $PPID 2>/dev/null; do sleep 0.2; done; touch "`+marker+`" ) &
 # Parent continues so the adapter kills it mid-session.
 exec sleep 60
 `)
@@ -127,10 +138,11 @@ exec sleep 60
 	waitForGrandchildMarker(t, marker)
 }
 
-// waitForGrandchildMarker polls past a 2s-lifetime descendant and fails as
-// soon as the marker appears — i.e. the moment anything is proven to have
-// survived the kill. Absent after the window, the group kill reached the
-// whole tree.
+// waitForGrandchildMarker polls long enough for a surviving descendant to
+// notice its parent's death (~0.2s poll cadence, plus scheduling slack)
+// and fails as soon as the marker appears - i.e. the moment anything is
+// proven to have survived the kill. Absent after the window, the group
+// kill reached the whole tree.
 func waitForGrandchildMarker(t *testing.T, marker string) {
 	t.Helper()
 	deadline := time.Now().Add(3500 * time.Millisecond)
