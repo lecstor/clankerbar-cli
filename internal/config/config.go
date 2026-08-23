@@ -640,6 +640,13 @@ type Config struct {
 	// which case this whole feature is off and the legacy workdir behaviour runs.
 	PrimaryRepo string `json:"primary_repo"`
 
+	// Escalation holds the mechanical review-tier escalation rules (CLA-379).
+	// Config-owned: a glob-to-tier mapping (path_rules) and a category-to-tier
+	// mapping (category_rules). The CLI evaluates them at review-spawn time; the
+	// plane holds only the execution-config reference to them. Empty = no
+	// escalation — the review phase keeps its configured tier unchanged.
+	Escalation Escalation `json:"escalation"`
+
 	// AllowUncheckedPR opts this project out of CLA-310's empty-check-rollup
 	// refusal: a delivery whose PR carries NO checks is logged as a WARNING
 	// instead of refused. It exists for repos with NO CI at all, where refusing
