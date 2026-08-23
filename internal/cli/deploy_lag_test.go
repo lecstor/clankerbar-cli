@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -410,6 +412,59 @@ func TestDeployLagFetchHuntIsBounded(t *testing.T) {
 	}
 }
 
+// The bound caps ATTEMPTS, not successes: a remote that refuses every fetch
+// must not convert the hunt into one round trip per candidate clone - that is
+// precisely the failure case the bound exists for.
+func TestDeployLagFetchHuntBoundCountsFailedAttempts(t *testing.T) {
+	f := newLagFixture()
+	delete(f.objects, lagDeployed)
+	f.fetchErr = errors.New("connection refused")
+	repos := make([]string, 0, 12)
+	for i := 0; i < 12; i++ {
+		repos = append(repos, fmt.Sprintf("/fake/parent/repo-%d", i))
+	}
+	e := lagEnv(f)
+	e.repos = func(context.Context, string) []string { return repos }
+
+	cfg := validCfg(t)
+	c := deployLagCheck(context.Background(), "deploy_lag",
+		"https://plane.example/health", "staging", cfg.WorkDir, e)
+
+	if c.status != warn {
+		t.Fatalf("hunt against a dead remote: got %v, want WARN (%s)", c.status, c.detail)
+	}
+	if len(f.fetchLog) != maxDeployLagFetches {
+		t.Errorf("attempted %d fetches against a dead remote, want the bound of %d", len(f.fetchLog), maxDeployLagFetches)
+	}
+	if !strings.Contains(c.detail, "trying to fetch") {
+		t.Errorf("detail should say the fetches were attempted, got %q", c.detail)
+	}
+}
+
+// deployGitRun carries its own deadline (doctor's context has none): a wedged
+// git binary must end in an error within the bound, not hang the preflight.
+func TestDeployGitRunBoundsEachCommand(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\nsleep 30\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	old := deployGitTimeout
+	deployGitTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { deployGitTimeout = old })
+
+	start := time.Now()
+	_, err := deployGitRun(context.Background(), ".", "ls-remote", "origin")
+	if err == nil {
+		t.Fatal("a wedged git must fail once its deadline passes, not hang")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("git exec returned only after %s; the per-command deadline did not fire", elapsed)
+	}
+}
+
 func TestDeployLagRemoteHasNoSuchBranchWarns(t *testing.T) {
 	f := newLagFixture()
 	f.hasBranch = false
@@ -481,6 +536,40 @@ func TestDeployLagsNoneConfiguredIsOneQuietLine(t *testing.T) {
 	}
 	if checks[0].status != pass || !strings.Contains(checks[0].detail, "not configured") {
 		t.Errorf("want a quiet PASS explaining the field, got %v (%s)", checks[0].status, checks[0].detail)
+	}
+}
+
+// Mixed configuration: when at least one project is monitored, a project that
+// names no endpoint still gets its own quiet line. A missing line is
+// indistinguishable from a forgotten one - the operator must be able to see
+// that project B is simply not monitored.
+func TestDeployLagsUnconfiguredProjectStillGetsItsLine(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Projects = []config.Project{
+		{Slug: "acme", HealthURL: "https://acme.test/health"}, // monitored
+		{Slug: "dark"}, // no URL anywhere (top level unset too): unmonitored, but visible
+	}
+
+	e := lagEnv(newLagFixture())
+	var fetched []string
+	e.fetchHealth = func(_ context.Context, u string) (deployHealth, error) {
+		fetched = append(fetched, u)
+		return deployHealth{Version: deployVersion{Commit: lagDeployed}}, nil
+	}
+	checks := checkDeployLags(context.Background(), cfg, e)
+	if len(checks) != 2 {
+		t.Fatalf("got %d checks (%v), want one per project including the unconfigured one", len(checks), names(checks))
+	}
+	watched := find(t, checks, "deploy_lag[acme]")
+	if watched.status != pass || !strings.Contains(watched.detail, "matches") {
+		t.Errorf("acme should have run a full comparison against its endpoint, got %v (%s)", watched.status, watched.detail)
+	}
+	dark := find(t, checks, "deploy_lag[dark]")
+	if dark.status != pass || !strings.Contains(dark.detail, "not configured") || !strings.Contains(dark.detail, "health_url") {
+		t.Errorf("the unconfigured project should get its own quiet PASS, got %v (%s)", dark.status, dark.detail)
+	}
+	if len(fetched) != 1 || fetched[0] != "https://acme.test/health" {
+		t.Errorf("only the monitored project's endpoint should be read, got %v", fetched)
 	}
 }
 

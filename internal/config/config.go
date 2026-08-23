@@ -898,13 +898,14 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
-// validateHealthURL holds a health_url to "an absolute URL with a scheme and
+// validateHealthURL holds a health_url to "an absolute http(s) URL with a
 // host". It is deliberately weaker than backlog_url's TLS floor: /health is a
 // public endpoint read without credentials, so there is no bearer token to
 // keep off the wire, and a plain-http internal plane is a legitimate thing to
-// point at. What it refuses is the value that could never be fetched at all -
-// which otherwise surfaces as an opaque client error from doctor instead of as
-// the misfiled config line it is.
+// point at. What it refuses is a value that could never be fetched at all - a
+// relative reference, or a scheme no HTTP client speaks - which would
+// otherwise surface as an opaque "unsupported protocol scheme" error from
+// doctor instead of as the misfiled config line it is.
 func validateHealthURL(raw, label string) error {
 	if raw == "" {
 		return nil
@@ -915,6 +916,36 @@ func validateHealthURL(raw, label string) error {
 	}
 	if u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("%s: %q is not an absolute URL with a scheme and host", label, raw)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("%s: %q must be an http or https URL; scheme %q can never be fetched", label, raw, u.Scheme)
+	}
+	return nil
+}
+
+// validateIntegrationBranch holds integration_branch to a bare ref-name shape.
+// The value is passed to `git fetch` and `git ls-remote` by doctor's deploy_lag
+// check (CLA-322); a value carrying refspec syntax (":") would make the fetch
+// argument a src:dst spec and MUTATE LOCAL REFS during a preflight, a leading
+// "-" reads as option syntax, and whitespace or anything outside a branch
+// name's alphabet is rejected by git downstream anyway. Empty is legal: it
+// means the default branch.
+func validateIntegrationBranch(raw, label string) error {
+	if raw == "" {
+		return nil
+	}
+	if strings.HasPrefix(raw, "-") || strings.ContainsAny(raw, ": \t\r\n") {
+		return fmt.Errorf("%s: %q must be a bare branch name (no leading \"-\", no \":\", no whitespace)", label, raw)
+	}
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '/', r == '.', r == '_', r == '-':
+		default:
+			return fmt.Errorf("%s: %q must be a plain branch name ([A-Za-z0-9/._-])", label, raw)
+		}
 	}
 	return nil
 }
@@ -2000,6 +2031,12 @@ func (c *Config) Validate() error {
 	if err := validateHealthURL(c.HealthURL, "health_url"); err != nil {
 		return err
 	}
+	// integration_branch reaches `git fetch`/`git ls-remote` in doctor's
+	// deploy_lag check; a refspec-shaped value would mutate local refs during a
+	// preflight. See validateIntegrationBranch.
+	if err := validateIntegrationBranch(c.IntegrationBranch, "integration_branch"); err != nil {
+		return err
+	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
@@ -2104,6 +2141,9 @@ func (c *Config) Validate() error {
 			return err
 		}
 		if err := validateHealthURL(p.HealthURL, fmt.Sprintf("projects[%d].health_url", i)); err != nil {
+			return err
+		}
+		if err := validateIntegrationBranch(p.IntegrationBranch, fmt.Sprintf("projects[%d].integration_branch", i)); err != nil {
 			return err
 		}
 		// The slug decides which queue is POLLED; the .mcp.json decides which

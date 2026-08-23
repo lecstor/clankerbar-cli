@@ -121,15 +121,27 @@ func fetchDeployHealth(ctx context.Context, rawURL string) (deployHealth, error)
 // against a fake in tests the way every other check drives its seam.
 type gitRunner func(ctx context.Context, dir string, args ...string) (string, error)
 
+// deployGitTimeout bounds each git exec this check runs. Doctor's context
+// carries no deadline of its own (it is a signal-only context - a cron gate has
+// nobody to Ctrl-C it), and WaitDelay only cuts in once the context is already
+// done, so without a per-command bound a blackholed network would hang
+// ls-remote or fetch indefinitely instead of ending as the WARN the check's
+// contract promises. It is a var so tests can shrink it rather than waiting
+// out the real bound.
+var deployGitTimeout = time.Minute
+
 // deployGitRun executes one git command in dir and returns trimmed stdout.
 //
 // The environment discipline is delivery.Verifier.run's, copied rather than
 // imported for the same reason Repos is shared rather than reimplemented there:
 // an unattended run has no terminal, and a git that asks for a password would
-// hang the preflight instead of answering. WaitDelay is load-bearing for the
-// same reason it is there - ls-remote spawns helpers that inherit the pipes,
+// hang the preflight instead of answering. Two bounds apply: the command's own
+// deadline (deployGitTimeout) and WaitDelay, which reaps the helper processes
+// ls-remote spawns once the command has been killed - they inherit the pipes,
 // and a killed git can otherwise leave the call sitting past its deadline.
 func deployGitRun(ctx context.Context, dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, deployGitTimeout)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -213,11 +225,14 @@ func deployCountRange(ctx context.Context, run gitRunner, repo, rng string) (int
 }
 
 // deployOldestAgeSeconds reports how long ago the OLDEST commit in rng was
-// authored, as a wall-clock duration from now. It takes the MINIMUM timestamp
-// across `%ct` lines explicitly rather than trusting log's ordering, so a
-// future change of traversal order cannot silently turn "oldest" into
-// "newest" and flip the threshold's verdict. An error means the age could not
-// be read at all; callers must not treat that as fresh.
+// COMMITTED, as a wall-clock duration from now. It reads `%ct` (committer
+// date - the moment the commit landed on the branch, which merges preserve)
+// deliberately: author dates survive rebases and cherry-picks and would make a
+// freshly-landed change read as ancient. It takes the MINIMUM timestamp across
+// the lines explicitly rather than trusting log's ordering, so a future change
+// of traversal order cannot silently turn "oldest" into "newest" and flip the
+// threshold's verdict. An error means the age could not be read at all;
+// callers must not treat that as fresh.
 func deployOldestAgeSeconds(ctx context.Context, run gitRunner, repo, rng string, now time.Time) (time.Duration, error) {
 	out, err := run(ctx, repo, "log", "--format=%ct", rng)
 	if err != nil {
@@ -278,26 +293,30 @@ func shortSHA(sha string) string {
 
 // checkDeployLags runs one deploy_lag check per project. In single-project
 // mode there is one, driven by the top-level fields; in multi-project mode
-// each project's own health_url wins when set, and projects that resolve to no
-// URL are skipped - they opted out per project rather than being forgotten.
+// each project's own resolution wins. When at least one project resolves to an
+// endpoint, EVERY project gets a line - a project that resolves to none gets a
+// quiet PASS saying so, because a missing line is indistinguishable from a
+// forgotten one. Only when nothing at all is configured does it collapse to a
+// single aggregate line rather than repeating it per project.
 func checkDeployLags(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	if len(cfg.Projects) == 0 {
 		return []check{deployLagCheck(ctx, "deploy_lag",
 			cfg.HealthURLFor(""), cfg.IntegrationBranchFor(""), cfg.WorkDir, e)}
 	}
 	configured := false
-	out := make([]check, 0, len(cfg.Projects))
 	for _, p := range cfg.Projects {
-		u := cfg.HealthURLFor(p.Slug)
-		if u == "" {
-			continue
+		if cfg.HealthURLFor(p.Slug) != "" {
+			configured = true
+			break
 		}
-		configured = true
-		out = append(out, deployLagCheck(ctx, "deploy_lag["+p.Slug+"]",
-			u, cfg.IntegrationBranchFor(p.Slug), projectWorkDir(cfg, p), e))
 	}
 	if !configured {
 		return []check{deployLagCheck(ctx, "deploy_lag", "", "", cfg.WorkDir, e)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, deployLagCheck(ctx, "deploy_lag["+p.Slug+"]",
+			cfg.HealthURLFor(p.Slug), cfg.IntegrationBranchFor(p.Slug), projectWorkDir(cfg, p), e))
 	}
 	return out
 }
@@ -314,8 +333,9 @@ func deployLagCheck(ctx context.Context, name, healthURL, integration, workdir s
 	}
 	// Name the comparison up front, on every verdict, so any single line of
 	// output can be traced back to its inputs the way checkConfig names its
-	// resolved values.
-	c.info = append(c.info, "judged against the REMOTE tip of <remote>/"+integration)
+	// resolved values. The remote is only resolved once a repository is, so
+	// this line names the branch and says where its tip comes from.
+	c.info = append(c.info, fmt.Sprintf("judged against the REMOTE tip of the %q branch", integration))
 
 	if healthURL == "" {
 		c.status = pass
@@ -472,7 +492,9 @@ func deployLagCheck(ctx context.Context, name, healthURL, integration, workdir s
 // When no clone has the object - usually one that simply has not fetched since
 // the build went out, which is exactly when the check matters most - it
 // fetches the INTEGRATION BRANCH into up to maxDeployLagFetches candidates and
-// re-probes. Fetching the bare SHA would need allow-any-SHA uploadpack on the
+// re-probes. The bound counts ATTEMPTS, not successes: a remote that refuses
+// every fetch must not convert the hunt into one round trip per candidate
+// clone. Fetching the bare SHA would need allow-any-SHA uploadpack on the
 // server, which GitHub does not enable by default; fetching the branch brings
 // its ancestors along, including (usually) the deployed commit.
 func locateDeployRepo(ctx context.Context, e doctorEnv, workdir, sha, integration string) (repo, reason string) {
@@ -494,15 +516,15 @@ func locateDeployRepo(ctx context.Context, e doctorEnv, workdir, sha, integratio
 		if attempts >= maxDeployLagFetches {
 			break
 		}
+		attempts++ // a failed fetch costs the round trip too; cap attempts, not successes
 		if _, err := e.gitRun(ctx, r, "fetch", "--quiet", "--", deployRemoteOf(ctx, e.gitRun, r), integration); err != nil {
 			continue
 		}
-		attempts++
 		if deployHaveObject(ctx, e.gitRun, r, sha) {
 			return r, ""
 		}
 	}
-	return "", fmt.Sprintf("deployed commit %s is held by no repository at or below %s, even after fetching %s into %s - the clones are shallow or belong to other histories",
+	return "", fmt.Sprintf("deployed commit %s is held by no repository at or below %s, even after trying to fetch %s into %s - the clones are shallow or belong to other histories",
 		shortSHA(sha), workdir, integration, plural(attempts, "one repository", fmt.Sprintf("%d repositories", attempts)))
 }
 

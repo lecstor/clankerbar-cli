@@ -90,6 +90,11 @@ func TestValidateRefusesUnusableHealthURL(t *testing.T) {
 	if err := c.Validate(); err == nil {
 		t.Error("a relative health_url must be refused")
 	}
+
+	c.HealthURL = "ftp://plane.example/health"
+	if err := c.Validate(); err == nil {
+		t.Error("a health_url with a non-HTTP scheme can never be fetched and must be refused at validation")
+	}
 }
 
 func TestValidateRefusesBadPerProjectHealthURL(t *testing.T) {
@@ -100,6 +105,11 @@ func TestValidateRefusesBadPerProjectHealthURL(t *testing.T) {
 	}
 	if err := c.Validate(); err == nil {
 		t.Error("a per-project health_url with a space must be refused")
+	}
+
+	c.Projects[0].HealthURL = "gopher://acme.test/health"
+	if err := c.Validate(); err == nil {
+		t.Error("a per-project health_url with a non-HTTP scheme must be refused")
 	}
 }
 
@@ -114,5 +124,74 @@ func TestValidateAllowsPlainHTTPHealthURL(t *testing.T) {
 	}
 	if err := c.Validate(); err != nil {
 		t.Errorf("credential-free http health endpoint should validate, got %v", err)
+	}
+}
+
+// --- integration_branch validation ---------------------------------------------
+//
+// The branch name reaches `git fetch`/`git ls-remote` in doctor's deploy_lag
+// check. A refspec-shaped value ("src:dst") would make the preflight fetch
+// MUTATE LOCAL REFS in every clone it touches; a leading "-" reads as option
+// syntax; anything else outside a branch-name alphabet git rejects anyway.
+
+func TestValidateRefusesRefspecShapedIntegrationBranch(t *testing.T) {
+	c := &Config{
+		Harness:           "claude",
+		Prompt:            "Work the backlog.",
+		IntegrationBranch: "staging:refs/heads/evil",
+	}
+	if err := c.Validate(); err == nil {
+		t.Error("a refspec-shaped integration_branch would mutate local refs during a preflight fetch and must be refused")
+	}
+}
+
+func TestValidateRefusesOptionShapedIntegrationBranch(t *testing.T) {
+	c := &Config{
+		Harness:           "claude",
+		Prompt:            "Work the backlog.",
+		IntegrationBranch: "--upload-pack=evil",
+	}
+	if err := c.Validate(); err == nil {
+		t.Error("a leading dash reads as option syntax and must be refused")
+	}
+}
+
+func TestValidateRefusesUnspellableIntegrationBranch(t *testing.T) {
+	c := &Config{
+		Harness:           "claude",
+		Prompt:            "Work the backlog.",
+		IntegrationBranch: "sta ging",
+	}
+	if err := c.Validate(); err == nil {
+		t.Error("whitespace is not part of any branch name and must be refused")
+	}
+
+	c.IntegrationBranch = "release~2026"
+	if err := c.Validate(); err == nil {
+		t.Error("characters outside the branch-name alphabet must be refused")
+	}
+}
+
+func TestValidateRefusesBadPerProjectIntegrationBranch(t *testing.T) {
+	c := &Config{
+		Harness:  "claude",
+		Prompt:   "Work the backlog.",
+		Projects: []Project{{Slug: "acme", IntegrationBranch: "main:x"}},
+	}
+	if err := c.Validate(); err == nil {
+		t.Error("the per-project integration_branch gets the same shape check")
+	}
+}
+
+func TestValidateAcceptsPlainIntegrationBranches(t *testing.T) {
+	for _, name := range []string{"", "main", "staging", "release/2026-08", "hot.fix_1-x"} {
+		c := &Config{
+			Harness:           "claude",
+			Prompt:            "Work the backlog.",
+			IntegrationBranch: name,
+		}
+		if err := c.Validate(); err != nil {
+			t.Errorf("integration_branch %q should validate, got %v", name, err)
+		}
 	}
 }

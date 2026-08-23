@@ -459,8 +459,13 @@ it is newer than the shared line, not a stale deploy. The sentinel stamps
 `unknown` and `<sha>-dirty` each get their own warning naming what they mean,
 and anything doctor cannot establish (endpoint down; the commit held by no local
 clone even after fetching the branch into them) is an honest WARN, never a green
-line. Unconfigured it prints one quiet PASS naming `health_url`, so the feature
-is discoverable without nagging anyone who opted out.
+line. Every git call it makes is bounded by its own deadline, so an unreachable
+remote ends as that WARN rather than a hung preflight, and the fetch hunt is
+capped in ATTEMPTS so a dead remote cannot turn it into one round trip per
+clone. Unconfigured it prints one quiet PASS naming `health_url`, so the feature
+is discoverable without nagging anyone who opted out; in a mixed multi-project
+config the unmonitored projects still get their own quiet PASS rather than
+disappearing from doctor's output.
 
 The `toolchains` audit reads every settings file Claude merges — the `--settings`
 policy, the config dir's `settings.json`/`settings.local.json`, and each session
