@@ -194,7 +194,7 @@ func TestDrain_UntrustedStillVerifiesAcceptedDeliveries(t *testing.T) {
 	openTestStateDir(t, d)
 
 	v := &fakeVerifier{}
-	d.newVerifier = func(string) deliveryVerifier { return v }
+	d.newVerifier = func(string, bool) deliveryVerifier { return v }
 
 	if _, _, _, err := drainOnce(t, d); err != nil {
 		t.Fatalf("drain returned error: %v", err)

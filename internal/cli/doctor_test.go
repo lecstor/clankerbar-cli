@@ -1560,6 +1560,75 @@ func TestBudgetSetIsReported(t *testing.T) {
 	}
 }
 
+// --- pr_gate (CLA-310) -------------------------------------------------------
+
+// The gate's prerequisite must be seen before it fires: without gh on PATH
+// every delivery naming a PR goes out as could-not-verify. That degrades the
+// run rather than stopping it, so it is a WARN — but a doctor that passed it
+// in silence would be exactly the quiet gap this task exists to close.
+func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
+	e := okEnv()
+	e.lookPath = func(file string) (string, error) {
+		if file == "gh" {
+			return "", errors.New("not found")
+		}
+		return "/usr/local/bin/" + file, nil
+	}
+
+	c := checkPRGate(validCfg(t), e)
+	if c.status != warn {
+		t.Errorf("missing gh: got %v, want WARN", c.status)
+	}
+	if !strings.Contains(c.detail, "gh is not on PATH") || c.remedy == "" {
+		t.Errorf("detail should name the missing prerequisite with a remedy: %q / %q", c.detail, c.remedy)
+	}
+}
+
+func TestPRGateWithGHPassesAndNamesTheDefault(t *testing.T) {
+	cfg := validCfg(t)
+
+	c := checkPRGate(cfg, okEnv())
+	if c.status != pass {
+		t.Errorf("gh present, default config: got %v, want PASS", c.status)
+	}
+	found := false
+	for _, line := range c.info {
+		if strings.Contains(line, "REFUSED") && strings.Contains(line, "allow_unchecked_pr") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("an untouched config should be told the default refuses empty rollups: %q", c.info)
+	}
+}
+
+// The opt-out is per project, so a multi-project config gets one line each:
+// the loose project must be visible by name, not averaged into one aggregate.
+func TestPRGateNamesPerProjectOptOut(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Projects = []config.Project{
+		{Slug: "strict"},
+		{Slug: "loose", AllowUncheckedPR: true},
+	}
+
+	c := checkPRGate(cfg, okEnv())
+	if c.status != pass {
+		t.Errorf("gh present: got %v, want PASS", c.status)
+	}
+	var strict, loose bool
+	for _, line := range c.info {
+		if strings.Contains(line, "[strict]") && strings.Contains(line, "REFUSED") {
+			strict = true
+		}
+		if strings.Contains(line, "[loose]") && strings.Contains(line, "WARNED") {
+			loose = true
+		}
+	}
+	if !strict || !loose {
+		t.Errorf("per-project lines missing: %q", c.info)
+	}
+}
+
 // --- CLA-344: the guards that were silently absent --------------------------
 //
 // The config that ran a 285.9M-token single session passed doctor with a clean
@@ -1868,9 +1937,10 @@ func TestConfigCheckNamesEnvKeysWithoutValues(t *testing.T) {
 }
 
 // A checkout's .mcp.json can declare a server that RUNS something at session
-// start, before any permission rule applies. doctor names them: CLA-257 polices
-// where that file may send the API key, not what it may start, and the gap was
-// silent.
+// start, before any permission rule applies. Since CLA-266 a discovered file
+// refuses them unless the operator allowlists the name — so the realistic
+// fixture is exactly that: an allowed discovered entry must still be NAMED here
+// (allowing is not hiding), beside the list that admitted it.
 func TestMCPServersCheckNamesLocalCommands(t *testing.T) {
 	dir := t.TempDir()
 	body := `{"mcpServers":{
@@ -1879,14 +1949,22 @@ func TestMCPServersCheckNamesLocalCommands(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := validCfgIn(t, dir)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{Harness: "claude", Prompt: "Work the backlog.", WorkDir: dir, AllowLocalMCPServers: []string{"docs"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
 
 	c := checkMCPServers(cfg)
 	if c.status != warn {
 		t.Fatalf("want WARN for a local-command MCP server, got %v (%s)", c.status, c.detail)
 	}
-	if !strings.Contains(strings.Join(c.info, "\n"), "docs") {
-		t.Errorf("the entry should be named:\n%s", strings.Join(c.info, "\n"))
+	joined := strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "docs") {
+		t.Errorf("the entry should be named:\n%s", joined)
+	}
+	if !strings.Contains(joined, "allow_local_mcp_servers") {
+		t.Errorf("the list that admitted it should be shown too:\n%s", joined)
 	}
 	if c.remedy == "" {
 		t.Error("a WARN must carry a remedy")
@@ -2055,6 +2133,30 @@ func TestPowerFieldMissingWarnsRatherThanPasses(t *testing.T) {
 	}
 }
 
+// An assertions output doctor does not recognise must not buy a PASS from that
+// read. The old fail-open returned true for any PreventUserIdleSystemSleep line
+// whose last token was not an integer, so checkPower reported PASS without ever
+// consulting `pmset -g` — short-circuiting exactly the branches CLA-250 added.
+// Falling through is strictly safer: with idle sleep enabled this lands in the
+// WARN, and with it disabled in the correct PASS — it cannot invent a problem.
+func TestPowerUnrecognisedAssertionLineFallsThroughToSettings(t *testing.T) {
+	assertions := "   PreventUserIdleSystemSleep       0 (inactive)\n"
+
+	c := checkPower(context.Background(), pmsetEnv(assertions, " sleep                10\n"))
+	if c.status != warn {
+		t.Fatalf("unrecognised assertion line, idle sleep enabled: got %v, want the settings-read WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "10 min") {
+		t.Errorf("should reach CLA-250's settings branch naming the timeout, got %q", c.detail)
+	}
+
+	// Same unrecognised assertions, sleep disabled: the fall-through yields the
+	// correct PASS from the settings read rather than a PASS guessed at upstream.
+	if c := checkPower(context.Background(), pmsetEnv(assertions, " sleep                0\n")); c.status != pass {
+		t.Errorf("unrecognised assertion line, sleep disabled: got %v, want PASS from the settings read (%s)", c.status, c.detail)
+	}
+}
+
 func TestPowerSkippedOffDarwin(t *testing.T) {
 	e := okEnv()
 	e.goos = "linux"
@@ -2067,8 +2169,21 @@ func TestPowerSkippedOffDarwin(t *testing.T) {
 	}
 }
 
-// The summary row lists the assertion name with a count even when nothing holds
-// it, so presence of the NAME proves nothing — only a non-zero count does.
+// Only two shapes are evidence of a held assertion: the summary row (exactly
+// the assertion name and an integer count, nothing else) and a per-process
+// detail line beginning `pid <n>(<proc>):`. The detail-line fixtures were
+// captured live from `pmset -g assertions` on 2026-08-22 rather than invented —
+// the point of CLA-306 is precisely that a guessed-at format is how the
+// fail-open got in.
+//
+// Everything else mentioning the name is NOT proven held and falls through: the
+// previous test (a last token that failed Atoi meant "held") answered YES for
+// every shape it did not recognise, including Apple appending a token to the
+// summary row — which turned into an unconditional PASS ahead of the branch
+// CLA-250 had just hardened. The trailing-token rule cuts both ways: a row that
+// carries anything beyond name-plus-count is unknown whether the count reads
+// zero or non-zero. And the detail line is matched on the raw line because the
+// process name inside the parens may itself contain spaces.
 func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -2076,9 +2191,16 @@ func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 		want bool
 	}{
 		{"zero count is not held", "   PreventUserIdleSystemSleep       0\n", false},
-		{"non-zero count is held", "   PreventUserIdleSystemSleep       1\n", true},
-		{"named holder is held", `   PreventUserIdleSystemSleep       1
-       pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"non-zero count is held", "   PreventUserIdleSystemSleep     1\n", true},
+		{"real detail line is held", "   pid 33594(caffeinate): [0x0029efa0000196db] 00:00:01 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"  \n", true},
+		{"minimal detail line is held", `   pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"detail line with spaces in the process name is held", `   pid 123(Google Chrome Helper): [0x0001] 00:00:01 PreventUserIdleSystemSleep named: "Helper"  `, true},
+		{"detail line with nested parens in the process name is held", `   pid 123(Google Chrome Helper (Renderer)): [0x0002] 00:00:01 PreventUserIdleSystemSleep named: "Helper"  `, true},
+		{"detail line with a non-numeric pid is not proven held", `   pid abc(caffeinate): PreventUserIdleSystemSleep`, false},
+		{"summary row with appended token is not proven held", "   PreventUserIdleSystemSleep       0 (inactive)\n", false},
+		{"summary row with non-zero count and appended token is not proven held", "   PreventUserIdleSystemSleep       1 (inactive)\n", false},
+		{"summary row with unparseable count is not proven held", "   PreventUserIdleSystemSleep      ?? \n", false},
+		{"name alone is not proven held", "PreventUserIdleSystemSleep\n", false},
 		{"absent entirely", "   PreventUserIdleDisplaySleep      0\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

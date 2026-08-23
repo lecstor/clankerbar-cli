@@ -228,6 +228,18 @@ func TestProjectsValidation(t *testing.T) {
 	})
 
 	t.Run("a valid projects list normalizes paths and passes", func(t *testing.T) {
+		// A fake HOME keeps the verdict off machine state: "~/dev" expands through
+		// $HOME, and discovery reads <workdir>/.mcp.json — on the real machine
+		// that would make this test depend on whatever the operator's own file
+		// declares (CLA-266 made that load-bearing).
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		if err := os.MkdirAll(filepath.Join(home, "dev"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "dev", ".mcp.json"), []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/clankerbar"}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		c := base()
 		c.Projects = []Project{
 			{Slug: "clankerbar", WorkDir: "~/dev"},
@@ -339,6 +351,34 @@ func TestProjectSummaryURL(t *testing.T) {
 			t.Errorf("ProjectSummaryURL() = %q, want the slug path-escaped", got)
 		}
 	})
+}
+
+// The CLA-310 empty-rollup opt-out resolves per project: a matching entry's
+// own value wins; an unmatched slug (the single-project shape reaching the
+// resolver with an empty one) falls back to the top level.
+func TestAllowUncheckedPRFor(t *testing.T) {
+	c := &Config{
+		AllowUncheckedPR: false,
+		Projects: []Project{
+			{Slug: "strict"},
+			{Slug: "loose", AllowUncheckedPR: true},
+		},
+	}
+
+	if c.AllowUncheckedPRFor("strict") {
+		t.Errorf("strict project inherited nothing and should refuse")
+	}
+	if !c.AllowUncheckedPRFor("loose") {
+		t.Errorf("loose project opted out and should warn")
+	}
+	if c.AllowUncheckedPRFor("") {
+		t.Errorf("unmatched slug should fall back to the top-level value (false here)")
+	}
+
+	top := &Config{AllowUncheckedPR: true}
+	if !top.AllowUncheckedPRFor("anything") {
+		t.Errorf("single-project mode should read the top-level field")
+	}
 }
 
 func TestProjectsSlugMCPMismatchRefused(t *testing.T) {

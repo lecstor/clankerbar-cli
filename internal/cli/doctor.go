@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -206,12 +207,13 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks := []check{checkConfig(cfg)}
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
 	checks = append(checks, checkConfigDirs(cfg)...)
+	checks = append(checks, checkRepos(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
 	checks = append(checks, checkMCPServers(cfg))
 	checks = append(checks, checkPermissionsAll(cfg)...)
-	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
+	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(cfg, e))
 }
 
 func doctorFailed(n int) error {
@@ -219,6 +221,12 @@ func doctorFailed(n int) error {
 }
 
 // --- 1. config ---------------------------------------------------------------
+
+// apiKeyOriginLabel prefixes the line naming the one origin the account-scoped
+// key may be sent to. A const so the README-pins coupling test (readme_pins_test.go,
+// CLA-383) can assert the README quotes exactly this label: rewording it here fails
+// that test until the README is updated.
+const apiKeyOriginLabel = "api key origin: "
 
 func checkConfig(cfg *config.Config) check {
 	c := check{name: "config", status: pass}
@@ -249,7 +257,7 @@ func checkConfig(cfg *config.Config) check {
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
-	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
+	c.info = append(c.info, apiKeyOriginLabel+orNone(cfg.CredentialOrigin()))
 	// What this config hands the child process, by NAME only - never a value, and
 	// never the file an @path names. A config that reaches the loop decides the
 	// spawned session's environment (CLA-260), so "which variables am I injecting"
@@ -282,6 +290,67 @@ func envKeyNames(env map[string]string) string {
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ", ")
+}
+
+// --- 1b. repos ---------------------------------------------------------------
+
+// checkRepos reports, per project (or once for a single-project run), every repo
+// the config declares and whether it resolves to a local checkout (CLA-437).
+//
+// This is the preflight for two silent failures at once. A declared repo whose
+// checkout is missing fails every iteration that names it with repo_not_found —
+// better seen here than in an overnight log. And a project that declares NO
+// repos keeps the legacy workdir behaviour, which is correct but easy to mistake
+// for "sessions already start in the task's repo"; saying which mode is live is
+// the difference.
+func checkRepos(cfg *config.Config) []check {
+	report := func(label string, repos map[string]string, primary, workdir string) check {
+		c := check{name: label}
+		if len(repos) == 0 && strings.TrimSpace(primary) == "" {
+			c.status = pass
+			c.detail = "none declared - sessions start in the workdir (" + orNone(workdir) + "); declare repos to start them in the task's checkout"
+			return c
+		}
+		c.status = pass
+		c.detail = "every declared repo resolves to a checkout"
+		idents := make([]string, 0, len(repos)+1)
+		for k := range repos {
+			idents = append(idents, k)
+		}
+		sort.Strings(idents)
+		if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
+			idents = append(idents, p)
+		}
+		bad := 0
+		for _, id := range idents {
+			mark := ""
+			if strings.TrimSpace(primary) != "" && id == strings.TrimSpace(primary) {
+				mark = " (primary)"
+			}
+			dir, err := config.ResolveCheckout(repos, primary, workdir, id)
+			if err != nil {
+				bad++
+				c.info = append(c.info, id+mark+" -> NOT FOUND")
+				continue
+			}
+			c.info = append(c.info, id+mark+" -> "+dir)
+		}
+		if bad > 0 {
+			c.status = warn
+			c.detail = fmt.Sprintf("%d of %d declared repos resolve to no local checkout - any task naming one fails its iteration", bad, len(idents))
+			c.remedy = "check the repo out under the workdir, or fix its repos path"
+		}
+		return c
+	}
+
+	if len(cfg.Projects) == 0 {
+		return []check{report("repos", cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), projectWorkDir(cfg, p)))
+	}
+	return out
 }
 
 // --- 2. harness --------------------------------------------------------------
@@ -1138,18 +1207,46 @@ func workdirLabel(dir string) string {
 func checkMCPServers(cfg *config.Config) check {
 	c := check{name: "mcp_servers"}
 	local := cfg.LocalMCPServers()
-	if len(local) == 0 {
+	if len(local) == 0 && len(cfg.AllowLocalMCPServers) == 0 && !anyProjectAllowlists(cfg) {
 		c.status = pass
 		c.detail = "no MCP server starts a local process"
 		return c
 	}
 	c.status = warn
-	c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	if len(local) == 0 {
+		c.detail = "an allow_local_mcp_servers list admits named entries from discovered <workdir>/.mcp.json files"
+	} else {
+		c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	}
 	for _, s := range local {
 		c.info = append(c.info, s.Name+": "+truncate(s.Command, 80)+"  ("+s.ConfigPath+")")
 	}
-	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and a checkout's .mcp.json can declare them"
+	// The CLA-266 opt-out gets the same visibility as its CLA-310 sibling
+	// (allow_unchecked_pr): a loose state nobody can see before it fires is not
+	// an operator's choice, it is a surprise. A discovered file refuses every
+	// command entry EXCEPT these names, so the list IS part of what runs.
+	if names := cfg.AllowLocalMCPServers; len(names) > 0 {
+		c.info = append(c.info, "allow_local_mcp_servers: "+strings.Join(names, ", ")+"  (admitted from any discovered <workdir>/.mcp.json)")
+	}
+	for _, p := range cfg.Projects {
+		if names := p.AllowLocalMCPServers; len(names) > 0 {
+			c.info = append(c.info, "projects["+p.Slug+"].allow_local_mcp_servers: "+strings.Join(names, ", "))
+		}
+	}
+	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and only allowlisted or explicitly-named configs are accepted now"
 	return c
+}
+
+// anyProjectAllowlists reports whether any project sets its own
+// allow_local_mcp_servers, so the pass line above does not hide a configured
+// list just because no current entry starts a process.
+func anyProjectAllowlists(cfg *config.Config) bool {
+	for _, p := range cfg.Projects {
+		if len(p.AllowLocalMCPServers) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // --- 8. permission policy ----------------------------------------------------
@@ -1637,21 +1734,55 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 }
 
 // holdsNoIdleSleep reports whether `pmset -g assertions` shows a live
-// PreventUserIdleSystemSleep. The count matters: the header line lists the
-// assertion name with a `0` when nothing holds it.
+// PreventUserIdleSystemSleep. Only two line shapes count as evidence, because
+// they are the only two pmset actually emits for this assertion (verified against
+// live output on 2026-08-22):
+//
+//   - the summary row: exactly the assertion name followed by an integer count
+//     and nothing else — held only when that count is non-zero;
+//   - a per-process detail line under "Listed by owning process:", which begins
+//     `pid <n>(<proc>):` and names the holder — held whenever one appears.
+//
+// Anything else mentioning the name is NOT PROVEN HELD and falls through, so
+// checkPower goes on to the `pmset -g` settings read rather than reporting PASS
+// from a shape it does not recognise. Falling through cannot invent a problem —
+// it only defers to the more direct question — whereas the previous test ("the
+// last token is not an integer means a detail line") answered YES, held for every
+// unrecognised shape, including Apple appending a token to the summary row or a
+// locale shifting its number format (CLA-306).
+//
+// Both branches match structure, not whitespace-split tokens, because splitting
+// is where the original guess went wrong: the detail-line regex runs on the raw
+// line since pmset prints the holding process's name verbatim inside the parens,
+// and a name containing spaces ("Google Chrome Helper") leaves no single field
+// carrying the `<n>(<proc>):` tail; the summary row demands exactly two fields
+// because any token beyond name-plus-count is an unknown in BOTH directions —
+// "1 (inactive)" no less than "0" (CLA-306 review).
+var pidDetailLine = regexp.MustCompile(`^\s*pid\s+\d+\(.+\):(?:\s|$)`)
+
 func holdsNoIdleSleep(out string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.Contains(line, "PreventUserIdleSystemSleep") {
 			continue
 		}
 		fields := strings.Fields(line)
-		n, err := strconv.Atoi(fields[len(fields)-1])
-		if err != nil {
-			// A detail line rather than the summary row (those name the holding
-			// process); its presence means something holds it.
-			return true
-		}
-		if n > 0 {
+		switch {
+		case len(fields) == 2 && fields[0] == "PreventUserIdleSystemSleep":
+			// Summary-row shape. Parse the COUNT position, not the tail: trailing
+			// tokens are exactly the unknown we must not guess from, so a row with
+			// anything after the count — or a count that will not parse — is an
+			// unrecognised variant and falls through rather than answer either way.
+			if n, err := strconv.Atoi(fields[1]); err == nil && n > 0 {
+				return true
+			}
+		case pidDetailLine.MatchString(line):
+			// Per-process detail line: `pid 81237(caffeinate): … named: "…"`. Its
+			// presence means a live process holds the assertion. Matched on the raw
+			// line so a process name containing spaces or even nested parens
+			// ("Google Chrome Helper (Renderer)") still reads as one
+			// `<pid>(<name>):` head; greedy to the LAST `):` is safe because the
+			// anchored pid head and the assertion-name pre-filter above already
+			// exclude every other line shape.
 			return true
 		}
 	}
@@ -2175,6 +2306,45 @@ func anyPhaseRunsTheDefaultTurnCap(cfg *config.Config) bool {
 		}
 	}
 	return false
+}
+
+// --- 12. delivery PR gate ----------------------------------------------------
+
+// checkPRGate reports CLA-310's delivery gate and its one prerequisite: the
+// driver's verifier reaches GitHub through the `gh` CLI, and a delivery whose
+// PR is CONFLICTING or carries NO checks is refused when it runs. A missing
+// `gh` is a WARN, not a FAIL — the check degrades to an explicit
+// refusal-to-verify and the run carries on, which is the package's fail-open
+// discipline — but the operator should see the gate's prerequisite BEFORE the
+// first delivery goes out unchecked.
+func checkPRGate(cfg *config.Config, e doctorEnv) check {
+	c := check{name: "pr_gate", status: pass}
+	path, err := e.lookPath("gh")
+	if err != nil {
+		c.status = warn
+		c.detail = "gh is not on PATH — deliveries naming a PR cannot be verified (an unchecked PR is not caught)"
+		c.remedy = "install the GitHub CLI (https://cli.github.com) so the driver can check mergeability and CI before accepting a delivery"
+		return c
+	}
+	c.detail = path + " present; a delivery's PR must be MERGEABLE with a passing check rollup"
+	if len(cfg.Projects) == 0 {
+		if cfg.AllowUncheckedPR {
+			c.info = append(c.info, "empty check rollups: WARNED, not refused (allow_unchecked_pr: true)")
+		} else {
+			c.info = append(c.info, "empty check rollups: REFUSED (the default; allow_unchecked_pr opts out for a repo with no CI)")
+		}
+		return c
+	}
+	// Per project, because the opt-out is per project: one line each, so a
+	// loose project is visible without grepping the config.
+	for _, p := range cfg.Projects {
+		state := "REFUSED"
+		if cfg.AllowUncheckedPRFor(p.Slug) {
+			state = "WARNED"
+		}
+		c.info = append(c.info, "empty rollups["+p.Slug+"]: "+state+" (allow_unchecked_pr)")
+	}
+	return c
 }
 
 // --- rendering ---------------------------------------------------------------

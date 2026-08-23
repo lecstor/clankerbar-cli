@@ -52,7 +52,7 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // first cut of this shipped with the seed untested and a mutation of it surviving
 // the whole suite.
 func newSessionResult(in Invocation) Result {
-	return Result{Claim: in.ResumeClaim}
+	return Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
 }
 
 // claudeArgs builds the session's argv. Extracted from Invoke so it can be
@@ -72,6 +72,16 @@ func claudeArgs(in Invocation) []string {
 	// config-dir's ambient allowlist).
 	if in.SettingsPath != "" {
 		args = append(args, "--settings", in.SettingsPath)
+	}
+	// The project's other declared repos (CLA-437): --add-dir is Claude's own
+	// mechanism for granting tool access beyond the working directory, so a
+	// two-repo project's session can read and edit its sibling whatever directory
+	// it starts in. One flag carrying every dir — the CLI documents it as
+	// variadic (`--add-dir <directories...>`). The operator's --settings policy
+	// still governs: this widens what the session MAY be granted, the settings
+	// file's deny rules still say what it IS. Probes never reach here.
+	if len(in.ExtraDirs) > 0 {
+		args = append(args, "--add-dir", strings.Join(in.ExtraDirs, " "))
 	}
 	// The phase backstop. Claude ends the session at the cap; whatever the tree
 	// holds is then the salvage's problem, which is exactly what it is for.
@@ -93,6 +103,33 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(sctx, "claude", claudeArgs(in)...)
+	setupProcessGroup(cmd)
+	// Kill the whole process group (descendants holding inherited pipes)
+	// rather than only the direct child, on ANY cancellation of sctx - the
+	// token-ceiling kill from consume(), or the caller's own cancellation
+	// (a Ctrl-C that stopped reaching the session subtree through the tty
+	// the moment Setpgid moved it out of the foreground group). Through
+	// exec.Cmd.Cancel, not a monitor goroutine: os/exec calls Cancel only
+	// while it still considers the process live. The trailing Kill mirrors
+	// CommandContext's own default Cancel, so the direct child still dies
+	// even if it already left the group.
+	//
+	// Assigned BEFORE Start, deliberately: os/exec documents that the caller
+	// sets Cancel and the other cancellation fields before starting the
+	// command, and the watchdog goroutine Start launches reads the field at
+	// cancellation time without synchronising on it - a post-Start write is
+	// a data race (-race catches it) even where it would happen to take
+	// effect.
+	//
+	// Known gap, deliberate: a descendant that ESCAPED the group (daemonised
+	// with setsid) survives this kill and can hold cmd.Stderr's pipe open -
+	// this path sets no WaitDelay, so Wait would block for that escapee's
+	// lifetime. Every in-group descendant dies, which is the bar; the
+	// setsid escapee is filed as CLA-423.
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return cmd.Process.Kill()
+	}
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
@@ -346,6 +383,7 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 		noteClaimed(content, toolUseID, res, console)
 	case pendingSettle:
 		res.Claim.Settled = true
+		res.notifyClaim()
 	}
 }
 
@@ -513,6 +551,9 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		RunID:  payload.Run.ID,
 		HasWIP: payload.HasWip || payload.Task.Branch != "",
 	}
+	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
+	// claim the moment the stream carries it, not when the process exits.
+	res.notifyClaim()
 	// Say it out loud. Everything downstream is silent by design — a claim that is
 	// never observed produces no handback and no complaint, so without this line
 	// the feature could quietly stop working (a stream-shape change under a
@@ -718,9 +759,38 @@ func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	stdout, stderr := newTail(), newTail()
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	runErr := cmd.Run()
+	return c.probeResult(stdout, stderr, runErr)
+}
 
+// probeResult turns a finished probe run into its Result: parse whatever the CLI
+// managed to emit, THEN classify how the run ended (CLA-299).
+//
+// The order is the whole point. Run can fail with something other than an exit
+// status after the process has already printed its answer — the JSON object is
+// then sitting in stdout, and only the wait fell over. Parsing first means the
+// spend figures survive alongside the error, which is what Probe owes the budget,
+// since it charges on every path; the old order parsed AFTER the branch, so a
+// probe that emitted and died returned raw Stdout/Stderr and zeroes — exactly
+// the structurally-zero-on-error figures CLA-287 documents reading.
+//
+// Reachability, established rather than assumed: the streams are memory-backed
+// tails (they never fail a write), the probe tees to no console, and it sets no
+// WaitDelay — so no stub behaviour reachable on darwin or linux produces a
+// non-exit Run error after output. A signal death and every context kill arrive
+// as *exec.ExitError; a Start failure emits nothing and the zero Result is
+// correct there. The realistic carriers are exotic pipe/IO faults, which makes
+// the branch rare but not optional: both stream-path adapters parse whatever
+// arrived before classifying the failure, and this seam is where the probe does
+// the same. Pinned by TestClaudeProbeParsesBeforeClassifyingTheRunError, which
+// drives this seam directly because no stub can produce the error end to end.
+func (c claude) probeResult(stdout, stderr *tail, runErr error) (Result, error) {
 	dropped := stdout.Dropped() + stderr.Dropped()
-	res := Result{Stdout: stdout.String(), Stderr: stderr.String(), OutputDropped: dropped, scans: newScanCache()}
+	res := Result{
+		Stdout:        stdout.String(),
+		Stderr:        stderr.String(),
+		OutputDropped: dropped,
+		scans:         newScanCache(),
+	}
 	// `--output-format json` is ONE object, so a trimmed tail does not merely lose
 	// context here — it loses the answer, and parse would fail into a Result that
 	// reads exactly like "no limit found". A few hundred bytes never reaches the
@@ -732,12 +802,12 @@ func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
 	if dropped > 0 {
 		res.markUntrusted(fmt.Sprintf("the probe's output overran the retained window (%d bytes dropped), so its verdict cannot be read", dropped))
 	}
+	c.parse(&res)
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 	} else if runErr != nil {
 		return res, runErr
 	}
-	c.parse(&res)
 	return res, nil
 }
 
@@ -1031,8 +1101,10 @@ func (c claude) Probe(ctx context.Context, in Invocation) (ProbeResult, error) {
 	res, err := c.Invoke(ctx, in)
 	// Spend first, and off the Result on every path: a probe that exited non-zero
 	// still cost what it cost, and under-counting is the one direction a budget
-	// breaker must not err in. On the error return this is whatever got parsed,
-	// which today is nothing — see ProbeResult and CLA-299.
+	// breaker must not err in. On the error return this is whatever the probe
+	// managed to parse from its output before the run error was classified
+	// (probeResult, CLA-299): a probe that emitted its answer and then died in
+	// Wait reports the spend it announced, not zero.
 	out := ProbeResult{Tokens: res.Tokens, CostUSD: res.CostUSD}
 	if err != nil {
 		return out, err

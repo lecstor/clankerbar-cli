@@ -71,6 +71,14 @@ func codexArgs(in Invocation) []string {
 	if in.Probe {
 		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}
 	}
+	// Invocation.ExtraDirs (CLA-437) is deliberately NOT translated here: codex's
+	// sandbox has no per-invocation flag for extra writable roots — its
+	// `workspace-write` scope is the cwd plus what CODEX_HOME/config.toml's
+	// `[sandbox_workspace_write] writable_roots` names, which is operator-owned
+	// local config like every other grant. A codex session on a multi-repo project
+	// therefore needs those roots declared there; inventing a config rewrite from
+	// the driver would widen a sandbox the operator wrote by hand. Documented in
+	// the README alongside repos/primary_repo.
 	args := []string{"exec", "--json", "--sandbox", "workspace-write", "--ask-for-approval", "never"}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "-m", m)
@@ -104,6 +112,20 @@ func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	captured.attach(cmd, console)
 	runErr := cmd.Run()
 
+	// p.finish has already run, so res carries everything the stream announced
+	// before the failure — the CLA-299 ordering: parse whatever arrived, THEN
+	// classify the run error. A non-exit failure therefore returns a fully parsed
+	// Result alongside the error, and a launch failure (nothing was ever emitted,
+	// so nothing was ever parsed) returns an honest zero.
+	//
+	// What actually lands in that branch on darwin/linux, established while
+	// landing CLA-299: a console whose Write fails mid-session (a full disk under
+	// the iteration log) surfaces as os/exec's copy error — a real ran-and-emitted
+	// case, pinned end to end by TestCodexInvokeReturnsAParsedResultAlongsideANonExitRunError.
+	// No WaitDelay is set here, so the grandchild-holds-the-pipe shape cannot
+	// error: it blocks in Run until the pipe closes (opencode's wall-clock cap is
+	// the bounded variant). Every signal and context kill arrives as
+	// *exec.ExitError instead.
 	res := captured.result("codex")
 	p.finish(&res)
 	if ee, ok := runErr.(*exec.ExitError); ok {
