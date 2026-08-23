@@ -1948,9 +1948,10 @@ func TestConfigCheckNamesEnvKeysWithoutValues(t *testing.T) {
 }
 
 // A checkout's .mcp.json can declare a server that RUNS something at session
-// start, before any permission rule applies. doctor names them: CLA-257 polices
-// where that file may send the API key, not what it may start, and the gap was
-// silent.
+// start, before any permission rule applies. Since CLA-266 a discovered file
+// refuses them unless the operator allowlists the name — so the realistic
+// fixture is exactly that: an allowed discovered entry must still be NAMED here
+// (allowing is not hiding), beside the list that admitted it.
 func TestMCPServersCheckNamesLocalCommands(t *testing.T) {
 	dir := t.TempDir()
 	body := `{"mcpServers":{
@@ -1959,14 +1960,22 @@ func TestMCPServersCheckNamesLocalCommands(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := validCfgIn(t, dir)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{Harness: "claude", Prompt: "Work the backlog.", WorkDir: dir, AllowLocalMCPServers: []string{"docs"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
 
 	c := checkMCPServers(cfg)
 	if c.status != warn {
 		t.Fatalf("want WARN for a local-command MCP server, got %v (%s)", c.status, c.detail)
 	}
-	if !strings.Contains(strings.Join(c.info, "\n"), "docs") {
-		t.Errorf("the entry should be named:\n%s", strings.Join(c.info, "\n"))
+	joined := strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "docs") {
+		t.Errorf("the entry should be named:\n%s", joined)
+	}
+	if !strings.Contains(joined, "allow_local_mcp_servers") {
+		t.Errorf("the list that admitted it should be shown too:\n%s", joined)
 	}
 	if c.remedy == "" {
 		t.Error("a WARN must carry a remedy")

@@ -71,6 +71,14 @@ func codexArgs(in Invocation) []string {
 	if in.Probe {
 		return []string{"exec", "--json", "--sandbox", "read-only", "--ask-for-approval", "never", "--", "."}
 	}
+	// Invocation.ExtraDirs (CLA-437) is deliberately NOT translated here: codex's
+	// sandbox has no per-invocation flag for extra writable roots — its
+	// `workspace-write` scope is the cwd plus what CODEX_HOME/config.toml's
+	// `[sandbox_workspace_write] writable_roots` names, which is operator-owned
+	// local config like every other grant. A codex session on a multi-repo project
+	// therefore needs those roots declared there; inventing a config rewrite from
+	// the driver would widen a sandbox the operator wrote by hand. Documented in
+	// the README alongside repos/primary_repo.
 	args := []string{"exec", "--json", "--sandbox", "workspace-write", "--ask-for-approval", "never"}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "-m", m)

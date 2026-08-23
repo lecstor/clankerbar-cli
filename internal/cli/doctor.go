@@ -217,6 +217,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks := []check{checkConfig(cfg)}
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
 	checks = append(checks, checkConfigDirs(cfg)...)
+	checks = append(checks, checkRepos(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
@@ -231,6 +232,12 @@ func doctorFailed(n int) error {
 }
 
 // --- 1. config ---------------------------------------------------------------
+
+// apiKeyOriginLabel prefixes the line naming the one origin the account-scoped
+// key may be sent to. A const so the README-pins coupling test (readme_pins_test.go,
+// CLA-383) can assert the README quotes exactly this label: rewording it here fails
+// that test until the README is updated.
+const apiKeyOriginLabel = "api key origin: "
 
 func checkConfig(cfg *config.Config) check {
 	c := check{name: "config", status: pass}
@@ -261,7 +268,7 @@ func checkConfig(cfg *config.Config) check {
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
-	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
+	c.info = append(c.info, apiKeyOriginLabel+orNone(cfg.CredentialOrigin()))
 	// What this config hands the child process, by NAME only - never a value, and
 	// never the file an @path names. A config that reaches the loop decides the
 	// spawned session's environment (CLA-260), so "which variables am I injecting"
@@ -294,6 +301,67 @@ func envKeyNames(env map[string]string) string {
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ", ")
+}
+
+// --- 1b. repos ---------------------------------------------------------------
+
+// checkRepos reports, per project (or once for a single-project run), every repo
+// the config declares and whether it resolves to a local checkout (CLA-437).
+//
+// This is the preflight for two silent failures at once. A declared repo whose
+// checkout is missing fails every iteration that names it with repo_not_found —
+// better seen here than in an overnight log. And a project that declares NO
+// repos keeps the legacy workdir behaviour, which is correct but easy to mistake
+// for "sessions already start in the task's repo"; saying which mode is live is
+// the difference.
+func checkRepos(cfg *config.Config) []check {
+	report := func(label string, repos map[string]string, primary, workdir string) check {
+		c := check{name: label}
+		if len(repos) == 0 && strings.TrimSpace(primary) == "" {
+			c.status = pass
+			c.detail = "none declared - sessions start in the workdir (" + orNone(workdir) + "); declare repos to start them in the task's checkout"
+			return c
+		}
+		c.status = pass
+		c.detail = "every declared repo resolves to a checkout"
+		idents := make([]string, 0, len(repos)+1)
+		for k := range repos {
+			idents = append(idents, k)
+		}
+		sort.Strings(idents)
+		if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
+			idents = append(idents, p)
+		}
+		bad := 0
+		for _, id := range idents {
+			mark := ""
+			if strings.TrimSpace(primary) != "" && id == strings.TrimSpace(primary) {
+				mark = " (primary)"
+			}
+			dir, err := config.ResolveCheckout(repos, primary, workdir, id)
+			if err != nil {
+				bad++
+				c.info = append(c.info, id+mark+" -> NOT FOUND")
+				continue
+			}
+			c.info = append(c.info, id+mark+" -> "+dir)
+		}
+		if bad > 0 {
+			c.status = warn
+			c.detail = fmt.Sprintf("%d of %d declared repos resolve to no local checkout - any task naming one fails its iteration", bad, len(idents))
+			c.remedy = "check the repo out under the workdir, or fix its repos path"
+		}
+		return c
+	}
+
+	if len(cfg.Projects) == 0 {
+		return []check{report("repos", cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), projectWorkDir(cfg, p)))
+	}
+	return out
 }
 
 // --- 2. harness --------------------------------------------------------------
@@ -1150,18 +1218,46 @@ func workdirLabel(dir string) string {
 func checkMCPServers(cfg *config.Config) check {
 	c := check{name: "mcp_servers"}
 	local := cfg.LocalMCPServers()
-	if len(local) == 0 {
+	if len(local) == 0 && len(cfg.AllowLocalMCPServers) == 0 && !anyProjectAllowlists(cfg) {
 		c.status = pass
 		c.detail = "no MCP server starts a local process"
 		return c
 	}
 	c.status = warn
-	c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	if len(local) == 0 {
+		c.detail = "an allow_local_mcp_servers list admits named entries from discovered <workdir>/.mcp.json files"
+	} else {
+		c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	}
 	for _, s := range local {
 		c.info = append(c.info, s.Name+": "+truncate(s.Command, 80)+"  ("+s.ConfigPath+")")
 	}
-	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and a checkout's .mcp.json can declare them"
+	// The CLA-266 opt-out gets the same visibility as its CLA-310 sibling
+	// (allow_unchecked_pr): a loose state nobody can see before it fires is not
+	// an operator's choice, it is a surprise. A discovered file refuses every
+	// command entry EXCEPT these names, so the list IS part of what runs.
+	if names := cfg.AllowLocalMCPServers; len(names) > 0 {
+		c.info = append(c.info, "allow_local_mcp_servers: "+strings.Join(names, ", ")+"  (admitted from any discovered <workdir>/.mcp.json)")
+	}
+	for _, p := range cfg.Projects {
+		if names := p.AllowLocalMCPServers; len(names) > 0 {
+			c.info = append(c.info, "projects["+p.Slug+"].allow_local_mcp_servers: "+strings.Join(names, ", "))
+		}
+	}
+	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and only allowlisted or explicitly-named configs are accepted now"
 	return c
+}
+
+// anyProjectAllowlists reports whether any project sets its own
+// allow_local_mcp_servers, so the pass line above does not hide a configured
+// list just because no current entry starts a process.
+func anyProjectAllowlists(cfg *config.Config) bool {
+	for _, p := range cfg.Projects {
+		if len(p.AllowLocalMCPServers) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // --- 8. permission policy ----------------------------------------------------
