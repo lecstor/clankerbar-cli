@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -359,18 +360,30 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
+	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut {
+		// The process exited cleanly on its own — ExitCode 0 — but a grandchild
+		// (a backgrounded build, a test run) inherited the output pipes and held
+		// them open past cmd.WaitDelay, so os/exec force-closed them and Run
+		// returned exec.ErrWaitDelay instead of an *exec.ExitError. p.finish has
+		// already run (the CLA-299 ordering: parse whatever arrived, THEN
+		// classify), and every event the session emitted was consumed by the live
+		// parse as it arrived — only grandchild bytes written after the parent's
+		// exit are lost, and those were never this session's output. This is a
+		// clean end, not a failure: returning it as an error failed a completed
+		// attempt in drainPhase with no retry classification (CLA-414). Residual
+		// risk, accepted: force-closed pipes mean this cannot be distinguished
+		// from a parent killed while pretending to succeed — ExitCode 0 plus a
+		// fully parsed live stream is the strongest evidence available either way.
+		// The same holds for a run-wide cancellation landing inside the window:
+		// sctx reads Canceled, not DeadlineExceeded, so !timedOut is true and the
+		// attempt ends "clean" during teardown. Nothing durable turns on it —
+		// salvage, handback and spend are computed from res before any error
+		// check either way, and the cancelled driver ctx stops the run one spawn
+		// later — so the noise is left standing rather than guarded against.
+		return res, nil
 	} else if runErr != nil && !timedOut {
-		// p.finish has already run, so res carries everything the stream announced
-		// (the CLA-299 ordering: parse whatever arrived, THEN classify). Two shapes
-		// land here: a launch failure (bad PATH, unreadable config — nothing was
-		// emitted, so res is an honest zero), and — because any deadline context
-		// sets cmd.WaitDelay above — exec.ErrWaitDelay, where the process exited
-		// CLEANLY but a grandchild held its output pipes open past the delay.
-		// ErrWaitDelay therefore carries a fully parsed Result of a session that
-		// finished successfully; returning it as an error makes the driver fail a
-		// completed attempt. Reclassifying that as the clean end it is, is filed
-		// separately as CLA-414 — a classification question, not a parsing one;
-		// the figures survive either way.
+		// A launch failure (bad PATH, unreadable config): nothing was emitted,
+		// so res is an honest zero, and the failure is real.
 		return res, runErr
 	} else if runErr != nil {
 		// Our own kill: the child died on the cancel, so its error is the kill's
@@ -417,6 +430,31 @@ const opencodeMCPResourcePattern = "mcp:*"
 // `*` catch-all, and the network/exfil tools (webfetch/websearch) are denied in
 // both shapes. A read-only run (probe, or the connectivity smoke) additionally
 // denies edits and shell — zero writes, just enough to reach the clankerbar MCP.
+//
+// EXTRA DIRECTORIES (CLA-437, agent-rule-scoping piece 2): each entry in
+// extraDirs — the project's other declared repos, plus any conventional worktree
+// area beside the spawn checkout — is granted the same reach the workdir has,
+// whatever directory the session starts in. Two layers, because the ask shapes
+// differ by where the session runs:
+//
+//   - A session spawned OUTSIDE a git repo (the multi-repo parent, today's
+//     default) asks read/edit with worktree-relative paths whose worktree is "/",
+//     i.e. the absolute path minus its leading slash. Each extra dir therefore
+//     gains its own root-relative allow, exactly like the workdir's.
+//   - A session spawned INSIDE a checkout (the new normal once the driver starts
+//     sessions in the task's repo) gets that checkout as its git worktree, so
+//     in-tree files ask as plain relative paths ("internal/x.go") and other
+//     trees ask with "../sibling/file"-style paths. Neither form can match a
+//     root-relative pattern, so this shape adds three rules: read/edit allow
+//     "**" (every plain-relative ask is in-tree by construction), deny "../**"
+//     (escapes fail closed), then allow each extra dir's "../name/**" form,
+//     which sorts AFTER the blanket "../**" deny and therefore wins for exactly
+//     the declared trees. Absolute-form asks cannot occur with a git worktree,
+//     and external_directory still gates every path-taking tool before its ask,
+//     so the boundary holds even where the pattern layer is redundant.
+//
+// With no extraDirs the emitted policy is byte-identical to what shipped before
+// CLA-437 for every existing config — the fake-provider matrix depends on it.
 //
 // `bash` stays TOOL-LEVEL: its permission patterns match parsed COMMANDS ("git
 // status --porcelain"), not paths, so a path rule can never express it. Commands
@@ -496,12 +534,16 @@ const opencodeMCPResourcePattern = "mcp:*"
 //     ("Users/jason/dev/..."). The read/edit patterns are therefore emitted in
 //     that same root-relative form. external_directory patterns are absolute
 //     globs (path.join(dir, "*")), so that rule uses the absolute form.
-func opencodePermission(readOnly bool, workdir string) string {
+func opencodePermission(readOnly bool, workdir string, extraDirs []string) string {
 	rootRel, abs := opencodeWorkdirPatterns(workdir)
 	// The exact (non-wildcard) workdir pattern, so reading the workdir root
 	// itself — a directory listing of ~/dev, pattern "Users/jason/dev" — is
 	// allowed along with everything under it.
 	exact := strings.TrimSuffix(rootRel, "/**")
+	read := map[string]string{rootRel: "allow", exact: "allow", opencodeMCPResourcePattern: "allow"}
+	edit := map[string]string{rootRel: "allow", exact: "allow"}
+	ext := map[string]string{"*": "deny", abs: "allow"}
+	scopeExtraDirs(read, edit, ext, workdir, extraDirs)
 	perm := map[string]any{
 		// The working set: read/edit scoped to the workdir subtree (root
 		// included), plus the external_directory carve-out for the same
@@ -512,9 +554,9 @@ func opencodePermission(readOnly bool, workdir string) string {
 		// `mcp:*` rides on "read" because that is the permission the MCP
 		// resource tools ask under — see the function doc. A read-only run
 		// keeps it: reaching the served protocol IS the point of the probe.
-		"read":               map[string]string{rootRel: "allow", exact: "allow", opencodeMCPResourcePattern: "allow"},
-		"edit":               map[string]string{rootRel: "allow", exact: "allow"},
-		"external_directory": map[string]string{"*": "deny", abs: "allow"},
+		"read":               read,
+		"edit":               edit,
+		"external_directory": ext,
 		// MCP tools must survive the `*` catch-all — see the function doc.
 		"*_*": "allow",
 		// The read-only search tools: grep/glob/list. Their asks carry the
@@ -544,6 +586,58 @@ func opencodePermission(readOnly bool, workdir string) string {
 	perm["*"] = "deny"
 	b, _ := json.Marshal(perm)
 	return string(b)
+}
+
+// scopeExtraDirs widens the policy's three path-scoped rules to cover extraDirs,
+// per the two ask-shape layers in opencodePermission's doc. It mutates the maps
+// in place so the base construction above stays the single description of the
+// legacy shape.
+func scopeExtraDirs(read, edit, ext map[string]string, workdir string, extraDirs []string) {
+	if len(extraDirs) == 0 {
+		return
+	}
+	inRepo := hasGitEntry(workdir)
+	if inRepo {
+		// In-checkout ask forms: plain-relative paths are in-tree by
+		// construction ("**"), sibling trees escape with a "../" prefix and are
+		// denied wholesale, then each declared tree's specific ".." allow sorts
+		// after that deny and re-opens exactly those (last-match-wins).
+		read["**"] = "allow"
+		edit["**"] = "allow"
+		read["../**"] = "deny"
+		edit["../**"] = "deny"
+	}
+	for _, dir := range extraDirs {
+		if dir == "" {
+			continue
+		}
+		rootRel, abs := opencodeWorkdirPatterns(dir)
+		exactDir := strings.TrimSuffix(rootRel, "/**")
+		read[rootRel] = "allow"
+		edit[rootRel] = "allow"
+		read[exactDir] = "allow"
+		edit[exactDir] = "allow"
+		ext[abs] = "allow"
+		if inRepo {
+			if rel, err := filepath.Rel(workdir, dir); err == nil && rel != "." {
+				relGlob := filepath.ToSlash(rel) + "/**"
+				read[relGlob] = "allow"
+				edit[relGlob] = "allow"
+			}
+		}
+	}
+}
+
+// hasGitEntry reports whether dir carries a .git entry — a directory in a normal
+// checkout, a FILE in a worktree of one. Either means opencode will discover a
+// git worktree there and shape its read/edit asks relative to it, which is what
+// decides which pattern layer the policy needs.
+func hasGitEntry(dir string) bool {
+	if dir == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(dir, ".git"))
+	return err == nil
 }
 
 // opencodeWorkdirPatterns derives the two pattern forms the policy needs from
@@ -579,7 +673,7 @@ func (opencode) env(in Invocation) []string {
 	// Fail-closed permission policy. Set before in.Env so an explicit caller
 	// OPENCODE_PERMISSION in in.Env still wins (exec takes the last of a dup key),
 	// but the ambient environment never silently loosens an unattended run.
-	env = append(env, "OPENCODE_PERMISSION="+opencodePermission(in.Probe, in.WorkDir))
+	env = append(env, "OPENCODE_PERMISSION="+opencodePermission(in.Probe, in.WorkDir, in.ExtraDirs))
 	// Pin the config dir so a headless session loads the SAME MCP servers,
 	// providers, model and auth as the interactive one (the claude/CODEX parity).
 	if in.ConfigDir != "" {

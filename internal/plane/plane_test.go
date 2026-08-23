@@ -406,3 +406,60 @@ func TestAskProjectQuestion_FailureIsQuestionNotFiled(t *testing.T) {
 		t.Errorf("err = %v, want ErrQuestionNotFiled", err)
 	}
 }
+
+// Heartbeat (CLA-358) renews a live claim's lease. The request shape is pinned
+// for the same reason Release's is: the loop beats on this every ten minutes
+// for the life of every session, and a shape drift would read as "renewal
+// failing" on every run at once.
+
+func TestHeartbeat_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := New(srv.URL+"/mcp/demo", "k-1").(Heartbeat).Heartbeat(context.Background(), "r-9"); err != nil {
+		t.Fatalf("Heartbeat: %v", err)
+	}
+
+	if got.method != http.MethodPost {
+		t.Errorf("method = %s, want POST", got.method)
+	}
+	if got.path != "/mcp/demo" {
+		t.Errorf("path = %s, want /mcp/demo", got.path)
+	}
+	if got.auth != "Bearer k-1" {
+		t.Errorf("Authorization = %q", got.auth)
+	}
+	if got.body["method"] != "tools/call" {
+		t.Errorf("method = %v, want tools/call", got.body["method"])
+	}
+	params, _ := got.body["params"].(map[string]any)
+	if params["name"] != "heartbeat" {
+		t.Errorf("tool = %v, want heartbeat", params["name"])
+	}
+	args, _ := params["arguments"].(map[string]any)
+	if args["runId"] != "r-9" {
+		t.Errorf("arguments = %+v, want runId=r-9", args)
+	}
+}
+
+func TestHeartbeat_RequiresARunID(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	err := New(srv.URL+"/mcp/demo", "k-1").(Heartbeat).Heartbeat(context.Background(), "")
+	if err == nil {
+		t.Fatal("Heartbeat with an empty runId returned nil, want an error")
+	}
+	if len(got.bodies) != 0 {
+		t.Fatalf("%d request(s) left the driver, want none - an empty runId must fail before the wire", len(got.bodies))
+	}
+}
+
+func TestHeartbeat_NotWiredDegradesCleanly(t *testing.T) {
+	p := New("", "")
+	hb, ok := p.(Heartbeat)
+	if !ok {
+		t.Fatal("a not-wired plane does not satisfy Heartbeat; the renewer would skip it silently instead of degrading with ErrNotWired")
+	}
+	if err := hb.Heartbeat(context.Background(), "r-1"); !errors.Is(err, ErrNotWired) {
+		t.Errorf("err = %v, want ErrNotWired", err)
+	}
+}

@@ -52,7 +52,7 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // first cut of this shipped with the seed untested and a mutation of it surviving
 // the whole suite.
 func newSessionResult(in Invocation) Result {
-	return Result{Claim: in.ResumeClaim}
+	return Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
 }
 
 // claudeArgs builds the session's argv. Extracted from Invoke so it can be
@@ -72,6 +72,16 @@ func claudeArgs(in Invocation) []string {
 	// config-dir's ambient allowlist).
 	if in.SettingsPath != "" {
 		args = append(args, "--settings", in.SettingsPath)
+	}
+	// The project's other declared repos (CLA-437): --add-dir is Claude's own
+	// mechanism for granting tool access beyond the working directory, so a
+	// two-repo project's session can read and edit its sibling whatever directory
+	// it starts in. One flag carrying every dir — the CLI documents it as
+	// variadic (`--add-dir <directories...>`). The operator's --settings policy
+	// still governs: this widens what the session MAY be granted, the settings
+	// file's deny rules still say what it IS. Probes never reach here.
+	if len(in.ExtraDirs) > 0 {
+		args = append(args, "--add-dir", strings.Join(in.ExtraDirs, " "))
 	}
 	// The phase backstop. Claude ends the session at the cap; whatever the tree
 	// holds is then the salvage's problem, which is exactly what it is for.
@@ -373,6 +383,7 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 		noteClaimed(content, toolUseID, res, console)
 	case pendingSettle:
 		res.Claim.Settled = true
+		res.notifyClaim()
 	}
 }
 
@@ -540,6 +551,9 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		RunID:  payload.Run.ID,
 		HasWIP: payload.HasWip || payload.Task.Branch != "",
 	}
+	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
+	// claim the moment the stream carries it, not when the process exits.
+	res.notifyClaim()
 	// Say it out loud. Everything downstream is silent by design — a claim that is
 	// never observed produces no handback and no complaint, so without this line
 	// the feature could quietly stop working (a stream-shape change under a

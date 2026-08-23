@@ -611,6 +611,35 @@ type Config struct {
 	// allowlist leaves open. Claude-specific; other harnesses ignore it. ~ expands.
 	SettingsPath string `json:"settings_path"`
 
+	// Repos maps the repos a project's tasks may name to their local checkouts,
+	// so a session starts in the TASK's repo rather than in the multi-repo parent
+	// (agent-rule-scoping pieces 2 and 3). Keyed by repo identity — either the
+	// full "owner/name" form the task carries or just its bare name — with the
+	// checkout path as the value (~ and relative paths both expand; a relative
+	// path resolves against the workdir). Resolution order, fallbacks and the
+	// loud repo_not_found failure are ResolveCheckout's, which is the only thing
+	// that should interpret this map.
+	//
+	// Declaring repos also widens each session's permission policy to cover every
+	// declared checkout regardless of cwd, so a two-repo project does not wall
+	// sessions started in one repo off the other. The grants themselves stay in
+	// local config — this map holds paths, never credentials.
+	//
+	// In single-project mode set it here; in multi-project mode set it per
+	// project (see Project.Repos), whose non-empty map replaces the top-level
+	// one for that project.
+	Repos map[string]string `json:"repos"`
+
+	// PrimaryRepo names the repo a session starts in when its task carries none:
+	// the fallback that keeps a fresh phase out of the multi-repo parent until
+	// the plane returns a repo for every task. It names a `repos` key, or any
+	// identity resolvable by the same steps; with exactly one repo declared and
+	// no primary named, that one is primary implicitly. Empty = no fallback, so
+	// a task without a repo fails the iteration with repo_not_found rather than
+	// start somewhere unconsidered — unless NO repos are configured at all, in
+	// which case this whole feature is off and the legacy workdir behaviour runs.
+	PrimaryRepo string `json:"primary_repo"`
+
 	// AllowUncheckedPR opts this project out of CLA-310's empty-check-rollup
 	// refusal: a delivery whose PR carries NO checks is logged as a WARNING
 	// instead of refused. It exists for repos with NO CI at all, where refusing
@@ -626,6 +655,26 @@ type Config struct {
 	// mode set it per project (see Project.AllowUncheckedPR), which overrides
 	// the top-level value for that project only.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// AllowLocalMCPServers names the MCP server entries an operator means to run
+	// from a DISCOVERED `<workdir>/.mcp.json` — the file Validate adopts by
+	// default when mcp_config_path is empty. Any local-command entry whose name
+	// is on this list is accepted from a discovered file; every other command
+	// entry in one is refused (CLA-266: such an entry starts a process at session
+	// init, before any permission rule applies, and a workdir default is not
+	// where that decision belongs). It reaches nothing else: opencode-schema
+	// policy keys (`permission`, `plugin`, `agent`) in a discovered file are
+	// refused regardless of this list — naming servers never approves policy.
+	//
+	// The safe state is the default (refuse); the loose state is this visible,
+	// operator-owned list, which `doctor` reports. A file the operator NAMES via
+	// mcp_config_path needs no entry here — naming it IS the statement, and its
+	// local servers are disclosed by doctor's WARN as they always were.
+	//
+	// In single-project mode set it here; in multi-project mode set it per
+	// project (see Project.AllowLocalMCPServers) to replace the top-level list
+	// for that project only.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
 
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
@@ -708,6 +757,50 @@ type Project struct {
 	// top-level field of the same name for this project only. See
 	// Config.AllowUncheckedPR for what it does and why the default refuses.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// AllowLocalMCPServers is this project's CLA-266 allowlist, REPLACING the
+	// top-level list of the same name for this project's discovered MCP config
+	// when it names anything; an entry that sets none inherits the top-level
+	// one. See Config.AllowLocalMCPServers and AllowLocalMCPServersFor.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
+
+	// Repos is this project's repo -> checkout map, REPLACING the top-level map
+	// of the same name for this project when it declares anything; an entry that
+	// sets none inherits the top-level one. See Config.Repos and ReposFor for
+	// what the map does and how it resolves.
+	Repos map[string]string `json:"repos"`
+
+	// PrimaryRepo is this project's no-repo-on-the-task fallback, overriding the
+	// top-level field of the same name for this project only when non-empty. See
+	// Config.PrimaryRepo and PrimaryRepoFor.
+	PrimaryRepo string `json:"primary_repo"`
+}
+
+// ReposFor resolves the CLA-437 repo -> checkout map for one project: a
+// matching projects[] entry's own NON-EMPTY map replaces the top-level one, and
+// everything else — an unmatched slug (how a single-project run reaches here
+// with no projects at all), or an entry that declared none — falls back to the
+// top-level map. Total, so no caller has a second error path.
+func (c *Config) ReposFor(slug string) map[string]string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.Repos) > 0 {
+			return p.Repos
+		}
+	}
+	return c.Repos
+}
+
+// PrimaryRepoFor resolves the CLA-437 no-repo fallback for one project: a
+// matching projects[] entry's own non-empty value wins, and everything else
+// falls back to the top-level field. Total, so no caller has a second error
+// path.
+func (c *Config) PrimaryRepoFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && strings.TrimSpace(p.PrimaryRepo) != "" {
+			return p.PrimaryRepo
+		}
+	}
+	return c.PrimaryRepo
 }
 
 // AllowUncheckedPRFor resolves the CLA-310 empty-rollup opt-out for one
@@ -722,6 +815,23 @@ func (c *Config) AllowUncheckedPRFor(slug string) bool {
 		}
 	}
 	return c.AllowUncheckedPR
+}
+
+// AllowLocalMCPServersFor resolves the CLA-266 discovered-file allowlist for
+// one project: a matching projects[] entry's own NON-EMPTY list replaces the
+// top-level one, and everything else — an unmatched slug (how a single-project
+// run reaches here with no projects at all), or an entry that set none — falls
+// back to the top-level list. There is deliberately no way to say "none here"
+// while the top level allows names: an empty allowlist is indistinguishable
+// from not having configured one, and pretending otherwise would let a project
+// line look tighter than it runs. Total, so no caller has a second error path.
+func (c *Config) AllowLocalMCPServersFor(slug string) []string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.AllowLocalMCPServers) > 0 {
+			return p.AllowLocalMCPServers
+		}
+	}
+	return c.AllowLocalMCPServers
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
@@ -1751,8 +1861,17 @@ func (c *Config) Validate() error {
 	// -p mode does NOT auto-discover .mcp.json, so without this a bare `clankerbar
 	// run` from a workdir that carries one would spawn sessions with no clankerbar
 	// tools at all — and the poller could derive no slug. Explicit config still wins.
+	//
+	// A file that arrives THIS way was found, not named, and is held to the
+	// discovered-file rule before anything else reads it (CLA-266): it may not
+	// declare local-process servers nor carry opencode-schema policy keys.
+	// checkMCPConfigOrigins below still applies to it either way — a discovered
+	// file can pass this gate and still fail the origin one.
 	if c.MCPConfigPath == "" {
 		c.MCPConfigPath = discoverMCPConfig(c.WorkDir)
+		if err := c.checkDiscoveredMCPConfig(c.MCPConfigPath, "mcp_config_path", c.AllowLocalMCPServers); err != nil {
+			return err
+		}
 	}
 
 	// Where the account-scoped API key is allowed to go, settled once, here
@@ -1818,6 +1937,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("settings_path: %w - it is the allow/deny policy the unattended session is gated by: chmod go-w %s", err, c.SettingsPath)
 	}
 
+	// The top-level repo map, for single-project configs (multi-project entries
+	// carry their own, checked in the loop below).
+	if err := validateRepos(c.Repos, "top level"); err != nil {
+		return err
+	}
+
 	// Multi-project entries: slug required and unique; paths normalized; each
 	// project's mcp config defaults to its own workdir's .mcp.json (falling back to
 	// the top-level one at invocation time — see loop.Target).
@@ -1826,6 +1951,9 @@ func (c *Config) Validate() error {
 		p := &c.Projects[i]
 		if p.Slug == "" {
 			return fmt.Errorf("projects[%d]: slug is required", i)
+		}
+		if err := validateRepos(p.Repos, fmt.Sprintf("projects[%d] (%s)", i, p.Slug)); err != nil {
+			return err
 		}
 		if seen[p.Slug] {
 			return fmt.Errorf("projects: duplicate slug %q", p.Slug)
@@ -1854,6 +1982,13 @@ func (c *Config) Validate() error {
 		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
+			// Discovered, not named, exactly like the top-level default above —
+			// same rule, labelled with THIS field so the remedy names the line
+			// the operator actually adds, and allowlisted per THIS project
+			// (CLA-266).
+			if err := c.checkDiscoveredMCPConfig(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i), c.AllowLocalMCPServersFor(p.Slug)); err != nil {
+				return err
+			}
 		}
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
 			return err
