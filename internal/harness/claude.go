@@ -52,7 +52,7 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // first cut of this shipped with the seed untested and a mutation of it surviving
 // the whole suite.
 func newSessionResult(in Invocation) Result {
-	return Result{Claim: in.ResumeClaim}
+	return Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
 }
 
 // claudeArgs builds the session's argv. Extracted from Invoke so it can be
@@ -72,6 +72,16 @@ func claudeArgs(in Invocation) []string {
 	// config-dir's ambient allowlist).
 	if in.SettingsPath != "" {
 		args = append(args, "--settings", in.SettingsPath)
+	}
+	// The project's other declared repos (CLA-437): --add-dir is Claude's own
+	// mechanism for granting tool access beyond the working directory, so a
+	// two-repo project's session can read and edit its sibling whatever directory
+	// it starts in. One flag carrying every dir — the CLI documents it as
+	// variadic (`--add-dir <directories...>`). The operator's --settings policy
+	// still governs: this widens what the session MAY be granted, the settings
+	// file's deny rules still say what it IS. Probes never reach here.
+	if len(in.ExtraDirs) > 0 {
+		args = append(args, "--add-dir", strings.Join(in.ExtraDirs, " "))
 	}
 	// The phase backstop. Claude ends the session at the cap; whatever the tree
 	// holds is then the salvage's problem, which is exactly what it is for.
@@ -93,6 +103,33 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(sctx, "claude", claudeArgs(in)...)
+	setupProcessGroup(cmd)
+	// Kill the whole process group (descendants holding inherited pipes)
+	// rather than only the direct child, on ANY cancellation of sctx - the
+	// token-ceiling kill from consume(), or the caller's own cancellation
+	// (a Ctrl-C that stopped reaching the session subtree through the tty
+	// the moment Setpgid moved it out of the foreground group). Through
+	// exec.Cmd.Cancel, not a monitor goroutine: os/exec calls Cancel only
+	// while it still considers the process live. The trailing Kill mirrors
+	// CommandContext's own default Cancel, so the direct child still dies
+	// even if it already left the group.
+	//
+	// Assigned BEFORE Start, deliberately: os/exec documents that the caller
+	// sets Cancel and the other cancellation fields before starting the
+	// command, and the watchdog goroutine Start launches reads the field at
+	// cancellation time without synchronising on it - a post-Start write is
+	// a data race (-race catches it) even where it would happen to take
+	// effect.
+	//
+	// Known gap, deliberate: a descendant that ESCAPED the group (daemonised
+	// with setsid) survives this kill and can hold cmd.Stderr's pipe open -
+	// this path sets no WaitDelay, so Wait would block for that escapee's
+	// lifetime. Every in-group descendant dies, which is the bar; the
+	// setsid escapee is filed as CLA-423.
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return cmd.Process.Kill()
+	}
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
@@ -346,6 +383,7 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 		noteClaimed(content, toolUseID, res, console)
 	case pendingSettle:
 		res.Claim.Settled = true
+		res.notifyClaim()
 	}
 }
 
@@ -513,6 +551,9 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		RunID:  payload.Run.ID,
 		HasWIP: payload.HasWip || payload.Task.Branch != "",
 	}
+	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
+	// claim the moment the stream carries it, not when the process exits.
+	res.notifyClaim()
 	// Say it out loud. Everything downstream is silent by design — a claim that is
 	// never observed produces no handback and no complaint, so without this line
 	// the feature could quietly stop working (a stream-shape change under a

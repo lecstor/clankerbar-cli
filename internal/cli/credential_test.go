@@ -84,7 +84,7 @@ func TestDoctorReportsTheCredentialOrigin(t *testing.T) {
 	c := checkConfig(validCfg(t))
 	found := false
 	for _, info := range c.info {
-		if strings.HasPrefix(info, "api key origin: ") {
+		if strings.HasPrefix(info, apiKeyOriginLabel) {
 			found = true
 			if !strings.Contains(info, "https://clankerbar.com") {
 				t.Errorf("api key origin line = %q", info)

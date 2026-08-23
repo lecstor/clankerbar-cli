@@ -215,6 +215,141 @@ func TestSalvage_APushThatFailsRecordsNoBranch(t *testing.T) {
 	}
 }
 
+// The transient git-over-HTTP/2 transport failure (CLA-354): the pack uploads
+// and dies mid-stream against GitHub's smart HTTP endpoint, and the IDENTICAL
+// push succeeds forced onto HTTP/1.1. One retry, with the flags that worked in
+// the field; both attempts have to show up in what the driver logs.
+func TestSalvage_RetriesAnHTTP2PushFailureWithHTTP11(t *testing.T) {
+	e := newEnv(t)
+	pushLog := filepath.Join(t.TempDir(), "push-log")
+	t.Setenv("PUSH_LOG", pushLog)
+	t.Setenv("FAIL_FIRST_PUSH", "http2")
+	salvager := New(e.root, "")
+	salvager.gitBin = installPushStandin(t)
+	write(t, filepath.Join(e.wt, "work.txt"), "hours of it")
+
+	out := salvager.Salvage(context.Background(), taskID, "CLA-354")
+
+	if out.Status != Saved {
+		t.Fatalf("status = %q (%s), want saved - the retry is supposed to land it", out.Status, out.Detail)
+	}
+	if out.Branch != e.branch {
+		t.Errorf("recorded branch %q, want %q", out.Branch, e.branch)
+	}
+	// The point of the retry: the commit really did reach the remote.
+	if remote := lsRemote(t, e.repo, e.branch); remote != out.Commit {
+		t.Errorf("origin/%s is at %q, want the salvage commit %q", e.branch, remote, out.Commit)
+	}
+	// Exactly one retry, and it is the plain push downgraded, not a different spell.
+	attempts := readLines(t, pushLog)
+	if len(attempts) != 2 {
+		t.Fatalf("%d pushes ran, want exactly 2 (the original and one retry):\n%s", len(attempts), strings.Join(attempts, "\n"))
+	}
+	if strings.Contains(attempts[0], "http.version") {
+		t.Errorf("the first attempt was already downgraded, so the retry proves nothing:\n%s", attempts[0])
+	}
+	for _, want := range []string{"-c http.version=HTTP/1.1", "-c http.postBuffer=157286400"} {
+		if !strings.Contains(attempts[1], want) {
+			t.Errorf("the retry does not carry %q:\n%s", want, attempts[1])
+		}
+	}
+	if !strings.Contains(attempts[1], e.branch) {
+		t.Errorf("the retry pushes something other than the task branch:\n%s", attempts[1])
+	}
+	// The driver's only channel here is the outcome detail, so BOTH attempts have
+	// to be named in it for the operator to see which path succeeded.
+	for _, want := range []string{"RPC failed", "http.version=HTTP/1.1"} {
+		if !strings.Contains(out.Detail, want) {
+			t.Errorf("the detail must name both attempts (%q missing): %s", want, out.Detail)
+		}
+	}
+}
+
+// Only if the RETRY fails too is the work declared unreachable: the whole point
+// of CLA-354 is that one more attempt usually lands it.
+func TestSalvage_APushThatFailsTwiceRecordsNoBranch(t *testing.T) {
+	e := newEnv(t)
+	pushLog := filepath.Join(t.TempDir(), "push-log")
+	t.Setenv("PUSH_LOG", pushLog)
+	t.Setenv("FAIL_EVERY_PUSH", "http2")
+	salvager := New(e.root, "")
+	salvager.gitBin = installPushStandin(t)
+	write(t, filepath.Join(e.wt, "work.txt"), "hours of it")
+
+	out := salvager.Salvage(context.Background(), taskID, "CLA-354")
+
+	if out.Status != Failed {
+		t.Fatalf("status = %q (%s), want failed", out.Status, out.Detail)
+	}
+	if out.Branch != "" {
+		t.Errorf("recorded branch %q for work that never reached the remote", out.Branch)
+	}
+	if out.Commit == "" {
+		t.Error("no commit reported; the local commit is the half that did work")
+	}
+	if lsRemote(t, e.repo, e.branch) != "" {
+		t.Error("a twice-failing push still put the branch on the remote")
+	}
+	if attempts := readLines(t, pushLog); len(attempts) != 2 {
+		t.Errorf("%d pushes ran, want exactly 2 - retried once, no more:\n%s", len(attempts), strings.Join(attempts, "\n"))
+	}
+	for _, want := range []string{"failed twice", "http.version=HTTP/1.1", "no branch was recorded"} {
+		if !strings.Contains(out.Detail, want) {
+			t.Errorf("the detail must say what happened to both attempts (%q missing): %s", want, out.Detail)
+		}
+	}
+}
+
+// The retry is for the HTTP/2 transport signature ONLY: an ordinary rejection -
+// a diverged remote, a missing repository - stays the single-attempt fact it
+// always was. Retrying those would just re-reject, slowly.
+func TestSalvage_ANonSignaturePushFailureIsNotRetried(t *testing.T) {
+	e := newEnv(t)
+	pushLog := filepath.Join(t.TempDir(), "push-log")
+	t.Setenv("PUSH_LOG", pushLog)
+	t.Setenv("FAIL_EVERY_PUSH", "rejected")
+	salvager := New(e.root, "")
+	salvager.gitBin = installPushStandin(t)
+	write(t, filepath.Join(e.wt, "work.txt"), "hours of it")
+
+	out := salvager.Salvage(context.Background(), taskID, "CLA-354")
+
+	if out.Status != Failed {
+		t.Fatalf("status = %q (%s), want failed", out.Status, out.Detail)
+	}
+	if out.Branch != "" {
+		t.Errorf("recorded branch %q for a push the remote rejected", out.Branch)
+	}
+	if attempts := readLines(t, pushLog); len(attempts) != 1 {
+		t.Errorf("%d pushes ran, want exactly 1 - a non-transport refusal earns no retry:\n%s", len(attempts), strings.Join(attempts, "\n"))
+	}
+	if !strings.Contains(out.Detail, "no branch was recorded") {
+		t.Errorf("the failure must say the hand-off was not recorded, got: %s", out.Detail)
+	}
+}
+
+// The signature itself, against the stderr shapes it must and must not catch.
+func TestHTTP2PushFailure(t *testing.T) {
+	tests := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{"the failure observed in the field", "Enumerating objects: 3, done.\nWriting objects: 100% (3/3), 253 bytes | 253.00 KiB/s, done.\nerror: RPC failed; HTTP 400 curl 22 The requested URL returned error: 400\nsend-pack: unexpected disconnect while reading sideband packet\nfatal: the remote end hung up unexpectedly\n", true},
+		{"case-insensitive", "ERROR: RPC FAILED; HTTP 400 CURL 22 THE REQUESTED URL RETURNED ERROR: 400", true},
+		{"a sibling status code of the same transport failure", "error: RPC failed; HTTP 502 curl 22 The requested URL returned error: 502", true},
+		{"a rejected ref is not a transport failure", "! [rejected]        main -> main (non-fast-forward)\nerror: failed to push some refs to 'origin'\n", false},
+		{"an unreachable remote is not a transport failure", "fatal: '/tmp/nope.git' does not appear to be a git repository\nfatal: Could not read from remote repository.\n", false},
+		{"the pure-HTTP/2 stream variant is deliberately not matched", "error: RPC failed; curl 92 HTTP/2 stream 0 was not closed cleanly: PROTOCOL_ERROR (err 1)\n", false},
+		{"empty", "", false},
+	}
+	for _, tc := range tests {
+		if got := http2PushFailure(tc.stderr); got != tc.want {
+			t.Errorf("%s: http2PushFailure = %t, want %t\nstderr: %q", tc.name, got, tc.want, tc.stderr)
+		}
+	}
+}
+
 // A task id that does not spell one cannot select a tree. Without this, a
 // degenerate id would still produce a prefix - and the prefix is what decides
 // which tree gets committed in.
@@ -515,4 +650,69 @@ func write(t *testing.T, path string, body string) {
 	if err := os.WriteFile(path, []byte(body+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+}
+
+// installPushStandin replaces the salvager's git binary with a script that
+// passes every command through to the real git except `push`, which it can fail
+// with a canned stderr so the retry behaviour can be driven from a test. Every
+// push's arguments land in $PUSH_LOG, one invocation per line, so a test can see
+// how many pushes ran and with what flags. Two variables drive it (set with
+// t.Setenv): FAIL_FIRST_PUSH fails only the first push, FAIL_EVERY_PUSH fails
+// all of them; "http2" spells the CLA-354 transport signature, "rejected" an
+// ordinary refusal that must not earn a retry.
+func installPushStandin(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "git-standin.sh")
+	write(t, path, `#!/bin/sh
+# A stand-in git binary for the salvage retry tests; see installPushStandin.
+is_push=
+for arg in "$@"; do
+	if [ "$arg" = "push" ]; then is_push=1; fi
+done
+if [ "$is_push" = 1 ]; then
+	printf '%s\n' "$*" >> "$PUSH_LOG"
+	n=$(( $(wc -l < "$PUSH_LOG") ))
+	fail="$FAIL_EVERY_PUSH"
+	if [ "$n" = "1" ]; then
+		fail="${fail:-$FAIL_FIRST_PUSH}"
+	fi
+	case "$fail" in
+	http2)
+		echo "Enumerating objects: 3, done." >&2
+		echo "Writing objects: 100% (3/3), 253 bytes | 253.00 KiB/s, done." >&2
+		echo "error: RPC failed; HTTP 400 curl 22 The requested URL returned error: 400" >&2
+		echo "send-pack: unexpected disconnect while reading sideband packet" >&2
+		echo "fatal: the remote end hung up unexpectedly" >&2
+		exit 1
+		;;
+	rejected)
+		echo "! [rejected]        HEAD -> refs/heads/the-branch (non-fast-forward)" >&2
+		echo "error: failed to push some refs to 'origin'" >&2
+		exit 1
+		;;
+	esac
+fi
+exec git "$@"
+`)
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// readLines returns a file's non-empty lines - the shape of the push stand-in's
+// $PUSH_LOG.
+func readLines(t *testing.T, path string) []string {
+	t.Helper()
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }

@@ -219,9 +219,17 @@ func TestOnlyOpencodeHonoursTheSessionWallClock(t *testing.T) {
 // hang precisely where it is needed. The stub reproduces that shape: a
 // backgrounded child that outlives its parent and keeps stdout open.
 //
-// It does NOT assert the orphan dies — it does not, today; killing the process
-// GROUP is platform-specific and filed separately. What is pinned here is that
-// the adapter returns rather than waiting on it.
+// The orphan's DEATH is pinned by TestOpencodeProcessGroupKillTerminatesAGrandchild;
+// WaitDelay is the backstop behind that group kill, covering a descendant that
+// escaped the group (daemonised with setsid lands in a group of its own, out of
+// our signals' reach - the gap claude's session path has no answer for at all,
+// CLA-423). What is pinned here is that the adapter returns rather than waiting
+// on any of them.
+//
+// Honest about what this does NOT pin: since the group kill landed, the stub's
+// backgrounded child dies WITH the group, so these tests no longer exercise
+// WaitDelay's own escapee case (an out-of-group fd holder) - that property is
+// currently untested on both adapters; pinning it is CLA-423's job.
 func TestOpencodeWallClockKillDoesNotHangOnAGrandchildHoldingTheStream(t *testing.T) {
 	opencodeStub(t, `#!/bin/sh
 echo '{"type":"text","part":{"type":"text","text":"working"}}'
