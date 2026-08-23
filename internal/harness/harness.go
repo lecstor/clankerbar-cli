@@ -88,11 +88,11 @@ type Adapter interface {
 	//
 	// It is the turn cap's stand-in for a harness whose CLI takes no turn flag,
 	// so the driver treats it exactly as it treats the other two: the phase
-	// ends, and nothing is retried or failed — the kill was the point.
+	// ends, and nothing is retried or failed - the kill was the point.
 	//
 	// What it does NOT buy today is the salvage. That runs only on a session
 	// whose claim the adapter observed (Capabilities.TracksClaims), and since
-	// CLA-365 opencode has BOTH HonoursSessionWallClock and TracksClaims — so
+	// CLA-365 opencode has BOTH HonoursSessionWallClock and TracksClaims - so
 	// a capped opencode session holding its claim IS salvaged (loop.go branches
 	// on res.Claim.Held(), and the claim-observing arm is the one that fires).
 	// Before CLA-365 the adapter enforcing this cap did not observe claims, so
