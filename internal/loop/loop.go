@@ -221,6 +221,13 @@ type Driver struct {
 	// clears once the count falls back to it or below.
 	fleetOpenQ []int
 
+	// waitGrace is how far past a stated reset the paused loop waits before its
+	// confirming probe: a reset time is a boundary, and arriving exactly on it
+	// invites an off-by-a-second retry against a cap that has not lifted yet.
+	// A field so tests can shrink it (CLA-305) - production always gets a
+	// minute, and no test should sleep a minute to watch a boundary land.
+	waitGrace time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
 	// second argument is CLA-310's empty-check-rollup opt-out for the target
@@ -294,6 +301,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		fleetPaused: make([]bool, n),
 		fleetRaised: make([]bool, n),
 		fleetOpenQ:  make([]int, n),
+		waitGrace:   time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -2341,28 +2349,42 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 // only be tripped by spend it can SEE was blind to exactly the spend this loop
 // generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
 // and this is the one loop with no other way out (CLA-287).
+// probeWait returns how long the paused loop sleeps before its next probe.
+//
+// A known reset still ahead of us is worth waiting for precisely: sleep until
+// just past it (reset + grace) instead of to the next tick of the poll grid,
+// so a cap that lifts on time costs one grace period of idleness rather than
+// up to a whole interval (CLA-305: 22 minutes dead on 2026-08-10, work queued,
+// nothing wrong). The cap at the interval stays: waitOrStop is what keeps a
+// paused loop responsive to a STOP marker, and an aligned multi-hour sleep
+// would make the stop switch feel dead - so the loop wakes on min(reset+grace,
+// the grid) and simply laps again when it wakes short of the reset. An unknown
+// or already-past reset falls back to the blind grid: codex states no reset at
+// all, and after CLA-258 claude parses one only from typed sources, so an
+// unknown reset is normal rather than exceptional.
+func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Duration {
+	if resetAt.IsZero() || !now.Before(resetAt) {
+		return interval
+	}
+	untilReset := resetAt.Add(grace).Sub(now)
+	if untilReset < interval {
+		return untilReset
+	}
+	return interval
+}
+
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
-	grace := 1 * time.Minute
 
-	waitUntilReset := func() time.Duration {
-		if lim.ResetAt.IsZero() || time.Now().After(lim.ResetAt) || time.Now().Equal(lim.ResetAt) {
-			return interval
-		}
-		// A known reset in the future: wait until ResetAt + grace, capped at now+
-		// interval so STOP stays responsive (a multi-hour uninterrupted sleep makes
-		// the stop switch feel dead). The cap is only when reset is in the future.
-		untilReset := time.Until(lim.ResetAt.Add(grace))
-		untilInterval := interval
-		if untilReset < untilInterval {
-			return untilReset
-		}
-		return untilInterval
-	}
-
+	// waitingForReset says the stated reset was still ahead of us as this wait
+	// began; it flips once the loop has slept across it. waitedOnReset snapshots
+	// that entry state, because a reset we waited on and a reset we arrived
+	// after are owed different endings (see the branch below).
 	waitingForReset := !lim.ResetAt.IsZero() && time.Now().Before(lim.ResetAt)
+	waitedOnReset := waitingForReset
 	if waitingForReset {
-		log.Printf("paused%s — waiting until that reset (with grace), capped at poll interval", resetSuffix(lim.ResetAt))
+		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		log.Printf("paused%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
 	} else {
 		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 	}
@@ -2373,21 +2395,22 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
 		}
-		waitDur := waitUntilReset()
+		waitDur := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
 		if d.waitOrStop(ctx, waitDur) {
 			return tokens, cost, true
 		}
-	// Only fall back to interval polling (instead of resuming immediately) when
-		// the reset actually passed during this supervised wait. When the reset was
-		// already past at entry (e.g. a resumed session whose reset expired during the
-		// previous phase), keep the old behaviour: resume straight away without
-		// requiring a probe to confirm it.
-		if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) && waitingForReset {
-			log.Print("stated reset passed — falling back to interval polling (reset claim is not a guarantee)")
+		// A stated reset is the provider's claim, not a guarantee, so crossing it
+		// mid-wait does NOT resume the run the way a blind-grid wake used to: it
+		// falls back to interval polling, and the very next probe is what confirms
+		// or refutes the claim. Only a reset that was ALREADY behind us at entry
+		// resumes on the stated time alone - the legacy contract pinned by
+		// TestDrainWithRetries_StatedResetPassed, where the caller sent us here
+		// knowing the reset had passed and one more interval of idleness is the
+		// price of not re-probing a phase that just told us it was capped.
+		if !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) && waitingForReset {
+			log.Print("stated reset passed - falling back to interval polling (a stated reset is a claim, not a guarantee)")
 			waitingForReset = false
-		} else if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) && !waitingForReset {
-			// Reset was already past at entry: resume immediately, preserving the
-			// existing behaviour (see TestDrainWithRetries_StatedResetPassed).
+		} else if !waitedOnReset && !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) {
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
