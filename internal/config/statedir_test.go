@@ -134,6 +134,13 @@ func TestExplicitStateDirWinsAndIsAbsolute(t *testing.T) {
 // XDG_STATE_HOME must be absolute per the spec. A relative one would resolve
 // against whatever cwd the daemon was started in — the ambiguity underWorkDir
 // exists to stamp out — so it is ignored rather than honoured.
+//
+// This test deliberately defeats the binary's teststate.Isolate isolation: a
+// relative XDG_STATE_HOME is ignored, so for its duration the derivation
+// points back at the operator's real ~/.local/state. That is safe ONLY while
+// the derived path is never opened or created here - the assertion compares
+// strings. If this test ever needs to touch the filesystem at the derived
+// path, it must first set an absolute XDG_STATE_HOME of its own.
 func TestRelativeXDGStateHomeIsIgnored(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", "relative/state")
 	home, err := os.UserHomeDir()
