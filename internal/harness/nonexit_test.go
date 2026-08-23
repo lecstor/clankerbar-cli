@@ -131,6 +131,7 @@ exit 0
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
+	start := time.Now()
 	res, err := (opencode{}).Invoke(context.Background(), Invocation{
 		Prompt:              "work",
 		MaxSessionWallClock: 30 * time.Second, // a cap far away — it exists only to set WaitDelay
@@ -138,6 +139,15 @@ exit 0
 	})
 	if err != nil {
 		t.Fatalf("Invoke error = %v, want nil — the stub exited cleanly and only died in Wait; CLA-414 classifies that as a clean end carrying the parsed Result", err)
+	}
+	// The ~5s is the signature of the WaitDelay death, not decoration, so it is
+	// asserted: without this floor the test above would pass VACUOUSLY if the
+	// stub ever stopped producing the death (the backgrounded sleeper dropped,
+	// the arming regressed) — err nil, ExitCode 0, nothing capped are all true
+	// of an ordinary clean exit too. Only a death in Wait holds Invoke for the
+	// delay; anything faster means the shape under test never happened.
+	if elapsed := time.Since(start); elapsed < 4*time.Second {
+		t.Errorf("Invoke returned after %s — under the 5s WaitDelay, so the stub did not die in Wait and this test pinned the ordinary clean-exit path instead of the CLA-414 classification arm", elapsed)
 	}
 	if (opencode{}).WallClockCapped(res) {
 		t.Error("the session was marked wall-clock capped; the child exited well inside its cap — this is a death in Wait, not our kill")

@@ -352,6 +352,12 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// risk, accepted: force-closed pipes mean this cannot be distinguished
 		// from a parent killed while pretending to succeed — ExitCode 0 plus a
 		// fully parsed live stream is the strongest evidence available either way.
+		// The same holds for a run-wide cancellation landing inside the window:
+		// sctx reads Canceled, not DeadlineExceeded, so !timedOut is true and the
+		// attempt ends "clean" during teardown. Nothing durable turns on it —
+		// salvage, handback and spend are computed from res before any error
+		// check either way, and the cancelled driver ctx stops the run one spawn
+		// later — so the noise is left standing rather than guarded against.
 		return res, nil
 	} else if runErr != nil && !timedOut {
 		// A launch failure (bad PATH, unreadable config): nothing was emitted,
