@@ -611,6 +611,35 @@ type Config struct {
 	// allowlist leaves open. Claude-specific; other harnesses ignore it. ~ expands.
 	SettingsPath string `json:"settings_path"`
 
+	// Repos maps the repos a project's tasks may name to their local checkouts,
+	// so a session starts in the TASK's repo rather than in the multi-repo parent
+	// (agent-rule-scoping pieces 2 and 3). Keyed by repo identity — either the
+	// full "owner/name" form the task carries or just its bare name — with the
+	// checkout path as the value (~ and relative paths both expand; a relative
+	// path resolves against the workdir). Resolution order, fallbacks and the
+	// loud repo_not_found failure are ResolveCheckout's, which is the only thing
+	// that should interpret this map.
+	//
+	// Declaring repos also widens each session's permission policy to cover every
+	// declared checkout regardless of cwd, so a two-repo project does not wall
+	// sessions started in one repo off the other. The grants themselves stay in
+	// local config — this map holds paths, never credentials.
+	//
+	// In single-project mode set it here; in multi-project mode set it per
+	// project (see Project.Repos), whose non-empty map replaces the top-level
+	// one for that project.
+	Repos map[string]string `json:"repos"`
+
+	// PrimaryRepo names the repo a session starts in when its task carries none:
+	// the fallback that keeps a fresh phase out of the multi-repo parent until
+	// the plane returns a repo for every task. It names a `repos` key, or any
+	// identity resolvable by the same steps; with exactly one repo declared and
+	// no primary named, that one is primary implicitly. Empty = no fallback, so
+	// a task without a repo fails the iteration with repo_not_found rather than
+	// start somewhere unconsidered — unless NO repos are configured at all, in
+	// which case this whole feature is off and the legacy workdir behaviour runs.
+	PrimaryRepo string `json:"primary_repo"`
+
 	// AllowUncheckedPR opts this project out of CLA-310's empty-check-rollup
 	// refusal: a delivery whose PR carries NO checks is logged as a WARNING
 	// instead of refused. It exists for repos with NO CI at all, where refusing
@@ -734,6 +763,44 @@ type Project struct {
 	// when it names anything; an entry that sets none inherits the top-level
 	// one. See Config.AllowLocalMCPServers and AllowLocalMCPServersFor.
 	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
+
+	// Repos is this project's repo -> checkout map, REPLACING the top-level map
+	// of the same name for this project when it declares anything; an entry that
+	// sets none inherits the top-level one. See Config.Repos and ReposFor for
+	// what the map does and how it resolves.
+	Repos map[string]string `json:"repos"`
+
+	// PrimaryRepo is this project's no-repo-on-the-task fallback, overriding the
+	// top-level field of the same name for this project only when non-empty. See
+	// Config.PrimaryRepo and PrimaryRepoFor.
+	PrimaryRepo string `json:"primary_repo"`
+}
+
+// ReposFor resolves the CLA-437 repo -> checkout map for one project: a
+// matching projects[] entry's own NON-EMPTY map replaces the top-level one, and
+// everything else — an unmatched slug (how a single-project run reaches here
+// with no projects at all), or an entry that declared none — falls back to the
+// top-level map. Total, so no caller has a second error path.
+func (c *Config) ReposFor(slug string) map[string]string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.Repos) > 0 {
+			return p.Repos
+		}
+	}
+	return c.Repos
+}
+
+// PrimaryRepoFor resolves the CLA-437 no-repo fallback for one project: a
+// matching projects[] entry's own non-empty value wins, and everything else
+// falls back to the top-level field. Total, so no caller has a second error
+// path.
+func (c *Config) PrimaryRepoFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && strings.TrimSpace(p.PrimaryRepo) != "" {
+			return p.PrimaryRepo
+		}
+	}
+	return c.PrimaryRepo
 }
 
 // AllowUncheckedPRFor resolves the CLA-310 empty-rollup opt-out for one
@@ -1870,6 +1937,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("settings_path: %w - it is the allow/deny policy the unattended session is gated by: chmod go-w %s", err, c.SettingsPath)
 	}
 
+	// The top-level repo map, for single-project configs (multi-project entries
+	// carry their own, checked in the loop below).
+	if err := validateRepos(c.Repos, "top level"); err != nil {
+		return err
+	}
+
 	// Multi-project entries: slug required and unique; paths normalized; each
 	// project's mcp config defaults to its own workdir's .mcp.json (falling back to
 	// the top-level one at invocation time — see loop.Target).
@@ -1878,6 +1951,9 @@ func (c *Config) Validate() error {
 		p := &c.Projects[i]
 		if p.Slug == "" {
 			return fmt.Errorf("projects[%d]: slug is required", i)
+		}
+		if err := validateRepos(p.Repos, fmt.Sprintf("projects[%d] (%s)", i, p.Slug)); err != nil {
+			return err
 		}
 		if seen[p.Slug] {
 			return fmt.Errorf("projects: duplicate slug %q", p.Slug)
