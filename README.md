@@ -1195,12 +1195,20 @@ alternatives, in order of preference:
    there instead of spending another session first.
 
    **The polls during a pause count too.** Waiting out a usage limit means probing
-   for an early reset every `poll_interval`, and a probe is a real harness session
-   — cheap (a one-character prompt, with the harness locked down to no tools or
-   read-only), but not free, and a week-long cap polled every 30 minutes is a few
-   hundred of them. Their tokens and cost go into the same running total the
-   breaker reads, so a pause whose probes alone cross a ceiling ends on that
-   ceiling rather than polling on.
+   for an early reset, and a probe is a real harness session - cheap (a
+   one-character prompt, with the harness locked down to no tools or read-only),
+   but not free, and a week-long cap polled every 30 minutes is a few hundred of
+   them. Their tokens and cost go into the same running total the breaker reads,
+   so a pause whose probes alone cross a ceiling ends on that ceiling rather than
+   polling on.
+
+   **A pause holding a stated reset aims at it.** When the limit carries a reset
+   time, the first probe lands just past that time instead of on the next tick of
+   the `poll_interval` grid (still capped at `poll_interval`, so a STOP marker
+   never goes stale), and the paused log line says so. A stated reset is a claim,
+   not a guarantee: once the pause crosses it, it falls back to probing every
+   `poll_interval` until a probe actually confirms the cap has lifted - it never
+   resumes on the stated time alone after having slept through it.
 
    **A session whose spend cannot be measured stops the run, if you set a spend
    ceiling.** Every figure the breaker reads is parsed out of the harness's event
