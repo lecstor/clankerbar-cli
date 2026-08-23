@@ -1446,14 +1446,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// arrives per step_finish and is summed all the way to the kill, so the
 		// figures are the honest cost of the session up to the moment it ended.
 		//
-		// What the line must NOT say is that the salvage handled the tree. The
-		// salvage returns immediately without a claim (see salvageStrandedWork),
-		// and the only adapter that enforces this cap today is the one that does
-		// not observe claims — so on every kill that can currently happen, nothing
-		// was committed and the work is still sitting in the worktree. Saying
-		// otherwise would be the reassuring falsehood doctor's own checks exist to
-		// remove (CLA-290). The claim-held wording is the one a claim-observing
-		// adapter will earn later; it is not what opencode gets today.
+		// Since CLA-365 opencode has BOTH HonoursSessionWallClock and
+		// TracksClaims (Capabilities.TracksClaims: true), so a capped opencode
+		// session holding its claim IS salvaged — the res.Claim.Held() arm above
+		// is the one that fires today. The else branch (nothing salvaged) applies
+		// only if an adapter enforcing this cap ever lacks claim observation
+		// again; it is kept defensive, not descriptive of the present. The claim-held
+		// wording was earned by CLA-365, not reserved for a future adapter.
 		if wallclock {
 			if res.Claim.Held() {
 				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
