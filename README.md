@@ -438,7 +438,10 @@ the loop's own `STOP`/`HALT` switch; under a workdir nothing runs in *yet* it is
 the same trap for the next `projects[]` entry that inherits it), **workdir** (per
 project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **permissions**
-(harness-specific policy sanity), **toolchains** (the build tools the project's
+(harness-specific policy sanity), **opencode_ambient_config** (an opencode
+config the driver never named that a session merges anyway: one whose
+`clankerbar` server points at another project, or one carrying keys that shape
+what a session may do), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
 long enough to do the work), and **budget** (ceilings parse and are sane).
 
@@ -1266,14 +1269,58 @@ line per ask, naming the rule that won. That log is the cheapest live proof
 available, because it records the decision whether or not the session goes on
 to produce any output.
 
-**The workdir should be a multi-repo parent, not a git checkout.** The
-read/edit rules are emitted to match the patterns opencode asks for a session
-whose project is *not* inside a git repo (worktree `/`; the multi-repo-parent
-case, `~/dev`). Point the workdir at a git checkout and opencode asks with
-checkout-relative patterns the rules cannot express, locking the session's
-structured Read/Edit tools out with no error — the exact failure this change
-removes. A per-task worktree always lives *under* a parent workdir, so the
-parent is the correct setting.
+**The policy covers both instance-directory shapes, and it did not always.**
+opencode makes its read/edit asks relative to the git worktree it resolves at
+the session's instance directory, so there are two ask forms and which one
+arrives is not the policy's choice. Outside any repo - the multi-repo parent,
+`~/dev` - the worktree is `/` and asks are the absolute path minus its leading
+slash (`Users/jason/dev/...`). Inside a checkout the worktree is the repo root
+and asks are repo-relative (`AGENTS.md`). Until CLA-441 only the first form was
+emitted, which was fine while every session ran in the parent and silently fatal
+once they did not: the second form matched no rule, fell to the `*` catch-all,
+and every structured Read/Edit was denied with no error and with the grants
+apparently in place. Widening their *scope* could not help, because the shape
+was wrong rather than the reach. Both forms are emitted now, and a session
+started in a *subdirectory* of a checkout is scoped to that subdirectory rather
+than to the repo above it.
+
+**Each session's instance directory is pinned to its workdir.** `cmd.Dir` sets
+the child's real cwd and nothing else; the inherited `PWD` still named wherever
+the daemon was started, and opencode honours `$PWD` - it creates a second
+instance there and runs the session in it. So every session every daemon spawned
+ran in the daemon's start directory whatever the project's `workdir` said, which
+is the same defect as the wrong project's MCP server (below), the wrong ask shape
+(above), and the wrong repo's `AGENTS.md`. Every adapter now sets `PWD` to the
+directory it is about to run in and drops `OLDPWD`.
+
+**And the project's MCP block is pinned past every layer opencode merges after
+it.** opencode's config order is: its global file, then `OPENCODE_CONFIG` (the
+file the driver names), then any project-level `opencode.json` discovered from
+the instance directory, then the `OPENCODE_CONFIG_DIR` directory again, then
+`OPENCODE_CONFIG_CONTENT`. Two of those layers land *after* the driver's file,
+and both were observed redirecting the `clankerbar` server at another project -
+a global block for sessions running in `~/dev`, a committed repo-level
+`opencode.json` for sessions running in a checkout. The named file's bytes are
+therefore also sent as `OPENCODE_CONFIG_CONTENT`, which opencode merges after
+every layer this driver or a checkout can write, so a drain session reaches the
+backlog it polls. (Three layers do follow it - the console active-org config, a
+managed config directory, and managed preferences - none of them writable by a
+repo or by us.) A file that still names another
+project is reported by `doctor`'s `opencode_ambient_config` check and logged once
+at startup - a warning, not a refusal, since spawned sessions are pinned past it
+and the file is often a checked-in artifact of somebody else's repo, but every
+*interactive* session in that tree still gets the wrong backlog. The same scan
+covers opencode's global config directory (`$XDG_CONFIG_HOME/opencode`, then
+`~/.opencode`, then whatever `config_dir` names) and reports a second kind of
+finding that the content pin does *not* mitigate: a discovered config carrying
+`permission`, `plugin`, an `agent` with tool or permission authority, or an
+`mcp` server that starts a local process. `mcp_config_path` files are refused
+for those keys; a file opencode discovers by itself is not, and it is merged
+into every session started in that tree. `permission` is the sharpest of them -
+the env policy is applied after every config layer, but the merge is per key and
+the flatten is in insertion order, so a file declaring `permission.read` moves
+that key ahead of the sorted-first `*` catch-all and the catch-all matches last,
+denying everything.
 
 ## Docs
 

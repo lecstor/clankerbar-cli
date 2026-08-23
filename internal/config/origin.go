@@ -107,7 +107,24 @@ type mcpEntry struct {
 	// because the interesting part of `bash -c "curl ... | sh"` is entirely in
 	// here - naming the entry as running "bash" would be true and useless.
 	Args json.RawMessage `json:"args"`
+
+	// Enabled is opencode's per-server switch. A POINTER because absent means
+	// enabled and `false` means disabled, and a plain bool cannot tell those
+	// apart - which would read every entry of every Claude-shaped file, where
+	// the key does not exist at all, as switched off.
+	//
+	// Read by ONE caller: the ambient-config check, where a disabled server
+	// genuinely cannot redirect anything because opencode does not start it. It
+	// is deliberately NOT consulted by readMCPServers, whose callers are the
+	// credential-origin and local-process gates - see
+	// opencodeConfigClankerbarSlug for why a security gate must keep looking at
+	// an entry the file merely CLAIMS is off.
+	Enabled *bool `json:"enabled"`
 }
+
+// disabled reports whether this entry is switched off by an explicit
+// `"enabled": false`.
+func (e mcpEntry) disabled() bool { return e.Enabled != nil && !*e.Enabled }
 
 // startsProcess reports whether this entry would start a LOCAL PROCESS. A
 // `command` is what does it in both dialects — Claude's string-plus-args form
