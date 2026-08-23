@@ -61,12 +61,15 @@ jobs:
         # after the next publish, not immediately.
         #
         # The trade-off this choice accepts, and why it is safe HERE. A PR created
-        # by GITHUB_TOKEN triggers NO further workflows (GitHub suppresses that to
-        # prevent recursion), so `ci.yml` does NOT run on `pull_request` for this
-        # PR - and `main` requires the `ci` check. What satisfies it instead is
-        # that `ci.yml` also runs on `push: [staging]`, and a required status check
-        # resolves against the PR's HEAD SHA. Every staging commit therefore
-        # already carries the `ci` run this PR needs, whoever opened it.
+        # by GITHUB_TOKEN DOES trigger a `pull_request` run - it is created but
+        # parks at `action_required`, so it contributes NO check run until a
+        # human approves it, at which point it runs and becomes a second `ci`
+        # check under the same required `ci` context. `main` requires the `ci`
+        # check; what satisfies it is that `ci.yml` also runs on `push: [staging]`,
+        # and a required status check resolves against the PR's HEAD SHA. Every
+        # staging commit therefore carries the `ci` run this PR needs, whoever
+        # opened it. The conclusion stays: the promotion PR is mergeable without
+        # that approval, because the push-to-staging run already satisfies it.
         #
         # So the load-bearing dependency is `staging` staying in ci.yml's push
         # list, which `TestCIWorkflowRunsOnBothIntegrationBranches` now guards.
