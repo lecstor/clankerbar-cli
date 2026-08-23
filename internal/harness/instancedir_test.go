@@ -250,6 +250,13 @@ func TestExtraDirFormIsRelativeToTheWorktreeNotTheWorkdir(t *testing.T) {
 // after it and beat it.
 func TestAnExtraDirAboveTheWorktreeCannotOpenAnEscape(t *testing.T) {
 	for name, layout := range map[string]struct{ workdir, extra func(base string) string }{
+		// The subdirectory shape, where scopeInstanceDir writes no "../**"
+		// deny at all: the escape has to be closed by the policy's own `*`
+		// catch-all, and nothing else is standing there.
+		"subdirectory of a checkout, an ancestor of it declared": {
+			workdir: func(b string) string { return filepath.Join(b, "outer", "repo", "services", "api") },
+			extra:   func(b string) string { return filepath.Join(b, "outer") },
+		},
 		"declared parent of a submodule": {
 			workdir: func(b string) string { return filepath.Join(b, "super", "sub") },
 			extra:   func(b string) string { return filepath.Join(b, "super") },
@@ -261,8 +268,22 @@ func TestAnExtraDirAboveTheWorktreeCannotOpenAnEscape(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			base := t.TempDir()
-			workdir := checkoutAt(t, layout.workdir(base), "file")
 			extra := checkoutAt(t, layout.extra(base), "dir")
+			workdir := layout.workdir(base)
+			if strings.Contains(name, "subdirectory") {
+				// The session starts in a plain directory INSIDE a checkout, so
+				// the worktree opencode resolves is that checkout - and the
+				// declared tree is an ancestor of it, giving rel == "..". This
+				// is the shape where scopeInstanceDir writes no "../**" deny at
+				// all, so the escape has to be closed by the policy's `*`
+				// catch-all and nothing else.
+				checkoutAt(t, filepath.Join(base, "outer", "repo"), "dir")
+				if err := os.MkdirAll(workdir, 0o755); err != nil {
+					t.Fatalf("mkdir: %v", err)
+				}
+			} else {
+				checkoutAt(t, workdir, "file")
+			}
 			perm := opencodePermission(false, workdir, []string{extra})
 
 			for _, ask := range []string{"../../etc/passwd", "../secret", "../../../Users/someone/.ssh/id_rsa"} {
@@ -273,9 +294,12 @@ func TestAnExtraDirAboveTheWorktreeCannotOpenAnEscape(t *testing.T) {
 					t.Errorf("edit %q = %s, want deny", ask, got)
 				}
 			}
-			// The declared tree is still reachable, through the two forms that
-			// CAN bound it - so this is a narrowing of the ask shapes, not a
-			// withdrawal of the grant.
+			// The two bounded forms survive, for the OTHER ask shape. They do
+			// not give this session the tree back - an in-checkout session
+			// only ever asks worktree-relative, which is why the deny above
+			// covers paths inside the declared tree too - they keep the
+			// declaration meaningful for a session that starts outside a
+			// checkout, and they keep the external_directory gate open.
 			p := parsePolicy(t, perm)
 			if !hasRelFormAllow(rules(p, "read"), extra) {
 				t.Errorf("read = %v; the declared tree's root-relative allow must survive", p["read"])

@@ -1252,15 +1252,39 @@ func checkOpencodeAmbientConfigs(cfg *config.Config) check {
 		return c
 	}
 	c.status = warn
-	c.detail = plural(len(conflicts),
-		"1 opencode config names a different project's backlog",
-		fmt.Sprintf("%d opencode configs name a different project's backlog", len(conflicts)))
+	// The two kinds are counted and remedied SEPARATELY. They share a scan and
+	// nothing else: one is a file naming the wrong backlog, mitigated for
+	// spawned sessions by the content pin; the other is a file that shapes
+	// what the session may do, which the pin does nothing about. A single
+	// sentence covering both said the mitigation out loud on findings it does
+	// not apply to (CLA-441 second review).
+	var slugs, shaping int
 	for _, cf := range conflicts {
 		c.info = append(c.info, cf.String())
+		if len(cf.Overrides) > 0 {
+			shaping++
+		} else {
+			slugs++
+		}
 	}
-	c.remedy = "spawned sessions are pinned to the right project through OPENCODE_CONFIG_CONTENT, so this is not a live wrong-backlog drain - " +
-		"but every INTERACTIVE opencode session in that tree still gets the wrong one: rename the block " +
-		"(the operator's own global one is now `clankerbar-interactive`), disable it, or point its url at the right slug"
+	var details, remedies []string
+	if slugs > 0 {
+		details = append(details, plural(slugs,
+			"1 opencode config names a different project's backlog",
+			fmt.Sprintf("%d opencode configs name a different project's backlog", slugs)))
+		remedies = append(remedies, "the wrong-backlog ones are mitigated for SPAWNED sessions by OPENCODE_CONFIG_CONTENT, but every INTERACTIVE "+
+			"opencode session in that tree still gets the wrong one: rename the block (the operator's own global one is now "+
+			"`clankerbar-interactive`), disable it, or point its url at the right slug")
+	}
+	if shaping > 0 {
+		details = append(details, plural(shaping,
+			"1 opencode config shapes what every session it loads into may do",
+			fmt.Sprintf("%d opencode configs shape what every session they load into may do", shaping)))
+		remedies = append(remedies, "the session-shaping ones are NOT mitigated by anything here - `mcp_config_path` files are refused for these keys, "+
+			"a file opencode discovers is not: remove the key, or accept that every session started in that tree runs with it")
+	}
+	c.detail = strings.Join(details, "; ")
+	c.remedy = strings.Join(remedies, "; ")
 	return c
 }
 

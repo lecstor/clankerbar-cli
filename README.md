@@ -439,8 +439,9 @@ the same trap for the next `projects[]` entry that inherits it), **workdir** (pe
 project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **permissions**
 (harness-specific policy sanity), **opencode_ambient_config** (an opencode
-config the driver never named whose `clankerbar` server points at another
-project), **toolchains** (the build tools the project's
+config the driver never named that a session merges anyway: one whose
+`clankerbar` server points at another project, or one carrying keys that shape
+what a session may do), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
 long enough to do the work), and **budget** (ceilings parse and are sane).
 
@@ -1308,7 +1309,18 @@ repo or by us.) A file that still names another
 project is reported by `doctor`'s `opencode_ambient_config` check and logged once
 at startup - a warning, not a refusal, since spawned sessions are pinned past it
 and the file is often a checked-in artifact of somebody else's repo, but every
-*interactive* session in that tree still gets the wrong backlog.
+*interactive* session in that tree still gets the wrong backlog. The same scan
+covers opencode's global config directory (`$XDG_CONFIG_HOME/opencode`, then
+`~/.opencode`, then whatever `config_dir` names) and reports a second kind of
+finding that the content pin does *not* mitigate: a discovered config carrying
+`permission`, `plugin`, an `agent` with tool or permission authority, or an
+`mcp` server that starts a local process. `mcp_config_path` files are refused
+for those keys; a file opencode discovers by itself is not, and it is merged
+into every session started in that tree. `permission` is the sharpest of them -
+the env policy is applied after every config layer, but the merge is per key and
+the flatten is in insertion order, so a file declaring `permission.read` moves
+that key ahead of the sorted-first `*` catch-all and the catch-all matches last,
+denying everything.
 
 ## Docs
 

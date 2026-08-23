@@ -86,15 +86,19 @@ func (c *Config) checkDiscoveredMCPConfig(path, label string, allow []string) er
 		raw  json.RawMessage
 		what string
 	}{
-		// One word of this entry is now known to be wrong, and it is left
-		// refusing anyway. A file's `permission` block does NOT override the
-		// exported policy: read out of 1.18.19's Config.loadInstanceState,
-		// OPENCODE_PERMISSION is parsed and merged in AFTER every config layer,
-		// and the merge's later argument wins (CLA-441 review). The refusal
-		// stands because a discovered file declaring policy at all is not the
-		// document this gate assumed it was, and that ordering is opencode's to
-		// change rather than ours - but the reason is no longer "it would win".
-		{"permission", f.Permission, "a permission policy, which this driver's adapter pins in the environment instead"},
+		// The mechanism behind this one, measured in 1.18.19 (CLA-441). The
+		// obvious reading is that it cannot bite - OPENCODE_PERMISSION is
+		// applied after every config layer, so surely it overwrites the file's
+		// block. It does not. That merge is recursive and PER KEY, `fromConfig`
+		// flattens the result in INSERTION order rather than sorted, and
+		// `evaluate` is findLast over that order. Our document is marshalled
+		// from a Go map, so it arrives sorted with the `*` catch-all first,
+		// which is the whole basis of the fail-closed posture. A file that
+		// declares `permission.read` gives `read` ITS position in the merged
+		// object - ahead of the `*` deny, which is env-only and lands last - so
+		// the catch-all matches last and every read in the session is denied.
+		// Not a loosening, a total lockout, which is the CLA-441 wall itself.
+		{"permission", f.Permission, "permission rules, which merge into the policy this driver exports and reorder it"},
 		{"plugin", f.Plugin, "code loaded and run at startup"},
 		{"agent", f.Agent, "agent definitions, including their modes and permissions"},
 	} {

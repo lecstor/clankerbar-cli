@@ -2702,9 +2702,13 @@ func TestDoctorWarnsOnAnAmbientOpencodeConfigNamingAnotherProject(t *testing.T) 
 	}
 
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
-	// opencode reads ~/.opencode as a global config dir too, so HOME is isolated
-	// or this test would answer to whatever is in the developer's home.
+	// opencode's global config dirs are ~/.opencode and
+	// $XDG_CONFIG_HOME/opencode (defaulting under HOME), so BOTH are isolated:
+	// the second half of this test asserts PASS, which would otherwise answer to
+	// whatever config root the machine or the CI image happens to have set
+	// (CLA-441 second review).
 	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	cfg := &config.Config{
 		Harness:       "opencode",
 		Prompt:        "Work the next backlog item.",

@@ -277,28 +277,61 @@ func TestGlobalScanCoversDotConfigWhenXDGIsUnset(t *testing.T) {
 
 // A discovered opencode config is merged into every session that loads it, and
 // checkDiscoveredMCPConfig's refusal never sees one - it gates only the file
-// mcp_config_path resolved to. So `plugin` (code opencode runs at session start)
-// and `agent` (agent definitions and their modes) are reported through the same
-// channel. `permission` is NOT: OPENCODE_PERMISSION is merged after every config
-// layer and wins, so warning about it would be warning about something that
-// cannot happen (CLA-441 review).
-func TestAmbientConfigDeclaringPluginOrAgentIsReported(t *testing.T) {
+// mcp_config_path resolved to. So the keys that decide what a session IS get
+// reported through the same channel.
+//
+// `permission` is on that list, against the plausible reading that it cannot
+// bite. OPENCODE_PERMISSION is applied after every config layer, but the merge
+// is per key and the flatten is in INSERTION order, so a file declaring
+// `permission.read` moves `read` ahead of our sorted-first `*` catch-all and the
+// catch-all matches LAST - a total read denial, which is the CLA-441 wall
+// itself (CLA-441 second review).
+func TestAmbientConfigDeclaringSessionShapingKeysIsReported(t *testing.T) {
 	configDir := t.TempDir()
 	writeAmbientFile(t, filepath.Join(configDir, "opencode.json"),
-		`{"plugin":["./evil.js"],"agent":{"build":{"mode":"all"}},"mcp":{"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"}}}`)
+		`{"permission":{"read":{"*.env":"ask"}},"plugin":["./evil.js"],"agent":{"build":{"mode":"all"}},`+
+			`"mcp":{"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"},"local":{"command":["node","serve.js"]}}}`)
 	c := opencodeRun(t, "ezyapp", t.TempDir(), configDir)
 
 	got := onlyConflict(t, c.OpencodeAmbientConflicts()) // the slug agrees, so only the override finding
-	if len(got.Overrides) != 2 {
-		t.Fatalf("overrides = %v, want plugin and agent", got.Overrides)
+	if len(got.Overrides) != 4 {
+		t.Fatalf("overrides = %v, want permission, plugin, agent and the local-process server", got.Overrides)
 	}
-	if !strings.Contains(got.String(), "plugin") || !strings.Contains(got.String(), "agent") {
-		t.Errorf("message must name the keys: %q", got.String())
+	for _, want := range []string{"permission", "plugin", "agent", "local"} {
+		if !strings.Contains(got.String(), want) {
+			t.Errorf("message must name %q: %q", want, got.String())
+		}
 	}
+}
 
-	writeAmbientFile(t, filepath.Join(configDir, "opencode.json"),
-		`{"permission":{"read":"allow"},"mcp":{"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"}}}`)
-	if got := opencodeRun(t, "ezyapp", t.TempDir(), configDir).OpencodeAmbientConflicts(); len(got) != 0 {
-		t.Errorf("conflicts = %v, want none: the adapter's OPENCODE_PERMISSION is merged after every config layer and wins", got)
-	}
+// The noise cases. Each of these was on the operator's own machine while this
+// was being written, and a check that fires on them is one they learn to skim.
+func TestSessionShapingReportIgnoresPowerlessDeclarations(t *testing.T) {
+	t.Run("agent that only picks a model", func(t *testing.T) {
+		configDir := t.TempDir()
+		// The operator's real global config: the whole agent block chooses a
+		// cheap model for generating session titles.
+		writeAmbientFile(t, filepath.Join(configDir, "opencode.jsonc"),
+			`{"agent":{"title":{"model":"opencode-go/deepseek-v4-flash"}},"mcp":{"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"}}}`)
+		if got := opencodeRun(t, "ezyapp", t.TempDir(), configDir).OpencodeAmbientConflicts(); len(got) != 0 {
+			t.Errorf("conflicts = %v, want none: a model choice is cost and style, not authority", got)
+		}
+	})
+	t.Run("disabled local-process server", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeAmbientFile(t, filepath.Join(configDir, "opencode.json"),
+			`{"mcp":{"local":{"command":["node","serve.js"],"enabled":false},"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"}}}`)
+		if got := opencodeRun(t, "ezyapp", t.TempDir(), configDir).OpencodeAmbientConflicts(); len(got) != 0 {
+			t.Errorf("conflicts = %v, want none: opencode does not start a disabled server", got)
+		}
+	})
+	t.Run("an agent block this cannot parse is reported anyway", func(t *testing.T) {
+		configDir := t.TempDir()
+		writeAmbientFile(t, filepath.Join(configDir, "opencode.json"),
+			`{"agent":["build"],"mcp":{"clankerbar":{"url":"https://clankerbar.com/mcp/ezyapp"}}}`)
+		got := onlyConflict(t, opencodeRun(t, "ezyapp", t.TempDir(), configDir).OpencodeAmbientConflicts())
+		if len(got.Overrides) != 1 {
+			t.Errorf("overrides = %v, want the unparseable block reported - the shape nobody modelled is the one nobody has looked at", got.Overrides)
+		}
+	})
 }

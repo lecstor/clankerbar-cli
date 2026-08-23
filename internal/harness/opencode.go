@@ -628,10 +628,18 @@ func scopeExtraDirs(read, edit, ext map[string]string, worktree string, extraDir
 			// worktree. Emitting it would either overwrite the "../**" deny
 			// with an allow (a declared parent of a submodule) or sort after it
 			// and beat it ("../../**"), turning the policy's only stated escape
-			// boundary into an allow of the whole filesystem. Such a tree stays
-			// reachable through the root-relative allow and the
-			// external_directory allow written just above; what is dropped is
-			// only the ask form that cannot be bounded (CLA-441 review).
+			// boundary into an allow of the whole filesystem.
+			//
+			// Be honest about the cost: this is a WITHDRAWN GRANT, not a
+			// narrowed one. An in-checkout session asks only in the
+			// worktree-relative form (ReadTool passes
+			// path.relative(worktree, file)), so the root-relative and
+			// external_directory allows written just above serve the OTHER
+			// shape and do nothing for this session - a declared tree
+			// containing its worktree is simply unreadable to it. There is no
+			// bounded glob to give it ("../*" spans "/" exactly as "../**"
+			// does), so the choice is that or an escape, and fail-closed wins
+			// (CLA-441 reviews).
 			if rel, err := filepath.Rel(worktree, dir); err == nil && rel != "." && !isDotDotChain(rel) {
 				relGlob := filepath.ToSlash(rel) + "/**"
 				read[relGlob] = "allow"

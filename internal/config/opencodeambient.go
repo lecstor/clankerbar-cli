@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -52,35 +53,30 @@ var (
 	opencodeProjectConfigNames = []string{"opencode.json", "opencode.jsonc"}
 )
 
-// opencode's two ALWAYS-READ global directories, neither of which is
-// OPENCODE_CONFIG_DIR. Read out of 1.18.19's Config.getGlobal and confirmed by
-// the live log above, which shows both being loaded in one run:
+// opencodeGlobalConfigDirs are the directories opencode reads global config from
+// whatever OPENCODE_CONFIG_DIR says. Read out of 1.18.19's Config.getGlobal and
+// corroborated by the live log above, which shows both being loaded in one run:
 //
-//   - $XDG_CONFIG_HOME/opencode, defaulting to ~/.config/opencode. This is the
-//     one an operator actually edits, and it is NOT derived from
-//     OPENCODE_CONFIG_DIR - that variable only appends a directory to a later
-//     merge layer. A `config_dir` that is unset (it has no default here, and a
-//     mixed-harness run's opencode block often carries none) or pointed
-//     somewhere else does not move it, so scanning only what `config_dir` names
-//     would miss exactly the file the operator has (CLA-441 review).
+//   - ONE slot with a default - `path.join(XDG_CONFIG_HOME || homedir()/".config",
+//     "opencode")`. It is the directory an operator actually edits, and it is NOT
+//     derived from OPENCODE_CONFIG_DIR; that variable only appends a directory to
+//     a later merge layer. A `config_dir` that is unset (it has no default in this
+//     package, and a mixed-harness run's opencode block often carries none) or
+//     pointed elsewhere does not move it, so scanning only what `config_dir` names
+//     misses exactly the file the operator has. One slot, not two: when
+//     XDG_CONFIG_HOME is set elsewhere, ~/.config/opencode is not read, and
+//     reporting on it would send the operator to edit a file no session loads
+//     (CLA-441 reviews).
 //   - ~/.opencode, its older sibling, read on top of that.
 //
-// The run's own `config_dir` is scanned as well, because it IS merged - just at
-// a later layer - and because an operator who sets it has put config there.
-var opencodeHomeConfigDirs = []string{"$XDG_CONFIG_HOME/opencode", "~/.config/opencode", "~/.opencode"}
-
-// expandOpencodeGlobalDir resolves one entry of opencodeHomeConfigDirs. The
-// XDG entry disappears when the variable is unset rather than resolving to
-// "/opencode", and its default is the ~/.config entry beside it.
-func expandOpencodeGlobalDir(dir string) string {
-	if strings.HasPrefix(dir, "$XDG_CONFIG_HOME/") {
-		base := os.Getenv("XDG_CONFIG_HOME")
-		if base == "" {
-			return ""
-		}
-		return filepath.Join(base, strings.TrimPrefix(dir, "$XDG_CONFIG_HOME/"))
+// The run's own `config_dir` is scanned beside them, because it IS merged - just
+// at a later layer - and because an operator who set it has put config there.
+func opencodeGlobalConfigDirs() []string {
+	base := os.Getenv("XDG_CONFIG_HOME")
+	if base == "" {
+		base = expandHome("~/.config")
 	}
-	return expandHome(dir)
+	return []string{filepath.Join(base, "opencode"), expandHome("~/.opencode")}
 }
 
 // OpencodeAmbientConflict is one discovered opencode config whose `clankerbar`
@@ -99,10 +95,10 @@ type OpencodeAmbientConflict struct {
 	// Overrides finding, which is about the file's other keys rather than its
 	// backlog.
 	Got string
-	// Overrides names the opencode keys this file carries that decide what a
-	// session IS rather than what it talks to - `plugin` (code opencode loads
-	// and runs at startup) and `agent` (agent definitions and their modes).
-	// Empty on a slug finding.
+	// Overrides names what this file carries that decides what a session IS
+	// rather than what it talks to - see sessionShapingKeys. Empty on a slug
+	// finding; the two kinds are reported separately, because their remedies
+	// have nothing in common.
 	Overrides []string
 }
 
@@ -190,13 +186,12 @@ type ambientScope struct {
 func (c *Config) opencodeAmbientScopes() []ambientScope {
 	var scopes []ambientScope
 	if all := c.drainedSlugs(); len(all) > 0 {
-		globals := append([]string{}, opencodeHomeConfigDirs...)
+		globals := opencodeGlobalConfigDirs()
 		if dir := c.SessionFor("opencode").ConfigDir; dir != "" {
-			globals = append(globals, dir)
+			globals = append(globals, expandHome(dir))
 		}
 		seen := map[string]bool{}
 		for _, dir := range globals {
-			dir = expandOpencodeGlobalDir(dir)
 			if dir == "" || seen[dir] {
 				continue
 			}
@@ -305,27 +300,114 @@ func readOpencodeConfig(path string) (mcpFile, bool) {
 	return f, true
 }
 
-// sessionShapingKeys names the keys a discovered opencode config carries that
-// decide what a session IS rather than what it talks to. checkDiscoveredMCPConfig
-// REFUSES these, but only on the file `mcp_config_path` resolved to - a file
-// opencode discovers by itself never reaches that gate, and it is merged into
-// every session all the same. `plugin` is code opencode loads and runs at
-// startup; `agent` replaces agent definitions and their modes.
+// sessionShapingKeys names what a discovered opencode config carries that
+// decides what a session IS rather than what it talks to.
+// checkDiscoveredMCPConfig REFUSES these, but only on the file
+// `mcp_config_path` resolved to - a file opencode discovers by itself never
+// reaches that gate, and it is merged into every session all the same.
 //
-// `permission` is deliberately NOT reported. It is in the same family and the
-// same gate refuses it, but on the question this check answers - can this file
-// change what a spawned session may do - the answer is measurably no:
-// OPENCODE_PERMISSION is merged in after every config layer and wins (1.18.19
-// Config.loadInstanceState). Reporting it would put a WARN in front of the
-// operator that is not true (CLA-441 review).
+// `permission` is on the list, and the road to that is worth writing down
+// because a plausible reading of 1.18.19 says it should not be. The
+// OPENCODE_PERMISSION env var IS applied after every config layer, so "the
+// file's block is simply overwritten" looks right and is wrong: the merge is
+// recursive and PER KEY (`o={...r,...a}` then a recursive descent on keys
+// present in both), and `fromConfig` flattens the result with Object.entries -
+// INSERTION ORDER, not sorted - while `evaluate` takes findLast over that
+// order. Our own document is marshalled from a Go map and so arrives sorted,
+// with the `*` catch-all first, which is exactly what the policy's fail-closed
+// posture depends on. Let an ambient file declare a `permission.read` block and
+// `read` takes ITS position in the merged object - ahead of the `*` deny, which
+// is env-only and lands last - so the catch-all becomes the final match and
+// every read in the session is denied. That is the CLA-441 wall itself, arrived
+// at from the other direction. Reported (CLA-441 second review).
+//
+// `plugin` is code opencode loads and runs at session start. An `mcp` entry
+// with a `command` is the same threat wearing a different key, and
+// startsProcess is the predicate the CLA-266 gate already applies to it, so it
+// is reported here rather than left as the conspicuous omission from a list
+// about what a session runs.
+//
+// `agent` is reported only for an entry carrying an AUTHORITY key - see
+// authorityAgents. The unfiltered version fired on the operator's own global
+// config, whose whole agent block picks a cheap model for generating titles,
+// and a WARN like that is how an operator learns to skim the ones that matter.
 func sessionShapingKeys(f mcpFile) []string {
 	var out []string
+	if rawSet(f.Permission) {
+		out = append(out, "`permission` (rules merged into the session's own policy, which reorders it and can deny everything)")
+	}
 	if rawSet(f.Plugin) {
 		out = append(out, "`plugin` (code run at session start)")
 	}
-	if rawSet(f.Agent) {
-		out = append(out, "`agent` (agent definitions and their modes)")
+	if names := authorityAgents(f.Agent); len(names) > 0 {
+		out = append(out, "`agent` with tool or permission authority ("+strings.Join(names, ", ")+")")
 	}
+	if names := localProcessServers(f); len(names) > 0 {
+		out = append(out, "an `mcp` server that starts a local process ("+strings.Join(names, ", ")+")")
+	}
+	return out
+}
+
+// authorityAgents names the agents in a discovered config's `agent` block that
+// carry a key deciding what that agent MAY DO - its permissions, its tool set,
+// its mode, whether it is disabled, or its prompt. An agent entry that only
+// picks a model or a temperature changes cost and style, not authority, and is
+// not worth an operator's attention on every doctor run.
+//
+// An `agent` block this cannot parse counts as authority-carrying: the report is
+// the conservative side, and a block shaped in a way this does not model is
+// precisely the one nobody has looked at.
+func authorityAgents(raw json.RawMessage) []string {
+	if !rawSet(raw) {
+		return nil
+	}
+	var block map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &block); err != nil {
+		return []string{"unparseable agent block"}
+	}
+	var out []string
+	for _, name := range sortedRawKeys(block) {
+		for _, key := range []string{"permission", "tools", "mode", "disable", "prompt"} {
+			if rawSet(block[name][key]) {
+				out = append(out, name)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// localProcessServers names the MCP entries of a discovered config that would
+// start a local process. Disabled entries are skipped for the same reason the
+// slug check skips them: opencode does not start them. This is a DIAGNOSTIC, not
+// the CLA-266 gate, which keeps looking at an entry the file claims is off.
+func localProcessServers(f mcpFile) []string {
+	var out []string
+	for _, block := range []map[string]mcpEntry{f.MCP, f.MCPServers} {
+		for _, name := range sortedEntryKeys(block) {
+			if e := block[name]; e.startsProcess() && !e.disabled() {
+				out = append(out, name)
+			}
+		}
+	}
+	return out
+}
+
+func sortedRawKeys(m map[string]map[string]json.RawMessage) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedEntryKeys(m map[string]mcpEntry) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
 	return out
 }
 

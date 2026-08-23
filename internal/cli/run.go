@@ -84,11 +84,20 @@ func Run(ctx context.Context, args []string) error {
 		return err
 	}
 	// Validation's one WARNING, said out loud at startup rather than only in
-	// `doctor` (CLA-441): a discovered opencode config naming another project's
-	// backlog. Spawned sessions are pinned past it, so it is not a refusal - but
-	// an overnight log that never mentions the file is how the same trap sat
-	// there for a fortnight, drained the wrong backlog, and looked healthy.
+	// `doctor` (CLA-441): an opencode config the driver never named that a
+	// session will merge anyway. Neither kind is a refusal - but an overnight
+	// log that never mentions the file is how the same trap sat there for a
+	// fortnight, drained the wrong backlog, and looked healthy.
+	//
+	// The trailing clause differs by kind. Saying "spawned sessions are pinned"
+	// on a `plugin`/`permission` finding would be a mitigation announced in the
+	// same line it does not apply to: the content pin settles which MCP server
+	// a session talks to and nothing about what it may run (CLA-441 second review).
 	for _, conflict := range cfg.OpencodeAmbientConflicts() {
+		if len(conflict.Overrides) > 0 {
+			log.Printf("WARNING: %s - nothing here pins that away; a session started in that tree runs with it", conflict)
+			continue
+		}
 		log.Printf("WARNING: %s - spawned sessions are pinned to the right project (OPENCODE_CONFIG_CONTENT), interactive ones in that tree are not", conflict)
 	}
 
