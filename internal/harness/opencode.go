@@ -3,6 +3,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -337,18 +338,30 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
+	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut {
+		// The process exited cleanly on its own — ExitCode 0 — but a grandchild
+		// (a backgrounded build, a test run) inherited the output pipes and held
+		// them open past cmd.WaitDelay, so os/exec force-closed them and Run
+		// returned exec.ErrWaitDelay instead of an *exec.ExitError. p.finish has
+		// already run (the CLA-299 ordering: parse whatever arrived, THEN
+		// classify), and every event the session emitted was consumed by the live
+		// parse as it arrived — only grandchild bytes written after the parent's
+		// exit are lost, and those were never this session's output. This is a
+		// clean end, not a failure: returning it as an error failed a completed
+		// attempt in drainPhase with no retry classification (CLA-414). Residual
+		// risk, accepted: force-closed pipes mean this cannot be distinguished
+		// from a parent killed while pretending to succeed — ExitCode 0 plus a
+		// fully parsed live stream is the strongest evidence available either way.
+		// The same holds for a run-wide cancellation landing inside the window:
+		// sctx reads Canceled, not DeadlineExceeded, so !timedOut is true and the
+		// attempt ends "clean" during teardown. Nothing durable turns on it —
+		// salvage, handback and spend are computed from res before any error
+		// check either way, and the cancelled driver ctx stops the run one spawn
+		// later — so the noise is left standing rather than guarded against.
+		return res, nil
 	} else if runErr != nil && !timedOut {
-		// p.finish has already run, so res carries everything the stream announced
-		// (the CLA-299 ordering: parse whatever arrived, THEN classify). Two shapes
-		// land here: a launch failure (bad PATH, unreadable config — nothing was
-		// emitted, so res is an honest zero), and — because any deadline context
-		// sets cmd.WaitDelay above — exec.ErrWaitDelay, where the process exited
-		// CLEANLY but a grandchild held its output pipes open past the delay.
-		// ErrWaitDelay therefore carries a fully parsed Result of a session that
-		// finished successfully; returning it as an error makes the driver fail a
-		// completed attempt. Reclassifying that as the clean end it is, is filed
-		// separately as CLA-414 — a classification question, not a parsing one;
-		// the figures survive either way.
+		// A launch failure (bad PATH, unreadable config): nothing was emitted,
+		// so res is an honest zero, and the failure is real.
 		return res, runErr
 	} else if runErr != nil {
 		// Our own kill: the child died on the cancel, so its error is the kill's

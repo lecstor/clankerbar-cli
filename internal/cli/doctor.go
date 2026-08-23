@@ -222,6 +222,12 @@ func doctorFailed(n int) error {
 
 // --- 1. config ---------------------------------------------------------------
 
+// apiKeyOriginLabel prefixes the line naming the one origin the account-scoped
+// key may be sent to. A const so the README-pins coupling test (readme_pins_test.go,
+// CLA-383) can assert the README quotes exactly this label: rewording it here fails
+// that test until the README is updated.
+const apiKeyOriginLabel = "api key origin: "
+
 func checkConfig(cfg *config.Config) check {
 	c := check{name: "config", status: pass}
 	if src := cfg.Source(); src != "" {
@@ -251,7 +257,7 @@ func checkConfig(cfg *config.Config) check {
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
-	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
+	c.info = append(c.info, apiKeyOriginLabel+orNone(cfg.CredentialOrigin()))
 	// What this config hands the child process, by NAME only - never a value, and
 	// never the file an @path names. A config that reaches the loop decides the
 	// spawned session's environment (CLA-260), so "which variables am I injecting"
