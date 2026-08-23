@@ -627,6 +627,26 @@ type Config struct {
 	// the top-level value for that project only.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
 
+	// AllowLocalMCPServers names the MCP server entries an operator means to run
+	// from a DISCOVERED `<workdir>/.mcp.json` — the file Validate adopts by
+	// default when mcp_config_path is empty. Any local-command entry whose name
+	// is on this list is accepted from a discovered file; every other command
+	// entry in one is refused (CLA-266: such an entry starts a process at session
+	// init, before any permission rule applies, and a workdir default is not
+	// where that decision belongs). It reaches nothing else: opencode-schema
+	// policy keys (`permission`, `plugin`, `agent`) in a discovered file are
+	// refused regardless of this list — naming servers never approves policy.
+	//
+	// The safe state is the default (refuse); the loose state is this visible,
+	// operator-owned list, which `doctor` reports. A file the operator NAMES via
+	// mcp_config_path needs no entry here — naming it IS the statement, and its
+	// local servers are disclosed by doctor's WARN as they always were.
+	//
+	// In single-project mode set it here; in multi-project mode set it per
+	// project (see Project.AllowLocalMCPServers) to replace the top-level list
+	// for that project only.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
+
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
 	// original single-project mode, driven by the top-level fields, exactly as
@@ -708,6 +728,12 @@ type Project struct {
 	// top-level field of the same name for this project only. See
 	// Config.AllowUncheckedPR for what it does and why the default refuses.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// AllowLocalMCPServers is this project's CLA-266 allowlist, REPLACING the
+	// top-level list of the same name for this project's discovered MCP config
+	// when it names anything; an entry that sets none inherits the top-level
+	// one. See Config.AllowLocalMCPServers and AllowLocalMCPServersFor.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
 }
 
 // AllowUncheckedPRFor resolves the CLA-310 empty-rollup opt-out for one
@@ -722,6 +748,23 @@ func (c *Config) AllowUncheckedPRFor(slug string) bool {
 		}
 	}
 	return c.AllowUncheckedPR
+}
+
+// AllowLocalMCPServersFor resolves the CLA-266 discovered-file allowlist for
+// one project: a matching projects[] entry's own NON-EMPTY list replaces the
+// top-level one, and everything else — an unmatched slug (how a single-project
+// run reaches here with no projects at all), or an entry that set none — falls
+// back to the top-level list. There is deliberately no way to say "none here"
+// while the top level allows names: an empty allowlist is indistinguishable
+// from not having configured one, and pretending otherwise would let a project
+// line look tighter than it runs. Total, so no caller has a second error path.
+func (c *Config) AllowLocalMCPServersFor(slug string) []string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.AllowLocalMCPServers) > 0 {
+			return p.AllowLocalMCPServers
+		}
+	}
+	return c.AllowLocalMCPServers
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
@@ -1751,8 +1794,17 @@ func (c *Config) Validate() error {
 	// -p mode does NOT auto-discover .mcp.json, so without this a bare `clankerbar
 	// run` from a workdir that carries one would spawn sessions with no clankerbar
 	// tools at all — and the poller could derive no slug. Explicit config still wins.
+	//
+	// A file that arrives THIS way was found, not named, and is held to the
+	// discovered-file rule before anything else reads it (CLA-266): it may not
+	// declare local-process servers nor carry opencode-schema policy keys.
+	// checkMCPConfigOrigins below still applies to it either way — a discovered
+	// file can pass this gate and still fail the origin one.
 	if c.MCPConfigPath == "" {
 		c.MCPConfigPath = discoverMCPConfig(c.WorkDir)
+		if err := c.checkDiscoveredMCPConfig(c.MCPConfigPath, "mcp_config_path", c.AllowLocalMCPServers); err != nil {
+			return err
+		}
 	}
 
 	// Where the account-scoped API key is allowed to go, settled once, here
@@ -1854,6 +1906,13 @@ func (c *Config) Validate() error {
 		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
+			// Discovered, not named, exactly like the top-level default above —
+			// same rule, labelled with THIS field so the remedy names the line
+			// the operator actually adds, and allowlisted per THIS project
+			// (CLA-266).
+			if err := c.checkDiscoveredMCPConfig(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i), c.AllowLocalMCPServersFor(p.Slug)); err != nil {
+				return err
+			}
 		}
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
 			return err
