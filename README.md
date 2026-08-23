@@ -874,20 +874,40 @@ headless mode does not auto-discover it, so **under `harness: "claude"`** the de
 is what gives spawned sessions their clankerbar tools. It always gives the driver a
 project slug to poll with, whichever harness is configured.
 
-**The other two harnesses do not read that file, and one of them chokes on it.**
-The default is applied regardless of harness, so this matters the moment you switch:
+**What a SESSION is handed is decided per harness, at hand-off** — the same file feeds
+two consumers with conflicting needs: the driver's poll reads its slug off the file
+whatever harness runs, while a session can only read its own schema. So the field is
+still filled for everyone, and the hand-off gates it (CLA-318):
 
-| harness | what it does with `mcp_config_path` |
+| harness | what its sessions are handed |
 | --- | --- |
-| `claude` | passed as `--mcp-config` (with `--strict-mcp-config`) and read as Claude's `.mcp.json`. |
-| `codex` | **ignored.** codex has no per-run MCP flag; its servers come from `[mcp_servers]` in `config.toml` under `CODEX_HOME` (which `config_dir` pins). |
-| `opencode` | passed as `OPENCODE_CONFIG`, and **must be an opencode config** - servers under `mcp`, not Claude's `mcpServers`. Pointed at a Claude-shaped `.mcp.json`, opencode refuses to start and every session dies at spawn. |
+| `claude` | the file, passed as `--mcp-config` (with `--strict-mcp-config`) — unchanged. |
+| `codex` | **nothing, whatever the field says.** codex has no per-run MCP flag; its servers come from `[mcp_servers]` in `config.toml` under `CODEX_HOME` (which `config_dir` pins). |
+| `opencode` | nothing named `.mcp.json`. The discovered default is Claude-shaped (`mcpServers`, not opencode's `mcp`) and cannot wire anything — older binaries refuse to even start on it — so it resolves to nothing instead of being passed as `OPENCODE_CONFIG`. Any other file passes verbatim. |
 
-Under `opencode`, set `mcp_config_path` **explicitly** to an opencode config. Leaving
-it out does not opt out: an empty value re-runs the `<workdir>/.mcp.json` discovery,
-so a workdir that carries a Claude `.mcp.json` hands it over no matter what. Run
-`clankerbar doctor` - it prints the caveat instead of a verdict where the file is not
-read, and FAILs the workdir check when `opencode` is pointed at a Claude-shaped one.
+To give opencode sessions their own MCP config, point a per-harness or per-project
+path (`harnesses.opencode.mcp_config_path`, or that project's `mcp_config_paths`)
+at an opencode-schema file. Naming a file `.mcp.json` under opencode resolves to
+nothing too — after validation there is no provenance left on a path, so the gate
+treats operator-named and discovered alike; `doctor` FAILs any Claude-shaped file
+that still reaches an opencode session check, which after the gate means only ones
+you named.
+
+The adapter also never inherits an ambient `OPENCODE_CONFIG` from the environment
+that started the driver: the variable is dropped from the inherited environment and
+exported only when the resolved path is non-empty, so what reaches a session is
+exactly this config's decision.
+
+**Opting out entirely:** set `mcp_config_path` to `"none"` — top level,
+`harnesses.<name>.mcp_config_path`, or per project. An empty value cannot opt out
+(it re-runs the `<workdir>/.mcp.json` discovery), but `"none"` survives `Validate`
+untouched, skips the origin checks, and resolves to nothing for every harness. The
+cost: a single-project run loses the slug its poll would have lifted from
+`.mcp.json`, so name the project in `backlog_url`
+(`https://<host>/mcp/<slug>`) to keep the poll project-scoped. Run `clankerbar
+doctor` to see how your workdir resolved: it prints the caveat where a harness reads
+no file at all, and FAILs a workdir check only when a file you named cannot be read
+by its harness.
 
 #### A discovered `.mcp.json` may not choose what runs
 

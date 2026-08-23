@@ -672,7 +672,20 @@ func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
 }
 
 func (opencode) env(in Invocation) []string {
-	env := os.Environ()
+	// OPENCODE_CONFIG is the driver's dial, never an inherited one: a value in
+	// the ambient environment would hand the session a config file nobody
+	// configured in clankerbar.json - the exact channel CLA-318 exists to close
+	// (the gate resolving "" must mean NOTHING is handed over, whatever the
+	// daemon that spawned this driver had exported). Filter it out of the
+	// inherited set rather than appending a duplicate, so the child sees our
+	// value or none - no dependence on dup-key resolution order.
+	var env []string
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, "OPENCODE_CONFIG=") {
+			continue
+		}
+		env = append(env, kv)
+	}
 	// Fail-closed permission policy. Set before in.Env so an explicit caller
 	// OPENCODE_PERMISSION in in.Env still wins (exec takes the last of a dup key),
 	// but the ambient environment never silently loosens an unattended run.
@@ -684,7 +697,9 @@ func (opencode) env(in Invocation) []string {
 	}
 	// opencode has no per-run MCP flag; when a caller supplies a config file path
 	// (in opencode's own schema, carrying the mcp block) point OPENCODE_CONFIG at
-	// it. The Claude-shaped .mcp.json is a different schema and is ignored here.
+	// it. A Claude-shaped .mcp.json is a different schema and is gated out by
+	// config.ResolveMCPConfig before it ever gets here (CLA-318), so empty means
+	// empty: no variable is exported at all.
 	if in.MCPConfigPath != "" {
 		env = append(env, "OPENCODE_CONFIG="+in.MCPConfigPath)
 	}

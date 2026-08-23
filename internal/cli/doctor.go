@@ -1075,10 +1075,13 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 
 	case harness.MCPConfigNative:
 		// The path IS handed over, but read in the harness's own schema. A
-		// Claude-shaped file here is not "no clankerbar tools", it is a config the
-		// harness refuses to start on - every iteration dies at spawn, forever. That
-		// is strictly worse than the missing-file case below, so it FAILs rather
-		// than WARNs: a WARN is advice, and there is no run to advise about.
+		// Claude-shaped file here cannot wire anything: its servers sit under
+		// `mcpServers`, which this schema never reads - and binaries stricter
+		// than the fleet-pinned one refuse to even start on it. No clankerbar
+		// tools arrive either way, so it FAILs rather than WARNs: the operator
+		// asked for wiring by naming this file, and this says plainly that the
+		// file cannot be the wiring they meant. (Since CLA-318 this arm is only
+		// reachable through a file the OPERATOR named - see below.)
 		if mcpConfigIsClaudeShaped(mcpConfigPath) {
 			c.status = fail
 			c.detail = mcpConfigPath + " is a Claude-shaped .mcp.json (`mcpServers`), which " + harnessName + " cannot read"
