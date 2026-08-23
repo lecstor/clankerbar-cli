@@ -207,6 +207,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks := []check{checkConfig(cfg)}
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
 	checks = append(checks, checkConfigDirs(cfg)...)
+	checks = append(checks, checkRepos(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
@@ -289,6 +290,67 @@ func envKeyNames(env map[string]string) string {
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ", ")
+}
+
+// --- 1b. repos ---------------------------------------------------------------
+
+// checkRepos reports, per project (or once for a single-project run), every repo
+// the config declares and whether it resolves to a local checkout (CLA-437).
+//
+// This is the preflight for two silent failures at once. A declared repo whose
+// checkout is missing fails every iteration that names it with repo_not_found —
+// better seen here than in an overnight log. And a project that declares NO
+// repos keeps the legacy workdir behaviour, which is correct but easy to mistake
+// for "sessions already start in the task's repo"; saying which mode is live is
+// the difference.
+func checkRepos(cfg *config.Config) []check {
+	report := func(label string, repos map[string]string, primary, workdir string) check {
+		c := check{name: label}
+		if len(repos) == 0 && strings.TrimSpace(primary) == "" {
+			c.status = pass
+			c.detail = "none declared - sessions start in the workdir (" + orNone(workdir) + "); declare repos to start them in the task's checkout"
+			return c
+		}
+		c.status = pass
+		c.detail = "every declared repo resolves to a checkout"
+		idents := make([]string, 0, len(repos)+1)
+		for k := range repos {
+			idents = append(idents, k)
+		}
+		sort.Strings(idents)
+		if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
+			idents = append(idents, p)
+		}
+		bad := 0
+		for _, id := range idents {
+			mark := ""
+			if strings.TrimSpace(primary) != "" && id == strings.TrimSpace(primary) {
+				mark = " (primary)"
+			}
+			dir, err := config.ResolveCheckout(repos, primary, workdir, id)
+			if err != nil {
+				bad++
+				c.info = append(c.info, id+mark+" -> NOT FOUND")
+				continue
+			}
+			c.info = append(c.info, id+mark+" -> "+dir)
+		}
+		if bad > 0 {
+			c.status = warn
+			c.detail = fmt.Sprintf("%d of %d declared repos resolve to no local checkout - any task naming one fails its iteration", bad, len(idents))
+			c.remedy = "check the repo out under the workdir, or fix its repos path"
+		}
+		return c
+	}
+
+	if len(cfg.Projects) == 0 {
+		return []check{report("repos", cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), projectWorkDir(cfg, p)))
+	}
+	return out
 }
 
 // --- 2. harness --------------------------------------------------------------

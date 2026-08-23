@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -162,8 +161,10 @@ type ParkAPI interface {
 
 type notWired struct{}
 
-func (notWired) Release(context.Context, string, string) error { return ErrNotWired }
-func (notWired) Heartbeat(context.Context, string) error       { return ErrNotWired }
+func (notWired) Release(context.Context, string, string) error    { return ErrNotWired }
+func (notWired) Heartbeat(context.Context, string) error          { return ErrNotWired }
+func (notWired) PeekNextTask(context.Context) (NextTask, error)   { return NextTask{}, ErrNotWired }
+func (notWired) TaskRepo(context.Context, string) (string, error) { return "", ErrNotWired }
 
 // New builds a Releaser. Missing either the endpoint or the key yields a
 // not-wired one, so an operator running without a configured plane is degraded
@@ -351,41 +352,12 @@ func (r *mcpReleaser) AttestMergeVerified(ctx context.Context, taskID, runID str
 	})
 }
 
-// call performs one MCP `tools/call` and reports whether it succeeded.
+// call performs one MCP `tools/call` and reports whether it succeeded. Callers
+// that also need the result's text payload (the task reads) use callText
+// directly; this is the fire-and-forget form the writes use.
 func (r *mcpReleaser) call(ctx context.Context, tool string, args map[string]any) error {
-	body, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "tools/call",
-		"params":  map[string]any{"name": tool, "arguments": args},
-	})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+r.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	// Streamable HTTP may answer with either shape; ask for both and parse either.
-	req.Header.Set("Accept", "application/json, text/event-stream")
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: HTTP %d: %s", tool, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return checkResult(tool, raw)
+	_, err := r.callText(ctx, tool, args)
+	return err
 }
 
 // checkResult decodes a tools/call response and turns a transport-level or

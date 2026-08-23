@@ -73,6 +73,16 @@ func claudeArgs(in Invocation) []string {
 	if in.SettingsPath != "" {
 		args = append(args, "--settings", in.SettingsPath)
 	}
+	// The project's other declared repos (CLA-437): --add-dir is Claude's own
+	// mechanism for granting tool access beyond the working directory, so a
+	// two-repo project's session can read and edit its sibling whatever directory
+	// it starts in. One flag carrying every dir — the CLI documents it as
+	// variadic (`--add-dir <directories...>`). The operator's --settings policy
+	// still governs: this widens what the session MAY be granted, the settings
+	// file's deny rules still say what it IS. Probes never reach here.
+	if len(in.ExtraDirs) > 0 {
+		args = append(args, "--add-dir", strings.Join(in.ExtraDirs, " "))
+	}
 	// The phase backstop. Claude ends the session at the cap; whatever the tree
 	// holds is then the salvage's problem, which is exactly what it is for.
 	if in.MaxTurns > 0 {

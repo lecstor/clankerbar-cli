@@ -280,6 +280,16 @@ type Invocation struct {
 	// headless permission policy. Merges with the config-dir's settings; deny wins.
 	// Empty = no extra file. Claude-specific; other adapters ignore it.
 	SettingsPath string
+	// ExtraDirs names additional directories the session must be able to read and
+	// edit BESIDES its working directory: the project's other declared repos, plus
+	// any conventional worktree area beside the spawn checkout (agent-rule-scoping
+	// piece 2 — permissions follow the project, not the cwd). Empty on every run
+	// whose project declares no repos, which leaves each adapter's policy exactly
+	// as it was. Each adapter expresses these in its own dialect — opencode's
+	// generated OPENCODE_PERMISSION gains read/edit/external_directory scope,
+	// claude gets --add-dir — and an adapter with no such concept ignores them;
+	// see the adapters for what each does and documents.
+	ExtraDirs []string
 	// Console is where the adapter streams live, human-readable progress (the
 	// terminal and/or a per-iteration logfile). Nil → os.Stderr.
 	Console io.Writer

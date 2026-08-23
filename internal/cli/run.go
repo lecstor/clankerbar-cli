@@ -125,6 +125,11 @@ func Run(ctx context.Context, args []string) error {
 				// single-harness config, which is what leaves the resolution above
 				// exactly as it was.
 				MCPConfigPaths: p.MCPConfigPaths,
+				// This project's repo -> checkout map and its no-repo fallback
+				// (CLA-437): sessions start in the task's repo and their
+				// permission policy covers every declared checkout.
+				Repos:       cfg.ReposFor(p.Slug),
+				PrimaryRepo: cfg.PrimaryRepoFor(p.Slug),
 			})
 		}
 		return loop.NewMulti(cfg, adapter, targets).Run(ctx)
@@ -133,8 +138,10 @@ func Run(ctx context.Context, args []string) error {
 	// One unnamed target — NewMulti with a single entry is exactly what New builds,
 	// and it is the only form that can carry a Releaser.
 	return loop.NewMulti(cfg, adapter, []loop.Target{{
-		Poller:   backlog.New(cfg.BacklogSummaryURL(), apiKey),
-		Releaser: plane.New(cfg.BacklogEndpoint(), apiKey),
+		Poller:      backlog.New(cfg.BacklogSummaryURL(), apiKey),
+		Releaser:    plane.New(cfg.BacklogEndpoint(), apiKey),
+		Repos:       cfg.ReposFor(""),
+		PrimaryRepo: cfg.PrimaryRepoFor(""),
 	}}).Run(ctx)
 }
 
