@@ -83,6 +83,14 @@ func Run(ctx context.Context, args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	// Validation's one WARNING, said out loud at startup rather than only in
+	// `doctor` (CLA-441): a discovered opencode config naming another project's
+	// backlog. Spawned sessions are pinned past it, so it is not a refusal - but
+	// an overnight log that never mentions the file is how the same trap sat
+	// there for a fortnight, drained the wrong backlog, and looked healthy.
+	for _, conflict := range cfg.OpencodeAmbientConflicts() {
+		log.Printf("WARNING: %s - spawned sessions are pinned to the right project (OPENCODE_CONFIG_CONTENT), interactive ones in that tree are not", conflict)
+	}
 
 	adapter, err := harness.Get(cfg.Harness)
 	if err != nil {

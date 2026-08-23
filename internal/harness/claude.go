@@ -785,7 +785,10 @@ func (c claude) probeResult(stdout, stderr *tail, runErr error) (Result, error) 
 }
 
 func (claude) env(in Invocation) []string {
-	env := append(os.Environ(), in.Env...)
+	// Pin the child's PWD to the directory Invoke sets as cmd.Dir, dropping the
+	// daemon's inherited value - see pinPWD. Applied to the INHERITED
+	// environment, before in.Env, so an explicit caller value still wins.
+	env := append(pinPWD(os.Environ(), in.WorkDir), in.Env...)
 	// Never truncate the session while subagents/background work run.
 	env = append(env, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0")
 	if in.ConfigDir != "" {
