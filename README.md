@@ -443,13 +443,32 @@ config the driver never named that a session merges anyway: one whose
 `clankerbar` server points at another project, or one carrying keys that shape
 what a session may do), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
-long enough to do the work), and **budget** (ceilings parse and are sane).
+long enough to do the work), **deploy_lag** (how far the deployed build lags the
+project's integration branch), and **budget** (ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
 entry that omits `workdir` or `mcp_config_path` inherits the top-level one, and
 doctor resolves it **exactly the way the loop does**, so it never reports on a
 directory your sessions will not use.
+
+`deploy_lag` reads the plane's `/health` (`health_url`, top level or per
+project) to learn WHICH commit is deployed, and compares it against the REMOTE
+tip of `integration_branch` (default `staging`). A gap is warned about only once
+its oldest undeployed commit is older than an hour - one fresh commit is normal
+deploy cadence, 21 overnight is not - and the count and age are named either
+way. A deployment AHEAD of the branch (a hotfix, or work not yet merged) passes:
+it is newer than the shared line, not a stale deploy. The sentinel stamps
+`unknown` and `<sha>-dirty` each get their own warning naming what they mean,
+and anything doctor cannot establish (endpoint down; the commit held by no local
+clone even after fetching the branch into them) is an honest WARN, never a green
+line. Every git call it makes is bounded by its own deadline, so an unreachable
+remote ends as that WARN rather than a hung preflight, and the fetch hunt is
+capped in ATTEMPTS so a dead remote cannot turn it into one round trip per
+clone. Unconfigured it prints one quiet PASS naming `health_url`, so the feature
+is discoverable without nagging anyone who opted out; in a mixed multi-project
+config the unmonitored projects still get their own quiet PASS rather than
+disappearing from doctor's output.
 
 The `toolchains` audit reads every settings file Claude merges — the `--settings`
 policy, the config dir's `settings.json`/`settings.local.json`, and each session
@@ -1195,12 +1214,20 @@ alternatives, in order of preference:
    there instead of spending another session first.
 
    **The polls during a pause count too.** Waiting out a usage limit means probing
-   for an early reset every `poll_interval`, and a probe is a real harness session
-   — cheap (a one-character prompt, with the harness locked down to no tools or
-   read-only), but not free, and a week-long cap polled every 30 minutes is a few
-   hundred of them. Their tokens and cost go into the same running total the
-   breaker reads, so a pause whose probes alone cross a ceiling ends on that
-   ceiling rather than polling on.
+   for an early reset, and a probe is a real harness session - cheap (a
+   one-character prompt, with the harness locked down to no tools or read-only),
+   but not free, and a week-long cap polled every 30 minutes is a few hundred of
+   them. Their tokens and cost go into the same running total the breaker reads,
+   so a pause whose probes alone cross a ceiling ends on that ceiling rather than
+   polling on.
+
+   **A pause holding a stated reset aims at it.** When the limit carries a reset
+   time, the first probe lands just past that time instead of on the next tick of
+   the `poll_interval` grid (still capped at `poll_interval`, so a STOP marker
+   never goes stale), and the paused log line says so. A stated reset is a claim,
+   not a guarantee: once the pause crosses it, it falls back to probing every
+   `poll_interval` until a probe actually confirms the cap has lifted - it never
+   resumes on the stated time alone after having slept through it.
 
    **A session whose spend cannot be measured stops the run, if you set a spend
    ceiling.** Every figure the breaker reads is parsed out of the harness's event
