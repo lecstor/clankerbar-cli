@@ -429,9 +429,11 @@ func mustResolveStateDir(t *testing.T, cfg *config.Config) string {
 }
 
 // A leftover marker is the failure that looks exactly like "the backlog was
-// empty": the loop stops on its first tick and exits clean.
+// empty": the loop stops on its first tick and exits clean. The CLA-461
+// restart/reload markers are the same class — a surprise re-exec or reload on
+// the first tick instead of a surprise stop — so every one of the five must warn.
 func TestStateDirLeftoverMarkersWarn(t *testing.T) {
-	for _, marker := range []string{"HALT", "STOP"} {
+	for _, marker := range []string{"HALT", "STOP", "RESTART", "RESTART_NOW", "RELOAD"} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := validCfg(t)
 			stateDir := mustResolveStateDir(t, cfg)

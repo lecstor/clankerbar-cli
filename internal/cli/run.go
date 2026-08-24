@@ -71,7 +71,7 @@ func Run(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	cfg.ApplyFlagOverrides(config.Overrides{
+	overrides := config.Overrides{
 		Harness:          f.harness,
 		Model:            f.model,
 		WorkDir:          f.workdir,
@@ -79,7 +79,8 @@ func Run(ctx context.Context, args []string) error {
 		MaxIterations:    f.maxIter,
 		PollInterval:     f.pollInterval,
 		IdlePollInterval: f.idlePoll,
-	})
+	}
+	cfg.ApplyFlagOverrides(overrides)
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
@@ -149,17 +150,45 @@ func Run(ctx context.Context, args []string) error {
 				PrimaryRepo: cfg.PrimaryRepoFor(p.Slug),
 			})
 		}
-		return loop.NewMulti(cfg, adapter, targets).Run(ctx)
+		return runDriver(ctx, loop.NewMulti(cfg, adapter, targets), f.cfgPath, overrides)
 	}
 
 	// One unnamed target — NewMulti with a single entry is exactly what New builds,
 	// and it is the only form that can carry a Releaser.
-	return loop.NewMulti(cfg, adapter, []loop.Target{{
+	return runDriver(ctx, loop.NewMulti(cfg, adapter, []loop.Target{{
 		Poller:      backlog.New(cfg.BacklogSummaryURL(), apiKey),
 		Releaser:    plane.New(cfg.BacklogEndpoint(), apiKey),
 		Repos:       cfg.ReposFor(""),
 		PrimaryRepo: cfg.PrimaryRepoFor(""),
-	}}).Run(ctx)
+	}}), f.cfgPath, overrides)
+}
+
+// runDriver drives the loop and turns a requested restart into an actual re-exec
+// (CLA-461). The reloader closure re-derives the config the way THIS invocation
+// did — Load + these flag overrides + Validate — so a RELOAD sees the flags it
+// was started with, not just the file; without it a reload would silently drop
+// every --flag the operator launched with. A restart re-execs with the same
+// argv through the same launch path, so the fresh daemon inherits both.
+func runDriver(ctx context.Context, drv *loop.Driver, cfgPath string, overrides config.Overrides) error {
+	drv.SetReloader(func() (*config.Config, error) {
+		fresh, err := config.Load(cfgPath)
+		if err != nil {
+			return nil, err
+		}
+		fresh.ApplyFlagOverrides(overrides)
+		if err := fresh.Validate(); err != nil {
+			return nil, err
+		}
+		return fresh, nil
+	})
+	err := drv.Run(ctx)
+	if err != nil {
+		return err
+	}
+	if drv.RestartRequested() {
+		return restartSelf(os.Args)
+	}
+	return nil
 }
 
 // credentialNotice is the startup line naming where CLANKERBAR_API_KEY will be

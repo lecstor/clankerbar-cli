@@ -40,6 +40,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -773,18 +774,36 @@ func checkStateDir(cfg *config.Config) check {
 	}
 	_ = dir.Remove(probe)
 
-	// A leftover marker stops the loop on its first tick — the failure that looks
-	// exactly like "the backlog was empty".
+	// A leftover marker makes the next start act on it straight away — the
+	// failure that looks exactly like "the backlog was empty" (STOP/HALT), or
+	// its CLA-461 siblings: a surprise re-exec or config reload on the first
+	// tick. Same class, different costs, so each marker names its own.
+	type controlMarker struct {
+		name string
+		cost string
+	}
+	markers := []controlMarker{
+		{"HALT", "the loop halts on its first tick and stays halted"},
+		{"STOP", "the loop stops on its first tick"},
+		{loop.MarkerRestart, "the daemon re-executes on its first tick"},
+		{loop.MarkerRestartNow, "the daemon kills its in-flight session and re-executes"},
+		{loop.MarkerReload, "the config file is re-read on its first tick"},
+	}
 	var found []string
-	for _, m := range []string{"HALT", "STOP"} {
-		if dir.Exists(m) {
-			found = append(found, m)
+	var costs []string
+	for _, m := range markers {
+		if dir.Exists(m.name) {
+			found = append(found, m.name)
+			costs = append(costs, m.name+" — "+m.cost)
 		}
 	}
 	if len(found) > 0 {
 		c.status = warn
 		c.detail = stateDir + " has a leftover " + strings.Join(found, " and ") + " marker"
-		c.remedy = "delete it, or the loop stops immediately: rm " + filepath.Join(stateDir, found[0])
+		c.remedy = "delete it, or the loop acts on it immediately on start: rm " + filepath.Join(stateDir, found[0])
+		for _, cost := range costs {
+			c.info = append(c.info, cost)
+		}
 		if inside.session {
 			// Otherwise the operator deletes the marker, runs again, and a session
 			// writes it back - the remedy above is a symptom's remedy when the state
