@@ -45,8 +45,11 @@ var ErrQuestionNotFiled = errors.New("task parked but the question was not filed
 
 // Releaser hands a claim back to the queue.
 type Releaser interface {
-	// Release ends the run holding taskID and returns the task to `ready`, so the
-	// next iteration can claim it immediately instead of waiting out a dead lease.
+	// Release ends the run holding taskID as `released` (never `failed`) and
+	// returns a no-WIP task to `ready`, so the next iteration can claim it
+	// immediately instead of waiting out a dead lease. It sends `release: true`,
+	// the plane's hand-an-unfinished-claim-back primitive (CLA-246), which also
+	// leaves the reclaim budget untouched.
 	//
 	// It must only be called for a task with NO work-in-progress branch recorded.
 	// Releasing one that HAS a branch would be actively worse than doing nothing:
@@ -192,18 +195,17 @@ func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("release: taskId and runId are both required")
 	}
-	// `status: ready` is what returns the task to the claimable queue. It clears
-	// the holder and — unlike the plane's own expiry sweep — does not charge the
-	// task a reclaim, which is the whole point of releasing rather than going
-	// quiet. `runId` signs the write, so the revision is credited to this run.
-	//
-	// No `outcome` is sent on purpose: the session may have written one, and this
-	// call is a handback, not a report. Clobbering its words would lose the only
-	// trace of what actually happened.
+	// `release: true` is the plane's hand-an-unfinished-claim-back primitive
+	// (CLA-246): it returns a no-WIP task to the claimable queue WITHOUT charging
+	// it a reclaim, and — unlike moving it with a status — records the run as
+	// `released`, never `failed`. It cannot be combined with `status` or
+	// `delivery` (a bare release IS the call; the plane refuses the combination),
+	// and no `outcome` is sent: the session may have written one, and this call is
+	// a handback, not a report.
 	return r.call(ctx, "update_task", map[string]any{
-		"taskId": taskID,
-		"runId":  runID,
-		"status": "ready",
+		"taskId":  taskID,
+		"runId":   runID,
+		"release": true,
 	})
 }
 

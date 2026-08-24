@@ -51,6 +51,11 @@ func mixedDriver(t *testing.T, impl, review *fakeAdapter) *Driver {
 		return nil, errors.New("no adapter " + name)
 	}
 	openTestStateDir(t, d)
+	// The implement phase's evidence gate (CLA-457) needs a working tree to
+	// search and a verifier; stub both the way phaseDriver does, so the mixed
+	// tests' checkpointed fixtures advance as before.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 	return d
 }
 
