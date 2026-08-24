@@ -519,16 +519,18 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		}
 		text = toolResultText(json.RawMessage(b))
 	}
-	var payload struct {
+  var payload struct {
 		Task struct {
-			ID     string `json:"id"`
-			Ref    string `json:"ref"`
-			Branch string `json:"branch"`
+			ID       string `json:"id"`
+			Ref      string `json:"ref"`
+			Branch   string `json:"branch"`
+			Category string `json:"category"`
 		} `json:"task"`
 		Run struct {
 			ID string `json:"id"`
 		} `json:"run"`
-		HasWip bool `json:"hasWip"`
+		HasWip bool   `json:"hasWip"`
+		Branch string `json:"branch"`
 	}
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
 		fmt.Fprintf(console, "  · claim NOT tracked%s: its result is not JSON (%v) - %s\n", about, err, snippet(text))
@@ -545,12 +547,20 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 	}
 	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
 	// safer to release just because THIS session has not written anything yet.
-	res.Claim = Claim{
-		TaskID: payload.Task.ID,
-		Ref:    payload.Task.Ref,
-		RunID:  payload.Run.ID,
-		HasWIP: payload.HasWip || payload.Task.Branch != "",
-	}
+	// The claim's own branch (top-level) names the pushed WIP; the task-level
+		// branch indicates whether the plane records one for WIP tracking.
+		claimBranch := payload.Branch
+		if payload.Task.Branch != "" && claimBranch == "" {
+			claimBranch = payload.Task.Branch
+		}
+		res.Claim = Claim{
+			TaskID:    payload.Task.ID,
+			Ref:       payload.Task.Ref,
+			RunID:     payload.Run.ID,
+			HasWIP:    payload.HasWip || payload.Task.Branch != "",
+			Category:  payload.Task.Category,
+			Branch:    claimBranch,
+		}
 	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
 	// claim the moment the stream carries it, not when the process exits.
 	res.notifyClaim()

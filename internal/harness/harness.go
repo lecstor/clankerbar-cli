@@ -733,6 +733,17 @@ type Claim struct {
 	// session after it pushed. It makes the claim UNSAFE to release: see
 	// Releasable.
 	HasWIP bool
+
+	// Category is the task-declared risk trigger value (e.g. "security",
+	// "migration", "feature", "chore"). Read from the claim payload so the
+	// review-phase escalation can apply CategoryRules without an extra plane
+	// call (CLA-379).
+	Category string
+
+	// Branch is the work-in-progress branch name recorded on the task
+	// (e.g. "clanker/x-..."). Used by the review-phase escalation to diff
+	// changed paths against the integration branch (CLA-379).
+	Branch string
 }
 
 // Held reports whether this session ended still holding a task — a claim that

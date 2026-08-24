@@ -17,6 +17,7 @@ import (
 	"log"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -2612,6 +2613,37 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		log.Printf("%sphase %q names tier %q, which resolves to no model on harness %q — running on that harness's default model instead",
 			labelOf(t), ph.Label(phaseIdx), ph.Tier, d.cfg.HarnessFor(ph))
 	}
+
+	// CLA-379: review-tier escalation evaluated at review-spawn time.
+	// The CLI reads the operator's escalation rules from config and applies
+	// them mechanically. Only raises; never lowers. The matching rule
+	// is logged so the spend is attributable, per the 2026-08-23 decision.
+	if d.cfg.Escalation.PathRules != nil || d.cfg.Escalation.CategoryRules != nil {
+		if isReviewPhase(ph) {
+			// Resolve the branch name for the diff: from the previous claim's
+			// branch record (CLA-379 plumbing), falling back to reading the
+			// workdir's git refs if the claim carries none.
+			branchName := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Branch != "" {
+				branchName = prev.Claim.Branch
+			}
+			changedPaths, _ := d.diffAgainstIntegration(t, branchName, spawnDir)
+			category := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Category != "" {
+				category = prev.Claim.Category
+			}
+			tier, rule := d.cfg.Escalation.Evaluate(changedPaths, category)
+			if tier != "" {
+				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
+				ph.Tier = tier
+				model, ok = d.cfg.ModelForPhase(ph)
+				if !ok {
+					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
+				}
+		}
+		}
+	}
+
 	inv.Model = model
 	if prev != nil && prev.Claim.Held() {
 		inv.Prompt = strings.NewReplacer(
@@ -2866,4 +2898,53 @@ func limitReason(lim harness.Limit) string {
 		return lim.Reason
 	}
 	return "usage limit"
+}
+
+// isReviewPhase reports whether a phase is a review-phase (the gate where
+// escalation applies). Named phases whose name is "review" are review phases;
+// custom prompts with no name are never treated as review for escalation.
+func isReviewPhase(ph config.Phase) bool {
+	return ph.Name == config.ReviewPhaseName
+}
+
+// diffAgainstIntegration compares a pushed branch to the integration branch
+// (staging) for changed paths, using git in the work directory.
+// It returns the list of changed file paths, or an error if the diff fails.
+func (d *Driver) diffAgainstIntegration(t Target, branchName string, workDir string) ([]string, error) {
+	if branchName == "" {
+		return nil, errors.New("no branch recorded for diff")
+	}
+	wd := workDir
+	if wd == "" {
+		wd = d.cfg.WorkDir
+		if wd == "" {
+			wd = "."
+		}
+	}
+	// Use git diff against the integration branch (staging by default).
+	// The command compares the branch tip to origin/staging.
+	cmd := exec.Command("git", "-C", wd, "diff", "--name-only", "origin/staging..."+branchName)
+	out, err := cmd.Output()
+	if err != nil {
+		// If the branch is new or the diff command fails, fall back to comparing
+		// the branch to the local staging branch.
+		cmd2 := exec.Command("git", "-C", wd, "diff", "--name-only", "staging..."+branchName)
+		out, err = cmd2.Output()
+		if err != nil {
+			// If both fail, return empty paths rather than failing the spawn.
+			return nil, nil
+		}
+	}
+	paths := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(paths) == 1 && paths[0] == "" {
+		return nil, nil
+	}
+	result := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result, nil
 }

@@ -923,7 +923,7 @@ func TestOpencodeObservesAClaimInARecordedSession(t *testing.T) {
 	var console strings.Builder
 	res := opencodeParsedFrom(Invocation{}, &console, opencodeRecording(t, 3))
 
-	want := Claim{TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun}
+	want := Claim{TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun, Category: "chore", Branch: "clanker/e1d01dae-temp-fixture-recording-target-for-cla-36"}
 	if res.Claim != want {
 		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
 	}
@@ -1004,7 +1004,8 @@ func TestOpencodeObservesTheSettleAndTheDeliveryReport(t *testing.T) {
 
 	want := Claim{
 		TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun,
-		HasWIP: true, Settled: true,
+		HasWIP: true, Settled: true, Category: "chore",
+		Branch: "clanker/e1d01dae-temp-fixture-recording-target-for-cla-36",
 	}
 	if res.Claim != want {
 		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
