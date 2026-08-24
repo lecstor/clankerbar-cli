@@ -94,6 +94,27 @@ func (d *Driver) cfgSourceDesc(i int) string {
 	return "local rules"
 }
 
+// invalidateRunConfigs marks every wired target's stored-config state as
+// unfetched again, so the next poll refetches and re-overlays on the CURRENT
+// base. Called from applyReload: a RELOAD swaps d.cfg, and a target's existing
+// overlay was built from the OLD base — its phases, prompts and any dial the
+// stored document does not set are the pre-reload file's, and must not outlive
+// it. The refetch lands on the poll immediately after the RELOAD marker was
+// consumed, which is still an iteration boundary — never mid-session. The
+// existing overlay is NOT dropped here: if that refetch fails, the previous
+// config stays in force (the same posture as any failed fetch), and it
+// self-heals on a later boundary.
+func (d *Driver) invalidateRunConfigs() {
+	for i := range d.targets {
+		if d.targets[i].RCfg == nil {
+			continue
+		}
+		d.rcVersions[i] = -1 // unfetched again: the next poll re-reads
+		d.rcAttempt[i] = time.Time{}
+		d.rcAttemptVer[i] = 0
+	}
+}
+
 // applyRunConfig overlays a fetched document onto a clone of the base config
 // and swaps it in as the target's effective config. Flag overrides re-apply on
 // top (they outrank the document), then Validate referees: an overlaid combo

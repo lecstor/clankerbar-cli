@@ -242,3 +242,96 @@ func TestApplyRunConfig_StoredEscalationRulesReachTheEvaluation(t *testing.T) {
 		t.Errorf("escalated tier resolved to model=%q ok=%t, want plane-strong via the STORED map", model, ok)
 	}
 }
+
+// stableRCfg returns the SAME document on every fetch — the shape the reload
+// test needs, where the poll's runConfigVersion never moves and only a RELOAD
+// invalidation can force a refetch. It counts fetches so the test can assert
+// the rebuild actually happened.
+type stableRCfg struct {
+	doc     string
+	fetches int
+}
+
+func (s *stableRCfg) RunConfig(context.Context) (*plane.RunConfigState, error) {
+	s.fetches++
+	return &plane.RunConfigState{Version: 1, Config: []byte(s.doc)}, nil
+}
+
+// A RELOAD swaps the local file; an in-force stored overlay must be rebuilt on
+// the FRESH base, not keep running the pre-reload one. The overlay only carries
+// the movable half, so the effective config's non-movable half (prompt, phases)
+// comes from the base it was built on: a stale overlay would keep the pre-reload
+// prompt while the reloaded base moves on. The poll's version never moves here,
+// so the refetch can only be the RELOAD invalidation's doing — and the overlay
+// surviving means the stored document was preserved across the rebuild, not
+// dropped.
+func TestRun_ReloadRebuildsAnInForceStoredOverlayOnTheFreshBase(t *testing.T) {
+	dir := t.TempDir()
+	base := fastCfg()
+	base.StateDir = dir
+	base.Prompt = "original brief"
+	base.Model = "base-1"
+	base.MaxIterations = 10
+	h := &hookedAdapter{fakeAdapter: fakeAdapter{steps: []invokeStep{{res: okResult(0, 0)}, {res: okResult(0, 0)}}}}
+	h.onInvoke = func(n int, _ context.Context) {
+		switch n {
+		case 0:
+			if err := plantMarker(dir, MarkerReload, ""); err != nil {
+				t.Errorf("planting RELOAD: %v", err)
+			}
+		case 1:
+			if err := plantMarker(dir, "STOP", ""); err != nil {
+				t.Errorf("planting STOP: %v", err)
+			}
+		}
+	}
+	rc := &stableRCfg{doc: `{"model":"plane-1"}`}
+	p := &fakePoller{sum: backlog.Summary{Claimable: 1, RunConfigVersion: 1}}
+	// No openTestStateDir here: the markers are planted at base.StateDir, so Run
+	// must open the state dir from the config (as the control tests do) rather
+	// than from a throwaway temp dir the markers would never reach.
+	d := NewMulti(base, h, []Target{{Poller: p, RCfg: rc}})
+	reloaded := false
+	d.SetReloader(func() (*config.Config, error) {
+		fresh := fastCfg()
+		fresh.StateDir = dir
+		fresh.Prompt = "reloaded brief"
+		fresh.Model = "base-2"
+		reloaded = true
+		return fresh, nil
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !reloaded {
+		t.Fatal("the reload closure never ran")
+	}
+	if len(h.invocations) != 2 {
+		t.Fatalf("ran %d sessions, want 2", len(h.invocations))
+	}
+	if rc.fetches != 2 {
+		t.Errorf("the stored config was fetched %d time(s), want 2 (once at start of run, once after the RELOAD rebuild)", rc.fetches)
+	}
+	// Both drains run on the stored document's model: the overlay survives the
+	// reload (rebuilt), it is not dropped back to the local file's model.
+	for i, inv := range h.invocations {
+		if inv.Model != "plane-1" {
+			t.Errorf("drain %d ran on model %q, want the stored plane-1 preserved across the reload", i+1, inv.Model)
+		}
+	}
+	if got := h.invocations[0].Prompt; !strings.Contains(got, "original brief") {
+		t.Errorf("the pre-reload session ran on prompt %q, want the original brief", got)
+	}
+	// The base's non-movable half follows the RELOAD: the second session must
+	// run on the reloaded prompt (rebuilt overlay on the fresh base), not the
+	// stale pre-reload one.
+	if got := h.invocations[1].Prompt; !strings.Contains(got, "reloaded brief") {
+		t.Errorf("the session after RELOAD ran on prompt %q, want the reloaded brief (the overlay must rebuild on the fresh base)", got)
+	}
+	if d.targets[0].Cfg == nil {
+		t.Error("the stored overlay should still be in force after the reload")
+	}
+	markerAbsent(t, dir, MarkerReload)
+}

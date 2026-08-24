@@ -2849,7 +2849,11 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// of here — resume, stop, or another lap — carries it.
 		tokens += got.Tokens
 		cost += got.CostUSD
-		d.charge(d.cfg.HarnessFor(ph), got.Tokens, got.CostUSD)
+		// The probe spawned on the TARGET's effective harness above (invocationOn
+		// with tc.HarnessFor), so its spend is booked under that same name —
+		// keying on the base harness would bill an overlay-redirected phase to
+		// the wrong per-harness account (CLA-410).
+		d.charge(tc.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true

@@ -141,5 +141,9 @@ func (d *Driver) applyReload() {
 		return
 	}
 	d.cfg = fresh
+	// A stored run-config overlay (CLA-410) was built from the OLD base; mark it
+	// for a rebuild on the fresh one at the next poll — still this boundary,
+	// never mid-session.
+	d.invalidateRunConfigs()
 	log.Printf("config reloaded from %s — dial edits apply from this iteration; harness/env/binary changes need a restart", fresh.Source())
 }
