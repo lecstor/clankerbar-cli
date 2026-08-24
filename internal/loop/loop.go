@@ -146,6 +146,21 @@ type Target struct {
 	// the handback for this target, which costs only the reclaim an expiring lease
 	// would have cost anyway — so a target without one degrades, it does not break.
 	Releaser plane.Releaser
+
+	// RCfg fetches this project's stored execution config (CLA-410). Nil means
+	// not wired: the target runs the local file rules exactly as before, which
+	// is also what the plane answers (version 0) until a document is ratified.
+	RCfg plane.RunConfigReader
+
+	// Cfg is this target's EFFECTIVE config — the driver's base config with the
+	// project's stored run-config document overlaid — or nil when no document is
+	// in force, in which case every read falls through to d.cfg unchanged. It
+	// carries only policy the plane may say (harness/model/tiers/budget/
+	// escalation/backstops); phases, wiring, env and machine paths stay local,
+	// so the overlay can never repoint a session at somebody else's dialect.
+	// Rebuilt between iterations when the poll's runConfigVersion moves — never
+	// mid-session.
+	Cfg *config.Config
 }
 
 // Driver runs the loop for one harness against one or more backlogs.
@@ -282,6 +297,30 @@ type Driver struct {
 	// restartPoll is how often the RESTART_NOW watcher polls the state dir. A
 	// field so tests can shrink it; production always gets restartCheckInterval.
 	restartPoll time.Duration
+
+	// Per-target run-config state (CLA-410). rcVersions holds the version each
+	// target's effective config was built from, -1 until the first fetch; the
+	// poll's runConfigVersion differing from it is the re-read signal, honoured
+	// exactly where STOP/RELOAD are: the ITERATION boundary (the poll only
+	// happens there), never mid-session. rcAttempt/rcAttemptVer rate-limit a
+	// FAILED refetch of one version to one try per backoff window (a new version
+	// always fetches), so a blip at ratify time retries without spamming.
+	rcVersions   []int
+	rcAttempt    []time.Time
+	rcAttemptVer []int
+
+	// tgtTokens / tgtCost accumulate each target's own spend for the per-target
+	// budget breaker: a stored config's budget must bite on ITS project's spend,
+	// not on a run total shared with every other target. The base budget keeps
+	// its existing run-wide duty unchanged; this breaker exists only where an
+	// overlay is actually in force.
+	tgtTokens []int
+	tgtCost   []float64
+
+	// overrides are the run's flag overrides, re-applied after every overlay so
+	// an explicit --harness/--model still wins over a stored document. cli.Run
+	// sets them via SetOverrides; the zero value applies nothing.
+	overrides config.Overrides
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -305,20 +344,25 @@ func New(cfg *config.Config, h harness.Adapter, poller backlog.Poller) *Driver {
 // account key, many project queues — round-robin over whichever have claimable work.
 func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
-	return &Driver{
+	d := &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:      make([]bool, n),
-		quietTokens: make([]int, n),
-		spent:       make([]int, n),
-		baseline:    make([]int, n),
-		openQs:      make([]int, n),
-		pending:     make([]bool, n),
-		skipUntil:   make([]time.Time, n),
-		fleetDead:   make([]int, n),
-		fleetPaused: make([]bool, n),
-		fleetRaised: make([]bool, n),
-		fleetOpenQ:  make([]int, n),
-		waitGrace:   time.Minute,
+		paused:       make([]bool, n),
+		quietTokens:  make([]int, n),
+		spent:        make([]int, n),
+		baseline:     make([]int, n),
+		openQs:       make([]int, n),
+		pending:      make([]bool, n),
+		skipUntil:    make([]time.Time, n),
+		fleetDead:    make([]int, n),
+		fleetPaused:  make([]bool, n),
+		fleetRaised:  make([]bool, n),
+		fleetOpenQ:   make([]int, n),
+		rcVersions:   make([]int, n),
+		rcAttempt:    make([]time.Time, n),
+		rcAttemptVer: make([]int, n),
+		tgtTokens:    make([]int, n),
+		tgtCost:      make([]float64, n),
+		waitGrace:    time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -329,6 +373,10 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
 	}
+	for i := range d.rcVersions {
+		d.rcVersions[i] = -1 // unfetched; 0 is a REAL answer (nothing stored)
+	}
+	return d
 }
 
 // adapterFor resolves the harness that runs one phase.
@@ -508,6 +556,13 @@ func (d *Driver) Run(ctx context.Context) error {
 				case err != nil:
 					log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
 				default:
+					// The stored execution-config boundary (CLA-410): a moved
+					// runConfigVersion — including the first poll, which is
+					// "start of run" — refetches and re-overlays BEFORE the
+					// spawn gate reads anything, so the drain that follows this
+					// poll runs on the current document. Mid-session is
+					// unreachable by construction: polls happen only here.
+					d.checkRunConfigVersion(runCtx, i, &d.targets[i], sum.RunConfigVersion)
 					// stale_claimable is reported beside claimable, not folded into it: an
 					// operator watching the console has to be able to tell "spawning
 					// because there is fresh work" from "spawning to recover an abandoned
@@ -597,6 +652,20 @@ func (d *Driver) Run(ctx context.Context) error {
 		// operator's ceiling rather than extending the run for free.
 		totalTokens += tokens
 		totalCost += cost
+		// The per-target ledger (CLA-410): where a stored budget is in force for
+		// THIS target, its ceilings are judged on its own spend, not on a total
+		// every target feeds. Checked here — the same between-iterations moment
+		// the run-wide breaker reads — and only when an overlay exists, so an
+		// un-overlaid target's behaviour is untouched.
+		d.tgtTokens[d.cursor] += tokens
+		d.tgtCost[d.cursor] += cost
+		if eff := d.targets[d.cursor].Cfg; eff != nil {
+			if dim := eff.Budget.ExceededBy(d.tgtTokens[d.cursor], d.tgtCost[d.cursor], time.Since(start)); dim != "" {
+				log.Printf("%sbudget reached: %s — stopping to leave headroom (target tokens=%d cost=$%.2f)",
+					d.prefix(d.cursor), dim, d.tgtTokens[d.cursor], d.tgtCost[d.cursor])
+				return nil
+			}
+		}
 		// Hand the drain's tokens to the verdict that will judge it: a fruitless
 		// drain is charged to the token-denominated quiet accumulator (CLA-343), and
 		// the figure must be this drain's, not whatever total happened to be in
@@ -732,7 +801,10 @@ func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) str
 //  2. If the next phase will never run, the handback skipped at the seam happens
 //     here instead — otherwise a budget stop leaves the task leased to nobody.
 func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, handoffs int, stop bool, err error) {
-	phases := d.cfg.EffectivePhases()
+	// The target's own effective config (CLA-410): a stored run-config overlay
+	// changes harness/model/budget here, not on the shared base.
+	tc := d.targetCfg(t)
+	phases := tc.EffectivePhases()
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
@@ -1007,7 +1079,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			if !last && end.empty {
 				log.Printf("%siteration %d: the %s phase ended holding a task with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns (its handoff was refused)",
 					labelOf(t), drainNum, ph.Label(i), end.emptyWhy)
-				d.tallyEmpty(ph.Label(i), d.cfg.HarnessFor(ph))
+				d.tallyEmpty(ph.Label(i), tc.HarnessFor(ph))
 				break
 			}
 		}
@@ -1280,7 +1352,7 @@ func verifiedBranch(res *harness.Result) string {
 // default turn cap (CLA-343), which is precisely what the inline zero-value
 // version failed to do.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
-	ph := d.cfg.EffectivePhases()[0]
+	ph := d.targetCfg(t).EffectivePhases()[0]
 	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, "", ph, true, nil, t, prior)
 	return tokens, cost, stop, err
 }
@@ -1306,6 +1378,7 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
 func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+	tc := d.targetCfg(t)
 	// The adapter for THIS phase, resolved once: everything below — the spawn, the
 	// classification of what came back, and the probe of any usage limit it hit —
 	// has to be the harness that actually ran, not the run's default. Resolved
@@ -1515,7 +1588,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// that guards the checkpoint veto — a dead LAST phase is still a dead
 		// phase, and the rate is a measurement, not a seam decision (see
 		// deadtally.go).
-		d.tallyDead(ph.Label(phaseIdx), d.cfg.HarnessFor(ph), res, capped, ceiling, wallclock)
+		d.tallyDead(ph.Label(phaseIdx), tc.HarnessFor(ph), res, capped, ceiling, wallclock)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
@@ -1590,7 +1663,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 				// Book it into the dead-phase tally (CLA-457): this is the
 				// "produced nothing" class the rate exists to measure, and a
 				// fleet-wide silent EOT is exactly the incident in question.
-				d.tallyEmpty(ph.Label(phaseIdx), d.cfg.HarnessFor(ph))
+				d.tallyEmpty(ph.Label(phaseIdx), tc.HarnessFor(ph))
 			}
 			// last && a clean exit is the shape CLA-384 is about: the phase ran to
 			// completion, pushed, and simply did not declare. A non-zero exit reached
@@ -1627,7 +1700,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			if res.Untrusted == "" {
 				tokens += res.Tokens
 				cost += res.CostUSD
-				d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
+				d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 			}
 			// A run failure that was not an exit status — a launch failure, or one
 			// of the deaths in Wait above — ends the attempt without any retry
@@ -1642,7 +1715,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if res.Untrusted != "" {
 			// held is nil here by construction — an untrusted stream never holds a
 			// phase open — so the sequence ends and nothing is carried forward.
-			utokens, ucost, ustop, uerr := d.endUntrustedDrain(drainNum, d.cfg.HarnessFor(ph), res, tokens, cost)
+			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
 
@@ -1654,7 +1727,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
-		d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
+		d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
@@ -1689,7 +1762,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// and stop on the very next check — having spent the night waiting for
 			// headroom it then declines to use. Stop now and say when the quota
 			// returns, so the operator can start a fresh run against it.
-			remaining, bounded := d.cfg.Budget.Remaining(time.Since(prior.start))
+			remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
 			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
 					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
@@ -1901,11 +1974,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 // (CLA-366) the session that went unreadable is not necessarily on d.h. Asking
 // d.h would let an unreadable opencode session be waved through on the grounds
 // that CLAUDE has no ceiling set.
-func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
+func (d *Driver) endUntrustedDrain(t Target, drainNum int, harnessName string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
 	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
 	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%s), and not handing back any claim it appeared to hold",
 		drainNum, res.Tokens, res.CostUSD, res.ExitString())
-	if !d.cfg.Budget.CountsSpendFor(harnessName) {
+	if !d.targetCfg(t).Budget.CountsSpendFor(harnessName) {
 		return tokens, cost, false, nil
 	}
 	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
@@ -2720,6 +2793,7 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 }
 
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
+	tc := d.targetCfg(t)
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
 
 	// waitingForReset says the stated reset was still ahead of us as this wait
@@ -2760,7 +2834,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
-		inv, ierr := d.invocationOn(t, d.cfg.HarnessFor(ph), true)
+		inv, ierr := d.invocationOn(t, tc.HarnessFor(ph), true)
 		if ierr != nil {
 			// A refused probe spawn spends nothing and learns nothing about the
 			// limit, so it reads exactly like any other probe error: log the
@@ -2775,7 +2849,11 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		// of here — resume, stop, or another lap — carries it.
 		tokens += got.Tokens
 		cost += got.CostUSD
-		d.charge(d.cfg.HarnessFor(ph), got.Tokens, got.CostUSD)
+		// The probe spawned on the TARGET's effective harness above (invocationOn
+		// with tc.HarnessFor), so its spend is booked under that same name —
+		// keying on the base harness would bill an overlay-redirected phase to
+		// the wrong per-harness account (CLA-410).
+		d.charge(tc.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true
@@ -2786,7 +2864,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			// never see the cost — the one shape this loop's breaker exists to end
 			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
 			// ceiling there is nothing to protect, so it waits on as before.
-			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpendFor(d.cfg.HarnessFor(ph)) {
+			if errors.Is(err, harness.ErrUntrusted) && tc.Budget.CountsSpendFor(tc.HarnessFor(ph)) {
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
 				return tokens, cost, true
 			}
@@ -2917,7 +2995,8 @@ func droppedNote(dropped int64) string {
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
 func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) (harness.Invocation, error) {
-	inv, err := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
+	tc := d.targetCfg(t)
+	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
 		return inv, err
 	}
@@ -2937,7 +3016,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// harness asked about is THIS PHASE's (CLA-366), not the run's — the ceiling
 	// is compiled into the invocation that is about to spawn, so keying it on d.h
 	// would hand an opencode phase the ceiling derived from claude's block.
-	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeilingFor(d.cfg.HarnessFor(ph))
+	inv.MaxSessionTokens = tc.Budget.SessionTokenCeilingFor(tc.HarnessFor(ph))
 	// The per-session wall-clock cap, resolved by EffectivePhases: this phase's
 	// own, else the run-wide one, else zero — and zero is OFF, which is the
 	// shipped default (CLA-368). Unlike the token ceiling this one HAS a disabled
@@ -2962,17 +3041,17 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// provider's and does not. An opencode phase whose harness block names no
 	// models therefore runs on opencode's own configured model — which is where
 	// opencode's model lives — rather than on a claude alias its CLI would die on.
-	model, ok := d.cfg.ModelForPhase(ph)
+	model, ok := tc.ModelForPhase(ph)
 	if !ok {
 		log.Printf("%sphase %q names tier %q, which resolves to no model on harness %q — running on that harness's default model instead",
-			labelOf(t), ph.Label(phaseIdx), ph.Tier, d.cfg.HarnessFor(ph))
+			labelOf(t), ph.Label(phaseIdx), ph.Tier, tc.HarnessFor(ph))
 	}
 
 	// CLA-379: review-tier escalation evaluated at review-spawn time.
 	// The CLI reads the operator's escalation rules from config and applies
 	// them mechanically. Only raises; never lowers. The matching rule
 	// is logged so the spend is attributable, per the 2026-08-23 decision.
-	if d.cfg.Escalation.PathRules != nil || d.cfg.Escalation.CategoryRules != nil {
+	if tc.Escalation.PathRules != nil || tc.Escalation.CategoryRules != nil {
 		if isReviewPhase(ph) {
 			// Resolve the branch name for the diff: from the previous claim's
 			// branch record (CLA-379 plumbing), falling back to reading the
@@ -2986,11 +3065,11 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 			if prev != nil && prev.Claim.Held() && prev.Claim.Category != "" {
 				category = prev.Claim.Category
 			}
-			tier, rule := d.cfg.Escalation.Evaluate(changedPaths, category)
+			tier, rule := tc.Escalation.Evaluate(changedPaths, category)
 			if tier != "" {
 				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
 				ph.Tier = tier
-				model, ok = d.cfg.ModelForPhase(ph)
+				model, ok = tc.ModelForPhase(ph)
 				if !ok {
 					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
 				}
@@ -3045,11 +3124,16 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 // spawn: the caller reports it and no session starts, because a session without
 // its declared env is the incident, not a degraded mode.
 func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness.Invocation, error) {
+	// The target's effective config supplies the model/tier half of SessionFor
+	// and decides which harness the project's own MCP file belongs to (CLA-410);
+	// the env, prompt and workdir fallbacks stay on the base config — they are
+	// machine-local core the plane never carries.
+	tc := d.targetCfg(t)
 	workdir := t.WorkDir
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
-	hc := d.cfg.SessionFor(harnessName)
+	hc := tc.SessionFor(harnessName)
 	env, err := d.cfg.SessionEnv(harnessName, t.Name)
 	if err != nil {
 		return harness.Invocation{}, err
@@ -3058,7 +3142,7 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		Prompt:        d.cfg.Prompt,
 		Model:         hc.Model,
 		WorkDir:       workdir,
-		MCPConfigPath: d.cfg.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
+		MCPConfigPath: tc.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
 		ConfigDir:     hc.ConfigDir,
 		SettingsPath:  hc.SettingsPath,
 		Env:           env,

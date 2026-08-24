@@ -372,11 +372,13 @@ clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
 clankerbar ctl restart -c ./clankerbar.json   # tell the RUNNING daemon to re-exec
 clankerbar ctl reload  -c ./clankerbar.json   # re-read the config file, no exec
+clankerbar propose-config                     # import this file into the plane (PENDING)
 ```
 
 Flags are **GNU-style**: `--long` options, `-x` shorts. `--config` (`-c`) and
 `--help` (`-h`) are the only short aliases; everything else is long-form only.
-`clankerbar run --help` and `clankerbar doctor --help` list them. A short flag's
+`clankerbar run --help`, `clankerbar doctor --help` and
+`clankerbar propose-config --help` list them. A short flag's
 value is separate (`-c ./x.json`) or `=`-joined (`-c=./x.json`); the inline
 `-c./x.json` form is rejected, so a typo like `-cofnig` cannot quietly become
 `--config=ofnig`.
@@ -1134,6 +1136,33 @@ repo B:
 The conventional task-worktree area beside a checkout (`<checkout>-wt` as its
 sibling) joins the grant list automatically whenever that directory exists, so
 a session can create and edit the worktree it is told to work in.
+
+### Execution config from the plane
+
+A project's execution dials - harness, model, tier buckets, budget, review-tier
+escalation rules, and the two backstops (`max_turns`, `max_session_wall_clock`,
+as integer seconds) - can live **on the plane** instead of in this file. The
+daemon reads each project's stored document (per project, so two queues can run
+two postures) and overlays it over this file; until a project has one, this
+file rules byte for byte. `doctor` reports which is in force per project, and
+warns when a stored dial cannot fire on your machine (a turn cap under opencode,
+say) - shape-validates on the plane, machine-fit is doctor's.
+
+Edits apply at the **next iteration boundary**, never mid-session: the daemon
+watches the version on the backlog-summary poll it already makes, and on a bump
+re-reads and re-overlays before spawning again. A document that fails local
+validation keeps the previous config and says so loudly. Flags still outrank the
+stored document: `--model` on the command line wins over a ratified value.
+
+Import today's file as the starting point with:
+
+```sh
+clankerbar propose-config            # --slug <project> when projects[] names several
+```
+
+That records a PENDING proposal; nothing changes until you ratify it in the
+console (Settings -> Run configuration). Phases, prompts, wiring, env and paths
+stay local: the plane custodies policy, never machine fit or credentials.
 
 ### Multi-project: one instance, many queues
 

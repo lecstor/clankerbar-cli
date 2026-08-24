@@ -43,6 +43,8 @@ func main() {
 		err = cli.Ctl(ctx, os.Args[2:])
 	case "doctor":
 		err = cli.Doctor(ctx, os.Args[2:])
+	case "propose-config":
+		err = cli.ProposeConfig(ctx, os.Args[2:])
 	case "dead-rate":
 		err = cli.DeadRate(ctx, os.Args[2:])
 	case "version", "--version", "-v":
