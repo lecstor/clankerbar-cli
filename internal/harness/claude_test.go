@@ -73,7 +73,7 @@ const (
 )
 
 // heldClaim is the claim the fixture stream establishes.
-func heldClaim() Claim { return Claim{TaskID: claimUUID, Ref: claimRef, RunID: "r-1"} }
+func heldClaim() Claim { return Claim{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Branch: "clanker/x"} }
 
 // withClaim prefixes the two events that claim the task, so each case states
 // only what it is actually about.
@@ -216,7 +216,7 @@ func TestClaudeClaimTracking(t *testing.T) {
 				toolUse("u1", claimTaskTool, `{"taskId":"`+claimUUID+`","takeover":true}`),
 				toolResult("u1", `{"task":{"id":"`+claimUUID+`","ref":"`+claimRef+`"},"run":{"id":"r-1"},"hasWip":true}`),
 			},
-			want: withWIP(),
+			want: Claim{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", HasWIP: true},
 		},
 		{
 			name: "another task's branch is not my WIP",

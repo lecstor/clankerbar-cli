@@ -305,7 +305,7 @@ func TestDrainPhases_AnOversizeHandoffPromptIsRefusedWithFallback(t *testing.T) 
 func TestDrainPhases_AHandoffCountsAgainstMaxIterations(t *testing.T) {
 	t.Run("ceiling already spent: refused", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{{res: handoffResult("more")}}}
-		d, _ := phaseDriver(t, h, nil)
+		d, rel := phaseDriver(t, h, nil)
 		d.cfg.Prompt = "Work the next backlog item."
 		d.cfg.MaxIterations = 1
 
@@ -315,6 +315,40 @@ func TestDrainPhases_AHandoffCountsAgainstMaxIterations(t *testing.T) {
 		}
 		if h.invokeCalls != 1 || handoffs != 0 {
 			t.Errorf("invokes=%d handoffs=%d, want 1 and 0 — this drain was the last iteration the ceiling allows", h.invokeCalls, handoffs)
+		}
+		// CLA-421, release side of the refused-handoff seam: nothing was
+		// pushed, so there is no takeover hand-off to preserve and the queue
+		// may have the task straight away — no waiting out the lease.
+		if len(rel.calls) != 1 {
+			t.Errorf("the task was handed back %d times, want once: %+v", len(rel.calls), rel.calls)
+		}
+	})
+	t.Run("ceiling already spent with work pushed: the lease is kept for the takeover hand-off", func(t *testing.T) {
+		// CLA-421, keep side of the refused-handoff seam — the deliberate
+		// choice, pinned so it stays one. A guard-refused handoff that still
+		// holds pushed work leaves the lease to expire: releasing would post
+		// `ready` over the branch and discard the plane's requiresTakeover
+		// hand-off, so the next clanker would start from nothing beside work
+		// it cannot see. The expiry sweep re-offers the task as a takeover
+		// with the branch attached — the same disposition the budget-stop
+		// seam already pins (TestDrainPhases_WhatTheSeamOwes...), decided
+		// here for the guard-refused handoff rather than fallen into.
+		res := handoffResult("more")
+		res.Claim.HasWIP = true
+		h := &fakeAdapter{steps: []invokeStep{{res: res}}}
+		d, rel := phaseDriver(t, h, nil)
+		d.cfg.Prompt = "Work the next backlog item."
+		d.cfg.MaxIterations = 1
+
+		_, _, handoffs, _, err := drainPhasesHandoffs(t, d, 1)
+		if err != nil {
+			t.Fatalf("drainPhases: %v", err)
+		}
+		if h.invokeCalls != 1 || handoffs != 0 {
+			t.Errorf("invokes=%d handoffs=%d, want 1 and 0", h.invokeCalls, handoffs)
+		}
+		if len(rel.calls) != 0 {
+			t.Errorf("the driver released a claim holding pushed work %+v — the takeover hand-off would be lost: %+v", res.Claim, rel.calls)
 		}
 	})
 	t.Run("one iteration of headroom buys exactly one respawn", func(t *testing.T) {
@@ -398,6 +432,103 @@ func TestDrainPhases_AHandoffNeedsACleanExitAndAHeldClaim(t *testing.T) {
 			}
 			if h.invokeCalls != 1 || handoffs != 0 {
 				t.Errorf("invokes=%d handoffs=%d, want 1 and 0", h.invokeCalls, handoffs)
+			}
+		})
+	}
+}
+
+// CLA-421: the incident shape. A session ends cleanly, its final message ends
+// with a handoff block, and the adapter observed NO claim from it — broken MCP
+// wiring, or claim events the parser never saw — so the driver holds no
+// task/run ids and cannot seed a successor's resume preamble. The marker is
+// refused for THAT reason, named as itself rather than folded into "no longer
+// holds a task" (which describes a settled task, a different situation), and
+// the sequence falls back to the standard path without spawning anything.
+func TestDrainPhases_AMarkerWithNoObservedClaimIsRefusedForThatReason(t *testing.T) {
+	unobserved := handoffResult("Resume: wire the parser in and pin the guards.")
+	unobserved.Claim = harness.Claim{} // the driver never saw a claim
+	h := &fakeAdapter{steps: []invokeStep{{res: unobserved}}}
+	d, rel := phaseDriver(t, h, nil)
+	d.cfg.Prompt = "Work the next backlog item."
+	logged := captureLogs(t)
+
+	_, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 1 || handoffs != 0 {
+		t.Errorf("invokes=%d handoffs=%d, want 1 and 0 — with no ids to seed, no successor may spawn", h.invokeCalls, handoffs)
+	}
+	// Nothing was ever observed, so nothing is owed: the driver must not touch
+	// ANY lease on the strength of a claim it cannot see. A possibly-live one
+	// goes to the plane's expiry sweep, which keeps a recorded branch attached
+	// as the takeover hand-off.
+	if len(rel.calls) != 0 {
+		t.Errorf("the driver released on a claim it never observed (%+v): %+v", unobserved.Claim, rel.calls)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "observed no claim from this session") {
+		t.Errorf("the refusal must state its own reason — no claim was observed, so no ids exist to seed a resume; got:\n%s", out)
+	}
+	if !strings.Contains(out, "takeover hand-off") {
+		t.Errorf("the refusal must name where a possibly-live lease goes — the expiry sweep, branch attached; got:\n%s", out)
+	}
+	if strings.Contains(out, "no longer holds a task") {
+		t.Errorf("the old ambiguous wording should be gone — a never-observed claim is not a settled one; got:\n%s", out)
+	}
+}
+
+// CLA-421: the two "no run to resume" shapes are different situations, and the
+// log says which one happened. A settled task is a final, correct refusal;
+// an unobserved claim means the ids were never seen and a possibly-live lease
+// goes to the expiry sweep with its takeover hand-off intact. An operator
+// reading the daemon log must not have to guess between them — and the
+// zero-claim case must never wear the settled wording, because it reads as
+// "nothing is owed" about a lease that may be ticking.
+func TestDetectHandoff_TheTwoNoRunRefusalsNameThemselves(t *testing.T) {
+	d, _ := phaseDriver(t, &fakeAdapter{}, nil)
+	for _, tc := range []struct {
+		name    string
+		res     harness.Result
+		want    []string
+		notWant []string
+	}{
+		{
+			name: "settled task",
+			res: func() harness.Result {
+				r := handoffResult("more")
+				r.Claim.Settled = true
+				return r
+			}(),
+			want:    []string{"settled t-1", "no run for a successor to resume"},
+			notWant: []string{"observed no claim"},
+		},
+		{
+			name: "no claim observed",
+			res: func() harness.Result {
+				r := handoffResult("more")
+				r.Claim = harness.Claim{}
+				return r
+			}(),
+			want:    []string{"observed no claim", "task/run ids", "takeover hand-off"},
+			notWant: []string{"settled t-1"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logged := captureLogs(t)
+			if got := detectHandoff(1, d.targets[0], tc.res); got != "" {
+				t.Fatalf("detectHandoff = %q, want a refusal", got)
+			}
+			out := logged.String()
+			for _, want := range tc.want {
+				if !strings.Contains(out, want) {
+					t.Errorf("the refusal is missing %q; got:\n%s", want, out)
+				}
+			}
+			for _, notWant := range tc.notWant {
+				if strings.Contains(out, notWant) {
+					t.Errorf("the refusal carries the other shape's wording %q; got:\n%s", notWant, out)
+				}
 			}
 		})
 	}

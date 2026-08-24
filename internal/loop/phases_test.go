@@ -367,7 +367,7 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	d.cfg.Budget = config.Budget{MaxTokens: 75_000_000}
 
 	ph := d.cfg.EffectivePhases()[0]
-	inv := d.invocationFor(d.targets[0], 0, ph, nil)
+	inv := d.invocationFor(d.targets[0], 0, ph, nil, "")
 
 	if want := d.cfg.Budget.SessionTokenCeiling(); inv.MaxSessionTokens != want {
 		t.Errorf("invocation carries MaxSessionTokens %d, want the resolved %d", inv.MaxSessionTokens, want)
@@ -708,18 +708,19 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	d.cfg.MaxSessionWallClock = config.Duration(time.Hour)
 
 	phases := d.cfg.EffectivePhases()
-	if got := d.invocationFor(d.targets[0], 0, phases[0], nil).MaxSessionWallClock; got != 20*time.Minute {
+	if got := d.invocationFor(d.targets[0], 0, phases[0], nil, "").MaxSessionWallClock; got != 20*time.Minute {
 		t.Errorf("phase 1 invocation carries %s, want its own 20m", got)
 	}
-	if got := d.invocationFor(d.targets[0], 1, phases[1], nil).MaxSessionWallClock; got != time.Hour {
+	if got := d.invocationFor(d.targets[0], 1, phases[1], nil, "").MaxSessionWallClock; got != time.Hour {
 		t.Errorf("phase 2 invocation carries %s, want the run-wide 1h it inherits", got)
 	}
 }
 
-// The operator-facing line has to be TRUE, and today it is true only in the
-// direction nobody can reach: the salvage runs on an observed claim, and the
-// only adapter that enforces the cap does not observe claims. Reporting a
-// salvage that never ran would be the reassuring falsehood CLA-290 removed from
+// The operator-facing line has to be TRUE, so the driver branches on the claim
+// it actually observed rather than asserting a salvage: since CLA-365 the only
+// adapter that enforces this cap (opencode) also observes claims, so BOTH arms
+// below are reachable today and each pins its own wording. Reporting a salvage
+// that never ran would be the reassuring falsehood CLA-290 removed from
 // doctor, in the one place a run leaves work behind.
 func TestDrainPhases_AWallClockCapDoesNotClaimASalvageThatCouldNotRun(t *testing.T) {
 	for _, tc := range []struct {
@@ -762,6 +763,81 @@ func TestDrainPhases_AWallClockCapDoesNotClaimASalvageThatCouldNotRun(t *testing
 			}
 		})
 	}
+}
+
+// CLA-345: the spawn line stamps the settings the session was spawned WITH,
+// because an old token/cost line is attributable only by evidence - what was
+// resolved at spawn time - not by inference from whatever the config file says
+// now. The stamped model must be inv.Model, the concrete id the harness was
+// handed (ModelForPhase's output), never the tier bucket name that produced it.
+// An empty model= is itself the honest stamp for "nothing configured; the
+// harness ran its own default".
+func TestDrainPhases_SpawnLineStampsTheResolvedModel(t *testing.T) {
+	t.Run("the run-wide model is stamped", func(t *testing.T) {
+		logs := captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+		d, _ := phaseDriver(t, h, nil)
+		d.cfg.Model = "claude-test-model"
+
+		if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+			t.Fatalf("drainPhases: %v", err)
+		}
+		want := "spawning fake (phase=1 model=claude-test-model log: "
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("spawn line does not carry %q: %s", want, logs.String())
+		}
+	})
+
+	t.Run("a tier is stamped as its resolved alias, never the bucket name", func(t *testing.T) {
+		logs := captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+		d, _ := phaseDriver(t, h, []config.Phase{{Name: "implement", Tier: "strong"}})
+		d.cfg.Models = map[string]string{"strong": "claude-opus-5"}
+
+		if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+			t.Fatalf("drainPhases: %v", err)
+		}
+		logged := logs.String()
+		if !strings.Contains(logged, "(phase=implement model=claude-opus-5 ") {
+			t.Errorf("spawn line does not stamp the resolved alias claude-opus-5: %s", logged)
+		}
+		if strings.Contains(logged, "model=strong") {
+			t.Errorf("spawn line stamped the tier bucket name instead of its alias: %s", logged)
+		}
+	})
+
+	t.Run("a retry attempt is stamped too", func(t *testing.T) {
+		logs := captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: transientResult()},
+			{res: okResult(1, 0)},
+		}}
+		d, _ := phaseDriver(t, h, nil)
+		d.cfg.Model = "claude-test-model"
+
+		if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+			t.Fatalf("drainPhases: %v", err)
+		}
+		want := "retry 1, spawning fake (phase=1 model=claude-test-model log: "
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("retry spawn line does not carry %q: %s", want, logs.String())
+		}
+	})
+
+	t.Run("an unconfigured model stamps the empty value the harness was handed", func(t *testing.T) {
+		logs := captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+		d, _ := phaseDriver(t, h, nil)
+
+		if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+			t.Fatalf("drainPhases: %v", err)
+		}
+		// model= followed by nothing IS the evidence: no explicit model existed
+		// at spawn time, so the session ran the harness's own default.
+		if !strings.Contains(logs.String(), "model= log:") {
+			t.Errorf("spawn line carries no bare model= for an unconfigured model: %s", logs.String())
+		}
+	})
 }
 
 // The undeclared counter is only worth having if it means ONE thing, so these pin

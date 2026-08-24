@@ -17,6 +17,7 @@ import (
 	"log"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -124,6 +125,22 @@ type Target struct {
 	// need an entry here and lacks one.
 	MCPConfigPaths map[string]string
 
+	// Repos is this project's repo -> local-checkout map (CLA-437, agent-rule-
+	// scoping pieces 2 and 3), and PrimaryRepo the fallback for a task that
+	// carries no repo. Between them they decide where each session STARTS: the
+	// task's own repo resolved to a checkout, never blindly the workdir — so the
+	// session reads its repo's rule files instead of a sibling's, and a grant
+	// scoped per-cwd cannot wall off the tree the task needs. Resolution order,
+	// the loud repo_not_found failure and the nothing-configured legacy path are
+	// config.ResolveCheckout's; this field only carries what the operator
+	// declared. Both empty = the feature is off and every spawn behaves exactly
+	// as before.
+	Repos map[string]string
+
+	// PrimaryRepo backs a session whose task names no repo (a fresh phase before
+	// the plane returns repos for everything). See Repos above.
+	PrimaryRepo string
+
 	// Releaser hands back a claim a session left holding (CLA-242). Nil disables
 	// the handback for this target, which costs only the reclaim an expiring lease
 	// would have cost anyway — so a target without one degrades, it does not break.
@@ -205,6 +222,13 @@ type Driver struct {
 	// clears once the count falls back to it or below.
 	fleetOpenQ []int
 
+	// waitGrace is how far past a stated reset the paused loop waits before its
+	// confirming probe: a reset time is a boundary, and arriving exactly on it
+	// invites an off-by-a-second retry against a cap that has not lifted yet.
+	// A field so tests can shrink it (CLA-305) - production always gets a
+	// minute, and no test should sleep a minute to watch a boundary land.
+	waitGrace time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
 	// second argument is CLA-310's empty-check-rollup opt-out for the target
@@ -278,6 +302,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		fleetPaused: make([]bool, n),
 		fleetRaised: make([]bool, n),
 		fleetOpenQ:  make([]int, n),
+		waitGrace:   time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -1051,6 +1076,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 	if aerr != nil {
 		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), aerr)
 	}
+	// Where this phase's sessions run, resolved ONCE per phase (CLA-437): the
+	// task repo's checkout when it resolves, the target's workdir when nothing
+	// does. Before the attempt ladder, so a repo that resolves to nothing fails
+	// the phase with repo_not_found before anything is spawned — a session that
+	// starts in the multi-repo parent reads a sibling's rule files and, on a
+	// cwd-scoped grant, hits the wall this replaces. The same directory then
+	// serves every retry: the task does not change between attempts.
+	spawnDir, serr := d.sessionDir(ctx, t, prev)
+	if serr != nil {
+		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), serr)
+	}
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -
 	// the spend the budget breaker above can never see (CLA-288).
@@ -1115,7 +1151,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv := d.invocationFor(t, phaseIdx, ph, prev)
+		inv := d.invocationFor(t, phaseIdx, ph, prev, spawnDir)
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
 		f, ferr := d.state.Create(logName)
@@ -1126,10 +1162,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			inv.Console = os.Stderr
 			log.Printf("could not open iteration log %s: %v", logPath, ferr)
 		}
+		// The spawn line stamps what the session was actually spawned WITH:
+		// phase and the resolved model id inv.Model carries (ModelForPhase's
+		// output, never the tier alias). A token/cost line in an old log is then
+		// attributable to the settings of THAT day rather than inferred from
+		// whatever the config file says now (CLA-345). An empty model= is itself
+		// evidence: no explicit model was configured at spawn time, and the
+		// harness ran its own default.
 		if retries == 0 {
-			log.Printf("iteration %d %s— spawning %s (log: %s)", drainNum, labelOf(t), a.Name(), logPath)
+			log.Printf("iteration %d %s- spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
 		} else {
-			log.Printf("iteration %d %s— retry %d, spawning %s (log: %s)", drainNum, labelOf(t), retries, a.Name(), logPath)
+			log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), retries, a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
 		}
 
 		// CLA-358: while THIS child runs, renew whatever task-lease it holds.
@@ -1159,7 +1202,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// Rescue whatever the session left uncommitted, FIRST — before the handback,
 		// because a successful salvage changes what the handback should do: a task
 		// with a branch recorded on it is no longer safe to release (CLA-314).
-		d.salvageStrandedWork(ctx, t, &res, producedNothing)
+		d.salvageStrandedWork(ctx, t, &res, producedNothing, inv.WorkDir)
 		// Hand back anything the session was still holding, BEFORE deciding what to
 		// do next — every branch below either waits, retries or returns, and all of
 		// them leave the lease unattended. Above the ierr check too: on every
@@ -1263,7 +1306,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// lease is time-sensitive and a git check is not; on every exit, because a
 		// session that pushed nothing and died is exactly as likely to have recorded
 		// a branch as one that finished cleanly.
-		d.verifyDeliveries(ctx, t, res)
+		d.verifyDeliveries(ctx, t, res, inv.WorkDir)
 
 		if ierr != nil {
 			if ctx.Err() != nil {
@@ -1438,7 +1481,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		}
 
 		// A session the ADAPTER ended for outliving its wall-clock cap is the same
-		// shape again: the phase ends, and neither a retry nor a failure is right —
+		// shape again: the phase ends, and neither a retry nor a failure is right -
 		// a retry would spend the same hours over again and reach the same deadline,
 		// and failing would stop the run over a cap doing its job (CLA-368).
 		//
@@ -1446,14 +1489,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// arrives per step_finish and is summed all the way to the kill, so the
 		// figures are the honest cost of the session up to the moment it ended.
 		//
-		// What the line must NOT say is that the salvage handled the tree. The
-		// salvage returns immediately without a claim (see salvageStrandedWork),
-		// and the only adapter that enforces this cap today is the one that does
-		// not observe claims — so on every kill that can currently happen, nothing
-		// was committed and the work is still sitting in the worktree. Saying
-		// otherwise would be the reassuring falsehood doctor's own checks exist to
-		// remove (CLA-290). The claim-held wording is the one a claim-observing
-		// adapter will earn later; it is not what opencode gets today.
+		// Since CLA-365 opencode has BOTH HonoursSessionWallClock and
+		// TracksClaims (Capabilities.TracksClaims: true), so a capped opencode
+		// session holding its claim IS salvaged - the res.Claim.Held() arm above
+		// is the one that fires today. The else branch (nothing salvaged) applies
+		// only if an adapter enforcing this cap ever lacks claim observation
+		// again; it is kept defensive, not descriptive of the present. The claim-held
+		// wording was earned by CLA-365, not reserved for a future adapter.
 		if wallclock {
 			if res.Claim.Held() {
 				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
@@ -1572,6 +1614,11 @@ func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness
 // worktree, and records the branch on the task so another machine can pick it up
 // (CLA-314).
 //
+// workdir is where the session actually ran — the resolved spawn directory, not
+// rebuilt from the target — because that is where its worktree lives once
+// sessions start in per-task checkouts (CLA-437). Salvaging from anywhere else
+// would report "nothing to salvage" over real stranded work.
+//
 // # Why it runs on EVERY ending, not only on a usage limit
 //
 // The worktree is what is being rescued, and it looks identical whether the
@@ -1602,7 +1649,7 @@ func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness
 // stays a takeover and the hand-off survives. If the record failed, the task has
 // no branch on it, releasing to `ready` is still the better move, and the old
 // path runs unchanged.
-func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result, producedNothing bool) {
+func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result, producedNothing bool, workdir string) {
 	if d.newSalvager == nil || !res.Claim.Held() {
 		return
 	}
@@ -1613,7 +1660,7 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), salvageTimeout)
 	defer cancel()
 
-	out := d.newSalvager(d.invocation(t, false).WorkDir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref)
+	out := d.newSalvager(workdir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref)
 	label := claimLabel(res.Claim)
 	switch out.Status {
 	case salvage.Nothing:
@@ -1957,7 +2004,7 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 // Blocking a legitimate closure because the tree could not be found would be worse
 // than the gap this replaces — and an Unknown is never allowed to read as a pass:
 // the attestation below is written only for a check that actually ran.
-func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Result) {
+func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Result, workdir string) {
 	if len(res.Reports) == 0 || d.newVerifier == nil {
 		return
 	}
@@ -1969,7 +2016,10 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 		return
 	}
 
-	v := d.newVerifier(d.invocation(t, false).WorkDir, d.cfg.AllowUncheckedPRFor(t.Name))
+	// workdir is the session's actual spawn directory (CLA-437), for the same
+	// reason salvageStrandedWork takes it: the commits being checked live in the
+	// repo the session worked in, which is no longer always the target's.
+	v := d.newVerifier(workdir, d.cfg.AllowUncheckedPRFor(t.Name))
 	for _, rep := range res.Reports {
 		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch, PR: rep.PR}
 		if rep.ClaimsMerge() {
@@ -2307,9 +2357,45 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 // only be tripped by spend it can SEE was blind to exactly the spend this loop
 // generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
 // and this is the one loop with no other way out (CLA-287).
+// probeWait returns how long the paused loop sleeps before its next probe.
+//
+// A known reset still ahead of us is worth waiting for precisely: sleep until
+// just past it (reset + grace) instead of to the next tick of the poll grid,
+// so a cap that lifts on time costs one grace period of idleness rather than
+// up to a whole interval (CLA-305: 22 minutes dead on 2026-08-10, work queued,
+// nothing wrong). The cap at the interval stays: waitOrStop is what keeps a
+// paused loop responsive to a STOP marker, and an aligned multi-hour sleep
+// would make the stop switch feel dead - so the loop wakes on min(reset+grace,
+// the grid) and simply laps again when it wakes short of the reset. An unknown
+// or already-past reset falls back to the blind grid: codex states no reset at
+// all, and after CLA-258 claude parses one only from typed sources, so an
+// unknown reset is normal rather than exceptional.
+func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Duration {
+	if resetAt.IsZero() || !now.Before(resetAt) {
+		return interval
+	}
+	untilReset := resetAt.Add(grace).Sub(now)
+	if untilReset < interval {
+		return untilReset
+	}
+	return interval
+}
+
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
-	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+
+	// waitingForReset says the stated reset was still ahead of us as this wait
+	// began; it flips once the loop has slept across it. waitedOnReset snapshots
+	// that entry state, because a reset we waited on and a reset we arrived
+	// after are owed different endings (see the branch below).
+	waitingForReset := !lim.ResetAt.IsZero() && time.Now().Before(lim.ResetAt)
+	waitedOnReset := waitingForReset
+	if waitingForReset {
+		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		log.Printf("paused%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
+	} else {
+		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+	}
 
 	for {
 		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
@@ -2317,11 +2403,23 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
 		}
-		if d.waitOrStop(ctx, interval) {
+		waitDur := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		if d.waitOrStop(ctx, waitDur) {
 			return tokens, cost, true
 		}
-		if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) {
-			log.Print("stated reset passed — resuming")
+		// A stated reset is the provider's claim, not a guarantee, so crossing it
+		// mid-wait does NOT resume the run the way a blind-grid wake used to: it
+		// falls back to interval polling, and the very next probe is what confirms
+		// or refutes the claim. Only a reset that was ALREADY behind us at entry
+		// resumes on the stated time alone - the legacy contract pinned by
+		// TestDrainWithRetries_StatedResetPassed, where the caller sent us here
+		// knowing the reset had passed and one more interval of idleness is the
+		// price of not re-probing a phase that just told us it was capped.
+		if !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) && waitingForReset {
+			log.Print("stated reset passed - falling back to interval polling (a stated reset is a claim, not a guarantee)")
+			waitingForReset = false
+		} else if !waitedOnReset && !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) {
+			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
 		got, err := a.Probe(ctx, d.invocationOn(t, d.cfg.HarnessFor(ph), true))
@@ -2451,6 +2549,13 @@ func droppedNote(dropped int64) string {
 // carrying this phase's prompt and turn cap, with the previous phase's claim
 // substituted into the prompt's placeholders.
 //
+// spawnDir is where this phase's sessions run, resolved once per phase by
+// sessionDir — the task repo's checkout when one is known, else the target's
+// workdir exactly as before. It is resolved by the CALLER rather than here so a
+// retry ladder re-spawns into the SAME directory it started in (the task has not
+// changed between attempts), and so a resolution failure fails the phase before
+// anything is spawned.
+//
 // The substitution is what lets a later phase RESUME a run rather than claim a
 // task. A session cannot know its own run id — it never called claim_task — so
 // the driver, which watched the earlier phase's stream go by, is the only thing
@@ -2460,8 +2565,12 @@ func droppedNote(dropped int64) string {
 // A placeholder with no claim to fill it is LEFT STANDING rather than blanked.
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result) harness.Invocation {
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) harness.Invocation {
 	inv := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
+	if spawnDir != "" {
+		inv.WorkDir = spawnDir
+	}
+	inv.ExtraDirs = d.extraDirsFor(t, spawnDir)
 	inv.MaxTurns = ph.MaxTurns
 	// The per-session runaway ceiling, resolved once per drain from the budget:
 	// the operator's own dial, else 2x max_tokens, else the documented floor.
@@ -2504,6 +2613,37 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		log.Printf("%sphase %q names tier %q, which resolves to no model on harness %q — running on that harness's default model instead",
 			labelOf(t), ph.Label(phaseIdx), ph.Tier, d.cfg.HarnessFor(ph))
 	}
+
+	// CLA-379: review-tier escalation evaluated at review-spawn time.
+	// The CLI reads the operator's escalation rules from config and applies
+	// them mechanically. Only raises; never lowers. The matching rule
+	// is logged so the spend is attributable, per the 2026-08-23 decision.
+	if d.cfg.Escalation.PathRules != nil || d.cfg.Escalation.CategoryRules != nil {
+		if isReviewPhase(ph) {
+			// Resolve the branch name for the diff: from the previous claim's
+			// branch record (CLA-379 plumbing), falling back to reading the
+			// workdir's git refs if the claim carries none.
+			branchName := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Branch != "" {
+				branchName = prev.Claim.Branch
+			}
+			changedPaths, _ := d.diffAgainstIntegration(t, branchName, spawnDir)
+			category := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Category != "" {
+				category = prev.Claim.Category
+			}
+			tier, rule := d.cfg.Escalation.Evaluate(changedPaths, category)
+			if tier != "" {
+				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
+				ph.Tier = tier
+				model, ok = d.cfg.ModelForPhase(ph)
+				if !ok {
+					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
+				}
+		}
+		}
+	}
+
 	inv.Model = model
 	if prev != nil && prev.Claim.Held() {
 		inv.Prompt = strings.NewReplacer(
@@ -2558,6 +2698,110 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) harness.
 		Probe:         probe,
 	}
 }
+
+// sessionDir resolves where a PHASE's sessions run: the checkout of the task
+// they will work, not the multi-repo parent (CLA-437, agent-rule-scoping pieces
+// 2 and 3).
+//
+// Which task that is depends on the phase. A RESUMED phase (prev carries a held
+// claim) knows its exact task, so its repo is read straight off the plane with
+// get_task. A FRESH phase has claimed nothing yet — the claim happens inside the
+// session — so the driver peeks at next_task, the same queue-head read the
+// session is about to make, and starts in that task's repo. The peek cannot race
+// a session out of work (it holds nothing), and if another clanker does claim the
+// peeked task first, the spawned session claims elsewhere and still works: the
+// permission policy covers every declared repo regardless of cwd, which is what
+// makes a best-effort cwd safe rather than load-bearing.
+//
+// Resolution then runs config.ResolveCheckout over what the target declared:
+// explicit repos entries, then the workdir-is-the-checkout convention, then
+// <workdir>/<name>. An identity that matches nothing fails the iteration with
+// repo_not_found — starting in the parent instead is exactly the wrong-repo-
+// reads and cwd-scoped-grant shape this exists to kill — while an empty result
+// (nothing configured anywhere) keeps the legacy workdir behaviour byte for byte.
+//
+// Lookup failures are degradation, not failure: a plane blip costs the spawn its
+// per-task directory (it falls through to the primary-repo chain), never the
+// iteration — the session about to spawn needs the plane too, and it can resolve
+// nothing either way.
+func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, error) {
+	repo := ""
+	if prev != nil && prev.Claim.Held() {
+		if src, ok := t.Releaser.(plane.TaskRepoSource); ok {
+			r, err := src.TaskRepo(ctx, prev.Claim.TaskID)
+			switch {
+			case err == nil:
+				repo = r
+			case errors.Is(err, plane.ErrNotWired):
+				// No plane endpoint/key: nothing to read, the fallback chain runs.
+			default:
+				log.Printf("%scould not read the repo of resumed task %s (%v) — falling back to the primary repo", labelOf(t), claimLabel(prev.Claim), err)
+			}
+		}
+	} else if peeker, ok := t.Releaser.(plane.TaskPeeker); ok {
+		next, err := peeker.PeekNextTask(ctx)
+		switch {
+		case err == nil:
+			repo = next.Repo
+			if next.Repo != "" {
+				log.Printf("%squeue head %s names repo %q — resolving it to this phase's start directory", labelOf(t), next.TaskID, next.Repo)
+			}
+		case errors.Is(err, plane.ErrNotWired):
+		default:
+			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), err)
+		}
+	}
+	workdir := t.WorkDir
+	if workdir == "" {
+		workdir = d.cfg.WorkDir
+	}
+	return config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
+}
+
+// extraDirsFor lists the directories a session's permission policy must cover
+// BESIDES where it runs: every checkout the project declares, whatever directory
+// the session starts in (agent-rule-scoping piece 2). This is the piece that
+// makes a best-effort spawn cwd safe — a two-repo project whose session started
+// in one repo can still reach the other.
+//
+// One implicit entry joins the declared ones: the conventional worktree area
+// beside the spawn checkout (<checkout>-wt as its sibling, this fleet's
+// documented layout). Task worktrees are separate git roots OUTSIDE every
+// declared repo, and a session that can create one but not edit in it is worse
+// than one never started. It is added only when the directory already exists —
+// no speculation, no widening beyond what is on disk.
+//
+// With nothing declared and no worktree area found this returns nil, which leaves
+// each adapter's policy exactly as it shipped before CLA-437.
+func (d *Driver) extraDirsFor(t Target, spawnDir string) []string {
+	workdir := t.WorkDir
+	if workdir == "" {
+		workdir = d.cfg.WorkDir
+	}
+	declared := config.DeclaredCheckouts(t.Repos, t.PrimaryRepo, workdir)
+	var out []string
+	seen := map[string]bool{}
+	add := func(dir string) {
+		if dir == "" || dir == spawnDir || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	for _, dir := range declared {
+		add(dir)
+	}
+	if spawnDir != "" {
+		wt := filepath.Join(filepath.Dir(spawnDir), filepath.Base(spawnDir)+"-wt")
+		if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+			add(wt)
+		}
+	}
+	return out
+}
+
+// orRef was folded into sessionDir's log line; kept out to avoid a helper with
+// one caller and one branch.
 
 // prefix returns the per-target log prefix ("[slug] "), or "" when the instance
 // drives a single unnamed target — so single-project logs read exactly as before.
@@ -2654,4 +2898,53 @@ func limitReason(lim harness.Limit) string {
 		return lim.Reason
 	}
 	return "usage limit"
+}
+
+// isReviewPhase reports whether a phase is a review-phase (the gate where
+// escalation applies). Named phases whose name is "review" are review phases;
+// custom prompts with no name are never treated as review for escalation.
+func isReviewPhase(ph config.Phase) bool {
+	return ph.Name == config.ReviewPhaseName
+}
+
+// diffAgainstIntegration compares a pushed branch to the integration branch
+// (staging) for changed paths, using git in the work directory.
+// It returns the list of changed file paths, or an error if the diff fails.
+func (d *Driver) diffAgainstIntegration(t Target, branchName string, workDir string) ([]string, error) {
+	if branchName == "" {
+		return nil, errors.New("no branch recorded for diff")
+	}
+	wd := workDir
+	if wd == "" {
+		wd = d.cfg.WorkDir
+		if wd == "" {
+			wd = "."
+		}
+	}
+	// Use git diff against the integration branch (staging by default).
+	// The command compares the branch tip to origin/staging.
+	cmd := exec.Command("git", "-C", wd, "diff", "--name-only", "origin/staging..."+branchName)
+	out, err := cmd.Output()
+	if err != nil {
+		// If the branch is new or the diff command fails, fall back to comparing
+		// the branch to the local staging branch.
+		cmd2 := exec.Command("git", "-C", wd, "diff", "--name-only", "staging..."+branchName)
+		out, err = cmd2.Output()
+		if err != nil {
+			// If both fail, return empty paths rather than failing the spawn.
+			return nil, nil
+		}
+	}
+	paths := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(paths) == 1 && paths[0] == "" {
+		return nil, nil
+	}
+	result := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result, nil
 }

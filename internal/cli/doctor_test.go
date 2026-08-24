@@ -46,6 +46,17 @@ func okEnv() doctorEnv {
 			}
 			return " sleep                0\n displaysleep        10\n", nil
 		},
+		// The deploy_lag seams (CLA-322). No fixture config sets health_url, so
+		// these only have to answer honestly rather than well: a stamp-less
+		// health read warns before the git seams are ever touched, and the git
+		// stub refuses loudly instead of panicking on nil.
+		fetchHealth: func(context.Context, string) (deployHealth, error) {
+			return deployHealth{}, nil
+		},
+		repos: func(context.Context, string) []string { return nil },
+		gitRun: func(context.Context, string, ...string) (string, error) {
+			return "", errors.New("okEnv runs no git")
+		},
 	}
 }
 
@@ -2008,6 +2019,10 @@ func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 		// know the sleep policy" states — exactly the kind of line that is useless
 		// without a remedy.
 		"power",
+		// deploy_lag reports even when unconfigured: one quiet PASS naming the
+		// field, so the feature is discoverable without warning anyone who
+		// opted out (CLA-322).
+		"deploy_lag",
 	} {
 		c := find(t, checks, want)
 		if c.detail == "" {
@@ -2678,5 +2693,64 @@ func TestBudgetEmptyPerHarnessBlockIsNamed(t *testing.T) {
 	c := checkBudget(cfg)
 	if !strings.Contains(c.detail, "per_harness[claude]") || !strings.Contains(c.detail, "no ceiling set") {
 		t.Errorf("an empty per-harness block was passed over in silence: %q", c.detail)
+	}
+}
+
+// CLA-441: an opencode config the driver never named, whose `clankerbar` server
+// points at a different project, is a WARN with the file named. Not a FAIL -
+// spawned sessions are pinned past it by OPENCODE_CONFIG_CONTENT, and the file
+// is frequently a checked-in artifact of somebody else's repo - and not silence,
+// because every interactive session in that tree still gets the wrong backlog.
+func TestDoctorWarnsOnAnAmbientOpencodeConfigNamingAnotherProject(t *testing.T) {
+	workdir := t.TempDir()
+	configDir := t.TempDir()
+	mcp := filepath.Join(workdir, "opencode-mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/ezyapp"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	global := filepath.Join(configDir, "opencode.jsonc")
+	if err := os.WriteFile(global, []byte(`{
+  // interactive setup, pointed at the other project
+  "mcp": { "clankerbar": { "type": "remote", "url": "https://clankerbar.com/mcp/clankerbar" } }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// opencode's global config dirs are ~/.opencode and
+	// $XDG_CONFIG_HOME/opencode (defaulting under HOME), so BOTH are isolated:
+	// the second half of this test asserts PASS, which would otherwise answer to
+	// whatever config root the machine or the CI image happens to have set
+	// (CLA-441 second review).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness:       "opencode",
+		Prompt:        "Work the next backlog item.",
+		WorkDir:       workdir,
+		MCPConfigPath: mcp,
+		Harnesses:     map[string]config.HarnessConfig{"opencode": {ConfigDir: configDir}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
+
+	c := checkOpencodeAmbientConfigs(cfg)
+	if c.status != warn {
+		t.Fatalf("status = %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), global) {
+		t.Errorf("the check must name the file the operator has to go and edit; info = %v", c.info)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN without a remedy is a line an operator can do nothing with")
+	}
+
+	// ...and a run whose files all agree is silent about the whole mechanism.
+	if err := os.WriteFile(global, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/ezyapp"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkOpencodeAmbientConfigs(cfg); c.status != pass {
+		t.Errorf("status = %v, want PASS once the file names the project this run drains (%s)", c.status, c.detail)
 	}
 }

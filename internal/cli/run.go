@@ -83,6 +83,23 @@ func Run(ctx context.Context, args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	// Validation's one WARNING, said out loud at startup rather than only in
+	// `doctor` (CLA-441): an opencode config the driver never named that a
+	// session will merge anyway. Neither kind is a refusal - but an overnight
+	// log that never mentions the file is how the same trap sat there for a
+	// fortnight, drained the wrong backlog, and looked healthy.
+	//
+	// The trailing clause differs by kind. Saying "spawned sessions are pinned"
+	// on a `plugin`/`permission` finding would be a mitigation announced in the
+	// same line it does not apply to: the content pin settles which MCP server
+	// a session talks to and nothing about what it may run (CLA-441 second review).
+	for _, conflict := range cfg.OpencodeAmbientConflicts() {
+		if len(conflict.Overrides) > 0 {
+			log.Printf("WARNING: %s - nothing here pins that away; a session started in that tree runs with it", conflict)
+			continue
+		}
+		log.Printf("WARNING: %s - spawned sessions are pinned to the right project (OPENCODE_CONFIG_CONTENT), interactive ones in that tree are not", conflict)
+	}
 
 	adapter, err := harness.Get(cfg.Harness)
 	if err != nil {
@@ -125,6 +142,11 @@ func Run(ctx context.Context, args []string) error {
 				// single-harness config, which is what leaves the resolution above
 				// exactly as it was.
 				MCPConfigPaths: p.MCPConfigPaths,
+				// This project's repo -> checkout map and its no-repo fallback
+				// (CLA-437): sessions start in the task's repo and their
+				// permission policy covers every declared checkout.
+				Repos:       cfg.ReposFor(p.Slug),
+				PrimaryRepo: cfg.PrimaryRepoFor(p.Slug),
 			})
 		}
 		return loop.NewMulti(cfg, adapter, targets).Run(ctx)
@@ -133,8 +155,10 @@ func Run(ctx context.Context, args []string) error {
 	// One unnamed target — NewMulti with a single entry is exactly what New builds,
 	// and it is the only form that can carry a Releaser.
 	return loop.NewMulti(cfg, adapter, []loop.Target{{
-		Poller:   backlog.New(cfg.BacklogSummaryURL(), apiKey),
-		Releaser: plane.New(cfg.BacklogEndpoint(), apiKey),
+		Poller:      backlog.New(cfg.BacklogSummaryURL(), apiKey),
+		Releaser:    plane.New(cfg.BacklogEndpoint(), apiKey),
+		Repos:       cfg.ReposFor(""),
+		PrimaryRepo: cfg.PrimaryRepoFor(""),
 	}}).Run(ctx)
 }
 

@@ -73,6 +73,16 @@ func claudeArgs(in Invocation) []string {
 	if in.SettingsPath != "" {
 		args = append(args, "--settings", in.SettingsPath)
 	}
+	// The project's other declared repos (CLA-437): --add-dir is Claude's own
+	// mechanism for granting tool access beyond the working directory, so a
+	// two-repo project's session can read and edit its sibling whatever directory
+	// it starts in. One flag carrying every dir — the CLI documents it as
+	// variadic (`--add-dir <directories...>`). The operator's --settings policy
+	// still governs: this widens what the session MAY be granted, the settings
+	// file's deny rules still say what it IS. Probes never reach here.
+	if len(in.ExtraDirs) > 0 {
+		args = append(args, "--add-dir", strings.Join(in.ExtraDirs, " "))
+	}
 	// The phase backstop. Claude ends the session at the cap; whatever the tree
 	// holds is then the salvage's problem, which is exactly what it is for.
 	if in.MaxTurns > 0 {
@@ -93,6 +103,33 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	cmd := exec.CommandContext(sctx, "claude", claudeArgs(in)...)
+	setupProcessGroup(cmd)
+	// Kill the whole process group (descendants holding inherited pipes)
+	// rather than only the direct child, on ANY cancellation of sctx - the
+	// token-ceiling kill from consume(), or the caller's own cancellation
+	// (a Ctrl-C that stopped reaching the session subtree through the tty
+	// the moment Setpgid moved it out of the foreground group). Through
+	// exec.Cmd.Cancel, not a monitor goroutine: os/exec calls Cancel only
+	// while it still considers the process live. The trailing Kill mirrors
+	// CommandContext's own default Cancel, so the direct child still dies
+	// even if it already left the group.
+	//
+	// Assigned BEFORE Start, deliberately: os/exec documents that the caller
+	// sets Cancel and the other cancellation fields before starting the
+	// command, and the watchdog goroutine Start launches reads the field at
+	// cancellation time without synchronising on it - a post-Start write is
+	// a data race (-race catches it) even where it would happen to take
+	// effect.
+	//
+	// Known gap, deliberate: a descendant that ESCAPED the group (daemonised
+	// with setsid) survives this kill and can hold cmd.Stderr's pipe open -
+	// this path sets no WaitDelay, so Wait would block for that escapee's
+	// lifetime. Every in-group descendant dies, which is the bar; the
+	// setsid escapee is filed as CLA-423.
+	cmd.Cancel = func() error {
+		killProcessGroup(cmd)
+		return cmd.Process.Kill()
+	}
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
@@ -494,16 +531,18 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		}
 		text = toolResultText(json.RawMessage(b))
 	}
-	var payload struct {
+  var payload struct {
 		Task struct {
-			ID     string `json:"id"`
-			Ref    string `json:"ref"`
-			Branch string `json:"branch"`
+			ID       string `json:"id"`
+			Ref      string `json:"ref"`
+			Branch   string `json:"branch"`
+			Category string `json:"category"`
 		} `json:"task"`
 		Run struct {
 			ID string `json:"id"`
 		} `json:"run"`
-		HasWip bool `json:"hasWip"`
+		HasWip bool   `json:"hasWip"`
+		Branch string `json:"branch"`
 	}
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
 		fmt.Fprintf(console, "  · claim NOT tracked%s: its result is not JSON (%v) - %s\n", about, err, snippet(text))
@@ -520,12 +559,20 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 	}
 	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
 	// safer to release just because THIS session has not written anything yet.
-	res.Claim = Claim{
-		TaskID: payload.Task.ID,
-		Ref:    payload.Task.Ref,
-		RunID:  payload.Run.ID,
-		HasWIP: payload.HasWip || payload.Task.Branch != "",
-	}
+	// The claim's own branch (top-level) names the pushed WIP; the task-level
+		// branch indicates whether the plane records one for WIP tracking.
+		claimBranch := payload.Branch
+		if payload.Task.Branch != "" && claimBranch == "" {
+			claimBranch = payload.Task.Branch
+		}
+		res.Claim = Claim{
+			TaskID:    payload.Task.ID,
+			Ref:       payload.Task.Ref,
+			RunID:     payload.Run.ID,
+			HasWIP:    payload.HasWip || payload.Task.Branch != "",
+			Category:  payload.Task.Category,
+			Branch:    claimBranch,
+		}
 	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
 	// claim the moment the stream carries it, not when the process exits.
 	res.notifyClaim()
@@ -787,7 +834,10 @@ func (c claude) probeResult(stdout, stderr *tail, runErr error) (Result, error) 
 }
 
 func (claude) env(in Invocation) []string {
-	env := append(os.Environ(), in.Env...)
+	// Pin the child's PWD to the directory Invoke sets as cmd.Dir, dropping the
+	// daemon's inherited value - see pinPWD. Applied to the INHERITED
+	// environment, before in.Env, so an explicit caller value still wins.
+	env := append(pinPWD(os.Environ(), in.WorkDir), in.Env...)
 	// Never truncate the session while subagents/background work run.
 	env = append(env, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0")
 	if in.ConfigDir != "" {

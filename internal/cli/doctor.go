@@ -38,6 +38,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
@@ -87,6 +88,12 @@ type doctorEnv struct {
 	apiKey     string
 	goos       string
 	pmset      func(ctx context.Context, args ...string) (string, error)
+
+	// The deploy_lag check's three seams (CLA-322): the /health read,
+	// repository discovery under a workdir, and every git exec it runs.
+	fetchHealth func(ctx context.Context, healthURL string) (deployHealth, error)
+	repos       func(ctx context.Context, workdir string) []string
+	gitRun      func(ctx context.Context, dir string, args ...string) (string, error)
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -114,6 +121,9 @@ func defaultDoctorEnv() doctorEnv {
 			out, err := exec.CommandContext(ctx, "pmset", args...).Output()
 			return string(out), err
 		},
+		fetchHealth: fetchDeployHealth,
+		repos:       delivery.Repos,
+		gitRun:      deployGitRun,
 	}
 }
 
@@ -207,10 +217,12 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks := []check{checkConfig(cfg)}
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
 	checks = append(checks, checkConfigDirs(cfg)...)
+	checks = append(checks, checkRepos(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
+	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
-	checks = append(checks, checkMCPServers(cfg))
+	checks = append(checks, checkMCPServers(cfg), checkOpencodeAmbientConfigs(cfg))
 	checks = append(checks, checkPermissionsAll(cfg)...)
 	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(cfg, e))
 }
@@ -220,6 +232,12 @@ func doctorFailed(n int) error {
 }
 
 // --- 1. config ---------------------------------------------------------------
+
+// apiKeyOriginLabel prefixes the line naming the one origin the account-scoped
+// key may be sent to. A const so the README-pins coupling test (readme_pins_test.go,
+// CLA-383) can assert the README quotes exactly this label: rewording it here fails
+// that test until the README is updated.
+const apiKeyOriginLabel = "api key origin: "
 
 func checkConfig(cfg *config.Config) check {
 	c := check{name: "config", status: pass}
@@ -250,7 +268,7 @@ func checkConfig(cfg *config.Config) check {
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
-	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
+	c.info = append(c.info, apiKeyOriginLabel+orNone(cfg.CredentialOrigin()))
 	// What this config hands the child process, by NAME only - never a value, and
 	// never the file an @path names. A config that reaches the loop decides the
 	// spawned session's environment (CLA-260), so "which variables am I injecting"
@@ -283,6 +301,67 @@ func envKeyNames(env map[string]string) string {
 	}
 	sort.Strings(keys)
 	return strings.Join(keys, ", ")
+}
+
+// --- 1b. repos ---------------------------------------------------------------
+
+// checkRepos reports, per project (or once for a single-project run), every repo
+// the config declares and whether it resolves to a local checkout (CLA-437).
+//
+// This is the preflight for two silent failures at once. A declared repo whose
+// checkout is missing fails every iteration that names it with repo_not_found —
+// better seen here than in an overnight log. And a project that declares NO
+// repos keeps the legacy workdir behaviour, which is correct but easy to mistake
+// for "sessions already start in the task's repo"; saying which mode is live is
+// the difference.
+func checkRepos(cfg *config.Config) []check {
+	report := func(label string, repos map[string]string, primary, workdir string) check {
+		c := check{name: label}
+		if len(repos) == 0 && strings.TrimSpace(primary) == "" {
+			c.status = pass
+			c.detail = "none declared - sessions start in the workdir (" + orNone(workdir) + "); declare repos to start them in the task's checkout"
+			return c
+		}
+		c.status = pass
+		c.detail = "every declared repo resolves to a checkout"
+		idents := make([]string, 0, len(repos)+1)
+		for k := range repos {
+			idents = append(idents, k)
+		}
+		sort.Strings(idents)
+		if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
+			idents = append(idents, p)
+		}
+		bad := 0
+		for _, id := range idents {
+			mark := ""
+			if strings.TrimSpace(primary) != "" && id == strings.TrimSpace(primary) {
+				mark = " (primary)"
+			}
+			dir, err := config.ResolveCheckout(repos, primary, workdir, id)
+			if err != nil {
+				bad++
+				c.info = append(c.info, id+mark+" -> NOT FOUND")
+				continue
+			}
+			c.info = append(c.info, id+mark+" -> "+dir)
+		}
+		if bad > 0 {
+			c.status = warn
+			c.detail = fmt.Sprintf("%d of %d declared repos resolve to no local checkout - any task naming one fails its iteration", bad, len(idents))
+			c.remedy = "check the repo out under the workdir, or fix its repos path"
+		}
+		return c
+	}
+
+	if len(cfg.Projects) == 0 {
+		return []check{report("repos", cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), projectWorkDir(cfg, p)))
+	}
+	return out
 }
 
 // --- 2. harness --------------------------------------------------------------
@@ -1166,6 +1245,57 @@ func checkMCPServers(cfg *config.Config) check {
 		}
 	}
 	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and only allowlisted or explicitly-named configs are accepted now"
+	return c
+}
+
+// checkOpencodeAmbientConfigs reports the opencode config files the driver never
+// names but opencode merges anyway, whose `clankerbar` MCP server points at
+// another project (CLA-441). The detection - and the reason it WARNS rather than
+// failing the run - lives in config.OpencodeAmbientConflicts; this renders it.
+//
+// The PASS line says nothing about the mechanism: a check that explains a hazard
+// nobody has is a line the operator learns to skip past.
+func checkOpencodeAmbientConfigs(cfg *config.Config) check {
+	c := check{name: "opencode_ambient_config", status: pass}
+	conflicts := cfg.OpencodeAmbientConflicts()
+	if len(conflicts) == 0 {
+		c.detail = "no discovered opencode config redirects the clankerbar MCP server"
+		return c
+	}
+	c.status = warn
+	// The two kinds are counted and remedied SEPARATELY. They share a scan and
+	// nothing else: one is a file naming the wrong backlog, mitigated for
+	// spawned sessions by the content pin; the other is a file that shapes
+	// what the session may do, which the pin does nothing about. A single
+	// sentence covering both said the mitigation out loud on findings it does
+	// not apply to (CLA-441 second review).
+	var slugs, shaping int
+	for _, cf := range conflicts {
+		c.info = append(c.info, cf.String())
+		if len(cf.Overrides) > 0 {
+			shaping++
+		} else {
+			slugs++
+		}
+	}
+	var details, remedies []string
+	if slugs > 0 {
+		details = append(details, plural(slugs,
+			"1 opencode config names a different project's backlog",
+			fmt.Sprintf("%d opencode configs name a different project's backlog", slugs)))
+		remedies = append(remedies, "the wrong-backlog ones are mitigated for SPAWNED sessions by OPENCODE_CONFIG_CONTENT, but every INTERACTIVE "+
+			"opencode session in that tree still gets the wrong one: rename the block (the operator's own global one is now "+
+			"`clankerbar-interactive`), disable it, or point its url at the right slug")
+	}
+	if shaping > 0 {
+		details = append(details, plural(shaping,
+			"1 opencode config shapes what every session it loads into may do",
+			fmt.Sprintf("%d opencode configs shape what every session they load into may do", shaping)))
+		remedies = append(remedies, "the session-shaping ones are NOT mitigated by anything here - `mcp_config_path` files are refused for these keys, "+
+			"a file opencode discovers is not: remove the key, or accept that every session started in that tree runs with it")
+	}
+	c.detail = strings.Join(details, "; ")
+	c.remedy = strings.Join(remedies, "; ")
 	return c
 }
 
