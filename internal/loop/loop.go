@@ -1712,6 +1712,15 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 					end.claim = claim
 					end.branch, evidenceOK, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir)
 					if evidenceOK {
+						// Fold the VERIFIED branch onto the carried claim, exactly as
+						// the observed-claim checkpoint above does: a recovered claim
+						// carries the plane's recorded branch and checkpointEvidence
+						// re-verified it, so the two already agree today — but the
+						// invariant "the carried claim's branch is the verified one"
+						// is what verifiedBranch and the takeover hand-off depend on,
+						// so hold it by construction rather than by coincidence of a
+						// single-source read.
+						end.claim.Claim.Branch = end.branch
 						end.checkpoint = true
 						log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s verified on the origin remote — treating it as the phase checkpoint and keeping the lease for the next phase",
 							labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, end.branch)

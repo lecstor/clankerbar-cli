@@ -278,6 +278,46 @@ func TestDrainPhases_ACappedBlindSpotPhaseCheckpointsOnThePlaneRecord(t *testing
 	}
 }
 
+// The token-ceiling and wall-clock arms of the peek's orderly-end disjunct are
+// the same recovery as the capped arm, pinned separately: a ceiling/wall-clock
+// kill is an orderly cut-off mid-thought, and with the plane confirming a
+// recorded branch (verified on origin) it is exactly as survivable as a cap.
+func TestDrainPhases_ACeilingOrWallClockBlindSpotPhaseCheckpointsOnThePlaneRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  func() harness.Result
+	}{
+		{"token ceiling", tokenCeilingResult},
+		{"wall clock", wallClockResult},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := captureLogs(t)
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: tc.res()}, // orderly cut-off, clean worktree, NO observed claim
+				{res: okResult(5, 0.05)},
+			}}
+			rel := &peekReleaser{
+				next:  plane.NextTask{TaskID: "t-1"},
+				state: map[string]plane.TaskState{"t-1": {Status: "in_progress", ClaimedByRun: "r-curl", Branch: "clanker/x"}},
+			}
+			d := blindSpotDriver(t, h, rel)
+
+			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+			}
+			if h.invokeCalls != 2 {
+				t.Fatalf("spawned %d sessions, want 2 — a plane-confirmed branch makes a ceiling/wall-clock cut-off survivable, exactly like the cap arm", h.invokeCalls)
+			}
+			if got := h.invocations[1].ResumeClaim; got.TaskID != "t-1" || got.RunID != "r-curl" {
+				t.Errorf("phase 2 ResumeClaim = %+v, want the plane-recovered t-1/r-curl", got)
+			}
+			if out := logs.String(); !strings.Contains(out, "treating it as the phase checkpoint") {
+				t.Errorf("the log does not say the plane record was taken as the checkpoint:\n%s", out)
+			}
+		})
+	}
+}
+
 // A plane record alone is not enough: since CLA-457 a checkpoint means a branch
 // VERIFIED on the origin remote, and a recovered claim faces the same gate.
 // A recorded-but-unverifiable branch keeps today's ending — and because the
