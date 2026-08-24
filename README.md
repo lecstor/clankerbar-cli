@@ -1003,6 +1003,66 @@ clankerbar tools and read as "the backlog was empty":
 Each of those errors is written to carry its own remedy, so they read as policy
 rather than as a bug.
 
+### Multi-repo projects: `repos` and `primary_repo`
+
+A task can name the repo it belongs to, and a session should start in THAT
+checkout rather than somewhere unconsidered. Two keys configure it - top level,
+or per project in multi-project mode, where a project's own non-empty values
+replace the top-level ones:
+
+```jsonc
+{
+  "repos": {
+    "lecstor/clankerbar-cli": "~/dev/clankerbar-cli",
+    "clankerbar": "../clankerbar"
+  },
+  "primary_repo": "lecstor/clankerbar-cli"
+}
+```
+
+**`repos`** maps a repo identity to its local checkout. The key is what a task's
+`repo` field carries: the full `owner/name`, or just the bare name. The value is
+a directory path, relative to the workdir or starting with `~`. It holds paths,
+never credentials.
+
+**`primary_repo`** names where a session starts when its task carries NO repo:
+a `repos` key, or any identity resolvable by the same steps below. With exactly
+one repo declared and no primary named, that one is primary implicitly. Left
+empty with two or more repos declared, a repo-less task fails the iteration
+instead of guessing.
+
+Resolution of an identity to a checkout, first match wins:
+
+1. a `repos` entry keyed by the full identity (`owner/name`);
+2. a `repos` entry keyed by the bare name;
+3. the workdir itself, when its basename IS that bare name;
+4. `<workdir>/<bare name>`, when such a directory exists;
+5. nothing: the iteration fails loudly with `repo_not_found` naming the
+   identity, rather than starting the session in the workdir anyway.
+
+With NOTHING configured at all the feature is off and the legacy workdir
+behaviour runs unchanged, so existing single-repo configs need none of this.
+Every resolved path is verified to exist as a directory before use; doctor
+reports each entry's resolution so a broken path is seen before it fails a run.
+
+**What each harness receives.** Declaring repos also widens every session's
+reach past its spawn checkout, so a session started in repo A can still work on
+repo B:
+
+- **`claude`**: `--add-dir` on the session argv, followed by one argv ELEMENT
+  per extra checkout (the flag is variadic over separate elements). The
+  settings file's deny rules still govern what it may actually do there.
+- **`opencode`**: an `external_directory` allow per declared checkout in the
+  `OPENCODE_PERMISSION` policy, matched absolutely regardless of cwd.
+- **`codex`**: nothing on argv. Codex's sandbox has no per-invocation flag for
+  extra writable roots; declare them yourself under
+  `[sandbox_workspace_write] writable_roots` in your `config.toml`. The driver
+  does not rewrite a sandbox you own.
+
+The conventional task-worktree area beside a checkout (`<checkout>-wt` as its
+sibling) joins the grant list automatically whenever that directory exists, so
+a session can create and edit the worktree it is told to work in.
+
 ### Multi-project: one instance, many queues
 
 One loop instance can drive **several projects** with a single **account-scoped**

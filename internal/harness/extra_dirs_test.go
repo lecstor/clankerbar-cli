@@ -3,6 +3,7 @@ package harness
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -144,20 +145,32 @@ func TestOpencodePolicyExtraDirsLegacySpawn(t *testing.T) {
 	}
 }
 
-// claude receives the declared repos by name on its argv: one variadic
-// --add-dir flag carrying every directory. Probes build their own argv and
-// never carry them.
+// claude receives the declared repos by name on its argv: one --add-dir flag,
+// then each directory as its OWN argv element. The flag is variadic over
+// separate elements, so the earlier joined-string emission parsed two extras as
+// ONE path containing spaces and granted nothing (CLA-443). The assertions are
+// element-wise for exactly that reason: a contains-check over
+// strings.Join(args, " ") passes under both emissions and cannot catch the
+// difference. Probes build their own argv and never carry them.
 func TestClaudeArgsExtraDirs(t *testing.T) {
+	dirs := []string{"/repos/a", "/repos/b", "/repos/c"}
 	args := claudeArgs(Invocation{
 		Prompt:       "Work.",
 		SettingsPath: "/cfg/settings.json",
-		ExtraDirs:    []string{"/repos/a", "/repos/b"},
+		ExtraDirs:    dirs,
 	})
-	if got := strings.Join(args, " "); !strings.Contains(got, "--add-dir /repos/a /repos/b") {
-		t.Errorf("args = %q, want one --add-dir carrying every declared checkout", got)
-	}
 	if n := count(args, "--add-dir"); n != 1 {
 		t.Errorf("--add-dir appears %d times in %v, want exactly once", n, args)
+	}
+	at := slices.Index(args, "--add-dir")
+	if at < 0 {
+		t.Fatalf("--add-dir missing from %v", args)
+	}
+	// Nothing follows the dirs in this invocation, so everything after the flag
+	// must be exactly the dirs, one element each - the shape a joined string
+	// fails, and the shape claude's variadic parse needs.
+	if rest := args[at+1:]; !slices.Equal(rest, dirs) {
+		t.Errorf("argv after --add-dir = %q, want each declared checkout as its own element %v", rest, dirs)
 	}
 	if got := claudeArgs(Invocation{Prompt: "Work."}); has(got, "--add-dir") {
 		t.Errorf("no-extra invocation emitted --add-dir: %v", got)
