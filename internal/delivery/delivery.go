@@ -586,16 +586,41 @@ func matchesRepoSlug(url, slug string) bool {
 	// Tolerate both ssh (git@host:owner/name) and https (https://host/owner/name) forms.
 	// The slug is 'owner/name'. We look for the exact sequence after stripping protocol.
 	clean := url
-	clean = strings.TrimSuffix(clean, ".git")
-	clean = strings.TrimSuffix(clean, "/")
+	// Strip the two trimmable suffixes in BOTH orders until stable: "name.git/",
+	// "name/.git", "/name.git" and trailing "/" all resolve to "…/name".
+	for {
+		before := clean
+		clean = strings.TrimSuffix(clean, ".git")
+		clean = strings.TrimSuffix(clean, "/")
+		if clean == before {
+			break
+		}
+	}
 	clean = strings.TrimPrefix(clean, "https://")
 	clean = strings.TrimPrefix(clean, "http://")
 	clean = strings.TrimPrefix(clean, "git@")
-	// After stripping protocol and ".git", both forms still contain the slug.
-	// ssh: 'github.com:lecstor/clankerbar-cli' -> after stripping 'github.com:' remains 'lecstor/clankerbar-cli'
-	// https: 'github.com/lecstor/clankerbar-cli' -> after stripping remains 'github.com/lecstor/clankerbar-cli'
-	// The simplest reliable check: does the cleaned URL contain the slug as a path segment?
-	return strings.Contains(clean, "/"+slug) || strings.Contains(clean, ":"+slug)
+	// After stripping protocol and ".git", both forms carry the slug as a path
+	// segment: ssh 'github.com:lecstor/clankerbar-cli' and https
+	// 'github.com/lecstor/clankerbar-cli'. The check requires a BOUNDARY on both
+	// sides of the slug — preceded by start, '/' or ':', followed by '/' or end —
+	// so `lecstor/clankerbar` never matches `lecstor/clankerbar-cli` (the
+	// project's own repo pair: the whole point of CLA-351 is to tell them apart).
+	for i := 0; i+len(slug) <= len(clean); i++ {
+		if !strings.HasPrefix(clean[i:], slug) {
+			continue
+		}
+		before, after := byte('/'), byte('/')
+		if i > 0 {
+			before = clean[i-1]
+		}
+		if j := i + len(slug); j < len(clean) {
+			after = clean[j]
+		}
+		if (before == '/' || before == ':') && (after == '/' || after == 0) {
+			return true
+		}
+	}
+	return false
 }
 
 func (v *Verifier) resolveRemote(ctx context.Context, repo string) string {

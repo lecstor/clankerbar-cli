@@ -2020,7 +2020,32 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 	// repo the session worked in, which is no longer always the target's.
 	v := d.newVerifier(workdir, d.cfg.AllowUncheckedPRFor(t.Name))
 	for _, rep := range res.Reports {
-		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch, PR: rep.PR}
+		// Resolve the claim's repo AUTHORITATIVELY from the task's own record —
+		// "the task's repo field (primary repo when unset)" is the doneWhen's
+		// words, and the session-declared value on update_task is secondary: a
+		// session can omit it (nothing in the served protocol tells it to pass
+		// `repo`), while the plane's task row always carries it (CLA-437). Mirror
+		// sessionDir's degradation exactly: an unwired plane falls back to the
+		// session's declaration, then to this target's primary repo.
+		repo := rep.Repo
+		if src, ok := t.Releaser.(plane.TaskRepoSource); ok && rep.TaskID != "" {
+			r, err := src.TaskRepo(ctx, rep.TaskID)
+			switch {
+			case err == nil && r != "":
+				repo = r
+			case err == nil && repo == "":
+				repo = t.PrimaryRepo
+			case errors.Is(err, plane.ErrNotWired):
+				if repo == "" {
+					repo = t.PrimaryRepo
+				}
+			default:
+				log.Printf("%scould not read the repo of task %s (%v) — the claim's session-declared repo is used as-is", labelOf(t), rep.Ref, err)
+			}
+		} else if repo == "" {
+			repo = t.PrimaryRepo
+		}
+		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch, PR: rep.PR, Repo: repo}
 		if rep.ClaimsMerge() {
 			claim.Commit, claim.IntegrationBranch = rep.Commit, rep.IntegrationBranch
 		}
@@ -2035,15 +2060,19 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 		cancel()
 
 		for _, c := range out.Checks {
+			where := labelOf(t)
+			if out.Repo != "" && out.Repo != workdir {
+				where += "[" + out.Repo + "] "
+			}
 			switch c.Status {
 			case delivery.Fail:
-				log.Printf("%sDELIVERY UNVERIFIED — %s: %s", labelOf(t), rep.Label(), c.Detail)
+				log.Printf("%sDELIVERY UNVERIFIED — %s: %s", where, rep.Label(), c.Detail)
 			case delivery.Warn:
-				log.Printf("%sDELIVERY WARN — %s: %s", labelOf(t), rep.Label(), c.Detail)
+				log.Printf("%sDELIVERY WARN — %s: %s", where, rep.Label(), c.Detail)
 			case delivery.Unknown:
-				log.Printf("%scould not verify %s: %s — carrying on", labelOf(t), rep.Label(), c.Detail)
+				log.Printf("%scould not verify %s: %s — carrying on", where, rep.Label(), c.Detail)
 			default:
-				log.Printf("%sverified %s: %s", labelOf(t), rep.Label(), c.Detail)
+				log.Printf("%sverified %s: %s", where, rep.Label(), c.Detail)
 			}
 		}
 		d.attestMerge(ctx, t, rep, out)

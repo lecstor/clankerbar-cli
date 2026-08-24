@@ -428,6 +428,7 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			TaskID   string `json:"taskId"`
 			Status   string `json:"status"`
 			Branch   string `json:"branch"`
+			Repo     string `json:"repo"`
 			Delivery struct {
 				Commit            string `json:"commit"`
 				IntegrationBranch string `json:"integrationBranch"`
@@ -442,13 +443,16 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		}
 		// The two claims the plane cannot check for itself. Armed here, kept only if
 		// the call is accepted, and verified against local git once the session ends
-		// (CLA-253).
+		// (CLA-253). Repo rides along (CLA-351): the session declares where its work
+		// lives, and the driver's post-iteration branch check uses it to tell two
+		// working copies with the same branch name apart.
 		res.expectReport(toolUseID, Report{
 			TaskID:            res.Claim.TaskID,
 			Ref:               res.Claim.Ref,
 			RunID:             res.Claim.RunID,
 			Status:            args.Status,
 			Branch:            args.Branch,
+			Repo:              args.Repo,
 			Commit:            args.Delivery.Commit,
 			IntegrationBranch: args.Delivery.IntegrationBranch,
 			PR:                args.Delivery.PR,
