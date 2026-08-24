@@ -6,10 +6,11 @@
 // claim — and one task (CLA-134) read `done` for four days while ~900 lines of its
 // work sat unpushed on one laptop, its own PR merging a stale snapshot.
 //
-// The driver is the right place to close that: it is already local, already in the
-// git tree, and already watches the session stream for `claim_task` and
+// The driver is the right place to close that: it is already local, already in
+// the git tree, and already watches the session stream for `claim_task` and
 // `update_task` (CLA-242). This adds a check to an observation that already
-// happens. It needs no new credentials and no plane change.
+// happens. It needs no new configured credentials - GitHub access rides the
+// operator's own `gh` auth, resolved per remote below - and no plane change.
 //
 // # Fail open, not closed
 //
@@ -44,6 +45,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -192,9 +194,10 @@ type Verifier struct {
 	// condition is never relaxed by it.
 	allowUncheckedPR bool
 
-	// ghBin and the polling window drive the PR check (prcheck.go). Fields so
-	// tests can substitute a fake gh and shrink the wait; New fills the
-	// production values.
+	// ghBin and the polling window drive the PR check (prcheck.go), and ghBin
+	// also resolves the per-owner token that scopes remote reads (CLA-458).
+	// Fields so tests can substitute a fake gh and shrink the wait; New fills
+	// the production values.
 	ghBin      string
 	prBudget   time.Duration
 	prInterval time.Duration
@@ -400,7 +403,7 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 		// AHEAD (or rewritten), never the local-ahead failure this check exists for:
 		// were we ahead, the remote tip would be one of our own ancestors and
 		// therefore present. Try one targeted fetch, then say we do not know.
-		_, _ = v.run(ctx, repo, "fetch", "--quiet", "--", remote, branch)
+		_, _ = v.runScoped(ctx, repo, "fetch", "--quiet", "--", remote, branch)
 	}
 	if !v.haveObject(ctx, repo, remoteSHA) {
 		return Check{Kind: BranchPushed, Status: Unknown, Detail: fmt.Sprintf(
@@ -436,7 +439,7 @@ func (v *Verifier) checkMerged(ctx context.Context, repo, remote, sha, integrati
 			"%s has no branch %q to check the delivery against", remote, integration)}
 	}
 	if !v.haveObject(ctx, repo, tip) {
-		_, _ = v.run(ctx, repo, "fetch", "--quiet", "--", remote, integration)
+		_, _ = v.runScoped(ctx, repo, "fetch", "--quiet", "--", remote, integration)
 	}
 	if !v.haveObject(ctx, repo, tip) {
 		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
@@ -651,8 +654,12 @@ func (v *Verifier) remoteURL(ctx context.Context, repo string) (string, error) {
 // lsRemote reads the remote's tip for a branch WITHOUT mutating anything. Empty
 // SHA with a nil error means the remote genuinely has no such branch — which is a
 // Fail, not an Unknown.
+//
+// This is a NETWORK command: it goes out scoped to the account that owns the
+// remote (runScoped), or a private repo answers "Repository not found" and the
+// check degrades to Unknown for want of credentials rather than evidence.
 func (v *Verifier) lsRemote(ctx context.Context, repo, remote, branch string) (string, error) {
-	out, err := v.run(ctx, repo, "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
+	out, err := v.runScoped(ctx, repo, "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
@@ -696,15 +703,28 @@ func (v *Verifier) aheadBy(ctx context.Context, repo, from, to string) string {
 // The environment is deliberately hostile to interaction: an unattended run has
 // no terminal, and a git that decides to ask for a password would hang the driver
 // rather than answering the question.
-//
-// The context alone does NOT bound this. `git ls-remote` and `git fetch` spawn
-// helpers (ssh, git-remote-https, a credential helper) that inherit the pipes
-// behind these buffers, and os/exec's Wait blocks until every inheritor closes its
-// write end — so a killed git can still leave the call sitting there. Measured at
-// 8s against a 500ms deadline, returning a nil error, which would have read as a
-// successful check. WaitDelay is what actually cuts it off, and the truncated read
-// is reported as the failure it is.
 func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string, error) {
+	return v.gitRun(ctx, dir, nil, args...)
+}
+
+// runScoped is run for the NETWORK commands: it adds the credential scoping
+// the resolved remote implies (remoteCredEnv), so ls-remote and fetch read a
+// private github.com remote as an account that can see it. Local operations
+// must stay on run: scoping costs a `gh auth token` spawn and local commands
+// never consult credentials.
+func (v *Verifier) runScoped(ctx context.Context, dir string, args ...string) (string, error) {
+	return v.gitRun(ctx, dir, v.remoteCredEnv(ctx, dir), args...)
+}
+
+// gitRun is run's engine, with extraEnv appended to the child's environment.
+// The WaitDelay discipline is not decoration: `git ls-remote` and `git fetch`
+// spawn helpers (ssh, git-remote-https, a credential helper) that inherit the
+// pipes behind these buffers, and os/exec's Wait blocks until every inheritor
+// closes its write end — so a killed git can still leave the call sitting
+// there. Measured at 8s against a 500ms deadline, returning a nil error, which
+// would have read as a successful check. WaitDelay is what actually cuts it
+// off, and the truncated read is reported as the failure it is.
+func (v *Verifier) gitRun(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, v.gitBin, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -714,6 +734,7 @@ func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string,
 		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
 		"GCM_INTERACTIVE=never",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -725,6 +746,118 @@ func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string,
 		return "", fmt.Errorf("git %s: %w", args[0], err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// --- credential resolution for remote reads (CLA-458) ------------------------
+//
+// A driven repository's origin may be an HTTPS URL that names no account
+// (`https://github.com/lecstor/ezyapp.git`). git then asks the ambient
+// credential helper without naming one either, and `gh auth git-credential`
+// serves whichever gh account is ACTIVE - which need not see the private repo,
+// so ls-remote answers "Repository not found", every check degrades to Unknown,
+// and since CLA-457 that Unknown is fail-closed: evidence that cannot run is
+// not evidence. The sibling repos whose origins DO embed their owner never hit
+// this, which is why the breakage looked like one repo being haunted.
+//
+// The fix rides the one GitHub credential mechanism this package already
+// depends on - `gh`, the same binary prCheck drives - rather than inventing a
+// second store: derive the owner from the remote URL, resolve THAT account's
+// token with `gh auth token --user`, and let git read the remote AS the owner
+// through a per-command insteadOf rewrite. Scoping by owner is load-bearing:
+// probed on gh 2.96.0, the credential helper refuses to serve a NON-active
+// account even when asked by name (an empty answer for username=lecstor while
+// username-less requests serve the active user), so credential.<url>.username
+// cannot carry this.
+//
+// The rewrite travels in the child's ENVIRONMENT (GIT_CONFIG_COUNT and
+// friends), never its argv: `-c url.<token>@github.com/...` would print the
+// token to ps(1) for every process on the box, while secrets in a child's env
+// are already this driver's hygiene model - CLANKERBAR_API_KEY rides the same
+// way. Nothing is persisted and no repository config is touched; the scope is
+// exactly this one git invocation.
+//
+// Every fallback below lands on "run unscoped" - byte-identical to pre-CLA-458
+// behavior - so fail-open stays fail-open: non-github hosts, ssh remotes,
+// owners with no gh token, and a failing or absent gh all degrade to today.
+
+const (
+	// insteadOfBase is the URL prefix git rewrites remote URLs INTO when the
+	// credential scoping applies: the token rides as the userinfo of a
+	// x-access-token URL, the convention GitHub Actions checkout established
+	// and GitHub's HTTPS endpoint accepts for OAuth tokens.
+	insteadOfBase = "url.https://x-access-token:%s@github.com/.insteadOf"
+
+	// insteadOfPrefix is WHAT gets rewritten: any https://github.com/ URL this
+	// invocation resolves - including through a remote name - reads as the
+	// token'd base above.
+	insteadOfPrefix = "https://github.com/"
+)
+
+// githubOwner extracts the account that owns a github.com HTTPS remote URL:
+// the first path segment of https://github.com/<owner>/<repo>. Empty for
+// anything else, because empty means "no scoping known": ssh remotes
+// authenticate with keys, other hosts are not gh accounts, GitHub Enterprise
+// would need its own gh hostname, and an owner-less URL has nothing to derive.
+func githubOwner(remoteURL string) string {
+	u, err := url.Parse(remoteURL)
+	if err != nil {
+		return ""
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return ""
+	}
+	if !strings.EqualFold(u.Hostname(), "github.com") {
+		return ""
+	}
+	owner := strings.TrimPrefix(u.Path, "/")
+	if i := strings.IndexByte(owner, '/'); i >= 0 {
+		owner = owner[:i]
+	}
+	return owner
+}
+
+// remoteCredEnv returns the environment additions that scope repo's resolved
+// remote to the account that owns it, or nil when no scoping applies. It costs
+// two local probes per network command - one `git remote get-url`, one `gh
+// auth token` spawn - and no cache, deliberately: Verify handles a single
+// claim, so the worst case is a handful of spawns at session end, while a
+// cache would outlive the gh auth state it was keyed on for every run after.
+func (v *Verifier) remoteCredEnv(ctx context.Context, repo string) []string {
+	raw, err := v.remoteURL(ctx, repo)
+	if err != nil || raw == "" {
+		return nil
+	}
+	owner := githubOwner(raw)
+	if owner == "" {
+		return nil
+	}
+	token := v.ghTokenFor(ctx, repo, owner)
+	if token == "" {
+		return nil
+	}
+	return []string{
+		"GIT_CONFIG_COUNT=1",
+		fmt.Sprintf("GIT_CONFIG_KEY_0="+insteadOfBase, token),
+		"GIT_CONFIG_VALUE_0=" + insteadOfPrefix,
+	}
+}
+
+// ghTokenFor resolves owner's GitHub token through `gh auth token --user` -
+// the same gh binary, and therefore the same credential mechanism, the PR
+// check already runs on. Any failure - gh missing, no such account, a wedged
+// call - is an empty token, which callers treat as "run unscoped". A token is
+// also refused if it cannot ride a single config value intact (embedded
+// whitespace would corrupt the insteadOf key into something silently wrong).
+func (v *Verifier) ghTokenFor(ctx context.Context, dir, owner string) string {
+	out, err := v.runGH(ctx, dir, "auth", "token", "--user", owner)
+	if err != nil {
+		return ""
+	}
+	token := strings.TrimSpace(out)
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return ""
+	}
+	return token
 }
 
 func short(sha string) string {
