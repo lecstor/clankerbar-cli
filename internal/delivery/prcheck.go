@@ -462,7 +462,15 @@ func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string) (prJudge
 // runner: an unattended run has no terminal to answer prompts with, and a
 // wedged helper must not hold the check past its WaitDelay.
 func (v *Verifier) runGH(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, v.ghBin, args...)
+	return runGHBin(ctx, v.ghBin, dir, args...)
+}
+
+// runGHBin is runGH with the binary spelled out, so the per-owner token
+// resolution in delivery.go (TokenForOwner, CLA-458) drives the same spawn
+// discipline without a Verifier in hand - CLA-459's doctor consumer passes
+// "gh" here.
+func runGHBin(ctx context.Context, ghBin, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, ghBin, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"GH_NO_UPDATE_NOTIFIER=1",
