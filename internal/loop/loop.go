@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -266,6 +267,21 @@ type Driver struct {
 	// measured over a run, not a drain — so it hangs off the Driver and is
 	// reported from Run. Lazily built; see tallyDead and logDeadTally.
 	deadTally map[tallyKey]*phaseTally
+
+	// restartRequested (CLA-461) flips when a RESTART / RESTART_NOW marker has
+	// been consumed and the run is unwinding toward a re-exec. Atomic because
+	// the RESTART_NOW watcher goroutine writes it while the loop reads it after
+	// Run returns.
+	restartRequested atomic.Bool
+
+	// reloadConfig rebuilds the config for a RELOAD marker (CLA-461). Production
+	// wires Load+ApplyFlagOverrides+Validate via SetReloader; nil falls back to
+	// Load(Source())+Validate. See control.go.
+	reloadConfig func() (*config.Config, error)
+
+	// restartPoll is how often the RESTART_NOW watcher polls the state dir. A
+	// field so tests can shrink it; production always gets restartCheckInterval.
+	restartPoll time.Duration
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -361,6 +377,9 @@ func (d *Driver) Run(ctx context.Context) error {
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
+	// Recomputed every iteration below, so a RELOAD that edits the interval is
+	// seen from the next idle poll on. This first value is only what the banner
+	// announces.
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 	// Every harness this run will SPAWN, not just the configured one: a mixed
 	// sequence's banner naming one of them is a log that disagrees with the
@@ -381,8 +400,16 @@ func (d *Driver) Run(ctx context.Context) error {
 	var totalCost float64
 	drains := 0
 
+	// CLA-461: everything below runs on a context this Run owns, so a RESTART_NOW
+	// marker can cancel it mid-session and ride the exact kill/cleanup/release
+	// machinery a Ctrl-C rides. Cancelling the caller's ctx directly is not
+	// available to us; deriving one is.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	d.watchRestartNow(runCtx, cancelRun)
+
 	for {
-		if ctx.Err() != nil {
+		if runCtx.Err() != nil {
 			log.Print("cancelled — stopping")
 			return nil
 		}
@@ -395,6 +422,42 @@ func (d *Driver) Run(ctx context.Context) error {
 			log.Print("STOP requested — stopping")
 			return nil
 		}
+		// The restart/reload markers (CLA-461), honoured exactly where STOP is:
+		// the ITERATION boundary. Never a mid-drain phase seam — the run holds
+		// the task there. Reaching this point means the previous drain has fully
+		// unwound and handed its claim back, so a graceful restart holds no claim
+		// across the boundary by construction (resume is the plane's job anyway).
+		// A RESTART_NOW consumed here found no session in flight and acts as a
+		// plain restart; when one IS in flight the watcher in watchRestartNow has
+		// already cancelled the drain and this block is never reached.
+		if present, msg := d.readMarker(MarkerRestart); present {
+			_ = d.state.Remove(MarkerRestart)
+			if msg != "" {
+				log.Printf("RESTART requested: %s", msg)
+			} else {
+				log.Print("RESTART requested")
+			}
+			log.Print("re-executing at the iteration boundary")
+			d.restartRequested.Store(true)
+			return nil
+		}
+		if present, msg := d.readMarker(MarkerRestartNow); present {
+			_ = d.state.Remove(MarkerRestartNow)
+			if msg != "" {
+				log.Printf("RESTART_NOW requested: %s", msg)
+			} else {
+				log.Print("RESTART_NOW requested")
+			}
+			log.Print("nothing in flight here — re-executing immediately")
+			d.restartRequested.Store(true)
+			return nil
+		}
+		if present, _ := d.readMarker(MarkerReload); present {
+			_ = d.state.Remove(MarkerReload)
+			log.Print("RELOAD requested — re-reading the config file at the iteration boundary")
+			d.applyReload()
+		}
+		idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 		if d.cfg.MaxIterations > 0 && drains >= d.cfg.MaxIterations {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
@@ -418,7 +481,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			anyCandidate := false
 			for i := range d.targets {
 				t := d.targets[i]
-				sum, err := t.Poller.Poll(ctx)
+				sum, err := t.Poller.Poll(runCtx)
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):
 					log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
@@ -495,7 +558,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			}
 			if !d.blind {
 				if !anyCandidate {
-					if d.waitOrStop(ctx, idle) {
+					if d.waitOrStop(runCtx, idle) {
 						return nil
 					}
 					continue
@@ -523,7 +586,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, handoffs, stop, err := d.drainPhases(ctx, drains, d.cursor, target,
+		tokens, cost, handoffs, stop, err := d.drainPhases(runCtx, drains, d.cursor, target,
 			spend{start: start, tokens: totalTokens, cost: totalCost})
 		// Count the spend BEFORE deciding what to do with the outcome: a drain that
 		// stopped or failed still burned what it burned, and the accumulator is what
@@ -562,7 +625,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		// more work appeared.
 		if d.blind {
 			log.Printf("idle — re-checking in %s", idle)
-			if d.waitOrStop(ctx, idle) {
+			if d.waitOrStop(runCtx, idle) {
 				return nil
 			}
 		}
@@ -1326,7 +1389,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv := d.invocationFor(t, phaseIdx, ph, prev, spawnDir)
+		inv, ierr := d.invocationFor(t, phaseIdx, ph, prev, spawnDir)
+		if ierr != nil {
+			// The session env refused to resolve (a failing or empty-output
+			// fromCommand, an unreadable @path file — the error names the
+			// variable). REFUSING THE SPAWN is the fail-closed contract: no
+			// session starts without its declared env (CLA-462). This is not a
+			// retryable failure — nothing was spawned and the cause is config,
+			// not a blip — so it fails the phase like a bad spawnDir does.
+			return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: refusing to spawn: %w", drainNum, ph.Label(phaseIdx), ierr)
+		}
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
 		f, ferr := d.state.Create(logName)
@@ -2688,7 +2760,16 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
-		got, err := a.Probe(ctx, d.invocationOn(t, d.cfg.HarnessFor(ph), true))
+		inv, ierr := d.invocationOn(t, d.cfg.HarnessFor(ph), true)
+		if ierr != nil {
+			// A refused probe spawn spends nothing and learns nothing about the
+			// limit, so it reads exactly like any other probe error: log the
+			// named variable (the error carries it) and poll again next
+			// interval. The wait stays bounded by its own dials.
+			log.Printf("probe error: %v — will retry next interval", ierr)
+			continue
+		}
+		got, err := a.Probe(ctx, inv)
 		// Count the probe BEFORE reading its verdict, and before the error branch: a
 		// probe that failed still spawned the harness and still spent. Every path out
 		// of here — resume, stop, or another lap — carries it.
@@ -2822,6 +2903,10 @@ func droppedNote(dropped int64) string {
 // changed between attempts), and so a resolution failure fails the phase before
 // anything is spawned.
 //
+// Unlike the directory, the session env is resolved per CALL, not once per
+// phase: every attempt re-runs its fromCommand declarations fresh, so a token
+// rotated mid-ladder still reaches the next attempt (CLA-462).
+//
 // The substitution is what lets a later phase RESUME a run rather than claim a
 // task. A session cannot know its own run id — it never called claim_task — so
 // the driver, which watched the earlier phase's stream go by, is the only thing
@@ -2831,8 +2916,11 @@ func droppedNote(dropped int64) string {
 // A placeholder with no claim to fill it is LEFT STANDING rather than blanked.
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) harness.Invocation {
-	inv := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) (harness.Invocation, error) {
+	inv, err := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
+	if err != nil {
+		return inv, err
+	}
 	if spawnDir != "" {
 		inv.WorkDir = spawnDir
 	}
@@ -2931,13 +3019,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// switched off.
 		inv.ResumeClaim = prev.Claim
 	}
-	return inv
-}
-
-// invocation builds the harness invocation for one target: the target's workdir
-// and .mcp.json (which select the project) over the config's global fields.
-func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
-	return d.invocationOn(t, d.cfg.Harness, probe)
+	return inv, nil
 }
 
 // invocationOn builds the invocation for one target ON A NAMED HARNESS: the
@@ -2955,12 +3037,23 @@ func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
 // project's own file is the top-level harness's, so it only applies there; and
 // the harness block's path is the single-project fallback. config.Validate
 // refuses the combination that would silently resolve to the wrong project.
-func (d *Driver) invocationOn(t Target, harnessName string, probe bool) harness.Invocation {
+//
+// The session env is composed HERE, at spawn time, fresh every call (CLA-462):
+// the four-level env overlay with every fromCommand executed now, so a rotated
+// token reaches this session without a daemon restart. An error — a failing,
+// timed-out or empty-output command, an unreadable @path file — REFUSES the
+// spawn: the caller reports it and no session starts, because a session without
+// its declared env is the incident, not a degraded mode.
+func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness.Invocation, error) {
 	workdir := t.WorkDir
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
 	hc := d.cfg.SessionFor(harnessName)
+	env, err := d.cfg.SessionEnv(harnessName, t.Name)
+	if err != nil {
+		return harness.Invocation{}, err
+	}
 	return harness.Invocation{
 		Prompt:        d.cfg.Prompt,
 		Model:         hc.Model,
@@ -2968,9 +3061,9 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) harness.
 		MCPConfigPath: d.cfg.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
 		ConfigDir:     hc.ConfigDir,
 		SettingsPath:  hc.SettingsPath,
-		Env:           d.cfg.EnvSlice(),
+		Env:           env,
 		Probe:         probe,
-	}
+	}, nil
 }
 
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task
@@ -3092,6 +3185,15 @@ func labelOf(t Target) string {
 
 // waitOrStop waits up to dur, but stays responsive to a STOP marker (consuming it)
 // and to context cancellation. Reports whether the loop should stop.
+//
+// CLA-461: the restart/reload markers get the same responsiveness, so a control
+// request is never stuck behind a multi-hour idle poll or a supervised limit
+// wait. RESTART / RESTART_NOW return true (stop) with restartRequested set, so
+// the caller's caller re-execs; RELOAD re-reads the config in place and lets the
+// CURRENT wait run out on its existing schedule — ending a supervised limit
+// wait early would turn a dial edit into an immediate paid probe against the
+// very limit being waited out. A changed poll_interval applies from the NEXT
+// pause, which recomputes it.
 func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 	const chunk = 3 * time.Second
 	// Round(0) strips the monotonic reading, so wallStart measures REAL elapsed
@@ -3107,6 +3209,31 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 			_ = d.state.Remove("STOP")
 			log.Print("STOP requested during wait — stopping")
 			return true
+		}
+		if present, msg := d.readMarker(MarkerRestart); present {
+			_ = d.state.Remove(MarkerRestart)
+			if msg != "" {
+				log.Printf("RESTART requested during wait: %s", msg)
+			} else {
+				log.Print("RESTART requested during wait")
+			}
+			d.restartRequested.Store(true)
+			return true
+		}
+		if present, msg := d.readMarker(MarkerRestartNow); present {
+			_ = d.state.Remove(MarkerRestartNow)
+			if msg != "" {
+				log.Printf("RESTART_NOW requested during wait: %s", msg)
+			} else {
+				log.Print("RESTART_NOW requested during wait")
+			}
+			d.restartRequested.Store(true)
+			return true
+		}
+		if present, _ := d.readMarker(MarkerReload); present {
+			_ = d.state.Remove(MarkerReload)
+			log.Print("RELOAD requested during wait — reloading config; this wait keeps its schedule")
+			d.applyReload()
 		}
 		remaining := time.Until(end)
 		if remaining <= 0 {

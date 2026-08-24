@@ -429,9 +429,11 @@ func mustResolveStateDir(t *testing.T, cfg *config.Config) string {
 }
 
 // A leftover marker is the failure that looks exactly like "the backlog was
-// empty": the loop stops on its first tick and exits clean.
+// empty": the loop stops on its first tick and exits clean. The CLA-461
+// restart/reload markers are the same class — a surprise re-exec or reload on
+// the first tick instead of a surprise stop — so every one of the five must warn.
 func TestStateDirLeftoverMarkersWarn(t *testing.T) {
-	for _, marker := range []string{"HALT", "STOP"} {
+	for _, marker := range []string{"HALT", "STOP", "RESTART", "RESTART_NOW", "RELOAD"} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := validCfg(t)
 			stateDir := mustResolveStateDir(t, cfg)
@@ -1511,7 +1513,7 @@ func TestPermissionsOpencodeEnvOverrideWarns(t *testing.T) {
 		Harness: "opencode",
 		Prompt:  "x",
 		WorkDir: t.TempDir(),
-		Env:     map[string]string{"OPENCODE_PERMISSION": `{"bash":"allow"}`},
+		Env:     config.EnvMap{"OPENCODE_PERMISSION": {Literal: `{"bash":"allow"}`}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -1961,11 +1963,11 @@ func TestDoctorAcceptsTheSameConfigNamedExplicitly(t *testing.T) {
 // credential and doctor output is what an operator pastes into an issue.
 func TestConfigCheckNamesEnvKeysWithoutValues(t *testing.T) {
 	cfg := validCfg(t)
-	cfg.Env = map[string]string{"ZED": "zzz", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secret"}
+	cfg.Env = config.EnvMap{"ZED": {Literal: "zzz"}, "CLAUDE_CODE_OAUTH_TOKEN": {Literal: "sk-ant-oat01-secret"}}
 
 	c := checkConfig(cfg)
 	joined := strings.Join(c.info, "\n")
-	if !strings.Contains(joined, "env: CLAUDE_CODE_OAUTH_TOKEN, ZED") {
+	if !strings.Contains(joined, "env[env]: CLAUDE_CODE_OAUTH_TOKEN, ZED") {
 		t.Errorf("config check should list the env keys, sorted:\n%s", joined)
 	}
 	if strings.Contains(joined, "sk-ant-oat01-secret") || strings.Contains(joined, "zzz") {

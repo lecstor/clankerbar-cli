@@ -370,6 +370,8 @@ Those promises harden at v1.0.
 clankerbar run --harness=claude
 clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
+clankerbar ctl restart -c ./clankerbar.json   # tell the RUNNING daemon to re-exec
+clankerbar ctl reload  -c ./clankerbar.json   # re-read the config file, no exec
 ```
 
 Flags are **GNU-style**: `--long` options, `-x` shorts. `--config` (`-c`) and
@@ -416,7 +418,8 @@ WARN  config_dir   not set — the session inherits the ambient environment
 WARN  backlog      https://clankerbar.com/api/projects/acme/backlog-summary — 0 claimable, 2 open question(s) — nothing to claim; the loop will idle without spawning
                 -> answer the open question(s) at clankerbar.com, or expect an idle run
 WARN  state_dir    /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549 has a leftover STOP marker
-                -> delete it, or the loop stops immediately: rm /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP
+                   STOP — the loop stops on its first tick
+                 -> delete it, or the loop acts on it immediately on start: rm /Users/you/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP
 WARN  workdir[acme] /Users/you/dev has no agent-instructions file (AGENTS.md / CLAUDE.md)
                 -> add one here naming each repo below and where its protocol lives — a session started in a multi-repo parent loads nothing from the repos under it
 PASS  permissions  /Users/you/.config/clankerbar/headless.json parses
@@ -432,7 +435,8 @@ harness), **backlog** (creds present and the summary read succeeds — distingui
 no creds, a rejected key, a `project_required` key/route mismatch, and an
 unreachable endpoint — plus whether the queue is gated on *your* open questions,
 or paused from the console), **state_dir** (the driver's own directory: writable,
-no leftover `HALT`/`STOP`, and not sitting inside a configured workdir - a state
+no leftover control markers (`HALT`/`STOP` and the `ctl` restart/reload family),
+and not sitting inside a configured workdir - a state
 dir under one a session is spawned in is writable by that session, which hands it
 the loop's own `STOP`/`HALT` switch; under a workdir nothing runs in *yet* it is
 the same trap for the next `projects[]` entry that inherits it), **workdir** (per
@@ -615,7 +619,30 @@ resolved path:
 
 ```sh
 touch ~/.local/state/clankerbar/loop/dev-9f70ef211d1e0549/STOP   # stop gracefully (responsive even mid-wait)
+clankerbar ctl restart    # finish the session, then re-exec at the iteration boundary
+clankerbar ctl restart --now   # kill the in-flight session, release its claim, re-exec now
+clankerbar ctl reload     # re-read the config file at the next boundary, no exec
 ```
+
+`ctl` writes a marker into the same state dir (`RESTART` / `RESTART_NOW` /
+`RELOAD`, read exactly where `STOP` is read), resolved from `-c <config>` —
+plus `--workdir`, if the daemon was launched with that override — the same way
+`run` resolves them. A **graceful restart** never cuts a session short:
+the daemon finishes what it is doing, holds no claim across the iteration
+boundary (the plane keeps all durable state, so resume is by construction),
+then re-execs itself with the **same argv and environment**, through its launch
+path - so restarting after installing a new build runs the new build. **Reload**
+re-reads the config file at the next iteration boundary without replacing
+anything: budget, ceiling, prompt and poll-interval edits apply to the next
+iteration; harness, env and binary changes need a restart.
+
+One limit worth knowing before you reach for restart: **re-exec preserves the
+daemon's CURRENT environment.** It cannot conjure env the daemon was never
+launched with - a tokenless daemon restarts tokenless (that class of problem is
+env ownership, not restart). And a leftover control marker causes a surprise
+restart or reload on the next start - `doctor` warns about all of them, and
+`ctl`'s own output says what to do if no loop is actually running against the
+config you pointed it at.
 
 An explicit `state_dir` wins, but pointing it back inside a workdir gives every
 session spawned there the ability to write these markers. `doctor` WARNs whenever
@@ -633,7 +660,7 @@ the driver polls the project-in-path summary route whenever it knows the slug, w
 it derives from your `.mcp.json`'s `/mcp/<slug>` URL or from the `projects` config
 (below). A *project-scoped* key works too (the CI-style setup). With no creds or no
 resolvable endpoint the loop drains blind and can't see the flag — the local
-`STOP`/`HALT` markers remain the fallback there. Two misconfigurations hard-stop
+`STOP`/`HALT` markers (and `ctl restart`/`reload`) remain the fallback there. Two misconfigurations hard-stop
 (non-zero exit) instead of blind-draining doomed sessions: a revoked/wrong key
 (`401/403`), and an account key with **no derivable project slug** (`400
 project_required` from the legacy slug-less route) — give the loop a slug via
@@ -821,6 +848,7 @@ says why. (JSON today; TOML is the likely final format.)
   "max_session_wall_clock": 0,
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
+  "env": {},
   "idle_poll_interval": "60s",
   "poll_interval": "30m",
   "max_retries": 0,
@@ -941,6 +969,50 @@ Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at t
 root here is the maintainers' own agent wiring and names the `clankerbar` project
 slug; running the loop from inside this checkout would have it poll a queue you
 cannot read, which it refuses rather than drains.
+
+#### `env`: the daemon owns each session's environment
+
+`env` declares extra environment for spawned sessions, so load-bearing variables
+do not depend on how the binary happened to be launched - with `GH_TOKEN`
+declared here, the wrapper script that used to export it stops being
+load-bearing and starting `clankerbar run` directly is safe (CLA-462). A value
+is either a literal string or a command whose stdout becomes the value:
+
+```json
+{
+  "env": {
+    "GH_TOKEN": { "fromCommand": "gh auth token -u your-account" },
+    "CLAUDE_CODE_OAUTH_TOKEN": "@~/.secrets/claude-oauth"
+  }
+}
+```
+
+The map overlays at four levels, most specific wins per key, in the same order
+the MCP config uses: top level, then `harnesses.<name>.env`, then
+`projects[].env`, then that project's `env_per_harness.<name>`. In multi-project
+mode declare each project's token on its own entry, so no session ever carries
+another project's credential.
+
+Three properties carry the security and reliability weight:
+
+- **Command-derived values are resolved fresh at every spawn.** A rotated token
+  reaches the next session with no daemon restart. A command that fails, times
+  out (10s), or prints nothing REFUSES that spawn with a log line naming the
+  variable - never a silent partial env, because a session missing its declared
+  environment is the incident, not a degraded mode.
+- **`@path` secrets stay owner-only, enforced.** A file any other local account
+  can read refuses the spawn, and so does a file that has been emptied - an
+  invisible token rot must fail at spawn with the variable named, not inside
+  git later.
+- **Values come from the operator's own config only.** Nothing in a workdir or
+  checkout feeds this map; the credential-origin rule for the account key is
+  unchanged.
+
+Variable names must be valid names (`[A-Za-z_][A-Za-z0-9_]*`) and commands must
+be non-empty; both are refused at load. `doctor` runs every declared command and
+re-checks every `@path` file, so a source that has stopped working is a FAIL in
+the preflight instead of a refusal at 3am, and it WARNs when a project declares
+repos but no `GH_TOKEN` source anywhere.
 
 ### Where the account-scoped key is allowed to go
 
@@ -1083,7 +1155,8 @@ have claimable work, each session spawning in its own project's workdir (whose
 
 Per entry: `slug` (required, the `<slug>` in `/mcp/<slug>`), `workdir`, and
 optionally `mcp_config_path` (defaults to `<workdir>/.mcp.json`). Budgets,
-`max_iterations`, and the `STOP`/`HALT` markers stay **instance-global** — one
+`max_iterations`, and the control markers (`STOP`/`HALT` plus the
+`ctl restart`/`reload` family) stay **instance-global** — one
 operator, one spend pool; the console pause is per project. With no `projects`
 list, the top-level fields drive a single project exactly as before.
 
@@ -1099,7 +1172,8 @@ and under Claude a `400` still stops. `max_retries: 0` (the default) means **nev
 keep retrying at the ceiling until the API recovers, right for a daemon; set a
 positive number to bound it. A usage-limit pause and a transient retry both re-run
 the same iteration and neither advances the iteration count. `STOP` stays
-responsive during any wait.
+responsive during any wait — and so do the restart/reload markers (`ctl
+restart`, `--now`, `reload`).
 
 **One thing is bounded even under `max_retries: 0`: attempts that report no spend
 at all.** A budget ceiling can only stop spend it is told about, and the figures it

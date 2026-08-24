@@ -396,7 +396,10 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	d.cfg.Budget = config.Budget{MaxTokens: 75_000_000}
 
 	ph := d.cfg.EffectivePhases()[0]
-	inv := d.invocationFor(d.targets[0], 0, ph, nil, "")
+	inv, err := d.invocationFor(d.targets[0], 0, ph, nil, "")
+	if err != nil {
+		t.Fatalf("invocationFor: %v", err)
+	}
 
 	if want := d.cfg.Budget.SessionTokenCeiling(); inv.MaxSessionTokens != want {
 		t.Errorf("invocation carries MaxSessionTokens %d, want the resolved %d", inv.MaxSessionTokens, want)
@@ -737,10 +740,18 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	d.cfg.MaxSessionWallClock = config.Duration(time.Hour)
 
 	phases := d.cfg.EffectivePhases()
-	if got := d.invocationFor(d.targets[0], 0, phases[0], nil, "").MaxSessionWallClock; got != 20*time.Minute {
+	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "")
+	if err != nil {
+		t.Fatalf("invocationFor phase 1: %v", err)
+	}
+	if got := inv1.MaxSessionWallClock; got != 20*time.Minute {
 		t.Errorf("phase 1 invocation carries %s, want its own 20m", got)
 	}
-	if got := d.invocationFor(d.targets[0], 1, phases[1], nil, "").MaxSessionWallClock; got != time.Hour {
+	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "")
+	if err != nil {
+		t.Fatalf("invocationFor phase 2: %v", err)
+	}
+	if got := inv2.MaxSessionWallClock; got != time.Hour {
 		t.Errorf("phase 2 invocation carries %s, want the run-wide 1h it inherits", got)
 	}
 }

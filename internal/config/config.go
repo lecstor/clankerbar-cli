@@ -229,6 +229,14 @@ type HarnessConfig struct {
 	// SettingsPath is the extra settings file (Claude Code's --settings) carrying
 	// the headless permission policy. Claude-specific; other adapters ignore it.
 	SettingsPath string `json:"settings_path"`
+
+	// Env is this harness's own extra session environment, overlaid ON TOP of the
+	// top-level env map (per-key winner) — see Config.Env for what the map holds.
+	// Unlike the fields above it does NOT inherit the top-level value only for the
+	// run-wide harness: environment is not dialect-shaped, so every layer of the
+	// overlay applies to every harness, with SessionEnv stacking them in
+	// most-specific-wins order.
+	Env EnvMap `json:"env"`
 }
 
 // Empty reports whether this block declares nothing at all — the shape that is
@@ -236,7 +244,7 @@ type HarnessConfig struct {
 // same reason. Written out rather than compared against the zero value because
 // the Models map makes the struct incomparable.
 func (h HarnessConfig) Empty() bool {
-	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == ""
+	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0
 }
 
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
@@ -792,21 +800,32 @@ type Config struct {
 	// member of; per-project keys are never needed.
 	Projects []Project `json:"projects"`
 
-	// Env is extra environment for the spawned harness process, as KEY=VALUE
-	// pairs. The child already inherits the loop's own environment, so this is for
-	// the unattended case (cron / launchd / systemd) where there is no interactive
-	// shell to export into — e.g. supplying CLAUDE_CODE_OAUTH_TOKEN when auth lives
-	// in a shell alias rather than the config dir.
+	// Env is extra environment for the spawned harness process. Each entry's
+	// value is either a literal string or an object {"fromCommand": "..."} whose
+	// stdout becomes the value, resolved FRESH AT EVERY SPAWN so a rotated token
+	// reaches the next session without a daemon restart (CLA-462). The child
+	// already inherits the loop's own environment, so this is for the unattended
+	// case: with GH_TOKEN declared here — per project if you drive several — the
+	// cb-run wrapper stops being load-bearing and launching the binary directly
+	// is safe.
 	//
-	// A value of the form "@path" is replaced by the contents of that file
-	// (trimmed; a leading ~ is expanded). Keep a secret in a 0600 file and point at
-	// it here rather than inlining it — mirroring CLANKERBAR_API_KEY, which is read
-	// from the environment, never this config file. That 0600 is ENFORCED, not
-	// advice: a file any other local account can read is refused (see resolveEnv).
-	Env map[string]string `json:"env"`
+	// The map overlays at FOUR levels in most-specific-wins order (the same
+	// precedence ResolveMCPConfig applies): this top-level map first, then
+	// `harnesses.<name>.env`, then `projects[].env`, then that project's
+	// `env_per_harness.<name>`. A value of the form "@path" is replaced by the
+	// contents of that file (trimmed; a leading ~ is expanded) — keep a secret in
+	// a 0600 file and point at it here rather than inlining it. That 0600 is
+	// ENFORCED, not advice: a file any other local account can read refuses the
+	// session spawn, as it always refused Validate.
+	//
+	// A fromCommand whose execution fails, times out (10s), or produces empty
+	// output REFUSES the session spawn with a log line naming the variable —
+	// fail closed, because a session missing its declared env is the incident,
+	// not a degraded mode. `doctor` verifies every declared command resolves
+	// before a run starts.
+	Env EnvMap `json:"env"`
 
-	source string   // path the config was loaded from, for diagnostics
-	env    []string // resolved KEY=VALUE pairs (built in Validate)
+	source string // path the config was loaded from, for diagnostics
 
 	// harnessFromFlag / modelFromFlag record that --harness / --model overrode
 	// the file. Both flags say "the run has ONE harness and this is it", which a
@@ -858,6 +877,19 @@ type Project struct {
 	//
 	// Each entry is held to the same origin and slug checks as MCPConfigPath.
 	MCPConfigPaths map[string]string `json:"mcp_config_paths"`
+
+	// Env is this project's extra session environment, overlaid on top of the
+	// top-level env map for THIS project's sessions only — see Config.Env for
+	// what an entry holds. This is where a project's GH_TOKEN belongs when one
+	// daemon drives several backlogs: each project declares its own source, so
+	// no session ever carries another project's credential.
+	Env EnvMap `json:"env"`
+
+	// EnvPerHarness is this project's env PER HARNESS (harness name -> env map),
+	// the most specific layer of the four-level overlay: it wins per key over
+	// projects[].env, which wins over `harnesses.<name>.env`, which wins over
+	// the top level. Empty on every config that needs no per-pair override.
+	EnvPerHarness map[string]EnvMap `json:"env_per_harness"`
 
 	// AllowUncheckedPR is this project's CLA-310 opt-out, overriding the
 	// top-level field of the same name for this project only. See
@@ -2283,11 +2315,29 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	resolved, err := resolveEnv(c.Env)
-	if err != nil {
+	// The session env declarations (CLA-462) are validated at all FOUR levels
+	// here — names and commands are static facts of the file, so a bad one is a
+	// config error, not a spawn-time surprise. Resolution itself happens fresh
+	// at every spawn (SessionEnv), because command-derived values exist to be
+	// fresh.
+	if err := validateEnvDecls(c.Env, "env"); err != nil {
 		return err
 	}
-	c.env = resolved
+	for _, name := range sortedKeys(c.Harnesses) {
+		if err := validateEnvDecls(c.Harnesses[name].Env, "harnesses."+name+".env"); err != nil {
+			return err
+		}
+	}
+	for i := range c.Projects {
+		if err := validateEnvDecls(c.Projects[i].Env, fmt.Sprintf("projects[%d].env", i)); err != nil {
+			return err
+		}
+		for _, h := range sortedKeys(c.Projects[i].EnvPerHarness) {
+			if err := validateEnvDecls(c.Projects[i].EnvPerHarness[h], fmt.Sprintf("projects[%d].env_per_harness.%s", i, h)); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -2304,45 +2354,6 @@ func discoverMCPConfig(workdir string) string {
 	return ""
 }
 
-// resolveEnv turns the env map into sorted KEY=VALUE pairs, reading "@path"
-// values from disk so a secret needn't be inlined in the config file. Sorting
-// keeps the child's environment deterministic across runs.
-//
-// An `@path` file must be owner-only (CLA-260). The indirection exists for one
-// reason - holding a credential out of the config file - and the doc comment on
-// Env has always told operators to keep it at 0600, but nothing checked, so a
-// `chmod 644` token file was accepted in silence and every local account could
-// read the key that drives the whole backlog. Refused rather than warned: a WARN
-// in an overnight log is read after the fact, if at all, and the fix is one
-// chmod.
-func resolveEnv(m map[string]string) ([]string, error) {
-	if len(m) == 0 {
-		return nil, nil
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		v := m[k]
-		if strings.HasPrefix(v, "@") {
-			path := expandHome(strings.TrimPrefix(v, "@"))
-			data, err := readOwnerOnly(path, groupOtherAccess)
-			if err != nil {
-				if errors.Is(err, errInsecureMode) {
-					return nil, fmt.Errorf("env %s: %w - an @path secret must be readable only by you: chmod 600 %s", k, err, path)
-				}
-				return nil, fmt.Errorf("env %s: %w", k, err)
-			}
-			v = strings.TrimSpace(string(data))
-		}
-		out = append(out, k+"="+v)
-	}
-	return out, nil
-}
-
 // sortedKeys is map iteration made deterministic, for the checks whose ERROR
 // depends on which entry is reached first. A validation message that names a
 // different block on each run of the same file reads as a flaky check rather
@@ -2355,10 +2366,6 @@ func sortedKeys[V any](m map[string]V) []string {
 	sort.Strings(keys)
 	return keys
 }
-
-// EnvSlice returns the resolved extra environment (KEY=VALUE) for the harness,
-// populated by Validate. Nil when no env is configured.
-func (c *Config) EnvSlice() []string { return c.env }
 
 // legacyStateDirName is where the state dir used to live, relative to the
 // workdir. Kept only so `doctor` and the loop can point an operator at a
