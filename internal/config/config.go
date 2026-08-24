@@ -309,23 +309,30 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
 // HandoffContinuation is appended, by the driver, to a handoff respawn's prompt
-// (CLA-353) so a phase's own terminal step survives a session-authored hand-off.
+// (CLA-353) so a phase's own contract survives a session-authored hand-off.
 // HandoffPreamble carries the "resume, don't claim" contract forward on every
 // handoff; the ORIGINAL phase brief's own instructions do not — a handoff
 // respawn's prompt is HandoffPreamble plus the predecessor's self-authored
 // nextPrompt alone, so anything the built-in brief said is otherwise gone the
-// moment a session hands off instead of finishing itself. For the review phase
-// that includes reviewTerminalStep - the PR-then-update_task sequence CLA-353
-// exists to make land - so a handoff mid-review must not be a way to lose it.
-// The rerun bound rides along with it (the phase-2 review of CLA-391): the
-// successor inheriting a half-fixed finding list is the session most likely
-// to rerun its way into the drain waste, and a handoff must not be how it
-// arrives unbounded.
-// Empty for a phase with no such step: the implement phase stops rather than
-// hands its task to in_review, so it has none to carry forward.
+// moment a session hands off instead of finishing itself.
+//
+// Two things ride, and the first rides for BOTH built-in phases. The rerun
+// bound (CLA-391) rides because a handoff must not be how unbounded rerunning
+// arrives: the review successor inheriting a half-fixed finding list is the
+// loopiest session there is, but the implement successor mid-verification is
+// the same shape — fresh context, no memory of the runs already paid for, and
+// every reason to start paying again — so bounding only the review respawn
+// would leave the asymmetry as the hole. The review phase ADDITIONALLY carries
+// reviewTerminalStep — the PR-then-update_task sequence CLA-353 exists to make
+// land — so a handoff mid-review must not be a way to lose it. The implement
+// phase carries the bound alone: it has no terminal step, because it stops
+// rather than hands its task to in_review.
 func HandoffContinuation(phaseName string) string {
-	if phaseName == ReviewPhaseName {
+	switch phaseName {
+	case ReviewPhaseName:
 		return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + reviewTerminalStep
+	case ImplementPhaseName:
+		return "\n\nThe phase's rerun bound is unchanged by handing off:" + rerunGuidance
 	}
 	return ""
 }

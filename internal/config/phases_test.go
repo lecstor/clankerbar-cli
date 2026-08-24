@@ -659,6 +659,8 @@ func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
 // it. Without HandoffContinuation a session that hands off mid-review drops the
 // PR-then-update_task sequence for its successor, silently reintroducing the bug
 // this task fixes on the one path a wording change in the brief cannot reach.
+// Since CLA-391 the rerun bound rides forward too — for BOTH built-in phases,
+// pinned below — so a handoff cannot be how unbounded rerunning arrives.
 func TestHandoffContinuation_CarriesTheReviewTerminalStepForward(t *testing.T) {
 	got := HandoffContinuation(ReviewPhaseName)
 	if !strings.Contains(got, reviewTerminalStep) {
@@ -671,10 +673,17 @@ func TestHandoffContinuation_CarriesTheReviewTerminalStepForward(t *testing.T) {
 		t.Errorf("HandoffContinuation(%q) does not carry the rerun bound forward:\n%s", ReviewPhaseName, got)
 	}
 
-	// The implement phase hands off nothing at in_review - it stops, and a later
-	// phase owns the resume brief - so it has no terminal step to lose.
-	if got := HandoffContinuation(ImplementPhaseName); got != "" {
-		t.Errorf("HandoffContinuation(%q) = %q, want empty — the implement phase has no terminal step to carry forward", ImplementPhaseName, got)
+	// The implement phase has no terminal step to lose — it stops rather than
+	// hands its task to in_review, and a later phase owns the resume brief — but
+	// its handoffs are real, so the rerun bound rides forward for it too
+	// (phase-2 review of CLA-391): its successor is mid-verification with none
+	// of the predecessor's memory of the runs already paid for, which is exactly
+	// the session that starts paying again. The terminal step, though, stays the
+	// review phase's alone.
+	if got := HandoffContinuation(ImplementPhaseName); !strings.Contains(got, rerunGuidance) {
+		t.Errorf("HandoffContinuation(%q) does not carry the rerun bound forward:\n%s", ImplementPhaseName, got)
+	} else if strings.Contains(got, reviewTerminalStep) {
+		t.Errorf("HandoffContinuation(%q) carries reviewTerminalStep, which belongs to the review phase alone:\n%s", ImplementPhaseName, got)
 	}
 	if got := HandoffContinuation("not-a-real-phase"); got != "" {
 		t.Errorf("HandoffContinuation of an unknown phase = %q, want empty", got)
