@@ -69,6 +69,25 @@ type mcpServer struct {
 type mcpFile struct {
 	MCPServers map[string]mcpEntry `json:"mcpServers"`
 	MCP        map[string]mcpEntry `json:"mcp"`
+
+	// The opencode-schema keys that decide what a session IS rather than what it
+	// talks to. Modelled because OPENCODE_CONFIG makes the file the session's
+	// ENTIRE config (harness/opencode.go), so a workdir-discovered file carrying
+	// any of these does not merely add servers — it overrides what the driver
+	// pins (CLA-266):
+	//
+	//   permission — replaces the fail-closed permission policy the adapter
+	//                exports; the CLA-260 threat with the safety rail removed;
+	//   plugin     — code opencode loads and runs at startup;
+	//   agent      — replaces agent definitions, including their modes and
+	//                per-agent permissions.
+	//
+	// Left RAW because "present at all" is the only fact this needs: every value
+	// shape counts (object, array, bool, string), and only an absent key or a
+	// JSON null means unset — the same reading Go's own optional types give them.
+	Permission json.RawMessage `json:"permission"`
+	Plugin     json.RawMessage `json:"plugin"`
+	Agent      json.RawMessage `json:"agent"`
 }
 
 type mcpEntry struct {
@@ -88,39 +107,92 @@ type mcpEntry struct {
 	// because the interesting part of `bash -c "curl ... | sh"` is entirely in
 	// here - naming the entry as running "bash" would be true and useless.
 	Args json.RawMessage `json:"args"`
+
+	// Enabled is opencode's per-server switch. A POINTER because absent means
+	// enabled and `false` means disabled, and a plain bool cannot tell those
+	// apart - which would read every entry of every Claude-shaped file, where
+	// the key does not exist at all, as switched off.
+	//
+	// Read by ONE caller: the ambient-config check, where a disabled server
+	// genuinely cannot redirect anything because opencode does not start it. It
+	// is deliberately NOT consulted by readMCPServers, whose callers are the
+	// credential-origin and local-process gates - see
+	// opencodeConfigClankerbarSlug for why a security gate must keep looking at
+	// an entry the file merely CLAIMS is off.
+	Enabled *bool `json:"enabled"`
 }
 
-// readMCPServers parses a harness MCP config and returns its server entries,
-// sorted by name so a refusal names the same one on every run.
+// disabled reports whether this entry is switched off by an explicit
+// `"enabled": false`.
+func (e mcpEntry) disabled() bool { return e.Enabled != nil && !*e.Enabled }
+
+// startsProcess reports whether this entry would start a LOCAL PROCESS. A
+// `command` is what does it in both dialects — Claude's string-plus-args form
+// and opencode's argv-array form both land here as raw JSON — so presence of
+// the key with any value other than null is the test. An entry with only `args`
+// and no `command` starts nothing, and an http/url entry is not a process.
+func (e mcpEntry) startsProcess() bool { return rawSet(e.Command) }
+
+// rawSet reports whether an optional raw-JSON key was present with a value
+// other than null. An absent key decodes to nil; `"key": null` decodes to the
+// literal bytes "null" — and Go's own optional types treat those two the same,
+// so a check that split them would refuse configs Go itself accepts.
+func rawSet(r json.RawMessage) bool {
+	s := strings.TrimSpace(string(r))
+	return s != "" && s != "null"
+}
+
+// readMCPFile parses a harness MCP config into the whole mcpFile model: both
+// server blocks and the opencode-schema keys beside them.
 //
-// It FAILS CLOSED. This feeds a security gate, and the same file is handed
-// onward to the harness, so "I could not read it" must not read as "there is
-// nothing in it to object to". An absent file is the one benign case — there is
-// then nothing to hand over either.
-func readMCPServers(path string) ([]mcpServer, error) {
+// It FAILS CLOSED like readMCPServers: this feeds security gates, and the same
+// file is handed onward to the harness, so "I could not read it" must not read
+// as "there is nothing in it to object to". An absent file is the one benign
+// case — there is then nothing to hand over either.
+func readMCPFile(path string) (mcpFile, error) {
+	var f mcpFile
 	if path == "" {
-		return nil, nil
+		return f, nil
 	}
 	data, err := os.ReadFile(expandHome(path))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return f, nil
 		}
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return f, fmt.Errorf("%s: %w", path, err)
 	}
-	var f mcpFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return f, fmt.Errorf("%s: %w", path, err)
+	}
+	return f, nil
+}
+
+// readMCPServers parses a harness MCP config and returns its server entries,
+// sorted by name so a refusal names the same one on every run.
+func readMCPServers(path string) ([]mcpServer, error) {
+	f, err := readMCPFile(path)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]mcpServer, 0, len(f.MCPServers)+len(f.MCP))
 	for _, block := range []map[string]mcpEntry{f.MCPServers, f.MCP} {
 		for name, s := range block {
-			out = append(out, mcpServer{
+			server := mcpServer{
 				name:    name,
 				url:     s.URL,
 				usesKey: referencesKey(s.Headers) || referencesKey(s.Env) || referencesKey(s.Environment),
-				command: strings.TrimSpace(strings.TrimSpace(string(s.Command)) + " " + strings.TrimSpace(string(s.Args))),
-			})
+			}
+			// Only an entry that would actually START something carries a command.
+			// Raw "null", and args-without-command, used to be reported as a
+			// process (doctor named an entry whose command read "null --serve"),
+			// which made this disclosure disagree with startsProcess — the same
+			// predicate CLA-266's gate applies to the very same entry. Disclosure
+			// and gate must answer "does this start a process" identically: a WARN
+			// listing entries that never run trains the operator to skim it.
+			if s.startsProcess() {
+				server.command = strings.TrimSpace(strings.TrimSpace(string(s.Command)) + " " + strings.TrimSpace(string(s.Args)))
+			}
+			out = append(out, server)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
@@ -148,10 +220,13 @@ type LocalMCPServer struct {
 // that is still the right call for an ORIGIN check, but it means a checkout can
 // declare a process the next unattended session will run.
 //
-// Naming them is not the same as refusing them: local MCP servers are a normal,
-// wanted thing to put in a repo's .mcp.json, and refusing them is a product
-// decision rather than a bug fix (filed separately). What this closes is the
-// silence.
+// What happens to them depends on how the file was found (CLA-266). A file the
+// operator NAMED is disclosed only — local MCP servers are a normal, wanted
+// thing to put behind an explicit config line, and this listing is what doctor
+// shows. A DISCOVERED one (Validate defaulting mcp_config_path to
+// `<workdir>/.mcp.json`) is refused outright by checkDiscoveredMCPConfig before
+// any session can read it, so from a validated config onward everything this
+// returns lives in a file the operator pointed at.
 func (c *Config) LocalMCPServers() []LocalMCPServer {
 	seen := make(map[string]bool)
 	var out []LocalMCPServer

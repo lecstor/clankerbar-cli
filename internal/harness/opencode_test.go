@@ -489,7 +489,7 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 		}
 	}
 
-	perm := opencodePermission(true, "/Users/jason/dev") // readOnly
+	perm := opencodePermission(true, "/Users/jason/dev", nil) // readOnly
 	p := parsePolicy(t, perm)
 	for _, tool := range []string{"edit", "bash"} {
 		if p[tool] != "deny" {
@@ -524,7 +524,7 @@ func TestOpencodeDrainInvocation(t *testing.T) {
 		t.Errorf("drain args = %q, want the model passed through", joined)
 	}
 
-	perm := opencodePermission(false, "/Users/jason/dev") // drain
+	perm := opencodePermission(false, "/Users/jason/dev", nil) // drain
 	p := parsePolicy(t, perm)
 	if p["edit"] != "Users/jason/dev/**:allow Users/jason/dev:allow" || p["bash"] != "allow" {
 		t.Errorf("drain policy must allow edit (path-scoped) + bash (tool-level), got edit=%q bash=%q", p["edit"], p["bash"])
@@ -538,7 +538,7 @@ func TestOpencodeDrainInvocation(t *testing.T) {
 // under that catch-all. Key order is load-bearing (opencode evaluates rules
 // last-match-wins), so the catch-all must sort first.
 func TestOpencodePermissionPathScoping(t *testing.T) {
-	perm := opencodePermission(false, "/Users/jason/dev")
+	perm := opencodePermission(false, "/Users/jason/dev", nil)
 	p := parsePolicy(t, perm)
 
 	want := map[string]string{
@@ -613,7 +613,7 @@ func TestOpencodeWorkdirPatterns(t *testing.T) {
 // catch-all, and the out-of-workdir external_directory gate stays closed even
 // though the `*_*` MCP rule's permission wildcard also matches that name.
 func TestOpencodePermissionEffective(t *testing.T) {
-	perm := opencodePermission(false, "/Users/jason/dev")
+	perm := opencodePermission(false, "/Users/jason/dev", nil)
 	cases := []struct {
 		permission, pattern, want string
 	}{
@@ -685,7 +685,7 @@ func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 		readOnly bool
 	}{{"drain", false}, {"probe", true}} {
 		t.Run(shape.name, func(t *testing.T) {
-			perm := opencodePermission(shape.readOnly, "/Users/jason/dev")
+			perm := opencodePermission(shape.readOnly, "/Users/jason/dev", nil)
 
 			// The three asks the resource tools actually make. The read's URI
 			// is a URL, so the pattern has to span both "/" and ":".

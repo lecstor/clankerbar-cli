@@ -63,10 +63,17 @@ checkpoint:
 
 Phase 1 claims the task, implements it in a worktree cut from the repo's
 integration branch, self-verifies, commits, pushes and records the branch — then
-stops. Phase 2 starts on a **fresh context**, resumes the *same* run (the driver
-substitutes the task and run ids into its brief, so it calls `heartbeat` instead
-of claiming), re-reads the bar and the standing decisions from the plane, works
-in that same worktree — never on the integration branch itself — runs the
+stops. When phase 1 instead finds an existing branch or worktree already
+carrying the task's work (a recovered claim, a prior session's WIP), its first
+step is to merge the integration branch into it - a merge, never a rebase,
+since rewriting pushed history breaks tip comparison - and re-validate the task
+against the merged tip before touching what it found: superseded means record
+the decision and park the task with an outcome saying so, or salvage only what
+still adds value - never verify-and-push stale work. Phase 2 starts on a
+**fresh context**, resumes the *same* run (the driver substitutes the task and
+run ids into its brief, so it calls `heartbeat` instead of claiming), re-reads
+the bar and the standing decisions from the plane, works in
+that same worktree — never on the integration branch itself — runs the
 adversarial review, fixes what it finds, pushes, opens a PR targeting the
 integration branch if no PR exists yet for the branch, and hands the task to
 `in_review`. The claim is held across the seam, so the task is never posted back
@@ -105,9 +112,12 @@ boundary too. Two other consequences worth knowing:
   alone, so with no phase after it every task would stop half-finished, forever,
   with nothing in the logs reading as an error.
 
-The saving is **projected** at 20-28% for a two-way cut — modelled off one real
-task's decile curve, not measured from a phased run, and stated that way
-deliberately until a phased run has been measured. Splitting thinner earns less
+The saving is **still unmeasured**: a phased run has now happened, but it is not
+comparable evidence - its implement phase reached the checkpoint over an
+implementation that already existed, so its totals capture a checkpoint plus a
+review rather than a from-scratch split, and quoting them as a saving would
+overstate the effect by a wide margin. A like-for-like measurement still does
+not exist, and it costs a full task run to get. Splitting thinner earns less
 each time while every extra boundary still pays a session's full startup cost.
 
 ### Session-initiated handoff: a boundary the session chooses
@@ -428,15 +438,37 @@ the loop's own `STOP`/`HALT` switch; under a workdir nothing runs in *yet* it is
 the same trap for the next `projects[]` entry that inherits it), **workdir** (per
 project: it resolves, an `.mcp.json`
 reaches it, and it carries an agent-instructions file), **permissions**
-(harness-specific policy sanity), **toolchains** (the build tools the project's
+(harness-specific policy sanity), **opencode_ambient_config** (an opencode
+config the driver never named that a session merges anyway: one whose
+`clankerbar` server points at another project, or one carrying keys that shape
+what a session may do), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
-long enough to do the work), and **budget** (ceilings parse and are sane).
+long enough to do the work), **deploy_lag** (how far the deployed build lags the
+project's integration branch), and **budget** (ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
 entry that omits `workdir` or `mcp_config_path` inherits the top-level one, and
 doctor resolves it **exactly the way the loop does**, so it never reports on a
 directory your sessions will not use.
+
+`deploy_lag` reads the plane's `/health` (`health_url`, top level or per
+project) to learn WHICH commit is deployed, and compares it against the REMOTE
+tip of `integration_branch` (default `staging`). A gap is warned about only once
+its oldest undeployed commit is older than an hour - one fresh commit is normal
+deploy cadence, 21 overnight is not - and the count and age are named either
+way. A deployment AHEAD of the branch (a hotfix, or work not yet merged) passes:
+it is newer than the shared line, not a stale deploy. The sentinel stamps
+`unknown` and `<sha>-dirty` each get their own warning naming what they mean,
+and anything doctor cannot establish (endpoint down; the commit held by no local
+clone even after fetching the branch into them) is an honest WARN, never a green
+line. Every git call it makes is bounded by its own deadline, so an unreachable
+remote ends as that WARN rather than a hung preflight, and the fetch hunt is
+capped in ATTEMPTS so a dead remote cannot turn it into one round trip per
+clone. Unconfigured it prints one quiet PASS naming `health_url`, so the feature
+is discoverable without nagging anyone who opted out; in a mixed multi-project
+config the unmonitored projects still get their own quiet PASS rather than
+disappearing from doctor's output.
 
 The `toolchains` audit reads every settings file Claude merges — the `--settings`
 policy, the config dir's `settings.json`/`settings.local.json`, and each session
@@ -842,14 +874,22 @@ started on a remaining slice under a minute.
 
 **opencode only** today — it is the harness with no turn flag, so this is its
 backstop; under claude or codex the dial is inert and `doctor` says so. Two
-consequences of that pairing are worth knowing before you set it. The salvage
-that commits and pushes what a cut-off session left runs only for an adapter
-that observes the session's task claim, which opencode does not — so a capped
-session's uncommitted work stays **in the worktree**, and the driver's log says
-exactly that rather than claiming a salvage that never ran. And because
-`phases` is refused for opencode for that same reason, the per-phase
-`max_wall_clock` is reachable only in a single-phase config today; the run-wide
-dial is the one an unphased opencode run uses.
+consequences of that pairing are worth knowing before you set it. First, the
+salvage applies here: since CLA-365 opencode observes the session's task claim,
+so when a capped session ends, whatever it left uncommitted is committed and
+pushed by the salvage, the same as for a turn-capped `claude` session - unless
+the salvage refuses (an interrupted merge, rebase, cherry-pick or revert;
+unresolved conflicts; an ambiguous worktree match) and leaves the work
+untouched, or the push is rejected and the work stays committed locally only.
+Both of those are named in the log. If instead no worktree at or below the
+run's workdir has a branch starting `clanker/<first 8 characters of the task
+id>`, the salvage finds nothing to act on and stays silent.
+Second, `phases` runs on opencode on that same claim-tracking basis (a
+multi-phase sequence is refused over a harness that observes no claim, which
+is codex today), so the per-phase `max_wall_clock` is reachable in a phased
+config too - though such a run still has no per-session turn or token cap (see
+`max_turns` and `budget.max_session_tokens` above), so set this dial
+deliberately.
 
 `mcp_config_path` defaults to `<workdir>/.mcp.json` when that file exists — Claude's
 headless mode does not auto-discover it, so **under `harness: "claude"`** the default
@@ -870,6 +910,32 @@ it out does not opt out: an empty value re-runs the `<workdir>/.mcp.json` discov
 so a workdir that carries a Claude `.mcp.json` hands it over no matter what. Run
 `clankerbar doctor` - it prints the caveat instead of a verdict where the file is not
 read, and FAILs the workdir check when `opencode` is pointed at a Claude-shaped one.
+
+#### A discovered `.mcp.json` may not choose what runs
+
+A file that arrives through the default above was FOUND, not named - and a checkout
+can write it as easily as you did (sessions run with edit permission in that
+directory, and the damage would land on the next unattended start). Since it is
+handed to the harness whole, a config nobody pointed at is held to three rules:
+
+1. **An MCP entry carrying a `command` - a locally spawned server - is refused.**
+   It starts at session init, before any permission rule applies, running as you
+   with the session's whole environment (`CLANKERBAR_API_KEY` included). Entries
+   you meant go under `"allow_local_mcp_servers": ["docs"]` - top level, or on a
+   `projects[]` entry (which replaces the top-level list for that project). The
+   other way out is naming the file: an explicit `mcp_config_path` adopts it
+   wholesale.
+2. **Keys that decide what a session IS are refused outright.** Under opencode the
+   file is the session's ENTIRE config, so a discovered one may not set
+   `permission` (it would replace the fail-closed policy the driver pins),
+   `plugin`, or `agent`. No allowlist reaches these; name the file if you mean them.
+3. **A discovered file that cannot be read is refused**, not passed through.
+
+`allow_local_mcp_servers` gets the same visibility as every other loose state:
+`doctor`'s `mcp_servers` check reports the list beside the entries it admits. A
+file you NAMED with `mcp_config_path` is exempt from all three rules - naming it
+is the statement that you vetted it - and its local servers are still disclosed
+by doctor's WARN as they always were.
 
 Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at the
 root here is the maintainers' own agent wiring and names the `clankerbar` project
@@ -1148,12 +1214,20 @@ alternatives, in order of preference:
    there instead of spending another session first.
 
    **The polls during a pause count too.** Waiting out a usage limit means probing
-   for an early reset every `poll_interval`, and a probe is a real harness session
-   — cheap (a one-character prompt, with the harness locked down to no tools or
-   read-only), but not free, and a week-long cap polled every 30 minutes is a few
-   hundred of them. Their tokens and cost go into the same running total the
-   breaker reads, so a pause whose probes alone cross a ceiling ends on that
-   ceiling rather than polling on.
+   for an early reset, and a probe is a real harness session - cheap (a
+   one-character prompt, with the harness locked down to no tools or read-only),
+   but not free, and a week-long cap polled every 30 minutes is a few hundred of
+   them. Their tokens and cost go into the same running total the breaker reads,
+   so a pause whose probes alone cross a ceiling ends on that ceiling rather than
+   polling on.
+
+   **A pause holding a stated reset aims at it.** When the limit carries a reset
+   time, the first probe lands just past that time instead of on the next tick of
+   the `poll_interval` grid (still capped at `poll_interval`, so a STOP marker
+   never goes stale), and the paused log line says so. A stated reset is a claim,
+   not a guarantee: once the pause crosses it, it falls back to probing every
+   `poll_interval` until a probe actually confirms the cap has lifted - it never
+   resumes on the stated time alone after having slept through it.
 
    **A session whose spend cannot be measured stops the run, if you set a spend
    ceiling.** Every figure the breaker reads is parsed out of the harness's event
@@ -1222,14 +1296,58 @@ line per ask, naming the rule that won. That log is the cheapest live proof
 available, because it records the decision whether or not the session goes on
 to produce any output.
 
-**The workdir should be a multi-repo parent, not a git checkout.** The
-read/edit rules are emitted to match the patterns opencode asks for a session
-whose project is *not* inside a git repo (worktree `/`; the multi-repo-parent
-case, `~/dev`). Point the workdir at a git checkout and opencode asks with
-checkout-relative patterns the rules cannot express, locking the session's
-structured Read/Edit tools out with no error — the exact failure this change
-removes. A per-task worktree always lives *under* a parent workdir, so the
-parent is the correct setting.
+**The policy covers both instance-directory shapes, and it did not always.**
+opencode makes its read/edit asks relative to the git worktree it resolves at
+the session's instance directory, so there are two ask forms and which one
+arrives is not the policy's choice. Outside any repo - the multi-repo parent,
+`~/dev` - the worktree is `/` and asks are the absolute path minus its leading
+slash (`Users/jason/dev/...`). Inside a checkout the worktree is the repo root
+and asks are repo-relative (`AGENTS.md`). Until CLA-441 only the first form was
+emitted, which was fine while every session ran in the parent and silently fatal
+once they did not: the second form matched no rule, fell to the `*` catch-all,
+and every structured Read/Edit was denied with no error and with the grants
+apparently in place. Widening their *scope* could not help, because the shape
+was wrong rather than the reach. Both forms are emitted now, and a session
+started in a *subdirectory* of a checkout is scoped to that subdirectory rather
+than to the repo above it.
+
+**Each session's instance directory is pinned to its workdir.** `cmd.Dir` sets
+the child's real cwd and nothing else; the inherited `PWD` still named wherever
+the daemon was started, and opencode honours `$PWD` - it creates a second
+instance there and runs the session in it. So every session every daemon spawned
+ran in the daemon's start directory whatever the project's `workdir` said, which
+is the same defect as the wrong project's MCP server (below), the wrong ask shape
+(above), and the wrong repo's `AGENTS.md`. Every adapter now sets `PWD` to the
+directory it is about to run in and drops `OLDPWD`.
+
+**And the project's MCP block is pinned past every layer opencode merges after
+it.** opencode's config order is: its global file, then `OPENCODE_CONFIG` (the
+file the driver names), then any project-level `opencode.json` discovered from
+the instance directory, then the `OPENCODE_CONFIG_DIR` directory again, then
+`OPENCODE_CONFIG_CONTENT`. Two of those layers land *after* the driver's file,
+and both were observed redirecting the `clankerbar` server at another project -
+a global block for sessions running in `~/dev`, a committed repo-level
+`opencode.json` for sessions running in a checkout. The named file's bytes are
+therefore also sent as `OPENCODE_CONFIG_CONTENT`, which opencode merges after
+every layer this driver or a checkout can write, so a drain session reaches the
+backlog it polls. (Three layers do follow it - the console active-org config, a
+managed config directory, and managed preferences - none of them writable by a
+repo or by us.) A file that still names another
+project is reported by `doctor`'s `opencode_ambient_config` check and logged once
+at startup - a warning, not a refusal, since spawned sessions are pinned past it
+and the file is often a checked-in artifact of somebody else's repo, but every
+*interactive* session in that tree still gets the wrong backlog. The same scan
+covers opencode's global config directory (`$XDG_CONFIG_HOME/opencode`, then
+`~/.opencode`, then whatever `config_dir` names) and reports a second kind of
+finding that the content pin does *not* mitigate: a discovered config carrying
+`permission`, `plugin`, an `agent` with tool or permission authority, or an
+`mcp` server that starts a local process. `mcp_config_path` files are refused
+for those keys; a file opencode discovers by itself is not, and it is merged
+into every session started in that tree. `permission` is the sharpest of them -
+the env policy is applied after every config layer, but the merge is per key and
+the flatten is in insertion order, so a file declaring `permission.read` moves
+that key ahead of the sorted-first `*` catch-all and the catch-all matches last,
+denying everything.
 
 ## Docs
 
