@@ -121,11 +121,13 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// a data race (-race catches it) even where it would happen to take
 	// effect.
 	//
-	// Known gap, deliberate: a descendant that ESCAPED the group (daemonised
-	// with setsid) survives this kill and can hold cmd.Stderr's pipe open -
-	// this path sets no WaitDelay, so Wait would block for that escapee's
-	// lifetime. Every in-group descendant dies, which is the bar; the
-	// setsid escapee is filed as CLA-423.
+	// A descendant that ESCAPED the group (daemonised with setsid) survives
+	// this kill — but it can no longer stall Wait past cmd.WaitDelay below,
+	// which force-closes whatever exec-owned pipes it holds. What remains of
+	// the gap is bounded and accounted: the escapee itself outlives the
+	// session unfed (CLA-423 closed the hang, not the orphan), and an escapee
+	// holding the exec-owned STDOUT end still blocks consume() before Wait —
+	// and so before WaitDelay's clock — ever starts (CLA-431).
 	cmd.Cancel = func() error {
 		killProcessGroup(cmd)
 		return cmd.Process.Kill()
@@ -134,6 +136,21 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = c.env(in)
+	// A cap that can hang is not a cap: the same grandchild-holds-the-pipe
+	// scenario the opencode adapter closes with WaitDelay (opencode.go:291-303).
+	// Armed UNCONDITIONALLY. An earlier revision set it only when the exec
+	// context carried a deadline, but no deadline ever reaches this path in
+	// production — the driver's run ctx is signal.NotifyContext (cancel-only),
+	// sctx below is WithCancel-only, and claude honours no wall-clock cap of
+	// its own — so that arm was dead code outside tests (phase-2 review of
+	// this branch). Arming always is safe for live sessions by WaitDelay's own
+	// semantics: its clock starts only once the exec context is done or Wait
+	// has observed child exit, so I/O of a still-running session is never cut
+	// short. It does NOT kill the escapee; it only lets the adapter return and
+	// account for what arrived before the forced close. That close triggers
+	// the same stream-drain path the scanner already handles: EOF, clean
+	// parse, and any bytes past the window counted in OutputDropped.
+	cmd.WaitDelay = 5 * time.Second
 
 	console := in.Console
 	if console == nil {
@@ -523,7 +540,7 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 		}
 		text = toolResultText(json.RawMessage(b))
 	}
-  var payload struct {
+	var payload struct {
 		Task struct {
 			ID       string `json:"id"`
 			Ref      string `json:"ref"`
@@ -552,19 +569,19 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
 	// safer to release just because THIS session has not written anything yet.
 	// The claim's own branch (top-level) names the pushed WIP; the task-level
-		// branch indicates whether the plane records one for WIP tracking.
-		claimBranch := payload.Branch
-		if payload.Task.Branch != "" && claimBranch == "" {
-			claimBranch = payload.Task.Branch
-		}
-		res.Claim = Claim{
-			TaskID:    payload.Task.ID,
-			Ref:       payload.Task.Ref,
-			RunID:     payload.Run.ID,
-			HasWIP:    payload.HasWip || payload.Task.Branch != "",
-			Category:  payload.Task.Category,
-			Branch:    claimBranch,
-		}
+	// branch indicates whether the plane records one for WIP tracking.
+	claimBranch := payload.Branch
+	if payload.Task.Branch != "" && claimBranch == "" {
+		claimBranch = payload.Task.Branch
+	}
+	res.Claim = Claim{
+		TaskID:   payload.Task.ID,
+		Ref:      payload.Task.Ref,
+		RunID:    payload.Run.ID,
+		HasWIP:   payload.HasWip || payload.Task.Branch != "",
+		Category: payload.Task.Category,
+		Branch:   claimBranch,
+	}
 	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
 	// claim the moment the stream carries it, not when the process exits.
 	res.notifyClaim()
