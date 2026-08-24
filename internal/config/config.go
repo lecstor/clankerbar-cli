@@ -74,6 +74,11 @@ const DefaultMaxTurns = 400
 // if a harness of yours legitimately dies silently more often than that.
 const DefaultMaxZeroSpendAttempts = 3
 
+// MaxInstanceNameLen is the plane's cap on a daemon instance name (CLA-465's
+// report bounds): longer names are refused by Validate rather than beached as
+// silently-dropped beacons.
+const MaxInstanceNameLen = 100
+
 // The built-in phase names, as constants because Validate reasons about them: a
 // sequence that ENDS on the implement brief can never reach review. Exported so
 // the driver can name the implement phase for the fleet dead-phase counter
@@ -605,6 +610,19 @@ type Config struct {
 	// takes it as --mcp-config (NOT auto-discovered in -p mode); Codex merges it
 	// into config.toml [mcp_servers]. See the adapters.
 	MCPConfigPath string `json:"mcp_config_path"`
+
+	// InstanceName names this daemon on the console's Fleet page (CLA-466):
+	// presence beacons are keyed per (project, instance name), so this is how two
+	// daemons driving the same project stay distinguishable. Empty falls back to
+	// the machine's hostname, which is right for the common one-daemon-per-host
+	// setup; if you run MORE THAN ONE daemon for the same project on the SAME
+	// host, name them here or their presence row will flicker between them
+	// (last report wins).
+	//
+	// The plane caps the name at 100 characters — Validate refuses longer here,
+	// so a too-long name fails loudly at startup instead of silently dropping
+	// every beacon.
+	InstanceName string `json:"instance_name"`
 
 	// MaxIterations stops the loop after N respawns. 0 = no iteration ceiling:
 	// the loop runs until a STOP/HALT marker or a signal stops it (or a budget
@@ -1951,6 +1969,13 @@ func (c *Config) Validate() error {
 	if c.MaxZeroSpendAttempts < 0 {
 		return errors.New("max_zero_spend_attempts is negative")
 	}
+	// The plane refuses an instance name over 100 characters (CLA-465's report
+	// bounds), so a beacon carrying one would be dropped on EVERY poll — reporting
+	// silently off. Refuse it here instead, where it is a config typo with a
+	// readable error, not a mystery gap on the Fleet page.
+	if len(strings.TrimSpace(c.InstanceName)) > MaxInstanceNameLen {
+		return fmt.Errorf("instance_name exceeds %d characters (the plane's limit)", MaxInstanceNameLen)
+	}
 	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")
 	}
@@ -2564,6 +2589,12 @@ func (c *Config) Source() string { return c.source }
 // and no slug). That is deliberate: New("") yields a not-wired poller, so the loop
 // falls into blind drain — which still makes progress — rather than retrying
 // forever against a slug-less base the plane can only reject.
+// Slug returns the project slug this config's wiring names — the `<slug>` in a
+// /mcp/<slug> endpoint or .mcp.json URL, "" when nothing derivable says. It is
+// how single-project mode answers "which project is this", the same derivation
+// the poll and the sessions already agree on.
+func (c *Config) Slug() string { return slugFromMCPURL(c.BacklogEndpoint()) }
+
 func (c *Config) BacklogEndpoint() string {
 	origin := c.CredentialOrigin()
 	if origin == "" {
@@ -2656,6 +2687,63 @@ func (c *Config) ProjectSummaryURL(p Project) string {
 
 func projectSummaryPath(origin, slug string) string {
 	return origin + "/api/projects/" + url.PathEscape(slug) + "/backlog-summary"
+}
+
+// FleetReportURL returns the URL of the daemon's fleet presence beacon target
+// (CLA-466): the plane's `POST .../fleet/report` surface, which takes presence
+// plus any finished iteration records in one authenticated call.
+//
+// Unlike the summary route there is NO legacy slug-less form — the report
+// endpoint exists only as `/api/projects/<slug>/fleet/report` (CLA-465). So a
+// setup with no derivable slug has no fleet URL at all: reporting is off for
+// that run (doctor says so), and the loop behaves exactly as it did before
+// fleets existed. Same origin rule as every credentialed call: CredentialOrigin,
+// never a path read off the workdir's .mcp.json.
+func (c *Config) FleetReportURL() string {
+	origin := c.CredentialOrigin()
+	if origin == "" {
+		return ""
+	}
+	if slug := slugFromMCPURL(c.BacklogEndpoint()); slug != "" {
+		return projectFleetReportPath(origin, slug)
+	}
+	return ""
+}
+
+// ProjectFleetReportURL returns the fleet-report URL for one configured project:
+// `<origin>/api/projects/<slug>/fleet/report`, on the same trusted
+// CredentialOrigin as every other credentialed call.
+func (c *Config) ProjectFleetReportURL(p Project) string {
+	origin := c.CredentialOrigin()
+	if origin == "" || p.Slug == "" {
+		return ""
+	}
+	return projectFleetReportPath(origin, p.Slug)
+}
+
+func projectFleetReportPath(origin, slug string) string {
+	return origin + "/api/projects/" + url.PathEscape(slug) + "/fleet/report"
+}
+
+// Identity fingerprints the effective config in force — what the fleet presence
+// beacon reports as `configIdentity` (CLA-466), so the console can tell two
+// daemons apart when they disagree about how to run and can see a RELOAD land.
+//
+// It is a SHA-256 over the JSON encoding of the config AS VALIDATED (flag
+// overrides applied), recomputed on demand rather than cached: a RELOAD swaps
+// d.cfg mid-run, and the next beacon must carry the new identity. Only exported
+// fields encode; no secret is in the config file by contract (the API key lives
+// in CLANKERBAR_API_KEY). Map fields encode with sorted keys, so the fingerprint
+// is stable across processes.
+func (c *Config) Identity() string {
+	b, err := json.Marshal(c)
+	if err != nil {
+		// Marshalling a Config cannot fail today (no channels/funcs/cycles); an
+		// empty identity reads plane-side as "unknown" rather than lying.
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // slugFromMCPURL extracts the `<slug>` from an `/mcp/<slug>` MCP endpoint URL, or

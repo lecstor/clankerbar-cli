@@ -16,10 +16,8 @@ import (
 	"syscall"
 
 	"github.com/lecstor/clankerbar-cli/internal/cli"
+	"github.com/lecstor/clankerbar-cli/internal/version"
 )
-
-// version is overwritten at release time via -ldflags "-X main.version=...".
-var version = "0.0.0-dev"
 
 func main() {
 	log.SetFlags(log.Ltime)
@@ -43,10 +41,12 @@ func main() {
 		err = cli.Ctl(ctx, os.Args[2:])
 	case "doctor":
 		err = cli.Doctor(ctx, os.Args[2:])
+	case "propose-config":
+		err = cli.ProposeConfig(ctx, os.Args[2:])
 	case "dead-rate":
 		err = cli.DeadRate(ctx, os.Args[2:])
 	case "version", "--version", "-v":
-		fmt.Println("clankerbar", version)
+		fmt.Println("clankerbar", version.Current)
 	case "help", "--help", "-h":
 		cli.Usage(os.Stdout)
 	default:

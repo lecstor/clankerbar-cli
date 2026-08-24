@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,8 +41,10 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -100,6 +104,15 @@ type doctorEnv struct {
 	// fromCommand, and re-checking one "@path" file's owner-only rule.
 	runEnvCmd func(ctx context.Context, command string) (string, error)
 	envPath   func(path string) error
+
+	// The fleet check's one seam (CLA-466): the harmless empty-body probe of the
+	// report endpoint. Production is fleet.Probe; tests substitute statuses.
+	fleetProbe func(ctx context.Context, endpoint, apiKey string) error
+
+	// The run-config check's seam (CLA-410): building the read/propose client
+	// for one project's MCP endpoint. Production is plane.NewRunConfigAPI; a
+	// field so tests serve stored documents from an httptest plane.
+	newRCfgAPI func(mcpURL, apiKey string) plane.RunConfigAPI
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -133,7 +146,9 @@ func defaultDoctorEnv() doctorEnv {
 		runEnvCmd: func(ctx context.Context, command string) (string, error) {
 			return config.RunEnvCommand(command)
 		},
-		envPath: config.VerifyEnvFilePath,
+		envPath:    config.VerifyEnvFilePath,
+		fleetProbe: fleet.Probe,
+		newRCfgAPI: plane.NewRunConfigAPI,
 	}
 }
 
@@ -231,6 +246,8 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkSessionEnv(ctx, cfg, e)...)
 	checks = append(checks, checkTokenSources(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
+	checks = append(checks, checkFleets(ctx, cfg, e)...)
+	checks = append(checks, checkRunConfigs(ctx, cfg, e)...)
 	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
@@ -646,6 +663,92 @@ func checkBacklog(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 		out = append(out, backlogCheck(ctx, "backlog["+p.Slug+"]", cfg.ProjectSummaryURL(p), e))
 	}
 	return out
+}
+
+// checkFleets reports whether fleet activity reporting (CLA-466) is wired and
+// its endpoint reachable — the same PASS/WARN table shape as the MCP wiring
+// checks (the CLA-448 precedent). One check per project, like backlog's.
+//
+// Every outcome is PASS or WARN, never FAIL: reporting is telemetry, so an
+// outage or a gap degrades console visibility while the loop runs exactly as
+// before. A rejected key already FAILs in the backlog check above it, where it
+// actually stops the run; saying it twice here at FAIL strength would make
+// doctor exit non-zero over a condition that costs nothing but a picture.
+func checkFleets(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	if len(cfg.Projects) == 0 {
+		return []check{fleetCheck(ctx, "fleet", cfg.FleetReportURL(), e)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, fleetCheck(ctx, "fleet["+p.Slug+"]", cfg.ProjectFleetReportURL(p), e))
+	}
+	return out
+}
+
+func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
+	c := check{name: name}
+
+	// Not-wired cases first: no key, no derivable slug-ful report URL. Both are
+	// the "reporting off, loop fine" shape.
+	if e.apiKey == "" {
+		c.status = warn
+		c.detail = "fleet activity reporting is off: no creds — CLANKERBAR_API_KEY is unset"
+		c.remedy = "export CLANKERBAR_API_KEY (mint one at clankerbar.com/projects/<slug>/api-keys)"
+		return c
+	}
+	if endpoint == "" {
+		c.status = warn
+		c.detail = "fleet activity reporting is off: no project-scoped /api/projects/<slug>/fleet/report endpoint could be derived"
+		c.remedy = "declare projects[].slug, or point mcp_config_path at an .mcp.json naming /mcp/<slug>"
+		return c
+	}
+
+	// The probe POSTs an EMPTY body: auth is checked before body validation, so a
+	// 400 proves reachable + routed + key accepted without writing anything. A
+	// real beacon would upsert this machine's presence row with doctor's own
+	// state, fighting whatever a live daemon on the same host reports.
+	err := e.fleetProbe(ctx, endpoint, e.apiKey)
+	switch {
+	case err == nil:
+		c.status = pass
+		c.detail = fmt.Sprintf("%s — reachable, key accepted; presence updates on each poll", endpoint)
+	case timedOut(err):
+		c.status = warn
+		c.detail = "fleet endpoint timed out — reports would be dropped (the loop is unaffected): " + endpoint
+		c.remedy = "check the plane is reachable"
+	default:
+		var pe *fleet.ProbeError
+		switch {
+		case errors.As(err, &pe) && (pe.Status == http.StatusUnauthorized || pe.Status == http.StatusForbidden):
+			c.status = warn
+			c.detail = fmt.Sprintf("fleet endpoint reachable but the key was rejected (HTTP %d) — reporting is off: %s", pe.Status, endpoint)
+			c.remedy = "check CLANKERBAR_API_KEY covers this project (a wrong project's key is refused before any write)"
+		case errors.As(err, &pe) && pe.Status == http.StatusNotFound:
+			c.status = warn
+			c.detail = "the plane has no fleet-report route (an older clankerbar deployment) — reporting is off"
+			c.remedy = "upgrade clankerbar to a build with fleet activity (CLA-465); the CLI runs fine without it"
+		case errors.As(err, &pe):
+			c.status = warn
+			c.detail = fmt.Sprintf("fleet endpoint answered unexpectedly (HTTP %d) — reporting may be degraded: %s", pe.Status, endpoint)
+			c.remedy = "check the plane is reachable: " + endpoint
+		default:
+			c.status = warn
+			c.detail = "fleet endpoint unreachable — reporting is off (the loop is unaffected): " + err.Error()
+			c.remedy = "check the plane is reachable: " + endpoint
+		}
+	}
+	return c
+}
+
+// timedOut reports whether err is a timeout, however the HTTP client chose to
+// express it: a context deadline or the Client.Timeout wrapper (a net.Error
+// with Timeout set), which are not the same error chain.
+func timedOut(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) check {
@@ -2641,4 +2744,136 @@ func plural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// --- run-config in force (CLA-410) -------------------------------------------
+
+// checkRunConfigs reports, per target, WHICH execution config the loop will run
+// under — the local file, or a stored plane document overlaid on it — plus any
+// machine-fit warnings about the STORED dials. The plane validates shape; only
+// this machine can see whether a dial it ratified can actually fire (a turn cap
+// under opencode, a cost ceiling on a harness that never reports cost), which is
+// the validation split the design memo draws.
+//
+// Never FAILs on plane trouble: an unreadable stored document leaves the loop
+// running its previous config (the same posture applyReload takes), so doctor
+// says WARN and keeps `doctor && run` usable.
+func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	type rcTarget struct {
+		name string // "" for the unnamed single target
+		url  string
+	}
+	var targets []rcTarget
+	for _, p := range cfg.Projects {
+		targets = append(targets, rcTarget{name: p.Slug, url: cfg.ProjectEndpoint(p)})
+	}
+	if len(cfg.Projects) == 0 {
+		targets = append(targets, rcTarget{url: cfg.BacklogEndpoint()})
+	}
+
+	src := "defaults"
+	if s := cfg.Source(); s != "" {
+		src = s
+	}
+
+	var checks []check
+	for _, t := range targets {
+		name := t.name
+		label := "run-config"
+		if name != "" {
+			label += "[" + name + "]"
+		}
+		newRCfg := e.newRCfgAPI
+		if newRCfg == nil {
+			// An env literal that predates the seam (every existing test) still
+			// gets production wiring, not a nil call.
+			newRCfg = plane.NewRunConfigAPI
+		}
+		rc := newRCfg(t.url, e.apiKey)
+		st, err := rc.RunConfig(ctx)
+		switch {
+		case errors.Is(err, plane.ErrNotWired):
+			// No endpoint or no key: nothing to compare against, and the backlog
+			// wiring check already reports that gap. Silence here is not hiding
+			// a finding; it is declining to duplicate one.
+			continue
+		case errors.Is(err, plane.ErrNoConfig):
+			checks = append(checks, check{
+				name:   label,
+				status: pass,
+				detail: "local rules (" + src + ") - nothing stored on the plane",
+			})
+			continue
+		case err != nil:
+			checks = append(checks, check{
+				name:   label,
+				status: warn,
+				detail: fmt.Sprintf("unreadable (%v) - local rules (%s) stay in force", err, src),
+				remedy: "check the plane is reachable; the loop keeps its previous config until the document fetches",
+			})
+			continue
+		}
+
+		c := check{name: label, status: pass}
+		var doc config.RunConfigDoc
+		if err := json.Unmarshal(st.Config, &doc); err != nil {
+			c.status = warn
+			c.detail = fmt.Sprintf("stored v%d undecodable (%v) - local rules (%s) stay in force", st.Version, err, src)
+			c.remedy = "re-propose a valid document from the console or propose-config"
+			checks = append(checks, c)
+			continue
+		}
+		if doc.Empty() {
+			c.detail = fmt.Sprintf("stored v%d sets nothing consumable - local rules (%s) in force", st.Version, src)
+			checks = append(checks, c)
+			continue
+		}
+		eff := cfg.Clone()
+		eff.ApplyRunConfig(&doc)
+		if err := eff.Validate(); err != nil {
+			c.status = warn
+			c.detail = fmt.Sprintf("stored v%d REFUSED locally (%v) - local rules (%s) stay in force", st.Version, err, src)
+			c.remedy = "fix the stored document and ratify again; until then the loop ignores it"
+			checks = append(checks, c)
+			continue
+		}
+		c.detail = fmt.Sprintf("stored v%d overlaid on %s", st.Version, src)
+		if st.Pending {
+			c.detail += "; a proposed change awaits ratification"
+		}
+		// Machine-fit notes on the STORED dials: what shape-validates but cannot
+		// fire here. Each names the dial as stored, so the operator edits the
+		// document rather than hunting their local file for a line they have.
+		var inert []string
+		if doc.MaxTurns > 0 {
+			var blind []string
+			for _, h := range eff.SpawnedHarnesses() {
+				if !harnessHonoursMaxTurns(h) {
+					blind = append(blind, h)
+				}
+			}
+			if len(blind) > 0 {
+				inert = append(inert, fmt.Sprintf("max_turns=%d is INERT under %s (it takes no turn flag)", doc.MaxTurns, strings.Join(blind, "/")))
+			}
+		}
+		if doc.MaxSessionWallClock > 0 {
+			if dial, on := inertSessionWallClock(eff); dial == "max_session_wall_clock" && on != "" {
+				inert = append(inert, fmt.Sprintf("max_session_wall_clock is INERT under %s (it enforces no session clock)", on))
+			}
+		}
+		if b := doc.Budget; b != nil {
+			for _, h := range slices.Sorted(maps.Keys(b.PerHarness)) {
+				if hb := b.PerHarness[h]; hb.MaxCostUSD > 0 && !harnessReportsCost(h) {
+					inert = append(inert, fmt.Sprintf("budget.per_harness[%s].max_cost_usd is INERT (%s never reports cost)", h, h))
+				}
+			}
+		}
+		if len(inert) > 0 {
+			c.status = warn
+			c.detail += "; " + strings.Join(inert, "; ")
+			c.remedy = "these dials ride along harmlessly but bound nothing on this machine"
+		}
+		checks = append(checks, c)
+	}
+	return checks
 }

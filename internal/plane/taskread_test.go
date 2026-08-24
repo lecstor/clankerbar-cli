@@ -154,3 +154,51 @@ func TestTaskRepo(t *testing.T) {
 		}
 	})
 }
+
+// The CLA-451 checkpoint peek reads a task's holder state off get_task: who
+// holds it (claimedByRun), whether work is handed over (branch), and in which
+// envelope. The fields are null on an unheld task and must decode to empty.
+func TestTaskState(t *testing.T) {
+	ctx := context.Background()
+	t.Run("wrapped envelope", func(t *testing.T) {
+		srv, got := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","ref":"CLA-451","status":"in_progress","claimedByRun":"r-9","branch":"clanker/x"}}`))
+		st, err := mustClient(t, srv).TaskState(ctx, "t-1")
+		if err != nil {
+			t.Fatalf("TaskState: %v", err)
+		}
+		want := TaskState{Status: "in_progress", Ref: "CLA-451", ClaimedByRun: "r-9", Branch: "clanker/x"}
+		if st != want {
+			t.Errorf("state = %+v, want %+v", st, want)
+		}
+		params := got.body["params"].(map[string]any)
+		if params["name"] != "get_task" {
+			t.Errorf("tool = %v, want get_task", params["name"])
+		}
+		args := params["arguments"].(map[string]any)
+		if args["taskId"] != "t-1" {
+			t.Errorf("taskId = %v, want t-1", args["taskId"])
+		}
+	})
+	t.Run("bare envelope", func(t *testing.T) {
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"status":"ready","claimedByRun":null,"branch":null}`))
+		st, err := mustClient(t, srv).TaskState(ctx, "t-2")
+		if err != nil {
+			t.Fatalf("TaskState: %v", err)
+		}
+		want := TaskState{Status: "ready"}
+		if st != want {
+			t.Errorf("state = %+v, want %+v — nulls decode to empty, like repo above", st, want)
+		}
+	})
+	t.Run("empty taskId refused locally", func(t *testing.T) {
+		if _, err := mustClient(t, nil).TaskState(ctx, ""); err == nil {
+			t.Error("TaskState with an empty taskId must be refused before any request")
+		}
+	})
+	t.Run("not wired", func(t *testing.T) {
+		nw := notWired{}
+		if _, err := nw.TaskState(ctx, "t-1"); !errors.Is(err, ErrNotWired) {
+			t.Errorf("err = %v, want ErrNotWired", err)
+		}
+	})
+}

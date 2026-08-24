@@ -25,6 +25,9 @@ Usage:
   clankerbar doctor [flags]  Preflight the setup — config, harness, backlog
                              wiring, workdir, permissions. Exits non-zero on any
                              FAIL, so it gates a run: doctor && run.
+  clankerbar propose-config  Import the local config's movable dials (harness,
+  [flags]                    model, tiers, budget, escalation) into the plane as a
+                             PENDING proposal the operator ratifies in the console.
   clankerbar dead-rate       Scan the iteration logs and report, per day, per
                              phase and per harness, how many sessions ran and
                              how many died producing nothing (the dead-phase
@@ -32,7 +35,7 @@ Usage:
   clankerbar version         Print the version.
   clankerbar help            Show this help.
 
-Run 'clankerbar run --help', 'clankerbar ctl --help' or 'clankerbar doctor --help'
-for their flags.
+Run 'clankerbar run --help', 'clankerbar ctl --help', 'clankerbar doctor --help'
+or 'clankerbar propose-config --help' for their flags.
 `)
 }

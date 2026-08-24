@@ -816,6 +816,70 @@ func githubOwner(remoteURL string) string {
 	return owner
 }
 
+// --- exported scoping helpers (CLA-459) ---------------------------------------
+//
+// Doctor's deploy_lag check (internal/cli/deploy_lag.go) reads remotes with
+// ls-remote and fetch too - it measures deploy lag against the REMOTE tip of
+// the integration branch - so it has the identical account-mismatch gap
+// CLA-458 closed here. These wrappers exist so it can apply exactly this
+// resolution rather than grow a second copy of it; the Verifier's own methods
+// below delegate to the same functions.
+
+// GithubOwner reports the account that owns a github.com HTTPS remote URL, or
+// "" when no scoping is derivable. See githubOwner.
+func GithubOwner(remoteURL string) string {
+	return githubOwner(remoteURL)
+}
+
+// ScopeEnv returns the environment additions that scope ONE git invocation to
+// token: every https://github.com/ URL that invocation resolves is rewritten,
+// through GIT_CONFIG_* insteadOf config, into a token-bearing x-access-token
+// URL. The token travels in the child's environment, never its argv - see the
+// package comment on this section for why ps(1) rules argv out. The result is
+// meant as extra env on a single exec; nothing is persisted.
+func ScopeEnv(token string) []string {
+	return []string{
+		"GIT_CONFIG_COUNT=1",
+		fmt.Sprintf("GIT_CONFIG_KEY_0="+insteadOfBase, token),
+		"GIT_CONFIG_VALUE_0=" + insteadOfPrefix,
+	}
+}
+
+// TokenForOwner resolves owner's GitHub token with `gh auth token --user`,
+// spawning ghBin in dir under runGH's interaction-hostile discipline. Any
+// failure - gh missing, no such account, a wedged call - is an empty token,
+// which callers treat as "run unscoped". A token is also refused if it cannot
+// ride a single config value intact (embedded whitespace would corrupt the
+// insteadOf key into something silently wrong).
+func TokenForOwner(ctx context.Context, dir, ghBin, owner string) string {
+	out, err := runGHBin(ctx, ghBin, dir, nil, "auth", "token", "--user", owner)
+	if err != nil {
+		return ""
+	}
+	token := strings.TrimSpace(out)
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return ""
+	}
+	return token
+}
+
+// ScopeRemoteEnv is the whole CLA-458 resolution for one already-read remote
+// URL: the env additions that let git read THAT remote as the github account
+// owning it, or nil when no scoping applies - non-github host, or an owner
+// whose token gh cannot serve. nil means "run unscoped", byte-identical to
+// pre-CLA-458 behavior; every fallback stays fail-open.
+func ScopeRemoteEnv(ctx context.Context, dir, ghBin, remoteURL string) []string {
+	owner := githubOwner(remoteURL)
+	if owner == "" {
+		return nil
+	}
+	token := TokenForOwner(ctx, dir, ghBin, owner)
+	if token == "" {
+		return nil
+	}
+	return ScopeEnv(token)
+}
+
 // remoteCredEnv returns the environment additions that scope repo's resolved
 // remote to the account that owns it, or nil when no scoping applies. It costs
 // two local probes per network command - one `git remote get-url`, one `gh
@@ -827,37 +891,14 @@ func (v *Verifier) remoteCredEnv(ctx context.Context, repo string) []string {
 	if err != nil || raw == "" {
 		return nil
 	}
-	owner := githubOwner(raw)
-	if owner == "" {
-		return nil
-	}
-	token := v.ghTokenFor(ctx, repo, owner)
-	if token == "" {
-		return nil
-	}
-	return []string{
-		"GIT_CONFIG_COUNT=1",
-		fmt.Sprintf("GIT_CONFIG_KEY_0="+insteadOfBase, token),
-		"GIT_CONFIG_VALUE_0=" + insteadOfPrefix,
-	}
+	return ScopeRemoteEnv(ctx, repo, v.ghBin, raw)
 }
 
 // ghTokenFor resolves owner's GitHub token through `gh auth token --user` -
 // the same gh binary, and therefore the same credential mechanism, the PR
-// check already runs on. Any failure - gh missing, no such account, a wedged
-// call - is an empty token, which callers treat as "run unscoped". A token is
-// also refused if it cannot ride a single config value intact (embedded
-// whitespace would corrupt the insteadOf key into something silently wrong).
+// check already runs on. See TokenForOwner.
 func (v *Verifier) ghTokenFor(ctx context.Context, dir, owner string) string {
-	out, err := v.runGH(ctx, dir, "auth", "token", "--user", owner)
-	if err != nil {
-		return ""
-	}
-	token := strings.TrimSpace(out)
-	if token == "" || strings.ContainsAny(token, " \t\r\n") {
-		return ""
-	}
-	return token
+	return TokenForOwner(ctx, dir, v.ghBin, owner)
 }
 
 func short(sha string) string {

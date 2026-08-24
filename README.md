@@ -112,6 +112,22 @@ boundary too. Two other consequences worth knowing:
   alone, so with no phase after it every task would stop half-finished, forever,
   with nothing in the logs reading as an error.
 
+The seam also survives a blind spot in how claims are observed (CLA-451). The
+driver learns a session's claim by parsing clankerbar tool calls out of its
+stream; a session that claimed through another channel — a raw API call with the
+same key, a future harness quirk, a renamed tool — ends its implement phase
+holding a task the driver never saw it take, and used to end the sequence there:
+no review phase, no lease renewal, and pushed work stranded behind an expiring
+lease until a takeover recovered it at a reclaim's cost. Now, before declaring a
+checkpointable phase empty, the driver asks the plane about the one task it can
+name — the task it dispatched: if that task is held with a branch recorded and
+that branch verifies on the origin remote (the same evidence gate every
+checkpoint passes), the driver treats it as the checkpoint and resumes the run
+by heartbeat in the next phase, exactly as after an observed claim. The guards
+are unchanged: an unreadable stream is never filled in from the plane, a session
+that died producing nothing is never promoted by a plane answer, an observed
+claim always wins over a peeked one, and a failed peek keeps today's ending.
+
 The saving is **still unmeasured**: a phased run has now happened, but it is not
 comparable evidence - its implement phase reached the checkpoint over an
 implementation that already existed, so its totals capture a checkpoint plus a
@@ -372,11 +388,13 @@ clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
 clankerbar ctl restart -c ./clankerbar.json   # tell the RUNNING daemon to re-exec
 clankerbar ctl reload  -c ./clankerbar.json   # re-read the config file, no exec
+clankerbar propose-config                     # import this file into the plane (PENDING)
 ```
 
 Flags are **GNU-style**: `--long` options, `-x` shorts. `--config` (`-c`) and
 `--help` (`-h`) are the only short aliases; everything else is long-form only.
-`clankerbar run --help` and `clankerbar doctor --help` list them. A short flag's
+`clankerbar run --help`, `clankerbar doctor --help` and
+`clankerbar propose-config --help` list them. A short flag's
 value is separate (`-c ./x.json`) or `=`-joined (`-c=./x.json`); the inline
 `-c./x.json` form is rejected, so a typo like `-cofnig` cannot quietly become
 `--config=ofnig`.
@@ -674,6 +692,38 @@ The Claude harness runs with `--output-format stream-json`, so the agent's own
 progress — assistant text and `→ Tool` markers — streams live too, and each
 attempt is captured to its own `<state-dir>/iteration-<ts>.log`.
 
+### Fleet visibility
+
+The daemon also reports what it is doing to the plane, so the console's Fleet
+page shows every instance — working *and* idle, where the run-based panel only
+sees a daemon that currently holds a task. Two things are reported, both riding
+cadences the loop already runs (no new timers):
+
+- **Presence** rides each backlog poll: who the instance is (`instance_name`,
+  falling back to the machine's hostname; set it when you run more than one
+  daemon for the same project on one host), the host and binary version, a
+  fingerprint of the config in force, and the state — `idle`,
+  `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
+  holds spawns, `stopping` as the final beacon when the run ends. State changes
+  beacon at phase boundaries too, so the page does not wait out a poll interval
+  to learn which phase is running. The plane stores exactly what you report; it
+  infers nothing.
+- **Iteration history**: exactly one record per drain, posted at the boundary it
+  just crossed — the task, the phases attempted, how it ended (`checkpoint`
+  work left for a takeover / `released` back to the queue or settled /
+  `parked` for the operator / `dead`), duration, and tokens.
+
+Everything is strictly fail-soft telemetry: a failed report is logged once and
+dropped, never retried (v1), and can never block, delay, or fail the loop, a
+claim, or a phase. Reports go to `/api/projects/<slug>/fleet/report` on the same
+trusted origin as every other credentialed call and are authenticated by your
+project API key - the same key the sessions use, never anything extra.
+
+`clankerbar doctor` checks the wiring in its PASS/WARN table (`fleet`): whether
+a report endpoint could be derived and is reachable, with the key accepted -
+verified without writing anything, so a cron'd doctor cannot fight a live
+daemon's presence row.
+
 ### Checking what a session says it delivered
 
 The control plane holds the backlog and takes a clanker at its word. When a session
@@ -848,6 +898,7 @@ says why. (JSON today; TOML is the likely final format.)
   "max_session_wall_clock": 0,
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
+  "instance_name": "",
   "env": {},
   "idle_poll_interval": "60s",
   "poll_interval": "30m",
@@ -1134,6 +1185,33 @@ repo B:
 The conventional task-worktree area beside a checkout (`<checkout>-wt` as its
 sibling) joins the grant list automatically whenever that directory exists, so
 a session can create and edit the worktree it is told to work in.
+
+### Execution config from the plane
+
+A project's execution dials - harness, model, tier buckets, budget, review-tier
+escalation rules, and the two backstops (`max_turns`, `max_session_wall_clock`,
+as integer seconds) - can live **on the plane** instead of in this file. The
+daemon reads each project's stored document (per project, so two queues can run
+two postures) and overlays it over this file; until a project has one, this
+file rules byte for byte. `doctor` reports which is in force per project, and
+warns when a stored dial cannot fire on your machine (a turn cap under opencode,
+say) - shape-validates on the plane, machine-fit is doctor's.
+
+Edits apply at the **next iteration boundary**, never mid-session: the daemon
+watches the version on the backlog-summary poll it already makes, and on a bump
+re-reads and re-overlays before spawning again. A document that fails local
+validation keeps the previous config and says so loudly. Flags still outrank the
+stored document: `--model` on the command line wins over a ratified value.
+
+Import today's file as the starting point with:
+
+```sh
+clankerbar propose-config            # --slug <project> when projects[] names several
+```
+
+That records a PENDING proposal; nothing changes until you ratify it in the
+console (Settings -> Run configuration). Phases, prompts, wiring, env and paths
+stay local: the plane custodies policy, never machine fit or credentials.
 
 ### Multi-project: one instance, many queues
 

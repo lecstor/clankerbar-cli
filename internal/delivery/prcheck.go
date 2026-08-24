@@ -53,6 +53,28 @@ package delivery
 // (Unknown), never a pass — the same three-way discipline as every other
 // check in this package. `doctor` reports `gh` availability so the gate's
 // prerequisite is seen before it fires.
+//
+// # Whose credentials the API reads carry (CLA-460)
+//
+// CLA-458 scoped this package's GIT reads to the account that owns the
+// github.com remote, because the ambient credential helper serves whichever
+// account happens to be ACTIVE. The gh API reads have the same disease by a
+// different mechanism: `gh pr view` authenticates as the active account too,
+// so a repo owned by the non-active account fails with "Could not resolve to
+// a PullRequest" and a real delivery degrades to Unknown/WARN. Git takes a
+// per-command credential through config rewrite; gh takes one through the
+// GH_TOKEN environment variable, which outranks its keyring. So before its
+// first poll, prCheck derives the owner from the remote URL exactly as the
+// git side does, resolves THAT account's token through `gh auth token
+// --user`, and hands gh the token as GH_TOKEN in the child's environment —
+// env, never argv, because `-c`-style arguments print to ps(1) while child
+// env is already this driver's hygiene model (CLANKERBAR_API_KEY rides the
+// same way). An ambient GH_TOKEN/GITHUB_TOKEN is DROPPED from such a child
+// rather than appended over: duplicate env entries have no portable
+// precedence, and which credential a child resolves is not something to bet
+// on. Every fallback lands on byte-identical pre-CLA-460 behavior — ssh
+// remotes, non-github hosts, and owners gh cannot resolve a token for all
+// run unscoped, exactly as before.
 
 import (
 	"bytes"
@@ -357,7 +379,7 @@ func normalizePR(pr string) string {
 
 // prCheck verifies the PR named in a delivery: mergeable, with a check rollup
 // that actually ran and passed. See the file comment for the two conditions,
-// the bounded wait, and the no-CI decision.
+// the bounded wait, the no-CI decision, and whose credentials the reads carry.
 //
 // The repository is the one the earlier checks resolved (they share this
 // Report), or the first candidate whose origin is a github.com remote — the
@@ -407,10 +429,22 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 			"PR %s cannot be verified: the remote of %s (%s) is not a github.com repository", prNum, repo, url)}
 	}
 
+	// Scope every API read below to the account that owns the remote, the way
+	// CLA-458 scoped the git ones. Resolved once here, not per poll: the polls
+	// then share one identity, and the worst case stays a couple of gh spawns
+	// per verification. Empty means "run unscoped" — the fallback the header
+	// documents.
+	var ghScope []string
+	if owner := githubOwner(url); owner != "" {
+		if token := v.ghTokenFor(ctx, repo, owner); token != "" {
+			ghScope = []string{"GH_TOKEN=" + token}
+		}
+	}
+
 	start := time.Now()
 	deadline := start.Add(v.prBudget)
 	for {
-		j, err := v.readPR(ctx, repo, slug, prNum)
+		j, err := v.readPR(ctx, repo, slug, prNum, ghScope)
 		if err != nil {
 			var nf *ghNotFoundError
 			if errors.As(err, &nf) {
@@ -442,9 +476,10 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 // readPR makes one `gh pr view` call and classifies what came back. The
 // waiting verdicts (prMergeableUnknown, prNoChecks, prChecksPending) mean
 // "true so far as it went, but not yet decidable" — the caller polls within
-// its budget.
-func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string) (prJudgement, error) {
-	out, err := v.runGH(ctx, dir, "pr", "view", prNum,
+// its budget. scope carries the caller's credential scoping, nil to run
+// unscoped.
+func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string, scope []string) (prJudgement, error) {
+	out, err := v.runGHScoped(ctx, dir, scope, "pr", "view", prNum,
 		"--repo", slug,
 		"--json", "mergeable,mergeStateStatus,statusCheckRollup,url")
 	if err != nil {
@@ -462,13 +497,45 @@ func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string) (prJudge
 // runner: an unattended run has no terminal to answer prompts with, and a
 // wedged helper must not hold the check past its WaitDelay.
 func (v *Verifier) runGH(ctx context.Context, dir string, args ...string) (string, error) {
-	cmd := exec.CommandContext(ctx, v.ghBin, args...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
+	return v.runGHScoped(ctx, dir, nil, args...)
+}
+
+// runGHScoped is runGH plus environment additions for THIS invocation — the
+// shape credential scoping has to take, since a token must reach this child
+// and no other. When additions ride along, the ambient GH_TOKEN and
+// GITHUB_TOKEN are dropped from the child's environment first rather than
+// appended over: an env array may carry duplicates and which entry a child
+// resolves is unspecified, so shadowing is not a guarantee a credential is
+// allowed to lean on. Empty additions leave the environment untouched,
+// byte-for-byte the pre-scoping behavior.
+func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
+	return runGHBin(ctx, v.ghBin, dir, extraEnv, args...)
+}
+
+// runGHBin is runGH with the binary spelled out, so the per-owner token
+// resolution in delivery.go (TokenForOwner, CLA-458) drives the same spawn
+// discipline without a Verifier in hand - CLA-459's doctor consumer passes
+// "gh" here. extraEnv carries per-invocation environment additions (see
+// runGHScoped); pass nil for the plain spawn.
+func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ...string) (string, error) {
+	env := append(os.Environ(),
 		"GH_NO_UPDATE_NOTIFIER=1",
 		"GH_FORCE_TTY=0",
 		"GIT_TERMINAL_PROMPT=0",
 	)
+	if len(extraEnv) > 0 {
+		scoped := make([]string, 0, len(env)+len(extraEnv))
+		for _, e := range env {
+			if i := strings.IndexByte(e, '='); i > 0 && isGhTokenVar(e[:i]) {
+				continue
+			}
+			scoped = append(scoped, e)
+		}
+		env = append(scoped, extraEnv...)
+	}
+	cmd := exec.CommandContext(ctx, ghBin, args...)
+	cmd.Dir = dir
+	cmd.Env = env
 	cmd.WaitDelay = ghWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -487,4 +554,16 @@ func (v *Verifier) runGH(ctx context.Context, dir string, args ...string) (strin
 		return "", fmt.Errorf("gh %s: %w", args[0], err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// isGhTokenVar reports whether an environment NAME is one of the variables gh
+// reads a token from ahead of its keyring. Both spellings must go when a
+// scoped token rides the invocation, or a stale ambient value could win by
+// accident of position.
+func isGhTokenVar(name string) bool {
+	switch name {
+	case "GH_TOKEN", "GITHUB_TOKEN":
+		return true
+	}
+	return false
 }
