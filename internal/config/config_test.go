@@ -272,7 +272,7 @@ func TestProjectsValidation(t *testing.T) {
 	t.Run("each project's mcp config defaults to its own workdir's .mcp.json", func(t *testing.T) {
 		dir := t.TempDir()
 		mcp := filepath.Join(dir, ".mcp.json")
-		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		c := base()
@@ -296,7 +296,7 @@ func TestProjectsValidation(t *testing.T) {
 		// clankerbar tools and the poller could derive no slug.
 		dir := t.TempDir()
 		mcp := filepath.Join(dir, ".mcp.json")
-		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		c := base()

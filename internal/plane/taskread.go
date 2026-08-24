@@ -52,8 +52,14 @@ type TaskRepoSource interface {
 // cannot race a session out of work. It may hand back a stale-lease takeover
 // candidate; that is still the task the spawned session will be offered first,
 // so its repo is the right cwd to start in.
+//
+// The arguments are an EMPTY OBJECT, not nil: the plane's next_task schema is
+// `inputSchema: {}` and MCP servers reject a null `arguments` against an object
+// schema (observed live as "Invalid input / expected: record / params.arguments"
+// on every daemon, which sent the peek to the primary-repo fallback and
+// silently defeated CLA-437's repo routing, CLA-448).
 func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
-	raw, err := r.callText(ctx, "next_task", nil)
+	raw, err := r.callText(ctx, "next_task", map[string]any{})
 	if err != nil {
 		return NextTask{}, err
 	}

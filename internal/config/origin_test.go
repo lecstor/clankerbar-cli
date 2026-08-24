@@ -135,6 +135,164 @@ func TestHostileMCPConfigRefusedForAProjectEntry(t *testing.T) {
 	}
 }
 
+// CLA-448: a daemon config whose resolved MCP config file is PRESENT but silent
+// about clankerbar is refused at Validate — sessions would start with no
+// clankerbar tools, which is how CLA-351 and CLA-377 each burned three clankers
+// and parked. A missing file keeps today's behavior (doctor's no-.mcp.json WARN
+// covers it); the refusal fires when the file is there and names nothing usable.
+func TestValidateRefusesMCPConfigSilentAboutClankerbar(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string // substrings the refusal must name
+	}{
+		{
+			name: "top-level mcp_config_path names no clankerbar server",
+			body: `{"mcpServers":{"context7":{"type":"http","url":"https://context7.example/v1"}}}`,
+			want: "mcp_config_path",
+		},
+		{
+			name: "top-level mcp_config_path declares clankerbar but disabled",
+			body: `{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj","enabled":false}}}`,
+			want: "enabled",
+		},
+		{
+			name: "project mcp_config_path names no clankerbar server",
+			body: `{"mcpServers":{"docs":{"type":"http","url":"https://docs.example.com/mcp"}}}`,
+			want: "projects[0].mcp_config_path",
+		},
+		{
+			name: "per-harness project mcp_config_paths entry names no clankerbar server",
+			body: `{"mcp":{"context7":{"type":"remote","url":"https://context7.example/v1"}}}`,
+			want: "mcp_config_paths",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			switch {
+			case strings.Contains(tc.want, "projects[0].mcp_config_path"):
+				dir, path := writeMCP(t, tc.body)
+				c := baseConfig(t.TempDir())
+				c.Projects = []Project{{Slug: "proj", WorkDir: dir, MCPConfigPath: path}}
+				err := c.Validate()
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("Validate() = %v, want a refusal naming %q", err, tc.want)
+				}
+			case strings.Contains(tc.want, "mcp_config_paths"):
+				// The per-harness file lives OUTSIDE the project workdir so the
+				// workdir's own discovery cannot shadow it with the same content.
+				body := tc.body
+				silentDir := t.TempDir()
+				path := filepath.Join(silentDir, "opencode.json")
+				if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				c := baseConfig(t.TempDir())
+				c.Projects = []Project{{Slug: "proj", WorkDir: t.TempDir(), MCPConfigPaths: map[string]string{"opencode": path}}}
+				err := c.Validate()
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("Validate() = %v, want a refusal naming %q", err, tc.want)
+				}
+			default:
+				_, path := writeMCP(t, tc.body)
+				c := defaults()
+				c.MCPConfigPath = path
+				err := c.Validate()
+				if err == nil || !strings.Contains(err.Error(), tc.want) {
+					t.Fatalf("Validate() = %v, want a refusal naming %q", err, tc.want)
+				}
+			}
+		})
+	}
+}
+
+func TestValidateAcceptsMCPConfigThatDeclaresClankerbar(t *testing.T) {
+	// The refusal must not fire on a file that names clankerbar, whatever else it
+	// carries: an entry using the key under the `mcpServers` block, an opencode
+	// `mcp` block, a key-using entry under another name, and an http server that
+	// references no key at all (the origin gate handles where the key may go).
+	dir, path := writeMCP(t, `{
+	  "mcpServers": {
+	    "clankerbar": {"type":"http","url":"https://clankerbar.com/mcp/proj","headers":{"Authorization":"Bearer ${CLANKERBAR_API_KEY}"}},
+	    "docs": {"type":"http","url":"https://docs.example.com/mcp"}
+	  }
+	}`)
+	c := baseConfig(dir)
+	c.MCPConfigPath = path
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil for a file that declares clankerbar", err)
+	}
+}
+
+// The predicate behind the refusal, read directly: which file shapes count as
+// declaring a usable clankerbar server, and which do not (CLA-448).
+func TestMCPClankerbarPredicate(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		url  string
+		ok   bool
+	}{
+		{
+			name: "an http entry named clankerbar in the claude block",
+			body: `{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`,
+			url:  "https://clankerbar.com/mcp/proj",
+			ok:   true,
+		},
+		{
+			name: "an http entry named clankerbar in the opencode block",
+			body: `{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj"}}}`,
+			url:  "https://clankerbar.com/mcp/proj",
+			ok:   true,
+		},
+		{
+			name: "an entry under another name handed the key counts",
+			body: `{"mcpServers":{"backlog":{"type":"http","url":"https://clankerbar.com/mcp/proj","headers":{"Authorization":"Bearer ${CLANKERBAR_API_KEY}"}}}}`,
+			url:  "https://clankerbar.com/mcp/proj",
+			ok:   true,
+		},
+		{
+			name: "a local-command entry named clankerbar counts, with no url",
+			body: `{"mcpServers":{"clankerbar":{"command":"clankerbar-mcp"}}}`,
+			ok:   true,
+		},
+		{
+			name: "clankerbar explicitly disabled does not",
+			body: `{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj","enabled":false}}}`,
+			ok:   false,
+		},
+		{
+			name: "unrelated servers only do not",
+			body: `{"mcp":{"context7":{"type":"remote","url":"https://context7.example/v1"}}}`,
+			ok:   false,
+		},
+		{
+			name: "an empty file does not",
+			body: `{}`,
+			ok:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, path := writeMCP(t, tc.body)
+			url, ok := MCPClankerbar(path)
+			if ok != tc.ok {
+				t.Fatalf("MCPClankerbar() ok = %v, want %v", ok, tc.ok)
+			}
+			if url != tc.url {
+				t.Errorf("MCPClankerbar() url = %q, want %q", url, tc.url)
+			}
+		})
+	}
+
+	t.Run("an absent file reports nothing", func(t *testing.T) {
+		url, ok := MCPClankerbar(filepath.Join(t.TempDir(), "missing.json"))
+		if ok || url != "" {
+			t.Errorf("MCPClankerbar() = (%q, %v), want (\"\", false) for an absent file", url, ok)
+		}
+	})
+}
+
 func TestUnrelatedMCPServerIsNotPoliced(t *testing.T) {
 	// An MCP config routinely carries servers that have nothing to do with
 	// clankerbar and are handed none of its credentials. Refusing those would
@@ -257,8 +415,11 @@ func TestLocalServerHandedTheKeyIsRefused(t *testing.T) {
 
 	// A local server that is handed nothing is left alone by the origin gate:
 	// plenty of named configs run one, and it is no business of a rule about
-	// where a credential goes.
-	dir, path = writeMCP(t, `{"mcpServers":{"some-tool":{"command":"some-binary","env":{"HOME":"/tmp"}}}}`)
+	// where a credential goes. CLA-448 adds a separate bar: the file must still
+	// declare clankerbar (a local command for some-tool alone would blind
+	// sessions), so the fixture is the honest shape — clankerbar plus the
+	// unrelated local server.
+	dir, path = writeMCP(t, `{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"},"some-tool":{"command":"some-binary","env":{"HOME":"/tmp"}}}}`)
 	c = baseConfig(dir)
 	c.MCPConfigPath = path
 	if err := c.Validate(); err != nil {
