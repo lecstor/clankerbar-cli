@@ -98,6 +98,9 @@ type Claim struct {
 	// rollup that actually ran and passed; see prcheck.go for the two
 	// conditions, the bounded wait, and the no-CI decision.
 	PR string
+
+	// Repo is the repository the claim lives in ("owner/name"). When set, it resolves ambiguity when the same branch exists in multiple repos (CLA-351).
+	Repo string
 }
 
 // Empty reports that there is nothing here to check.
@@ -273,6 +276,15 @@ func (v *Verifier) Verify(ctx context.Context, c Claim) Report {
 // unpushed-work failure this exists to catch into a Pass. Ambiguity is reported,
 // not guessed at.
 func (v *Verifier) branchCheck(ctx context.Context, repos []string, branch string, rep *Report) Check {
+	// If the claim names a repo, filter the candidates to those whose remote URL
+	// matches the slug (CLA-351). If none match, fall back honestly: the refusal
+	// message names the ambiguous repos as before, rather than hiding the mismatch.
+	if rep.Claim.Repo != "" {
+		filtered := v.resolveRepoByURL(ctx, repos, rep.Claim.Repo)
+		if len(filtered) > 0 {
+			repos = filtered
+		}
+	}
 	var found []string
 	for _, r := range repos {
 		if sha, err := v.run(ctx, r, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil && sha != "" {
@@ -542,6 +554,75 @@ func sameDir(a, b string) bool { return realPath(a) == realPath(b) }
 // repository has it, otherwise its only remote. A repo with several remotes and no
 // `origin` keeps the configured name and fails the read loudly, rather than
 // silently checking against whichever remote happened to sort first.
+
+// resolveRepoByURL filters repos to those whose remote URL matches the claim's repo slug.
+func (v *Verifier) resolveRepoByURL(ctx context.Context, repos []string, repoSlug string) []string {
+	if repoSlug == "" {
+		return repos
+	}
+	var matched []string
+	for _, r := range repos {
+		url, err := v.remoteURL(ctx, r)
+		if err != nil || url == "" {
+			continue
+		}
+		if matchesRepoSlug(url, repoSlug) {
+			matched = append(matched, r)
+		}
+	}
+	if len(matched) == 0 {
+		// If no working copy matches, fall back to all repos so the refusal is honest.
+		return repos
+	}
+	return matched
+}
+
+// matchesRepoSlug reports whether a remote URL names the repo slug (owner/name),
+// tolerating https and ssh forms.
+func matchesRepoSlug(url, slug string) bool {
+	if slug == "" {
+		return true
+	}
+	// Tolerate both ssh (git@host:owner/name) and https (https://host/owner/name) forms.
+	// The slug is 'owner/name'. We look for the exact sequence after stripping protocol.
+	clean := url
+	// Strip the two trimmable suffixes in BOTH orders until stable: "name.git/",
+	// "name/.git", "/name.git" and trailing "/" all resolve to "…/name".
+	for {
+		before := clean
+		clean = strings.TrimSuffix(clean, ".git")
+		clean = strings.TrimSuffix(clean, "/")
+		if clean == before {
+			break
+		}
+	}
+	clean = strings.TrimPrefix(clean, "https://")
+	clean = strings.TrimPrefix(clean, "http://")
+	clean = strings.TrimPrefix(clean, "git@")
+	// After stripping protocol and ".git", both forms carry the slug as a path
+	// segment: ssh 'github.com:lecstor/clankerbar-cli' and https
+	// 'github.com/lecstor/clankerbar-cli'. The check requires a BOUNDARY on both
+	// sides of the slug — preceded by start, '/' or ':', followed by '/' or end —
+	// so `lecstor/clankerbar` never matches `lecstor/clankerbar-cli` (the
+	// project's own repo pair: the whole point of CLA-351 is to tell them apart).
+	for i := 0; i+len(slug) <= len(clean); i++ {
+		if !strings.HasPrefix(clean[i:], slug) {
+			continue
+		}
+		before, after := byte('/'), byte('/')
+		if i > 0 {
+			before = clean[i-1]
+		}
+		if j := i + len(slug); j < len(clean) {
+			after = clean[j]
+		}
+		if (before == '/' || before == ':') && (after == '/' || after == 0) {
+			return true
+		}
+	}
+	return false
+}
+
 func (v *Verifier) resolveRemote(ctx context.Context, repo string) string {
 	out, err := v.run(ctx, repo, "remote")
 	if err != nil || out == "" {
