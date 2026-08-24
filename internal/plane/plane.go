@@ -178,6 +178,36 @@ func New(mcpURL, apiKey string) Releaser {
 	if mcpURL == "" || apiKey == "" {
 		return notWired{}
 	}
+	return wiredClient(mcpURL, apiKey)
+}
+
+// NewRunConfigAPI builds the run-config half of the surface: reading the stored
+// execution config and proposing one. Missing either the endpoint or the key
+// yields the not-wired client, degrading exactly like New.
+//
+// The not-wired value is deliberately a DIFFERENT type from New's: each
+// constructor hands out only its own capabilities, so a caller type-asserting
+// for one it did not ask for gets a refusal, not a silent claim (the same
+// property plane_test.go asserts for Recorder and ParkAPI).
+//
+// mcpURL is the project-scoped MCP endpoint (`https://…/mcp/<slug>`).
+func NewRunConfigAPI(mcpURL, apiKey string) RunConfigAPI {
+	if mcpURL == "" || apiKey == "" {
+		return rcNotWired{}
+	}
+	return wiredClient(mcpURL, apiKey)
+}
+
+// rcNotWired is NewRunConfigAPI's not-wired answer — only what RunConfigAPI
+// names, so it cannot be asserted into a capability nobody requested.
+type rcNotWired struct{}
+
+func (rcNotWired) RunConfig(context.Context) (*RunConfigState, error) { return nil, ErrNotWired }
+func (rcNotWired) ProposeRunConfig(context.Context, map[string]any, string) error {
+	return ErrNotWired
+}
+
+func wiredClient(mcpURL, apiKey string) *mcpReleaser {
 	return &mcpReleaser{
 		endpoint: strings.TrimRight(mcpURL, "/"),
 		apiKey:   apiKey,
