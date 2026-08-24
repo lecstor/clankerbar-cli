@@ -33,9 +33,10 @@ builds:
     flags:
       - -mod=readonly
       - -trimpath
-    # main.version is stamped so `clankerbar version` reports the release tag.
+    # version.Current is stamped so `clankerbar version` reports the release tag
+    # and the fleet presence beacon reports it (CLA-466).
     ldflags:
-      - -s -w -X main.version={{ .Version }}
+      - -s -w -X github.com/lecstor/clankerbar-cli/internal/version.Current={{ .Version }}
     goos:
       - darwin
       - linux

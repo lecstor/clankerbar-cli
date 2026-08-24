@@ -57,6 +57,9 @@ func okEnv() doctorEnv {
 		gitRun: func(context.Context, string, ...string) (string, error) {
 			return "", errors.New("okEnv runs no git")
 		},
+		// The fleet seam (CLA-466): an empty-body probe that succeeds, i.e. a
+		// plane that is reachable and accepts the key. Tests break it explicitly.
+		fleetProbe: func(context.Context, string, string) error { return nil },
 	}
 }
 

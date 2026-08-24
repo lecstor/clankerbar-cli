@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +41,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
@@ -102,6 +105,10 @@ type doctorEnv struct {
 	runEnvCmd func(ctx context.Context, command string) (string, error)
 	envPath   func(path string) error
 
+	// The fleet check's one seam (CLA-466): the harmless empty-body probe of the
+	// report endpoint. Production is fleet.Probe; tests substitute statuses.
+	fleetProbe func(ctx context.Context, endpoint, apiKey string) error
+
 	// The run-config check's seam (CLA-410): building the read/propose client
 	// for one project's MCP endpoint. Production is plane.NewRunConfigAPI; a
 	// field so tests serve stored documents from an httptest plane.
@@ -140,6 +147,7 @@ func defaultDoctorEnv() doctorEnv {
 			return config.RunEnvCommand(command)
 		},
 		envPath:    config.VerifyEnvFilePath,
+		fleetProbe: fleet.Probe,
 		newRCfgAPI: plane.NewRunConfigAPI,
 	}
 }
@@ -238,6 +246,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkSessionEnv(ctx, cfg, e)...)
 	checks = append(checks, checkTokenSources(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
+	checks = append(checks, checkFleets(ctx, cfg, e)...)
 	checks = append(checks, checkRunConfigs(ctx, cfg, e)...)
 	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
@@ -654,6 +663,92 @@ func checkBacklog(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 		out = append(out, backlogCheck(ctx, "backlog["+p.Slug+"]", cfg.ProjectSummaryURL(p), e))
 	}
 	return out
+}
+
+// checkFleets reports whether fleet activity reporting (CLA-466) is wired and
+// its endpoint reachable — the same PASS/WARN table shape as the MCP wiring
+// checks (the CLA-448 precedent). One check per project, like backlog's.
+//
+// Every outcome is PASS or WARN, never FAIL: reporting is telemetry, so an
+// outage or a gap degrades console visibility while the loop runs exactly as
+// before. A rejected key already FAILs in the backlog check above it, where it
+// actually stops the run; saying it twice here at FAIL strength would make
+// doctor exit non-zero over a condition that costs nothing but a picture.
+func checkFleets(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	if len(cfg.Projects) == 0 {
+		return []check{fleetCheck(ctx, "fleet", cfg.FleetReportURL(), e)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, fleetCheck(ctx, "fleet["+p.Slug+"]", cfg.ProjectFleetReportURL(p), e))
+	}
+	return out
+}
+
+func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
+	c := check{name: name}
+
+	// Not-wired cases first: no key, no derivable slug-ful report URL. Both are
+	// the "reporting off, loop fine" shape.
+	if e.apiKey == "" {
+		c.status = warn
+		c.detail = "fleet activity reporting is off: no creds — CLANKERBAR_API_KEY is unset"
+		c.remedy = "export CLANKERBAR_API_KEY (mint one at clankerbar.com/projects/<slug>/api-keys)"
+		return c
+	}
+	if endpoint == "" {
+		c.status = warn
+		c.detail = "fleet activity reporting is off: no project-scoped /api/projects/<slug>/fleet/report endpoint could be derived"
+		c.remedy = "declare projects[].slug, or point mcp_config_path at an .mcp.json naming /mcp/<slug>"
+		return c
+	}
+
+	// The probe POSTs an EMPTY body: auth is checked before body validation, so a
+	// 400 proves reachable + routed + key accepted without writing anything. A
+	// real beacon would upsert this machine's presence row with doctor's own
+	// state, fighting whatever a live daemon on the same host reports.
+	err := e.fleetProbe(ctx, endpoint, e.apiKey)
+	switch {
+	case err == nil:
+		c.status = pass
+		c.detail = fmt.Sprintf("%s — reachable, key accepted; presence updates on each poll", endpoint)
+	case timedOut(err):
+		c.status = warn
+		c.detail = "fleet endpoint timed out — reports would be dropped (the loop is unaffected): " + endpoint
+		c.remedy = "check the plane is reachable"
+	default:
+		var pe *fleet.ProbeError
+		switch {
+		case errors.As(err, &pe) && (pe.Status == http.StatusUnauthorized || pe.Status == http.StatusForbidden):
+			c.status = warn
+			c.detail = fmt.Sprintf("fleet endpoint reachable but the key was rejected (HTTP %d) — reporting is off: %s", pe.Status, endpoint)
+			c.remedy = "check CLANKERBAR_API_KEY covers this project (a wrong project's key is refused before any write)"
+		case errors.As(err, &pe) && pe.Status == http.StatusNotFound:
+			c.status = warn
+			c.detail = "the plane has no fleet-report route (an older clankerbar deployment) — reporting is off"
+			c.remedy = "upgrade clankerbar to a build with fleet activity (CLA-465); the CLI runs fine without it"
+		case errors.As(err, &pe):
+			c.status = warn
+			c.detail = fmt.Sprintf("fleet endpoint answered unexpectedly (HTTP %d) — reporting may be degraded: %s", pe.Status, endpoint)
+			c.remedy = "check the plane is reachable: " + endpoint
+		default:
+			c.status = warn
+			c.detail = "fleet endpoint unreachable — reporting is off (the loop is unaffected): " + err.Error()
+			c.remedy = "check the plane is reachable: " + endpoint
+		}
+	}
+	return c
+}
+
+// timedOut reports whether err is a timeout, however the HTTP client chose to
+// express it: a context deadline or the Client.Timeout wrapper (a net.Error
+// with Timeout set), which are not the same error chain.
+func timedOut(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) check {

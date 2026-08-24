@@ -692,6 +692,38 @@ The Claude harness runs with `--output-format stream-json`, so the agent's own
 progress — assistant text and `→ Tool` markers — streams live too, and each
 attempt is captured to its own `<state-dir>/iteration-<ts>.log`.
 
+### Fleet visibility
+
+The daemon also reports what it is doing to the plane, so the console's Fleet
+page shows every instance — working *and* idle, where the run-based panel only
+sees a daemon that currently holds a task. Two things are reported, both riding
+cadences the loop already runs (no new timers):
+
+- **Presence** rides each backlog poll: who the instance is (`instance_name`,
+  falling back to the machine's hostname; set it when you run more than one
+  daemon for the same project on one host), the host and binary version, a
+  fingerprint of the config in force, and the state — `idle`,
+  `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
+  holds spawns, `stopping` as the final beacon when the run ends. State changes
+  beacon at phase boundaries too, so the page does not wait out a poll interval
+  to learn which phase is running. The plane stores exactly what you report; it
+  infers nothing.
+- **Iteration history**: exactly one record per drain, posted at the boundary it
+  just crossed — the task, the phases attempted, how it ended (`checkpoint`
+  work left for a takeover / `released` back to the queue or settled /
+  `parked` for the operator / `dead`), duration, and tokens.
+
+Everything is strictly fail-soft telemetry: a failed report is logged once and
+dropped, never retried (v1), and can never block, delay, or fail the loop, a
+claim, or a phase. Reports go to `/api/projects/<slug>/fleet/report` on the same
+trusted origin as every other credentialed call and are authenticated by your
+project API key - the same key the sessions use, never anything extra.
+
+`clankerbar doctor` checks the wiring in its PASS/WARN table (`fleet`): whether
+a report endpoint could be derived and is reachable, with the key accepted -
+verified without writing anything, so a cron'd doctor cannot fight a live
+daemon's presence row.
+
 ### Checking what a session says it delivered
 
 The control plane holds the backlog and takes a clanker at its word. When a session
@@ -866,6 +898,7 @@ says why. (JSON today; TOML is the likely final format.)
   "max_session_wall_clock": 0,
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
+  "instance_name": "",
   "env": {},
   "idle_poll_interval": "60s",
   "poll_interval": "30m",

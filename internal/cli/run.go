@@ -13,6 +13,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
@@ -154,6 +155,12 @@ func Run(ctx context.Context, args []string) error {
 				// permission policy covers every declared checkout.
 				Repos:       cfg.ReposFor(p.Slug),
 				PrimaryRepo: cfg.PrimaryRepoFor(p.Slug),
+				// Fleet activity reporting for this project (CLA-466): presence
+				// on every poll, iteration records at drain boundaries. Not
+				// wired (a no-op reporter) when no slug-ful report URL can be
+				// derived or the key is unset — telemetry degrades, never the
+				// loop.
+				Fleet: fleet.New(cfg.ProjectFleetReportURL(p), apiKey),
 			})
 		}
 		return runDriver(ctx, loop.NewMulti(cfg, adapter, targets), f.cfgPath, overrides)
@@ -167,6 +174,7 @@ func Run(ctx context.Context, args []string) error {
 		Poller:      backlog.New(cfg.BacklogSummaryURL(), apiKey),
 		Releaser:    rel,
 		RCfg:        rc,
+		Fleet:       fleet.New(cfg.FleetReportURL(), apiKey),
 		Repos:       cfg.ReposFor(""),
 		PrimaryRepo: cfg.PrimaryRepoFor(""),
 	}}), f.cfgPath, overrides)
