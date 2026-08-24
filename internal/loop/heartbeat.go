@@ -72,6 +72,11 @@ type leaseRenewer struct {
 	claims  chan harness.Claim
 	done    chan struct{}
 	stopped chan struct{}
+	// tick is a test seam: when non-nil, run drives its cadence from this
+	// channel instead of constructing a time.Ticker (see run). Tests inject
+	// a channel they fire by hand so a claim queued through observe() can be
+	// raced against a tick deterministically.
+	tick chan time.Time
 }
 
 // startLeaseRenewal begins renewing the spawned session's claim lease and
@@ -165,8 +170,20 @@ func (r *leaseRenewer) apply(c, current harness.Claim) harness.Claim {
 // released.
 func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 	defer close(r.stopped)
-	ticker := time.NewTicker(r.interval)
-	defer ticker.Stop()
+	// Testing seam: a test-provided tick channel subordinates the renewer to
+	// ticks the test fires by hand, so a claim observation can be interleaved
+	// with a tick on a spine the test fully controls. Nil keeps the real
+	// time-based cadence.
+	var tick <-chan time.Time
+	stopTicker := func() {}
+	if r.tick != nil {
+		tick = r.tick
+	} else {
+		t := time.NewTicker(r.interval)
+		tick = t.C
+		stopTicker = t.Stop
+	}
+	defer stopTicker()
 	beats := 0
 	failures := 0
 	for {
@@ -180,7 +197,7 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 			return
 		case c := <-r.claims:
 			current = r.apply(c, current)
-		case <-ticker.C:
+		case <-tick:
 			// A claim transition queued by observe() wins over the tick,
 			// every time. Without draining here, select's random pick can
 			// hand the tick to a loop whose `current` is still the pre-settle
