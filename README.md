@@ -974,7 +974,9 @@ Three properties carry the security and reliability weight:
   variable - never a silent partial env, because a session missing its declared
   environment is the incident, not a degraded mode.
 - **`@path` secrets stay owner-only, enforced.** A file any other local account
-  can read refuses the spawn, exactly as it always refused Validate.
+  can read refuses the spawn, and so does a file that has been emptied - an
+  invisible token rot must fail at spawn with the variable named, not inside
+  git later.
 - **Values come from the operator's own config only.** Nothing in a workdir or
   checkout feeds this map; the credential-origin rule for the account key is
   unchanged.

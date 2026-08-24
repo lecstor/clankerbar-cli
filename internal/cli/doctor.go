@@ -1429,12 +1429,19 @@ func anyProjectAllowlists(cfg *config.Config) bool {
 
 // --- 8. permission policy ----------------------------------------------------
 
-// opencodePermissionOverride finds an OPENCODE_PERMISSION declaration that would
-// override the adapter's own fail-closed export — exec takes the last duplicate
-// key, so ANY declared value wins — across all four env levels (top level,
-// harness block, project blocks, project-per-harness blocks for this harness).
-// It reports where it was declared and the declared source: the literal, or the
-// command that produces it. Never the resolved output.
+// opencodePermissionOverride finds an OPENCODE_PERMISSION declaration that
+// would override the adapter's own fail-closed export — exec takes the last
+// duplicate key, so ANY declared value wins — across all four env levels. It
+// scans MOST-SPECIFIC-FIRST inside each project's scope (the
+// project-per-harness block for this harness, then the project block), then the
+// harness block, then top level: SessionEnv composes the child env per key by
+// exactly that precedence, so when two levels declare the same name it is the
+// more specific one the session actually carries. Naming a layer whose value
+// loses the overlay would send the operator to edit the wrong line. Across
+// projects the first declaring project is reported — each session carries only
+// its own project's layers, so no single entry wins a whole multi-project run.
+// The value reported is the declared source — the literal, or the command that
+// produces it — never the resolved output.
 func opencodePermissionOverride(cfg *config.Config, harnessName string) (where, value string, ok bool) {
 	const key = "OPENCODE_PERMISSION"
 	scan := func(label string, m config.EnvMap) (string, string, bool) {
@@ -1446,24 +1453,24 @@ func opencodePermissionOverride(cfg *config.Config, harnessName string) (where, 
 		}
 		return "", "", false
 	}
-	if w, v, found := scan("env", cfg.Env); found {
-		return w, v, true
+	for i := range cfg.Projects {
+		p := &cfg.Projects[i]
+		if ph, exists := p.EnvPerHarness[harnessName]; exists {
+			if w, v, found := scan(fmt.Sprintf("projects[%d].env_per_harness.%s", i, harnessName), ph); found {
+				return w, v, true
+			}
+		}
+		if w, v, found := scan(fmt.Sprintf("projects[%d].env", i), p.Env); found {
+			return w, v, true
+		}
 	}
 	if hc, exists := cfg.Harnesses[harnessName]; exists {
 		if w, v, found := scan("harnesses."+harnessName+".env", hc.Env); found {
 			return w, v, true
 		}
 	}
-	for i := range cfg.Projects {
-		p := &cfg.Projects[i]
-		if w, v, found := scan(fmt.Sprintf("projects[%d].env", i), p.Env); found {
-			return w, v, true
-		}
-		if ph, exists := p.EnvPerHarness[harnessName]; exists {
-			if w, v, found := scan(fmt.Sprintf("projects[%d].env_per_harness.%s", i, harnessName), ph); found {
-				return w, v, true
-			}
-		}
+	if w, v, found := scan("env", cfg.Env); found {
+		return w, v, true
 	}
 	return "", "", false
 }

@@ -141,3 +141,37 @@ func TestCheckTokenSourcesJudgesPerProject(t *testing.T) {
 		t.Fatalf("got %s, want %s", got, want)
 	}
 }
+
+// When OPENCODE_PERMISSION is declared at two levels, the session carries the
+// MORE specific one (SessionEnv's per-key overlay, adapters append it last), so
+// that is the declaration doctor must name — pointing the operator at the layer
+// whose value loses the overlay sends them to edit the wrong line.
+func TestOpencodePermissionOverrideNamesTheWinningLayer(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Env = config.EnvMap{"OPENCODE_PERMISSION": config.CommandEnv("echo top")}
+	cfg.Harnesses = map[string]config.HarnessConfig{
+		"opencode": {Env: config.EnvMap{"OPENCODE_PERMISSION": {Literal: `{"bash":"allow"}`}}},
+	}
+
+	where, v, ok := opencodePermissionOverride(cfg, "opencode")
+	if !ok {
+		t.Fatal("want a found override")
+	}
+	if where != "harnesses.opencode.env" {
+		t.Fatalf("named %q, want the harness block (the more specific layer)", where)
+	}
+	if v != `{"bash":"allow"}` {
+		t.Fatalf("quoted %q, want the WINNING declaration's value", v)
+	}
+
+	// The pair block beats the project block beats everything above.
+	cfg.Projects = []config.Project{{Slug: "p", WorkDir: t.TempDir(),
+		Env: config.EnvMap{"OPENCODE_PERMISSION": {Literal: "proj"}},
+		EnvPerHarness: map[string]config.EnvMap{
+			"opencode": {"OPENCODE_PERMISSION": config.CommandEnv("gh auth token -u x")},
+		}}}
+	where, _, ok = opencodePermissionOverride(cfg, "opencode")
+	if !ok || where != "projects[0].env_per_harness.opencode" {
+		t.Fatalf("named %q (ok=%v), want the project-per-harness block", where, ok)
+	}
+}

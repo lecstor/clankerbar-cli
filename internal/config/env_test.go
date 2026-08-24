@@ -354,6 +354,36 @@ func TestSessionEnvRefusalCoversEveryLayer(t *testing.T) {
 	}
 }
 
+// An "@path" file that resolves to empty is refused, exactly as a command's
+// empty output is: an emptied token file would hand the child an empty
+// GH_TOKEN and move the failure into git/gh inside a session. An INLINE ""
+// literal is different — static, visible in the config, sometimes deliberate —
+// and still passes.
+func TestSessionEnvRefusesAnEmptyAtPathFile(t *testing.T) {
+	skipIfModeIsMeaningless(t)
+	dir := t.TempDir()
+	empty := filepath.Join(dir, "empty")
+	if err := os.WriteFile(empty, []byte("  \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := defaults()
+	c.Env = EnvMap{"GH_TOKEN": {Literal: "@" + empty}}
+	_, err := c.SessionEnv(c.Harness, "")
+	if err == nil || !strings.Contains(err.Error(), "env GH_TOKEN") || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("want an empty-file refusal naming the variable, got %v", err)
+	}
+
+	c.Env = EnvMap{"FLAG": {Literal: ""}}
+	got, err := c.SessionEnv(c.Harness, "")
+	if err != nil {
+		t.Fatalf("an inline empty literal must still pass: %v", err)
+	}
+	if len(got) != 1 || got[0] != "FLAG=" {
+		t.Fatalf("got %v", got)
+	}
+}
+
 // --- doctor support -----------------------------------------------------------
 
 func TestDeclaredEnvsListsAllFourLevelsInOrder(t *testing.T) {
@@ -420,5 +450,21 @@ func TestVerifyEnvFilePathEnforcesOwnerOnly(t *testing.T) {
 	err := VerifyEnvFilePath(p)
 	if !errors.Is(err, errInsecureMode) {
 		t.Fatalf("0644 file accepted: %v", err)
+	}
+}
+
+// The preflight matches spawn behavior on emptied files too: a secret that has
+// been truncated to whitespace is the silent-misattribution failure, and doctor
+// is where it is caught cheaply.
+func TestVerifyEnvFilePathRefusesAnEmptyFile(t *testing.T) {
+	skipIfModeIsMeaningless(t)
+	dir := t.TempDir()
+	p := filepath.Join(dir, "tok")
+	if err := os.WriteFile(p, []byte(" \n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := VerifyEnvFilePath(p)
+	if err == nil || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("want an empty-file refusal, got %v", err)
 	}
 }

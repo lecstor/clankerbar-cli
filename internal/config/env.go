@@ -278,9 +278,14 @@ func resolveEnvValue(name string, v EnvValue) (string, error) {
 }
 
 // resolveLiteral resolves a literal value, expanding the "@path" form against
-// an owner-only file exactly as resolveEnv did. The underlying error — the
-// insecure-mode sentinel included — stays wrapped, so callers can still
-// classify it.
+// an owner-only file exactly as resolveEnv did. A file that resolves to empty
+// is REFUSED, for the same reason a command's empty output is: an emptied token
+// file hands the child an empty GH_TOKEN and moves the failure from spawn time
+// (loud, named) into git/gh deep inside a session (silent, misattributed). An
+// inline "" literal is different — it is static and visible in the operator's
+// own config, and a deliberately set-but-empty variable is a real pattern — so
+// it passes through untouched. The underlying error — the insecure-mode
+// sentinel included — stays wrapped, so callers can still classify it.
 func resolveLiteral(literal string) (string, error) {
 	if !strings.HasPrefix(literal, "@") {
 		return literal, nil
@@ -293,7 +298,11 @@ func resolveLiteral(literal string) (string, error) {
 		}
 		return "", err
 	}
-	return strings.TrimSpace(string(data)), nil
+	val := strings.TrimSpace(string(data))
+	if val == "" {
+		return "", fmt.Errorf("@path %s is empty", path)
+	}
+	return val, nil
 }
 
 // DeclaredEnvs lists every env declaration in the config, in a stable order,
@@ -325,18 +334,23 @@ func (c *Config) DeclaredEnvs() []DeclaredEnv {
 	return out
 }
 
-// VerifyEnvFilePath checks that an "@path" secret file is readable and meets
-// its owner-only rule, without returning its contents. It is the check
-// Validate used to run on every @path value; it lives here so `doctor` can
-// keep making that preflight before a run leans on a file resolution now
-// deferred to spawn time.
+// VerifyEnvFilePath checks that an "@path" secret file is readable, meets its
+// owner-only rule, and is not EMPTY — the same refusal spawn-time resolution
+// applies (an emptied token file is the silent-misattribution failure this map
+// exists to end) — without returning its contents. It is the check Validate
+// used to run on every @path value; it lives here so `doctor` can keep making
+// that preflight before a run leans on a file resolution now deferred to spawn
+// time.
 func VerifyEnvFilePath(path string) error {
-	_, err := readOwnerOnly(expandHome(path), groupOtherAccess)
+	data, err := readOwnerOnly(expandHome(path), groupOtherAccess)
 	if err != nil {
 		if errors.Is(err, errInsecureMode) {
 			return fmt.Errorf("%w - an @path secret must be readable only by you: chmod 600 %s", err, path)
 		}
 		return err
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return fmt.Errorf("@path %s is empty", path)
 	}
 	return nil
 }
