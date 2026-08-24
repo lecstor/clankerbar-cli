@@ -1343,6 +1343,61 @@ func verifiedBranch(res *harness.Result) string {
 	return ""
 }
 
+// peekCheckpointClaim asks the plane whether the task this phase was BRIEFED on
+// is now held, with a branch recorded, by some run of this project's key — the
+// claim a session took through a channel the driver cannot observe (CLA-451:
+// a raw API call with the same credential, a harness quirk, a renamed tool).
+// It returns that claim as a synthesized Result for the seam to gate and carry,
+// or nil when today's ending should stand.
+//
+// nil is returned — and the standard ending follows — when: the driver never
+// knew which task it briefed (empty id; nothing to ask about); the target has
+// no plane reads wired; the read fails (a plane blip degrades exactly like the
+// spawn-dir peek does); or the answer is not unambiguous custody — status
+// still "in_progress", a holding run, AND a recorded branch, all three. A task
+// that moved on (reviewed, done, released) was settled by its own session and
+// the sequence is over; a hold without a branch is the empty exit CLA-457
+// already refuses to advance on.
+//
+// The three fields together are also the honest boundary of what this can
+// know: the plane does not expose WHICH key holds a task, so "some run of this
+// project's credential" is approximated by "held at all". The driver shares
+// one key with every session it spawns, the briefed task came from this
+// driver's own dispatch, and a wrong attribution fails safe — a foreign run's
+// id seeds a heartbeat the plane refuses, ending the drain loudly rather than
+// silently stranding work.
+func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int, phaseLabel, briefedTask string) *harness.Result {
+	if briefedTask == "" {
+		return nil
+	}
+	src, ok := t.Releaser.(plane.TaskStateSource)
+	if !ok {
+		return nil
+	}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	st, err := src.TaskState(sctx, briefedTask)
+	switch {
+	case err == nil:
+	case errors.Is(err, plane.ErrNotWired):
+		return nil
+	default:
+		log.Printf("%siteration %d: %s ended without an observed claim; the plane read of %s failed (%v) — keeping today's ending rather than guessing",
+			labelOf(t), drainNum, phaseLabel, briefedTask, err)
+		return nil
+	}
+	if st.Status != "in_progress" || st.ClaimedByRun == "" || st.Branch == "" {
+		return nil
+	}
+	return &harness.Result{Claim: harness.Claim{
+		TaskID: briefedTask,
+		Ref:    st.Ref,
+		RunID:  st.ClaimedByRun,
+		HasWIP: true,
+		Branch: st.Branch,
+	}}
+}
+
 // drainWithRetries runs a single unphased drain — the whole task in one session.
 // It is what a config with no `phases` gets, and it is kept as its own entry
 // point because that is the shape every existing test drives.
@@ -1394,7 +1449,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 	// starts in the multi-repo parent reads a sibling's rule files and, on a
 	// cwd-scoped grant, hits the wall this replaces. The same directory then
 	// serves every retry: the task does not change between attempts.
-	spawnDir, serr := d.sessionDir(ctx, t, prev)
+	//
+	// The second value is the task this phase was briefed on (CLA-451): exact for
+	// a resumed phase, the spawn-time queue-head peek for a fresh one. Held onto
+	// here because the seam needs it AFTER the session ends — it is the one task
+	// the driver can ask the plane about when the stream carried no claim state.
+	spawnDir, briefedTask, serr := d.sessionDir(ctx, t, prev)
 	if serr != nil {
 		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), serr)
 	}
@@ -1676,6 +1736,73 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// (or that never ran) leaves the lease live, so a retry session would
 			// only be refused and burned.
 			end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+
+			// CLA-451: the blind-spot convergence. Everything above learns about
+			// claims by parsing clankerbar tool calls out of the stream; a session
+			// that claimed by another channel (a raw API call with the same key,
+			// a harness quirk, a renamed tool) ends checkpointable with NO observed
+			// claim — and used to end the sequence here, stranding its pushed work
+			// behind an expiring lease until a takeover recovered it at a reclaim's
+			// cost. Before declaring the phase empty, ask the plane about the one
+			// task this driver can name: the task it BRIEFED. If that task is held,
+			// with a branch recorded, by some run of this project's key, treat it
+			// as the phase's checkpoint exactly as an observed claim would be.
+			//
+			// Every conjunct below keeps an existing guard absolute:
+			//
+			//   - end.claim == nil && !res.Claim.Held() — an OBSERVED claim,
+			//     settled or not, stays the authoritative view; the peek never
+			//     overwrites or second-guesses one.
+			//   - res.Untrusted == "" — a stream that could not be read whole is
+			//     never read for claim state, and the plane is not asked to fill
+			//     the hole either: the settle we never saw may be in the missing
+			//     bytes (CLA-262).
+			//   - !producedNothing — the dead-phase veto (CLA-386): a final step
+			//     that finished "unknown" having produced nothing is not a
+			//     checkpoint no matter what the plane says, so it is not even
+			//     consulted.
+			//   - the orderly-end disjunct mirrors `checkpointable` exactly, with
+			//     the plane's recorded branch standing in for the HasWIP the cap
+			//     path needs — a branch the PLANE confirms is stronger evidence
+			//     than one read off a stream.
+			//   - !last — a last phase has no successor to hold the lease for;
+			//     a handoff cannot widen this either, because detectHandoff
+			//     refuses on no observed claim before we get here.
+			//
+			// A claim the peek recovers then faces the SAME evidence gate as an
+			// observed one: the recorded branch must really be on the origin
+			// remote before the seam advances (CLA-457), because a plane record
+			// alone cannot tell a pushed branch from a phantom one. Evidence that
+			// fails keeps today's behavior — the drain ends, and the live lease
+			// expires with its recorded branch intact as the takeover hand-off.
+			// The peek itself is a READ of the briefed task (get_task), never a
+			// claim and never a heartbeat: it cannot race a session out of work,
+			// and a peek that fails or comes back not-held simply falls through
+			// to the standard ending below.
+			if end.claim == nil && !last && res.Untrusted == "" && !producedNothing &&
+				!res.Claim.Held() && (res.ExitCode == 0 || capped || ceiling || wallclock) {
+				if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask); claim != nil {
+					end.claim = claim
+					end.branch, evidenceOK, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir)
+					if evidenceOK {
+						// Fold the VERIFIED branch onto the carried claim, exactly as
+						// the observed-claim checkpoint above does: a recovered claim
+						// carries the plane's recorded branch and checkpointEvidence
+						// re-verified it, so the two already agree today — but the
+						// invariant "the carried claim's branch is the verified one"
+						// is what verifiedBranch and the takeover hand-off depend on,
+						// so hold it by construction rather than by coincidence of a
+						// single-source read.
+						end.claim.Claim.Branch = end.branch
+						end.checkpoint = true
+						log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s verified on the origin remote — treating it as the phase checkpoint and keeping the lease for the next phase",
+							labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, end.branch)
+					} else {
+						log.Printf("%siteration %d: the plane holds %s (run %s) with branch %q recorded, but that branch could not be verified on the origin remote (%s) — not treating it as a checkpoint; the lease expires with its hand-off intact",
+							labelOf(t), drainNum, claim.Claim.TaskID, claim.Claim.RunID, end.branch, evidenceWhy)
+					}
+				}
+			}
 		}
 		// Then check what it said it delivered. After the handback, because a dead
 		// lease is time-sensitive and a git check is not; on every exit, because a
@@ -3152,7 +3279,11 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task
 // they will work, not the multi-repo parent (CLA-437, agent-rule-scoping pieces
-// 2 and 3).
+// 2 and 3). It also returns the id of the task the phase is BRIEFED on — exact
+// for a resumed phase (the predecessor's claim), best-effort for a fresh one
+// (the queue-head peek, the same read the session is about to make). The seam's
+// checkpoint peek reads it after the phase ends (CLA-451); empty means the
+// driver never knew which task to ask about, and the peek is skipped.
 //
 // Which task that is depends on the phase. A RESUMED phase (prev carries a held
 // claim) knows its exact task, so its repo is read straight off the plane with
@@ -3175,9 +3306,11 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 // per-task directory (it falls through to the primary-repo chain), never the
 // iteration — the session about to spawn needs the plane too, and it can resolve
 // nothing either way.
-func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, error) {
+func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, string, error) {
 	repo := ""
+	briefed := ""
 	if prev != nil && prev.Claim.Held() {
+		briefed = prev.Claim.TaskID
 		if src, ok := t.Releaser.(plane.TaskRepoSource); ok {
 			r, err := src.TaskRepo(ctx, prev.Claim.TaskID)
 			switch {
@@ -3193,6 +3326,7 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 		next, err := peeker.PeekNextTask(ctx)
 		switch {
 		case err == nil:
+			briefed = next.TaskID
 			repo = next.Repo
 			if next.Repo != "" {
 				log.Printf("%squeue head %s names repo %q — resolving it to this phase's start directory", labelOf(t), next.TaskID, next.Repo)
@@ -3206,7 +3340,8 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
-	return config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
+	dir, err := config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
+	return dir, briefed, err
 }
 
 // extraDirsFor lists the directories a session's permission policy must cover

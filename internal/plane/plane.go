@@ -168,6 +168,9 @@ func (notWired) Release(context.Context, string, string) error    { return ErrNo
 func (notWired) Heartbeat(context.Context, string) error          { return ErrNotWired }
 func (notWired) PeekNextTask(context.Context) (NextTask, error)   { return NextTask{}, ErrNotWired }
 func (notWired) TaskRepo(context.Context, string) (string, error) { return "", ErrNotWired }
+func (notWired) TaskState(context.Context, string) (TaskState, error) {
+	return TaskState{}, ErrNotWired
+}
 
 // New builds a Releaser. Missing either the endpoint or the key yields a
 // not-wired one, so an operator running without a configured plane is degraded
