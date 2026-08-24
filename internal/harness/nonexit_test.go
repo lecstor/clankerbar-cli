@@ -263,9 +263,9 @@ echo '{"is_error":false,"result":"alive","total_cost_usd":0.02,"usage":{"input_t
 // The same out-of-group escapee shape the opencode adapter closes with
 // WaitDelay: a stub session that exits cleanly but leaves a daemonised
 // (setsid) grandchild holding the inherited stderr fd open. Without
-// WaitDelay the adapter hangs past its own deadline; with it, Invoke
-// returns within the delay and preserves whatever arrived before the
-// forced close.
+// WaitDelay the adapter hangs for the escapee's full lifetime - no context
+// deadline exists on this path to end it; with it, Invoke returns within
+// the delay and preserves whatever arrived before the forced close.
 
 func skipWithoutSetsid(t *testing.T) {
 	t.Helper()
@@ -293,17 +293,16 @@ exit 0
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 		t.Fatalf("writing stub: %v", err)
 	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-
 	skipWithoutSetsid(t)
 
-	start := time.Now()
-	// A deadline context triggers WaitDelay (claude.go:103-106); the cap
-	// is generous so the delay itself, not the cap, is the bound.
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	res, err := (claude{}).Invoke(ctx, Invocation{
+	start := time.Now()
+	// No deadline anywhere - the production shape: the driver's run ctx
+	// (signal.NotifyContext) carries none and this adapter manufactures
+	// none, so arming must not depend on one. The elapsed bound is generous
+	// so the delay itself, not anything else, is what ends Invoke.
+	res, err := (claude{}).Invoke(context.Background(), Invocation{
 		Prompt:  "work",
 		Console: io.Discard,
 	})
