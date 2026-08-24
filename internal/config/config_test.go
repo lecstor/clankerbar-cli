@@ -50,7 +50,7 @@ func TestValidateHarnessFromRegistry(t *testing.T) {
 	}
 }
 
-func TestResolveEnv(t *testing.T) {
+func TestSessionEnvResolvesTopLevel(t *testing.T) {
 	dir := t.TempDir()
 	secret := filepath.Join(dir, "token")
 	if err := os.WriteFile(secret, []byte("  sk-ant-oat01-abc\n"), 0o600); err != nil {
@@ -58,7 +58,8 @@ func TestResolveEnv(t *testing.T) {
 	}
 
 	t.Run("nil map yields nil", func(t *testing.T) {
-		got, err := resolveEnv(nil)
+		c := defaults()
+		got, err := c.SessionEnv(c.Harness, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -68,11 +69,13 @@ func TestResolveEnv(t *testing.T) {
 	})
 
 	t.Run("literals and @file, sorted and trimmed", func(t *testing.T) {
-		got, err := resolveEnv(map[string]string{
-			"ZED":                     "last",
-			"CLAUDE_CODE_OAUTH_TOKEN": "@" + secret,
-			"ALPHA":                   "first",
-		})
+		c := defaults()
+		c.Env = EnvMap{
+			"ZED":                     {Literal: "last"},
+			"CLAUDE_CODE_OAUTH_TOKEN": {Literal: "@" + secret},
+			"ALPHA":                   {Literal: "first"},
+		}
+		got, err := c.SessionEnv(c.Harness, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -87,21 +90,23 @@ func TestResolveEnv(t *testing.T) {
 	})
 
 	t.Run("missing @file is an error naming the key", func(t *testing.T) {
-		_, err := resolveEnv(map[string]string{"TOK": "@" + filepath.Join(dir, "nope")})
+		c := defaults()
+		c.Env = EnvMap{"TOK": {Literal: "@" + filepath.Join(dir, "nope")}}
+		_, err := c.SessionEnv(c.Harness, "")
 		if err == nil {
 			t.Fatal("want error for missing file, got nil")
 		}
 	})
 }
 
-func TestValidatePopulatesEnvSlice(t *testing.T) {
+// CLA-462: resolution moved from Validate (once per daemon start) to every
+// spawn, so Validate now checks DECLARATIONS only — names and commands are
+// static facts of the file — and leaves values alone entirely.
+func TestValidateChecksEnvDeclarationsWithoutResolving(t *testing.T) {
 	c := defaults()
-	c.Env = map[string]string{"FOO": "bar"}
+	c.Env = EnvMap{"FOO": {Literal: "bar"}}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
-	}
-	if got := c.EnvSlice(); !reflect.DeepEqual(got, []string{"FOO=bar"}) {
-		t.Fatalf("EnvSlice = %v", got)
 	}
 }
 
