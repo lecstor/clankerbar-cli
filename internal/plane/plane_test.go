@@ -76,10 +76,14 @@ func TestRelease_RequestShape(t *testing.T) {
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
 		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
 	}
-	// `ready` is what returns the task to the claimable queue without charging it
-	// a reclaim. `parked` would hide it from next_task and wait for the operator.
-	if args["status"] != "ready" {
-		t.Errorf("status = %v, want ready", args["status"])
+	// `release: true` is what returns the task to the claimable queue without
+	// charging it a reclaim, and records the run as `released`, never `failed`. It
+	// must not be combined with a status or a delivery: a bare release IS the call.
+	if args["release"] != true {
+		t.Errorf("release = %v, want true", args["release"])
+	}
+	if _, present := args["status"]; present {
+		t.Errorf("release must not carry a status (%+v) — `release` cannot be combined with `status` plane-side", args)
 	}
 	// The session may have written an outcome; a handback must not clobber it.
 	if _, present := args["outcome"]; present {

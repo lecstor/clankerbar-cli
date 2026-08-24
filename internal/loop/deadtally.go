@@ -75,6 +75,29 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 	}
 }
 
+// tallyEmpty books one held-but-empty implement exit into the run's dead-phase
+// tally as a dead phase (CLA-457). It is called ONLY at the seam, where the
+// driver has just classified the exit as empty — the 2026-08-24 fleet-incident
+// shape: a clean stop still holding the task with no branch recorded
+// anywhere the plane can fetch. That is the same "produced nothing" class as
+// the CLA-386 quiet death, so it feeds the same rate an operator watches; it is
+// booked SCENED here rather than folded into the generic deadPhase predicate
+// because the classification lives at the seam (implement, non-last, would-be
+// checkpoint), and only the seam has that context. The run was already counted
+// by tallyDead; this adds its dead.
+func (d *Driver) tallyEmpty(phase, harness string) {
+	if d.deadTally == nil {
+		d.deadTally = map[tallyKey]*phaseTally{}
+	}
+	k := tallyKey{phase: phase, harness: harness}
+	t := d.deadTally[k]
+	if t == nil {
+		t = &phaseTally{}
+		d.deadTally[k] = t
+	}
+	t.dead++
+}
+
 // logDeadTally prints the run's dead-phase tally so far, one line per
 // (phase, harness) cell, each with its denominator. A line is printed after
 // every drain, so the operator watching the daemon log sees the rate grow —

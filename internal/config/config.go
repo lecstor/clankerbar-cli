@@ -457,19 +457,21 @@ var builtinPhasePrompts = map[string]string{
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,
 
-	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
-		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
-		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
-		"then get_task with includeDecisions: true to re-read the bar and the standing decisions. An empty branch " +
-		"field on the task is a FAILED hand-off to report, not work to silently adopt and implement. Work in the " +
-		"worktree for the branch recorded on the task, and never commit to the integration branch (staging) - a " +
-		"session whose cwd is already the main checkout sitting on staging is not a decision to commit where you " +
-		"are, it is this failure mode. Read the diff on that branch. Then run the adversarial review gate, fix " +
-		"what it finds, and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you " +
-		"fixed, by name, and point it at the fix commits (or, if not yet committed, the fix diff) and the " +
-		"regression surface they touch - not at the whole diff, whose full pass already happened. A full second " +
-		"pass is the exception you state a reason for (a fix that had to reach outside its own area), never the " +
-		"default." + rerunGuidance + reviewTerminalStep + handoffGuidance,
+	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase recorded " +
+		"branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin " +
+		"remote with its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that " +
+		"run, not starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
+		PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the " +
+		"bar and the standing decisions. An empty branch field on the task is a FAILED hand-off to report, not " +
+		"work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
+		" recorded on the task, and never commit to the integration branch (staging) - a session whose cwd is " +
+		"already the main checkout sitting on staging is not a decision to commit where you are, it is this " +
+		"failure mode. Read the diff on that branch. Then run the adversarial review gate, fix what it finds, " +
+		"and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you fixed, by name, " +
+		"and point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
+		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception you " +
+		"state a reason for (a fix that had to reach outside its own area), never the default." + rerunGuidance +
+		reviewTerminalStep + handoffGuidance,
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
@@ -477,10 +479,14 @@ var builtinPhasePrompts = map[string]string{
 var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // The placeholders a phase prompt may carry, substituted by the driver from the
-// claim the previous phase left held.
+// claim the previous phase left held. {{branch}} names the recorded, verified
+// hand-off branch (CLA-457): the implement phase's checkpoint is gated on it
+// being real and on the origin remote, so the review brief can name it rather
+// than asserting an unverified "an earlier session already implemented".
 const (
-	PhaseTaskPlaceholder = "{{taskId}}"
-	PhaseRunPlaceholder  = "{{runId}}"
+	PhaseTaskPlaceholder   = "{{taskId}}"
+	PhaseRunPlaceholder    = "{{runId}}"
+	PhaseBranchPlaceholder = "{{branch}}"
 )
 
 // Config is the resolved loop configuration. The comments here are the source of
@@ -2047,7 +2053,7 @@ func (c *Config) Validate() error {
 			if effective == "" {
 				effective = builtinPhasePrompts[ph.Name]
 			}
-			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder} {
+			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder, PhaseBranchPlaceholder} {
 				if strings.Contains(effective, pl) {
 					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim to fill it from — it claims a task of its own, so a resume brief cannot go first",
 						ph.Label(0), pl)

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -29,6 +30,15 @@ func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Drive
 	rel := &fakeReleaser{}
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	openTestStateDir(t, d)
+	// The implement phase's checkpoint since CLA-457 requires the recorded branch
+	// to be VERIFIED on the origin remote, and the evidence check needs a working
+	// tree to search. The phase-seam tests stub both: a temp workdir (so the
+	// check has somewhere to run) and a verifier that passes whatever branch the
+	// session recorded (so a healthy checkpoint fixture advances exactly as it
+	// used to). The delivery tests override newVerifier with their own fakes and
+	// drive real repositories, and are untouched by this default.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 	return d, rel
 }
 
@@ -58,10 +68,24 @@ func twoPhases() []config.Phase {
 	return []config.Phase{{Name: "implement"}, {Name: "review"}}
 }
 
-// checkpointed is a phase-1 result: a clean exit still holding the task, which
-// is what "reached the checkpoint" looks like on the stream.
+// checkpointed is a phase-1 result that REACHES the checkpoint: a clean exit
+// still holding the task, with a branch recorded on the plane and verified on
+// the origin remote — the exit evidence a checkpoint now means (CLA-457). A
+// clean exit ALONE, still holding the task, is no longer a checkpoint: that is
+// the empty shape the 2026-08-24 fleet incident is built on.
 func checkpointed(tokens int, cost float64) harness.Result {
-	return held(okResult(tokens, cost), openClaim())
+	return reported(held(okResult(tokens, cost), openClaim()), branchReport())
+}
+
+// passVerifier is the default delivery verifier for the phase-seam tests: a
+// BranchPushed check that passes for every branch a fixture recorded, because a
+// checkpoint now MEANS a branch verified on the origin remote (CLA-457). The
+// tests that care what the verifier says override newVerifier with their own
+// fake (or a real repository).
+func passVerifier() *fakeVerifier {
+	return &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{
+		Kind: delivery.BranchPushed, Status: delivery.Pass, Detail: "branch verified on the origin remote",
+	}}}}
 }
 
 func TestDrainPhases_RunsOneSessionPerPhase(t *testing.T) {
@@ -210,7 +234,12 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 		wantReleases int
 	}{
 		{
-			name:         "nothing pushed: handed straight back",
+			// Since CLA-457 a clean-exit no-branch phase 1 is the EMPTY shape, not
+			// a seam checkpoint: it is released immediately in drainPhase (never
+			// held across the seam), so there is nothing for the deferred handback
+			// to do here — the release already happened, and the one bounded retry
+			// is stopped by the same budget that used to stop the seam.
+			name:         "nothing pushed: released as empty, never held across the seam",
 			claim:        openClaim(),
 			wantReleases: 1,
 		},
@@ -218,7 +247,7 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 			name: "work pushed (what phase 1 actually leaves): lease left to expire",
 			// update_task(branch:) sets HasWIP; CLA-314 keeps such a claim
 			// non-releasable so the task returns as a takeover with its branch.
-			claim:        harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			claim:        harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
 			wantReleases: 0,
 		},
 	} {
@@ -254,7 +283,7 @@ func TestDrainPhases_ATurnCappedPhaseIsACheckpointNotAFatalExit(t *testing.T) {
 			// The salvage recorded a branch (or the phase did), so a checkpoint
 			// genuinely exists for phase 2 to resume from.
 			name:        "capped with work pushed: phase 2 resumes it",
-			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
 			wantInvokes: 2,
 		},
 		{
@@ -305,7 +334,7 @@ func TestDrainPhases_ATokenCeilingHitIsACheckpointNotAFatalExit(t *testing.T) {
 	}{
 		{
 			name:        "killed with work pushed: phase 2 resumes it",
-			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
 			wantInvokes: 2,
 		},
 		{
@@ -638,7 +667,7 @@ func TestDrainPhases_AWallClockCapIsACheckpointNotAFatalExit(t *testing.T) {
 	}{
 		{
 			name:        "capped with work pushed: phase 2 resumes it",
-			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true},
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
 			wantInvokes: 2,
 		},
 		{
@@ -849,7 +878,9 @@ func TestDrainPhases_SpawnLineStampsTheResolvedModel(t *testing.T) {
 // that - the discrimination lives in the callers - so these drive whole phase
 // runs.
 func TestUndeclared_CountsOnlyACleanFinalPhaseThatDidNotDeclare(t *testing.T) {
-	wip := func() harness.Claim { return harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true} }
+	wip := func() harness.Claim {
+		return harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+	}
 
 	t.Run("the CLA-384 shape counts", func(t *testing.T) {
 		captureLogs(t)
@@ -1047,7 +1078,7 @@ func TestDrainPhases_ADeadPhaseIsRetriedNotAdvancedToReview(t *testing.T) {
 // and THEN died on an unknown reason has produced something, so it keeps its
 // checkpoint and the seam advances exactly as a healthy phase's does.
 func TestDrainPhases_DeadWithABranchRecordedStillAdvances(t *testing.T) {
-	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(deadResult(), wip)},
 		{res: okResult(1, 0)},
@@ -1063,23 +1094,229 @@ func TestDrainPhases_DeadWithABranchRecordedStillAdvances(t *testing.T) {
 	}
 }
 
-// A session that completed its final answer ("stop") is untouched: whatever the
-// seam did before this feature is what it keeps doing.
-func TestDrainPhases_AStopReasonIsUntouched(t *testing.T) {
-	ok := okResult(1, 0)
-	ok.Raw[harness.FinishReasonKey] = "stop"
+// A clean stop with nothing recorded is the 2026-08-24 fleet-incident shape:
+// the session claimed, explored, hit a silent EOT, and ended cleanly still
+// holding the task with no branch on the plane. It is a held-but-empty FAILED
+// phase, not a checkpoint — released, retried at most once (bounded at 1),
+// counted in the dead-phase tally, and never handed to the review brief. Before
+// CLA-457 this shape was an "ordinary checkpoint" purely because the lease
+// renewer (CLA-358) keeps every session that claimed holding — which is exactly
+// how two silent EOTs advanced the seam to review on a false premise.
+func TestDrainPhases_HeldButEmptyIsANotCheckpointAndRetriesOnce(t *testing.T) {
+	empty := func() harness.Result {
+		ok := okResult(1, 0)
+		ok.Raw[harness.FinishReasonKey] = "stop"
+		return held(ok, openClaim())
+	}
+	logged := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{{res: empty()}, {res: empty()}}}
+	d, rel := phaseDriver(t, h, twoPhases())
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	// The empty implement exit is a FAILED phase: released, retried at most once,
+	// and the review brief never spawns.
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 (the empty phase and its single bounded retry) — held-but-empty is not a checkpoint and cannot spawn review", h.invokeCalls)
+	}
+	for _, inv := range h.invocations {
+		if strings.Contains(inv.Prompt, "PHASE 2") {
+			t.Errorf("the review phase spawned after a held-but-empty implement exit: %q", inv.Prompt)
+		}
+	}
+	// Released to the queue so a fresh session can pick the task back up — once
+	// per empty session (the original and its one retry each held and released
+	// the task).
+	if len(rel.calls) != 2 || rel.calls[0] != (releaseCall{"t-1", "r-1"}) || rel.calls[1] != (releaseCall{"t-1", "r-1"}) {
+		t.Errorf("released %+v, want {t-1 r-1} twice (one release per empty session) — the empty claim goes back to the queue, never to review", rel.calls)
+	}
+	// A distinct line names why, so the operator can tell an empty exit from a
+	// healthy one.
+	out := logged.String()
+	if !strings.Contains(out, "no recorded branch") || !strings.Contains(out, "not a checkpoint") {
+		t.Errorf("the empty exit is not named as a not-a-checkpoint with its reason:\n%s", out)
+	}
+	// And it counts toward the dead-phase tally — the measurement the operator
+	// watches for a fleet-wide silent EOT.
+	cell := d.deadTally[tallyKey{phase: "implement", harness: "claude"}]
+	if cell == nil || cell.run != 2 || cell.dead != 2 {
+		t.Errorf("tally cell = %+v, want run=2 dead=2 — both empty sessions count as dead phases", cell)
+	}
+}
+
+// Its sibling: a "stop" finish WITH a recorded, origin-verified branch IS a
+// checkpoint — the normal healthy implement end.
+func TestDrainPhases_AStopReasonWithARecordedBranchStillCheckpoints(t *testing.T) {
+	ck := checkpointed(1, 0)
+	ck.Raw[harness.FinishReasonKey] = "stop"
 	h := &fakeAdapter{steps: []invokeStep{
-		{res: held(ok, openClaim())},
+		{res: ck},
 		{res: okResult(1, 0)},
 	}}
 	d, _ := phaseDriver(t, h, twoPhases())
 
-	_, _, stop, err := drainPhasesOnce(t, d)
-	if err != nil || stop {
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
 	if h.invokeCalls != 2 {
-		t.Errorf("spawned %d sessions, want 2 — a reason: stop session is an ordinary checkpoint", h.invokeCalls)
+		t.Errorf("spawned %d sessions, want 2 — a reason:stop session WITH a verified branch is an ordinary checkpoint", h.invokeCalls)
+	}
+}
+
+// A branch recorded but NOT reachable on the origin remote is not a checkpoint
+// either — the second half of the evidence gate (CLA-457). The claim carries
+// WIP, so it is NEVER released: the takeover hand-off must survive. But the
+// review phase must not spawn on a branch nothing can fetch.
+func TestDrainPhases_RecordedButUnreachableBranchIsNotACheckpoint(t *testing.T) {
+	logged := captureLogs(t)
+	// The real update_task(branch:) sets HasWIP on the claim AND arms the report;
+	// the branch is recorded but the verifier will say it was never pushed.
+	recorded := reported(held(okResult(1, 0),
+		harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}), branchReport())
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: recorded},
+		{res: okResult(1, 0)},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+	// The verifier says the recorded branch was never pushed.
+	d.newVerifier = func(string, bool) deliveryVerifier {
+		return &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{
+			Kind: delivery.BranchPushed, Status: delivery.Fail,
+			Detail: `branch "clanker/x" is NOT on origin`,
+		}}}}
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions, want 1 — an unpushed branch must not advance the seam to review", h.invokeCalls)
+	}
+	// HasWIP means the claim is never released: the hand-off stays a takeover
+	// once the lease dies, and retrying against a live claim is refused.
+	if len(rel.calls) != 0 {
+		t.Errorf("released a claim with a recorded (unpushed) branch: %+v — that would destroy the takeover hand-off", rel.calls)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "not a checkpoint") || !strings.Contains(out, "NOT on origin") {
+		t.Errorf("the unreachable-branch exit is not named with its reason:\n%s", out)
+	}
+}
+
+// The review brief is recomposed from plane state: it names the branch phase 1
+// recorded and the driver verified, instead of asserting an unverified
+// phase-1 success (CLA-457 part 3).
+func TestDrainPhases_ReviewBriefNamesTheRecordedBranch(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: reported(held(okResult(1, 0), openClaim()), branchReport())},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+
+	if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — the review phase must run on the verified branch", h.invokeCalls)
+	}
+	p2 := h.invocations[1].Prompt
+	if !strings.Contains(p2, "clanker/x") {
+		t.Errorf("the review brief does not name the branch phase 1 recorded: %q", p2)
+	}
+	if strings.Contains(p2, config.PhaseBranchPlaceholder) {
+		t.Errorf("the {{branch}} placeholder survived into the review brief: %q", p2)
+	}
+	if strings.Contains(p2, "an earlier session has already") {
+		t.Errorf("the review brief still asserts an unverified phase-1 success: %q", p2)
+	}
+}
+
+// branchStatusVerifier answers each branch by name with a scripted verdict, for
+// the evidence-gate tests where the verifier must DISAGREE per branch (a draft
+// recorded first that was never pushed, and the real branch that was).
+type branchStatusVerifier map[string]delivery.Status
+
+func (m branchStatusVerifier) Verify(_ context.Context, c delivery.Claim) delivery.Report {
+	rep := delivery.Report{Claim: c}
+	st, ok := m[c.Branch]
+	if !ok {
+		st = delivery.Unknown
+	}
+	rep.Checks = []delivery.Check{{Kind: delivery.BranchPushed, Status: st, Detail: "branch " + c.Branch + " judges " + string(st)}}
+	return rep
+}
+
+// A session that records a DRAFT branch early (never pushed) and the REAL branch
+// later (pushed and verified) must checkpoint on the REAL one: ANY recorded
+// branch that verifies on origin is evidence, not only the first recorded
+// (CLA-457). An earlier cut returned on the first branch's verdict, which failed
+// the phase over a draft even though a verified hand-off exists — and the review
+// brief must name the verified branch, never the draft.
+func TestDrainPhases_AnyVerifiedBranchIsEvidenceNotJustTheFirstRecorded(t *testing.T) {
+	draft := harness.Report{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Branch: "clanker/draft"}
+	final := harness.Report{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Branch: "clanker/final"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: reported(held(okResult(1, 0), openClaim()), draft, final)},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	d.newVerifier = func(string, bool) deliveryVerifier {
+		return branchStatusVerifier{"clanker/draft": delivery.Fail, "clanker/final": delivery.Pass}
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — the phase checkpoints on the VERIFIED final branch even though a draft was recorded first", h.invokeCalls)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "clanker/final") {
+		t.Errorf("the review brief should name the verified branch clanker/final:\n%q", h.invocations[1].Prompt)
+	}
+	if strings.Contains(h.invocations[1].Prompt, "clanker/draft") {
+		t.Errorf("the review brief named the unverified draft branch: %q", h.invocations[1].Prompt)
+	}
+}
+
+// A handoff the driver REFUSES (max-iterations already spent) ends the carve-out
+// the handoff exempted: the exit is re-judged as the bare exit it really is, so
+// a no-evidence implement session must NOT advance to review on a brief that
+// claims a verified branch (CLA-457). The claim was held for a successor that is
+// not coming, so the deferred handback releases it.
+func TestDrainPhases_RefusedHandoffWithNoEvidenceDoesNotAdvanceToReview(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: handoffResult("Continue implementing: the design is settled, write the code.")},
+		{res: okResult(1, 0)},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+	d.cfg.MaxIterations = 1 // the respawn would be iteration 2: refused
+	logged := captureLogs(t)
+
+	_, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	// The handoff was refused and the exit had no evidence: only the one session
+	// ran, and the review brief never spawned.
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions, want 1 — a refused no-evidence handoff exits the drain without spawning review", h.invokeCalls)
+	}
+	if handoffs != 0 {
+		t.Errorf("handoffs = %d, want 0 — the refused handoff never spawned a successor", handoffs)
+	}
+	for _, inv := range h.invocations {
+		if strings.Contains(inv.Prompt, "PHASE 2") {
+			t.Errorf("the review phase spawned after a refused no-evidence handoff: %q", inv.Prompt)
+		}
+	}
+	// The held claim is released by the deferred handback (no WIP).
+	if len(rel.calls) != 1 || rel.calls[0] != (releaseCall{"t-1", "r-1"}) {
+		t.Errorf("released %+v, want exactly {t-1 r-1} via the deferred handback", rel.calls)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "handoff refused") || !strings.Contains(out, "not a checkpoint") {
+		t.Errorf("the refusal and the empty judgement are not both named:\n%s", out)
 	}
 }
 
@@ -1301,6 +1538,10 @@ func TestDrainPhases_ADeadOnADifferentTaskDoesNotParkTheSecondTask(t *testing.T)
 	cfg.Prompt = ""
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	openTestStateDir(t, d)
+	// The implement-success retry's checkpoint (CLA-457) needs the evidence gate
+	// stubbed: a working tree and a passing verifier, like the other helpers.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 
 	_, _, stop, err := drainPhasesOnce(t, d)
 	if err != nil || stop {
@@ -1338,6 +1579,9 @@ func TestDrainPhases_AResumedPhaseDeathIsNotDeadClassified(t *testing.T) {
 	cfg.Prompt = ""
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	openTestStateDir(t, d)
+	// Phase 1's checkpoint (CLA-457) needs the evidence gate stubbed.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 
 	_, _, stop, err := drainPhasesOnce(t, d)
 	if err != nil {

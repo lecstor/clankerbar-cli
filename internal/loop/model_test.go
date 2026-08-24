@@ -112,8 +112,11 @@ func TestDrainWithRetries_AnUnphasedRunStillPinsTheConfiguredModel(t *testing.T)
 // that reviews it — an author briefing its own reviewer frames away from its own
 // weak spots without meaning to. That is a property of the CALL GRAPH, not of
 // the words in the shipped brief: the driver is the caller, it builds phase N+1's
-// prompt from CONFIG plus exactly two ids off the held claim, and phase N's
-// session output is not an input to it at all.
+// prompt from CONFIG plus exactly three claim-derived values (the task id, the
+// run id, and the verified branch since CLA-457), and phase N's
+// session output is not an input to it at all — the branch is plane state the
+// checkpoint verified on the origin remote, not prose a session could frame
+// with.
 //
 // So this asserts the absence of a channel rather than the contents of a string.
 // A future "let the previous phase add a note to the next brief" would satisfy
@@ -164,15 +167,23 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 	// promises to catch.
 	//
 	// Stating the WHOLE of the brief's provenance closes it: the operator's
-	// config, with the two claim ids substituted, and nothing else. Any field that
-	// ever reaches the prompt makes it differ.
+	// config, with exactly three claim-derived values substituted, and nothing
+	// else. Any field that ever reaches the prompt makes it differ.
+	//
+	// The third value — {{branch}} — joined in CLA-457 and is the one deliberate
+	// exception to "no stream-derived text in the brief": it is the branch the
+	// checkpoint VERIFIED on the origin remote, legitimately a branch name and
+	// nothing a session could smuggle prose through. The implementing session
+	// still cannot frame its own reviewer: an arbitrary branch name changes what
+	// the reviewer works in, never what it is told to attack.
 	claim := openClaim()
 	want := strings.NewReplacer(
 		config.PhaseTaskPlaceholder, claim.TaskID,
 		config.PhaseRunPlaceholder, claim.RunID,
+		config.PhaseBranchPlaceholder, "clanker/x",
 	).Replace(d.cfg.EffectivePhases()[1].Prompt)
 	if h.invocations[1].Prompt != want {
-		t.Fatalf("phase 2's brief carried something other than config + the two claim ids:\n got: %q\nwant: %q",
+		t.Fatalf("phase 2's brief carried something other than config + the three claim-derived values:\n got: %q\nwant: %q",
 			h.invocations[1].Prompt, want)
 	}
 }
