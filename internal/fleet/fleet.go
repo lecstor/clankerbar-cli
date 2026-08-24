@@ -112,11 +112,17 @@ type Report struct {
 type Reporter interface {
 	// Send enqueues one report and returns at once. Under an unresponsive
 	// endpoint the queue fills and the report is dropped (counted, mentioned in
-	// the next line the reporter logs) rather than awaited.
+	// the next line the reporter logs) rather than awaited. After Close it is a
+	// no-op.
 	Send(r Report)
-	// Close delivers one FINAL report synchronously — the run is over, so a
-	// short blocking send costs nothing — then leaves the reporter inert. Used
-	// for the `stopping` beacon on shutdown paths.
+	// Close ends reporting. Everything still queued is delivered first (newest
+	// first, bounded — a run that ends at a drain boundary must not lose the
+	// iteration record that boundary just posted), then r is POSTed
+	// synchronously — the run is over, so a short blocking wait costs nothing —
+	// and the reporter goes inert: r is the LAST POST it ever makes, so after
+	// it, console silence means the daemon is gone rather than stopped talking.
+	// Idempotent: only the first call speaks. Used for the `stopping` beacon on
+	// shutdown paths.
 	Close(r Report)
 }
 
@@ -143,6 +149,7 @@ func New(endpoint, apiKey string) Reporter {
 		apiKey:   apiKey,
 		client:   &http.Client{Timeout: reportTimeout, CheckRedirect: noDowngradeRedirect},
 		queue:    make(chan Report, queueCap),
+		done:     make(chan struct{}),
 	}
 }
 
@@ -150,6 +157,13 @@ func New(endpoint, apiKey string) Reporter {
 // accumulates, so a hung endpoint burns timeouts in the background while the
 // loop never notices.
 const reportTimeout = 5 * time.Second
+
+// closeFlushBudget bounds how long Close may spend delivering what is still
+// queued before the `stopping` beacon. One report's worth of patience: it lets
+// a run that ends right at a drain boundary get that boundary's iteration
+// record out (the newest queued report, posted first) while a wedged plane
+// still cannot hold process exit hostage for the whole queue.
+const closeFlushBudget = 5 * time.Second
 
 // queueCap is how many reports may sit unread while the pump works through a
 // slow endpoint. Generous next to the production cadence (one per idle poll);
@@ -162,12 +176,22 @@ type httpReporter struct {
 	client   *http.Client
 	queue    chan Report
 
+	// done is closed by Close; the pump's select on queue-vs-done then parks
+	// it for good. postMu serialises every POST so that after Close takes the
+	// lock nothing can land after the `stopping` beacon. closed makes Send a
+	// no-op once Close has run, and guards Close's own idempotence.
+	done       chan struct{}
+	postMu     sync.Mutex
+	closed     atomic.Bool
 	startOnce  sync.Once
 	dropped    atomic.Int64
 	failStreak atomic.Int64
 }
 
 func (r *httpReporter) Send(rep Report) {
+	if r.closed.Load() {
+		return // Close has ended reporting — the stopping beacon already went out
+	}
 	r.startOnce.Do(func() { go r.pump() })
 	select {
 	case r.queue <- rep:
@@ -178,28 +202,82 @@ func (r *httpReporter) Send(rep Report) {
 	}
 }
 
-// Close posts the final report directly, bypassing the queue: the run is over,
-// nothing else will be enqueued, and a bounded blocking wait here is what makes
-// the `stopping` beacon actually land before process exit. Never called
-// concurrently with itself.
+// Close ends the reporter: it waits out whatever POST is in flight, delivers
+// what is still queued (newest first, within closeFlushBudget), then POSTs rep
+// itself — the last POST this reporter ever makes. Serialising on postMu across
+// the whole sequence is what makes that "last" claim hold: the pump takes the
+// same lock to receive, so once Close holds it the pump can neither deliver
+// nor receive, and any report the pump was already delivering has landed
+// before Close's critical section begins.
 func (r *httpReporter) Close(rep Report) {
-	r.post(rep)
+	if !r.closed.CompareAndSwap(false, true) {
+		return // idempotent: only the first Close speaks
+	}
+	close(r.done) // the pump delivers nothing further — its in-flight one first
+	r.postMu.Lock()
+	defer r.postMu.Unlock()
+
+	// Everything still queued is what the pump did not deliver before the run
+	// ended. Newest first: presence is last-writer-wins, so the newest queued
+	// state is the one worth having before `stopping`, and the newest report is
+	// the one carrying this boundary's iteration record — the thing a run
+	// ending at the boundary must not lose.
+	var queued []Report
+drain:
+	for {
+		select {
+		case q := <-r.queue:
+			queued = append(queued, q)
+		default:
+			break drain
+		}
+	}
+	flushStart := time.Now()
+	delivered, lost := 0, 0
+	for i := len(queued) - 1; i >= 0; i-- {
+		if time.Since(flushStart) > closeFlushBudget {
+			break
+		}
+		if err := r.sendOnce(queued[i]); err != nil {
+			lost++
+		} else {
+			delivered++
+		}
+	}
+	if undelivered := len(queued) - delivered; undelivered > 0 {
+		log.Printf("fleet: shutdown: %d queued report(s) not delivered (%d failed, %d dropped by budget)", undelivered, lost, undelivered-lost)
+	}
+
+	// The stopping beacon itself — the last POST this reporter makes; after it,
+	// console silence means the daemon is gone, not that it stopped talking.
+	r.deliver(rep)
 }
 
-// pump serialises every queued report through post, one goroutine for the life
-// of the process. Order preserved: the plane's presence upsert is
-// last-writer-wins, so arrival order is the truth.
+// pump serialises every queued report through deliver, one goroutine for the
+// life of the process. Order preserved: the plane's presence upsert is
+// last-writer-wins, so arrival order is the truth. The lock is taken around
+// the RECEIVE, not just the POST, so Close can park the pump: once Close holds
+// postMu the pump can no longer take a report, and any report it already holds
+// has been delivered before Close's critical section starts.
 func (r *httpReporter) pump() {
-	for rep := range r.queue {
-		r.post(rep)
+	for {
+		r.postMu.Lock()
+		select {
+		case rep := <-r.queue:
+			r.deliver(rep)
+			r.postMu.Unlock()
+		case <-r.done:
+			r.postMu.Unlock()
+			return
+		}
 	}
 }
 
-// post performs one authenticated POST and applies the fail-soft logging rule:
-// the FIRST failure of a streak is logged, further consecutive failures are
-// silent (an overnight outage must not write a line per poll), and recovery is
-// logged once with how many reports were lost.
-func (r *httpReporter) post(rep Report) {
+// deliver performs one authenticated POST and applies the fail-soft logging
+// rule: the FIRST failure of a streak is logged, further consecutive failures
+// are silent (an overnight outage must not write a line per poll), and recovery
+// is logged once with how many reports were lost. Callers hold postMu.
+func (r *httpReporter) deliver(rep Report) {
 	if err := r.sendOnce(rep); err != nil {
 		if r.failStreak.Add(1) == 1 {
 			log.Printf("fleet report failed and was dropped (further consecutive failures stay silent): %v", err)

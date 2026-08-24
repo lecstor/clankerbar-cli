@@ -164,6 +164,103 @@ func TestCloseLandsBeforeItReturns(t *testing.T) {
 	}
 }
 
+// The contract that makes console silence meaningful: after Close, the stopping
+// beacon is the LAST POST the reporter makes. Everything still queued lands
+// before it — including the iteration record a run that ends right at a drain
+// boundary would otherwise lose — and a Send after Close is a no-op. The plane
+// is wedged on the first post to force the queue to back up, then released:
+// the pump delivers that one, Close takes the lock, delivers the rest newest
+// first, then stopping — and nothing arrives after it.
+func TestCloseEndsTheReporterWithStoppingLast(t *testing.T) {
+	type wire struct {
+		State struct {
+			Kind string `json:"kind"`
+		} `json:"state"`
+		Iterations []struct {
+			Outcome string `json:"outcome"`
+		} `json:"iterations"`
+	}
+	var mu sync.Mutex
+	var posts []string // one "kind[:outcome]" per request, in arrival order
+	var n int
+	firstStarted := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var a wire
+		_ = json.Unmarshal(body, &a)
+		mu.Lock()
+		entry := a.State.Kind
+		if len(a.Iterations) > 0 {
+			entry += ":" + a.Iterations[0].Outcome
+		}
+		posts = append(posts, entry)
+		i := n
+		n++
+		mu.Unlock()
+		if i == 0 { // the pump's first POST is wedged until the test lets go
+			close(firstStarted)
+			<-release
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	rep := New(srv.URL, "k")
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}) // r1 — the pump takes and wedges on it
+	<-firstStarted
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}) // r2
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}) // r3
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle},  // r4 — the boundary's iteration record
+		Iterations: []Iteration{{TaskID: "t-1", TaskRef: "CLA-1", Outcome: OutcomeReleased, DurationSeconds: 1, Tokens: 3}}})
+	rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}}) // r5
+	close(release)
+	rep.Close(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(posts) != 6 {
+		t.Fatalf("arrival = %v, want the pump's r1 + a 4-report flush + stopping (6 posts)", posts)
+	}
+	if posts[len(posts)-1] != "stopping" {
+		t.Errorf("last arrival = %q, want stopping — nothing may post after it:\n%v", posts[len(posts)-1], posts)
+	}
+	recordLanded := false
+	for _, p := range posts {
+		if p == "idle:released" {
+			recordLanded = true
+		}
+	}
+	if !recordLanded {
+		t.Errorf("the queued iteration record never landed — a run ending at the boundary must not lose it:\n%v", posts)
+	}
+}
+
+func TestSendAfterCloseIsInert(t *testing.T) {
+	arrived := make(chan struct{}, 8)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		arrived <- struct{}{}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	rep := New(srv.URL, "k")
+	rep.Close(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateStopping}})
+	select {
+	case <-arrived:
+	default:
+		t.Fatal("the closing beacon itself did not arrive")
+	}
+	for i := 0; i < 3; i++ {
+		rep.Send(Report{Identity: Identity{Instance: "x"}, State: State{Kind: StateIdle}})
+	}
+	select {
+	case <-arrived:
+		t.Fatal("a Send after Close still posted — Close must leave the reporter inert")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
 func TestProbeDistinguishesTheFourAnswers(t *testing.T) {
 	t.Run("400 empty-body refusal means wired", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
