@@ -848,6 +848,7 @@ says why. (JSON today; TOML is the likely final format.)
   "max_session_wall_clock": 0,
   "mcp_config_path": "./.mcp.json",
   "config_dir": "~/.claude",
+  "env": {},
   "idle_poll_interval": "60s",
   "poll_interval": "30m",
   "max_retries": 0,
@@ -968,6 +969,50 @@ Point it at *your* workdir, not at a checkout of this repo. The `.mcp.json` at t
 root here is the maintainers' own agent wiring and names the `clankerbar` project
 slug; running the loop from inside this checkout would have it poll a queue you
 cannot read, which it refuses rather than drains.
+
+#### `env`: the daemon owns each session's environment
+
+`env` declares extra environment for spawned sessions, so load-bearing variables
+do not depend on how the binary happened to be launched - with `GH_TOKEN`
+declared here, the wrapper script that used to export it stops being
+load-bearing and starting `clankerbar run` directly is safe (CLA-462). A value
+is either a literal string or a command whose stdout becomes the value:
+
+```json
+{
+  "env": {
+    "GH_TOKEN": { "fromCommand": "gh auth token -u your-account" },
+    "CLAUDE_CODE_OAUTH_TOKEN": "@~/.secrets/claude-oauth"
+  }
+}
+```
+
+The map overlays at four levels, most specific wins per key, in the same order
+the MCP config uses: top level, then `harnesses.<name>.env`, then
+`projects[].env`, then that project's `env_per_harness.<name>`. In multi-project
+mode declare each project's token on its own entry, so no session ever carries
+another project's credential.
+
+Three properties carry the security and reliability weight:
+
+- **Command-derived values are resolved fresh at every spawn.** A rotated token
+  reaches the next session with no daemon restart. A command that fails, times
+  out (10s), or prints nothing REFUSES that spawn with a log line naming the
+  variable - never a silent partial env, because a session missing its declared
+  environment is the incident, not a degraded mode.
+- **`@path` secrets stay owner-only, enforced.** A file any other local account
+  can read refuses the spawn, and so does a file that has been emptied - an
+  invisible token rot must fail at spawn with the variable named, not inside
+  git later.
+- **Values come from the operator's own config only.** Nothing in a workdir or
+  checkout feeds this map; the credential-origin rule for the account key is
+  unchanged.
+
+Variable names must be valid names (`[A-Za-z_][A-Za-z0-9_]*`) and commands must
+be non-empty; both are refused at load. `doctor` runs every declared command and
+re-checks every `@path` file, so a source that has stopped working is a FAIL in
+the preflight instead of a refusal at 3am, and it WARNs when a project declares
+repos but no `GH_TOKEN` source anywhere.
 
 ### Where the account-scoped key is allowed to go
 

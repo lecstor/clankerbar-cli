@@ -95,6 +95,11 @@ type doctorEnv struct {
 	fetchHealth func(ctx context.Context, healthURL string) (deployHealth, error)
 	repos       func(ctx context.Context, workdir string) []string
 	gitRun      func(ctx context.Context, dir string, args ...string) (string, error)
+
+	// The session-env check's two seams (CLA-462): running one declared
+	// fromCommand, and re-checking one "@path" file's owner-only rule.
+	runEnvCmd func(ctx context.Context, command string) (string, error)
+	envPath   func(path string) error
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -125,6 +130,10 @@ func defaultDoctorEnv() doctorEnv {
 		fetchHealth: fetchDeployHealth,
 		repos:       delivery.Repos,
 		gitRun:      deployGitRun,
+		runEnvCmd: func(ctx context.Context, command string) (string, error) {
+			return config.RunEnvCommand(command)
+		},
+		envPath: config.VerifyEnvFilePath,
 	}
 }
 
@@ -219,6 +228,8 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
 	checks = append(checks, checkConfigDirs(cfg)...)
 	checks = append(checks, checkRepos(cfg)...)
+	checks = append(checks, checkSessionEnv(ctx, cfg, e)...)
+	checks = append(checks, checkTokenSources(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
@@ -274,8 +285,11 @@ func checkConfig(cfg *config.Config) check {
 	// never the file an @path names. A config that reaches the loop decides the
 	// spawned session's environment (CLA-260), so "which variables am I injecting"
 	// should be answerable from the preflight rather than by re-reading the file.
-	if names := envKeyNames(cfg.Env); names != "" {
-		c.info = append(c.info, "env: "+names)
+	// Since CLA-462 declarations live at four levels; each line names its level.
+	if decls := cfg.DeclaredEnvs(); len(decls) > 0 {
+		for _, line := range rangeEnvNames(decls) {
+			c.info = append(c.info, line)
+		}
 	}
 	if len(cfg.Projects) > 0 {
 		for _, p := range cfg.Projects {
@@ -289,19 +303,27 @@ func checkConfig(cfg *config.Config) check {
 	return c
 }
 
-// envKeyNames renders the config's extra environment as a sorted list of KEYS,
-// with no values: one of them is routinely a credential, and doctor's output is
+// rangeEnvNames renders the config's declared session env as one line per
+// LEVEL that declares anything — "env: A, B", "projects[0].env_per_harness.claude: C"
+// — with no values: one of them is routinely a credential, and doctor's output is
 // the thing an operator pastes into an issue.
-func envKeyNames(env map[string]string) string {
-	if len(env) == 0 {
-		return ""
+func rangeEnvNames(decls []config.DeclaredEnv) []string {
+	byLabel := map[string][]string{}
+	for _, d := range decls {
+		byLabel[d.Label] = append(byLabel[d.Label], d.Name)
 	}
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
+	labels := make([]string, 0, len(byLabel))
+	for l := range byLabel {
+		labels = append(labels, l)
 	}
-	sort.Strings(keys)
-	return strings.Join(keys, ", ")
+	sort.Strings(labels)
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names := byLabel[l]
+		sort.Strings(names)
+		out = append(out, "env["+l+"]: "+strings.Join(names, ", "))
+	}
+	return out
 }
 
 // --- 1b. repos ---------------------------------------------------------------
@@ -361,6 +383,85 @@ func checkRepos(cfg *config.Config) []check {
 	out := make([]check, 0, len(cfg.Projects))
 	for _, p := range cfg.Projects {
 		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), projectWorkDir(cfg, p)))
+	}
+	return out
+}
+
+// --- 1c. session env ---------------------------------------------------------
+
+// checkSessionEnv verifies every DECLARED env entry that needs resolving can be
+// resolved right now (CLA-462): each fromCommand is executed and each "@path"
+// literal is re-read under its owner-only rule. Outputs are discarded — doctor
+// reports the verdict and the variable's name, never a credential. One FAIL
+// here means every spawn that overlay reaches will refuse until it is fixed,
+// so seeing it in the preflight is the cheap copy of the same fact.
+//
+// Plain literals need no check and get none: there is nothing to resolve.
+func checkSessionEnv(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	var out []check
+	for _, d := range cfg.DeclaredEnvs() {
+		switch {
+		case d.FromCommand != "":
+			c := check{name: "session env " + d.Name + " (" + d.Label + ")"}
+			if _, err := e.runEnvCmd(ctx, d.FromCommand); err != nil {
+				c.status = fail
+				c.detail = fmt.Sprintf("fromCommand %q failed: %v", d.FromCommand, err)
+				c.remedy = "fix the command - spawns it gates refuse rather than run without " + d.Name
+				out = append(out, c)
+				continue
+			}
+			c.status = pass
+			c.detail = "fromCommand resolves"
+			out = append(out, c)
+		case d.Path != "":
+			c := check{name: "session env file " + d.Name + " (" + d.Label + ")"}
+			if err := e.envPath(d.Path); err != nil {
+				c.status = fail
+				c.detail = d.Path + ": " + err.Error()
+				c.remedy = "fix the file's mode or path - spawns it gates refuse rather than run without " + d.Name
+				out = append(out, c)
+				continue
+			}
+			c.status = pass
+			c.detail = "owner-only file readable"
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// checkTokenSources warns when a scope whose repos PUSH has declared no source
+// for GH_TOKEN anywhere its sessions' overlays look — top level, any harness
+// block, or the project's own two blocks (CLA-462). This is exactly the shape
+// of the 2026-08-24 incident: a daemon launched without the wrapper spawned
+// sessions with no token, which died later at `git push` with an error naming
+// nothing. A WARN, not a FAIL: a repo may push over ssh or not at all, and the
+// operator owns that call — the heuristic (repos declared = pushes happen) is
+// only allowed to speak up, not to stop the run.
+func checkTokenSources(cfg *config.Config) []check {
+	report := func(label, slug string) check {
+		c := check{name: label}
+		if len(cfg.ReposFor(slug)) == 0 {
+			c.status = pass
+			c.detail = "no repos declared - nothing here is known to push"
+			return c
+		}
+		if cfg.TokenSourceDeclared(slug, "GH_TOKEN") {
+			c.status = pass
+			c.detail = "GH_TOKEN has a declared source"
+			return c
+		}
+		c.status = warn
+		c.detail = "repos are declared but no env level declares GH_TOKEN - sessions push with whatever identity their inherited environment happens to carry"
+		c.remedy = `declare "env": {"GH_TOKEN": {"fromCommand": "gh auth token -u <account>"}} (top level, per harness, per project, or per project-per-harness)`
+		return c
+	}
+	if len(cfg.Projects) == 0 {
+		return []check{report("gh token source", "")}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, report("gh token source["+p.Slug+"]", p.Slug))
 	}
 	return out
 }
@@ -1347,6 +1448,52 @@ func anyProjectAllowlists(cfg *config.Config) bool {
 
 // --- 8. permission policy ----------------------------------------------------
 
+// opencodePermissionOverride finds an OPENCODE_PERMISSION declaration that
+// would override the adapter's own fail-closed export — exec takes the last
+// duplicate key, so ANY declared value wins — across all four env levels. It
+// scans MOST-SPECIFIC-FIRST inside each project's scope (the
+// project-per-harness block for this harness, then the project block), then the
+// harness block, then top level: SessionEnv composes the child env per key by
+// exactly that precedence, so when two levels declare the same name it is the
+// more specific one the session actually carries. Naming a layer whose value
+// loses the overlay would send the operator to edit the wrong line. Across
+// projects the first declaring project is reported — each session carries only
+// its own project's layers, so no single entry wins a whole multi-project run.
+// The value reported is the declared source — the literal, or the command that
+// produces it — never the resolved output.
+func opencodePermissionOverride(cfg *config.Config, harnessName string) (where, value string, ok bool) {
+	const key = "OPENCODE_PERMISSION"
+	scan := func(label string, m config.EnvMap) (string, string, bool) {
+		if v, found := m[key]; found {
+			if v.IsCommand() {
+				return label, "fromCommand: " + v.FromCommand, true
+			}
+			return label, v.Literal, true
+		}
+		return "", "", false
+	}
+	for i := range cfg.Projects {
+		p := &cfg.Projects[i]
+		if ph, exists := p.EnvPerHarness[harnessName]; exists {
+			if w, v, found := scan(fmt.Sprintf("projects[%d].env_per_harness.%s", i, harnessName), ph); found {
+				return w, v, true
+			}
+		}
+		if w, v, found := scan(fmt.Sprintf("projects[%d].env", i), p.Env); found {
+			return w, v, true
+		}
+	}
+	if hc, exists := cfg.Harnesses[harnessName]; exists {
+		if w, v, found := scan("harnesses."+harnessName+".env", hc.Env); found {
+			return w, v, true
+		}
+	}
+	if w, v, found := scan("env", cfg.Env); found {
+		return w, v, true
+	}
+	return "", "", false
+}
+
 // checkPermissions reports on the run harness's permission policy. See
 // checkPermissionsAll, which is what doctorChecks calls.
 func checkPermissions(cfg *config.Config) check {
@@ -1409,9 +1556,10 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 	case "opencode":
 		// The adapter always exports a fail-closed OPENCODE_PERMISSION — but exec
 		// takes the LAST duplicate key, so an operator's own env silently wins.
-		if v, ok := cfg.Env["OPENCODE_PERMISSION"]; ok {
+		// Since CLA-462 that env is declared at four levels; any of them wins.
+		if where, v, ok := opencodePermissionOverride(cfg, harnessName); ok {
 			c.status = warn
-			c.detail = "env overrides the adapter's fail-closed OPENCODE_PERMISSION"
+			c.detail = "env overrides the adapter's fail-closed OPENCODE_PERMISSION (declared at " + where + ")"
 			c.remedy = "drop it, or confirm it denies what an unattended run must not call: " + truncate(v, 60)
 			return c
 		}

@@ -1389,7 +1389,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv := d.invocationFor(t, phaseIdx, ph, prev, spawnDir)
+		inv, ierr := d.invocationFor(t, phaseIdx, ph, prev, spawnDir)
+		if ierr != nil {
+			// The session env refused to resolve (a failing or empty-output
+			// fromCommand, an unreadable @path file — the error names the
+			// variable). REFUSING THE SPAWN is the fail-closed contract: no
+			// session starts without its declared env (CLA-462). This is not a
+			// retryable failure — nothing was spawned and the cause is config,
+			// not a blip — so it fails the phase like a bad spawnDir does.
+			return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: refusing to spawn: %w", drainNum, ph.Label(phaseIdx), ierr)
+		}
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
 		f, ferr := d.state.Create(logName)
@@ -2751,7 +2760,16 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
-		got, err := a.Probe(ctx, d.invocationOn(t, d.cfg.HarnessFor(ph), true))
+		inv, ierr := d.invocationOn(t, d.cfg.HarnessFor(ph), true)
+		if ierr != nil {
+			// A refused probe spawn spends nothing and learns nothing about the
+			// limit, so it reads exactly like any other probe error: log the
+			// named variable (the error carries it) and poll again next
+			// interval. The wait stays bounded by its own dials.
+			log.Printf("probe error: %v — will retry next interval", ierr)
+			continue
+		}
+		got, err := a.Probe(ctx, inv)
 		// Count the probe BEFORE reading its verdict, and before the error branch: a
 		// probe that failed still spawned the harness and still spent. Every path out
 		// of here — resume, stop, or another lap — carries it.
@@ -2885,6 +2903,10 @@ func droppedNote(dropped int64) string {
 // changed between attempts), and so a resolution failure fails the phase before
 // anything is spawned.
 //
+// Unlike the directory, the session env is resolved per CALL, not once per
+// phase: every attempt re-runs its fromCommand declarations fresh, so a token
+// rotated mid-ladder still reaches the next attempt (CLA-462).
+//
 // The substitution is what lets a later phase RESUME a run rather than claim a
 // task. A session cannot know its own run id — it never called claim_task — so
 // the driver, which watched the earlier phase's stream go by, is the only thing
@@ -2894,8 +2916,11 @@ func droppedNote(dropped int64) string {
 // A placeholder with no claim to fill it is LEFT STANDING rather than blanked.
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) harness.Invocation {
-	inv := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) (harness.Invocation, error) {
+	inv, err := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
+	if err != nil {
+		return inv, err
+	}
 	if spawnDir != "" {
 		inv.WorkDir = spawnDir
 	}
@@ -2994,13 +3019,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// switched off.
 		inv.ResumeClaim = prev.Claim
 	}
-	return inv
-}
-
-// invocation builds the harness invocation for one target: the target's workdir
-// and .mcp.json (which select the project) over the config's global fields.
-func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
-	return d.invocationOn(t, d.cfg.Harness, probe)
+	return inv, nil
 }
 
 // invocationOn builds the invocation for one target ON A NAMED HARNESS: the
@@ -3018,12 +3037,23 @@ func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
 // project's own file is the top-level harness's, so it only applies there; and
 // the harness block's path is the single-project fallback. config.Validate
 // refuses the combination that would silently resolve to the wrong project.
-func (d *Driver) invocationOn(t Target, harnessName string, probe bool) harness.Invocation {
+//
+// The session env is composed HERE, at spawn time, fresh every call (CLA-462):
+// the four-level env overlay with every fromCommand executed now, so a rotated
+// token reaches this session without a daemon restart. An error — a failing,
+// timed-out or empty-output command, an unreadable @path file — REFUSES the
+// spawn: the caller reports it and no session starts, because a session without
+// its declared env is the incident, not a degraded mode.
+func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness.Invocation, error) {
 	workdir := t.WorkDir
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
 	hc := d.cfg.SessionFor(harnessName)
+	env, err := d.cfg.SessionEnv(harnessName, t.Name)
+	if err != nil {
+		return harness.Invocation{}, err
+	}
 	return harness.Invocation{
 		Prompt:        d.cfg.Prompt,
 		Model:         hc.Model,
@@ -3031,9 +3061,9 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) harness.
 		MCPConfigPath: d.cfg.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
 		ConfigDir:     hc.ConfigDir,
 		SettingsPath:  hc.SettingsPath,
-		Env:           d.cfg.EnvSlice(),
+		Env:           env,
 		Probe:         probe,
-	}
+	}, nil
 }
 
 // sessionDir resolves where a PHASE's sessions run: the checkout of the task
