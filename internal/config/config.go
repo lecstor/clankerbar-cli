@@ -2116,6 +2116,9 @@ func (c *Config) Validate() error {
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
+	if err := checkMCPConfigNamesClankerbar(c.MCPConfigPath, "mcp_config_path"); err != nil {
+		return err
+	}
 	// Each per-harness MCP config points the SAME account key at a host, so it is
 	// held to the same trusted origin. Sorted so a config with two bad blocks
 	// reports the same one every time rather than whichever the map iterated
@@ -2125,6 +2128,9 @@ func (c *Config) Validate() error {
 	for _, name := range sortedKeys(c.Harnesses) {
 		hc := c.Harnesses[name]
 		if err := c.checkMCPConfigOrigins(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
+			return err
+		}
+		if err := checkMCPConfigNamesClankerbar(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
 			return err
 		}
 		// The single-project split-brain, refused the same way the multi-project
@@ -2216,6 +2222,9 @@ func (c *Config) Validate() error {
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
 			return err
 		}
+		if err := checkMCPConfigNamesClankerbar(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+			return err
+		}
 		if err := validateHealthURL(p.HealthURL, fmt.Sprintf("projects[%d].health_url", i)); err != nil {
 			return err
 		}
@@ -2236,6 +2245,9 @@ func (c *Config) Validate() error {
 			p.MCPConfigPaths[name] = path
 			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
 			if err := c.checkMCPConfigOrigins(path, label); err != nil {
+				return err
+			}
+			if err := checkMCPConfigNamesClankerbar(path, label); err != nil {
 				return err
 			}
 			if fromMCP := slugFromMCPURL(mcpURLFromConfig(path)); fromMCP != "" && fromMCP != p.Slug {

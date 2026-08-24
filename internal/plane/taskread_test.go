@@ -53,6 +53,15 @@ func TestPeekNextTask(t *testing.T) {
 		if params["name"] != "next_task" {
 			t.Errorf("tool = %v, want next_task", params["name"])
 		}
+		// CLA-448: the plane's next_task schema is `inputSchema: {}` and refuses a
+		// null `arguments`; the driver must send an empty OBJECT (a session's MCP
+		// SDK does the same). This failed live on every daemon as "Invalid input /
+		// expected: record / params.arguments", which sent the peek to the
+		// primary-repo fallback and silently defeated CLA-437's repo routing.
+		args, ok := params["arguments"].(map[string]any)
+		if !ok || len(args) != 0 {
+			t.Errorf("arguments = %#v, want an empty object, not nil or null", params["arguments"])
+		}
 	})
 	t.Run("empty queue", func(t *testing.T) {
 		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"next":null}`))
