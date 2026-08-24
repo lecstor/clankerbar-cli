@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode"
@@ -28,6 +29,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/salvage"
@@ -146,6 +148,13 @@ type Target struct {
 	// the handback for this target, which costs only the reclaim an expiring lease
 	// would have cost anyway — so a target without one degrades, it does not break.
 	Releaser plane.Releaser
+
+	// Fleet reports this project's activity to the plane (CLA-466): a presence
+	// beacon on every backlog poll, state-change beacons at phase boundaries, and
+	// exactly one iteration record per drain. Nil (not wired) disables reporting,
+	// which costs only console visibility — reporting is telemetry and is never
+	// load-bearing.
+	Fleet fleet.Reporter
 }
 
 // Driver runs the loop for one harness against one or more backlogs.
@@ -282,6 +291,15 @@ type Driver struct {
 	// restartPoll is how often the RESTART_NOW watcher polls the state dir. A
 	// field so tests can shrink it; production always gets restartCheckInterval.
 	restartPoll time.Duration
+
+	// iter is one target's mid-drain presence state (CLA-466), written by
+	// beginIteration / endIteration around each drain and read by fleetState when
+	// a poll beacons. Single-goroutine, so plain fields.
+	iter []iterState
+
+	// hostname/hostOnce cache os.Hostname for the fleet beacon identity.
+	hostname string
+	hostOnce sync.Once
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -318,6 +336,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		fleetPaused: make([]bool, n),
 		fleetRaised: make([]bool, n),
 		fleetOpenQ:  make([]int, n),
+		iter:        make([]iterState, n),
 		waitGrace:   time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
@@ -408,6 +427,11 @@ func (d *Driver) Run(ctx context.Context) error {
 	defer cancelRun()
 	d.watchRestartNow(runCtx, cancelRun)
 
+	// CLA-466: whatever ends the run — STOP/HALT, a restart marker,
+	// max-iterations, budget, signal or error — every target's final `stopping`
+	// beacon goes out first. After it, console silence means the daemon is gone.
+	defer d.fleetShutdown()
+
 	for {
 		if runCtx.Err() != nil {
 			log.Print("cancelled — stopping")
@@ -482,6 +506,11 @@ func (d *Driver) Run(ctx context.Context) error {
 			for i := range d.targets {
 				t := d.targets[i]
 				sum, err := t.Poller.Poll(runCtx)
+				// CLA-466: the presence beacon rides THIS poll — no new cadence.
+				// It fires whatever the poll answered (even an error poll proves
+				// the daemon is alive and looping), and carries the state derived
+				// below, so a console-paused target reads `draining`, not `idle`.
+				d.beacon(i, t, d.fleetState(i))
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):
 					log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
@@ -761,6 +790,46 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// not a budget (see the end.empty branch below).
 	emptyRetries := 0
 
+	// CLA-466: one iteration record posts at this drain's boundary, whatever way
+	// it ends — hence the defer, and hence locals the deferred closure reads.
+	drainStart := time.Now()
+	var (
+		phasesRun []string // distinct phase labels attempted, in order
+		seen      harness.Claim
+		parkFired bool // the per-task dead budget parked the task
+		tripFired bool // the fleet dead counter tripped and paused this target
+		finalDisp string
+		// finalDead / lastProducedNothing are the FINAL attempt's dead
+		// classifications (the seam's, and the tally's wider one): a death that
+		// was retried past must not brand the record, and a LAST-phase death
+		// never sets end.dead at all (no retry/park applies) yet the record must
+		// still read `dead` — see phaseEnd.producedNothing.
+		finalDead           bool
+		lastProducedNothing bool
+	)
+	defer func() {
+		outcome := finalDisp
+		switch {
+		case parkFired:
+			outcome = fleet.OutcomeParked
+		case tripFired || finalDead || lastProducedNothing || err != nil:
+			outcome = fleet.OutcomeDead
+		case outcome == "":
+			// Nothing was ever observed — a launch failure with no claim state,
+			// say. The record still posts (exactly one per iteration); its task
+			// fields are simply empty and the outcome reads as released.
+			outcome = fleet.OutcomeReleased
+		}
+		d.endIteration(ti, t, fleet.Iteration{
+			TaskID:          seen.TaskID,
+			TaskRef:         seen.Ref,
+			Phases:          phasesRun,
+			Outcome:         outcome,
+			DurationSeconds: time.Since(drainStart).Seconds(),
+			Tokens:          tokens,
+		})
+	}()
+
 	for i := 0; i < len(phases); {
 		ph := phases[i]
 		last := i == len(phases)-1
@@ -840,6 +909,19 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		}
 		spawned++
 
+		// CLA-466: announce the phase change NOW rather than at the next poll, so
+		// the console sees which phase is running without waiting out an idle
+		// interval. taskRef is empty until a claim has been observed (the first
+		// phase claims inside drainPhase); from then on it rides every beacon.
+		ref := ""
+		if carried != nil {
+			ref = claimLabel(carried.Claim)
+		}
+		if len(phasesRun) == 0 || phasesRun[len(phasesRun)-1] != ph.Label(i) {
+			phasesRun = append(phasesRun, ph.Label(i))
+		}
+		d.beginIteration(ti, t, drainNum, ref, ph.Label(i))
+
 		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, i, tag, ph, last, carried, t, spend{
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
@@ -847,6 +929,17 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		})
 		tokens += ptokens
 		cost += pcost
+		finalDead = end.dead
+		lastProducedNothing = end.producedNothing
+		// CLA-466: the record's task identity and claim disposition follow EVERY
+		// claim the sequence observed — including one a dead phase already handed
+		// back itself (end.released), which the switch below deliberately drops
+		// from `carried`. The off-brief exception matches the switch's own first
+		// arm: a claim on a DIFFERENT task does not re-attribute the iteration.
+		if end.claim != nil && !(carried != nil && carried.Claim.TaskID != end.claim.Claim.TaskID) {
+			seen = end.claim.Claim
+			finalDisp = claimDisposition(end.claim)
+		}
 		// What, if anything, is still owed a handback. Three cases, and getting any
 		// of them wrong is a task either stranded on a dead lease or posted back to
 		// the queue over work already in review:
@@ -944,6 +1037,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				log.Printf("%siteration %d: the %s phase died producing nothing for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
 					labelOf(t), drainNum, ph.Label(i), deadRetries+1, perTaskDeadBound)
 				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
+				parkFired = true // CLA-466: the record says parked, not dead
 				// The task is parked for the operator and this drain is over; the
 				// daemon carries on with the next task. Not a stop: the run did
 				// not fail, one task reached a human.
@@ -953,6 +1047,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			d.fleetDead[ti]++
 			if d.fleetDead[ti] >= fleetDeadBound {
 				d.fleetTrip(ctx, t, ti, drainNum, end.claim)
+				tripFired = true // CLA-466: a fleet trip ends this drain on a death
 				// The fleet trip pauses this target and this drain is over; the
 				// in-flight task was already released with the dead phase. Not a
 				// stop: the run itself did not fail.
@@ -1109,6 +1204,15 @@ type phaseEnd struct {
 	// already been released (a retry re-claims); drainPhases owns the retry-once-
 	// then-park decision and its per-task budget.
 	dead bool
+
+	// producedNothing is the WIDER dead classification (the tally's, CLA-402):
+	// the same signature WITHOUT the !last conjunct end.dead carries, because a
+	// dead LAST phase is still a death even though no retry/park machinery can
+	// apply to it. Only the fleet record reads this field (CLA-466) — the
+	// iteration record must say `dead` when the drain ended on exactly such a
+	// final-phase death — so it deliberately does not feed the counters or the
+	// seam, whose !last gating is pinned by its own tests.
+	producedNothing bool
 
 	// empty reports a held-but-empty exit — the 2026-08-24 fleet-incident shape:
 	// the phase ended cleanly still holding the task with NO durable,
@@ -1520,6 +1624,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if res.Claim.TaskID != "" {
 			end.claim = &res
 		}
+		// The wider classification rides the end for the fleet record only — see
+		// phaseEnd.producedNothing.
+		end.producedNothing = producedNothing
 		// A handoff block ending the session's final message (CLA-352) holds the
 		// task open exactly like a phase seam — even on the LAST phase, where
 		// there is otherwise no successor to hold it for. The remaining guards
