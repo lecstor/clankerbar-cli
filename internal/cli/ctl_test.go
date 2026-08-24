@@ -134,6 +134,58 @@ func TestCtlRefusesAMissingStateDir(t *testing.T) {
 	}
 }
 
+// A daemon launched with `run -c cfg.json --workdir X` derives its state dir
+// from X when the config file pins no explicit state_dir - so ctl must accept
+// the same override and land the marker where THAT daemon reads it, not where
+// the config file alone resolves. Writing there would report success against a
+// restart nothing ever performs.
+func TestCtlWorkdirOverrideResolvesWhereTheDaemonReads(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	daemonWork := t.TempDir() // the daemon's actual launch override
+
+	fileCfg := &config.Config{
+		Harness: "claude",
+		Prompt:  "Work the backlog.",
+		WorkDir: t.TempDir(), // what the config FILE pins
+	}
+	cfgPath := func() string {
+		if err := fileCfg.Validate(); err != nil {
+			t.Fatalf("fixture config does not validate: %v", err)
+		}
+		return writeCtlConfig(t, fileCfg)
+	}()
+
+	// Where a daemon launched with --workdir=daemonWork resolves its markers.
+	expected := &config.Config{Harness: "claude", Prompt: "Work the backlog.", WorkDir: daemonWork}
+	if err := expected.Validate(); err != nil {
+		t.Fatalf("override config does not validate: %v", err)
+	}
+	daemonStateDir, err := expected.ResolveStateDir()
+	if err != nil {
+		t.Fatalf("ResolveStateDir: %v", err)
+	}
+	if err := os.MkdirAll(daemonStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Ctl(t.Context(), []string{"restart", "-c", cfgPath, "--workdir", daemonWork}); err != nil {
+		t.Fatalf("ctl restart --workdir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(daemonStateDir, loop.MarkerRestart)); err != nil {
+		t.Fatalf("the marker must land where the overridden daemon reads it (%s): %v", daemonStateDir, err)
+	}
+	fileStateDir, err := fileCfg.ResolveStateDir()
+	if err != nil {
+		t.Fatalf("ResolveStateDir for the un-overridden config: %v", err)
+	}
+	if fileStateDir == daemonStateDir {
+		t.Fatal("fixture broken: both resolutions agree, so this test cannot discriminate")
+	}
+	if _, err := os.Stat(filepath.Join(fileStateDir, loop.MarkerRestart)); !os.IsNotExist(err) {
+		t.Errorf("the config file's own resolution must stay untouched; stat err = %v", err)
+	}
+}
+
 func TestCtlArgumentErrors(t *testing.T) {
 	cfg, stateDir := ctlCfg(t)
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {

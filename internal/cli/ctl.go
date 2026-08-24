@@ -22,12 +22,14 @@ import (
 
 type ctlFlags struct {
 	cfgPath string
+	workdir string
 	now     bool
 }
 
 func newCtlFlagSet(f *ctlFlags) *pflag.FlagSet {
 	fs := newFlagSet("ctl")
 	fs.StringVarP(&f.cfgPath, "config", "c", "", "the config file of the RUNNING daemon (default: ~/.config/clankerbar/config.json); its state_dir/workdir decides where the marker is written")
+	fs.StringVar(&f.workdir, "workdir", "", "repeat the daemon's --workdir launch override, when it used one - with no explicit state_dir the state dir derives FROM the workdir, so this decides where the marker lands")
 	fs.BoolVar(&f.now, "now", false, "restart only: kill the in-flight session first (existing process-group kill), release any held claim, then re-exec")
 	return fs
 }
@@ -67,14 +69,17 @@ func parseCtlArgs(fs *pflag.FlagSet, args []string) (string, error) {
 
 // Ctl writes one control marker into the running daemon's state dir and prints
 // what will happen next. It resolves the state dir EXACTLY as `run` does — same
-// config file, same resolution — because a marker written anywhere else is a
-// marker nothing reads, which is precisely the failure this command must not
-// have: an operator who restarts nothing walks away believing they did.
+// config file, same override layering (`--workdir` repeats the daemon's launch
+// override) — because a marker written anywhere else is a marker nothing reads,
+// which is precisely the failure this command must not have: an operator who
+// restarts nothing walks away believing they did.
 //
 // A missing state dir is refused rather than created: creating one would hand
 // back success against a daemon that either is not running or was launched with
 // a different config, and the surprise-restart-on-next-start failure class is
-// what `doctor` warns about for exactly that shape.
+// what `doctor` warns about for exactly that shape. An existing dir whose daemon
+// has since stopped cannot be detected locally (there is no pidfile), so the
+// success output says what to do in that case instead of claiming liveness.
 func Ctl(_ context.Context, args []string) error {
 	var f ctlFlags
 	fs := newCtlFlagSet(&f)
@@ -93,6 +98,13 @@ func Ctl(_ context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
+	// The same override layering `run` performs, so ctl resolves the state dir
+	// EXACTLY as a daemon launched with those flags did. --workdir is the one
+	// that matters: with no explicit state_dir the state dir derives FROM the
+	// workdir (ResolveStateDir), so a daemon started with --workdir=X reads its
+	// markers under X - ctl without the same flag would write into a directory
+	// nothing reads and report success against a restart that never happens.
+	cfg.ApplyFlagOverrides(config.Overrides{WorkDir: f.workdir})
 	// Validated, not just loaded: ResolveStateDir keys off workdir/state_dir,
 	// and Validate is what pins workdir down absolutely — skipping it here could
 	// resolve a DIFFERENT directory than the validated run resolved.
@@ -127,6 +139,7 @@ func Ctl(_ context.Context, args []string) error {
 	for _, line := range effectLines(action, f.now) {
 		fmt.Println(line)
 	}
+	fmt.Println("if no loop is running against this config right now, delete this marker before starting one - the next start acts on it immediately (`clankerbar doctor` warns about leftover markers too)")
 	return nil
 }
 

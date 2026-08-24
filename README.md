@@ -625,8 +625,9 @@ clankerbar ctl reload     # re-read the config file at the next boundary, no exe
 ```
 
 `ctl` writes a marker into the same state dir (`RESTART` / `RESTART_NOW` /
-`RELOAD`, read exactly where `STOP` is read), resolved from `-c <config>` the
-same way `run` resolves it. A **graceful restart** never cuts a session short:
+`RELOAD`, read exactly where `STOP` is read), resolved from `-c <config>` —
+plus `--workdir`, if the daemon was launched with that override — the same way
+`run` resolves them. A **graceful restart** never cuts a session short:
 the daemon finishes what it is doing, holds no claim across the iteration
 boundary (the plane keeps all durable state, so resume is by construction),
 then re-execs itself with the **same argv and environment**, through its launch
@@ -639,7 +640,9 @@ One limit worth knowing before you reach for restart: **re-exec preserves the
 daemon's CURRENT environment.** It cannot conjure env the daemon was never
 launched with - a tokenless daemon restarts tokenless (that class of problem is
 env ownership, not restart). And a leftover control marker causes a surprise
-restart or reload on the next start - `doctor` warns about all of them.
+restart or reload on the next start - `doctor` warns about all of them, and
+`ctl`'s own output says what to do if no loop is actually running against the
+config you pointed it at.
 
 An explicit `state_dir` wins, but pointing it back inside a workdir gives every
 session spawned there the ability to write these markers. `doctor` WARNs whenever
