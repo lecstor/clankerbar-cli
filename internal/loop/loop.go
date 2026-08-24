@@ -691,6 +691,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// classification fires.
 	deadRetries := 0
 	deadTask := ""
+	// Consecutive held-but-empty implement exits in this drain (CLA-457). Bounded
+	// at ONE retry per the 2026-08-24 decision, deliberately smaller than the
+	// dead-phase ladder: the empty shape returns to the queue rather than
+	// parking, so the retry is a courtesy to a plausibly-transient silent EOT,
+	// not a budget (see the end.empty branch below).
+	emptyRetries := 0
 
 	for i := 0; i < len(phases); {
 		ph := phases[i]
@@ -931,10 +937,44 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				nextPrompt = end.handoff
 				continue
 			}
+			// The handoff was REFUSED, so its exemption from the evidence gate ends
+			// here: the exit is re-judged as the bare exit it really is (CLA-457).
+			// With no durable, origin-reachable branch evidence that is a FAILED
+			// empty phase — logged, tallied, never handed to the review brief.
+			if !last && end.empty {
+				log.Printf("%siteration %d: the %s phase ended holding a task with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns (its handoff was refused)",
+					labelOf(t), drainNum, ph.Label(i), end.emptyWhy)
+				d.tallyEmpty(ph.Label(i), d.cfg.HarnessFor(ph))
+				break
+			}
 		}
 		// This session ended without a respawn being accepted, so any chain is
 		// broken: a later handoff starts counting from a standard-brief session.
 		chain = 0
+
+		// A held-but-empty exit is a FAILED phase (2026-08-24), not a checkpoint
+		// and not an ordinary "ended without holding the task" end: the claim was
+		// held to the end, it just carried no durable, origin-reachable branch
+		// evidence. It gets ONE bounded retry, and only when the claim was ACTUALLY
+		// released back to the queue — a fresh claiming session can then pick the
+		// task straight back up. A recorded-but-unreachable branch was left to the
+		// takeover path by the handback (never released), and retrying would seed a
+		// session against a live lease nothing here renews, so such an exit ends the
+		// drain. This also covers a handoff the guards REFUSED above (chain cap,
+		// max-iterations): the handoff exemption ends the moment the successor is
+		// not going to run, so the exit must be re-judged as the bare exit it really
+		// is. Deliberately OUTSIDE the dead-phase ladder: the dead shape
+		// retries-then-parks a task that can kill four sessions, while the empty
+		// shape returns to the queue for the next drain — the tally measures it
+		// without tripping the park or fleet machinery, which is how a fleet-wide
+		// silent EOT shows up in the rate the operator watches.
+		if end.empty {
+			if !last && i == 0 && emptyRetries < 1 && end.releasedToQueue {
+				emptyRetries++
+				continue
+			}
+			break
+		}
 
 		// A non-final phase that did not reach its checkpoint leaves the next one
 		// nothing to resume: the session settled the task itself (worked past its
@@ -954,6 +994,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// each phase earns its own retry ladder (CLA-386).
 		deadRetries = 0
 		deadTask = ""
+		emptyRetries = 0
 		// CLA-396: a successful IMPLEMENT phase resets the FLEET-wide dead-phase
 		// counter. Only the implement phase runs the harness that can exhibit the
 		// zero-usage death — the review phase runs on the claude harness, which
@@ -1006,6 +1047,36 @@ type phaseEnd struct {
 	// then-park decision and its per-task budget.
 	dead bool
 
+	// empty reports a held-but-empty exit — the 2026-08-24 fleet-incident shape:
+	// the phase ended cleanly still holding the task with NO durable,
+	// origin-reachable branch evidence on the plane record. It is a FAILED phase,
+	// not a checkpoint: the seam must not hand it to the review brief. The claim
+	// has already been released (a fresh session re-claims) or left to expire (a
+	// recorded-but-unreachable branch keeps its takeover hand-off); drainPhases
+	// owns the one-bounded retry. Deliberately distinct from dead, which keys on
+	// the "unknown" finish reason — the incident's sessions finished with reason
+	// "stop", so the dead signature alone did not catch them. Set on a HANDOFF
+	// too, so a refused handoff is re-judged as the bare exit it really is.
+	empty bool
+
+	// emptyWhy is the evidence-gate reason when empty fired, for the "not a
+	// checkpoint" log line ("no branch recorded on the task", or the failing
+	// branch check's detail).
+	emptyWhy string
+
+	// branch is the verified branch name when this phase checkpointed — the
+	// plane-record evidence the checkpoint is now gated on (CLA-457), carried
+	// here so the successor's brief can name it instead of asserting an
+	// unverified phase-1 success. Folded onto the carried claim by the seam.
+	branch string
+
+	// releasedToQueue reports that this phase's handback ACTUALLY returned the
+	// claim to the ready queue (releaseHeldClaim succeeded), as opposed to
+	// leaving it to the takeover path or a failed release. It is the only signal
+	// a retry may re-claim against: a release the plane refused leaves the lease
+	// live, and a fresh claiming session would only be refused (CLA-457).
+	releasedToQueue bool
+
 	// handoff is the successor prompt the session emitted in its final message's
 	// handoff block, already past the parse-time guards (marker present, prompt
 	// non-empty and under the size cap, clean exit, trusted stream, task still
@@ -1031,6 +1102,110 @@ type phaseEnd struct {
 func deadPhase(res harness.Result) bool {
 	r, _ := res.Raw[harness.FinishReasonKey].(string)
 	return r == harness.FinishReasonUnknown && !res.Claim.HasWIP
+}
+
+// recordedBranches lists the branch names the plane's record carries for a
+// phase result: every branch this run recorded via update_task(branch) that the
+// plane accepted (the accepted Reports), plus the branch that came in on the
+// claim itself (a resumed predecessor's recorded WIP, or the task's branch at
+// claim time). These are the names a checkpoint can be verified against.
+func recordedBranches(res harness.Result) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(b string) {
+		if b != "" && !seen[b] {
+			seen[b] = true
+			out = append(out, b)
+		}
+	}
+	for _, rep := range res.Reports {
+		if res.Claim.Names(rep.TaskID) || (rep.Ref != "" && res.Claim.Names(rep.Ref)) {
+			add(rep.Branch)
+		}
+	}
+	if res.Claim.HasWIP {
+		add(res.Claim.Branch)
+	}
+	return out
+}
+
+// checkpointEvidence reports whether the plane's record carries the phase's
+// exit evidence — a branch recorded by this run whose tip really exists on the
+// origin remote — and returns that branch. Held-ness alone is NOT the evidence:
+// since CLA-358 the driver's lease renewer renews a claim for a session's whole
+// lifetime, so ANY session that claimed ends held, and "still holding" cannot
+// distinguish a checkpoint from an empty exit (2026-08-24 fleet incident: two
+// implement sessions claimed, cut a worktree, hit a silent model EOT, exited
+// cleanly with real usage and no edits, and the seam advanced to review on the
+// false premise).
+//
+// ok is true only when a recorded branch's BranchPushed check PASSED — the
+// branch is on the origin remote with its tip reachable. A branch that was
+// never pushed is not evidence, and a check that could not run (no git, no
+// repository resolved) is not evidence either: a checkpoint is claimed only on
+// the verified present, never on the absence of a negative. That is the
+// deliberate difference from verifyDeliveries, which warns loudly on the same
+// failing check but does not gate anything on it.
+func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.Result, workdir string) (branch string, ok bool, why string) {
+	branches := recordedBranches(res)
+	if len(branches) == 0 {
+		return "", false, "no branch recorded on the task"
+	}
+	if d.newVerifier == nil || workdir == "" {
+		return "", false, fmt.Sprintf("branch %q recorded but could not be checked (no working tree)", branches[0])
+	}
+	v := d.newVerifier(workdir, d.cfg.AllowUncheckedPRFor(t.Name))
+	vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
+	defer cancel()
+	// ANY recorded branch that passes is evidence — a session may record a draft
+	// branch early and the real one later. Remember the first failure for the
+	// diagnostic, keep going, and only give up when no recorded branch could be
+	// verified.
+	firstB, firstWhy := "", ""
+	for _, b := range branches {
+		out := v.Verify(vctx, delivery.Claim{Label: claimLabel(res.Claim), Branch: b})
+		for _, c := range out.Checks {
+			if c.Kind != delivery.BranchPushed {
+				continue
+			}
+			if c.Status == delivery.Pass {
+				return b, true, ""
+			}
+			// Fail and Unknown both mean "not evidence" for THIS branch: an
+			// unreachable branch, or one we could not check. Keep scanning; a
+			// later recorded branch may be the one that is really there.
+			if firstWhy == "" {
+				firstB, firstWhy = b, c.Detail
+			}
+			break
+		}
+	}
+	if firstWhy != "" {
+		return firstB, false, firstWhy
+	}
+	return "", false, "none of the recorded branches could be verified on the origin remote"
+}
+
+// verifiedBranch returns the branch the previous phase recorded and verified —
+// the hand-off the successor's brief names (CLA-457). The seam folds the
+// VERIFIED branch onto the carried claim when it checkpoints, so the claim's
+// branch IS the verified one for a checkpointed phase; the recorded-Branches
+// fallback covers a claim that was never re-judged (a resumed-with-WIP
+// predecessor, or a defensive hole). The predecessor's checkpoint is gated on
+// this same evidence, so an empty return here is a misconfigured sequence
+// announcing itself via a standing {{branch}} placeholder rather than a
+// plausible runtime state.
+func verifiedBranch(res *harness.Result) string {
+	if res == nil {
+		return ""
+	}
+	if res.Claim.Branch != "" {
+		return res.Claim.Branch
+	}
+	if bs := recordedBranches(*res); len(bs) > 0 {
+		return bs[0]
+	}
+	return ""
 }
 
 // drainWithRetries runs a single unphased drain — the whole task in one session.
@@ -1279,15 +1454,57 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// live in drainPhases; if they refuse, the deferred handback there
 		// releases what this held.
 		handoff := detectHandoff(drainNum, t, res)
-		if (!last || handoff != "") && res.Untrusted == "" && checkpointable && res.Claim.Held() && !dead {
+		// The seam contender: an orderly end still holding the task, minus the dead
+		// signature. This is the gate the incident put in question — see below.
+		canCheckpoint := res.Untrusted == "" && checkpointable && res.Claim.Held() && !dead
+		// CLA-457: held-ness alone must never advance the seam. Since CLA-358 the
+		// driver's lease renewer renews a claim for a session's whole lifetime, so
+		// ANY session that claimed ends held — "still holding" is a constant, not
+		// a checkpoint signal. A non-final phase reaches its checkpoint ONLY when
+		// the plane's record carries the phase's exit evidence: a branch recorded
+		// by this run whose tip really exists on the origin remote (the implement
+		// phase in the shipped sequence). The evidence is computed even on a
+		// handoff: an HONORED handoff continues the same phase regardless (its
+		// successor has nothing to falsely resume), but a REFUSED handoff must be
+		// re-judged as the bare exit it really is, and this is the only place the
+		// verification can run.
+		evidenceOK := true
+		evidenceWhy := ""
+		if !last && canCheckpoint {
+			end.branch, evidenceOK, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir)
+		}
+		// A held-but-empty exit (2026-08-24): a would-be checkpoint refused by the
+		// evidence gate — not by any of the older vetoes (dead, untrusted, not
+		// checkpointable) — so this is a FAILED phase, not a completed one. It is
+		// carried on the result in BOTH branches on purpose: for a bare exit it is
+		// the classification of record, and for a handoff it is what lets
+		// drainPhases downgrade the exit when the handoff is refused. An honored
+		// handoff never reaches that downgrade — the phase continues first.
+		empty := !last && canCheckpoint && !evidenceOK
+		end.empty = empty
+		end.emptyWhy = evidenceWhy
+		// A handoff holds the seam OPEN even without evidence: its successor
+		// continues THIS phase's job, so it is not the false-premise advance the
+		// gate exists to stop. The evidence gate governs only the bare seam
+		// advance to the NEXT configured phase (handoff == ""); a refused handoff
+		// is downgraded to that bare judgement in drainPhases.
+		if (!last || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK) {
 			end.checkpoint = true
 			end.handoff = handoff
+			if end.branch != "" && end.claim != nil {
+				// Fold the VERIFIED branch onto the carried claim, which is both the
+				// successor's resume seed and (via verifiedBranch) the source the
+				// review brief names. Without this the brief would re-derive the
+				// FIRST recorded branch — a draft — and call it verified, exactly
+				// the ungrounded assertion the recomposition exists to kill.
+				end.claim.Claim.Branch = end.branch
+			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
 					labelOf(t), drainNum, res.Claim.TaskID)
 			} else {
-				log.Printf("%siteration %d: phase reached its checkpoint holding %s — keeping the lease for the next phase",
-					labelOf(t), drainNum, res.Claim.TaskID)
+				log.Printf("%siteration %d: phase reached its checkpoint holding %s (branch %s verified on the origin remote) — keeping the lease for the next phase",
+					labelOf(t), drainNum, res.Claim.TaskID, end.branch)
 			}
 		} else {
 			// `released` records only a handback that could actually have happened:
@@ -1295,12 +1512,25 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// as released would erase a predecessor's claim that is still live.
 			end.released = res.Claim.Held()
 			end.dead = dead
+			if end.empty {
+				log.Printf("%siteration %d: the %s phase ended holding %s with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns",
+					labelOf(t), drainNum, ph.Label(phaseIdx), claimLabel(res.Claim), evidenceWhy)
+				// Book it into the dead-phase tally (CLA-457): this is the
+				// "produced nothing" class the rate exists to measure, and a
+				// fleet-wide silent EOT is exactly the incident in question.
+				d.tallyEmpty(ph.Label(phaseIdx), d.cfg.HarnessFor(ph))
+			}
 			// last && a clean exit is the shape CLA-384 is about: the phase ran to
 			// completion, pushed, and simply did not declare. A non-zero exit reached
 			// the same place by crashing, which is a different failure with its own
 			// reporting, and an earlier phase reaching here did not have declaring as
 			// its job at all.
-			d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+			//
+			// The return tells whether the claim is actually back in the ready queue
+			// — the thing a bounded retry can re-claim. A release the plane refused
+			// (or that never ran) leaves the lease live, so a retry session would
+			// only be refused and burned.
+			end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
 		}
 		// Then check what it said it delivered. After the handback, because a dead
 		// lease is time-sensitive and a git check is not; on every exit, because a
@@ -1926,7 +2156,13 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 // a budget trip between phases, a crash, a transient retry, a usage-limit wait, a
 // refused handoff - and counting those would make the number mean nothing, which
 // is the only thing it has going for it.
-func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) {
+//
+// It returns whether the claim is ACTUALLY back in the ready queue at the end —
+// that is, whether releaseHeldClaim really released it. The seam uses that to
+// decide whether a bounded retry may re-claim (a claim left to the takeover path,
+// or a release the plane refused, is still live and a fresh session would only be
+// refused); the other callers ignore it.
+func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) bool {
 	// A stream read only in part tells us which calls we SAW, never which the
 	// session made: the settle that released the task may simply be in the bytes
 	// that never arrived. Handing the task back on that reading posts `ready` over
@@ -1938,10 +2174,10 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			log.Printf("%ssession appeared to end holding %s, but its output could not be read whole — leaving the lease to expire rather than releasing a task that may already be settled",
 				labelOf(t), res.Claim.TaskID)
 		}
-		return
+		return false
 	}
 	if !res.Claim.Held() {
-		return
+		return false
 	}
 	if !res.Claim.Releasable() {
 		// Leaving the lease alone is right — see Releasable. Whether it is also a
@@ -1951,14 +2187,14 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			d.undeclared++
 			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
 				labelOf(t), res.Claim.TaskID, d.undeclared)
-			return
+			return false
 		}
 		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
 			labelOf(t), res.Claim.TaskID)
-		return
+		return false
 	}
 	if t.Releaser == nil {
-		return
+		return false
 	}
 	// Detach from ctx: a cancelled run (Ctrl-C, SIGTERM) is exactly when a claim
 	// would otherwise be abandoned, so the handback has to outlive the signal that
@@ -1970,9 +2206,10 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		if !errors.Is(err, plane.ErrNotWired) {
 			log.Printf("%scould not hand %s back: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
 		}
-		return
+		return false
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
+	return true
 }
 
 // verifyDeliveries checks, against local git, what the session told the plane it
@@ -2669,15 +2906,23 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 				if !ok {
 					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
 				}
-		}
+			}
 		}
 	}
 
 	inv.Model = model
 	if prev != nil && prev.Claim.Held() {
+		// The {{branch}} placeholder is filled from the recorded, VERIFIED hand-off
+		// (CLA-457): the checkpoint the driver ran against this claim already
+		// confirmed the branch is on the origin remote, so the review brief can
+		// name it instead of asserting an unverified phase-1 success. verifiedBranch
+		// reads the accepted reports first (the plane record of what THIS run
+		// recorded), falling back to the claim's own branch for a resumed-with-WIP
+		// predecessor.
 		inv.Prompt = strings.NewReplacer(
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
+			config.PhaseBranchPlaceholder, verifiedBranch(prev),
 		).Replace(inv.Prompt)
 		// Seed the claim as well as the prompt. The session is told not to claim,
 		// so the adapter would observe none — and Result.Claim.Held() is what gates

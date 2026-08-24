@@ -51,6 +51,11 @@ func mixedDriver(t *testing.T, impl, review *fakeAdapter) *Driver {
 		return nil, errors.New("no adapter " + name)
 	}
 	openTestStateDir(t, d)
+	// The implement phase's evidence gate (CLA-457) needs a working tree to
+	// search and a verifier; stub both the way phaseDriver does, so the mixed
+	// tests' checkpointed fixtures advance as before.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 	return d
 }
 
@@ -69,10 +74,14 @@ func TestDrainPhases_EachPhaseSpawnsItsOwnHarness(t *testing.T) {
 	}
 	// And the handoff still works ACROSS the harness boundary: the review session
 	// is seeded with the claim the implement session left held, which is what lets
-	// it resume the run instead of claiming a task of its own.
+	// it resume the run instead of claiming a task of its own. Since CLA-457 the
+	// seeded claim also carries the VERIFIED branch the seam folded onto it, so the
+	// review phase knows which branch to work in.
 	got := review.invocations[0]
-	if got.ResumeClaim != openClaim() {
-		t.Errorf("the review phase's ResumeClaim = %+v, want the implement phase's claim — a claim is plane state and crosses harnesses freely", got.ResumeClaim)
+	want := openClaim()
+	want.Branch = "clanker/x"
+	if got.ResumeClaim != want {
+		t.Errorf("the review phase's ResumeClaim = %+v, want the implement phase's claim with the verified branch folded on (%+v) — a claim is plane state and crosses harnesses freely", got.ResumeClaim, want)
 	}
 	if !strings.Contains(got.Prompt, openClaim().RunID) {
 		t.Errorf("the review phase's prompt did not get the run id substituted: %q", got.Prompt)

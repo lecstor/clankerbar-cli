@@ -642,7 +642,10 @@ func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"worktree for the branch recorded on the task",
+		// Since CLA-457 the branch is recomposed from plane state: the brief names
+		// the verified branch ({{branch}}) rather than asserting an unverified
+		// phase-1 success.
+		"worktree for branch " + PhaseBranchPlaceholder + " recorded on the task",
 		"never commit to the integration branch",
 		"empty branch",
 		"FAILED hand-off",
