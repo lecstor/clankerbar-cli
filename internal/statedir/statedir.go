@@ -1,5 +1,6 @@
 // Package statedir owns the one directory the DAEMON writes on its own account:
-// the loop's control markers (STOP/HALT) and its per-iteration transcripts.
+// the loop's control markers (STOP/HALT and the CLA-461 restart/reload family)
+// and its per-iteration transcripts.
 //
 // It exists because that directory is the daemon's blind spot. The daemon runs
 // OUTSIDE the confinement its own sessions run inside — claude gets
@@ -78,7 +79,8 @@ const gitignoreBody = "*\n"
 // `state_dir` happened to name.
 const sentinelName = ".clankerbar-statedir"
 
-const sentinelBody = "clankerbar loop state dir: iteration transcripts and STOP/HALT markers.\n" +
+const sentinelBody = "clankerbar loop state dir: iteration transcripts and control markers\n" +
+	"(STOP/HALT/RESTART/RESTART_NOW/RELOAD).\n" +
 	"Created and owned by clankerbar; safe to delete while no loop is running.\n"
 
 // maxMarkerBytes caps a control-marker read. A marker holds a one-line reason;
@@ -562,7 +564,12 @@ func (d *Dir) checkAdoptable() error {
 // evidence it is something else and adoption stops.
 func (d *Dir) isOurArtifact(name string) bool {
 	switch {
-	case name == sentinelName, name == "STOP", name == "HALT":
+	case name == sentinelName,
+		name == "STOP", name == "HALT",
+		// CLA-461: the ctl-written restart/reload markers. A state dir holding a
+		// pending control request must stay adoptable — the daemon reading that
+		// request is exactly the process that opens this directory next.
+		name == "RESTART", name == "RESTART_NOW", name == "RELOAD":
 		return true
 	case name == ".DS_Store", name == "Thumbs.db":
 		// Not ours, but not the operator's either: the file manager writes these

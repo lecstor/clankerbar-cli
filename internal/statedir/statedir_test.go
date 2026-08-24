@@ -561,6 +561,11 @@ func TestOpenAdoptsAPreSentinelStateDir(t *testing.T) {
 		".gitignore":                        gitignoreBody,
 		"iteration-20260101-d1-a0-abcd.log": "transcript\n",
 		"STOP":                              "operator\n",
+		// CLA-461: a dir holding a pending ctl request stays adoptable - the
+		// daemon reading the request is the next thing to open this directory.
+		"RESTART":     "ctl\n",
+		"RESTART_NOW": "ctl --now\n",
+		"RELOAD":      "ctl\n",
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(path, name), []byte(body), 0o600); err != nil {
@@ -575,6 +580,11 @@ func TestOpenAdoptsAPreSentinelStateDir(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(path, "STOP")); string(b) != "operator\n" {
 		t.Errorf("adoption disturbed an existing marker: got %q", b)
+	}
+	for _, name := range []string{"RESTART", "RESTART_NOW", "RELOAD"} {
+		if b, _ := os.ReadFile(filepath.Join(path, name)); string(b) != "ctl\n" && name != "RESTART_NOW" {
+			t.Errorf("adoption disturbed %s: got %q", name, b)
+		}
 	}
 }
 
