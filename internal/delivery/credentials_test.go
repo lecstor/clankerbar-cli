@@ -48,7 +48,7 @@ func writeCredShim(t *testing.T) (gitShim, ghFake string) {
 	writeFile(t, ghFake, `#!/bin/sh
 if [ "$1" = auth ] && [ "$2" = token ]; then
 	if [ "$GH_FAKE_FAIL" = 1 ]; then
-		echo "no oauth token found for github.com account $5" >&2
+		echo "no oauth token found for github.com account $4" >&2
 		exit 1
 	fi
 	printf '%s\n' "$GH_FAKE_TOKEN"
