@@ -2589,6 +2589,12 @@ func (c *Config) Source() string { return c.source }
 // and no slug). That is deliberate: New("") yields a not-wired poller, so the loop
 // falls into blind drain — which still makes progress — rather than retrying
 // forever against a slug-less base the plane can only reject.
+// Slug returns the project slug this config's wiring names — the `<slug>` in a
+// /mcp/<slug> endpoint or .mcp.json URL, "" when nothing derivable says. It is
+// how single-project mode answers "which project is this", the same derivation
+// the poll and the sessions already agree on.
+func (c *Config) Slug() string { return slugFromMCPURL(c.BacklogEndpoint()) }
+
 func (c *Config) BacklogEndpoint() string {
 	origin := c.CredentialOrigin()
 	if origin == "" {
