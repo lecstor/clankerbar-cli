@@ -630,9 +630,15 @@ func (r *Result) settleReport(toolUseID string, accepted bool) {
 	// Deduplicated on the CLAIM, not on the whole call, and the later one wins: two
 	// updates can restate the same branch under different statuses, and it is the
 	// most recent status that says whether the work is being handed to review or
-	// declared landed.
+	// declared landed. The replace carries the PRIOR Repo when the restatement
+	// drops it (CLA-351): a session that declared `repo` on one update and then
+	// restates `branch` with a status change — the protocol-encouraged shape —
+	// must not have its repo wiped, or the resolved branch check is lost.
 	for i, prior := range r.Reports {
 		if prior.sameClaim(rep) {
+			if rep.Repo == "" {
+				rep.Repo = prior.Repo
+			}
 			r.Reports[i] = rep
 			return
 		}
@@ -660,6 +666,13 @@ type Report struct {
 
 	// Branch is a recorded work-in-progress branch.
 	Branch string
+
+	// Repo is the repository the session declared its work lives in
+	// ("owner/name"), carried alongside the branch on the same update_task
+	// (CLA-351). Empty when the session did not declare one — the verifier then
+	// falls back to its existing behaviour, and the driver resolves the
+	// ambiguity-free case as before.
+	Repo string
 
 	// Commit and IntegrationBranch are a declared delivery, and PR is the pull
 	// request that carried it. PR is echoed back in the plane attestation, and
@@ -733,6 +746,17 @@ type Claim struct {
 	// session after it pushed. It makes the claim UNSAFE to release: see
 	// Releasable.
 	HasWIP bool
+
+	// Category is the task-declared risk trigger value (e.g. "security",
+	// "migration", "feature", "chore"). Read from the claim payload so the
+	// review-phase escalation can apply CategoryRules without an extra plane
+	// call (CLA-379).
+	Category string
+
+	// Branch is the work-in-progress branch name recorded on the task
+	// (e.g. "clanker/x-..."). Used by the review-phase escalation to diff
+	// changed paths against the integration branch (CLA-379).
+	Branch string
 }
 
 // Held reports whether this session ended still holding a task — a claim that

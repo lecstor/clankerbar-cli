@@ -328,6 +328,113 @@ func TestAmbiguousBranchAcrossClones_DegradesToCannotCheck(t *testing.T) {
 	}
 }
 
+// matchesRepoSlug is the whole resolution: a bare Contains would match
+// `lecstor/clankerbar` against `lecstor/clankerbar-cli` — the project's OWN repo
+// pair, the exact ambiguity CLA-351 exists to resolve — so the slug must sit on
+// a segment boundary, in both the https and ssh spellings, with and without
+// .git and trailing slashes.
+func TestMatchesRepoSlugBoundaries(t *testing.T) {
+	cases := []struct {
+		url, slug string
+		want      bool
+	}{
+		{"https://github.com/lecstor/clankerbar.git", "lecstor/clankerbar", true},
+		{"https://github.com/lecstor/clankerbar", "lecstor/clankerbar", true},
+		{"https://github.com/lecstor/clankerbar/", "lecstor/clankerbar", true},
+		{"git@github.com:lecstor/clankerbar.git", "lecstor/clankerbar", true},
+		{"git@github.com:lecstor/clankerbar", "lecstor/clankerbar", true},
+		{"ssh://git@github.com/lecstor/clankerbar", "lecstor/clankerbar", true},
+		// The prefix trap: the short slug must NOT match the long repo.
+		{"https://github.com/lecstor/clankerbar-cli.git", "lecstor/clankerbar", false},
+		{"git@github.com:lecstor/clankerbar-cli.git", "lecstor/clankerbar", false},
+		{"https://github.com/lecstor/clankerbar-cli-js.git", "lecstor/clankerbar-cli", false},
+		// The other direction matches exactly, never by prefix either.
+		{"https://github.com/lecstor/clankerbar-cli.git", "lecstor/clankerbar-cli", true},
+		{"https://github.com/lecstor/clankerbar.git", "lecstor/clankerbar-cli", false},
+		// An unrelated but similar-looking host must not match.
+		{"https://github.com/otherorg/clankerbar.git", "lecstor/clankerbar", false},
+	}
+	for _, tc := range cases {
+		if got := matchesRepoSlug(tc.url, tc.slug); got != tc.want {
+			t.Errorf("matchesRepoSlug(%q, %q) = %v, want %v", tc.url, tc.slug, got, tc.want)
+		}
+	}
+}
+
+// CLA-351: when a claim branch exists in MULTIPLE working copies below the
+// workdir, the claim's `repo` field resolves which one to verify. With no repo
+// field the honest refusal stands (the classic ambiguity above); with one that
+// matches a working copy's remote URL, the check runs against THAT copy — and
+// only that copy, however the candidates sort.
+func TestAmbiguousBranchResolvedByClaimRepo(t *testing.T) {
+	env := newEnv(t)
+	env.commit("main", "base.txt", "base")
+	env.push("main")
+	env.checkout("clanker/feature")
+	env.commit("clanker/feature", "work.txt", "work")
+	env.push("clanker/feature")
+	// The work that never left the laptop, in the tree the session actually used.
+	env.commit("clanker/feature", "more.txt", "more")
+
+	// A second clone, sorting FIRST, whose copy of the branch is at the pushed tip.
+	review := filepath.Join(env.root, "aaa-review")
+	run(t, env.root, "git", "clone", env.remote, review)
+	configure(t, review)
+	run(t, review, "git", "checkout", "-b", "clanker/feature", "origin/clanker/feature")
+	// The claim's repo slug must match this clone's REMOTE URL — that is how the
+	// resolver tells two working copies apart (CLA-351): by what each one's
+	// `origin` names, tolerating https/ssh forms. A REAL second bare remote whose
+	// path contains the slug, so the pushed-branch check against it succeeds
+	// (a fake URL would resolve the ambiguity and then fail the ls-remote).
+	reviewRemote := filepath.Join(env.root, "example", "review.git")
+	run(t, env.root, "git", "init", "--bare", "-b", "main", reviewRemote)
+	run(t, review, "git", "remote", "set-url", "origin", reviewRemote)
+	run(t, review, "git", "push", "origin", "clanker/feature")
+
+	t.Run("with no repo field the refusal stands", func(t *testing.T) {
+		rep := verify(t, env.root, Claim{Label: "CLA-253", Branch: "clanker/feature"})
+		c := mustStatus(t, rep, BranchPushed, Unknown)
+		if !strings.Contains(c.Detail, "2 repositories") {
+			t.Errorf("the detail should name the ambiguity, got %q", c.Detail)
+		}
+	})
+
+	t.Run("a resolving repo field verifies the matching copy", func(t *testing.T) {
+		// The claim names the repo whose remote URL matches the session's tree.
+		rep := verify(t, env.root, Claim{Label: "CLA-253", Branch: "clanker/feature", Repo: "example/review"})
+		if rep.Failed() {
+			t.Fatalf("pushed work in the named repo should pass, got %s", render(rep))
+		}
+		mustStatus(t, rep, BranchPushed, Pass)
+		if rep.Repo != review {
+			t.Errorf("checked %q, want the repo the claim named %q", rep.Repo, review)
+		}
+	})
+
+	t.Run("a repo field matching neither copy keeps the honest refusal", func(t *testing.T) {
+		rep := verify(t, env.root, Claim{Label: "CLA-253", Branch: "clanker/feature", Repo: "stranger/other"})
+		c := mustStatus(t, rep, BranchPushed, Unknown)
+		if !strings.Contains(c.Detail, "2 repositories") {
+			t.Errorf("an unresolvable repo must not guess; got %q", c.Detail)
+		}
+	})
+
+	t.Run("a resolving field pointing at a repo without the branch stays a failure, not a guess", func(t *testing.T) {
+		// The review's open point: the filter may narrow to a repo that does NOT
+		// carry the branch while another candidate does. The check must then fail
+		// honestly against the NAMED repo — reporting the absent branch — rather
+		// than silently falling back to the excluded copy.
+		rep := verify(t, env.root, Claim{Label: "CLA-253", Branch: "clanker/feature", Repo: "example/review"})
+		// The branch IS on review's remote (pushed above), so this stays a check
+		// that RUNS; what must be pinned is that it ran against `review`, not the
+		// `work` copy that carries the extra commit.
+		if rep.Repo != review {
+			t.Errorf("checked %q, want the claim's named repo %q", rep.Repo, review)
+		}
+		mustStatus(t, rep, BranchPushed, Pass)
+	})
+}
+
 // `git rev-parse` answers for the nearest ENCLOSING repository. A `git init`-ed
 // home directory would otherwise match the multi-repo parent itself, the walk
 // would stop there, and the feature would report "cannot check" forever.

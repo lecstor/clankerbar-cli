@@ -154,7 +154,10 @@ func TestAllowListAdmitsOnlyTheNamedEntries(t *testing.T) {
 // AllowUncheckedPRFor.
 func TestAllowListResolvesPerProject(t *testing.T) {
 	makeCfg := func() (*Config, string) {
-		dir, _ := writeMCP(t, `{"mcpServers":{"docs":{"command":"bash"}}}`)
+		// The honest discovered-file shape: clankerbar present, plus the local
+		// `docs` server the allow-list is about (CLA-448: a silent file would be
+		// refused for a different reason before the allow-list was ever reached).
+		dir, _ := writeMCP(t, `{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"},"docs":{"command":"bash"}}}`)
 		c := defaults()
 		c.Projects = []Project{{Slug: "proj", WorkDir: dir}}
 		return c, dir
@@ -169,7 +172,7 @@ func TestAllowListResolvesPerProject(t *testing.T) {
 	})
 
 	t.Run("a project list replaces it, and the refusal labels THIS field", func(t *testing.T) {
-		dir, _ := writeMCP(t, `{"mcpServers":{"other":{"command":"bash"}}}`)
+		dir, _ := writeMCP(t, `{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"},"other":{"command":"bash"}}}`)
 		c := defaults()
 		c.AllowLocalMCPServers = []string{"docs"}
 		c.Projects = []Project{{Slug: "proj", WorkDir: dir, AllowLocalMCPServers: []string{"docs"}}}

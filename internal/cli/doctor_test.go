@@ -1073,37 +1073,63 @@ func TestSessionCheckFailsOpencodePointedAtAClaudeShapedConfig(t *testing.T) {
 	}
 }
 
-// The other two opencode shapes must NOT fail. An absent path is normal - opencode
-// carries its own config - and a present non-Claude file is one doctor has no
-// schema to judge. Both get the caveat instead of a verdict, so a PASS is never
-// read as "the clankerbar wiring is there".
-func TestSessionCheckDoesNotClaimMCPWiringForOpencode(t *testing.T) {
-	native := filepath.Join(t.TempDir(), "opencode.json")
+// The absent opencode path must NOT fail: opencode legitimately carries its own
+// config, and doctor cannot parse that schema - that case keeps the caveat. But
+// a CONFIGURED opencode file is the statement, and doctor can now read it
+// (CLA-448): a file that is present and silent about clankerbar is exactly the
+// tool-less-session config that burned CLA-351 and CLA-377 to parked, so it
+// FAILs rather than earning the caveat.
+func TestSessionCheckVerifiesOpencodeConfigNamesClankerbar(t *testing.T) {
+	dir := t.TempDir()
+	native := filepath.Join(dir, "opencode.json")
 	if err := os.WriteFile(native, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	silent := filepath.Join(dir, "silent.json")
+	if err := os.WriteFile(silent, []byte(`{"mcp":{"context7":{"type":"remote","url":"https://context7.example/v1"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	disabled := filepath.Join(dir, "disabled.json")
+	if err := os.WriteFile(disabled, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj","enabled":false}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	cases := []struct {
-		name          string
-		mcpConfigPath string
-	}{
-		{"none is configured", ""},
-		{"an opencode-shaped config is configured", native},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), tc.mcpConfigPath, "opencode")
-			if c.status != pass {
-				t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
-			}
-			if strings.Contains(c.detail, ".mcp.json") {
-				t.Errorf("the verdict line must not rest on the .mcp.json for opencode, got %q", c.detail)
-			}
-			if !strings.Contains(strings.Join(c.info, "\n"), "OPENCODE_CONFIG") {
-				t.Errorf("an opencode workdir must SAY where its MCP servers come from, got info %q", c.info)
-			}
-		})
-	}
+	t.Run("none is configured -> caveat, not a verdict", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "", "opencode")
+		if c.status != pass {
+			t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(strings.Join(c.info, "\n"), "not checked") {
+			t.Errorf("an unconfigured opencode workdir must say the wiring was not checked, got info %q", c.info)
+		}
+	})
+
+	t.Run("a configured opencode file that names clankerbar passes and names it", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), native, "opencode")
+		if c.status != pass {
+			t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(strings.Join(c.info, "\n"), "clankerbar MCP server: https://clankerbar.com/mcp/proj") {
+			t.Errorf("a configured opencode workdir must NAME the wired clankerbar URL, got info %q", c.info)
+		}
+	})
+
+	t.Run("a configured opencode file silent about clankerbar fails", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), silent, "opencode")
+		if c.status != fail {
+			t.Fatalf("silent opencode config: got %v, want FAIL (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(c.remedy, "clankerbar") {
+			t.Errorf("the remedy must name the missing clankerbar entry, got %q", c.remedy)
+		}
+	})
+
+	t.Run("a configured opencode file with clankerbar disabled fails", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), disabled, "opencode")
+		if c.status != fail {
+			t.Fatalf("disabled clankerbar config: got %v, want FAIL (%s)", c.status, c.detail)
+		}
+	})
 }
 
 // The backstop for the hole the first fix left: it gated the arm on a `switch`
@@ -1162,7 +1188,7 @@ func TestEveryRegisteredHarnessIsClassifiedByTheWorkdirCheck(t *testing.T) {
 // report green about a directory the loop will never use.
 func TestSessionFallsBackToTopLevelWorkDir(t *testing.T) {
 	parent := multiRepoParent(t, "AGENTS.md")
-	if err := os.WriteFile(filepath.Join(parent, ".mcp.json"), []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(parent, ".mcp.json"), []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/acme"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1191,7 +1217,7 @@ func TestSessionFallsBackToTopLevelWorkDir(t *testing.T) {
 func TestSessionFallsBackToTopLevelMCPConfig(t *testing.T) {
 	parent := multiRepoParent(t, "AGENTS.md")
 	mcp := filepath.Join(t.TempDir(), ".mcp.json")
-	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/acme"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1847,7 +1873,7 @@ func TestDoctorRunPrintsTheCodexMCPCaveat(t *testing.T) {
 		t.Fatal(err)
 	}
 	mcp := filepath.Join(dir, ".mcp.json")
-	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(t.TempDir(), "clankerbar.json")
