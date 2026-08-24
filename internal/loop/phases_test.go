@@ -1232,6 +1232,94 @@ func TestDrainPhases_ReviewBriefNamesTheRecordedBranch(t *testing.T) {
 	}
 }
 
+// branchStatusVerifier answers each branch by name with a scripted verdict, for
+// the evidence-gate tests where the verifier must DISAGREE per branch (a draft
+// recorded first that was never pushed, and the real branch that was).
+type branchStatusVerifier map[string]delivery.Status
+
+func (m branchStatusVerifier) Verify(_ context.Context, c delivery.Claim) delivery.Report {
+	rep := delivery.Report{Claim: c}
+	st, ok := m[c.Branch]
+	if !ok {
+		st = delivery.Unknown
+	}
+	rep.Checks = []delivery.Check{{Kind: delivery.BranchPushed, Status: st, Detail: "branch " + c.Branch + " judges " + string(st)}}
+	return rep
+}
+
+// A session that records a DRAFT branch early (never pushed) and the REAL branch
+// later (pushed and verified) must checkpoint on the REAL one: ANY recorded
+// branch that verifies on origin is evidence, not only the first recorded
+// (CLA-457). An earlier cut returned on the first branch's verdict, which failed
+// the phase over a draft even though a verified hand-off exists — and the review
+// brief must name the verified branch, never the draft.
+func TestDrainPhases_AnyVerifiedBranchIsEvidenceNotJustTheFirstRecorded(t *testing.T) {
+	draft := harness.Report{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Branch: "clanker/draft"}
+	final := harness.Report{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Branch: "clanker/final"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: reported(held(okResult(1, 0), openClaim()), draft, final)},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	d.newVerifier = func(string, bool) deliveryVerifier {
+		return branchStatusVerifier{"clanker/draft": delivery.Fail, "clanker/final": delivery.Pass}
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — the phase checkpoints on the VERIFIED final branch even though a draft was recorded first", h.invokeCalls)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "clanker/final") {
+		t.Errorf("the review brief should name the verified branch clanker/final:\n%q", h.invocations[1].Prompt)
+	}
+	if strings.Contains(h.invocations[1].Prompt, "clanker/draft") {
+		t.Errorf("the review brief named the unverified draft branch: %q", h.invocations[1].Prompt)
+	}
+}
+
+// A handoff the driver REFUSES (max-iterations already spent) ends the carve-out
+// the handoff exempted: the exit is re-judged as the bare exit it really is, so
+// a no-evidence implement session must NOT advance to review on a brief that
+// claims a verified branch (CLA-457). The claim was held for a successor that is
+// not coming, so the deferred handback releases it.
+func TestDrainPhases_RefusedHandoffWithNoEvidenceDoesNotAdvanceToReview(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: handoffResult("Continue implementing: the design is settled, write the code.")},
+		{res: okResult(1, 0)},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+	d.cfg.MaxIterations = 1 // the respawn would be iteration 2: refused
+	logged := captureLogs(t)
+
+	_, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	// The handoff was refused and the exit had no evidence: only the one session
+	// ran, and the review brief never spawned.
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions, want 1 — a refused no-evidence handoff exits the drain without spawning review", h.invokeCalls)
+	}
+	if handoffs != 0 {
+		t.Errorf("handoffs = %d, want 0 — the refused handoff never spawned a successor", handoffs)
+	}
+	for _, inv := range h.invocations {
+		if strings.Contains(inv.Prompt, "PHASE 2") {
+			t.Errorf("the review phase spawned after a refused no-evidence handoff: %q", inv.Prompt)
+		}
+	}
+	// The held claim is released by the deferred handback (no WIP).
+	if len(rel.calls) != 1 || rel.calls[0] != (releaseCall{"t-1", "r-1"}) {
+		t.Errorf("released %+v, want exactly {t-1 r-1} via the deferred handback", rel.calls)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "handoff refused") || !strings.Contains(out, "not a checkpoint") {
+		t.Errorf("the refusal and the empty judgement are not both named:\n%s", out)
+	}
+}
+
 // A task that can kill four full implement phases reaches the operator rather
 // than a fifth session — parked, with an OPEN question so the operator actually
 // sees it. The retry budget is per task: three deaths earn three retries, and
