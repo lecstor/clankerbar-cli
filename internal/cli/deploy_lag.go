@@ -148,13 +148,17 @@ var deployGitTimeout = time.Minute
 // repos, so the check degraded to "could not read refs" exactly where measuring
 // real deploy lag matters. Local commands never consult credentials and stay
 // unscoped, byte-identical to before.
+//
+// The deadline is applied BEFORE the credential resolution, so the `gh` that
+// scoping spawns is a child of this same deadline: a wedged gh must end as the
+// bounded fail-open error, not stall the preflight past deployGitTimeout.
 func deployGitRun(ctx context.Context, dir string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, deployGitTimeout)
+	defer cancel()
 	var extraEnv []string
 	if len(args) > 0 && (args[0] == "ls-remote" || args[0] == "fetch") {
 		extraEnv = deployCredEnv(ctx, dir)
 	}
-	ctx, cancel := context.WithTimeout(ctx, deployGitTimeout)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -190,7 +194,9 @@ func deployGitRun(ctx context.Context, dir string, args ...string) (string, erro
 //
 // It spawns only local commands plus at most one `gh auth token`; no cache,
 // for the reason delivery records: a cache would outlive the gh auth state it
-// was keyed on.
+// was keyed on. The whole resolution runs under the caller's deployGitTimeout
+// deadline (deployGitRun applies it before calling here), so a wedged gh is
+// reaped at the deadline rather than stalling the preflight.
 func deployCredEnv(ctx context.Context, repo string) []string {
 	remote := deployRemoteOf(ctx, deployGitRun, repo)
 	raw, err := deployGitRun(ctx, repo, "remote", "get-url", remote)

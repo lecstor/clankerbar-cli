@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // CLA-459 regression tests: doctor's deploy_lag check reads remotes with
@@ -95,6 +96,9 @@ exec "__REAL_GIT__" "$@"
 	ghFake := filepath.Join(binDir, "gh")
 	ghBody := strings.NewReplacer("__GH_RECORD__", ghRecord).Replace(`#!/bin/sh
 printf '%s\n' "$*" >> "__GH_RECORD__"
+if [ -n "$DEPLOY_GH_FAKE_SLEEP" ]; then
+	exec sleep "$DEPLOY_GH_FAKE_SLEEP"
+fi
 if [ "$1" = auth ] && [ "$2" = token ]; then
 	if [ "$DEPLOY_GH_FAKE_FAIL" = 1 ]; then
 		echo "no oauth token found for github.com account $4" >&2
@@ -342,5 +346,38 @@ func TestDeployLagOwnerWithoutGhTokenFallsBackUnscoped(t *testing.T) {
 	ghCalls, err := os.ReadFile(ghRecord)
 	if err != nil || !strings.Contains(string(ghCalls), "--user some-org") {
 		t.Errorf("gh should have been asked for some-org's token before falling back, got %q (%v)", string(ghCalls), err)
+	}
+}
+
+// A wedged gh must not hold the network command past its own deadline. Doctor's
+// context is signal-only - it carries no deadline - so the credential
+// resolution has to run under deployGitTimeout itself: a gh that hangs is then
+// reaped at the deadline and the command ends as a bounded fail-open error
+// instead of stalling the preflight for as long as gh is wedged.
+func TestDeployLagBoundsCredentialResolutionByTheCommandDeadline(t *testing.T) {
+	old := deployGitTimeout
+	deployGitTimeout = 2 * time.Second
+	t.Cleanup(func() { deployGitTimeout = old })
+
+	repoDir, _ := deployCredRepo(t, "https://github.com/lecstor/ezyapp.git", true)
+	binDir, record, ghRecord := writeDeployCredShims(t)
+
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DEPLOY_CRED_RECORD", record)
+	t.Setenv("DEPLOY_CRED_GH_RECORD", ghRecord)
+	t.Setenv("DEPLOY_GH_FAKE_SLEEP", "10") // far past the 2s deadline
+
+	start := time.Now()
+	_, err := deployGitRun(context.Background(), repoDir, "ls-remote", "--heads", "--", "origin", "refs/heads/staging")
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Errorf("the expired deadline should have failed the command, got nil")
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("credential resolution outlived the command deadline by %s - gh is not bound by deployGitTimeout", elapsed)
+	}
+	if body, err := os.ReadFile(ghRecord); err != nil || !strings.Contains(string(body), "auth token --user lecstor") {
+		t.Errorf("gh should have started its token lookup before the deadline reaped it, got %q (%v)", string(body), err)
 	}
 }
