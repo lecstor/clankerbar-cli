@@ -2620,23 +2620,27 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// is logged so the spend is attributable, per the 2026-08-23 decision.
 	if d.cfg.Escalation.PathRules != nil || d.cfg.Escalation.CategoryRules != nil {
 		if isReviewPhase(ph) {
-			// Try to evaluate path rules from the workdir's branch vs staging.
-			changedPaths, _ := d.diffAgainstIntegration(t, "", spawnDir)
-			tier, rule := d.cfg.Escalation.Evaluate(changedPaths, "")
+			// Resolve the branch name for the diff: from the previous claim's
+			// branch record (CLA-379 plumbing), falling back to reading the
+			// workdir's git refs if the claim carries none.
+			branchName := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Branch != "" {
+				branchName = prev.Claim.Branch
+			}
+			changedPaths, _ := d.diffAgainstIntegration(t, branchName, spawnDir)
+			category := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Category != "" {
+				category = prev.Claim.Category
+			}
+			tier, rule := d.cfg.Escalation.Evaluate(changedPaths, category)
 			if tier != "" {
-				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v)", labelOf(t), tier, rule, changedPaths)
+				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
 				ph.Tier = tier
 				model, ok = d.cfg.ModelForPhase(ph)
 				if !ok {
 					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
 				}
-			} else if prev != nil && prev.Claim.Held() && d.cfg.Escalation.CategoryRules != nil {
-				// Category-based escalation when the previous claim is available.
-				tier, rule = d.cfg.Escalation.Evaluate(nil, "")
-				if tier == "" && rule == "" {
-					// No category info in claim; skip category evaluation for now.
-				}
-			}
+		}
 		}
 	}
 
