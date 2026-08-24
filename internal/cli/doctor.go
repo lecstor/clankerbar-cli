@@ -1100,18 +1100,33 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 			c.remedy = "point mcp_config_path at a " + harnessName + " config - " + use.Note
 			return c
 		}
-		// Otherwise there is nothing here we can honestly verdict on: an absent
-		// path is normal for this harness, and a present non-Claude one we have no
-		// schema to judge. An absent one is NOT warned about here even though a
-		// mixed-harness phase could reach the backlog through neither this file
-		// nor its config dir (CLA-366): the config dir legitimately carries the
-		// server for this harness, doctor cannot parse that schema to find out,
-		// and TestSessionCheckDoesNotClaimMCPWiringForOpencode pins the resulting
-		// PASS-with-caveat deliberately. The guard for a phase harness that
-		// declares NOTHING is in config.Validate, which refuses an empty
-		// `harnesses.<name>` block outright - the right place for it, since it
-		// fires before a session is spawned rather than in a log at 3am.
-		c.info = append(c.info, mcpConfigNotCheckedNote(use))
+		// When a path IS configured, the file is the statement - and doctor can
+		// now read the opencode schema well enough to verify the statement says
+		// clankerbar (CLA-448). The old "not checked" caveat existed because the
+		// schema was unreadable; the opencode file is JSON like any other, and a
+		// configured file that is silent about clankerbar is exactly the
+		// tool-less-session config that burned CLA-351 and CLA-377 to parked.
+		// FAIL, not WARN: a green workdir must not certify a session that cannot
+		// see the backlog.
+		if mcpConfigPath != "" {
+			if url, ok := config.MCPClankerbar(mcpConfigPath); ok {
+				server := url
+				if server == "" {
+					server = "(local command)"
+				}
+				c.info = append(c.info, "clankerbar MCP server: "+server+" ("+mcpConfigPath+")")
+			} else {
+				c.status = fail
+				c.detail = mcpConfigPath + " does not declare a usable clankerbar MCP server"
+				c.remedy = "name an entry \"clankerbar\" (or one referencing CLANKERBAR_API_KEY) in that file, not \"enabled\": false - sessions spawned with it would have no clankerbar tools"
+				return c
+			}
+		} else {
+			// Nothing configured: the harness's own config dir legitimately carries
+			// the server, and doctor cannot parse that schema - the caveat stands
+			// only for this case (CLA-448).
+			c.info = append(c.info, mcpConfigNotCheckedNote(use))
+		}
 
 	case harness.MCPConfigClaudeJSON:
 		// A session with no .mcp.json reaching it gets no clankerbar tools at all — it

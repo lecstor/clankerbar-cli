@@ -276,6 +276,36 @@ func referencesKey(m map[string]string) bool {
 	return false
 }
 
+// MCPClankerbar reports the usable clankerbar server the file at path declares:
+// an entry named `clankerbar`, or one referencing `CLANKERBAR_API_KEY`, that is
+// not explicitly `"enabled": false`. It returns that entry's URL ("" for a
+// local-command entry, which has none) and whether such an entry exists at all.
+//
+// This is the "always has clankerbar set up" probe (CLA-448): it feeds both
+// Validate's refusal of a named MCP config that is present and silent about
+// clankerbar, and doctor's sessionCheck verdict for the opencode harness. It is
+// deliberately STRICTER than checkMCPConfigOrigins, which only constrains where
+// the key may go — a file with no clankerbar entry at all has nothing to check
+// there and passes, exactly the tool-less-session config this predicate exists
+// to refuse.
+func MCPClankerbar(path string) (url string, ok bool) {
+	f, err := readMCPFile(path)
+	if err != nil {
+		return "", false
+	}
+	for _, block := range []map[string]mcpEntry{f.MCPServers, f.MCP} {
+		for name, s := range block {
+			if s.disabled() {
+				continue
+			}
+			if name == "clankerbar" || referencesKey(s.Headers) || referencesKey(s.Env) || referencesKey(s.Environment) {
+				return s.URL, true
+			}
+		}
+	}
+	return "", false
+}
+
 // checkMCPConfigOrigins refuses a harness MCP config that would send the API key
 // somewhere this config does not trust.
 //
@@ -294,6 +324,35 @@ func referencesKey(m map[string]string) bool {
 // A refusal, not a silent drop: dropping the file would spawn a session with no
 // clankerbar tools at all, which burns an iteration and reads as "the backlog was
 // empty". The operator gets a named host and a remedy instead.
+// checkMCPConfigNamesClankerbar refuses a resolved MCP config file that is
+// PRESENT but silent about clankerbar (CLA-448): a file a daemon hands to every
+// session, whose sessions would therefore start with no clankerbar tools at
+// all — the shape that burned three clankers on CLA-351 and CLA-377 before
+// parking them. A missing file keeps today's behavior (doctor's no-.mcp.json
+// WARN covers it), and an empty path is the harness's fallback to its own
+// config dir, which this check must not second-guess.
+func checkMCPConfigNamesClankerbar(path, label string) error {
+	if path == "" {
+		return nil
+	}
+	fi, err := os.Stat(expandHome(path))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s: %s is not a regular file", label, path)
+	}
+	if _, ok := MCPClankerbar(path); !ok {
+		return fmt.Errorf("%s: %s does not declare a usable clankerbar server — sessions would start with no clankerbar tools "+
+			"(add an entry named \"clankerbar\", or one referencing %s, that is not \"enabled\": false)",
+			label, path, credentialEnvVar)
+	}
+	return nil
+}
+
 func (c *Config) checkMCPConfigOrigins(path, label string) error {
 	servers, err := readMCPServers(path)
 	if err != nil {
