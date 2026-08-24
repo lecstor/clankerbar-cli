@@ -47,6 +47,27 @@ type TaskRepoSource interface {
 	TaskRepo(ctx context.Context, taskID string) (string, error)
 }
 
+// TaskState is what a get_task read learned about WHO holds a task right now:
+// the plane's own status word, the qualified ref, the id of the run currently
+// holding it (empty when nothing does), and any work-in-progress branch
+// recorded on it.
+type TaskState struct {
+	Status       string
+	Ref          string
+	ClaimedByRun string
+	Branch       string
+}
+
+// TaskStateSource reads one task's holder state, for the CLA-451 checkpoint
+// peek: when a phase ends without an observed claim, the driver asks this about
+// the task it briefed before declaring the phase empty. Like both reads above,
+// it is a READ of one named task — it holds nothing and claims nothing — and
+// best-effort by contract: an error degrades to today's ending, never to a
+// failed run.
+type TaskStateSource interface {
+	TaskState(ctx context.Context, taskID string) (TaskState, error)
+}
+
 // PeekNextTask calls the plane's next_task — the same read a session makes to
 // find work, which is a read and not a claim: it holds nothing, so the peek
 // cannot race a session out of work. It may hand back a stale-lease takeover
@@ -75,7 +96,7 @@ func (r *mcpReleaser) PeekNextTask(ctx context.Context) (NextTask, error) {
 	if payload.Next == nil || payload.Next.ID == "" {
 		return NextTask{}, nil
 	}
-	return NextTask{TaskID: payload.Next.ID, Repo: repoString(payload.Next.Repo)}, nil
+	return NextTask{TaskID: payload.Next.ID, Repo: wireString(payload.Next.Repo)}, nil
 }
 
 // TaskRepo calls get_task for one task and returns its `repo` field. The
@@ -99,16 +120,58 @@ func (r *mcpReleaser) TaskRepo(ctx context.Context, taskID string) (string, erro
 		return "", fmt.Errorf("get_task: decode response: %w", err)
 	}
 	if payload.Task != nil {
-		return repoString(payload.Task.Repo), nil
+		return wireString(payload.Task.Repo), nil
 	}
-	return repoString(payload.Repo), nil
+	return wireString(payload.Repo), nil
 }
 
-// repoString narrows the decoded `repo` field, which the plane sends as a
-// string or null. A non-string is treated as absent rather than an error: the
-// field's meaning is "which repo this task targets", and no value it can carry
-// turns a spawn into a failure — that is resolution's job, on a real string.
-func repoString(v any) string {
+// TaskState calls get_task for one task and returns the fields naming its
+// holder: status, claimedByRun, branch and ref. The response is accepted in
+// both envelopes the plane has used (see TaskRepo). A field the plane sends as
+// null decodes to empty, like repo above — an unheld task reads as
+// status "ready" (or whatever it moved to) with no run and no branch, which is
+// exactly the shape the caller's guard wants to see.
+func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, error) {
+	if taskID == "" {
+		return TaskState{}, errors.New("task state: taskId is required")
+	}
+	raw, err := r.callText(ctx, "get_task", map[string]any{"taskId": taskID})
+	if err != nil {
+		return TaskState{}, err
+	}
+	var payload struct {
+		Task *taskHolderWire `json:"task"`
+		taskHolderWire
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return TaskState{}, fmt.Errorf("get_task: decode response: %w", err)
+	}
+	w := payload.taskHolderWire
+	if payload.Task != nil {
+		w = *payload.Task
+	}
+	return TaskState{
+		Status:       wireString(w.Status),
+		Ref:          wireString(w.Ref),
+		ClaimedByRun: wireString(w.ClaimedByRun),
+		Branch:       wireString(w.Branch),
+	}, nil
+}
+
+// taskHolderWire is the slice of a get_task response that names its holder.
+type taskHolderWire struct {
+	Status       any `json:"status"`
+	Ref          any `json:"ref"`
+	ClaimedByRun any `json:"claimedByRun"`
+	Branch       any `json:"branch"`
+}
+
+// wireString narrows a decoded JSON field the plane sends as a string or null
+// (repo, status, ref, branch, claimedByRun). A non-string is treated as absent
+// rather than an error: every field read here is descriptive, and no value one
+// can carry turns a spawn or a seam decision into a failure — resolution and
+// classification act only on real strings.
+func wireString(v any) string {
 	s, _ := v.(string)
 	return strings.TrimSpace(s)
 }

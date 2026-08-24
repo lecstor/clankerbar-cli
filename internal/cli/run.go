@@ -132,10 +132,16 @@ func Run(ctx context.Context, args []string) error {
 	if projects := cfg.Projects; len(projects) > 0 {
 		targets := make([]loop.Target, 0, len(projects))
 		for _, p := range projects {
+			rel := plane.New(cfg.ProjectEndpoint(p), apiKey)
+			rc := plane.NewRunConfigAPI(cfg.ProjectEndpoint(p), apiKey)
 			targets = append(targets, loop.Target{
-				Name:          p.Slug,
-				Poller:        backlog.New(cfg.ProjectSummaryURL(p), apiKey),
-				Releaser:      plane.New(cfg.ProjectEndpoint(p), apiKey),
+				Name:     p.Slug,
+				Poller:   backlog.New(cfg.ProjectSummaryURL(p), apiKey),
+				Releaser: rel,
+				// The same client reads this project's stored execution config
+				// (CLA-410). Unwired only when there is no endpoint/key, which
+				// leaves the local file rules in force exactly as before.
+				RCfg:          rc,
 				WorkDir:       p.WorkDir,
 				MCPConfigPath: p.MCPConfigPath,
 				// The per-harness files for this project, for a sequence whose
@@ -155,9 +161,12 @@ func Run(ctx context.Context, args []string) error {
 
 	// One unnamed target — NewMulti with a single entry is exactly what New builds,
 	// and it is the only form that can carry a Releaser.
+	rel := plane.New(cfg.BacklogEndpoint(), apiKey)
+	rc := plane.NewRunConfigAPI(cfg.BacklogEndpoint(), apiKey)
 	return runDriver(ctx, loop.NewMulti(cfg, adapter, []loop.Target{{
 		Poller:      backlog.New(cfg.BacklogSummaryURL(), apiKey),
-		Releaser:    plane.New(cfg.BacklogEndpoint(), apiKey),
+		Releaser:    rel,
+		RCfg:        rc,
 		Repos:       cfg.ReposFor(""),
 		PrimaryRepo: cfg.PrimaryRepoFor(""),
 	}}), f.cfgPath, overrides)
@@ -170,6 +179,10 @@ func Run(ctx context.Context, args []string) error {
 // every --flag the operator launched with. A restart re-execs with the same
 // argv through the same launch path, so the fresh daemon inherits both.
 func runDriver(ctx context.Context, drv *loop.Driver, cfgPath string, overrides config.Overrides) error {
+	// The stored run-config overlay (CLA-410) re-applies these after every
+	// fetch-and-overlay: a ratified document outranks the FILE, but the flags
+	// the operator actually launched with outrank both.
+	drv.SetOverrides(overrides)
 	drv.SetReloader(func() (*config.Config, error) {
 		fresh, err := config.Load(cfgPath)
 		if err != nil {

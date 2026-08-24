@@ -509,6 +509,15 @@ func (v *Verifier) runGH(ctx context.Context, dir string, args ...string) (strin
 // allowed to lean on. Empty additions leave the environment untouched,
 // byte-for-byte the pre-scoping behavior.
 func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
+	return runGHBin(ctx, v.ghBin, dir, extraEnv, args...)
+}
+
+// runGHBin is runGH with the binary spelled out, so the per-owner token
+// resolution in delivery.go (TokenForOwner, CLA-458) drives the same spawn
+// discipline without a Verifier in hand - CLA-459's doctor consumer passes
+// "gh" here. extraEnv carries per-invocation environment additions (see
+// runGHScoped); pass nil for the plain spawn.
+func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ...string) (string, error) {
 	env := append(os.Environ(),
 		"GH_NO_UPDATE_NOTIFIER=1",
 		"GH_FORCE_TTY=0",
@@ -524,7 +533,7 @@ func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []strin
 		}
 		env = append(scoped, extraEnv...)
 	}
-	cmd := exec.CommandContext(ctx, v.ghBin, args...)
+	cmd := exec.CommandContext(ctx, ghBin, args...)
 	cmd.Dir = dir
 	cmd.Env = env
 	cmd.WaitDelay = ghWaitDelay
