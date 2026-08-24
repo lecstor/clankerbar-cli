@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 )
 
 const (
@@ -139,9 +140,25 @@ var deployGitTimeout = time.Minute
 // deadline (deployGitTimeout) and WaitDelay, which reaps the helper processes
 // ls-remote spawns once the command has been killed - they inherit the pipes,
 // and a killed git can otherwise leave the call sitting past its deadline.
+//
+// The two NETWORK commands this check runs (ls-remote, fetch) additionally go
+// out with CLA-458's per-owner credential scoping (see deployCredEnv): an HTTPS
+// github origin that names no account is otherwise read as whichever gh account
+// is ACTIVE, and on this machine that account cannot see the private lecstor
+// repos, so the check degraded to "could not read refs" exactly where measuring
+// real deploy lag matters. Local commands never consult credentials and stay
+// unscoped, byte-identical to before.
+//
+// The deadline is applied BEFORE the credential resolution, so the `gh` that
+// scoping spawns is a child of this same deadline: a wedged gh must end as the
+// bounded fail-open error, not stall the preflight past deployGitTimeout.
 func deployGitRun(ctx context.Context, dir string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, deployGitTimeout)
 	defer cancel()
+	var extraEnv []string
+	if len(args) > 0 && (args[0] == "ls-remote" || args[0] == "fetch") {
+		extraEnv = deployCredEnv(ctx, dir)
+	}
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -151,6 +168,7 @@ func deployGitRun(ctx context.Context, dir string, args ...string) (string, erro
 		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
 		"GCM_INTERACTIVE=never",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -163,6 +181,34 @@ func deployGitRun(ctx context.Context, dir string, args ...string) (string, erro
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }
+
+// deployCredEnv returns the environment additions that scope one git
+// invocation at repo to the github account that owns its remote URL, or nil
+// when no scoping applies. It is delivery.Verifier.remoteCredEnv's twin for
+// this check, sharing the resolution through delivery.ScopeRemoteEnv rather
+// than copying it (CLA-459): the remote is resolved the same way the check
+// resolves it everywhere else (deployRemoteOf), its URL read with a local
+// `git remote get-url`, and owner/token/env come from the ONE mechanism
+// CLA-458 shipped. nil - non-github host, ssh remote, owner with no gh token,
+// a failing gh - means run unscoped: fail-open stays fail-open.
+//
+// It spawns only local commands plus at most one `gh auth token`; no cache,
+// for the reason delivery records: a cache would outlive the gh auth state it
+// was keyed on. The whole resolution runs under the caller's deployGitTimeout
+// deadline (deployGitRun applies it before calling here), so a wedged gh is
+// reaped at the deadline rather than stalling the preflight.
+func deployCredEnv(ctx context.Context, repo string) []string {
+	remote := deployRemoteOf(ctx, deployGitRun, repo)
+	raw, err := deployGitRun(ctx, repo, "remote", "get-url", remote)
+	if err != nil || raw == "" {
+		return nil
+	}
+	return delivery.ScopeRemoteEnv(ctx, repo, deployGhBin, raw)
+}
+
+// deployGhBin is the binary deployCredEnv resolves per-owner tokens with -
+// the same gh dependency doctor's PR-gate check already rides.
+const deployGhBin = "gh"
 
 // deployRemoteOf picks which remote to judge against: origin when the repo
 // has it, else its only remote, else origin. The same rule
