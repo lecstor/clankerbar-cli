@@ -138,6 +138,20 @@ func (r *leaseRenewer) observe(c harness.Claim) {
 	}
 }
 
+// apply folds one observed claim snapshot into the renewer's running state,
+// logging the transitions that matter. The newest snapshot is the truth: a
+// settle keeps the run id and flips Settled, so it arrives as a snapshot whose
+// RunID is unchanged - which is exactly why the pause below keys off Held.
+func (r *leaseRenewer) apply(c, current harness.Claim) harness.Claim {
+	switch {
+	case c.Settled && !current.Settled:
+		log.Printf("%sthe session settled %s - pausing lease renewal until it holds a task again", r.prefix, claimName(c))
+	case !c.Settled && c.RunID != "" && c.RunID != current.RunID:
+		log.Printf("%srenewing the lease of %s every %s while the session runs", r.prefix, claimName(c), r.interval)
+	}
+	return c
+}
+
 // run is the renewer's loop: beat every interval for as long as the current
 // claim is HELD (Claim.Held: a task held and not yet settled by the session
 // itself), follow the claim as the session settles one task and claims the
@@ -165,14 +179,23 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 			}
 			return
 		case c := <-r.claims:
-			switch {
-			case c.Settled && !current.Settled:
-				log.Printf("%sthe session settled %s - pausing lease renewal until it holds a task again", r.prefix, claimName(c))
-			case !c.Settled && c.RunID != "" && c.RunID != current.RunID:
-				log.Printf("%srenewing the lease of %s every %s while the session runs", r.prefix, claimName(c), r.interval)
-			}
-			current = c
+			current = r.apply(c, current)
 		case <-ticker.C:
+			// A claim transition queued by observe() wins over the tick,
+			// every time. Without draining here, select's random pick can
+			// hand the tick to a loop whose `current` is still the pre-settle
+			// claim, and beat ONCE MORE on a lease the session already
+			// settled - the flake that made the pause test fail on CI. The
+			// settle is newer truth than the cadence the ticker carries.
+		drain:
+			for {
+				select {
+				case c := <-r.claims:
+					current = r.apply(c, current)
+				default:
+					break drain
+				}
+			}
 			if !current.Held() {
 				continue
 			}
