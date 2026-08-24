@@ -852,7 +852,7 @@ func ScopeEnv(token string) []string {
 // ride a single config value intact (embedded whitespace would corrupt the
 // insteadOf key into something silently wrong).
 func TokenForOwner(ctx context.Context, dir, ghBin, owner string) string {
-	out, err := runGHBin(ctx, ghBin, dir, "auth", "token", "--user", owner)
+	out, err := runGHBin(ctx, ghBin, dir, nil, "auth", "token", "--user", owner)
 	if err != nil {
 		return ""
 	}

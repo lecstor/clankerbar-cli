@@ -6,6 +6,11 @@ package delivery
 // one that would have caught PR #208; the naive-predicate test beside it pins
 // WHY the inversion matters, so a future refactor cannot quietly reintroduce
 // the wave-through.
+//
+// Since CLA-460 the verifier also probes `auth token --user` before its first
+// API read, so every fake below serves that probe out of band (see
+// writeGHTo) and the CLA-460 tests record, per invocation, exactly which
+// credentials the child resolved.
 
 import (
 	"context"
@@ -31,6 +36,12 @@ const (
 	jsonFailing = `{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[` +
 		`{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"FAILURE"},` +
 		`{"__typename":"CheckRun","name":"docs","status":"COMPLETED","conclusion":"SUCCESS"}]}`
+
+	// ghFakeToken is what every fake gh answers the `auth token --user`
+	// credential probe with when GH_FAKE_TOKEN names it: the asserted VALUE,
+	// so the chain "derive owner -> resolve THAT account -> plumb the resolved
+	// value" is pinned end to end in the CLA-460 tests.
+	ghFakeToken = "gho_cla460-fake-owner-token"
 )
 
 // prEnv builds a workdir whose repo has a github.com-shaped origin — the URL
@@ -57,7 +68,8 @@ func fakeGH(t *testing.T, output string) string {
 
 // fakeGHSeq answers with outputs[0] on the first call, outputs[1] on the
 // second, and repeats the last one from then on. It also returns the path of
-// its call counter, so a test can assert how many reads happened.
+// its call counter, so a test can assert how many reads happened. The
+// credential probe never reaches the counter — see writeGHTo.
 func fakeGHSeq(t *testing.T, outputs ...string) (string, string) {
 	t.Helper()
 	if len(outputs) == 0 {
@@ -84,10 +96,67 @@ func writeGH(t *testing.T, body string) string {
 
 func writeGHTo(t *testing.T, path, body string) string {
 	t.Helper()
+	// Every fake serves the credential probe prCheck makes before its first
+	// API read (CLA-460), out of band and before anything else — so the probe
+	// consumes neither a fixture nor, for fakeGHSeq, a sequence slot. With
+	// GH_FAKE_TOKEN unset, or GH_FAKE_FAIL=1, the probe answers empty or
+	// fails: what callers read as "no resolvable token", the unscoped
+	// fallback's trigger.
+	body = `case "$1/$2" in
+auth/token)
+	if [ "$GH_FAKE_FAIL" = 1 ]; then
+		echo "no oauth token found for github.com account $4" >&2
+		exit 1
+	fi
+	printf '%s\n' "${GH_FAKE_TOKEN-}"
+	exit 0
+;;
+esac
+` + body
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+body), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	return path
+}
+
+// recordingGH writes a fake gh that appends one section per invocation to
+// $GH_RECORD — the argv head plus the exact GH_TOKEN/GITHUB_TOKEN the child
+// resolved — then answers every non-probe invocation with output.
+func recordingGH(t *testing.T, output string) string {
+	t.Helper()
+	body := `{
+	printf '=== %s %s\n' "$1" "$2"
+	if [ -n "${GH_TOKEN+x}" ]; then printf 'ghtoken=%s\n' "$GH_TOKEN"; else printf 'ghtoken=UNSET\n'; fi
+	if [ -n "${GITHUB_TOKEN+x}" ]; then printf 'githubtoken=%s\n' "$GITHUB_TOKEN"; else printf 'githubtoken=UNSET\n'; fi
+} >> "$GH_RECORD"
+cat <<'J'
+` + output + `
+J
+`
+	return writeGH(t, body)
+}
+
+// ghSections splits a GH_RECORD into per-invocation sections keyed by the
+// argv head the fake saw ("pr view", "auth token"), each holding the token
+// lines the shim wrote.
+func ghSections(t *testing.T, record string) map[string][]string {
+	t.Helper()
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("gh record missing - the fake gh never ran: %v", err)
+	}
+	out := map[string][]string{}
+	cur := ""
+	for _, line := range strings.Split(string(body), "\n") {
+		switch {
+		case strings.HasPrefix(line, "=== "):
+			cur = strings.TrimPrefix(line, "=== ")
+			out[cur] = nil
+		case cur != "" && line != "":
+			out[cur] = append(out[cur], line)
+		}
+	}
+	return out
 }
 
 // prVerifier is the verifier under test with a fake gh and a polling window
@@ -308,7 +377,8 @@ func TestPendingChecksRefuseAtTheBound(t *testing.T) {
 // resolved state, so a normal CI that is seconds behind the push passes.
 //
 // The budget has to cover TWO gh process spawns (macOS spawns are slow, tens
-// to hundreds of milliseconds each), not just two polls.
+// to hundreds of milliseconds each), not just two polls. The credential probe
+// does not count against it — see writeGHTo.
 func TestPollingResolvesWhenGitHubCatchesUp(t *testing.T) {
 	dir := prEnv(t)
 	gh, counter := fakeGHSeq(t, jsonUnknown, jsonMergeablePassing)
@@ -321,6 +391,66 @@ func TestPollingResolvesWhenGitHubCatchesUp(t *testing.T) {
 	n, err := os.ReadFile(counter)
 	if err != nil || strings.TrimSpace(string(n)) != "2" {
 		t.Fatalf("expected exactly 2 gh reads (poll then resolve), got %q (%v)", n, err)
+	}
+}
+
+// --- whose credentials the API reads carry (CLA-460) -------------------------
+
+// THE pin: when the remote owner's token resolves, the PR read goes out AS
+// that owner — GH_TOKEN carries exactly the value the probe answered, and the
+// ambient spellings are DROPPED outright rather than raced. Decoy ambient
+// values are planted on purpose: the disease here is an ambient credential
+// answering for the wrong account, so the pin has to show one losing.
+func TestPRCheckScopesTheAPIReadToTheRemoteOwner(t *testing.T) {
+	dir := prEnv(t)
+	record := filepath.Join(t.TempDir(), "gh-record.log")
+	t.Setenv("GH_RECORD", record)
+	t.Setenv("GH_FAKE_TOKEN", ghFakeToken)
+	t.Setenv("GH_TOKEN", "ambient-decoy-not-the-owners")
+	t.Setenv("GITHUB_TOKEN", "ambient-github-decoy")
+	gh := recordingGH(t, jsonMergeablePassing)
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+
+	pr := ghSections(t, record)["pr view"]
+	if len(pr) == 0 {
+		t.Fatal("the PR read never ran - scoping cannot have ridden it")
+	}
+	for _, l := range pr {
+		if l != "ghtoken="+ghFakeToken && l != "githubtoken=UNSET" {
+			t.Errorf("PR read carried %q; want ghtoken=%s and GITHUB_TOKEN dropped", l, ghFakeToken)
+		}
+	}
+}
+
+// The fallback is today's behavior, byte for byte: an owner whose token does
+// not resolve leaves the PR read UNscoped, and the ambient credentials such a
+// read has always seen survive untouched — stripping them would be a second
+// behavior change hiding inside the fix. The check itself must still run and
+// still pass.
+func TestPRCheckRunsUnscopedWhenOwnerTokenDoesNotResolve(t *testing.T) {
+	dir := prEnv(t)
+	record := filepath.Join(t.TempDir(), "gh-record.log")
+	t.Setenv("GH_RECORD", record)
+	// No GH_FAKE_TOKEN: the probe answers empty — the unresolvable-owner case.
+	t.Setenv("GH_TOKEN", "ambient-decoy-stays")
+	t.Setenv("GITHUB_TOKEN", "github-decoy-stays")
+	gh := recordingGH(t, jsonMergeablePassing)
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+
+	pr := ghSections(t, record)["pr view"]
+	if len(pr) == 0 {
+		t.Fatal("the PR read never ran")
+	}
+	for _, l := range pr {
+		if l != "ghtoken=ambient-decoy-stays" && l != "githubtoken=github-decoy-stays" {
+			t.Errorf("unscoped fallback must leave ambient credentials untouched, got %q", l)
+		}
 	}
 }
 
