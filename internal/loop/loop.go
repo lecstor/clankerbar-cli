@@ -921,6 +921,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// parking, so the retry is a courtesy to a plausibly-transient silent EOT,
 	// not a budget (see the end.empty branch below).
 	emptyRetries := 0
+	// Whether the checkpoint that opened the CURRENT phase was evidenced by the
+	// plane's record rather than a verified branch (CLA-497). Set at each seam
+	// from the claim carried INTO the phase; a handoff respawn continues the
+	// same phase and must keep the value, so it is never recomputed at the loop
+	// head (where `carried` has already become the phase's own claim).
+	branchlessCheckpoint := false
 
 	// CLA-466: one iteration record posts at this drain's boundary, whatever way
 	// it ends — hence the defer, and hence locals the deferred closure reads.
@@ -997,7 +1003,17 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			promptBytes = len(nextPrompt)
 			continuation := ""
 			if i < len(d.cfg.Phases) && d.cfg.Phases[i].Prompt == "" {
-				continuation = config.HandoffContinuation(ph.Name)
+				// CLA-497: a handoff during a NO-CODE review must not append the
+				// branch-shaped reviewTerminalStep, which tells the successor to
+				// open a PR for a task that has no branch and no code.
+				// branchlessCheckpoint records the checkpoint that opened this
+				// phase (captured at the seam from the carried claim), so the
+				// continuation matches the brief this phase's first session ran.
+				if ph.Name == config.ReviewPhaseName && branchlessCheckpoint {
+					continuation = config.NoCodeHandoffContinuation()
+				} else {
+					continuation = config.HandoffContinuation(ph.Name)
+				}
 			}
 			ph.Prompt = config.HandoffPreamble + nextPrompt + continuation
 			nextPrompt = ""
@@ -1089,6 +1105,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// still-live claim and hand back a task the sequence was never meant to
 		// touch. Keep what we had: the task phase 1 is holding is the one owed a
 		// handback, whatever its successor went and did.
+		seamClaim := carried
 		switch {
 		case carried != nil && end.claim != nil && end.claim.Claim.TaskID != carried.Claim.TaskID:
 			log.Printf("iteration %d: the %s phase claimed %s, which is NOT the task it was resuming (%s) — it was told not to claim at all; keeping the original for the handback",
@@ -1098,6 +1115,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		case end.claim != nil:
 			carried = end.claim
 		}
+		// CLA-497: whether the checkpoint that opened THIS phase was evidenced
+		// by the plane's record (no verified branch). Read from the PRE-switch
+		// claim - the one the seam advanced with: after the switch, carried is
+		// this phase's OWN claim, whose branch says nothing about the checkpoint
+		// that opened the phase, and the handoff continuation must match the
+		// brief this phase's FIRST session ran, not what its last one recorded.
+		branchlessCheckpoint = seamClaim != nil && seamClaim.Claim.Branch == ""
 
 		// A run-level stop wins over a dead phase. drainPhase returns stop=true
 		// for a budget trip, credit exhaustion (lim.Stop), and a resumed phase
@@ -1359,8 +1383,9 @@ type phaseEnd struct {
 	empty bool
 
 	// emptyWhy is the evidence-gate reason when empty fired, for the "not a
-	// checkpoint" log line ("no branch recorded on the task", or the failing
-	// branch check's detail).
+	// checkpoint" log line ("no branch recorded on the task", the failing
+	// branch check's detail, or — since CLA-497 — the plane record's answer
+	// when the branch-less evidence forms were consulted and showed nothing).
 	emptyWhy string
 
 	// branch is the verified branch name when this phase checkpointed — the
@@ -1429,60 +1454,152 @@ func recordedBranches(res harness.Result) []string {
 }
 
 // checkpointEvidence reports whether the plane's record carries the phase's
-// exit evidence — a branch recorded by this run whose tip really exists on the
-// origin remote — and returns that branch. Held-ness alone is NOT the evidence:
-// since CLA-358 the driver's lease renewer renews a claim for a session's whole
-// lifetime, so ANY session that claimed ends held, and "still holding" cannot
-// distinguish a checkpoint from an empty exit (2026-08-24 fleet incident: two
-// implement sessions claimed, cut a worktree, hit a silent model EOT, exited
-// cleanly with real usage and no edits, and the seam advanced to review on the
-// false premise).
+// exit evidence, and returns the branch that evidence names (empty for the
+// branch-less forms). Held-ness alone is NOT the evidence: since CLA-358 the
+// driver's lease renewer renews a claim for a session's whole lifetime, so ANY
+// session that claimed ends held, and "still holding" cannot distinguish a
+// checkpoint from an empty exit (2026-08-24 fleet incident: two implement
+// sessions claimed, cut a worktree, hit a silent model EOT, exited cleanly
+// with real usage and no edits, and the seam advanced to review on the false
+// premise).
 //
-// ok is true only when a recorded branch's BranchPushed check PASSED — the
-// branch is on the origin remote with its tip reachable. A branch that was
-// never pushed is not evidence, and a check that could not run (no git, no
-// repository resolved) is not evidence either: a checkpoint is claimed only on
-// the verified present, never on the absence of a negative. That is the
-// deliberate difference from verifyDeliveries, which warns loudly on the same
-// failing check but does not gate anything on it.
+// The evidence is ANY of three forms (CLA-497) — "the plane's record shows
+// this phase did its job":
+//
+//   - (a) a branch recorded by this run whose tip really exists on the origin
+//     remote — today's check, unchanged. A branch that was never pushed is not
+//     evidence, and a check that could not run (no git, no repository
+//     resolved) is not evidence either: a checkpoint is claimed only on the
+//     verified present, never on the absence of a negative. That is the
+//     deliberate difference from verifyDeliveries, which warns loudly on the
+//     same failing check but does not gate anything on it.
+//   - (b) the task having LEFT `ready` (in_review / done / parked / blocked):
+//     its own session settled it on the plane. A no-code task can never
+//     produce form (a) — there is no branch to record — and without this form
+//     it is structurally incapable of checkpointing: the EZY-290 shape (a
+//     one-token task-body edit) burned nine sessions in a claim -> empty-exit
+//     -> release loop before this existed.
+//   - (c) a DECLARED no-code delivery on the task: the same delivery.noCode
+//     flag update_task requires to close such a task, read off the plane's
+//     record. It counts whether or not the session still holds the lease.
+//
+// Forms (b) and (c) are read through the SAME single-task plane peek CLA-451
+// introduced (planeExitRecord below), not a second implementation. The bounds
+// CLA-457 set stay absolute: held-ness alone is still nothing (status
+// in_progress proves only that someone holds the lease), and a session that
+// claimed, recorded no branch, and left the task sitting in `ready` is STILL
+// an empty exit — "nothing happened" — whatever this function would have said
+// about its manners.
 func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.Result, workdir string) (branch string, ok bool, why string) {
 	branches := recordedBranches(res)
-	if len(branches) == 0 {
-		return "", false, "no branch recorded on the task"
-	}
-	if d.newVerifier == nil || workdir == "" {
-		return "", false, fmt.Sprintf("branch %q recorded but could not be checked (no working tree)", branches[0])
-	}
-	v := d.newVerifier(workdir, d.cfg.AllowUncheckedPRFor(t.Name))
-	vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
-	defer cancel()
-	// ANY recorded branch that passes is evidence — a session may record a draft
-	// branch early and the real one later. Remember the first failure for the
-	// diagnostic, keep going, and only give up when no recorded branch could be
-	// verified.
+
+	// Form (a): the recorded-branch check. Remember the first failure for the
+	// diagnostic; fall through to the plane-record forms when nothing here
+	// passes.
 	firstB, firstWhy := "", ""
-	for _, b := range branches {
-		out := v.Verify(vctx, delivery.Claim{Label: claimLabel(res.Claim), Branch: b})
-		for _, c := range out.Checks {
-			if c.Kind != delivery.BranchPushed {
-				continue
+	if len(branches) > 0 {
+		if d.newVerifier == nil || workdir == "" {
+			firstB, firstWhy = branches[0], fmt.Sprintf("branch %q recorded but could not be checked (no working tree)", branches[0])
+		} else {
+			v := d.newVerifier(workdir, d.cfg.AllowUncheckedPRFor(t.Name))
+			vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
+			defer cancel()
+			// ANY recorded branch that passes is evidence — a session may record a draft
+			// branch early and the real one later. Remember the first failure for the
+			// diagnostic, keep going, and only give up when no recorded branch could be
+			// verified.
+			for _, b := range branches {
+				out := v.Verify(vctx, delivery.Claim{Label: claimLabel(res.Claim), Branch: b})
+				for _, c := range out.Checks {
+					if c.Kind != delivery.BranchPushed {
+						continue
+					}
+					if c.Status == delivery.Pass {
+						return b, true, ""
+					}
+					// Fail and Unknown both mean "not evidence" for THIS branch: an
+					// unreachable branch, or one we could not check. Keep scanning; a
+					// later recorded branch may be the one that is really there.
+					if firstWhy == "" {
+						firstB, firstWhy = b, c.Detail
+					}
+					break
+				}
 			}
-			if c.Status == delivery.Pass {
-				return b, true, ""
-			}
-			// Fail and Unknown both mean "not evidence" for THIS branch: an
-			// unreachable branch, or one we could not check. Keep scanning; a
-			// later recorded branch may be the one that is really there.
-			if firstWhy == "" {
-				firstB, firstWhy = b, c.Detail
-			}
-			break
 		}
 	}
-	if firstWhy != "" {
-		return firstB, false, firstWhy
+
+	// Forms (b) and (c): the plane's own record of the task.
+	_, recordOK, recordWhy := d.planeExitRecord(ctx, t, res)
+	if recordOK {
+		return "", true, ""
 	}
-	return "", false, "none of the recorded branches could be verified on the origin remote"
+
+	// No form held. Compose the diagnostic from whichever legs ran: the plane's
+	// answer when it gave one (prefixed by the branch leg's failure when both
+	// ran), else the legacy branch-only reasons, unchanged.
+	switch {
+	case firstWhy != "" && recordWhy != "":
+		return firstB, false, firstWhy + "; " + recordWhy
+	case recordWhy != "":
+		return "", false, recordWhy
+	case firstWhy != "":
+		return firstB, false, firstWhy
+	case len(branches) > 0:
+		return "", false, "none of the recorded branches could be verified on the origin remote"
+	default:
+		return "", false, "no branch recorded on the task"
+	}
+}
+
+// planeExitRecord reads the plane's record of the claimed task for the two
+// branch-independent exit-evidence forms (CLA-497): the task having LEFT
+// `ready` (in_review / done / parked / blocked — its own session settled it),
+// or a DECLARED no-code delivery (the plane's first-class "this shipped no
+// code"). It is the SAME single-task get_task read CLA-451's checkpoint peek
+// uses — plane.TaskStateSource, extended with the delivery flag — not a second
+// implementation of the peek.
+//
+// Best-effort like every plane read: ok is false with an EMPTY why whenever
+// the read cannot answer at all (no claimed task id, no wired reader, a plane
+// blip), and the gate then judges on branch evidence alone, byte-for-byte as
+// before this read existed. A read that ANSWERS but shows no evidence returns
+// the reason the gate will log — the difference between "nothing happened"
+// (task still ready or merely held) and a peek that never ran.
+//
+// The bounds are load-bearing: status "in_progress" proves only that SOMEONE
+// holds the lease — held-ness alone was CLA-457's original false positive and
+// stays worthless here — and a task still sitting in `ready` is still the
+// empty exit, however orderly the session that said nothing about it.
+func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Result) (st plane.TaskState, ok bool, why string) {
+	taskID := res.Claim.TaskID
+	src, wired := t.Releaser.(plane.TaskStateSource)
+	if taskID == "" || !wired {
+		return plane.TaskState{}, false, ""
+	}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	st, err := src.TaskState(sctx, taskID)
+	switch {
+	case err == nil:
+	case errors.Is(err, plane.ErrNotWired):
+		return plane.TaskState{}, false, ""
+	default:
+		log.Printf("%scould not read the plane's record of %s for phase exit evidence (%v) — judging the exit on branch evidence alone", labelOf(t), taskID, err)
+		return plane.TaskState{}, false, ""
+	}
+	switch st.Status {
+	case "in_review", "done", "parked", "blocked":
+		// Form (b): the task LEFT `ready`. Its session settled it on the plane,
+		// which for a no-code task is the strongest statement there is.
+		return st, true, ""
+	}
+	if st.DeliveryNoCode {
+		// Form (c): a declared no-code delivery — the plane's own record that
+		// this task's correct delivery is no code, held lease or not.
+		return st, true, ""
+	}
+	return st, false, fmt.Sprintf("the plane's record shows no exit evidence either (status %q, no no-code delivery)", st.Status)
 }
 
 // verifiedBranch returns the branch the previous phase recorded and verified —
@@ -1863,20 +1980,32 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if (!last || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK) {
 			end.checkpoint = true
 			end.handoff = handoff
-			if end.branch != "" && end.claim != nil {
-				// Fold the VERIFIED branch onto the carried claim, which is both the
-				// successor's resume seed and (via verifiedBranch) the source the
-				// review brief names. Without this the brief would re-derive the
-				// FIRST recorded branch — a draft — and call it verified, exactly
-				// the ungrounded assertion the recomposition exists to kill.
-				end.claim.Claim.Branch = end.branch
+			if end.claim != nil {
+				// The invariant "the carried claim's branch is the VERIFIED one"
+				// is held by construction, whatever form the evidence took
+				// (CLA-497): the branch form folds the verified branch on, and
+				// the plane-record forms clear whatever the session recorded -
+				// a recorded branch that FAILED origin verification must not
+				// ride into the successor's brief, which names {{branch}} as
+				// verified on the origin remote (CLA-457), and the no-code
+				// brief is selected exactly on an empty claim branch.
+				if end.branch != "" {
+					end.claim.Claim.Branch = end.branch
+				} else {
+					end.claim.Claim.Branch = ""
+				}
 			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
 					labelOf(t), drainNum, res.Claim.TaskID)
-			} else {
+			} else if end.branch != "" {
 				log.Printf("%siteration %d: phase reached its checkpoint holding %s (branch %s verified on the origin remote) — keeping the lease for the next phase",
 					labelOf(t), drainNum, res.Claim.TaskID, end.branch)
+			} else {
+				// The plane-record forms of exit evidence (CLA-497): a no-code or
+				// already-settled task checkpoints with no branch to name.
+				log.Printf("%siteration %d: phase reached its checkpoint holding %s (exit evidenced by the plane's record — task left ready or declared a no-code delivery; no branch) — keeping the lease for the next phase",
+					labelOf(t), drainNum, res.Claim.TaskID)
 			}
 		} else {
 			// `released` records only a handback that could actually have happened:
@@ -3380,11 +3509,25 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// reads the accepted reports first (the plane record of what THIS run
 		// recorded), falling back to the claim's own branch for a resumed-with-WIP
 		// predecessor.
+		//
+		// CLA-497: a checkpoint evidenced by the PLANE'S RECORD - the task left
+		// `ready` or declared a no-code delivery - names no branch, and the
+		// branch-shaped builtin brief would tell its successor the hand-off
+		// FAILED ("an empty branch field ... is a FAILED hand-off to report"),
+		// the exact opposite of the checkpoint the driver just recorded. Swap in
+		// the no-code brief for the BUILT-IN prompt only; an operator's custom
+		// prompt owns its own wording. The empty claim branch is the
+		// discriminator because drainPhase holds "claim.Branch is the verified
+		// branch, or empty when the evidence was branch-less" by construction.
+		prompt := inv.Prompt
+		if prev.Claim.Branch == "" && prompt == config.BuiltinReviewBrief() {
+			prompt = config.NoCodeReviewBrief()
+		}
 		inv.Prompt = strings.NewReplacer(
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
 			config.PhaseBranchPlaceholder, verifiedBranch(prev),
-		).Replace(inv.Prompt)
+		).Replace(prompt)
 		// Seed the claim as well as the prompt. The session is told not to claim,
 		// so the adapter would observe none — and Result.Claim.Held() is what gates
 		// the handback, the salvage and the delivery check. Without this, the phase

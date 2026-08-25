@@ -321,6 +321,25 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
+// noCodeReviewTerminalStep is the no-code review brief's LAST instruction
+// (CLA-497), the counterpart of reviewTerminalStep for a phase-1 exit that was
+// evidenced by the plane's record rather than a branch. There is nothing to
+// commit and no PR to open - the task's correct delivery is no code - so the
+// step is the handover alone, with the same emphatic, final-call shape
+// CLA-384 pinned on the branch-shaped one. It also covers the form-(b) case
+// where phase 1 ALREADY settled the task (in_review / done / parked /
+// blocked): the handover happened before this phase ran, and the session's job
+// is to verify the record reads honestly and stop - re-opening or releasing a
+// settled task would restart the release loop this task exists to kill.
+const noCodeReviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: if the task still sits in " +
+	"in_progress with its no-code delivery declared, hand it over with update_task(taskId, runId, status: " +
+	"\"in_review\", outcome: ...), where the outcome MUST carry a **Tests** section saying what you actually " +
+	"verified - without one the plane REFUSES the call, so a session that leaves it out has not handed " +
+	"anything over. If phase 1 already settled the task (it left in_progress before this phase ran), the " +
+	"handover already happened: verify the record reads honestly and end the session - do NOT re-open, " +
+	"release or re-settle the task. Ending this session while the task still needs the handover is this " +
+	"phase FAILING, not finishing. The ONLY exception is a declared handoff."
+
 // HandoffContinuation is appended, by the driver, to a handoff respawn's prompt
 // (CLA-353) so a phase's own contract survives a session-authored hand-off.
 // HandoffPreamble carries the "resume, don't claim" contract forward on every
@@ -485,6 +504,50 @@ var builtinPhasePrompts = map[string]string{
 		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception you " +
 		"state a reason for (a fix that had to reach outside its own area), never the default." + rerunGuidance +
 		reviewTerminalStep + handoffGuidance,
+}
+
+// noCodeReviewBrief is the review brief for a phase-1 exit evidenced by the
+// PLANE'S RECORD (CLA-497) instead of a branch: the task left `ready`
+// (in_review / done / parked / blocked - its own session settled it), or it
+// carries a declared no-code delivery. There is no branch because the task's
+// correct delivery is no code, so the branch-shaped builtin review brief would
+// misdirect its successor - it asserts a branch "the driver verified to exist"
+// that does not exist, and its "empty branch field is a FAILED hand-off to
+// report" instruction contradicts the checkpoint the driver just recorded. The
+// no-code review runs the adversarial gate over the plane's record of what
+// phase 1 did, and its terminal step is the handover alone - no commit, no PR.
+const noCodeReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase's " +
+	"exit was evidenced by the PLANE'S RECORD rather than a branch: the task left `ready` (in_review / done / " +
+	"parked / blocked - its own session settled it) or carries a declared no-code delivery. There is NO " +
+	"branch, because this task's correct delivery is no code - nothing to check out, no worktree to work " +
+	"in, no PR to open. The empty branch field is NOT a failed hand-off: the driver recorded this " +
+	"checkpoint on exactly that record. You are RESUMING that run, not starting a new one: do not call " +
+	"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
+	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"expected: the settlement IS the delivery, so proceed to the review below. Then get_task with " +
+	"includeDecisions: true to re-read the bar and the standing decisions. Run the adversarial review gate " +
+	"over the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the decisions " +
+	"recorded on this task or its siblings: is the settlement honest, does the record carry what the task's " +
+	"doneWhen required, does the no-code declaration match the work? Fix what the gate finds by amending " +
+	"the record (update_task, record_decision) - never by inventing code, a branch or a PR." + rerunGuidance +
+	noCodeReviewTerminalStep + handoffGuidance
+
+// BuiltinReviewBrief returns the shipped review brief, so the driver can tell
+// whether a phase runs the built-in brief (vs an operator's custom prompt)
+// when it must choose a variant (CLA-497): a checkpoint evidenced by the
+// plane's record names no branch, and the branch-shaped brief would tell the
+// successor its hand-off FAILED.
+func BuiltinReviewBrief() string { return builtinPhasePrompts[ReviewPhaseName] }
+
+// NoCodeReviewBrief returns the review brief for a checkpoint evidenced by the
+// plane's record (CLA-497) - see noCodeReviewBrief.
+func NoCodeReviewBrief() string { return noCodeReviewBrief }
+
+// NoCodeHandoffContinuation is HandoffContinuation for a no-code review
+// handoff (CLA-497): the branch-shaped reviewTerminalStep would tell the
+// successor to open a PR for a task that has no branch and no code.
+func NoCodeHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + noCodeReviewTerminalStep
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an

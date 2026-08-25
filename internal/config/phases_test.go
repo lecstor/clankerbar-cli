@@ -656,6 +656,59 @@ func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
 	}
 }
 
+// CLA-497: a checkpoint evidenced by the plane's record - the task left
+// `ready` or declared a no-code delivery - names no branch, so the review
+// successor gets the no-code brief: it must not assert a verified branch,
+// must not call the empty branch field a failed hand-off, and must not tell
+// the session to work in a worktree or open a PR. Its terminal step is the
+// handover alone, pinned in the same shape TestReviewBriefStatesItsTerminalStep
+// pins the branch-shaped one.
+func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
+	for _, want := range []string{
+		// The record, not a branch, is what the checkpoint means.
+		"evidenced by the PLANE'S RECORD",
+		// The successor is not told to treat the empty branch as a failure.
+		"NOT a failed hand-off",
+		// The terminal step: the handover, with the outcome's Tests section.
+		"update_task(taskId, runId, status: \"in_review\", outcome: ...)",
+		"**Tests**",
+		"REFUSES",
+		// The form-(b) case where phase 1 already settled the task.
+		"already settled the task",
+	} {
+		if !strings.Contains(noCodeReviewBrief, want) {
+			t.Errorf("no-code review brief does not say %q:\n%s", want, noCodeReviewBrief)
+		}
+	}
+	// The branch-shaped instructions must be ABSENT: this brief is selected
+	// exactly when there is no branch, so each one would misdirect.
+	for _, banned := range []string{
+		"FAILED hand-off to report",
+		"Work in the worktree",
+		"Open a PR",
+		"COMMIT and PUSH",
+		PhaseBranchPlaceholder,
+	} {
+		if strings.Contains(noCodeReviewBrief, banned) {
+			t.Errorf("no-code review brief still says %q - it is selected exactly when there is no branch to name:\n%s", banned, noCodeReviewBrief)
+		}
+	}
+	// Position, like the branch-shaped brief: the no-code terminal step is the
+	// last thing before the shared handoff guidance.
+	if !strings.HasSuffix(noCodeReviewBrief, noCodeReviewTerminalStep+handoffGuidance) {
+		t.Errorf("the no-code terminal step is not the last thing before the handoff guidance:\n%s", noCodeReviewBrief)
+	}
+	// The no-code handoff continuation carries the no-code terminal step and
+	// the rerun bound, and never the PR step.
+	cont := NoCodeHandoffContinuation()
+	if !strings.Contains(cont, noCodeReviewTerminalStep) || !strings.Contains(cont, rerunGuidance) {
+		t.Errorf("NoCodeHandoffContinuation does not carry the no-code terminal step and rerun bound:\n%s", cont)
+	}
+	if strings.Contains(cont, "Open a PR") {
+		t.Errorf("NoCodeHandoffContinuation carries the branch-shaped PR step:\n%s", cont)
+	}
+}
+
 // CLA-353: a handoff respawn replaces ph.Prompt wholesale with
 // config.HandoffPreamble plus the predecessor's self-authored prompt (CLA-352) —
 // the built-in brief text, including reviewTerminalStep, is not otherwise part of
