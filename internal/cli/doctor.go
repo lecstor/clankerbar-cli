@@ -247,6 +247,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkTokenSources(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkFleets(ctx, cfg, e)...)
+	checks = append(checks, checkInstanceIdentity(cfg))
 	checks = append(checks, checkRunConfigs(ctx, cfg, e)...)
 	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
@@ -749,6 +750,82 @@ func timedOut(err error) bool {
 	}
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// --- fleet identity -----------------------------------------------------------
+
+// checkInstanceIdentity warns when two config files in THIS config's directory
+// would resolve to the same Fleet-page instance identity (CLA-501).
+//
+// The collision is invisible from inside one daemon  -  every daemon believes its
+// own name is fine  -  so the check has to look sideways at its siblings: each
+// top-level *.json in the config's directory is read for instance_name and
+// resolved through the SAME function the loop beacons under
+// (config.ResolveInstanceName), and any identity claimed by two or more files
+// warns. Files that do not parse as JSON are skipped: a file the loader cannot
+// read cannot start a daemon, so it cannot beacon anything to collide with.
+//
+// Since CLA-501 the default identity embeds the config basename, so distinct
+// filenames cannot collide; what remains is two siblings declaring the same
+// explicit instance_name (or a truncation-induced prefix clash)  -  exactly the
+// silent overwrite this check exists to catch before an overnight run.
+func checkInstanceIdentity(cfg *config.Config) check {
+	c := check{name: "instance identity"}
+	host, err := os.Hostname()
+	if err != nil {
+		// The loop logs the same failure and beacons a blank host half; here a
+		// blank simply resolves against basenames alone.
+		host = ""
+	}
+	resolved := cfg.ResolvedInstanceName(host)
+	c.info = append(c.info, "identity: "+resolved)
+
+	src := cfg.Source()
+	if src == "" {
+		c.detail = "no config file in play; nothing to scan for sibling collisions"
+		return c
+	}
+	dir := filepath.Dir(src)
+	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
+		c.detail = "could not list " + dir + ": " + err.Error()
+		return c
+	}
+
+	type named struct {
+		InstanceName string `json:"instance_name"`
+	}
+	byIdentity := map[string][]string{}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue // unreadable sibling: cannot run, cannot collide; say nothing
+		}
+		var n named
+		if err := json.Unmarshal(data, &n); err != nil {
+			continue // not a clankerbar config (or unparseable): see above
+		}
+		id := config.ResolveInstanceName(n.InstanceName, f, host)
+		byIdentity[id] = append(byIdentity[id], filepath.Base(f))
+	}
+
+	var collided []string
+	for id, names := range byIdentity {
+		if len(names) > 1 {
+			sort.Strings(names)
+			collided = append(collided, id+" <- "+strings.Join(names, ", "))
+		}
+	}
+	if len(collided) == 0 {
+		c.detail = fmt.Sprintf("no identity collisions among %d config file(s) in %s", len(files), dir)
+		return c
+	}
+	sort.Strings(collided)
+	c.status = warn
+	c.detail = fmt.Sprintf("%d config file(s) in %s would beacon under the SAME fleet identity; their presence rows overwrite each other: %s",
+		len(files), dir, strings.Join(collided, "; "))
+	c.remedy = "give each co-located daemon a distinct config filename, or set a distinct instance_name in each"
+	return c
 }
 
 func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) check {

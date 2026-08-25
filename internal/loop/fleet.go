@@ -13,7 +13,6 @@ package loop
 import (
 	"log"
 	"os"
-	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
@@ -51,13 +50,11 @@ func (d *Driver) hostnameOnce() string {
 // (which swaps d.cfg) is visible to the console as a changed configIdentity
 // rather than requiring a restart.
 func (d *Driver) fleetIdentity() fleet.Identity {
-	inst := strings.TrimSpace(d.cfg.InstanceName)
-	if inst == "" {
-		// Unnamed falls back to the hostname — right for the common
-		// one-daemon-per-host setup; multi-daemon hosts declare instance_name
-		// (see Config.InstanceName).
-		inst = d.hostnameOnce()
-	}
+	// Explicit instance_name wins; otherwise hostname plus config basename,
+	// unique per running daemon, so co-located daemons no longer collapse into
+	// one presence row (CLA-501). Stable across a RELOAD: the reloader re-reads
+	// the same path, so the basename half cannot change under a live daemon.
+	inst := d.cfg.ResolvedInstanceName(d.hostnameOnce())
 	cfgID := ""
 	if d.cfg != nil {
 		cfgID = d.cfg.Identity()
