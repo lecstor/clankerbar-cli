@@ -699,9 +699,11 @@ page shows every instance — working *and* idle, where the run-based panel only
 sees a daemon that currently holds a task. Two things are reported, both riding
 cadences the loop already runs (no new timers):
 
-- **Presence** rides each backlog poll: who the instance is (`instance_name`,
-  falling back to the machine's hostname; set it when you run more than one
-  daemon for the same project on one host), the host and binary version, a
+- **Presence** rides each backlog poll: who the instance is (`instance_name`;
+  when unset it resolves to the machine's hostname plus the config file's
+  basename, e.g. `Jasons-MBP/clanker1`, so several daemons started from
+  different configs on one host stay distinct; set `instance_name` to override),
+  the host and binary version, a
   fingerprint of the config in force, and the state — `idle`,
   `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
   holds spawns, `stopping` as the final beacon when the run ends. State changes

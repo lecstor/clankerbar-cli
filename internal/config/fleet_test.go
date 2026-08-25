@@ -7,6 +7,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestValidateInstanceNameCap(t *testing.T) {
@@ -67,4 +68,93 @@ func TestIdentityIsDeterministicAndSensitiveToEdits(t *testing.T) {
 	if len(a.Identity()) != 64 {
 		t.Errorf("identity = %d chars, want a full sha256 hex", len(a.Identity()))
 	}
+}
+
+// CLA-501: the resolved instance identity. The bare-hostname fallback keyed
+// every co-located daemon to ONE presence row  -  each beacon overwriting the
+// last  -  so the default is now hostname plus config basename. The
+// content-hash Identity above was rejected as the discriminator on purpose:
+// co-located daemon configs routinely hash identically.
+
+func TestResolveInstanceName(t *testing.T) {
+	t.Run("two configs with different basenames resolve to two distinct identities", func(t *testing.T) {
+		a := ResolveInstanceName("", "/home/op/fleet/clanker1.json", "Jasons-MBP")
+		b := ResolveInstanceName("", "/home/op/fleet/clanker2.json", "Jasons-MBP")
+		if a == b {
+			t.Fatalf("co-located daemons with distinct config files must not share an identity; both %q", a)
+		}
+		if a != "Jasons-MBP/clanker1" {
+			t.Errorf("a = %q, want %q", a, "Jasons-MBP/clanker1")
+		}
+	})
+	t.Run("identical content under different names still resolves distinctly", func(t *testing.T) {
+		// The live four-daemon fleet this fix targets serves IDENTICAL configs
+		// from clanker1.json..clanker4.json; only the path tells them apart.
+		a := ResolveInstanceName("", "/home/op/fleet/clanker1.json", "h")
+		b := ResolveInstanceName("", "/home/op/fleet/clanker4.json", "h")
+		if a == b {
+			t.Fatal("same content, different basename: identities must differ")
+		}
+	})
+	t.Run("explicit instance_name wins over the default", func(t *testing.T) {
+		got := ResolveInstanceName("box-a", "/home/op/fleet/clanker1.json", "Jasons-MBP")
+		if got != "box-a" {
+			t.Errorf("got %q, want the explicit name verbatim", got)
+		}
+	})
+	t.Run("a whitespace-only name counts as unset", func(t *testing.T) {
+		got := ResolveInstanceName("   ", "/home/op/fleet/clanker1.json", "Jasons-MBP")
+		if got != "Jasons-MBP/clanker1" {
+			t.Errorf("got %q, want the default composition", got)
+		}
+	})
+	t.Run("no config file falls back to the hostname alone", func(t *testing.T) {
+		got := ResolveInstanceName("", "", "Jasons-MBP")
+		if got != "Jasons-MBP" {
+			t.Errorf("got %q, want the bare hostname (nothing better exists)", got)
+		}
+	})
+	t.Run("an unreadable hostname still leaves the basename", func(t *testing.T) {
+		got := ResolveInstanceName("", "/home/op/fleet/clanker1.json", "")
+		if got != "clanker1" {
+			t.Errorf("got %q, want the basename alone (minus the .json suffix)", got)
+		}
+	})
+	t.Run("the composed default is capped at MaxInstanceNameLen", func(t *testing.T) {
+		long := strings.Repeat("x", MaxInstanceNameLen) // basename longer than the cap by itself
+		got := ResolveInstanceName("", "/fleet/"+long+".json", "Jasons-MBP")
+		if len(got) > MaxInstanceNameLen {
+			t.Errorf("resolved default is %d chars; the plane refuses anything over %d", len(got), MaxInstanceNameLen)
+		}
+	})
+	t.Run("truncation never splits a multi-byte rune", func(t *testing.T) {
+		// A basename of multi-byte runes crossing the 100-byte cap would, on a
+		// raw byte slice, cut mid-rune - and json.Marshal then replaces the
+		// broken byte with U+FFFD, corrupting the identity this function exists
+		// to pin. The composed identity must stay valid UTF-8 AND within the cap.
+		wide := strings.Repeat("\u00e9", MaxInstanceNameLen) // é = 2 bytes; >100 bytes by itself
+		got := ResolveInstanceName("", "/fleet/"+wide+".json", "Jasons-MBP")
+		if len(got) > MaxInstanceNameLen {
+			t.Errorf("resolved default is %d bytes; the plane refuses anything over %d", len(got), MaxInstanceNameLen)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("resolved default %q is invalid UTF-8 (a rune was split at the truncation boundary)", got)
+		}
+		// Two distinct basenames that differ WITHIN the truncation window must
+		// still resolve to two distinct identities, even under truncation
+		// pressure. (Two that differ only past byte 100 are allowed to collapse -
+		// that is the documented pathological prefix-clash doctor scans for.)
+		a := ResolveInstanceName("", "/fleet/"+wide+".json", "Jasons-MBP")
+		ab := ResolveInstanceName("", "/fleet/x"+wide+".json", "Jasons-MBP")
+		if a == ab {
+			t.Errorf("distinct basenames differing within the cap collapsed to one identity %q after truncation", a)
+		}
+	})
+	t.Run("the method resolves through the config's own source path", func(t *testing.T) {
+		cfg := &Config{Harness: "claude", Prompt: "Work."}
+		cfg.source = "/home/op/fleet/clanker2.json"
+		if got := cfg.ResolvedInstanceName("Jasons-MBP"); got != "Jasons-MBP/clanker2" {
+			t.Errorf("ResolvedInstanceName = %q", got)
+		}
+	})
 }

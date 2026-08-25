@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
@@ -676,15 +677,14 @@ type Config struct {
 
 	// InstanceName names this daemon on the console's Fleet page (CLA-466):
 	// presence beacons are keyed per (project, instance name), so this is how two
-	// daemons driving the same project stay distinguishable. Empty falls back to
-	// the machine's hostname, which is right for the common one-daemon-per-host
-	// setup; if you run MORE THAN ONE daemon for the same project on the SAME
-	// host, name them here or their presence row will flicker between them
-	// (last report wins).
+	// daemons driving the same project stay distinguishable. Empty resolves to
+	// the machine's hostname plus the config file's basename (see
+	// ResolveInstanceName) - unique per running daemon, so co-located daemons
+	// with distinct config files no longer collapse into one Fleet row (CLA-501).
 	//
 	// The plane caps the name at 100 characters — Validate refuses longer here,
 	// so a too-long name fails loudly at startup instead of silently dropping
-	// every beacon.
+	// every beacon. The resolved default is truncated to the same cap.
 	InstanceName string `json:"instance_name"`
 
 	// MaxIterations stops the loop after N respawns. 0 = no iteration ceiling:
@@ -2786,6 +2786,58 @@ func (c *Config) ProjectFleetReportURL(p Project) string {
 
 func projectFleetReportPath(origin, slug string) string {
 	return origin + "/api/projects/" + url.PathEscape(slug) + "/fleet/report"
+}
+
+// ResolveInstanceName composes the Fleet-page instance identity a daemon
+// beacons under (CLA-466): an explicit instance_name wins verbatim; otherwise
+// the default is the machine's hostname plus the config file's basename minus
+// its .json suffix ("Jasons-MBP/clanker1"), because the config PATH is what
+// actually distinguishes co-located daemons (CLA-501). The earlier
+// bare-hostname fallback keyed every same-host daemon to one presence row,
+// each beacon overwriting the last.
+//
+// The config-identity hash was considered and rejected as the discriminator:
+// it fingerprints file CONTENT, and the live co-located configs hash identically.
+//
+// The composed default is truncated to MaxInstanceNameLen so it cannot exceed
+// the plane's cap. Two paths identical within that prefix would still collide;
+// that is pathological, and visible to doctor's sibling scan, which resolves
+// identities through this same function.
+func ResolveInstanceName(instanceName, sourcePath, hostname string) string {
+	if name := strings.TrimSpace(instanceName); name != "" {
+		return name
+	}
+	base := ""
+	if sourcePath != "" {
+		base = strings.TrimSuffix(filepath.Base(sourcePath), ".json")
+	}
+	var name string
+	switch {
+	case hostname != "" && base != "":
+		name = hostname + "/" + base
+	case hostname != "":
+		name = hostname // no config file in play  -  nothing better than the host
+	default:
+		name = base // hostname unreadable; the basename still disambiguates
+	}
+	if len(name) > MaxInstanceNameLen {
+		// Byte-truncate, but never split a multi-byte rune: a split rune would
+		// marshal as U+FFFD (encoding/json replaces invalid UTF-8), corrupting
+		// the very identity this function exists to pin - and two distinct long
+		// basenames could even collapse onto one mangled prefix, re-creating the
+		// collision CLA-501 exists to fix. Back off to a rune boundary instead.
+		name = name[:MaxInstanceNameLen]
+		for len(name) > 0 && !utf8.ValidString(name) {
+			name = name[:len(name)-1]
+		}
+	}
+	return name
+}
+
+// ResolvedInstanceName is ResolveInstanceName over this config's instance_name
+// and source path.
+func (c *Config) ResolvedInstanceName(hostname string) string {
+	return ResolveInstanceName(c.InstanceName, c.source, hostname)
 }
 
 // Identity fingerprints the effective config in force — what the fleet presence

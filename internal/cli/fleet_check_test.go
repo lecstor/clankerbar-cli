@@ -9,6 +9,8 @@ package cli
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -117,5 +119,101 @@ func TestDoctorFleet_PerProjectChecks(t *testing.T) {
 		if c.status != pass {
 			t.Errorf("fleet[%s] = %s (%s), want PASS", slug, c.status, c.detail)
 		}
+	}
+}
+
+// --- CLA-501: the instance-identity sibling scan -------------------------------
+
+// writeDaemonConfigFile writes one owner-only config body into dir/base.
+func writeDaemonConfigFile(t *testing.T, dir, base, body string) string {
+	t.Helper()
+	p := filepath.Join(dir, base)
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatalf("write %s: %v", p, err)
+	}
+	return p
+}
+
+const identityCfgBody = `{"harness":"claude","prompt":"Work.","backlog_url":"https://plane.example/mcp/acme"}`
+
+// loadDaemonConfig writes a plain daemon config (no instance_name) and loads it,
+// so cfg.Source() names a real file whose siblings can be scanned.
+func loadDaemonConfig(t *testing.T, dir, base string) *config.Config {
+	t.Helper()
+	p := writeDaemonConfigFile(t, dir, base, identityCfgBody)
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("config.Load(%s): %v", p, err)
+	}
+	return cfg
+}
+
+// The check is wired into the preflight: it must appear by name alongside the
+// other fleet-adjacent checks.
+func TestDoctorInstanceIdentityIsWired(t *testing.T) {
+	checks := doctorChecks(context.Background(), fleetCfg(t), okEnv())
+	find(t, checks, "instance identity")
+}
+
+// The bug this check exists for is invisible from inside one daemon: each
+// co-located daemon believes its own name is fine. Two siblings declaring the
+// SAME explicit instance_name would beacon under one Fleet row again.
+func TestDoctorInstanceIdentityCollisionBetweenSiblingsWarns(t *testing.T) {
+	dir := t.TempDir()
+	writeDaemonConfigFile(t, dir, "clanker1.json",
+		`{"harness":"claude","prompt":"Work.","instance_name":"box-a"}`)
+	self := writeDaemonConfigFile(t, dir, "clanker2.json",
+		`{"harness":"claude","prompt":"Work.","instance_name":"box-a"}`)
+	cfg, err := config.Load(self)
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	c := checkInstanceIdentity(cfg)
+	if c.status != warn {
+		t.Fatalf("two sibling configs with the same instance_name = %s (%s), want WARN", c.status, c.detail)
+	}
+	for _, want := range []string{"clanker1.json", "clanker2.json"} {
+		if !strings.Contains(c.detail, want) {
+			t.Errorf("WARN detail %q does not name %q", c.detail, want)
+		}
+	}
+}
+
+// The fix's own shape must NOT read as a collision: distinct basenames with no
+// instance_name resolve distinctly now - warning on them would nag every
+// well-configured multi-daemon host.
+func TestDoctorInstanceIdentityDistinctBasenamesPass(t *testing.T) {
+	dir := t.TempDir()
+	writeDaemonConfigFile(t, dir, "clanker1.json", identityCfgBody)
+	cfg := loadDaemonConfig(t, dir, "clanker2.json")
+	c := checkInstanceIdentity(cfg)
+	if c.status != pass {
+		t.Fatalf("two unnamed sibling configs = %s (%s), want PASS (distinct basenames are distinct identities)", c.status, c.detail)
+	}
+	host, _ := os.Hostname()
+	if !strings.Contains(strings.Join(c.info, "\n"), host+"/clanker2") {
+		t.Errorf("info %v does not show the resolved identity", c.info)
+	}
+}
+
+// A file the loader could not parse cannot start a daemon, so it can never
+// beacon anything to collide with: the scan skips it rather than crashing or
+// mis-reporting it as a peer.
+func TestDoctorInstanceIdentitySkipsUnparseableSiblings(t *testing.T) {
+	dir := t.TempDir()
+	writeDaemonConfigFile(t, dir, "notes.json", `{not json`)
+	writeDaemonConfigFile(t, dir, "clanker1.json", identityCfgBody)
+	cfg := loadDaemonConfig(t, dir, "clanker2.json")
+	c := checkInstanceIdentity(cfg)
+	if c.status != pass {
+		t.Fatalf("unparseable sibling = %s (%s), want PASS with the bad file skipped", c.status, c.detail)
+	}
+}
+
+// Flags-only runs have no config directory to look sideways at.
+func TestDoctorInstanceIdentityNoConfigFilePasses(t *testing.T) {
+	c := checkInstanceIdentity(&config.Config{Harness: "claude", Prompt: "Work."})
+	if c.status != pass || !strings.Contains(c.detail, "no config file") {
+		t.Errorf("flags-only run = %s (%s), want PASS explaining nothing was scanned", c.status, c.detail)
 	}
 }

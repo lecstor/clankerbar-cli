@@ -15,7 +15,7 @@ func TestEscalationPathMatch(t *testing.T) {
 		PathRules: map[string]string{"drizzle/**": "strong", "docs/architecture.md": "strong"},
 	}
 	tests := []struct {
-		path    string
+		path     string
 		wantTier string
 		wantRule string
 	}{
