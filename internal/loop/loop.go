@@ -921,6 +921,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// parking, so the retry is a courtesy to a plausibly-transient silent EOT,
 	// not a budget (see the end.empty branch below).
 	emptyRetries := 0
+	// Whether the checkpoint that opened the CURRENT phase was evidenced by the
+	// plane's record rather than a verified branch (CLA-497). Set at each seam
+	// from the claim carried INTO the phase; a handoff respawn continues the
+	// same phase and must keep the value, so it is never recomputed at the loop
+	// head (where `carried` has already become the phase's own claim).
+	branchlessCheckpoint := false
 
 	// CLA-466: one iteration record posts at this drain's boundary, whatever way
 	// it ends — hence the defer, and hence locals the deferred closure reads.
@@ -997,7 +1003,17 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			promptBytes = len(nextPrompt)
 			continuation := ""
 			if i < len(d.cfg.Phases) && d.cfg.Phases[i].Prompt == "" {
-				continuation = config.HandoffContinuation(ph.Name)
+				// CLA-497: a handoff during a NO-CODE review must not append the
+				// branch-shaped reviewTerminalStep, which tells the successor to
+				// open a PR for a task that has no branch and no code.
+				// branchlessCheckpoint records the checkpoint that opened this
+				// phase (captured at the seam from the carried claim), so the
+				// continuation matches the brief this phase's first session ran.
+				if ph.Name == config.ReviewPhaseName && branchlessCheckpoint {
+					continuation = config.NoCodeHandoffContinuation()
+				} else {
+					continuation = config.HandoffContinuation(ph.Name)
+				}
 			}
 			ph.Prompt = config.HandoffPreamble + nextPrompt + continuation
 			nextPrompt = ""
@@ -1089,6 +1105,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// still-live claim and hand back a task the sequence was never meant to
 		// touch. Keep what we had: the task phase 1 is holding is the one owed a
 		// handback, whatever its successor went and did.
+		seamClaim := carried
 		switch {
 		case carried != nil && end.claim != nil && end.claim.Claim.TaskID != carried.Claim.TaskID:
 			log.Printf("iteration %d: the %s phase claimed %s, which is NOT the task it was resuming (%s) — it was told not to claim at all; keeping the original for the handback",
@@ -1098,6 +1115,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		case end.claim != nil:
 			carried = end.claim
 		}
+		// CLA-497: whether the checkpoint that opened THIS phase was evidenced
+		// by the plane's record (no verified branch). Read from the PRE-switch
+		// claim - the one the seam advanced with: after the switch, carried is
+		// this phase's OWN claim, whose branch says nothing about the checkpoint
+		// that opened the phase, and the handoff continuation must match the
+		// brief this phase's FIRST session ran, not what its last one recorded.
+		branchlessCheckpoint = seamClaim != nil && seamClaim.Claim.Branch == ""
 
 		// A run-level stop wins over a dead phase. drainPhase returns stop=true
 		// for a budget trip, credit exhaustion (lim.Stop), and a resumed phase
@@ -1956,13 +1980,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if (!last || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK) {
 			end.checkpoint = true
 			end.handoff = handoff
-			if end.branch != "" && end.claim != nil {
-				// Fold the VERIFIED branch onto the carried claim, which is both the
-				// successor's resume seed and (via verifiedBranch) the source the
-				// review brief names. Without this the brief would re-derive the
-				// FIRST recorded branch — a draft — and call it verified, exactly
-				// the ungrounded assertion the recomposition exists to kill.
-				end.claim.Claim.Branch = end.branch
+			if end.claim != nil {
+				// The invariant "the carried claim's branch is the VERIFIED one"
+				// is held by construction, whatever form the evidence took
+				// (CLA-497): the branch form folds the verified branch on, and
+				// the plane-record forms clear whatever the session recorded -
+				// a recorded branch that FAILED origin verification must not
+				// ride into the successor's brief, which names {{branch}} as
+				// verified on the origin remote (CLA-457), and the no-code
+				// brief is selected exactly on an empty claim branch.
+				if end.branch != "" {
+					end.claim.Claim.Branch = end.branch
+				} else {
+					end.claim.Claim.Branch = ""
+				}
 			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
@@ -3478,11 +3509,25 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// reads the accepted reports first (the plane record of what THIS run
 		// recorded), falling back to the claim's own branch for a resumed-with-WIP
 		// predecessor.
+		//
+		// CLA-497: a checkpoint evidenced by the PLANE'S RECORD - the task left
+		// `ready` or declared a no-code delivery - names no branch, and the
+		// branch-shaped builtin brief would tell its successor the hand-off
+		// FAILED ("an empty branch field ... is a FAILED hand-off to report"),
+		// the exact opposite of the checkpoint the driver just recorded. Swap in
+		// the no-code brief for the BUILT-IN prompt only; an operator's custom
+		// prompt owns its own wording. The empty claim branch is the
+		// discriminator because drainPhase holds "claim.Branch is the verified
+		// branch, or empty when the evidence was branch-less" by construction.
+		prompt := inv.Prompt
+		if prev.Claim.Branch == "" && prompt == config.BuiltinReviewBrief() {
+			prompt = config.NoCodeReviewBrief()
+		}
 		inv.Prompt = strings.NewReplacer(
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
 			config.PhaseBranchPlaceholder, verifiedBranch(prev),
-		).Replace(inv.Prompt)
+		).Replace(prompt)
 		// Seed the claim as well as the prompt. The session is told not to claim,
 		// so the adapter would observe none — and Result.Claim.Held() is what gates
 		// the handback, the salvage and the delivery check. Without this, the phase
