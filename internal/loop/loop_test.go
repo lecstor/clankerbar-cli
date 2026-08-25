@@ -1450,6 +1450,9 @@ func TestRun_Markers(t *testing.T) {
 		if !strings.Contains(out, "left over from a previous run") {
 			t.Errorf("start-up must warn loudly about the leftover marker; log was:\n%s", out)
 		}
+		if !strings.Contains(out, "please stop") {
+			t.Errorf("start-up warning must carry the leftover marker's message; log was:\n%s", out)
+		}
 		if strings.Contains(out, "STOP requested") {
 			t.Errorf("the leftover marker must not be acted on as a stop request; log was:\n%s", out)
 		}

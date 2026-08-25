@@ -202,6 +202,11 @@ func TestRun_ShutdownPathsSweepPendingStopMarker(t *testing.T) {
 // same boundary, before any poll could land a fresh drop). Both still owe the
 // guarantee: the sweep is registered unconditionally precisely so no exit path
 // has to argue its own reachability.
+//
+// The third subtest pins the sweep's closing line on an error exit with NO
+// marker to sweep — the exact "run ended: <why>" line the 2026-08-25 incident's
+// truncated log lacked, and the one branch of the sweep the end-to-end cases
+// cannot reach (they all plant a marker by construction).
 func TestRun_SweepCoversTheExitsNoLiveWindowCanReach(t *testing.T) {
 	t.Run("zero-spend bound trip", func(t *testing.T) {
 		d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
@@ -225,13 +230,29 @@ func TestRun_SweepCoversTheExitsNoLiveWindowCanReach(t *testing.T) {
 		openTestStateDir(t, d)
 		writeMarker(t, d.state.Path(), "HALT", "wedged — needs a human")
 		writeMarker(t, d.state.Path(), "STOP", "stop too")
-		captureLogs(t)
+		logs := captureLogs(t)
 		d.sweepPendingStop(nil)
 		if !markerPresent(t, d.state.Path(), "HALT") {
 			t.Error("HALT must be left in place for the operator")
 		}
 		if markerPresent(t, d.state.Path(), "STOP") {
 			t.Error("the pending STOP beside the HALT must be swept")
+		}
+		if out := logs.String(); !strings.Contains(out, "without consuming the STOP marker") {
+			t.Errorf("the sweep must still say what it did beside a HALT; log was:\n%s", out)
+		}
+	})
+
+	t.Run("error exit with no marker still closes the log with why", func(t *testing.T) {
+		d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+		openTestStateDir(t, d)
+		logs := captureLogs(t)
+		// Any error return shape; what matters is the closing line.
+		err := fmt.Errorf("iteration 4: %w: 3 consecutive attempts died before fake reported any usage", errZeroSpendLoop)
+		d.sweepPendingStop(err)
+		out := logs.String()
+		if !strings.Contains(out, "run ended: ") || !strings.Contains(out, errZeroSpendLoop.Error()) {
+			t.Errorf("the sweep must close the log with the exit reason; log was:\n%s", out)
 		}
 	})
 }
