@@ -190,6 +190,32 @@ func TestTaskState(t *testing.T) {
 			t.Errorf("state = %+v, want %+v — nulls decode to empty, like repo above", st, want)
 		}
 	})
+	// The delivery record rides the same response (CLA-497): noCode is the
+	// plane's declared "this task shipped no code" flag, and it must decode off
+	// BOTH envelopes — and stay false when the record or the flag is absent or
+	// null, exactly like every other field here.
+	t.Run("delivery noCode decodes", func(t *testing.T) {
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-3","status":"done","delivery":{"noCode":true,"commit":null,"pr":null}}}`))
+		st, err := mustClient(t, srv).TaskState(ctx, "t-3")
+		if err != nil {
+			t.Fatalf("TaskState: %v", err)
+		}
+		want := TaskState{Status: "done", DeliveryNoCode: true}
+		if st != want {
+			t.Errorf("state = %+v, want %+v", st, want)
+		}
+	})
+	t.Run("absent and null delivery decode false", func(t *testing.T) {
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-4","status":"in_progress","claimedByRun":"r-1","delivery":null}}`))
+		st, err := mustClient(t, srv).TaskState(ctx, "t-4")
+		if err != nil {
+			t.Fatalf("TaskState: %v", err)
+		}
+		want := TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+		if st != want {
+			t.Errorf("state = %+v, want %+v — a null delivery is no delivery", st, want)
+		}
+	})
 	t.Run("empty taskId refused locally", func(t *testing.T) {
 		if _, err := mustClient(t, nil).TaskState(ctx, ""); err == nil {
 			t.Error("TaskState with an empty taskId must be refused before any request")
