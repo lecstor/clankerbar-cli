@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
@@ -2820,7 +2821,15 @@ func ResolveInstanceName(instanceName, sourcePath, hostname string) string {
 		name = base // hostname unreadable; the basename still disambiguates
 	}
 	if len(name) > MaxInstanceNameLen {
+		// Byte-truncate, but never split a multi-byte rune: a split rune would
+		// marshal as U+FFFD (encoding/json replaces invalid UTF-8), corrupting
+		// the very identity this function exists to pin - and two distinct long
+		// basenames could even collapse onto one mangled prefix, re-creating the
+		// collision CLA-501 exists to fix. Back off to a rune boundary instead.
 		name = name[:MaxInstanceNameLen]
+		for len(name) > 0 && !utf8.ValidString(name) {
+			name = name[:len(name)-1]
+		}
 	}
 	return name
 }
