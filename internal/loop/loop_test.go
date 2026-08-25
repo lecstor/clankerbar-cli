@@ -132,6 +132,11 @@ type fakeAdapter struct {
 	// the no-progress breaker tests set it so a fruitless session costs a real
 	// ~30M and the token threshold is actually reachable (CLA-343).
 	tokens int
+	// onInvoke, when set, fires just before each scripted step is returned, with
+	// the call number: the seam for dropping something onto a daemon DURING a
+	// live session (a soft-stop marker planted mid-flight, CLA-491). No earlier
+	// hook can express that without racing one of the loop's marker reads.
+	onInvoke func(call int)
 }
 
 // Name is what the driver charges this adapter's spend to, so the per-harness
@@ -154,6 +159,9 @@ func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harnes
 	f.invocations = append(f.invocations, in)
 	i := f.invokeCalls
 	f.invokeCalls++
+	if f.onInvoke != nil {
+		f.onInvoke(i)
+	}
 	if i < len(f.steps) {
 		return f.steps[i].res, f.steps[i].err
 	}
@@ -1414,21 +1422,36 @@ func TestDrainWithRetries_BudgetExhaustionAfterUsageStopsRatherThanRetrying(t *t
 // Control markers and the max-iterations ceiling.
 
 func TestRun_Markers(t *testing.T) {
-	t.Run("STOP stops gracefully and is consumed", func(t *testing.T) {
+	// CLA-491: a STOP marker that PREDATES the run is a leftover from a previous
+	// daemon's exit path that never consumed it (a failure, a budget trip or a
+	// signal), not a fresh request. A fresh start warns, consumes it and gets on
+	// with the work; dropping a marker while a daemon RUNS remains the soft-stop
+	// switch (the waitOrStop tests pin that, and TestRun_SoftStopThenRelaunch
+	// pins the boundary drop end to end).
+	t.Run("a leftover STOP marker warns and does not stop a fresh start", func(t *testing.T) {
 		cfg := fastCfg()
 		dir := t.TempDir()
 		cfg.StateDir = dir
+		cfg.MaxIterations = 1 // the run must now DO work, so bound it
 		writeMarker(t, dir, "STOP", "please stop")
 		h := &fakeAdapter{}
 		p := &fakePoller{sum: backlog.Summary{Claimable: 1}}
+		logs := captureLogs(t)
 		if err := runLoop(t, cfg, h, p); err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
-		if h.invokeCalls != 0 {
-			t.Errorf("STOP should stop before spending; got %d Invoke calls", h.invokeCalls)
+		if h.invokeCalls != 1 {
+			t.Errorf("a leftover STOP marker must not stop a fresh start before spending; got %d Invoke calls", h.invokeCalls)
 		}
 		if _, err := os.Stat(filepath.Join(dir, "STOP")); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("STOP marker should be removed after a graceful stop; stat err = %v", err)
+			t.Errorf("leftover STOP marker should be consumed at start-up; stat err = %v", err)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "left over from a previous run") {
+			t.Errorf("start-up must warn loudly about the leftover marker; log was:\n%s", out)
+		}
+		if strings.Contains(out, "STOP requested") {
+			t.Errorf("the leftover marker must not be acted on as a stop request; log was:\n%s", out)
 		}
 	})
 
