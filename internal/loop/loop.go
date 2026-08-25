@@ -422,7 +422,11 @@ func (d *Driver) adapterFor(ph config.Phase) (harness.Adapter, error) {
 // context cancellation. An empty queue is NOT a stop condition — it idles and
 // keeps polling. Returns nil on a graceful stop; an error only on an unexpected,
 // non-retryable failure.
-func (d *Driver) Run(ctx context.Context) error {
+//
+// Two things hold on every way out (CLA-491): a STOP marker this run never
+// consumed is removed rather than left where the next start would read it as a
+// fresh stop request, and the last log line names why the run ended.
+func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// A caller may have opened the state dir already (tests, and any future entry
 	// point that wants to fail before spawning anything). Opening it here is the
 	// normal path.
@@ -441,6 +445,16 @@ func (d *Driver) Run(ctx context.Context) error {
 			d.state = nil
 		}()
 	}
+	// Belt and braces on the way out (CLA-491). Every shutdown path that does not
+	// pass a STOP read (a non-retryable phase failure, a budget or zero-spend
+	// trip, max-iterations, HALT, a cancelled context) leaves a
+	// pending STOP marker where it fell, and the next start used to read it as
+	// fresh and stop itself seconds into its first cycle: the 2026-08-25 fleet
+	// soft-stop left one behind clanker1, and the upgraded replacement DOA'd on
+	// it. Registered here rather than at each return so a future shutdown path
+	// cannot forget it. (The closure, not `defer d.sweepPendingStop(runErr)`:
+	// arguments evaluate at registration, and runErr is not assigned yet.)
+	defer func() { d.sweepPendingStop(runErr) }()
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
@@ -460,6 +474,22 @@ func (d *Driver) Run(ctx context.Context) error {
 	// ignore it and conclude the stop switch is broken.
 	if legacy := d.cfg.LegacyStateDir(); legacy != "" {
 		log.Printf("note: %s is left over from before the state dir moved out of the workdir — markers there are IGNORED, and its old transcripts are still world-readable inside your repo; move or delete it", legacy)
+	}
+	// A STOP marker already sitting here PREDATES this process: markers are only
+	// ever read and consumed by a running daemon (the cycle top below, and
+	// waitOrStop), so one found at start-up was left behind by a previous run
+	// that exited without consuming it (CLA-491). Its intent died with that run;
+	// acting on it here would stop this daemon before it did anything: exactly
+	// what the upgraded clanker1 did seconds after its start banner. Consume it
+	// with a loud note instead. A stop dropped AFTER this point is fresh and
+	// still lands on every read below.
+	if present, msg := d.readMarker("STOP"); present {
+		_ = d.state.Remove("STOP")
+		note := ""
+		if msg != "" {
+			note = ": " + msg
+		}
+		log.Printf("warning: STOP marker%s is left over from a previous run - consumed WITHOUT stopping this one; drop a fresh marker to stop THIS run", note)
 	}
 
 	start := time.Now()
@@ -728,6 +758,36 @@ func (d *Driver) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// sweepPendingStop is Run's exit sweep (CLA-491): it removes a STOP marker the
+// run never consumed, and logs the reason the run ended.
+//
+// A pending marker at exit means the operator dropped a soft stop against a LIVE
+// daemon that then exited through a path with no STOP read (a non-retryable
+// phase failure, a budget or zero-spend trip inside the drain, HALT beside it,
+// a signal). The marker's intent is satisfied by ANY exit: the daemon is down
+// either way, but leaving it would make the next start read a ghost and stop
+// itself before doing anything. runErr carries how this run ended: an error
+// return names it in the closing line (and so does every graceful path's own
+// log line above), so the daemon log always says why.
+func (d *Driver) sweepPendingStop(runErr error) {
+	if d.state == nil {
+		return
+	}
+	present, _ := d.readMarker("STOP")
+	if !present {
+		if runErr != nil {
+			log.Printf("run ended: %v", runErr)
+		}
+		return
+	}
+	_ = d.state.Remove("STOP")
+	why := "stopped for another reason"
+	if runErr != nil {
+		why = runErr.Error()
+	}
+	log.Printf("run ended (%s) without consuming the STOP marker - removed it so the next start is not stopped by it", why)
 }
 
 // spend is what the run had already consumed when this drain began, plus when it
