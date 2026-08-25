@@ -49,13 +49,21 @@ type TaskRepoSource interface {
 
 // TaskState is what a get_task read learned about WHO holds a task right now:
 // the plane's own status word, the qualified ref, the id of the run currently
-// holding it (empty when nothing does), and any work-in-progress branch
-// recorded on it.
+// holding it (empty when nothing does), any work-in-progress branch
+// recorded on it, and whether the record carries a declared no-code
+// delivery (CLA-497).
 type TaskState struct {
 	Status       string
 	Ref          string
 	ClaimedByRun string
 	Branch       string
+
+	// DeliveryNoCode reports the task record's delivery.noCode flag: the
+	// plane's first-class "this task shipped no code" declaration. It rides
+	// the SAME get_task read as everything above — one peek mechanism
+	// (CLA-451), extended rather than duplicated (CLA-497) — so a reader of
+	// the holder state never needs a second round-trip to learn it.
+	DeliveryNoCode bool
 }
 
 // TaskStateSource reads one task's holder state, for the CLA-451 checkpoint
@@ -126,7 +134,8 @@ func (r *mcpReleaser) TaskRepo(ctx context.Context, taskID string) (string, erro
 }
 
 // TaskState calls get_task for one task and returns the fields naming its
-// holder: status, claimedByRun, branch and ref. The response is accepted in
+// holder: status, claimedByRun, branch and ref, plus the delivery record's
+// noCode flag. The response is accepted in
 // both envelopes the plane has used (see TaskRepo). A field the plane sends as
 // null decodes to empty, like repo above — an unheld task reads as
 // status "ready" (or whatever it moved to) with no run and no branch, which is
@@ -151,10 +160,11 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 		w = *payload.Task
 	}
 	return TaskState{
-		Status:       wireString(w.Status),
-		Ref:          wireString(w.Ref),
-		ClaimedByRun: wireString(w.ClaimedByRun),
-		Branch:       wireString(w.Branch),
+		Status:         wireString(w.Status),
+		Ref:            wireString(w.Ref),
+		ClaimedByRun:   wireString(w.ClaimedByRun),
+		Branch:         wireString(w.Branch),
+		DeliveryNoCode: w.Delivery != nil && wireBool(w.Delivery.NoCode),
 	}, nil
 }
 
@@ -164,6 +174,9 @@ type taskHolderWire struct {
 	Ref          any `json:"ref"`
 	ClaimedByRun any `json:"claimedByRun"`
 	Branch       any `json:"branch"`
+	Delivery     *struct {
+		NoCode any `json:"noCode"`
+	} `json:"delivery"`
 }
 
 // wireString narrows a decoded JSON field the plane sends as a string or null
@@ -174,6 +187,15 @@ type taskHolderWire struct {
 func wireString(v any) string {
 	s, _ := v.(string)
 	return strings.TrimSpace(s)
+}
+
+// wireBool narrows a decoded JSON field the plane sends as a boolean or null.
+// A non-boolean is treated as absent (false), matching wireString's posture:
+// the fields read here describe the record, and none of them turns a peek
+// into an error.
+func wireBool(v any) bool {
+	b, _ := v.(bool)
+	return b
 }
 
 // callText is call for callers who need the result's text payload, not just its
