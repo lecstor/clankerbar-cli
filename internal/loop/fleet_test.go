@@ -12,6 +12,8 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -476,5 +478,98 @@ func TestReporter_OutageThenRecoveryLogsOnceWithTheDropCount(t *testing.T) {
 	}
 	if !strings.Contains(line, "5 failed") {
 		t.Errorf("recovery line %q does not name the whole silent streak", line)
+	}
+}
+
+// --- CLA-501: the resolved instance identity ----------------------------------
+
+// writeDaemonConfig writes one owner-only daemon config body to dir/base and
+// loads it, so the config's source path (the half the default identity embeds)
+// is real.
+func writeDaemonConfig(t *testing.T, dir, base string) *config.Config {
+	t.Helper()
+	p := filepath.Join(dir, base)
+	body := `{"harness":"claude","prompt":"Work the backlog."}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatalf("write %s: %v", p, err)
+	}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("config.Load(%s): %v", p, err)
+	}
+	return cfg
+}
+
+// identityOf builds the minimal driver and reports what it would beacon.
+func identityOf(t *testing.T, cfg *config.Config) fleet.Identity {
+	t.Helper()
+	d := NewMulti(cfg, &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
+	return d.fleetIdentity()
+}
+
+// The bug CLA-501 fixes: four daemons on one host all beaconed the bare
+// hostname, so the plane's unique (project, instance_name) key collapsed them
+// into one Fleet row. Two daemons started from different config files in the
+// same directory must resolve to two DISTINCT identities.
+func TestFleetIdentityDistinctPerConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	a := identityOf(t, writeDaemonConfig(t, dir, "clanker1.json"))
+	b := identityOf(t, writeDaemonConfig(t, dir, "clanker2.json"))
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("os.Hostname: %v", err)
+	}
+	if a.Instance == b.Instance {
+		t.Fatalf("distinct config files must not share an instance identity; both %q", a.Instance)
+	}
+	if want := host + "/clanker1"; a.Instance != want {
+		t.Errorf("a.Instance = %q, want %q (hostname + config basename)", a.Instance, want)
+	}
+	if want := host + "/clanker2"; b.Instance != want {
+		t.Errorf("b.Instance = %q, want %q", b.Instance, want)
+	}
+	if a.Instance == host || b.Instance == host {
+		t.Error("the bare hostname alone must never be the identity when a config file names this daemon")
+	}
+}
+
+// An explicit instance_name still wins over the new default: the operator who
+// already named their daemons keeps exactly the names they chose.
+func TestFleetIdentityExplicitNameWins(t *testing.T) {
+	dir := t.TempDir()
+	cfg := writeDaemonConfig(t, dir, "clanker1.json")
+	cfg.InstanceName = "box-a"
+	id := identityOf(t, cfg)
+	if id.Instance != "box-a" {
+		t.Errorf("Instance = %q, want the explicit name verbatim", id.Instance)
+	}
+}
+
+// ctl reload re-reads the SAME config file, so the basename half of the default
+// cannot change under a live daemon: the Fleet page must keep seeing one row,
+// not watch its daemon rename itself mid-run.
+func TestFleetIdentityStableAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	cfg := writeDaemonConfig(t, dir, "clanker1.json")
+	d := NewMulti(cfg, &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
+	before := d.fleetIdentity()
+
+	path := cfg.Source()
+	d.SetReloader(func() (*config.Config, error) {
+		fresh, err := loadValidatedConfig(path)
+		if err != nil {
+			return nil, err
+		}
+		fresh.Prompt = "reloaded brief" // proves the swap actually happened
+		return fresh, nil
+	})
+	d.applyReload()
+	if d.cfg.Prompt != "reloaded brief" {
+		t.Fatal("the reload never swapped the config in; this test would pass vacuously")
+	}
+	after := d.fleetIdentity()
+	if after.Instance != before.Instance {
+		t.Errorf("identity changed across a reload: %q -> %q; a live daemon must keep its name",
+			before.Instance, after.Instance)
 	}
 }
