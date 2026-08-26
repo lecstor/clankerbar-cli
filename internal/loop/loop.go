@@ -228,8 +228,10 @@ type Driver struct {
 	// in TOKENS, and a session killed by a bad config reports ~0 of them, so a
 	// target failing this way would never climb it. harnessFails counts
 	// consecutive failed drains since the last success (reset only by success,
-	// so a target that keeps failing escalates even across an idle stretch whose
-	// poll cleared skipUntil); harnessErrs keeps each failure's text for the
+	// so a target that keeps failing escalates: an idle stretch does NOT clear
+	// the sit-out (judgeProgress's idle reset preserves skipUntil while
+	// harnessFails > 0), so the ladder holds until the back-off elapses or the
+	// harness succeeds again); harnessErrs keeps each failure's text for the
 	// log line and for the run-wide report when nothing is left to drive.
 	harnessFails []int
 	harnessErrs  []error
@@ -3095,9 +3097,19 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// quietThreshold fresh fruitless drains.
 	if !sum.Spawnable() && !d.pending[i] {
 		if d.quietTokens[i] > 0 {
-			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d tokens of drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quietTokens[i])
+			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d tokens of drain(s) that settled nothing and clearing any no-progress back-off", d.prefix(i), d.quietTokens[i])
 		}
-		d.quietTokens[i], d.skipUntil[i] = 0, time.Time{}
+		d.quietTokens[i] = 0
+		// An idle stretch clears the no-progress (quiet) back-off - with no work
+		// there is nothing to judge, and the blocker may have resolved itself.
+		// A CLA-507 harness sit-out is different: the harness itself is broken,
+		// and an empty queue does not fix it. Clearing skipUntil here would cut
+		// the laddered sit-out short the moment the queue momentarily empties
+		// (a sibling daemon consuming the work), so it is preserved until it
+		// elapses or the harness succeeds again.
+		if d.harnessFails[i] == 0 {
+			d.skipUntil[i] = time.Time{}
+		}
 		d.baseline[i], d.openQs[i] = settled, openQs
 		return
 	}
@@ -3206,14 +3218,13 @@ func (d *Driver) backedOff(i int) bool {
 // The log line is the operator's whole diagnosis for the exact incident that
 // motivated this (2026-08-26): which project died, in which workdir, the
 // harness's own error text - and the reassurance that the fleet carried on.
-func (d *Driver) sidelineTarget(i int, drainNum int, err error) time.Duration {
+func (d *Driver) sidelineTarget(i int, drainNum int, err error) {
 	d.harnessFails[i]++
 	d.harnessErrs[i] = err
 	wait := failureBackoff(d.harnessFails[i])
 	d.skipUntil[i] = time.Now().Add(wait)
 	log.Printf("%siteration %d: sidelining this project for %s (harness failure %d in a row; workdir %s) - the OTHER projects keep draining. Cause: %v",
 		d.prefix(i), drainNum, wait, d.harnessFails[i], d.workdirOf(d.targets[i]), err)
-	return wait
 }
 
 // failureBackoff maps a run of consecutive harness failures onto the same ladder

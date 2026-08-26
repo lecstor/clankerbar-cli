@@ -108,10 +108,8 @@ func TestRun_RepeatedHarnessFailureEscalatesTheLadder(t *testing.T) {
 		{Name: "beta", Poller: beta, WorkDir: "/repos/beta"},
 	}
 	d := NewMulti(cfg, h, targets)
-	var started bool
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = started
 	beta.onCall = func(i int) {
 		// Fires during iteration 3's poll scan, before that pass selects a
 		// target: alpha's 15m sit-out is declared over, so iteration 4 retries
@@ -138,6 +136,61 @@ func TestRun_RepeatedHarnessFailureEscalatesTheLadder(t *testing.T) {
 	until := time.Until(d.skipUntil[0])
 	if until <= 25*time.Minute || until >= 31*time.Minute {
 		t.Errorf("second failure should sit out the ~30m band; got %s", until.Round(time.Second))
+	}
+}
+
+// The laddered sit-out must SURVIVE an idle stretch. judgeProgress's idle
+// reset clears the shared skipUntil for the no-progress breaker, and without a
+// guard it clears a CLA-507 harness sit-out with it: a queue that momentarily
+// empties (a sibling daemon consuming the work) would cancel the ladder, and
+// the broken target would be retried at the first poll where work reappears -
+// not the promised 15m/30m/1h/2h back-off. An empty queue is not a fixed
+// harness, so the sit-out must hold until it elapses or the harness succeeds.
+func TestRun_HarnessBackoffSurvivesAnIdleStretch(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 4
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: nonRetryableResult()}, // alpha, iteration 1 - the broken harness
+		{res: okResult(0, 0)},       // beta, iteration 2
+		{res: okResult(0, 0)},       // beta, iteration 3 (alpha sitting out)
+		{res: okResult(0, 0)},       // beta, iteration 4 (alpha still sitting out)
+	}}
+	alpha := &fakePoller{sum: backlog.Summary{Claimable: 2}, sums: []backlog.Summary{
+		{Claimable: 2}, // poll 0: spawnable -> alpha drains and fails
+		{Claimable: 2}, // poll 1: spawnable but backed off -> not a candidate
+		{},             // poll 2: queue momentarily EMPTY -> the idle reset fires
+		{Claimable: 2}, // poll 3: work is back; the sit-out must still hold
+	}}
+	beta := &fakePoller{sum: backlog.Summary{Claimable: 2}, sums: []backlog.Summary{
+		{},             // poll 0: not spawnable, so iteration 1 rotates to alpha
+		{Claimable: 2}, // poll 1: spawnable -> beta drains
+		{Claimable: 2}, // poll 2: spawnable -> beta drains again
+		{Claimable: 2}, // poll 3: spawnable -> beta drains again
+	}}
+	targets := []Target{
+		{Name: "alpha", Poller: alpha, WorkDir: "/repos/alpha"},
+		{Name: "beta", Poller: beta, WorkDir: "/repos/beta"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	d := NewMulti(cfg, h, targets)
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("run returned an error: %v", err)
+	}
+	var seq []string
+	for _, inv := range h.invocations {
+		seq = append(seq, inv.WorkDir)
+	}
+	want := []string{"/repos/alpha", "/repos/beta", "/repos/beta", "/repos/beta"}
+	if strings.Join(seq, ",") != strings.Join(want, ",") {
+		t.Fatalf("drains went %v, want %v - the idle stretch must not clear the harness sit-out", seq, want)
+	}
+	if d.harnessFails[0] != 1 {
+		t.Errorf("the failed harness must still carry its failure count; got %d", d.harnessFails[0])
+	}
+	if d.skipUntil[0].IsZero() || !time.Now().Before(d.skipUntil[0]) {
+		t.Errorf("alpha's sit-out must still be live after the idle stretch; skipUntil=%v", d.skipUntil[0])
 	}
 }
 
