@@ -215,6 +215,25 @@ type Driver struct {
 	pending     []bool      // a drain of this target is awaiting its progress verdict
 	skipUntil   []time.Time // a backed-off target is ineligible until this time
 
+	// Per-target harness-failure state (CLA-507). A drain that returns an ERROR
+	// failed while trying to run THIS target's session - a malformed opencode.json
+	// in its workdir, a missing checkout, a harness binary that will not start.
+	// That failure belongs to the project, not to the run: ending the run took
+	// every healthy sibling down with it on 2026-08-26 (three of four fleet
+	// daemons died on one project's bad config). So the target sits out on the
+	// same ladder the no-progress breaker shapes, escalating while it keeps
+	// failing and rejoining once it succeeds again, while the others drain on.
+	//
+	// The quiet breaker cannot stand in for this: its accumulator is denominated
+	// in TOKENS, and a session killed by a bad config reports ~0 of them, so a
+	// target failing this way would never climb it. harnessFails counts
+	// consecutive failed drains since the last success (reset only by success,
+	// so a target that keeps failing escalates even across an idle stretch whose
+	// poll cleared skipUntil); harnessErrs keeps each failure's text for the
+	// log line and for the run-wide report when nothing is left to drive.
+	harnessFails []int
+	harnessErrs  []error
+
 	// The fleet dead-phase counter (CLA-396). Per-target because a multi-target
 	// driver runs several projects, and "the fleet" is one project's sessions:
 	// a run of dead phases on project A must not pause project B. The per-task
@@ -371,6 +390,8 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		openQs:       make([]int, n),
 		pending:      make([]bool, n),
 		skipUntil:    make([]time.Time, n),
+		harnessFails: make([]int, n),
+		harnessErrs:  make([]error, n),
 		fleetDead:    make([]int, n),
 		fleetPaused:  make([]bool, n),
 		fleetRaised:  make([]bool, n),
@@ -688,9 +709,28 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		if d.blind {
-			// Blind mode has no counts to route on — rotate across targets so every
-			// queue still gets sessions.
-			d.cursor = (d.cursor + 1) % len(d.targets)
+			// Blind mode has no counts to route on - rotate across targets so every
+			// queue still gets sessions. A target sitting out a harness failure
+			// (CLA-507) is skipped here exactly as the wired gate skips it; the only
+			// way skipUntil can be set in blind mode is that failure path, since
+			// judgeProgress never runs without polls. Walking a full lap without
+			// finding a drivable target means nothing is left, and that exit is the
+			// honest one. The lap reads from the PRE-pass cursor: mutating d.cursor
+			// per step would make later steps orbit the mutated value instead of
+			// walking the ring.
+			found := false
+			orig := d.cursor
+			for i := 1; i <= len(d.targets); i++ {
+				idx := (orig + i) % len(d.targets)
+				d.cursor = idx
+				if !d.backedOff(idx) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("every project's harness is failing - nothing left to drive, stopping:%s", d.sidelinedReport())
+			}
 			target = d.targets[d.cursor]
 		}
 
@@ -738,7 +778,28 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		// producing (the last line before the run ends IS the run total).
 		d.logDeadTally()
 		if err != nil {
-			return err
+			// Classify before acting (CLA-507). The run-wide causes are the ones
+			// the poll loop already hard-stops on - a bad key or a missing project
+			// selector is shared by every target, so no target can make progress
+			// and sidelining would just defer the same exit. They never originate
+			// in a drain today; the guard keeps that boundary explicit rather than
+			// incidental. Context cancellation arrives as stop=true with err=nil,
+			// so it needs no classification here.
+			if errors.Is(err, backlog.ErrUnauthorized) || errors.Is(err, backlog.ErrProjectRequired) {
+				return err
+			}
+			// Everything else out of drainPhases happened while trying to run
+			// THIS target's session, so it sidelines THIS target: it sits out on
+			// the escalating ladder while every other project drains on, and
+			// self-heals once its harness succeeds again.
+			d.sidelineTarget(d.cursor, drains, err)
+			if d.allSidelined() {
+				return fmt.Errorf("every project's harness is failing - nothing left to drive, stopping:%s", d.sidelinedReport())
+			}
+		} else if d.harnessFails[d.cursor] > 0 {
+			log.Printf("%sthe harness succeeded again - rejoining the rotation", d.prefix(d.cursor))
+			d.harnessFails[d.cursor] = 0
+			d.harnessErrs[d.cursor] = nil
 		}
 		if stop {
 			return nil
@@ -3133,6 +3194,72 @@ func (d *Driver) backedOff(i int) bool {
 	d.skipUntil[i] = time.Time{}
 	log.Printf("%sback-off elapsed — trying again", d.prefix(i))
 	return false
+}
+
+// sidelineTarget marks target i failed after drainPhases returned an error: the
+// failure happened while running THIS project's session, so this project sits out
+// while the others drain on. The sit-out uses the quiet ladder's shape: 15m,
+// 30m, 1h, then a 2h cap, keyed on consecutive failures rather than fruitless
+// tokens, and it self-heals: the operator fixes the config (or the checkout), the
+// next attempt after the sit-out succeeds, and Run resets the count.
+//
+// The log line is the operator's whole diagnosis for the exact incident that
+// motivated this (2026-08-26): which project died, in which workdir, the
+// harness's own error text - and the reassurance that the fleet carried on.
+func (d *Driver) sidelineTarget(i int, drainNum int, err error) time.Duration {
+	d.harnessFails[i]++
+	d.harnessErrs[i] = err
+	wait := failureBackoff(d.harnessFails[i])
+	d.skipUntil[i] = time.Now().Add(wait)
+	log.Printf("%siteration %d: sidelining this project for %s (harness failure %d in a row; workdir %s) - the OTHER projects keep draining. Cause: %v",
+		d.prefix(i), drainNum, wait, d.harnessFails[i], d.workdirOf(d.targets[i]), err)
+	return wait
+}
+
+// failureBackoff maps a run of consecutive harness failures onto the same ladder
+// quietBackoff serves. judgeProgress's first trip lands at rung quietThreshold
+// (15m); failure N starts one rung earlier than N+1 so each repeat escalates one
+// band: 15m, 30m, 1h, then quietBackoff's own 2h cap.
+func failureBackoff(fails int) time.Duration {
+	return quietBackoff(quietThreshold - 1 + fails)
+}
+
+// allSidelined reports whether every target is CURRENTLY sitting out a harness
+// failure: nothing left to drive, so ending the run beats idle-polling forever.
+// A target counts only while its failure back-off is live - skipUntil zeroed by
+// an elapsed wait means it is drivable again, whatever its history, and a target
+// that has never failed since its last success never counts.
+func (d *Driver) allSidelined() bool {
+	if len(d.targets) == 0 {
+		return false
+	}
+	now := time.Now()
+	for i := range d.targets {
+		if d.harnessFails[i] == 0 || d.skipUntil[i].IsZero() || !now.Before(d.skipUntil[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// sidelinedReport renders one line per target with the error that benched it, for
+// the run-wide exit when every target is sidelined.
+func (d *Driver) sidelinedReport() string {
+	var b strings.Builder
+	for i := range d.targets {
+		fmt.Fprintf(&b, "\n  [%s] (workdir %s): %v", d.targets[i].Name, d.workdirOf(d.targets[i]), d.harnessErrs[i])
+	}
+	return b.String()
+}
+
+// workdirOf resolves where a target's sessions run, for log lines: the target's
+// own workdir when it declares one, the config's otherwise - the same resolution
+// the invocation gets, so the log names the directory the session actually died in.
+func (d *Driver) workdirOf(t Target) string {
+	if t.WorkDir != "" {
+		return t.WorkDir
+	}
+	return d.cfg.WorkDir
 }
 
 // sleepStall reports how much real time a wait lost to system suspension, and
