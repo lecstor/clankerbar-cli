@@ -42,6 +42,13 @@ func openTestStateDir(t *testing.T, d *Driver) {
 type invokeStep struct {
 	res harness.Result
 	err error
+	// claims, when non-nil, are fired at Invocation.OnClaim in order before the
+	// step's result returns — the mid-session claim stream a real adapter's
+	// parser emits (CLA-510). afterClaims, when set, runs once they are all
+	// queued, so a test can hold the session open until the lease renewer has
+	// folded them in (which is what makes the fleet claim beacon deterministic).
+	claims      []harness.Claim
+	afterClaims func()
 }
 
 func okResult(tokens int, cost float64) harness.Result {
@@ -163,6 +170,14 @@ func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harnes
 		f.onInvoke(i)
 	}
 	if i < len(f.steps) {
+		if st := f.steps[i]; st.claims != nil && in.OnClaim != nil {
+			for _, c := range st.claims {
+				in.OnClaim(c)
+			}
+			if st.afterClaims != nil {
+				st.afterClaims()
+			}
+		}
 		return f.steps[i].res, f.steps[i].err
 	}
 	// Steps exhausted → a clean success, so a loop that keeps draining does not

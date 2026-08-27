@@ -155,7 +155,7 @@ func TestStartLeaseRenewalSkipsWhenThereIsNothingToRenewWith(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &Driver{}
 			inv := harness.Invocation{Probe: tc.probe}
-			r := d.startLeaseRenewal(context.Background(), tc.target, &inv, "")
+			r := d.startLeaseRenewal(context.Background(), 0, tc.target, &inv, "")
 			if (r == nil) != tc.wantNil {
 				t.Fatalf("startLeaseRenewal returned %T, wantNil=%v", r, tc.wantNil)
 			}

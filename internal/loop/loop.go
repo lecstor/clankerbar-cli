@@ -215,6 +215,27 @@ type Driver struct {
 	pending     []bool      // a drain of this target is awaiting its progress verdict
 	skipUntil   []time.Time // a backed-off target is ineligible until this time
 
+	// Per-target harness-failure state (CLA-507). A drain that returns an ERROR
+	// failed while trying to run THIS target's session - a malformed opencode.json
+	// in its workdir, a missing checkout, a harness binary that will not start.
+	// That failure belongs to the project, not to the run: ending the run took
+	// every healthy sibling down with it on 2026-08-26 (three of four fleet
+	// daemons died on one project's bad config). So the target sits out on the
+	// same ladder the no-progress breaker shapes, escalating while it keeps
+	// failing and rejoining once it succeeds again, while the others drain on.
+	//
+	// The quiet breaker cannot stand in for this: its accumulator is denominated
+	// in TOKENS, and a session killed by a bad config reports ~0 of them, so a
+	// target failing this way would never climb it. harnessFails counts
+	// consecutive failed drains since the last success (reset only by success,
+	// so a target that keeps failing escalates: an idle stretch does NOT clear
+	// the sit-out (judgeProgress's idle reset preserves skipUntil while
+	// harnessFails > 0), so the ladder holds until the back-off elapses or the
+	// harness succeeds again); harnessErrs keeps each failure's text for the
+	// log line and for the run-wide report when nothing is left to drive.
+	harnessFails []int
+	harnessErrs  []error
+
 	// The fleet dead-phase counter (CLA-396). Per-target because a multi-target
 	// driver runs several projects, and "the fleet" is one project's sessions:
 	// a run of dead phases on project A must not pause project B. The per-task
@@ -309,8 +330,11 @@ type Driver struct {
 
 	// iter is one target's mid-drain presence state (CLA-466), written by
 	// beginIteration / endIteration around each drain and read by fleetState when
-	// a poll beacons. Single-goroutine, so plain fields.
-	iter []iterState
+	// a poll beacons. Guarded by iterMu: since CLA-510 the lease renewer's
+	// goroutine also revises the ref mid-session (reflectClaim), so these are no
+	// longer touched by the loop alone.
+	iter   []iterState
+	iterMu sync.Mutex
 
 	// hostname/hostOnce cache os.Hostname for the fleet beacon identity.
 	hostname string
@@ -371,6 +395,8 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		openQs:       make([]int, n),
 		pending:      make([]bool, n),
 		skipUntil:    make([]time.Time, n),
+		harnessFails: make([]int, n),
+		harnessErrs:  make([]error, n),
 		fleetDead:    make([]int, n),
 		fleetPaused:  make([]bool, n),
 		fleetRaised:  make([]bool, n),
@@ -688,9 +714,28 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			}
 		}
 		if d.blind {
-			// Blind mode has no counts to route on — rotate across targets so every
-			// queue still gets sessions.
-			d.cursor = (d.cursor + 1) % len(d.targets)
+			// Blind mode has no counts to route on - rotate across targets so every
+			// queue still gets sessions. A target sitting out a harness failure
+			// (CLA-507) is skipped here exactly as the wired gate skips it; the only
+			// way skipUntil can be set in blind mode is that failure path, since
+			// judgeProgress never runs without polls. Walking a full lap without
+			// finding a drivable target means nothing is left, and that exit is the
+			// honest one. The lap reads from the PRE-pass cursor: mutating d.cursor
+			// per step would make later steps orbit the mutated value instead of
+			// walking the ring.
+			found := false
+			orig := d.cursor
+			for i := 1; i <= len(d.targets); i++ {
+				idx := (orig + i) % len(d.targets)
+				d.cursor = idx
+				if !d.backedOff(idx) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("every project's harness is failing - nothing left to drive, stopping:%s", d.sidelinedReport())
+			}
 			target = d.targets[d.cursor]
 		}
 
@@ -738,7 +783,28 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 		// producing (the last line before the run ends IS the run total).
 		d.logDeadTally()
 		if err != nil {
-			return err
+			// Classify before acting (CLA-507). The run-wide causes are the ones
+			// the poll loop already hard-stops on - a bad key or a missing project
+			// selector is shared by every target, so no target can make progress
+			// and sidelining would just defer the same exit. They never originate
+			// in a drain today; the guard keeps that boundary explicit rather than
+			// incidental. Context cancellation arrives as stop=true with err=nil,
+			// so it needs no classification here.
+			if errors.Is(err, backlog.ErrUnauthorized) || errors.Is(err, backlog.ErrProjectRequired) {
+				return err
+			}
+			// Everything else out of drainPhases happened while trying to run
+			// THIS target's session, so it sidelines THIS target: it sits out on
+			// the escalating ladder while every other project drains on, and
+			// self-heals once its harness succeeds again.
+			d.sidelineTarget(d.cursor, drains, err)
+			if d.allSidelined() {
+				return fmt.Errorf("every project's harness is failing - nothing left to drive, stopping:%s", d.sidelinedReport())
+			}
+		} else if d.harnessFails[d.cursor] > 0 {
+			log.Printf("%sthe harness succeeded again - rejoining the rotation", d.prefix(d.cursor))
+			d.harnessFails[d.cursor] = 0
+			d.harnessErrs[d.cursor] = nil
 		}
 		if stop {
 			return nil
@@ -1061,6 +1127,9 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// the console sees which phase is running without waiting out an idle
 		// interval. taskRef is empty until a claim has been observed (the first
 		// phase claims inside drainPhase); from then on it rides every beacon.
+		// CLA-510: a first-phase claim no longer waits for the next phase
+		// boundary — the renewer's claim reflector (startLeaseRenewal) revises
+		// the in-flight ref and beacons the moment the session's claim lands.
 		ref := ""
 		if carried != nil {
 			ref = claimLabel(carried.Claim)
@@ -1070,7 +1139,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		}
 		d.beginIteration(ti, t, drainNum, ref, ph.Label(i))
 
-		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, i, tag, ph, last, carried, t, spend{
+		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, i, tag, ph, last, carried, t, spend{
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
@@ -1689,7 +1758,7 @@ func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int
 // version failed to do.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	ph := d.targetCfg(t).EffectivePhases()[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, "", ph, true, nil, t, prior)
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior)
 	return tokens, cost, stop, err
 }
 
@@ -1713,7 +1782,9 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // phaseIdx is this phase's 0-based position in the sequence, carried only so a
 // phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
-func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+// ti is the target's index, for the fleet claim reflector wired into the lease
+// renewer below (CLA-510).
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	tc := d.targetCfg(t)
 	// The adapter for THIS phase, resolved once: everything below — the spawn, the
 	// classification of what came back, and the probe of any usage limit it hit —
@@ -1843,7 +1914,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// across supervised waits, after exit. Inside the window the adapter may
 		// run its own resurrection machinery (opencode CLA-406): those processes
 		// continue the SAME session on the SAME claim, so renewal spans them.
-		renewer := d.startLeaseRenewal(ctx, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
+		renewer := d.startLeaseRenewal(ctx, ti, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
 		res, ierr := a.Invoke(ctx, inv)
 		renewer.stop()
 		if f != nil {
@@ -3034,9 +3105,19 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// quietThreshold fresh fruitless drains.
 	if !sum.Spawnable() && !d.pending[i] {
 		if d.quietTokens[i] > 0 {
-			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d tokens of drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quietTokens[i])
+			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d tokens of drain(s) that settled nothing and clearing any no-progress back-off", d.prefix(i), d.quietTokens[i])
 		}
-		d.quietTokens[i], d.skipUntil[i] = 0, time.Time{}
+		d.quietTokens[i] = 0
+		// An idle stretch clears the no-progress (quiet) back-off - with no work
+		// there is nothing to judge, and the blocker may have resolved itself.
+		// A CLA-507 harness sit-out is different: the harness itself is broken,
+		// and an empty queue does not fix it. Clearing skipUntil here would cut
+		// the laddered sit-out short the moment the queue momentarily empties
+		// (a sibling daemon consuming the work), so it is preserved until it
+		// elapses or the harness succeeds again.
+		if d.harnessFails[i] == 0 {
+			d.skipUntil[i] = time.Time{}
+		}
 		d.baseline[i], d.openQs[i] = settled, openQs
 		return
 	}
@@ -3133,6 +3214,71 @@ func (d *Driver) backedOff(i int) bool {
 	d.skipUntil[i] = time.Time{}
 	log.Printf("%sback-off elapsed — trying again", d.prefix(i))
 	return false
+}
+
+// sidelineTarget marks target i failed after drainPhases returned an error: the
+// failure happened while running THIS project's session, so this project sits out
+// while the others drain on. The sit-out uses the quiet ladder's shape: 15m,
+// 30m, 1h, then a 2h cap, keyed on consecutive failures rather than fruitless
+// tokens, and it self-heals: the operator fixes the config (or the checkout), the
+// next attempt after the sit-out succeeds, and Run resets the count.
+//
+// The log line is the operator's whole diagnosis for the exact incident that
+// motivated this (2026-08-26): which project died, in which workdir, the
+// harness's own error text - and the reassurance that the fleet carried on.
+func (d *Driver) sidelineTarget(i int, drainNum int, err error) {
+	d.harnessFails[i]++
+	d.harnessErrs[i] = err
+	wait := failureBackoff(d.harnessFails[i])
+	d.skipUntil[i] = time.Now().Add(wait)
+	log.Printf("%siteration %d: sidelining this project for %s (harness failure %d in a row; workdir %s) - the OTHER projects keep draining. Cause: %v",
+		d.prefix(i), drainNum, wait, d.harnessFails[i], d.workdirOf(d.targets[i]), err)
+}
+
+// failureBackoff maps a run of consecutive harness failures onto the same ladder
+// quietBackoff serves. judgeProgress's first trip lands at rung quietThreshold
+// (15m); failure N starts one rung earlier than N+1 so each repeat escalates one
+// band: 15m, 30m, 1h, then quietBackoff's own 2h cap.
+func failureBackoff(fails int) time.Duration {
+	return quietBackoff(quietThreshold - 1 + fails)
+}
+
+// allSidelined reports whether every target is CURRENTLY sitting out a harness
+// failure: nothing left to drive, so ending the run beats idle-polling forever.
+// A target counts only while its failure back-off is live - skipUntil zeroed by
+// an elapsed wait means it is drivable again, whatever its history, and a target
+// that has never failed since its last success never counts.
+func (d *Driver) allSidelined() bool {
+	if len(d.targets) == 0 {
+		return false
+	}
+	now := time.Now()
+	for i := range d.targets {
+		if d.harnessFails[i] == 0 || d.skipUntil[i].IsZero() || !now.Before(d.skipUntil[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// sidelinedReport renders one line per target with the error that benched it, for
+// the run-wide exit when every target is sidelined.
+func (d *Driver) sidelinedReport() string {
+	var b strings.Builder
+	for i := range d.targets {
+		fmt.Fprintf(&b, "\n  [%s] (workdir %s): %v", d.targets[i].Name, d.workdirOf(d.targets[i]), d.harnessErrs[i])
+	}
+	return b.String()
+}
+
+// workdirOf resolves where a target's sessions run, for log lines: the target's
+// own workdir when it declares one, the config's otherwise - the same resolution
+// the invocation gets, so the log names the directory the session actually died in.
+func (d *Driver) workdirOf(t Target) string {
+	if t.WorkDir != "" {
+		return t.WorkDir
+	}
+	return d.cfg.WorkDir
 }
 
 // sleepStall reports how much real time a wait lost to system suspension, and
