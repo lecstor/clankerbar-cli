@@ -7,6 +7,12 @@ package loop
 // outcome across all four paths (checkpoint / released / parked / dead), and an
 // outage of the report endpoint leaves loop timing and outcomes untouched with
 // the failure logged once.
+//
+// CLA-510: the mid-phase claim. A first-phase session claims INSIDE the drain,
+// after its boundary beacon has already gone out; the claim reflector riding
+// the lease-renewal seam revises the in-flight ref and beacons immediately —
+// so the card fills within seconds of the claim, follows the current claim,
+// and never invents a ref from a refused claim.
 
 import (
 	"context"
@@ -14,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -214,6 +221,239 @@ func TestDrainPhases_StateChangeBeaconsFireAtPhaseBoundaries(t *testing.T) {
 	}
 	if sent[1].State.TaskRef != "t-1" || sent[1].State.N != 1 {
 		t.Errorf("second boundary beacon = {n:%d ref:%q}, want {n:1 ref:t-1}", sent[1].State.N, sent[1].State.TaskRef)
+	}
+}
+
+// --- the mid-phase claim (CLA-510) ------------------------------------------
+
+// fleetRenewingDriver is fleetDriver with a releaser that CAN heartbeat, so
+// startLeaseRenewal wires Invocation.OnClaim — the seam the CLA-510 claim
+// reflector rides (fleetDriver's plain fakeReleaser cannot).
+func fleetRenewingDriver(t *testing.T, cfg *config.Config, h harness.Adapter, ff *fakeFleet) *Driver {
+	t.Helper()
+	d := NewMulti(cfg, h, []Target{{
+		Poller:   busyPoller(),
+		Releaser: renewingReleaser{fakeReleaser: &fakeReleaser{}, hb: &recordingHeartbeat{}},
+		Fleet:    ff,
+	}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	return d
+}
+
+// waitForBeaconRef polls the fake fleet until a report whose state carries the
+// given task ref has been sent. Returns false on timeout. Used by the fake's
+// afterClaims hook to hold a session open until the renewer has folded its
+// claim stream into the fleet ref — the thing that makes the claim beacon
+// deterministic instead of a race against stop().
+func waitForBeaconRef(ff *fakeFleet, ref string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		sent, _ := ff.reports()
+		for _, r := range sent {
+			if r.State.TaskRef == ref {
+				return true
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+// iterationRefs lists the task ref of every iteration-state beacon, in order —
+// the card's history through one drain. "" means the card shows no task.
+func iterationRefs(ff *fakeFleet) []string {
+	sent, _ := ff.reports()
+	var refs []string
+	for _, r := range sent {
+		if r.State.Kind == fleet.StateIteration {
+			refs = append(refs, r.State.TaskRef)
+		}
+	}
+	return refs
+}
+
+// A phase-1 drain whose session claims MID-phase: the reflector revises the
+// in-flight ref and beacons at the claim — the card fills within seconds, not
+// at the next phase boundary — and what the NEXT poll beacon would render
+// (fleetState, read mid-session) already carries the ref, so the revision is
+// durable state, not a one-shot beacon.
+func TestDrainPhases_MidPhaseClaimBeaconsTheRefAndPollBeaconsCarryIt(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-ref"
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	ff := &fakeFleet{}
+	var d *Driver
+	var midDrain fleet.State
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// Hold the session open until the renewer has folded the claim in —
+			// the claim beacon landing in the fake reporter is that proof — then
+			// read what the next poll beacon would have rendered.
+			if !waitForBeaconRef(ff, "CLA-1", 2*time.Second) {
+				t.Error("the renewer never folded the mid-phase claim into the fleet ref")
+			}
+			midDrain = d.fleetState(0)
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d = fleetRenewingDriver(t, cfg, h, ff)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	sent, _ := ff.reports()
+	// The card's history through the drain: boundary beacon with NO ref (the
+	// claim has not been observed yet — no guessing from next_task), the claim
+	// beacon, then the back-to-normal close.
+	if got := iterationRefs(ff); !slices.Equal(got, []string{"", "CLA-1"}) {
+		t.Fatalf("iteration beacon refs = %v, want [\"\" CLA-1]", got)
+	}
+	if len(sent) < 3 || sent[len(sent)-1].State.Kind != fleet.StateIdle {
+		t.Fatalf("last beacon = %+v, want the back-to-normal idle close", sent[len(sent)-1])
+	}
+	// The claim beacon itself names the task and the phase it was claimed in.
+	if sent[1].State.TaskRef != "CLA-1" || sent[1].State.N != 1 {
+		t.Errorf("claim beacon = {n:%d ref:%q}, want {n:1 ref:CLA-1}", sent[1].State.N, sent[1].State.TaskRef)
+	}
+	// What the next poll beacon renders mid-session: the ref must already be
+	// there, or a poll-driven beacon would wipe the card back to blank.
+	if midDrain.Kind != fleet.StateIteration || midDrain.TaskRef != "CLA-1" || midDrain.N != 1 {
+		t.Errorf("mid-drain poll state = %+v, want iteration {n:1 ref:CLA-1}", midDrain)
+	}
+	// The revision is not a second record: exactly one iteration still posts.
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+	if recs[0].TaskRef != "CLA-1" {
+		t.Errorf("record taskRef = %q, want CLA-1", recs[0].TaskRef)
+	}
+}
+
+// A session that settles one task and claims another mid-stream: the card
+// follows the CURRENT claim, and clears while nothing is held — it must not
+// latch the first claim it ever saw.
+func TestDrainPhases_RefFollowsTheCurrentClaimAndClears(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-follow"
+	claimA := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	claimB := harness.Claim{TaskID: "t-2", Ref: "CLA-2", RunID: "r-2"}
+	ff := &fakeFleet{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{
+			claimA,
+			{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true},
+			claimB,
+		},
+		afterClaims: func() {
+			if !waitForBeaconRef(ff, "CLA-2", 2*time.Second) {
+				t.Error("the renewer never folded the settle-and-reclaim stream into the fleet ref")
+			}
+		},
+		res: held(okResult(7, 0.5), claimB),
+	}}}
+	d := fleetRenewingDriver(t, cfg, h, ff)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	if got := iterationRefs(ff); !slices.Equal(got, []string{"", "CLA-1", "", "CLA-2"}) {
+		t.Fatalf("iteration beacon refs = %v, want [\"\" CLA-1 \"\" CLA-2] — the card must follow the current claim and clear while nothing is held", got)
+	}
+	if recs := ff.records(); len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+}
+
+// A refused claim is not a claim: it records no ids, so a real adapter fires
+// nothing at OnClaim (harness.Invocation). Drive the defensive half — even if
+// an empty snapshot reached the reflector, no ref may appear on the card.
+func TestDrainPhases_RefusedClaimCarriesNoRef(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-refused"
+	ff := &fakeFleet{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{{}},
+		res:    okResult(7, 0.5),
+	}}}
+	d := fleetRenewingDriver(t, cfg, h, ff)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	sent, _ := ff.reports()
+	for i, r := range sent {
+		if r.State.Kind == fleet.StateIteration && r.State.TaskRef != "" {
+			t.Errorf("beacon %d carries taskRef %q from a refused claim — no ref may be invented", i, r.State.TaskRef)
+		}
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+	if recs[0].TaskID != "" || recs[0].TaskRef != "" {
+		t.Errorf("record task fields = {%s %s}, want empty — a refused claim is not a claim", recs[0].TaskID, recs[0].TaskRef)
+	}
+}
+
+// The reflector directly: a beacon only on a ref CHANGE — a session that
+// churns claims must not turn the card into a stream — and never outside a
+// live iteration.
+func TestReflectClaim_BeaconsOnlyOnARefChange(t *testing.T) {
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Fleet: ff}})
+	d.iter = []iterState{{on: true, n: 3, phase: "implement"}}
+	reflect := d.reflectClaim(0, d.targets[0])
+
+	// The refused shape (no ids): nothing held, nothing changed, no beacon.
+	reflect(harness.Claim{})
+	if got := d.fleetState(0); got.TaskRef != "" {
+		t.Fatalf("ref after an empty snapshot = %q, want empty — a refused claim is not a claim", got.TaskRef)
+	}
+	sent, _ := ff.reports()
+	if len(sent) != 0 {
+		t.Fatalf("a no-change snapshot beaconed %d time(s), want 0", len(sent))
+	}
+
+	// A real claim fills the card and beacons exactly once.
+	reflect(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"})
+	if got := d.fleetState(0); got.TaskRef != "CLA-1" || got.N != 3 {
+		t.Fatalf("state after the claim = %+v, want iteration {n:3 ref:CLA-1}", got)
+	}
+	sent, _ = ff.reports()
+	if len(sent) != 1 || sent[0].State.TaskRef != "CLA-1" {
+		t.Fatalf("claim beacon = %+v, want exactly one carrying CLA-1", sent)
+	}
+
+	// The same claim again: no churn.
+	reflect(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"})
+	sent, _ = ff.reports()
+	if len(sent) != 1 {
+		t.Fatalf("a duplicate claim snapshot beaconed again; want the single change beacon, got %d", len(sent))
+	}
+
+	// The settle clears the card and beacons.
+	reflect(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
+	if got := d.fleetState(0); got.TaskRef != "" {
+		t.Fatalf("ref after the settle = %q, want cleared", got.TaskRef)
+	}
+	sent, _ = ff.reports()
+	if len(sent) != 2 || sent[1].State.TaskRef != "" {
+		t.Fatalf("settle beacon = %+v, want exactly one clearing the ref", sent)
+	}
+
+	// A live iteration is required: no beacon outside a drain.
+	d.iter[0] = iterState{}
+	reflect(harness.Claim{TaskID: "t-9", Ref: "CLA-9", RunID: "r-9"})
+	sent, _ = ff.reports()
+	if len(sent) != 2 {
+		t.Fatalf("a snapshot with no live iteration beaconed; want no change, got %d", len(sent))
 	}
 }
 

@@ -330,8 +330,11 @@ type Driver struct {
 
 	// iter is one target's mid-drain presence state (CLA-466), written by
 	// beginIteration / endIteration around each drain and read by fleetState when
-	// a poll beacons. Single-goroutine, so plain fields.
-	iter []iterState
+	// a poll beacons. Guarded by iterMu: since CLA-510 the lease renewer's
+	// goroutine also revises the ref mid-session (reflectClaim), so these are no
+	// longer touched by the loop alone.
+	iter   []iterState
+	iterMu sync.Mutex
 
 	// hostname/hostOnce cache os.Hostname for the fleet beacon identity.
 	hostname string
@@ -1124,6 +1127,9 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// the console sees which phase is running without waiting out an idle
 		// interval. taskRef is empty until a claim has been observed (the first
 		// phase claims inside drainPhase); from then on it rides every beacon.
+		// CLA-510: a first-phase claim no longer waits for the next phase
+		// boundary — the renewer's claim reflector (startLeaseRenewal) revises
+		// the in-flight ref and beacons the moment the session's claim lands.
 		ref := ""
 		if carried != nil {
 			ref = claimLabel(carried.Claim)
@@ -1133,7 +1139,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		}
 		d.beginIteration(ti, t, drainNum, ref, ph.Label(i))
 
-		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, i, tag, ph, last, carried, t, spend{
+		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, i, tag, ph, last, carried, t, spend{
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
@@ -1752,7 +1758,7 @@ func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int
 // version failed to do.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	ph := d.targetCfg(t).EffectivePhases()[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, "", ph, true, nil, t, prior)
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior)
 	return tokens, cost, stop, err
 }
 
@@ -1776,7 +1782,9 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // phaseIdx is this phase's 0-based position in the sequence, carried only so a
 // phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
-func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+// ti is the target's index, for the fleet claim reflector wired into the lease
+// renewer below (CLA-510).
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	tc := d.targetCfg(t)
 	// The adapter for THIS phase, resolved once: everything below — the spawn, the
 	// classification of what came back, and the probe of any usage limit it hit —
@@ -1906,7 +1914,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// across supervised waits, after exit. Inside the window the adapter may
 		// run its own resurrection machinery (opencode CLA-406): those processes
 		// continue the SAME session on the SAME claim, so renewal spans them.
-		renewer := d.startLeaseRenewal(ctx, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
+		renewer := d.startLeaseRenewal(ctx, ti, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
 		res, ierr := a.Invoke(ctx, inv)
 		renewer.stop()
 		if f != nil {

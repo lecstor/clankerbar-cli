@@ -20,9 +20,12 @@ import (
 )
 
 // iterState is one target's mid-drain presence: what `iteration {n, taskRef,
-// phase}` the Fleet page should show while this drain runs. The loop is
-// single-goroutine, so these are plain fields — no locking, because a poll (the
-// only other reader) can never run concurrently with the drain that writes them.
+// phase}` the Fleet page should show while this drain runs.
+//
+// Accesses are guarded by Driver.iterMu: the loop writes at phase boundaries
+// (beginIteration / endIteration), and since CLA-510 the lease renewer's
+// goroutine ALSO revises the ref mid-session (reflectClaim), so these are no
+// longer touched by the loop alone.
 type iterState struct {
 	on    bool
 	n     int
@@ -79,7 +82,10 @@ func (d *Driver) fleetIdentity() fleet.Identity {
 // draining for every quiet spell would blur the one signal draining exists for —
 // "something is holding spawns closed until an operator acts".
 func (d *Driver) fleetState(ti int) fleet.State {
-	if s := d.iterAt(ti); s.on {
+	d.iterMu.Lock()
+	s := d.iterAt(ti)
+	d.iterMu.Unlock()
+	if s.on {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
 	if d.pausedAt(ti) || d.fleetPausedAt(ti) {
@@ -119,6 +125,45 @@ func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.It
 	})
 }
 
+// reflectClaim returns the claim reflector for target ti (CLA-510): it keeps
+// the mid-drain presence ref in step with the CURRENT claim the session holds
+// — set when a claim is actually observed, cleared when the session settles it
+// or holds nothing — and beacons immediately on a change, so the fleet card
+// fills in within seconds of a first-phase claim instead of at the next phase
+// boundary. It is a REVISION of the in-flight state, never a second iteration
+// record: the one record per drain posted by endIteration is unchanged.
+//
+// It rides the SAME observation seam as lease renewal — the renewer calls it
+// from apply for every snapshot its OnClaim hook receives — so there is no
+// second watcher to keep in agreement, and a claim that was REFUSED never
+// reaches it: a refused claim records no ids, so the adapter fires nothing
+// (harness.Invocation.OnClaim). Only a ref CHANGE beacons; a session that
+// churns claims cannot turn this into a stream.
+//
+// Runs on the renewer goroutine, which is exactly why iterMu exists: the loop
+// writes d.iter at phase boundaries while this revises it mid-session. The
+// renewer never reflects after stop() returns (see leaseRenewer.apply), so the
+// revision cannot land on a later phase's state.
+func (d *Driver) reflectClaim(ti int, t Target) func(harness.Claim) {
+	return func(c harness.Claim) {
+		ref := ""
+		if c.Held() {
+			ref = claimLabel(c)
+		}
+		d.iterMu.Lock()
+		s := d.iterAt(ti)
+		if !s.on || s.ref == ref {
+			d.iterMu.Unlock()
+			return
+		}
+		s.ref = ref
+		d.iter[ti] = s
+		st := fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
+		d.iterMu.Unlock()
+		d.beacon(ti, t, st)
+	}
+}
+
 // fleetShutdown delivers each target's final `stopping` beacon synchronously.
 // It runs deferred from Run, so EVERY exit path says goodbye — STOP/HALT, a
 // restart marker, max-iterations, budget, signal, even a hard error return —
@@ -141,9 +186,11 @@ func (d *Driver) fleetShutdown() {
 // run. Called just before each spawn — including handoff respawns of the same
 // phase, whose repeat beacon is harmless (presence is last-writer-wins).
 func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase string) {
+	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
 		d.iter[ti] = iterState{on: true, n: drainNum, ref: ref, phase: phase}
 	}
+	d.iterMu.Unlock()
 	d.beacon(ti, t, d.fleetState(ti))
 }
 
@@ -163,9 +210,11 @@ func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase strin
 //   - nothing observed at all -> released, best-effort (the iteration ran;
 //     exactly one record posts per iteration, always)
 func (d *Driver) endIteration(ti int, t Target, rec fleet.Iteration) {
+	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
 		d.iter[ti] = iterState{}
 	}
+	d.iterMu.Unlock()
 	d.beacon(ti, t, d.fleetState(ti), rec)
 }
 

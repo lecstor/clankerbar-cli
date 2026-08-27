@@ -63,7 +63,7 @@ func TestFailingFromCommandRefusesTheSpawn(t *testing.T) {
 	}
 	d.cfg.Env = config.EnvMap{"GH_TOKEN": config.CommandEnv("gh auth token")}
 
-	_, _, _, _, err := d.drainPhase(context.Background(), 1, 0, "", d.cfg.EffectivePhases()[0], true, nil, d.targets[0], spend{start: time.Now()})
+	_, _, _, _, err := d.drainPhase(context.Background(), 1, 0, 0, "", d.cfg.EffectivePhases()[0], true, nil, d.targets[0], spend{start: time.Now()})
 	if err == nil {
 		t.Fatal("the phase spawned a session despite a failing declared command")
 	}
