@@ -454,6 +454,22 @@ func TestReflectClaim_BeaconsOnlyOnARefChange(t *testing.T) {
 		t.Fatalf("settle beacon = %+v, want exactly one clearing the ref", sent)
 	}
 
+	// A closed done channel refuses the write: a snapshot that reaches the
+	// reflector after renewer stop() must not revise the row, whatever claim
+	// it carries — the refusal branch that makes the no-cross-row invariant
+	// hold by construction.
+	closedDone := make(chan struct{})
+	close(closedDone)
+	reflectClosed := d.reflectClaim(0, d.targets[0], closedDone)
+	reflectClosed(harness.Claim{TaskID: "t-2", Ref: "CLA-2", RunID: "r-2"})
+	if got := d.fleetState(0); got.TaskRef != "" {
+		t.Fatalf("a post-stop snapshot wrote ref %q; the refusal branch must keep the row unchanged", got.TaskRef)
+	}
+	sent, _ = ff.reports()
+	if len(sent) != 2 {
+		t.Fatalf("a post-stop snapshot beaconed; want the 2 prior beacons, got %d", len(sent))
+	}
+
 	// A live iteration is required: no beacon outside a drain.
 	d.iter[0] = iterState{}
 	reflect(harness.Claim{TaskID: "t-9", Ref: "CLA-9", RunID: "r-9"})

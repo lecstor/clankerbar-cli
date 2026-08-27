@@ -147,9 +147,11 @@ func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.It
 // snapshots once done is closed, and the write site re-checks done under
 // iterMu below, so a snapshot that slipped past the apply guard while done was
 // still open cannot land on a later phase's row even if something between the
-// two checks were ever made blocking. The write cannot cross stop(); the
-// beacon that follows it is a report send, governed by the reporter's own
-// non-blocking contract, not driver state.
+// two checks were ever made blocking. No revision can land on a cleared row or
+// a later phase's row: close(done) precedes the loop's own row writes, and the
+// write site re-checks done under the same mutex those writes serialize on.
+// The beacon that follows a write is a report send, governed by the reporter's
+// own non-blocking contract, not driver state.
 func (d *Driver) reflectClaim(ti int, t Target, done <-chan struct{}) func(harness.Claim) {
 	return func(c harness.Claim) {
 		ref := ""
