@@ -291,7 +291,11 @@ func TestDrainPhases_MidPhaseClaimBeaconsTheRefAndPollBeaconsCarryIt(t *testing.
 		afterClaims: func() {
 			// Hold the session open until the renewer has folded the claim in —
 			// the claim beacon landing in the fake reporter is that proof — then
-			// read what the next poll beacon would have rendered.
+			// read what the next poll beacon WOULD have rendered. A poll beacon
+			// cannot fire mid-drain by construction: the poll loop and the drain
+			// share one goroutine (loop.go), so fleetState is the durable state
+			// the next poll would read — pinning it here is what proves the
+			// revision is not a one-shot beacon.
 			if !waitForBeaconRef(ff, "CLA-1", 2*time.Second) {
 				t.Error("the renewer never folded the mid-phase claim into the fleet ref")
 			}
@@ -409,7 +413,9 @@ func TestReflectClaim_BeaconsOnlyOnARefChange(t *testing.T) {
 	ff := &fakeFleet{}
 	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Fleet: ff}})
 	d.iter = []iterState{{on: true, n: 3, phase: "implement"}}
-	reflect := d.reflectClaim(0, d.targets[0])
+	// A never-closed done: the unit test drives the reflector directly, with no
+	// renewer lifecycle to race.
+	reflect := d.reflectClaim(0, d.targets[0], make(chan struct{}))
 
 	// The refused shape (no ids): nothing held, nothing changed, no beacon.
 	reflect(harness.Claim{})

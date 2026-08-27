@@ -117,7 +117,9 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 		// CLA-510: the fleet card's task ref rides the same observation seam
 		// as lease renewal - one watcher, two consumers. Only when there is a
 		// reporter to see it; a nil Fleet makes the reflector pure overhead.
-		r.reflect = d.reflectClaim(ti, t)
+		// done is handed over so the reflector can refuse writes after stop()
+		// at its own write site, not only at apply's guard.
+		r.reflect = d.reflectClaim(ti, t, r.done)
 	}
 	inv.OnClaim = r.observe
 	go r.run(ctx, inv.ResumeClaim)
@@ -166,11 +168,13 @@ func (r *leaseRenewer) observe(c harness.Claim) {
 //
 // The fleet reflector (CLA-510) runs here, on the renewer goroutine, before the
 // renewal state folds in - one choke point for both consumers of the snapshot.
-// The done-guard at the top is what keeps the reflector off driver state after
-// stop(): stop()'s wait is bounded, so the goroutine can outlive it wedged in a
+// The done-guard at the top bounds what can reach the reflector after stop():
+// stop()'s wait is bounded, so the goroutine can outlive it wedged in a
 // Heartbeat call, and a snapshot queued before the stop and picked up after it
-// must not reach the reflector - the driver may already be into the next phase,
-// and the ref would be revised for work the session no longer owns.
+// must not revise the fleet row - the driver may already be into the next phase.
+// The guard is a check-then-act; the reflector's own write site re-checks done
+// under iterMu (see Driver.reflectClaim), so the no-reflect-after-stop
+// invariant holds by construction at the write, not only by interleaving luck.
 func (r *leaseRenewer) apply(c, current harness.Claim) harness.Claim {
 	select {
 	case <-r.done:

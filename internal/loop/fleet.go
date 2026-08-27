@@ -141,16 +141,32 @@ func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.It
 // churns claims cannot turn this into a stream.
 //
 // Runs on the renewer goroutine, which is exactly why iterMu exists: the loop
-// writes d.iter at phase boundaries while this revises it mid-session. The
-// renewer never reflects after stop() returns (see leaseRenewer.apply), so the
-// revision cannot land on a later phase's state.
-func (d *Driver) reflectClaim(ti int, t Target) func(harness.Claim) {
+// writes d.iter at phase boundaries while this revises it mid-session.
+//
+// The renewer never reflects after stop() returns: leaseRenewer.apply drops
+// snapshots once done is closed, and the write site re-checks done under
+// iterMu below, so a snapshot that slipped past the apply guard while done was
+// still open cannot land on a later phase's row even if something between the
+// two checks were ever made blocking. The write cannot cross stop(); the
+// beacon that follows it is a report send, governed by the reporter's own
+// non-blocking contract, not driver state.
+func (d *Driver) reflectClaim(ti int, t Target, done <-chan struct{}) func(harness.Claim) {
 	return func(c harness.Claim) {
 		ref := ""
 		if c.Held() {
 			ref = claimLabel(c)
 		}
 		d.iterMu.Lock()
+		select {
+		case <-done:
+			// stop() closed done while this snapshot was in flight: the
+			// session is over and the row is about to be cleared or handed to
+			// the next phase — revising it now would attribute work the
+			// session no longer owns.
+			d.iterMu.Unlock()
+			return
+		default:
+		}
 		s := d.iterAt(ti)
 		if !s.on || s.ref == ref {
 			d.iterMu.Unlock()
