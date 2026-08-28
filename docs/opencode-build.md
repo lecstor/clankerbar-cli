@@ -71,10 +71,10 @@ turn - `packages/opencode/src/session/prompt.ts:1113` omits `"unknown"` from the
 exclusion that the same file applies ~180 lines later at `:1295`. Reproduced against a local
 fake provider by patching v1.18.19 and watching the behaviour flip.
 
-Filed upstream as **anomalyco/opencode#43622**. Absent from every release checked (v1.15.0
-through v1.18.19, the current latest), and present in the one older checkout available here
-(1.2.27, at `prompt.ts:323`), so it reads as a guard dropped in a refactor rather than a
-missing feature.
+Filed upstream as **anomalyco/opencode#43622**, still **open** as of 2026-08-28 with no
+maintainer response. Present in every release from v1.15.0 through v1.18.19, and absent from
+the one older checkout available here (1.2.27, at `prompt.ts:323`), so it reads as a guard
+dropped in a refactor rather than a missing feature.
 
 For us that failure looks like a session that ended with no branch and no error (it had
 usually done paid work first - only the final step is empty) -
@@ -86,10 +86,33 @@ and continues it on a mechanical match - bounded at 5 resurrections per Invoke, 
 probe per death, falling through to the dead-phase path unchanged when a probe fails.
 The upstream loop-exit bug still stands; this catches its victims instead.
 
-If we ever pin a patched build rather than waiting for upstream: **do not vendor the
-one-line fix**. Adding `"unknown"` to the list at `:1113` removes the silent exit but
-produces an unbounded retry loop - 138 steps and climbing in the test, with no cap observed.
+## Why the fleet is pinned to 1.18.19, deliberately
+
+An earlier version of this page warned: if we ever pin a patched build, **do not vendor the
+one-line fix** - adding `"unknown"` to the list at `:1113` removes the silent exit but
+produces an unbounded retry loop, 138 steps and climbing in the test with no cap observed.
 The shape that works is `:1301`, where a `content-filter` finish is surfaced as an error.
+
+**Upstream then shipped exactly that one-line fix, in v1.18.20, with exactly that
+consequence.** So the trade on the 1.18.x line is:
+
+| Build | Indeterminate finish reason | Consequence |
+|---|---|---|
+| **<= 1.18.19** | exits 0, silently, discarding the turn | a dead phase - which **CLA-406 catches and resurrects** |
+| **>= 1.18.20** | does not exit; retries without bound | burns paid steps with no error and no cap; CLA-406 never fires, and the wall-clock cap is the only backstop |
+
+A death we detect and recover beats a loop that spends until the clock runs out, so **the
+fleet runs 1.18.19 on purpose**. Homebrew has 1.18.21 installed but **unlinked**;
+`/opt/homebrew/bin/opencode` is a symlink into the version-pinned `opencode@1.18.19` formula.
+
+**Do not "fix" that pin by relinking.** It looks like drift - a newer version installed and
+not in use - and it is not. If you see `brew list --versions` showing a newer opencode than
+`opencode --version` reports, that is this pin working.
+
+**What lifts it:** a build where an indeterminate finish reason is *surfaced as an error*
+rather than either swallowed or retried - the `:1301` shape. Watch #43622. Until then, do not
+upgrade past 1.18.19, and check `opencode --version` (not `brew list`) before concluding
+anything about which build produced a failure.
 
 ## See also
 
