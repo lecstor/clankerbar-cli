@@ -497,10 +497,16 @@ const implementResumedBranchRule = "RESUMED WORK comes first when you find it: i
 // session" sentence: TestBuiltinImplementBriefPinsTheResumedBranchRule locates
 // the terminal stop by that exact phrase, and this clause sits before the
 // resumed-work rule, so reusing it would move the pin's anchor.
+//
+// The fork also preempts the resumed-work rule below: a close-out claim carries
+// a recorded branch, so that rule's "existing branch" trigger would otherwise
+// match an offer it must never apply to - merging the integration branch into an
+// approved PR branch would rewrite the diff the approval and the green CI stand
+// on. "For found work, not this offer" says the boundary in the brief itself.
 const implementCloseOutRule = "If next_task instead offers an approved-awaiting-merge task - implementation and " +
 	"review already done, only the close-out remaining - that offer IS this session's job: follow the offer's " +
-	"own instructions, and once the close-out is done STOP and end the session. Ending that way is the task " +
-	"going to plan, not the task being abandoned."
+	"own instructions, and once the close-out is done STOP and end the session. The resumed-work rule below is " +
+	"for found work, not this offer. Ending that way is the task going to plan, not the task being abandoned."
 
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
@@ -514,7 +520,7 @@ var builtinPhasePrompts = map[string]string{
 	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
 		implementCloseOutRule + " " +
 		implementResumedBranchRule +
-		" Unless you parked above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
+		" Unless you parked above or served a close-out above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,

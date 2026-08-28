@@ -112,7 +112,7 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 		"record_decision",
 		"park the task with an outcome citing it",
 		"do not spend the run re-verifying and pushing stale work",
-		"unless you parked above, the rest of the flow is unchanged",
+		"unless you parked above or served a close-out above, the rest of the flow is unchanged",
 	} {
 		if !strings.Contains(lower, want) {
 			t.Errorf("the resumed-branch rule never says %q:\n%s", want, brief)
@@ -136,7 +136,7 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 	supersededIdx := strings.Index(lower, "supersedes the task")
 	parkIdx := strings.Index(lower, "park the task with an outcome citing it")
 	staleIdx := strings.Index(lower, "re-verifying and pushing stale work")
-	joinIdx := strings.Index(lower, "unless you parked above, the rest of the flow is unchanged")
+	joinIdx := strings.Index(lower, "unless you parked above or served a close-out above, the rest of the flow is unchanged")
 	if mergeIdx == -1 || revalidateIdx == -1 || supersededIdx == -1 || parkIdx == -1 || staleIdx == -1 || joinIdx == -1 {
 		t.Fatalf("merge (%d), re-validate (%d), supersession (%d), parking (%d), stale-work end (%d) or flow join (%d) missing from the brief:\n%s",
 			mergeIdx, revalidateIdx, supersededIdx, parkIdx, staleIdx, joinIdx, brief)
@@ -196,6 +196,15 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 // TestBuiltinImplementBriefPinsTheResumedBranchRule established: a fragment
 // like "the offer" alone would survive a mutation that inverts the admission
 // into "decline the offer and ask".
+//
+// Two routing guards pin the fork's exclusivity. "The resumed-work rule below
+// is for found work, not this offer" preempts that rule's "existing branch"
+// trigger, which a close-out claim's recorded branch would otherwise satisfy -
+// applying its merge-and-revalidate sequence to an approved PR branch would
+// rewrite the diff the approval and the green CI stand on. And "served a
+// close-out above" exempts the close-out case from the join into the
+// claim/worktree/commit flow, which otherwise reads as instructing the session
+// to keep going after the close-out.
 func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
 	brief, ok := builtinPhasePrompts[ImplementPhaseName]
 	if !ok {
@@ -211,6 +220,8 @@ func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
 		"that offer is this session's job",
 		"follow the offer's own instructions",
 		"once the close-out is done stop and end the session",
+		"the resumed-work rule below is for found work, not this offer",
+		"unless you parked above or served a close-out above, the rest of the flow is unchanged",
 		"going to plan",
 	} {
 		if !strings.Contains(lower, want) {
