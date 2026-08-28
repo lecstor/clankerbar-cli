@@ -52,11 +52,11 @@ type RosterProject struct {
 
 // RosterEntry is one declared instance as the account-scoped poll serves it.
 type RosterEntry struct {
-	Name         string            `json:"name"`
-	DesiredState string            `json:"desiredState"`
-	Placement    string            `json:"placement"`
+	Name         string                     `json:"name"`
+	DesiredState string                     `json:"desiredState"`
+	Placement    string                     `json:"placement"`
 	Overrides    map[string]json.RawMessage `json:"overrides"`
-	Projects     []RosterProject   `json:"projects"`
+	Projects     []RosterProject            `json:"projects"`
 }
 
 // RosterDesiredRunning / RosterDesiredStopped are the two desired states the
@@ -93,19 +93,19 @@ var rosterMachineLayerKeys = map[string]bool{
 // may be overridden on a roster entry). Mirrors the plane's
 // ROSTER_RUN_CONFIG_KEYS.
 var rosterRunConfigKeys = map[string]bool{
-	"$schema_version":        true,
-	"model":                  true,
-	"models":                 true,
-	"prompt":                 true,
-	"phases":                 true,
-	"max_turns":              true,
-	"max_session_wall_clock": true,
-	"backlog_url":            true,
-	"budget":                 true,
-	"escalation":             true,
-	"transitions":            true,
+	"$schema_version":         true,
+	"model":                   true,
+	"models":                  true,
+	"prompt":                  true,
+	"phases":                  true,
+	"max_turns":               true,
+	"max_session_wall_clock":  true,
+	"backlog_url":             true,
+	"budget":                  true,
+	"escalation":              true,
+	"transitions":             true,
 	"allow_local_mcp_servers": true,
-	"notes":                  true,
+	"notes":                   true,
 }
 
 // checkEntry is the supervisor's own copy of the plane's write-time gate: an

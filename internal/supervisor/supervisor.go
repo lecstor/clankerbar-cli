@@ -286,6 +286,14 @@ func Supervise(ctx context.Context, o Options) error {
 		d.cacheDir = dir
 	}
 
+	// The exit channel must exist BEFORE the first reconcile spawns children:
+	// a child that crashes between its spawn and the channel's creation would
+	// block forever on a nil-channel send, and its exit event would never
+	// reach the loop — no respawn, and stopAll would wait on a child that was
+	// already gone. The loop consumes constantly, so a modest fixed buffer is
+	// all a burst of simultaneous exits needs.
+	d.exits = make(chan exitEvent, 16)
+
 	if err := d.reconcile(); err != nil {
 		return err
 	}
@@ -304,7 +312,6 @@ func Supervise(ctx context.Context, o Options) error {
 	}
 	sort.Strings(names)
 	log.Printf("supervising %d instance(s) from the roster: %s", len(d.instances), strings.Join(names, ", "))
-	d.exits = make(chan exitEvent, len(d.instances))
 
 	pollTicker := time.NewTicker(d.o.PollInterval)
 	defer pollTicker.Stop()
@@ -821,6 +828,15 @@ func (d *Supervisor) respawnDue() {
 			continue
 		}
 		inst.restartAt = time.Time{}
+		// The schedule was made when the instance still wanted a child; a poll
+		// may have flipped it since (stopped, removed, refused, policy-refused)
+		// and the timer path must not spawn against the current desired state
+		// any more than the reconcile path would. Dropping the stale schedule
+		// is the idempotent move: the next reconcile re-evaluates the instance
+		// from the roster.
+		if inst.desired != RosterDesiredRunning || inst.removed || inst.refused || inst.policyRefused {
+			continue
+		}
 		d.spawn(inst)
 	}
 }

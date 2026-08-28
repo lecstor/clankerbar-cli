@@ -34,7 +34,9 @@ func testRosterEntries() []RosterEntry {
 }
 
 // The poll client decodes the account-scoped payload: entries with their
-// projects, and an absent overrides document as an empty (never nil) one.
+// projects, and an entry's overrides document. (An ABSENT overrides document
+// decodes to a nil map — the reconcile treats nil and empty alike, since both
+// read as "no override".)
 func TestRosterFetchDecodesEntries(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/daemon-roster" {

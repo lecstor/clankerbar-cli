@@ -83,10 +83,10 @@ func Supervise(ctx context.Context, args []string) error {
 	}
 
 	o := supervisor.Options{
-		Binary:  bin,
+		Binary:    bin,
 		RosterURL: strings.TrimRight(base.BacklogURL, "/") + "/api/daemon-roster",
-		APIKey:  key,
-		BaseCfg: base,
+		APIKey:    key,
+		BaseCfg:   base,
 	}
 	if root := os.Getenv(WorkdirRootEnv); root != "" {
 		o.WorkdirRoot = root
