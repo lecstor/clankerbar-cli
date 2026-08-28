@@ -83,6 +83,12 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	if loaded.WorkDir != filepath.Join(root, "widgets") {
 		t.Errorf("workdir = %q, want the derived %q", loaded.WorkDir, filepath.Join(root, "widgets"))
 	}
+	if len(loaded.Projects) != 1 {
+		t.Fatalf("projects = %d, want 1", len(loaded.Projects))
+	}
+	if loaded.Projects[0].WorkDir != filepath.Join(root, "widgets") {
+		t.Errorf("projects[0].workdir = %q, want the derived %q", loaded.Projects[0].WorkDir, filepath.Join(root, "widgets"))
+	}
 	if loaded.InstanceName != "daemon-one" {
 		t.Errorf("instance_name = %q, want the roster entry's name (daemon-one)", loaded.InstanceName)
 	}

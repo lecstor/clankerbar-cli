@@ -52,9 +52,18 @@ import (
 
 // applyDerivedWorkdirs writes the phase-2a derived workdirs into the config
 // the materialized file is built from: the single-project config's workdir,
-// or each project's own. The top-level workdir of a multi-project config
+// or each project's own. The top-level workdir of a MULTI-project config
 // stays as declared — it is the multi-repo parent, which the derivation does
 // not derive (sessions run in the per-project workdirs).
+//
+// A single-project config is the instance itself, not a multi-repo parent, so
+// its top-level workdir follows the derived checkout too (the phase-2b shape
+// the roster entry replaces, whose derivation landed top-level). Without the
+// pin, the materialized file's top-level `workdir` would be the supervisor's
+// launch cwd — implicit, machine-context-dependent — and the top-level
+// conventions resolved against it (mcp_config_path discovery, relative
+// settings_path, Config.Identity) would vary with wherever the supervisor
+// happened to start rather than the checkout the entry names.
 func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 	if len(cfg.Projects) == 0 {
 		if dir, ok := derived[""]; ok {
@@ -65,6 +74,11 @@ func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 	for i := range cfg.Projects {
 		if dir, ok := derived[cfg.Projects[i].Slug]; ok {
 			cfg.Projects[i].WorkDir = dir
+		}
+	}
+	if len(cfg.Projects) == 1 {
+		if dir, ok := derived[cfg.Projects[0].Slug]; ok {
+			cfg.WorkDir = dir
 		}
 	}
 }

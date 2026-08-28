@@ -336,6 +336,12 @@ func Supervise(ctx context.Context, o Options) error {
 // the running, stop the stopped, drop the gone. It is idempotent by
 // construction: unchanged state spawns nothing and writes nothing.
 func (d *Supervisor) reconcile() error {
+	if d.ctx.Err() != nil {
+		// The fleet stop is landing: the select loop may have picked this poll
+		// tick over ctx.Done, and acting on the roster now could spawn a child
+		// stopAll is about to drain. A cancelled context reconciles to nothing.
+		return nil
+	}
 	entries, err := d.roster.Fetch(d.ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotWired) {
