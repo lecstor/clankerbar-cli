@@ -1,38 +1,51 @@
-// Package supervisor runs the fleet supervisor (CLA-525, phase 1 of
+// Package supervisor runs the fleet supervisor (CLA-525, phases 1-3 of
 // docs/proposals/daemon-supervisor.md): bare `clankerbar` — or
-// `clankerbar supervise` — starts every daemon whose config file is in the
-// config dir as a supervised child process, restarts a child that exits
-// unexpectedly (with backoff), and forwards the supervisor's own
-// SIGINT/SIGTERM as a fleet-wide stop.
+// `clankerbar supervise` — reconciles the machine against the plane's
+// account-scoped roster: every entry with `desired: running` has a supervised
+// child up, every entry with `desired: stopped` has its stop marker written and
+// drains at its iteration boundary, and flipping desired state in the console
+// lands on the machine within one poll, with no operator command.
 //
 // The supervisor deliberately invents nothing. Each child is
 // `clankerbar run -c <file>` — the exact command the operator used to run by
-// hand — except the file is now the GENERATED effective config in the child's
-// state dir (phase 2b): the operator's declared intent with the machine
-// conventions materialized over it, regenerated on every reconcile. Instance
-// identity (`hostname/basename(config)`, ResolveInstanceName), per-instance
-// state dirs and the fleet beacon all behave exactly as before — identity
-// because the generated file pins it, and the state dir because the generated
-// file pins that too.
-// The permission-policy gate (phase 2c) runs at the child-start gate: the
-// settings_path the config names is the fail-closed headless permission
-// policy, and a daemon whose policy file is absent is refused rather than
-// started without one — at enumeration, and again at every spawn, so a policy
-// file deleted while the supervisor runs stops the next respawn, not the
-// running child.
-// Stopping a child means writing the STOP marker into its state dir, the same
-// marker a hand-written `touch STOP` writes, never killing the process: the
-// daemon drains at its iteration boundary and exits by itself. The one rule
-// the supervisor adds is the restart decision: a child that exits for any
-// reason other than a stop it was told about is respawned, with backoff.
+// hand — except the file is the GENERATED effective config in the child's
+// state dir (phase 2b): the operator's machine-layer local config with the
+// roster entry's project and its one permitted policy override (`harness` and
+// its per-harness block, Decision 1) materialized over it, regenerated on
+// every reconcile. Instance identity (`instance_name`), per-instance state
+// dirs and the fleet beacon all behave exactly as before — identity because
+// the generated file pins the roster name, and the state dir because the
+// generated file pins that too.
 //
-// What this phase does NOT do: no plane call, no roster, no desired state, no
-// version check, no self-update. The config dir is enumerated once at startup
-// — add a config file and restart the supervisor to pick it up.
+// The one-directional merge is an ALLOWLIST (roster.go): plane keys may set
+// policy and may NEVER reach `env`, `settings_path`, `workdir` or
+// `mcp_config_path`, and no run-config key other than `harness` and its block
+// is per-instance. A roster entry carrying one is refused loudly and named in
+// the log, never silently dropped — a silent drop is how a daemon ends up
+// looking configured and not being.
+//
+// Stopping a child means writing the STOP marker into its state dir, the same
+// marker `clankerbar ctl stop` writes, never killing the process: the daemon
+// drains at its iteration boundary and exits by itself. No new daemon-side
+// control mechanism exists — the supervisor is a translator, not a second
+// control plane. The one rule the supervisor adds is the restart decision: a
+// child that exits for any reason other than a stop it was told about is
+// respawned, with backoff. The permission-policy gate (phase 2c) runs at the
+// child-start gate: a config whose settings_path names an absent file is
+// refused rather than started without it — at reconcile, and again at every
+// spawn.
+//
+// The plane is polled, not held (Decision 2 — desired state, not commands: a
+// missed poll is caught by the next one, and nothing a reconnect could lose is
+// lost). An unreachable plane does not stop the fleet: a warm supervisor keeps
+// reconciling against the last-known-good roster, and a cold start reconciles
+// from the cached roster + materialized configs on disk (phase 2b wrote them
+// for exactly this) rather than starting nothing.
 package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -48,8 +61,8 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
-// Defaults for the restart backoff and the stop settle window. All four are
-// overridable through Options, which is what the tests do.
+// Defaults for the restart backoff, the stop settle window, and the roster
+// poll. All are overridable through Options, which is what the tests do.
 const (
 	// defaultBackoffBase is the first delay after an unexpected exit.
 	defaultBackoffBase = 2 * time.Second
@@ -75,12 +88,14 @@ const (
 	// session finishes), so the wait itself is never bounded; only its
 	// silence is.
 	defaultStopLogEvery = 30 * time.Second
+	// defaultPollInterval is how often the account-scoped roster is polled. A
+	// console flip lands within one poll, so this is the steering latency of
+	// the whole fleet; 15s is a toggle, not a queue.
+	defaultPollInterval = 15 * time.Second
 )
 
 // Options configures one supervisor run. Zero values take the defaults above.
 type Options struct {
-	// ConfigDir is the directory whose `*.json` files are the instances.
-	ConfigDir string
 	// Binary is the executable children are spawned with — the supervisor's
 	// own binary, so a child's restart (RESTART marker -> re-exec) stays on
 	// the same launch path the operator's shell uses.
@@ -88,14 +103,39 @@ type Options struct {
 
 	// WorkdirRoot is the machine-stated root each child's workdir derives
 	// from (phase 2a of the daemon-supervisor proposal): <root>/<repo name>
-	// for the repo the instance's project names. Empty = derivation is OFF
-	// and children run on their config files' own workdirs — the phase-1
-	// behaviour, unchanged. When set, EVERY instance is derived at
-	// enumeration, and a failed derivation — the derived directory missing,
-	// or not a checkout of the expected repo — refuses that daemon: it is
-	// never spawned, the path tried is reported, and the supervisor's own
-	// working directory is never used as a fallback (the CLA-441 failure).
+	// for the repo the instance's project names, taken from the roster entry
+	// (the plane's `project.primary_repo`). Empty = derivation is OFF and
+	// children run on the base config's own workdirs. When set, EVERY
+	// instance is derived at reconcile, and a failed derivation — the derived
+	// directory missing, or not a checkout of the expected repo — refuses
+	// that daemon: it is never spawned, the path tried is reported, and the
+	// supervisor's own working directory is never used as a fallback (the
+	// CLA-441 failure).
 	WorkdirRoot string
+
+	// RosterURL is the account-scoped roster endpoint the supervisor polls
+	// (`<origin>/api/daemon-roster`). Empty = not wired: Supervise refuses to
+	// run, because a supervisor without the roster is a supervisor with no
+	// desired state.
+	RosterURL string
+
+	// APIKey is the account key the roster is fetched with (CLANKERBAR_API_KEY
+	// in the environment). Empty = not wired, like RosterURL.
+	APIKey string
+
+	// BaseCfg is the machine-layer config every instance is built from: the
+	// operator's local config carrying env, settings_path, config_dir,
+	// mcp_config_path and the rest of what can never come from the plane.
+	// Nil = the discovered local config, or bare defaults when none exists.
+	BaseCfg *config.Config
+
+	// RosterCacheDir is where the supervisor keeps the last-known-good roster
+	// and the per-instance state dirs (with their materialized configs).
+	// Empty = the default under the loop state root.
+	RosterCacheDir string
+
+	// PollInterval is how often the roster is polled. 0 = defaultPollInterval.
+	PollInterval time.Duration
 
 	BackoffBase       time.Duration
 	BackoffCap        time.Duration
@@ -122,18 +162,43 @@ func (o Options) withDefaults() Options {
 	if o.StopLogEvery <= 0 {
 		o.StopLogEvery = defaultStopLogEvery
 	}
+	if o.PollInterval <= 0 {
+		o.PollInterval = defaultPollInterval
+	}
 	return o
 }
 
-// Instance is one supervised config file: the child process serving it, and
+// Instance is one supervised roster entry: the child process serving it, and
 // the bookkeeping that decides whether it gets respawned.
 type Instance struct {
-	path string // the config file
-	name string // resolved fleet identity, for logs
-	cfg  *config.Config
+	name  string       // the roster entry's name (also the fleet identity)
+	entry *RosterEntry // the roster row this instance serves
+
+	cfg      *config.Config
+	stateDir string
+
+	// desired is the entry's last reconciled desired state. Anything other
+	// than "running" — stopped, or an entry that vanished or was refused —
+	// means the child must not be respawned once it is gone.
+	desired string
+	// removed marks an instance whose entry is no longer on the roster: stop
+	// the child, never respawn, drop the instance once it has exited.
+	removed bool
+	// refused marks an instance whose entry failed the allowlist or shape
+	// checks: refused loudly, child stopped, never respawned.
+	refused bool
+	// stopRequested is set once a STOP marker has been written for a stopped
+	// instance's live child, so repeated polls write nothing (idempotent
+	// reconcile). Cleared on the next spawn.
+	stopRequested bool
+	// policyRefused is set when the last config build hit the permission-
+	// policy gate: the spawn is refused (even on a last-known-good config
+	// whose own policy file still exists), and the next poll retries the
+	// build — a restored policy file brings the daemon back without a
+	// supervisor restart (phase 2c).
+	policyRefused bool
 
 	mu         sync.Mutex
-	stateDir   string    // resolved at the last spawn (may move across edits)
 	cmd        *exec.Cmd // current child, nil while in backoff
 	exited     bool      // the current child has exited
 	aliveSince time.Time // when the current child was spawned
@@ -158,8 +223,20 @@ type Supervisor struct {
 	o Options
 
 	// hostname is the machine identity the fleet names resolve against,
-	// resolved once at startup (ResolveInstanceName).
+	// resolved once at startup.
 	hostname string
+
+	// roster is the account-scoped poll client; entries is the last-known-good
+	// roster the supervisor reconciles against when the plane is unreachable.
+	roster  *RosterClient
+	entries []RosterEntry
+
+	// cacheDir holds the cached roster and the per-instance state dirs.
+	cacheDir string
+
+	// loggedRemote remembers remote entries already reported, so the "ignored
+	// without error" line is said once per entry, not once per poll.
+	loggedRemote map[string]bool
 
 	instances []*Instance
 	exits     chan exitEvent
@@ -174,24 +251,20 @@ type Supervisor struct {
 // drains at its iteration boundary (possibly taking a while — an in-flight
 // session finishes), and Supervise waits for all of them before returning.
 //
-// A config dir holding no instance configs is not an error: the supervisor
-// says so and returns, rather than idling forever over nothing.
+// The first reconcile happens before the select loop; the plane is polled
+// from then on. A roster with nothing local on it (empty, or all remote) is
+// not an error: the supervisor says so and returns, rather than idling forever
+// over nothing — and an unreachable plane with no cached roster is the same
+// shape: nothing to reconcile from, so nothing to supervise.
 func Supervise(ctx context.Context, o Options) error {
 	host, _ := os.Hostname()
-	d := &Supervisor{o: o.withDefaults(), ctx: ctx, hostname: host}
-	if err := d.enumerate(); err != nil {
-		return err
+	d := &Supervisor{
+		o:            o.withDefaults(),
+		ctx:          ctx,
+		hostname:     host,
+		roster:       NewRosterClient(o.RosterURL, o.APIKey),
+		loggedRemote: map[string]bool{},
 	}
-	if len(d.instances) == 0 {
-		log.Printf("no instance configs in %s - nothing to supervise", d.o.ConfigDir)
-		return nil
-	}
-	names := make([]string, len(d.instances))
-	for i, inst := range d.instances {
-		names[i] = inst.name
-	}
-	log.Printf("supervising %d instance(s) from %s: %s", len(d.instances), d.o.ConfigDir, strings.Join(names, ", "))
-	d.exits = make(chan exitEvent, len(d.instances))
 
 	if ctx.Err() != nil {
 		// Cancelled before any child was spawned: nothing is running, so
@@ -202,10 +275,46 @@ func Supervise(ctx context.Context, o Options) error {
 		log.Print("stop requested before any child was started - nothing to stop")
 		return nil
 	}
-	for _, inst := range d.instances {
-		d.spawn(inst)
+
+	if o.RosterCacheDir != "" {
+		d.cacheDir = o.RosterCacheDir
+	} else {
+		dir, err := rosterCacheDir()
+		if err != nil {
+			return fmt.Errorf("supervise: %w", err)
+		}
+		d.cacheDir = dir
 	}
 
+	// The exit channel must exist BEFORE the first reconcile spawns children:
+	// a child that crashes between its spawn and the channel's creation would
+	// block forever on a nil-channel send, and its exit event would never
+	// reach the loop — no respawn, and stopAll would wait on a child that was
+	// already gone. The loop consumes constantly, so a modest fixed buffer is
+	// all a burst of simultaneous exits needs.
+	d.exits = make(chan exitEvent, 16)
+
+	if err := d.reconcile(); err != nil {
+		return err
+	}
+	if d.entries == nil {
+		// The plane was unreachable at start and no cached roster exists;
+		// reconcile already said so. Nothing to supervise.
+		return nil
+	}
+	if len(d.instances) == 0 {
+		log.Print("roster holds no local instances - nothing to supervise")
+		return nil
+	}
+	names := make([]string, len(d.instances))
+	for i, inst := range d.instances {
+		names[i] = inst.name
+	}
+	sort.Strings(names)
+	log.Printf("supervising %d instance(s) from the roster: %s", len(d.instances), strings.Join(names, ", "))
+
+	pollTicker := time.NewTicker(d.o.PollInterval)
+	defer pollTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -215,72 +324,328 @@ func Supervise(ctx context.Context, o Options) error {
 		case <-d.timerCh:
 			d.respawnDue()
 			d.armRestart()
+		case <-pollTicker.C:
+			d.reconcile()
 		}
 	}
 }
 
-// enumerate reads every `*.json` in the config dir and keeps the ones that are
-// actually instance configs. A file is skipped — loudly, so a file that stops
-// being supervised is never a surprise — when it is not JSON, carries no
-// recognized clankerbar key (MCP configs, headless permission policies and
-// other JSON share this directory), fails to load, fails to resolve the
-// machine conventions (the phase-2a workdir derivation, the phase-2c
-// permission-policy gate, and the same Load + Validate + state-dir resolution
-// `run` performs), or fails validation. A file that fails here would either
-// never have started a daemon or would crash-loop the child at startup;
-// skipping it with the reason is strictly more useful than supervising a
-// crash.
-func (d *Supervisor) enumerate() error {
-	files, err := filepath.Glob(filepath.Join(d.o.ConfigDir, "*.json"))
-	if err != nil {
-		return fmt.Errorf("list %s: %w", d.o.ConfigDir, err)
+// reconcile is one poll-and-apply pass: fetch the roster (or fall back to the
+// last-known-good one when the plane is unreachable), refresh every instance's
+// config from its entry, refuse what the allowlist refuses, and act — spawn
+// the running, stop the stopped, drop the gone. It is idempotent by
+// construction: unchanged state spawns nothing and writes nothing.
+func (d *Supervisor) reconcile() error {
+	if d.ctx.Err() != nil {
+		// The fleet stop is landing: the select loop may have picked this poll
+		// tick over ctx.Done, and acting on the roster now could spawn a child
+		// stopAll is about to drain. A cancelled context reconciles to nothing.
+		return nil
 	}
-	for _, f := range files {
-		data, err := os.ReadFile(f)
-		if err != nil {
-			log.Printf("skipping %s: %v", f, err)
-			continue
+	entries, err := d.roster.Fetch(d.ctx)
+	if err != nil {
+		if errors.Is(err, ErrNotWired) {
+			return err
 		}
-		if !config.LooksLikeConfig(data) {
-			log.Printf("skipping %s: not a clankerbar instance config (no recognized keys) - the config dir also holds MCP configs and permission policies, and those are not daemons", filepath.Base(f))
-			continue
-		}
-		cfg, err := config.Load(f)
-		if err != nil {
-			log.Printf("skipping %s: %v", filepath.Base(f), err)
-			continue
-		}
-		resolved, stateDir, err := d.resolveInstance(cfg)
-		if err != nil {
-			if d.o.WorkdirRoot != "" && errors.Is(err, ErrWorkdirRefused) {
-				// The fail-closed workdir derivation (phase 2a). A refusal here
-				// is like every other enumerate skip — the file would either
-				// never have started a daemon or would run one somewhere
-				// unverified — and the line reports the derived path that was
-				// tried. There is deliberately NO fallback to the supervisor's
-				// own working directory: that fallback is the CLA-441 failure,
-				// and a daemon whose workdir cannot be derived is not started
-				// at all.
-				log.Printf("skipping %s: workdir derivation refused: %v", f, err)
-			} else if errors.Is(err, ErrPolicyRefused) {
-				// The fail-closed permission-policy gate (phase 2c). A daemon
-				// whose settings_path names a file that does not exist would
-				// start without the policy the boundary requires; the line
-				// names the daemon and the policy path that was tried.
-				log.Printf("skipping %s (instance %s): permission policy refused: %v", f, cfg.ResolvedInstanceName(d.hostname), err)
+		if d.entries == nil {
+			// Cold start, plane unreachable: the last-known-good roster on
+			// disk is the fallback — a network blip must not be an outage
+			// (the proposal's offline seam, which phase 2b wrote materialized
+			// configs to disk for).
+			if cached := loadCachedRoster(d.cacheDir); len(cached) > 0 {
+				log.Printf("plane unreachable at start (%v) - starting from the cached roster", err)
+				d.entries = cached
 			} else {
-				log.Printf("skipping %s: %v", filepath.Base(f), err)
+				log.Printf("plane unreachable at start (%v) and no cached roster - nothing to supervise", err)
+				return nil
+			}
+		} else {
+			log.Printf("plane unreachable (%v) - reconciling against the last-known-good roster", err)
+		}
+		entries = d.entries
+	} else {
+		d.entries = entries
+		writeCachedRoster(d.cacheDir, entries)
+	}
+
+	byName := make(map[string]*Instance, len(d.instances))
+	for _, inst := range d.instances {
+		byName[inst.name] = inst
+	}
+	live := make(map[string]bool, len(entries))
+	for i := range entries {
+		e := &entries[i]
+		live[e.Name] = true
+		if e.Placement == RosterPlacementRemote {
+			// Decision 7: remote placement is not implemented, and the plane
+			// refuses it at write time anyway — but the supervisor must not
+			// fail on one, so it is ignored. Said once per entry, not once
+			// per poll.
+			if !d.loggedRemote[e.Name] {
+				log.Printf("roster: ignoring entry %q - placement remote is not implemented (Decision 7)", e.Name)
+				d.loggedRemote[e.Name] = true
 			}
 			continue
 		}
-		d.instances = append(d.instances, &Instance{
-			path:     f,
-			name:     resolved.ResolvedInstanceName(d.hostname),
-			cfg:      resolved,
-			stateDir: stateDir,
+		if err := checkEntry(e); err != nil {
+			// Refused loudly, named in the log, never silently dropped. The
+			// plane's own write-time gate should make this unreachable; the
+			// supervisor's copy is the boundary's last line.
+			log.Print(err)
+			if inst := byName[e.Name]; inst != nil {
+				inst.refused = true
+			}
+			continue
+		}
+		inst := byName[e.Name]
+		if inst == nil {
+			inst = &Instance{name: e.Name, entry: e}
+			d.instances = append(d.instances, inst)
+		}
+		// The entry is the desired state: refresh the pointer every poll, so
+		// an edit on the plane (a harness override, a project list, the
+		// desired state) is what the next build reads. Holding the first
+		// poll's entry would freeze the instance on the configuration that
+		// created it.
+		inst.entry = e
+		inst.refused = false
+		inst.removed = false
+		inst.desired = e.DesiredState
+		d.refreshInstance(inst)
+	}
+
+	// An instance whose entry is gone (deleted in the console) is a stop, not
+	// a mystery: the operator removed its configuration, and the supervisor
+	// must not keep the daemon it was configuration for.
+	for _, inst := range d.instances {
+		if inst.refused || live[inst.name] {
+			continue
+		}
+		if !inst.removed {
+			inst.removed = true
+			log.Printf("%s: no longer on the roster - writing STOP and leaving it stopped", inst.name)
+		}
+	}
+
+	// Act on the fleet.
+	for _, inst := range d.instances {
+		switch {
+		case inst.refused || inst.removed || inst.desired == RosterDesiredStopped:
+			d.ensureStopped(inst)
+		default:
+			d.ensureRunning(inst)
+		}
+	}
+
+	// Drop instances that are gone and have already exited; the ones still
+	// draining stay until their child's exit event arrives.
+	kept := d.instances[:0]
+	for _, inst := range d.instances {
+		inst.mu.Lock()
+		alive := inst.cmd != nil && !inst.exited
+		inst.mu.Unlock()
+		if (inst.removed || inst.refused) && !alive {
+			continue
+		}
+		kept = append(kept, inst)
+	}
+	d.instances = kept
+
+	d.armRestart()
+	return nil
+}
+
+// refreshInstance rebuilds one instance's effective config from its roster
+// entry. The result is what the next spawn materializes. A build that fails:
+//
+//   - with ErrPolicyRefused (phase 2c) refuses the spawn — even on the last
+//     known config, because that config's own policy file may be the one the
+//     operator replaced — and the next poll retries the build;
+//   - for any other reason (workdir derivation, validation, an unknown
+//     harness) keeps the last-known-good: the previous config, or the
+//     materialized config on disk, so a blip never takes a running daemon
+//     down. Loud, never silent: the log says why the child will run on the
+//     old config.
+func (d *Supervisor) refreshInstance(inst *Instance) {
+	fresh, sd, err := d.buildConfig(inst.entry)
+	if err == nil {
+		inst.mu.Lock()
+		inst.cfg = fresh
+		inst.stateDir = sd
+		inst.mu.Unlock()
+		inst.policyRefused = false
+		return
+	}
+	if errors.Is(err, ErrPolicyRefused) {
+		log.Printf("%s: refused: %v - retrying on the next poll", inst.name, err)
+		inst.policyRefused = true
+		return
+	}
+	// The state dir is deterministic from the entry name, so a cold start
+	// whose build fails (the plane unreachable and the base config no longer
+	// resolvable — a moved workdir, a corrupt edit) can still find the
+	// last-known-good materialized config phase 2b wrote for exactly this.
+	inst.mu.Lock()
+	if inst.stateDir == "" {
+		inst.stateDir = rosterStateDir(d.cacheDir, inst.entry.Name)
+	}
+	inst.mu.Unlock()
+	if loaded := d.loadMaterialized(inst); loaded != nil {
+		inst.mu.Lock()
+		inst.cfg = loaded
+		inst.mu.Unlock()
+		log.Printf("%s: building its config failed (%v) - spawning on the last-known-good materialized config", inst.name, err)
+		return
+	}
+	if inst.cfg != nil {
+		log.Printf("%s: building its config failed (%v) - keeping the previous config", inst.name, err)
+		return
+	}
+	log.Printf("%s: building its config failed (%v) and no last-known-good exists - not started", inst.name, err)
+}
+
+// buildConfig materializes one roster entry into an effective config: the
+// machine-layer base (the operator's local config), with the entry's project
+// list, its one permitted policy override (`harness` and the per-harness
+// block's model/models half), and the pinned identity and state dir written
+// over it — then the same resolution `run` performs: the phase-2a workdir
+// derivation, Validate, the phase-2c permission-policy gate, and the state-dir
+// resolution.
+func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error) {
+	base := d.o.BaseCfg
+	if base == nil {
+		var err error
+		base, err = config.Load("")
+		if err != nil {
+			return nil, "", err
+		}
+	} else if src := base.Source(); src != "" {
+		// The machine layer is the operator's local config, and edits to it
+		// apply at the next reconcile exactly as source-file edits did in
+		// phase 2: re-read it on every build. A re-read that fails (a corrupt
+		// edit, a deleted file) keeps the last good base — the same fallback
+		// posture as every other failed re-read.
+		if re, err := config.Load(src); err == nil {
+			base = re
+		} else {
+			log.Printf("re-reading the supervisor's local config (%s) failed (%v) - keeping the last good one", src, err)
+		}
+	}
+	cfg := base.Clone()
+	// The roster owns the projects: each entry names the project(s) it
+	// drives, and each project's primary repo is what the workdir derivation
+	// derives from (the plane's `project.primary_repo` in place of the local
+	// declaration phase 2a read).
+	cfg.InstanceName = e.Name
+	cfg.StateDir = rosterStateDir(d.cacheDir, e.Name)
+	cfg.Projects = make([]config.Project, 0, len(e.Projects))
+	for _, p := range e.Projects {
+		cfg.Projects = append(cfg.Projects, config.Project{
+			Slug:        strings.TrimSpace(p.Slug),
+			PrimaryRepo: strings.TrimSpace(p.PrimaryRepo),
 		})
 	}
-	return nil
+	// Decision 1: harness and its per-harness block are the ONLY per-instance
+	// policy overrides. checkEntry has already refused every other key; what
+	// lands here is exactly the two allowed ones.
+	if raw, ok := e.Overrides["harness"]; ok {
+		var h string
+		if err := json.Unmarshal(raw, &h); err != nil {
+			return nil, "", fmt.Errorf("entry %q: harness override is not a string: %v", e.Name, err)
+		}
+		cfg.Harness = strings.TrimSpace(h)
+	}
+	if raw, ok := e.Overrides["harnesses"]; ok {
+		var blocks map[string]config.RunConfigHarnessBlock
+		if err := json.Unmarshal(raw, &blocks); err != nil {
+			return nil, "", fmt.Errorf("entry %q: harnesses override is not a per-harness block: %v", e.Name, err)
+		}
+		for name, b := range blocks {
+			hc := cfg.Harnesses[name]
+			hc.Model = strings.TrimSpace(b.Model)
+			if b.Models != nil {
+				hc.Models = b.Models
+			}
+			cfg.Harnesses[name] = hc
+		}
+	}
+	return d.resolveInstance(cfg)
+}
+
+// loadMaterialized loads an instance's last-known-good materialized config
+// from its state dir — the file phase 2b wrote and the child last ran on. It
+// is the cold-start fallback: a config the roster entry can no longer produce
+// (the workdir moved while the plane was unreachable) still has its last
+// materialization on disk, and the daemon runs on that rather than not at all.
+func (d *Supervisor) loadMaterialized(inst *Instance) *config.Config {
+	inst.mu.Lock()
+	dir := inst.stateDir
+	inst.mu.Unlock()
+	if dir == "" {
+		return nil
+	}
+	cfg, err := config.Load(filepath.Join(dir, statedir.MaterializedConfigName))
+	if err != nil {
+		return nil
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil
+	}
+	return cfg
+}
+
+// ensureRunning brings one instance to its desired running state: a live child
+// needs nothing (idempotent), a backoff respawn already scheduled needs
+// nothing (the timer owns it), a refused or config-less instance starts
+// nothing.
+func (d *Supervisor) ensureRunning(inst *Instance) {
+	if inst.policyRefused || inst.halted {
+		// Refused at build time: the spawn must not fall back to the last
+		// config, and the next poll retries the build. HALTed: the operator
+		// planted the per-instance stop switch; the poll must not undo it.
+		return
+	}
+	inst.mu.Lock()
+	alive := inst.cmd != nil && !inst.exited
+	pending := !inst.restartAt.IsZero()
+	inst.mu.Unlock()
+	if alive || pending {
+		return
+	}
+	if inst.cfg == nil {
+		return // nothing to start yet: the build failed and no last-known-good exists
+	}
+	d.spawn(inst)
+}
+
+// ensureStopped brings one instance to its desired stopped state: STOP is
+// written exactly once per live child (past the settle window, so the marker
+// cannot be eaten by the child's startup consumption — CLA-491), and the
+// child drains at its iteration boundary. Idempotent: a STOP already written
+// writes nothing more.
+func (d *Supervisor) ensureStopped(inst *Instance) {
+	inst.mu.Lock()
+	alive := inst.cmd != nil && !inst.exited
+	since := time.Since(inst.aliveSince)
+	dir := inst.stateDir
+	inst.mu.Unlock()
+	if !alive {
+		return
+	}
+	if inst.stopRequested {
+		return // STOP already written; waiting for the drain
+	}
+	if since < d.o.SettleBeforeStop {
+		return // inside the startup window; the next poll writes it
+	}
+	if dir == "" {
+		return
+	}
+	if _, err := os.Lstat(dir); err != nil {
+		return // no state dir yet; the next poll writes it
+	}
+	d.writeStop(inst, dir)
+	inst.stopRequested = true
 }
 
 // resolveInstance resolves the machine conventions one instance runs under,
@@ -297,8 +662,8 @@ func (d *Supervisor) enumerate() error {
 // policy cannot be verified is not started at all.
 //
 // The derivation applies only when WorkdirRoot is set — with no machine root
-// stated, the config's own workdir governs (the phase-1 behaviour, unchanged)
-// and the config validates exactly as `run` would validate it.
+// stated, the base config's own workdir governs and the config validates
+// exactly as `run` would validate it.
 func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string, error) {
 	if d.o.WorkdirRoot != "" {
 		derived, err := deriveInstanceWorkdirs(cfg, d.o.WorkdirRoot)
@@ -320,64 +685,50 @@ func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string
 	return cfg, stateDir, nil
 }
 
-// spawn starts one instance's child. The source config is re-read and
-// re-resolved first (same derivation + Load + Validate + state-dir resolution
-// + permission-policy gate the enumerate performed), so the supervisor's
-// record of the state dir and the materialized config follow edits the
-// operator made since the last spawn — the RUNNING child still reads the file
-// it started with, and a RELOAD keeps that handle, so the freshly materialized
-// file is exactly what the next child starts from. A source that no longer
-// loads, derives or validates leaves the last good config in place: the child
-// is spawned on the previous materialization, which is exactly what the
-// on-disk cache is for — subject to the policy gate below, which still
-// refuses the spawn if that config's policy file is gone too. A source whose
-// permission policy cannot be verified is refused with backoff instead: its
-// settings_path names the policy the daemon must run under, and the child
-// must not be started under a different one.
+// spawn starts one instance's child on its effective config, materialized
+// into the instance's state dir. The permission-policy gate (phase 2c) runs
+// here as the hard child-start gate, over a config RE-RESOLVED at the spawn:
+// the entry is built fresh from the current roster row and the current base
+// config, so an edit that lands between polls is seen at the child-start gate,
+// not on the next reconcile. A ErrPolicyRefused re-resolve refuses with backoff
+// and never falls back — the last materialized config may name the very policy
+// file the operator replaced. Any other re-resolve failure keeps the
+// last-known-good (the previous build, or the materialized config loaded by
+// refreshInstance), and the gate re-checks THAT config's policy file too: a
+// fallback whose own policy is gone is also refused. Retry with backoff, so a
+// policy file restored while the supervisor runs is picked up by the next
+// respawn.
 //
 // The child is spawned with `run -c` pointing at the MATERIALIZED config in
-// its state dir — never the source file, so the config a daemon runs on is
-// always the generated artifact. A materialization that cannot be written (an
-// unwritable or unadoptable state dir) is as unexpected as a spawn failure:
-// same backoff, same ladder, no child.
+// its state dir — never the operator's local config — so the config a daemon
+// runs on is always the generated artifact. A materialization that cannot be
+// written (an unwritable or unadoptable state dir) is as unexpected as a
+// spawn failure: same backoff, same ladder, no child.
 func (d *Supervisor) spawn(inst *Instance) {
-	if fresh, err := config.Load(inst.path); err == nil {
-		if resolved, sd, err := d.resolveInstance(fresh); err == nil {
-			inst.mu.Lock()
-			inst.cfg = resolved
-			inst.stateDir = sd
-			inst.mu.Unlock()
-		} else if errors.Is(err, ErrPolicyRefused) {
-			// A permission-policy refusal is not a fallback trigger: the
-			// config the operator is looking at names a policy file that does
-			// not exist, and starting the child on the last materialized
-			// config would silently keep the daemon running under a policy the
-			// operator has replaced (that config's settings_path may name a
-			// different file than the one the source names now). Fail closed
-			// like the enumeration gate: refuse with backoff, and a restored
-			// or fixed file is picked up by the next retry.
+	fresh, sd, err := d.buildConfig(inst.entry)
+	if err != nil {
+		if errors.Is(err, ErrPolicyRefused) {
 			log.Printf("%s: refusing to start: %v - retrying with backoff", inst.name, err)
 			inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
 			return
-		} else {
-			log.Printf("%s: re-resolving its config failed (%v) - spawning on the last materialized config", inst.name, err)
 		}
+		log.Printf("%s: re-resolving its config failed (%v) - spawning on the last-known-good config", inst.name, err)
 	} else {
-		log.Printf("%s: re-reading its config failed (%v) - spawning on the last materialized config", inst.name, err)
+		inst.mu.Lock()
+		inst.cfg = fresh
+		inst.stateDir = sd
+		inst.mu.Unlock()
+		inst.policyRefused = false
 	}
-	// The permission-policy gate (phase 2c) at the child-start gate. The
-	// config that will actually be spawned — freshly resolved, or the last
-	// materialized config after a re-read/re-resolve failure of any OTHER kind
-	// — must name a permission policy file that exists; an absent one refuses
-	// the spawn, the refusal naming the daemon and the path. A fresh config
-	// has already passed this check inside resolveInstance; the re-check is
-	// the hard gate the boundary wants, and it is what refuses the fallback
-	// when that config's policy file is gone too. Retry with backoff instead,
-	// so a policy file restored while the supervisor runs is picked up by the
-	// next respawn.
 	inst.mu.Lock()
 	cfg := inst.cfg
 	inst.mu.Unlock()
+	if cfg == nil {
+		// The build failed and no last-known-good exists — nothing to start;
+		// the next poll retries the build.
+		log.Printf("%s: nothing to start - the config build failed and no last-known-good exists", inst.name)
+		return
+	}
 	if err := checkPermissionPolicy(cfg); err != nil {
 		log.Printf("%s: refusing to start: %v - retrying with backoff", inst.name, err)
 		inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
@@ -411,14 +762,18 @@ func (d *Supervisor) spawn(inst *Instance) {
 	inst.exited = false
 	inst.exitErr = nil
 	inst.mu.Unlock()
+	// A fresh child starts clean: the next stopped flip must write its STOP
+	// again, it must not inherit the previous child's marker state.
+	inst.stopRequested = false
 	log.Printf("%s: spawned (pid %d, %s)", inst.name, cmd.Process.Pid, cfgPath)
 	go func() {
 		d.exits <- exitEvent{inst, cmd.Wait()}
 	}()
 }
 
-// onExit classifies one child exit: a stop the supervisor ordered, a HALT the
-// operator planted, or an unexpected exit. Only the last respawns.
+// onExit classifies one child exit: a stop the supervisor ordered (desired
+// state, roster removal, refusal), a HALT the operator planted, or an
+// unexpected exit. Only the last respawns.
 func (d *Supervisor) onExit(inst *Instance, err error) {
 	// The exited flag is set BEFORE the ctx check, not after: the select loop
 	// may have picked this event in the same instant the fleet stop landed
@@ -433,6 +788,15 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 
 	if d.ctx.Err() != nil {
 		return // the fleet is stopping; stopAll owns the outcome now
+	}
+
+	// A child that was told to stop — desired stopped, entry removed,
+	// entry refused — is not restarted. The desired flip is reconciled on the
+	// next poll, so a child that dies between the flip and the STOP write is
+	// also left stopped: the instance's desired state is authoritative, not
+	// the marker's arrival.
+	if inst.desired != RosterDesiredRunning || inst.removed || inst.refused {
+		return
 	}
 
 	if inst.halted {
@@ -512,6 +876,15 @@ func (d *Supervisor) respawnDue() {
 			continue
 		}
 		inst.restartAt = time.Time{}
+		// The schedule was made when the instance still wanted a child; a poll
+		// may have flipped it since (stopped, removed, refused, policy-refused,
+		// HALTed) and the timer path must not spawn against the current desired
+		// state any more than the reconcile path would. Dropping the stale
+		// schedule is the idempotent move: the next reconcile re-evaluates the
+		// instance from the roster.
+		if inst.desired != RosterDesiredRunning || inst.removed || inst.refused || inst.policyRefused || inst.halted {
+			continue
+		}
 		d.spawn(inst)
 	}
 }
@@ -589,7 +962,7 @@ func (d *Supervisor) stopAll() error {
 				continue
 			}
 			inst.mu.Lock()
-			alive := !inst.exited
+			alive := inst.cmd != nil && !inst.exited
 			since := time.Since(inst.aliveSince)
 			dir := inst.stateDir
 			inst.mu.Unlock()
@@ -619,13 +992,13 @@ func (d *Supervisor) stopAll() error {
 //     lands. A STOP the daemon finds at startup is consumed WITHOUT stopping
 //     (CLA-491: a marker a previous run left behind must not kill the next
 //     one), so a stop written into that window would be eaten and the child
-//     would run on. stopAll only calls this once the child has been alive for
-//     the settle window, which guarantees it has passed that consumption.
+//     would run on. The callers only call this once the child has been alive
+//     for the settle window, which guarantees it has passed that consumption.
 //   - The state dir is never CREATED here: a dir the supervisor created for a
 //     child that has not started yet would be adopted by that child, whose
 //     startup would then eat the marker exactly as above. Writing into a dir
-//     the child itself created (the Lstat gate in stopAll) is what guarantees
-//     the child is past its startup marker check.
+//     the child itself created (the Lstat gate in the callers) is what
+//     guarantees the child is past its startup marker check.
 //
 // A child that cannot be stopped this way — the state dir refuses to open, or
 // the marker write fails — is logged loudly and left running: the supervisor
