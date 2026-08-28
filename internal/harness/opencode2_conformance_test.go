@@ -219,3 +219,75 @@ func TestOpencode2Conformance(t *testing.T) {
 		})
 	}
 }
+
+// TestOpencode2ConformanceContentPin pins the load-bearing ordering behind the
+// adapter's config pin: the beta merges OPENCODE_CONFIG_CONTENT AFTER
+// OPENCODE_CONFIG (verified 2026-08-28 with both directions; see env's
+// comment). The adapter hands the driver's file over as OPENCODE_CONFIG plus
+// its bytes as OPENCODE_CONFIG_CONTENT, so the pin holds only while content is
+// the later layer — and the beta changes without notice (CLA-381), so a build
+// that reverses the ordering must turn this red rather than silently
+// un-pinning the driver's config (the CLA-441 defect class). Executed RAW (not
+// through Invoke) on purpose: through the adapter, the content bytes are the
+// file's own, which would mask the ordering with the dup-key override; the
+// adapter's own env shape is unit-tested (TestOpencode2Env). Here
+// OPENCODE_CONFIG names a DEAD provider and the content layer names the fake —
+// the session reaching the fake proves the ordering.
+func TestOpencode2ConformanceContentPin(t *testing.T) {
+	requireOpencode2Conformance(t)
+
+	fake := &fakeOpenAI{script: "stop"}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	deadCfg := t.TempDir() + "/opencode.json"
+	dead := fmt.Sprintf(`{
+  "$schema": "https://opencode.ai/config.json",
+  "model": { "providerID": "dead", "model": "dead-model" },
+  "provider": {
+    "dead": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": "http://127.0.0.1:1/v1", "apiKey": "k" },
+      "models": { "dead-model": { "name": "Dead" } }
+    }
+  }
+}`)
+	if err := os.WriteFile(deadCfg, []byte(dead), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := os.Environ()
+	env = append(env, opencodeIsolateEnv(t)...)
+	env = append(env, "OPENCODE_CONFIG="+deadCfg)
+	env = append(env, "OPENCODE_CONFIG_CONTENT="+fakeConfigContent(t, srv.URL))
+	ctx, cancel := context.WithTimeout(context.Background(), opencode2ConformanceOut)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "opencode2", "run", "--standalone", "--format", "json", "--", conformancePrompt)
+	cmd.Dir = t.TempDir()
+	cmd.Env = env
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	if fake.hit.Load() == 0 {
+		t.Fatal("content layer did not win over OPENCODE_CONFIG — a build that reverses the merge order would silently un-pin the driver's config (CLA-441)")
+	}
+	if !strings.Contains(string(out), `"text":"OK"`) {
+		t.Errorf("final answer not on the stream: %.200s", out)
+	}
+}
+
+// fakeConfigContent is the same 2.x-schema config opencode2FakeConfig writes,
+// returned as a string for the content layer.
+func fakeConfigContent(t *testing.T, providerURL string) string {
+	t.Helper()
+	return fmt.Sprintf(`{
+  "$schema": "https://opencode.ai/config.json",
+  "model": { "providerID": "fake", "model": "fake-model" },
+  "provider": {
+    "fake": {
+      "npm": "@ai-sdk/openai-compatible",
+      "options": { "baseURL": %q, "apiKey": "test-key" },
+      "models": { "fake-model": { "name": "Fake Model" } }
+    }
+  }
+}`, providerURL+"/v1")
+}
