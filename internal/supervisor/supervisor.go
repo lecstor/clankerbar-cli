@@ -75,6 +75,17 @@ type Options struct {
 	// the same launch path the operator's shell uses.
 	Binary string
 
+	// WorkdirRoot is the machine-stated root each child's workdir derives
+	// from (phase 2a of the daemon-supervisor proposal): <root>/<repo name>
+	// for the repo the instance's project names. Empty = derivation is OFF
+	// and children run on their config files' own workdirs — the phase-1
+	// behaviour, unchanged. When set, EVERY instance is derived at
+	// enumeration, and a failed derivation — the derived directory missing,
+	// or not a checkout of the expected repo — refuses that daemon: it is
+	// never spawned, the path tried is reported, and the supervisor's own
+	// working directory is never used as a fallback (the CLA-441 failure).
+	WorkdirRoot string
+
 	BackoffBase       time.Duration
 	BackoffCap        time.Duration
 	BackoffResetAfter time.Duration
@@ -229,6 +240,19 @@ func (d *Supervisor) enumerate() error {
 		if err != nil {
 			log.Printf("skipping %s: %v", filepath.Base(f), err)
 			continue
+		}
+		if d.o.WorkdirRoot != "" {
+			// The fail-closed workdir derivation (phase 2a). A refusal here is
+			// like every other enumerate skip — the file would either never
+			// have started a daemon or would run one somewhere unverified —
+			// and the line reports the derived path that was tried. There is
+			// deliberately NO fallback to the supervisor's own working
+			// directory: that fallback is the CLA-441 failure, and a daemon
+			// whose workdir cannot be derived is not started at all.
+			if _, err := deriveInstanceWorkdirs(cfg, d.o.WorkdirRoot); err != nil {
+				log.Printf("skipping %s: workdir derivation refused: %v", f, err)
+				continue
+			}
 		}
 		d.instances = append(d.instances, &Instance{
 			path:     f,

@@ -430,6 +430,17 @@ self-update. The config dir is enumerated **once, at startup** — add a config
 file and restart the supervisor to pick it up. The startup log names every
 file it picked up and every file it skipped, with the reason.
 
+**Workdir derivation (phase 2a).** Set `CLANKERBAR_WORKDIR_ROOT` to the
+machine's one checkout root and the supervisor derives each child's workdir as
+`<root>/<repo name>` for the repo its config names (`primary_repo`, per project
+when the config drives several). Derivation fails closed, both conditions
+learned from the CLA-441 wrong-workdir failure: if the derived directory does
+not exist, or is not a checkout of the expected repo (its origin remote names
+something else), that daemon is **refused at startup** — the path tried is
+reported, nothing is created, and the supervisor's own working directory is
+never used as a fallback. With the variable unset, derivation is off and
+children run on their config files' own workdirs, exactly as before.
+
 The config dir also holds JSON that is not instance configs — MCP configs
 (`opencode-mcp.json`), headless permission policies (`headless-drain.json`),
 opencode's own config (`opencode.json`) — and the supervisor tells them apart
