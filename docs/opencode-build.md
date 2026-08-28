@@ -1,8 +1,11 @@
-# Which opencode build we run, and why not opencode2
+# Which opencode build we run
 
-Short answer: **the Homebrew stable line** (`/opt/homebrew/bin/opencode`, 1.18.x). Not
-`opencode2`. This page exists because that was decided on 2026-08-19 and never written
-down, and re-deriving it a day later cost real time.
+Short answer: **the Homebrew stable line** (`/opt/homebrew/bin/opencode`, 1.18.x) is what
+the fleet runs today, and **opencode2 is supported and is the direction** (decision
+`f953195e`, 2026-08-28, recorded below). This page exists because the switch to stable was
+decided on 2026-08-19 and never written down, and re-deriving it a day later cost real time;
+its original "why not opencode2" heading was reconstructed speculation that got quoted as a
+verdict and cost a working adapter (CLA-538) before the operator made the call it asked for.
 
 ## The adapter runs a bare name, so PATH decides
 
@@ -18,11 +21,30 @@ from the same resolution the driver will do. The `[opencode]` qualifier appears 
 opencode is a phase harness here; were it the run harness the label would read bare
 `harness`.
 
-## Why not opencode2
+## opencode2 is supported
 
-We ran the `opencode2` nightly (`0.0.0-next-17403`) on the first mixed-harness drain,
-2026-08-19. At 12:48 an implement session about five minutes and 21 tool calls into a task
-emitted a single untyped error event and exited 1:
+**Decision `f953195e` (2026-08-28, operator): OpenCode 2 is the direction, and the CLI
+will support it.** The opencode2 adapter that CLA-538 dropped relands under **CLA-541**,
+carrying the permission-policy fix the decision makes required: no path may leave a
+registered harness reading ambient config with no `OPENCODE_PERMISSION` while doctor
+reports pass.
+
+The paragraph this one replaces was reconstructed from CLA-381 and said so in its body -
+"no decision record exists for the switch back to stable" - but its heading, "why not
+opencode2", read as a verdict, and that is how it got quoted one hop away. A page
+reconstructing a decision nobody recorded should say so in its heading, not only in its
+body: the next reader may be an agent that quotes the heading.
+
+opencode2 is not a vanished nightly. **v0.0.0-beta-18314** is installed at
+`~/Library/pnpm/bin/opencode2` (2026-08-27), with a launcher at
+`~/.config/opencode2/opencode2-wrapper.sh` that sets `OPENCODE_CONFIG_DIR=~/.config/opencode2`
+so the v2 plugin dir loads and opencode v1 never sees it. The pinned `v0.0.0-dev-17653` is
+gone; the line moved, it did not die.
+
+The history that made this page hedge is real and stays: we ran the `opencode2` nightly
+(`0.0.0-next-17403`) on the first mixed-harness drain, 2026-08-19. At 12:48 an implement
+session about five minutes and 21 tool calls into a task emitted a single untyped error
+event and exited 1:
 
 ```json
 {"type":"error","error":{"type":"unknown","message":"Transport"}}
@@ -32,23 +54,14 @@ A transport drop is the canonical transient, but the driver treated any opencode
 terminal, so one provider hiccup stopped **the whole daemon** and needed a hand restart.
 That is **CLA-381**, and it fixed our classifier - transient stream failures now retry under
 the existing backoff. The classifier fix stands on its own and is not a reason to avoid
-opencode2.
+opencode2; with the decision above on record, that sentence stops being a hedge and becomes
+the point.
 
-**No decision record exists for the switch back to stable.** What follows is reconstructed
-from CLA-381 and can be corrected by whoever actually made the call.
-
-The likely reason is narrower and duller than the incident: the nightly's error surface is
-undocumented and changes without notice, and an unattended fleet cannot classify failures it
-cannot predict. CLA-381's note is *consistent with* that, though it warns about both builds in
-the same breath - *"the error surface may be version-dependent: this was the opencode2 nightly
-... stable 1.18.x may report stream failures differently, so classify by pattern"*. Read as
-written, it pins neither surface; it is an argument for pattern-matching, not for stable.
-
-**There is a live trap from that experiment.** `~/.config/clankerbar/bin/opencode` is a
-symlink to `opencode2.exe`, created 2026-08-19 12:43, five minutes before the incident above.
-It is **abandoned**, and inert only because that directory is on nobody's PATH. If anything
-ever puts it there, the whole fleet silently switches binaries with no log line saying so.
-Delete it, or if you keep it, say here what it is for.
+**Never let a symlink silently switch the fleet's binary.** The 2026-08-19 experiment left
+an abandoned `~/.config/clankerbar/bin/opencode` symlink to `opencode2.exe`, inert only
+because that directory sat on nobody's PATH. The directory no longer exists (verified
+2026-08-28), so the trap is gone; the shape is the one to never recreate - a symlink that
+switches every daemon's binary with no log line saying so.
 
 ## Stable is not free of defects either
 
@@ -84,4 +97,5 @@ The shape that works is `:1301`, where a `content-filter` finish is surfaced as 
   Console Go tool-schema rejection family. A different failure with a different cause; do not
   reach for it when a session dies quietly with zero usage.
 - CLA-381 (the opencode2 incident and the classifier fix), CLA-401 (the investigation that
-  cleared the gateway and the model), CLA-406 (our mitigation).
+  cleared the gateway and the model), CLA-406 (our mitigation), CLA-541 (the opencode2
+  adapter reland), CLA-538 (the drop that reverted it and prompted the decision above).
