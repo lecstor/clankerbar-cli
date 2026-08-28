@@ -335,3 +335,64 @@ func TestSessionShapingReportIgnoresPowerlessDeclarations(t *testing.T) {
 		}
 	})
 }
+
+// CLA-541: an opencode2 run gets the same ambient-config audit as an opencode
+// one (spawnsOpencode covers both lines), it scans the v2 global config dir
+// (~/.config/opencode2 — the file an operator actually edits for the beta),
+// and the v2 `mcp.servers` dialect parses (verified against beta-18314,
+// docs/opencode2.md). The run's own slug is derived through the same dialect.
+func opencode2Run(t *testing.T, slug, workdir string) *Config {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	mcp := writeAmbientFile(t, filepath.Join(t.TempDir(), "opencode2-mcp.json"),
+		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/`+slug+`"}}}}`)
+	return &Config{
+		Harness:       "opencode2",
+		Prompt:        "Work the next backlog item.",
+		WorkDir:       workdir,
+		MCPConfigPath: mcp,
+	}
+}
+
+func TestOpencode2RunScansItsGlobalDirAndDialect(t *testing.T) {
+	home := t.TempDir()
+	cfg := opencode2Run(t, "proj", t.TempDir())
+	t.Setenv("HOME", home)
+	// The v2 global config dir names a DIFFERENT project in the beta's own
+	// mcp.servers dialect.
+	writeAmbientFile(t, filepath.Join(home, ".config/opencode2/opencode.json"),
+		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}}`)
+	got := cfg.OpencodeAmbientConflicts()
+	c := onlyConflict(t, got)
+	if c.Got != "other" || c.Want != "proj" {
+		t.Errorf("conflict = %+v, want other vs proj", c)
+	}
+	if c.Scope != "global" {
+		t.Errorf("scope = %q, want global", c.Scope)
+	}
+}
+
+func TestOpencode2GlobalDirIsNotScannedForV1Runs(t *testing.T) {
+	// The v2 config dir is scanned for opencode2 runs only — a v1 run's audit
+	// must not send the operator to edit ~/.config/opencode2, a file no v1
+	// session loads.
+	cfg := opencodeRun(t, "proj", t.TempDir(), "")
+	writeAmbientFile(t, filepath.Join(t.TempDir(), ".config/opencode2/opencode.json"),
+		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}}`)
+	if got := cfg.OpencodeAmbientConflicts(); len(got) != 0 {
+		t.Errorf("v1 run flagged a v2-only config: %+v", got)
+	}
+}
+
+func TestOpencode2RunScansDeclaredConfigDir(t *testing.T) {
+	cfg := opencode2Run(t, "proj", t.TempDir())
+	dir := t.TempDir()
+	cfg.Harnesses = map[string]HarnessConfig{"opencode2": {ConfigDir: dir}}
+	writeAmbientFile(t, filepath.Join(dir, "opencode.json"),
+		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}}`)
+	got := cfg.OpencodeAmbientConflicts()
+	if c := onlyConflict(t, got); c.Got != "other" {
+		t.Errorf("conflict = %+v, want the declared config_dir's redirect surfaced", c)
+	}
+}

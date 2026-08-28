@@ -190,6 +190,15 @@ func (c *Config) opencodeAmbientScopes() []ambientScope {
 		if dir := c.SessionFor("opencode").ConfigDir; dir != "" {
 			globals = append(globals, expandHome(dir))
 		}
+		// opencode2 reads its own config dir (~/.config/opencode2 by default,
+		// verified against beta-18314 via `opencode2 debug config`), plus the
+		// same hardcoded ~/.claude / ~/.agents and ~/.opencode discovery the
+		// v1 line uses — XDG_CONFIG_HOME moves NONE of them. A run that spawns
+		// opencode2 gets the v2 dir scanned so the audit is not blind to the
+		// file an operator actually edits (docs/opencode2.md).
+		if c.spawnsOpencode2() {
+			globals = append(globals, opencode2GlobalConfigDirs()...)
+		}
 		seen := map[string]bool{}
 		for _, dir := range globals {
 			if dir == "" || seen[dir] {
@@ -245,13 +254,44 @@ func (c *Config) drainedSlugs() []string {
 	return out
 }
 
-// spawnsOpencode reports whether any session this run spawns runs on opencode.
-// SPAWNED, not merely declared: an opencode block nothing ever runs makes these
-// files irrelevant, and a warning about an irrelevant file is how an operator
-// learns to skim the ones that matter.
+// spawnsOpencode2 reports whether any session this run spawns runs on the
+// opencode2 line specifically — the v2 config dir is scanned for those runs
+// only (opencode2AmbientScopes).
+func (c *Config) spawnsOpencode2() bool {
+	for _, h := range c.SpawnedHarnesses() {
+		if h == "opencode2" {
+			return true
+		}
+	}
+	return false
+}
+
+// opencode2GlobalConfigDirs are the directories the opencode2 preview reads
+// global config from. VERIFIED against beta-18314 (`opencode2 debug config`
+// with XDG_CONFIG_HOME pointed elsewhere): ~/.config/opencode2 is read
+// HARDCODED — unlike the v1 line, XDG_CONFIG_HOME does not move it — and the
+// file there is the operator's real v2 config (docs/opencode2.md). The beta
+// also reads ~/.claude, ~/.agents and ~/.opencode hardcoded; ~/.opencode is
+// already in the v1 scan (opencodeGlobalConfigDirs) which the widened
+// spawnsOpencode applies to both lines, and ~/.claude / ~/.agents are the
+// CLAUDE adapter's own scan domain. This function adds the one dir that is
+// opencode2's own and would otherwise be invisible to the audit.
+func opencode2GlobalConfigDirs() []string {
+	return []string{expandHome("~/.config/opencode2")}
+}
+
+// spawnsOpencode reports whether any session this run spawns runs on opencode
+// OR opencode2. SPAWNED, not merely declared: an opencode block nothing ever
+// runs makes these files irrelevant, and a warning about an irrelevant file is
+// how an operator learns to skim the ones that matter. opencode2 is included
+// because it reads ambient configs too (the hardcoded v2 config dir plus the
+// shared ~/.claude / ~/.agents / ~/.opencode discovery — verified against
+// beta-18314, see docs/opencode2.md) and its adapter exports the same
+// fail-closed permission policy: a run on either line must get the same
+// ambient-config audit (CLA-541).
 func (c *Config) spawnsOpencode() bool {
 	for _, h := range c.SpawnedHarnesses() {
-		if h == "opencode" {
+		if h == "opencode" || h == "opencode2" {
 			return true
 		}
 	}

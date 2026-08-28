@@ -90,6 +90,62 @@ type mcpFile struct {
 	Agent      json.RawMessage `json:"agent"`
 }
 
+// UnmarshalJSON decodes the union mcpFile shape and additionally flattens the
+// opencode 2.x `mcp.servers` dialect into MCP, so every consumer (the
+// credential-origin gates, the local-process disclosure, the ambient-config
+// audit, the slug derivation) sees an opencode2 config's servers exactly as a
+// v1 config's — verified dialect of the installed beta-18314, docs/opencode2.md.
+//
+// The two dialects cannot collide on a real file: opencode 1.x writes `mcp` as
+// a map of server-name -> entry, opencode 2.x writes it as an object with a
+// `servers` sub-map. The one ambiguous document — a v1 file whose only server
+// is literally named "servers" — is resolved by the VALUE: the v2 container's
+// `servers` value is an object of entries, which decodes into mcpEntry as all
+// zero (its fields are entry fields, url/command/…, and none match), where a
+// v1 entry object carries at least one of those fields. An all-zero "servers"
+// entry is therefore read as the v2 container and flattened.
+func (f *mcpFile) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		MCPServers map[string]mcpEntry `json:"mcpServers"`
+		MCP        json.RawMessage     `json:"mcp"`
+		Permission json.RawMessage     `json:"permission"`
+		Plugin     json.RawMessage     `json:"plugin"`
+		Agent      json.RawMessage     `json:"agent"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	f.MCPServers = raw.MCPServers
+	f.Permission, f.Plugin, f.Agent = raw.Permission, raw.Plugin, raw.Agent
+	if len(raw.MCP) == 0 || string(raw.MCP) == "null" {
+		return nil
+	}
+	var v1 map[string]mcpEntry
+	if err := json.Unmarshal(raw.MCP, &v1); err != nil {
+		return err
+	}
+	if e, ok := v1["servers"]; ok && len(v1) == 1 && entryIsZero(e) {
+		var v2 struct {
+			Servers map[string]mcpEntry `json:"servers"`
+		}
+		if err := json.Unmarshal(raw.MCP, &v2); err == nil {
+			f.MCP = v2.Servers
+			return nil
+		}
+	}
+	f.MCP = v1
+	return nil
+}
+
+// entryIsZero reports whether an mcpEntry decoded as all-zero — no URL, no
+// header/env maps, no command/args, no enabled flag. It is the discriminator
+// between a v1 entry literally named "servers" and the v2 `mcp.servers`
+// container (see mcpFile.UnmarshalJSON).
+func entryIsZero(e mcpEntry) bool {
+	return e.URL == "" && e.Headers == nil && e.Env == nil && e.Environment == nil &&
+		e.Command == nil && e.Args == nil && e.Enabled == nil
+}
+
 type mcpEntry struct {
 	URL         string            `json:"url"`
 	Headers     map[string]string `json:"headers"`

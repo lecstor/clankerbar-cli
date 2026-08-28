@@ -2,6 +2,8 @@ package harness
 
 import (
 	"io"
+	"math"
+	"os"
 	"strings"
 	"testing"
 )
@@ -44,8 +46,10 @@ func TestOpencode2Args(t *testing.T) {
 	}
 }
 
-// The verified `--format json` surface emits ONE JSON per assistant text part —
-// no step_finish, no tool_use. The parser keeps the LAST non-empty text.
+// The verified beta-18314 `--format json` surface: a plain text answer (the
+// common case) emits ONLY a text event — the provider's usage block is not
+// surfaced, no step_finish follows. The parser keeps the LAST non-empty text
+// and reports nothing.
 func TestOpencode2Parse(t *testing.T) {
 	const stream = `{"type":"text","timestamp":1,"sessionID":"s1","part":{"type":"text","text":"Working...","messageID":"m1"}}
 not json, skipped
@@ -55,7 +59,69 @@ not json, skipped
 		t.Errorf("FinalMessage = %q, want %q", res.FinalMessage, "Done.")
 	}
 	if res.UsageReported {
-		t.Error("UsageReported = true, want false — opencode2's stream never reports usage")
+		t.Error("UsageReported = true, want false — no step_finish in this stream")
+	}
+}
+
+// The beta's step_finish events (verified on TOOL-CALL turns: reason/cost/
+// tokens, no `total` sibling — only input/output/reasoning plus the cache
+// pair). A plain text answer emits no step_finish (see TestOpencode2Parse),
+// so the parse is defensive: when a step_finish IS present, sum usage across
+// steps and record the last reason.
+func TestOpencode2Parse_stepFinish(t *testing.T) {
+	const stream = `{"type":"step_start","timestamp":1,"sessionID":"s1","part":{"type":"step-start"}}
+{"type":"text","timestamp":2,"sessionID":"s1","part":{"type":"text","text":"Working...","messageID":"m1"}}
+{"type":"step_finish","timestamp":3,"sessionID":"s1","part":{"type":"step-finish","reason":"stop","cost":0.0001,"tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}
+{"type":"text","timestamp":4,"sessionID":"s1","part":{"type":"text","text":"Done.","messageID":"m2"}}
+{"type":"step_finish","timestamp":5,"sessionID":"s1","part":{"type":"step-finish","reason":"stop","cost":0.0002,"tokens":{"input":5,"output":1,"reasoning":0,"cache":{"read":0,"write":0}}}}`
+	res := opencode2Parsed(stream)
+	if res.FinalMessage != "Done." {
+		t.Errorf("FinalMessage = %q, want %q", res.FinalMessage, "Done.")
+	}
+	if !res.UsageReported {
+		t.Error("UsageReported = false, want true — the beta's step_finish events report usage")
+	}
+	// total is absent on the beta: input+output+reasoning per step.
+	if res.Tokens != 10+2+5+1 {
+		t.Errorf("Tokens = %d, want %d (sum of input+output across both steps)", res.Tokens, 18)
+	}
+	if math.Abs(res.CostUSD-0.0003) > 1e-9 {
+		t.Errorf("CostUSD = %v, want %v", res.CostUSD, 0.0003)
+	}
+	if got := res.Raw[FinishReasonKey]; got != "stop" {
+		t.Errorf("Raw[FinishReasonKey] = %v, want %q (the LAST step's reason)", got, "stop")
+	}
+}
+
+// A step_finish that DOES carry `total` (a future build) wins over the
+// input+output+reasoning fallback.
+func TestOpencode2Parse_stepFinishTotal(t *testing.T) {
+	const stream = `{"type":"step_finish","part":{"type":"step-finish","reason":"stop","tokens":{"total":99,"input":10,"output":2,"reasoning":0}}}`
+	res := opencode2Parsed(stream)
+	if !res.UsageReported || res.Tokens != 99 {
+		t.Errorf("UsageReported=%v Tokens=%d, want true/99 — an explicit total must win", res.UsageReported, res.Tokens)
+	}
+}
+
+// The #43622 shape (a stream with no finish_reason) does NOT produce a
+// quiet-death step_finish on beta-18314: the build emits typed
+// provider.invalid-output error events, retries internally, and exits 1
+// (verified by the conformance suite). The parse records the events it sees —
+// text and any step_finish — and never invents a quiet-death marker: a stream
+// that only ever carried text reports no usage and no terminal reason.
+func TestOpencode2Parse_quietShapeIsLoud(t *testing.T) {
+	const stream = `{"type":"step_start","part":{"type":"step-start"}}
+{"type":"text","part":{"type":"text","text":"OK"}}
+{"type":"error","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason"}}`
+	res := opencode2Parsed(stream)
+	if res.FinalMessage != "OK" {
+		t.Errorf("FinalMessage = %q, want %q", res.FinalMessage, "OK")
+	}
+	if res.UsageReported {
+		t.Error("UsageReported = true — the quiet shape carries no usage and none may be invented")
+	}
+	if res.Raw[TerminalReasonKey] != nil {
+		t.Errorf("Raw[TerminalReasonKey] = %v, want absent — beta-18314 fails loudly, there is no quiet-death marker", res.Raw[TerminalReasonKey])
 	}
 }
 
@@ -92,22 +158,79 @@ func TestOpencode2Parse_ignoresNonTextParts(t *testing.T) {
 }
 
 func TestOpencode2Env(t *testing.T) {
-	in := Invocation{MCPConfigPath: "/tmp/v2.json", Env: []string{"XDG_DATA_HOME=/tmp/d"}}
+	in := Invocation{MCPConfigPath: "/tmp/v2.json", ConfigDir: "/tmp/v2cfg", Env: []string{"XDG_DATA_HOME=/tmp/d"}}
 	env := (opencode2{}).env(in)
 	if !containsEnv(env, "OPENCODE_CONFIG=/tmp/v2.json") {
 		t.Errorf("env missing OPENCODE_CONFIG=/tmp/v2.json: %v", env)
 	}
+	// The fail-closed permission policy is exported, the same shape the stable
+	// adapter exports. beta-18314 does NOT honor the env var (verified: the
+	// headless default without --auto declines every tool call regardless), but
+	// the export is belt-and-braces for a build that reads it — and doctor
+	// reports exactly this (docs/opencode2.md).
+	if !containsEnvPrefix(env, "OPENCODE_PERMISSION=") {
+		t.Errorf("env missing OPENCODE_PERMISSION: %v", env)
+	}
 	if !containsEnv(env, "XDG_DATA_HOME=/tmp/d") {
 		t.Errorf("env missing caller XDG var: %v", env)
 	}
-	// No ConfigDir mapping: opencode2's config discovery is hardcoded, so it
-	// must NOT invent an OPENCODE_CONFIG_DIR knob (see the adapter doc).
+	// A caller's OPENCODE_PERMISSION still wins (exec takes the last dup key):
+	// the same override ordering as the stable adapter.
+	in.Env = append(in.Env, "OPENCODE_PERMISSION={\"*\":\"allow\"}")
+	env = (opencode2{}).env(in)
+	if got := envValue(env, "OPENCODE_PERMISSION"); got != `{"*":"allow"}` {
+		t.Errorf("caller OPENCODE_PERMISSION must win, got %q", got)
+	}
+	// config_dir maps to NOTHING: beta-18314's config discovery is hardcoded
+	// (~/.claude, ~/.agents, ~/.config/opencode2, ~/.opencode) and the
+	// OPENCODE_CONFIG_DIR-named variable steers only the plugin dir, so the
+	// adapter must not pretend to pin config with it (see the adapter doc).
 	if containsEnvPrefix(env, "OPENCODE_CONFIG_DIR=") {
-		t.Errorf("env sets OPENCODE_CONFIG_DIR — must not: %v", env)
+		t.Errorf("env sets OPENCODE_CONFIG_DIR — must not: config discovery is hardcoded and config_dir maps to nothing: %v", env)
 	}
-	if got := (opencode2{}).env(Invocation{}); containsEnvPrefix(got, "OPENCODE_CONFIG=") {
-		t.Errorf("env sets OPENCODE_CONFIG with no MCPConfigPath: %v", got)
+	// With an empty Invocation the adapter appends nothing of its own beyond
+	// what the ambient environment already carries.
+	added := addedEnv((opencode2{}).env(Invocation{}), os.Environ())
+	for _, e := range added {
+		if strings.HasPrefix(e, "OPENCODE_CONFIG=") || strings.HasPrefix(e, "OPENCODE_CONFIG_DIR=") {
+			t.Errorf("empty Invocation must not append %q", e)
+		}
 	}
+}
+
+// envValue returns the LAST occurrence of key in env — the one exec actually
+// uses (a later duplicate key wins).
+func envValue(env []string, key string) string {
+	prefix := key + "="
+	out := ""
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			out = strings.TrimPrefix(e, prefix)
+		}
+	}
+	return out
+}
+
+// addedEnv returns the entries of env whose key is absent from baseline — the
+// entries the adapter appended rather than inherited.
+func addedEnv(env, baseline []string) []string {
+	base := map[string]bool{}
+	for _, e := range baseline {
+		if i := strings.IndexByte(e, '='); i > 0 {
+			base[e[:i]] = true
+		}
+	}
+	var out []string
+	for _, e := range env {
+		key := e
+		if i := strings.IndexByte(e, '='); i > 0 {
+			key = e[:i]
+		}
+		if !base[key] {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func TestOpencode2DetectLimit(t *testing.T) {
@@ -161,27 +284,45 @@ func TestOpencode2IsTransient(t *testing.T) {
 }
 
 func TestOpencode2IsUnclassifiedTransient(t *testing.T) {
-	// opencode's heuristic keys on reported usage, and opencode2 never reports
-	// usage — so there is no heuristic arm here. An unrecognised non-retryable
-	// failure stops loudly instead of re-spawning paid sessions (CLA-381).
-	if (opencode2{}).IsUnclassifiedTransient(Result{}) {
-		t.Error("IsUnclassifiedTransient must be false for opencode2")
+	// The CLA-381 heuristic shares the stable adapter's shape: an exit 1 whose
+	// cause no pattern names, on a session that REPORTED usage, leans
+	// retryable. beta-18314 does NOT report usage for a plain text answer
+	// (verified — no step_finish follows it), so the common path stays a stop;
+	// the arm is live for a future build that surfaces usage via step_finish.
+	cases := []struct {
+		name string
+		res  Result
+		want bool
+	}{
+		{"exit 0 never transient", Result{ExitCode: 0, UsageReported: true}, false},
+		{"exit 1 with no usage stays a stop", Result{ExitCode: 1}, false},
+		{"exit 1 with usage leans retryable", Result{ExitCode: 1, UsageReported: true}, true},
+		{"recognized budget stop vetoes", Result{ExitCode: 1, UsageReported: true, Stderr: "payment required"}, false},
+		{"recognized fatal vetoes", Result{ExitCode: 1, UsageReported: true, Stderr: "error: authentication failed"}, false},
+		{"recognized transient pattern wins", Result{ExitCode: 1, UsageReported: true, Stderr: "transport error"}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (opencode2{}).IsUnclassifiedTransient(tc.res); got != tc.want {
+				t.Errorf("IsUnclassifiedTransient = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
 func TestOpencode2Capabilities(t *testing.T) {
 	c := (opencode2{}).Capabilities()
 	if c.TracksClaims {
-		t.Error("TracksClaims must be false — the stream carries no tool events, so a phased run must be refused")
+		t.Error("TracksClaims must be false — tool_use events exist on tool-call turns but the adapter does not consume them for claim tracking, so a phased run must be refused")
 	}
 	if !c.HonoursSessionWallClock {
-		t.Error("HonoursSessionWallClock must be true — Invoke's process kill is the phase backstop (no turn flag, no usage)")
+		t.Error("HonoursSessionWallClock must be true — Invoke's process-group kill is the phase backstop (no turn flag)")
 	}
 	if c.HonoursMaxTurns {
 		t.Error("HonoursMaxTurns must be false")
 	}
 	if c.ReportsCost {
-		t.Error("ReportsCost must be false — no usage/cost event reaches this surface")
+		t.Error("ReportsCost must be false — a plain text answer (the common case) emits NO step_finish and the provider's usage block is not surfaced (verified against beta-18314), so budget.max_cost_usd is inert")
 	}
 	if c.HasSessionTokenCeiling {
 		t.Error("HasSessionTokenCeiling must be false")
@@ -189,11 +330,16 @@ func TestOpencode2Capabilities(t *testing.T) {
 }
 
 func TestOpencode2ZeroUsageUnknown(t *testing.T) {
-	// The quiet-death marker is read off a step_finish event, and this surface
-	// has none. False is the HONEST answer: inventing a marker for a shape we
-	// cannot observe would mislead the driver (see docs/opencode2.md).
+	// beta-18314 does not exhibit the quiet-death signature: the #43622 shape
+	// exits 1 with a typed provider.invalid-output error event (a LOUD failure,
+	// verified by the conformance suite), never a silent exit-0. False is the
+	// honest answer — inventing a marker for a shape this build does not
+	// produce would mislead the driver (docs/opencode2.md).
 	if (opencode2{}).ZeroUsageUnknown(Result{}) {
 		t.Error("ZeroUsageUnknown must be false for opencode2")
+	}
+	if (opencode2{}).ZeroUsageUnknown(opencode2Parsed(`{"type":"step_finish","part":{"type":"step-finish","reason":"unknown"}}`)) {
+		t.Error("ZeroUsageUnknown must be false even for an unknown-reason step — the marker is not implemented on this build")
 	}
 }
 
