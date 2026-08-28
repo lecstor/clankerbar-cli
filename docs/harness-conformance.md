@@ -38,7 +38,7 @@ test, just pointed at a real provider. Neither runs without its env var, so
   (`finish_reason: "stop"` plus a usage block) makes the adapter report a
   clean, spend-accounted, NOT-silent session — exit 0, `finish_reason: "stop"`,
   `UsageReported` true, `ZeroUsageUnknown` false.
-- **Quiet death** (`quiet` script), opencode up to and including **v1.18.18**: the
+- **Quiet death** (`quiet` script), opencode up to and including **v1.18.19**: the
   [#43622](https://github.com/anomalyco/opencode/issues/43622) shape, where no
   chunk ever carries a non-null `finish_reason`. opencode hands the CLI
   `reason: "unknown"`, all-zero tokens/cost, **exit 0 with no error** — which
@@ -69,15 +69,11 @@ test, just pointed at a real provider. Neither runs without its env var, so
 
 - **No orphaned servers.** `opencode run` is client/server; the test isolates
   each run with fresh XDG dirs so a warm server can never serve it. Verified on
-  1.18.18 that the per-run server tears itself down when the run ends. This test
-  never touches long-lived `opencode2` processes — an interactive `opencode2`
-  TUI and its `serve --service` backend (verified connected over localhost) can
-  be running on the same machine and are in no way products of, or affected by,
-  the suite.
+  1.18.18 that the per-run server tears itself down when the run ends.
 
 Upstream's fix landed as v1.18.20 (retry the empty stream instead of exiting
 silently; the anomalyco issue's PRs #41466/#43881 describe the same family).
-The daemons now run v1.18.21. Two things changed with it: the silent exit-0 is
+Two things changed with it: the silent exit-0 is
 gone (a transiently-empty stream recovers instead of dying), and a
 PERSISTENTLY-empty stream now spins in an unbounded retry instead — which is
 why the wall-clock cap (`max_session_wall_clock` / per-phase `max_wall_clock`)

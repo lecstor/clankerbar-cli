@@ -8,7 +8,7 @@ package harness
 // what "the model" returns — including the shape from
 // https://github.com/anomalyco/opencode/issues/43622 that makes opencode
 // process a response and hand the CLI a GARBLED/BROKEN result. Which garbled
-// shape depends on the build: <= v1.18.18 it is a final step reading
+// shape depends on the build: <= v1.18.19 it is a final step reading
 // `reason: "unknown"` with all-zero usage and a silent exit 0; >= v1.18.20 the
 // same stream retries in a tight unbounded loop instead of exiting, and the
 // quiet-death test bounds that world with a wall-clock cap (see
@@ -295,7 +295,7 @@ func TestOpencodeConformance_control(t *testing.T) {
 // finish reason. What the CLI must do depends on which WORLD the binary on PATH
 // lives in, and the test is world-aware rather than world-anchored:
 //
-//   - v1.18.18 and older (the guillotine world): the session exits 0 silently
+//   - v1.18.19 and older (the guillotine world): the session exits 0 silently
 //     with a final step reading reason "unknown" and all-zero usage, and the
 //     CLI MUST name it (ZeroUsageUnknown) rather than read it as a clean run.
 //   - v1.18.20+ (the retry world): the silent exit is fixed upstream by
@@ -354,7 +354,7 @@ func TestOpencodeConformance_quietDeath(t *testing.T) {
 		t.Log("NOTE for maintainers: on a capped end the composite ZeroUsageUnknown marker cedes to wall_clock_capped (one terminal_reason key). Whether a capped SPIN should also count in the dead-phase tally is an open decision for the 1.18.20+ world.")
 
 	case observedQuietDeath(res):
-		// The guillotine world (v1.18.18 and older): exit 0, reason unknown,
+		// The guillotine world (v1.18.19 and older): exit 0, reason unknown,
 		// all-zero usage, no retry. The CLI must name it. UsageReported is
 		// deliberately not asserted — opencode emits a (all-zero) tokens block
 		// even on this shape, and the adapter counts "the event existed" as
