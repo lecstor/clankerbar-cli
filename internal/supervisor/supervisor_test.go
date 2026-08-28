@@ -707,7 +707,8 @@ func TestStopLogsWhenTheFleetCannotDrain(t *testing.T) {
 }
 
 // spawnPid pulls the child pid out of a captured supervisor log line
-// ("<name>: spawned (pid 123, <path>)"), or 0 when no spawn is logged.
+// ("<name>: spawned (pid 123, <path>, version <v>)"), or 0 when no spawn is
+// logged.
 func spawnPid(t *testing.T, log string) int {
 	t.Helper()
 	const marker = "spawned (pid "
