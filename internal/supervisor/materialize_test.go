@@ -166,8 +166,14 @@ func TestChildrenSpawnOnTheMaterializedConfig(t *testing.T) {
 	done := runSupervise(ctx, testOptions(t, dir))
 
 	want := filepath.Join(state, statedir.MaterializedConfigName)
-	waitFor(t, 5*time.Second, "the child to spawn on the generated config", func() bool {
-		return strings.Contains(buf.String(), want)
+	// Wait for the child to both spawn on the generated config AND write its
+	// first iteration log: the spawn log line lands the moment cmd.Start()
+	// returns, but the child is a separate process that takes a beat to exec,
+	// read the config and drop its iteration log. Polling only the log line
+	// raced that window - the assertion below would read 0 spawns for a child
+	// that was already writing. The two conditions together are the event.
+	waitFor(t, 5*time.Second, "the child to spawn on the generated config and write its first iteration log", func() bool {
+		return strings.Contains(buf.String(), want) && countRuns(t, state) >= 1
 	})
 	if got := countRuns(t, state); got != 1 {
 		t.Fatalf("spawns = %d, want 1", got)
