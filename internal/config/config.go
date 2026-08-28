@@ -474,6 +474,40 @@ const implementResumedBranchRule = "RESUMED WORK comes first when you find it: i
 	"still adds value and carry on with the normal flow; either way do NOT spend the run re-verifying and " +
 	"pushing stale work."
 
+// implementCloseOutRule is the implement brief's disposition for the offer the
+// plane boosts ahead of fresh work (CLA-540): an approved-awaiting-merge task —
+// implementation and review already done, only the close-out remaining — which
+// next_task serves FIRST and which the phase-1 brief must not refuse by default.
+// A phased implement session is told to claim, work, commit, push and stop at
+// the checkpoint; a close-out has no commit, no branch and no worktree, and its
+// required act is a status move the brief's letter forbids — so without an
+// exception the session asks the operator about an offer that is exactly its
+// job (observed twice on 2026-08-28: CLA-533 and CLA-526, both green and
+// mergeable, both raised as blocking questions).
+//
+// Everything the plane already says on the offer stays there: the merge target,
+// the red-CI repair rule and the decline door all ride on the offer's mergeHint,
+// and the CLA-341 one-representation rule keeps them in that one place. The
+// clause also names ONE offer, never the queue — several close-outs pending
+// means this session serves the one it was offered and ends, not all of them on
+// one accumulating context, which is the failure the unphased prompt's
+// drain-vocabulary ban exists to stop.
+//
+// The ending deliberately does NOT reuse the checkpoint's "Then STOP and end the
+// session" sentence: TestBuiltinImplementBriefPinsTheResumedBranchRule locates
+// the terminal stop by that exact phrase, and this clause sits before the
+// resumed-work rule, so reusing it would move the pin's anchor.
+//
+// The fork also preempts the resumed-work rule below: a close-out claim carries
+// a recorded branch, so that rule's "existing branch" trigger would otherwise
+// match an offer it must never apply to - merging the integration branch into an
+// approved PR branch would rewrite the diff the approval and the green CI stand
+// on. "For found work, not this offer" says the boundary in the brief itself.
+const implementCloseOutRule = "If next_task instead offers an approved-awaiting-merge task - implementation and " +
+	"review already done, only the close-out remaining - that offer IS this session's job: follow the offer's " +
+	"own instructions, and once the close-out is done STOP and end the session. The resumed-work rule below is " +
+	"for found work, not this offer. Ending that way is the task going to plan, not the task being abandoned."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
 // The split is implement, then review-and-fix, and that grouping is deliberate:
@@ -483,9 +517,10 @@ const implementResumedBranchRule = "RESUMED WORK comes first when you find it: i
 // workflow puts implementation and fix in ONE actor and the review in a separate
 // read-only one. Splitting where that workflow already splits is the whole idea.
 var builtinPhasePrompts = map[string]string{
-	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work disposition below): " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
+		implementCloseOutRule + " " +
 		implementResumedBranchRule +
-		" Unless you parked above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
+		" Unless you parked above or served a close-out above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,
