@@ -550,9 +550,10 @@ func checkHarnessNamed(ctx context.Context, label, bin string, e doctorEnv) chec
 // system keychain instead of the config dir, so a missing marker means "I cannot
 // confirm this", never "this is broken".
 var authMarkers = map[string][]string{
-	"claude":   {".credentials.json", ".claude.json", "settings.json"},
-	"codex":    {"auth.json", "config.toml"},
-	"opencode": {"auth.json", "config.json"},
+	"claude":    {".credentials.json", ".claude.json", "settings.json"},
+	"codex":     {"auth.json", "config.toml"},
+	"opencode":  {"auth.json", "config.json"},
+	"opencode2": {"opencode.json", "opencode.jsonc", "auth.json"}, // the 2.x preview config lives at ~/.config/opencode2/opencode.json (verified against beta-18314 via `opencode2 debug config`); auth.json covers the credentials file it keeps
 }
 
 // checkConfigDir reports on the run harness's config dir. See checkConfigDirs,
@@ -2111,6 +2112,23 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 		}
 		c.status = pass
 		c.detail = "adapter exports a fail-closed OPENCODE_PERMISSION"
+
+	case "opencode2":
+		// The adapter exports the SAME fail-closed OPENCODE_PERMISSION as the
+		// stable adapter — one policy to maintain, belt-and-braces for a build
+		// that honors it. The override audit is deliberately NOT applied here:
+		// on beta-18314 the env var is NOT honored at all (verified 2026-08-28:
+		// with `--auto` + `{"*": "deny"}` the write tool still executed, and
+		// with no env var the same write was declined), so an operator's
+		// OPENCODE_PERMISSION cannot loosen anything — warning about an
+		// override would send them to edit a knob this build ignores. The
+		// fail-closed property of an unattended run comes from the HEADLESS
+		// DEFAULT: without `--auto`, every tool call is declined ("The user
+		// declined this tool call"), and this adapter never passes `--auto`.
+		// This case is what makes doctor truthful for a registered harness
+		// that reads the same ambient configs as opencode (docs/opencode2.md).
+		c.status = pass
+		c.detail = "adapter exports a fail-closed OPENCODE_PERMISSION (same policy as opencode), and never passes --auto; beta-18314 does not honor the env var but its headless default declines every tool call — see docs/opencode2.md"
 
 	default:
 		c.status = pass

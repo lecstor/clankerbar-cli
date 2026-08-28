@@ -459,15 +459,20 @@ func TestUnclassifiedTransientImpliesTransient(t *testing.T) {
 	}
 }
 
-// opencode is the only adapter that guesses, and the others say so by returning
-// false rather than by not being asked. Pinned because the day a second one grows
-// a heuristic, it has to be a deliberate edit here too - the loop's bound is
-// per-adapter and silently applies to whoever opts in.
+// opencode and opencode2 are the only adapters that guess, and the others say
+// so by returning false rather than by not being asked. opencode2 grew the
+// heuristic with CLA-541 because beta-18314 reports usage via step_finish
+// (verified) — the same reason the v1 heuristic exists. Pinned because the day
+// a third one grows a heuristic, it has to be a deliberate edit here too - the
+// loop's bound is per-adapter and silently applies to whoever opts in.
 func TestOnlyOpencodeGuesses(t *testing.T) {
 	// The heuristic's own shape: exit 1, usage reported, text nothing recognises.
 	res := Result{ExitCode: 1, UsageReported: true, Stderr: "some failure text no pattern recognises"}
 	if !(opencode{}).IsUnclassifiedTransient(res) {
 		t.Error("opencode stopped reporting its heuristic - the loop can no longer bound it")
+	}
+	if !(opencode2{}).IsUnclassifiedTransient(res) {
+		t.Error("opencode2 stopped reporting its heuristic - beta-18314 reports usage, so the post-usage retry bound applies to it too")
 	}
 	if (claude{}).IsUnclassifiedTransient(res) || (codex{}).IsUnclassifiedTransient(res) {
 		t.Error("a pattern-driven adapter reported a guess")
