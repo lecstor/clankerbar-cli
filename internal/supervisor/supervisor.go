@@ -396,6 +396,12 @@ func (d *Supervisor) reconcile() error {
 			inst = &Instance{name: e.Name, entry: e}
 			d.instances = append(d.instances, inst)
 		}
+		// The entry is the desired state: refresh the pointer every poll, so
+		// an edit on the plane (a harness override, a project list, the
+		// desired state) is what the next build reads. Holding the first
+		// poll's entry would freeze the instance on the configuration that
+		// created it.
+		inst.entry = e
 		inst.refused = false
 		inst.removed = false
 		inst.desired = e.DesiredState
@@ -469,6 +475,15 @@ func (d *Supervisor) refreshInstance(inst *Instance) {
 		inst.policyRefused = true
 		return
 	}
+	// The state dir is deterministic from the entry name, so a cold start
+	// whose build fails (the plane unreachable and the base config no longer
+	// resolvable — a moved workdir, a corrupt edit) can still find the
+	// last-known-good materialized config phase 2b wrote for exactly this.
+	inst.mu.Lock()
+	if inst.stateDir == "" {
+		inst.stateDir = rosterStateDir(d.cacheDir, inst.entry.Name)
+	}
+	inst.mu.Unlock()
 	if loaded := d.loadMaterialized(inst); loaded != nil {
 		inst.mu.Lock()
 		inst.cfg = loaded
@@ -578,9 +593,10 @@ func (d *Supervisor) loadMaterialized(inst *Instance) *config.Config {
 // nothing (the timer owns it), a refused or config-less instance starts
 // nothing.
 func (d *Supervisor) ensureRunning(inst *Instance) {
-	if inst.policyRefused {
+	if inst.policyRefused || inst.halted {
 		// Refused at build time: the spawn must not fall back to the last
-		// config, and the next poll retries the build.
+		// config, and the next poll retries the build. HALTed: the operator
+		// planted the per-instance stop switch; the poll must not undo it.
 		return
 	}
 	inst.mu.Lock()
@@ -663,14 +679,19 @@ func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string
 	return cfg, stateDir, nil
 }
 
-// spawn starts one instance's child on its effective config (refreshed by the
-// last reconcile), materialized into the instance's state dir. The permission-
-// policy gate (phase 2c) runs here as the hard child-start gate: the config
-// that will actually be spawned — freshly built, or the last-known-good after
-// a build failure of any other kind — must name a permission policy file that
-// exists; an absent one refuses the spawn, the refusal naming the daemon and
-// the path. Retry with backoff instead, so a policy file restored while the
-// supervisor runs is picked up by the next respawn.
+// spawn starts one instance's child on its effective config, materialized
+// into the instance's state dir. The permission-policy gate (phase 2c) runs
+// here as the hard child-start gate, over a config RE-RESOLVED at the spawn:
+// the entry is built fresh from the current roster row and the current base
+// config, so an edit that lands between polls is seen at the child-start gate,
+// not on the next reconcile. A ErrPolicyRefused re-resolve refuses with backoff
+// and never falls back — the last materialized config may name the very policy
+// file the operator replaced. Any other re-resolve failure keeps the
+// last-known-good (the previous build, or the materialized config loaded by
+// refreshInstance), and the gate re-checks THAT config's policy file too: a
+// fallback whose own policy is gone is also refused. Retry with backoff, so a
+// policy file restored while the supervisor runs is picked up by the next
+// respawn.
 //
 // The child is spawned with `run -c` pointing at the MATERIALIZED config in
 // its state dir — never the operator's local config — so the config a daemon
@@ -678,9 +699,30 @@ func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string
 // written (an unwritable or unadoptable state dir) is as unexpected as a
 // spawn failure: same backoff, same ladder, no child.
 func (d *Supervisor) spawn(inst *Instance) {
+	fresh, sd, err := d.buildConfig(inst.entry)
+	if err != nil {
+		if errors.Is(err, ErrPolicyRefused) {
+			log.Printf("%s: refusing to start: %v - retrying with backoff", inst.name, err)
+			inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
+			return
+		}
+		log.Printf("%s: re-resolving its config failed (%v) - spawning on the last-known-good config", inst.name, err)
+	} else {
+		inst.mu.Lock()
+		inst.cfg = fresh
+		inst.stateDir = sd
+		inst.mu.Unlock()
+		inst.policyRefused = false
+	}
 	inst.mu.Lock()
 	cfg := inst.cfg
 	inst.mu.Unlock()
+	if cfg == nil {
+		// The build failed and no last-known-good exists — nothing to start;
+		// the next poll retries the build.
+		log.Printf("%s: nothing to start - the config build failed and no last-known-good exists", inst.name)
+		return
+	}
 	if err := checkPermissionPolicy(cfg); err != nil {
 		log.Printf("%s: refusing to start: %v - retrying with backoff", inst.name, err)
 		inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
@@ -829,12 +871,12 @@ func (d *Supervisor) respawnDue() {
 		}
 		inst.restartAt = time.Time{}
 		// The schedule was made when the instance still wanted a child; a poll
-		// may have flipped it since (stopped, removed, refused, policy-refused)
-		// and the timer path must not spawn against the current desired state
-		// any more than the reconcile path would. Dropping the stale schedule
-		// is the idempotent move: the next reconcile re-evaluates the instance
-		// from the roster.
-		if inst.desired != RosterDesiredRunning || inst.removed || inst.refused || inst.policyRefused {
+		// may have flipped it since (stopped, removed, refused, policy-refused,
+		// HALTed) and the timer path must not spawn against the current desired
+		// state any more than the reconcile path would. Dropping the stale
+		// schedule is the idempotent move: the next reconcile re-evaluates the
+		// instance from the roster.
+		if inst.desired != RosterDesiredRunning || inst.removed || inst.refused || inst.policyRefused || inst.halted {
 			continue
 		}
 		d.spawn(inst)
@@ -914,7 +956,7 @@ func (d *Supervisor) stopAll() error {
 				continue
 			}
 			inst.mu.Lock()
-			alive := !inst.exited
+			alive := inst.cmd != nil && !inst.exited
 			since := time.Since(inst.aliveSince)
 			dir := inst.stateDir
 			inst.mu.Unlock()

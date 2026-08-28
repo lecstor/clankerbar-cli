@@ -23,6 +23,7 @@ package supervisor
 // materialized configs (phase 2b) sit beside it — see rosterStateDir.
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -275,12 +276,12 @@ func sanitizeSlug(name string) string {
 // writeCachedRoster persists the last-known-good roster. A failure is logged,
 // never fatal: the cache is a convenience for an offline start, and a poll that
 // reached the plane has already done the real work in memory.
+//
+// The write is skipped when the served roster is byte-identical to the cached
+// one — reconciliation with unchanged state must write nothing, and the cache
+// is rewritten only when the last-known-good actually changes.
 func writeCachedRoster(dir string, entries []RosterEntry) {
 	if dir == "" {
-		return
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		log.Printf("roster: cannot create the cache dir %s (%v) - offline starts will have nothing to reconcile from", dir, err)
 		return
 	}
 	data, err := json.Marshal(entries)
@@ -289,6 +290,13 @@ func writeCachedRoster(dir string, entries []RosterEntry) {
 		return
 	}
 	path := filepath.Join(dir, rosterCacheName)
+	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, data) {
+		return // unchanged: nothing to write
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		log.Printf("roster: cannot create the cache dir %s (%v) - offline starts will have nothing to reconcile from", dir, err)
+		return
+	}
 	// Remove-then-create through O_EXCL, like the materialized-config write: a
 	// symlink planted at the name is removed, never followed.
 	if _, err := os.Lstat(path); err == nil {

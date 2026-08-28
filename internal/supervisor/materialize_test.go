@@ -2,10 +2,12 @@ package supervisor
 
 // Phase 2b of docs/proposals/daemon-supervisor.md (in the clankerbar repo):
 // the supervisor generates each child's effective config into the child's own
-// state dir from machine conventions and the environment, and starts the
+// state dir from machine conventions and the roster entry, and starts the
 // child with `run -c` pointing at it. The generated file is a cache —
 // regenerated on every reconcile, safe to delete — written to disk so it
-// doubles as the offline last-known-good.
+// doubles as the offline last-known-good. In phase 3b the entry drives the
+// build: the projects come from the roster row, identity is the entry's name,
+// and the state dir is derived from the same name.
 
 import (
 	"context"
@@ -20,12 +22,23 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
+// materializeOptions builds the options the direct (non-Supervise) materialize
+// tests drive buildConfig with. HOME is isolated so the machine-layer config
+// discovery in buildConfig returns defaults instead of the operator's real
+// config.
+func materializeOptions(t *testing.T, cacheDir, workdirRoot string) Options {
+	t.Helper()
+	t.Setenv("HOME", t.TempDir())
+	o := Options{RosterCacheDir: cacheDir, WorkdirRoot: workdirRoot}
+	return o.withDefaults()
+}
+
 // The generated config is a REAL config: it loads and validates through the
 // existing loader — the exact path `run -c` takes — and carries the machine
 // conventions: the phase-2a derived workdir, the identity pinned from the
-// source config path, the pinned state dir, and the default plane origin (the
-// credential itself lives only in CLANKERBAR_API_KEY, which never lands in a
-// file).
+// roster entry's name, the pinned state dir (derived from the same name), and
+// the default plane origin (the credential itself lives only in
+// CLANKERBAR_API_KEY, which never lands in a file).
 func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	root := t.TempDir()
 	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
@@ -37,27 +50,17 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	dir := t.TempDir()
-	stateDir := filepath.Join(t.TempDir(), "state")
-	src := filepath.Join(dir, "daemon.json")
-	body := `{"harness": "claude", "state_dir": "` + stateDir + `", "primary_repo": "acme/widgets"}`
-	if err := os.WriteFile(src, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	cacheDir := t.TempDir()
+	entry := runEntry("daemon-one", "acme/widgets")
 
-	o := testOptions(t, dir)
-	o.WorkdirRoot = root
-	d := &Supervisor{o: o.withDefaults(), hostname: "testhost"}
+	o := materializeOptions(t, cacheDir, root)
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
 
-	cfg, err := config.Load(src)
+	cfg, stateDir, err := d.buildConfig(&entry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, stateDir, err := d.resolveInstance(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inst := &Instance{path: src, name: resolved.ResolvedInstanceName(d.hostname), cfg: resolved, stateDir: stateDir}
+	inst := &Instance{name: entry.Name, entry: &entry, cfg: cfg, stateDir: stateDir}
 	path, err := d.materializeConfig(inst)
 	if err != nil {
 		t.Fatal(err)
@@ -80,8 +83,8 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	if loaded.WorkDir != filepath.Join(root, "widgets") {
 		t.Errorf("workdir = %q, want the derived %q", loaded.WorkDir, filepath.Join(root, "widgets"))
 	}
-	if loaded.InstanceName != "testhost/daemon" {
-		t.Errorf("instance_name = %q, want the identity resolved from the source config path (testhost/daemon)", loaded.InstanceName)
+	if loaded.InstanceName != "daemon-one" {
+		t.Errorf("instance_name = %q, want the roster entry's name (daemon-one)", loaded.InstanceName)
 	}
 	if sd, err := loaded.ResolveStateDir(); err != nil || sd != stateDir {
 		t.Errorf("ResolveStateDir = %q (%v), want the pinned %q", sd, err, stateDir)
@@ -96,35 +99,31 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 
 // A multi-project instance derives one workdir per project, and the generated
 // config carries each project's derived workdir — the phase-2a value consumed
-// at materialization time.
+// at materialization time. The projects come from the roster entry.
 func TestMaterializedConfigConsumesPerProjectDerivedWorkdirs(t *testing.T) {
 	root := t.TempDir()
 	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
 	makeCheckout(t, filepath.Join(root, "gadgets"), "acme/gadgets")
 
-	dir := t.TempDir()
-	stateDir := filepath.Join(t.TempDir(), "state")
-	src := filepath.Join(dir, "multi.json")
-	body := `{"harness": "claude", "state_dir": "` + stateDir + `", "projects": [
-		{"slug": "one", "primary_repo": "acme/widgets"},
-		{"slug": "two", "primary_repo": "acme/gadgets"}]}`
-	if err := os.WriteFile(src, []byte(body), 0o644); err != nil {
-		t.Fatal(err)
+	cacheDir := t.TempDir()
+	entry := RosterEntry{
+		Name:         "multi",
+		DesiredState: RosterDesiredRunning,
+		Placement:    RosterPlacementLocal,
+		Projects: []RosterProject{
+			{Slug: "one", PrimaryRepo: "acme/widgets"},
+			{Slug: "two", PrimaryRepo: "acme/gadgets"},
+		},
 	}
 
-	o := testOptions(t, dir)
-	o.WorkdirRoot = root
-	d := &Supervisor{o: o.withDefaults(), hostname: "testhost"}
+	o := materializeOptions(t, cacheDir, root)
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
 
-	cfg, err := config.Load(src)
+	cfg, stateDir, err := d.buildConfig(&entry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, stateDir, err := d.resolveInstance(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	inst := &Instance{path: src, name: resolved.ResolvedInstanceName(d.hostname), cfg: resolved, stateDir: stateDir}
+	inst := &Instance{name: entry.Name, entry: &entry, cfg: cfg, stateDir: stateDir}
 	path, err := d.materializeConfig(inst)
 	if err != nil {
 		t.Fatal(err)
@@ -147,15 +146,18 @@ func TestMaterializedConfigConsumesPerProjectDerivedWorkdirs(t *testing.T) {
 }
 
 // The supervisor starts every child on the GENERATED config: the spawn log
-// names the materialized path inside the child's state dir, and the child —
-// the fake daemon, whose only reading of its config is state_dir — runs at
-// all only because the generated file carried it. Deleting the generated file
-// while the child runs is harmless: the child loaded it at startup and the
-// supervisor does not touch it until the next spawn.
+// names the materialized path inside the child's state dir (derived from the
+// entry name), and the child — the fake daemon, whose only reading of its
+// config is state_dir — runs at all only because the generated file carried
+// it. Deleting the generated file while the child runs is harmless: the child
+// loaded it at startup and the supervisor does not touch it until the next
+// spawn.
 func TestChildrenSpawnOnTheMaterializedConfig(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
-	writeInstanceConfig(t, dir, "daemon.json", "sleep", state)
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
 
 	var buf lockedBuffer
 	log.SetOutput(&buf)
@@ -163,8 +165,9 @@ func TestChildrenSpawnOnTheMaterializedConfig(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
+	state := entryStateDir(cacheDir, "daemon-one")
 	want := filepath.Join(state, statedir.MaterializedConfigName)
 	// Wait for the child to both spawn on the generated config AND write its
 	// first iteration log: the spawn log line lands the moment cmd.Start()
@@ -208,14 +211,17 @@ func TestChildrenSpawnOnTheMaterializedConfig(t *testing.T) {
 // loop exists for — the regeneration happens BEFORE the respawn, so the
 // respawned child starts on a fresh file.
 func TestMaterializedConfigIsACache(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
-	writeInstanceConfig(t, dir, "daemon.json", "crash", state)
+	cacheDir := t.TempDir()
+	setHelperMode(t, "crash")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
+	state := entryStateDir(cacheDir, "daemon-one")
 	path := filepath.Join(state, statedir.MaterializedConfigName)
 	waitFor(t, 5*time.Second, "the generated config to exist", func() bool {
 		_, err := os.Lstat(path)

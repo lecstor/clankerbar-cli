@@ -1,9 +1,13 @@
 package supervisor
 
-// The supervisor's tests drive it against a FAKE daemon: the test binary
-// re-invoked as the child (TestMain -> helperMain), behaving per the mode
-// recorded in the CLANKERBAR_SUPER_MODE environment variable. The fake mirrors
-// the real daemon's load-bearing behaviours and nothing else:
+// The supervisor's tests drive it against a FAKE daemon and a FAKE plane: the
+// test binary re-invoked as the child (TestMain -> helperMain) behaves per the
+// mode recorded in the CLANKERBAR_SUPER_MODE environment variable, and the
+// account-scoped roster is served by a local httptest server whose entries the
+// test can flip between polls (that is the console flip the doneWhen describes).
+//
+// The fake daemon mirrors the real daemon's load-bearing behaviours and nothing
+// else:
 //
 //   - it creates its own state dir (0700) at startup,
 //   - it consumes a STOP marker found AT STARTUP without stopping (the
@@ -36,9 +40,10 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -46,6 +51,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/teststate"
 )
 
@@ -171,14 +177,60 @@ func helperMain() {
 
 // --- test scaffolding -------------------------------------------------------
 
+// fakePlane serves the account-scoped roster over httptest. The served
+// entries are mutable (set) so a test can flip desired state between polls —
+// the console flip — and the plane can be put down (setDown) to exercise the
+// offline paths.
+type fakePlane struct {
+	mu      sync.Mutex
+	entries []RosterEntry
+	down    bool
+}
+
+func (p *fakePlane) serve(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.mu.Lock()
+		down := p.down
+		entries := p.entries
+		p.mu.Unlock()
+		if down {
+			http.Error(w, "plane unreachable", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"entries": entries})
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func (p *fakePlane) set(entries []RosterEntry) {
+	p.mu.Lock()
+	p.entries = entries
+	p.mu.Unlock()
+}
+
+func (p *fakePlane) setDown(down bool) {
+	p.mu.Lock()
+	p.down = down
+	p.mu.Unlock()
+}
+
 // testOptions returns supervisor options pointed at the test binary as the
-// child, with fast intervals so the tests do not wait on production defaults.
-func testOptions(t *testing.T, dir string) Options {
+// child and the fake plane as the roster, with fast intervals so the tests do
+// not wait on production defaults. HOME is isolated so the machine-layer
+// config discovery in buildConfig never reads the operator's real config.
+func testOptions(t *testing.T, cacheDir string, srv *httptest.Server) Options {
 	t.Helper()
 	t.Setenv(helperEnv, "1") // children must re-enter as the fake daemon
+	t.Setenv("HOME", t.TempDir())
 	return Options{
-		ConfigDir:         dir,
 		Binary:            os.Args[0],
+		RosterURL:         srv.URL + "/api/daemon-roster",
+		APIKey:            "test-key",
+		RosterCacheDir:    cacheDir,
+		PollInterval:      50 * time.Millisecond,
 		BackoffBase:       50 * time.Millisecond,
 		BackoffCap:        200 * time.Millisecond,
 		BackoffResetAfter: time.Second,
@@ -186,40 +238,39 @@ func testOptions(t *testing.T, dir string) Options {
 	}
 }
 
-// writeInstanceConfig drops one fake-daemon config file into dir. The MODE is
-// carried in the process env (helperModeEnv), inherited by every child: since
-// phase 2b the child reads the supervisor's MATERIALIZED config, which carries
-// only real config fields — so a test-only key would not survive
-// materialization, and the mode has to travel outside the file.
-func writeInstanceConfig(t *testing.T, dir, name, mode, stateDir string) {
+// setHelperMode sets the fake daemon's mode for the children of one run. The
+// mode is process-wide, so one run uses one mode (see the file comment).
+func setHelperMode(t *testing.T, mode string) {
 	t.Helper()
 	t.Setenv(helperModeEnv, mode)
-	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q}`, stateDir)
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
+}
+
+// runEntry builds a local running roster entry driving one project. repo is
+// the project's primary_repo (empty when no workdir derivation is wanted).
+func runEntry(name, repo string) RosterEntry {
+	return RosterEntry{
+		Name:         name,
+		DesiredState: RosterDesiredRunning,
+		Placement:    RosterPlacementLocal,
+		Projects:     []RosterProject{{Slug: "acme", PrimaryRepo: repo}},
 	}
 }
 
-// writeInstanceConfigRepo is writeInstanceConfig with a primary_repo declared,
-// so the workdir derivation (phase 2a) has a repo to derive from.
-func writeInstanceConfigRepo(t *testing.T, dir, name, mode, stateDir, primary string) {
-	t.Helper()
-	t.Setenv(helperModeEnv, mode)
-	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "primary_repo": %q}`, stateDir, primary)
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
+// stopEntry builds a local stopped roster entry driving one project.
+func stopEntry(name string) RosterEntry {
+	return RosterEntry{
+		Name:         name,
+		DesiredState: RosterDesiredStopped,
+		Placement:    RosterPlacementLocal,
+		Projects:     []RosterProject{{Slug: "acme"}},
 	}
 }
 
-// writeInstanceConfigPolicy is writeInstanceConfig with a settings_path
-// declared, so the permission-policy gate (phase 2c) has a file to verify.
-func writeInstanceConfigPolicy(t *testing.T, dir, name, mode, stateDir, settingsPath string) {
-	t.Helper()
-	t.Setenv(helperModeEnv, mode)
-	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "settings_path": %q}`, stateDir, settingsPath)
-	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-		t.Fatal(err)
-	}
+// entryStateDir is the state dir the supervisor derives for one roster entry:
+// the same derivation the implementation uses, so tests know where the fake
+// daemon writes its iteration logs and where STOP lands.
+func entryStateDir(cacheDir, name string) string {
+	return rosterStateDir(cacheDir, name)
 }
 
 // countRuns reports how many iteration-*.log files the fake has written into
@@ -284,29 +335,30 @@ func (b *lockedBuffer) String() string {
 
 // --- tests ------------------------------------------------------------------
 
-// The supervisor starts exactly one child per instance config, and ignores the
-// other JSON that shares the config dir.
-func TestSpawnPerFile(t *testing.T) {
-	dir := t.TempDir()
-	a := filepath.Join(t.TempDir(), "state-a")
-	b := filepath.Join(t.TempDir(), "state-b")
-	writeInstanceConfig(t, dir, "a.json", "sleep", a)
-	writeInstanceConfig(t, dir, "b.json", "sleep", b)
-	// Not instance configs: an MCP config, a headless permission policy, and
-	// unparseable JSON. None may spawn a child.
-	os.WriteFile(filepath.Join(dir, "mcp.json"), []byte(`{"mcp": {"cb": {"type": "remote", "url": "https://plane/mcp/slug"}}}`), 0o644)
-	os.WriteFile(filepath.Join(dir, "headless.json"), []byte(`{"permissions": {"allow": ["Bash(go test:*)"]}}`), 0o644)
-	os.WriteFile(filepath.Join(dir, "broken.json"), []byte(`{not json`), 0o644)
+// The supervisor starts exactly one child per running roster entry, and
+// nothing for a stopped one.
+func TestSpawnPerRosterEntry(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", ""), runEntry("daemon-two", ""), stopEntry("daemon-three")})
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
-	waitFor(t, 5*time.Second, "both instances to come up", func() bool {
+	a := entryStateDir(cacheDir, "daemon-one")
+	b := entryStateDir(cacheDir, "daemon-two")
+	c := entryStateDir(cacheDir, "daemon-three")
+	waitFor(t, 5*time.Second, "both running instances to come up", func() bool {
 		return countRuns(t, a) == 1 && countRuns(t, b) == 1
 	})
 	if got := countRuns(t, a) + countRuns(t, b); got != 2 {
-		t.Fatalf("total spawns = %d, want exactly 2 (one per instance config)", got)
+		t.Fatalf("total spawns = %d, want exactly 2 (one per running entry)", got)
+	}
+	if got := countRuns(t, c); got != 0 {
+		t.Fatalf("stopped entry spawned %d time(s), want 0", got)
 	}
 
 	cancel()
@@ -329,14 +381,17 @@ func TestSpawnPerFile(t *testing.T) {
 // A child that exits unexpectedly is restarted, and the respawn rate backs off
 // (the ladder doubles to the cap rather than spinning at the base interval).
 func TestUnexpectedExitRestartWithBackoff(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
-	writeInstanceConfig(t, dir, "crashy.json", "crash", state)
+	cacheDir := t.TempDir()
+	setHelperMode(t, "crash")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("crashy", "")})
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
+	state := entryStateDir(cacheDir, "crashy")
 	waitFor(t, 5*time.Second, "the crashing child to have been respawned at least twice", func() bool {
 		return countRuns(t, state) >= 3
 	})
@@ -369,18 +424,40 @@ func TestUnexpectedExitRestartWithBackoff(t *testing.T) {
 	})
 }
 
-// A child the supervisor told to stop is NOT restarted: the STOP marker lands,
-// the child drains (exits) at its boundary, and the supervisor waits for it.
-func TestDeliberateStopNoRestart(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
-	writeInstanceConfig(t, dir, "daemon.json", "sleep", state)
+// Flipping desired state in the console lands on the machine within one poll
+// and with no operator command: a running entry's child is stopped (STOP
+// written, child drains, no respawn), and flipping back brings it up again.
+func TestDesiredFlipWithinOnePoll(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep-seen")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
-	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+	state := entryStateDir(cacheDir, "daemon-one")
+	waitFor(t, 5*time.Second, "the running child to come up", func() bool { return countRuns(t, state) == 1 })
+
+	// The console flip: the entry is now desired stopped. The STOP marker must
+	// land and the child must drain within one poll — no operator command.
+	plane.set([]RosterEntry{stopEntry("daemon-one")})
+	waitFor(t, 5*time.Second, "STOP to land and the child to drain", func() bool {
+		_, err := os.Lstat(filepath.Join(state, "STOP-SEEN"))
+		return err == nil
+	})
+	if got := countRuns(t, state); got != 1 {
+		t.Fatalf("spawns after the flip to stopped = %d, want 1 — a stopped child must not be restarted", got)
+	}
+
+	// Flip back: the next poll brings the child up again.
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	waitFor(t, 5*time.Second, "the child to come back up after the flip back to running", func() bool {
+		return countRuns(t, state) == 2
+	})
+
 	cancel()
 	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
 		select {
@@ -393,28 +470,76 @@ func TestDeliberateStopNoRestart(t *testing.T) {
 			return false
 		}
 	})
-	if got := countRuns(t, state); got != 1 {
-		t.Fatalf("spawns = %d, want 1 — a child told to stop must not be restarted", got)
+}
+
+// Reconciliation is idempotent: repeated polls with unchanged state spawn
+// nothing and write nothing — no respawn, no STOP marker.
+func TestReconcileIsIdempotent(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", ""), runEntry("daemon-two", ""), stopEntry("daemon-three")})
+	srv := plane.serve(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+	a := entryStateDir(cacheDir, "daemon-one")
+	b := entryStateDir(cacheDir, "daemon-two")
+	c := entryStateDir(cacheDir, "daemon-three")
+	waitFor(t, 5*time.Second, "both running instances to come up", func() bool {
+		return countRuns(t, a) == 1 && countRuns(t, b) == 1
+	})
+
+	// Let several polls pass over an unchanged roster: nothing may spawn and
+	// nothing may be written — no STOP marker anywhere.
+	time.Sleep(6 * 50 * time.Millisecond) // six polls at the test interval
+	if got := countRuns(t, a) + countRuns(t, b); got != 2 {
+		t.Fatalf("total spawns after six unchanged polls = %d, want 2 — reconcile is not idempotent", got)
 	}
+	for _, dir := range []string{a, b, c} {
+		if _, err := os.Lstat(filepath.Join(dir, "STOP")); err == nil {
+			t.Fatalf("an unchanged roster wrote STOP into %s — reconcile is not idempotent", dir)
+		}
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
 }
 
 // The fleet-wide drain: cancelling the context (the signal path) writes a STOP
 // marker into every child's own state dir, every child exits, none restart.
 func TestFleetWideDrainOnSignal(t *testing.T) {
-	dir := t.TempDir()
-	states := []string{
-		filepath.Join(t.TempDir(), "s1"),
-		filepath.Join(t.TempDir(), "s2"),
-		filepath.Join(t.TempDir(), "s3"),
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep-seen")
+	plane := &fakePlane{}
+	names := []string{"d1", "d2", "d3"}
+	entries := make([]RosterEntry, 0, len(names))
+	for _, n := range names {
+		entries = append(entries, runEntry(n, ""))
 	}
-	for i, s := range states {
-		writeInstanceConfig(t, dir, fmt.Sprintf("d%d.json", i+1), "sleep-seen", s)
-	}
+	plane.set(entries)
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
+	states := make([]string, 0, len(names))
+	for _, n := range names {
+		states = append(states, entryStateDir(cacheDir, n))
+	}
 	for _, s := range states {
 		waitFor(t, 5*time.Second, "all children to come up", func() bool { return countRuns(t, s) == 1 })
 	}
@@ -443,14 +568,17 @@ func TestFleetWideDrainOnSignal(t *testing.T) {
 // HALT is the operator's per-instance stop switch: a child that exits with a
 // HALT marker in its state dir is left stopped, not respawned.
 func TestHaltLeavesInstanceStopped(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
-	writeInstanceConfig(t, dir, "halted.json", "halt", state)
+	cacheDir := t.TempDir()
+	setHelperMode(t, "halt")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("halted", "")})
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
+	state := entryStateDir(cacheDir, "halted")
 	waitFor(t, 5*time.Second, "the halting child to run once", func() bool { return countRuns(t, state) == 1 })
 	// Six times the base backoff: if the HALT were ignored, a respawn would
 	// have happened long before this.
@@ -472,20 +600,24 @@ func TestHaltLeavesInstanceStopped(t *testing.T) {
 	})
 }
 
-// A config dir with nothing superviseable in it is a clean no-op, not an
-// error and not an idle hang.
-func TestEmptyConfigDirReturnsCleanly(t *testing.T) {
-	dir := t.TempDir() // empty
+// A roster with nothing local on it is a clean no-op, not an error and not an
+// idle hang.
+func TestEmptyRosterReturnsCleanly(t *testing.T) {
+	cacheDir := t.TempDir()
+	plane := &fakePlane{}
+	plane.set(nil)
+	srv := plane.serve(t)
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("Supervise on an empty dir returned %v, want nil", err)
+			t.Fatalf("Supervise over an empty roster returned %v, want nil", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("Supervise on an empty dir did not return")
+		t.Fatal("Supervise over an empty roster did not return")
 	}
 }
 
@@ -495,13 +627,15 @@ func TestEmptyConfigDirReturnsCleanly(t *testing.T) {
 // to stopAll, which counted every never-spawned instance as live and then
 // blocked forever on the exit channel.)
 func TestPreCancelledContextReturnsCleanly(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
-	writeInstanceConfig(t, dir, "a.json", "sleep", state)
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("a", "")})
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // cancelled before Supervise runs
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 	select {
 	case err := <-done:
 		if err != nil {
@@ -510,7 +644,7 @@ func TestPreCancelledContextReturnsCleanly(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Supervise on a pre-cancelled ctx did not return - stopAll waits for children that were never spawned")
 	}
-	if got := countRuns(t, state); got != 0 {
+	if got := countRuns(t, entryStateDir(cacheDir, "a")); got != 0 {
 		t.Fatalf("spawns = %d, want 0 - a pre-cancelled supervisor must not spawn children", got)
 	}
 }
@@ -521,7 +655,7 @@ func TestPreCancelledContextReturnsCleanly(t *testing.T) {
 // never ends) both leave the stop waiting by design — the supervisor never
 // kills — and the wait must be loud.
 func TestStopLogsWhenTheFleetCannotDrain(t *testing.T) {
-	dir := t.TempDir()
+	cacheDir := t.TempDir()
 	cases := []struct {
 		name string
 		mode string
@@ -531,14 +665,16 @@ func TestStopLogsWhenTheFleetCannotDrain(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			state := filepath.Join(t.TempDir(), "state")
-			writeInstanceConfig(t, dir, "stuck.json", tc.mode, state)
+			setHelperMode(t, tc.mode)
+			plane := &fakePlane{}
+			plane.set([]RosterEntry{runEntry("stuck", "")})
+			srv := plane.serve(t)
 
 			var buf lockedBuffer
 			log.SetOutput(&buf)
 			defer log.SetOutput(os.Stderr)
 
-			o := testOptions(t, dir)
+			o := testOptions(t, cacheDir, srv)
 			o.StopLogEvery = 100 * time.Millisecond
 			ctx, cancel := context.WithCancel(context.Background())
 			done := runSupervise(ctx, o)
@@ -594,30 +730,34 @@ func spawnPid(t *testing.T, log string) int {
 // The workdir derivation gate (phase 2a): with a machine root stated, an
 // instance whose derived workdir fails the fail-closed conditions is refused —
 // no child is ever spawned for it, the path tried is reported, and the rest of
-// the fleet keeps running.
+// the fleet keeps running. The repo the entry's project names is what the
+// derivation derives from.
 func TestWorkdirDerivationFailureSpawnsNothing(t *testing.T) {
 	root := t.TempDir()
 	// The good instance's derived workdir must be a real checkout of the repo
-	// its config names; the ghost instance's derived path will simply not exist.
+	// its project names; the ghost instance's derived path will simply not
+	// exist.
 	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
 
-	dir := t.TempDir()
-	goodState := filepath.Join(t.TempDir(), "state-good")
-	ghostState := filepath.Join(t.TempDir(), "state-ghost")
-	writeInstanceConfigRepo(t, dir, "good.json", "sleep", goodState, "acme/widgets")
-	writeInstanceConfigRepo(t, dir, "ghost.json", "sleep", ghostState, "acme/ghost")
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("good", "acme/widgets"), runEntry("ghost", "acme/ghost")})
+	srv := plane.serve(t)
 
 	var buf lockedBuffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 
-	o := testOptions(t, dir)
+	o := testOptions(t, cacheDir, srv)
 	o.WorkdirRoot = root
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	done := runSupervise(ctx, o)
 
-	// The good instance derives, spawns, and runs.
+	goodState := entryStateDir(cacheDir, "good")
+	ghostState := entryStateDir(cacheDir, "ghost")
+	// The derivable instance derives, spawns, and runs.
 	waitFor(t, 5*time.Second, "the derivable instance to come up", func() bool {
 		return countRuns(t, goodState) == 1
 	})
@@ -648,20 +788,24 @@ func TestWorkdirDerivationFailureSpawnsNothing(t *testing.T) {
 	}
 }
 
-// With no machine root stated, derivation is OFF and every valid config is
-// supervised on its own declared workdir — the phase-1 behaviour, unchanged.
+// With no machine root stated, derivation is OFF and every valid entry is
+// supervised on its base config's own workdir — the phase-1 behaviour,
+// unchanged.
 func TestWorkdirDerivationOffWithoutRoot(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
-	writeInstanceConfigRepo(t, dir, "daemon.json", "sleep", state, "acme/ghost")
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon", "acme/ghost")})
+	srv := plane.serve(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir)) // no WorkdirRoot
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
+	state := entryStateDir(cacheDir, "daemon")
 	// The ghost repo has no checkout anywhere, yet the instance runs: without
-	// a stated root there is nothing to derive, so the config's own workdir
-	// governs, exactly as before phase 2a.
+	// a stated root there is nothing to derive, so the base config's own
+	// workdir governs, exactly as before phase 2a.
 	waitFor(t, 5*time.Second, "the instance to come up", func() bool { return countRuns(t, state) == 1 })
 	cancel()
 	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
@@ -677,45 +821,20 @@ func TestWorkdirDerivationOffWithoutRoot(t *testing.T) {
 	})
 }
 
-// enumerate keeps exactly the parseable, valid instance configs and reports
-// the skips as log lines.
-func TestEnumerateSkipsNonConfigs(t *testing.T) {
-	dir := t.TempDir()
-	a := filepath.Join(t.TempDir(), "state-a")
-	writeInstanceConfig(t, dir, "a.json", "sleep", a)
-	os.WriteFile(filepath.Join(dir, "mcp.json"), []byte(`{"mcp": {}}`), 0o644)
-	os.WriteFile(filepath.Join(dir, "policy.json"), []byte(`{"permissions": {}}`), 0o644)
-	os.WriteFile(filepath.Join(dir, "broken.json"), []byte(`{`), 0o644)
-	// A config that would fail validation (unknown harness) is skipped too.
-	os.WriteFile(filepath.Join(dir, "bad-harness.json"), []byte(`{"harness": "no-such-harness", "state_dir": "/tmp/x"}`), 0o644)
-
-	d := &Supervisor{o: testOptions(t, dir).withDefaults()}
-	if err := d.enumerate(); err != nil {
-		t.Fatal(err)
-	}
-	if len(d.instances) != 1 {
-		t.Fatalf("enumerate kept %d instance(s), want 1 — only a.json is a valid instance config", len(d.instances))
-	}
-	if d.instances[0].path != filepath.Join(dir, "a.json") {
-		t.Fatalf("kept %s, want a.json", d.instances[0].path)
-	}
-}
-
-// The permission-policy gate (phase 2c): an instance whose settings_path names
-// a file that does not exist is refused at enumeration — no child is ever
-// spawned for it, the refusal names the daemon and the path tried, and the
-// rest of the fleet keeps running.
-func TestPermissionPolicyAbsentSpawnsNothing(t *testing.T) {
-	dir := t.TempDir()
-	goodState := filepath.Join(t.TempDir(), "state-good")
-	ghostState := filepath.Join(t.TempDir(), "state-ghost")
-	policy := filepath.Join(t.TempDir(), "headless.json")
-	if err := os.WriteFile(policy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	missing := filepath.Join(t.TempDir(), "headless-missing.json")
-	writeInstanceConfigPolicy(t, dir, "good.json", "sleep", goodState, policy)
-	writeInstanceConfigPolicy(t, dir, "ghost.json", "sleep", ghostState, missing)
+// A roster entry with placement remote is ignored without error: no child is
+// ever spawned for it, the rest of the fleet keeps running, and the ignore is
+// said once per entry (Decision 7 — the plane refuses them at write time; the
+// supervisor still must not fail on one).
+func TestRemotePlacementIgnoredWithoutError(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{
+		runEntry("local-one", ""),
+		{Name: "remote-one", DesiredState: RosterDesiredRunning, Placement: RosterPlacementRemote,
+			Projects: []RosterProject{{Slug: "acme"}}},
+	})
+	srv := plane.serve(t)
 
 	var buf lockedBuffer
 	log.SetOutput(&buf)
@@ -723,8 +842,252 @@ func TestPermissionPolicyAbsentSpawnsNothing(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
 
+	localState := entryStateDir(cacheDir, "local-one")
+	remoteState := entryStateDir(cacheDir, "remote-one")
+	waitFor(t, 5*time.Second, "the local instance to come up", func() bool {
+		return countRuns(t, localState) == 1
+	})
+	// The remote instance never spawns, and the ignore is logged (once).
+	time.Sleep(300 * time.Millisecond)
+	if got := countRuns(t, remoteState); got != 0 {
+		t.Fatalf("spawns for the remote-placed instance = %d, want 0 — remote placement is ignored", got)
+	}
+	if logText := buf.String(); !strings.Contains(logText, `ignoring entry "remote-one"`) {
+		t.Fatalf("the ignore is not logged:\n%s", logText)
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// A roster entry carrying a key that may not come from the plane is refused
+// loudly at reconcile: the refusal names the entry AND the key, no child is
+// ever spawned for it, and the rest of the fleet keeps running. Each refusal
+// class is its own entry — machine-layer keys, run-config keys, and unknown
+// keys.
+func TestRefusedEntryNamedLoudlySpawnsNothing(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	bad := []struct {
+		name string
+		key  string
+		val  string
+	}{
+		{"bad-env", "env", `{"FOO": "bar"}`},
+		{"bad-settings", "settings_path", `"/tmp/nope.json"`},
+		{"bad-workdir", "workdir", `"/tmp/nope"`},
+		{"bad-mcp", "mcp_config_path", `"/tmp/nope.json"`},
+		{"bad-model", "model", `"opus"`},
+		{"bad-budget", "budget", `{"per_session": 1}`},
+		{"bad-mystery", "nope", `1`},
+	}
+	entries := []RosterEntry{runEntry("good", "")}
+	for _, b := range bad {
+		entries = append(entries, RosterEntry{
+			Name: b.name, DesiredState: RosterDesiredRunning, Placement: RosterPlacementLocal,
+			Projects:  []RosterProject{{Slug: "acme"}},
+			Overrides: map[string]json.RawMessage{b.key: json.RawMessage(b.val)},
+		})
+	}
+	plane.set(entries)
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+	goodState := entryStateDir(cacheDir, "good")
+	waitFor(t, 5*time.Second, "the good instance to come up", func() bool {
+		return countRuns(t, goodState) == 1
+	})
+	time.Sleep(300 * time.Millisecond)
+	for _, b := range bad {
+		if got := countRuns(t, entryStateDir(cacheDir, b.name)); got != 0 {
+			t.Errorf("refused entry %q spawned %d time(s), want 0", b.name, got)
+		}
+		if logText := buf.String(); !strings.Contains(logText, b.name) || !strings.Contains(logText, b.key) {
+			t.Errorf("the refusal of %q is not logged naming both the entry and the key %q:\n%s", b.name, b.key, logText)
+		}
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// A cold start with the plane unreachable reconciles from the cached roster on
+// disk: the running entry's child comes up, the stopped entry stays stopped,
+// and the log says what it started from.
+func TestColdStartFromCachedRosterWhenPlaneUnreachable(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	// A previous run's successful poll left the last-known-good roster.
+	writeCachedRoster(cacheDir, []RosterEntry{runEntry("daemon-one", ""), stopEntry("daemon-two")})
+
+	plane := &fakePlane{}
+	plane.setDown(true) // the plane is unreachable at start
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+	a := entryStateDir(cacheDir, "daemon-one")
+	b := entryStateDir(cacheDir, "daemon-two")
+	waitFor(t, 5*time.Second, "the cached running entry to come up", func() bool {
+		return countRuns(t, a) == 1
+	})
+	if got := countRuns(t, b); got != 0 {
+		t.Fatalf("cached stopped entry spawned %d time(s), want 0", got)
+	}
+	if logText := buf.String(); !strings.Contains(logText, "starting from the cached roster") {
+		t.Fatalf("the cold-start fallback is not logged:\n%s", logText)
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// A warm supervisor whose plane goes down keeps reconciling against the
+// last-known-good roster: the running children stay up, nothing respawns, and
+// the log says the plane is unreachable.
+func TestPlaneLossKeepsFleetRunning(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+	state := entryStateDir(cacheDir, "daemon-one")
+	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+
+	plane.setDown(true) // the plane goes away mid-run
+	waitFor(t, 5*time.Second, "the plane loss to be logged", func() bool {
+		return strings.Contains(buf.String(), "plane unreachable") &&
+			strings.Contains(buf.String(), "last-known-good roster")
+	})
+	// Several polls against the last-known-good roster: the child stays up,
+	// nothing respawns, no STOP is written.
+	time.Sleep(6 * 50 * time.Millisecond)
+	if got := countRuns(t, state); got != 1 {
+		t.Fatalf("spawns after plane loss = %d, want 1 — the fleet must keep running from the last-known-good roster", got)
+	}
+	if _, err := os.Lstat(filepath.Join(state, "STOP")); err == nil {
+		t.Fatal("a STOP marker was written while the plane was merely unreachable")
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// The permission-policy gate (phase 2c): an instance whose effective
+// settings_path names a file that does not exist is refused at reconcile — no
+// child is ever spawned for it, the refusal names the daemon and the path
+// tried, and the rest of the fleet keeps running. The policy is a MACHINE-LAYER
+// value, so the base config carries it per harness: the good entry runs on
+// claude (whose policy exists), the ghost entry overrides harness to opencode
+// (whose per-harness policy is missing).
+func TestPermissionPolicyAbsentSpawnsNothing(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{
+		runEntry("good", ""),
+		{Name: "ghost", DesiredState: RosterDesiredRunning, Placement: RosterPlacementLocal,
+			Projects: []RosterProject{{Slug: "acme"}},
+			Overrides: map[string]json.RawMessage{
+				"harness": json.RawMessage(`"opencode"`),
+			}},
+	})
+	srv := plane.serve(t)
+
+	policy := filepath.Join(t.TempDir(), "headless.json")
+	if err := os.WriteFile(policy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "headless-missing.json")
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	o := testOptions(t, cacheDir, srv)
+	// The machine layer: loaded under the isolated HOME (so defaults fill the
+	// prompt and the rest), then the per-harness policies overlaid — claude's
+	// exists, opencode's does not.
+	base, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.SettingsPath = policy
+	base.Harnesses = map[string]config.HarnessConfig{
+		"opencode": {SettingsPath: missing},
+	}
+	o.BaseCfg = base
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, o)
+
+	goodState := entryStateDir(cacheDir, "good")
+	ghostState := entryStateDir(cacheDir, "ghost")
 	// The instance whose policy file exists spawns and runs.
 	waitFor(t, 5*time.Second, "the instance with a policy file to come up", func() bool {
 		return countRuns(t, goodState) == 1
@@ -767,22 +1130,33 @@ func TestPermissionPolicyAbsentSpawnsNothing(t *testing.T) {
 // new one without the file. Once the file is restored, the backoff retry
 // respawns the child.
 func TestPermissionPolicyRemovedAfterStartRefusesRespawn(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
 	policy := filepath.Join(t.TempDir(), "headless.json")
 	if err := os.WriteFile(policy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeInstanceConfigPolicy(t, dir, "daemon.json", "sleep", state, policy)
 
 	var buf lockedBuffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 
+	o := testOptions(t, cacheDir, srv)
+	base, err := config.Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.SettingsPath = policy
+	o.BaseCfg = base
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
+	done := runSupervise(ctx, o)
 
+	state := entryStateDir(cacheDir, "daemon-one")
 	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
 	// Take the policy away, then kill the child so the supervisor must respawn.
 	if err := os.Remove(policy); err != nil {
@@ -795,9 +1169,14 @@ func TestPermissionPolicyRemovedAfterStartRefusesRespawn(t *testing.T) {
 	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
-	// The respawn must be refused, naming the daemon and the policy path.
+	// The respawn must be refused, naming the daemon and the policy path. The
+	// refusal can be spoken by either gate — the poll's re-resolve ("refused:")
+	// or the spawn itself ("refusing to start:") — so accept either wording;
+	// what must hold either way is that the path is named and no child starts.
 	waitFor(t, 5*time.Second, "the refused respawn to be logged", func() bool {
-		return strings.Contains(buf.String(), "refusing to start") && strings.Contains(buf.String(), policy)
+		logText := buf.String()
+		return strings.Contains(logText, policy) &&
+			(strings.Contains(logText, "refused:") || strings.Contains(logText, "refusing to start"))
 	})
 	if got := countRuns(t, state); got != 1 {
 		t.Fatalf("spawns after the policy file was removed = %d, want 1 — the gate must not start a child without its policy", got)
@@ -825,37 +1204,46 @@ func TestPermissionPolicyRemovedAfterStartRefusesRespawn(t *testing.T) {
 }
 
 // The spawn-time gate (phase 2c) refuses a policy that goes missing from an
-// EDITED source, even when the previous config's policy file still exists: the
-// daemon must not be respawned on the last materialized config under a policy
-// the operator has replaced. The backoff retry picks up the restored file
+// EDITED base config, even when the previous config's policy file still
+// exists: the daemon must not be respawned on the last materialized config
+// under a policy the operator has replaced. The base config is the machine
+// layer, so the edit lands on it; the backoff retry picks up the restored file
 // without a supervisor restart.
 func TestPermissionPolicyEditedToAbsentRefusesRespawn(t *testing.T) {
-	dir := t.TempDir()
-	state := filepath.Join(t.TempDir(), "state")
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
 	oldPolicy := filepath.Join(t.TempDir(), "headless-old.json")
 	if err := os.WriteFile(oldPolicy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	newPolicy := filepath.Join(t.TempDir(), "headless-new.json") // named, never created
-	writeInstanceConfigPolicy(t, dir, "daemon.json", "sleep", state, oldPolicy)
 
 	var buf lockedBuffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := runSupervise(ctx, testOptions(t, dir))
-
-	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
-	// Edit the source to name a policy file that does not exist. The OLD
-	// policy file stays on disk, so the last materialized config would pass
-	// the gate — the refusal must come from the re-resolve, and it must NOT
-	// fall back to that config.
-	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "settings_path": %q}`, state, newPolicy)
-	if err := os.WriteFile(filepath.Join(dir, "daemon.json"), []byte(body), 0o644); err != nil {
+	o := testOptions(t, cacheDir, srv)
+	base, err := config.Load("")
+	if err != nil {
 		t.Fatal(err)
 	}
+	base.SettingsPath = oldPolicy
+	o.BaseCfg = base
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, o)
+
+	state := entryStateDir(cacheDir, "daemon-one")
+	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+	// Edit the machine layer to name a policy file that does not exist. The
+	// OLD policy file stays on disk, so the last materialized config would
+	// pass the gate — the refusal must come from the re-resolve, and it must
+	// NOT fall back to that config.
+	base.SettingsPath = newPolicy
 	pid := spawnPid(t, buf.String())
 	if pid <= 0 {
 		t.Fatalf("no spawned pid in the log:\n%s", buf.String())
@@ -864,7 +1252,9 @@ func TestPermissionPolicyEditedToAbsentRefusesRespawn(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitFor(t, 5*time.Second, "the refused respawn to be logged", func() bool {
-		return strings.Contains(buf.String(), "refusing to start") && strings.Contains(buf.String(), newPolicy)
+		logText := buf.String()
+		return strings.Contains(logText, newPolicy) &&
+			(strings.Contains(logText, "refused:") || strings.Contains(logText, "refusing to start"))
 	})
 	// No child may spawn on the old materialized config, however long the
 	// backoff retries run against the still-absent file.
@@ -920,30 +1310,5 @@ func TestBackoffDelay(t *testing.T) {
 		if got := backoffDelay(tc.prev, tc.uptime, base, cap, resetAfter); got != tc.want {
 			t.Errorf("%s: backoffDelay(%v, %v) = %v, want %v", tc.name, tc.prev, tc.uptime, got, tc.want)
 		}
-	}
-}
-
-// The supervisor sorts nothing itself; enumeration comes back in the glob's
-// sorted order, so two instances are stable and distinct.
-func TestEnumerateSortsInstances(t *testing.T) {
-	dir := t.TempDir()
-	writeInstanceConfig(t, dir, "b.json", "sleep", filepath.Join(t.TempDir(), "b"))
-	writeInstanceConfig(t, dir, "a.json", "sleep", filepath.Join(t.TempDir(), "a"))
-
-	d := &Supervisor{o: testOptions(t, dir).withDefaults()}
-	if err := d.enumerate(); err != nil {
-		t.Fatal(err)
-	}
-	var names []string
-	for _, inst := range d.instances {
-		names = append(names, filepath.Base(inst.path))
-	}
-	sort.Strings(names)
-	got := make([]string, len(d.instances))
-	for i, inst := range d.instances {
-		got[i] = filepath.Base(inst.path)
-	}
-	if strings.Join(got, ",") != strings.Join(names, ",") {
-		t.Fatalf("instances not in sorted order: %v", got)
 	}
 }
