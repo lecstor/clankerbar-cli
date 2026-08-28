@@ -16,17 +16,24 @@ package supervisor
 //
 // The modes: "sleep" (exit on STOP), "sleep-seen" (exit on STOP, leave the
 // marker and drop a STOP-SEEN file as proof the marker landed), "crash" (exit
-// 1 immediately) and "halt" (write HALT, exit 1).
+// 1 immediately), "halt" (write HALT, exit 1), "sleep-no-dir" (never create
+// the state dir: the daemon-stuck-before-startup shape) and "stubborn" (never
+// exit, whatever lands in the state dir: the drain-stuck shape).
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -79,29 +86,33 @@ func helperMain() {
 		os.Exit(9)
 	}
 
-	// The real daemon creates its own state dir at startup.
-	if err := os.MkdirAll(spec.StateDir, 0o700); err != nil {
-		fmt.Fprintln(os.Stderr, "fake daemon: state dir:", err)
-		os.Exit(9)
-	}
-	// Count existing runs, then write this run's iteration log — the real
-	// daemon's artifact naming, so the supervisor adopts the dir.
-	entries, _ := os.ReadDir(spec.StateDir)
-	n := 0
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "iteration-") && strings.HasSuffix(e.Name(), ".log") {
-			n++
+	// The real daemon creates its own state dir at startup — except
+	// "sleep-no-dir", which deliberately does not, so the supervisor faces a
+	// child that is alive but has no state dir to write STOP into.
+	if spec.Mode != "sleep-no-dir" {
+		if err := os.MkdirAll(spec.StateDir, 0o700); err != nil {
+			fmt.Fprintln(os.Stderr, "fake daemon: state dir:", err)
+			os.Exit(9)
 		}
-	}
-	name := fmt.Sprintf("iteration-%d.log", n+1)
-	if err := os.WriteFile(filepath.Join(spec.StateDir, name), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
-		fmt.Fprintln(os.Stderr, "fake daemon: iteration log:", err)
-		os.Exit(9)
-	}
-	// The CLA-491 startup consumption: a STOP found here predates this process
-	// and is eaten WITHOUT stopping.
-	if _, err := os.Lstat(filepath.Join(spec.StateDir, "STOP")); err == nil {
-		_ = os.Remove(filepath.Join(spec.StateDir, "STOP"))
+		// Count existing runs, then write this run's iteration log — the real
+		// daemon's artifact naming, so the supervisor adopts the dir.
+		entries, _ := os.ReadDir(spec.StateDir)
+		n := 0
+		for _, e := range entries {
+			if strings.HasPrefix(e.Name(), "iteration-") && strings.HasSuffix(e.Name(), ".log") {
+				n++
+			}
+		}
+		name := fmt.Sprintf("iteration-%d.log", n+1)
+		if err := os.WriteFile(filepath.Join(spec.StateDir, name), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake daemon: iteration log:", err)
+			os.Exit(9)
+		}
+		// The CLA-491 startup consumption: a STOP found here predates this process
+		// and is eaten WITHOUT stopping.
+		if _, err := os.Lstat(filepath.Join(spec.StateDir, "STOP")); err == nil {
+			_ = os.Remove(filepath.Join(spec.StateDir, "STOP"))
+		}
 	}
 
 	stopPath := filepath.Join(spec.StateDir, "STOP")
@@ -124,6 +135,18 @@ func helperMain() {
 				os.Exit(0)
 			}
 			time.Sleep(20 * time.Millisecond)
+		}
+	case "sleep-no-dir":
+		// Alive forever, no state dir: a real daemon wedged (or dead) before
+		// its statedir.Open. The supervisor can never write STOP to it.
+		for {
+			time.Sleep(50 * time.Millisecond)
+		}
+	case "stubborn":
+		// Alive forever with a state dir, ignoring every marker: a daemon
+		// wedged mid-drain, whose STOP never lands at an iteration boundary.
+		for {
+			time.Sleep(50 * time.Millisecond)
 		}
 	default:
 		fmt.Fprintln(os.Stderr, "fake daemon: unknown mode", spec.Mode)
@@ -198,6 +221,25 @@ func runSupervise(ctx context.Context, o Options) <-chan error {
 	return done
 }
 
+// lockedBuffer is a concurrency-safe log sink: the supervisor goroutine
+// writes log lines into it while the test goroutine polls them.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 // --- tests ------------------------------------------------------------------
 
 // The supervisor starts exactly one child per instance config, and ignores the
@@ -262,9 +304,12 @@ func TestUnexpectedExitRestartWithBackoff(t *testing.T) {
 	if after < before {
 		t.Fatalf("spawn count went backwards: %d -> %d", before, after)
 	}
-	// At the 200ms cap, 500ms buys at most ~3 more spawns; at the flat 50ms
-	// base it would buy ~10. The count must sit between the two.
-	if extra := after - before; extra > 3 {
+	// At the 200ms cap, 500ms buys at most ~3 more spawns (+50, +150, +350),
+	// and a 4th only if the sleep overruns ~550ms under CI load; at the flat
+	// 50ms base the same window buys ~10. The bound sits wide of the cap's
+	// worst case (6 tolerates a sleep that overruns to ~1s) and still far
+	// below what a non-doubling ladder produces.
+	if extra := after - before; extra > 6 {
 		t.Fatalf("%d extra spawns in 500ms — the backoff is not doubling (cap %s, base %s)", extra, 200*time.Millisecond, 50*time.Millisecond)
 	}
 
@@ -400,6 +445,108 @@ func TestEmptyConfigDirReturnsCleanly(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Supervise on an empty dir did not return")
 	}
+}
+
+// A supervisor whose context is ALREADY cancelled must return cleanly, not
+// deadlock: nothing was spawned, so no Wait goroutine exists and no exit
+// event will ever arrive. (Regression: the pre-cancelled path used to hand
+// to stopAll, which counted every never-spawned instance as live and then
+// blocked forever on the exit channel.)
+func TestPreCancelledContextReturnsCleanly(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	writeInstanceConfig(t, dir, "a.json", "sleep", state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before Supervise runs
+	done := runSupervise(ctx, testOptions(t, dir))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Supervise on a pre-cancelled ctx returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Supervise on a pre-cancelled ctx did not return - stopAll waits for children that were never spawned")
+	}
+	if got := countRuns(t, state); got != 0 {
+		t.Fatalf("spawns = %d, want 0 - a pre-cancelled supervisor must not spawn children", got)
+	}
+}
+
+// A fleet stop that can make no progress must SAY so instead of hanging
+// silently: a child stuck before its state dir exists (nothing to write STOP
+// into) and a child that ignores STOP forever (the marker lands, the drain
+// never ends) both leave the stop waiting by design — the supervisor never
+// kills — and the wait must be loud.
+func TestStopLogsWhenTheFleetCannotDrain(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name string
+		mode string
+	}{
+		{"child stuck before its state dir exists", "sleep-no-dir"},
+		{"child that ignores STOP", "stubborn"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := filepath.Join(t.TempDir(), "state")
+			writeInstanceConfig(t, dir, "stuck.json", tc.mode, state)
+
+			var buf lockedBuffer
+			log.SetOutput(&buf)
+			defer log.SetOutput(os.Stderr)
+
+			o := testOptions(t, dir)
+			o.StopLogEvery = 100 * time.Millisecond
+			ctx, cancel := context.WithCancel(context.Background())
+			done := runSupervise(ctx, o)
+
+			waitFor(t, 5*time.Second, "the child to be spawned", func() bool {
+				return strings.Contains(buf.String(), "spawned (pid")
+			})
+			cancel()
+			waitFor(t, 5*time.Second, "the stuck stop to log what it waits for", func() bool {
+				return strings.Contains(buf.String(), "stop still waiting")
+			})
+			// The stop is stuck by construction; kill the child so the test
+			// leaves no orphan, and verify the supervisor then finishes.
+			if pid := spawnPid(t, buf.String()); pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+			waitFor(t, 5*time.Second, "the supervisor to return once the child is gone", func() bool {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatalf("Supervise returned %v, want nil", err)
+					}
+					return true
+				default:
+					return false
+				}
+			})
+		})
+	}
+}
+
+// spawnPid pulls the child pid out of a captured supervisor log line
+// ("<name>: spawned (pid 123, <path>)"), or 0 when no spawn is logged.
+func spawnPid(t *testing.T, log string) int {
+	t.Helper()
+	const marker = "spawned (pid "
+	i := strings.Index(log, marker)
+	if i < 0 {
+		return 0
+	}
+	rest := log[i+len(marker):]
+	j := strings.Index(rest, ",")
+	if j < 0 {
+		return 0
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(rest[:j]))
+	if err != nil {
+		return 0
+	}
+	return pid
 }
 
 // enumerate keeps exactly the parseable, valid instance configs and reports

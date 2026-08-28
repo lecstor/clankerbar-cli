@@ -28,6 +28,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -57,6 +58,12 @@ const (
 	// for the settle window has long passed that consumption, so its STOP is
 	// guaranteed to be honoured.
 	defaultSettleBeforeStop = 2 * time.Second
+	// defaultStopLogEvery is how long a fleet stop may make no progress —
+	// no child exit, no child becoming stoppable — before the supervisor
+	// says so on the log. Drains can legitimately take minutes (an in-flight
+	// session finishes), so the wait itself is never bounded; only its
+	// silence is.
+	defaultStopLogEvery = 30 * time.Second
 )
 
 // Options configures one supervisor run. Zero values take the defaults above.
@@ -72,6 +79,9 @@ type Options struct {
 	BackoffCap        time.Duration
 	BackoffResetAfter time.Duration
 	SettleBeforeStop  time.Duration
+	// StopLogEvery is how long a fleet stop may sit without progress before
+	// the supervisor logs what it is still waiting for. 0 = defaultStopLogEvery.
+	StopLogEvery time.Duration
 }
 
 func (o Options) withDefaults() Options {
@@ -86,6 +96,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.SettleBeforeStop <= 0 {
 		o.SettleBeforeStop = defaultSettleBeforeStop
+	}
+	if o.StopLogEvery <= 0 {
+		o.StopLogEvery = defaultStopLogEvery
 	}
 	return o
 }
@@ -154,7 +167,13 @@ func Supervise(ctx context.Context, o Options) error {
 	d.exits = make(chan exitEvent, len(d.instances))
 
 	if ctx.Err() != nil {
-		return d.stopAll()
+		// Cancelled before any child was spawned: nothing is running, so
+		// there is nothing to drain. Returning here is not an optimisation —
+		// stopAll would deadlock: every never-spawned instance still reads as
+		// live (exited is false until a Wait goroutine reports) and stopAll
+		// would block forever on exit events no goroutine will ever post.
+		log.Print("stop requested before any child was started - nothing to stop")
+		return nil
 	}
 	for _, inst := range d.instances {
 		d.spawn(inst)
@@ -391,69 +410,97 @@ func (d *Supervisor) armRestart() {
 // timer is moot because the select loop is not running. The marker is the one
 // `ctl`/a hand-written touch write: the daemon drains at its iteration
 // boundary — an in-flight session finishes — and exits by itself.
+//
+// One loop does both halves — the settle wait and the exit wait — because a
+// child that dies DURING its settle wait must be noticed via its exit event,
+// not by polling a flag nothing sets. `exited` is only ever set by onExit,
+// which runs on the main select loop; that loop is not running here, so a
+// child whose event sits unconsumed in the channel still reads as live, and a
+// separate settle loop would wait on it forever (it died before creating its
+// state dir, so the dir-never-appears condition never clears either).
 func (d *Supervisor) stopAll() error {
 	log.Print("stop requested - writing STOP to every instance")
-	for _, inst := range d.instances {
-		d.stopOne(inst)
-	}
-	pending := map[*Instance]bool{}
-	for _, inst := range d.instances {
-		inst.mu.Lock()
-		live := !inst.exited
-		inst.mu.Unlock()
-		if live {
-			pending[inst] = true
+	done := map[*Instance]bool{}    // child exited (event consumed) or never spawned
+	stopped := map[*Instance]bool{} // STOP marker written; awaiting the child's exit
+	waitStart := time.Now()
+	lastExit := waitStart
+	lastLog := waitStart
+	readyTick := time.NewTicker(50 * time.Millisecond)
+	defer readyTick.Stop()
+	for len(done) < len(d.instances) {
+		select {
+		case ev := <-d.exits:
+			done[ev.inst] = true
+			lastExit = time.Now()
+		case <-readyTick.C:
+			// A drain can legitimately take minutes (an in-flight session
+			// finishes), so the wait is never bounded — but a stop making no
+			// progress at all must say so, or a wedged child reads as a hang.
+			// lastLog gates the line to once per interval: a stuck stop must
+			// not become a 20-lines-a-second log.
+			now := time.Now()
+			if quiet := now.Sub(lastExit); quiet >= d.o.StopLogEvery && now.Sub(lastLog) >= d.o.StopLogEvery {
+				lastLog = now
+				var stuck []string
+				for _, inst := range d.instances {
+					if !done[inst] {
+						stuck = append(stuck, inst.name)
+					}
+				}
+				sort.Strings(stuck)
+				log.Printf("stop still waiting for %d instance(s) after %s (no exit in %s): %s - they stop at their iteration boundary; the supervisor keeps waiting rather than killing them",
+					len(stuck), time.Since(waitStart).Round(time.Second), quiet.Round(time.Second), strings.Join(stuck, ", "))
+			}
 		}
-	}
-	// Every live child's Wait goroutine posts exactly one more event. Stale
-	// events for children that died before the count are dropped.
-	for len(pending) > 0 {
-		ev := <-d.exits
-		delete(pending, ev.inst)
+		for _, inst := range d.instances {
+			if done[inst] || stopped[inst] {
+				continue
+			}
+			inst.mu.Lock()
+			alive := !inst.exited
+			since := time.Since(inst.aliveSince)
+			dir := inst.stateDir
+			inst.mu.Unlock()
+			if !alive {
+				done[inst] = true
+				continue
+			}
+			if since >= d.o.SettleBeforeStop {
+				if _, err := os.Lstat(dir); err == nil {
+					d.writeStop(inst, dir)
+					// written or not, one attempt is enough: a failure is
+					// logged loudly and the child is left to drain (or not)
+					// on its own; the supervisor keeps waiting for its exit.
+					stopped[inst] = true
+				}
+			}
+		}
 	}
 	log.Print("all instances stopped")
 	return nil
 }
 
-// stopOne writes the STOP marker into one instance's state dir, or returns
-// having decided there is nothing to stop. Two rules keep the write honest:
+// writeStop writes the STOP marker into one instance's state dir, or logs
+// loudly why it could not. Two rules keep the write honest:
 //
 //   - The child must be past its STARTUP marker consumption before a STOP
 //     lands. A STOP the daemon finds at startup is consumed WITHOUT stopping
 //     (CLA-491: a marker a previous run left behind must not kill the next
 //     one), so a stop written into that window would be eaten and the child
-//     would run on. A child alive for the settle window has passed it, so
-//     stopOne waits for that (or for the child's own exit) before writing.
+//     would run on. stopAll only calls this once the child has been alive for
+//     the settle window, which guarantees it has passed that consumption.
 //   - The state dir is never CREATED here: a dir the supervisor created for a
 //     child that has not started yet would be adopted by that child, whose
 //     startup would then eat the marker exactly as above. Writing into a dir
-//     the child itself created is what guarantees the child is past its
-//     startup marker check.
+//     the child itself created (the Lstat gate in stopAll) is what guarantees
+//     the child is past its startup marker check.
 //
 // A child that cannot be stopped this way — the state dir refuses to open, or
 // the marker write fails — is logged loudly and left running: the supervisor
-// keeps waiting (stopAll's pending loop), because stopping it by killing the
-// process is exactly what this phase must not do.
-func (d *Supervisor) stopOne(inst *Instance) {
-	for {
-		inst.mu.Lock()
-		alive := !inst.exited
-		since := time.Since(inst.aliveSince)
-		dir := inst.stateDir
-		inst.mu.Unlock()
-		if !alive {
-			return
-		}
-		if since >= d.o.SettleBeforeStop {
-			if _, err := os.Lstat(dir); err == nil {
-				break
-			}
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
+// keeps waiting for its exit, because stopping it by killing the process is
+// exactly what this phase must not do.
+func (d *Supervisor) writeStop(inst *Instance, dir string) {
 	inst.mu.Lock()
-	dir := inst.stateDir
 	cfg := inst.cfg
 	inst.mu.Unlock()
 	st, err := statedir.Open(dir, cfg.SessionWorkDirs()...)
