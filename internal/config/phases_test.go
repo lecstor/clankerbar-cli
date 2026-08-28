@@ -182,6 +182,80 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 	}
 }
 
+// CLA-540: a phased implement session is told to claim, work, commit, push and
+// stop at the checkpoint — and an approved-awaiting-merge offer from next_task
+// needs none of that: no commit, no branch, no worktree, its required act a
+// status move the brief's letter forbids. Without an exception the session asks
+// the operator about an offer that is exactly its job (observed twice on
+// 2026-08-28: CLA-533 and CLA-526, both green and mergeable, both raised as
+// blocking questions). The brief must admit the case as its own fork: the offer
+// IS the session's job, the offer's own instructions are the brief for it, and
+// ending after it is the task going to plan.
+//
+// The content assertions are FULL directional phrases, in the shape
+// TestBuiltinImplementBriefPinsTheResumedBranchRule established: a fragment
+// like "the offer" alone would survive a mutation that inverts the admission
+// into "decline the offer and ask".
+func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
+	brief, ok := builtinPhasePrompts[ImplementPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
+	}
+	if implementCloseOutRule == "" {
+		t.Fatal("the implement brief has no close-out rule")
+	}
+
+	lower := strings.ToLower(brief)
+	for _, want := range []string{
+		"if next_task instead offers an approved-awaiting-merge task",
+		"that offer is this session's job",
+		"follow the offer's own instructions",
+		"once the close-out is done stop and end the session",
+		"going to plan",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the implement brief never says %q; a close-out offer must be admitted as this session's job:\n%s", want, brief)
+		}
+	}
+
+	// The fork comes FIRST: the offer replaces fresh work, so the close-out
+	// disposition must precede the resumed-work rule and the checkpoint
+	// instruction, which both concern a task this session claims for itself.
+	closeIdx := strings.Index(lower, strings.ToLower(implementCloseOutRule))
+	ruleIdx := strings.Index(lower, strings.ToLower(implementResumedBranchRule))
+	stopIdx := strings.Index(lower, "then stop and end the session")
+	if closeIdx == -1 || ruleIdx == -1 || stopIdx == -1 {
+		t.Fatalf("close-out rule (%d), resumed-branch rule (%d) or terminal stop (%d) missing from the brief:\n%s",
+			closeIdx, ruleIdx, stopIdx, brief)
+	}
+	if !(closeIdx < ruleIdx && ruleIdx < stopIdx) {
+		t.Errorf("the close-out fork (%d) must precede the resumed-work rule (%d) and the terminal stop (%d):\n%s",
+			closeIdx, ruleIdx, stopIdx, brief)
+	}
+
+	// What the clause must NOT carry (the plane's offer owns all of it, and a
+	// second copy would drift — CLA-341): a placeholder, a named branch or merge
+	// target, the red-CI repair rule, the decline door, the queue (ONE offer, not
+	// several), or a worktree-reclaim step. "main" is banned as a whole word so
+	// "remaining" is not caught, the way TestRerunGuidancePointsAtWaitingRather
+	// ThanRestatingIt bans the waiting reference's mechanics.
+	for _, banned := range []string{
+		"{{", "branch", "worktree", "staging", "integration",
+		"red", "decline", "cannot attempt", "queue",
+	} {
+		if strings.Contains(strings.ToLower(implementCloseOutRule), banned) {
+			t.Errorf("the close-out rule says %q — it belongs on the offer, not in the brief:\n%s", banned, implementCloseOutRule)
+		}
+	}
+	words := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(implementCloseOutRule), func(r rune) bool { return !unicode.IsLetter(r) }) {
+		words[w] = true
+	}
+	if words["main"] {
+		t.Errorf("the close-out rule names %q as a merge target — the offer's own instructions own the target, and a brief that names one is wrong for every other topology:\n%s", "main", implementCloseOutRule)
+	}
+}
+
 // The resume brief is useless without the ids, and they are substituted by the
 // driver — so the placeholders have to actually be in the shipped text.
 func TestBuiltinReviewPhaseCarriesTheResumePlaceholders(t *testing.T) {
