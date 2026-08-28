@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
@@ -72,6 +73,112 @@ func TestBuiltinImplementPhaseTellsTheSessionToStopAtTheCheckpoint(t *testing.T)
 	// pointless: reviewing its own work, and closing the task itself.
 	if !strings.Contains(lower, "in_review") {
 		t.Errorf("the implement brief does not tell the session to leave in_review alone:\n%s", brief)
+	}
+}
+
+// CLA-378: a resumed branch is a liability until it has been synced and
+// re-proven. EZY-199 was a recovered stale claim whose implement phase verified
+// the found tip faithfully (build, unit suite, 60 e2e executions, push) without
+// ever syncing staging in - staging had superseded the branch's whole fix a day
+// earlier, and the review phase paid for the archaeology and salvage a cheap
+// up-front check would have made unnecessary. The brief must carry all three
+// parts of the rule: merge the integration branch (never rebase), re-validate
+// the task against the merged tip before working, and on supersession record
+// the decision and park the task instead of re-verifying stale work.
+//
+// The content assertions are FULL directional phrases, not fragments: an
+// earlier draft pinned "doing or verifying" alone, and a mutation flipping the
+// rule's BEFORE to AFTER - the exact behaviour this rule exists to remove -
+// shipped green because the fragment survived the inversion. Every phrase here
+// fails when its direction or disposition is edited away.
+func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
+	brief, ok := builtinPhasePrompts[ImplementPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
+	}
+
+	lower := strings.ToLower(brief)
+	for _, want := range []string{
+		"existing branch or worktree",
+		"haswip",
+		"your first step is to merge the project's integration branch into it",
+		"a merge, never a rebase",
+		"phase-boundary check",
+		"then re-validate the task against the merged tip before doing or verifying any of the found work",
+		"can silently revert a newer fix",
+		"the task's own bar",
+		"not the absence of conflict markers",
+		"if the merged tip supersedes the task",
+		"record_decision",
+		"park the task with an outcome citing it",
+		"do not spend the run re-verifying and pushing stale work",
+		"unless you parked above, the rest of the flow is unchanged",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the resumed-branch rule never says %q:\n%s", want, brief)
+		}
+	}
+
+	// The join back into the normal flow must be NON-exclusive: an earlier
+	// draft said "Otherwise, claim the task...", which read as exempting a
+	// resumed-and-still-valid session from commit/push/record-branch/STOP -
+	// the exact phase-1 contract phase 2 depends on.
+	if strings.Contains(lower, "otherwise, claim") {
+		t.Errorf("the resumed-branch rule excludes the found-work case from the normal flow with 'Otherwise, claim'; the join must carry every path into the checkpoint instructions:\n%s", brief)
+	}
+
+	// Order is part of the rule: sync, then re-prove, then the supersession
+	// disposition ending in the stale-work prohibition. Presence alone would
+	// pass a brief listing them in an order a session could read as
+	// verify-first, the exact behaviour being removed.
+	mergeIdx := strings.Index(lower, "your first step is to merge")
+	revalidateIdx := strings.Index(lower, "before doing or verifying any of the found work")
+	supersededIdx := strings.Index(lower, "supersedes the task")
+	parkIdx := strings.Index(lower, "park the task with an outcome citing it")
+	staleIdx := strings.Index(lower, "re-verifying and pushing stale work")
+	joinIdx := strings.Index(lower, "unless you parked above, the rest of the flow is unchanged")
+	if mergeIdx == -1 || revalidateIdx == -1 || supersededIdx == -1 || parkIdx == -1 || staleIdx == -1 || joinIdx == -1 {
+		t.Fatalf("merge (%d), re-validate (%d), supersession (%d), parking (%d), stale-work end (%d) or flow join (%d) missing from the brief:\n%s",
+			mergeIdx, revalidateIdx, supersededIdx, parkIdx, staleIdx, joinIdx, brief)
+	}
+	if !(mergeIdx < revalidateIdx && revalidateIdx < supersededIdx && supersededIdx < parkIdx && parkIdx < staleIdx && staleIdx < joinIdx) {
+		t.Errorf("the rule is not sync (%d) -> re-validate (%d) -> supersede/park (%d, %d) -> stale-work end (%d) -> flow join (%d) in that order:\n%s",
+			mergeIdx, revalidateIdx, supersededIdx, parkIdx, staleIdx, joinIdx, brief)
+	}
+
+	// The rule is entry guidance, so it rides BEFORE the terminal checkpoint
+	// instruction: this file's own field history (reviewTerminalStep) credits
+	// the brief's emphatic, named LAST instruction for never failing, and the
+	// first draft broke that shape by wedging the rule between STOP and the
+	// handoff guidance.
+	stopIdx := strings.Index(lower, "then stop and end the session")
+	ruleIdx := strings.Index(lower, strings.ToLower(implementResumedBranchRule))
+	if stopIdx == -1 || ruleIdx == -1 {
+		t.Fatalf("the stop instruction (%d) or the resumed-branch rule (%d) is missing:\n%s", stopIdx, ruleIdx, brief)
+	}
+	if ruleIdx > stopIdx {
+		t.Errorf("the resumed-branch rule (%d) sits after the terminal checkpoint instruction (%d); entry guidance must precede the work/stop sequence so the brief keeps its emphatic last instruction:\n%s", ruleIdx, stopIdx, brief)
+	}
+	if !strings.HasSuffix(brief, handoffGuidance) {
+		t.Errorf("the implement brief does not end with the shared handoff guidance:\n%s", brief)
+	}
+	// The join must sit in front of the work sequence it introduces: a join
+	// after the STOP instruction leaves the flow with no path statement
+	// before it (mutation-proven escapable before this pin existed).
+	if joinIdx > stopIdx {
+		t.Errorf("the flow join (%d) sits after the STOP instruction (%d); it must introduce the work sequence, not follow it:\n%s", joinIdx, stopIdx, brief)
+	}
+
+	// Harness-neutral: one wording serves every harness's implement phase. The
+	// registry, not a hardcoded list, is the source of truth for the name set.
+	names := harness.Names()
+	if len(names) == 0 {
+		t.Fatal("no harnesses registered; the neutrality check would be vacuous")
+	}
+	for _, name := range names {
+		if strings.Contains(lower, strings.ToLower(name)) {
+			t.Errorf("the implement brief names harness %q; its wording must hold for every harness:\n%s", name, brief)
+		}
 	}
 }
 
@@ -535,7 +642,10 @@ func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
 	}
 
 	for _, want := range []string{
-		"worktree for the branch recorded on the task",
+		// Since CLA-457 the branch is recomposed from plane state: the brief names
+		// the verified branch ({{branch}}) rather than asserting an unverified
+		// phase-1 success.
+		"worktree for branch " + PhaseBranchPlaceholder + " recorded on the task",
 		"never commit to the integration branch",
 		"empty branch",
 		"FAILED hand-off",
@@ -546,24 +656,202 @@ func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
 	}
 }
 
+// CLA-497: a checkpoint evidenced by the plane's record - the task left
+// `ready` or declared a no-code delivery - names no branch, so the review
+// successor gets the no-code brief: it must not assert a verified branch,
+// must not call the empty branch field a failed hand-off, and must not tell
+// the session to work in a worktree or open a PR. Its terminal step is the
+// handover alone, pinned in the same shape TestReviewBriefStatesItsTerminalStep
+// pins the branch-shaped one.
+func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
+	for _, want := range []string{
+		// The record, not a branch, is what the checkpoint means.
+		"evidenced by the PLANE'S RECORD",
+		// The successor is not told to treat the empty branch as a failure.
+		"NOT a failed hand-off",
+		// The terminal step: the handover, with the outcome's Tests section.
+		"update_task(taskId, runId, status: \"in_review\", outcome: ...)",
+		"**Tests**",
+		"REFUSES",
+		// The form-(b) case where phase 1 already settled the task.
+		"already settled the task",
+	} {
+		if !strings.Contains(noCodeReviewBrief, want) {
+			t.Errorf("no-code review brief does not say %q:\n%s", want, noCodeReviewBrief)
+		}
+	}
+	// The branch-shaped instructions must be ABSENT: this brief is selected
+	// exactly when there is no branch, so each one would misdirect.
+	for _, banned := range []string{
+		"FAILED hand-off to report",
+		"Work in the worktree",
+		"Open a PR",
+		"COMMIT and PUSH",
+		PhaseBranchPlaceholder,
+	} {
+		if strings.Contains(noCodeReviewBrief, banned) {
+			t.Errorf("no-code review brief still says %q - it is selected exactly when there is no branch to name:\n%s", banned, noCodeReviewBrief)
+		}
+	}
+	// Position, like the branch-shaped brief: the no-code terminal step is the
+	// last thing before the shared handoff guidance.
+	if !strings.HasSuffix(noCodeReviewBrief, noCodeReviewTerminalStep+handoffGuidance) {
+		t.Errorf("the no-code terminal step is not the last thing before the handoff guidance:\n%s", noCodeReviewBrief)
+	}
+	// The no-code handoff continuation carries the no-code terminal step and
+	// the rerun bound, and never the PR step.
+	cont := NoCodeHandoffContinuation()
+	if !strings.Contains(cont, noCodeReviewTerminalStep) || !strings.Contains(cont, rerunGuidance) {
+		t.Errorf("NoCodeHandoffContinuation does not carry the no-code terminal step and rerun bound:\n%s", cont)
+	}
+	if strings.Contains(cont, "Open a PR") {
+		t.Errorf("NoCodeHandoffContinuation carries the branch-shaped PR step:\n%s", cont)
+	}
+}
+
 // CLA-353: a handoff respawn replaces ph.Prompt wholesale with
 // config.HandoffPreamble plus the predecessor's self-authored prompt (CLA-352) —
 // the built-in brief text, including reviewTerminalStep, is not otherwise part of
 // it. Without HandoffContinuation a session that hands off mid-review drops the
 // PR-then-update_task sequence for its successor, silently reintroducing the bug
 // this task fixes on the one path a wording change in the brief cannot reach.
+// Since CLA-391 the rerun bound rides forward too — for BOTH built-in phases,
+// pinned below — so a handoff cannot be how unbounded rerunning arrives.
 func TestHandoffContinuation_CarriesTheReviewTerminalStepForward(t *testing.T) {
 	got := HandoffContinuation(ReviewPhaseName)
 	if !strings.Contains(got, reviewTerminalStep) {
 		t.Errorf("HandoffContinuation(%q) does not carry reviewTerminalStep forward:\n%s", ReviewPhaseName, got)
 	}
+	// And the rerun bound rides along (phase-2 review of CLA-391): the
+	// successor inheriting a half-fixed finding list is the loopiest session
+	// there is, and a handoff must not be how it arrives unbounded.
+	if !strings.Contains(got, rerunGuidance) {
+		t.Errorf("HandoffContinuation(%q) does not carry the rerun bound forward:\n%s", ReviewPhaseName, got)
+	}
 
-	// The implement phase hands off nothing at in_review - it stops, and a later
-	// phase owns the resume brief - so it has no terminal step to lose.
-	if got := HandoffContinuation(ImplementPhaseName); got != "" {
-		t.Errorf("HandoffContinuation(%q) = %q, want empty — the implement phase has no terminal step to carry forward", ImplementPhaseName, got)
+	// The implement phase has no terminal step to lose — it stops rather than
+	// hands its task to in_review, and a later phase owns the resume brief — but
+	// its handoffs are real, so the rerun bound rides forward for it too
+	// (phase-2 review of CLA-391): its successor is mid-verification with none
+	// of the predecessor's memory of the runs already paid for, which is exactly
+	// the session that starts paying again. The terminal step, though, stays the
+	// review phase's alone.
+	if got := HandoffContinuation(ImplementPhaseName); !strings.Contains(got, rerunGuidance) {
+		t.Errorf("HandoffContinuation(%q) does not carry the rerun bound forward:\n%s", ImplementPhaseName, got)
+	} else if strings.Contains(got, reviewTerminalStep) {
+		t.Errorf("HandoffContinuation(%q) carries reviewTerminalStep, which belongs to the review phase alone:\n%s", ImplementPhaseName, got)
 	}
 	if got := HandoffContinuation("not-a-real-phase"); got != "" {
 		t.Errorf("HandoffContinuation of an unknown phase = %q, want empty", got)
+	}
+}
+
+// CLA-391: repeated verification was the dominant measured waste of the
+// 2026-08-19/20 drain - fourteen near-identical Playwright runs differing only
+// in the grep filter, twelve identical `go test -race ./...` on a two-file
+// diff. The built-in briefs bound consecutive reruns of the same command and
+// demand a stated reason past the bound. Pinned per brief, in the shape
+// TestBuiltinPhaseBriefsCarryTheHandoffGuidance established, so a rewrite
+// cannot drop the bound from one brief silently.
+func TestBuiltinPhaseBriefsCarryTheRerunBound(t *testing.T) {
+	for name, brief := range builtinPhasePrompts {
+		for _, want := range []string{
+			// The bound itself, on consecutive reruns of one command.
+			"two consecutive reruns of the same command",
+			// The escape hatch has a price: a stated reason, which is what
+			// keeps "I changed something, re-run it" open while a loop of
+			// identical runs has nothing to say.
+			"a third needs a stated reason",
+			// Reading 1 the task called out: the bound is per command, not on
+			// verification overall - typecheck, tests, lint is three commands
+			// run once each.
+			"per command, not on verification overall",
+			// Reading 2: a narrowed rerun is still a rerun. The fourteen-run
+			// case differed only by its filter, so a bound phrased only as
+			// "the same command" would not have caught it.
+			"different selector, filter or flag",
+			// The CLAIM that a narrowed rerun counts, not just its vocabulary:
+			// inverting the sentence around "different selector, filter or flag"
+			// used to leave every pinned fragment verbatim intact while
+			// asserting the opposite of the doneWhen (phase-2 review).
+			"counts against the same command's bound",
+			"not a change to what is under test",
+			// Consecutiveness defined: other tool calls cannot reset the count,
+			// or interleaved reads and greps defeat the bound entirely.
+			"do not reset the count",
+			// The arithmetic past a stated reason, which the first wording left
+			// to the reader: a reason buys one run, not a fresh pair.
+			"buys one run, not a fresh pair",
+			// The idle-polling case points at the served waiting reference
+			// rather than restating its rules.
+			"clankerbar.com/skills/clankerbar/waiting.md",
+			// ...and the pointer is scoped to KEEPING the task, because Rule 1
+			// of that reference read unscoped tells a mid-phase session to
+			// release.
+			"keeping hold of this task",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("the %q brief never says %q; the rerun bound is not pinned in it:\n%s", name, want, brief)
+			}
+		}
+	}
+}
+
+// The rerun guidance must not dilute the endings. CLA-384's lesson was
+// position, not presence: an emphatic final block works, a trailing clause
+// does not. So the bound rides BEFORE each brief's ending - the handoff
+// guidance for the implement phase, the terminal step for the review phase -
+// leaving the review brief's terminal-step-then-handoff suffix untouched
+// (TestReviewBriefStatesItsTerminalStep pins that suffix exactly).
+func TestRerunGuidanceSitsBeforeEachBriefsEnding(t *testing.T) {
+	// Both directions of CLA-384's position lesson: LATE enough to ride with
+	// the brief's tail (prefixing it ahead of the working instructions would
+	// bury it at the front, which the first version of this test permitted),
+	// and never displacing the emphatic ending each brief must keep.
+	impl := builtinPhasePrompts[ImplementPhaseName]
+	ci := strings.Index(impl, "update_task(taskId, runId, branch)")
+	ri, hi := strings.Index(impl, rerunGuidance), strings.Index(impl, handoffGuidance)
+	if ri == -1 || hi == -1 || ci == -1 || ri < ci || ri > hi {
+		t.Errorf("the implement brief does not carry the rerun bound after its checkpoint instruction (%d) and before its handoff guidance (%d); got rerun at %d:\n%s", ci, hi, ri, impl)
+	}
+
+	rev := builtinPhasePrompts[ReviewPhaseName]
+	gi := strings.Index(rev, "adversarial review gate")
+	rr, ti := strings.Index(rev, rerunGuidance), strings.Index(rev, reviewTerminalStep)
+	if rr == -1 || ti == -1 || gi == -1 || rr < gi || rr > ti {
+		t.Errorf("the review brief does not carry the rerun bound after its gate paragraph (%d) and before its terminal step (%d); got rerun at %d:\n%s", gi, ti, rr, rev)
+	}
+}
+
+// The waiting pointer must stay a pointer. The served waiting reference owns
+// the mechanics - lease cadence, blocking inside one tool call - and a second
+// copy in the brief would drift, the same way a test carrying its own copy of
+// a string just moves the rot. Naming the problem and naming the address is
+// the brief's whole obligation here.
+func TestRerunGuidancePointsAtWaitingRatherThanRestatingIt(t *testing.T) {
+	if !strings.Contains(rerunGuidance, "clankerbar.com/skills/clankerbar/waiting.md") {
+		t.Errorf("rerunGuidance does not name the served waiting reference:\n%s", rerunGuidance)
+	}
+	// Whole words, not substrings: the substring match fired on "release"
+	// containing "lease", failing a future edit that was doing the right
+	// thing and pointing its author at the wrong repair. The ban remains a
+	// heuristic against copying the reference's mechanics vocabulary - it
+	// cannot prove a restatement absent, only make the cheap drifts loud.
+	words := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(rerunGuidance), func(r rune) bool { return !unicode.IsLetter(r) }) {
+		words[w] = true
+	}
+	for _, banned := range []string{"heartbeat", "lease", "sleep"} {
+		if words[banned] {
+			t.Errorf("rerunGuidance says %q - it is restating the waiting reference's mechanics, which live at the address it should point at and would drift here:\n%s", banned, rerunGuidance)
+		}
+	}
+	// The pointer is scoped as well as pointed (phase-2 review): Rule 1 of the
+	// waiting reference tells a claim-holder to let go, and read unscoped it
+	// directs a mid-phase session to release - the exact failure the briefs'
+	// own endings forbid. The session takes the polling discipline and keeps
+	// the task.
+	if !strings.Contains(rerunGuidance, "keeping hold of this task") {
+		t.Errorf("rerunGuidance does not scope the waiting pointer to keeping the task; unscoped, Rule 1 reads as permission to release mid-phase:\n%s", rerunGuidance)
 	}
 }

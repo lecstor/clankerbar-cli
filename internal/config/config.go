@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
@@ -73,6 +74,11 @@ const DefaultMaxTurns = 400
 // and a usage-limit pause is counted neither way (see loop.drainPhase). Raise it
 // if a harness of yours legitimately dies silently more often than that.
 const DefaultMaxZeroSpendAttempts = 3
+
+// MaxInstanceNameLen is the plane's cap on a daemon instance name (CLA-465's
+// report bounds): longer names are refused by Validate rather than beached as
+// silently-dropped beacons.
+const MaxInstanceNameLen = 100
 
 // The built-in phase names, as constants because Validate reasons about them: a
 // sequence that ENDS on the implement brief can never reach review. Exported so
@@ -229,6 +235,14 @@ type HarnessConfig struct {
 	// SettingsPath is the extra settings file (Claude Code's --settings) carrying
 	// the headless permission policy. Claude-specific; other adapters ignore it.
 	SettingsPath string `json:"settings_path"`
+
+	// Env is this harness's own extra session environment, overlaid ON TOP of the
+	// top-level env map (per-key winner) — see Config.Env for what the map holds.
+	// Unlike the fields above it does NOT inherit the top-level value only for the
+	// run-wide harness: environment is not dialect-shaped, so every layer of the
+	// overlay applies to every harness, with SessionEnv stacking them in
+	// most-specific-wins order.
+	Env EnvMap `json:"env"`
 }
 
 // Empty reports whether this block declares nothing at all — the shape that is
@@ -236,7 +250,7 @@ type HarnessConfig struct {
 // same reason. Written out rather than compared against the zero value because
 // the Models map makes the struct incomparable.
 func (h HarnessConfig) Empty() bool {
-	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == ""
+	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0
 }
 
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
@@ -308,20 +322,50 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
+// noCodeReviewTerminalStep is the no-code review brief's LAST instruction
+// (CLA-497), the counterpart of reviewTerminalStep for a phase-1 exit that was
+// evidenced by the plane's record rather than a branch. There is nothing to
+// commit and no PR to open - the task's correct delivery is no code - so the
+// step is the handover alone, with the same emphatic, final-call shape
+// CLA-384 pinned on the branch-shaped one. It also covers the form-(b) case
+// where phase 1 ALREADY settled the task (in_review / done / parked /
+// blocked): the handover happened before this phase ran, and the session's job
+// is to verify the record reads honestly and stop - re-opening or releasing a
+// settled task would restart the release loop this task exists to kill.
+const noCodeReviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: if the task still sits in " +
+	"in_progress with its no-code delivery declared, hand it over with update_task(taskId, runId, status: " +
+	"\"in_review\", outcome: ...), where the outcome MUST carry a **Tests** section saying what you actually " +
+	"verified - without one the plane REFUSES the call, so a session that leaves it out has not handed " +
+	"anything over. If phase 1 already settled the task (it left in_progress before this phase ran), the " +
+	"handover already happened: verify the record reads honestly and end the session - do NOT re-open, " +
+	"release or re-settle the task. Ending this session while the task still needs the handover is this " +
+	"phase FAILING, not finishing. The ONLY exception is a declared handoff."
+
 // HandoffContinuation is appended, by the driver, to a handoff respawn's prompt
-// (CLA-353) so a phase's own terminal step survives a session-authored hand-off.
+// (CLA-353) so a phase's own contract survives a session-authored hand-off.
 // HandoffPreamble carries the "resume, don't claim" contract forward on every
 // handoff; the ORIGINAL phase brief's own instructions do not — a handoff
 // respawn's prompt is HandoffPreamble plus the predecessor's self-authored
 // nextPrompt alone, so anything the built-in brief said is otherwise gone the
-// moment a session hands off instead of finishing itself. For the review phase
-// that includes reviewTerminalStep - the PR-then-update_task sequence CLA-353
-// exists to make land - so a handoff mid-review must not be a way to lose it.
-// Empty for a phase with no such step: the implement phase stops rather than
-// hands its task to in_review, so it has none to carry forward.
+// moment a session hands off instead of finishing itself.
+//
+// Two things ride, and the first rides for BOTH built-in phases. The rerun
+// bound (CLA-391) rides because a handoff must not be how unbounded rerunning
+// arrives: the review successor inheriting a half-fixed finding list is the
+// loopiest session there is, but the implement successor mid-verification is
+// the same shape — fresh context, no memory of the runs already paid for, and
+// every reason to start paying again — so bounding only the review respawn
+// would leave the asymmetry as the hole. The review phase ADDITIONALLY carries
+// reviewTerminalStep — the PR-then-update_task sequence CLA-353 exists to make
+// land — so a handoff mid-review must not be a way to lose it. The implement
+// phase carries the bound alone: it has no terminal step, because it stops
+// rather than hands its task to in_review.
 func HandoffContinuation(phaseName string) string {
-	if phaseName == ReviewPhaseName {
-		return "\n\nThe phase's terminal step is unchanged by handing off:" + reviewTerminalStep
+	switch phaseName {
+	case ReviewPhaseName:
+		return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + reviewTerminalStep
+	case ImplementPhaseName:
+		return "\n\nThe phase's rerun bound is unchanged by handing off:" + rerunGuidance
 	}
 	return ""
 }
@@ -341,6 +385,95 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 	"already lives in the repo or on the task, and under 4KB. The successor resumes this same run under this " +
 	"same brief's scope, so do NOT settle, release or hand back the task first."
 
+// rerunGuidance rides on every built-in phase brief (CLA-391). Repeated
+// verification was the dominant measured waste of the 2026-08-19/20 drain: one
+// review phase ran the same Playwright spec fourteen times differing only in
+// the grep filter; another ran twelve identical `go test -race ./...` on a
+// two-file diff; a third managed seven full-suite runs, eight typechecks and
+// ten lints inside one phase. Cost is turns times context, and every rerun is
+// another turn over everything the session holds, so the brief bounds
+// CONSECUTIVE reruns of the same command and demands a stated reason past the
+// bound.
+//
+// The phase-2 adversarial review found three ways the first wording still let
+// the fourteen-run loop through, and the wording closes each:
+//
+//   - A reason phrased as "name what changed since the last run" was satisfied
+//     by the selector change ITSELF - "narrowed the grep" is a change, and it
+//     does make the output differ, so fourteen compliant runs each carried a
+//     truthful-looking reason line. The reason must name a change to what is
+//     UNDER TEST, or say why the last result may not reproduce; a narrower
+//     selector is neither.
+//   - "Consecutive" was undefined, so any interleaved call (read, grep, diff -
+//     the shape real sessions actually produce) reset the count every turn and
+//     the ceiling never engaged. Only a change to what the command tests
+//     resets it now; other tool calls do not.
+//   - The arithmetic past a reason was unstated: a reason buying a fresh pair
+//     makes fourteen runs four cheap lines, while an absolute ceiling collides
+//     with the review brief's own fix-and-reverify demand. A reason buys ONE
+//     run, and the count restarts only when the thing under test changed -
+//     which is exactly what happens each time a fix lands, so honest
+//     re-verification never reaches the bound at all.
+//
+// Two readings the task called out stay pinned in the wording: the bound is
+// per command, not on verification overall (typecheck, then tests, then lint
+// is three commands run once each); and a narrowed rerun is still a rerun
+// (same suite, different selector or filter - the fourteen-run case differed
+// ONLY by its filter). The sibling failure, consecutive turns idling on a
+// background job and re-polling its output, is the waiting problem the served
+// skill already carries a reference for - so the brief POINTS at it rather
+// than restating rules that live there and would drift here. That pointer is
+// SCOPED as well as pointed: waiting.md's Rule 1 tells a claim-holder to let
+// go, and read unscoped it directs a mid-phase session to release - the exact
+// failure the briefs' own endings forbid - so the session takes the polling
+// discipline and keeps hold of the task.
+const rerunGuidance = " RERUN BOUND: every rerun of a verification command is another turn over everything the " +
+	"session holds, so bound them - two consecutive reruns of the same command is the ceiling, and a third " +
+	"needs a stated reason first: one line saying either what changed in the code or environment UNDER TEST " +
+	"since the last run, or why the last result may not reproduce (flakiness, timing, state outside this " +
+	"checkout). A narrowed rerun is still a rerun: re-running the same suite with a different selector, filter " +
+	"or flag counts against the same command's bound, because a different selector is not a change to what is " +
+	"under test. Tool calls in between do not reset the count either, and a stated reason buys one run, not a " +
+	"fresh pair - the count starts over only when what the command tests actually changed, which for a " +
+	"fix-and-reverify loop is every fix landing, so honest re-verification never reaches the bound. Nothing " +
+	"changed means the result cannot differ - read the previous output instead of paying for it again. The " +
+	"bound is per command, not on verification overall - typecheck, then tests, then lint is three commands " +
+	"run once each. Consecutive turns spent idling on a background job or re-polling its output are the " +
+	"WAITING problem, not the rerun problem: read " +
+	"https://clankerbar.com/skills/clankerbar/waiting.md before your next poll and take from it the polling " +
+	"discipline while keeping hold of this task. This bound governs every verification command this phase runs."
+
+// implementResumedBranchRule is the implement brief's rule for resuming an EXISTING branch or
+// worktree (CLA-378). EZY-199 was a recovered stale claim whose implement phase followed the
+// rest of this brief faithfully - it verified the found tip with a build, the unit suite and
+// 60 e2e executions, then pushed - and never synced against staging, which had superseded the
+// branch's whole fix a day earlier. The review phase then paid $11.70 for the archaeology,
+// merge and salvage that an up-front check costing cents would have made unnecessary.
+//
+// Three parts, each load-bearing. SYNC first, as a merge and never a rebase: the branch may
+// already be pushed, and the daemon's phase-boundary check compares the pushed origin tip to
+// the local tip, which a rebase invalidates. RE-VALIDATE against the MERGED tip before doing
+// or verifying anything: a clean merge proves nothing - it can silently revert a newer fix -
+// so the check is the task's own bar, not conflict markers. On SUPERSESSION, record the
+// decision and PARK the task with an outcome citing it - a bare stop leaves the recorded
+// branch reading as checkpointed WIP, which spends a review phase rediscovering the stale
+// tip - or salvage only what still adds value; never re-verify and push stale work.
+//
+// Harness-neutral on purpose: one wording serves every harness's implement phase.
+const implementResumedBranchRule = "RESUMED WORK comes first when you find it: if the claim hands you an EXISTING branch or " +
+	"worktree for this task (a recovered stale claim, a prior session's WIP - check the repo yourself whatever " +
+	"the claim's hasWip flag said), your FIRST step is to merge the project's integration branch into it - a " +
+	"merge, NEVER a rebase: the branch may already be pushed, and rewriting pushed history invalidates the " +
+	"daemon's phase-boundary check, which compares the pushed origin tip to your local tip. THEN re-validate " +
+	"the task against the merged tip BEFORE doing or verifying any of the found work: a clean merge is not " +
+	"proof the task still needs doing - a non-conflicting merge can silently revert a newer fix - so the " +
+	"check is the task's own bar (for a bug: does it still reproduce?), not the absence of conflict markers. " +
+	"If the merged tip supersedes the task, record the decision (record_decision), then PARK the task with an " +
+	"outcome citing it (update_task status: parked) - task.branch is already set on a resumed branch, so a bare " +
+	"stop reads as checkpointed WIP and spends a phase 2 rediscovering the staleness - or salvage only what " +
+	"still adds value and carry on with the normal flow; either way do NOT spend the run re-verifying and " +
+	"pushing stale work."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
 // The split is implement, then review-and-fix, and that grouping is deliberate:
@@ -350,25 +483,72 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 // workflow puts implementation and fix in ONE actor and the review in a separate
 // read-only one. Splitting where that workflow already splits is the whole idea.
 var builtinPhasePrompts = map[string]string{
-	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY: " +
-		"claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work disposition below): " +
+		implementResumedBranchRule +
+		" Unless you parked above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
-		"Ending there is this task going to plan, not the task being abandoned." + handoffGuidance,
+		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,
 
-	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
-		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
-		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
-		"then get_task with includeDecisions: true to re-read the bar and the standing decisions. An empty branch " +
-		"field on the task is a FAILED hand-off to report, not work to silently adopt and implement. Work in the " +
-		"worktree for the branch recorded on the task, and never commit to the integration branch (staging) - a " +
-		"session whose cwd is already the main checkout sitting on staging is not a decision to commit where you " +
-		"are, it is this failure mode. Read the diff on that branch. Then run the adversarial review gate, fix " +
-		"what it finds, and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you " +
-		"fixed, by name, and point it at the fix commits (or, if not yet committed, the fix diff) and the " +
-		"regression surface they touch - not at the whole diff, whose full pass already happened. A full second " +
-		"pass is the exception you state a reason for (a fix that had to reach outside its own area), never the " +
-		"default." + reviewTerminalStep + handoffGuidance,
+	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase recorded " +
+		"branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin " +
+		"remote with its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that " +
+		"run, not starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
+		PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the " +
+		"bar and the standing decisions. An empty branch field on the task is a FAILED hand-off to report, not " +
+		"work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
+		" recorded on the task, and never commit to the integration branch (staging) - a session whose cwd is " +
+		"already the main checkout sitting on staging is not a decision to commit where you are, it is this " +
+		"failure mode. Read the diff on that branch. Then run the adversarial review gate, fix what it finds, " +
+		"and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you fixed, by name, " +
+		"and point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
+		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception you " +
+		"state a reason for (a fix that had to reach outside its own area), never the default." + rerunGuidance +
+		reviewTerminalStep + handoffGuidance,
+}
+
+// noCodeReviewBrief is the review brief for a phase-1 exit evidenced by the
+// PLANE'S RECORD (CLA-497) instead of a branch: the task left `ready`
+// (in_review / done / parked / blocked - its own session settled it), or it
+// carries a declared no-code delivery. There is no branch because the task's
+// correct delivery is no code, so the branch-shaped builtin review brief would
+// misdirect its successor - it asserts a branch "the driver verified to exist"
+// that does not exist, and its "empty branch field is a FAILED hand-off to
+// report" instruction contradicts the checkpoint the driver just recorded. The
+// no-code review runs the adversarial gate over the plane's record of what
+// phase 1 did, and its terminal step is the handover alone - no commit, no PR.
+const noCodeReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase's " +
+	"exit was evidenced by the PLANE'S RECORD rather than a branch: the task left `ready` (in_review / done / " +
+	"parked / blocked - its own session settled it) or carries a declared no-code delivery. There is NO " +
+	"branch, because this task's correct delivery is no code - nothing to check out, no worktree to work " +
+	"in, no PR to open. The empty branch field is NOT a failed hand-off: the driver recorded this " +
+	"checkpoint on exactly that record. You are RESUMING that run, not starting a new one: do not call " +
+	"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
+	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"expected: the settlement IS the delivery, so proceed to the review below. Then get_task with " +
+	"includeDecisions: true to re-read the bar and the standing decisions. Run the adversarial review gate " +
+	"over the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the decisions " +
+	"recorded on this task or its siblings: is the settlement honest, does the record carry what the task's " +
+	"doneWhen required, does the no-code declaration match the work? Fix what the gate finds by amending " +
+	"the record (update_task, record_decision) - never by inventing code, a branch or a PR." + rerunGuidance +
+	noCodeReviewTerminalStep + handoffGuidance
+
+// BuiltinReviewBrief returns the shipped review brief, so the driver can tell
+// whether a phase runs the built-in brief (vs an operator's custom prompt)
+// when it must choose a variant (CLA-497): a checkpoint evidenced by the
+// plane's record names no branch, and the branch-shaped brief would tell the
+// successor its hand-off FAILED.
+func BuiltinReviewBrief() string { return builtinPhasePrompts[ReviewPhaseName] }
+
+// NoCodeReviewBrief returns the review brief for a checkpoint evidenced by the
+// plane's record (CLA-497) - see noCodeReviewBrief.
+func NoCodeReviewBrief() string { return noCodeReviewBrief }
+
+// NoCodeHandoffContinuation is HandoffContinuation for a no-code review
+// handoff (CLA-497): the branch-shaped reviewTerminalStep would tell the
+// successor to open a PR for a task that has no branch and no code.
+func NoCodeHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + noCodeReviewTerminalStep
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
@@ -376,10 +556,14 @@ var builtinPhasePrompts = map[string]string{
 var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // The placeholders a phase prompt may carry, substituted by the driver from the
-// claim the previous phase left held.
+// claim the previous phase left held. {{branch}} names the recorded, verified
+// hand-off branch (CLA-457): the implement phase's checkpoint is gated on it
+// being real and on the origin remote, so the review brief can name it rather
+// than asserting an unverified "an earlier session already implemented".
 const (
-	PhaseTaskPlaceholder = "{{taskId}}"
-	PhaseRunPlaceholder  = "{{runId}}"
+	PhaseTaskPlaceholder   = "{{taskId}}"
+	PhaseRunPlaceholder    = "{{runId}}"
+	PhaseBranchPlaceholder = "{{branch}}"
 )
 
 // Config is the resolved loop configuration. The comments here are the source of
@@ -491,6 +675,18 @@ type Config struct {
 	// into config.toml [mcp_servers]. See the adapters.
 	MCPConfigPath string `json:"mcp_config_path"`
 
+	// InstanceName names this daemon on the console's Fleet page (CLA-466):
+	// presence beacons are keyed per (project, instance name), so this is how two
+	// daemons driving the same project stay distinguishable. Empty resolves to
+	// the machine's hostname plus the config file's basename (see
+	// ResolveInstanceName) - unique per running daemon, so co-located daemons
+	// with distinct config files no longer collapse into one Fleet row (CLA-501).
+	//
+	// The plane caps the name at 100 characters — Validate refuses longer here,
+	// so a too-long name fails loudly at startup instead of silently dropping
+	// every beacon. The resolved default is truncated to the same cap.
+	InstanceName string `json:"instance_name"`
+
 	// MaxIterations stops the loop after N respawns. 0 = no iteration ceiling:
 	// the loop runs until a STOP/HALT marker or a signal stops it (or a budget
 	// ceiling is reached); an empty queue idle-polls rather than exiting — the
@@ -579,6 +775,102 @@ type Config struct {
 	// allowlist leaves open. Claude-specific; other harnesses ignore it. ~ expands.
 	SettingsPath string `json:"settings_path"`
 
+	// Repos maps the repos a project's tasks may name to their local checkouts,
+	// so a session starts in the TASK's repo rather than in the multi-repo parent
+	// (agent-rule-scoping pieces 2 and 3). Keyed by repo identity — either the
+	// full "owner/name" form the task carries or just its bare name — with the
+	// checkout path as the value (~ and relative paths both expand; a relative
+	// path resolves against the workdir). Resolution order, fallbacks and the
+	// loud repo_not_found failure are ResolveCheckout's, which is the only thing
+	// that should interpret this map.
+	//
+	// Declaring repos also widens each session's permission policy to cover every
+	// declared checkout regardless of cwd, so a two-repo project does not wall
+	// sessions started in one repo off the other. The grants themselves stay in
+	// local config — this map holds paths, never credentials.
+	//
+	// In single-project mode set it here; in multi-project mode set it per
+	// project (see Project.Repos), whose non-empty map replaces the top-level
+	// one for that project.
+	Repos map[string]string `json:"repos"`
+
+	// PrimaryRepo names the repo a session starts in when its task carries none:
+	// the fallback that keeps a fresh phase out of the multi-repo parent until
+	// the plane returns a repo for every task. It names a `repos` key, or any
+	// identity resolvable by the same steps; with exactly one repo declared and
+	// no primary named, that one is primary implicitly. Empty = no fallback, so
+	// a task without a repo fails the iteration with repo_not_found rather than
+	// start somewhere unconsidered — unless NO repos are configured at all, in
+	// which case this whole feature is off and the legacy workdir behaviour runs.
+	PrimaryRepo string `json:"primary_repo"`
+
+	// Escalation holds the mechanical review-tier escalation rules (CLA-379).
+	// Config-owned: a glob-to-tier mapping (path_rules) and a category-to-tier
+	// mapping (category_rules). The CLI evaluates them at review-spawn time; the
+	// plane holds only the execution-config reference to them. Empty = no
+	// escalation — the review phase keeps its configured tier unchanged.
+	Escalation Escalation `json:"escalation"`
+
+	// AllowUncheckedPR opts this project out of CLA-310's empty-check-rollup
+	// refusal: a delivery whose PR carries NO checks is logged as a WARNING
+	// instead of refused. It exists for repos with NO CI at all, where refusing
+	// every delivery would wedge the driver shut; both clankerbar repos have
+	// CI, so for them the default (refuse) costs nothing.
+	//
+	// The mergeability half of the gate is NEVER relaxed by it: a CONFLICTING
+	// PR is refused either way, because a conflicted PR is exactly the state
+	// that produces an empty rollup, and silence-reads-as-pass is the bug the
+	// gate exists to kill. The safe state is the default; the loose state is
+	// this visible, operator-owned line, which `doctor` reports so it is seen
+	// before it fires. In single-project mode set it here; in multi-project
+	// mode set it per project (see Project.AllowUncheckedPR), which overrides
+	// the top-level value for that project only.
+	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// HealthURL is the deployment health endpoint (`/health`) doctor's deploy_lag
+	// check reads to learn WHICH commit is running out there - CLA-322. The plane
+	// stamps version.commit at BUILD time, so "is commit X live?" is one request
+	// and a string compare; this URL names where to ask. It is an operator-set
+	// value with no derived default, because a deployment can live anywhere
+	// (staging, production, a self-hosted plane) and deriving it from backlog_url
+	// would answer about whichever environment the guess happened to hit. Empty =
+	// not monitored: the check says so once, quietly, and moves on.
+	//
+	// The endpoint is read WITHOUT credentials - /health is public - so unlike
+	// backlog_url it is held only to "parses as an absolute URL", not to the
+	// bearer-token TLS floor.
+	HealthURL string `json:"health_url"`
+
+	// IntegrationBranch is the branch deployments are built from and promoted
+	// along - the branch whose tip a healthy deployed build should be an ancestor
+	// of. Doctor's deploy_lag check compares /health's version.commit against its
+	// REMOTE tip. Default: staging (the convention both of this project's repos
+	// use); override where your project integrates elsewhere. It deliberately does
+	// NOT come from delivery.Claim.IntegrationBranch: that is a per-session
+	// declaration of where one commit landed, while this is standing per-project
+	// configuration about how releases flow.
+	IntegrationBranch string `json:"integration_branch"`
+
+	// AllowLocalMCPServers names the MCP server entries an operator means to run
+	// from a DISCOVERED `<workdir>/.mcp.json` — the file Validate adopts by
+	// default when mcp_config_path is empty. Any local-command entry whose name
+	// is on this list is accepted from a discovered file; every other command
+	// entry in one is refused (CLA-266: such an entry starts a process at session
+	// init, before any permission rule applies, and a workdir default is not
+	// where that decision belongs). It reaches nothing else: opencode-schema
+	// policy keys (`permission`, `plugin`, `agent`) in a discovered file are
+	// refused regardless of this list — naming servers never approves policy.
+	//
+	// The safe state is the default (refuse); the loose state is this visible,
+	// operator-owned list, which `doctor` reports. A file the operator NAMES via
+	// mcp_config_path needs no entry here — naming it IS the statement, and its
+	// local servers are disclosed by doctor's WARN as they always were.
+	//
+	// In single-project mode set it here; in multi-project mode set it per
+	// project (see Project.AllowLocalMCPServers) to replace the top-level list
+	// for that project only.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
+
 	// Projects declares the backlogs a single loop instance drives — one entry per
 	// clankerbar project (CLA-142: one account key, many queues). Empty = the
 	// original single-project mode, driven by the top-level fields, exactly as
@@ -589,21 +881,32 @@ type Config struct {
 	// member of; per-project keys are never needed.
 	Projects []Project `json:"projects"`
 
-	// Env is extra environment for the spawned harness process, as KEY=VALUE
-	// pairs. The child already inherits the loop's own environment, so this is for
-	// the unattended case (cron / launchd / systemd) where there is no interactive
-	// shell to export into — e.g. supplying CLAUDE_CODE_OAUTH_TOKEN when auth lives
-	// in a shell alias rather than the config dir.
+	// Env is extra environment for the spawned harness process. Each entry's
+	// value is either a literal string or an object {"fromCommand": "..."} whose
+	// stdout becomes the value, resolved FRESH AT EVERY SPAWN so a rotated token
+	// reaches the next session without a daemon restart (CLA-462). The child
+	// already inherits the loop's own environment, so this is for the unattended
+	// case: with GH_TOKEN declared here — per project if you drive several — the
+	// cb-run wrapper stops being load-bearing and launching the binary directly
+	// is safe.
 	//
-	// A value of the form "@path" is replaced by the contents of that file
-	// (trimmed; a leading ~ is expanded). Keep a secret in a 0600 file and point at
-	// it here rather than inlining it — mirroring CLANKERBAR_API_KEY, which is read
-	// from the environment, never this config file. That 0600 is ENFORCED, not
-	// advice: a file any other local account can read is refused (see resolveEnv).
-	Env map[string]string `json:"env"`
+	// The map overlays at FOUR levels in most-specific-wins order (the same
+	// precedence ResolveMCPConfig applies): this top-level map first, then
+	// `harnesses.<name>.env`, then `projects[].env`, then that project's
+	// `env_per_harness.<name>`. A value of the form "@path" is replaced by the
+	// contents of that file (trimmed; a leading ~ is expanded) — keep a secret in
+	// a 0600 file and point at it here rather than inlining it. That 0600 is
+	// ENFORCED, not advice: a file any other local account can read refuses the
+	// session spawn, as it always refused Validate.
+	//
+	// A fromCommand whose execution fails, times out (10s), or produces empty
+	// output REFUSES the session spawn with a log line naming the variable —
+	// fail closed, because a session missing its declared env is the incident,
+	// not a degraded mode. `doctor` verifies every declared command resolves
+	// before a run starts.
+	Env EnvMap `json:"env"`
 
-	source string   // path the config was loaded from, for diagnostics
-	env    []string // resolved KEY=VALUE pairs (built in Validate)
+	source string // path the config was loaded from, for diagnostics
 
 	// harnessFromFlag / modelFromFlag record that --harness / --model overrode
 	// the file. Both flags say "the run has ONE harness and this is it", which a
@@ -655,6 +958,208 @@ type Project struct {
 	//
 	// Each entry is held to the same origin and slug checks as MCPConfigPath.
 	MCPConfigPaths map[string]string `json:"mcp_config_paths"`
+
+	// Env is this project's extra session environment, overlaid on top of the
+	// top-level env map for THIS project's sessions only — see Config.Env for
+	// what an entry holds. This is where a project's GH_TOKEN belongs when one
+	// daemon drives several backlogs: each project declares its own source, so
+	// no session ever carries another project's credential.
+	Env EnvMap `json:"env"`
+
+	// EnvPerHarness is this project's env PER HARNESS (harness name -> env map),
+	// the most specific layer of the four-level overlay: it wins per key over
+	// projects[].env, which wins over `harnesses.<name>.env`, which wins over
+	// the top level. Empty on every config that needs no per-pair override.
+	EnvPerHarness map[string]EnvMap `json:"env_per_harness"`
+
+	// AllowUncheckedPR is this project's CLA-310 opt-out, overriding the
+	// top-level field of the same name for this project only. See
+	// Config.AllowUncheckedPR for what it does and why the default refuses.
+	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// HealthURL is this project's deployment health endpoint (`/health`),
+	// overriding the top-level field of the same name for this project only.
+	// See Config.HealthURL. Each project is a distinct backlog with its own
+	// deployment, so in multi-project mode each one names where ITS plane
+	// answers.
+	HealthURL string `json:"health_url"`
+
+	// IntegrationBranch is this project's integration branch, overriding the
+	// top-level field of the same name for this project only. See
+	// Config.IntegrationBranch for what it means; the default is staging.
+	IntegrationBranch string `json:"integration_branch"`
+
+	// AllowLocalMCPServers is this project's CLA-266 allowlist, REPLACING the
+	// top-level list of the same name for this project's discovered MCP config
+	// when it names anything; an entry that sets none inherits the top-level
+	// one. See Config.AllowLocalMCPServers and AllowLocalMCPServersFor.
+	AllowLocalMCPServers []string `json:"allow_local_mcp_servers"`
+
+	// Repos is this project's repo -> checkout map, REPLACING the top-level map
+	// of the same name for this project when it declares anything; an entry that
+	// sets none inherits the top-level one. See Config.Repos and ReposFor for
+	// what the map does and how it resolves.
+	Repos map[string]string `json:"repos"`
+
+	// PrimaryRepo is this project's no-repo-on-the-task fallback, overriding the
+	// top-level field of the same name for this project only when non-empty. See
+	// Config.PrimaryRepo and PrimaryRepoFor.
+	PrimaryRepo string `json:"primary_repo"`
+}
+
+// ReposFor resolves the CLA-437 repo -> checkout map for one project: a
+// matching projects[] entry's own NON-EMPTY map replaces the top-level one, and
+// everything else — an unmatched slug (how a single-project run reaches here
+// with no projects at all), or an entry that declared none — falls back to the
+// top-level map. Total, so no caller has a second error path.
+func (c *Config) ReposFor(slug string) map[string]string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.Repos) > 0 {
+			return p.Repos
+		}
+	}
+	return c.Repos
+}
+
+// PrimaryRepoFor resolves the CLA-437 no-repo fallback for one project: a
+// matching projects[] entry's own non-empty value wins, and everything else
+// falls back to the top-level field. Total, so no caller has a second error
+// path.
+func (c *Config) PrimaryRepoFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && strings.TrimSpace(p.PrimaryRepo) != "" {
+			return p.PrimaryRepo
+		}
+	}
+	return c.PrimaryRepo
+}
+
+// AllowUncheckedPRFor resolves the CLA-310 empty-rollup opt-out for one
+// project: a matching projects[] entry's own value wins, and everything else
+// — including an unmatched slug, which is how a single-project run reaches
+// here with an empty one — falls back to the top-level field. Total, so no
+// caller has a second error path.
+func (c *Config) AllowUncheckedPRFor(slug string) bool {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return p.AllowUncheckedPR
+		}
+	}
+	return c.AllowUncheckedPR
+}
+
+// DefaultIntegrationBranch is the branch whose tip doctor's deploy_lag check
+// (CLA-322) judges the deployed build against when neither the project nor the
+// top-level config names one. Both of this project's repos integrate through
+// `staging`, so that is the convention the default encodes; an operator whose
+// project integrates elsewhere sets integration_branch explicitly rather than
+// getting an answer about a branch they do not have.
+const DefaultIntegrationBranch = "staging"
+
+// HealthURLFor resolves the deploy_lag check's /health endpoint for one
+// project: a matching projects[] entry's value wins when it is set, and
+// everything else falls back to the top-level field. Empty means not
+// monitored - there is deliberately no derived default, because a guessed
+// environment would answer about the wrong deployment.
+func (c *Config) HealthURLFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return firstNonEmpty(p.HealthURL, c.HealthURL)
+		}
+	}
+	return c.HealthURL
+}
+
+// IntegrationBranchFor resolves the branch the deployed build is judged
+// against for one project: a matching projects[] entry's value wins when it is
+// set, then the top-level field, then DefaultIntegrationBranch. Total, so the
+// check never has to carry its own fallback.
+func (c *Config) IntegrationBranchFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return firstNonEmpty(p.IntegrationBranch, c.IntegrationBranch, DefaultIntegrationBranch)
+		}
+	}
+	return firstNonEmpty(c.IntegrationBranch, DefaultIntegrationBranch)
+}
+
+// firstNonEmpty returns the first argument that is not "", or "" if none is.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// validateHealthURL holds a health_url to "an absolute http(s) URL with a
+// host". It is deliberately weaker than backlog_url's TLS floor: /health is a
+// public endpoint read without credentials, so there is no bearer token to
+// keep off the wire, and a plain-http internal plane is a legitimate thing to
+// point at. What it refuses is a value that could never be fetched at all - a
+// relative reference, or a scheme no HTTP client speaks - which would
+// otherwise surface as an opaque "unsupported protocol scheme" error from
+// doctor instead of as the misfiled config line it is.
+func validateHealthURL(raw, label string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a URL: %w", label, raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("%s: %q is not an absolute URL with a scheme and host", label, raw)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("%s: %q must be an http or https URL; scheme %q can never be fetched", label, raw, u.Scheme)
+	}
+	return nil
+}
+
+// validateIntegrationBranch holds integration_branch to a bare ref-name shape.
+// The value is passed to `git fetch` and `git ls-remote` by doctor's deploy_lag
+// check (CLA-322); a value carrying refspec syntax (":") would make the fetch
+// argument a src:dst spec and MUTATE LOCAL REFS during a preflight, a leading
+// "-" reads as option syntax, and whitespace or anything outside a branch
+// name's alphabet is rejected by git downstream anyway. Empty is legal: it
+// means the default branch.
+func validateIntegrationBranch(raw, label string) error {
+	if raw == "" {
+		return nil
+	}
+	if strings.HasPrefix(raw, "-") || strings.ContainsAny(raw, ": \t\r\n") {
+		return fmt.Errorf("%s: %q must be a bare branch name (no leading \"-\", no \":\", no whitespace)", label, raw)
+	}
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '/', r == '.', r == '_', r == '-':
+		default:
+			return fmt.Errorf("%s: %q must be a plain branch name ([A-Za-z0-9/._-])", label, raw)
+		}
+	}
+	return nil
+}
+
+// AllowLocalMCPServersFor resolves the CLA-266 discovered-file allowlist for
+// one project: a matching projects[] entry's own NON-EMPTY list replaces the
+// top-level one, and everything else — an unmatched slug (how a single-project
+// run reaches here with no projects at all), or an entry that set none — falls
+// back to the top-level list. There is deliberately no way to say "none here"
+// while the top level allows names: an empty allowlist is indistinguishable
+// from not having configured one, and pretending otherwise would let a project
+// line look tighter than it runs. Total, so no caller has a second error path.
+func (c *Config) AllowLocalMCPServersFor(slug string) []string {
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.AllowLocalMCPServers) > 0 {
+			return p.AllowLocalMCPServers
+		}
+	}
+	return c.AllowLocalMCPServers
 }
 
 // Budget is the "leave headroom / don't run away" circuit breaker. No harness
@@ -1230,6 +1735,80 @@ func discover() string {
 	return ""
 }
 
+// ConfigDir returns the directory instance configs live in: the parent of the
+// one auto-discovered file (homeConfigRelPath), i.e. `~/.config/clankerbar` by
+// default. The fleet supervisor (CLA-525) enumerates every `*.json` in it; Load
+// with an empty path reads `config.json` inside it. Same home-relative
+// construction as discover, so the two can never disagree about where configs
+// live.
+func ConfigDir() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("config dir: %w", err)
+	}
+	return filepath.Dir(filepath.Join(home, homeConfigRelPath)), nil
+}
+
+// topLevelConfigKeys are the JSON keys Config unmarshals from. A file carrying
+// at least one of them IS a clankerbar config (or claims to be); the other JSON
+// that shares the config dir — MCP configs (`mcp`, `mcpServers`), headless
+// permission policies (`permissions`, `allow`, `deny`), opencode configs — carry
+// none. Kept in lockstep with the Config struct's json tags, which are the
+// source of truth: adding a knob without adding its key here would silently
+// stop the supervisor from recognising the files that set it.
+var topLevelConfigKeys = map[string]bool{
+	"allow_local_mcp_servers": true,
+	"allow_unchecked_pr":      true,
+	"backlog_url":             true,
+	"budget":                  true,
+	"config_dir":              true,
+	"env":                     true,
+	"escalation":              true,
+	"harness":                 true,
+	"harnesses":               true,
+	"health_url":              true,
+	"idle_poll_interval":      true,
+	"instance_name":           true,
+	"integration_branch":      true,
+	"max_iterations":          true,
+	"max_retries":             true,
+	"max_session_wall_clock":  true,
+	"max_turns":               true,
+	"max_zero_spend_attempts": true,
+	"mcp_config_path":         true,
+	"model":                   true,
+	"models":                  true,
+	"phases":                  true,
+	"poll_interval":           true,
+	"primary_repo":            true,
+	"projects":                true,
+	"prompt":                  true,
+	"repos":                   true,
+	"retry_cap":               true,
+	"settings_path":           true,
+	"state_dir":               true,
+	"workdir":                 true,
+}
+
+// LooksLikeConfig reports whether data is JSON carrying at least one recognized
+// clankerbar config key. It is the supervisor's first filter over `*.json` in
+// the config dir: a file that fails it cannot be an instance config whatever
+// Load and Validate would say (a headless permission policy validates as an
+// empty config with defaults), so it is skipped without even being loaded.
+// Unparseable data is not a config.
+func LooksLikeConfig(data []byte) bool {
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return false
+	}
+	for k := range keys {
+		if topLevelConfigKeys[k] {
+			return true
+		}
+	}
+	return false
+}
+
 // refuseImplicitWorkDirConfig refuses to run when a `clankerbar.json` is sitting
 // in the process working directory and no --config was given.
 //
@@ -1527,6 +2106,13 @@ func (c *Config) Validate() error {
 	if c.MaxZeroSpendAttempts < 0 {
 		return errors.New("max_zero_spend_attempts is negative")
 	}
+	// The plane refuses an instance name over 100 characters (CLA-465's report
+	// bounds), so a beacon carrying one would be dropped on EVERY poll — reporting
+	// silently off. Refuse it here instead, where it is a config typo with a
+	// readable error, not a mystery gap on the Fleet page.
+	if len(strings.TrimSpace(c.InstanceName)) > MaxInstanceNameLen {
+		return fmt.Errorf("instance_name exceeds %d characters (the plane's limit)", MaxInstanceNameLen)
+	}
 	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")
 	}
@@ -1661,7 +2247,7 @@ func (c *Config) Validate() error {
 			if effective == "" {
 				effective = builtinPhasePrompts[ph.Name]
 			}
-			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder} {
+			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder, PhaseBranchPlaceholder} {
 				if strings.Contains(effective, pl) {
 					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim to fill it from — it claims a task of its own, so a resume brief cannot go first",
 						ph.Label(0), pl)
@@ -1684,8 +2270,17 @@ func (c *Config) Validate() error {
 	// -p mode does NOT auto-discover .mcp.json, so without this a bare `clankerbar
 	// run` from a workdir that carries one would spawn sessions with no clankerbar
 	// tools at all — and the poller could derive no slug. Explicit config still wins.
+	//
+	// A file that arrives THIS way was found, not named, and is held to the
+	// discovered-file rule before anything else reads it (CLA-266): it may not
+	// declare local-process servers nor carry opencode-schema policy keys.
+	// checkMCPConfigOrigins below still applies to it either way — a discovered
+	// file can pass this gate and still fail the origin one.
 	if c.MCPConfigPath == "" {
 		c.MCPConfigPath = discoverMCPConfig(c.WorkDir)
+		if err := c.checkDiscoveredMCPConfig(c.MCPConfigPath, "mcp_config_path", c.AllowLocalMCPServers); err != nil {
+			return err
+		}
 	}
 
 	// Where the account-scoped API key is allowed to go, settled once, here
@@ -1704,7 +2299,24 @@ func (c *Config) Validate() error {
 	if _, err := secureurl.Origin(c.BacklogURL); err != nil {
 		return fmt.Errorf("backlog_url: %w", err)
 	}
+	// health_url is read WITHOUT credentials (/health is public), so unlike
+	// backlog_url it is not held to the bearer-token TLS floor - only to being
+	// a usable absolute URL. A value that cannot be fetched would otherwise
+	// surface as an opaque HTTP-client error from doctor's deploy_lag check
+	// instead of as the misfiled config it is.
+	if err := validateHealthURL(c.HealthURL, "health_url"); err != nil {
+		return err
+	}
+	// integration_branch reaches `git fetch`/`git ls-remote` in doctor's
+	// deploy_lag check; a refspec-shaped value would mutate local refs during a
+	// preflight. See validateIntegrationBranch.
+	if err := validateIntegrationBranch(c.IntegrationBranch, "integration_branch"); err != nil {
+		return err
+	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
+		return err
+	}
+	if err := checkMCPConfigNamesClankerbar(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
 	// Each per-harness MCP config points the SAME account key at a host, so it is
@@ -1716,6 +2328,9 @@ func (c *Config) Validate() error {
 	for _, name := range sortedKeys(c.Harnesses) {
 		hc := c.Harnesses[name]
 		if err := c.checkMCPConfigOrigins(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
+			return err
+		}
+		if err := checkMCPConfigNamesClankerbar(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
 			return err
 		}
 		// The single-project split-brain, refused the same way the multi-project
@@ -1751,6 +2366,12 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("settings_path: %w - it is the allow/deny policy the unattended session is gated by: chmod go-w %s", err, c.SettingsPath)
 	}
 
+	// The top-level repo map, for single-project configs (multi-project entries
+	// carry their own, checked in the loop below).
+	if err := validateRepos(c.Repos, "top level"); err != nil {
+		return err
+	}
+
 	// Multi-project entries: slug required and unique; paths normalized; each
 	// project's mcp config defaults to its own workdir's .mcp.json (falling back to
 	// the top-level one at invocation time — see loop.Target).
@@ -1759,6 +2380,9 @@ func (c *Config) Validate() error {
 		p := &c.Projects[i]
 		if p.Slug == "" {
 			return fmt.Errorf("projects[%d]: slug is required", i)
+		}
+		if err := validateRepos(p.Repos, fmt.Sprintf("projects[%d] (%s)", i, p.Slug)); err != nil {
+			return err
 		}
 		if seen[p.Slug] {
 			return fmt.Errorf("projects: duplicate slug %q", p.Slug)
@@ -1787,8 +2411,24 @@ func (c *Config) Validate() error {
 		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
+			// Discovered, not named, exactly like the top-level default above —
+			// same rule, labelled with THIS field so the remedy names the line
+			// the operator actually adds, and allowlisted per THIS project
+			// (CLA-266).
+			if err := c.checkDiscoveredMCPConfig(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i), c.AllowLocalMCPServersFor(p.Slug)); err != nil {
+				return err
+			}
 		}
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+			return err
+		}
+		if err := checkMCPConfigNamesClankerbar(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+			return err
+		}
+		if err := validateHealthURL(p.HealthURL, fmt.Sprintf("projects[%d].health_url", i)); err != nil {
+			return err
+		}
+		if err := validateIntegrationBranch(p.IntegrationBranch, fmt.Sprintf("projects[%d].integration_branch", i)); err != nil {
 			return err
 		}
 		// The slug decides which queue is POLLED; the .mcp.json decides which
@@ -1805,6 +2445,9 @@ func (c *Config) Validate() error {
 			p.MCPConfigPaths[name] = path
 			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
 			if err := c.checkMCPConfigOrigins(path, label); err != nil {
+				return err
+			}
+			if err := checkMCPConfigNamesClankerbar(path, label); err != nil {
 				return err
 			}
 			if fromMCP := slugFromMCPURL(mcpURLFromConfig(path)); fromMCP != "" && fromMCP != p.Slug {
@@ -1834,11 +2477,29 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	resolved, err := resolveEnv(c.Env)
-	if err != nil {
+	// The session env declarations (CLA-462) are validated at all FOUR levels
+	// here — names and commands are static facts of the file, so a bad one is a
+	// config error, not a spawn-time surprise. Resolution itself happens fresh
+	// at every spawn (SessionEnv), because command-derived values exist to be
+	// fresh.
+	if err := validateEnvDecls(c.Env, "env"); err != nil {
 		return err
 	}
-	c.env = resolved
+	for _, name := range sortedKeys(c.Harnesses) {
+		if err := validateEnvDecls(c.Harnesses[name].Env, "harnesses."+name+".env"); err != nil {
+			return err
+		}
+	}
+	for i := range c.Projects {
+		if err := validateEnvDecls(c.Projects[i].Env, fmt.Sprintf("projects[%d].env", i)); err != nil {
+			return err
+		}
+		for _, h := range sortedKeys(c.Projects[i].EnvPerHarness) {
+			if err := validateEnvDecls(c.Projects[i].EnvPerHarness[h], fmt.Sprintf("projects[%d].env_per_harness.%s", i, h)); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -1855,45 +2516,6 @@ func discoverMCPConfig(workdir string) string {
 	return ""
 }
 
-// resolveEnv turns the env map into sorted KEY=VALUE pairs, reading "@path"
-// values from disk so a secret needn't be inlined in the config file. Sorting
-// keeps the child's environment deterministic across runs.
-//
-// An `@path` file must be owner-only (CLA-260). The indirection exists for one
-// reason - holding a credential out of the config file - and the doc comment on
-// Env has always told operators to keep it at 0600, but nothing checked, so a
-// `chmod 644` token file was accepted in silence and every local account could
-// read the key that drives the whole backlog. Refused rather than warned: a WARN
-// in an overnight log is read after the fact, if at all, and the fix is one
-// chmod.
-func resolveEnv(m map[string]string) ([]string, error) {
-	if len(m) == 0 {
-		return nil, nil
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		v := m[k]
-		if strings.HasPrefix(v, "@") {
-			path := expandHome(strings.TrimPrefix(v, "@"))
-			data, err := readOwnerOnly(path, groupOtherAccess)
-			if err != nil {
-				if errors.Is(err, errInsecureMode) {
-					return nil, fmt.Errorf("env %s: %w - an @path secret must be readable only by you: chmod 600 %s", k, err, path)
-				}
-				return nil, fmt.Errorf("env %s: %w", k, err)
-			}
-			v = strings.TrimSpace(string(data))
-		}
-		out = append(out, k+"="+v)
-	}
-	return out, nil
-}
-
 // sortedKeys is map iteration made deterministic, for the checks whose ERROR
 // depends on which entry is reached first. A validation message that names a
 // different block on each run of the same file reads as a flaky check rather
@@ -1906,10 +2528,6 @@ func sortedKeys[V any](m map[string]V) []string {
 	sort.Strings(keys)
 	return keys
 }
-
-// EnvSlice returns the resolved extra environment (KEY=VALUE) for the harness,
-// populated by Validate. Nil when no env is configured.
-func (c *Config) EnvSlice() []string { return c.env }
 
 // legacyStateDirName is where the state dir used to live, relative to the
 // workdir. Kept only so `doctor` and the loop can point an operator at a
@@ -2108,6 +2726,12 @@ func (c *Config) Source() string { return c.source }
 // and no slug). That is deliberate: New("") yields a not-wired poller, so the loop
 // falls into blind drain — which still makes progress — rather than retrying
 // forever against a slug-less base the plane can only reject.
+// Slug returns the project slug this config's wiring names — the `<slug>` in a
+// /mcp/<slug> endpoint or .mcp.json URL, "" when nothing derivable says. It is
+// how single-project mode answers "which project is this", the same derivation
+// the poll and the sessions already agree on.
+func (c *Config) Slug() string { return slugFromMCPURL(c.BacklogEndpoint()) }
+
 func (c *Config) BacklogEndpoint() string {
 	origin := c.CredentialOrigin()
 	if origin == "" {
@@ -2200,6 +2824,115 @@ func (c *Config) ProjectSummaryURL(p Project) string {
 
 func projectSummaryPath(origin, slug string) string {
 	return origin + "/api/projects/" + url.PathEscape(slug) + "/backlog-summary"
+}
+
+// FleetReportURL returns the URL of the daemon's fleet presence beacon target
+// (CLA-466): the plane's `POST .../fleet/report` surface, which takes presence
+// plus any finished iteration records in one authenticated call.
+//
+// Unlike the summary route there is NO legacy slug-less form — the report
+// endpoint exists only as `/api/projects/<slug>/fleet/report` (CLA-465). So a
+// setup with no derivable slug has no fleet URL at all: reporting is off for
+// that run (doctor says so), and the loop behaves exactly as it did before
+// fleets existed. Same origin rule as every credentialed call: CredentialOrigin,
+// never a path read off the workdir's .mcp.json.
+func (c *Config) FleetReportURL() string {
+	origin := c.CredentialOrigin()
+	if origin == "" {
+		return ""
+	}
+	if slug := slugFromMCPURL(c.BacklogEndpoint()); slug != "" {
+		return projectFleetReportPath(origin, slug)
+	}
+	return ""
+}
+
+// ProjectFleetReportURL returns the fleet-report URL for one configured project:
+// `<origin>/api/projects/<slug>/fleet/report`, on the same trusted
+// CredentialOrigin as every other credentialed call.
+func (c *Config) ProjectFleetReportURL(p Project) string {
+	origin := c.CredentialOrigin()
+	if origin == "" || p.Slug == "" {
+		return ""
+	}
+	return projectFleetReportPath(origin, p.Slug)
+}
+
+func projectFleetReportPath(origin, slug string) string {
+	return origin + "/api/projects/" + url.PathEscape(slug) + "/fleet/report"
+}
+
+// ResolveInstanceName composes the Fleet-page instance identity a daemon
+// beacons under (CLA-466): an explicit instance_name wins verbatim; otherwise
+// the default is the machine's hostname plus the config file's basename minus
+// its .json suffix ("Jasons-MBP/clanker1"), because the config PATH is what
+// actually distinguishes co-located daemons (CLA-501). The earlier
+// bare-hostname fallback keyed every same-host daemon to one presence row,
+// each beacon overwriting the last.
+//
+// The config-identity hash was considered and rejected as the discriminator:
+// it fingerprints file CONTENT, and the live co-located configs hash identically.
+//
+// The composed default is truncated to MaxInstanceNameLen so it cannot exceed
+// the plane's cap. Two paths identical within that prefix would still collide;
+// that is pathological, and visible to doctor's sibling scan, which resolves
+// identities through this same function.
+func ResolveInstanceName(instanceName, sourcePath, hostname string) string {
+	if name := strings.TrimSpace(instanceName); name != "" {
+		return name
+	}
+	base := ""
+	if sourcePath != "" {
+		base = strings.TrimSuffix(filepath.Base(sourcePath), ".json")
+	}
+	var name string
+	switch {
+	case hostname != "" && base != "":
+		name = hostname + "/" + base
+	case hostname != "":
+		name = hostname // no config file in play  -  nothing better than the host
+	default:
+		name = base // hostname unreadable; the basename still disambiguates
+	}
+	if len(name) > MaxInstanceNameLen {
+		// Byte-truncate, but never split a multi-byte rune: a split rune would
+		// marshal as U+FFFD (encoding/json replaces invalid UTF-8), corrupting
+		// the very identity this function exists to pin - and two distinct long
+		// basenames could even collapse onto one mangled prefix, re-creating the
+		// collision CLA-501 exists to fix. Back off to a rune boundary instead.
+		name = name[:MaxInstanceNameLen]
+		for len(name) > 0 && !utf8.ValidString(name) {
+			name = name[:len(name)-1]
+		}
+	}
+	return name
+}
+
+// ResolvedInstanceName is ResolveInstanceName over this config's instance_name
+// and source path.
+func (c *Config) ResolvedInstanceName(hostname string) string {
+	return ResolveInstanceName(c.InstanceName, c.source, hostname)
+}
+
+// Identity fingerprints the effective config in force — what the fleet presence
+// beacon reports as `configIdentity` (CLA-466), so the console can tell two
+// daemons apart when they disagree about how to run and can see a RELOAD land.
+//
+// It is a SHA-256 over the JSON encoding of the config AS VALIDATED (flag
+// overrides applied), recomputed on demand rather than cached: a RELOAD swaps
+// d.cfg mid-run, and the next beacon must carry the new identity. Only exported
+// fields encode; no secret is in the config file by contract (the API key lives
+// in CLANKERBAR_API_KEY). Map fields encode with sorted keys, so the fingerprint
+// is stable across processes.
+func (c *Config) Identity() string {
+	b, err := json.Marshal(c)
+	if err != nil {
+		// Marshalling a Config cannot fail today (no channels/funcs/cycles); an
+		// empty identity reads plane-side as "unknown" rather than lying.
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
 }
 
 // slugFromMCPURL extracts the `<slug>` from an `/mcp/<slug>` MCP endpoint URL, or

@@ -50,7 +50,7 @@ func TestValidateHarnessFromRegistry(t *testing.T) {
 	}
 }
 
-func TestResolveEnv(t *testing.T) {
+func TestSessionEnvResolvesTopLevel(t *testing.T) {
 	dir := t.TempDir()
 	secret := filepath.Join(dir, "token")
 	if err := os.WriteFile(secret, []byte("  sk-ant-oat01-abc\n"), 0o600); err != nil {
@@ -58,7 +58,8 @@ func TestResolveEnv(t *testing.T) {
 	}
 
 	t.Run("nil map yields nil", func(t *testing.T) {
-		got, err := resolveEnv(nil)
+		c := defaults()
+		got, err := c.SessionEnv(c.Harness, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -68,11 +69,13 @@ func TestResolveEnv(t *testing.T) {
 	})
 
 	t.Run("literals and @file, sorted and trimmed", func(t *testing.T) {
-		got, err := resolveEnv(map[string]string{
-			"ZED":                     "last",
-			"CLAUDE_CODE_OAUTH_TOKEN": "@" + secret,
-			"ALPHA":                   "first",
-		})
+		c := defaults()
+		c.Env = EnvMap{
+			"ZED":                     {Literal: "last"},
+			"CLAUDE_CODE_OAUTH_TOKEN": {Literal: "@" + secret},
+			"ALPHA":                   {Literal: "first"},
+		}
+		got, err := c.SessionEnv(c.Harness, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -87,21 +90,23 @@ func TestResolveEnv(t *testing.T) {
 	})
 
 	t.Run("missing @file is an error naming the key", func(t *testing.T) {
-		_, err := resolveEnv(map[string]string{"TOK": "@" + filepath.Join(dir, "nope")})
+		c := defaults()
+		c.Env = EnvMap{"TOK": {Literal: "@" + filepath.Join(dir, "nope")}}
+		_, err := c.SessionEnv(c.Harness, "")
 		if err == nil {
 			t.Fatal("want error for missing file, got nil")
 		}
 	})
 }
 
-func TestValidatePopulatesEnvSlice(t *testing.T) {
+// CLA-462: resolution moved from Validate (once per daemon start) to every
+// spawn, so Validate now checks DECLARATIONS only — names and commands are
+// static facts of the file — and leaves values alone entirely.
+func TestValidateChecksEnvDeclarationsWithoutResolving(t *testing.T) {
 	c := defaults()
-	c.Env = map[string]string{"FOO": "bar"}
+	c.Env = EnvMap{"FOO": {Literal: "bar"}}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
-	}
-	if got := c.EnvSlice(); !reflect.DeepEqual(got, []string{"FOO=bar"}) {
-		t.Fatalf("EnvSlice = %v", got)
 	}
 }
 
@@ -228,6 +233,18 @@ func TestProjectsValidation(t *testing.T) {
 	})
 
 	t.Run("a valid projects list normalizes paths and passes", func(t *testing.T) {
+		// A fake HOME keeps the verdict off machine state: "~/dev" expands through
+		// $HOME, and discovery reads <workdir>/.mcp.json — on the real machine
+		// that would make this test depend on whatever the operator's own file
+		// declares (CLA-266 made that load-bearing).
+		home := t.TempDir()
+		t.Setenv("HOME", home)
+		if err := os.MkdirAll(filepath.Join(home, "dev"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(home, "dev", ".mcp.json"), []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/clankerbar"}}}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
 		c := base()
 		c.Projects = []Project{
 			{Slug: "clankerbar", WorkDir: "~/dev"},
@@ -260,7 +277,7 @@ func TestProjectsValidation(t *testing.T) {
 	t.Run("each project's mcp config defaults to its own workdir's .mcp.json", func(t *testing.T) {
 		dir := t.TempDir()
 		mcp := filepath.Join(dir, ".mcp.json")
-		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		c := base()
@@ -284,7 +301,7 @@ func TestProjectsValidation(t *testing.T) {
 		// clankerbar tools and the poller could derive no slug.
 		dir := t.TempDir()
 		mcp := filepath.Join(dir, ".mcp.json")
-		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		c := base()
@@ -339,6 +356,34 @@ func TestProjectSummaryURL(t *testing.T) {
 			t.Errorf("ProjectSummaryURL() = %q, want the slug path-escaped", got)
 		}
 	})
+}
+
+// The CLA-310 empty-rollup opt-out resolves per project: a matching entry's
+// own value wins; an unmatched slug (the single-project shape reaching the
+// resolver with an empty one) falls back to the top level.
+func TestAllowUncheckedPRFor(t *testing.T) {
+	c := &Config{
+		AllowUncheckedPR: false,
+		Projects: []Project{
+			{Slug: "strict"},
+			{Slug: "loose", AllowUncheckedPR: true},
+		},
+	}
+
+	if c.AllowUncheckedPRFor("strict") {
+		t.Errorf("strict project inherited nothing and should refuse")
+	}
+	if !c.AllowUncheckedPRFor("loose") {
+		t.Errorf("loose project opted out and should warn")
+	}
+	if c.AllowUncheckedPRFor("") {
+		t.Errorf("unmatched slug should fall back to the top-level value (false here)")
+	}
+
+	top := &Config{AllowUncheckedPR: true}
+	if !top.AllowUncheckedPRFor("anything") {
+		t.Errorf("single-project mode should read the top-level field")
+	}
 }
 
 func TestProjectsSlugMCPMismatchRefused(t *testing.T) {

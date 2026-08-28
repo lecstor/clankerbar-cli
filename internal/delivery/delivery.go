@@ -6,20 +6,24 @@
 // claim — and one task (CLA-134) read `done` for four days while ~900 lines of its
 // work sat unpushed on one laptop, its own PR merging a stale snapshot.
 //
-// The driver is the right place to close that: it is already local, already in the
-// git tree, and already watches the session stream for `claim_task` and
+// The driver is the right place to close that: it is already local, already in
+// the git tree, and already watches the session stream for `claim_task` and
 // `update_task` (CLA-242). This adds a check to an observation that already
-// happens. It needs no new credentials and no plane change.
+// happens. It needs no new configured credentials - GitHub access rides the
+// operator's own `gh` auth, resolved per remote below - and no plane change.
 //
 // # Fail open, not closed
 //
-// Every check has three outcomes, not two: Pass, Fail, and Unknown. Unknown is
-// load-bearing. If the check cannot run — no git on PATH, no remote, a workdir
-// that is not a repository, a remote tip we do not have locally — the answer is
-// "could not verify", never "verified". A driver that reported a false pass would
-// be worse than the gap it replaces, and one that blocked a legitimate closure
-// because it could not find the tree would be worse still. Not knowing is not the
-// same as knowing it is fine, and neither is grounds for overriding the session.
+// Every check has four outcomes, not two: Pass, Fail, Unknown, and Warn.
+// Unknown is load-bearing. If the check cannot run — no git on PATH, no
+// remote, a workdir that is not a repository, a remote tip we do not have
+// locally — the answer is "could not verify", never "verified". A driver that
+// reported a false pass would be worse than the gap it replaces, and one that
+// blocked a legitimate closure because it could not find the tree would be
+// worse still. Not knowing is not the same as knowing it is fine, and neither
+// is grounds for overriding the session. Warn is CLA-310's: a check that ran
+// and found only the loose side of an operator's explicit opt-out — never
+// emitted by default.
 //
 // # Which working tree
 //
@@ -41,6 +45,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -59,6 +64,10 @@ const (
 	Fail Status = "fail"
 	// Unknown: the check could not run. NOT a pass.
 	Unknown Status = "unknown"
+	// Warn: the check ran and found the loose side of an explicit operator
+	// opt-out (CLA-310's allow_unchecked_pr). It is neither a pass — the detail
+	// says what to confirm — nor a failure, because the operator chose it.
+	Warn Status = "warn"
 )
 
 // Kind names which claim a check was about.
@@ -85,11 +94,20 @@ type Claim struct {
 	// carried the work, and the branch it is claimed to have landed on.
 	Commit            string
 	IntegrationBranch string
+
+	// PR is the pull request the session named as carrying the delivery
+	// (CLA-310). Verified through the `gh` CLI — mergeable, with a check
+	// rollup that actually ran and passed; see prcheck.go for the two
+	// conditions, the bounded wait, and the no-CI decision.
+	PR string
+
+	// Repo is the repository the claim lives in ("owner/name"). When set, it resolves ambiguity when the same branch exists in multiple repos (CLA-351).
+	Repo string
 }
 
 // Empty reports that there is nothing here to check.
 func (c Claim) Empty() bool {
-	return c.Branch == "" && (c.Commit == "" || c.IntegrationBranch == "")
+	return c.Branch == "" && (c.Commit == "" || c.IntegrationBranch == "") && c.PR == ""
 }
 
 // Check is one verified (or unverifiable) assertion.
@@ -170,6 +188,19 @@ type Verifier struct {
 	workdir string
 	gitBin  string
 	remote  string
+
+	// allowUncheckedPR is CLA-310's operator opt-out: an empty check rollup on
+	// a named PR is downgraded from a refusal to a Warn. The MERGEABLE
+	// condition is never relaxed by it.
+	allowUncheckedPR bool
+
+	// ghBin and the polling window drive the PR check (prcheck.go), and ghBin
+	// also resolves the per-owner token that scopes remote reads (CLA-458).
+	// Fields so tests can substitute a fake gh and shrink the wait; New fills
+	// the production values.
+	ghBin      string
+	prBudget   time.Duration
+	prInterval time.Duration
 }
 
 // New builds a Verifier rooted at a session's workdir. remote is the git remote
@@ -178,7 +209,23 @@ func New(workdir, remote string) *Verifier {
 	if remote == "" {
 		remote = "origin"
 	}
-	return &Verifier{workdir: workdir, gitBin: "git", remote: remote}
+	return &Verifier{
+		workdir:    workdir,
+		gitBin:     "git",
+		remote:     remote,
+		ghBin:      "gh",
+		prBudget:   prPollBudget,
+		prInterval: prPollInterval,
+	}
+}
+
+// AllowUncheckedPR applies the no-CI opt-out (CLA-310): an empty check rollup
+// on a delivery's PR becomes a WARN instead of a refusal. It never relaxes
+// the mergeability condition, and it changes nothing for repos whose PRs do
+// carry checks. Returns the verifier, for chaining off New.
+func (v *Verifier) AllowUncheckedPR() *Verifier {
+	v.allowUncheckedPR = true
+	return v
 }
 
 // Verify checks a claim and returns what it found. It never returns an error:
@@ -214,6 +261,12 @@ func (v *Verifier) Verify(ctx context.Context, c Claim) Report {
 	if c.Commit != "" && c.IntegrationBranch != "" {
 		rep.Checks = append(rep.Checks, v.mergeCheck(ctx, repos, c.Commit, c.IntegrationBranch, &rep))
 	}
+	if c.PR != "" {
+		// Runs after the git checks so it can prefer the repository they
+		// resolved (rep.Repo); a PR number belongs to a repository, and the
+		// branch/commit checks are what identify it.
+		rep.Checks = append(rep.Checks, v.prCheck(ctx, repos, c.PR, &rep))
+	}
 	return rep
 }
 
@@ -226,6 +279,15 @@ func (v *Verifier) Verify(ctx context.Context, c Claim) Report {
 // unpushed-work failure this exists to catch into a Pass. Ambiguity is reported,
 // not guessed at.
 func (v *Verifier) branchCheck(ctx context.Context, repos []string, branch string, rep *Report) Check {
+	// If the claim names a repo, filter the candidates to those whose remote URL
+	// matches the slug (CLA-351). If none match, fall back honestly: the refusal
+	// message names the ambiguous repos as before, rather than hiding the mismatch.
+	if rep.Claim.Repo != "" {
+		filtered := v.resolveRepoByURL(ctx, repos, rep.Claim.Repo)
+		if len(filtered) > 0 {
+			repos = filtered
+		}
+	}
 	var found []string
 	for _, r := range repos {
 		if sha, err := v.run(ctx, r, "rev-parse", "--verify", "--quiet", "refs/heads/"+branch); err == nil && sha != "" {
@@ -303,6 +365,9 @@ func (v *Verifier) allUnknown(c Claim, reason string) []Check {
 	if c.Commit != "" && c.IntegrationBranch != "" {
 		out = append(out, Check{Kind: CommitMerged, Status: Unknown, Detail: reason})
 	}
+	if c.PR != "" {
+		out = append(out, Check{Kind: PRVerified, Status: Unknown, Detail: reason})
+	}
 	return out
 }
 
@@ -338,7 +403,7 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 		// AHEAD (or rewritten), never the local-ahead failure this check exists for:
 		// were we ahead, the remote tip would be one of our own ancestors and
 		// therefore present. Try one targeted fetch, then say we do not know.
-		_, _ = v.run(ctx, repo, "fetch", "--quiet", "--", remote, branch)
+		_, _ = v.runScoped(ctx, repo, "fetch", "--quiet", "--", remote, branch)
 	}
 	if !v.haveObject(ctx, repo, remoteSHA) {
 		return Check{Kind: BranchPushed, Status: Unknown, Detail: fmt.Sprintf(
@@ -374,7 +439,7 @@ func (v *Verifier) checkMerged(ctx context.Context, repo, remote, sha, integrati
 			"%s has no branch %q to check the delivery against", remote, integration)}
 	}
 	if !v.haveObject(ctx, repo, tip) {
-		_, _ = v.run(ctx, repo, "fetch", "--quiet", "--", remote, integration)
+		_, _ = v.runScoped(ctx, repo, "fetch", "--quiet", "--", remote, integration)
 	}
 	if !v.haveObject(ctx, repo, tip) {
 		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
@@ -492,6 +557,75 @@ func sameDir(a, b string) bool { return realPath(a) == realPath(b) }
 // repository has it, otherwise its only remote. A repo with several remotes and no
 // `origin` keeps the configured name and fails the read loudly, rather than
 // silently checking against whichever remote happened to sort first.
+
+// resolveRepoByURL filters repos to those whose remote URL matches the claim's repo slug.
+func (v *Verifier) resolveRepoByURL(ctx context.Context, repos []string, repoSlug string) []string {
+	if repoSlug == "" {
+		return repos
+	}
+	var matched []string
+	for _, r := range repos {
+		url, err := v.remoteURL(ctx, r)
+		if err != nil || url == "" {
+			continue
+		}
+		if matchesRepoSlug(url, repoSlug) {
+			matched = append(matched, r)
+		}
+	}
+	if len(matched) == 0 {
+		// If no working copy matches, fall back to all repos so the refusal is honest.
+		return repos
+	}
+	return matched
+}
+
+// matchesRepoSlug reports whether a remote URL names the repo slug (owner/name),
+// tolerating https and ssh forms.
+func matchesRepoSlug(url, slug string) bool {
+	if slug == "" {
+		return true
+	}
+	// Tolerate both ssh (git@host:owner/name) and https (https://host/owner/name) forms.
+	// The slug is 'owner/name'. We look for the exact sequence after stripping protocol.
+	clean := url
+	// Strip the two trimmable suffixes in BOTH orders until stable: "name.git/",
+	// "name/.git", "/name.git" and trailing "/" all resolve to "…/name".
+	for {
+		before := clean
+		clean = strings.TrimSuffix(clean, ".git")
+		clean = strings.TrimSuffix(clean, "/")
+		if clean == before {
+			break
+		}
+	}
+	clean = strings.TrimPrefix(clean, "https://")
+	clean = strings.TrimPrefix(clean, "http://")
+	clean = strings.TrimPrefix(clean, "git@")
+	// After stripping protocol and ".git", both forms carry the slug as a path
+	// segment: ssh 'github.com:lecstor/clankerbar-cli' and https
+	// 'github.com/lecstor/clankerbar-cli'. The check requires a BOUNDARY on both
+	// sides of the slug — preceded by start, '/' or ':', followed by '/' or end —
+	// so `lecstor/clankerbar` never matches `lecstor/clankerbar-cli` (the
+	// project's own repo pair: the whole point of CLA-351 is to tell them apart).
+	for i := 0; i+len(slug) <= len(clean); i++ {
+		if !strings.HasPrefix(clean[i:], slug) {
+			continue
+		}
+		before, after := byte('/'), byte('/')
+		if i > 0 {
+			before = clean[i-1]
+		}
+		if j := i + len(slug); j < len(clean) {
+			after = clean[j]
+		}
+		if (before == '/' || before == ':') && (after == '/' || after == 0) {
+			return true
+		}
+	}
+	return false
+}
+
 func (v *Verifier) resolveRemote(ctx context.Context, repo string) string {
 	out, err := v.run(ctx, repo, "remote")
 	if err != nil || out == "" {
@@ -509,11 +643,23 @@ func (v *Verifier) resolveRemote(ctx context.Context, repo string) string {
 	return v.remote
 }
 
+// remoteURL reads the URL of the repository's resolved remote, for callers
+// that need to know WHERE the remote points (the PR check derives the GitHub
+// owner/name from it). Empty with a nil error is not possible here: a remote
+// always has a URL or cannot be read.
+func (v *Verifier) remoteURL(ctx context.Context, repo string) (string, error) {
+	return v.run(ctx, repo, "remote", "get-url", v.resolveRemote(ctx, repo))
+}
+
 // lsRemote reads the remote's tip for a branch WITHOUT mutating anything. Empty
 // SHA with a nil error means the remote genuinely has no such branch — which is a
 // Fail, not an Unknown.
+//
+// This is a NETWORK command: it goes out scoped to the account that owns the
+// remote (runScoped), or a private repo answers "Repository not found" and the
+// check degrades to Unknown for want of credentials rather than evidence.
 func (v *Verifier) lsRemote(ctx context.Context, repo, remote, branch string) (string, error) {
-	out, err := v.run(ctx, repo, "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
+	out, err := v.runScoped(ctx, repo, "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
 	if err != nil {
 		return "", err
 	}
@@ -557,15 +703,28 @@ func (v *Verifier) aheadBy(ctx context.Context, repo, from, to string) string {
 // The environment is deliberately hostile to interaction: an unattended run has
 // no terminal, and a git that decides to ask for a password would hang the driver
 // rather than answering the question.
-//
-// The context alone does NOT bound this. `git ls-remote` and `git fetch` spawn
-// helpers (ssh, git-remote-https, a credential helper) that inherit the pipes
-// behind these buffers, and os/exec's Wait blocks until every inheritor closes its
-// write end — so a killed git can still leave the call sitting there. Measured at
-// 8s against a 500ms deadline, returning a nil error, which would have read as a
-// successful check. WaitDelay is what actually cuts it off, and the truncated read
-// is reported as the failure it is.
 func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string, error) {
+	return v.gitRun(ctx, dir, nil, args...)
+}
+
+// runScoped is run for the NETWORK commands: it adds the credential scoping
+// the resolved remote implies (remoteCredEnv), so ls-remote and fetch read a
+// private github.com remote as an account that can see it. Local operations
+// must stay on run: scoping costs a `gh auth token` spawn and local commands
+// never consult credentials.
+func (v *Verifier) runScoped(ctx context.Context, dir string, args ...string) (string, error) {
+	return v.gitRun(ctx, dir, v.remoteCredEnv(ctx, dir), args...)
+}
+
+// gitRun is run's engine, with extraEnv appended to the child's environment.
+// The WaitDelay discipline is not decoration: `git ls-remote` and `git fetch`
+// spawn helpers (ssh, git-remote-https, a credential helper) that inherit the
+// pipes behind these buffers, and os/exec's Wait blocks until every inheritor
+// closes its write end — so a killed git can still leave the call sitting
+// there. Measured at 8s against a 500ms deadline, returning a nil error, which
+// would have read as a successful check. WaitDelay is what actually cuts it
+// off, and the truncated read is reported as the failure it is.
+func (v *Verifier) gitRun(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, v.gitBin, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -575,6 +734,7 @@ func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string,
 		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
 		"GCM_INTERACTIVE=never",
 	)
+	cmd.Env = append(cmd.Env, extraEnv...)
 	cmd.WaitDelay = 5 * time.Second
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -586,6 +746,159 @@ func (v *Verifier) run(ctx context.Context, dir string, args ...string) (string,
 		return "", fmt.Errorf("git %s: %w", args[0], err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// --- credential resolution for remote reads (CLA-458) ------------------------
+//
+// A driven repository's origin may be an HTTPS URL that names no account
+// (`https://github.com/lecstor/ezyapp.git`). git then asks the ambient
+// credential helper without naming one either, and `gh auth git-credential`
+// serves whichever gh account is ACTIVE - which need not see the private repo,
+// so ls-remote answers "Repository not found", every check degrades to Unknown,
+// and since CLA-457 that Unknown is fail-closed: evidence that cannot run is
+// not evidence. The sibling repos whose origins DO embed their owner never hit
+// this, which is why the breakage looked like one repo being haunted.
+//
+// The fix rides the one GitHub credential mechanism this package already
+// depends on - `gh`, the same binary prCheck drives - rather than inventing a
+// second store: derive the owner from the remote URL, resolve THAT account's
+// token with `gh auth token --user`, and let git read the remote AS the owner
+// through a per-command insteadOf rewrite. Scoping by owner is load-bearing:
+// probed on gh 2.96.0, the credential helper refuses to serve a NON-active
+// account even when asked by name (an empty answer for username=lecstor while
+// username-less requests serve the active user), so credential.<url>.username
+// cannot carry this.
+//
+// The rewrite travels in the child's ENVIRONMENT (GIT_CONFIG_COUNT and
+// friends), never its argv: `-c url.<token>@github.com/...` would print the
+// token to ps(1) for every process on the box, while secrets in a child's env
+// are already this driver's hygiene model - CLANKERBAR_API_KEY rides the same
+// way. Nothing is persisted and no repository config is touched; the scope is
+// exactly this one git invocation.
+//
+// Every fallback below lands on "run unscoped" - byte-identical to pre-CLA-458
+// behavior - so fail-open stays fail-open: non-github hosts, ssh remotes,
+// owners with no gh token, and a failing or absent gh all degrade to today.
+
+const (
+	// insteadOfBase is the URL prefix git rewrites remote URLs INTO when the
+	// credential scoping applies: the token rides as the userinfo of a
+	// x-access-token URL, the convention GitHub Actions checkout established
+	// and GitHub's HTTPS endpoint accepts for OAuth tokens.
+	insteadOfBase = "url.https://x-access-token:%s@github.com/.insteadOf"
+
+	// insteadOfPrefix is WHAT gets rewritten: any https://github.com/ URL this
+	// invocation resolves - including through a remote name - reads as the
+	// token'd base above.
+	insteadOfPrefix = "https://github.com/"
+)
+
+// githubOwner extracts the account that owns a github.com HTTPS remote URL:
+// the first path segment of https://github.com/<owner>/<repo>. Empty for
+// anything else, because empty means "no scoping known": ssh remotes
+// authenticate with keys, other hosts are not gh accounts, GitHub Enterprise
+// would need its own gh hostname, and an owner-less URL has nothing to derive.
+func githubOwner(remoteURL string) string {
+	u, err := url.Parse(remoteURL)
+	if err != nil {
+		return ""
+	}
+	if u.Scheme != "https" && u.Scheme != "http" {
+		return ""
+	}
+	if !strings.EqualFold(u.Hostname(), "github.com") {
+		return ""
+	}
+	owner := strings.TrimPrefix(u.Path, "/")
+	if i := strings.IndexByte(owner, '/'); i >= 0 {
+		owner = owner[:i]
+	}
+	return owner
+}
+
+// --- exported scoping helpers (CLA-459) ---------------------------------------
+//
+// Doctor's deploy_lag check (internal/cli/deploy_lag.go) reads remotes with
+// ls-remote and fetch too - it measures deploy lag against the REMOTE tip of
+// the integration branch - so it has the identical account-mismatch gap
+// CLA-458 closed here. These wrappers exist so it can apply exactly this
+// resolution rather than grow a second copy of it; the Verifier's own methods
+// below delegate to the same functions.
+
+// GithubOwner reports the account that owns a github.com HTTPS remote URL, or
+// "" when no scoping is derivable. See githubOwner.
+func GithubOwner(remoteURL string) string {
+	return githubOwner(remoteURL)
+}
+
+// ScopeEnv returns the environment additions that scope ONE git invocation to
+// token: every https://github.com/ URL that invocation resolves is rewritten,
+// through GIT_CONFIG_* insteadOf config, into a token-bearing x-access-token
+// URL. The token travels in the child's environment, never its argv - see the
+// package comment on this section for why ps(1) rules argv out. The result is
+// meant as extra env on a single exec; nothing is persisted.
+func ScopeEnv(token string) []string {
+	return []string{
+		"GIT_CONFIG_COUNT=1",
+		fmt.Sprintf("GIT_CONFIG_KEY_0="+insteadOfBase, token),
+		"GIT_CONFIG_VALUE_0=" + insteadOfPrefix,
+	}
+}
+
+// TokenForOwner resolves owner's GitHub token with `gh auth token --user`,
+// spawning ghBin in dir under runGH's interaction-hostile discipline. Any
+// failure - gh missing, no such account, a wedged call - is an empty token,
+// which callers treat as "run unscoped". A token is also refused if it cannot
+// ride a single config value intact (embedded whitespace would corrupt the
+// insteadOf key into something silently wrong).
+func TokenForOwner(ctx context.Context, dir, ghBin, owner string) string {
+	out, err := runGHBin(ctx, ghBin, dir, nil, "auth", "token", "--user", owner)
+	if err != nil {
+		return ""
+	}
+	token := strings.TrimSpace(out)
+	if token == "" || strings.ContainsAny(token, " \t\r\n") {
+		return ""
+	}
+	return token
+}
+
+// ScopeRemoteEnv is the whole CLA-458 resolution for one already-read remote
+// URL: the env additions that let git read THAT remote as the github account
+// owning it, or nil when no scoping applies - non-github host, or an owner
+// whose token gh cannot serve. nil means "run unscoped", byte-identical to
+// pre-CLA-458 behavior; every fallback stays fail-open.
+func ScopeRemoteEnv(ctx context.Context, dir, ghBin, remoteURL string) []string {
+	owner := githubOwner(remoteURL)
+	if owner == "" {
+		return nil
+	}
+	token := TokenForOwner(ctx, dir, ghBin, owner)
+	if token == "" {
+		return nil
+	}
+	return ScopeEnv(token)
+}
+
+// remoteCredEnv returns the environment additions that scope repo's resolved
+// remote to the account that owns it, or nil when no scoping applies. It costs
+// two local probes per network command - one `git remote get-url`, one `gh
+// auth token` spawn - and no cache, deliberately: Verify handles a single
+// claim, so the worst case is a handful of spawns at session end, while a
+// cache would outlive the gh auth state it was keyed on for every run after.
+func (v *Verifier) remoteCredEnv(ctx context.Context, repo string) []string {
+	raw, err := v.remoteURL(ctx, repo)
+	if err != nil || raw == "" {
+		return nil
+	}
+	return ScopeRemoteEnv(ctx, repo, v.ghBin, raw)
+}
+
+// ghTokenFor resolves owner's GitHub token through `gh auth token --user` -
+// the same gh binary, and therefore the same credential mechanism, the PR
+// check already runs on. See TokenForOwner.
+func (v *Verifier) ghTokenFor(ctx context.Context, dir, owner string) string {
+	return TokenForOwner(ctx, dir, v.ghBin, owner)
 }
 
 func short(sha string) string {

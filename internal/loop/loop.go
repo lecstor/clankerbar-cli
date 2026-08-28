@@ -17,15 +17,19 @@ import (
 	"log"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/salvage"
@@ -124,10 +128,48 @@ type Target struct {
 	// need an entry here and lacks one.
 	MCPConfigPaths map[string]string
 
+	// Repos is this project's repo -> local-checkout map (CLA-437, agent-rule-
+	// scoping pieces 2 and 3), and PrimaryRepo the fallback for a task that
+	// carries no repo. Between them they decide where each session STARTS: the
+	// task's own repo resolved to a checkout, never blindly the workdir — so the
+	// session reads its repo's rule files instead of a sibling's, and a grant
+	// scoped per-cwd cannot wall off the tree the task needs. Resolution order,
+	// the loud repo_not_found failure and the nothing-configured legacy path are
+	// config.ResolveCheckout's; this field only carries what the operator
+	// declared. Both empty = the feature is off and every spawn behaves exactly
+	// as before.
+	Repos map[string]string
+
+	// PrimaryRepo backs a session whose task names no repo (a fresh phase before
+	// the plane returns repos for everything). See Repos above.
+	PrimaryRepo string
+
 	// Releaser hands back a claim a session left holding (CLA-242). Nil disables
 	// the handback for this target, which costs only the reclaim an expiring lease
 	// would have cost anyway — so a target without one degrades, it does not break.
 	Releaser plane.Releaser
+
+	// Fleet reports this project's activity to the plane (CLA-466): a presence
+	// beacon on every backlog poll, state-change beacons at phase boundaries, and
+	// exactly one iteration record per drain. Nil (not wired) disables reporting,
+	// which costs only console visibility — reporting is telemetry and is never
+	// load-bearing.
+	Fleet fleet.Reporter
+
+	// RCfg fetches this project's stored execution config (CLA-410). Nil means
+	// not wired: the target runs the local file rules exactly as before, which
+	// is also what the plane answers (version 0) until a document is ratified.
+	RCfg plane.RunConfigReader
+
+	// Cfg is this target's EFFECTIVE config — the driver's base config with the
+	// project's stored run-config document overlaid — or nil when no document is
+	// in force, in which case every read falls through to d.cfg unchanged. It
+	// carries only policy the plane may say (harness/model/tiers/budget/
+	// escalation/backstops); phases, wiring, env and machine paths stay local,
+	// so the overlay can never repoint a session at somebody else's dialect.
+	// Rebuilt between iterations when the poll's runConfigVersion moves — never
+	// mid-session.
+	Cfg *config.Config
 }
 
 // Driver runs the loop for one harness against one or more backlogs.
@@ -173,6 +215,27 @@ type Driver struct {
 	pending     []bool      // a drain of this target is awaiting its progress verdict
 	skipUntil   []time.Time // a backed-off target is ineligible until this time
 
+	// Per-target harness-failure state (CLA-507). A drain that returns an ERROR
+	// failed while trying to run THIS target's session - a malformed opencode.json
+	// in its workdir, a missing checkout, a harness binary that will not start.
+	// That failure belongs to the project, not to the run: ending the run took
+	// every healthy sibling down with it on 2026-08-26 (three of four fleet
+	// daemons died on one project's bad config). So the target sits out on the
+	// same ladder the no-progress breaker shapes, escalating while it keeps
+	// failing and rejoining once it succeeds again, while the others drain on.
+	//
+	// The quiet breaker cannot stand in for this: its accumulator is denominated
+	// in TOKENS, and a session killed by a bad config reports ~0 of them, so a
+	// target failing this way would never climb it. harnessFails counts
+	// consecutive failed drains since the last success (reset only by success,
+	// so a target that keeps failing escalates: an idle stretch does NOT clear
+	// the sit-out (judgeProgress's idle reset preserves skipUntil while
+	// harnessFails > 0), so the ladder holds until the back-off elapses or the
+	// harness succeeds again); harnessErrs keeps each failure's text for the
+	// log line and for the run-wide report when nothing is left to drive.
+	harnessFails []int
+	harnessErrs  []error
+
 	// The fleet dead-phase counter (CLA-396). Per-target because a multi-target
 	// driver runs several projects, and "the fleet" is one project's sessions:
 	// a run of dead phases on project A must not pause project B. The per-task
@@ -205,9 +268,19 @@ type Driver struct {
 	// clears once the count falls back to it or below.
 	fleetOpenQ []int
 
+	// waitGrace is how far past a stated reset the paused loop waits before its
+	// confirming probe: a reset time is a boundary, and arriving exactly on it
+	// invites an off-by-a-second retry against a cap that has not lifted yet.
+	// A field so tests can shrink it (CLA-305) - production always gets a
+	// minute, and no test should sleep a minute to watch a boundary land.
+	waitGrace time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
-	// tests can substitute one; production always gets internal/delivery.
-	newVerifier func(workdir string) deliveryVerifier
+	// tests can substitute one; production always gets internal/delivery. The
+	// second argument is CLA-310's empty-check-rollup opt-out for the target
+	// being verified — resolved from config by the caller, which knows the
+	// target, so the verifier itself stays project-blind.
+	newVerifier func(workdir string, allowUncheckedPR bool) deliveryVerifier
 
 	// newSalvager builds the stranded-work rescuer for a workdir (CLA-314). Same
 	// shape and the same reason as newVerifier.
@@ -239,6 +312,57 @@ type Driver struct {
 	// measured over a run, not a drain — so it hangs off the Driver and is
 	// reported from Run. Lazily built; see tallyDead and logDeadTally.
 	deadTally map[tallyKey]*phaseTally
+
+	// restartRequested (CLA-461) flips when a RESTART / RESTART_NOW marker has
+	// been consumed and the run is unwinding toward a re-exec. Atomic because
+	// the RESTART_NOW watcher goroutine writes it while the loop reads it after
+	// Run returns.
+	restartRequested atomic.Bool
+
+	// reloadConfig rebuilds the config for a RELOAD marker (CLA-461). Production
+	// wires Load+ApplyFlagOverrides+Validate via SetReloader; nil falls back to
+	// Load(Source())+Validate. See control.go.
+	reloadConfig func() (*config.Config, error)
+
+	// restartPoll is how often the RESTART_NOW watcher polls the state dir. A
+	// field so tests can shrink it; production always gets restartCheckInterval.
+	restartPoll time.Duration
+
+	// iter is one target's mid-drain presence state (CLA-466), written by
+	// beginIteration / endIteration around each drain and read by fleetState when
+	// a poll beacons. Guarded by iterMu: since CLA-510 the lease renewer's
+	// goroutine also revises the ref mid-session (reflectClaim), so these are no
+	// longer touched by the loop alone.
+	iter   []iterState
+	iterMu sync.Mutex
+
+	// hostname/hostOnce cache os.Hostname for the fleet beacon identity.
+	hostname string
+	hostOnce sync.Once
+
+	// Per-target run-config state (CLA-410). rcVersions holds the version each
+	// target's effective config was built from, -1 until the first fetch; the
+	// poll's runConfigVersion differing from it is the re-read signal, honoured
+	// exactly where STOP/RELOAD are: the ITERATION boundary (the poll only
+	// happens there), never mid-session. rcAttempt/rcAttemptVer rate-limit a
+	// FAILED refetch of one version to one try per backoff window (a new version
+	// always fetches), so a blip at ratify time retries without spamming.
+	rcVersions   []int
+	rcAttempt    []time.Time
+	rcAttemptVer []int
+
+	// tgtTokens / tgtCost accumulate each target's own spend for the per-target
+	// budget breaker: a stored config's budget must bite on ITS project's spend,
+	// not on a run total shared with every other target. The base budget keeps
+	// its existing run-wide duty unchanged; this breaker exists only where an
+	// overlay is actually in force.
+	tgtTokens []int
+	tgtCost   []float64
+
+	// overrides are the run's flag overrides, re-applied after every overlay so
+	// an explicit --harness/--model still wins over a stored document. cli.Run
+	// sets them via SetOverrides; the zero value applies nothing.
+	overrides config.Overrides
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -262,23 +386,42 @@ func New(cfg *config.Config, h harness.Adapter, poller backlog.Poller) *Driver {
 // account key, many project queues — round-robin over whichever have claimable work.
 func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
-	return &Driver{
+	d := &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:      make([]bool, n),
-		quietTokens: make([]int, n),
-		spent:       make([]int, n),
-		baseline:    make([]int, n),
-		openQs:      make([]int, n),
-		pending:     make([]bool, n),
-		skipUntil:   make([]time.Time, n),
-		fleetDead:   make([]int, n),
-		fleetPaused: make([]bool, n),
-		fleetRaised: make([]bool, n),
-		fleetOpenQ:  make([]int, n),
-		newVerifier: func(workdir string) deliveryVerifier { return delivery.New(workdir, "") },
+		paused:       make([]bool, n),
+		quietTokens:  make([]int, n),
+		spent:        make([]int, n),
+		baseline:     make([]int, n),
+		openQs:       make([]int, n),
+		pending:      make([]bool, n),
+		skipUntil:    make([]time.Time, n),
+		harnessFails: make([]int, n),
+		harnessErrs:  make([]error, n),
+		fleetDead:    make([]int, n),
+		fleetPaused:  make([]bool, n),
+		fleetRaised:  make([]bool, n),
+		fleetOpenQ:   make([]int, n),
+		iter:         make([]iterState, n),
+		rcVersions:   make([]int, n),
+		rcAttempt:    make([]time.Time, n),
+		rcAttemptVer: make([]int, n),
+		tgtTokens:    make([]int, n),
+		tgtCost:      make([]float64, n),
+		waitGrace:    time.Minute,
+		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
+			v := delivery.New(workdir, "")
+			if allowUncheckedPR {
+				v.AllowUncheckedPR()
+			}
+			return v
+		},
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
 	}
+	for i := range d.rcVersions {
+		d.rcVersions[i] = -1 // unfetched; 0 is a REAL answer (nothing stored)
+	}
+	return d
 }
 
 // adapterFor resolves the harness that runs one phase.
@@ -305,7 +448,11 @@ func (d *Driver) adapterFor(ph config.Phase) (harness.Adapter, error) {
 // context cancellation. An empty queue is NOT a stop condition — it idles and
 // keeps polling. Returns nil on a graceful stop; an error only on an unexpected,
 // non-retryable failure.
-func (d *Driver) Run(ctx context.Context) error {
+//
+// Two things hold on every way out (CLA-491): a STOP marker this run never
+// consumed is removed rather than left where the next start would read it as a
+// fresh stop request, and the last log line names why the run ended.
+func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// A caller may have opened the state dir already (tests, and any future entry
 	// point that wants to fail before spawning anything). Opening it here is the
 	// normal path.
@@ -324,9 +471,22 @@ func (d *Driver) Run(ctx context.Context) error {
 			d.state = nil
 		}()
 	}
+	// Belt and braces on the way out (CLA-491). Every shutdown path that does not
+	// pass a STOP read (a non-retryable phase failure, a budget or zero-spend
+	// trip, max-iterations, HALT, a cancelled context) leaves a
+	// pending STOP marker where it fell, and the next start used to read it as
+	// fresh and stop itself seconds into its first cycle: the 2026-08-25 fleet
+	// soft-stop left one behind clanker1, and the upgraded replacement DOA'd on
+	// it. Registered here rather than at each return so a future shutdown path
+	// cannot forget it. (The closure, not `defer d.sweepPendingStop(runErr)`:
+	// arguments evaluate at registration, and runErr is not assigned yet.)
+	defer func() { d.sweepPendingStop(runErr) }()
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
+	// Recomputed every iteration below, so a RELOAD that edits the interval is
+	// seen from the next idle poll on. This first value is only what the banner
+	// announces.
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 	// Every harness this run will SPAWN, not just the configured one: a mixed
 	// sequence's banner naming one of them is a log that disagrees with the
@@ -341,14 +501,43 @@ func (d *Driver) Run(ctx context.Context) error {
 	if legacy := d.cfg.LegacyStateDir(); legacy != "" {
 		log.Printf("note: %s is left over from before the state dir moved out of the workdir — markers there are IGNORED, and its old transcripts are still world-readable inside your repo; move or delete it", legacy)
 	}
+	// A STOP marker already sitting here PREDATES this process: markers are only
+	// ever read and consumed by a running daemon (the cycle top below, and
+	// waitOrStop), so one found at start-up was left behind by a previous run
+	// that exited without consuming it (CLA-491). Its intent died with that run;
+	// acting on it here would stop this daemon before it did anything: exactly
+	// what the upgraded clanker1 did seconds after its start banner. Consume it
+	// with a loud note instead. A stop dropped AFTER this point is fresh and
+	// still lands on every read below.
+	if present, msg := d.readMarker("STOP"); present {
+		_ = d.state.Remove("STOP")
+		note := ""
+		if msg != "" {
+			note = ": " + msg
+		}
+		log.Printf("warning: STOP marker%s is left over from a previous run - consumed WITHOUT stopping this one; drop a fresh marker to stop THIS run", note)
+	}
 
 	start := time.Now()
 	var totalTokens int
 	var totalCost float64
 	drains := 0
 
+	// CLA-461: everything below runs on a context this Run owns, so a RESTART_NOW
+	// marker can cancel it mid-session and ride the exact kill/cleanup/release
+	// machinery a Ctrl-C rides. Cancelling the caller's ctx directly is not
+	// available to us; deriving one is.
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	d.watchRestartNow(runCtx, cancelRun)
+
+	// CLA-466: whatever ends the run — STOP/HALT, a restart marker,
+	// max-iterations, budget, signal or error — every target's final `stopping`
+	// beacon goes out first. After it, console silence means the daemon is gone.
+	defer d.fleetShutdown()
+
 	for {
-		if ctx.Err() != nil {
+		if runCtx.Err() != nil {
 			log.Print("cancelled — stopping")
 			return nil
 		}
@@ -361,6 +550,42 @@ func (d *Driver) Run(ctx context.Context) error {
 			log.Print("STOP requested — stopping")
 			return nil
 		}
+		// The restart/reload markers (CLA-461), honoured exactly where STOP is:
+		// the ITERATION boundary. Never a mid-drain phase seam — the run holds
+		// the task there. Reaching this point means the previous drain has fully
+		// unwound and handed its claim back, so a graceful restart holds no claim
+		// across the boundary by construction (resume is the plane's job anyway).
+		// A RESTART_NOW consumed here found no session in flight and acts as a
+		// plain restart; when one IS in flight the watcher in watchRestartNow has
+		// already cancelled the drain and this block is never reached.
+		if present, msg := d.readMarker(MarkerRestart); present {
+			_ = d.state.Remove(MarkerRestart)
+			if msg != "" {
+				log.Printf("RESTART requested: %s", msg)
+			} else {
+				log.Print("RESTART requested")
+			}
+			log.Print("re-executing at the iteration boundary")
+			d.restartRequested.Store(true)
+			return nil
+		}
+		if present, msg := d.readMarker(MarkerRestartNow); present {
+			_ = d.state.Remove(MarkerRestartNow)
+			if msg != "" {
+				log.Printf("RESTART_NOW requested: %s", msg)
+			} else {
+				log.Print("RESTART_NOW requested")
+			}
+			log.Print("nothing in flight here — re-executing immediately")
+			d.restartRequested.Store(true)
+			return nil
+		}
+		if present, _ := d.readMarker(MarkerReload); present {
+			_ = d.state.Remove(MarkerReload)
+			log.Print("RELOAD requested — re-reading the config file at the iteration boundary")
+			d.applyReload()
+		}
+		idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 		if d.cfg.MaxIterations > 0 && drains >= d.cfg.MaxIterations {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
 			return nil
@@ -384,7 +609,12 @@ func (d *Driver) Run(ctx context.Context) error {
 			anyCandidate := false
 			for i := range d.targets {
 				t := d.targets[i]
-				sum, err := t.Poller.Poll(ctx)
+				sum, err := t.Poller.Poll(runCtx)
+				// CLA-466: the presence beacon rides THIS poll — no new cadence.
+				// It fires whatever the poll answered (even an error poll proves
+				// the daemon is alive and looping), and carries the state derived
+				// below, so a console-paused target reads `draining`, not `idle`.
+				d.beacon(i, t, d.fleetState(i))
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):
 					log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
@@ -411,6 +641,13 @@ func (d *Driver) Run(ctx context.Context) error {
 				case err != nil:
 					log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
 				default:
+					// The stored execution-config boundary (CLA-410): a moved
+					// runConfigVersion — including the first poll, which is
+					// "start of run" — refetches and re-overlays BEFORE the
+					// spawn gate reads anything, so the drain that follows this
+					// poll runs on the current document. Mid-session is
+					// unreachable by construction: polls happen only here.
+					d.checkRunConfigVersion(runCtx, i, &d.targets[i], sum.RunConfigVersion)
 					// stale_claimable is reported beside claimable, not folded into it: an
 					// operator watching the console has to be able to tell "spawning
 					// because there is fresh work" from "spawning to recover an abandoned
@@ -461,7 +698,7 @@ func (d *Driver) Run(ctx context.Context) error {
 			}
 			if !d.blind {
 				if !anyCandidate {
-					if d.waitOrStop(ctx, idle) {
+					if d.waitOrStop(runCtx, idle) {
 						return nil
 					}
 					continue
@@ -477,9 +714,28 @@ func (d *Driver) Run(ctx context.Context) error {
 			}
 		}
 		if d.blind {
-			// Blind mode has no counts to route on — rotate across targets so every
-			// queue still gets sessions.
-			d.cursor = (d.cursor + 1) % len(d.targets)
+			// Blind mode has no counts to route on - rotate across targets so every
+			// queue still gets sessions. A target sitting out a harness failure
+			// (CLA-507) is skipped here exactly as the wired gate skips it; the only
+			// way skipUntil can be set in blind mode is that failure path, since
+			// judgeProgress never runs without polls. Walking a full lap without
+			// finding a drivable target means nothing is left, and that exit is the
+			// honest one. The lap reads from the PRE-pass cursor: mutating d.cursor
+			// per step would make later steps orbit the mutated value instead of
+			// walking the ring.
+			found := false
+			orig := d.cursor
+			for i := 1; i <= len(d.targets); i++ {
+				idx := (orig + i) % len(d.targets)
+				d.cursor = idx
+				if !d.backedOff(idx) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("every project's harness is failing - nothing left to drive, stopping:%s", d.sidelinedReport())
+			}
 			target = d.targets[d.cursor]
 		}
 
@@ -489,7 +745,7 @@ func (d *Driver) Run(ctx context.Context) error {
 		drains++
 		// The next poll of this target judges whether the drain settled anything.
 		d.pending[d.cursor] = true
-		tokens, cost, handoffs, stop, err := d.drainPhases(ctx, drains, d.cursor, target,
+		tokens, cost, handoffs, stop, err := d.drainPhases(runCtx, drains, d.cursor, target,
 			spend{start: start, tokens: totalTokens, cost: totalCost})
 		// Count the spend BEFORE deciding what to do with the outcome: a drain that
 		// stopped or failed still burned what it burned, and the accumulator is what
@@ -500,6 +756,20 @@ func (d *Driver) Run(ctx context.Context) error {
 		// operator's ceiling rather than extending the run for free.
 		totalTokens += tokens
 		totalCost += cost
+		// The per-target ledger (CLA-410): where a stored budget is in force for
+		// THIS target, its ceilings are judged on its own spend, not on a total
+		// every target feeds. Checked here — the same between-iterations moment
+		// the run-wide breaker reads — and only when an overlay exists, so an
+		// un-overlaid target's behaviour is untouched.
+		d.tgtTokens[d.cursor] += tokens
+		d.tgtCost[d.cursor] += cost
+		if eff := d.targets[d.cursor].Cfg; eff != nil {
+			if dim := eff.Budget.ExceededBy(d.tgtTokens[d.cursor], d.tgtCost[d.cursor], time.Since(start)); dim != "" {
+				log.Printf("%sbudget reached: %s — stopping to leave headroom (target tokens=%d cost=$%.2f)",
+					d.prefix(d.cursor), dim, d.tgtTokens[d.cursor], d.tgtCost[d.cursor])
+				return nil
+			}
+		}
 		// Hand the drain's tokens to the verdict that will judge it: a fruitless
 		// drain is charged to the token-denominated quiet accumulator (CLA-343), and
 		// the figure must be this drain's, not whatever total happened to be in
@@ -513,7 +783,28 @@ func (d *Driver) Run(ctx context.Context) error {
 		// producing (the last line before the run ends IS the run total).
 		d.logDeadTally()
 		if err != nil {
-			return err
+			// Classify before acting (CLA-507). The run-wide causes are the ones
+			// the poll loop already hard-stops on - a bad key or a missing project
+			// selector is shared by every target, so no target can make progress
+			// and sidelining would just defer the same exit. They never originate
+			// in a drain today; the guard keeps that boundary explicit rather than
+			// incidental. Context cancellation arrives as stop=true with err=nil,
+			// so it needs no classification here.
+			if errors.Is(err, backlog.ErrUnauthorized) || errors.Is(err, backlog.ErrProjectRequired) {
+				return err
+			}
+			// Everything else out of drainPhases happened while trying to run
+			// THIS target's session, so it sidelines THIS target: it sits out on
+			// the escalating ladder while every other project drains on, and
+			// self-heals once its harness succeeds again.
+			d.sidelineTarget(d.cursor, drains, err)
+			if d.allSidelined() {
+				return fmt.Errorf("every project's harness is failing - nothing left to drive, stopping:%s", d.sidelinedReport())
+			}
+		} else if d.harnessFails[d.cursor] > 0 {
+			log.Printf("%sthe harness succeeded again - rejoining the rotation", d.prefix(d.cursor))
+			d.harnessFails[d.cursor] = 0
+			d.harnessErrs[d.cursor] = nil
 		}
 		if stop {
 			return nil
@@ -528,11 +819,41 @@ func (d *Driver) Run(ctx context.Context) error {
 		// more work appeared.
 		if d.blind {
 			log.Printf("idle — re-checking in %s", idle)
-			if d.waitOrStop(ctx, idle) {
+			if d.waitOrStop(runCtx, idle) {
 				return nil
 			}
 		}
 	}
+}
+
+// sweepPendingStop is Run's exit sweep (CLA-491): it removes a STOP marker the
+// run never consumed, and logs the reason the run ended.
+//
+// A pending marker at exit means the operator dropped a soft stop against a LIVE
+// daemon that then exited through a path with no STOP read (a non-retryable
+// phase failure, a budget or zero-spend trip inside the drain, HALT beside it,
+// a signal). The marker's intent is satisfied by ANY exit: the daemon is down
+// either way, but leaving it would make the next start read a ghost and stop
+// itself before doing anything. runErr carries how this run ended: an error
+// return names it in the closing line (and so does every graceful path's own
+// log line above), so the daemon log always says why.
+func (d *Driver) sweepPendingStop(runErr error) {
+	if d.state == nil {
+		return
+	}
+	present, _ := d.readMarker("STOP")
+	if !present {
+		if runErr != nil {
+			log.Printf("run ended: %v", runErr)
+		}
+		return
+	}
+	_ = d.state.Remove("STOP")
+	why := "stopped for another reason"
+	if runErr != nil {
+		why = runErr.Error()
+	}
+	log.Printf("run ended (%s) without consuming the STOP marker - removed it so the next start is not stopped by it", why)
 }
 
 // spend is what the run had already consumed when this drain began, plus when it
@@ -635,7 +956,10 @@ func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) str
 //  2. If the next phase will never run, the handback skipped at the seam happens
 //     here instead — otherwise a budget stop leaves the task leased to nobody.
 func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, prior spend) (tokens int, cost float64, handoffs int, stop bool, err error) {
-	phases := d.cfg.EffectivePhases()
+	// The target's own effective config (CLA-410): a stored run-config overlay
+	// changes harness/model/budget here, not on the shared base.
+	tc := d.targetCfg(t)
+	phases := tc.EffectivePhases()
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
@@ -657,6 +981,58 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// classification fires.
 	deadRetries := 0
 	deadTask := ""
+	// Consecutive held-but-empty implement exits in this drain (CLA-457). Bounded
+	// at ONE retry per the 2026-08-24 decision, deliberately smaller than the
+	// dead-phase ladder: the empty shape returns to the queue rather than
+	// parking, so the retry is a courtesy to a plausibly-transient silent EOT,
+	// not a budget (see the end.empty branch below).
+	emptyRetries := 0
+	// Whether the checkpoint that opened the CURRENT phase was evidenced by the
+	// plane's record rather than a verified branch (CLA-497). Set at each seam
+	// from the claim carried INTO the phase; a handoff respawn continues the
+	// same phase and must keep the value, so it is never recomputed at the loop
+	// head (where `carried` has already become the phase's own claim).
+	branchlessCheckpoint := false
+
+	// CLA-466: one iteration record posts at this drain's boundary, whatever way
+	// it ends — hence the defer, and hence locals the deferred closure reads.
+	drainStart := time.Now()
+	var (
+		phasesRun []string // distinct phase labels attempted, in order
+		seen      harness.Claim
+		parkFired bool // the per-task dead budget parked the task
+		tripFired bool // the fleet dead counter tripped and paused this target
+		finalDisp string
+		// finalDead / lastProducedNothing are the FINAL attempt's dead
+		// classifications (the seam's, and the tally's wider one): a death that
+		// was retried past must not brand the record, and a LAST-phase death
+		// never sets end.dead at all (no retry/park applies) yet the record must
+		// still read `dead` — see phaseEnd.producedNothing.
+		finalDead           bool
+		lastProducedNothing bool
+	)
+	defer func() {
+		outcome := finalDisp
+		switch {
+		case parkFired:
+			outcome = fleet.OutcomeParked
+		case tripFired || finalDead || lastProducedNothing || err != nil:
+			outcome = fleet.OutcomeDead
+		case outcome == "":
+			// Nothing was ever observed — a launch failure with no claim state,
+			// say. The record still posts (exactly one per iteration); its task
+			// fields are simply empty and the outcome reads as released.
+			outcome = fleet.OutcomeReleased
+		}
+		d.endIteration(ti, t, fleet.Iteration{
+			TaskID:          seen.TaskID,
+			TaskRef:         seen.Ref,
+			Phases:          phasesRun,
+			Outcome:         outcome,
+			DurationSeconds: time.Since(drainStart).Seconds(),
+			Tokens:          tokens,
+		})
+	}()
 
 	for i := 0; i < len(phases); {
 		ph := phases[i]
@@ -693,7 +1069,17 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			promptBytes = len(nextPrompt)
 			continuation := ""
 			if i < len(d.cfg.Phases) && d.cfg.Phases[i].Prompt == "" {
-				continuation = config.HandoffContinuation(ph.Name)
+				// CLA-497: a handoff during a NO-CODE review must not append the
+				// branch-shaped reviewTerminalStep, which tells the successor to
+				// open a PR for a task that has no branch and no code.
+				// branchlessCheckpoint records the checkpoint that opened this
+				// phase (captured at the seam from the carried claim), so the
+				// continuation matches the brief this phase's first session ran.
+				if ph.Name == config.ReviewPhaseName && branchlessCheckpoint {
+					continuation = config.NoCodeHandoffContinuation()
+				} else {
+					continuation = config.HandoffContinuation(ph.Name)
+				}
 			}
 			ph.Prompt = config.HandoffPreamble + nextPrompt + continuation
 			nextPrompt = ""
@@ -737,13 +1123,40 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		}
 		spawned++
 
-		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, i, tag, ph, last, carried, t, spend{
+		// CLA-466: announce the phase change NOW rather than at the next poll, so
+		// the console sees which phase is running without waiting out an idle
+		// interval. taskRef is empty until a claim has been observed (the first
+		// phase claims inside drainPhase); from then on it rides every beacon.
+		// CLA-510: a first-phase claim no longer waits for the next phase
+		// boundary — the renewer's claim reflector (startLeaseRenewal) revises
+		// the in-flight ref and beacons the moment the session's claim lands.
+		ref := ""
+		if carried != nil {
+			ref = claimLabel(carried.Claim)
+		}
+		if len(phasesRun) == 0 || phasesRun[len(phasesRun)-1] != ph.Label(i) {
+			phasesRun = append(phasesRun, ph.Label(i))
+		}
+		d.beginIteration(ti, t, drainNum, ref, ph.Label(i))
+
+		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, i, tag, ph, last, carried, t, spend{
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
 		})
 		tokens += ptokens
 		cost += pcost
+		finalDead = end.dead
+		lastProducedNothing = end.producedNothing
+		// CLA-466: the record's task identity and claim disposition follow EVERY
+		// claim the sequence observed — including one a dead phase already handed
+		// back itself (end.released), which the switch below deliberately drops
+		// from `carried`. The off-brief exception matches the switch's own first
+		// arm: a claim on a DIFFERENT task does not re-attribute the iteration.
+		if end.claim != nil && !(carried != nil && carried.Claim.TaskID != end.claim.Claim.TaskID) {
+			seen = end.claim.Claim
+			finalDisp = claimDisposition(end.claim)
+		}
 		// What, if anything, is still owed a handback. Three cases, and getting any
 		// of them wrong is a task either stranded on a dead lease or posted back to
 		// the queue over work already in review:
@@ -761,6 +1174,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// still-live claim and hand back a task the sequence was never meant to
 		// touch. Keep what we had: the task phase 1 is holding is the one owed a
 		// handback, whatever its successor went and did.
+		seamClaim := carried
 		switch {
 		case carried != nil && end.claim != nil && end.claim.Claim.TaskID != carried.Claim.TaskID:
 			log.Printf("iteration %d: the %s phase claimed %s, which is NOT the task it was resuming (%s) — it was told not to claim at all; keeping the original for the handback",
@@ -770,6 +1184,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		case end.claim != nil:
 			carried = end.claim
 		}
+		// CLA-497: whether the checkpoint that opened THIS phase was evidenced
+		// by the plane's record (no verified branch). Read from the PRE-switch
+		// claim - the one the seam advanced with: after the switch, carried is
+		// this phase's OWN claim, whose branch says nothing about the checkpoint
+		// that opened the phase, and the handoff continuation must match the
+		// brief this phase's FIRST session ran, not what its last one recorded.
+		branchlessCheckpoint = seamClaim != nil && seamClaim.Claim.Branch == ""
 
 		// A run-level stop wins over a dead phase. drainPhase returns stop=true
 		// for a budget trip, credit exhaustion (lim.Stop), and a resumed phase
@@ -841,6 +1262,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				log.Printf("%siteration %d: the %s phase died producing nothing for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
 					labelOf(t), drainNum, ph.Label(i), deadRetries+1, perTaskDeadBound)
 				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
+				parkFired = true // CLA-466: the record says parked, not dead
 				// The task is parked for the operator and this drain is over; the
 				// daemon carries on with the next task. Not a stop: the run did
 				// not fail, one task reached a human.
@@ -850,6 +1272,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			d.fleetDead[ti]++
 			if d.fleetDead[ti] >= fleetDeadBound {
 				d.fleetTrip(ctx, t, ti, drainNum, end.claim)
+				tripFired = true // CLA-466: a fleet trip ends this drain on a death
 				// The fleet trip pauses this target and this drain is over; the
 				// in-flight task was already released with the dead phase. Not a
 				// stop: the run itself did not fail.
@@ -897,10 +1320,44 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				nextPrompt = end.handoff
 				continue
 			}
+			// The handoff was REFUSED, so its exemption from the evidence gate ends
+			// here: the exit is re-judged as the bare exit it really is (CLA-457).
+			// With no durable, origin-reachable branch evidence that is a FAILED
+			// empty phase — logged, tallied, never handed to the review brief.
+			if !last && end.empty {
+				log.Printf("%siteration %d: the %s phase ended holding a task with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns (its handoff was refused)",
+					labelOf(t), drainNum, ph.Label(i), end.emptyWhy)
+				d.tallyEmpty(ph.Label(i), tc.HarnessFor(ph))
+				break
+			}
 		}
 		// This session ended without a respawn being accepted, so any chain is
 		// broken: a later handoff starts counting from a standard-brief session.
 		chain = 0
+
+		// A held-but-empty exit is a FAILED phase (2026-08-24), not a checkpoint
+		// and not an ordinary "ended without holding the task" end: the claim was
+		// held to the end, it just carried no durable, origin-reachable branch
+		// evidence. It gets ONE bounded retry, and only when the claim was ACTUALLY
+		// released back to the queue — a fresh claiming session can then pick the
+		// task straight back up. A recorded-but-unreachable branch was left to the
+		// takeover path by the handback (never released), and retrying would seed a
+		// session against a live lease nothing here renews, so such an exit ends the
+		// drain. This also covers a handoff the guards REFUSED above (chain cap,
+		// max-iterations): the handoff exemption ends the moment the successor is
+		// not going to run, so the exit must be re-judged as the bare exit it really
+		// is. Deliberately OUTSIDE the dead-phase ladder: the dead shape
+		// retries-then-parks a task that can kill four sessions, while the empty
+		// shape returns to the queue for the next drain — the tally measures it
+		// without tripping the park or fleet machinery, which is how a fleet-wide
+		// silent EOT shows up in the rate the operator watches.
+		if end.empty {
+			if !last && i == 0 && emptyRetries < 1 && end.releasedToQueue {
+				emptyRetries++
+				continue
+			}
+			break
+		}
 
 		// A non-final phase that did not reach its checkpoint leaves the next one
 		// nothing to resume: the session settled the task itself (worked past its
@@ -920,6 +1377,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// each phase earns its own retry ladder (CLA-386).
 		deadRetries = 0
 		deadTask = ""
+		emptyRetries = 0
 		// CLA-396: a successful IMPLEMENT phase resets the FLEET-wide dead-phase
 		// counter. Only the implement phase runs the harness that can exhibit the
 		// zero-usage death — the review phase runs on the claude harness, which
@@ -972,6 +1430,46 @@ type phaseEnd struct {
 	// then-park decision and its per-task budget.
 	dead bool
 
+	// producedNothing is the WIDER dead classification (the tally's, CLA-402):
+	// the same signature WITHOUT the !last conjunct end.dead carries, because a
+	// dead LAST phase is still a death even though no retry/park machinery can
+	// apply to it. Only the fleet record reads this field (CLA-466) — the
+	// iteration record must say `dead` when the drain ended on exactly such a
+	// final-phase death — so it deliberately does not feed the counters or the
+	// seam, whose !last gating is pinned by its own tests.
+	producedNothing bool
+
+	// empty reports a held-but-empty exit — the 2026-08-24 fleet-incident shape:
+	// the phase ended cleanly still holding the task with NO durable,
+	// origin-reachable branch evidence on the plane record. It is a FAILED phase,
+	// not a checkpoint: the seam must not hand it to the review brief. The claim
+	// has already been released (a fresh session re-claims) or left to expire (a
+	// recorded-but-unreachable branch keeps its takeover hand-off); drainPhases
+	// owns the one-bounded retry. Deliberately distinct from dead, which keys on
+	// the "unknown" finish reason — the incident's sessions finished with reason
+	// "stop", so the dead signature alone did not catch them. Set on a HANDOFF
+	// too, so a refused handoff is re-judged as the bare exit it really is.
+	empty bool
+
+	// emptyWhy is the evidence-gate reason when empty fired, for the "not a
+	// checkpoint" log line ("no branch recorded on the task", the failing
+	// branch check's detail, or — since CLA-497 — the plane record's answer
+	// when the branch-less evidence forms were consulted and showed nothing).
+	emptyWhy string
+
+	// branch is the verified branch name when this phase checkpointed — the
+	// plane-record evidence the checkpoint is now gated on (CLA-457), carried
+	// here so the successor's brief can name it instead of asserting an
+	// unverified phase-1 success. Folded onto the carried claim by the seam.
+	branch string
+
+	// releasedToQueue reports that this phase's handback ACTUALLY returned the
+	// claim to the ready queue (releaseHeldClaim succeeded), as opposed to
+	// leaving it to the takeover path or a failed release. It is the only signal
+	// a retry may re-claim against: a release the plane refused leaves the lease
+	// live, and a fresh claiming session would only be refused (CLA-457).
+	releasedToQueue bool
+
 	// handoff is the successor prompt the session emitted in its final message's
 	// handoff block, already past the parse-time guards (marker present, prompt
 	// non-empty and under the size cap, clean exit, trusted stream, task still
@@ -999,6 +1497,257 @@ func deadPhase(res harness.Result) bool {
 	return r == harness.FinishReasonUnknown && !res.Claim.HasWIP
 }
 
+// recordedBranches lists the branch names the plane's record carries for a
+// phase result: every branch this run recorded via update_task(branch) that the
+// plane accepted (the accepted Reports), plus the branch that came in on the
+// claim itself (a resumed predecessor's recorded WIP, or the task's branch at
+// claim time). These are the names a checkpoint can be verified against.
+func recordedBranches(res harness.Result) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(b string) {
+		if b != "" && !seen[b] {
+			seen[b] = true
+			out = append(out, b)
+		}
+	}
+	for _, rep := range res.Reports {
+		if res.Claim.Names(rep.TaskID) || (rep.Ref != "" && res.Claim.Names(rep.Ref)) {
+			add(rep.Branch)
+		}
+	}
+	if res.Claim.HasWIP {
+		add(res.Claim.Branch)
+	}
+	return out
+}
+
+// checkpointEvidence reports whether the plane's record carries the phase's
+// exit evidence, and returns the branch that evidence names (empty for the
+// branch-less forms). Held-ness alone is NOT the evidence: since CLA-358 the
+// driver's lease renewer renews a claim for a session's whole lifetime, so ANY
+// session that claimed ends held, and "still holding" cannot distinguish a
+// checkpoint from an empty exit (2026-08-24 fleet incident: two implement
+// sessions claimed, cut a worktree, hit a silent model EOT, exited cleanly
+// with real usage and no edits, and the seam advanced to review on the false
+// premise).
+//
+// The evidence is ANY of three forms (CLA-497) — "the plane's record shows
+// this phase did its job":
+//
+//   - (a) a branch recorded by this run whose tip really exists on the origin
+//     remote — today's check, unchanged. A branch that was never pushed is not
+//     evidence, and a check that could not run (no git, no repository
+//     resolved) is not evidence either: a checkpoint is claimed only on the
+//     verified present, never on the absence of a negative. That is the
+//     deliberate difference from verifyDeliveries, which warns loudly on the
+//     same failing check but does not gate anything on it.
+//   - (b) the task having LEFT `ready` (in_review / done / parked / blocked):
+//     its own session settled it on the plane. A no-code task can never
+//     produce form (a) — there is no branch to record — and without this form
+//     it is structurally incapable of checkpointing: the EZY-290 shape (a
+//     one-token task-body edit) burned nine sessions in a claim -> empty-exit
+//     -> release loop before this existed.
+//   - (c) a DECLARED no-code delivery on the task: the same delivery.noCode
+//     flag update_task requires to close such a task, read off the plane's
+//     record. It counts whether or not the session still holds the lease.
+//
+// Forms (b) and (c) are read through the SAME single-task plane peek CLA-451
+// introduced (planeExitRecord below), not a second implementation. The bounds
+// CLA-457 set stay absolute: held-ness alone is still nothing (status
+// in_progress proves only that someone holds the lease), and a session that
+// claimed, recorded no branch, and left the task sitting in `ready` is STILL
+// an empty exit — "nothing happened" — whatever this function would have said
+// about its manners.
+func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.Result, workdir string) (branch string, ok bool, why string) {
+	branches := recordedBranches(res)
+
+	// Form (a): the recorded-branch check. Remember the first failure for the
+	// diagnostic; fall through to the plane-record forms when nothing here
+	// passes.
+	firstB, firstWhy := "", ""
+	if len(branches) > 0 {
+		if d.newVerifier == nil || workdir == "" {
+			firstB, firstWhy = branches[0], fmt.Sprintf("branch %q recorded but could not be checked (no working tree)", branches[0])
+		} else {
+			v := d.newVerifier(workdir, d.cfg.AllowUncheckedPRFor(t.Name))
+			vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
+			defer cancel()
+			// ANY recorded branch that passes is evidence — a session may record a draft
+			// branch early and the real one later. Remember the first failure for the
+			// diagnostic, keep going, and only give up when no recorded branch could be
+			// verified.
+			for _, b := range branches {
+				out := v.Verify(vctx, delivery.Claim{Label: claimLabel(res.Claim), Branch: b})
+				for _, c := range out.Checks {
+					if c.Kind != delivery.BranchPushed {
+						continue
+					}
+					if c.Status == delivery.Pass {
+						return b, true, ""
+					}
+					// Fail and Unknown both mean "not evidence" for THIS branch: an
+					// unreachable branch, or one we could not check. Keep scanning; a
+					// later recorded branch may be the one that is really there.
+					if firstWhy == "" {
+						firstB, firstWhy = b, c.Detail
+					}
+					break
+				}
+			}
+		}
+	}
+
+	// Forms (b) and (c): the plane's own record of the task.
+	_, recordOK, recordWhy := d.planeExitRecord(ctx, t, res)
+	if recordOK {
+		return "", true, ""
+	}
+
+	// No form held. Compose the diagnostic from whichever legs ran: the plane's
+	// answer when it gave one (prefixed by the branch leg's failure when both
+	// ran), else the legacy branch-only reasons, unchanged.
+	switch {
+	case firstWhy != "" && recordWhy != "":
+		return firstB, false, firstWhy + "; " + recordWhy
+	case recordWhy != "":
+		return "", false, recordWhy
+	case firstWhy != "":
+		return firstB, false, firstWhy
+	case len(branches) > 0:
+		return "", false, "none of the recorded branches could be verified on the origin remote"
+	default:
+		return "", false, "no branch recorded on the task"
+	}
+}
+
+// planeExitRecord reads the plane's record of the claimed task for the two
+// branch-independent exit-evidence forms (CLA-497): the task having LEFT
+// `ready` (in_review / done / parked / blocked — its own session settled it),
+// or a DECLARED no-code delivery (the plane's first-class "this shipped no
+// code"). It is the SAME single-task get_task read CLA-451's checkpoint peek
+// uses — plane.TaskStateSource, extended with the delivery flag — not a second
+// implementation of the peek.
+//
+// Best-effort like every plane read: ok is false with an EMPTY why whenever
+// the read cannot answer at all (no claimed task id, no wired reader, a plane
+// blip), and the gate then judges on branch evidence alone, byte-for-byte as
+// before this read existed. A read that ANSWERS but shows no evidence returns
+// the reason the gate will log — the difference between "nothing happened"
+// (task still ready or merely held) and a peek that never ran.
+//
+// The bounds are load-bearing: status "in_progress" proves only that SOMEONE
+// holds the lease — held-ness alone was CLA-457's original false positive and
+// stays worthless here — and a task still sitting in `ready` is still the
+// empty exit, however orderly the session that said nothing about it.
+func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Result) (st plane.TaskState, ok bool, why string) {
+	taskID := res.Claim.TaskID
+	src, wired := t.Releaser.(plane.TaskStateSource)
+	if taskID == "" || !wired {
+		return plane.TaskState{}, false, ""
+	}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	st, err := src.TaskState(sctx, taskID)
+	switch {
+	case err == nil:
+	case errors.Is(err, plane.ErrNotWired):
+		return plane.TaskState{}, false, ""
+	default:
+		log.Printf("%scould not read the plane's record of %s for phase exit evidence (%v) — judging the exit on branch evidence alone", labelOf(t), taskID, err)
+		return plane.TaskState{}, false, ""
+	}
+	switch st.Status {
+	case "in_review", "done", "parked", "blocked":
+		// Form (b): the task LEFT `ready`. Its session settled it on the plane,
+		// which for a no-code task is the strongest statement there is.
+		return st, true, ""
+	}
+	if st.DeliveryNoCode {
+		// Form (c): a declared no-code delivery — the plane's own record that
+		// this task's correct delivery is no code, held lease or not.
+		return st, true, ""
+	}
+	return st, false, fmt.Sprintf("the plane's record shows no exit evidence either (status %q, no no-code delivery)", st.Status)
+}
+
+// verifiedBranch returns the branch the previous phase recorded and verified —
+// the hand-off the successor's brief names (CLA-457). The seam folds the
+// VERIFIED branch onto the carried claim when it checkpoints, so the claim's
+// branch IS the verified one for a checkpointed phase; the recorded-Branches
+// fallback covers a claim that was never re-judged (a resumed-with-WIP
+// predecessor, or a defensive hole). The predecessor's checkpoint is gated on
+// this same evidence, so an empty return here is a misconfigured sequence
+// announcing itself via a standing {{branch}} placeholder rather than a
+// plausible runtime state.
+func verifiedBranch(res *harness.Result) string {
+	if res == nil {
+		return ""
+	}
+	if res.Claim.Branch != "" {
+		return res.Claim.Branch
+	}
+	if bs := recordedBranches(*res); len(bs) > 0 {
+		return bs[0]
+	}
+	return ""
+}
+
+// peekCheckpointClaim asks the plane whether the task this phase was BRIEFED on
+// is now held, with a branch recorded, by some run of this project's key — the
+// claim a session took through a channel the driver cannot observe (CLA-451:
+// a raw API call with the same credential, a harness quirk, a renamed tool).
+// It returns that claim as a synthesized Result for the seam to gate and carry,
+// or nil when today's ending should stand.
+//
+// nil is returned — and the standard ending follows — when: the driver never
+// knew which task it briefed (empty id; nothing to ask about); the target has
+// no plane reads wired; the read fails (a plane blip degrades exactly like the
+// spawn-dir peek does); or the answer is not unambiguous custody — status
+// still "in_progress", a holding run, AND a recorded branch, all three. A task
+// that moved on (reviewed, done, released) was settled by its own session and
+// the sequence is over; a hold without a branch is the empty exit CLA-457
+// already refuses to advance on.
+//
+// The three fields together are also the honest boundary of what this can
+// know: the plane does not expose WHICH key holds a task, so "some run of this
+// project's credential" is approximated by "held at all". The driver shares
+// one key with every session it spawns, the briefed task came from this
+// driver's own dispatch, and a wrong attribution fails safe — a foreign run's
+// id seeds a heartbeat the plane refuses, ending the drain loudly rather than
+// silently stranding work.
+func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int, phaseLabel, briefedTask string) *harness.Result {
+	if briefedTask == "" {
+		return nil
+	}
+	src, ok := t.Releaser.(plane.TaskStateSource)
+	if !ok {
+		return nil
+	}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	st, err := src.TaskState(sctx, briefedTask)
+	switch {
+	case err == nil:
+	case errors.Is(err, plane.ErrNotWired):
+		return nil
+	default:
+		log.Printf("%siteration %d: %s ended without an observed claim; the plane read of %s failed (%v) — keeping today's ending rather than guessing",
+			labelOf(t), drainNum, phaseLabel, briefedTask, err)
+		return nil
+	}
+	if st.Status != "in_progress" || st.ClaimedByRun == "" || st.Branch == "" {
+		return nil
+	}
+	return &harness.Result{Claim: harness.Claim{
+		TaskID: briefedTask,
+		Ref:    st.Ref,
+		RunID:  st.ClaimedByRun,
+		HasWIP: true,
+		Branch: st.Branch,
+	}}
+}
+
 // drainWithRetries runs a single unphased drain — the whole task in one session.
 // It is what a config with no `phases` gets, and it is kept as its own entry
 // point because that is the shape every existing test drives.
@@ -1008,8 +1757,8 @@ func deadPhase(res harness.Result) bool {
 // default turn cap (CLA-343), which is precisely what the inline zero-value
 // version failed to do.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
-	ph := d.cfg.EffectivePhases()[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, "", ph, true, nil, t, prior)
+	ph := d.targetCfg(t).EffectivePhases()[0]
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior)
 	return tokens, cost, stop, err
 }
 
@@ -1033,7 +1782,10 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // phaseIdx is this phase's 0-based position in the sequence, carried only so a
 // phase with no name can still be NAMED in a log line — ph.Label(phaseIdx) falls
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
-func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+// ti is the target's index, for the fleet claim reflector wired into the lease
+// renewer below (CLA-510).
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+	tc := d.targetCfg(t)
 	// The adapter for THIS phase, resolved once: everything below — the spawn, the
 	// classification of what came back, and the probe of any usage limit it hit —
 	// has to be the harness that actually ran, not the run's default. Resolved
@@ -1041,6 +1793,22 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 	a, aerr := d.adapterFor(ph)
 	if aerr != nil {
 		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), aerr)
+	}
+	// Where this phase's sessions run, resolved ONCE per phase (CLA-437): the
+	// task repo's checkout when it resolves, the target's workdir when nothing
+	// does. Before the attempt ladder, so a repo that resolves to nothing fails
+	// the phase with repo_not_found before anything is spawned — a session that
+	// starts in the multi-repo parent reads a sibling's rule files and, on a
+	// cwd-scoped grant, hits the wall this replaces. The same directory then
+	// serves every retry: the task does not change between attempts.
+	//
+	// The second value is the task this phase was briefed on (CLA-451): exact for
+	// a resumed phase, the spawn-time queue-head peek for a fresh one. Held onto
+	// here because the seam needs it AFTER the session ends — it is the one task
+	// the driver can ask the plane about when the stream carried no claim state.
+	spawnDir, briefedTask, serr := d.sessionDir(ctx, t, prev)
+	if serr != nil {
+		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), serr)
 	}
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -
@@ -1106,7 +1874,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv := d.invocationFor(t, phaseIdx, ph, prev)
+		inv, ierr := d.invocationFor(t, phaseIdx, ph, prev, spawnDir)
+		if ierr != nil {
+			// The session env refused to resolve (a failing or empty-output
+			// fromCommand, an unreadable @path file — the error names the
+			// variable). REFUSING THE SPAWN is the fail-closed contract: no
+			// session starts without its declared env (CLA-462). This is not a
+			// retryable failure — nothing was spawned and the cause is config,
+			// not a blip — so it fails the phase like a bad spawnDir does.
+			return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: refusing to spawn: %w", drainNum, ph.Label(phaseIdx), ierr)
+		}
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
 		f, ferr := d.state.Create(logName)
@@ -1117,13 +1894,29 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			inv.Console = os.Stderr
 			log.Printf("could not open iteration log %s: %v", logPath, ferr)
 		}
+		// The spawn line stamps what the session was actually spawned WITH:
+		// phase and the resolved model id inv.Model carries (ModelForPhase's
+		// output, never the tier alias). A token/cost line in an old log is then
+		// attributable to the settings of THAT day rather than inferred from
+		// whatever the config file says now (CLA-345). An empty model= is itself
+		// evidence: no explicit model was configured at spawn time, and the
+		// harness ran its own default.
 		if retries == 0 {
-			log.Printf("iteration %d %s— spawning %s (log: %s)", drainNum, labelOf(t), a.Name(), logPath)
+			log.Printf("iteration %d %s- spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
 		} else {
-			log.Printf("iteration %d %s— retry %d, spawning %s (log: %s)", drainNum, labelOf(t), retries, a.Name(), logPath)
+			log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), retries, a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
 		}
 
+		// CLA-358: while THIS child runs, renew whatever task-lease it holds.
+		// Started before Invoke so a resumed phase's seeded claim renews from
+		// the first tick; stopped the moment Invoke returns, which is what makes
+		// renewal pause whenever no child process is running - between attempts,
+		// across supervised waits, after exit. Inside the window the adapter may
+		// run its own resurrection machinery (opencode CLA-406): those processes
+		// continue the SAME session on the SAME claim, so renewal spans them.
+		renewer := d.startLeaseRenewal(ctx, ti, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
 		res, ierr := a.Invoke(ctx, inv)
+		renewer.stop()
 		if f != nil {
 			_ = f.Close()
 		}
@@ -1141,13 +1934,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// Rescue whatever the session left uncommitted, FIRST — before the handback,
 		// because a successful salvage changes what the handback should do: a task
 		// with a branch recorded on it is no longer safe to release (CLA-314).
-		d.salvageStrandedWork(ctx, t, &res, producedNothing)
+		d.salvageStrandedWork(ctx, t, &res, producedNothing, inv.WorkDir)
 		// Hand back anything the session was still holding, BEFORE deciding what to
 		// do next — every branch below either waits, retries or returns, and all of
-		// them leave the lease unattended. Above the ierr check too: Invoke returns
-		// a fully parsed Result alongside a Wait failure, so a claim observed on
-		// that stream is real and must not be dropped just because the process died
-		// untidily. A launch failure yields a zero Result, which releases nothing.
+		// them leave the lease unattended. Above the ierr check too: on every
+		// adapter, an Invoke whose run failed with something other than an exit
+		// status returns whatever the stream had announced by then, fully parsed,
+		// alongside the error (CLA-299) — claude's drain path parses its stream as
+		// it arrives; codex and opencode run their parsers to completion before
+		// classifying the failure — so a claim observed there is real and must not
+		// be dropped just because the process died untidily. A launch failure
+		// yields a zero Result, which releases nothing.
 		//
 		// UNLESS this phase reached its checkpoint with another phase still to run.
 		// Then the sequence is not over: the next phase resumes THIS run with
@@ -1203,25 +2000,82 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// that guards the checkpoint veto — a dead LAST phase is still a dead
 		// phase, and the rate is a measurement, not a seam decision (see
 		// deadtally.go).
-		d.tallyDead(ph.Label(phaseIdx), d.cfg.HarnessFor(ph), res, capped, ceiling, wallclock)
+		d.tallyDead(ph.Label(phaseIdx), tc.HarnessFor(ph), res, capped, ceiling, wallclock)
 		end = phaseEnd{}
 		if res.Claim.TaskID != "" {
 			end.claim = &res
 		}
+		// The wider classification rides the end for the fleet record only — see
+		// phaseEnd.producedNothing.
+		end.producedNothing = producedNothing
 		// A handoff block ending the session's final message (CLA-352) holds the
 		// task open exactly like a phase seam — even on the LAST phase, where
 		// there is otherwise no successor to hold it for. The remaining guards
 		// live in drainPhases; if they refuse, the deferred handback there
 		// releases what this held.
 		handoff := detectHandoff(drainNum, t, res)
-		if (!last || handoff != "") && res.Untrusted == "" && checkpointable && res.Claim.Held() && !dead {
+		// The seam contender: an orderly end still holding the task, minus the dead
+		// signature. This is the gate the incident put in question — see below.
+		canCheckpoint := res.Untrusted == "" && checkpointable && res.Claim.Held() && !dead
+		// CLA-457: held-ness alone must never advance the seam. Since CLA-358 the
+		// driver's lease renewer renews a claim for a session's whole lifetime, so
+		// ANY session that claimed ends held — "still holding" is a constant, not
+		// a checkpoint signal. A non-final phase reaches its checkpoint ONLY when
+		// the plane's record carries the phase's exit evidence: a branch recorded
+		// by this run whose tip really exists on the origin remote (the implement
+		// phase in the shipped sequence). The evidence is computed even on a
+		// handoff: an HONORED handoff continues the same phase regardless (its
+		// successor has nothing to falsely resume), but a REFUSED handoff must be
+		// re-judged as the bare exit it really is, and this is the only place the
+		// verification can run.
+		evidenceOK := true
+		evidenceWhy := ""
+		if !last && canCheckpoint {
+			end.branch, evidenceOK, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir)
+		}
+		// A held-but-empty exit (2026-08-24): a would-be checkpoint refused by the
+		// evidence gate — not by any of the older vetoes (dead, untrusted, not
+		// checkpointable) — so this is a FAILED phase, not a completed one. It is
+		// carried on the result in BOTH branches on purpose: for a bare exit it is
+		// the classification of record, and for a handoff it is what lets
+		// drainPhases downgrade the exit when the handoff is refused. An honored
+		// handoff never reaches that downgrade — the phase continues first.
+		empty := !last && canCheckpoint && !evidenceOK
+		end.empty = empty
+		end.emptyWhy = evidenceWhy
+		// A handoff holds the seam OPEN even without evidence: its successor
+		// continues THIS phase's job, so it is not the false-premise advance the
+		// gate exists to stop. The evidence gate governs only the bare seam
+		// advance to the NEXT configured phase (handoff == ""); a refused handoff
+		// is downgraded to that bare judgement in drainPhases.
+		if (!last || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK) {
 			end.checkpoint = true
 			end.handoff = handoff
+			if end.claim != nil {
+				// The invariant "the carried claim's branch is the VERIFIED one"
+				// is held by construction, whatever form the evidence took
+				// (CLA-497): the branch form folds the verified branch on, and
+				// the plane-record forms clear whatever the session recorded -
+				// a recorded branch that FAILED origin verification must not
+				// ride into the successor's brief, which names {{branch}} as
+				// verified on the origin remote (CLA-457), and the no-code
+				// brief is selected exactly on an empty claim branch.
+				if end.branch != "" {
+					end.claim.Claim.Branch = end.branch
+				} else {
+					end.claim.Claim.Branch = ""
+				}
+			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
 					labelOf(t), drainNum, res.Claim.TaskID)
+			} else if end.branch != "" {
+				log.Printf("%siteration %d: phase reached its checkpoint holding %s (branch %s verified on the origin remote) — keeping the lease for the next phase",
+					labelOf(t), drainNum, res.Claim.TaskID, end.branch)
 			} else {
-				log.Printf("%siteration %d: phase reached its checkpoint holding %s — keeping the lease for the next phase",
+				// The plane-record forms of exit evidence (CLA-497): a no-code or
+				// already-settled task checkpoints with no branch to name.
+				log.Printf("%siteration %d: phase reached its checkpoint holding %s (exit evidenced by the plane's record — task left ready or declared a no-code delivery; no branch) — keeping the lease for the next phase",
 					labelOf(t), drainNum, res.Claim.TaskID)
 			}
 		} else {
@@ -1230,24 +2084,121 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// as released would erase a predecessor's claim that is still live.
 			end.released = res.Claim.Held()
 			end.dead = dead
+			if end.empty {
+				log.Printf("%siteration %d: the %s phase ended holding %s with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns",
+					labelOf(t), drainNum, ph.Label(phaseIdx), claimLabel(res.Claim), evidenceWhy)
+				// Book it into the dead-phase tally (CLA-457): this is the
+				// "produced nothing" class the rate exists to measure, and a
+				// fleet-wide silent EOT is exactly the incident in question.
+				d.tallyEmpty(ph.Label(phaseIdx), tc.HarnessFor(ph))
+			}
 			// last && a clean exit is the shape CLA-384 is about: the phase ran to
 			// completion, pushed, and simply did not declare. A non-zero exit reached
 			// the same place by crashing, which is a different failure with its own
 			// reporting, and an earlier phase reaching here did not have declaring as
 			// its job at all.
-			d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+			//
+			// The return tells whether the claim is actually back in the ready queue
+			// — the thing a bounded retry can re-claim. A release the plane refused
+			// (or that never ran) leaves the lease live, so a retry session would
+			// only be refused and burned.
+			end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+
+			// CLA-451: the blind-spot convergence. Everything above learns about
+			// claims by parsing clankerbar tool calls out of the stream; a session
+			// that claimed by another channel (a raw API call with the same key,
+			// a harness quirk, a renamed tool) ends checkpointable with NO observed
+			// claim — and used to end the sequence here, stranding its pushed work
+			// behind an expiring lease until a takeover recovered it at a reclaim's
+			// cost. Before declaring the phase empty, ask the plane about the one
+			// task this driver can name: the task it BRIEFED. If that task is held,
+			// with a branch recorded, by some run of this project's key, treat it
+			// as the phase's checkpoint exactly as an observed claim would be.
+			//
+			// Every conjunct below keeps an existing guard absolute:
+			//
+			//   - end.claim == nil && !res.Claim.Held() — an OBSERVED claim,
+			//     settled or not, stays the authoritative view; the peek never
+			//     overwrites or second-guesses one.
+			//   - res.Untrusted == "" — a stream that could not be read whole is
+			//     never read for claim state, and the plane is not asked to fill
+			//     the hole either: the settle we never saw may be in the missing
+			//     bytes (CLA-262).
+			//   - !producedNothing — the dead-phase veto (CLA-386): a final step
+			//     that finished "unknown" having produced nothing is not a
+			//     checkpoint no matter what the plane says, so it is not even
+			//     consulted.
+			//   - the orderly-end disjunct mirrors `checkpointable` exactly, with
+			//     the plane's recorded branch standing in for the HasWIP the cap
+			//     path needs — a branch the PLANE confirms is stronger evidence
+			//     than one read off a stream.
+			//   - !last — a last phase has no successor to hold the lease for;
+			//     a handoff cannot widen this either, because detectHandoff
+			//     refuses on no observed claim before we get here.
+			//
+			// A claim the peek recovers then faces the SAME evidence gate as an
+			// observed one: the recorded branch must really be on the origin
+			// remote before the seam advances (CLA-457), because a plane record
+			// alone cannot tell a pushed branch from a phantom one. Evidence that
+			// fails keeps today's behavior — the drain ends, and the live lease
+			// expires with its recorded branch intact as the takeover hand-off.
+			// The peek itself is a READ of the briefed task (get_task), never a
+			// claim and never a heartbeat: it cannot race a session out of work,
+			// and a peek that fails or comes back not-held simply falls through
+			// to the standard ending below.
+			if end.claim == nil && !last && res.Untrusted == "" && !producedNothing &&
+				!res.Claim.Held() && (res.ExitCode == 0 || capped || ceiling || wallclock) {
+				if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask); claim != nil {
+					end.claim = claim
+					end.branch, evidenceOK, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir)
+					if evidenceOK {
+						// Fold the VERIFIED branch onto the carried claim, exactly as
+						// the observed-claim checkpoint above does: a recovered claim
+						// carries the plane's recorded branch and checkpointEvidence
+						// re-verified it, so the two already agree today — but the
+						// invariant "the carried claim's branch is the verified one"
+						// is what verifiedBranch and the takeover hand-off depend on,
+						// so hold it by construction rather than by coincidence of a
+						// single-source read.
+						end.claim.Claim.Branch = end.branch
+						end.checkpoint = true
+						log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s verified on the origin remote — treating it as the phase checkpoint and keeping the lease for the next phase",
+							labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, end.branch)
+					} else {
+						log.Printf("%siteration %d: the plane holds %s (run %s) with branch %q recorded, but that branch could not be verified on the origin remote (%s) — not treating it as a checkpoint; the lease expires with its hand-off intact",
+							labelOf(t), drainNum, claim.Claim.TaskID, claim.Claim.RunID, end.branch, evidenceWhy)
+					}
+				}
+			}
 		}
 		// Then check what it said it delivered. After the handback, because a dead
 		// lease is time-sensitive and a git check is not; on every exit, because a
 		// session that pushed nothing and died is exactly as likely to have recorded
 		// a branch as one that finished cleanly.
-		d.verifyDeliveries(ctx, t, res)
+		d.verifyDeliveries(ctx, t, res, inv.WorkDir)
 
 		if ierr != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true, end, nil
 			}
-			// Couldn't launch the harness at all (bad PATH/flags/env) — not a blip.
+			// Count this attempt's spend before giving up on it. A non-exit run
+			// failure is either a launch failure (nothing emitted, nothing parsed —
+			// adding zeroes changes nothing) or a session that ran, announced its
+			// spend and died in Wait (CLA-299): the Result was parsed precisely so
+			// the budget would not lose what the attempt actually cost. That holds
+			// only while the stream was read whole, which is what the guard below
+			// makes binding: a failure whose stream ALSO came back untrusted
+			// carries a floor, not a total, and gets the same refusal as the
+			// untrusted branch below and endUntrustedDrain (CLA-262) - counted
+			// nowhere, so no breaker ever acts on a figure that cannot be known.
+			if res.Untrusted == "" {
+				tokens += res.Tokens
+				cost += res.CostUSD
+				d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
+			}
+			// A run failure that was not an exit status — a launch failure, or one
+			// of the deaths in Wait above — ends the attempt without any retry
+			// classification. Not a blip.
 			return tokens, cost, false, end, fmt.Errorf("invoke %s: %w", a.Name(), ierr)
 		}
 
@@ -1258,7 +2209,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		if res.Untrusted != "" {
 			// held is nil here by construction — an untrusted stream never holds a
 			// phase open — so the sequence ends and nothing is carried forward.
-			utokens, ucost, ustop, uerr := d.endUntrustedDrain(drainNum, d.cfg.HarnessFor(ph), res, tokens, cost)
+			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
 
@@ -1270,7 +2221,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
-		d.charge(d.cfg.HarnessFor(ph), res.Tokens, res.CostUSD)
+		d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
@@ -1305,7 +2256,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 			// and stop on the very next check — having spent the night waiting for
 			// headroom it then declines to use. Stop now and say when the quota
 			// returns, so the operator can start a fresh run against it.
-			remaining, bounded := d.cfg.Budget.Remaining(time.Since(prior.start))
+			remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
 			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
 					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
@@ -1399,7 +2350,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		}
 
 		// A session the ADAPTER ended for outliving its wall-clock cap is the same
-		// shape again: the phase ends, and neither a retry nor a failure is right —
+		// shape again: the phase ends, and neither a retry nor a failure is right -
 		// a retry would spend the same hours over again and reach the same deadline,
 		// and failing would stop the run over a cap doing its job (CLA-368).
 		//
@@ -1407,14 +2358,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 		// arrives per step_finish and is summed all the way to the kill, so the
 		// figures are the honest cost of the session up to the moment it ended.
 		//
-		// What the line must NOT say is that the salvage handled the tree. The
-		// salvage returns immediately without a claim (see salvageStrandedWork),
-		// and the only adapter that enforces this cap today is the one that does
-		// not observe claims — so on every kill that can currently happen, nothing
-		// was committed and the work is still sitting in the worktree. Saying
-		// otherwise would be the reassuring falsehood doctor's own checks exist to
-		// remove (CLA-290). The claim-held wording is the one a claim-observing
-		// adapter will earn later; it is not what opencode gets today.
+		// Since CLA-365 opencode has BOTH HonoursSessionWallClock and
+		// TracksClaims (Capabilities.TracksClaims: true), so a capped opencode
+		// session holding its claim IS salvaged - the res.Claim.Held() arm above
+		// is the one that fires today. The else branch (nothing salvaged) applies
+		// only if an adapter enforcing this cap ever lacks claim observation
+		// again; it is kept defensive, not descriptive of the present. The claim-held
+		// wording was earned by CLA-365, not reserved for a future adapter.
 		if wallclock {
 			if res.Claim.Held() {
 				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
@@ -1518,11 +2468,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, phaseIdx int, tag
 // (CLA-366) the session that went unreadable is not necessarily on d.h. Asking
 // d.h would let an unreadable opencode session be waved through on the grounds
 // that CLAUDE has no ceiling set.
-func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
+func (d *Driver) endUntrustedDrain(t Target, drainNum int, harnessName string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
 	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
 	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%s), and not handing back any claim it appeared to hold",
 		drainNum, res.Tokens, res.CostUSD, res.ExitString())
-	if !d.cfg.Budget.CountsSpendFor(harnessName) {
+	if !d.targetCfg(t).Budget.CountsSpendFor(harnessName) {
 		return tokens, cost, false, nil
 	}
 	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
@@ -1532,6 +2482,11 @@ func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness
 // salvageStrandedWork commits and pushes the work a dead session left in its
 // worktree, and records the branch on the task so another machine can pick it up
 // (CLA-314).
+//
+// workdir is where the session actually ran — the resolved spawn directory, not
+// rebuilt from the target — because that is where its worktree lives once
+// sessions start in per-task checkouts (CLA-437). Salvaging from anywhere else
+// would report "nothing to salvage" over real stranded work.
 //
 // # Why it runs on EVERY ending, not only on a usage limit
 //
@@ -1563,7 +2518,7 @@ func (d *Driver) endUntrustedDrain(drainNum int, harnessName string, res harness
 // stays a takeover and the hand-off survives. If the record failed, the task has
 // no branch on it, releasing to `ready` is still the better move, and the old
 // path runs unchanged.
-func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result, producedNothing bool) {
+func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness.Result, producedNothing bool, workdir string) {
 	if d.newSalvager == nil || !res.Claim.Held() {
 		return
 	}
@@ -1574,7 +2529,7 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), salvageTimeout)
 	defer cancel()
 
-	out := d.newSalvager(d.invocation(t, false).WorkDir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref)
+	out := d.newSalvager(workdir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref)
 	label := claimLabel(res.Claim)
 	switch out.Status {
 	case salvage.Nothing:
@@ -1840,7 +2795,13 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 // a budget trip between phases, a crash, a transient retry, a usage-limit wait, a
 // refused handoff - and counting those would make the number mean nothing, which
 // is the only thing it has going for it.
-func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) {
+//
+// It returns whether the claim is ACTUALLY back in the ready queue at the end —
+// that is, whether releaseHeldClaim really released it. The seam uses that to
+// decide whether a bounded retry may re-claim (a claim left to the takeover path,
+// or a release the plane refused, is still live and a fresh session would only be
+// refused); the other callers ignore it.
+func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Result, countUndeclared bool) bool {
 	// A stream read only in part tells us which calls we SAW, never which the
 	// session made: the settle that released the task may simply be in the bytes
 	// that never arrived. Handing the task back on that reading posts `ready` over
@@ -1852,10 +2813,10 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			log.Printf("%ssession appeared to end holding %s, but its output could not be read whole — leaving the lease to expire rather than releasing a task that may already be settled",
 				labelOf(t), res.Claim.TaskID)
 		}
-		return
+		return false
 	}
 	if !res.Claim.Held() {
-		return
+		return false
 	}
 	if !res.Claim.Releasable() {
 		// Leaving the lease alone is right — see Releasable. Whether it is also a
@@ -1865,14 +2826,14 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			d.undeclared++
 			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
 				labelOf(t), res.Claim.TaskID, d.undeclared)
-			return
+			return false
 		}
 		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
 			labelOf(t), res.Claim.TaskID)
-		return
+		return false
 	}
 	if t.Releaser == nil {
-		return
+		return false
 	}
 	// Detach from ctx: a cancelled run (Ctrl-C, SIGTERM) is exactly when a claim
 	// would otherwise be abandoned, so the handback has to outlive the signal that
@@ -1884,9 +2845,10 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		if !errors.Is(err, plane.ErrNotWired) {
 			log.Printf("%scould not hand %s back: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
 		}
-		return
+		return false
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
+	return true
 }
 
 // verifyDeliveries checks, against local git, what the session told the plane it
@@ -1907,13 +2869,18 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 // looking at. Loud logging is the floor, it is cheap, and it is reversible.
 // Recorded as a decision on CLA-253.
 //
+// "Refusing the delivery" (CLA-310) lives inside that shape: a PR check that
+// fails is a Fail with the failing condition and its remedy named in the log,
+// and no verified attestation behind it — the driver's verdict on the delivery
+// is refusal, not a rewrite of what the session told the plane.
+//
 // # Fail open
 //
 // A check that could not run reports "could not verify" and the run carries on.
 // Blocking a legitimate closure because the tree could not be found would be worse
 // than the gap this replaces — and an Unknown is never allowed to read as a pass:
 // the attestation below is written only for a check that actually ran.
-func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Result) {
+func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Result, workdir string) {
 	if len(res.Reports) == 0 || d.newVerifier == nil {
 		return
 	}
@@ -1925,28 +2892,64 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 		return
 	}
 
-	v := d.newVerifier(d.invocation(t, false).WorkDir)
+	// workdir is the session's actual spawn directory (CLA-437), for the same
+	// reason salvageStrandedWork takes it: the commits being checked live in the
+	// repo the session worked in, which is no longer always the target's.
+	v := d.newVerifier(workdir, d.cfg.AllowUncheckedPRFor(t.Name))
 	for _, rep := range res.Reports {
-		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch}
+		// Resolve the claim's repo AUTHORITATIVELY from the task's own record —
+		// "the task's repo field (primary repo when unset)" is the doneWhen's
+		// words, and the session-declared value on update_task is secondary: a
+		// session can omit it (nothing in the served protocol tells it to pass
+		// `repo`), while the plane's task row always carries it (CLA-437). Mirror
+		// sessionDir's degradation exactly: an unwired plane falls back to the
+		// session's declaration, then to this target's primary repo.
+		repo := rep.Repo
+		if src, ok := t.Releaser.(plane.TaskRepoSource); ok && rep.TaskID != "" {
+			r, err := src.TaskRepo(ctx, rep.TaskID)
+			switch {
+			case err == nil && r != "":
+				repo = r
+			case err == nil && repo == "":
+				repo = t.PrimaryRepo
+			case errors.Is(err, plane.ErrNotWired):
+				if repo == "" {
+					repo = t.PrimaryRepo
+				}
+			default:
+				log.Printf("%scould not read the repo of task %s (%v) — the claim's session-declared repo is used as-is", labelOf(t), rep.Ref, err)
+			}
+		} else if repo == "" {
+			repo = t.PrimaryRepo
+		}
+		claim := delivery.Claim{Label: rep.Label(), Branch: rep.Branch, PR: rep.PR, Repo: repo}
 		if rep.ClaimsMerge() {
 			claim.Commit, claim.IntegrationBranch = rep.Commit, rep.IntegrationBranch
 		}
 		// Detached and bounded PER REPORT: a shared deadline would silently degrade
 		// every claim after the first slow one to "cannot check". Detached because a
 		// cancel arriving mid-check should not turn a real answer into a half one —
-		// the guard above is what makes cancellation prompt.
+		// the guard above is what makes cancellation prompt. The PR check's own
+		// polling budget sits well inside this deadline, so one slow GitHub read
+		// cannot starve the git checks that share the report.
 		vctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), deliveryCheckTimeout)
 		out := v.Verify(vctx, claim)
 		cancel()
 
 		for _, c := range out.Checks {
+			where := labelOf(t)
+			if out.Repo != "" && out.Repo != workdir {
+				where += "[" + out.Repo + "] "
+			}
 			switch c.Status {
 			case delivery.Fail:
-				log.Printf("%sDELIVERY UNVERIFIED — %s: %s", labelOf(t), rep.Label(), c.Detail)
+				log.Printf("%sDELIVERY UNVERIFIED — %s: %s", where, rep.Label(), c.Detail)
+			case delivery.Warn:
+				log.Printf("%sDELIVERY WARN — %s: %s", where, rep.Label(), c.Detail)
 			case delivery.Unknown:
-				log.Printf("%scould not verify %s: %s — carrying on", labelOf(t), rep.Label(), c.Detail)
+				log.Printf("%scould not verify %s: %s — carrying on", where, rep.Label(), c.Detail)
 			default:
-				log.Printf("%sverified %s: %s", labelOf(t), rep.Label(), c.Detail)
+				log.Printf("%sverified %s: %s", where, rep.Label(), c.Detail)
 			}
 		}
 		d.attestMerge(ctx, t, rep, out)
@@ -2102,9 +3105,19 @@ func (d *Driver) judgeProgress(i int, sum backlog.Summary) {
 	// quietThreshold fresh fruitless drains.
 	if !sum.Spawnable() && !d.pending[i] {
 		if d.quietTokens[i] > 0 {
-			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d tokens of drain(s) that settled nothing and clearing any back-off", d.prefix(i), d.quietTokens[i])
+			log.Printf("%snothing to spawn for — idle, not fruitless; forgetting %d tokens of drain(s) that settled nothing and clearing any no-progress back-off", d.prefix(i), d.quietTokens[i])
 		}
-		d.quietTokens[i], d.skipUntil[i] = 0, time.Time{}
+		d.quietTokens[i] = 0
+		// An idle stretch clears the no-progress (quiet) back-off - with no work
+		// there is nothing to judge, and the blocker may have resolved itself.
+		// A CLA-507 harness sit-out is different: the harness itself is broken,
+		// and an empty queue does not fix it. Clearing skipUntil here would cut
+		// the laddered sit-out short the moment the queue momentarily empties
+		// (a sibling daemon consuming the work), so it is preserved until it
+		// elapses or the harness succeeds again.
+		if d.harnessFails[i] == 0 {
+			d.skipUntil[i] = time.Time{}
+		}
 		d.baseline[i], d.openQs[i] = settled, openQs
 		return
 	}
@@ -2203,6 +3216,71 @@ func (d *Driver) backedOff(i int) bool {
 	return false
 }
 
+// sidelineTarget marks target i failed after drainPhases returned an error: the
+// failure happened while running THIS project's session, so this project sits out
+// while the others drain on. The sit-out uses the quiet ladder's shape: 15m,
+// 30m, 1h, then a 2h cap, keyed on consecutive failures rather than fruitless
+// tokens, and it self-heals: the operator fixes the config (or the checkout), the
+// next attempt after the sit-out succeeds, and Run resets the count.
+//
+// The log line is the operator's whole diagnosis for the exact incident that
+// motivated this (2026-08-26): which project died, in which workdir, the
+// harness's own error text - and the reassurance that the fleet carried on.
+func (d *Driver) sidelineTarget(i int, drainNum int, err error) {
+	d.harnessFails[i]++
+	d.harnessErrs[i] = err
+	wait := failureBackoff(d.harnessFails[i])
+	d.skipUntil[i] = time.Now().Add(wait)
+	log.Printf("%siteration %d: sidelining this project for %s (harness failure %d in a row; workdir %s) - the OTHER projects keep draining. Cause: %v",
+		d.prefix(i), drainNum, wait, d.harnessFails[i], d.workdirOf(d.targets[i]), err)
+}
+
+// failureBackoff maps a run of consecutive harness failures onto the same ladder
+// quietBackoff serves. judgeProgress's first trip lands at rung quietThreshold
+// (15m); failure N starts one rung earlier than N+1 so each repeat escalates one
+// band: 15m, 30m, 1h, then quietBackoff's own 2h cap.
+func failureBackoff(fails int) time.Duration {
+	return quietBackoff(quietThreshold - 1 + fails)
+}
+
+// allSidelined reports whether every target is CURRENTLY sitting out a harness
+// failure: nothing left to drive, so ending the run beats idle-polling forever.
+// A target counts only while its failure back-off is live - skipUntil zeroed by
+// an elapsed wait means it is drivable again, whatever its history, and a target
+// that has never failed since its last success never counts.
+func (d *Driver) allSidelined() bool {
+	if len(d.targets) == 0 {
+		return false
+	}
+	now := time.Now()
+	for i := range d.targets {
+		if d.harnessFails[i] == 0 || d.skipUntil[i].IsZero() || !now.Before(d.skipUntil[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// sidelinedReport renders one line per target with the error that benched it, for
+// the run-wide exit when every target is sidelined.
+func (d *Driver) sidelinedReport() string {
+	var b strings.Builder
+	for i := range d.targets {
+		fmt.Fprintf(&b, "\n  [%s] (workdir %s): %v", d.targets[i].Name, d.workdirOf(d.targets[i]), d.harnessErrs[i])
+	}
+	return b.String()
+}
+
+// workdirOf resolves where a target's sessions run, for log lines: the target's
+// own workdir when it declares one, the config's otherwise - the same resolution
+// the invocation gets, so the log names the directory the session actually died in.
+func (d *Driver) workdirOf(t Target) string {
+	if t.WorkDir != "" {
+		return t.WorkDir
+	}
+	return d.cfg.WorkDir
+}
+
 // sleepStall reports how much real time a wait lost to system suspension, and
 // whether that is worth saying out loud.
 //
@@ -2259,9 +3337,46 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 // only be tripped by spend it can SEE was blind to exactly the spend this loop
 // generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
 // and this is the one loop with no other way out (CLA-287).
+// probeWait returns how long the paused loop sleeps before its next probe.
+//
+// A known reset still ahead of us is worth waiting for precisely: sleep until
+// just past it (reset + grace) instead of to the next tick of the poll grid,
+// so a cap that lifts on time costs one grace period of idleness rather than
+// up to a whole interval (CLA-305: 22 minutes dead on 2026-08-10, work queued,
+// nothing wrong). The cap at the interval stays: waitOrStop is what keeps a
+// paused loop responsive to a STOP marker, and an aligned multi-hour sleep
+// would make the stop switch feel dead - so the loop wakes on min(reset+grace,
+// the grid) and simply laps again when it wakes short of the reset. An unknown
+// or already-past reset falls back to the blind grid: codex states no reset at
+// all, and after CLA-258 claude parses one only from typed sources, so an
+// unknown reset is normal rather than exceptional.
+func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Duration {
+	if resetAt.IsZero() || !now.Before(resetAt) {
+		return interval
+	}
+	untilReset := resetAt.Add(grace).Sub(now)
+	if untilReset < interval {
+		return untilReset
+	}
+	return interval
+}
+
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
+	tc := d.targetCfg(t)
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
-	log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+
+	// waitingForReset says the stated reset was still ahead of us as this wait
+	// began; it flips once the loop has slept across it. waitedOnReset snapshots
+	// that entry state, because a reset we waited on and a reset we arrived
+	// after are owed different endings (see the branch below).
+	waitingForReset := !lim.ResetAt.IsZero() && time.Now().Before(lim.ResetAt)
+	waitedOnReset := waitingForReset
+	if waitingForReset {
+		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		log.Printf("paused%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
+	} else {
+		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+	}
 
 	for {
 		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
@@ -2269,20 +3384,45 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
 		}
-		if d.waitOrStop(ctx, interval) {
+		waitDur := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		if d.waitOrStop(ctx, waitDur) {
 			return tokens, cost, true
 		}
-		if !lim.ResetAt.IsZero() && time.Now().After(lim.ResetAt) {
-			log.Print("stated reset passed — resuming")
+		// A stated reset is the provider's claim, not a guarantee, so crossing it
+		// mid-wait does NOT resume the run the way a blind-grid wake used to: it
+		// falls back to interval polling, and the very next probe is what confirms
+		// or refutes the claim. Only a reset that was ALREADY behind us at entry
+		// resumes on the stated time alone - the legacy contract pinned by
+		// TestDrainWithRetries_StatedResetPassed, where the caller sent us here
+		// knowing the reset had passed and one more interval of idleness is the
+		// price of not re-probing a phase that just told us it was capped.
+		if !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) && waitingForReset {
+			log.Print("stated reset passed - falling back to interval polling (a stated reset is a claim, not a guarantee)")
+			waitingForReset = false
+		} else if !waitedOnReset && !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) {
+			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
 		}
-		got, err := a.Probe(ctx, d.invocationOn(t, d.cfg.HarnessFor(ph), true))
+		inv, ierr := d.invocationOn(t, tc.HarnessFor(ph), true)
+		if ierr != nil {
+			// A refused probe spawn spends nothing and learns nothing about the
+			// limit, so it reads exactly like any other probe error: log the
+			// named variable (the error carries it) and poll again next
+			// interval. The wait stays bounded by its own dials.
+			log.Printf("probe error: %v — will retry next interval", ierr)
+			continue
+		}
+		got, err := a.Probe(ctx, inv)
 		// Count the probe BEFORE reading its verdict, and before the error branch: a
 		// probe that failed still spawned the harness and still spent. Every path out
 		// of here — resume, stop, or another lap — carries it.
 		tokens += got.Tokens
 		cost += got.CostUSD
-		d.charge(d.cfg.HarnessFor(ph), got.Tokens, got.CostUSD)
+		// The probe spawned on the TARGET's effective harness above (invocationOn
+		// with tc.HarnessFor), so its spend is booked under that same name —
+		// keying on the base harness would bill an overlay-redirected phase to
+		// the wrong per-harness account (CLA-410).
+		d.charge(tc.HarnessFor(ph), got.Tokens, got.CostUSD)
 		if err != nil {
 			if ctx.Err() != nil {
 				return tokens, cost, true
@@ -2293,7 +3433,7 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			// never see the cost — the one shape this loop's breaker exists to end
 			// (CLA-262, and the same reasoning as endUntrustedDrain). With no spend
 			// ceiling there is nothing to protect, so it waits on as before.
-			if errors.Is(err, harness.ErrUntrusted) && d.cfg.Budget.CountsSpendFor(d.cfg.HarnessFor(ph)) {
+			if errors.Is(err, harness.ErrUntrusted) && tc.Budget.CountsSpendFor(tc.HarnessFor(ph)) {
 				log.Printf("paused, and the probe's own output cannot be read (%v) — stopping rather than polling on: its spend cannot be counted, so a token/cost ceiling can no longer be honoured. Rerun after the reset.", err)
 				return tokens, cost, true
 			}
@@ -2403,6 +3543,17 @@ func droppedNote(dropped int64) string {
 // carrying this phase's prompt and turn cap, with the previous phase's claim
 // substituted into the prompt's placeholders.
 //
+// spawnDir is where this phase's sessions run, resolved once per phase by
+// sessionDir — the task repo's checkout when one is known, else the target's
+// workdir exactly as before. It is resolved by the CALLER rather than here so a
+// retry ladder re-spawns into the SAME directory it started in (the task has not
+// changed between attempts), and so a resolution failure fails the phase before
+// anything is spawned.
+//
+// Unlike the directory, the session env is resolved per CALL, not once per
+// phase: every attempt re-runs its fromCommand declarations fresh, so a token
+// rotated mid-ladder still reaches the next attempt (CLA-462).
+//
 // The substitution is what lets a later phase RESUME a run rather than claim a
 // task. A session cannot know its own run id — it never called claim_task — so
 // the driver, which watched the earlier phase's stream go by, is the only thing
@@ -2412,8 +3563,16 @@ func droppedNote(dropped int64) string {
 // A placeholder with no claim to fill it is LEFT STANDING rather than blanked.
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result) harness.Invocation {
-	inv := d.invocationOn(t, d.cfg.HarnessFor(ph), false)
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) (harness.Invocation, error) {
+	tc := d.targetCfg(t)
+	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
+	if err != nil {
+		return inv, err
+	}
+	if spawnDir != "" {
+		inv.WorkDir = spawnDir
+	}
+	inv.ExtraDirs = d.extraDirsFor(t, spawnDir)
 	inv.MaxTurns = ph.MaxTurns
 	// The per-session runaway ceiling, resolved once per drain from the budget:
 	// the operator's own dial, else 2x max_tokens, else the documented floor.
@@ -2426,7 +3585,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// harness asked about is THIS PHASE's (CLA-366), not the run's — the ceiling
 	// is compiled into the invocation that is about to spawn, so keying it on d.h
 	// would hand an opencode phase the ceiling derived from claude's block.
-	inv.MaxSessionTokens = d.cfg.Budget.SessionTokenCeilingFor(d.cfg.HarnessFor(ph))
+	inv.MaxSessionTokens = tc.Budget.SessionTokenCeilingFor(tc.HarnessFor(ph))
 	// The per-session wall-clock cap, resolved by EffectivePhases: this phase's
 	// own, else the run-wide one, else zero — and zero is OFF, which is the
 	// shipped default (CLA-368). Unlike the token ceiling this one HAS a disabled
@@ -2451,17 +3610,70 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// provider's and does not. An opencode phase whose harness block names no
 	// models therefore runs on opencode's own configured model — which is where
 	// opencode's model lives — rather than on a claude alias its CLI would die on.
-	model, ok := d.cfg.ModelForPhase(ph)
+	model, ok := tc.ModelForPhase(ph)
 	if !ok {
 		log.Printf("%sphase %q names tier %q, which resolves to no model on harness %q — running on that harness's default model instead",
-			labelOf(t), ph.Label(phaseIdx), ph.Tier, d.cfg.HarnessFor(ph))
+			labelOf(t), ph.Label(phaseIdx), ph.Tier, tc.HarnessFor(ph))
 	}
+
+	// CLA-379: review-tier escalation evaluated at review-spawn time.
+	// The CLI reads the operator's escalation rules from config and applies
+	// them mechanically. Only raises; never lowers. The matching rule
+	// is logged so the spend is attributable, per the 2026-08-23 decision.
+	if tc.Escalation.PathRules != nil || tc.Escalation.CategoryRules != nil {
+		if isReviewPhase(ph) {
+			// Resolve the branch name for the diff: from the previous claim's
+			// branch record (CLA-379 plumbing), falling back to reading the
+			// workdir's git refs if the claim carries none.
+			branchName := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Branch != "" {
+				branchName = prev.Claim.Branch
+			}
+			changedPaths, _ := d.diffAgainstIntegration(t, branchName, spawnDir)
+			category := ""
+			if prev != nil && prev.Claim.Held() && prev.Claim.Category != "" {
+				category = prev.Claim.Category
+			}
+			tier, rule := tc.Escalation.Evaluate(changedPaths, category)
+			if tier != "" {
+				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
+				ph.Tier = tier
+				model, ok = tc.ModelForPhase(ph)
+				if !ok {
+					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
+				}
+			}
+		}
+	}
+
 	inv.Model = model
 	if prev != nil && prev.Claim.Held() {
+		// The {{branch}} placeholder is filled from the recorded, VERIFIED hand-off
+		// (CLA-457): the checkpoint the driver ran against this claim already
+		// confirmed the branch is on the origin remote, so the review brief can
+		// name it instead of asserting an unverified phase-1 success. verifiedBranch
+		// reads the accepted reports first (the plane record of what THIS run
+		// recorded), falling back to the claim's own branch for a resumed-with-WIP
+		// predecessor.
+		//
+		// CLA-497: a checkpoint evidenced by the PLANE'S RECORD - the task left
+		// `ready` or declared a no-code delivery - names no branch, and the
+		// branch-shaped builtin brief would tell its successor the hand-off
+		// FAILED ("an empty branch field ... is a FAILED hand-off to report"),
+		// the exact opposite of the checkpoint the driver just recorded. Swap in
+		// the no-code brief for the BUILT-IN prompt only; an operator's custom
+		// prompt owns its own wording. The empty claim branch is the
+		// discriminator because drainPhase holds "claim.Branch is the verified
+		// branch, or empty when the evidence was branch-less" by construction.
+		prompt := inv.Prompt
+		if prev.Claim.Branch == "" && prompt == config.BuiltinReviewBrief() {
+			prompt = config.NoCodeReviewBrief()
+		}
 		inv.Prompt = strings.NewReplacer(
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
-		).Replace(inv.Prompt)
+			config.PhaseBranchPlaceholder, verifiedBranch(prev),
+		).Replace(prompt)
 		// Seed the claim as well as the prompt. The session is told not to claim,
 		// so the adapter would observe none — and Result.Claim.Held() is what gates
 		// the handback, the salvage and the delivery check. Without this, the phase
@@ -2469,13 +3681,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// switched off.
 		inv.ResumeClaim = prev.Claim
 	}
-	return inv
-}
-
-// invocation builds the harness invocation for one target: the target's workdir
-// and .mcp.json (which select the project) over the config's global fields.
-func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
-	return d.invocationOn(t, d.cfg.Harness, probe)
+	return inv, nil
 }
 
 // invocationOn builds the invocation for one target ON A NAMED HARNESS: the
@@ -2493,23 +3699,151 @@ func (d *Driver) invocation(t Target, probe bool) harness.Invocation {
 // project's own file is the top-level harness's, so it only applies there; and
 // the harness block's path is the single-project fallback. config.Validate
 // refuses the combination that would silently resolve to the wrong project.
-func (d *Driver) invocationOn(t Target, harnessName string, probe bool) harness.Invocation {
+//
+// The session env is composed HERE, at spawn time, fresh every call (CLA-462):
+// the four-level env overlay with every fromCommand executed now, so a rotated
+// token reaches this session without a daemon restart. An error — a failing,
+// timed-out or empty-output command, an unreadable @path file — REFUSES the
+// spawn: the caller reports it and no session starts, because a session without
+// its declared env is the incident, not a degraded mode.
+func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness.Invocation, error) {
+	// The target's effective config supplies the model/tier half of SessionFor
+	// and decides which harness the project's own MCP file belongs to (CLA-410);
+	// the env, prompt and workdir fallbacks stay on the base config — they are
+	// machine-local core the plane never carries.
+	tc := d.targetCfg(t)
 	workdir := t.WorkDir
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
-	hc := d.cfg.SessionFor(harnessName)
+	hc := tc.SessionFor(harnessName)
+	env, err := d.cfg.SessionEnv(harnessName, t.Name)
+	if err != nil {
+		return harness.Invocation{}, err
+	}
 	return harness.Invocation{
 		Prompt:        d.cfg.Prompt,
 		Model:         hc.Model,
 		WorkDir:       workdir,
-		MCPConfigPath: d.cfg.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
+		MCPConfigPath: tc.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
 		ConfigDir:     hc.ConfigDir,
 		SettingsPath:  hc.SettingsPath,
-		Env:           d.cfg.EnvSlice(),
+		Env:           env,
 		Probe:         probe,
-	}
+	}, nil
 }
+
+// sessionDir resolves where a PHASE's sessions run: the checkout of the task
+// they will work, not the multi-repo parent (CLA-437, agent-rule-scoping pieces
+// 2 and 3). It also returns the id of the task the phase is BRIEFED on — exact
+// for a resumed phase (the predecessor's claim), best-effort for a fresh one
+// (the queue-head peek, the same read the session is about to make). The seam's
+// checkpoint peek reads it after the phase ends (CLA-451); empty means the
+// driver never knew which task to ask about, and the peek is skipped.
+//
+// Which task that is depends on the phase. A RESUMED phase (prev carries a held
+// claim) knows its exact task, so its repo is read straight off the plane with
+// get_task. A FRESH phase has claimed nothing yet — the claim happens inside the
+// session — so the driver peeks at next_task, the same queue-head read the
+// session is about to make, and starts in that task's repo. The peek cannot race
+// a session out of work (it holds nothing), and if another clanker does claim the
+// peeked task first, the spawned session claims elsewhere and still works: the
+// permission policy covers every declared repo regardless of cwd, which is what
+// makes a best-effort cwd safe rather than load-bearing.
+//
+// Resolution then runs config.ResolveCheckout over what the target declared:
+// explicit repos entries, then the workdir-is-the-checkout convention, then
+// <workdir>/<name>. An identity that matches nothing fails the iteration with
+// repo_not_found — starting in the parent instead is exactly the wrong-repo-
+// reads and cwd-scoped-grant shape this exists to kill — while an empty result
+// (nothing configured anywhere) keeps the legacy workdir behaviour byte for byte.
+//
+// Lookup failures are degradation, not failure: a plane blip costs the spawn its
+// per-task directory (it falls through to the primary-repo chain), never the
+// iteration — the session about to spawn needs the plane too, and it can resolve
+// nothing either way.
+func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, string, error) {
+	repo := ""
+	briefed := ""
+	if prev != nil && prev.Claim.Held() {
+		briefed = prev.Claim.TaskID
+		if src, ok := t.Releaser.(plane.TaskRepoSource); ok {
+			r, err := src.TaskRepo(ctx, prev.Claim.TaskID)
+			switch {
+			case err == nil:
+				repo = r
+			case errors.Is(err, plane.ErrNotWired):
+				// No plane endpoint/key: nothing to read, the fallback chain runs.
+			default:
+				log.Printf("%scould not read the repo of resumed task %s (%v) — falling back to the primary repo", labelOf(t), claimLabel(prev.Claim), err)
+			}
+		}
+	} else if peeker, ok := t.Releaser.(plane.TaskPeeker); ok {
+		next, err := peeker.PeekNextTask(ctx)
+		switch {
+		case err == nil:
+			briefed = next.TaskID
+			repo = next.Repo
+			if next.Repo != "" {
+				log.Printf("%squeue head %s names repo %q — resolving it to this phase's start directory", labelOf(t), next.TaskID, next.Repo)
+			}
+		case errors.Is(err, plane.ErrNotWired):
+		default:
+			log.Printf("%scould not peek the next task's repo (%v) — falling back to the primary repo", labelOf(t), err)
+		}
+	}
+	workdir := t.WorkDir
+	if workdir == "" {
+		workdir = d.cfg.WorkDir
+	}
+	dir, err := config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
+	return dir, briefed, err
+}
+
+// extraDirsFor lists the directories a session's permission policy must cover
+// BESIDES where it runs: every checkout the project declares, whatever directory
+// the session starts in (agent-rule-scoping piece 2). This is the piece that
+// makes a best-effort spawn cwd safe — a two-repo project whose session started
+// in one repo can still reach the other.
+//
+// One implicit entry joins the declared ones: the conventional worktree area
+// beside the spawn checkout (<checkout>-wt as its sibling, this fleet's
+// documented layout). Task worktrees are separate git roots OUTSIDE every
+// declared repo, and a session that can create one but not edit in it is worse
+// than one never started. It is added only when the directory already exists —
+// no speculation, no widening beyond what is on disk.
+//
+// With nothing declared and no worktree area found this returns nil, which leaves
+// each adapter's policy exactly as it shipped before CLA-437.
+func (d *Driver) extraDirsFor(t Target, spawnDir string) []string {
+	workdir := t.WorkDir
+	if workdir == "" {
+		workdir = d.cfg.WorkDir
+	}
+	declared := config.DeclaredCheckouts(t.Repos, t.PrimaryRepo, workdir)
+	var out []string
+	seen := map[string]bool{}
+	add := func(dir string) {
+		if dir == "" || dir == spawnDir || seen[dir] {
+			return
+		}
+		seen[dir] = true
+		out = append(out, dir)
+	}
+	for _, dir := range declared {
+		add(dir)
+	}
+	if spawnDir != "" {
+		wt := filepath.Join(filepath.Dir(spawnDir), filepath.Base(spawnDir)+"-wt")
+		if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
+			add(wt)
+		}
+	}
+	return out
+}
+
+// orRef was folded into sessionDir's log line; kept out to avoid a helper with
+// one caller and one branch.
 
 // prefix returns the per-target log prefix ("[slug] "), or "" when the instance
 // drives a single unnamed target — so single-project logs read exactly as before.
@@ -2526,6 +3860,15 @@ func labelOf(t Target) string {
 
 // waitOrStop waits up to dur, but stays responsive to a STOP marker (consuming it)
 // and to context cancellation. Reports whether the loop should stop.
+//
+// CLA-461: the restart/reload markers get the same responsiveness, so a control
+// request is never stuck behind a multi-hour idle poll or a supervised limit
+// wait. RESTART / RESTART_NOW return true (stop) with restartRequested set, so
+// the caller's caller re-execs; RELOAD re-reads the config in place and lets the
+// CURRENT wait run out on its existing schedule — ending a supervised limit
+// wait early would turn a dial edit into an immediate paid probe against the
+// very limit being waited out. A changed poll_interval applies from the NEXT
+// pause, which recomputes it.
 func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 	const chunk = 3 * time.Second
 	// Round(0) strips the monotonic reading, so wallStart measures REAL elapsed
@@ -2541,6 +3884,31 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 			_ = d.state.Remove("STOP")
 			log.Print("STOP requested during wait — stopping")
 			return true
+		}
+		if present, msg := d.readMarker(MarkerRestart); present {
+			_ = d.state.Remove(MarkerRestart)
+			if msg != "" {
+				log.Printf("RESTART requested during wait: %s", msg)
+			} else {
+				log.Print("RESTART requested during wait")
+			}
+			d.restartRequested.Store(true)
+			return true
+		}
+		if present, msg := d.readMarker(MarkerRestartNow); present {
+			_ = d.state.Remove(MarkerRestartNow)
+			if msg != "" {
+				log.Printf("RESTART_NOW requested during wait: %s", msg)
+			} else {
+				log.Print("RESTART_NOW requested during wait")
+			}
+			d.restartRequested.Store(true)
+			return true
+		}
+		if present, _ := d.readMarker(MarkerReload); present {
+			_ = d.state.Remove(MarkerReload)
+			log.Print("RELOAD requested during wait — reloading config; this wait keeps its schedule")
+			d.applyReload()
 		}
 		remaining := time.Until(end)
 		if remaining <= 0 {
@@ -2606,4 +3974,53 @@ func limitReason(lim harness.Limit) string {
 		return lim.Reason
 	}
 	return "usage limit"
+}
+
+// isReviewPhase reports whether a phase is a review-phase (the gate where
+// escalation applies). Named phases whose name is "review" are review phases;
+// custom prompts with no name are never treated as review for escalation.
+func isReviewPhase(ph config.Phase) bool {
+	return ph.Name == config.ReviewPhaseName
+}
+
+// diffAgainstIntegration compares a pushed branch to the integration branch
+// (staging) for changed paths, using git in the work directory.
+// It returns the list of changed file paths, or an error if the diff fails.
+func (d *Driver) diffAgainstIntegration(t Target, branchName string, workDir string) ([]string, error) {
+	if branchName == "" {
+		return nil, errors.New("no branch recorded for diff")
+	}
+	wd := workDir
+	if wd == "" {
+		wd = d.cfg.WorkDir
+		if wd == "" {
+			wd = "."
+		}
+	}
+	// Use git diff against the integration branch (staging by default).
+	// The command compares the branch tip to origin/staging.
+	cmd := exec.Command("git", "-C", wd, "diff", "--name-only", "origin/staging..."+branchName)
+	out, err := cmd.Output()
+	if err != nil {
+		// If the branch is new or the diff command fails, fall back to comparing
+		// the branch to the local staging branch.
+		cmd2 := exec.Command("git", "-C", wd, "diff", "--name-only", "staging..."+branchName)
+		out, err = cmd2.Output()
+		if err != nil {
+			// If both fail, return empty paths rather than failing the spawn.
+			return nil, nil
+		}
+	}
+	paths := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(paths) == 1 && paths[0] == "" {
+		return nil, nil
+	}
+	result := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result, nil
 }

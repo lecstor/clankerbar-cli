@@ -22,9 +22,12 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"slices"
 	"sort"
@@ -37,7 +40,11 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/loop"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -86,6 +93,26 @@ type doctorEnv struct {
 	apiKey     string
 	goos       string
 	pmset      func(ctx context.Context, args ...string) (string, error)
+
+	// The deploy_lag check's three seams (CLA-322): the /health read,
+	// repository discovery under a workdir, and every git exec it runs.
+	fetchHealth func(ctx context.Context, healthURL string) (deployHealth, error)
+	repos       func(ctx context.Context, workdir string) []string
+	gitRun      func(ctx context.Context, dir string, args ...string) (string, error)
+
+	// The session-env check's two seams (CLA-462): running one declared
+	// fromCommand, and re-checking one "@path" file's owner-only rule.
+	runEnvCmd func(ctx context.Context, command string) (string, error)
+	envPath   func(path string) error
+
+	// The fleet check's one seam (CLA-466): the harmless empty-body probe of the
+	// report endpoint. Production is fleet.Probe; tests substitute statuses.
+	fleetProbe func(ctx context.Context, endpoint, apiKey string) error
+
+	// The run-config check's seam (CLA-410): building the read/propose client
+	// for one project's MCP endpoint. Production is plane.NewRunConfigAPI; a
+	// field so tests serve stored documents from an httptest plane.
+	newRCfgAPI func(mcpURL, apiKey string) plane.RunConfigAPI
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -113,6 +140,15 @@ func defaultDoctorEnv() doctorEnv {
 			out, err := exec.CommandContext(ctx, "pmset", args...).Output()
 			return string(out), err
 		},
+		fetchHealth: fetchDeployHealth,
+		repos:       delivery.Repos,
+		gitRun:      deployGitRun,
+		runEnvCmd: func(ctx context.Context, command string) (string, error) {
+			return config.RunEnvCommand(command)
+		},
+		envPath:    config.VerifyEnvFilePath,
+		fleetProbe: fleet.Probe,
+		newRCfgAPI: plane.NewRunConfigAPI,
 	}
 }
 
@@ -206,12 +242,20 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks := []check{checkConfig(cfg)}
 	checks = append(checks, checkHarnesses(ctx, cfg, e)...)
 	checks = append(checks, checkConfigDirs(cfg)...)
+	checks = append(checks, checkRepos(cfg)...)
+	checks = append(checks, checkSessionEnv(ctx, cfg, e)...)
+	checks = append(checks, checkTokenSources(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
+	checks = append(checks, checkFleets(ctx, cfg, e)...)
+	checks = append(checks, checkInstanceIdentity(cfg))
+	checks = append(checks, checkRunConfigs(ctx, cfg, e)...)
+	checks = append(checks, checkDeployLags(ctx, cfg, e)...)
 	checks = append(checks, checkStateDir(cfg))
 	checks = append(checks, checkSessions(cfg)...)
-	checks = append(checks, checkMCPServers(cfg))
+	checks = append(checks, checkStranded(ctx, cfg, e))
+	checks = append(checks, checkMCPServers(cfg), checkOpencodeAmbientConfigs(cfg))
 	checks = append(checks, checkPermissionsAll(cfg)...)
-	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg))
+	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(cfg, e))
 }
 
 func doctorFailed(n int) error {
@@ -219,6 +263,12 @@ func doctorFailed(n int) error {
 }
 
 // --- 1. config ---------------------------------------------------------------
+
+// apiKeyOriginLabel prefixes the line naming the one origin the account-scoped
+// key may be sent to. A const so the README-pins coupling test (readme_pins_test.go,
+// CLA-383) can assert the README quotes exactly this label: rewording it here fails
+// that test until the README is updated.
+const apiKeyOriginLabel = "api key origin: "
 
 func checkConfig(cfg *config.Config) check {
 	c := check{name: "config", status: pass}
@@ -249,13 +299,16 @@ func checkConfig(cfg *config.Config) check {
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
-	c.info = append(c.info, "api key origin: "+orNone(cfg.CredentialOrigin()))
+	c.info = append(c.info, apiKeyOriginLabel+orNone(cfg.CredentialOrigin()))
 	// What this config hands the child process, by NAME only - never a value, and
 	// never the file an @path names. A config that reaches the loop decides the
 	// spawned session's environment (CLA-260), so "which variables am I injecting"
 	// should be answerable from the preflight rather than by re-reading the file.
-	if names := envKeyNames(cfg.Env); names != "" {
-		c.info = append(c.info, "env: "+names)
+	// Since CLA-462 declarations live at four levels; each line names its level.
+	if decls := cfg.DeclaredEnvs(); len(decls) > 0 {
+		for _, line := range rangeEnvNames(decls) {
+			c.info = append(c.info, line)
+		}
 	}
 	if len(cfg.Projects) > 0 {
 		for _, p := range cfg.Projects {
@@ -269,19 +322,167 @@ func checkConfig(cfg *config.Config) check {
 	return c
 }
 
-// envKeyNames renders the config's extra environment as a sorted list of KEYS,
-// with no values: one of them is routinely a credential, and doctor's output is
+// rangeEnvNames renders the config's declared session env as one line per
+// LEVEL that declares anything — "env: A, B", "projects[0].env_per_harness.claude: C"
+// — with no values: one of them is routinely a credential, and doctor's output is
 // the thing an operator pastes into an issue.
-func envKeyNames(env map[string]string) string {
-	if len(env) == 0 {
-		return ""
+func rangeEnvNames(decls []config.DeclaredEnv) []string {
+	byLabel := map[string][]string{}
+	for _, d := range decls {
+		byLabel[d.Label] = append(byLabel[d.Label], d.Name)
 	}
-	keys := make([]string, 0, len(env))
-	for k := range env {
-		keys = append(keys, k)
+	labels := make([]string, 0, len(byLabel))
+	for l := range byLabel {
+		labels = append(labels, l)
 	}
-	sort.Strings(keys)
-	return strings.Join(keys, ", ")
+	sort.Strings(labels)
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		names := byLabel[l]
+		sort.Strings(names)
+		out = append(out, "env["+l+"]: "+strings.Join(names, ", "))
+	}
+	return out
+}
+
+// --- 1b. repos ---------------------------------------------------------------
+
+// checkRepos reports, per project (or once for a single-project run), every repo
+// the config declares and whether it resolves to a local checkout (CLA-437).
+//
+// This is the preflight for two silent failures at once. A declared repo whose
+// checkout is missing fails every iteration that names it with repo_not_found —
+// better seen here than in an overnight log. And a project that declares NO
+// repos keeps the legacy workdir behaviour, which is correct but easy to mistake
+// for "sessions already start in the task's repo"; saying which mode is live is
+// the difference.
+func checkRepos(cfg *config.Config) []check {
+	report := func(label string, repos map[string]string, primary, workdir string) check {
+		c := check{name: label}
+		if len(repos) == 0 && strings.TrimSpace(primary) == "" {
+			c.status = pass
+			c.detail = "none declared - sessions start in the workdir (" + orNone(workdir) + "); declare repos to start them in the task's checkout"
+			return c
+		}
+		c.status = pass
+		c.detail = "every declared repo resolves to a checkout"
+		idents := make([]string, 0, len(repos)+1)
+		for k := range repos {
+			idents = append(idents, k)
+		}
+		sort.Strings(idents)
+		if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
+			idents = append(idents, p)
+		}
+		bad := 0
+		for _, id := range idents {
+			mark := ""
+			if strings.TrimSpace(primary) != "" && id == strings.TrimSpace(primary) {
+				mark = " (primary)"
+			}
+			dir, err := config.ResolveCheckout(repos, primary, workdir, id)
+			if err != nil {
+				bad++
+				c.info = append(c.info, id+mark+" -> NOT FOUND")
+				continue
+			}
+			c.info = append(c.info, id+mark+" -> "+dir)
+		}
+		if bad > 0 {
+			c.status = warn
+			c.detail = fmt.Sprintf("%d of %d declared repos resolve to no local checkout - any task naming one fails its iteration", bad, len(idents))
+			c.remedy = "check the repo out under the workdir, or fix its repos path"
+		}
+		return c
+	}
+
+	if len(cfg.Projects) == 0 {
+		return []check{report("repos", cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), projectWorkDir(cfg, p)))
+	}
+	return out
+}
+
+// --- 1c. session env ---------------------------------------------------------
+
+// checkSessionEnv verifies every DECLARED env entry that needs resolving can be
+// resolved right now (CLA-462): each fromCommand is executed and each "@path"
+// literal is re-read under its owner-only rule. Outputs are discarded — doctor
+// reports the verdict and the variable's name, never a credential. One FAIL
+// here means every spawn that overlay reaches will refuse until it is fixed,
+// so seeing it in the preflight is the cheap copy of the same fact.
+//
+// Plain literals need no check and get none: there is nothing to resolve.
+func checkSessionEnv(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	var out []check
+	for _, d := range cfg.DeclaredEnvs() {
+		switch {
+		case d.FromCommand != "":
+			c := check{name: "session env " + d.Name + " (" + d.Label + ")"}
+			if _, err := e.runEnvCmd(ctx, d.FromCommand); err != nil {
+				c.status = fail
+				c.detail = fmt.Sprintf("fromCommand %q failed: %v", d.FromCommand, err)
+				c.remedy = "fix the command - spawns it gates refuse rather than run without " + d.Name
+				out = append(out, c)
+				continue
+			}
+			c.status = pass
+			c.detail = "fromCommand resolves"
+			out = append(out, c)
+		case d.Path != "":
+			c := check{name: "session env file " + d.Name + " (" + d.Label + ")"}
+			if err := e.envPath(d.Path); err != nil {
+				c.status = fail
+				c.detail = d.Path + ": " + err.Error()
+				c.remedy = "fix the file's mode or path - spawns it gates refuse rather than run without " + d.Name
+				out = append(out, c)
+				continue
+			}
+			c.status = pass
+			c.detail = "owner-only file readable"
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// checkTokenSources warns when a scope whose repos PUSH has declared no source
+// for GH_TOKEN anywhere its sessions' overlays look — top level, any harness
+// block, or the project's own two blocks (CLA-462). This is exactly the shape
+// of the 2026-08-24 incident: a daemon launched without the wrapper spawned
+// sessions with no token, which died later at `git push` with an error naming
+// nothing. A WARN, not a FAIL: a repo may push over ssh or not at all, and the
+// operator owns that call — the heuristic (repos declared = pushes happen) is
+// only allowed to speak up, not to stop the run.
+func checkTokenSources(cfg *config.Config) []check {
+	report := func(label, slug string) check {
+		c := check{name: label}
+		if len(cfg.ReposFor(slug)) == 0 {
+			c.status = pass
+			c.detail = "no repos declared - nothing here is known to push"
+			return c
+		}
+		if cfg.TokenSourceDeclared(slug, "GH_TOKEN") {
+			c.status = pass
+			c.detail = "GH_TOKEN has a declared source"
+			return c
+		}
+		c.status = warn
+		c.detail = "repos are declared but no env level declares GH_TOKEN - sessions push with whatever identity their inherited environment happens to carry"
+		c.remedy = `declare "env": {"GH_TOKEN": {"fromCommand": "gh auth token -u <account>"}} (top level, per harness, per project, or per project-per-harness)`
+		return c
+	}
+	if len(cfg.Projects) == 0 {
+		return []check{report("gh token source", "")}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, report("gh token source["+p.Slug+"]", p.Slug))
+	}
+	return out
 }
 
 // --- 2. harness --------------------------------------------------------------
@@ -467,6 +668,168 @@ func checkBacklog(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	return out
 }
 
+// checkFleets reports whether fleet activity reporting (CLA-466) is wired and
+// its endpoint reachable — the same PASS/WARN table shape as the MCP wiring
+// checks (the CLA-448 precedent). One check per project, like backlog's.
+//
+// Every outcome is PASS or WARN, never FAIL: reporting is telemetry, so an
+// outage or a gap degrades console visibility while the loop runs exactly as
+// before. A rejected key already FAILs in the backlog check above it, where it
+// actually stops the run; saying it twice here at FAIL strength would make
+// doctor exit non-zero over a condition that costs nothing but a picture.
+func checkFleets(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	if len(cfg.Projects) == 0 {
+		return []check{fleetCheck(ctx, "fleet", cfg.FleetReportURL(), e)}
+	}
+	out := make([]check, 0, len(cfg.Projects))
+	for _, p := range cfg.Projects {
+		out = append(out, fleetCheck(ctx, "fleet["+p.Slug+"]", cfg.ProjectFleetReportURL(p), e))
+	}
+	return out
+}
+
+func fleetCheck(ctx context.Context, name, endpoint string, e doctorEnv) check {
+	c := check{name: name}
+
+	// Not-wired cases first: no key, no derivable slug-ful report URL. Both are
+	// the "reporting off, loop fine" shape.
+	if e.apiKey == "" {
+		c.status = warn
+		c.detail = "fleet activity reporting is off: no creds — CLANKERBAR_API_KEY is unset"
+		c.remedy = "export CLANKERBAR_API_KEY (mint one at clankerbar.com/projects/<slug>/api-keys)"
+		return c
+	}
+	if endpoint == "" {
+		c.status = warn
+		c.detail = "fleet activity reporting is off: no project-scoped /api/projects/<slug>/fleet/report endpoint could be derived"
+		c.remedy = "declare projects[].slug, or point mcp_config_path at an .mcp.json naming /mcp/<slug>"
+		return c
+	}
+
+	// The probe POSTs an EMPTY body: auth is checked before body validation, so a
+	// 400 proves reachable + routed + key accepted without writing anything. A
+	// real beacon would upsert this machine's presence row with doctor's own
+	// state, fighting whatever a live daemon on the same host reports.
+	err := e.fleetProbe(ctx, endpoint, e.apiKey)
+	switch {
+	case err == nil:
+		c.status = pass
+		c.detail = fmt.Sprintf("%s — reachable, key accepted; presence updates on each poll", endpoint)
+	case timedOut(err):
+		c.status = warn
+		c.detail = "fleet endpoint timed out — reports would be dropped (the loop is unaffected): " + endpoint
+		c.remedy = "check the plane is reachable"
+	default:
+		var pe *fleet.ProbeError
+		switch {
+		case errors.As(err, &pe) && (pe.Status == http.StatusUnauthorized || pe.Status == http.StatusForbidden):
+			c.status = warn
+			c.detail = fmt.Sprintf("fleet endpoint reachable but the key was rejected (HTTP %d) — reporting is off: %s", pe.Status, endpoint)
+			c.remedy = "check CLANKERBAR_API_KEY covers this project (a wrong project's key is refused before any write)"
+		case errors.As(err, &pe) && pe.Status == http.StatusNotFound:
+			c.status = warn
+			c.detail = "the plane has no fleet-report route (an older clankerbar deployment) — reporting is off"
+			c.remedy = "upgrade clankerbar to a build with fleet activity (CLA-465); the CLI runs fine without it"
+		case errors.As(err, &pe):
+			c.status = warn
+			c.detail = fmt.Sprintf("fleet endpoint answered unexpectedly (HTTP %d) — reporting may be degraded: %s", pe.Status, endpoint)
+			c.remedy = "check the plane is reachable: " + endpoint
+		default:
+			c.status = warn
+			c.detail = "fleet endpoint unreachable — reporting is off (the loop is unaffected): " + err.Error()
+			c.remedy = "check the plane is reachable: " + endpoint
+		}
+	}
+	return c
+}
+
+// timedOut reports whether err is a timeout, however the HTTP client chose to
+// express it: a context deadline or the Client.Timeout wrapper (a net.Error
+// with Timeout set), which are not the same error chain.
+func timedOut(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// --- fleet identity -----------------------------------------------------------
+
+// checkInstanceIdentity warns when two config files in THIS config's directory
+// would resolve to the same Fleet-page instance identity (CLA-501).
+//
+// The collision is invisible from inside one daemon  -  every daemon believes its
+// own name is fine  -  so the check has to look sideways at its siblings: each
+// top-level *.json in the config's directory is read for instance_name and
+// resolved through the SAME function the loop beacons under
+// (config.ResolveInstanceName), and any identity claimed by two or more files
+// warns. Files that do not parse as JSON are skipped: a file the loader cannot
+// read cannot start a daemon, so it cannot beacon anything to collide with.
+//
+// Since CLA-501 the default identity embeds the config basename, so distinct
+// filenames cannot collide; what remains is two siblings declaring the same
+// explicit instance_name (or a truncation-induced prefix clash)  -  exactly the
+// silent overwrite this check exists to catch before an overnight run.
+func checkInstanceIdentity(cfg *config.Config) check {
+	c := check{name: "instance identity"}
+	host, err := os.Hostname()
+	if err != nil {
+		// The loop logs the same failure and beacons a blank host half; here a
+		// blank simply resolves against basenames alone.
+		host = ""
+	}
+	resolved := cfg.ResolvedInstanceName(host)
+	c.info = append(c.info, "identity: "+resolved)
+
+	src := cfg.Source()
+	if src == "" {
+		c.detail = "no config file in play; nothing to scan for sibling collisions"
+		return c
+	}
+	dir := filepath.Dir(src)
+	files, err := filepath.Glob(filepath.Join(dir, "*.json"))
+	if err != nil {
+		c.detail = "could not list " + dir + ": " + err.Error()
+		return c
+	}
+
+	type named struct {
+		InstanceName string `json:"instance_name"`
+	}
+	byIdentity := map[string][]string{}
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue // unreadable sibling: cannot run, cannot collide; say nothing
+		}
+		var n named
+		if err := json.Unmarshal(data, &n); err != nil {
+			continue // not a clankerbar config (or unparseable): see above
+		}
+		id := config.ResolveInstanceName(n.InstanceName, f, host)
+		byIdentity[id] = append(byIdentity[id], filepath.Base(f))
+	}
+
+	var collided []string
+	for id, names := range byIdentity {
+		if len(names) > 1 {
+			sort.Strings(names)
+			collided = append(collided, id+" <- "+strings.Join(names, ", "))
+		}
+	}
+	if len(collided) == 0 {
+		c.detail = fmt.Sprintf("no identity collisions among %d config file(s) in %s", len(files), dir)
+		return c
+	}
+	sort.Strings(collided)
+	c.status = warn
+	c.detail = fmt.Sprintf("%d config file(s) in %s would beacon under the SAME fleet identity; their presence rows overwrite each other: %s",
+		len(files), dir, strings.Join(collided, "; "))
+	c.remedy = "give each co-located daemon a distinct config filename, or set a distinct instance_name in each"
+	return c
+}
+
 func backlogCheck(ctx context.Context, name, summaryURL string, e doctorEnv) check {
 	c := check{name: name}
 
@@ -593,18 +956,36 @@ func checkStateDir(cfg *config.Config) check {
 	}
 	_ = dir.Remove(probe)
 
-	// A leftover marker stops the loop on its first tick — the failure that looks
-	// exactly like "the backlog was empty".
+	// A leftover marker makes the next start act on it straight away — the
+	// failure that looks exactly like "the backlog was empty" (STOP/HALT), or
+	// its CLA-461 siblings: a surprise re-exec or config reload on the first
+	// tick. Same class, different costs, so each marker names its own.
+	type controlMarker struct {
+		name string
+		cost string
+	}
+	markers := []controlMarker{
+		{"HALT", "the loop halts on its first tick and stays halted"},
+		{"STOP", "the loop stops on its first tick"},
+		{loop.MarkerRestart, "the daemon re-executes on its first tick"},
+		{loop.MarkerRestartNow, "the daemon kills its in-flight session and re-executes"},
+		{loop.MarkerReload, "the config file is re-read on its first tick"},
+	}
 	var found []string
-	for _, m := range []string{"HALT", "STOP"} {
-		if dir.Exists(m) {
-			found = append(found, m)
+	var costs []string
+	for _, m := range markers {
+		if dir.Exists(m.name) {
+			found = append(found, m.name)
+			costs = append(costs, m.name+" — "+m.cost)
 		}
 	}
 	if len(found) > 0 {
 		c.status = warn
 		c.detail = stateDir + " has a leftover " + strings.Join(found, " and ") + " marker"
-		c.remedy = "delete it, or the loop stops immediately: rm " + filepath.Join(stateDir, found[0])
+		c.remedy = "delete it, or the loop acts on it immediately on start: rm " + filepath.Join(stateDir, found[0])
+		for _, cost := range costs {
+			c.info = append(c.info, cost)
+		}
 		if inside.session {
 			// Otherwise the operator deletes the marker, runs again, and a session
 			// writes it back - the remedy above is a symptom's remedy when the state
@@ -1021,18 +1402,33 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 			c.remedy = "point mcp_config_path at a " + harnessName + " config - " + use.Note
 			return c
 		}
-		// Otherwise there is nothing here we can honestly verdict on: an absent
-		// path is normal for this harness, and a present non-Claude one we have no
-		// schema to judge. An absent one is NOT warned about here even though a
-		// mixed-harness phase could reach the backlog through neither this file
-		// nor its config dir (CLA-366): the config dir legitimately carries the
-		// server for this harness, doctor cannot parse that schema to find out,
-		// and TestSessionCheckDoesNotClaimMCPWiringForOpencode pins the resulting
-		// PASS-with-caveat deliberately. The guard for a phase harness that
-		// declares NOTHING is in config.Validate, which refuses an empty
-		// `harnesses.<name>` block outright - the right place for it, since it
-		// fires before a session is spawned rather than in a log at 3am.
-		c.info = append(c.info, mcpConfigNotCheckedNote(use))
+		// When a path IS configured, the file is the statement - and doctor can
+		// now read the opencode schema well enough to verify the statement says
+		// clankerbar (CLA-448). The old "not checked" caveat existed because the
+		// schema was unreadable; the opencode file is JSON like any other, and a
+		// configured file that is silent about clankerbar is exactly the
+		// tool-less-session config that burned CLA-351 and CLA-377 to parked.
+		// FAIL, not WARN: a green workdir must not certify a session that cannot
+		// see the backlog.
+		if mcpConfigPath != "" {
+			if url, ok := config.MCPClankerbar(mcpConfigPath); ok {
+				server := url
+				if server == "" {
+					server = "(local command)"
+				}
+				c.info = append(c.info, "clankerbar MCP server: "+server+" ("+mcpConfigPath+")")
+			} else {
+				c.status = fail
+				c.detail = mcpConfigPath + " does not declare a usable clankerbar MCP server"
+				c.remedy = "name an entry \"clankerbar\" (or one referencing CLANKERBAR_API_KEY) in that file, not \"enabled\": false - sessions spawned with it would have no clankerbar tools"
+				return c
+			}
+		} else {
+			// Nothing configured: the harness's own config dir legitimately carries
+			// the server, and doctor cannot parse that schema - the caveat stands
+			// only for this case (CLA-448).
+			c.info = append(c.info, mcpConfigNotCheckedNote(use))
+		}
 
 	case harness.MCPConfigClaudeJSON:
 		// A session with no .mcp.json reaching it gets no clankerbar tools at all — it
@@ -1122,7 +1518,372 @@ func workdirLabel(dir string) string {
 	return dir
 }
 
-// --- 7. mcp servers ----------------------------------------------------------
+// --- 7. stranded commits ----------------------------------------------------
+
+// checkStranded reports commits that exist only on this machine: reachable from
+// a local branch or a worktree HEAD (including detached ones), and from no
+// remote-tracking ref.
+//
+// The failure this exists for is silent and irreversible, not loud and
+// expensive: on 2026-08-28 three commits were found that existed in exactly one
+// place on earth — local `main` in one checkout, on no remote branch and no
+// other local branch. They had been committed on a permanent branch the
+// workflow forbids (so they were unpushable) and in a worktree under
+// /private/tmp, which macOS sweeps; when the tree went, the only surviving
+// pointer was a local ref nobody looks at. The causes vary — a swept temp dir,
+// an abandoned worktree, a stale checkout, an iteration that died mid-flight —
+// and they all have one signature: commits reachable from a local ref and from
+// no remote ref.
+//
+// This check is deliberately inert: it reports and recommends, and never
+// deletes, moves, pushes or rebases. A clean worktree is not evidence of
+// abandonment, and a live holder may be mid-task, so acting on someone else's
+// tree is dangerous — a report that surfaces the work and does nothing is safe
+// precisely because it does nothing.
+func checkStranded(ctx context.Context, cfg *config.Config, e doctorEnv) check {
+	c := check{name: "stranded", status: pass}
+
+	repos := strandedRepos(ctx, cfg, e)
+	if len(repos) == 0 {
+		c.detail = "no git repositories found under " + strings.Join(configuredWorkDirs(cfg), ", ")
+		return c
+	}
+
+	// One check for every repo, with the findings carrying the repo path when
+	// there is more than one: the report must summarise, not dump — the CLI repo
+	// alone has 27 worktrees, and a per-tip line for every clean one is exactly
+	// the noise an operator learns to skim past.
+	multi := len(repos) > 1
+	var lines []string
+	withFindings, unchecked := 0, 0
+	for _, repo := range repos {
+		report, found := strandedFindings(ctx, e.gitRun, repo)
+		// A repo is counted as unchecked when none of its lines is a REAL
+		// finding — read failure, or every per-tip comparison failed: its only
+		// lines are errors, and the summary sentence must not read it as work
+		// that exists only on this machine. A repo with findings counts as one
+		// that holds stranded commits even when a line beside them is an error.
+		if len(report) > 0 && !found {
+			unchecked++
+		}
+		if found {
+			withFindings++
+		}
+		for _, f := range report {
+			// Error lines name the repo even when it is the only one in scope:
+			// the remedy points at "the repo named above", and a bare "could
+			// not enumerate" line names nothing. Finding lines stay bare — the
+			// ref or worktree path is the handle a human rescues by — and take
+			// the repo prefix only when more than one repo is in scope.
+			if multi || f.err {
+				f.text = repo + ": " + f.text
+			}
+			lines = append(lines, f.text)
+		}
+	}
+
+	if len(lines) == 0 {
+		c.detail = fmt.Sprintf("%d %s checked — no commit exists only on this machine",
+			len(repos), plural(len(repos), "repo", "repos"))
+		return c
+	}
+	c.status = warn
+	switch {
+	case unchecked > 0 && withFindings == 0:
+		c.detail = fmt.Sprintf("%d of %d %s could not be fully checked",
+			unchecked, len(repos), plural(len(repos), "repo", "repos"))
+		c.remedy = "run the failing git command by hand in the repo named above, or accept the gap"
+	case unchecked > 0:
+		c.detail = fmt.Sprintf("%d of %d %s could not be fully checked, and %d hold commits that exist only on this machine",
+			unchecked, len(repos), plural(len(repos), "repo", "repos"), withFindings)
+		c.remedy = "run the failing git command by hand in the repo named above, and move any live work to a branch and push it"
+	default:
+		c.detail = fmt.Sprintf("%d of %d %s hold commits that exist only on this machine",
+			withFindings, len(repos), plural(len(repos), "repo", "repos"))
+		c.remedy = "these commits are on no remote, so only this machine has them — nothing was changed; move any live work to a branch and push it, or delete the ref if it is debris"
+	}
+	c.info = lines
+	return c
+}
+
+// strandedRepos lists the repositories the stranded check reports on: every
+// checkout the config resolves to for each project — the declared repos
+// (CLA-437), and the checkouts under the project's workdir.
+//
+// The workdir scan is scoped to the project's own repos when a slug is
+// configured: a multi-repo parent holds checkouts that belong to other
+// projects, and warning about every one of them is how a WARN line becomes
+// something an operator skims. The project's repos are taken to be the ones
+// named after its slug — the same deliberate under-reporting direction as
+// detectToolchains: a missed report is a one-off, a wall of irrelevant
+// warnings buries the one that mattered.
+func strandedRepos(ctx context.Context, cfg *config.Config, e doctorEnv) []string {
+	type target struct {
+		dir     string
+		slug    string
+		repos   map[string]string
+		primary string
+	}
+	var targets []target
+	if len(cfg.Projects) == 0 {
+		targets = append(targets, target{dir: cfg.WorkDir, repos: cfg.ReposFor(""), primary: cfg.PrimaryRepoFor("")})
+	} else {
+		for _, p := range cfg.Projects {
+			targets = append(targets, target{
+				dir:     projectWorkDir(cfg, p),
+				slug:    p.Slug,
+				repos:   cfg.ReposFor(p.Slug),
+				primary: cfg.PrimaryRepoFor(p.Slug),
+			})
+		}
+	}
+
+	// delivery.Repos returns working-tree dirs deduplicated by repository, so
+	// linked worktrees never double-report. The declared checkouts can collide
+	// with the scan the other way round — a declared path that is a WORKTREE of
+	// a repo the scan also found: two paths, one repository. Dedupe the
+	// combined list by the shared git directory, the same identity
+	// candidateRepos uses, so a repository is checked once no matter how many
+	// of its trees the config names.
+	seen := map[string]bool{}
+	var out []string
+	add := func(dir string) {
+		if dir == "" {
+			return
+		}
+		key := repoCommonDir(ctx, e.gitRun, dir)
+		if key == "" {
+			// The repo could not be read at all: keep it on its path — the
+			// check's error line will say why — rather than silently dropping
+			// it under a key we cannot know.
+			key = resolvePath(dir)
+		}
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, dir)
+		}
+	}
+	for _, t := range targets {
+		dir := t.dir
+		if dir == "" {
+			dir = "."
+		}
+		// Declared repos first: an explicit `repos` path is the project's repo
+		// by declaration, even when the checkout lives outside the workdir.
+		for _, checkout := range config.DeclaredCheckouts(t.repos, t.primary, dir) {
+			add(checkout)
+		}
+		for _, repo := range e.repos(ctx, dir) {
+			if t.slug != "" && !repoHasSlug(repo, dir, t.slug) {
+				continue
+			}
+			add(repo)
+		}
+	}
+	return out
+}
+
+// repoHasSlug reports whether repo is one of the project's own checkouts: the
+// workdir itself (whatever its name — the single-repo case, where the workdir
+// IS the checkout), or a checkout whose directory name starts with the slug.
+func repoHasSlug(repo, workdir, slug string) bool {
+	if resolvePath(repo) == resolvePath(workdir) {
+		return true
+	}
+	return strings.HasPrefix(filepath.Base(repo), slug)
+}
+
+// repoCommonDir is the shared git directory of a checkout — the identity a
+// repository keeps across all its working trees. The main checkout reports
+// ".git" relative to itself, a linked worktree reports the common dir as an
+// absolute path; both are normalised to the same resolved path, so two trees
+// of one repo compare equal. Empty when the repo cannot be read.
+func repoCommonDir(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), dir string) string {
+	out, err := gitRun(ctx, dir, "rev-parse", "--git-common-dir")
+	if err != nil || out == "" {
+		return ""
+	}
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(dir, out)
+	}
+	return resolvePath(out)
+}
+
+// strandedLine is one report line for a repo: a finding naming a tip that
+// reaches stranded commits, or an error line naming a git read that failed.
+// err lines are prefixed with the repo path by the caller even in single-repo
+// mode, so the repo the remedy points at ("run the failing git command by hand
+// in the repo named above") is actually named; finding lines stay bare, the
+// ref or worktree path being the handle a human rescues by.
+type strandedLine struct {
+	text string
+	err  bool
+}
+
+// strandedFindings returns the lines to report for one repository — a finding
+// per tip that reaches a commit no remote-tracking ref reaches, and an error
+// line per git read that failed — and whether any line is a REAL finding
+// (commits established to exist only on this machine).
+//
+// A finding names the ref (a branch) or the worktree path (a detached HEAD —
+// the only handle a detached commit has), how many commits are stranded, and
+// the newest one's subject and date: the three facts a human needs to tell live
+// work from debris at a glance.
+func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), repo string) ([]strandedLine, bool) {
+	branches, err := gitRun(ctx, repo, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads")
+	if err != nil {
+		return []strandedLine{{text: "could not enumerate the local branches: " + err.Error(), err: true}}, false
+	}
+	listing, err := gitRun(ctx, repo, "worktree", "list", "--porcelain")
+	if err != nil {
+		return []strandedLine{{text: "could not enumerate the worktrees: " + err.Error(), err: true}}, false
+	}
+
+	// Tips, deduplicated by sha with the branch name winning: a detached HEAD
+	// that happens to sit on a branch tip is the same commits, and the branch is
+	// the stable handle a human rescues by.
+	names := map[string]string{}
+	var shas []string
+	add := func(sha, name string) {
+		if sha == "" {
+			return
+		}
+		if _, ok := names[sha]; ok {
+			return
+		}
+		names[sha] = name
+		shas = append(shas, sha)
+	}
+	for _, line := range strings.Split(branches, "\n") {
+		if name, sha, ok := strings.Cut(line, " "); ok {
+			add(sha, name)
+		}
+	}
+	for _, wt := range parseStrandedWorktrees(listing) {
+		add(wt.head, "detached HEAD at "+wt.path)
+	}
+	if len(shas) == 0 {
+		return nil, false // an unborn repository has no commits to strand
+	}
+
+	remotes, err := gitRun(ctx, repo, "for-each-ref", "refs/remotes")
+	if err != nil {
+		return []strandedLine{{text: "could not read the remote-tracking refs: " + err.Error(), err: true}}, false
+	}
+	if remotes == "" {
+		// No remote-tracking refs at all: every local commit qualifies, and
+		// per-tip lines would dump the whole history. One finding names the
+		// state instead — the whole repository is on no remote.
+		all, err := gitRun(ctx, repo, strandedRevListArgs(shas)...)
+		if err != nil {
+			return []strandedLine{{text: "could not enumerate the local commits: " + err.Error(), err: true}}, false
+		}
+		if all == "" {
+			return nil, false
+		}
+		n := strings.Count(all, "\n") + 1
+		subject, date, err := newestCommit(ctx, gitRun, repo, firstLine(all))
+		if err != nil {
+			return []strandedLine{{text: fmt.Sprintf("no remote-tracking refs — %s exist only on this machine, but the newest could not be read: %s",
+				plural(n, "1 commit", fmt.Sprintf("%d commits", n)), err.Error()), err: true}}, true
+		}
+		return []strandedLine{{text: fmt.Sprintf("no remote-tracking refs — %s exist only on this machine, newest %q (%s)",
+			plural(n, "1 commit", fmt.Sprintf("%d commits", n)), truncate(subject, 60), date)}}, true
+	}
+
+	var lines []strandedLine
+	found := false
+	for _, sha := range shas {
+		stranded, err := gitRun(ctx, repo, "rev-list", sha, "--not", "--remotes")
+		if err != nil {
+			lines = append(lines, strandedLine{text: names[sha] + ": could not compare against the remotes: " + err.Error(), err: true})
+			continue
+		}
+		if stranded == "" {
+			continue
+		}
+		// The rev-list output above IS the finding — commits established to be
+		// on no remote — even when the newest one's subject cannot be read.
+		found = true
+		// rev-list prints newest first, one sha per line; the runner trimmed the
+		// trailing newline, so a non-empty list has count = newlines + 1.
+		n := strings.Count(stranded, "\n") + 1
+		subject, date, err := newestCommit(ctx, gitRun, repo, firstLine(stranded))
+		if err != nil {
+			lines = append(lines, strandedLine{text: fmt.Sprintf("%s: %s stranded, but the newest could not be read: %s",
+				names[sha], plural(n, "1 commit", fmt.Sprintf("%d commits", n)), err.Error()), err: true})
+			continue
+		}
+		lines = append(lines, strandedLine{text: fmt.Sprintf("%s: %s, newest %q (%s)",
+			names[sha], plural(n, "1 commit", fmt.Sprintf("%d commits", n)), truncate(subject, 60), date)})
+	}
+	return lines, found
+}
+
+// strandedRevListArgs builds `rev-list <tips...> --not --remotes`: every commit
+// reachable from a tip and from no remote-tracking ref. Built as one slice so
+// the two call sites cannot drift apart on the arg order.
+func strandedRevListArgs(shas []string) []string {
+	out := make([]string, 0, len(shas)+3)
+	out = append(out, "rev-list")
+	out = append(out, shas...)
+	out = append(out, "--not", "--remotes")
+	return out
+}
+
+// newestCommit renders a commit's subject and short date — the two facts the
+// stranded report promises per finding.
+func newestCommit(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), repo, sha string) (subject, date string, err error) {
+	out, err := gitRun(ctx, repo, "show", "-s", "--format=%s%n%ad", "--date=short", sha)
+	if err != nil {
+		return "", "", err
+	}
+	subject, date, _ = strings.Cut(out, "\n")
+	return subject, date, nil
+}
+
+// strandedWorktree is one entry of `git worktree list --porcelain`, kept only
+// for the entries that matter to the stranded check: detached heads.
+type strandedWorktree struct {
+	path     string
+	head     string
+	detached bool
+}
+
+// parseStrandedWorktrees reads `git worktree list --porcelain`: blank-line-
+// separated blocks, each led by `worktree <path>` with `HEAD <sha>` and, when a
+// branch is checked out, `branch refs/heads/<name>`. A `detached` block has no
+// branch line and is exactly the tip no branch names. Bare blocks (no working
+// tree) are dropped: their HEAD is a branch, so the branch enumeration already
+// covers it.
+func parseStrandedWorktrees(listing string) []strandedWorktree {
+	var out []strandedWorktree
+	var cur strandedWorktree
+	flush := func() {
+		if cur.detached && cur.path != "" && cur.head != "" {
+			out = append(out, cur)
+		}
+		cur = strandedWorktree{}
+	}
+	for _, line := range strings.Split(listing, "\n") {
+		line = strings.TrimRight(line, "\r")
+		switch {
+		case strings.TrimSpace(line) == "":
+			flush()
+		case strings.HasPrefix(line, "worktree "):
+			flush()
+			cur.path = strings.TrimPrefix(line, "worktree ")
+		case strings.HasPrefix(line, "HEAD "):
+			cur.head = strings.TrimPrefix(line, "HEAD ")
+		case strings.HasPrefix(line, "detached"):
+			cur.detached = true
+		}
+	}
+	flush()
+	return out
+}
+
+// --- 8. mcp servers ----------------------------------------------------------
 
 // checkMCPServers names the MCP entries that start a LOCAL PROCESS in every
 // spawned session.
@@ -1139,21 +1900,146 @@ func workdirLabel(dir string) string {
 func checkMCPServers(cfg *config.Config) check {
 	c := check{name: "mcp_servers"}
 	local := cfg.LocalMCPServers()
-	if len(local) == 0 {
+	if len(local) == 0 && len(cfg.AllowLocalMCPServers) == 0 && !anyProjectAllowlists(cfg) {
 		c.status = pass
 		c.detail = "no MCP server starts a local process"
 		return c
 	}
 	c.status = warn
-	c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	if len(local) == 0 {
+		c.detail = "an allow_local_mcp_servers list admits named entries from discovered <workdir>/.mcp.json files"
+	} else {
+		c.detail = plural(len(local), "1 MCP server starts a local process", fmt.Sprintf("%d MCP servers start local processes", len(local))) + " in every session"
+	}
 	for _, s := range local {
 		c.info = append(c.info, s.Name+": "+truncate(s.Command, 80)+"  ("+s.ConfigPath+")")
 	}
-	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and a checkout's .mcp.json can declare them"
+	// The CLA-266 opt-out gets the same visibility as its CLA-310 sibling
+	// (allow_unchecked_pr): a loose state nobody can see before it fires is not
+	// an operator's choice, it is a surprise. A discovered file refuses every
+	// command entry EXCEPT these names, so the list IS part of what runs.
+	if names := cfg.AllowLocalMCPServers; len(names) > 0 {
+		c.info = append(c.info, "allow_local_mcp_servers: "+strings.Join(names, ", ")+"  (admitted from any discovered <workdir>/.mcp.json)")
+	}
+	for _, p := range cfg.Projects {
+		if names := p.AllowLocalMCPServers; len(names) > 0 {
+			c.info = append(c.info, "projects["+p.Slug+"].allow_local_mcp_servers: "+strings.Join(names, ", "))
+		}
+	}
+	c.remedy = "confirm you meant each of these - they run at session start, before any permission rule applies, and only allowlisted or explicitly-named configs are accepted now"
 	return c
 }
 
-// --- 8. permission policy ----------------------------------------------------
+// checkOpencodeAmbientConfigs reports the opencode config files the driver never
+// names but opencode merges anyway, whose `clankerbar` MCP server points at
+// another project (CLA-441). The detection - and the reason it WARNS rather than
+// failing the run - lives in config.OpencodeAmbientConflicts; this renders it.
+//
+// The PASS line says nothing about the mechanism: a check that explains a hazard
+// nobody has is a line the operator learns to skip past.
+func checkOpencodeAmbientConfigs(cfg *config.Config) check {
+	c := check{name: "opencode_ambient_config", status: pass}
+	conflicts := cfg.OpencodeAmbientConflicts()
+	if len(conflicts) == 0 {
+		c.detail = "no discovered opencode config redirects the clankerbar MCP server"
+		return c
+	}
+	c.status = warn
+	// The two kinds are counted and remedied SEPARATELY. They share a scan and
+	// nothing else: one is a file naming the wrong backlog, mitigated for
+	// spawned sessions by the content pin; the other is a file that shapes
+	// what the session may do, which the pin does nothing about. A single
+	// sentence covering both said the mitigation out loud on findings it does
+	// not apply to (CLA-441 second review).
+	var slugs, shaping int
+	for _, cf := range conflicts {
+		c.info = append(c.info, cf.String())
+		if len(cf.Overrides) > 0 {
+			shaping++
+		} else {
+			slugs++
+		}
+	}
+	var details, remedies []string
+	if slugs > 0 {
+		details = append(details, plural(slugs,
+			"1 opencode config names a different project's backlog",
+			fmt.Sprintf("%d opencode configs name a different project's backlog", slugs)))
+		remedies = append(remedies, "the wrong-backlog ones are mitigated for SPAWNED sessions by OPENCODE_CONFIG_CONTENT, but every INTERACTIVE "+
+			"opencode session in that tree still gets the wrong one: rename the block (the operator's own global one is now "+
+			"`clankerbar-interactive`), disable it, or point its url at the right slug")
+	}
+	if shaping > 0 {
+		details = append(details, plural(shaping,
+			"1 opencode config shapes what every session it loads into may do",
+			fmt.Sprintf("%d opencode configs shape what every session they load into may do", shaping)))
+		remedies = append(remedies, "the session-shaping ones are NOT mitigated by anything here - `mcp_config_path` files are refused for these keys, "+
+			"a file opencode discovers is not: remove the key, or accept that every session started in that tree runs with it")
+	}
+	c.detail = strings.Join(details, "; ")
+	c.remedy = strings.Join(remedies, "; ")
+	return c
+}
+
+// anyProjectAllowlists reports whether any project sets its own
+// allow_local_mcp_servers, so the pass line above does not hide a configured
+// list just because no current entry starts a process.
+func anyProjectAllowlists(cfg *config.Config) bool {
+	for _, p := range cfg.Projects {
+		if len(p.AllowLocalMCPServers) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// --- 9. permission policy ----------------------------------------------------
+
+// opencodePermissionOverride finds an OPENCODE_PERMISSION declaration that
+// would override the adapter's own fail-closed export — exec takes the last
+// duplicate key, so ANY declared value wins — across all four env levels. It
+// scans MOST-SPECIFIC-FIRST inside each project's scope (the
+// project-per-harness block for this harness, then the project block), then the
+// harness block, then top level: SessionEnv composes the child env per key by
+// exactly that precedence, so when two levels declare the same name it is the
+// more specific one the session actually carries. Naming a layer whose value
+// loses the overlay would send the operator to edit the wrong line. Across
+// projects the first declaring project is reported — each session carries only
+// its own project's layers, so no single entry wins a whole multi-project run.
+// The value reported is the declared source — the literal, or the command that
+// produces it — never the resolved output.
+func opencodePermissionOverride(cfg *config.Config, harnessName string) (where, value string, ok bool) {
+	const key = "OPENCODE_PERMISSION"
+	scan := func(label string, m config.EnvMap) (string, string, bool) {
+		if v, found := m[key]; found {
+			if v.IsCommand() {
+				return label, "fromCommand: " + v.FromCommand, true
+			}
+			return label, v.Literal, true
+		}
+		return "", "", false
+	}
+	for i := range cfg.Projects {
+		p := &cfg.Projects[i]
+		if ph, exists := p.EnvPerHarness[harnessName]; exists {
+			if w, v, found := scan(fmt.Sprintf("projects[%d].env_per_harness.%s", i, harnessName), ph); found {
+				return w, v, true
+			}
+		}
+		if w, v, found := scan(fmt.Sprintf("projects[%d].env", i), p.Env); found {
+			return w, v, true
+		}
+	}
+	if hc, exists := cfg.Harnesses[harnessName]; exists {
+		if w, v, found := scan("harnesses."+harnessName+".env", hc.Env); found {
+			return w, v, true
+		}
+	}
+	if w, v, found := scan("env", cfg.Env); found {
+		return w, v, true
+	}
+	return "", "", false
+}
 
 // checkPermissions reports on the run harness's permission policy. See
 // checkPermissionsAll, which is what doctorChecks calls.
@@ -1217,9 +2103,10 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 	case "opencode":
 		// The adapter always exports a fail-closed OPENCODE_PERMISSION — but exec
 		// takes the LAST duplicate key, so an operator's own env silently wins.
-		if v, ok := cfg.Env["OPENCODE_PERMISSION"]; ok {
+		// Since CLA-462 that env is declared at four levels; any of them wins.
+		if where, v, ok := opencodePermissionOverride(cfg, harnessName); ok {
 			c.status = warn
-			c.detail = "env overrides the adapter's fail-closed OPENCODE_PERMISSION"
+			c.detail = "env overrides the adapter's fail-closed OPENCODE_PERMISSION (declared at " + where + ")"
 			c.remedy = "drop it, or confirm it denies what an unattended run must not call: " + truncate(v, 60)
 			return c
 		}
@@ -1233,7 +2120,7 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 	return c
 }
 
-// --- 9. toolchain grants -----------------------------------------------------
+// --- 10. toolchain grants -----------------------------------------------------
 
 // toolchainMarkers maps a marker file to the command a session must be allowed
 // to execute to verify that repo. Only markers that name their tool
@@ -1557,7 +2444,7 @@ func firstField(s string) string {
 	return fields[0]
 }
 
-// --- 10. power ----------------------------------------------------------------
+// --- 11. power ----------------------------------------------------------------
 
 // unknownSleepRemedy is shared by both ways doctor can fail to learn the sleep
 // policy — `pmset -g` not running at all, and running but reporting no
@@ -1638,21 +2525,55 @@ func checkPower(ctx context.Context, e doctorEnv) check {
 }
 
 // holdsNoIdleSleep reports whether `pmset -g assertions` shows a live
-// PreventUserIdleSystemSleep. The count matters: the header line lists the
-// assertion name with a `0` when nothing holds it.
+// PreventUserIdleSystemSleep. Only two line shapes count as evidence, because
+// they are the only two pmset actually emits for this assertion (verified against
+// live output on 2026-08-22):
+//
+//   - the summary row: exactly the assertion name followed by an integer count
+//     and nothing else — held only when that count is non-zero;
+//   - a per-process detail line under "Listed by owning process:", which begins
+//     `pid <n>(<proc>):` and names the holder — held whenever one appears.
+//
+// Anything else mentioning the name is NOT PROVEN HELD and falls through, so
+// checkPower goes on to the `pmset -g` settings read rather than reporting PASS
+// from a shape it does not recognise. Falling through cannot invent a problem —
+// it only defers to the more direct question — whereas the previous test ("the
+// last token is not an integer means a detail line") answered YES, held for every
+// unrecognised shape, including Apple appending a token to the summary row or a
+// locale shifting its number format (CLA-306).
+//
+// Both branches match structure, not whitespace-split tokens, because splitting
+// is where the original guess went wrong: the detail-line regex runs on the raw
+// line since pmset prints the holding process's name verbatim inside the parens,
+// and a name containing spaces ("Google Chrome Helper") leaves no single field
+// carrying the `<n>(<proc>):` tail; the summary row demands exactly two fields
+// because any token beyond name-plus-count is an unknown in BOTH directions —
+// "1 (inactive)" no less than "0" (CLA-306 review).
+var pidDetailLine = regexp.MustCompile(`^\s*pid\s+\d+\(.+\):(?:\s|$)`)
+
 func holdsNoIdleSleep(out string) bool {
 	for _, line := range strings.Split(out, "\n") {
 		if !strings.Contains(line, "PreventUserIdleSystemSleep") {
 			continue
 		}
 		fields := strings.Fields(line)
-		n, err := strconv.Atoi(fields[len(fields)-1])
-		if err != nil {
-			// A detail line rather than the summary row (those name the holding
-			// process); its presence means something holds it.
-			return true
-		}
-		if n > 0 {
+		switch {
+		case len(fields) == 2 && fields[0] == "PreventUserIdleSystemSleep":
+			// Summary-row shape. Parse the COUNT position, not the tail: trailing
+			// tokens are exactly the unknown we must not guess from, so a row with
+			// anything after the count — or a count that will not parse — is an
+			// unrecognised variant and falls through rather than answer either way.
+			if n, err := strconv.Atoi(fields[1]); err == nil && n > 0 {
+				return true
+			}
+		case pidDetailLine.MatchString(line):
+			// Per-process detail line: `pid 81237(caffeinate): … named: "…"`. Its
+			// presence means a live process holds the assertion. Matched on the raw
+			// line so a process name containing spaces or even nested parens
+			// ("Google Chrome Helper (Renderer)") still reads as one
+			// `<pid>(<name>):` head; greedy to the LAST `):` is safe because the
+			// anchored pid head and the assertion-name pre-filter above already
+			// exclude every other line shape.
 			return true
 		}
 	}
@@ -1675,7 +2596,7 @@ func idleSleepMinutes(out string) (int, bool) {
 	return 0, false
 }
 
-// --- 11. budget --------------------------------------------------------------
+// --- 12. budget --------------------------------------------------------------
 
 func checkBudget(cfg *config.Config) check {
 	c := check{name: "budget"}
@@ -2178,6 +3099,45 @@ func anyPhaseRunsTheDefaultTurnCap(cfg *config.Config) bool {
 	return false
 }
 
+// --- 13. delivery PR gate ----------------------------------------------------
+
+// checkPRGate reports CLA-310's delivery gate and its one prerequisite: the
+// driver's verifier reaches GitHub through the `gh` CLI, and a delivery whose
+// PR is CONFLICTING or carries NO checks is refused when it runs. A missing
+// `gh` is a WARN, not a FAIL — the check degrades to an explicit
+// refusal-to-verify and the run carries on, which is the package's fail-open
+// discipline — but the operator should see the gate's prerequisite BEFORE the
+// first delivery goes out unchecked.
+func checkPRGate(cfg *config.Config, e doctorEnv) check {
+	c := check{name: "pr_gate", status: pass}
+	path, err := e.lookPath("gh")
+	if err != nil {
+		c.status = warn
+		c.detail = "gh is not on PATH — deliveries naming a PR cannot be verified (an unchecked PR is not caught)"
+		c.remedy = "install the GitHub CLI (https://cli.github.com) so the driver can check mergeability and CI before accepting a delivery"
+		return c
+	}
+	c.detail = path + " present; a delivery's PR must be MERGEABLE with a passing check rollup"
+	if len(cfg.Projects) == 0 {
+		if cfg.AllowUncheckedPR {
+			c.info = append(c.info, "empty check rollups: WARNED, not refused (allow_unchecked_pr: true)")
+		} else {
+			c.info = append(c.info, "empty check rollups: REFUSED (the default; allow_unchecked_pr opts out for a repo with no CI)")
+		}
+		return c
+	}
+	// Per project, because the opt-out is per project: one line each, so a
+	// loose project is visible without grepping the config.
+	for _, p := range cfg.Projects {
+		state := "REFUSED"
+		if cfg.AllowUncheckedPRFor(p.Slug) {
+			state = "WARNED"
+		}
+		c.info = append(c.info, "empty rollups["+p.Slug+"]: "+state+" (allow_unchecked_pr)")
+	}
+	return c
+}
+
 // --- rendering ---------------------------------------------------------------
 
 // checkLabelWidth is the column the check names are padded to. Wide enough for
@@ -2228,4 +3188,136 @@ func plural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// --- run-config in force (CLA-410) -------------------------------------------
+
+// checkRunConfigs reports, per target, WHICH execution config the loop will run
+// under — the local file, or a stored plane document overlaid on it — plus any
+// machine-fit warnings about the STORED dials. The plane validates shape; only
+// this machine can see whether a dial it ratified can actually fire (a turn cap
+// under opencode, a cost ceiling on a harness that never reports cost), which is
+// the validation split the design memo draws.
+//
+// Never FAILs on plane trouble: an unreadable stored document leaves the loop
+// running its previous config (the same posture applyReload takes), so doctor
+// says WARN and keeps `doctor && run` usable.
+func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
+	type rcTarget struct {
+		name string // "" for the unnamed single target
+		url  string
+	}
+	var targets []rcTarget
+	for _, p := range cfg.Projects {
+		targets = append(targets, rcTarget{name: p.Slug, url: cfg.ProjectEndpoint(p)})
+	}
+	if len(cfg.Projects) == 0 {
+		targets = append(targets, rcTarget{url: cfg.BacklogEndpoint()})
+	}
+
+	src := "defaults"
+	if s := cfg.Source(); s != "" {
+		src = s
+	}
+
+	var checks []check
+	for _, t := range targets {
+		name := t.name
+		label := "run-config"
+		if name != "" {
+			label += "[" + name + "]"
+		}
+		newRCfg := e.newRCfgAPI
+		if newRCfg == nil {
+			// An env literal that predates the seam (every existing test) still
+			// gets production wiring, not a nil call.
+			newRCfg = plane.NewRunConfigAPI
+		}
+		rc := newRCfg(t.url, e.apiKey)
+		st, err := rc.RunConfig(ctx)
+		switch {
+		case errors.Is(err, plane.ErrNotWired):
+			// No endpoint or no key: nothing to compare against, and the backlog
+			// wiring check already reports that gap. Silence here is not hiding
+			// a finding; it is declining to duplicate one.
+			continue
+		case errors.Is(err, plane.ErrNoConfig):
+			checks = append(checks, check{
+				name:   label,
+				status: pass,
+				detail: "local rules (" + src + ") - nothing stored on the plane",
+			})
+			continue
+		case err != nil:
+			checks = append(checks, check{
+				name:   label,
+				status: warn,
+				detail: fmt.Sprintf("unreadable (%v) - local rules (%s) stay in force", err, src),
+				remedy: "check the plane is reachable; the loop keeps its previous config until the document fetches",
+			})
+			continue
+		}
+
+		c := check{name: label, status: pass}
+		var doc config.RunConfigDoc
+		if err := json.Unmarshal(st.Config, &doc); err != nil {
+			c.status = warn
+			c.detail = fmt.Sprintf("stored v%d undecodable (%v) - local rules (%s) stay in force", st.Version, err, src)
+			c.remedy = "re-propose a valid document from the console or propose-config"
+			checks = append(checks, c)
+			continue
+		}
+		if doc.Empty() {
+			c.detail = fmt.Sprintf("stored v%d sets nothing consumable - local rules (%s) in force", st.Version, src)
+			checks = append(checks, c)
+			continue
+		}
+		eff := cfg.Clone()
+		eff.ApplyRunConfig(&doc)
+		if err := eff.Validate(); err != nil {
+			c.status = warn
+			c.detail = fmt.Sprintf("stored v%d REFUSED locally (%v) - local rules (%s) stay in force", st.Version, err, src)
+			c.remedy = "fix the stored document and ratify again; until then the loop ignores it"
+			checks = append(checks, c)
+			continue
+		}
+		c.detail = fmt.Sprintf("stored v%d overlaid on %s", st.Version, src)
+		if st.Pending {
+			c.detail += "; a proposed change awaits ratification"
+		}
+		// Machine-fit notes on the STORED dials: what shape-validates but cannot
+		// fire here. Each names the dial as stored, so the operator edits the
+		// document rather than hunting their local file for a line they have.
+		var inert []string
+		if doc.MaxTurns > 0 {
+			var blind []string
+			for _, h := range eff.SpawnedHarnesses() {
+				if !harnessHonoursMaxTurns(h) {
+					blind = append(blind, h)
+				}
+			}
+			if len(blind) > 0 {
+				inert = append(inert, fmt.Sprintf("max_turns=%d is INERT under %s (it takes no turn flag)", doc.MaxTurns, strings.Join(blind, "/")))
+			}
+		}
+		if doc.MaxSessionWallClock > 0 {
+			if dial, on := inertSessionWallClock(eff); dial == "max_session_wall_clock" && on != "" {
+				inert = append(inert, fmt.Sprintf("max_session_wall_clock is INERT under %s (it enforces no session clock)", on))
+			}
+		}
+		if b := doc.Budget; b != nil {
+			for _, h := range slices.Sorted(maps.Keys(b.PerHarness)) {
+				if hb := b.PerHarness[h]; hb.MaxCostUSD > 0 && !harnessReportsCost(h) {
+					inert = append(inert, fmt.Sprintf("budget.per_harness[%s].max_cost_usd is INERT (%s never reports cost)", h, h))
+				}
+			}
+		}
+		if len(inert) > 0 {
+			c.status = warn
+			c.detail += "; " + strings.Join(inert, "; ")
+			c.remedy = "these dials ride along harmlessly but bound nothing on this machine"
+		}
+		checks = append(checks, c)
+	}
+	return checks
 }

@@ -22,7 +22,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -46,8 +45,11 @@ var ErrQuestionNotFiled = errors.New("task parked but the question was not filed
 
 // Releaser hands a claim back to the queue.
 type Releaser interface {
-	// Release ends the run holding taskID and returns the task to `ready`, so the
-	// next iteration can claim it immediately instead of waiting out a dead lease.
+	// Release ends the run holding taskID as `released` (never `failed`) and
+	// returns a no-WIP task to `ready`, so the next iteration can claim it
+	// immediately instead of waiting out a dead lease. It sends `release: true`,
+	// the plane's hand-an-unfinished-claim-back primitive (CLA-246), which also
+	// leaves the reclaim budget untouched.
 	//
 	// It must only be called for a task with NO work-in-progress branch recorded.
 	// Releasing one that HAS a branch would be actively worse than doing nothing:
@@ -72,6 +74,14 @@ type Releaser interface {
 // It is a SEPARATE interface from Releaser on purpose. The driver type-asserts for
 // it, so a Releaser that cannot attest (a not-wired plane, a test double) degrades
 // to warn-only rather than failing to compile or failing to run.
+
+// Heartbeat renews an active claim's lease. The loop calls it periodically
+// while a session holds a claim, so the 30-minute lease does not expire
+// mid-session (CLA-358).
+type Heartbeat interface {
+	Heartbeat(ctx context.Context, runID string) error
+}
+
 type Attester interface {
 	AttestMergeVerified(ctx context.Context, taskID, runID string, d Delivery, verified bool) error
 }
@@ -154,7 +164,13 @@ type ParkAPI interface {
 
 type notWired struct{}
 
-func (notWired) Release(context.Context, string, string) error { return ErrNotWired }
+func (notWired) Release(context.Context, string, string) error    { return ErrNotWired }
+func (notWired) Heartbeat(context.Context, string) error          { return ErrNotWired }
+func (notWired) PeekNextTask(context.Context) (NextTask, error)   { return NextTask{}, ErrNotWired }
+func (notWired) TaskRepo(context.Context, string) (string, error) { return "", ErrNotWired }
+func (notWired) TaskState(context.Context, string) (TaskState, error) {
+	return TaskState{}, ErrNotWired
+}
 
 // New builds a Releaser. Missing either the endpoint or the key yields a
 // not-wired one, so an operator running without a configured plane is degraded
@@ -165,6 +181,36 @@ func New(mcpURL, apiKey string) Releaser {
 	if mcpURL == "" || apiKey == "" {
 		return notWired{}
 	}
+	return wiredClient(mcpURL, apiKey)
+}
+
+// NewRunConfigAPI builds the run-config half of the surface: reading the stored
+// execution config and proposing one. Missing either the endpoint or the key
+// yields the not-wired client, degrading exactly like New.
+//
+// The not-wired value is deliberately a DIFFERENT type from New's: each
+// constructor hands out only its own capabilities, so a caller type-asserting
+// for one it did not ask for gets a refusal, not a silent claim (the same
+// property plane_test.go asserts for Recorder and ParkAPI).
+//
+// mcpURL is the project-scoped MCP endpoint (`https://…/mcp/<slug>`).
+func NewRunConfigAPI(mcpURL, apiKey string) RunConfigAPI {
+	if mcpURL == "" || apiKey == "" {
+		return rcNotWired{}
+	}
+	return wiredClient(mcpURL, apiKey)
+}
+
+// rcNotWired is NewRunConfigAPI's not-wired answer — only what RunConfigAPI
+// names, so it cannot be asserted into a capability nobody requested.
+type rcNotWired struct{}
+
+func (rcNotWired) RunConfig(context.Context) (*RunConfigState, error) { return nil, ErrNotWired }
+func (rcNotWired) ProposeRunConfig(context.Context, map[string]any, string) error {
+	return ErrNotWired
+}
+
+func wiredClient(mcpURL, apiKey string) *mcpReleaser {
 	return &mcpReleaser{
 		endpoint: strings.TrimRight(mcpURL, "/"),
 		apiKey:   apiKey,
@@ -182,18 +228,17 @@ func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("release: taskId and runId are both required")
 	}
-	// `status: ready` is what returns the task to the claimable queue. It clears
-	// the holder and — unlike the plane's own expiry sweep — does not charge the
-	// task a reclaim, which is the whole point of releasing rather than going
-	// quiet. `runId` signs the write, so the revision is credited to this run.
-	//
-	// No `outcome` is sent on purpose: the session may have written one, and this
-	// call is a handback, not a report. Clobbering its words would lose the only
-	// trace of what actually happened.
+	// `release: true` is the plane's hand-an-unfinished-claim-back primitive
+	// (CLA-246): it returns a no-WIP task to the claimable queue WITHOUT charging
+	// it a reclaim, and — unlike moving it with a status — records the run as
+	// `released`, never `failed`. It cannot be combined with `status` or
+	// `delivery` (a bare release IS the call; the plane refuses the combination),
+	// and no `outcome` is sent: the session may have written one, and this call is
+	// a handback, not a report.
 	return r.call(ctx, "update_task", map[string]any{
-		"taskId": taskID,
-		"runId":  runID,
-		"status": "ready",
+		"taskId":  taskID,
+		"runId":   runID,
+		"release": true,
 	})
 }
 
@@ -342,41 +387,12 @@ func (r *mcpReleaser) AttestMergeVerified(ctx context.Context, taskID, runID str
 	})
 }
 
-// call performs one MCP `tools/call` and reports whether it succeeded.
+// call performs one MCP `tools/call` and reports whether it succeeded. Callers
+// that also need the result's text payload (the task reads) use callText
+// directly; this is the fire-and-forget form the writes use.
 func (r *mcpReleaser) call(ctx context.Context, tool string, args map[string]any) error {
-	body, err := json.Marshal(map[string]any{
-		"jsonrpc": "2.0",
-		"id":      1,
-		"method":  "tools/call",
-		"params":  map[string]any{"name": tool, "arguments": args},
-	})
-	if err != nil {
-		return err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.endpoint, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+r.apiKey)
-	req.Header.Set("Content-Type", "application/json")
-	// Streamable HTTP may answer with either shape; ask for both and parse either.
-	req.Header.Set("Accept", "application/json, text/event-stream")
-
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s: HTTP %d: %s", tool, resp.StatusCode, strings.TrimSpace(string(raw)))
-	}
-	return checkResult(tool, raw)
+	_, err := r.callText(ctx, tool, args)
+	return err
 }
 
 // checkResult decodes a tools/call response and turns a transport-level or
@@ -436,4 +452,16 @@ func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
 		return fmt.Errorf("refusing redirect: %w", err)
 	}
 	return nil
+}
+
+// Heartbeat renews a live claim's lease. It is the driver-side renewal (CLA-358):
+// the loop calls it periodically while a session lives, so a >30-minute session
+// does not have its lease expire and become a stale take-over offer.
+func (r *mcpReleaser) Heartbeat(ctx context.Context, runID string) error {
+	if runID == "" {
+		return errors.New("heartbeat: runId is required")
+	}
+	return r.call(ctx, "heartbeat", map[string]any{
+		"runId": runID,
+	})
 }

@@ -46,6 +46,20 @@ func okEnv() doctorEnv {
 			}
 			return " sleep                0\n displaysleep        10\n", nil
 		},
+		// The deploy_lag seams (CLA-322). No fixture config sets health_url, so
+		// these only have to answer honestly rather than well: a stamp-less
+		// health read warns before the git seams are ever touched, and the git
+		// stub refuses loudly instead of panicking on nil.
+		fetchHealth: func(context.Context, string) (deployHealth, error) {
+			return deployHealth{}, nil
+		},
+		repos: func(context.Context, string) []string { return nil },
+		gitRun: func(context.Context, string, ...string) (string, error) {
+			return "", errors.New("okEnv runs no git")
+		},
+		// The fleet seam (CLA-466): an empty-body probe that succeeds, i.e. a
+		// plane that is reachable and accepts the key. Tests break it explicitly.
+		fleetProbe: func(context.Context, string, string) error { return nil },
 	}
 }
 
@@ -418,9 +432,11 @@ func mustResolveStateDir(t *testing.T, cfg *config.Config) string {
 }
 
 // A leftover marker is the failure that looks exactly like "the backlog was
-// empty": the loop stops on its first tick and exits clean.
+// empty": the loop stops on its first tick and exits clean. The CLA-461
+// restart/reload markers are the same class — a surprise re-exec or reload on
+// the first tick instead of a surprise stop — so every one of the five must warn.
 func TestStateDirLeftoverMarkersWarn(t *testing.T) {
-	for _, marker := range []string{"HALT", "STOP"} {
+	for _, marker := range []string{"HALT", "STOP", "RESTART", "RESTART_NOW", "RELOAD"} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := validCfg(t)
 			stateDir := mustResolveStateDir(t, cfg)
@@ -1062,37 +1078,63 @@ func TestSessionCheckFailsOpencodePointedAtAClaudeShapedConfig(t *testing.T) {
 	}
 }
 
-// The other two opencode shapes must NOT fail. An absent path is normal - opencode
-// carries its own config - and a present non-Claude file is one doctor has no
-// schema to judge. Both get the caveat instead of a verdict, so a PASS is never
-// read as "the clankerbar wiring is there".
-func TestSessionCheckDoesNotClaimMCPWiringForOpencode(t *testing.T) {
-	native := filepath.Join(t.TempDir(), "opencode.json")
+// The absent opencode path must NOT fail: opencode legitimately carries its own
+// config, and doctor cannot parse that schema - that case keeps the caveat. But
+// a CONFIGURED opencode file is the statement, and doctor can now read it
+// (CLA-448): a file that is present and silent about clankerbar is exactly the
+// tool-less-session config that burned CLA-351 and CLA-377 to parked, so it
+// FAILs rather than earning the caveat.
+func TestSessionCheckVerifiesOpencodeConfigNamesClankerbar(t *testing.T) {
+	dir := t.TempDir()
+	native := filepath.Join(dir, "opencode.json")
 	if err := os.WriteFile(native, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	silent := filepath.Join(dir, "silent.json")
+	if err := os.WriteFile(silent, []byte(`{"mcp":{"context7":{"type":"remote","url":"https://context7.example/v1"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	disabled := filepath.Join(dir, "disabled.json")
+	if err := os.WriteFile(disabled, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj","enabled":false}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	cases := []struct {
-		name          string
-		mcpConfigPath string
-	}{
-		{"none is configured", ""},
-		{"an opencode-shaped config is configured", native},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), tc.mcpConfigPath, "opencode")
-			if c.status != pass {
-				t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
-			}
-			if strings.Contains(c.detail, ".mcp.json") {
-				t.Errorf("the verdict line must not rest on the .mcp.json for opencode, got %q", c.detail)
-			}
-			if !strings.Contains(strings.Join(c.info, "\n"), "OPENCODE_CONFIG") {
-				t.Errorf("an opencode workdir must SAY where its MCP servers come from, got info %q", c.info)
-			}
-		})
-	}
+	t.Run("none is configured -> caveat, not a verdict", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "", "opencode")
+		if c.status != pass {
+			t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(strings.Join(c.info, "\n"), "not checked") {
+			t.Errorf("an unconfigured opencode workdir must say the wiring was not checked, got info %q", c.info)
+		}
+	})
+
+	t.Run("a configured opencode file that names clankerbar passes and names it", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), native, "opencode")
+		if c.status != pass {
+			t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(strings.Join(c.info, "\n"), "clankerbar MCP server: https://clankerbar.com/mcp/proj") {
+			t.Errorf("a configured opencode workdir must NAME the wired clankerbar URL, got info %q", c.info)
+		}
+	})
+
+	t.Run("a configured opencode file silent about clankerbar fails", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), silent, "opencode")
+		if c.status != fail {
+			t.Fatalf("silent opencode config: got %v, want FAIL (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(c.remedy, "clankerbar") {
+			t.Errorf("the remedy must name the missing clankerbar entry, got %q", c.remedy)
+		}
+	})
+
+	t.Run("a configured opencode file with clankerbar disabled fails", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), disabled, "opencode")
+		if c.status != fail {
+			t.Fatalf("disabled clankerbar config: got %v, want FAIL (%s)", c.status, c.detail)
+		}
+	})
 }
 
 // The backstop for the hole the first fix left: it gated the arm on a `switch`
@@ -1151,7 +1193,7 @@ func TestEveryRegisteredHarnessIsClassifiedByTheWorkdirCheck(t *testing.T) {
 // report green about a directory the loop will never use.
 func TestSessionFallsBackToTopLevelWorkDir(t *testing.T) {
 	parent := multiRepoParent(t, "AGENTS.md")
-	if err := os.WriteFile(filepath.Join(parent, ".mcp.json"), []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(parent, ".mcp.json"), []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/acme"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1180,7 +1222,7 @@ func TestSessionFallsBackToTopLevelWorkDir(t *testing.T) {
 func TestSessionFallsBackToTopLevelMCPConfig(t *testing.T) {
 	parent := multiRepoParent(t, "AGENTS.md")
 	mcp := filepath.Join(t.TempDir(), ".mcp.json")
-	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/acme"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1474,7 +1516,7 @@ func TestPermissionsOpencodeEnvOverrideWarns(t *testing.T) {
 		Harness: "opencode",
 		Prompt:  "x",
 		WorkDir: t.TempDir(),
-		Env:     map[string]string{"OPENCODE_PERMISSION": `{"bash":"allow"}`},
+		Env:     config.EnvMap{"OPENCODE_PERMISSION": {Literal: `{"bash":"allow"}`}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
@@ -1557,6 +1599,75 @@ func TestBudgetSetIsReported(t *testing.T) {
 	}
 	if c.status != warn {
 		t.Errorf("a run ceiling without session guards: got %v, want WARN (CLA-344)", c.status)
+	}
+}
+
+// --- pr_gate (CLA-310) -------------------------------------------------------
+
+// The gate's prerequisite must be seen before it fires: without gh on PATH
+// every delivery naming a PR goes out as could-not-verify. That degrades the
+// run rather than stopping it, so it is a WARN — but a doctor that passed it
+// in silence would be exactly the quiet gap this task exists to close.
+func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
+	e := okEnv()
+	e.lookPath = func(file string) (string, error) {
+		if file == "gh" {
+			return "", errors.New("not found")
+		}
+		return "/usr/local/bin/" + file, nil
+	}
+
+	c := checkPRGate(validCfg(t), e)
+	if c.status != warn {
+		t.Errorf("missing gh: got %v, want WARN", c.status)
+	}
+	if !strings.Contains(c.detail, "gh is not on PATH") || c.remedy == "" {
+		t.Errorf("detail should name the missing prerequisite with a remedy: %q / %q", c.detail, c.remedy)
+	}
+}
+
+func TestPRGateWithGHPassesAndNamesTheDefault(t *testing.T) {
+	cfg := validCfg(t)
+
+	c := checkPRGate(cfg, okEnv())
+	if c.status != pass {
+		t.Errorf("gh present, default config: got %v, want PASS", c.status)
+	}
+	found := false
+	for _, line := range c.info {
+		if strings.Contains(line, "REFUSED") && strings.Contains(line, "allow_unchecked_pr") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("an untouched config should be told the default refuses empty rollups: %q", c.info)
+	}
+}
+
+// The opt-out is per project, so a multi-project config gets one line each:
+// the loose project must be visible by name, not averaged into one aggregate.
+func TestPRGateNamesPerProjectOptOut(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Projects = []config.Project{
+		{Slug: "strict"},
+		{Slug: "loose", AllowUncheckedPR: true},
+	}
+
+	c := checkPRGate(cfg, okEnv())
+	if c.status != pass {
+		t.Errorf("gh present: got %v, want PASS", c.status)
+	}
+	var strict, loose bool
+	for _, line := range c.info {
+		if strings.Contains(line, "[strict]") && strings.Contains(line, "REFUSED") {
+			strict = true
+		}
+		if strings.Contains(line, "[loose]") && strings.Contains(line, "WARNED") {
+			loose = true
+		}
+	}
+	if !strict || !loose {
+		t.Errorf("per-project lines missing: %q", c.info)
 	}
 }
 
@@ -1767,7 +1878,7 @@ func TestDoctorRunPrintsTheCodexMCPCaveat(t *testing.T) {
 		t.Fatal(err)
 	}
 	mcp := filepath.Join(dir, ".mcp.json")
-	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(t.TempDir(), "clankerbar.json")
@@ -1855,11 +1966,11 @@ func TestDoctorAcceptsTheSameConfigNamedExplicitly(t *testing.T) {
 // credential and doctor output is what an operator pastes into an issue.
 func TestConfigCheckNamesEnvKeysWithoutValues(t *testing.T) {
 	cfg := validCfg(t)
-	cfg.Env = map[string]string{"ZED": "zzz", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secret"}
+	cfg.Env = config.EnvMap{"ZED": {Literal: "zzz"}, "CLAUDE_CODE_OAUTH_TOKEN": {Literal: "sk-ant-oat01-secret"}}
 
 	c := checkConfig(cfg)
 	joined := strings.Join(c.info, "\n")
-	if !strings.Contains(joined, "env: CLAUDE_CODE_OAUTH_TOKEN, ZED") {
+	if !strings.Contains(joined, "env[env]: CLAUDE_CODE_OAUTH_TOKEN, ZED") {
 		t.Errorf("config check should list the env keys, sorted:\n%s", joined)
 	}
 	if strings.Contains(joined, "sk-ant-oat01-secret") || strings.Contains(joined, "zzz") {
@@ -1868,9 +1979,10 @@ func TestConfigCheckNamesEnvKeysWithoutValues(t *testing.T) {
 }
 
 // A checkout's .mcp.json can declare a server that RUNS something at session
-// start, before any permission rule applies. doctor names them: CLA-257 polices
-// where that file may send the API key, not what it may start, and the gap was
-// silent.
+// start, before any permission rule applies. Since CLA-266 a discovered file
+// refuses them unless the operator allowlists the name — so the realistic
+// fixture is exactly that: an allowed discovered entry must still be NAMED here
+// (allowing is not hiding), beside the list that admitted it.
 func TestMCPServersCheckNamesLocalCommands(t *testing.T) {
 	dir := t.TempDir()
 	body := `{"mcpServers":{
@@ -1879,14 +1991,22 @@ func TestMCPServersCheckNamesLocalCommands(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cfg := validCfgIn(t, dir)
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{Harness: "claude", Prompt: "Work the backlog.", WorkDir: dir, AllowLocalMCPServers: []string{"docs"}}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
 
 	c := checkMCPServers(cfg)
 	if c.status != warn {
 		t.Fatalf("want WARN for a local-command MCP server, got %v (%s)", c.status, c.detail)
 	}
-	if !strings.Contains(strings.Join(c.info, "\n"), "docs") {
-		t.Errorf("the entry should be named:\n%s", strings.Join(c.info, "\n"))
+	joined := strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "docs") {
+		t.Errorf("the entry should be named:\n%s", joined)
+	}
+	if !strings.Contains(joined, "allow_local_mcp_servers") {
+		t.Errorf("the list that admitted it should be shown too:\n%s", joined)
 	}
 	if c.remedy == "" {
 		t.Error("a WARN must carry a remedy")
@@ -1925,11 +2045,15 @@ func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 
 	for _, want := range []string{
 		"config", "harness", "config_dir", "backlog",
-		"state_dir", "workdir", "mcp_servers", "permissions", "toolchains", "budget",
+		"state_dir", "workdir", "stranded", "mcp_servers", "permissions", "toolchains", "budget",
 		// power has three WARN branches, two of which are the "doctor does not
 		// know the sleep policy" states — exactly the kind of line that is useless
 		// without a remedy.
 		"power",
+		// deploy_lag reports even when unconfigured: one quiet PASS naming the
+		// field, so the feature is discoverable without warning anyone who
+		// opted out (CLA-322).
+		"deploy_lag",
 	} {
 		c := find(t, checks, want)
 		if c.detail == "" {
@@ -2055,6 +2179,30 @@ func TestPowerFieldMissingWarnsRatherThanPasses(t *testing.T) {
 	}
 }
 
+// An assertions output doctor does not recognise must not buy a PASS from that
+// read. The old fail-open returned true for any PreventUserIdleSystemSleep line
+// whose last token was not an integer, so checkPower reported PASS without ever
+// consulting `pmset -g` — short-circuiting exactly the branches CLA-250 added.
+// Falling through is strictly safer: with idle sleep enabled this lands in the
+// WARN, and with it disabled in the correct PASS — it cannot invent a problem.
+func TestPowerUnrecognisedAssertionLineFallsThroughToSettings(t *testing.T) {
+	assertions := "   PreventUserIdleSystemSleep       0 (inactive)\n"
+
+	c := checkPower(context.Background(), pmsetEnv(assertions, " sleep                10\n"))
+	if c.status != warn {
+		t.Fatalf("unrecognised assertion line, idle sleep enabled: got %v, want the settings-read WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "10 min") {
+		t.Errorf("should reach CLA-250's settings branch naming the timeout, got %q", c.detail)
+	}
+
+	// Same unrecognised assertions, sleep disabled: the fall-through yields the
+	// correct PASS from the settings read rather than a PASS guessed at upstream.
+	if c := checkPower(context.Background(), pmsetEnv(assertions, " sleep                0\n")); c.status != pass {
+		t.Errorf("unrecognised assertion line, sleep disabled: got %v, want PASS from the settings read (%s)", c.status, c.detail)
+	}
+}
+
 func TestPowerSkippedOffDarwin(t *testing.T) {
 	e := okEnv()
 	e.goos = "linux"
@@ -2067,8 +2215,21 @@ func TestPowerSkippedOffDarwin(t *testing.T) {
 	}
 }
 
-// The summary row lists the assertion name with a count even when nothing holds
-// it, so presence of the NAME proves nothing — only a non-zero count does.
+// Only two shapes are evidence of a held assertion: the summary row (exactly
+// the assertion name and an integer count, nothing else) and a per-process
+// detail line beginning `pid <n>(<proc>):`. The detail-line fixtures were
+// captured live from `pmset -g assertions` on 2026-08-22 rather than invented —
+// the point of CLA-306 is precisely that a guessed-at format is how the
+// fail-open got in.
+//
+// Everything else mentioning the name is NOT proven held and falls through: the
+// previous test (a last token that failed Atoi meant "held") answered YES for
+// every shape it did not recognise, including Apple appending a token to the
+// summary row — which turned into an unconditional PASS ahead of the branch
+// CLA-250 had just hardened. The trailing-token rule cuts both ways: a row that
+// carries anything beyond name-plus-count is unknown whether the count reads
+// zero or non-zero. And the detail line is matched on the raw line because the
+// process name inside the parens may itself contain spaces.
 func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -2076,9 +2237,16 @@ func TestHoldsNoIdleSleepReadsTheCount(t *testing.T) {
 		want bool
 	}{
 		{"zero count is not held", "   PreventUserIdleSystemSleep       0\n", false},
-		{"non-zero count is held", "   PreventUserIdleSystemSleep       1\n", true},
-		{"named holder is held", `   PreventUserIdleSystemSleep       1
-       pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"non-zero count is held", "   PreventUserIdleSystemSleep     1\n", true},
+		{"real detail line is held", "   pid 33594(caffeinate): [0x0029efa0000196db] 00:00:01 PreventUserIdleSystemSleep named: \"caffeinate command-line tool\"  \n", true},
+		{"minimal detail line is held", `   pid 42(caffeinate): PreventUserIdleSystemSleep named: "caffeinate"`, true},
+		{"detail line with spaces in the process name is held", `   pid 123(Google Chrome Helper): [0x0001] 00:00:01 PreventUserIdleSystemSleep named: "Helper"  `, true},
+		{"detail line with nested parens in the process name is held", `   pid 123(Google Chrome Helper (Renderer)): [0x0002] 00:00:01 PreventUserIdleSystemSleep named: "Helper"  `, true},
+		{"detail line with a non-numeric pid is not proven held", `   pid abc(caffeinate): PreventUserIdleSystemSleep`, false},
+		{"summary row with appended token is not proven held", "   PreventUserIdleSystemSleep       0 (inactive)\n", false},
+		{"summary row with non-zero count and appended token is not proven held", "   PreventUserIdleSystemSleep       1 (inactive)\n", false},
+		{"summary row with unparseable count is not proven held", "   PreventUserIdleSystemSleep      ?? \n", false},
+		{"name alone is not proven held", "PreventUserIdleSystemSleep\n", false},
 		{"absent entirely", "   PreventUserIdleDisplaySleep      0\n", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2556,5 +2724,64 @@ func TestBudgetEmptyPerHarnessBlockIsNamed(t *testing.T) {
 	c := checkBudget(cfg)
 	if !strings.Contains(c.detail, "per_harness[claude]") || !strings.Contains(c.detail, "no ceiling set") {
 		t.Errorf("an empty per-harness block was passed over in silence: %q", c.detail)
+	}
+}
+
+// CLA-441: an opencode config the driver never named, whose `clankerbar` server
+// points at a different project, is a WARN with the file named. Not a FAIL -
+// spawned sessions are pinned past it by OPENCODE_CONFIG_CONTENT, and the file
+// is frequently a checked-in artifact of somebody else's repo - and not silence,
+// because every interactive session in that tree still gets the wrong backlog.
+func TestDoctorWarnsOnAnAmbientOpencodeConfigNamingAnotherProject(t *testing.T) {
+	workdir := t.TempDir()
+	configDir := t.TempDir()
+	mcp := filepath.Join(workdir, "opencode-mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/ezyapp"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	global := filepath.Join(configDir, "opencode.jsonc")
+	if err := os.WriteFile(global, []byte(`{
+  // interactive setup, pointed at the other project
+  "mcp": { "clankerbar": { "type": "remote", "url": "https://clankerbar.com/mcp/clankerbar" } }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// opencode's global config dirs are ~/.opencode and
+	// $XDG_CONFIG_HOME/opencode (defaulting under HOME), so BOTH are isolated:
+	// the second half of this test asserts PASS, which would otherwise answer to
+	// whatever config root the machine or the CI image happens to have set
+	// (CLA-441 second review).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness:       "opencode",
+		Prompt:        "Work the next backlog item.",
+		WorkDir:       workdir,
+		MCPConfigPath: mcp,
+		Harnesses:     map[string]config.HarnessConfig{"opencode": {ConfigDir: configDir}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
+
+	c := checkOpencodeAmbientConfigs(cfg)
+	if c.status != warn {
+		t.Fatalf("status = %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), global) {
+		t.Errorf("the check must name the file the operator has to go and edit; info = %v", c.info)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN without a remedy is a line an operator can do nothing with")
+	}
+
+	// ...and a run whose files all agree is silent about the whole mechanism.
+	if err := os.WriteFile(global, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/ezyapp"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkOpencodeAmbientConfigs(cfg); c.status != pass {
+		t.Errorf("status = %v, want PASS once the file names the project this run drains (%s)", c.status, c.detail)
 	}
 }

@@ -100,10 +100,35 @@ func parseHandoff(final string) (prompt string, found bool, refusal string) {
 //     it is not read for claim state (CLA-262): the block may be cut mid-prompt,
 //     and half a session-authored prompt is worse than none. The untrusted path
 //     already logs loudly, so nothing is added here.
+//
 //   - only a CLEAN exit hands off. A turn-capped or failed session's final
 //     message is wherever it happened to stop, not a deliberate ending.
+//
 //   - the session must still HOLD its task: the successor resumes the same run,
-//     so a settled or never-claimed task leaves nothing to resume.
+//     so a settled or never-claimed task leaves nothing to resume. The two ways
+//     that happens are logged as themselves (CLA-421), because they are
+//     different situations with different consequences.
+//
+//     A SETTLED task means the session moved it off in_progress itself -
+//     done, in_review, parked, blocked (settlesTask: any status but
+//     in_progress) - and there is genuinely no run to resume. The
+//     refusal is final and correct.
+//
+//     NO OBSERVED CLAIM means the adapter never saw this session claim anything,
+//     so the driver holds no task/run ids - and without them the resume
+//     preamble cannot be seeded: handing the successor a brief carrying literal
+//     placeholders is worse than refusing. A marker from an unobserved claim is
+//     therefore refused even though the plain checkpoint path now CAN recover
+//     ids from the plane (CLA-451): there the successor runs a DRIVER-authored
+//     brief on the task the driver itself dispatched, while here the marker
+//     would seed a SESSION-authored prompt, and the guards against self-directed
+//     injection were sized for sessions whose claim state was observed. The
+//     refusal stays as stated, and any lease the session did take is left to
+//     expire — or, since CLA-451, handed to the next phase when the plane
+//     confirms the briefed task held with a verified branch. Otherwise the
+//     plane's expiry sweep is the path that still gets the work picked up with
+//     its context intact: it keeps a recorded branch attached as the takeover
+//     hand-off.
 func detectHandoff(drainNum int, t Target, res harness.Result) string {
 	prompt, found, refusal := parseHandoff(res.FinalMessage)
 	if !found || res.Untrusted != "" {
@@ -114,9 +139,13 @@ func detectHandoff(drainNum int, t Target, res harness.Result) string {
 		log.Printf("%siteration %d: handoff marker ignored — the session did not end cleanly (%s), so its final message is not a deliberate handoff",
 			labelOf(t), drainNum, res.ExitString())
 		return ""
-	case !res.Claim.Held():
-		log.Printf("%siteration %d: handoff marker ignored — the session no longer holds a task, so there is no run for a successor to resume",
+	case res.Claim.TaskID == "":
+		log.Printf("%siteration %d: handoff marker ignored — the driver observed no claim from this session, so it has no task/run ids to seed a successor's resume from; any lease the session took is left to expire, where the plane keeps a recorded branch attached as the takeover hand-off",
 			labelOf(t), drainNum)
+		return ""
+	case res.Claim.Settled:
+		log.Printf("%siteration %d: handoff marker ignored — the session settled %s itself (moved it off in_progress), so there is no run for a successor to resume",
+			labelOf(t), drainNum, res.Claim.TaskID)
 		return ""
 	case refusal != "":
 		log.Printf("%siteration %d: handoff refused — %s; falling back to the normal path",

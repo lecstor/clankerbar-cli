@@ -63,6 +63,15 @@ type Summary struct {
 	// breaker built on version would never fire on the runs that most need it.
 	InReview int
 	Done     int
+
+	// RunConfigVersion is the execution-config's own monotonic counter (CLA-408):
+	// 0 = never set (the CLI's local file rules), N >= 1 = a stored document is in
+	// force at version N. A CHANGE between polls is the loop's edit signal — it
+	// re-fetches get_project_run_config and applies the document at that iteration
+	// boundary, never mid-session. Absent from an older plane's payload it decodes
+	// to 0, which is also "nothing stored", so an old plane degrades to today's
+	// behaviour with no version negotiation — the same shape StaleClaimable rides.
+	RunConfigVersion int
 }
 
 // Settled is the count of work that has reached a reviewer or is finished — the
@@ -279,20 +288,23 @@ func parseSummary(body []byte) (Summary, error) {
 		StaleClaimable int  `json:"staleClaimable"`
 		OpenQuestions  int  `json:"openQuestions"`
 		LoopPaused     bool `json:"loopPaused"`
+
+		RunConfigVersion int `json:"runConfigVersion"`
 	}
 	if err := json.Unmarshal(trimmed, &payload); err != nil {
 		return Summary{}, fmt.Errorf("decode backlog summary: %w", err)
 	}
 	return Summary{
-		Version:        payload.Version,
-		Ready:          payload.Counts.Ready,
-		Claimable:      payload.Claimable,
-		StaleClaimable: payload.StaleClaimable,
-		InProgress:     payload.Counts.InProgress,
-		OpenQuestions:  payload.OpenQuestions,
-		Paused:         payload.LoopPaused,
-		InReview:       payload.Counts.InReview,
-		Done:           payload.Counts.Done,
+		Version:          payload.Version,
+		Ready:            payload.Counts.Ready,
+		Claimable:        payload.Claimable,
+		StaleClaimable:   payload.StaleClaimable,
+		InProgress:       payload.Counts.InProgress,
+		OpenQuestions:    payload.OpenQuestions,
+		Paused:           payload.LoopPaused,
+		InReview:         payload.Counts.InReview,
+		Done:             payload.Counts.Done,
+		RunConfigVersion: payload.RunConfigVersion,
 	}, nil
 }
 
