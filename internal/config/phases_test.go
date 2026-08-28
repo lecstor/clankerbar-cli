@@ -268,22 +268,26 @@ func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
 }
 
 // CLA-544: a wall-clock kill earns a checkpoint only with WIP, and WIP is a
-// branch the salvage recorded — which requires something in the worktree. The
-// sessions that killed CLA-529 and CLA-531 three times each made not one Edit,
-// Write or Create call: they read and planned for their whole lives, the kill
-// landed on a clean worktree, nothing was salvageable, and the no-progress
-// ladder parked the task. The brief must demand a first commit EARLY — before
-// the design is fully settled — and commits as it goes, so a kill lands on
-// salvageable work instead of on nothing.
+// branch recorded on the TASK — the session's own update_task(branch), or the
+// salvage recording one. The salvage refuses a clean worktree on purpose
+// (salvage.go: "The one thing that must NOT happen here is recording a branch"),
+// so a commit nobody pushed and recorded is as invisible to the plane as no
+// commit at all. The sessions that killed CLA-529 and CLA-531 three times each
+// made not one Edit, Write or Create call: they read and planned for their
+// whole lives, the kill landed on a clean worktree, nothing was salvageable,
+// and the no-progress ladder parked the task. The brief must therefore demand a
+// first commit EARLY — before the design is fully settled — then push it and
+// RECORD the branch, and commit and push as it goes, so a kill lands on a
+// checkpoint instead of on nothing.
 //
 // The trigger is an EVENT, never a duration: a session cannot read its own
 // wall clock (the same constraint that shaped handoffGuidance), so "commit
 // within fifteen minutes" is not implementable — a skeleton, a failing test, a
 // stub with the signatures are events it can recognise. And the clause is a
-// FLOOR, not a ceiling: it must not read as licence to commit broken or
-// half-considered code as a habit, nor to push work that has not been
-// self-verified — the terminal step's bar (self-verify, then COMMIT, PUSH,
-// record the branch) is unchanged.
+// FLOOR, not a ceiling: checkpoint pushes are WIP, not deliveries — the
+// terminal step's bar (self-verify, then COMMIT, PUSH, record the branch) is
+// unchanged, and a checkpoint push must not be passed off as the self-verified
+// terminal delivery.
 func TestBuiltinImplementBriefDemandsAnEarlyCommit(t *testing.T) {
 	brief, ok := builtinPhasePrompts[ImplementPhaseName]
 	if !ok {
@@ -298,17 +302,22 @@ func TestBuiltinImplementBriefDemandsAnEarlyCommit(t *testing.T) {
 		"first commit",
 		"before the design is fully settled",
 		"skeleton, a failing test, a stub with the signatures",
-		"commit as you go rather than once at the end",
+		"commit and push as you go rather than once at the end",
+		"push it and record the branch",
+		"update_task(taskid, runid, branch)",
+		"record it as soon as the first commit is pushed",
+		"not only at the end",
 		"uncommitted worktree is lost",
-		"a committed one is a checkpoint the next phase resumes from",
+		"a local commit nobody pushed and recorded is lost the same way",
+		"the next phase resumes from the branch recorded on the task",
 		"earlier floor",
 		"does not lower the ceiling",
 		"terminal step's bar is unchanged",
 		"not licence to commit broken or half-considered code as a habit",
-		"push work that has not been self-verified",
+		"pass a checkpoint push off as the self-verified terminal delivery",
 	} {
 		if !strings.Contains(lower, want) {
-			t.Errorf("the implement brief never says %q — the first commit must be demanded early, anchored to an event the session can recognise:\n%s", want, brief)
+			t.Errorf("the implement brief never says %q — the first commit must be demanded early, anchored to an event the session can recognise, and pushed and recorded so the plane can checkpoint it:\n%s", want, brief)
 		}
 	}
 

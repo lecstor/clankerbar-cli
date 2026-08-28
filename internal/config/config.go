@@ -509,31 +509,42 @@ const implementCloseOutRule = "If next_task instead offers an approved-awaiting-
 	"for found work, not this offer. Ending that way is the task going to plan, not the task being abandoned."
 
 // implementCommitEarlyRule is the implement brief's checkpoint floor (CLA-544):
-// get a first commit down EARLY, before the design is fully settled, and commit
-// as you go rather than once at the end. CLA-529 and CLA-531 were each handed
-// back empty three times on 2026-08-28: the four heaviest sessions contained
-// not one Edit, Write or Create tool call - each read and planned for its whole
-// life, a wall-clock kill ended it with a clean worktree, and nothing was
-// salvageable. The driver's checkpoint line (loop.go) earns a wall-clock-killed
-// session a checkpoint only with WIP, and WIP is a branch the salvage recorded
-// - which requires something in the tree. A first commit is the cheapest way to
-// put something there.
+// get a first commit down EARLY, before the design is fully settled - and push
+// it and RECORD the branch on the task as soon as that first commit is down -
+// then commit and push as you go rather than once at the end. CLA-529 and
+// CLA-531 were each handed back empty three times on 2026-08-28: the four
+// heaviest sessions contained not one Edit, Write or Create tool call - each
+// read and planned for its whole life, a wall-clock kill ended it with a clean
+// worktree, and nothing was salvageable.
+//
+// The mechanism is the driver's checkpoint line (loop.go): a wall-clock-killed
+// session earns a checkpoint only with HasWIP, and HasWIP means a branch
+// recorded on the TASK - the session's own update_task(branch), or the salvage
+// recording one. The salvage refuses a clean worktree on purpose (salvage.go:
+// "The one thing that must NOT happen here is recording a branch"), so a commit
+// nobody pushed and recorded is as invisible to the plane as no commit at all.
+// The clause therefore names all three acts - commit, push, record - because
+// the record is the checkpoint, and it must land as soon as the first commit is
+// pushed, not only at the terminal step.
 //
 // Two constraints shaped the wording. The trigger is an EVENT, never a
 // duration: a session cannot read its own wall clock (the constraint that
 // shaped handoffGuidance), so "commit within fifteen minutes" is not
 // implementable; a skeleton, a failing test, a stub with the signatures are
-// events it can recognise. And the clause is a FLOOR, not a ceiling: it must
-// not read as licence to commit broken or half-considered code as a habit, nor
-// to push work that has not been self-verified - the terminal step's bar
-// (self-verify, then commit, push, record the branch) is unchanged.
-const implementCommitEarlyRule = " COMMIT EARLY and COMMIT AS YOU GO: get a first commit down before the design is fully " +
-	"settled - a skeleton, a failing test, a stub with the signatures, the first thing that compiles - and " +
-	"commit as you go rather than once at the end. An uncommitted worktree is lost when a session ends " +
-	"early; a committed one is a checkpoint the next phase resumes from. This adds an earlier floor, it does " +
-	"not lower the ceiling: the terminal step's bar is unchanged - self-verify, then COMMIT, PUSH, and " +
-	"record the branch - and checkpoint commits are not licence to commit broken or half-considered code as " +
-	"a habit, nor to push work that has not been self-verified."
+// events it can recognise. And the clause is a FLOOR, not a ceiling: checkpoint
+// pushes are WIP, not deliveries - the terminal step's bar (self-verify, then
+// commit, push, record the branch) is unchanged, and a checkpoint push must not
+// be passed off as the self-verified terminal delivery.
+const implementCommitEarlyRule = " COMMIT EARLY, PUSH EARLY, RECORD EARLY: get a first commit down before the design is fully " +
+	"settled - a skeleton, a failing test, a stub with the signatures, the first thing that compiles - then " +
+	"push it and record the branch with update_task(taskId, runId, branch), and commit and push as you go " +
+	"rather than once at the end. A checkpoint is a branch the plane was told about: an uncommitted " +
+	"worktree is lost when a session ends early, and a local commit nobody pushed and recorded is lost the " +
+	"same way - the next phase resumes from the branch recorded on the task, so record it as soon as the " +
+	"first commit is pushed, not only at the end. This adds an earlier floor, it does not lower the ceiling: " +
+	"the terminal step's bar is unchanged - self-verify, then COMMIT, PUSH, and record the branch - and " +
+	"checkpoint commits are not licence to commit broken or half-considered code as a habit, nor to pass a " +
+	"checkpoint push off as the self-verified terminal delivery."
 
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
