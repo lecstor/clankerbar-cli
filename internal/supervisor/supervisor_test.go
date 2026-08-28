@@ -211,6 +211,17 @@ func writeInstanceConfigRepo(t *testing.T, dir, name, mode, stateDir, primary st
 	}
 }
 
+// writeInstanceConfigPolicy is writeInstanceConfig with a settings_path
+// declared, so the permission-policy gate (phase 2c) has a file to verify.
+func writeInstanceConfigPolicy(t *testing.T, dir, name, mode, stateDir, settingsPath string) {
+	t.Helper()
+	t.Setenv(helperModeEnv, mode)
+	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "settings_path": %q}`, stateDir, settingsPath)
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // countRuns reports how many iteration-*.log files the fake has written into
 // stateDir — i.e. how many times that instance has been spawned.
 func countRuns(t *testing.T, stateDir string) int {
@@ -688,6 +699,129 @@ func TestEnumerateSkipsNonConfigs(t *testing.T) {
 	if d.instances[0].path != filepath.Join(dir, "a.json") {
 		t.Fatalf("kept %s, want a.json", d.instances[0].path)
 	}
+}
+
+// The permission-policy gate (phase 2c): an instance whose settings_path names
+// a file that does not exist is refused at enumeration — no child is ever
+// spawned for it, the refusal names the daemon and the path tried, and the
+// rest of the fleet keeps running.
+func TestPermissionPolicyAbsentSpawnsNothing(t *testing.T) {
+	dir := t.TempDir()
+	goodState := filepath.Join(t.TempDir(), "state-good")
+	ghostState := filepath.Join(t.TempDir(), "state-ghost")
+	policy := filepath.Join(t.TempDir(), "headless.json")
+	if err := os.WriteFile(policy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "headless-missing.json")
+	writeInstanceConfigPolicy(t, dir, "good.json", "sleep", goodState, policy)
+	writeInstanceConfigPolicy(t, dir, "ghost.json", "sleep", ghostState, missing)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	// The instance whose policy file exists spawns and runs.
+	waitFor(t, 5*time.Second, "the instance with a policy file to come up", func() bool {
+		return countRuns(t, goodState) == 1
+	})
+	// The refused instance must NEVER spawn, however long the fleet runs.
+	time.Sleep(300 * time.Millisecond)
+	if got := countRuns(t, ghostState); got != 0 {
+		t.Fatalf("spawns for the refused instance = %d, want 0 — a missing permission policy must spawn nothing", got)
+	}
+	// The refusal is loud and names the daemon and the policy path that was
+	// tried.
+	logText := buf.String()
+	if !strings.Contains(logText, missing) {
+		t.Fatalf("the refusal log does not name the policy path tried %q:\n%s", missing, logText)
+	}
+	if !strings.Contains(logText, "ghost") {
+		t.Fatalf("the refusal log does not name the refused daemon:\n%s", logText)
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+	if got := countRuns(t, ghostState); got != 0 {
+		t.Fatalf("spawns for the refused instance after the stop = %d, want 0", got)
+	}
+}
+
+// The spawn-time gate (phase 2c): a policy file deleted AFTER the instance was
+// admitted refuses the next respawn — the running child is untouched (it
+// already has its policy loaded), but the child-start gate must not start a
+// new one without the file. Once the file is restored, the backoff retry
+// respawns the child.
+func TestPermissionPolicyRemovedAfterStartRefusesRespawn(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	policy := filepath.Join(t.TempDir(), "headless.json")
+	if err := os.WriteFile(policy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeInstanceConfigPolicy(t, dir, "daemon.json", "sleep", state, policy)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+	// Take the policy away, then kill the child so the supervisor must respawn.
+	if err := os.Remove(policy); err != nil {
+		t.Fatal(err)
+	}
+	pid := spawnPid(t, buf.String())
+	if pid <= 0 {
+		t.Fatalf("no spawned pid in the log:\n%s", buf.String())
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	// The respawn must be refused, naming the daemon and the policy path.
+	waitFor(t, 5*time.Second, "the refused respawn to be logged", func() bool {
+		return strings.Contains(buf.String(), "refusing to start") && strings.Contains(buf.String(), policy)
+	})
+	if got := countRuns(t, state); got != 1 {
+		t.Fatalf("spawns after the policy file was removed = %d, want 1 — the gate must not start a child without its policy", got)
+	}
+	// Restore the policy file: the next backoff retry starts the child again.
+	if err := os.WriteFile(policy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the child to be respawned once the policy file is back", func() bool {
+		return countRuns(t, state) == 2
+	})
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
 }
 
 // backoffDelay is the pure schedule: double from the base up to the cap, and
