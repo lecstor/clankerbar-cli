@@ -1556,24 +1556,28 @@ func checkStranded(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	var lines []string
 	withFindings, unchecked := 0, 0
 	for _, repo := range repos {
-		findings, failed := strandedFindings(ctx, e.gitRun, repo)
-		if failed {
+		report, found := strandedFindings(ctx, e.gitRun, repo)
+		// A repo is counted as unchecked when none of its lines is a REAL
+		// finding — read failure, or every per-tip comparison failed: its only
+		// lines are errors, and the summary sentence must not read it as work
+		// that exists only on this machine. A repo with findings counts as one
+		// that holds stranded commits even when a line beside them is an error.
+		if len(report) > 0 && !found {
 			unchecked++
 		}
-		if len(findings) == 0 {
-			continue
-		}
-		// A repo that could not be read at all is counted as unchecked, never
-		// as one that HOLDS stranded commits: its only "finding" is the error
-		// line, and the summary sentence must not read it as work on no remote.
-		if !failed {
+		if found {
 			withFindings++
 		}
-		for _, f := range findings {
-			if multi {
-				f = repo + ": " + f
+		for _, f := range report {
+			// Error lines name the repo even when it is the only one in scope:
+			// the remedy points at "the repo named above", and a bare "could
+			// not enumerate" line names nothing. Finding lines stay bare — the
+			// ref or worktree path is the handle a human rescues by — and take
+			// the repo prefix only when more than one repo is in scope.
+			if multi || f.err {
+				f.text = repo + ": " + f.text
 			}
-			lines = append(lines, f)
+			lines = append(lines, f.text)
 		}
 	}
 
@@ -1634,15 +1638,26 @@ func strandedRepos(ctx context.Context, cfg *config.Config, e doctorEnv) []strin
 	}
 
 	// delivery.Repos returns working-tree dirs deduplicated by repository, so
-	// linked worktrees never double-report. Dedupe across the per-project scans
-	// too: several projects routinely share the top-level workdir.
+	// linked worktrees never double-report. The declared checkouts can collide
+	// with the scan the other way round — a declared path that is a WORKTREE of
+	// a repo the scan also found: two paths, one repository. Dedupe the
+	// combined list by the shared git directory, the same identity
+	// candidateRepos uses, so a repository is checked once no matter how many
+	// of its trees the config names.
 	seen := map[string]bool{}
 	var out []string
 	add := func(dir string) {
 		if dir == "" {
 			return
 		}
-		if key := resolvePath(dir); !seen[key] {
+		key := repoCommonDir(ctx, e.gitRun, dir)
+		if key == "" {
+			// The repo could not be read at all: keep it on its path — the
+			// check's error line will say why — rather than silently dropping
+			// it under a key we cannot know.
+			key = resolvePath(dir)
+		}
+		if !seen[key] {
 			seen[key] = true
 			out = append(out, dir)
 		}
@@ -1677,21 +1692,50 @@ func repoHasSlug(repo, workdir, slug string) bool {
 	return strings.HasPrefix(filepath.Base(repo), slug)
 }
 
-// strandedFindings returns one line per tip of repo that reaches a commit no
-// remote-tracking ref reaches, and whether the repo could not be fully read.
+// repoCommonDir is the shared git directory of a checkout — the identity a
+// repository keeps across all its working trees. The main checkout reports
+// ".git" relative to itself, a linked worktree reports the common dir as an
+// absolute path; both are normalised to the same resolved path, so two trees
+// of one repo compare equal. Empty when the repo cannot be read.
+func repoCommonDir(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), dir string) string {
+	out, err := gitRun(ctx, dir, "rev-parse", "--git-common-dir")
+	if err != nil || out == "" {
+		return ""
+	}
+	if !filepath.IsAbs(out) {
+		out = filepath.Join(dir, out)
+	}
+	return resolvePath(out)
+}
+
+// strandedLine is one report line for a repo: a finding naming a tip that
+// reaches stranded commits, or an error line naming a git read that failed.
+// err lines are prefixed with the repo path by the caller even in single-repo
+// mode, so the repo the remedy points at ("run the failing git command by hand
+// in the repo named above") is actually named; finding lines stay bare, the
+// ref or worktree path being the handle a human rescues by.
+type strandedLine struct {
+	text string
+	err  bool
+}
+
+// strandedFindings returns the lines to report for one repository — a finding
+// per tip that reaches a commit no remote-tracking ref reaches, and an error
+// line per git read that failed — and whether any line is a REAL finding
+// (commits established to exist only on this machine).
 //
 // A finding names the ref (a branch) or the worktree path (a detached HEAD —
 // the only handle a detached commit has), how many commits are stranded, and
 // the newest one's subject and date: the three facts a human needs to tell live
 // work from debris at a glance.
-func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), repo string) ([]string, bool) {
+func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir string, args ...string) (string, error), repo string) ([]strandedLine, bool) {
 	branches, err := gitRun(ctx, repo, "for-each-ref", "--format=%(refname:short) %(objectname)", "refs/heads")
 	if err != nil {
-		return []string{"could not enumerate the local branches: " + err.Error()}, true
+		return []strandedLine{{text: "could not enumerate the local branches: " + err.Error(), err: true}}, false
 	}
 	listing, err := gitRun(ctx, repo, "worktree", "list", "--porcelain")
 	if err != nil {
-		return []string{"could not enumerate the worktrees: " + err.Error()}, true
+		return []strandedLine{{text: "could not enumerate the worktrees: " + err.Error(), err: true}}, false
 	}
 
 	// Tips, deduplicated by sha with the branch name winning: a detached HEAD
@@ -1723,7 +1767,7 @@ func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir 
 
 	remotes, err := gitRun(ctx, repo, "for-each-ref", "refs/remotes")
 	if err != nil {
-		return []string{"could not read the remote-tracking refs: " + err.Error()}, true
+		return []strandedLine{{text: "could not read the remote-tracking refs: " + err.Error(), err: true}}, false
 	}
 	if remotes == "" {
 		// No remote-tracking refs at all: every local commit qualifies, and
@@ -1731,7 +1775,7 @@ func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir 
 		// state instead — the whole repository is on no remote.
 		all, err := gitRun(ctx, repo, strandedRevListArgs(shas)...)
 		if err != nil {
-			return []string{"could not enumerate the local commits: " + err.Error()}, true
+			return []strandedLine{{text: "could not enumerate the local commits: " + err.Error(), err: true}}, false
 		}
 		if all == "" {
 			return nil, false
@@ -1739,36 +1783,40 @@ func strandedFindings(ctx context.Context, gitRun func(ctx context.Context, dir 
 		n := strings.Count(all, "\n") + 1
 		subject, date, err := newestCommit(ctx, gitRun, repo, firstLine(all))
 		if err != nil {
-			return []string{fmt.Sprintf("no remote-tracking refs — %s exist only on this machine, but the newest could not be read: %s",
-				plural(n, "1 commit", fmt.Sprintf("%d commits", n)), err.Error())}, false
+			return []strandedLine{{text: fmt.Sprintf("no remote-tracking refs — %s exist only on this machine, but the newest could not be read: %s",
+				plural(n, "1 commit", fmt.Sprintf("%d commits", n)), err.Error()), err: true}}, true
 		}
-		return []string{fmt.Sprintf("no remote-tracking refs — %s exist only on this machine, newest %q (%s)",
-			plural(n, "1 commit", fmt.Sprintf("%d commits", n)), truncate(subject, 60), date)}, false
+		return []strandedLine{{text: fmt.Sprintf("no remote-tracking refs — %s exist only on this machine, newest %q (%s)",
+			plural(n, "1 commit", fmt.Sprintf("%d commits", n)), truncate(subject, 60), date)}}, true
 	}
 
-	var lines []string
+	var lines []strandedLine
+	found := false
 	for _, sha := range shas {
 		stranded, err := gitRun(ctx, repo, "rev-list", sha, "--not", "--remotes")
 		if err != nil {
-			lines = append(lines, names[sha]+": could not compare against the remotes: "+err.Error())
+			lines = append(lines, strandedLine{text: names[sha] + ": could not compare against the remotes: " + err.Error(), err: true})
 			continue
 		}
 		if stranded == "" {
 			continue
 		}
+		// The rev-list output above IS the finding — commits established to be
+		// on no remote — even when the newest one's subject cannot be read.
+		found = true
 		// rev-list prints newest first, one sha per line; the runner trimmed the
 		// trailing newline, so a non-empty list has count = newlines + 1.
 		n := strings.Count(stranded, "\n") + 1
 		subject, date, err := newestCommit(ctx, gitRun, repo, firstLine(stranded))
 		if err != nil {
-			lines = append(lines, fmt.Sprintf("%s: %s stranded, but the newest could not be read: %s",
-				names[sha], plural(n, "1 commit", fmt.Sprintf("%d commits", n)), err.Error()))
+			lines = append(lines, strandedLine{text: fmt.Sprintf("%s: %s stranded, but the newest could not be read: %s",
+				names[sha], plural(n, "1 commit", fmt.Sprintf("%d commits", n)), err.Error()), err: true})
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("%s: %s, newest %q (%s)",
-			names[sha], plural(n, "1 commit", fmt.Sprintf("%d commits", n)), truncate(subject, 60), date))
+		lines = append(lines, strandedLine{text: fmt.Sprintf("%s: %s, newest %q (%s)",
+			names[sha], plural(n, "1 commit", fmt.Sprintf("%d commits", n)), truncate(subject, 60), date)})
 	}
-	return lines, false
+	return lines, found
 }
 
 // strandedRevListArgs builds `rev-list <tips...> --not --remotes`: every commit

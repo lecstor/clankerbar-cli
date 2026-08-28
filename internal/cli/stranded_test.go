@@ -8,6 +8,7 @@ package cli
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
@@ -416,5 +417,81 @@ func TestStranded_MixedUncheckableAndFindingRepos(t *testing.T) {
 	}
 	if len(c.info) != 2 {
 		t.Fatalf("got %d lines, want the error line and the finding line: %v", len(c.info), c.info)
+	}
+}
+
+// The same repository reachable by two paths — a declared `repos` entry
+// pointing at a WORKTREE of a repo the workdir scan also found — must be
+// checked ONCE: two trees of one repo share a ref database, so checking both
+// would double-report every finding and double-count the repo in the summary.
+func TestStranded_OneRepoReachableByTwoPathsIsCheckedOnce(t *testing.T) {
+	e := strandedEnvOnBranch(t, "clanker/abcd1234-ours")
+	gitT(t, e.wt, "commit", "-q", "--allow-empty", "-m", "stranded once, reported once")
+
+	// The declared path is the WORKTREE, not the main checkout: a different
+	// directory, the same repository.
+	cfg := validCfgIn(t, e.root)
+	cfg.Projects = []config.Project{{Slug: "repo", Repos: map[string]string{"owner/repo": e.wt}}}
+
+	c := checkStranded(context.Background(), cfg, realGitEnv(t))
+
+	if c.status != warn {
+		t.Fatalf("status = %v (%s), want WARN", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "1 of 1 repo") || !strings.Contains(c.detail, "hold commits") {
+		t.Errorf("the repo must be counted once, got %q", c.detail)
+	}
+	if len(c.info) != 1 {
+		t.Fatalf("got %d finding lines, want exactly one (the same commits reported once): %v", len(c.info), c.info)
+	}
+	if !strings.Contains(c.info[0], "clanker/abcd1234-ours") {
+		t.Errorf("the one line should name the stranded branch: %q", c.info[0])
+	}
+}
+
+// A repo whose per-tip comparison fails everywhere established no stranded
+// commit: it counts as UNCHECKED ("could not be fully checked"), never as one
+// that holds commits, and its error line names the repo even when it is the
+// only one in scope — the remedy points at "the repo named above".
+func TestStranded_RepoWhoseComparisonsAllFailCountsAsUnchecked(t *testing.T) {
+	repo := filepath.Join(t.TempDir(), "repo-a")
+	e := okEnv()
+	e.repos = func(context.Context, string) []string { return []string{repo} }
+	e.gitRun = func(_ context.Context, dir string, args ...string) (string, error) {
+		switch args[0] {
+		case "rev-parse":
+			return "/repo-a/.git", nil
+		case "for-each-ref":
+			if len(args) > 1 && args[len(args)-1] == "refs/remotes" {
+				return "refs/remotes/origin/main", nil
+			}
+			return "main 1111111111111111111111111111111111111111", nil
+		case "worktree":
+			return "", nil
+		case "rev-list":
+			return "", errors.New("boom")
+		}
+		return "", nil
+	}
+
+	c := checkStranded(context.Background(), validCfgIn(t, t.TempDir()), e)
+
+	if c.status != warn {
+		t.Fatalf("status = %v (%s), want WARN", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "1 of 1 repo could not be fully checked") {
+		t.Errorf("detail should say the repo could not be fully checked, got %q", c.detail)
+	}
+	if strings.Contains(c.detail, "hold commits") {
+		t.Errorf("a repo whose comparison failed must not be reported as holding stranded commits: %q", c.detail)
+	}
+	if len(c.info) != 1 {
+		t.Fatalf("got %d lines, want the one error line: %v", len(c.info), c.info)
+	}
+	if !strings.HasPrefix(c.info[0], repo+": ") {
+		t.Errorf("the error line must name the repo even in single-repo mode: %q", c.info[0])
+	}
+	if !strings.Contains(c.info[0], "could not compare against the remotes") {
+		t.Errorf("the error line should say what failed: %q", c.info[0])
 	}
 }
