@@ -4,6 +4,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -158,10 +159,17 @@ func TestOpencode2Parse_ignoresNonTextParts(t *testing.T) {
 }
 
 func TestOpencode2Env(t *testing.T) {
-	in := Invocation{MCPConfigPath: "/tmp/v2.json", ConfigDir: "/tmp/v2cfg", Env: []string{"XDG_DATA_HOME=/tmp/d"}}
-	env := (opencode2{}).env(in)
-	if !containsEnv(env, "OPENCODE_CONFIG=/tmp/v2.json") {
-		t.Errorf("env missing OPENCODE_CONFIG=/tmp/v2.json: %v", env)
+	cfgPath := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(cfgPath, []byte(`{"mcp": "pin"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	in := Invocation{MCPConfigPath: cfgPath, ConfigDir: "/tmp/v2cfg", Env: []string{"XDG_DATA_HOME=/tmp/d"}}
+	env, err := (opencode2{}).env(in)
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	if !containsEnv(env, "OPENCODE_CONFIG="+cfgPath) {
+		t.Errorf("env missing OPENCODE_CONFIG=%s: %v", cfgPath, env)
 	}
 	// The fail-closed permission policy is exported, the same shape the stable
 	// adapter exports. beta-18314 does NOT honor the env var (verified: the
@@ -174,28 +182,70 @@ func TestOpencode2Env(t *testing.T) {
 	if !containsEnv(env, "XDG_DATA_HOME=/tmp/d") {
 		t.Errorf("env missing caller XDG var: %v", env)
 	}
+	// The content pin: the same bytes the v1 adapter pins, because beta-18314
+	// merges OPENCODE_CONFIG_CONTENT after every other layer (verified — see
+	// the adapter doc), so the driver's file must be the last word. The pin
+	// reads the config file and FAILS CLOSED when it cannot.
+	if got := envValue(env, "OPENCODE_CONFIG_CONTENT"); got != `{"mcp": "pin"}` {
+		t.Errorf("OPENCODE_CONFIG_CONTENT = %q, want the config file's bytes", got)
+	}
 	// A caller's OPENCODE_PERMISSION still wins (exec takes the last dup key):
 	// the same override ordering as the stable adapter.
 	in.Env = append(in.Env, "OPENCODE_PERMISSION={\"*\":\"allow\"}")
-	env = (opencode2{}).env(in)
+	env, err = (opencode2{}).env(in)
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
 	if got := envValue(env, "OPENCODE_PERMISSION"); got != `{"*":"allow"}` {
 		t.Errorf("caller OPENCODE_PERMISSION must win, got %q", got)
 	}
 	// config_dir maps to NOTHING: beta-18314's config discovery is hardcoded
-	// (~/.claude, ~/.agents, ~/.config/opencode2, ~/.opencode) and the
-	// OPENCODE_CONFIG_DIR-named variable steers only the plugin dir, so the
-	// adapter must not pretend to pin config with it (see the adapter doc).
-	if containsEnvPrefix(env, "OPENCODE_CONFIG_DIR=") {
-		t.Errorf("env sets OPENCODE_CONFIG_DIR — must not: config discovery is hardcoded and config_dir maps to nothing: %v", env)
+	// (~/.claude, <cwd>/.claude, ~/.agents, ~/.config/opencode2, ~/.opencode)
+	// and the OPENCODE_CONFIG_DIR-named variable steers only the plugin dir, so
+	// the adapter must not pretend to pin config with it (see the adapter doc).
+	// Asserted on the DELTA: the adapter inherits whatever the ambient
+	// environment carries (an operator's wrapper legitimately sets it), it just
+	// never adds it.
+	if added := addedEnv(env, os.Environ()); addedEnvHasPrefix(added, "OPENCODE_CONFIG_DIR=") {
+		t.Errorf("env sets OPENCODE_CONFIG_DIR — must not: config discovery is hardcoded and config_dir maps to nothing: %v", added)
 	}
 	// With an empty Invocation the adapter appends nothing of its own beyond
 	// what the ambient environment already carries.
-	added := addedEnv((opencode2{}).env(Invocation{}), os.Environ())
+	added := addedEnv(env2(t, Invocation{}), os.Environ())
 	for _, e := range added {
-		if strings.HasPrefix(e, "OPENCODE_CONFIG=") || strings.HasPrefix(e, "OPENCODE_CONFIG_DIR=") {
+		if strings.HasPrefix(e, "OPENCODE_CONFIG=") || strings.HasPrefix(e, "OPENCODE_CONFIG_DIR=") || strings.HasPrefix(e, "OPENCODE_CONFIG_CONTENT=") {
 			t.Errorf("empty Invocation must not append %q", e)
 		}
 	}
+}
+
+func TestOpencode2EnvFailClosed(t *testing.T) {
+	// The content pin reads the config file the driver named; a file that
+	// cannot be read must refuse to spawn rather than launch a session whose
+	// last config word is ambient (the CLA-441 defect class). Mirror of the
+	// stable adapter's fail-closed test.
+	_, err := (opencode2{}).env(Invocation{MCPConfigPath: "/nonexistent/opencode2.json"})
+	if err == nil {
+		t.Fatal("env with an unreadable MCPConfigPath must fail closed")
+	}
+}
+
+func env2(t *testing.T, in Invocation) []string {
+	t.Helper()
+	env, err := (opencode2{}).env(in)
+	if err != nil {
+		t.Fatalf("env: %v", err)
+	}
+	return env
+}
+
+func addedEnvHasPrefix(env []string, prefix string) bool {
+	for _, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // envValue returns the LAST occurrence of key in env — the one exec actually

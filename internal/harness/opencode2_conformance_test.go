@@ -160,9 +160,10 @@ func TestOpencode2Conformance(t *testing.T) {
 			if fake.hit.Load() == 0 {
 				t.Fatal("fake provider was never hit — opencode2 resolved a real provider instead of fake/fake-model. NOTE: that run may have spent real tokens")
 			}
-			if res.ExitCode != 0 {
-				t.Errorf("ExitCode = %d, want 0 (stderr: %.200s)", res.ExitCode, res.Stderr)
-			}
+			// Exit-code expectations are script-specific: the stop script ends
+			// 0 cleanly with the answer, while the quiet script is the #43622
+			// shape that beta-18314 makes exit 1 (loud failure) — see the
+			// switch below, which pins each direction.
 			if res.FinalMessage != "OK" {
 				t.Errorf("FinalMessage = %q, want %q", res.FinalMessage, "OK")
 			}
@@ -185,6 +186,9 @@ func TestOpencode2Conformance(t *testing.T) {
 			//     build does not exhibit the silent signature).
 			switch script {
 			case "stop":
+				if res.ExitCode != 0 {
+					t.Errorf("ExitCode = %d, want 0 (stderr: %.200s)", res.ExitCode, res.Stderr)
+				}
 				if res.UsageReported {
 					t.Error("UsageReported = true — beta-18314 does not surface the provider usage block on a plain text answer")
 				}

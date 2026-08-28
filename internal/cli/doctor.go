@@ -553,7 +553,7 @@ var authMarkers = map[string][]string{
 	"claude":    {".credentials.json", ".claude.json", "settings.json"},
 	"codex":     {"auth.json", "config.toml"},
 	"opencode":  {"auth.json", "config.json"},
-	"opencode2": {"opencode.jsonc", "auth.json"}, // the 2.x preview config lives at ~/.config/opencode/opencode.jsonc
+	"opencode2": {"opencode.json", "opencode.jsonc", "auth.json"}, // the 2.x preview config lives at ~/.config/opencode2/opencode.json (verified against beta-18314 via `opencode2 debug config`); auth.json covers the credentials file it keeps
 }
 
 // checkConfigDir reports on the run harness's config dir. See checkConfigDirs,

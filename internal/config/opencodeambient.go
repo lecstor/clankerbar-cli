@@ -191,11 +191,16 @@ func (c *Config) opencodeAmbientScopes() []ambientScope {
 			globals = append(globals, expandHome(dir))
 		}
 		// opencode2 reads its own config dir (~/.config/opencode2 by default,
-		// verified against beta-18314 via `opencode2 debug config`), plus the
-		// same hardcoded ~/.claude / ~/.agents and ~/.opencode discovery the
-		// v1 line uses — XDG_CONFIG_HOME moves NONE of them. A run that spawns
-		// opencode2 gets the v2 dir scanned so the audit is not blind to the
-		// file an operator actually edits (docs/opencode2.md).
+		// verified against beta-18314 via `opencode2 debug config`), plus its
+		// own hardcoded ~/.claude, <cwd>/.claude, ~/.agents and ~/.opencode
+		// discovery — XDG_CONFIG_HOME moves NONE of them. ~/.opencode is
+		// already in the v1 scan (opencodeGlobalConfigDirs), which the widened
+		// spawnsOpencode applies to both lines; ~/.claude and ~/.agents are NOT
+		// scanned by this audit for any harness (their file-level merge surface
+		// on the beta is unverified, and this audit only reports files a
+		// session actually loads). This function adds the one dir that is
+		// opencode2's own and would otherwise be invisible to the audit — the
+		// file an operator actually edits for the beta (docs/opencode2.md).
 		if c.spawnsOpencode2() {
 			globals = append(globals, opencode2GlobalConfigDirs()...)
 		}

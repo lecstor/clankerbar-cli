@@ -385,14 +385,23 @@ func TestOpencode2GlobalDirIsNotScannedForV1Runs(t *testing.T) {
 	}
 }
 
-func TestOpencode2RunScansDeclaredConfigDir(t *testing.T) {
+func TestOpencode2DeclaredConfigDirIsNotScanned(t *testing.T) {
+	// `harnesses.opencode2.config_dir` is INERT on the v2 adapter: the adapter
+	// deliberately never maps it to OPENCODE_CONFIG_DIR (which on the beta
+	// steers the PLUGIN dir, verified — redirecting plugins to the fleet's
+	// config dir would silently detach the operator's plugin setup), and the
+	// beta's config-file discovery is hardcoded. So no v2 session loads a file
+	// in the declared config_dir, and the audit must not report one there —
+	// reporting it would send the operator to edit a file no session loads
+	// (the same standard the v1 scan's comment states). The v1 line's tests
+	// scan the declared dir because the v1 adapter DOES map it to
+	// OPENCODE_CONFIG_DIR, a real merge layer for 1.x.
 	cfg := opencode2Run(t, "proj", t.TempDir())
 	dir := t.TempDir()
 	cfg.Harnesses = map[string]HarnessConfig{"opencode2": {ConfigDir: dir}}
 	writeAmbientFile(t, filepath.Join(dir, "opencode.json"),
 		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}}`)
-	got := cfg.OpencodeAmbientConflicts()
-	if c := onlyConflict(t, got); c.Got != "other" {
-		t.Errorf("conflict = %+v, want the declared config_dir's redirect surfaced", c)
+	if got := cfg.OpencodeAmbientConflicts(); len(got) != 0 {
+		t.Errorf("inert declared config_dir must not be scanned: %+v", got)
 	}
 }

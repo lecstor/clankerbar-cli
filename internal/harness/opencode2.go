@@ -45,14 +45,17 @@ func init() { Register(opencode2{}) }
 //     `mcp.servers` (the operator's own v2 config and `opencode2 debug config`
 //     corroborate it). `OPENCODE_CONFIG` points at the config file, a custom
 //     `npm: @ai-sdk/openai-compatible` provider block is accepted, and the
-//     provider-qualified `--model` form works. `OPENCODE_CONFIG_DIR` is NOT
-//     set by this adapter: it steers the PLUGIN dir (verified: a plugin under
+//     provider-qualified `--model` form works. The file's bytes are ALSO
+//     pinned as `OPENCODE_CONFIG_CONTENT`, which beta-18314 merges after every
+//     other layer (verified 2026-08-28 — see env) — the same fail-closed pin
+//     the stable adapter ships (CLA-441): no ambient config can be the last
+//     word on a spawned session. `OPENCODE_CONFIG_DIR` is NOT set by this
+//     adapter: it steers the PLUGIN dir (verified: a plugin under
 //     `$OPENCODE_CONFIG_DIR/plugins` loads, the operator's wrapper relies on
-//     this), but config-file discovery is HARDCODED (~/.claude, ~/.agents,
-//     ~/.config/opencode2, ~/.opencode — XDG_CONFIG_HOME does not move them),
-//     so mapping `config_dir` to it would redirect plugins without pinning any
-//     config. The fleet's config file travels via `OPENCODE_CONFIG`, exactly
-//     as the stable adapter hands it.
+//     this), but config-file discovery is HARDCODED (~/.claude, <cwd>/.claude,
+//     ~/.agents, ~/.config/opencode2, ~/.opencode — XDG_CONFIG_HOME does not
+//     move them), so mapping `config_dir` to it would redirect plugins without
+//     pinning any config.
 //   - Permissions: the adapter exports the SAME fail-closed OPENCODE_PERMISSION
 //     policy the stable adapter exports (one policy to maintain, one posture
 //     for both lines). VERIFIED caveat: beta-18314 does NOT honor the env var —
@@ -103,7 +106,14 @@ func (o opencode2) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
-	cmd.Env = o.env(in)
+	env, err := o.env(in)
+	if err != nil {
+		// Nothing has been spawned yet, so this is a clean refusal to start
+		// rather than a session to classify: an empty Result, and the error the
+		// caller reports. See env's fail-closed note.
+		return Result{}, err
+	}
+	cmd.Env = env
 	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
 	// io.MultiWriter values, so os/exec makes its own pipes and cmd.Run waits
 	// for every WRITER of them to close — and CommandContext kills the direct
@@ -194,7 +204,7 @@ func opencode2Args(in Invocation) []string {
 	return append(args, "--", prompt)
 }
 
-func (opencode2) env(in Invocation) []string {
+func (opencode2) env(in Invocation) ([]string, error) {
 	env := os.Environ()
 	// Fail-closed permission policy, the SAME shape the stable adapter exports
 	// (one policy to maintain, one posture for both lines). Set before in.Env
@@ -207,17 +217,44 @@ func (opencode2) env(in Invocation) []string {
 	// that reads it; doctor says exactly this (see the type doc).
 	env = append(env, "OPENCODE_PERMISSION="+opencodePermission(in.Probe, in.WorkDir, in.ExtraDirs))
 	// OPENCODE_CONFIG_DIR is deliberately NOT set: beta-18314's config-file
-	// discovery is hardcoded (~/.claude, ~/.agents, ~/.config/opencode2,
-	// ~/.opencode — XDG_CONFIG_HOME does not move them), so `config_dir` maps
-	// to nothing. The variable that IS named that way steers the PLUGIN dir
-	// (verified), and redirecting plugins to the fleet's config dir would
+	// discovery is hardcoded (~/.claude, <cwd>/.claude, ~/.agents,
+	// ~/.config/opencode2, ~/.opencode — XDG_CONFIG_HOME does not move them,
+	// verified via `opencode2 debug config`), so `config_dir` maps to nothing.
+	// The variable that IS named that way steers the PLUGIN dir (verified: a
+	// plugin under $OPENCODE_CONFIG_DIR/plugins loads) and adds a config-dir
+	// merge layer, and redirecting plugins to the fleet's config dir would
 	// silently detach the operator's plugin setup. The config file the fleet
-	// hands over travels via OPENCODE_CONFIG, like the stable adapter.
+	// hands over travels via OPENCODE_CONFIG — plus OPENCODE_CONFIG_CONTENT,
+	// the same fail-closed pin the stable adapter ships (see below).
 	if in.MCPConfigPath != "" {
 		env = append(env, "OPENCODE_CONFIG="+in.MCPConfigPath)
+		// Pin the driver's own bytes as OPENCODE_CONFIG_CONTENT, which the beta
+		// merges AFTER every other layer — verified 2026-08-28 against
+		// beta-18314 with two configs naming different providers: whichever
+		// provider the content layer named is the one the session hit, in both
+		// directions (the same ordering the stable adapter reads out of 1.18.19
+		// — CLA-441). Without the pin, the LAST word on every key is some
+		// ambient layer's: the hardcoded ~/.config/opencode2/opencode.json, an
+		// inherited OPENCODE_CONFIG_CONTENT (this machine's wrapper carries
+		// one), or an OPENCODE_CONFIG_DIR dir — exactly the class that
+		// redirected a v1 session to another project's backlog (CLA-441). The
+		// pin costs one read of a file this process already trusts; the same
+		// two costs the stable adapter documents apply (a literal credential in
+		// the file now reaches the child's environment, and env+argv is capped
+		// around 1 MB on macOS).
+		//
+		// FAIL CLOSED on the read: the alternative — spawn with OPENCODE_CONFIG
+		// alone — is a session that starts, looks healthy, and claims from
+		// whichever project the ambient config names. A session that never
+		// starts is a loud, correct outage.
+		content, err := os.ReadFile(in.MCPConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
+		}
+		env = append(env, "OPENCODE_CONFIG_CONTENT="+string(content))
 	}
 	env = append(env, in.Env...)
-	return env
+	return env, nil
 }
 
 // opencode2Parse consumes the `--format json` stream. On the verified
@@ -255,9 +292,9 @@ func (p *opencode2Parse) line(line []byte) {
 	var ev struct {
 		Type string `json:"type"`
 		Part *struct {
-			Type   string  `json:"type"`
-			Text   string  `json:"text"`
-			Reason string  `json:"reason"`
+			Type   string `json:"type"`
+			Text   string `json:"text"`
+			Reason string `json:"reason"`
 			Tokens *struct {
 				Total     int `json:"total"`
 				Input     int `json:"input"`
@@ -421,7 +458,7 @@ func (opencode2) Capabilities() Capabilities {
 	return Capabilities{
 		TracksClaims:            false, // tool_use events exist on tool-call turns, but the adapter does not consume them for claim tracking; a phased run is refused by config.Validate
 		HonoursMaxTurns:         false,
-		HonoursSessionWallClock: true, // the process-group kill in Invoke is the phase backstop
+		HonoursSessionWallClock: true,  // the process-group kill in Invoke is the phase backstop
 		ReportsCost:             false, // a plain text answer (the common case) emits NO step_finish and the provider's usage block is not surfaced — verified against beta-18314, so budget.max_cost_usd is inert
 		HasSessionTokenCeiling:  false,
 	}
