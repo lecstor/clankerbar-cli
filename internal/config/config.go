@@ -508,6 +508,33 @@ const implementCloseOutRule = "If next_task instead offers an approved-awaiting-
 	"own instructions, and once the close-out is done STOP and end the session. The resumed-work rule below is " +
 	"for found work, not this offer. Ending that way is the task going to plan, not the task being abandoned."
 
+// implementCommitEarlyRule is the implement brief's checkpoint floor (CLA-544):
+// get a first commit down EARLY, before the design is fully settled, and commit
+// as you go rather than once at the end. CLA-529 and CLA-531 were each handed
+// back empty three times on 2026-08-28: the four heaviest sessions contained
+// not one Edit, Write or Create tool call - each read and planned for its whole
+// life, a wall-clock kill ended it with a clean worktree, and nothing was
+// salvageable. The driver's checkpoint line (loop.go) earns a wall-clock-killed
+// session a checkpoint only with WIP, and WIP is a branch the salvage recorded
+// - which requires something in the tree. A first commit is the cheapest way to
+// put something there.
+//
+// Two constraints shaped the wording. The trigger is an EVENT, never a
+// duration: a session cannot read its own wall clock (the constraint that
+// shaped handoffGuidance), so "commit within fifteen minutes" is not
+// implementable; a skeleton, a failing test, a stub with the signatures are
+// events it can recognise. And the clause is a FLOOR, not a ceiling: it must
+// not read as licence to commit broken or half-considered code as a habit, nor
+// to push work that has not been self-verified - the terminal step's bar
+// (self-verify, then commit, push, record the branch) is unchanged.
+const implementCommitEarlyRule = " COMMIT EARLY and COMMIT AS YOU GO: get a first commit down before the design is fully " +
+	"settled - a skeleton, a failing test, a stub with the signatures, the first thing that compiles - and " +
+	"commit as you go rather than once at the end. An uncommitted worktree is lost when a session ends " +
+	"early; a committed one is a checkpoint the next phase resumes from. This adds an earlier floor, it does " +
+	"not lower the ceiling: the terminal step's bar is unchanged - self-verify, then COMMIT, PUSH, and " +
+	"record the branch - and checkpoint commits are not licence to commit broken or half-considered code as " +
+	"a habit, nor to push work that has not been self-verified."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
 // The split is implement, then review-and-fix, and that grouping is deliberate:
@@ -520,6 +547,7 @@ var builtinPhasePrompts = map[string]string{
 	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
 		implementCloseOutRule + " " +
 		implementResumedBranchRule +
+		implementCommitEarlyRule +
 		" Unless you parked above or served a close-out above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
 		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +

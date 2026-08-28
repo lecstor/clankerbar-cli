@@ -267,6 +267,81 @@ func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
 	}
 }
 
+// CLA-544: a wall-clock kill earns a checkpoint only with WIP, and WIP is a
+// branch the salvage recorded — which requires something in the worktree. The
+// sessions that killed CLA-529 and CLA-531 three times each made not one Edit,
+// Write or Create call: they read and planned for their whole lives, the kill
+// landed on a clean worktree, nothing was salvageable, and the no-progress
+// ladder parked the task. The brief must demand a first commit EARLY — before
+// the design is fully settled — and commits as it goes, so a kill lands on
+// salvageable work instead of on nothing.
+//
+// The trigger is an EVENT, never a duration: a session cannot read its own
+// wall clock (the same constraint that shaped handoffGuidance), so "commit
+// within fifteen minutes" is not implementable — a skeleton, a failing test, a
+// stub with the signatures are events it can recognise. And the clause is a
+// FLOOR, not a ceiling: it must not read as licence to commit broken or
+// half-considered code as a habit, nor to push work that has not been
+// self-verified — the terminal step's bar (self-verify, then COMMIT, PUSH,
+// record the branch) is unchanged.
+func TestBuiltinImplementBriefDemandsAnEarlyCommit(t *testing.T) {
+	brief, ok := builtinPhasePrompts[ImplementPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
+	}
+	if implementCommitEarlyRule == "" {
+		t.Fatal("the implement brief has no commit-early rule")
+	}
+
+	lower := strings.ToLower(brief)
+	for _, want := range []string{
+		"first commit",
+		"before the design is fully settled",
+		"skeleton, a failing test, a stub with the signatures",
+		"commit as you go rather than once at the end",
+		"uncommitted worktree is lost",
+		"a committed one is a checkpoint the next phase resumes from",
+		"earlier floor",
+		"does not lower the ceiling",
+		"terminal step's bar is unchanged",
+		"not licence to commit broken or half-considered code as a habit",
+		"push work that has not been self-verified",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the implement brief never says %q — the first commit must be demanded early, anchored to an event the session can recognise:\n%s", want, brief)
+		}
+	}
+
+	// The anchor is an EVENT, not a duration: a session cannot measure its own
+	// wall clock, so a time budget is a rule it cannot follow.
+	for _, banned := range []string{"within 15", "within fifteen", "minute", "hour"} {
+		if strings.Contains(strings.ToLower(implementCommitEarlyRule), banned) {
+			t.Errorf("the commit-early rule anchors the first commit to a duration (%q) — a session cannot read its own wall clock:\n%s", banned, implementCommitEarlyRule)
+		}
+	}
+
+	// The clause is entry guidance for the normal flow, so it rides BEFORE the
+	// terminal checkpoint instruction — the same position pin the resumed-branch
+	// rule carries. A commit-early clause wedged after STOP would read as
+	// post-session advice nobody follows.
+	ruleIdx := strings.Index(lower, strings.ToLower(implementCommitEarlyRule))
+	stopIdx := strings.Index(lower, "then stop and end the session")
+	if ruleIdx == -1 || stopIdx == -1 {
+		t.Fatalf("commit-early rule (%d) or terminal stop (%d) missing from the brief:\n%s", ruleIdx, stopIdx, brief)
+	}
+	if ruleIdx > stopIdx {
+		t.Errorf("the commit-early rule (%d) sits after the terminal checkpoint instruction (%d); it must precede the work/stop sequence so the brief keeps its emphatic last instruction:\n%s", ruleIdx, stopIdx, brief)
+	}
+
+	// Phase 0 refuses a first-phase prompt carrying the resume placeholders —
+	// the implement brief IS phase 0, so the clause must never import them.
+	for _, ph := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder} {
+		if strings.Contains(implementCommitEarlyRule, ph) {
+			t.Errorf("the commit-early rule carries %s — the implement brief is phase 0 and refuses resume placeholders:\n%s", ph, implementCommitEarlyRule)
+		}
+	}
+}
+
 // The resume brief is useless without the ids, and they are substituted by the
 // driver — so the placeholders have to actually be in the shipped text.
 func TestBuiltinReviewPhaseCarriesTheResumePlaceholders(t *testing.T) {
