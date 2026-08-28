@@ -459,6 +459,18 @@ not starting nothing. The instance identity and the state dir are pinned
 inside it, so a daemon beacons and stops exactly as it did when its file
 lived in the config dir.
 
+**Permission policy gate (phase 2c).** The supervisor never starts a daemon
+without its permission policy: `settings_path` is the fail-closed headless
+allow/deny policy, deliberately read-only to agents — a plane that could set
+it could hand a daemon a permissive policy — and the file it names must exist
+when the daemon starts. An instance whose policy file is absent is **refused**
+— no child is spawned, and the refusal names the daemon and the policy path
+tried. The gate is checked at enumeration and again at every (re)spawn, so a
+policy file deleted while the supervisor runs stops the next respawn, not the
+running child, and a restored file is picked up by the next backoff retry. A
+config that names no `settings_path` is unaffected — it runs on the ambient
+allowlist, which `doctor` already warns about.
+
 The config dir also holds JSON that is not instance configs — MCP configs
 (`opencode-mcp.json`), headless permission policies (`headless-drain.json`),
 opencode's own config (`opencode.json`) — and the supervisor tells them apart

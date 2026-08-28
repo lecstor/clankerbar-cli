@@ -14,6 +14,12 @@
 // state dirs and the fleet beacon all behave exactly as before — identity
 // because the generated file pins it, and the state dir because the generated
 // file pins that too.
+// The permission-policy gate (phase 2c) runs at the child-start gate: the
+// settings_path the config names is the fail-closed headless permission
+// policy, and a daemon whose policy file is absent is refused rather than
+// started without one — at enumeration, and again at every spawn, so a policy
+// file deleted while the supervisor runs stops the next respawn, not the
+// running child.
 // Stopping a child means writing the STOP marker into its state dir, the same
 // marker a hand-written `touch STOP` writes, never killing the process: the
 // daemon drains at its iteration boundary and exits by itself. The one rule
@@ -218,11 +224,12 @@ func Supervise(ctx context.Context, o Options) error {
 // being supervised is never a surprise — when it is not JSON, carries no
 // recognized clankerbar key (MCP configs, headless permission policies and
 // other JSON share this directory), fails to load, fails to resolve the
-// machine conventions (the phase-2a workdir derivation and the same Load +
-// Validate + state-dir resolution `run` performs), or fails validation. A
-// file that fails here would either never have started a daemon or would
-// crash-loop the child at startup; skipping it with the reason is strictly
-// more useful than supervising a crash.
+// machine conventions (the phase-2a workdir derivation, the phase-2c
+// permission-policy gate, and the same Load + Validate + state-dir resolution
+// `run` performs), or fails validation. A file that fails here would either
+// never have started a daemon or would crash-loop the child at startup;
+// skipping it with the reason is strictly more useful than supervising a
+// crash.
 func (d *Supervisor) enumerate() error {
 	files, err := filepath.Glob(filepath.Join(d.o.ConfigDir, "*.json"))
 	if err != nil {
@@ -255,6 +262,12 @@ func (d *Supervisor) enumerate() error {
 				// and a daemon whose workdir cannot be derived is not started
 				// at all.
 				log.Printf("skipping %s: workdir derivation refused: %v", f, err)
+			} else if errors.Is(err, ErrPolicyRefused) {
+				// The fail-closed permission-policy gate (phase 2c). A daemon
+				// whose settings_path names a file that does not exist would
+				// start without the policy the boundary requires; the line
+				// names the daemon and the policy path that was tried.
+				log.Printf("skipping %s (instance %s): permission policy refused: %v", f, cfg.ResolvedInstanceName(d.hostname), err)
 			} else {
 				log.Printf("skipping %s: %v", filepath.Base(f), err)
 			}
@@ -278,6 +291,11 @@ func (d *Supervisor) enumerate() error {
 // the same Load + Validate + ResolveStateDir the daemon itself performs. The
 // returned config is the one the materialized file is built from.
 //
+// The permission-policy gate (phase 2c) runs after Validate, on the RESOLVED
+// settings_path: an absent policy file refuses the instance, so it is never
+// spawned. Like the workdir gate, there is no fallback branch — a daemon whose
+// policy cannot be verified is not started at all.
+//
 // The derivation applies only when WorkdirRoot is set — with no machine root
 // stated, the config's own workdir governs (the phase-1 behaviour, unchanged)
 // and the config validates exactly as `run` would validate it.
@@ -292,6 +310,9 @@ func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string
 	if err := cfg.Validate(); err != nil {
 		return nil, "", err
 	}
+	if err := checkPermissionPolicy(cfg); err != nil {
+		return nil, "", err
+	}
 	stateDir, err := cfg.ResolveStateDir()
 	if err != nil {
 		return nil, "", err
@@ -300,14 +321,19 @@ func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string
 }
 
 // spawn starts one instance's child. The source config is re-read and
-// re-resolved first (same derivation + Load + Validate + ResolveStateDir the
-// enumerate performed), so the supervisor's record of the state dir and the
-// materialized config follow edits the operator made since the last spawn —
-// the RUNNING child still reads the file it started with, and a RELOAD keeps
-// that handle, so the freshly materialized file is exactly what the next
-// child starts from. A source that no longer loads, derives or validates
-// leaves the last good config in place: the child is spawned on the previous
-// materialization, which is exactly what the on-disk cache is for.
+// re-resolved first (same derivation + Load + Validate + state-dir resolution
+// + permission-policy gate the enumerate performed), so the supervisor's
+// record of the state dir and the materialized config follow edits the
+// operator made since the last spawn — the RUNNING child still reads the file
+// it started with, and a RELOAD keeps that handle, so the freshly materialized
+// file is exactly what the next child starts from. A source that no longer
+// loads, derives or validates leaves the last good config in place: the child
+// is spawned on the previous materialization, which is exactly what the
+// on-disk cache is for — subject to the policy gate below, which still
+// refuses the spawn if that config's policy file is gone too. A source whose
+// permission policy cannot be verified is refused with backoff instead: its
+// settings_path names the policy the daemon must run under, and the child
+// must not be started under a different one.
 //
 // The child is spawned with `run -c` pointing at the MATERIALIZED config in
 // its state dir — never the source file, so the config a daemon runs on is
@@ -321,11 +347,41 @@ func (d *Supervisor) spawn(inst *Instance) {
 			inst.cfg = resolved
 			inst.stateDir = sd
 			inst.mu.Unlock()
+		} else if errors.Is(err, ErrPolicyRefused) {
+			// A permission-policy refusal is not a fallback trigger: the
+			// config the operator is looking at names a policy file that does
+			// not exist, and starting the child on the last materialized
+			// config would silently keep the daemon running under a policy the
+			// operator has replaced (that config's settings_path may name a
+			// different file than the one the source names now). Fail closed
+			// like the enumeration gate: refuse with backoff, and a restored
+			// or fixed file is picked up by the next retry.
+			log.Printf("%s: refusing to start: %v - retrying with backoff", inst.name, err)
+			inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
+			return
 		} else {
 			log.Printf("%s: re-resolving its config failed (%v) - spawning on the last materialized config", inst.name, err)
 		}
 	} else {
 		log.Printf("%s: re-reading its config failed (%v) - spawning on the last materialized config", inst.name, err)
+	}
+	// The permission-policy gate (phase 2c) at the child-start gate. The
+	// config that will actually be spawned — freshly resolved, or the last
+	// materialized config after a re-read/re-resolve failure of any OTHER kind
+	// — must name a permission policy file that exists; an absent one refuses
+	// the spawn, the refusal naming the daemon and the path. A fresh config
+	// has already passed this check inside resolveInstance; the re-check is
+	// the hard gate the boundary wants, and it is what refuses the fallback
+	// when that config's policy file is gone too. Retry with backoff instead,
+	// so a policy file restored while the supervisor runs is picked up by the
+	// next respawn.
+	inst.mu.Lock()
+	cfg := inst.cfg
+	inst.mu.Unlock()
+	if err := checkPermissionPolicy(cfg); err != nil {
+		log.Printf("%s: refusing to start: %v - retrying with backoff", inst.name, err)
+		inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
+		return
 	}
 	cfgPath, err := d.materializeConfig(inst)
 	if err != nil {
