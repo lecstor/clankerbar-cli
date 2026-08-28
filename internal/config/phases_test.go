@@ -112,7 +112,7 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 		"record_decision",
 		"park the task with an outcome citing it",
 		"do not spend the run re-verifying and pushing stale work",
-		"unless you parked above, the rest of the flow is unchanged",
+		"unless you parked above or served a close-out above, the rest of the flow is unchanged",
 	} {
 		if !strings.Contains(lower, want) {
 			t.Errorf("the resumed-branch rule never says %q:\n%s", want, brief)
@@ -136,7 +136,7 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 	supersededIdx := strings.Index(lower, "supersedes the task")
 	parkIdx := strings.Index(lower, "park the task with an outcome citing it")
 	staleIdx := strings.Index(lower, "re-verifying and pushing stale work")
-	joinIdx := strings.Index(lower, "unless you parked above, the rest of the flow is unchanged")
+	joinIdx := strings.Index(lower, "unless you parked above or served a close-out above, the rest of the flow is unchanged")
 	if mergeIdx == -1 || revalidateIdx == -1 || supersededIdx == -1 || parkIdx == -1 || staleIdx == -1 || joinIdx == -1 {
 		t.Fatalf("merge (%d), re-validate (%d), supersession (%d), parking (%d), stale-work end (%d) or flow join (%d) missing from the brief:\n%s",
 			mergeIdx, revalidateIdx, supersededIdx, parkIdx, staleIdx, joinIdx, brief)
@@ -179,6 +179,91 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 		if strings.Contains(lower, strings.ToLower(name)) {
 			t.Errorf("the implement brief names harness %q; its wording must hold for every harness:\n%s", name, brief)
 		}
+	}
+}
+
+// CLA-540: a phased implement session is told to claim, work, commit, push and
+// stop at the checkpoint — and an approved-awaiting-merge offer from next_task
+// needs none of that: no commit, no branch, no worktree, its required act a
+// status move the brief's letter forbids. Without an exception the session asks
+// the operator about an offer that is exactly its job (observed twice on
+// 2026-08-28: CLA-533 and CLA-526, both green and mergeable, both raised as
+// blocking questions). The brief must admit the case as its own fork: the offer
+// IS the session's job, the offer's own instructions are the brief for it, and
+// ending after it is the task going to plan.
+//
+// The content assertions are FULL directional phrases, in the shape
+// TestBuiltinImplementBriefPinsTheResumedBranchRule established: a fragment
+// like "the offer" alone would survive a mutation that inverts the admission
+// into "decline the offer and ask".
+//
+// Two routing guards pin the fork's exclusivity. "The resumed-work rule below
+// is for found work, not this offer" preempts that rule's "existing branch"
+// trigger, which a close-out claim's recorded branch would otherwise satisfy -
+// applying its merge-and-revalidate sequence to an approved PR branch would
+// rewrite the diff the approval and the green CI stand on. And "served a
+// close-out above" exempts the close-out case from the join into the
+// claim/worktree/commit flow, which otherwise reads as instructing the session
+// to keep going after the close-out.
+func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
+	brief, ok := builtinPhasePrompts[ImplementPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
+	}
+	if implementCloseOutRule == "" {
+		t.Fatal("the implement brief has no close-out rule")
+	}
+
+	lower := strings.ToLower(brief)
+	for _, want := range []string{
+		"if next_task instead offers an approved-awaiting-merge task",
+		"that offer is this session's job",
+		"follow the offer's own instructions",
+		"once the close-out is done stop and end the session",
+		"the resumed-work rule below is for found work, not this offer",
+		"unless you parked above or served a close-out above, the rest of the flow is unchanged",
+		"going to plan",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the implement brief never says %q; a close-out offer must be admitted as this session's job:\n%s", want, brief)
+		}
+	}
+
+	// The fork comes FIRST: the offer replaces fresh work, so the close-out
+	// disposition must precede the resumed-work rule and the checkpoint
+	// instruction, which both concern a task this session claims for itself.
+	closeIdx := strings.Index(lower, strings.ToLower(implementCloseOutRule))
+	ruleIdx := strings.Index(lower, strings.ToLower(implementResumedBranchRule))
+	stopIdx := strings.Index(lower, "then stop and end the session")
+	if closeIdx == -1 || ruleIdx == -1 || stopIdx == -1 {
+		t.Fatalf("close-out rule (%d), resumed-branch rule (%d) or terminal stop (%d) missing from the brief:\n%s",
+			closeIdx, ruleIdx, stopIdx, brief)
+	}
+	if !(closeIdx < ruleIdx && ruleIdx < stopIdx) {
+		t.Errorf("the close-out fork (%d) must precede the resumed-work rule (%d) and the terminal stop (%d):\n%s",
+			closeIdx, ruleIdx, stopIdx, brief)
+	}
+
+	// What the clause must NOT carry (the plane's offer owns all of it, and a
+	// second copy would drift — CLA-341): a placeholder, a named branch or merge
+	// target, the red-CI repair rule, the decline door, the queue (ONE offer, not
+	// several), or a worktree-reclaim step. "main" is banned as a whole word so
+	// "remaining" is not caught, the way TestRerunGuidancePointsAtWaitingRather
+	// ThanRestatingIt bans the waiting reference's mechanics.
+	for _, banned := range []string{
+		"{{", "branch", "worktree", "staging", "integration",
+		"red", "decline", "cannot attempt", "queue",
+	} {
+		if strings.Contains(strings.ToLower(implementCloseOutRule), banned) {
+			t.Errorf("the close-out rule says %q — it belongs on the offer, not in the brief:\n%s", banned, implementCloseOutRule)
+		}
+	}
+	words := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(implementCloseOutRule), func(r rune) bool { return !unicode.IsLetter(r) }) {
+		words[w] = true
+	}
+	if words["main"] {
+		t.Errorf("the close-out rule names %q as a merge target — the offer's own instructions own the target, and a brief that names one is wrong for every other topology:\n%s", "main", implementCloseOutRule)
 	}
 }
 
