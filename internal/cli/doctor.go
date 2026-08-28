@@ -550,9 +550,10 @@ func checkHarnessNamed(ctx context.Context, label, bin string, e doctorEnv) chec
 // system keychain instead of the config dir, so a missing marker means "I cannot
 // confirm this", never "this is broken".
 var authMarkers = map[string][]string{
-	"claude":   {".credentials.json", ".claude.json", "settings.json"},
-	"codex":    {"auth.json", "config.toml"},
-	"opencode": {"auth.json", "config.json"},
+	"claude":    {".credentials.json", ".claude.json", "settings.json"},
+	"codex":     {"auth.json", "config.toml"},
+	"opencode":  {"auth.json", "config.json"},
+	"opencode2": {"opencode.jsonc", "auth.json"}, // the 2.x preview config lives at ~/.config/opencode/opencode.jsonc
 }
 
 // checkConfigDir reports on the run harness's config dir. See checkConfigDirs,
