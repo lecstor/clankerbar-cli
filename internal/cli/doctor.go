@@ -1563,7 +1563,12 @@ func checkStranded(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 		if len(findings) == 0 {
 			continue
 		}
-		withFindings++
+		// A repo that could not be read at all is counted as unchecked, never
+		// as one that HOLDS stranded commits: its only "finding" is the error
+		// line, and the summary sentence must not read it as work on no remote.
+		if !failed {
+			withFindings++
+		}
 		for _, f := range findings {
 			if multi {
 				f = repo + ": " + f

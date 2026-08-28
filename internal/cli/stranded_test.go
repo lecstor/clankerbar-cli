@@ -346,3 +346,75 @@ func TestStranded_CoversDeclaredReposOutsideTheWorkdir(t *testing.T) {
 		t.Errorf("the declared checkout's stranded commit is missing from: %v", c.info)
 	}
 }
+
+// A repo whose git commands fail entirely is counted as UNCHECKED, never as one
+// that holds stranded commits: its only "finding" is the error line, and the
+// summary sentence must not read it as work on no remote.
+func TestStranded_UncheckableRepoCountsAsUncheckedNotAsFindings(t *testing.T) {
+	e := okEnv()
+	e.repos = func(context.Context, string) []string {
+		return []string{filepath.Join(t.TempDir(), "repo-a"), filepath.Join(t.TempDir(), "repo-b")}
+	}
+	e.gitRun = func(context.Context, string, ...string) (string, error) {
+		return "", fmt.Errorf("boom")
+	}
+
+	c := checkStranded(context.Background(), validCfgIn(t, t.TempDir()), e)
+
+	if c.status != warn {
+		t.Fatalf("status = %v (%s), want WARN", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "could not be fully checked") {
+		t.Errorf("detail should say the repos could not be fully checked, got %q", c.detail)
+	}
+	if strings.Contains(c.detail, "hold commits") {
+		t.Errorf("an uncheckable repo must not be reported as holding stranded commits: %q", c.detail)
+	}
+	if len(c.info) != 2 {
+		t.Fatalf("got %d lines, want the two error lines: %v", len(c.info), c.info)
+	}
+}
+
+// One repo that cannot be read and one that holds a stranded commit: the
+// summary must count them separately — "X could not be fully checked, and Y
+// hold commits" — never merging the error repo into the findings count.
+func TestStranded_MixedUncheckableAndFindingRepos(t *testing.T) {
+	good := filepath.Join(t.TempDir(), "repo-good")
+	bad := filepath.Join(t.TempDir(), "repo-bad")
+	e := okEnv()
+	e.repos = func(context.Context, string) []string { return []string{good, bad} }
+	e.gitRun = func(_ context.Context, dir string, args ...string) (string, error) {
+		if dir == bad {
+			return "", fmt.Errorf("boom")
+		}
+		switch args[0] {
+		case "for-each-ref":
+			// refs/heads listing: one branch tip; refs/remotes listing: one remote.
+			if len(args) > 1 && args[len(args)-1] == "refs/remotes" {
+				return "refs/remotes/origin/main", nil
+			}
+			return "main 1111111111111111111111111111111111111111", nil
+		case "worktree":
+			return "", nil
+		case "rev-list":
+			return "1111111111111111111111111111111111111111", nil
+		case "show":
+			return "stranded work\n2026-08-28", nil
+		}
+		return "", nil
+	}
+
+	c := checkStranded(context.Background(), validCfgIn(t, t.TempDir()), e)
+
+	if c.status != warn {
+		t.Fatalf("status = %v (%s), want WARN", c.status, c.detail)
+	}
+	for _, want := range []string{"1 of 2 repos could not be fully checked", "and 1 hold commits"} {
+		if !strings.Contains(c.detail, want) {
+			t.Errorf("detail %q is missing %q", c.detail, want)
+		}
+	}
+	if len(c.info) != 2 {
+		t.Fatalf("got %d lines, want the error line and the finding line: %v", len(c.info), c.info)
+	}
+}
