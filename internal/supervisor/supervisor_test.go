@@ -150,8 +150,10 @@ func helperMain() {
 			time.Sleep(20 * time.Millisecond)
 		}
 	case "sleep-no-dir":
-		// Alive forever, no state dir: a real daemon wedged (or dead) before
-		// its statedir.Open. The supervisor can never write STOP to it.
+		// Alive forever, never opening the state dir: a real daemon wedged
+		// (or dead) before its statedir.Open. The supervisor's STOP lands in
+		// the dir (which the supervisor itself created for the generated
+		// config) but is never consumed, so the drain waits and logs.
 		for {
 			time.Sleep(50 * time.Millisecond)
 		}

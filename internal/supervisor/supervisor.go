@@ -321,7 +321,11 @@ func (d *Supervisor) spawn(inst *Instance) {
 			inst.cfg = resolved
 			inst.stateDir = sd
 			inst.mu.Unlock()
+		} else {
+			log.Printf("%s: re-resolving its config failed (%v) - spawning on the last materialized config", inst.name, err)
 		}
+	} else {
+		log.Printf("%s: re-reading its config failed (%v) - spawning on the last materialized config", inst.name, err)
 	}
 	cfgPath, err := d.materializeConfig(inst)
 	if err != nil {

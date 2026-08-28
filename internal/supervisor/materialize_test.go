@@ -29,6 +29,13 @@ import (
 func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	root := t.TempDir()
 	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
+	// A discovered <workdir>/.mcp.json must land in the materialized file via
+	// the documented mcp_config_path default, resolved against the DERIVED
+	// workdir.
+	mcp := `{"mcpServers": {"clankerbar": {"type": "http", "url": "https://clankerbar.com/mcp/acme", "headers": {"Authorization": "Bearer ${CLANKERBAR_API_KEY}"}}}}`
+	if err := os.WriteFile(filepath.Join(root, "widgets", ".mcp.json"), []byte(mcp), 0o644); err != nil {
+		t.Fatal(err)
+	}
 
 	dir := t.TempDir()
 	stateDir := filepath.Join(t.TempDir(), "state")
@@ -81,6 +88,9 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	}
 	if loaded.BacklogURL != "https://clankerbar.com" {
 		t.Errorf("backlog_url = %q, want the default plane origin", loaded.BacklogURL)
+	}
+	if loaded.MCPConfigPath != filepath.Join(root, "widgets", ".mcp.json") {
+		t.Errorf("mcp_config_path = %q, want the discovered default resolved against the derived workdir", loaded.MCPConfigPath)
 	}
 }
 
