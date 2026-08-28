@@ -403,10 +403,11 @@ no longer starts each daemon by hand, and stopping the fleet is one Ctrl-C.
 
 The supervisor invents nothing — every mechanism already existed:
 
-- **Each child is the command the operator used to run by hand.** Instance
-  identity (`hostname/basename(config)`), per-instance state dirs, control
-  markers and the fleet beacon all behave exactly as before; each child
-  beacons under the name derived from its own file.
+- **Each child is the command the operator used to run by hand — on a config
+  the supervisor generates.** Instance identity (`hostname/basename(config)`),
+  per-instance state dirs, control markers and the fleet beacon all behave
+  exactly as before; each child beacons under the name derived from its own
+  source file.
 - **A child that exits unexpectedly is restarted, with backoff.** The delay
   doubles from 2s to a 60s cap per consecutive unexpected exit; a run that
   stayed up at least 2 minutes is treated as healthy and resets the ladder.
@@ -425,10 +426,10 @@ The supervisor invents nothing — every mechanism already existed:
   in its state dir, not `STOP`.**
 
 What the supervisor does NOT do (later phases of the proposal): no plane call,
-no roster, no desired state, no materialized config, no version check, no
-self-update. The config dir is enumerated **once, at startup** — add a config
-file and restart the supervisor to pick it up. The startup log names every
-file it picked up and every file it skipped, with the reason.
+no roster, no desired state, no version check, no self-update. The config dir
+is enumerated **once, at startup** — add a config file and restart the
+supervisor to pick it up. The startup log names every file it picked up and
+every file it skipped, with the reason.
 
 **Workdir derivation (phase 2a).** Set `CLANKERBAR_WORKDIR_ROOT` to the
 machine's one checkout root and the supervisor derives each child's workdir as
@@ -440,6 +441,23 @@ something else), that daemon is **refused at startup** — the path tried is
 reported, nothing is created, and the supervisor's own working directory is
 never used as a fallback. With the variable unset, derivation is off and
 children run on their config files' own workdirs, exactly as before.
+
+**Materialized configs (phase 2b).** Every child runs on a config the
+supervisor *generates*, not the file in the config dir: the child's effective
+config — the operator's declared intent plus the machine conventions, namely
+the derived workdir, the resolved `settings_path` / `config_dir` /
+`mcp_config_path` (documented defaults applied), the default `backlog_url`
+(the credential itself stays in `CLANKERBAR_API_KEY` in the environment,
+which the child inherits) — is written to `materialized.json` in the child's
+own state dir, and the child is started with `run -c` pointing at it. The
+generated file is a **cache**: regenerated on every reconcile (each spawn
+re-reads the source config), never hand-edited, and safe to delete while a
+child runs — the next spawn regenerates it. It is written to disk rather than
+held in memory so it doubles as the offline last-known-good once the roster
+drives the fleet (phase 3b): an unreachable plane means starting from cache,
+not starting nothing. The instance identity and the state dir are pinned
+inside it, so a daemon beacons and stops exactly as it did when its file
+lived in the config dir.
 
 The config dir also holds JSON that is not instance configs — MCP configs
 (`opencode-mcp.json`), headless permission policies (`headless-drain.json`),

@@ -7,8 +7,13 @@
 //
 // The supervisor deliberately invents nothing. Each child is
 // `clankerbar run -c <file>` — the exact command the operator used to run by
-// hand — so instance identity (`hostname/basename(config)`, ResolveInstanceName),
-// per-instance state dirs and the fleet beacon all behave exactly as before.
+// hand — except the file is now the GENERATED effective config in the child's
+// state dir (phase 2b): the operator's declared intent with the machine
+// conventions materialized over it, regenerated on every reconcile. Instance
+// identity (`hostname/basename(config)`, ResolveInstanceName), per-instance
+// state dirs and the fleet beacon all behave exactly as before — identity
+// because the generated file pins it, and the state dir because the generated
+// file pins that too.
 // Stopping a child means writing the STOP marker into its state dir, the same
 // marker a hand-written `touch STOP` writes, never killing the process: the
 // daemon drains at its iteration boundary and exits by itself. The one rule
@@ -16,13 +21,13 @@
 // reason other than a stop it was told about is respawned, with backoff.
 //
 // What this phase does NOT do: no plane call, no roster, no desired state, no
-// materialized config, no version check, no self-update. The config dir is
-// enumerated once at startup — add a config file and restart the supervisor to
-// pick it up.
+// version check, no self-update. The config dir is enumerated once at startup
+// — add a config file and restart the supervisor to pick it up.
 package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -146,6 +151,10 @@ type exitEvent struct {
 type Supervisor struct {
 	o Options
 
+	// hostname is the machine identity the fleet names resolve against,
+	// resolved once at startup (ResolveInstanceName).
+	hostname string
+
 	instances []*Instance
 	exits     chan exitEvent
 	ctx       context.Context
@@ -162,7 +171,8 @@ type Supervisor struct {
 // A config dir holding no instance configs is not an error: the supervisor
 // says so and returns, rather than idling forever over nothing.
 func Supervise(ctx context.Context, o Options) error {
-	d := &Supervisor{o: o.withDefaults(), ctx: ctx}
+	host, _ := os.Hostname()
+	d := &Supervisor{o: o.withDefaults(), ctx: ctx, hostname: host}
 	if err := d.enumerate(); err != nil {
 		return err
 	}
@@ -207,16 +217,17 @@ func Supervise(ctx context.Context, o Options) error {
 // actually instance configs. A file is skipped — loudly, so a file that stops
 // being supervised is never a surprise — when it is not JSON, carries no
 // recognized clankerbar key (MCP configs, headless permission policies and
-// other JSON share this directory), fails to load, fails validation, or cannot
-// resolve a state dir. A file that fails here would either never have started
-// a daemon or would crash-loop the child at startup; skipping it with the
-// reason is strictly more useful than supervising a crash.
+// other JSON share this directory), fails to load, fails to resolve the
+// machine conventions (the phase-2a workdir derivation and the same Load +
+// Validate + state-dir resolution `run` performs), or fails validation. A
+// file that fails here would either never have started a daemon or would
+// crash-loop the child at startup; skipping it with the reason is strictly
+// more useful than supervising a crash.
 func (d *Supervisor) enumerate() error {
 	files, err := filepath.Glob(filepath.Join(d.o.ConfigDir, "*.json"))
 	if err != nil {
 		return fmt.Errorf("list %s: %w", d.o.ConfigDir, err)
 	}
-	host, _ := os.Hostname()
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
@@ -232,59 +243,100 @@ func (d *Supervisor) enumerate() error {
 			log.Printf("skipping %s: %v", filepath.Base(f), err)
 			continue
 		}
-		if err := cfg.Validate(); err != nil {
-			log.Printf("skipping %s: invalid config: %v", filepath.Base(f), err)
-			continue
-		}
-		stateDir, err := cfg.ResolveStateDir()
+		resolved, stateDir, err := d.resolveInstance(cfg)
 		if err != nil {
-			log.Printf("skipping %s: %v", filepath.Base(f), err)
-			continue
-		}
-		if d.o.WorkdirRoot != "" {
-			// The fail-closed workdir derivation (phase 2a). A refusal here is
-			// like every other enumerate skip — the file would either never
-			// have started a daemon or would run one somewhere unverified —
-			// and the line reports the derived path that was tried. There is
-			// deliberately NO fallback to the supervisor's own working
-			// directory: that fallback is the CLA-441 failure, and a daemon
-			// whose workdir cannot be derived is not started at all.
-			if _, err := deriveInstanceWorkdirs(cfg, d.o.WorkdirRoot); err != nil {
+			if d.o.WorkdirRoot != "" && errors.Is(err, ErrWorkdirRefused) {
+				// The fail-closed workdir derivation (phase 2a). A refusal here
+				// is like every other enumerate skip — the file would either
+				// never have started a daemon or would run one somewhere
+				// unverified — and the line reports the derived path that was
+				// tried. There is deliberately NO fallback to the supervisor's
+				// own working directory: that fallback is the CLA-441 failure,
+				// and a daemon whose workdir cannot be derived is not started
+				// at all.
 				log.Printf("skipping %s: workdir derivation refused: %v", f, err)
-				continue
+			} else {
+				log.Printf("skipping %s: %v", filepath.Base(f), err)
 			}
+			continue
 		}
 		d.instances = append(d.instances, &Instance{
 			path:     f,
-			name:     cfg.ResolvedInstanceName(host),
-			cfg:      cfg,
+			name:     resolved.ResolvedInstanceName(d.hostname),
+			cfg:      resolved,
 			stateDir: stateDir,
 		})
 	}
 	return nil
 }
 
-// spawn starts one instance's child. The config is re-loaded and re-validated
-// first (same Load + Validate + ResolveStateDir the daemon itself performs) so
-// the supervisor's record of the state dir follows edits the operator made
-// since the last spawn — the RUNNING child still reads the dir it resolved at
-// its own start, and a RELOAD keeps that handle, so the freshly resolved value
-// is exactly where this child's markers live. A config that no longer loads is
-// still spawned: the child's own startup reports the error and exits, which is
-// the honest way to surface it, and the backoff handles the resulting crash
-// loop.
+// resolveInstance resolves the machine conventions one instance runs under,
+// in the order the materialized config is built from them: the phase-2a
+// workdir derivation (when a machine root is stated) FIRST, so validation
+// resolves every relative path and the mcp discovery against the DERIVED
+// workdir rather than against wherever the supervisor happened to start; then
+// the same Load + Validate + ResolveStateDir the daemon itself performs. The
+// returned config is the one the materialized file is built from.
+//
+// The derivation applies only when WorkdirRoot is set — with no machine root
+// stated, the config's own workdir governs (the phase-1 behaviour, unchanged)
+// and the config validates exactly as `run` would validate it.
+func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string, error) {
+	if d.o.WorkdirRoot != "" {
+		derived, err := deriveInstanceWorkdirs(cfg, d.o.WorkdirRoot)
+		if err != nil {
+			return nil, "", err
+		}
+		applyDerivedWorkdirs(cfg, derived)
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, "", err
+	}
+	stateDir, err := cfg.ResolveStateDir()
+	if err != nil {
+		return nil, "", err
+	}
+	return cfg, stateDir, nil
+}
+
+// spawn starts one instance's child. The source config is re-read and
+// re-resolved first (same derivation + Load + Validate + ResolveStateDir the
+// enumerate performed), so the supervisor's record of the state dir and the
+// materialized config follow edits the operator made since the last spawn —
+// the RUNNING child still reads the file it started with, and a RELOAD keeps
+// that handle, so the freshly materialized file is exactly what the next
+// child starts from. A source that no longer loads, derives or validates
+// leaves the last good config in place: the child is spawned on the previous
+// materialization, which is exactly what the on-disk cache is for.
+//
+// The child is spawned with `run -c` pointing at the MATERIALIZED config in
+// its state dir — never the source file, so the config a daemon runs on is
+// always the generated artifact. A materialization that cannot be written (an
+// unwritable or unadoptable state dir) is as unexpected as a spawn failure:
+// same backoff, same ladder, no child.
 func (d *Supervisor) spawn(inst *Instance) {
 	if fresh, err := config.Load(inst.path); err == nil {
-		if err := fresh.Validate(); err == nil {
-			if sd, err := fresh.ResolveStateDir(); err == nil {
-				inst.mu.Lock()
-				inst.cfg = fresh
-				inst.stateDir = sd
-				inst.mu.Unlock()
-			}
+		if resolved, sd, err := d.resolveInstance(fresh); err == nil {
+			inst.mu.Lock()
+			inst.cfg = resolved
+			inst.stateDir = sd
+			inst.mu.Unlock()
+		} else {
+			log.Printf("%s: re-resolving its config failed (%v) - spawning on the last materialized config", inst.name, err)
 		}
+	} else {
+		log.Printf("%s: re-reading its config failed (%v) - spawning on the last materialized config", inst.name, err)
 	}
-	cmd := exec.Command(d.o.Binary, "run", "-c", inst.path)
+	cfgPath, err := d.materializeConfig(inst)
+	if err != nil {
+		inst.mu.Lock()
+		dir := inst.stateDir
+		inst.mu.Unlock()
+		log.Printf("%s: cannot write its generated config into %s (%v) - retrying with backoff", inst.name, dir, err)
+		inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
+		return
+	}
+	cmd := exec.Command(d.o.Binary, "run", "-c", cfgPath)
 	// The children's logs stream to the same stdout/stderr the supervisor's
 	// do — the operator watches daemons today by watching one terminal per
 	// daemon, and the fleet must not be quieter than that.
@@ -303,7 +355,7 @@ func (d *Supervisor) spawn(inst *Instance) {
 	inst.exited = false
 	inst.exitErr = nil
 	inst.mu.Unlock()
-	log.Printf("%s: spawned (pid %d, %s)", inst.name, cmd.Process.Pid, inst.path)
+	log.Printf("%s: spawned (pid %d, %s)", inst.name, cmd.Process.Pid, cfgPath)
 	go func() {
 		d.exits <- exitEvent{inst, cmd.Wait()}
 	}()

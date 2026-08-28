@@ -1,6 +1,6 @@
 package cli
 
-// The fleet supervisor (CLA-525, phase 1 of docs/proposals/daemon-supervisor.md
+// The fleet supervisor (CLA-525, phases 1-2 of docs/proposals/daemon-supervisor.md
 // in the clankerbar repo): bare `clankerbar` — and the explicit
 // `clankerbar supervise` alias — starts every daemon whose config file is in
 // the config dir as a supervised child, restarts a child that exits
@@ -8,7 +8,9 @@ package cli
 // fleet-wide stop: every child gets a STOP marker in its state dir, the same
 // marker a hand-written `touch STOP` writes, so each drains at its iteration
 // boundary rather than being killed mid-session, and the supervisor waits for
-// all of them.
+// all of them. Since phase 2b each child runs on a config the supervisor
+// GENERATES into the child's state dir (`materialized.json`), never on the
+// hand-maintained file in the config dir.
 
 import (
 	"context"

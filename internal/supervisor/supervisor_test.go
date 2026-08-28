@@ -2,8 +2,8 @@ package supervisor
 
 // The supervisor's tests drive it against a FAKE daemon: the test binary
 // re-invoked as the child (TestMain -> helperMain), behaving per the mode
-// recorded in its config file. The fake mirrors the real daemon's load-bearing
-// behaviours and nothing else:
+// recorded in the CLANKERBAR_SUPER_MODE environment variable. The fake mirrors
+// the real daemon's load-bearing behaviours and nothing else:
 //
 //   - it creates its own state dir (0700) at startup,
 //   - it consumes a STOP marker found AT STARTUP without stopping (the
@@ -14,11 +14,20 @@ package supervisor
 //     artifact names the real daemon writes, so the supervisor's statedir.Open
 //     keeps adopting the dir.
 //
+// The MODE travels in an env var, not the config file, because the child no
+// longer reads the operator's config: since phase 2b it runs on the
+// supervisor's MATERIALIZED config, which carries only real config fields — a
+// test-only key would not survive materialization. The state dir still comes
+// from the config file, and the materialized one pins it, so a fake that
+// starts at all is evidence the generated config carried the state dir.
+//
 // The modes: "sleep" (exit on STOP), "sleep-seen" (exit on STOP, leave the
 // marker and drop a STOP-SEEN file as proof the marker landed), "crash" (exit
 // 1 immediately), "halt" (write HALT, exit 1), "sleep-no-dir" (never create
 // the state dir: the daemon-stuck-before-startup shape) and "stubborn" (never
-// exit, whatever lands in the state dir: the drain-stuck shape).
+// exit, whatever lands in the state dir: the drain-stuck shape). No test runs
+// instances in different modes at once, so a single process-wide variable is
+// enough.
 
 import (
 	"bytes"
@@ -41,6 +50,10 @@ import (
 )
 
 const helperEnv = "CLANKERBAR_SUPER_HELPER"
+
+// helperModeEnv carries the fake daemon's mode (see the file comment for why
+// it is an env var and not a config key).
+const helperModeEnv = "CLANKERBAR_SUPER_MODE"
 
 // TestMain doubles as the child-process entry point: with the helper env set,
 // the test binary behaves as the fake daemon instead of running tests. The
@@ -74,7 +87,6 @@ func helperMain() {
 	}
 	var spec struct {
 		StateDir string `json:"state_dir"`
-		Mode     string `json:"test_mode"`
 	}
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
@@ -85,11 +97,12 @@ func helperMain() {
 		fmt.Fprintln(os.Stderr, "fake daemon: bad config:", err)
 		os.Exit(9)
 	}
+	mode := os.Getenv(helperModeEnv)
 
 	// The real daemon creates its own state dir at startup — except
 	// "sleep-no-dir", which deliberately does not, so the supervisor faces a
 	// child that is alive but has no state dir to write STOP into.
-	if spec.Mode != "sleep-no-dir" {
+	if mode != "sleep-no-dir" {
 		if err := os.MkdirAll(spec.StateDir, 0o700); err != nil {
 			fmt.Fprintln(os.Stderr, "fake daemon: state dir:", err)
 			os.Exit(9)
@@ -116,7 +129,7 @@ func helperMain() {
 	}
 
 	stopPath := filepath.Join(spec.StateDir, "STOP")
-	switch spec.Mode {
+	switch mode {
 	case "crash":
 		os.Exit(1)
 	case "halt":
@@ -127,7 +140,7 @@ func helperMain() {
 	case "sleep", "sleep-seen":
 		for {
 			if _, err := os.Lstat(stopPath); err == nil {
-				if spec.Mode == "sleep" {
+				if mode == "sleep" {
 					_ = os.Remove(stopPath)
 				} else {
 					_ = os.WriteFile(filepath.Join(spec.StateDir, "STOP-SEEN"), []byte("marker landed\n"), 0o600)
@@ -137,8 +150,10 @@ func helperMain() {
 			time.Sleep(20 * time.Millisecond)
 		}
 	case "sleep-no-dir":
-		// Alive forever, no state dir: a real daemon wedged (or dead) before
-		// its statedir.Open. The supervisor can never write STOP to it.
+		// Alive forever, never opening the state dir: a real daemon wedged
+		// (or dead) before its statedir.Open. The supervisor's STOP lands in
+		// the dir (which the supervisor itself created for the generated
+		// config) but is never consumed, so the drain waits and logs.
 		for {
 			time.Sleep(50 * time.Millisecond)
 		}
@@ -149,7 +164,7 @@ func helperMain() {
 			time.Sleep(50 * time.Millisecond)
 		}
 	default:
-		fmt.Fprintln(os.Stderr, "fake daemon: unknown mode", spec.Mode)
+		fmt.Fprintln(os.Stderr, "fake daemon: unknown mode", mode)
 		os.Exit(9)
 	}
 }
@@ -171,10 +186,15 @@ func testOptions(t *testing.T, dir string) Options {
 	}
 }
 
-// writeInstanceConfig drops one fake-daemon config file into dir.
+// writeInstanceConfig drops one fake-daemon config file into dir. The MODE is
+// carried in the process env (helperModeEnv), inherited by every child: since
+// phase 2b the child reads the supervisor's MATERIALIZED config, which carries
+// only real config fields — so a test-only key would not survive
+// materialization, and the mode has to travel outside the file.
 func writeInstanceConfig(t *testing.T, dir, name, mode, stateDir string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "test_mode": %q}`, stateDir, mode)
+	t.Setenv(helperModeEnv, mode)
+	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q}`, stateDir)
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +204,8 @@ func writeInstanceConfig(t *testing.T, dir, name, mode, stateDir string) {
 // so the workdir derivation (phase 2a) has a repo to derive from.
 func writeInstanceConfigRepo(t *testing.T, dir, name, mode, stateDir, primary string) {
 	t.Helper()
-	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "test_mode": %q, "primary_repo": %q}`, stateDir, mode, primary)
+	t.Setenv(helperModeEnv, mode)
+	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "primary_repo": %q}`, stateDir, primary)
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
