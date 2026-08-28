@@ -180,6 +180,16 @@ func writeInstanceConfig(t *testing.T, dir, name, mode, stateDir string) {
 	}
 }
 
+// writeInstanceConfigRepo is writeInstanceConfig with a primary_repo declared,
+// so the workdir derivation (phase 2a) has a repo to derive from.
+func writeInstanceConfigRepo(t *testing.T, dir, name, mode, stateDir, primary string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "test_mode": %q, "primary_repo": %q}`, stateDir, mode, primary)
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // countRuns reports how many iteration-*.log files the fake has written into
 // stateDir — i.e. how many times that instance has been spawned.
 func countRuns(t *testing.T, stateDir string) int {
@@ -547,6 +557,92 @@ func spawnPid(t *testing.T, log string) int {
 		return 0
 	}
 	return pid
+}
+
+// The workdir derivation gate (phase 2a): with a machine root stated, an
+// instance whose derived workdir fails the fail-closed conditions is refused —
+// no child is ever spawned for it, the path tried is reported, and the rest of
+// the fleet keeps running.
+func TestWorkdirDerivationFailureSpawnsNothing(t *testing.T) {
+	root := t.TempDir()
+	// The good instance's derived workdir must be a real checkout of the repo
+	// its config names; the ghost instance's derived path will simply not exist.
+	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
+
+	dir := t.TempDir()
+	goodState := filepath.Join(t.TempDir(), "state-good")
+	ghostState := filepath.Join(t.TempDir(), "state-ghost")
+	writeInstanceConfigRepo(t, dir, "good.json", "sleep", goodState, "acme/widgets")
+	writeInstanceConfigRepo(t, dir, "ghost.json", "sleep", ghostState, "acme/ghost")
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	o := testOptions(t, dir)
+	o.WorkdirRoot = root
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, o)
+
+	// The good instance derives, spawns, and runs.
+	waitFor(t, 5*time.Second, "the derivable instance to come up", func() bool {
+		return countRuns(t, goodState) == 1
+	})
+	// The refused instance must NEVER spawn, however long the fleet runs.
+	time.Sleep(300 * time.Millisecond)
+	if got := countRuns(t, ghostState); got != 0 {
+		t.Fatalf("spawns for the refused instance = %d, want 0 — a failed derivation must spawn nothing", got)
+	}
+	// The refusal is loud and names the path that was tried.
+	if logText := buf.String(); !strings.Contains(logText, filepath.Join(root, "ghost")) {
+		t.Fatalf("the refusal log does not name the path tried %q:\n%s", filepath.Join(root, "ghost"), logText)
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+	if got := countRuns(t, ghostState); got != 0 {
+		t.Fatalf("spawns for the refused instance after the stop = %d, want 0", got)
+	}
+}
+
+// With no machine root stated, derivation is OFF and every valid config is
+// supervised on its own declared workdir — the phase-1 behaviour, unchanged.
+func TestWorkdirDerivationOffWithoutRoot(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	writeInstanceConfigRepo(t, dir, "daemon.json", "sleep", state, "acme/ghost")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir)) // no WorkdirRoot
+
+	// The ghost repo has no checkout anywhere, yet the instance runs: without
+	// a stated root there is nothing to derive, so the config's own workdir
+	// governs, exactly as before phase 2a.
+	waitFor(t, 5*time.Second, "the instance to come up", func() bool { return countRuns(t, state) == 1 })
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
 }
 
 // enumerate keeps exactly the parseable, valid instance configs and reports
