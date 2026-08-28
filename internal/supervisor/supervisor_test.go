@@ -1,0 +1,481 @@
+package supervisor
+
+// The supervisor's tests drive it against a FAKE daemon: the test binary
+// re-invoked as the child (TestMain -> helperMain), behaving per the mode
+// recorded in its config file. The fake mirrors the real daemon's load-bearing
+// behaviours and nothing else:
+//
+//   - it creates its own state dir (0700) at startup,
+//   - it consumes a STOP marker found AT STARTUP without stopping (the
+//     CLA-491 behaviour: a leftover marker must not kill the next run),
+//   - in sleep modes it polls for STOP and exits when it appears (consuming it,
+//     like the real loop does at its iteration boundary),
+//   - it counts its own runs by writing iteration-<n>.log files — the same
+//     artifact names the real daemon writes, so the supervisor's statedir.Open
+//     keeps adopting the dir.
+//
+// The modes: "sleep" (exit on STOP), "sleep-seen" (exit on STOP, leave the
+// marker and drop a STOP-SEEN file as proof the marker landed), "crash" (exit
+// 1 immediately) and "halt" (write HALT, exit 1).
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/teststate"
+)
+
+const helperEnv = "CLANKERBAR_SUPER_HELPER"
+
+// TestMain doubles as the child-process entry point: with the helper env set,
+// the test binary behaves as the fake daemon instead of running tests. The
+// suite itself runs under teststate.Isolate (required of every package whose
+// tests can reach internal/config, enforced mechanically): XDG_STATE_HOME is
+// pointed at a fresh temp dir so nothing here can write into the operator's
+// real loop state root, and the post-run guard fails the binary if anything
+// leaked there.
+func TestMain(m *testing.M) {
+	if os.Getenv(helperEnv) == "1" {
+		helperMain()
+		os.Exit(0) // unreachable — helperMain exits
+	}
+	os.Exit(teststate.Isolate(m))
+}
+
+// helperMain is the fake daemon. Args are exactly what the supervisor spawns:
+// <test binary> run -c <config>.
+func helperMain() {
+	args := os.Args[1:]
+	cfgPath := ""
+	for i := 0; i < len(args)-1; i++ {
+		if args[i] == "-c" {
+			cfgPath = args[i+1]
+			break
+		}
+	}
+	if cfgPath == "" {
+		fmt.Fprintln(os.Stderr, "fake daemon: no -c <config> in args:", args)
+		os.Exit(9)
+	}
+	var spec struct {
+		StateDir string `json:"state_dir"`
+		Mode     string `json:"test_mode"`
+	}
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fake daemon: read config:", err)
+		os.Exit(9)
+	}
+	if err := json.Unmarshal(data, &spec); err != nil || spec.StateDir == "" {
+		fmt.Fprintln(os.Stderr, "fake daemon: bad config:", err)
+		os.Exit(9)
+	}
+
+	// The real daemon creates its own state dir at startup.
+	if err := os.MkdirAll(spec.StateDir, 0o700); err != nil {
+		fmt.Fprintln(os.Stderr, "fake daemon: state dir:", err)
+		os.Exit(9)
+	}
+	// Count existing runs, then write this run's iteration log — the real
+	// daemon's artifact naming, so the supervisor adopts the dir.
+	entries, _ := os.ReadDir(spec.StateDir)
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "iteration-") && strings.HasSuffix(e.Name(), ".log") {
+			n++
+		}
+	}
+	name := fmt.Sprintf("iteration-%d.log", n+1)
+	if err := os.WriteFile(filepath.Join(spec.StateDir, name), []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "fake daemon: iteration log:", err)
+		os.Exit(9)
+	}
+	// The CLA-491 startup consumption: a STOP found here predates this process
+	// and is eaten WITHOUT stopping.
+	if _, err := os.Lstat(filepath.Join(spec.StateDir, "STOP")); err == nil {
+		_ = os.Remove(filepath.Join(spec.StateDir, "STOP"))
+	}
+
+	stopPath := filepath.Join(spec.StateDir, "STOP")
+	switch spec.Mode {
+	case "crash":
+		os.Exit(1)
+	case "halt":
+		if err := os.WriteFile(filepath.Join(spec.StateDir, "HALT"), []byte("halted by test\n"), 0o600); err != nil {
+			os.Exit(9)
+		}
+		os.Exit(1)
+	case "sleep", "sleep-seen":
+		for {
+			if _, err := os.Lstat(stopPath); err == nil {
+				if spec.Mode == "sleep" {
+					_ = os.Remove(stopPath)
+				} else {
+					_ = os.WriteFile(filepath.Join(spec.StateDir, "STOP-SEEN"), []byte("marker landed\n"), 0o600)
+				}
+				os.Exit(0)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "fake daemon: unknown mode", spec.Mode)
+		os.Exit(9)
+	}
+}
+
+// --- test scaffolding -------------------------------------------------------
+
+// testOptions returns supervisor options pointed at the test binary as the
+// child, with fast intervals so the tests do not wait on production defaults.
+func testOptions(t *testing.T, dir string) Options {
+	t.Helper()
+	t.Setenv(helperEnv, "1") // children must re-enter as the fake daemon
+	return Options{
+		ConfigDir:         dir,
+		Binary:            os.Args[0],
+		BackoffBase:       50 * time.Millisecond,
+		BackoffCap:        200 * time.Millisecond,
+		BackoffResetAfter: time.Second,
+		SettleBeforeStop:  10 * time.Millisecond,
+	}
+}
+
+// writeInstanceConfig drops one fake-daemon config file into dir.
+func writeInstanceConfig(t *testing.T, dir, name, mode, stateDir string) {
+	t.Helper()
+	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "test_mode": %q}`, stateDir, mode)
+	if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// countRuns reports how many iteration-*.log files the fake has written into
+// stateDir — i.e. how many times that instance has been spawned.
+func countRuns(t *testing.T, stateDir string) int {
+	t.Helper()
+	entries, err := os.ReadDir(stateDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "iteration-") && strings.HasSuffix(e.Name(), ".log") {
+			n++
+		}
+	}
+	return n
+}
+
+// waitFor polls cond until it holds or the timeout passes, then fails.
+func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// runSupervise starts Supervise in a goroutine and returns a channel carrying
+// its error (nil on a clean fleet stop).
+func runSupervise(ctx context.Context, o Options) <-chan error {
+	done := make(chan error, 1)
+	go func() { done <- Supervise(ctx, o) }()
+	return done
+}
+
+// --- tests ------------------------------------------------------------------
+
+// The supervisor starts exactly one child per instance config, and ignores the
+// other JSON that shares the config dir.
+func TestSpawnPerFile(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(t.TempDir(), "state-a")
+	b := filepath.Join(t.TempDir(), "state-b")
+	writeInstanceConfig(t, dir, "a.json", "sleep", a)
+	writeInstanceConfig(t, dir, "b.json", "sleep", b)
+	// Not instance configs: an MCP config, a headless permission policy, and
+	// unparseable JSON. None may spawn a child.
+	os.WriteFile(filepath.Join(dir, "mcp.json"), []byte(`{"mcp": {"cb": {"type": "remote", "url": "https://plane/mcp/slug"}}}`), 0o644)
+	os.WriteFile(filepath.Join(dir, "headless.json"), []byte(`{"permissions": {"allow": ["Bash(go test:*)"]}}`), 0o644)
+	os.WriteFile(filepath.Join(dir, "broken.json"), []byte(`{not json`), 0o644)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	waitFor(t, 5*time.Second, "both instances to come up", func() bool {
+		return countRuns(t, a) == 1 && countRuns(t, b) == 1
+	})
+	if got := countRuns(t, a) + countRuns(t, b); got != 2 {
+		t.Fatalf("total spawns = %d, want exactly 2 (one per instance config)", got)
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+	if got := countRuns(t, a) + countRuns(t, b); got != 2 {
+		t.Fatalf("total spawns after stop = %d, want 2 — a deliberate stop must not restart anything", got)
+	}
+}
+
+// A child that exits unexpectedly is restarted, and the respawn rate backs off
+// (the ladder doubles to the cap rather than spinning at the base interval).
+func TestUnexpectedExitRestartWithBackoff(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	writeInstanceConfig(t, dir, "crashy.json", "crash", state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	waitFor(t, 5*time.Second, "the crashing child to have been respawned at least twice", func() bool {
+		return countRuns(t, state) >= 3
+	})
+	before := countRuns(t, state)
+	time.Sleep(500 * time.Millisecond)
+	after := countRuns(t, state)
+	if after < before {
+		t.Fatalf("spawn count went backwards: %d -> %d", before, after)
+	}
+	// At the 200ms cap, 500ms buys at most ~3 more spawns; at the flat 50ms
+	// base it would buy ~10. The count must sit between the two.
+	if extra := after - before; extra > 3 {
+		t.Fatalf("%d extra spawns in 500ms — the backoff is not doubling (cap %s, base %s)", extra, 200*time.Millisecond, 50*time.Millisecond)
+	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// A child the supervisor told to stop is NOT restarted: the STOP marker lands,
+// the child drains (exits) at its boundary, and the supervisor waits for it.
+func TestDeliberateStopNoRestart(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	writeInstanceConfig(t, dir, "daemon.json", "sleep", state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+	if got := countRuns(t, state); got != 1 {
+		t.Fatalf("spawns = %d, want 1 — a child told to stop must not be restarted", got)
+	}
+}
+
+// The fleet-wide drain: cancelling the context (the signal path) writes a STOP
+// marker into every child's own state dir, every child exits, none restart.
+func TestFleetWideDrainOnSignal(t *testing.T) {
+	dir := t.TempDir()
+	states := []string{
+		filepath.Join(t.TempDir(), "s1"),
+		filepath.Join(t.TempDir(), "s2"),
+		filepath.Join(t.TempDir(), "s3"),
+	}
+	for i, s := range states {
+		writeInstanceConfig(t, dir, fmt.Sprintf("d%d.json", i+1), "sleep-seen", s)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	for _, s := range states {
+		waitFor(t, 5*time.Second, "all children to come up", func() bool { return countRuns(t, s) == 1 })
+	}
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+	for _, s := range states {
+		if _, err := os.Lstat(filepath.Join(s, "STOP-SEEN")); err != nil {
+			t.Errorf("no STOP marker reached %s — the fleet-wide drain missed an instance", s)
+		}
+		if got := countRuns(t, s); got != 1 {
+			t.Errorf("spawns in %s = %d, want 1 — the drain must not restart", s, got)
+		}
+	}
+}
+
+// HALT is the operator's per-instance stop switch: a child that exits with a
+// HALT marker in its state dir is left stopped, not respawned.
+func TestHaltLeavesInstanceStopped(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	writeInstanceConfig(t, dir, "halted.json", "halt", state)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	waitFor(t, 5*time.Second, "the halting child to run once", func() bool { return countRuns(t, state) == 1 })
+	// Six times the base backoff: if the HALT were ignored, a respawn would
+	// have happened long before this.
+	time.Sleep(300 * time.Millisecond)
+	if got := countRuns(t, state); got != 1 {
+		t.Fatalf("spawns = %d, want 1 — a child that exited under HALT must not be restarted", got)
+	}
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// A config dir with nothing superviseable in it is a clean no-op, not an
+// error and not an idle hang.
+func TestEmptyConfigDirReturnsCleanly(t *testing.T) {
+	dir := t.TempDir() // empty
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Supervise on an empty dir returned %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Supervise on an empty dir did not return")
+	}
+}
+
+// enumerate keeps exactly the parseable, valid instance configs and reports
+// the skips as log lines.
+func TestEnumerateSkipsNonConfigs(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(t.TempDir(), "state-a")
+	writeInstanceConfig(t, dir, "a.json", "sleep", a)
+	os.WriteFile(filepath.Join(dir, "mcp.json"), []byte(`{"mcp": {}}`), 0o644)
+	os.WriteFile(filepath.Join(dir, "policy.json"), []byte(`{"permissions": {}}`), 0o644)
+	os.WriteFile(filepath.Join(dir, "broken.json"), []byte(`{`), 0o644)
+	// A config that would fail validation (unknown harness) is skipped too.
+	os.WriteFile(filepath.Join(dir, "bad-harness.json"), []byte(`{"harness": "no-such-harness", "state_dir": "/tmp/x"}`), 0o644)
+
+	d := &Supervisor{o: testOptions(t, dir).withDefaults()}
+	if err := d.enumerate(); err != nil {
+		t.Fatal(err)
+	}
+	if len(d.instances) != 1 {
+		t.Fatalf("enumerate kept %d instance(s), want 1 — only a.json is a valid instance config", len(d.instances))
+	}
+	if d.instances[0].path != filepath.Join(dir, "a.json") {
+		t.Fatalf("kept %s, want a.json", d.instances[0].path)
+	}
+}
+
+// backoffDelay is the pure schedule: double from the base up to the cap, and
+// reset to the base after a healthy run.
+func TestBackoffDelay(t *testing.T) {
+	const (
+		base       = 2 * time.Second
+		cap        = 60 * time.Second
+		resetAfter = 2 * time.Minute
+	)
+	cases := []struct {
+		name   string
+		prev   time.Duration
+		uptime time.Duration
+		want   time.Duration
+	}{
+		{"first crash", 0, 100 * time.Millisecond, base},
+		{"doubles", base, 100 * time.Millisecond, 4 * time.Second},
+		{"doubles again", 4 * time.Second, 100 * time.Millisecond, 8 * time.Second},
+		{"caps", 30 * time.Second, 100 * time.Millisecond, cap},
+		{"stays capped", cap, 100 * time.Millisecond, cap},
+		{"healthy run resets", cap, resetAfter + time.Second, base},
+		{"healthy run from zero", 0, resetAfter, base},
+	}
+	for _, tc := range cases {
+		if got := backoffDelay(tc.prev, tc.uptime, base, cap, resetAfter); got != tc.want {
+			t.Errorf("%s: backoffDelay(%v, %v) = %v, want %v", tc.name, tc.prev, tc.uptime, got, tc.want)
+		}
+	}
+}
+
+// The supervisor sorts nothing itself; enumeration comes back in the glob's
+// sorted order, so two instances are stable and distinct.
+func TestEnumerateSortsInstances(t *testing.T) {
+	dir := t.TempDir()
+	writeInstanceConfig(t, dir, "b.json", "sleep", filepath.Join(t.TempDir(), "b"))
+	writeInstanceConfig(t, dir, "a.json", "sleep", filepath.Join(t.TempDir(), "a"))
+
+	d := &Supervisor{o: testOptions(t, dir).withDefaults()}
+	if err := d.enumerate(); err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, inst := range d.instances {
+		names = append(names, filepath.Base(inst.path))
+	}
+	sort.Strings(names)
+	got := make([]string, len(d.instances))
+	for i, inst := range d.instances {
+		got[i] = filepath.Base(inst.path)
+	}
+	if strings.Join(got, ",") != strings.Join(names, ",") {
+		t.Fatalf("instances not in sorted order: %v", got)
+	}
+}
