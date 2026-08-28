@@ -327,11 +327,13 @@ func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string
 // operator made since the last spawn — the RUNNING child still reads the file
 // it started with, and a RELOAD keeps that handle, so the freshly materialized
 // file is exactly what the next child starts from. A source that no longer
-// loads, derives, validates or passes the permission-policy gate leaves the
-// last good config in place: the child is spawned on the previous
-// materialization, which is exactly what the on-disk cache is for — subject
-// to the policy gate below, which still refuses the spawn if that config's
-// policy file is gone too.
+// loads, derives or validates leaves the last good config in place: the child
+// is spawned on the previous materialization, which is exactly what the
+// on-disk cache is for — subject to the policy gate below, which still
+// refuses the spawn if that config's policy file is gone too. A source whose
+// permission policy cannot be verified is refused with backoff instead: its
+// settings_path names the policy the daemon must run under, and the child
+// must not be started under a different one.
 //
 // The child is spawned with `run -c` pointing at the MATERIALIZED config in
 // its state dir — never the source file, so the config a daemon runs on is
@@ -346,12 +348,17 @@ func (d *Supervisor) spawn(inst *Instance) {
 			inst.stateDir = sd
 			inst.mu.Unlock()
 		} else if errors.Is(err, ErrPolicyRefused) {
-			// A permission-policy refusal is not a fallback trigger on its own:
-			// the last materialized config carries the settings_path of the
-			// config it was built from, which may be a different (valid) one if
-			// the source was edited since. The gate below decides against that
-			// config's policy; this line just says why the fresh one lost.
-			log.Printf("%s: its permission policy cannot be verified (%v) - the fallback materialized config must still pass the policy gate", inst.name, err)
+			// A permission-policy refusal is not a fallback trigger: the
+			// config the operator is looking at names a policy file that does
+			// not exist, and starting the child on the last materialized
+			// config would silently keep the daemon running under a policy the
+			// operator has replaced (that config's settings_path may name a
+			// different file than the one the source names now). Fail closed
+			// like the enumeration gate: refuse with backoff, and a restored
+			// or fixed file is picked up by the next retry.
+			log.Printf("%s: refusing to start: %v - retrying with backoff", inst.name, err)
+			inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
+			return
 		} else {
 			log.Printf("%s: re-resolving its config failed (%v) - spawning on the last materialized config", inst.name, err)
 		}
@@ -359,15 +366,15 @@ func (d *Supervisor) spawn(inst *Instance) {
 		log.Printf("%s: re-reading its config failed (%v) - spawning on the last materialized config", inst.name, err)
 	}
 	// The permission-policy gate (phase 2c) at the child-start gate. The
-	// config that will actually be spawned — freshly resolved or the last
-	// materialized fallback — must name a permission policy file that exists;
-	// an absent one refuses the spawn, the refusal naming the daemon and the
-	// path. There is deliberately no fallback past this point: the materialized
-	// config carries the same settings_path as the source it was built from, so
-	// "spawning on the last materialized config" would still start a daemon
-	// without its policy when the file is gone. Retry with backoff instead, so
-	// a policy file restored while the supervisor runs is picked up by the next
-	// respawn.
+	// config that will actually be spawned — freshly resolved, or the last
+	// materialized config after a re-read/re-resolve failure of any OTHER kind
+	// — must name a permission policy file that exists; an absent one refuses
+	// the spawn, the refusal naming the daemon and the path. A fresh config
+	// has already passed this check inside resolveInstance; the re-check is
+	// the hard gate the boundary wants, and it is what refuses the fallback
+	// when that config's policy file is gone too. Retry with backoff instead,
+	// so a policy file restored while the supervisor runs is picked up by the
+	// next respawn.
 	inst.mu.Lock()
 	cfg := inst.cfg
 	inst.mu.Unlock()

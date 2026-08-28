@@ -36,9 +36,9 @@ var ErrPolicyRefused = errors.New("permission_policy_refused")
 
 // checkPermissionPolicy verifies that the permission-policy file every harness
 // the config spawns sessions on will load exists: SessionFor(h).SettingsPath
-// for each spawned harness. An absent file — or a path that is not a file —
-// refuses with ErrPolicyRefused naming the path; an empty settings_path (no
-// policy named) passes.
+// for each spawned harness. A file that is absent, is not a file, or cannot be
+// stat'ed refuses with ErrPolicyRefused naming the path; an empty
+// settings_path (no policy named) passes.
 func checkPermissionPolicy(cfg *config.Config) error {
 	for _, h := range cfg.SpawnedHarnesses() {
 		path := cfg.SessionFor(h).SettingsPath
@@ -46,7 +46,7 @@ func checkPermissionPolicy(cfg *config.Config) error {
 			continue
 		}
 		if fi, err := os.Stat(path); err != nil || fi.IsDir() {
-			return fmt.Errorf("%w: %s (the permission policy harness %q will load) is absent - refusing to start the daemon without it", ErrPolicyRefused, path, h)
+			return fmt.Errorf("%w: %s (the permission policy harness %q will load) is missing, unreadable, or not a file - a daemon is never started without it", ErrPolicyRefused, path, h)
 		}
 	}
 	return nil

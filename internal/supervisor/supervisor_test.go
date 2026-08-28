@@ -824,6 +824,76 @@ func TestPermissionPolicyRemovedAfterStartRefusesRespawn(t *testing.T) {
 	})
 }
 
+// The spawn-time gate (phase 2c) refuses a policy that goes missing from an
+// EDITED source, even when the previous config's policy file still exists: the
+// daemon must not be respawned on the last materialized config under a policy
+// the operator has replaced. The backoff retry picks up the restored file
+// without a supervisor restart.
+func TestPermissionPolicyEditedToAbsentRefusesRespawn(t *testing.T) {
+	dir := t.TempDir()
+	state := filepath.Join(t.TempDir(), "state")
+	oldPolicy := filepath.Join(t.TempDir(), "headless-old.json")
+	if err := os.WriteFile(oldPolicy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newPolicy := filepath.Join(t.TempDir(), "headless-new.json") // named, never created
+	writeInstanceConfigPolicy(t, dir, "daemon.json", "sleep", state, oldPolicy)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, dir))
+
+	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+	// Edit the source to name a policy file that does not exist. The OLD
+	// policy file stays on disk, so the last materialized config would pass
+	// the gate — the refusal must come from the re-resolve, and it must NOT
+	// fall back to that config.
+	body := fmt.Sprintf(`{"harness": "claude", "state_dir": %q, "settings_path": %q}`, state, newPolicy)
+	if err := os.WriteFile(filepath.Join(dir, "daemon.json"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pid := spawnPid(t, buf.String())
+	if pid <= 0 {
+		t.Fatalf("no spawned pid in the log:\n%s", buf.String())
+	}
+	if err := syscall.Kill(pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the refused respawn to be logged", func() bool {
+		return strings.Contains(buf.String(), "refusing to start") && strings.Contains(buf.String(), newPolicy)
+	})
+	// No child may spawn on the old materialized config, however long the
+	// backoff retries run against the still-absent file.
+	time.Sleep(300 * time.Millisecond)
+	if got := countRuns(t, state); got != 1 {
+		t.Fatalf("spawns after the source named an absent policy = %d, want 1 — the daemon must not fall back to the last materialized config", got)
+	}
+	// Restore the policy file: the next backoff retry starts the child again.
+	if err := os.WriteFile(newPolicy, []byte(`{"permissions": {"allow": []}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the child to be respawned once the policy file is back", func() bool {
+		return countRuns(t, state) == 2
+	})
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
 // backoffDelay is the pure schedule: double from the base up to the cap, and
 // reset to the base after a healthy run.
 func TestBackoffDelay(t *testing.T) {
