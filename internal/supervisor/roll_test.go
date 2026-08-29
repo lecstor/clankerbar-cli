@@ -268,7 +268,7 @@ func TestRollSkipsRemoteStoppedAndRefusedEntries(t *testing.T) {
 		`roll: skipping entry "remote" - placement remote is not implemented (Decision 7)`,
 		`roll: skipping entry "stopped" - desired state is "stopped", not running`,
 		`roll: skipping entry "refused" - desired state is "sideways", not running`,
-		"roll complete: 0 child(ren) on " + version.Current + " (1 already on it, 3 not touched)",
+		"roll complete: 0 child(ren) on " + version.Current + " (1 already on it, 0 not running, 3 not touched)",
 	} {
 		if !strings.Contains(text, want) {
 			t.Errorf("roll output does not contain %q:\n%s", want, text)

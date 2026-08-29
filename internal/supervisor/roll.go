@@ -113,7 +113,7 @@ func Roll(ctx context.Context, o Options) error {
 		return fmt.Errorf("roll: %w", err)
 	}
 
-	rolled, skipped, untouched := 0, 0, 0
+	rolled, already, notRunning, untouched := 0, 0, 0, 0
 	for i := range entries {
 		e := &entries[i]
 		switch {
@@ -138,7 +138,7 @@ func Roll(ctx context.Context, o Options) error {
 		cur := readLocalBeacon(dir)
 		if cur != nil && cur.Version == target {
 			log.Printf("roll: %s already runs %s - skipping", e.Name, target)
-			skipped++
+			already++
 			continue
 		}
 		if _, err := os.Lstat(dir); err != nil {
@@ -147,7 +147,7 @@ func Roll(ctx context.Context, o Options) error {
 			// is rolled; the line says so loudly rather than letting the
 			// summary's "rolled N" read as the whole fleet.
 			log.Printf("roll: %s has no state dir yet - it is not running under this supervisor; skipping (once it is up, re-run the roll)", e.Name)
-			skipped++
+			notRunning++
 			continue
 		}
 
@@ -165,7 +165,7 @@ func Roll(ctx context.Context, o Options) error {
 		rolled++
 	}
 
-	log.Printf("roll complete: %d child(ren) on %s (%d already on it, %d not touched)", rolled, target, skipped, untouched)
+	log.Printf("roll complete: %d child(ren) on %s (%d already on it, %d not running, %d not touched)", rolled, target, already, notRunning, untouched)
 	return nil
 }
 

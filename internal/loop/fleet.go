@@ -12,12 +12,14 @@ package loop
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
@@ -164,6 +166,15 @@ func (d *Driver) writeLocalBeacon(st fleet.State) {
 	}
 	_ = d.state.Remove(LocalBeaconName)
 	if err := d.state.WriteFile(LocalBeaconName, body); err != nil {
+		if errors.Is(err, statedir.ErrExists) {
+			// A concurrent beacon won the remove-then-create race — the claim
+			// reflector (CLA-510) beacons from the lease-renewer goroutine, so
+			// two beacons can write this file at once. The winner's file is a
+			// complete, fresh beacon from the same daemon, which is exactly
+			// what this write was going to produce: not a failure, and not a
+			// reason to tell the operator the roll cannot verify.
+			return
+		}
 		if !d.beaconWriteFailed.Swap(true) {
 			log.Printf("fleet: cannot write the local beacon into %s (%v) - the roll cannot verify a restarted child without it", d.state.Path(), err)
 		}
