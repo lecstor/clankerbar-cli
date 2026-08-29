@@ -52,7 +52,9 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/teststate"
+	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
 const helperEnv = "CLANKERBAR_SUPER_HELPER"
@@ -127,6 +129,27 @@ func helperMain() {
 			fmt.Fprintln(os.Stderr, "fake daemon: iteration log:", err)
 			os.Exit(9)
 		}
+		// The local beacon (phase 5b): what the roll verifies against. The
+		// supervisor passes the version it recorded for THIS spawn in
+		// CLANKERBAR_CHILD_VERSION; the fake reports it back the way the real
+		// daemon reports its own build.
+		v := os.Getenv(childVersionEnv)
+		if v == "" {
+			v = version.Current
+		}
+		beaconBody, err := json.Marshal(map[string]any{
+			"version": v,
+			"state":   "idle",
+			"at":      time.Now().UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "fake daemon: beacon:", err)
+			os.Exit(9)
+		}
+		if err := os.WriteFile(filepath.Join(spec.StateDir, loop.LocalBeaconName), beaconBody, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake daemon: beacon:", err)
+			os.Exit(9)
+		}
 		// The CLA-491 startup consumption: a STOP found here predates this process
 		// and is eaten WITHOUT stopping.
 		if _, err := os.Lstat(filepath.Join(spec.StateDir, "STOP")); err == nil {
@@ -151,6 +174,14 @@ func helperMain() {
 				} else {
 					_ = os.WriteFile(filepath.Join(spec.StateDir, "STOP-SEEN"), []byte("marker landed\n"), 0o600)
 				}
+				os.Exit(0)
+			}
+			// The phase-5b roll: the real daemon drains and re-execs in place;
+			// the fake simulates the restart as an EXIT, so the supervisor
+			// respawns the child from the (possibly swapped) launch path — the
+			// same landing the roll's beacon verify watches for.
+			if _, err := os.Lstat(filepath.Join(spec.StateDir, loop.MarkerRestart)); err == nil {
+				_ = os.Remove(filepath.Join(spec.StateDir, loop.MarkerRestart))
 				os.Exit(0)
 			}
 			time.Sleep(20 * time.Millisecond)
