@@ -28,6 +28,29 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
+// instanceLine returns one instance's line out of the LATEST fleet-status
+// listing. The log buffer accumulates listings, so a plain first-match search
+// would keep returning the startup listing forever; the current surface is
+// the last "fleet status:" block. The per-child assertions (which version
+// sits on which line) go through this, so they pin the mapping the test
+// exists for rather than a global substring.
+func instanceLine(t *testing.T, text, name string) string {
+	t.Helper()
+	idx := strings.LastIndex(text, "fleet status:")
+	if idx < 0 {
+		t.Fatalf("no fleet status listing yet:\n%s", text)
+		return ""
+	}
+	tail := text[idx:]
+	for _, line := range strings.Split(tail, "\n") {
+		if strings.HasPrefix(line, "  "+name+": ") {
+			return line
+		}
+	}
+	t.Fatalf("no listing line for %q in the latest listing:\n%s", name, tail)
+	return ""
+}
+
 // The discovery and reporting shape: with no hook, every child's version is
 // the supervisor's own build (version.Current), and the listing carries the
 // supervisor's version in the header and each child's version on its line.
@@ -114,11 +137,15 @@ func TestFleetStatusShowsSkewBetweenChildren(t *testing.T) {
 	waitFor(t, 5*time.Second, "both children to come up", func() bool {
 		return countRuns(t, oldState) == 1 && countRuns(t, newState) == 1
 	})
-	// The one listing carries both versions, each on its own child's line.
+	// The one listing carries both versions, EACH ON ITS OWN CHILD'S LINE —
+	// the per-child mapping is the point of this test, so it is asserted
+	// line-scoped, not as a global substring.
 	waitFor(t, 5*time.Second, "the listing to show each child on its own version", func() bool {
 		text := buf.String()
-		return strings.Contains(text, "daemon-old: running (pid ") && strings.Contains(text, "version 1.0.0") &&
-			strings.Contains(text, "daemon-new: running (pid ") && strings.Contains(text, "version 2.0.0")
+		return strings.Contains(instanceLine(t, text, "daemon-old"), "running (pid ") &&
+			strings.Contains(instanceLine(t, text, "daemon-old"), "version 1.0.0") &&
+			strings.Contains(instanceLine(t, text, "daemon-new"), "running (pid ") &&
+			strings.Contains(instanceLine(t, text, "daemon-new"), "version 2.0.0")
 	})
 
 	cancel()
@@ -160,8 +187,8 @@ func TestFleetStatusShowsSkewBetweenChildAndSupervisor(t *testing.T) {
 	waitFor(t, 5*time.Second, "the listing to name both the supervisor and the child version", func() bool {
 		text := buf.String()
 		return strings.Contains(text, "fleet status: supervisor "+version.Current) &&
-			strings.Contains(text, "daemon-one: running (pid ") &&
-			strings.Contains(text, "version 2.0.0")
+			strings.Contains(instanceLine(t, text, "daemon-one"), "running (pid ") &&
+			strings.Contains(instanceLine(t, text, "daemon-one"), "version 2.0.0")
 	})
 
 	cancel()
@@ -257,6 +284,77 @@ func TestFleetStatusDoesNotRepeatOnUnchangedPolls(t *testing.T) {
 	if after := strings.Count(buf.String(), "fleet status:"); after != before {
 		t.Fatalf("the fleet status listing repeated on unchanged polls: %d before, %d after — the status surface must be idempotent like the reconcile it follows", before, after)
 	}
+
+	cancel()
+	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// The status surface stays idempotent while a restart is PENDING too: the
+// listing names the SCHEDULED delay, so its text does not drift between polls
+// (a countdown would re-print the listing on every poll for the whole backoff
+// window — the "at most one listing per transition" contract, broken).
+func TestFleetStatusDoesNotRepeatWhileARestartIsPending(t *testing.T) {
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	d := &Supervisor{
+		instances: []*Instance{{
+			name:        "crashy",
+			desired:     RosterDesiredRunning,
+			restartAt:   time.Now().Add(time.Second),
+			lastBackoff: time.Second,
+		}},
+	}
+	d.logFleetStatus()
+	// The remaining time has since changed; the listing text must not have.
+	time.Sleep(5 * time.Millisecond)
+	d.logFleetStatus()
+	if got := strings.Count(buf.String(), "fleet status:"); got != 1 {
+		t.Fatalf("the pending-restart listing repeated while no fleet state changed: %d listings, want 1 — the listing must name the scheduled delay, not a drifting countdown", got)
+	}
+	if line := buf.String(); !strings.Contains(line, "crashy: restarting in 1s (last version ") {
+		t.Fatalf("the pending-restart line does not name the scheduled delay:\n%s", line)
+	}
+}
+
+// A removed instance is NAMED at its exit: the listing flips its line to
+// "removed" the moment the child drains — the operator sees what happened to
+// the entry instead of watching it silently disappear (without the onExit
+// listing, the last listing would be "stopping" and the instance would then
+// leave the fleet unnamed, as the next reconcile drops it).
+func TestFleetStatusNamesARemovedInstanceAtItsExit(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+	state := entryStateDir(cacheDir, "daemon-one")
+	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+	// Remove the entry: the child drains and the listing names the removal.
+	plane.set([]RosterEntry{})
+	waitFor(t, 5*time.Second, "the listing to name the removed instance at its exit", func() bool {
+		return strings.Contains(instanceLine(t, buf.String(), "daemon-one"), "removed")
+	})
 
 	cancel()
 	waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {

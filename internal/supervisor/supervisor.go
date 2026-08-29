@@ -826,6 +826,10 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 	// also left stopped: the instance's desired state is authoritative, not
 	// the marker's arrival.
 	if inst.desired != RosterDesiredRunning || inst.removed || inst.refused {
+		// The fleet changed: the listing flips this line now — "stopped",
+		// or "removed"/"refused" for an entry that is about to leave the
+		// fleet — rather than on the next poll.
+		d.logFleetStatus()
 		return
 	}
 
@@ -841,6 +845,7 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 	if d.haltPresent(inst) {
 		inst.halted = true
 		log.Printf("%s: HALT marker present in %s - leaving it stopped; delete the marker and restart the supervisor to resume it", inst.name, inst.stateDir)
+		d.logFleetStatus()
 		return
 	}
 
@@ -936,7 +941,12 @@ func (d *Supervisor) fleetStatus() string {
 		case inst.desired != RosterDesiredRunning:
 			b.WriteString("stopped")
 		case !restartAt.IsZero():
-			fmt.Fprintf(&b, "restarting in %s (last version %s)", time.Until(restartAt).Round(time.Millisecond), v)
+			// The SCHEDULED delay, not the remaining time: the listing text
+			// must not drift between polls, or logFleetStatus would re-print
+			// it on every poll for the whole backoff window. scheduleRestart
+			// sets lastBackoff and restartAt together, so the pending
+			// restart's delay is exactly what lastBackoff holds.
+			fmt.Fprintf(&b, "restarting in %s (last version %s)", inst.lastBackoff, v)
 		default:
 			if v != "" {
 				fmt.Fprintf(&b, "down (last version %s)", v)
