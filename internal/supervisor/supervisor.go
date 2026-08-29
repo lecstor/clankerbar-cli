@@ -1,4 +1,4 @@
-// Package supervisor runs the fleet supervisor (CLA-525, phases 1-3 of
+// Package supervisor runs the fleet supervisor (CLA-525, phases 1-3 and 5a of
 // docs/proposals/daemon-supervisor.md): bare `clankerbar` — or
 // `clankerbar supervise` — reconciles the machine against the plane's
 // account-scoped roster: every entry with `desired: running` has a supervised
@@ -41,6 +41,12 @@
 // reconciling against the last-known-good roster, and a cold start reconciles
 // from the cached roster + materialized configs on disk (phase 2b wrote them
 // for exactly this) rather than starting nothing.
+//
+// Since phase 5a the supervisor's own log is a status surface: on every change
+// of the fleet it lists the version it itself runs and, per instance, the
+// state and the version of the child serving it — so version skew between
+// children (and between a child and the supervisor) is observable on the
+// machine, not only on the fleet page.
 package supervisor
 
 import (
@@ -59,6 +65,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
+	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
 // Defaults for the restart backoff, the stop settle window, and the roster
@@ -144,6 +151,17 @@ type Options struct {
 	// StopLogEvery is how long a fleet stop may sit without progress before
 	// the supervisor logs what it is still waiting for. 0 = defaultStopLogEvery.
 	StopLogEvery time.Duration
+
+	// VersionOf returns the version recorded for a child at the moment it is
+	// spawned: the binary version the child was just launched with. Nil =
+	// version.Current — the supervisor's own build, which is exactly the
+	// binary every child is spawned from (phase 5a discovers without a
+	// per-daemon file: no query, no version file, the spawn is the
+	// derivation). The hook exists so tests can simulate the phase-5b roll —
+	// children spawned before a binary swap stay on the old version while
+	// later spawns carry the new one — the one situation in which a single
+	// supervisor's children can carry different versions.
+	VersionOf func() string
 }
 
 func (o Options) withDefaults() Options {
@@ -203,6 +221,12 @@ type Instance struct {
 	exited     bool      // the current child has exited
 	aliveSince time.Time // when the current child was spawned
 	exitErr    error
+	// childVersion is the binary version of the current child, recorded at
+	// its spawn (phase 5a): the version of the binary it was launched from.
+	// It is the version the status listing reports; a respawn after a binary
+	// swap records the new version. Empty = the instance has never spawned a
+	// child.
+	childVersion string
 
 	restartAt   time.Time // zero = not scheduled for a restart
 	lastBackoff time.Duration
@@ -244,6 +268,11 @@ type Supervisor struct {
 
 	timer   *time.Timer
 	timerCh <-chan time.Time
+
+	// lastStatus is the last fleet-status listing printed, so logFleetStatus
+	// prints once per CHANGE: idempotent polls print nothing, exactly as
+	// reconcile itself writes nothing.
+	lastStatus string
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
@@ -306,12 +335,6 @@ func Supervise(ctx context.Context, o Options) error {
 		log.Print("roster holds no local instances - nothing to supervise")
 		return nil
 	}
-	names := make([]string, len(d.instances))
-	for i, inst := range d.instances {
-		names[i] = inst.name
-	}
-	sort.Strings(names)
-	log.Printf("supervising %d instance(s) from the roster: %s", len(d.instances), strings.Join(names, ", "))
 
 	pollTicker := time.NewTicker(d.o.PollInterval)
 	defer pollTicker.Stop()
@@ -450,6 +473,11 @@ func (d *Supervisor) reconcile() error {
 		kept = append(kept, inst)
 	}
 	d.instances = kept
+
+	// The fleet changed (or not): the status surface follows reconcile, so a
+	// spawn, a stop, a flip or a removal is reflected within the same poll —
+	// and an unchanged pass prints nothing.
+	d.logFleetStatus()
 
 	d.armRestart()
 	return nil
@@ -761,11 +789,13 @@ func (d *Supervisor) spawn(inst *Instance) {
 	inst.aliveSince = time.Now()
 	inst.exited = false
 	inst.exitErr = nil
+	inst.childVersion = childVersion(d.o.VersionOf)
 	inst.mu.Unlock()
 	// A fresh child starts clean: the next stopped flip must write its STOP
 	// again, it must not inherit the previous child's marker state.
 	inst.stopRequested = false
-	log.Printf("%s: spawned (pid %d, %s)", inst.name, cmd.Process.Pid, cfgPath)
+	log.Printf("%s: spawned (pid %d, %s, version %s)", inst.name, cmd.Process.Pid, cfgPath, inst.childVersion)
+	d.logFleetStatus()
 	go func() {
 		d.exits <- exitEvent{inst, cmd.Wait()}
 	}()
@@ -796,6 +826,10 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 	// also left stopped: the instance's desired state is authoritative, not
 	// the marker's arrival.
 	if inst.desired != RosterDesiredRunning || inst.removed || inst.refused {
+		// The fleet changed: the listing flips this line now — "stopped",
+		// or "removed"/"refused" for an entry that is about to leave the
+		// fleet — rather than on the next poll.
+		d.logFleetStatus()
 		return
 	}
 
@@ -811,6 +845,7 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 	if d.haltPresent(inst) {
 		inst.halted = true
 		log.Printf("%s: HALT marker present in %s - leaving it stopped; delete the marker and restart the supervisor to resume it", inst.name, inst.stateDir)
+		d.logFleetStatus()
 		return
 	}
 
@@ -826,6 +861,10 @@ func (inst *Instance) scheduleRestart(d *Supervisor, err error, uptime time.Dura
 	inst.restartAt = time.Now().Add(delay)
 	log.Printf("%s: exited unexpectedly (%v, up %s) - restarting in %s", inst.name, exitErrString(err), uptime.Round(time.Millisecond), delay)
 	d.armRestart()
+	// The fleet changed: the status listing now shows the child down and its
+	// restart scheduled. Called from every restart-scheduling path (an exit,
+	// a refused or failed spawn), so no transition goes unlisted.
+	d.logFleetStatus()
 }
 
 // backoffDelay is the pure restart schedule: the previous delay doubles
@@ -852,6 +891,90 @@ func exitErrString(err error) string {
 		return "exit 0"
 	}
 	return err.Error()
+}
+
+// childVersion returns the version to record for a child at spawn: the
+// Options hook when set, else the supervisor's own build — every child is
+// spawned from this binary, so its version IS the version this process was
+// built as (phase 5a: discovery without a per-daemon file — no query, no
+// version file; the spawn itself is the derivation).
+func childVersion(hook func() string) string {
+	if hook != nil {
+		return hook()
+	}
+	return version.Current
+}
+
+// fleetStatus builds the supervisor's status surface (phase 5a): the header
+// names the version the supervisor itself runs, and each instance line names
+// its state and the version of the child serving it — the version recorded at
+// THAT child's spawn, which is what makes version skew observable on the
+// machine: a child spawned before a binary swap stays on the old version
+// while later spawns carry the new one, and both sit next to the
+// supervisor's own version in the same listing.
+func (d *Supervisor) fleetStatus() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "fleet status: supervisor %s, %d instance(s)", version.Current, len(d.instances))
+	for _, inst := range d.instances {
+		inst.mu.Lock()
+		alive := inst.cmd != nil && !inst.exited
+		pid := 0
+		if alive && inst.cmd.Process != nil {
+			pid = inst.cmd.Process.Pid
+		}
+		v := inst.childVersion
+		restartAt := inst.restartAt
+		b.WriteString("\n  " + inst.name + ": ")
+		switch {
+		case alive && inst.stopRequested:
+			fmt.Fprintf(&b, "stopping (pid %d, version %s)", pid, v)
+		case alive:
+			fmt.Fprintf(&b, "running (pid %d, version %s)", pid, v)
+		case inst.removed:
+			b.WriteString("removed")
+		case inst.refused:
+			b.WriteString("refused")
+		case inst.halted:
+			b.WriteString("halted")
+		case inst.policyRefused:
+			b.WriteString("refused (permission policy)")
+		case inst.desired != RosterDesiredRunning:
+			b.WriteString("stopped")
+		case !restartAt.IsZero():
+			// The SCHEDULED delay, not the remaining time: the listing text
+			// must not drift between polls, or logFleetStatus would re-print
+			// it on every poll for the whole backoff window. scheduleRestart
+			// sets lastBackoff and restartAt together, so the pending
+			// restart's delay is exactly what lastBackoff holds.
+			fmt.Fprintf(&b, "restarting in %s (last version %s)", inst.lastBackoff, v)
+		default:
+			if v != "" {
+				fmt.Fprintf(&b, "down (last version %s)", v)
+			} else {
+				b.WriteString("down")
+			}
+		}
+		inst.mu.Unlock()
+	}
+	return b.String()
+}
+
+// logFleetStatus prints the fleet status listing once per CHANGE: an
+// unchanged listing prints nothing, so idempotent polls stay silent (the
+// status surface is as idempotent as the reconcile it follows) and a
+// crash-looping child costs at most one listing per transition, not one per
+// poll. An empty fleet prints nothing — the empty-roster line already says
+// everything.
+func (d *Supervisor) logFleetStatus() {
+	if len(d.instances) == 0 {
+		return
+	}
+	text := d.fleetStatus()
+	if text == d.lastStatus {
+		return
+	}
+	d.lastStatus = text
+	log.Print(text)
 }
 
 // haltPresent reports whether a HALT marker sits in the instance's state dir.

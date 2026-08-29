@@ -707,7 +707,8 @@ func TestStopLogsWhenTheFleetCannotDrain(t *testing.T) {
 }
 
 // spawnPid pulls the child pid out of a captured supervisor log line
-// ("<name>: spawned (pid 123, <path>)"), or 0 when no spawn is logged.
+// ("<name>: spawned (pid 123, <path>, version <v>)"), or 0 when no spawn is
+// logged.
 func spawnPid(t *testing.T, log string) int {
 	t.Helper()
 	const marker = "spawned (pid "
@@ -1227,11 +1228,23 @@ func TestPermissionPolicyEditedToAbsentRefusesRespawn(t *testing.T) {
 	defer log.SetOutput(os.Stderr)
 
 	o := testOptions(t, cacheDir, srv)
-	base, err := config.Load("")
+	// The machine layer is the operator's config FILE: buildConfig re-reads
+	// the base's source on every build, so the edit lands on disk — the shape
+	// an operator's edit takes, and the only race-free way to change what a
+	// RUNNING supervisor reads (mutating the in-memory base would race the
+	// poll loop's re-read).
+	basePath := filepath.Join(t.TempDir(), "config.json")
+	writeBase := func(settingsPath string) {
+		t.Helper()
+		if err := os.WriteFile(basePath, []byte(fmt.Sprintf(`{"settings_path": %q}`, settingsPath)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeBase(oldPolicy)
+	base, err := config.Load(basePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	base.SettingsPath = oldPolicy
 	o.BaseCfg = base
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1243,7 +1256,7 @@ func TestPermissionPolicyEditedToAbsentRefusesRespawn(t *testing.T) {
 	// OLD policy file stays on disk, so the last materialized config would
 	// pass the gate — the refusal must come from the re-resolve, and it must
 	// NOT fall back to that config.
-	base.SettingsPath = newPolicy
+	writeBase(newPolicy)
 	pid := spawnPid(t, buf.String())
 	if pid <= 0 {
 		t.Fatalf("no spawned pid in the log:\n%s", buf.String())
