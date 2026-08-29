@@ -802,7 +802,7 @@ func (d *Supervisor) spawn(inst *Instance) {
 	// wrapper can read what the supervisor believes the child runs. The real
 	// daemon ignores it — its beacon reports its own build, which is the
 	// ground truth the roll verifies.
-	cmd.Env = append(os.Environ(), childVersionEnv+"="+v)
+	cmd.Env = spawnEnv(v)
 	// The children's logs stream to the same stdout/stderr the supervisor's
 	// do — the operator watches daemons today by watching one terminal per
 	// daemon, and the fleet must not be quieter than that.
@@ -934,6 +934,24 @@ func childVersion(hook func() string) string {
 		return hook()
 	}
 	return version.Current
+}
+
+// spawnEnv builds a child's environment: the parent's, with any pre-existing
+// CLANKERBAR_CHILD_VERSION dropped and the supervisor's recorded value
+// appended. The drop is load-bearing: getenv returns the FIRST match when a
+// key appears twice in an environment, so an operator env carrying the
+// reserved name would otherwise shadow the supervisor's value — and the
+// wrapper that "can read what the supervisor believes the child runs" would
+// read a stranger's number instead.
+func spawnEnv(v string) []string {
+	prefix := childVersionEnv + "="
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, prefix) {
+			env = append(env, kv)
+		}
+	}
+	return append(env, prefix+v)
 }
 
 // fleetStatus builds the supervisor's status surface (phase 5a): the header

@@ -12,6 +12,7 @@ package supervisor
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -350,5 +351,39 @@ func TestParseVersionLine(t *testing.T) {
 		if err != nil || got != tc.want {
 			t.Errorf("parseVersionLine(%q) = %q, %v; want %q", tc.in, got, err, tc.want)
 		}
+	}
+}
+
+// The beacon read refuses a planted symlink: every other file read in the
+// state dir refuses to follow one, and the beacon is the roll's verify gate —
+// a link pointing at a forked version string must not satisfy it.
+func TestReadLocalBeaconRefusesASymlink(t *testing.T) {
+	dir := t.TempDir()
+	// A plausible-looking target: a complete beacon reporting the target
+	// version, as a forked file outside the state dir would.
+	target := version.Current
+	fake := filepath.Join(dir, "forked-beacon")
+	body, err := json.Marshal(map[string]any{"version": target, "state": "idle", "at": time.Now().UTC().Format(time.RFC3339)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fake, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(fake, filepath.Join(dir, loop.LocalBeaconName)); err != nil {
+		t.Fatal(err)
+	}
+	if b := readLocalBeacon(dir); b != nil {
+		t.Fatalf("readLocalBeacon followed a planted symlink: %+v", b)
+	}
+
+	// The same name as a plain file reads through — the refusal is about the
+	// link, not the name.
+	_ = os.Remove(filepath.Join(dir, loop.LocalBeaconName))
+	if err := os.WriteFile(filepath.Join(dir, loop.LocalBeaconName), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if b := readLocalBeacon(dir); b == nil || b.Version != target {
+		t.Fatalf("readLocalBeacon on a plain file = %+v, want version %s", b, target)
 	}
 }

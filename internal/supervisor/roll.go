@@ -299,9 +299,21 @@ type localBeacon struct {
 
 // readLocalBeacon reads one child's local beacon. Absent, corrupt, or
 // version-less all read as nil — the roll treats "cannot see the child's
-// self-report" as "not on the target yet" and keeps waiting.
+// self-report" as "not on the target yet" and keeps waiting. A symlink
+// planted at the name reads as nil too, mirroring the state dir's control
+// surface: every other file read there refuses to follow one, and the beacon
+// is the roll's verify gate — a link pointing at a forked version string
+// must not satisfy it.
 func readLocalBeacon(dir string) *localBeacon {
-	data, err := os.ReadFile(filepath.Join(dir, loop.LocalBeaconName))
+	path := filepath.Join(dir, loop.LocalBeaconName)
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return nil
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}

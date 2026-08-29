@@ -1356,3 +1356,26 @@ func TestBackoffDelay(t *testing.T) {
 		}
 	}
 }
+
+// spawnEnv must drop a pre-existing CLANKERBAR_CHILD_VERSION from the parent
+// environment: getenv returns the FIRST match for a duplicated key, so an
+// operator env carrying the reserved name would otherwise shadow the
+// supervisor's recorded value in the child.
+func TestSpawnEnvDropsAPreExistingChildVersion(t *testing.T) {
+	t.Setenv(childVersionEnv, "operator-stale")
+	t.Setenv("KEEP_ME", "yes")
+	env := spawnEnv("1.2.3")
+	joined := strings.Join(env, "\n")
+	if strings.Contains(joined, childVersionEnv+"=operator-stale") {
+		t.Fatalf("spawnEnv kept a pre-existing %s: %v", childVersionEnv, env)
+	}
+	if !strings.Contains(joined, childVersionEnv+"=1.2.3") {
+		t.Fatalf("spawnEnv lost the supervisor's value: %v", env)
+	}
+	if !strings.Contains(joined, "KEEP_ME=yes") {
+		t.Fatalf("spawnEnv dropped an unrelated variable: %v", env)
+	}
+	if got := len(env); got != len(os.Environ()) {
+		t.Fatalf("spawnEnv changed the variable count: %d entries -> %d", len(os.Environ()), got)
+	}
+}
