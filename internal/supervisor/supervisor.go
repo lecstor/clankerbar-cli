@@ -164,10 +164,12 @@ type Options struct {
 	VersionOf func() string
 
 	// VerifyTimeout is how long the phase-5b roll waits for ONE child's next
-	// beacon to report the target version before halting the roll. 0 =
-	// defaultVerifyTimeout. A drain finishes at the child's iteration
-	// boundary, so the wait must be generous; the cap exists so a child that
-	// never comes back halts the roll instead of hanging it.
+	// beacon to report the target version before halting the roll — and, since
+	// phase 5c, how long the replace waits for the whole fleet to drain before
+	// halting the replacement. 0 = defaultVerifyTimeout. A drain finishes at
+	// the child's iteration boundary, so the wait must be generous; the cap
+	// exists so a child that never comes back halts the roll — or a child that
+	// never drains halts the replacement — instead of hanging it.
 	VerifyTimeout time.Duration
 
 	// LaunchVersion reports the version of the binary at the fleet's launch
@@ -175,9 +177,18 @@ type Options struct {
 	// (phase 5b) compares it against its own build BEFORE touching any child:
 	// the operator installs the new build at the launch path and runs the
 	// roll from it, and a roll whose launch path still carries another
-	// version refuses rather than rolling nothing. Nil = run `<Binary>
-	// version` and parse the line.
+	// version refuses rather than rolling nothing. The replace (phase 5c)
+	// compares it against the marker's requesting version BEFORE draining any
+	// child. Nil = run `<Binary> version` and parse the line.
 	LaunchVersion func() (string, error)
+
+	// ExecInPlace replaces the supervisor's process image in place with the
+	// binary at the fleet's launch path, invoked with the same argv and env
+	// (phase 5c). Nil = the platform's exec(2). The hook exists so tests can
+	// simulate the replacement without exec'ing the test binary over itself:
+	// the drain happens before it, and a returned error resumes the loop with
+	// the marker already consumed.
+	ExecInPlace func(bin string, argv []string, env []string) error
 }
 
 // childVersionEnv is the environment variable the supervisor sets on every
@@ -274,6 +285,11 @@ type Supervisor struct {
 	// resolved once at startup.
 	hostname string
 
+	// startedAt is when this supervisor process began — the staleness gate
+	// for the REPLACE marker (phase 5c): a marker written before this process
+	// started is not a request THIS supervisor owes and is discarded.
+	startedAt time.Time
+
 	// roster is the account-scoped poll client; entries is the last-known-good
 	// roster the supervisor reconciles against when the plane is unreachable.
 	roster  *RosterClient
@@ -315,6 +331,7 @@ func Supervise(ctx context.Context, o Options) error {
 		o:            o.withDefaults(),
 		ctx:          ctx,
 		hostname:     host,
+		startedAt:    time.Now(),
 		roster:       NewRosterClient(o.RosterURL, o.APIKey),
 		loggedRemote: map[string]bool{},
 	}
@@ -389,6 +406,11 @@ func (d *Supervisor) reconcile() error {
 		// stopAll is about to drain. A cancelled context reconciles to nothing.
 		return nil
 	}
+	// The phase-5c replacement gate runs before the roster is even fetched:
+	// the drain acts on the fleet this process already holds, and an
+	// unreachable plane must not postpone a replacement the operator asked
+	// for.
+	d.checkReplace()
 	entries, err := d.roster.Fetch(d.ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotWired) {

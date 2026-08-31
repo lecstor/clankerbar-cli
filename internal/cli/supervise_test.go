@@ -184,3 +184,22 @@ func TestSuperviseRollRejectsPositionalArgs(t *testing.T) {
 		t.Fatalf("supervise roll bogus returned %v, want an unexpected-argument error", err)
 	}
 }
+
+// --- supervise replace (phase 5c) routing -----------------------------------
+
+// `supervise replace --help` is a request that succeeded, like every other
+// help.
+func TestSuperviseReplaceHelpIsClean(t *testing.T) {
+	if err := Supervise(context.Background(), []string{"replace", "--help"}); err != nil {
+		t.Fatalf("supervise replace --help returned %v, want nil", err)
+	}
+}
+
+// The replacement request takes no positionals: `supervise replace bogus` is
+// a mistake, not a silent ignore.
+func TestSuperviseReplaceRejectsPositionalArgs(t *testing.T) {
+	err := Supervise(context.Background(), []string{"replace", "bogus"})
+	if err == nil || !strings.Contains(err.Error(), "unexpected argument") {
+		t.Fatalf("supervise replace bogus returned %v, want an unexpected-argument error", err)
+	}
+}
