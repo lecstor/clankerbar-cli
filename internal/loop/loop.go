@@ -319,6 +319,12 @@ type Driver struct {
 	// Run returns.
 	restartRequested atomic.Bool
 
+	// beaconWriteFailed is the streak latch for the LOCAL beacon write
+	// (loop/fleet.go): the first consecutive failure is logged, further ones
+	// stay silent, and recovery is logged once. Atomic because the claim
+	// reflector (CLA-510) beacons from the lease-renewer goroutine.
+	beaconWriteFailed atomic.Bool
+
 	// reloadConfig rebuilds the config for a RELOAD marker (CLA-461). Production
 	// wires Load+ApplyFlagOverrides+Validate via SetReloader; nil falls back to
 	// Load(Source())+Validate. See control.go.

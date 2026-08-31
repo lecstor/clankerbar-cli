@@ -162,7 +162,31 @@ type Options struct {
 	// later spawns carry the new one — the one situation in which a single
 	// supervisor's children can carry different versions.
 	VersionOf func() string
+
+	// VerifyTimeout is how long the phase-5b roll waits for ONE child's next
+	// beacon to report the target version before halting the roll. 0 =
+	// defaultVerifyTimeout. A drain finishes at the child's iteration
+	// boundary, so the wait must be generous; the cap exists so a child that
+	// never comes back halts the roll instead of hanging it.
+	VerifyTimeout time.Duration
+
+	// LaunchVersion reports the version of the binary at the fleet's launch
+	// path — the file children re-exec (RESTART) and respawn from. The roll
+	// (phase 5b) compares it against its own build BEFORE touching any child:
+	// the operator installs the new build at the launch path and runs the
+	// roll from it, and a roll whose launch path still carries another
+	// version refuses rather than rolling nothing. Nil = run `<Binary>
+	// version` and parse the line.
+	LaunchVersion func() (string, error)
 }
+
+// childVersionEnv is the environment variable the supervisor sets on every
+// child spawn carrying the version it recorded for that child (phase 5b). The
+// real daemon ignores it — its beacon reports its OWN build, which is the
+// ground truth the roll verifies — and the fake daemon in tests reports it as
+// its own version, so a test can simulate a binary swap by changing the
+// VersionOf hook between spawns.
+const childVersionEnv = "CLANKERBAR_CHILD_VERSION"
 
 func (o Options) withDefaults() Options {
 	if o.BackoffBase <= 0 {
@@ -771,7 +795,14 @@ func (d *Supervisor) spawn(inst *Instance) {
 		inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
 		return
 	}
+	v := childVersion(d.o.VersionOf)
 	cmd := exec.Command(d.o.Binary, "run", "-c", cfgPath)
+	// The version recorded for this child rides the spawn environment (phase
+	// 5b): the fake daemon in tests reports it as its own version, and a
+	// wrapper can read what the supervisor believes the child runs. The real
+	// daemon ignores it — its beacon reports its own build, which is the
+	// ground truth the roll verifies.
+	cmd.Env = spawnEnv(v)
 	// The children's logs stream to the same stdout/stderr the supervisor's
 	// do — the operator watches daemons today by watching one terminal per
 	// daemon, and the fleet must not be quieter than that.
@@ -789,7 +820,7 @@ func (d *Supervisor) spawn(inst *Instance) {
 	inst.aliveSince = time.Now()
 	inst.exited = false
 	inst.exitErr = nil
-	inst.childVersion = childVersion(d.o.VersionOf)
+	inst.childVersion = v
 	inst.mu.Unlock()
 	// A fresh child starts clean: the next stopped flip must write its STOP
 	// again, it must not inherit the previous child's marker state.
@@ -903,6 +934,24 @@ func childVersion(hook func() string) string {
 		return hook()
 	}
 	return version.Current
+}
+
+// spawnEnv builds a child's environment: the parent's, with any pre-existing
+// CLANKERBAR_CHILD_VERSION dropped and the supervisor's recorded value
+// appended. The drop is load-bearing: getenv returns the FIRST match when a
+// key appears twice in an environment, so an operator env carrying the
+// reserved name would otherwise shadow the supervisor's value — and the
+// wrapper that "can read what the supervisor believes the child runs" would
+// read a stranger's number instead.
+func spawnEnv(v string) []string {
+	prefix := childVersionEnv + "="
+	env := make([]string, 0, len(os.Environ())+1)
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, prefix) {
+			env = append(env, kv)
+		}
+	}
+	return append(env, prefix+v)
 }
 
 // fleetStatus builds the supervisor's status surface (phase 5a): the header

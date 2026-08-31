@@ -153,3 +153,34 @@ func (b *lockedLog) Reset() {
 	defer b.mu.Unlock()
 	b.buf.Reset()
 }
+
+// --- supervise roll (phase 5b) routing -------------------------------------
+
+// The roll rides the supervisor's own wiring refusal: without the account key
+// there is no roster to roll against, so `supervise roll` must refuse exactly
+// as `supervise` does. The routing itself is what this pins — the roll's
+// behaviour lives in internal/supervisor.
+func TestSuperviseRollRequiresTheAccountKey(t *testing.T) {
+	t.Setenv("CLANKERBAR_API_KEY", "")
+	t.Setenv("HOME", t.TempDir())
+	err := Supervise(context.Background(), []string{"roll"})
+	if err == nil || !strings.Contains(err.Error(), "CLANKERBAR_API_KEY") {
+		t.Fatalf("supervise roll without the account key returned %v, want a refusal naming the key", err)
+	}
+}
+
+// `supervise roll --help` is a request that succeeded, like every other help.
+func TestSuperviseRollHelpIsClean(t *testing.T) {
+	if err := Supervise(context.Background(), []string{"roll", "--help"}); err != nil {
+		t.Fatalf("supervise roll --help returned %v, want nil", err)
+	}
+}
+
+// The roll takes no positionals: `supervise roll bogus` is a mistake, not a
+// silent ignore.
+func TestSuperviseRollRejectsPositionalArgs(t *testing.T) {
+	err := Supervise(context.Background(), []string{"roll", "bogus"})
+	if err == nil || !strings.Contains(err.Error(), "unexpected argument") {
+		t.Fatalf("supervise roll bogus returned %v, want an unexpected-argument error", err)
+	}
+}

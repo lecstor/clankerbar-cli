@@ -42,8 +42,13 @@ const WorkdirRootEnv = "CLANKERBAR_WORKDIR_ROOT"
 // Supervise runs the fleet supervisor. args carries the flags of the
 // invocation: the bare `clankerbar` form passes none, `clankerbar supervise`
 // passes whatever followed the subcommand. Phase 3 takes no flags beyond the
-// shared help.
+// shared help. `clankerbar supervise roll` is the phase-5b one-shot fleet
+// roll, routed here before the flag parse because it is the one positional
+// form this command takes.
 func Supervise(ctx context.Context, args []string) error {
+	if len(args) > 0 && args[0] == "roll" {
+		return Roll(ctx, args[1:])
+	}
 	fs := newFlagSet("supervise")
 	if err := parseFlags(fs, args); err != nil {
 		if errors.Is(err, pflag.ErrHelp) {
@@ -93,4 +98,53 @@ func Supervise(ctx context.Context, args []string) error {
 		log.Printf("deriving children's workdirs from %s (set by %s) - an instance whose derived workdir is missing or is not a checkout of its project's repo will not be started", root, WorkdirRootEnv)
 	}
 	return supervisor.Supervise(ctx, o)
+}
+
+// Roll runs the phase-5b one-shot fleet roll: every local running child is
+// restarted at its iteration boundary and verified — via its next local
+// beacon — to be reporting the version THIS binary runs, one child at a
+// time; a child that fails to come back on it halts the roll. The operator
+// installs the new build at the fleet's launch path and runs
+// `clankerbar supervise roll` from it; the roll refuses to touch any child
+// when the launch path still carries another version.
+//
+// The wiring is the supervisor's own: the same account key, the same roster
+// endpoint, the same launch-path resolution — a roll over the same fleet the
+// supervisor serves, never over process listings.
+func Roll(ctx context.Context, args []string) error {
+	fs := newFlagSet("supervise roll")
+	if err := parseFlags(fs, args); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return nil // --help already printed usage
+		}
+		return err
+	}
+
+	// Children re-exec (RESTART) and respawn from the launch path, so that is
+	// the file the new build must replace — and the roll's pre-flight probes
+	// exactly that path.
+	bin, err := launchBinary(os.Args)
+	if err != nil {
+		return fmt.Errorf("supervise roll: %w", err)
+	}
+
+	base, err := config.Load("")
+	if err != nil {
+		return fmt.Errorf("supervise roll: %w", err)
+	}
+
+	// Same irreducible credential as the supervisor: the roll reads the
+	// account-scoped roster, so the account key is the whole wiring.
+	key := os.Getenv("CLANKERBAR_API_KEY")
+	if key == "" {
+		return errors.New("supervise roll: CLANKERBAR_API_KEY is required - the roll reads the same account-scoped roster the supervisor reconciles against")
+	}
+
+	o := supervisor.Options{
+		Binary:    bin,
+		RosterURL: strings.TrimRight(base.BacklogURL, "/") + "/api/daemon-roster",
+		APIKey:    key,
+		BaseCfg:   base,
+	}
+	return supervisor.Roll(ctx, o)
 }

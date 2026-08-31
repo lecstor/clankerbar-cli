@@ -40,6 +40,14 @@ Usage:
                                 phase and per harness, how many sessions ran and
                                 how many died producing nothing (the dead-phase
                                 rate).
+  clankerbar supervise roll    Roll the fleet onto the version THIS binary
+                                runs, one child at a time: install the new
+                                build at the fleet's launch path and run this
+                                from it. Each child gets a RESTART marker, drains
+                                at its iteration boundary, and is verified — via
+                                its next beacon — to report the new version
+                                before the next child is touched; a child that
+                                does not come back on it halts the roll.
   clankerbar version            Print the version.
   clankerbar help               Show this help.
 
