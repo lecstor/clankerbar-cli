@@ -411,6 +411,14 @@ func (d *Supervisor) reconcile() error {
 	// unreachable plane must not postpone a replacement the operator asked
 	// for.
 	d.checkReplace()
+	if d.ctx.Err() != nil {
+		// The fleet stop landed while the replacement drain was in progress
+		// (the drain can hold this pass for up to VerifyTimeout): the drain
+		// aborted, and acting on the roster now could spawn a child stopAll
+		// is about to drain. A cancelled context reconciles to nothing,
+		// exactly as at the top of this pass.
+		return nil
+	}
 	entries, err := d.roster.Fetch(d.ctx)
 	if err != nil {
 		if errors.Is(err, ErrNotWired) {

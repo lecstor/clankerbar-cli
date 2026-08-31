@@ -238,6 +238,14 @@ func (d *Supervisor) checkReplace() {
 	log.Print("replace: REPLACE honoured - writing STOP to every child; each drains at its iteration boundary")
 	d.removeReplaceMarker()
 	if stuck := d.drainForReplace(); stuck != "" {
+		if d.ctx.Err() != nil {
+			// The fleet stop landed mid-drain: the supervisor exits instead
+			// of replacing itself, and the stop owns the children now — the
+			// marker is already consumed, so nothing re-triggers on the next
+			// supervisor.
+			log.Printf("replace: %s", stuck)
+			return
+		}
 		log.Printf("replace: %s - the fleet is not drained, so no replacement happens; the children that stopped are respawned, and once the stuck child is fixed, re-running `clankerbar supervise replace` is safe", stuck)
 		return
 	}

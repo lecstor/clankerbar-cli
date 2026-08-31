@@ -235,6 +235,94 @@ func TestReplaceHaltsWithoutExecWhenAChildNeverDrains(t *testing.T) {
 	})
 }
 
+// A fleet stop landing MID-drain aborts the replacement AND the reconcile
+// pass that was running it: the drain can hold a reconcile for up to
+// VerifyTimeout, and the top-of-reconcile guard ("a cancelled context
+// reconciles to nothing — acting on the roster now could spawn a child
+// stopAll is about to drain") must hold after the drain's abort too, not only
+// before it. The abort reads as the absence of the fall-through's one
+// observable: the fake plane is UP, so a "plane unreachable" line can only
+// come from a roster fetch run on a cancelled context — the continued
+// reconcile the fix stops. No exec either, and the fleet is left exactly as
+// the stop finds it.
+func TestReplaceMidDrainFleetStopAbortsWithoutFallingThroughToReconcile(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "stubborn")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("stuck", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := testOptions(t, cacheDir, srv)
+	o.LaunchVersion = func() (string, error) { return version.Current, nil }
+	o.VerifyTimeout = 5 * time.Second
+	rec := &execRecorder{}
+	o.ExecInPlace = rec.hook()
+	done := runSupervise(ctx, o)
+
+	state := entryStateDir(cacheDir, "stuck")
+	waitFor(t, 5*time.Second, "the stubborn child to come up", func() bool {
+		return countRuns(t, state) == 1
+	})
+
+	writeMarker(t, cacheDir, version.Current)
+	// The drain is now in progress: it has written STOP and is waiting for a
+	// child that will never honour it — the fleet stop lands here, mid-drain.
+	waitFor(t, 5*time.Second, "the drain to have written STOP", func() bool {
+		return strings.Contains(buf.String(), "STOP written to")
+	})
+	cancel()
+
+	waitFor(t, 5*time.Second, "the mid-drain abort to be logged", func() bool {
+		return strings.Contains(buf.String(), "the fleet stop landed mid-drain")
+	})
+	// The abort's log arm says the supervisor exits instead of replacing
+	// itself — it must not borrow the timeout arm's tail ("the children that
+	// stopped are respawned"), which is false here: the stop owns the fleet.
+	if text := buf.String(); strings.Contains(text, "the children that stopped are respawned") {
+		t.Errorf("the mid-drain abort logged the timeout arm's respawn claim:\n%s", text)
+	}
+	// Fix: the aborted reconcile does NOT fall through to the roster. The
+	// plane is up, so the continued reconcile's cancelled-context fetch is the
+	// only possible source of a "plane unreachable" line; give a would-be
+	// fall-through a beat, then pin its absence.
+	time.Sleep(500 * time.Millisecond)
+	if text := buf.String(); strings.Contains(text, "plane unreachable") {
+		t.Errorf("reconcile fell through to the roster after the mid-drain abort:\n%s", text)
+	}
+	// No exec, marker consumed, child untouched: the stop owns the fleet now.
+	if got := rec.len(); got != 0 {
+		t.Errorf("exec invoked %d time(s), want 0 - the abort must not exec", got)
+	}
+	if _, err := os.Lstat(filepath.Join(cacheDir, replaceMarkerName)); !os.IsNotExist(err) {
+		t.Errorf("the REPLACE marker was not consumed; stat err = %v", err)
+	}
+	if got := countRuns(t, state); got != 1 {
+		t.Errorf("spawns = %d, want 1 - the fleet stop must not respawn the child", got)
+	}
+
+	// The fleet stop still has to wait for the wedged child; kill it so the
+	// test leaves no orphan, exactly as the stuck-stop test does.
+	if pid := spawnPid(t, buf.String()); pid > 0 {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	waitFor(t, 5*time.Second, "the supervisor to return once the child is gone", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
 // The replacement is scoped to local placement (Decision 7): the drain acts
 // on the supervisor's own instances, which reconcile builds from local
 // entries only — a remote entry never becomes an instance, so it is never
