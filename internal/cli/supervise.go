@@ -43,11 +43,17 @@ const WorkdirRootEnv = "CLANKERBAR_WORKDIR_ROOT"
 // invocation: the bare `clankerbar` form passes none, `clankerbar supervise`
 // passes whatever followed the subcommand. Phase 3 takes no flags beyond the
 // shared help. `clankerbar supervise roll` is the phase-5b one-shot fleet
-// roll, routed here before the flag parse because it is the one positional
-// form this command takes.
+// roll and `clankerbar supervise replace` the phase-5c one-shot replacement
+// request, routed here before the flag parse because they are the positional
+// forms this command takes.
 func Supervise(ctx context.Context, args []string) error {
-	if len(args) > 0 && args[0] == "roll" {
-		return Roll(ctx, args[1:])
+	if len(args) > 0 {
+		switch args[0] {
+		case "roll":
+			return Roll(ctx, args[1:])
+		case "replace":
+			return Replace(ctx, args[1:])
+		}
 	}
 	fs := newFlagSet("supervise")
 	if err := parseFlags(fs, args); err != nil {
@@ -147,4 +153,39 @@ func Roll(ctx context.Context, args []string) error {
 		BaseCfg:   base,
 	}
 	return supervisor.Roll(ctx, o)
+}
+
+// Replace runs the phase-5c one-shot supervisor replacement request: it
+// verifies that the fleet's launch path carries the version THIS binary runs
+// (the same pre-flight the roll performs — the replacement execs the launch
+// path, so the new build must already be installed there), then writes the
+// REPLACE marker the RUNNING supervisor honours at its next poll: drain every
+// child at its iteration boundary, then exec the launch path in place.
+//
+// The launchd/systemd fallback (Decision 5): operators who run the supervisor
+// under an OS-level unit have a second path with the same contract — install
+// the new build at the launch path, let the fleet drain, then restart the
+// unit. Exec-in-place exists so a supervisor NOT under a unit (a terminal)
+// replaces itself without a process gap; on a platform without exec(2) the
+// unit path is the only one.
+//
+// Unlike the roll, the replacement request touches no roster: the drain and
+// the exec are the supervisor's own, from the fleet it holds in memory — so
+// the account key is not part of this command's wiring.
+func Replace(ctx context.Context, args []string) error {
+	fs := newFlagSet("supervise replace")
+	if err := parseFlags(fs, args); err != nil {
+		if errors.Is(err, pflag.ErrHelp) {
+			return nil // --help already printed usage
+		}
+		return err
+	}
+
+	// The replacement execs the launch path, so that is the file the new
+	// build must replace — and the pre-flight probes exactly that path.
+	bin, err := launchBinary(os.Args)
+	if err != nil {
+		return fmt.Errorf("supervise replace: %w", err)
+	}
+	return supervisor.Replace(ctx, supervisor.Options{Binary: bin})
 }

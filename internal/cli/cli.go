@@ -48,6 +48,16 @@ Usage:
                                 its next beacon — to report the new version
                                 before the next child is touched; a child that
                                 does not come back on it halts the roll.
+  clankerbar supervise replace  Replace the SUPERVISOR itself in place: run
+                                this from the new build after installing it at
+                                the fleet's launch path (and after the roll).
+                                The running supervisor drains every child at
+                                its iteration boundary and then execs the
+                                launch path, so the fleet comes back under the
+                                new supervisor; a child that never drains
+                                halts the replacement. The launchd/systemd
+                                fallback: restart the unit after the drain
+                                instead.
   clankerbar version            Print the version.
   clankerbar help               Show this help.
 
