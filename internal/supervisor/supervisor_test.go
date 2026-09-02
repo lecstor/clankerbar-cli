@@ -1156,6 +1156,33 @@ func TestPermissionPolicyAbsentSpawnsNothing(t *testing.T) {
 	}
 }
 
+// The machine layer is the common single-harness config: no `harnesses:` key,
+// so Harnesses is nil and Clone keeps it nil. A roster entry whose permitted
+// `harnesses` override names a block over that shape used to panic in
+// buildConfig with the same "assignment to entry in nil map" the ApplyRunConfig
+// guard (CLA-474) fixes - the same root cause one path over: the override loop
+// wrote straight into the nil map.
+func TestBuildConfigHarnessesOverrideAllocatesNilBase(t *testing.T) {
+	d := &Supervisor{cacheDir: t.TempDir()}
+	d.o.BaseCfg = &config.Config{Harness: "claude", Prompt: "Work the next backlog item."}
+	entry := RosterEntry{
+		Name:         "one",
+		DesiredState: RosterDesiredRunning,
+		Placement:    RosterPlacementLocal,
+		Projects:     []RosterProject{{Slug: "acme"}},
+		Overrides: map[string]json.RawMessage{
+			"harnesses": json.RawMessage(`{"opencode":{"model":"sonnet"}}`),
+		},
+	}
+	cfg, _, err := d.buildConfig(&entry)
+	if err != nil {
+		t.Fatalf("buildConfig: %v", err)
+	}
+	if got := cfg.Harnesses["opencode"]; got.Model != "sonnet" {
+		t.Errorf("opencode block model = %q, want the override (buildConfig must allocate the nil map)", got.Model)
+	}
+}
+
 // The spawn-time gate (phase 2c): a policy file deleted AFTER the instance was
 // admitted refuses the next respawn — the running child is untouched (it
 // already has its policy loaded), but the child-start gate must not start a
