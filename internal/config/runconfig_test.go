@@ -78,6 +78,25 @@ func TestApplyRunConfig_EveryConsumedFamilyOverlaysAndAbsentKeepsLocal(t *testin
 	}
 }
 
+func TestApplyRunConfig_NilBaseHarnessesAllocatesOnOverlay(t *testing.T) {
+	// The common single-harness config has no `harnesses:` key, so defaults()
+	// leaves the map nil; every overlay test base happens to pre-populate it.
+	// A stored document carrying a harnesses block over the nil-map shape used
+	// to panic with "assignment to entry in nil map".
+	base := defaults()
+	base.ApplyRunConfig(&RunConfigDoc{
+		SchemaVersion: 1,
+		Harnesses:     map[string]RunConfigHarnessBlock{"opencode": {Model: "oc-default", Models: map[string]string{"cheap": "oc-cheap"}}},
+	})
+	if got := base.Harnesses["opencode"]; got.Model != "oc-default" {
+		t.Errorf("opencode block model = %q, want the stored one (overlay must allocate the nil map)", got.Model)
+	}
+	// The policy half lands; the machine-local half stays absent, as everywhere else.
+	if got := base.SessionFor("opencode"); got.Model != "oc-default" || got.ConfigDir != "" {
+		t.Errorf("opencode session model=%q configDir=%q, want the stored model and no machine-local wiring", got.Model, got.ConfigDir)
+	}
+}
+
 func TestApplyRunConfig_EmptyDocumentIsANoOp(t *testing.T) {
 	base := overlayBase()
 	before := base.Clone()
