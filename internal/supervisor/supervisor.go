@@ -642,6 +642,15 @@ func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error)
 		if err := json.Unmarshal(raw, &blocks); err != nil {
 			return nil, "", fmt.Errorf("entry %q: harnesses override is not a per-harness block: %v", e.Name, err)
 		}
+		// The loop below writes into cfg.Harnesses, which Clone keeps nil when
+		// the machine layer is the common single-harness config (no `harnesses:`
+		// key, so the map never exists to copy). A roster entry carrying the
+		// permitted `harnesses` override over that shape must allocate rather
+		// than panic with "assignment to entry in nil map" - the same root
+		// cause ApplyRunConfig guards (CLA-474).
+		if len(blocks) > 0 && cfg.Harnesses == nil {
+			cfg.Harnesses = make(map[string]config.HarnessConfig, len(blocks))
+		}
 		for name, b := range blocks {
 			hc := cfg.Harnesses[name]
 			hc.Model = strings.TrimSpace(b.Model)

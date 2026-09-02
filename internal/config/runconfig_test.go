@@ -82,8 +82,14 @@ func TestApplyRunConfig_NilBaseHarnessesAllocatesOnOverlay(t *testing.T) {
 	// The common single-harness config has no `harnesses:` key, so defaults()
 	// leaves the map nil; every overlay test base happens to pre-populate it.
 	// A stored document carrying a harnesses block over the nil-map shape used
-	// to panic with "assignment to entry in nil map".
+	// to panic with "assignment to entry in nil map". The precondition is
+	// asserted, not assumed: if defaults() ever starts pre-populating the map
+	// this test must fail loudly rather than silently stop exercising the
+	// nil path while staying green - the exact drift this bug was born from.
 	base := defaults()
+	if base.Harnesses != nil {
+		t.Fatalf("precondition: defaults() must leave Harnesses nil for the nil-base shape, got %d entries", len(base.Harnesses))
+	}
 	base.ApplyRunConfig(&RunConfigDoc{
 		SchemaVersion: 1,
 		Harnesses:     map[string]RunConfigHarnessBlock{"opencode": {Model: "oc-default", Models: map[string]string{"cheap": "oc-cheap"}}},
