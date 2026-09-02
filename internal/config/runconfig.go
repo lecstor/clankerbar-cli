@@ -141,6 +141,14 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) {
 	if doc.Models != nil {
 		c.Models = doc.Models
 	}
+	// The loop below writes into c.Harnesses, which the common single-harness
+	// config (no `harnesses:` key) leaves nil: defaults() never creates the map
+	// and Clone only copies a non-nil source. A stored document carrying a
+	// harnesses block over such a config must allocate rather than panic with
+	// "assignment to entry in nil map".
+	if len(doc.Harnesses) > 0 && c.Harnesses == nil {
+		c.Harnesses = make(map[string]HarnessConfig, len(doc.Harnesses))
+	}
 	for name, block := range doc.Harnesses {
 		hc := c.Harnesses[name]
 		if m := strings.TrimSpace(block.Model); m != "" {

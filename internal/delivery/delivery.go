@@ -569,7 +569,7 @@ func (v *Verifier) resolveRepoByURL(ctx context.Context, repos []string, repoSlu
 		if err != nil || url == "" {
 			continue
 		}
-		if matchesRepoSlug(url, repoSlug) {
+		if MatchesRepoSlug(url, repoSlug) {
 			matched = append(matched, r)
 		}
 	}
@@ -580,9 +580,13 @@ func (v *Verifier) resolveRepoByURL(ctx context.Context, repos []string, repoSlu
 	return matched
 }
 
-// matchesRepoSlug reports whether a remote URL names the repo slug (owner/name),
-// tolerating https and ssh forms.
-func matchesRepoSlug(url, slug string) bool {
+// MatchesRepoSlug reports whether a remote URL names the repo slug (owner/name),
+// tolerating https and ssh forms. It is the one comparison the codebase uses
+// for "is this checkout the repo named X": the delivery verifier uses it to
+// attribute a branch to a repo (CLA-351), and the supervisor's workdir
+// derivation uses it to refuse a child whose checkout is a different repo
+// (CLA-547).
+func MatchesRepoSlug(url, slug string) bool {
 	if slug == "" {
 		return true
 	}
