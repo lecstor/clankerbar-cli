@@ -78,7 +78,7 @@ func (d *Driver) fleetIdentity() fleet.Identity {
 // tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases:
 //
 //   - mid-drain                -> iteration {n, taskRef, phase}
-//   - console- or fleet-paused -> draining (alive, spawning nothing new)
+//   - console-, fleet- or startup-paused -> draining (alive, spawning nothing new)
 //   - otherwise                -> idle
 //
 // A backed-off target (skipUntil still in the future) reports idle on purpose:
@@ -92,13 +92,13 @@ func (d *Driver) fleetState(ti int) fleet.State {
 	if s.on {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
-	if d.pausedAt(ti) || d.fleetPausedAt(ti) {
+	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) {
 		return fleet.State{Kind: fleet.StateDraining}
 	}
 	return fleet.State{Kind: fleet.StateIdle}
 }
 
-// iterAt/pausedAt/fleetPausedAt are bounds-checked reads of the per-target
+// iterAt/pausedAt/fleetPausedAt/startupPausedAt are bounds-checked reads of the per-target
 // slices. A Driver built by hand in a test carries empty slices; reporting must
 // degrade to idle for it, not panic.
 func (d *Driver) iterAt(ti int) iterState {
@@ -114,6 +114,14 @@ func (d *Driver) pausedAt(ti int) bool {
 
 func (d *Driver) fleetPausedAt(ti int) bool {
 	return ti >= 0 && ti < len(d.fleetPaused) && d.fleetPaused[ti]
+}
+
+// startupPausedAt is the startup-trip (CLA-562) half of the draining signal:
+// a target paused awaiting the operator's answer to the harness-startup
+// question is alive and spawning nothing new, exactly like a fleet-paused one,
+// and must not read idle on the console.
+func (d *Driver) startupPausedAt(ti int) bool {
+	return ti >= 0 && ti < len(d.startupPaused) && d.startupPaused[ti]
 }
 
 // beacon sends one presence report for target ti. Nil-safe on the reporter so
