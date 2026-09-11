@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -121,6 +122,9 @@ func TestStartupBound_FourSidelineFifthPausesAndRaises(t *testing.T) {
 		}
 		if !strings.Contains(q.body, "/repos/alpha") {
 			t.Errorf("startup question body lost the workdir: %q", q.body)
+		}
+		if strings.Contains(q.body, "in a row") {
+			t.Errorf("startup question body echoes the sideline log's \"harness failure N in a row\" phrasing with the startup count, which disagrees with the sideline count once a with-usage error interleaves (it resets the startup run but not the sideline ladder): %q", q.body)
 		}
 		if out := logs.String(); !strings.Contains(out, "consecutive harness-startup failures") {
 			t.Errorf("trip log line missing:\n%s", out)
@@ -311,5 +315,29 @@ func TestStartupSuccessResetsTheCounter(t *testing.T) {
 	}
 	if len(rel.questions) != 0 {
 		t.Errorf("filed %d questions, want 0  -  no run of five was ever reached", len(rel.questions))
+	}
+}
+
+// A startup-paused target reads draining on presence, not idle: it is alive
+// and spawning nothing new until the operator answers, exactly like a
+// fleet-paused one. Before the fix it read idle, hiding the wait it just asked
+// for from the console.
+func TestStartupPaused_PresenceReadsDraining(t *testing.T) {
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller()}})
+	if got := d.fleetState(0); got.Kind != fleet.StateIdle {
+		t.Fatalf("fresh target state = %v, want idle", got)
+	}
+	d.startupPaused[0] = true
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining {
+		t.Errorf("startup-paused state = %v, want draining", got)
+	}
+	d.startupPaused[0] = false
+	if got := d.fleetState(0); got.Kind != fleet.StateIdle {
+		t.Errorf("resumed target state = %v, want idle", got)
+	}
+	// Bounds-checked like its siblings: a hand-built Driver degrades to idle.
+	empty := &Driver{}
+	if got := empty.fleetState(0); got.Kind != fleet.StateIdle {
+		t.Errorf("empty-driver state = %v, want idle", got)
 	}
 }

@@ -2796,8 +2796,8 @@ func (d *Driver) startupTrip(ctx context.Context, t Target, ti, drainNum int, ca
 		// count at the last poll, BEFORE the question below raises it by one.
 		d.startupOpenQ[ti] = d.openQs[ti]
 		body := fmt.Sprintf(
-			"**%d consecutive harness-startup failures - the harness or provider looks broken, not the tasks.** Each spawn failed before reporting any usage (harness failure %d in a row; workdir %s) before this, so the driver paused this project rather than sidelining and retrying forever against a harness that is already known to be failing.\n\nCause: %v\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next startup failure will pause it again and raise a fresh question. Iteration logs are in %s.",
-			d.startupFails[ti], d.startupFails[ti], d.workdirOf(t), cause, d.state.Path())
+			"**%d consecutive harness-startup failures - the harness or provider looks broken, not the tasks.** Each spawn failed before reporting any usage (workdir %s), so the driver paused this project rather than sidelining and retrying forever against a harness that is already known to be failing.\n\nCause: %v\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next startup failure will pause it again and raise a fresh question. Iteration logs are in %s.",
+			d.startupFails[ti], d.workdirOf(t), cause, d.state.Path())
 		options := []string{
 			"The harness recovered - resume draining this project",
 			"Still investigating - I will answer when it is safe to resume",
