@@ -322,7 +322,12 @@ func TestRun_SoftStopThenRelaunchDoesNotSelfStop(t *testing.T) {
 // session on a busy loop that never idles) ends the run after the current
 // task, before the next spawn. Planting during the session (onInvoke) rather
 // than between polls is the substance: the waitOrStop reads only fire on idle
-// waits, so only a task-boundary read can see this drop before the next spawn.
+// waits, so the wired cases below pin the previously uncovered plant location,
+// while the blind cases isolate the new task-boundary read itself — in wired
+// mode the cycle-top read would also see the drop before the next poll, so
+// only the blind pair fails without the boundary (the wait path logs
+// "during wait" for STOP, and HALT is not read during waits at all, so either
+// falling through to the idle wait is observable).
 func TestRun_TaskBoundaryStopMarker(t *testing.T) {
 	t.Run("STOP placed mid-drain stops before the next spawn and is consumed", func(t *testing.T) {
 		cfg := fastCfg()
@@ -377,6 +382,67 @@ func TestRun_TaskBoundaryStopMarker(t *testing.T) {
 		}
 		if !markerPresent(t, dir, "HALT") {
 			t.Error("HALT must be left in place for the operator")
+		}
+	})
+
+	t.Run("blind STOP placed mid-drain stops at the task boundary, not during the idle wait", func(t *testing.T) {
+		cfg := fastCfg()
+		dir := t.TempDir()
+		cfg.StateDir = dir
+		cfg.MaxIterations = 10 // would keep spawning if the stop did not land
+		h := &fakeAdapter{}    // steps exhausted → clean successes
+		p := &fakePoller{err: backlog.ErrNotWired}
+		logs := captureLogs(t)
+		h.onInvoke = func(i int) {
+			if i == 0 {
+				writeMarker(t, dir, "STOP", "stop after this task")
+			}
+		}
+		if err := runLoop(t, cfg, h, p); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 1 {
+			t.Errorf("a STOP dropped mid-drain must end the run after the current task; spawned %d sessions", h.invokeCalls)
+		}
+		if markerPresent(t, dir, "STOP") {
+			t.Error("STOP must be consumed on stop so a restart is not stillborn")
+		}
+		out := logs.String()
+		if !strings.Contains(out, "STOP requested — stopping") {
+			t.Errorf("the stop must land at the task boundary; log was:\n%s", out)
+		}
+		if strings.Contains(out, "during wait") {
+			t.Errorf("the boundary read must fire before the blind idle wait; fell through to the wait path; log was:\n%s", out)
+		}
+		if strings.Contains(out, "idle — re-checking") {
+			t.Errorf("the boundary stop must precede the blind idle; log was:\n%s", out)
+		}
+	})
+
+	t.Run("blind HALT placed mid-drain stops at the task boundary, before the idle wait", func(t *testing.T) {
+		cfg := fastCfg()
+		dir := t.TempDir()
+		cfg.StateDir = dir
+		cfg.MaxIterations = 10 // would keep spawning if the stop did not land
+		h := &fakeAdapter{}    // steps exhausted → clean successes
+		p := &fakePoller{err: backlog.ErrNotWired}
+		logs := captureLogs(t)
+		h.onInvoke = func(i int) {
+			if i == 0 {
+				writeMarker(t, dir, "HALT", "wedged — needs a human")
+			}
+		}
+		if err := runLoop(t, cfg, h, p); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 1 {
+			t.Errorf("a HALT dropped mid-drain must end the run after the current task; spawned %d sessions", h.invokeCalls)
+		}
+		if !markerPresent(t, dir, "HALT") {
+			t.Error("HALT must be left in place for the operator")
+		}
+		if out := logs.String(); strings.Contains(out, "idle — re-checking") {
+			t.Errorf("the boundary read must fire before the blind idle wait (which never reads HALT); log was:\n%s", out)
 		}
 	})
 }
