@@ -101,9 +101,10 @@ func (d *Driver) checkRunConfigVersion(ctx context.Context, i int, t *Target, ve
 			d.rcFails[i]++
 		}
 		d.rcAttemptVer[i] = version
-		d.rcAttempt[i] = time.Now().Add(rcFetchBackoff(d.rcFails[i]))
-		log.Printf("%srun-config: fetch failed (%v) - keeping %s; retrying at the next boundary",
-			d.prefix(i), err, d.cfgSourceDesc(i))
+		wait := rcFetchBackoff(d.rcFails[i])
+		d.rcAttempt[i] = time.Now().Add(wait)
+		log.Printf("%srun-config: fetch failed (%v) - keeping %s; retrying in %s",
+			d.prefix(i), err, d.cfgSourceDesc(i), wait)
 		return // rcVersions unchanged, so the next poll retries (throttled above)
 	}
 	d.rcAttempt[i] = time.Time{}
