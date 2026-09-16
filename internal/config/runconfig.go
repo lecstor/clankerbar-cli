@@ -153,7 +153,15 @@ func cloneStrMap(m map[string]string) map[string]string {
 // Callers re-run Validate afterwards: an overlay CAN produce a combination the
 // local file alone could not (a stored harness name nobody registered), and a
 // refused combination must be loud, not silently half-applied.
+// A newer `$schema_version` never overlays, not even through a direct call:
+// the consume points (the loop's applyRunConfig, doctor's checkRunConfigs)
+// refuse it LOUDLY before calling; this early return is the quiet backstop
+// behind them, so a future caller that forgets the check still keeps the
+// previous config instead of running keys whose meaning may have changed.
 func (c *Config) ApplyRunConfig(doc *RunConfigDoc) {
+	if doc.SchemaNewer() {
+		return
+	}
 	if doc.Empty() {
 		return
 	}

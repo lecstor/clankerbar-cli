@@ -256,6 +256,37 @@ func TestRun_NewerSchemaVersionKeepsThePreviousConfig(t *testing.T) {
 	}
 }
 
+// The SchemaNewer check runs BEFORE Empty: a newer-schema document that sets
+// nothing else must still be refused loudly as a version mismatch, not waved
+// through as "nothing consumable". A reordering to Empty-first would stay
+// safe (no overlay either way) but go quiet about the real cause.
+func TestRun_NewerSchemaEmptyDocumentStillRefusedLoudly(t *testing.T) {
+	var events []string
+	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
+	rc := &fakeRCfg{docs: map[int]string{1: `{"$schema_version":9999}`}, events: &events}
+	cfg := fastCfg()
+	cfg.Model = "local-model"
+	buf := captureLogs(t)
+
+	d := rcRunDriver(t, cfg, []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+	}, rc, h)
+
+	if logs := buf.String(); !strings.Contains(logs, "newer than this build understands") {
+		t.Errorf("the empty newer-schema refusal was not logged loudly; log had: %s", logs)
+	}
+	if d.targets[0].Cfg != nil {
+		t.Error("an empty newer-schema document installed an overlay; the previous config must stay")
+	}
+	if d.rcVersions[0] != 1 {
+		t.Errorf("rcVersions = %d, want 1 (a deterministic refusal must not hot-loop)", d.rcVersions[0])
+	}
+	if len(rc.fetches) != 1 {
+		t.Errorf("fetched %d times, want 1 (the refused version must not refetch on the next boundary)", len(rc.fetches))
+	}
+}
+
 // cli#118: the review-tier escalation evaluation reads PLANE-declared rules -
 // they land in the target's effective config and resolve exactly as when they
 // came from the local file.

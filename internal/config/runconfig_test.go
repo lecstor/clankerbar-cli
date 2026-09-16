@@ -120,6 +120,28 @@ func TestRunConfigDoc_SchemaNewerRefusesOnlyTheFuture(t *testing.T) {
 	}
 }
 
+// The overlay itself is the backstop behind the consume points' loud refusal:
+// a newer-schema document applied through a direct ApplyRunConfig call must
+// still be a no-op, so a future caller that forgets the SchemaNewer check
+// keeps the previous config instead of running redefined keys.
+func TestApplyRunConfig_NewerSchemaIsANoOp(t *testing.T) {
+	base := overlayBase()
+	before := base.Clone()
+	base.ApplyRunConfig(&RunConfigDoc{
+		SchemaVersion: RunConfigSchemaVersion + 1,
+		Harness:       "opencode",
+		Model:         "plane-x",
+		Models:        map[string]string{"strong": "plane-strong"},
+		MaxTurns:      42,
+		Budget:        &RunConfigBudget{MaxTokens: 77_000_000},
+		Escalation:    &RunConfigEscalation{CategoryRules: map[string]string{"bug": "strong"}},
+	})
+	if !reflect.DeepEqual(base, before) {
+		t.Errorf("a newer-schema document overlaid: harness=%q model=%q turns=%d (want the previous config kept)",
+			base.Harness, base.Model, base.MaxTurns)
+	}
+}
+
 func TestApplyRunConfig_EmptyDocumentIsANoOp(t *testing.T) {
 	base := overlayBase()
 	before := base.Clone()
