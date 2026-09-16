@@ -265,6 +265,18 @@ func TestApplyRunConfig_HarnessSwapRefusesInheritedWiring(t *testing.T) {
 	if err := projOK.ApplyRunConfig(&RunConfigDoc{SchemaVersion: 1, Harness: "opencode"}); err != nil {
 		t.Fatalf("a swap with a per-harness project file was refused: %v", err)
 	}
+
+	// An empty top-level is not a free pass: run-wide wiring with no named
+	// harness would still be handed to the new top-level on a swap, so it is
+	// refused like any other inheritance.
+	emptyTop := defaults()
+	emptyTop.Harness = ""
+	emptyTop.ConfigDir = "/local/dir"
+	if err := emptyTop.ApplyRunConfig(&RunConfigDoc{SchemaVersion: 1, Harness: "opencode"}); err == nil {
+		t.Error("a swap over run-wide wiring with an empty top-level was applied; want a refusal")
+	} else if got := err.Error(); !containsFold(got, "config_dir") {
+		t.Errorf("empty-top refusal %q does not name the inherited config_dir", got)
+	}
 }
 
 func containsFold(hay, needle string) bool {

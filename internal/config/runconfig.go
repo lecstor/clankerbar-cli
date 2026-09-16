@@ -143,15 +143,16 @@ func cloneStrMap(m map[string]string) map[string]string {
 // the base sets none of those fields run-wide (or per project), or the new
 // harness already declares its own values for every one the base sets. Anything
 // else returns an error and leaves c untouched — the callers log it on the
-// existing loud "REFUSED locally" path and keep the previous config.
+// existing loud "REFUSED locally" path and keep the previous config. The
+// supervisor's per-instance harness override rides the same check through
+// CheckHarnessSwap: it re-points the same top-level over the same machine
+// layer through a different door.
 func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	if doc.Empty() {
 		return nil
 	}
-	if h := strings.TrimSpace(doc.Harness); h != "" && c.Harness != "" && h != c.Harness {
-		if err := c.refuseHarnessSwap(doc, h); err != nil {
-			return err
-		}
+	if err := c.CheckHarnessSwap(doc); err != nil {
+		return err
 	}
 	if h := strings.TrimSpace(doc.Harness); h != "" {
 		c.Harness = h
@@ -214,6 +215,28 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	return nil
 }
 
+// CheckHarnessSwap refuses a document that re-points the top-level harness
+// when the swap would hand the new harness the old one's machine-local wiring
+// (CLA-475) — the same guard ApplyRunConfig enforces, exported so the
+// supervisor's per-instance harness override (which re-points the top-level
+// over the same machine layer through a different door) rides exactly it. A
+// nil or harness-less document, or one naming the current top-level
+// (whitespace aside), is not a swap and always passes. An empty top-level is
+// not a free pass: run-wide wiring with no named harness would still be
+// handed to the new top-level on a swap, so it is refused like any other
+// inheritance. A refusal leaves c untouched.
+func (c *Config) CheckHarnessSwap(doc *RunConfigDoc) error {
+	if doc == nil {
+		return nil
+	}
+	newH := strings.TrimSpace(doc.Harness)
+	oldH := strings.TrimSpace(c.Harness)
+	if newH == "" || newH == oldH {
+		return nil
+	}
+	return c.refuseHarnessSwap(doc, newH)
+}
+
 // refuseHarnessSwap reports whether re-pointing the top-level harness from the
 // base's to newH would hand newH the old harness's dialect. It is called
 // BEFORE any mutation, so an error leaves the base untouched for the caller's
@@ -230,7 +253,7 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 // model still inherits the old config dir through its gaps, which is the exact
 // failure this refuses. The check is therefore per field, not per block.
 func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
-	oldH := c.Harness
+	oldH := strings.TrimSpace(c.Harness)
 	baseBlock := c.Harnesses[newH]
 	docBlock := doc.Harnesses[newH]
 	docModel := strings.TrimSpace(doc.Model)
@@ -269,7 +292,7 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 	if len(inherited) == 0 {
 		return nil
 	}
-	return fmt.Errorf("stored harness %q cannot replace %q: the new harness would inherit %s from the current top-level wiring "+
+	return fmt.Errorf("harness %q cannot replace %q: the new harness would inherit %s from the current top-level wiring "+
 		"(run-wide/project machine fields follow SessionFor/ResolveMCPConfig) — declare %s under `harnesses.%s` (or per-project `mcp_config_paths[%s]`) locally first",
 		newH, oldH, strings.Join(inherited, ", "), strings.Join(inherited, ", "), newH, newH)
 }
