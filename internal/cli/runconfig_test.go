@@ -107,6 +107,26 @@ func TestCheckRunConfigs_UndecodableAndRefusedDocumentsWarnNotFail(t *testing.T)
 	}
 }
 
+// CLA-475: doctor reports the same loud refusal the loop enforces — a stored
+// harness swap over run-wide machine wiring warns REFUSED rather than
+// reporting an overlay that would re-home the old harness's dialect.
+func TestCheckRunConfigs_HarnessSwapOverWiringWarnsRefused(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "claude"
+	cfg.Model = "claude-alias"
+	cfg.ConfigDir = "/local/claude-dir"
+	cfg.MCPConfigPath = "/local/claude-mcp.json"
+	cfg.SettingsPath = "/local/claude-settings.json"
+	raw, _ := json.Marshal(map[string]any{"harness": "opencode"})
+	checks := checkRunConfigs(context.Background(), cfg, rcPlaneEnv(func() (*plane.RunConfigState, error) {
+		return &plane.RunConfigState{Version: 7, Config: raw}, nil
+	}))
+	c := findRunConfigCheck(t, checks)
+	if c.status != warn || !strings.Contains(c.detail, "REFUSED locally") {
+		t.Errorf("status=%v detail=%q, want WARN containing REFUSED locally", c.status, c.detail)
+	}
+}
+
 // Unwired: nothing to compare against, and the backlog wiring check already
 // reports that gap - so this check stays silent rather than duplicating it.
 func TestCheckRunConfigs_NotWiredIsSilent(t *testing.T) {

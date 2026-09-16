@@ -220,6 +220,38 @@ func TestRun_AnOverlaidConfigValidateRefusesStaysPut(t *testing.T) {
 	}
 }
 
+// CLA-475: a ratified harness swap over run-wide machine wiring is refused
+// loudly and the previous config stays — the new harness must not inherit
+// the old one's config dir / settings / mcp file / model alias via
+// SessionFor. Same loud posture as the Validate refusal above, exercised
+// through the driver boundary rather than ApplyRunConfig directly.
+func TestRun_HarnessSwapOverWiredBaseIsRefused(t *testing.T) {
+	var events []string
+	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
+	rc := &fakeRCfg{docs: map[int]string{1: `{"harness":"opencode"}`}, events: &events}
+	cfg := fastCfg()
+	cfg.Harness = "claude"
+	cfg.Model = "claude-alias"
+	cfg.ConfigDir = "/local/claude-dir"
+	cfg.MCPConfigPath = "/local/claude-mcp.json"
+	cfg.SettingsPath = "/local/claude-settings.json"
+	buf := captureLogs(t)
+
+	rcRunDriver(t, cfg, []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+	}, rc, h)
+
+	if logs := buf.String(); !strings.Contains(logs, "REFUSED locally") {
+		t.Errorf("the harness-swap refusal was not logged loudly; log had: %s", logs)
+	}
+	for i, inv := range h.invocations {
+		if inv.Model != "claude-alias" {
+			t.Errorf("drain %d ran on %q despite a refused harness swap", i+1, inv.Model)
+		}
+	}
+}
+
 // cli#118: the review-tier escalation evaluation reads PLANE-declared rules -
 // they land in the target's effective config and resolve exactly as when they
 // came from the local file.
@@ -231,7 +263,9 @@ func TestApplyRunConfig_StoredEscalationRulesReachTheEvaluation(t *testing.T) {
 		Escalation:    &config.RunConfigEscalation{CategoryRules: map[string]string{"bug": "strong"}},
 	}
 	eff := cfg.Clone()
-	eff.ApplyRunConfig(doc)
+	if err := eff.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
 
 	tier, rule := eff.Escalation.Evaluate(nil, "bug")
 	if tier != "strong" || !strings.Contains(rule, "bug") {

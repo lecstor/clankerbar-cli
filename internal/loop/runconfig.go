@@ -139,7 +139,12 @@ func (d *Driver) applyRunConfig(i int, t *Target, st *plane.RunConfigState) {
 		return
 	}
 	eff := d.cfg.Clone()
-	eff.ApplyRunConfig(&doc)
+	if err := eff.ApplyRunConfig(&doc); err != nil {
+		log.Printf("%srun-config v%d: REFUSED locally (%v) - keeping %s; fix the stored document and ratify again",
+			d.prefix(i), st.Version, err, d.cfgSourceDesc(i))
+		d.rcVersions[i] = st.Version // deterministic refusal: don't hot-loop
+		return
+	}
 	if d.overrides != (config.Overrides{}) {
 		eff.ApplyFlagOverrides(d.overrides)
 	}
