@@ -630,28 +630,42 @@ func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error)
 	// Decision 1: harness and its per-harness block are the ONLY per-instance
 	// policy overrides. checkEntry has already refused every other key; what
 	// lands here is exactly the two allowed ones.
+	//
+	// The harness override is parsed before it is applied because re-pointing
+	// the top-level rides the CLA-475 swap guard: over a machine layer that
+	// wires the old harness run-wide, the new harness would silently inherit
+	// that dialect through SessionFor/ResolveMCPConfig — the same re-homing a
+	// stored run-config swap performs, through this door instead. The entry's
+	// harnesses block carries only the policy half, exactly like the stored
+	// document, so the synthetic document captures the override exactly, and
+	// a refusal keeps the last-known-good via the caller's loud path.
+	var overrideBlocks map[string]config.RunConfigHarnessBlock
+	if raw, ok := e.Overrides["harnesses"]; ok {
+		if err := json.Unmarshal(raw, &overrideBlocks); err != nil {
+			return nil, "", fmt.Errorf("entry %q: harnesses override is not a per-harness block: %v", e.Name, err)
+		}
+	}
 	if raw, ok := e.Overrides["harness"]; ok {
 		var h string
 		if err := json.Unmarshal(raw, &h); err != nil {
 			return nil, "", fmt.Errorf("entry %q: harness override is not a string: %v", e.Name, err)
 		}
+		if err := cfg.CheckHarnessSwap(&config.RunConfigDoc{Harness: strings.TrimSpace(h), Harnesses: overrideBlocks}); err != nil {
+			return nil, "", fmt.Errorf("entry %q: %v", e.Name, err)
+		}
 		cfg.Harness = strings.TrimSpace(h)
 	}
-	if raw, ok := e.Overrides["harnesses"]; ok {
-		var blocks map[string]config.RunConfigHarnessBlock
-		if err := json.Unmarshal(raw, &blocks); err != nil {
-			return nil, "", fmt.Errorf("entry %q: harnesses override is not a per-harness block: %v", e.Name, err)
-		}
+	if len(overrideBlocks) > 0 {
 		// The loop below writes into cfg.Harnesses, which Clone keeps nil when
 		// the machine layer is the common single-harness config (no `harnesses:`
 		// key, so the map never exists to copy). A roster entry carrying the
 		// permitted `harnesses` override over that shape must allocate rather
 		// than panic with "assignment to entry in nil map" - the same root
 		// cause ApplyRunConfig guards (CLA-474).
-		if len(blocks) > 0 && cfg.Harnesses == nil {
-			cfg.Harnesses = make(map[string]config.HarnessConfig, len(blocks))
+		if len(overrideBlocks) > 0 && cfg.Harnesses == nil {
+			cfg.Harnesses = make(map[string]config.HarnessConfig, len(overrideBlocks))
 		}
-		for name, b := range blocks {
+		for name, b := range overrideBlocks {
 			hc := cfg.Harnesses[name]
 			hc.Model = strings.TrimSpace(b.Model)
 			if b.Models != nil {
