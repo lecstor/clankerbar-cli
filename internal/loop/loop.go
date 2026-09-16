@@ -893,6 +893,31 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			return nil
 		}
 
+		// CLA-564: every task boundary is a stop boundary, not just idle waits.
+		// The cycle top reads these before the next poll, and this repeats the
+		// read after the drain has fully unwound so the stop lands here —
+		// before the next poll's side effects and the next spawn — rather than
+		// depending on a single read a future fast path could bypass. A
+		// file-exists read, never a wait, so the wired "loop straight back"
+		// path below stays fast. HALT stops without being consumed (the
+		// operator deletes it to resume); STOP is consumed on stop so a
+		// restart is not stillborn.
+		//
+		// A cancelled context outranks both markers here exactly as at the
+		// cycle top: falling through lets the top report the cancel, and the
+		// exit sweep clears any pending STOP (CLA-491).
+		if runCtx.Err() == nil {
+			if present, msg := d.readMarker("HALT"); present {
+				log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
+				return nil
+			}
+			if present, _ := d.readMarker("STOP"); present {
+				_ = d.state.Remove("STOP")
+				log.Print("STOP requested — stopping")
+				return nil
+			}
+		}
+
 		// Blind mode has no counts to gate on, so it idles between sessions rather
 		// than spinning. Note this is a PER-TASK pause now: the default prompt asks
 		// for one task, so a blind run alternates task / idle / task, where the old
