@@ -95,6 +95,7 @@ func TestCheckRunConfigs_UndecodableAndRefusedDocumentsWarnNotFail(t *testing.T)
 	}{
 		{"undecodable", `{"model":`, "undecodable"},
 		{"validate-refused", `{"harness":"not-a-harness"}`, "REFUSED locally"},
+		{"newer-schema", `{"$schema_version":9999,"model":"plane-x"}`, "newer than this build understands"},
 	} {
 		raw := json.RawMessage(tc.raw)
 		checks := checkRunConfigs(context.Background(), cfg, rcPlaneEnv(func() (*plane.RunConfigState, error) {

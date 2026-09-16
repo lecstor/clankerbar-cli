@@ -103,6 +103,23 @@ func TestApplyRunConfig_NilBaseHarnessesAllocatesOnOverlay(t *testing.T) {
 	}
 }
 
+// Only the past and present are consumable: a document carrying a
+// $schema_version newer than RunConfigSchemaVersion reports SchemaNewer, so
+// the consume points can refuse it before Empty or the overlay ever see it.
+// Pinned against the constant, not a literal, so a future version bump moves
+// the boundary without rewriting the test — while the existing overlay tests
+// (all SchemaVersion: 1) pin that today's version still applies.
+func TestRunConfigDoc_SchemaNewerRefusesOnlyTheFuture(t *testing.T) {
+	for _, doc := range []*RunConfigDoc{nil, {}, {SchemaVersion: RunConfigSchemaVersion}} {
+		if doc.SchemaNewer() {
+			t.Errorf("SchemaNewer() = true for %+v, want false (this build's own version is consumable)", doc)
+		}
+	}
+	if doc := (&RunConfigDoc{SchemaVersion: RunConfigSchemaVersion + 1}); !doc.SchemaNewer() {
+		t.Errorf("SchemaNewer() = false for %+v, want true (a newer schema may have changed the known keys' meaning)", doc)
+	}
+}
+
 func TestApplyRunConfig_EmptyDocumentIsANoOp(t *testing.T) {
 	base := overlayBase()
 	before := base.Clone()

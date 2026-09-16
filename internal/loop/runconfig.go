@@ -128,6 +128,15 @@ func (d *Driver) applyRunConfig(i int, t *Target, st *plane.RunConfigState) {
 		d.rcVersions[i] = st.Version // deterministic decode failure: don't hot-loop
 		return
 	}
+	if doc.SchemaNewer() {
+		// A newer schema may have changed the meaning of the keys this build
+		// knows: applying the familiar-looking half would run a policy the
+		// operator did not ratify. Keep the previous config, loudly.
+		log.Printf("%srun-config v%d: schema v%d is newer than this build understands (v%d) - keeping %s; upgrade the CLI and re-ratify",
+			d.prefix(i), st.Version, doc.SchemaVersion, config.RunConfigSchemaVersion, d.cfgSourceDesc(i))
+		d.rcVersions[i] = st.Version // deterministic refusal: don't hot-loop
+		return
+	}
 	if doc.Empty() {
 		// A stored-but-empty document consumes to nothing: same posture as
 		// version 0, said once on the transition.

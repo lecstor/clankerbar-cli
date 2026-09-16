@@ -3284,6 +3284,13 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 			checks = append(checks, c)
 			continue
 		}
+		if doc.SchemaNewer() {
+			c.status = warn
+			c.detail = fmt.Sprintf("stored v%d uses schema v%d, newer than this build understands (v%d) - local rules (%s) stay in force", st.Version, doc.SchemaVersion, config.RunConfigSchemaVersion, src)
+			c.remedy = "upgrade the CLI, then re-ratify the document from the console"
+			checks = append(checks, c)
+			continue
+		}
 		if doc.Empty() {
 			c.detail = fmt.Sprintf("stored v%d sets nothing consumable - local rules (%s) in force", st.Version, src)
 			checks = append(checks, c)
