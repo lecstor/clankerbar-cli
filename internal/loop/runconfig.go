@@ -50,40 +50,90 @@ func (d *Driver) checkRunConfigVersion(ctx context.Context, i int, t *Target, ve
 	if t.RCfg == nil || version == d.rcVersions[i] {
 		return
 	}
+	// Permanent nothing-stored (CLA-481): version 0 IS the plane's "never set"
+	// answer, so when nothing is in force (unfetched or already at none) the
+	// answer is known without a fetch. Latch silently — staying at none is not
+	// news — instead of fetching every boundary only to learn ErrNoConfig.
+	// A 0 arriving while a stored overlay is in force (rcVersions > 0) still
+	// fetches below, so the drop to local is confirmed and logged.
+	if version == 0 && d.rcVersions[i] <= 0 {
+		if d.targets[i].Cfg != nil {
+			log.Printf("%srun-config: nothing stored on the plane - the local file rules", d.prefix(i))
+			d.targets[i].Cfg = nil
+		}
+		d.rcVersions[i] = 0
+		d.rcAttempt[i] = time.Time{}
+		d.rcAttemptVer[i] = 0
+		d.rcFails[i] = 0
+		return
+	}
 	// Rate-limit RETRIES after a failed fetch of the SAME version to one per
 	// backoff window, so a blip at ratify time retries without spamming the log.
 	// A DIFFERENT version always fetches: the operator moved the document again,
-	// and no throttle may delay that past the boundary it arrived on.
+	// and no throttle may delay that past the boundary it arrived on. The window
+	// widens with consecutive failures (CLA-481), so a permanently unreachable
+	// plane backs off instead of logging every 30s forever.
 	if version == d.rcAttemptVer[i] && !time.Now().After(d.rcAttempt[i]) {
 		return
 	}
-	d.rcAttemptVer[i] = version
-	d.rcAttempt[i] = time.Now().Add(d.rcAttemptBackoff())
 	st, err := t.RCfg.RunConfig(ctx)
 	if err != nil {
-		if errors.Is(err, plane.ErrNoConfig) {
-			// Nothing stored: the local file rules. Say it once per transition,
-			// not every poll — dropping from a stored doc to none is real news,
-			// staying at none is not.
+		if errors.Is(err, plane.ErrNoConfig) || errors.Is(err, plane.ErrNotWired) {
+			// Permanent: nothing to fetch, ever, for this version. ErrNotWired
+			// is the slug-less / project-scoped-key shape (rcNotWired) — the
+			// same "local file rules" posture as nothing stored, silent
+			// thereafter, never retried. Say it once per transition, not every
+			// poll — dropping from a stored doc to none is real news, staying
+			// at none is not.
 			if d.targets[i].Cfg != nil || d.rcVersions[i] > 0 {
 				log.Printf("%srun-config: nothing stored on the plane - the local file rules", d.prefix(i))
 				d.targets[i].Cfg = nil
 			}
 			d.rcVersions[i] = version
+			d.rcAttempt[i] = time.Time{}
+			d.rcAttemptVer[i] = 0
+			d.rcFails[i] = 0
 			return
 		}
+		if version != d.rcAttemptVer[i] {
+			d.rcFails[i] = 1
+		} else {
+			d.rcFails[i]++
+		}
+		d.rcAttemptVer[i] = version
+		d.rcAttempt[i] = time.Now().Add(rcFetchBackoff(d.rcFails[i]))
 		log.Printf("%srun-config: fetch failed (%v) - keeping %s; retrying at the next boundary",
 			d.prefix(i), err, d.cfgSourceDesc(i))
-		return // rcVersions unchanged, so the next poll retries
+		return // rcVersions unchanged, so the next poll retries (throttled above)
 	}
+	d.rcAttempt[i] = time.Time{}
+	d.rcAttemptVer[i] = 0
+	d.rcFails[i] = 0
 	d.applyRunConfig(i, t, st)
 }
 
-// rcAttemptBackoff is how long a failed refetch waits before trying again.
-// A field-shaped function rather than a var so tests need no clock injection:
-// production gets the idle interval's worth of margin, tests get zero and drive
-// the boundary directly.
-func (d *Driver) rcAttemptBackoff() time.Duration { return 30 * time.Second }
+// rcFetchBackoff is how long a failed refetch waits before trying the SAME
+// version again: 30s, 60s, 120s, ..., capped at 5m. The first failure retries
+// promptly (a blip at ratify time), a persistently unreachable plane backs off
+// instead of spamming every boundary. A DIFFERENT version always fetches
+// immediately — the operator moved the document, and no throttle may delay it.
+func rcFetchBackoff(fails int) time.Duration {
+	const (
+		base = 30 * time.Second
+		cap_ = 5 * time.Minute
+	)
+	if fails <= 1 {
+		return base
+	}
+	d := base
+	for i := 1; i < fails; i++ {
+		d *= 2
+		if d >= cap_ {
+			return cap_
+		}
+	}
+	return d
+}
 
 // cfgSourceDesc names what a target's sessions currently run under, for log
 // lines that have to distinguish "the stored document" from "the local file".
@@ -112,6 +162,7 @@ func (d *Driver) invalidateRunConfigs() {
 		d.rcVersions[i] = -1 // unfetched again: the next poll re-reads
 		d.rcAttempt[i] = time.Time{}
 		d.rcAttemptVer[i] = 0
+		d.rcFails[i] = 0
 	}
 }
 

@@ -394,9 +394,13 @@ type Driver struct {
 	// happens there), never mid-session. rcAttempt/rcAttemptVer rate-limit a
 	// FAILED refetch of one version to one try per backoff window (a new version
 	// always fetches), so a blip at ratify time retries without spamming.
+	// rcFails counts consecutive transient failures for rcAttemptVer, so the
+	// window widens exponentially (CLA-481) instead of fixed 30s spam; a
+	// permanent latch (ErrNoConfig/ErrNotWired) or any success resets it.
 	rcVersions   []int
 	rcAttempt    []time.Time
 	rcAttemptVer []int
+	rcFails      []int
 
 	// tgtTokens / tgtCost accumulate each target's own spend for the per-target
 	// budget breaker: a stored config's budget must bite on ITS project's spend,
@@ -435,30 +439,31 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
 	d := &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:       make([]bool, n),
-		quietTokens:  make([]int, n),
-		spent:        make([]int, n),
-		baseline:     make([]int, n),
-		openQs:       make([]int, n),
-		pending:      make([]bool, n),
-		skipUntil:    make([]time.Time, n),
-		harnessFails: make([]int, n),
-		harnessErrs:  make([]error, n),
-		fleetDead:    make([]int, n),
-		fleetPaused:  make([]bool, n),
-		fleetRaised:  make([]bool, n),
-		fleetOpenQ:   make([]int, n),
+		paused:        make([]bool, n),
+		quietTokens:   make([]int, n),
+		spent:         make([]int, n),
+		baseline:      make([]int, n),
+		openQs:        make([]int, n),
+		pending:       make([]bool, n),
+		skipUntil:     make([]time.Time, n),
+		harnessFails:  make([]int, n),
+		harnessErrs:   make([]error, n),
+		fleetDead:     make([]int, n),
+		fleetPaused:   make([]bool, n),
+		fleetRaised:   make([]bool, n),
+		fleetOpenQ:    make([]int, n),
 		startupFails:  make([]int, n),
 		startupPaused: make([]bool, n),
 		startupRaised: make([]bool, n),
 		startupOpenQ:  make([]int, n),
-		iter:         make([]iterState, n),
-		rcVersions:   make([]int, n),
-		rcAttempt:    make([]time.Time, n),
-		rcAttemptVer: make([]int, n),
-		tgtTokens:    make([]int, n),
-		tgtCost:      make([]float64, n),
-		waitGrace:    time.Minute,
+		iter:          make([]iterState, n),
+		rcVersions:    make([]int, n),
+		rcAttempt:     make([]time.Time, n),
+		rcAttemptVer:  make([]int, n),
+		rcFails:       make([]int, n),
+		tgtTokens:     make([]int, n),
+		tgtCost:       make([]float64, n),
+		waitGrace:     time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
