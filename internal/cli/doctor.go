@@ -3290,7 +3290,13 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 			continue
 		}
 		eff := cfg.Clone()
-		eff.ApplyRunConfig(&doc)
+		if err := eff.ApplyRunConfig(&doc); err != nil {
+			c.status = warn
+			c.detail = fmt.Sprintf("stored v%d REFUSED locally (%v) - local rules (%s) stay in force", st.Version, err, src)
+			c.remedy = "fix the stored document and ratify again; until then the loop ignores it"
+			checks = append(checks, c)
+			continue
+		}
 		if err := eff.Validate(); err != nil {
 			c.status = warn
 			c.detail = fmt.Sprintf("stored v%d REFUSED locally (%v) - local rules (%s) stay in force", st.Version, err, src)

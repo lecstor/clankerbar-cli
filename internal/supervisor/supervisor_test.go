@@ -1183,6 +1183,87 @@ func TestBuildConfigHarnessesOverrideAllocatesNilBase(t *testing.T) {
 	}
 }
 
+// A per-instance harness override re-points the same top-level a stored
+// run-config swap does (CLA-475): over a machine layer that wires the old
+// harness run-wide, the new harness would silently inherit that dialect
+// through SessionFor. buildConfig refuses it loudly — naming the entry and
+// the inherited fields — and the caller keeps the last-known-good, exactly
+// like the stored-swap refusal. A new harness carrying its own wiring (the
+// entry's policy half, or a complete local block) still lands.
+func TestBuildConfigHarnessOverrideRefusesInheritedWiring(t *testing.T) {
+	wiredBase := func() *config.Config {
+		return &config.Config{
+			Harness: "claude",
+			Prompt:  "Work the next backlog item.",
+			Model:   "claude-alias",
+			Models:  map[string]string{"strong": "claude-strong"},
+		}
+	}
+	newEntry := func(overrides map[string]json.RawMessage) *RosterEntry {
+		return &RosterEntry{
+			Name:         "one",
+			DesiredState: RosterDesiredRunning,
+			Placement:    RosterPlacementLocal,
+			Projects:     []RosterProject{{Slug: "acme"}},
+			Overrides:    overrides,
+		}
+	}
+
+	// The reported shape: run-wide wiring, entry re-points the harness with
+	// nothing of its own. Refused before resolveInstance ever runs, naming
+	// the entry and both harnesses.
+	d := &Supervisor{cacheDir: t.TempDir()}
+	d.o.BaseCfg = wiredBase()
+	_, _, err := d.buildConfig(newEntry(map[string]json.RawMessage{
+		"harness": json.RawMessage(`"opencode"`),
+	}))
+	if err == nil {
+		t.Fatal("a harness override over run-wide wiring was applied; want a refusal")
+	}
+	for _, want := range []string{"one", "opencode", "claude", "model"} {
+		if !strings.Contains(strings.ToLower(err.Error()), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+
+	// The entry's own policy half covers the policy pair: run-wide
+	// model/models plus an entry harnesses block for the new harness lands,
+	// on the entry's own aliases.
+	d2 := &Supervisor{cacheDir: t.TempDir()}
+	d2.o.BaseCfg = wiredBase()
+	cfg, _, err := d2.buildConfig(newEntry(map[string]json.RawMessage{
+		"harness":   json.RawMessage(`"opencode"`),
+		"harnesses": json.RawMessage(`{"opencode":{"model":"oc-model","models":{"strong":"oc-strong"}}}`),
+	}))
+	if err != nil {
+		t.Fatalf("an override carrying the new harness's own policy was refused: %v", err)
+	}
+	if cfg.Harness != "opencode" {
+		t.Errorf("harness = %q, want opencode", cfg.Harness)
+	}
+	if got := cfg.SessionFor("opencode"); got.Model != "oc-model" {
+		t.Errorf("opencode model = %q, want the entry's own oc-model", got.Model)
+	}
+
+	// A complete local block also lets the same override through: every
+	// wired field has its own value, so nothing is inherited.
+	d3 := &Supervisor{cacheDir: t.TempDir()}
+	base := wiredBase()
+	base.Harnesses = map[string]config.HarnessConfig{
+		"opencode": {Model: "oc-model", Models: map[string]string{"strong": "oc-strong"}},
+	}
+	d3.o.BaseCfg = base
+	cfg, _, err = d3.buildConfig(newEntry(map[string]json.RawMessage{
+		"harness": json.RawMessage(`"opencode"`),
+	}))
+	if err != nil {
+		t.Fatalf("an override onto a fully-wired local block was refused: %v", err)
+	}
+	if cfg.Harness != "opencode" {
+		t.Errorf("harness = %q, want opencode", cfg.Harness)
+	}
+}
+
 // The spawn-time gate (phase 2c): a policy file deleted AFTER the instance was
 // admitted refuses the next respawn — the running child is untouched (it
 // already has its policy loaded), but the child-start gate must not start a
