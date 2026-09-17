@@ -107,6 +107,45 @@ func TestApplyRunConfig_NilBaseHarnessesAllocatesOnOverlay(t *testing.T) {
 	}
 }
 
+// Only the past and present are consumable: a document carrying a
+// $schema_version newer than RunConfigSchemaVersion reports SchemaNewer, so
+// the consume points can refuse it before Empty or the overlay ever see it.
+// Pinned against the constant, not a literal, so a future version bump moves
+// the boundary without rewriting the test — while the existing overlay tests
+// (all SchemaVersion: 1) pin that today's version still applies.
+func TestRunConfigDoc_SchemaNewerRefusesOnlyTheFuture(t *testing.T) {
+	for _, doc := range []*RunConfigDoc{nil, {}, {SchemaVersion: RunConfigSchemaVersion}} {
+		if doc.SchemaNewer() {
+			t.Errorf("SchemaNewer() = true for %+v, want false (this build's own version is consumable)", doc)
+		}
+	}
+	if doc := (&RunConfigDoc{SchemaVersion: RunConfigSchemaVersion + 1}); !doc.SchemaNewer() {
+		t.Errorf("SchemaNewer() = false for %+v, want true (a newer schema may have changed the known keys' meaning)", doc)
+	}
+}
+
+// The overlay itself is the backstop behind the consume points' loud refusal:
+// a newer-schema document applied through a direct ApplyRunConfig call must
+// still be a no-op, so a future caller that forgets the SchemaNewer check
+// keeps the previous config instead of running redefined keys.
+func TestApplyRunConfig_NewerSchemaIsANoOp(t *testing.T) {
+	base := overlayBase()
+	before := base.Clone()
+	base.ApplyRunConfig(&RunConfigDoc{
+		SchemaVersion: RunConfigSchemaVersion + 1,
+		Harness:       "opencode",
+		Model:         "plane-x",
+		Models:        map[string]string{"strong": "plane-strong"},
+		MaxTurns:      42,
+		Budget:        &RunConfigBudget{MaxTokens: 77_000_000},
+		Escalation:    &RunConfigEscalation{CategoryRules: map[string]string{"bug": "strong"}},
+	})
+	if !reflect.DeepEqual(base, before) {
+		t.Errorf("a newer-schema document overlaid: harness=%q model=%q turns=%d (want the previous config kept)",
+			base.Harness, base.Model, base.MaxTurns)
+	}
+}
+
 func TestApplyRunConfig_EmptyDocumentIsANoOp(t *testing.T) {
 	base := overlayBase()
 	before := base.Clone()

@@ -22,6 +22,16 @@ import (
 	"strings"
 )
 
+// RunConfigSchemaVersion is the newest `$schema_version` this build
+// understands. A stored document carrying a HIGHER version is refused at both
+// consume points (the loop's applyRunConfig and doctor's checkRunConfigs),
+// loudly and keeping the previous config — never partially applied. The
+// version bump is the one signal that means "the keys you do know may no
+// longer mean what you think", which is exactly what the unknown-keys rule
+// below cannot cover: extra keys degrade to unconsumed, but a newer schema
+// may have changed the meaning of the keys this build DOES know.
+const RunConfigSchemaVersion = 1
+
 // RunConfigHarnessBlock is the POLICY half of a per-harness block as the plane
 // stores it. The machine-fit twins (`config_dir`, `mcp_config_path`,
 // `settings_path`) are paths and wiring the plane never carries, so an overlay
@@ -55,6 +65,9 @@ type RunConfigEscalation struct {
 // keys this build consumes. JSON decoding ignores everything else, so a newer
 // plane's added keys degrade to "unconsumed" rather than unmarshal errors;
 // Empty reports that case so the caller can say "nothing applied" honestly.
+// A newer `$schema_version` is NOT covered by that rule — it means the known
+// keys themselves may have changed meaning — so the consume points refuse it
+// outright; see RunConfigSchemaVersion and SchemaNewer.
 type RunConfigDoc struct {
 	SchemaVersion       int                              `json:"$schema_version"`
 	Harness             string                           `json:"harness"`
@@ -65,6 +78,18 @@ type RunConfigDoc struct {
 	MaxSessionWallClock Duration                         `json:"max_session_wall_clock"`
 	Budget              *RunConfigBudget                 `json:"budget"`
 	Escalation          *RunConfigEscalation             `json:"escalation"`
+}
+
+// SchemaNewer reports whether the document carries a `$schema_version` newer
+// than this build understands (see RunConfigSchemaVersion). The consume points
+// check this BEFORE Empty: a newer-schema document that happens to set nothing
+// else must still be refused loudly as a version mismatch, not waved through
+// as "nothing consumable".
+func (d *RunConfigDoc) SchemaNewer() bool {
+	if d == nil {
+		return false
+	}
+	return d.SchemaVersion > RunConfigSchemaVersion
 }
 
 // Empty reports whether the document consumes to nothing: every field a stored
@@ -131,6 +156,11 @@ func cloneStrMap(m map[string]string) map[string]string {
 // Callers re-run Validate afterwards: an overlay CAN produce a combination the
 // local file alone could not (a stored harness name nobody registered), and a
 // refused combination must be loud, not silently half-applied.
+// A newer `$schema_version` never overlays, not even through a direct call:
+// the consume points (the loop's applyRunConfig, doctor's checkRunConfigs)
+// refuse it LOUDLY before calling; this early return is the quiet backstop
+// behind them, so a future caller that forgets the check still keeps the
+// previous config instead of running keys whose meaning may have changed.
 //
 // A harness swap is refused outright when it would hand the new harness the
 // old one's machine-local wiring (CLA-475): SessionFor attaches the run-wide
@@ -148,6 +178,9 @@ func cloneStrMap(m map[string]string) map[string]string {
 // CheckHarnessSwap: it re-points the same top-level over the same machine
 // layer through a different door.
 func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
+	if doc.SchemaNewer() {
+		return nil
+	}
 	if doc.Empty() {
 		return nil
 	}
