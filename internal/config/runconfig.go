@@ -17,7 +17,10 @@
 // (console-facing reasoning).
 package config
 
-import "strings"
+import (
+	"fmt"
+	"strings"
+)
 
 // RunConfigSchemaVersion is the newest `$schema_version` this build
 // understands. A stored document carrying a HIGHER version is refused at both
@@ -158,12 +161,31 @@ func cloneStrMap(m map[string]string) map[string]string {
 // refuse it LOUDLY before calling; this early return is the quiet backstop
 // behind them, so a future caller that forgets the check still keeps the
 // previous config instead of running keys whose meaning may have changed.
-func (c *Config) ApplyRunConfig(doc *RunConfigDoc) {
+//
+// A harness swap is refused outright when it would hand the new harness the
+// old one's machine-local wiring (CLA-475): SessionFor attaches the run-wide
+// model, models, config_dir, mcp_config_path and settings_path to whichever
+// harness is top-level, and ResolveMCPConfig attaches a project's own
+// mcp_config_path to the top-level harness, so re-pointing `harness` over a
+// base that wires the old harness run-wide (or per project) silently re-homes
+// that dialect. The document carries no machine fields to re-wire the new
+// harness with, so the only safe swaps are the ones that inherit nothing:
+// the base sets none of those fields run-wide (or per project), or the new
+// harness already declares its own values for every one the base sets. Anything
+// else returns an error and leaves c untouched — the callers log it on the
+// existing loud "REFUSED locally" path and keep the previous config. The
+// supervisor's per-instance harness override rides the same check through
+// CheckHarnessSwap: it re-points the same top-level over the same machine
+// layer through a different door.
+func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	if doc.SchemaNewer() {
-		return
+		return nil
 	}
 	if doc.Empty() {
-		return
+		return nil
+	}
+	if err := c.CheckHarnessSwap(doc); err != nil {
+		return err
 	}
 	if h := strings.TrimSpace(doc.Harness); h != "" {
 		c.Harness = h
@@ -223,6 +245,89 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) {
 			c.Escalation.CategoryRules = e.CategoryRules
 		}
 	}
+	return nil
+}
+
+// CheckHarnessSwap refuses a document that re-points the top-level harness
+// when the swap would hand the new harness the old one's machine-local wiring
+// (CLA-475) — the same guard ApplyRunConfig enforces, exported so the
+// supervisor's per-instance harness override (which re-points the top-level
+// over the same machine layer through a different door) rides exactly it. A
+// nil or harness-less document, or one naming the current top-level
+// (whitespace aside), is not a swap and always passes. An empty top-level is
+// not a free pass: run-wide wiring with no named harness would still be
+// handed to the new top-level on a swap, so it is refused like any other
+// inheritance. A refusal leaves c untouched.
+func (c *Config) CheckHarnessSwap(doc *RunConfigDoc) error {
+	if doc == nil {
+		return nil
+	}
+	newH := strings.TrimSpace(doc.Harness)
+	oldH := strings.TrimSpace(c.Harness)
+	if newH == "" || newH == oldH {
+		return nil
+	}
+	return c.refuseHarnessSwap(doc, newH)
+}
+
+// refuseHarnessSwap reports whether re-pointing the top-level harness from the
+// base's to newH would hand newH the old harness's dialect. It is called
+// BEFORE any mutation, so an error leaves the base untouched for the caller's
+// loud refusal path.
+//
+// SessionFor fills Model, Models, ConfigDir, MCPConfigPath and SettingsPath
+// from the run-wide fields for the top-level harness only; ResolveMCPConfig
+// additionally serves a project's own mcp_config_path to the top-level
+// harness. The stored document carries none of the machine fields, so after a
+// swap the new top-level inherits whatever the base still holds run-wide (or
+// per project) unless it already declares its own value for that field —
+// from the local harnesses block, or, for the policy pair, from the document
+// itself. A "non-empty block" alone is not enough: a block carrying only a
+// model still inherits the old config dir through its gaps, which is the exact
+// failure this refuses. The check is therefore per field, not per block.
+func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
+	oldH := strings.TrimSpace(c.Harness)
+	baseBlock := c.Harnesses[newH]
+	docBlock := doc.Harnesses[newH]
+	docModel := strings.TrimSpace(doc.Model)
+
+	var inherited []string
+	// Policy pair: the document CAN re-wire these, so a document-provided
+	// value (run-wide or per-harness) is the new harness's own, not an
+	// inheritance. Only the all-absent shape inherits the old alias.
+	if strings.TrimSpace(c.Model) != "" && docModel == "" &&
+		strings.TrimSpace(docBlock.Model) == "" && strings.TrimSpace(baseBlock.Model) == "" {
+		inherited = append(inherited, "model")
+	}
+	if len(c.Models) > 0 && doc.Models == nil &&
+		docBlock.Models == nil && baseBlock.Models == nil {
+		inherited = append(inherited, "models")
+	}
+	// Machine twins: the document carries none, so only a local block value
+	// keeps the new harness off the run-wide (old) one.
+	if strings.TrimSpace(c.ConfigDir) != "" && strings.TrimSpace(baseBlock.ConfigDir) == "" {
+		inherited = append(inherited, "config_dir")
+	}
+	if strings.TrimSpace(c.MCPConfigPath) != "" && strings.TrimSpace(baseBlock.MCPConfigPath) == "" {
+		inherited = append(inherited, "mcp_config_path")
+	}
+	if strings.TrimSpace(c.SettingsPath) != "" && strings.TrimSpace(baseBlock.SettingsPath) == "" {
+		inherited = append(inherited, "settings_path")
+	}
+	for _, p := range c.Projects {
+		if strings.TrimSpace(p.MCPConfigPath) == "" {
+			continue
+		}
+		if strings.TrimSpace(p.MCPConfigPaths[newH]) == "" {
+			inherited = append(inherited, fmt.Sprintf("projects[%s].mcp_config_path", p.Slug))
+		}
+	}
+	if len(inherited) == 0 {
+		return nil
+	}
+	return fmt.Errorf("harness %q cannot replace %q: the new harness would inherit %s from the current top-level wiring "+
+		"(run-wide/project machine fields follow SessionFor/ResolveMCPConfig) — declare %s under `harnesses.%s` (or per-project `mcp_config_paths[%s]`) locally first",
+		newH, oldH, strings.Join(inherited, ", "), strings.Join(inherited, ", "), newH, newH)
 }
 
 // RunConfigDocument renders the config's MOVABLE half as the plane-side
