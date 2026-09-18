@@ -95,6 +95,8 @@ func TestCheckRunConfigs_UndecodableAndRefusedDocumentsWarnNotFail(t *testing.T)
 	}{
 		{"undecodable", `{"model":`, "undecodable"},
 		{"validate-refused", `{"harness":"not-a-harness"}`, "REFUSED locally"},
+		{"newer-schema", `{"$schema_version":9999,"model":"plane-x"}`, "newer than this build understands"},
+		{"newer-schema-empty", `{"$schema_version":9999}`, "newer than this build understands"},
 	} {
 		raw := json.RawMessage(tc.raw)
 		checks := checkRunConfigs(context.Background(), cfg, rcPlaneEnv(func() (*plane.RunConfigState, error) {
@@ -104,6 +106,26 @@ func TestCheckRunConfigs_UndecodableAndRefusedDocumentsWarnNotFail(t *testing.T)
 		if c.status != warn || !strings.Contains(c.detail, tc.want) {
 			t.Errorf("%s: status=%v detail=%q, want WARN containing %q", tc.name, c.status, c.detail, tc.want)
 		}
+	}
+}
+
+// CLA-475: doctor reports the same loud refusal the loop enforces — a stored
+// harness swap over run-wide machine wiring warns REFUSED rather than
+// reporting an overlay that would re-home the old harness's dialect.
+func TestCheckRunConfigs_HarnessSwapOverWiringWarnsRefused(t *testing.T) {
+	cfg := validCfg(t)
+	cfg.Harness = "claude"
+	cfg.Model = "claude-alias"
+	cfg.ConfigDir = "/local/claude-dir"
+	cfg.MCPConfigPath = "/local/claude-mcp.json"
+	cfg.SettingsPath = "/local/claude-settings.json"
+	raw, _ := json.Marshal(map[string]any{"harness": "opencode"})
+	checks := checkRunConfigs(context.Background(), cfg, rcPlaneEnv(func() (*plane.RunConfigState, error) {
+		return &plane.RunConfigState{Version: 7, Config: raw}, nil
+	}))
+	c := findRunConfigCheck(t, checks)
+	if c.status != warn || !strings.Contains(c.detail, "REFUSED locally") {
+		t.Errorf("status=%v detail=%q, want WARN containing REFUSED locally", c.status, c.detail)
 	}
 }
 

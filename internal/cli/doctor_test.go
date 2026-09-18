@@ -2045,7 +2045,7 @@ func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 
 	for _, want := range []string{
 		"config", "harness", "config_dir", "backlog",
-		"state_dir", "workdir", "mcp_servers", "permissions", "toolchains", "budget",
+		"state_dir", "workdir", "stranded", "mcp_servers", "permissions", "toolchains", "budget",
 		// power has three WARN branches, two of which are the "doctor does not
 		// know the sleep policy" states — exactly the kind of line that is useless
 		// without a remedy.

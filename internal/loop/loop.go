@@ -102,6 +102,16 @@ const perTaskDeadBound = 4
 // retryable class from the numerator.
 const fleetDeadBound = 5
 
+// startupFailBound is how many consecutive harness-startup failures on one
+// target pause it and raise one project-level question (CLA-562). Mirrors
+// fleetDeadBound on purpose: the dead-phase escalation (CLA-396) never fires
+// for a session that dies at startup - that counter only sees sessions that
+// started - so the startup-failure sideline path (CLA-507) was unbounded by
+// design: 50 consecutive failures over 4 days on a bad reasoningEffort value,
+// sidelining 2h and retrying, with nothing filed and nothing paused. Five is
+// the same conservative signal as the fleet bound, and triage may move it.
+const startupFailBound = 5
+
 // Target is one backlog a Driver drives: a project's cheap poller plus where that
 // project's drain sessions run (CLA-142). A single-project Driver has exactly one,
 // unnamed target; a multi-project Driver has one per configured project.
@@ -268,6 +278,37 @@ type Driver struct {
 	// clears once the count falls back to it or below.
 	fleetOpenQ []int
 
+	// Per-target harness-startup-failure state (CLA-562). A startup failure is
+	// a drain that returned an ERROR having reported no usage (tokens == 0):
+	// no session ever ran - a bad reasoningEffort value exiting 1 at spawn, a
+	// missing checkout, a harness binary that will not start - exit before any
+	// usage report. A dead phase (CLA-396) is the opposite: the session ran and
+	// produced nothing. The two counters are deliberately distinct and one
+	// failure never ticks both: a dead phase returns err == nil (handled inside
+	// drainPhases, never reaching the sideline path), and a startup failure
+	// returns err != nil with tokens == 0 (never satisfying end.dead, which
+	// requires a held claim). startupFails counts consecutive startup failures
+	// since the last drain that spawned anything (reset on any err == nil, and
+	// on any err with tokens > 0, which proves a session ran); the backoff /
+	// sideline (harnessFails) stays for the first startupFailBound-1 attempts
+	// and only the Nth escalates to a pause-and-raise, mirroring fleetTrip.
+	startupFails []int
+
+	// startupPaused marks a target whose startup counter has tripped: the loop
+	// stops spawning for it until the operator answers the raised question -
+	// measured as the open-question count falling back to startupOpenQ, the
+	// same signal the fleet pause uses.
+	startupPaused []bool
+
+	// startupRaised records that this target's startup question is OPEN, so a
+	// trip raises exactly ONE project-level question per episode. Cleared with
+	// the pause, so a new episode raises fresh.
+	startupRaised []bool
+
+	// startupOpenQ is the open-question baseline captured at raise, before the
+	// question itself raises the count.
+	startupOpenQ []int
+
 	// waitGrace is how far past a stated reset the paused loop waits before its
 	// confirming probe: a reset time is a boundary, and arriving exactly on it
 	// invites an off-by-a-second retry against a cap that has not lifted yet.
@@ -319,6 +360,12 @@ type Driver struct {
 	// Run returns.
 	restartRequested atomic.Bool
 
+	// beaconWriteFailed is the streak latch for the LOCAL beacon write
+	// (loop/fleet.go): the first consecutive failure is logged, further ones
+	// stay silent, and recovery is logged once. Atomic because the claim
+	// reflector (CLA-510) beacons from the lease-renewer goroutine.
+	beaconWriteFailed atomic.Bool
+
 	// reloadConfig rebuilds the config for a RELOAD marker (CLA-461). Production
 	// wires Load+ApplyFlagOverrides+Validate via SetReloader; nil falls back to
 	// Load(Source())+Validate. See control.go.
@@ -347,9 +394,13 @@ type Driver struct {
 	// happens there), never mid-session. rcAttempt/rcAttemptVer rate-limit a
 	// FAILED refetch of one version to one try per backoff window (a new version
 	// always fetches), so a blip at ratify time retries without spamming.
+	// rcFails counts consecutive transient failures for rcAttemptVer, so the
+	// window widens exponentially (CLA-481) instead of fixed 30s spam; a
+	// permanent latch (ErrNoConfig/ErrNotWired) or any success resets it.
 	rcVersions   []int
 	rcAttempt    []time.Time
 	rcAttemptVer []int
+	rcFails      []int
 
 	// tgtTokens / tgtCost accumulate each target's own spend for the per-target
 	// budget breaker: a stored config's budget must bite on ITS project's spend,
@@ -388,26 +439,31 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
 	d := &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:       make([]bool, n),
-		quietTokens:  make([]int, n),
-		spent:        make([]int, n),
-		baseline:     make([]int, n),
-		openQs:       make([]int, n),
-		pending:      make([]bool, n),
-		skipUntil:    make([]time.Time, n),
-		harnessFails: make([]int, n),
-		harnessErrs:  make([]error, n),
-		fleetDead:    make([]int, n),
-		fleetPaused:  make([]bool, n),
-		fleetRaised:  make([]bool, n),
-		fleetOpenQ:   make([]int, n),
-		iter:         make([]iterState, n),
-		rcVersions:   make([]int, n),
-		rcAttempt:    make([]time.Time, n),
-		rcAttemptVer: make([]int, n),
-		tgtTokens:    make([]int, n),
-		tgtCost:      make([]float64, n),
-		waitGrace:    time.Minute,
+		paused:        make([]bool, n),
+		quietTokens:   make([]int, n),
+		spent:         make([]int, n),
+		baseline:      make([]int, n),
+		openQs:        make([]int, n),
+		pending:       make([]bool, n),
+		skipUntil:     make([]time.Time, n),
+		harnessFails:  make([]int, n),
+		harnessErrs:   make([]error, n),
+		fleetDead:     make([]int, n),
+		fleetPaused:   make([]bool, n),
+		fleetRaised:   make([]bool, n),
+		fleetOpenQ:    make([]int, n),
+		startupFails:  make([]int, n),
+		startupPaused: make([]bool, n),
+		startupRaised: make([]bool, n),
+		startupOpenQ:  make([]int, n),
+		iter:          make([]iterState, n),
+		rcVersions:    make([]int, n),
+		rcAttempt:     make([]time.Time, n),
+		rcAttemptVer:  make([]int, n),
+		rcFails:       make([]int, n),
+		tgtTokens:     make([]int, n),
+		tgtCost:       make([]float64, n),
+		waitGrace:     time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -686,7 +742,16 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 							d.fleetRaised[i] = false
 							log.Printf("%sfleet pause cleared — the operator answered the dead-phase question; resuming", d.prefix(i))
 						}
-						if sum.Spawnable() && !d.backedOff(i) && !d.fleetPaused[i] {
+						// CLA-562: the same resume signal for the startup-failure
+						// pause - answering resumes, and the next startup failure
+						// re-arms (the counter stays at the bound, so the next
+						// startup failure trips again and raises fresh).
+						if d.startupPaused[i] && sum.OpenQuestions <= d.startupOpenQ[i] {
+							d.startupPaused[i] = false
+							d.startupRaised[i] = false
+							log.Printf("%sstartup-failure pause cleared - the operator answered the harness question; resuming", d.prefix(i))
+						}
+						if sum.Spawnable() && !d.backedOff(i) && !d.fleetPaused[i] && !d.startupPaused[i] {
 							candidates[i] = true
 							anyCandidate = true
 						}
@@ -798,16 +863,64 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			// the escalating ladder while every other project drains on, and
 			// self-heals once its harness succeeds again.
 			d.sidelineTarget(d.cursor, drains, err)
+			// CLA-562: the startup-failure escalation rides on top of the
+			// sideline, mirroring the fleet trip. A startup failure is an ERROR
+			// with no usage reported (no session ever ran); a dead phase is
+			// err == nil, so one failure never ticks both counters. The sideline
+			// stays for the first startupFailBound-1 attempts; only the Nth
+			// escalates to a pause-and-raise. An error WITH usage proves a
+			// session ran, so it breaks startup consecutiveness without tripping.
+			if tokens == 0 {
+				d.startupFails[d.cursor]++
+				if d.startupFails[d.cursor] >= startupFailBound {
+					d.startupTrip(runCtx, target, d.cursor, drains, err)
+				}
+			} else {
+				d.startupFails[d.cursor] = 0
+			}
 			if d.allSidelined() {
 				return fmt.Errorf("every project's harness is failing - nothing left to drive, stopping:%s", d.sidelinedReport())
 			}
-		} else if d.harnessFails[d.cursor] > 0 {
-			log.Printf("%sthe harness succeeded again - rejoining the rotation", d.prefix(d.cursor))
-			d.harnessFails[d.cursor] = 0
-			d.harnessErrs[d.cursor] = nil
+		} else {
+			if d.harnessFails[d.cursor] > 0 {
+				log.Printf("%sthe harness succeeded again - rejoining the rotation", d.prefix(d.cursor))
+				d.harnessFails[d.cursor] = 0
+				d.harnessErrs[d.cursor] = nil
+			}
+			// CLA-562: any drain that spawned (err == nil) proves the harness
+			// starts, so it resets startup consecutiveness — including a drain
+			// that ended in a dead-phase park or fleet trip, which still ran
+			// sessions. The fleet counter is untouched here; its reset lives in
+			// drainPhases (implement success only).
+			d.startupFails[d.cursor] = 0
 		}
 		if stop {
 			return nil
+		}
+
+		// CLA-564: every task boundary is a stop boundary, not just idle waits.
+		// The cycle top reads these before the next poll, and this repeats the
+		// read after the drain has fully unwound so the stop lands here —
+		// before the next poll's side effects and the next spawn — rather than
+		// depending on a single read a future fast path could bypass. A
+		// file-exists read, never a wait, so the wired "loop straight back"
+		// path below stays fast. HALT stops without being consumed (the
+		// operator deletes it to resume); STOP is consumed on stop so a
+		// restart is not stillborn.
+		//
+		// A cancelled context outranks both markers here exactly as at the
+		// cycle top: falling through lets the top report the cancel, and the
+		// exit sweep clears any pending STOP (CLA-491).
+		if runCtx.Err() == nil {
+			if present, msg := d.readMarker("HALT"); present {
+				log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
+				return nil
+			}
+			if present, _ := d.readMarker("STOP"); present {
+				_ = d.state.Remove("STOP")
+				log.Print("STOP requested — stopping")
+				return nil
+			}
 		}
 
 		// Blind mode has no counts to gate on, so it idles between sessions rather
@@ -2677,6 +2790,64 @@ func (d *Driver) fleetTrip(ctx context.Context, t Target, ti, drainNum int, res 
 		d.prefix(ti), drainNum, d.fleetDead[ti])
 }
 
+// startupTrip pauses a target whose harness-startup counter has reached
+// startupFailBound (CLA-562): that many consecutive spawns failing before any
+// usage report means the harness or provider is broken right now, not the
+// tasks, and every further spawn would pay the same sideline-and-retry for
+// nothing. Same shape as fleetTrip: the target stops spawning until the
+// operator answers the raised project-level question (the open-question count
+// falls back to what it was at the raise - see the poll gate in Run).
+//
+// The question is PROJECT-level - ask_question with no taskId - because a
+// startup trip is not one task's triage: pinning it to whichever drain happened
+// to be in flight would make the operator answer about a bystander. It is filed
+// as a non-blocking `decision` - there is no task to block (the loop's pause is
+// the enforcement), and the ruling is project-level judgment for the decision
+// log.
+//
+// The body carries the harness exit signature (the sideline cause), as the
+// sideline log line does: "provider looks broken" without the error string
+// sends the operator grep-hunting through state-dir logs.
+//
+// "Exactly one" is guaranteed by startupRaised, cleared with the pause so a new
+// episode raises fresh. If the question cannot be filed, the pause is NOT set
+// and the counter stays at the bound, so the next startup failure retries the
+// raise - loudly - while the sideline backoff keeps bounding each attempt.
+func (d *Driver) startupTrip(ctx context.Context, t Target, ti, drainNum int, cause error) {
+	pk, ok := t.Releaser.(plane.ParkAPI)
+	if !ok {
+		log.Printf("%siteration %d: %d consecutive harness-startup failures, but the releaser cannot file a project question - NOT pausing (the operator could never resume it); the sideline backoff still bounds each attempt",
+			d.prefix(ti), drainNum, d.startupFails[ti])
+		return
+	}
+	if !d.startupRaised[ti] {
+		d.startupRaised[ti] = true
+		// The baseline the resume signal is measured against: the open-question
+		// count at the last poll, BEFORE the question below raises it by one.
+		d.startupOpenQ[ti] = d.openQs[ti]
+		body := fmt.Sprintf(
+			"**%d consecutive harness-startup failures - the harness or provider looks broken, not the tasks.** Each spawn failed before reporting any usage (workdir %s), so the driver paused this project rather than sidelining and retrying forever against a harness that is already known to be failing.\n\nCause: %v\n\nThe loop is PAUSED for this project until you answer. Answering resumes it; the next startup failure will pause it again and raise a fresh question. Iteration logs are in %s.",
+			d.startupFails[ti], d.workdirOf(t), cause, d.state.Path())
+		options := []string{
+			"The harness recovered - resume draining this project",
+			"Still investigating - I will answer when it is safe to resume",
+			"Switch or restart the harness - try again",
+			"Something else is wrong - stop the daemon",
+		}
+		pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+		defer pcancel()
+		if err := pk.AskProjectQuestion(pctx, body, options, "decision"); err != nil {
+			log.Printf("%siteration %d: the harness-startup question could not be filed: %v - NOT pausing (the operator could never resume it); the next startup failure will retry the raise",
+				d.prefix(ti), drainNum, err)
+			d.startupRaised[ti] = false
+			return
+		}
+	}
+	d.startupPaused[ti] = true
+	log.Printf("%siteration %d: %d consecutive harness-startup failures - the harness looks broken, not the tasks; pausing this project until the operator answers the raised question. Cause: %v",
+		d.prefix(ti), drainNum, d.startupFails[ti], cause)
+}
+
 // parkDeadPhase parks the task after four consecutive dead phases, filing an
 // OPEN question so the park reaches the operator instead of vanishing into the
 // Done tab (CLA-395). The question is a non-blocking `clarification` — the task
@@ -3248,12 +3419,20 @@ func failureBackoff(fails int) time.Duration {
 // A target counts only while its failure back-off is live - skipUntil zeroed by
 // an elapsed wait means it is drivable again, whatever its history, and a target
 // that has never failed since its last success never counts.
+//
+// A target paused for an operator answer (fleet or startup trip, CLA-396/562)
+// never counts as sidelined: the pause is meant to wait for the answer, not to
+// exit. Without this a fleet of one that trips its startup bound would exit on
+// the same iteration it paused, losing the wait it just asked for.
 func (d *Driver) allSidelined() bool {
 	if len(d.targets) == 0 {
 		return false
 	}
 	now := time.Now()
 	for i := range d.targets {
+		if d.fleetPaused[i] || d.startupPaused[i] {
+			return false
+		}
 		if d.harnessFails[i] == 0 || d.skipUntil[i].IsZero() || !now.Before(d.skipUntil[i]) {
 			return false
 		}

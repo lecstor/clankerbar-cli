@@ -470,3 +470,52 @@ func TestEquivalentOriginSpellingsAreAccepted(t *testing.T) {
 		}
 	}
 }
+
+// CLA-541: the opencode 2.x dialect puts servers under `mcp.servers` (verified
+// against beta-18314, docs/opencode2.md). The mcpFile decode flattens that
+// shape into MCP so every consumer — the gates, the slug derivation, the
+// ambient audit — sees an opencode2 config exactly as a v1 one.
+func TestMCPClankerbarV2Dialect(t *testing.T) {
+	_, path := writeMCP(t, `{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}}`)
+	url, ok := MCPClankerbar(path)
+	if !ok || url != "https://clankerbar.com/mcp/proj" {
+		t.Errorf("MCPClankerbar() = (%q, %v), want (https://clankerbar.com/mcp/proj, true)", url, ok)
+	}
+	if got := mcpURLFromConfig(path); got != "https://clankerbar.com/mcp/proj" {
+		t.Errorf("mcpURLFromConfig() = %q, want the v2-dialect clankerbar URL", got)
+	}
+	servers, err := readMCPServers(path)
+	if err != nil || len(servers) != 1 || servers[0].name != "clankerbar" {
+		t.Errorf("readMCPServers() = %v, %v — want the flattened v2 server", servers, err)
+	}
+}
+
+func TestMCPClankerbarV2DialectDisabled(t *testing.T) {
+	_, path := writeMCP(t, `{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj","enabled":false}}}}`)
+	url, ok := MCPClankerbar(path)
+	if ok || url != "" {
+		t.Errorf("MCPClankerbar() = (%q, %v), want (\"\", false) for a disabled v2 entry", url, ok)
+	}
+}
+
+func TestV2DialectLocalProcessIsDisclosed(t *testing.T) {
+	// The local-process disclosure (CLA-266) must see a v2-dialect entry that
+	// starts a command, the same way it sees a v1 one.
+	_, path := writeMCP(t, `{"mcp":{"servers":{"runme":{"command":["npx","-y","runme-mcp"]}}}}`)
+	servers, err := readMCPServers(path)
+	if err != nil || len(servers) != 1 || servers[0].command == "" {
+		t.Errorf("readMCPServers() = %v, %v — want the v2 local-process command disclosed", servers, err)
+	}
+}
+
+// A v1 file whose server is literally named "servers" must still decode as a
+// v1 entry — the dialect discriminator is the VALUE (an entry carries entry
+// fields; the v2 container's `servers` value is an object of entries), never
+// the bare name.
+func TestV1ServerNamedServersStillDecodes(t *testing.T) {
+	_, path := writeMCP(t, `{"mcp":{"servers":{"url":"https://clankerbar.com/mcp/proj","headers":{"Authorization":"Bearer ${CLANKERBAR_API_KEY}"}}}}`)
+	url, ok := MCPClankerbar(path)
+	if !ok || url != "https://clankerbar.com/mcp/proj" {
+		t.Errorf("MCPClankerbar() = (%q, %v), want the v1 entry named servers", url, ok)
+	}
+}

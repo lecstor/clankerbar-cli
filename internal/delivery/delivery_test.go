@@ -328,7 +328,7 @@ func TestAmbiguousBranchAcrossClones_DegradesToCannotCheck(t *testing.T) {
 	}
 }
 
-// matchesRepoSlug is the whole resolution: a bare Contains would match
+// MatchesRepoSlug is the whole resolution: a bare Contains would match
 // `lecstor/clankerbar` against `lecstor/clankerbar-cli` — the project's OWN repo
 // pair, the exact ambiguity CLA-351 exists to resolve — so the slug must sit on
 // a segment boundary, in both the https and ssh spellings, with and without
@@ -355,8 +355,8 @@ func TestMatchesRepoSlugBoundaries(t *testing.T) {
 		{"https://github.com/otherorg/clankerbar.git", "lecstor/clankerbar", false},
 	}
 	for _, tc := range cases {
-		if got := matchesRepoSlug(tc.url, tc.slug); got != tc.want {
-			t.Errorf("matchesRepoSlug(%q, %q) = %v, want %v", tc.url, tc.slug, got, tc.want)
+		if got := MatchesRepoSlug(tc.url, tc.slug); got != tc.want {
+			t.Errorf("MatchesRepoSlug(%q, %q) = %v, want %v", tc.url, tc.slug, got, tc.want)
 		}
 	}
 }

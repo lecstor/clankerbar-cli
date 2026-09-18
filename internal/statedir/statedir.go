@@ -80,8 +80,17 @@ const gitignoreBody = "*\n"
 const sentinelName = ".clankerbar-statedir"
 
 const sentinelBody = "clankerbar loop state dir: iteration transcripts and control markers\n" +
-	"(STOP/HALT/RESTART/RESTART_NOW/RELOAD).\n" +
+	"(STOP/HALT/RESTART/RESTART_NOW/RELOAD), plus the supervisor's generated\n" +
+	"instance config (materialized.json).\n" +
 	"Created and owned by clankerbar; safe to delete while no loop is running.\n"
+
+// MaterializedConfigName is the generated effective config the fleet
+// supervisor writes into each child's state dir (daemon-supervisor phase 2b)
+// and starts the child with: `run -c <state dir>/materialized.json`. It is a
+// cache — regenerated on every reconcile, never hand-edited, safe to delete —
+// which is why the adoption check below must count it as ours: a state dir
+// holding it must stay adoptable by the daemon and by doctor.
+const MaterializedConfigName = "materialized.json"
 
 // maxMarkerBytes caps a control-marker read. A marker holds a one-line reason;
 // the cap stops a large or endless file (a fifo, /dev/zero, a log someone
@@ -569,7 +578,11 @@ func (d *Dir) isOurArtifact(name string) bool {
 		// CLA-461: the ctl-written restart/reload markers. A state dir holding a
 		// pending control request must stay adoptable — the daemon reading that
 		// request is exactly the process that opens this directory next.
-		name == "RESTART", name == "RESTART_NOW", name == "RELOAD":
+		name == "RESTART", name == "RESTART_NOW", name == "RELOAD",
+		// The supervisor's generated effective config (phase 2b). The daemon
+		// that opens this directory next was started with `run -c` pointing at
+		// it, and doctor opens the same directory — both must adopt it.
+		name == MaterializedConfigName:
 		return true
 	case name == ".DS_Store", name == "Thumbs.db":
 		// Not ours, but not the operator's either: the file manager writes these

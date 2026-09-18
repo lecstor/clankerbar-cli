@@ -112,7 +112,7 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 		"record_decision",
 		"park the task with an outcome citing it",
 		"do not spend the run re-verifying and pushing stale work",
-		"unless you parked above, the rest of the flow is unchanged",
+		"unless you parked above or served a close-out above, the rest of the flow is unchanged",
 	} {
 		if !strings.Contains(lower, want) {
 			t.Errorf("the resumed-branch rule never says %q:\n%s", want, brief)
@@ -136,7 +136,7 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 	supersededIdx := strings.Index(lower, "supersedes the task")
 	parkIdx := strings.Index(lower, "park the task with an outcome citing it")
 	staleIdx := strings.Index(lower, "re-verifying and pushing stale work")
-	joinIdx := strings.Index(lower, "unless you parked above, the rest of the flow is unchanged")
+	joinIdx := strings.Index(lower, "unless you parked above or served a close-out above, the rest of the flow is unchanged")
 	if mergeIdx == -1 || revalidateIdx == -1 || supersededIdx == -1 || parkIdx == -1 || staleIdx == -1 || joinIdx == -1 {
 		t.Fatalf("merge (%d), re-validate (%d), supersession (%d), parking (%d), stale-work end (%d) or flow join (%d) missing from the brief:\n%s",
 			mergeIdx, revalidateIdx, supersededIdx, parkIdx, staleIdx, joinIdx, brief)
@@ -178,6 +178,175 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 	for _, name := range names {
 		if strings.Contains(lower, strings.ToLower(name)) {
 			t.Errorf("the implement brief names harness %q; its wording must hold for every harness:\n%s", name, brief)
+		}
+	}
+}
+
+// CLA-540: a phased implement session is told to claim, work, commit, push and
+// stop at the checkpoint — and an approved-awaiting-merge offer from next_task
+// needs none of that: no commit, no branch, no worktree, its required act a
+// status move the brief's letter forbids. Without an exception the session asks
+// the operator about an offer that is exactly its job (observed twice on
+// 2026-08-28: CLA-533 and CLA-526, both green and mergeable, both raised as
+// blocking questions). The brief must admit the case as its own fork: the offer
+// IS the session's job, the offer's own instructions are the brief for it, and
+// ending after it is the task going to plan.
+//
+// The content assertions are FULL directional phrases, in the shape
+// TestBuiltinImplementBriefPinsTheResumedBranchRule established: a fragment
+// like "the offer" alone would survive a mutation that inverts the admission
+// into "decline the offer and ask".
+//
+// Two routing guards pin the fork's exclusivity. "The resumed-work rule below
+// is for found work, not this offer" preempts that rule's "existing branch"
+// trigger, which a close-out claim's recorded branch would otherwise satisfy -
+// applying its merge-and-revalidate sequence to an approved PR branch would
+// rewrite the diff the approval and the green CI stand on. And "served a
+// close-out above" exempts the close-out case from the join into the
+// claim/worktree/commit flow, which otherwise reads as instructing the session
+// to keep going after the close-out.
+func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
+	brief, ok := builtinPhasePrompts[ImplementPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
+	}
+	if implementCloseOutRule == "" {
+		t.Fatal("the implement brief has no close-out rule")
+	}
+
+	lower := strings.ToLower(brief)
+	for _, want := range []string{
+		"if next_task instead offers an approved-awaiting-merge task",
+		"that offer is this session's job",
+		"follow the offer's own instructions",
+		"once the close-out is done stop and end the session",
+		"the resumed-work rule below is for found work, not this offer",
+		"unless you parked above or served a close-out above, the rest of the flow is unchanged",
+		"going to plan",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the implement brief never says %q; a close-out offer must be admitted as this session's job:\n%s", want, brief)
+		}
+	}
+
+	// The fork comes FIRST: the offer replaces fresh work, so the close-out
+	// disposition must precede the resumed-work rule and the checkpoint
+	// instruction, which both concern a task this session claims for itself.
+	closeIdx := strings.Index(lower, strings.ToLower(implementCloseOutRule))
+	ruleIdx := strings.Index(lower, strings.ToLower(implementResumedBranchRule))
+	stopIdx := strings.Index(lower, "then stop and end the session")
+	if closeIdx == -1 || ruleIdx == -1 || stopIdx == -1 {
+		t.Fatalf("close-out rule (%d), resumed-branch rule (%d) or terminal stop (%d) missing from the brief:\n%s",
+			closeIdx, ruleIdx, stopIdx, brief)
+	}
+	if !(closeIdx < ruleIdx && ruleIdx < stopIdx) {
+		t.Errorf("the close-out fork (%d) must precede the resumed-work rule (%d) and the terminal stop (%d):\n%s",
+			closeIdx, ruleIdx, stopIdx, brief)
+	}
+
+	// What the clause must NOT carry (the plane's offer owns all of it, and a
+	// second copy would drift — CLA-341): a placeholder, a named branch or merge
+	// target, the red-CI repair rule, the decline door, the queue (ONE offer, not
+	// several), or a worktree-reclaim step. "main" is banned as a whole word so
+	// "remaining" is not caught, the way TestRerunGuidancePointsAtWaitingRather
+	// ThanRestatingIt bans the waiting reference's mechanics.
+	for _, banned := range []string{
+		"{{", "branch", "worktree", "staging", "integration",
+		"red", "decline", "cannot attempt", "queue",
+	} {
+		if strings.Contains(strings.ToLower(implementCloseOutRule), banned) {
+			t.Errorf("the close-out rule says %q — it belongs on the offer, not in the brief:\n%s", banned, implementCloseOutRule)
+		}
+	}
+	words := map[string]bool{}
+	for _, w := range strings.FieldsFunc(strings.ToLower(implementCloseOutRule), func(r rune) bool { return !unicode.IsLetter(r) }) {
+		words[w] = true
+	}
+	if words["main"] {
+		t.Errorf("the close-out rule names %q as a merge target — the offer's own instructions own the target, and a brief that names one is wrong for every other topology:\n%s", "main", implementCloseOutRule)
+	}
+}
+
+// CLA-544: a wall-clock kill earns a checkpoint only with WIP, and WIP is a
+// branch recorded on the TASK — the session's own update_task(branch), or the
+// salvage recording one. The salvage refuses a clean worktree on purpose
+// (salvage.go: "The one thing that must NOT happen here is recording a branch"),
+// so a commit nobody pushed and recorded is as invisible to the plane as no
+// commit at all. The sessions that killed CLA-529 and CLA-531 three times each
+// made not one Edit, Write or Create call: they read and planned for their
+// whole lives, the kill landed on a clean worktree, nothing was salvageable,
+// and the no-progress ladder parked the task. The brief must therefore demand a
+// first commit EARLY — before the design is fully settled — then push it and
+// RECORD the branch, and commit and push as it goes, so a kill lands on a
+// checkpoint instead of on nothing.
+//
+// The trigger is an EVENT, never a duration: a session cannot read its own
+// wall clock (the same constraint that shaped handoffGuidance), so "commit
+// within fifteen minutes" is not implementable — a skeleton, a failing test, a
+// stub with the signatures are events it can recognise. And the clause is a
+// FLOOR, not a ceiling: checkpoint pushes are WIP, not deliveries — the
+// terminal step's bar (self-verify, then COMMIT, PUSH, record the branch) is
+// unchanged, and a checkpoint push must not be passed off as the self-verified
+// terminal delivery.
+func TestBuiltinImplementBriefDemandsAnEarlyCommit(t *testing.T) {
+	brief, ok := builtinPhasePrompts[ImplementPhaseName]
+	if !ok {
+		t.Fatalf("no built-in brief for phase %q", ImplementPhaseName)
+	}
+	if implementCommitEarlyRule == "" {
+		t.Fatal("the implement brief has no commit-early rule")
+	}
+
+	lower := strings.ToLower(brief)
+	for _, want := range []string{
+		"first commit",
+		"before the design is fully settled",
+		"skeleton, a failing test, a stub with the signatures",
+		"commit and push as you go rather than once at the end",
+		"push it and record the branch",
+		"update_task(taskid, runid, branch)",
+		"record it as soon as the first commit is pushed",
+		"not only at the end",
+		"uncommitted worktree is lost",
+		"a local commit nobody pushed and recorded is lost the same way",
+		"the next phase resumes from the branch recorded on the task",
+		"earlier floor",
+		"does not lower the ceiling",
+		"terminal step's bar is unchanged",
+		"not licence to commit broken or half-considered code as a habit",
+		"pass a checkpoint push off as the self-verified terminal delivery",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the implement brief never says %q — the first commit must be demanded early, anchored to an event the session can recognise, and pushed and recorded so the plane can checkpoint it:\n%s", want, brief)
+		}
+	}
+
+	// The anchor is an EVENT, not a duration: a session cannot measure its own
+	// wall clock, so a time budget is a rule it cannot follow.
+	for _, banned := range []string{"within 15", "within fifteen", "minute", "hour"} {
+		if strings.Contains(strings.ToLower(implementCommitEarlyRule), banned) {
+			t.Errorf("the commit-early rule anchors the first commit to a duration (%q) — a session cannot read its own wall clock:\n%s", banned, implementCommitEarlyRule)
+		}
+	}
+
+	// The clause is entry guidance for the normal flow, so it rides BEFORE the
+	// terminal checkpoint instruction — the same position pin the resumed-branch
+	// rule carries. A commit-early clause wedged after STOP would read as
+	// post-session advice nobody follows.
+	ruleIdx := strings.Index(lower, strings.ToLower(implementCommitEarlyRule))
+	stopIdx := strings.Index(lower, "then stop and end the session")
+	if ruleIdx == -1 || stopIdx == -1 {
+		t.Fatalf("commit-early rule (%d) or terminal stop (%d) missing from the brief:\n%s", ruleIdx, stopIdx, brief)
+	}
+	if ruleIdx > stopIdx {
+		t.Errorf("the commit-early rule (%d) sits after the terminal checkpoint instruction (%d); it must precede the work/stop sequence so the brief keeps its emphatic last instruction:\n%s", ruleIdx, stopIdx, brief)
+	}
+
+	// Phase 0 refuses a first-phase prompt carrying the resume placeholders —
+	// the implement brief IS phase 0, so the clause must never import them.
+	for _, ph := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder} {
+		if strings.Contains(implementCommitEarlyRule, ph) {
+			t.Errorf("the commit-early rule carries %s — the implement brief is phase 0 and refuses resume placeholders:\n%s", ph, implementCommitEarlyRule)
 		}
 	}
 }

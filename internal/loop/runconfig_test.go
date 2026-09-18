@@ -140,15 +140,19 @@ func TestRun_TheConfigReaderIsNeverConsultedMidSession(t *testing.T) {
 }
 
 // No stored config (version 0): byte-for-byte fallback - both drains run on
-// the LOCAL model and no effective overlay comes to exist.
+// the LOCAL model and no effective overlay comes to exist. Version 0 IS the
+// plane's "never set" answer (CLA-481), so the loop latches it without a fetch:
+// zero fetches, zero log lines, across any number of boundaries.
 func TestRun_NoStoredConfigKeepsTheLocalRules(t *testing.T) {
 	var events []string
 	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
 	rc := &fakeRCfg{events: &events} // no docs -> ErrNoConfig at any version
 	cfg := fastCfg()
 	cfg.Model = "local-model"
+	buf := captureLogs(t)
 
 	d := rcRunDriver(t, cfg, []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 0},
 		{Ready: 1, Claimable: 1, RunConfigVersion: 0},
 		{Ready: 1, Claimable: 1, RunConfigVersion: 0},
 	}, rc, h)
@@ -158,11 +162,17 @@ func TestRun_NoStoredConfigKeepsTheLocalRules(t *testing.T) {
 			t.Errorf("drain %d ran on %q, want the local file's model", i+1, inv.Model)
 		}
 	}
-	if len(rc.fetches) == 0 {
-		t.Fatal("the poll carried a version but the config was never fetched")
+	if len(rc.fetches) != 0 {
+		t.Errorf("version-0 polls fetched %d time(s), want 0 (0 already means nothing stored)", len(rc.fetches))
+	}
+	if logs := buf.String(); strings.Contains(logs, "run-config") {
+		t.Errorf("version-0 polls logged, want silence; log had: %s", logs)
 	}
 	if d.targets[0].Cfg != nil {
 		t.Error("a project with nothing stored grew an effective config overlay")
+	}
+	if d.rcVersions[0] != 0 {
+		t.Errorf("rcVersions = %d, want 0 latched without a fetch", d.rcVersions[0])
 	}
 }
 
@@ -189,6 +199,169 @@ func TestRun_AFailedFetchKeepsLocalThenTheNextVersionApplies(t *testing.T) {
 	}
 	if d.rcVersions[0] != 2 {
 		t.Errorf("rcVersions = %d, want 2", d.rcVersions[0])
+	}
+}
+
+// notWiredRCfg is the slug-less / project-scoped-key shape (CLA-481): every
+// fetch answers plane.ErrNotWired, the way rcNotWired does when NewRunConfigAPI
+// gets no endpoint or key.
+type notWiredRCfg struct {
+	fetches int
+	events  *[]string
+}
+
+func (f *notWiredRCfg) RunConfig(context.Context) (*plane.RunConfigState, error) {
+	f.fetches++
+	if f.events != nil {
+		*f.events = append(*f.events, "fetch")
+	}
+	return nil, plane.ErrNotWired
+}
+
+// A not-wired reader latches like nothing-stored (CLA-481): one fetch, silence
+// thereafter, never retried across boundaries — not a 30s log for the daemon's
+// lifetime.
+func TestRun_ErrNotWiredLatchesSilently(t *testing.T) {
+	var events []string
+	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
+	rc := &notWiredRCfg{events: &events}
+	cfg := fastCfg()
+	cfg.Model = "local-model"
+	buf := captureLogs(t)
+
+	d := NewMulti(cfg, h, []Target{{Poller: &fakePoller{sums: []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+	}}, RCfg: rc}})
+	cfg.StateDir = t.TempDir()
+	// rcRunDriver sets StateDir/MaxIterations itself; replicate the few lines
+	// here because that helper only takes *fakeRCfg.
+	d.cfg.StateDir = cfg.StateDir
+	d.cfg.MaxIterations = 3
+	openTestStateDir(t, d)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for i, inv := range h.invocations {
+		if inv.Model != "local-model" {
+			t.Errorf("drain %d ran on %q, want the local file's model", i+1, inv.Model)
+		}
+	}
+	if rc.fetches != 1 {
+		t.Errorf("ErrNotWired fetched %d time(s), want exactly 1 (latch, never retry)", rc.fetches)
+	}
+	if logs := buf.String(); strings.Contains(logs, "run-config") {
+		t.Errorf("ErrNotWired logged, want silence; log had: %s", logs)
+	}
+	if d.targets[0].Cfg != nil {
+		t.Error("a not-wired target grew an effective config overlay")
+	}
+	if d.rcVersions[0] != 1 {
+		t.Errorf("rcVersions = %d, want 1 latched", d.rcVersions[0])
+	}
+}
+
+// The transient backoff widens instead of fixed 30s spam (CLA-481): 30s, 60s,
+// 120s, 240s, then the 5m cap.
+func TestRCFetchBackoff_Widens(t *testing.T) {
+	want := map[int]time.Duration{
+		1:  30 * time.Second,
+		2:  60 * time.Second,
+		3:  120 * time.Second,
+		4:  240 * time.Second,
+		5:  300 * time.Second,
+		6:  300 * time.Second,
+		10: 300 * time.Second,
+	}
+	for fails, w := range want {
+		if got := rcFetchBackoff(fails); got != w {
+			t.Errorf("rcFetchBackoff(%d) = %s, want %s", fails, got, w)
+		}
+	}
+}
+
+// alwaysFailRCfg fails every fetch transiently, so the test can drive the
+// boundary directly and watch the window widen without waiting out real time.
+type alwaysFailRCfg struct {
+	fetches int
+}
+
+func (f *alwaysFailRCfg) RunConfig(context.Context) (*plane.RunConfigState, error) {
+	f.fetches++
+	return nil, errors.New("plane unreachable")
+}
+
+// Consecutive transient failures of the SAME version widen the retry window
+// (CLA-481): the second retry waits ~60s, the third ~120s — not a fixed 30s.
+// A different version still fetches immediately.
+func TestCheckRunConfigVersion_TransientBackoffWidens(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	h := &fakeAdapter{}
+	rc := &alwaysFailRCfg{}
+	d := NewMulti(cfg, h, []Target{{Poller: &fakePoller{}, RCfg: rc}})
+	openTestStateDir(t, d)
+	ctx := context.Background()
+	buf := captureLogs(t)
+
+	d.checkRunConfigVersion(ctx, 0, &d.targets[0], 1)
+	if rc.fetches != 1 || d.rcFails[0] != 1 {
+		t.Fatalf("after 1st failure: fetches=%d fails=%d, want 1/1", rc.fetches, d.rcFails[0])
+	}
+	firstWait := time.Until(d.rcAttempt[0])
+
+	// Within the window the same version does not refetch (and logs nothing new).
+	d.checkRunConfigVersion(ctx, 0, &d.targets[0], 1)
+	if rc.fetches != 1 {
+		t.Fatalf("throttled retry fetched, want no fetch within the window (fetches=%d)", rc.fetches)
+	}
+
+	// Past the window it refetches, and the new window is wider.
+	d.rcAttempt[0] = time.Now().Add(-time.Second)
+	d.checkRunConfigVersion(ctx, 0, &d.targets[0], 1)
+	if rc.fetches != 2 || d.rcFails[0] != 2 {
+		t.Fatalf("after 2nd failure: fetches=%d fails=%d, want 2/2", rc.fetches, d.rcFails[0])
+	}
+	secondWait := time.Until(d.rcAttempt[0])
+	if secondWait <= firstWait {
+		t.Errorf("second window %s did not widen past first %s", secondWait, firstWait)
+	}
+	if secondWait < 55*time.Second || secondWait > 65*time.Second {
+		t.Errorf("second window = %s, want ~60s", secondWait)
+	}
+
+	d.rcAttempt[0] = time.Now().Add(-time.Second)
+	d.checkRunConfigVersion(ctx, 0, &d.targets[0], 1)
+	if rc.fetches != 3 || d.rcFails[0] != 3 {
+		t.Fatalf("after 3rd failure: fetches=%d fails=%d, want 3/3", rc.fetches, d.rcFails[0])
+	}
+	thirdWait := time.Until(d.rcAttempt[0])
+	if thirdWait <= secondWait {
+		t.Errorf("third window %s did not widen past second %s", thirdWait, secondWait)
+	}
+	if thirdWait < 115*time.Second || thirdWait > 125*time.Second {
+		t.Errorf("third window = %s, want ~120s", thirdWait)
+	}
+
+	// Three fetches logged three times — the widening is in WHEN fetches
+	// happen, not in suppressing the log for a fetch that did happen.
+	if n := strings.Count(buf.String(), "fetch failed"); n != 3 {
+		t.Errorf("logged %d fetch failures, want 3 (one per fetch)", n)
+	}
+
+	// A different version is never throttled by the old version's window.
+	d.rcAttempt[0] = time.Now().Add(time.Hour) // would block version 1
+	before := rc.fetches
+	d.checkRunConfigVersion(ctx, 0, &d.targets[0], 2)
+	if rc.fetches != before+1 {
+		t.Errorf("a new version did not fetch immediately past the old window (fetches=%d, want %d)", rc.fetches, before+1)
+	}
+	if d.rcFails[0] != 1 {
+		t.Errorf("a new version's first failure has fails=%d, want 1 (count restarts per version)", d.rcFails[0])
 	}
 }
 
@@ -220,6 +393,105 @@ func TestRun_AnOverlaidConfigValidateRefusesStaysPut(t *testing.T) {
 	}
 }
 
+// A stored document with a NEWER $schema_version is refused like any other
+// unusable document: the familiar-looking keys may have changed meaning, so
+// the previous config stays, the refusal is loud, and the version is marked
+// consumed so the next boundary does not hot-loop the same fetch.
+func TestRun_NewerSchemaVersionKeepsThePreviousConfig(t *testing.T) {
+	var events []string
+	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
+	rc := &fakeRCfg{docs: map[int]string{1: `{"$schema_version":9999,"model":"plane-x"}`}, events: &events}
+	cfg := fastCfg()
+	cfg.Model = "local-model"
+	buf := captureLogs(t)
+
+	d := rcRunDriver(t, cfg, []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+	}, rc, h)
+
+	if logs := buf.String(); !strings.Contains(logs, "newer than this build understands") {
+		t.Errorf("the schema refusal was not logged loudly; log had: %s", logs)
+	}
+	for i, inv := range h.invocations {
+		if inv.Model != "local-model" {
+			t.Errorf("drain %d ran on %q despite a newer-schema document", i+1, inv.Model)
+		}
+	}
+	if d.targets[0].Cfg != nil {
+		t.Error("a newer-schema document installed an overlay; the previous config must stay")
+	}
+	if d.rcVersions[0] != 1 {
+		t.Errorf("rcVersions = %d, want 1 (a deterministic refusal must not hot-loop)", d.rcVersions[0])
+	}
+	if len(rc.fetches) != 1 {
+		t.Errorf("fetched %d times, want 1 (the refused version must not refetch on the next boundary)", len(rc.fetches))
+	}
+}
+
+// The SchemaNewer check runs BEFORE Empty: a newer-schema document that sets
+// nothing else must still be refused loudly as a version mismatch, not waved
+// through as "nothing consumable". A reordering to Empty-first would stay
+// safe (no overlay either way) but go quiet about the real cause.
+func TestRun_NewerSchemaEmptyDocumentStillRefusedLoudly(t *testing.T) {
+	var events []string
+	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
+	rc := &fakeRCfg{docs: map[int]string{1: `{"$schema_version":9999}`}, events: &events}
+	cfg := fastCfg()
+	cfg.Model = "local-model"
+	buf := captureLogs(t)
+
+	d := rcRunDriver(t, cfg, []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+	}, rc, h)
+
+	if logs := buf.String(); !strings.Contains(logs, "newer than this build understands") {
+		t.Errorf("the empty newer-schema refusal was not logged loudly; log had: %s", logs)
+	}
+	if d.targets[0].Cfg != nil {
+		t.Error("an empty newer-schema document installed an overlay; the previous config must stay")
+	}
+	if d.rcVersions[0] != 1 {
+		t.Errorf("rcVersions = %d, want 1 (a deterministic refusal must not hot-loop)", d.rcVersions[0])
+	}
+	if len(rc.fetches) != 1 {
+		t.Errorf("fetched %d times, want 1 (the refused version must not refetch on the next boundary)", len(rc.fetches))
+	}
+}
+
+// CLA-475: a ratified harness swap over run-wide machine wiring is refused
+// loudly and the previous config stays — the new harness must not inherit
+// the old one's config dir / settings / mcp file / model alias via
+// SessionFor. Same loud posture as the Validate refusal above, exercised
+// through the driver boundary rather than ApplyRunConfig directly.
+func TestRun_HarnessSwapOverWiredBaseIsRefused(t *testing.T) {
+	var events []string
+	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
+	rc := &fakeRCfg{docs: map[int]string{1: `{"harness":"opencode"}`}, events: &events}
+	cfg := fastCfg()
+	cfg.Harness = "claude"
+	cfg.Model = "claude-alias"
+	cfg.ConfigDir = "/local/claude-dir"
+	cfg.MCPConfigPath = "/local/claude-mcp.json"
+	cfg.SettingsPath = "/local/claude-settings.json"
+	buf := captureLogs(t)
+
+	rcRunDriver(t, cfg, []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+	}, rc, h)
+
+	if logs := buf.String(); !strings.Contains(logs, "REFUSED locally") {
+		t.Errorf("the harness-swap refusal was not logged loudly; log had: %s", logs)
+	}
+	for i, inv := range h.invocations {
+		if inv.Model != "claude-alias" {
+			t.Errorf("drain %d ran on %q despite a refused harness swap", i+1, inv.Model)
+		}
+	}
+}
+
 // cli#118: the review-tier escalation evaluation reads PLANE-declared rules -
 // they land in the target's effective config and resolve exactly as when they
 // came from the local file.
@@ -231,7 +503,9 @@ func TestApplyRunConfig_StoredEscalationRulesReachTheEvaluation(t *testing.T) {
 		Escalation:    &config.RunConfigEscalation{CategoryRules: map[string]string{"bug": "strong"}},
 	}
 	eff := cfg.Clone()
-	eff.ApplyRunConfig(doc)
+	if err := eff.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
 
 	tier, rule := eff.Escalation.Evaluate(nil, "bug")
 	if tier != "strong" || !strings.Contains(rule, "bug") {

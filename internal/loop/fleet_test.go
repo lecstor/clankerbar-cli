@@ -16,6 +16,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -30,6 +31,8 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
+	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
 // fakeFleet records every report the driver hands it, synchronously, so
@@ -833,5 +836,59 @@ func TestFleetIdentityStableAcrossReload(t *testing.T) {
 	if after.Instance != before.Instance {
 		t.Errorf("identity changed across a reload: %q -> %q; a live daemon must keep its name",
 			before.Instance, after.Instance)
+	}
+}
+
+// The LOCAL beacon (phase 5b): every beacon also refreshes the state dir's
+// BEACON file — the daemon's own build and last state, written beside the
+// plane POST so the supervisor's roll can verify a restarted child WITHOUT a
+// plane read. The write is fail-soft like every telemetry write, and the
+// final `stopping` beacon lands in the file too, so after a run the file
+// says stopping.
+func TestRun_LocalBeaconAccompaniesEachBeacon(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.InstanceName = "box-a"
+	// The state dir is opened by the test under a known path (Run skips its
+	// own open when d.state is already set), so the file's location is
+	// assertable.
+	st, err := statedir.Open(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("statedir.Open: %v", err)
+	}
+	defer st.Close() //nolint:errcheck
+	p := &fakePoller{sum: backlog.Summary{Ready: 0, Claimable: 0}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p.onCall = func(i int) {
+		if i >= 2 {
+			cancel()
+		}
+	}
+	h := &fakeAdapter{}
+	d, _ := fleetDriver(t, cfg, h)
+	d.targets[0].Poller = p
+	d.state = st
+	d.targets[0].Fleet = nil // the local beacon is independent of the reporter wiring
+
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cfg.StateDir, LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon file after a beaconed run: %v", err)
+	}
+	var b localBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.Version != version.Current {
+		t.Errorf("local beacon version = %q, want the daemon's own build %q", b.Version, version.Current)
+	}
+	// fleetShutdown runs deferred from Run, so the file's LAST state is the
+	// stopping beacon — the same final word the plane POST carries.
+	if b.State != fleet.StateStopping {
+		t.Errorf("local beacon state after the run = %q, want %q (the final stopping beacon must land locally too)", b.State, fleet.StateStopping)
 	}
 }

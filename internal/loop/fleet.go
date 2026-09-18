@@ -11,11 +11,15 @@
 package loop
 
 import (
+	"encoding/json"
+	"errors"
 	"log"
 	"os"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
@@ -74,7 +78,7 @@ func (d *Driver) fleetIdentity() fleet.Identity {
 // tracks — no new bookkeeping beyond the mid-drain marker set in drainPhases:
 //
 //   - mid-drain                -> iteration {n, taskRef, phase}
-//   - console- or fleet-paused -> draining (alive, spawning nothing new)
+//   - console-, fleet- or startup-paused -> draining (alive, spawning nothing new)
 //   - otherwise                -> idle
 //
 // A backed-off target (skipUntil still in the future) reports idle on purpose:
@@ -88,13 +92,13 @@ func (d *Driver) fleetState(ti int) fleet.State {
 	if s.on {
 		return fleet.State{Kind: fleet.StateIteration, N: s.n, TaskRef: s.ref, Phase: s.phase}
 	}
-	if d.pausedAt(ti) || d.fleetPausedAt(ti) {
+	if d.pausedAt(ti) || d.fleetPausedAt(ti) || d.startupPausedAt(ti) {
 		return fleet.State{Kind: fleet.StateDraining}
 	}
 	return fleet.State{Kind: fleet.StateIdle}
 }
 
-// iterAt/pausedAt/fleetPausedAt are bounds-checked reads of the per-target
+// iterAt/pausedAt/fleetPausedAt/startupPausedAt are bounds-checked reads of the per-target
 // slices. A Driver built by hand in a test carries empty slices; reporting must
 // degrade to idle for it, not panic.
 func (d *Driver) iterAt(ti int) iterState {
@@ -112,9 +116,18 @@ func (d *Driver) fleetPausedAt(ti int) bool {
 	return ti >= 0 && ti < len(d.fleetPaused) && d.fleetPaused[ti]
 }
 
+// startupPausedAt is the startup-trip (CLA-562) half of the draining signal:
+// a target paused awaiting the operator's answer to the harness-startup
+// question is alive and spawning nothing new, exactly like a fleet-paused one,
+// and must not read idle on the console.
+func (d *Driver) startupPausedAt(ti int) bool {
+	return ti >= 0 && ti < len(d.startupPaused) && d.startupPaused[ti]
+}
+
 // beacon sends one presence report for target ti. Nil-safe on the reporter so
 // tests and not-wired targets need no branching at the call sites.
 func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.Iteration) {
+	d.writeLocalBeacon(st)
 	if t.Fleet == nil {
 		return
 	}
@@ -123,6 +136,61 @@ func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.It
 		State:      st,
 		Iterations: iterations,
 	})
+}
+
+// LocalBeaconName is the local presence file the daemon keeps beside its plane
+// beacons: the same identity+state the next POST carries, written into the
+// state dir so the supervisor's roll (phase 5b) can verify a restarted child
+// is reporting the new version WITHOUT a plane read. It is the "beacon" the
+// roll's verify-before-next gate reads.
+const LocalBeaconName = "BEACON"
+
+// localBeacon is the JSON shape of LocalBeaconName. The supervisor's roll
+// mirrors it for reading (the same roster-style lockstep: two packages, one
+// contract), so a new field here must land in internal/supervisor/roll.go too.
+type localBeacon struct {
+	Version string    `json:"version"`
+	State   string    `json:"state"`
+	At      time.Time `json:"at"`
+}
+
+// writeLocalBeacon refreshes the local beacon file. Fail-soft exactly like the
+// plane beacon: telemetry is never control flow, so a write failure is logged
+// (once per streak) and dropped — the daemon's own life never depends on it.
+// The write is remove-then-create, like the roster cache write: a concurrent
+// reader (the roll) sees either the absent name or complete bytes, never a
+// torn file, and a symlink planted at the name is removed, not followed.
+func (d *Driver) writeLocalBeacon(st fleet.State) {
+	if d.state == nil {
+		return
+	}
+	body, err := json.Marshal(localBeacon{
+		Version: version.Current,
+		State:   st.Kind,
+		At:      time.Now().UTC(),
+	})
+	if err != nil {
+		return // the four state kinds and a version string cannot fail to marshal
+	}
+	_ = d.state.Remove(LocalBeaconName)
+	if err := d.state.WriteFile(LocalBeaconName, body); err != nil {
+		if errors.Is(err, statedir.ErrExists) {
+			// A concurrent beacon won the remove-then-create race — the claim
+			// reflector (CLA-510) beacons from the lease-renewer goroutine, so
+			// two beacons can write this file at once. The winner's file is a
+			// complete, fresh beacon from the same daemon, which is exactly
+			// what this write was going to produce: not a failure, and not a
+			// reason to tell the operator the roll cannot verify.
+			return
+		}
+		if !d.beaconWriteFailed.Swap(true) {
+			log.Printf("fleet: cannot write the local beacon into %s (%v) - the roll cannot verify a restarted child without it", d.state.Path(), err)
+		}
+		return
+	}
+	if d.beaconWriteFailed.Swap(false) {
+		log.Printf("fleet: local beacon write recovered")
+	}
 }
 
 // reflectClaim returns the claim reflector for target ti (CLA-510): it keeps
@@ -189,6 +257,7 @@ func (d *Driver) reflectClaim(ti int, t Target, done <-chan struct{}) func(harne
 // a stopping beacon, quiet means the daemon is gone, not that it stopped talking.
 func (d *Driver) fleetShutdown() {
 	for _, t := range d.targets {
+		d.writeLocalBeacon(fleet.State{Kind: fleet.StateStopping})
 		if t.Fleet == nil {
 			continue
 		}
