@@ -270,3 +270,80 @@ func TestDrainPhases_ARecoveredClaimWithAnUnreadableOriginCheckpointsUnverified(
 		t.Errorf("a recovered claim with an unreadable origin was refused as a checkpoint:\n%s", out)
 	}
 }
+
+// A verified branch still outranks an unreadable one, whichever order they were
+// recorded in: the scan returns on the first Pass, so an earlier Unknown is the
+// fallback for when nothing verified — never a veto on a later branch that did.
+// The Unknown-first order is the one combination the CLA-576 arms left unpinned
+// (review finding).
+func TestDrainPhases_AVerifiedBranchOutranksAnEarlierUnreadableOne(t *testing.T) {
+	draft := harness.Report{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Branch: "clanker/draft"}
+	final := harness.Report{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Branch: "clanker/final"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: reported(held(okResult(1, 0), openClaim()), draft, final)},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	d.newVerifier = func(string, bool) deliveryVerifier {
+		return branchStatusVerifier{"clanker/draft": delivery.Unknown, "clanker/final": delivery.Pass}
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — a later verified branch is the checkpoint even when an earlier one was unreadable", h.invokeCalls)
+	}
+	p2 := h.invocations[1].Prompt
+	if !strings.Contains(p2, "clanker/final") || strings.Contains(p2, "clanker/draft") {
+		t.Errorf("the successor brief should name the verified branch clanker/final, never the unreadable draft:\n%s", p2)
+	}
+	if strings.Contains(p2, "UNVERIFIED") || !strings.Contains(p2, "verified to exist on the origin remote") {
+		t.Errorf("a verified checkpoint did not get the verified brief:\n%s", p2)
+	}
+}
+
+// The unverified checkpoint's cause is the CHECK not completing, never "the
+// origin remote could not be read" asserted as fact: delivery.Unknown also
+// covers a check that never reached the remote (a branch no local repository
+// has, an ambiguous repo, no git on PATH), and both the log line and the
+// successor's brief must not contradict the detail the driver actually holds
+// (review finding). The classification is unchanged — still an unverified
+// checkpoint, still a review phase — only the driver's claim about why.
+func TestDrainPhases_AnUnverifiedCheckpointNamesTheCheckNotTheRemoteAsTheCause(t *testing.T) {
+	logged := captureLogs(t)
+	// HasWIP records the branch on the plane; the local check never reaches the
+	// remote because no repository under the workdir carries the branch.
+	recorded := held(okResult(1, 0),
+		harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/phantom"})
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: recorded},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	d.newVerifier = func(string, bool) deliveryVerifier {
+		return &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{
+			Kind:   delivery.BranchPushed,
+			Status: delivery.Unknown,
+			Detail: `no repository at or below /work has a branch "clanker/phantom" (looked in /work)`,
+		}}}}
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — an Unknown that never reached the remote is still an unverified checkpoint", h.invokeCalls)
+	}
+	out := logged.String()
+	if !strings.Contains(out, "UNVERIFIED checkpoint") || !strings.Contains(out, `no repository at or below /work has a branch "clanker/phantom"`) {
+		t.Errorf("the log does not state the checkpoint is unverified with its own detail:\n%s", out)
+	}
+	if strings.Contains(out, "the origin remote could not be read") {
+		t.Errorf("the log asserts a remote-read failure the detail does not support:\n%s", out)
+	}
+	if p2 := h.invocations[1].Prompt; strings.Contains(p2, "its read of the remote failed") ||
+		strings.Contains(p2, "verified to exist on the origin remote") {
+		t.Errorf("the successor brief asserts a remote-read failure or origin verification the detail does not support:\n%s", p2)
+	}
+}

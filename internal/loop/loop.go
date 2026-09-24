@@ -1748,6 +1748,14 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 	// branch whose origin could not be read at all are different facts, and only
 	// the second one is a checkpoint.
 	if unknownSeen {
+		// The log line this feeds is the operator's whole account of why the
+		// checkpoint is unverified, so an Unknown carrying no detail still gets
+		// a sentence: an empty parenthetical would say nothing at exactly the
+		// moment the log matters most. The bool above, not this string, is the
+		// discriminator.
+		if unknownWhy == "" {
+			unknownWhy = "the branch check returned unknown without a detail"
+		}
 		return unknownB, true, true, unknownWhy
 	}
 
@@ -2231,7 +2239,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
 					labelOf(t), drainNum, res.Claim.TaskID)
 			} else if end.branch != "" && evidenceUnverified {
-				log.Printf("%siteration %d: phase reached an UNVERIFIED checkpoint holding %s (branch %s recorded, but the origin remote could not be read: %s) — keeping the lease for the next phase; the review phase must verify the branch itself",
+				// The cause is the CHECK not completing, named by evidenceWhy
+				// (the Unknown check's own detail) — never "the origin remote
+				// could not be read" asserted as fact: delivery.Unknown also
+				// covers a check that never reached the remote (a branch no
+				// local repository has, an ambiguous repo, no git on PATH), and
+				// the log must not contradict the detail it prints.
+				log.Printf("%siteration %d: phase reached an UNVERIFIED checkpoint holding %s (branch %s recorded, but it could not be verified on the origin remote: %s) — keeping the lease for the next phase; the review phase must verify the branch itself",
 					labelOf(t), drainNum, res.Claim.TaskID, end.branch, evidenceWhy)
 			} else if end.branch != "" {
 				log.Printf("%siteration %d: phase reached its checkpoint holding %s (branch %s verified on the origin remote) — keeping the lease for the next phase",
@@ -2329,7 +2343,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 						end.claim.CheckpointUnverified = evidenceUnverified
 						end.checkpoint = true
 						if evidenceUnverified {
-							log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s recorded — the origin remote could not be read (%s), so this is an UNVERIFIED checkpoint: keeping the lease for the next phase; the review phase must verify the branch itself",
+							log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s recorded — it could not be verified on the origin remote (%s), so this is an UNVERIFIED checkpoint: keeping the lease for the next phase; the review phase must verify the branch itself",
 								labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, end.branch, evidenceWhy)
 						} else {
 							log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s verified on the origin remote — treating it as the phase checkpoint and keeping the lease for the next phase",

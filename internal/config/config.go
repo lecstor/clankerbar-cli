@@ -609,9 +609,12 @@ const noCodeReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder
 
 // unverifiedReviewBrief is the review brief for a checkpoint the driver could
 // NOT verify against the origin remote (CLA-576): the implement phase recorded
-// branch {{branch}} on the plane, but the driver's read of the remote failed
-// (network, a GitHub outage, a credential problem), so whether the branch was
-// ever pushed — and whether phase 1 did anything at all — is unknown. The
+// branch {{branch}} on the plane, but the driver's branch check did not
+// complete — most often the remote could not be read (network, a GitHub
+// outage, a credential problem), though a check that never reached the remote
+// (no local branch to compare, an ambiguous repo, no git on PATH) lands in the
+// same delivery.Unknown — so whether the branch was ever pushed — and whether
+// phase 1 did anything at all — is unknown. The
 // branch-shaped builtin brief would tell the successor "a branch the driver
 // verified to exist on the origin remote with its tip reachable, so phase 1
 // really did implement, commit and push", which is exactly the claim this
@@ -622,7 +625,8 @@ const noCodeReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder
 // still reaches a review phase).
 const unverifiedReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase " +
 	"recorded branch " + PhaseBranchPlaceholder + " on the plane — but the driver could NOT verify that branch on " +
-	"the origin remote: its read of the remote failed (network, a GitHub outage, a credential problem), so whether " +
+	"the origin remote: its check did not complete — most often because the remote could not be read (network, a " +
+	"GitHub outage, a credential problem), but a check that never reached the remote is possible too — so whether " +
 	"phase 1 pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a " +
 	"verified hand-off: do NOT assume the branch exists, and do NOT assume phase 1 implemented, committed and " +
 	"pushed. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. " +
@@ -631,8 +635,9 @@ const unverifiedReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceho
 	"branch " + PhaseBranchPlaceholder + " from the origin remote (git ls-remote origin " + PhaseBranchPlaceholder +
 	", or fetch it) and confirm it carries phase 1's work. If the branch is not on the origin remote, phase 1 did " +
 	"NOT deliver: report the failed hand-off in your outcome and hand the task over for a human decision — do not " +
-	"review a phantom diff. If the remote still cannot be read, say the hand-off could not be verified and end " +
-	"without inventing work. If the branch is there, work in the worktree for branch " + PhaseBranchPlaceholder +
+	"review a phantom diff. If the remote still cannot be read, the hand-off could not be verified: say exactly " +
+	"that in your outcome and hand the task over as the terminal step below requires — do not invent work. If the " +
+	"branch is there, work in the worktree for branch " + PhaseBranchPlaceholder +
 	" recorded on the task, and never commit to the integration branch (staging) - a session whose cwd is already " +
 	"the main checkout sitting on staging is not a decision to commit where you are, it is this failure mode. Read " +
 	"the diff on that branch. Then run the adversarial review gate, fix what it finds, and re-verify SCOPED to " +

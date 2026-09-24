@@ -893,11 +893,19 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 		"UNKNOWN",
 		"UNVERIFIED",
 		"do NOT assume phase 1 implemented, committed and pushed",
+		// The cause is the CHECK not completing, never a remote-read failure
+		// asserted as fact: delivery.Unknown also covers a check that never
+		// reached the remote (no local branch to compare, an ambiguous repo).
+		"its check did not complete",
+		"a check that never reached the remote is possible too",
 		// The self-verification step, before any review.
 		"FIRST verify the hand-off yourself",
 		"git ls-remote origin " + PhaseBranchPlaceholder,
 		// The absent-branch outcome: report it, never review a phantom diff.
 		"do not review a phantom diff",
+		// The still-unreadable arm names the hand-over rather than leaving the
+		// session to end holding the task against the terminal step.
+		"hand the task over as the terminal step below requires",
 		// The resume contract and the review gate survive.
 		"do not call next_task",
 		"heartbeat(",
