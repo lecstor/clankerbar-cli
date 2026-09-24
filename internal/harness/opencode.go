@@ -96,6 +96,16 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		return res, nil
 	}
 	console := in.Console
+	// CLA-584: the output-cap stall. A final step that hit the output token
+	// limit with zero output is NOT the quiet death the loop below resumes —
+	// the session is alive and its transcript is intact; the step failed
+	// because the model spent its whole output budget thinking. It gets ONE
+	// resume carrying a steer (opencode_stall.go), and this runs BEFORE the
+	// quiet-death loop so a stall resume that then dies quietly still gets
+	// CLA-406's probe on its own terms.
+	if o.OutputCapNoOutput(res) {
+		o.resumeOutputCapStall(ctx, in, &res, deadline)
+	}
 	// An UNTRUSTED stream is never resurrected: CLA-262 forbids reading claim
 	// state off an over-run capture, and both the coherence ref and the
 	// continuation's seed come from exactly that state - while the driver's
@@ -1002,7 +1012,17 @@ type opencodeParse struct {
 	// session can do hours of real paid work and then die with an "unknown"
 	// final step that reported nothing, so the session total (p.total/p.cost)
 	// is NOT the discriminator. Only the final step's own usage is.
-	lastStepZeroUsage                     bool
+	lastStepZeroUsage bool
+	// lastStepOut and lastStepReason are the MOST RECENT step_finish's OWN
+	// output and reasoning token counts (CLA-584). lastStepOut is the
+	// discriminator for the output-cap stall — a final "length" step with ZERO
+	// output — and it is deliberately not the all-zero test above: the recorded
+	// MAK-123 stall carried reasoning=32000 and a nonzero total, so only the
+	// output figure sees it. lastStepReason rides onto the Result for the
+	// daemon's named log line. Both move only with a step_finish that carried a
+	// reason, so they always describe the same event as lastReason (deadscan's
+	// rule, kept in step so the two classifiers cannot disagree).
+	lastStepOut, lastStepReason           int
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
@@ -1074,6 +1094,14 @@ func (p *opencodeParse) line(line []byte) {
 		// whether a final answer was produced.
 		if ev.Part.Reason != "" {
 			p.lastReason = ev.Part.Reason
+			// CLA-584: the stalled step's own figures move WITH the reason, so
+			// the pair always describes ONE event. A reason-less step_finish is
+			// skipped for this pair exactly as deadscan skips it for its own —
+			// otherwise the previous step's "length" would be paired with THIS
+			// event's zero output (or its output paired with the previous
+			// reason), and the live adapter would resume a session the
+			// retrospective scan reads as a mere long answer.
+			p.lastStepOut, p.lastStepReason = 0, 0
 		}
 		// tokens and cost are siblings on the part; count each independently so
 		// a step that reports one without the other still lands in the budget.
@@ -1091,6 +1119,10 @@ func (p *opencodeParse) line(line []byte) {
 			p.reason += tk.Reasoning
 			p.cWrite += tk.Cache.Write
 			p.cRead += tk.Cache.Read
+			if ev.Part.Reason != "" {
+				p.lastStepOut = tk.Output
+				p.lastStepReason = tk.Reasoning
+			}
 			if tk.Total != 0 {
 				p.lastStepZeroUsage = false
 			}
@@ -1242,6 +1274,18 @@ func (p *opencodeParse) finish(res *Result) {
 		// final "unknown" step that reported nothing.
 		if p.lastReason == FinishReasonUnknown && p.lastStepZeroUsage {
 			res.Raw[TerminalReasonKey] = ZeroUsageReason
+		}
+		// CLA-584: the output-cap stall — a FINAL step that hit the output token
+		// limit with ZERO output. Distinct from the quiet death above in the two
+		// ways that matter: the step reported real usage (reasoning and cost),
+		// and opencode ended the turn itself rather than the stream being
+		// dropped, so the session is alive and resumable. The reasoning count
+		// rides along because it is what makes the stall legible — thousands of
+		// tokens of thinking, nothing emitted — and it is the step's OWN count,
+		// like every other final-step figure here.
+		if p.lastReason == FinishReasonLength && p.lastStepOut == 0 {
+			res.Raw[TerminalReasonKey] = OutputCapReason
+			res.Raw[OutputCapReasoningKey] = p.lastStepReason
 		}
 	}
 	// The opencode session id, when the stream named one: the CLA-406
@@ -1430,6 +1474,25 @@ func (opencode) ZeroUsageUnknown(res Result) bool {
 	}
 	r, _ := res.Raw[TerminalReasonKey].(string)
 	return r == ZeroUsageReason
+}
+
+// OutputCapNoOutput reports whether this session ended on the CLA-584 output-cap
+// stall: a FINAL step_finish carrying reason "length" whose OWN output tokens
+// were zero — the model spent the step's whole output budget thinking and
+// emitted nothing. Read back from the adapter's own terminal_reason marker, so
+// unlike the CLA-398 quiet death this is not a question about usage being
+// absent: the MAK-123 stall reported reasoning=32000 and real cost, and only
+// the output figure was zero.
+//
+// It is the resume gate in Invoke (one resume with a steer, see
+// opencode_stall.go) and the driver's marker for naming the end instead of its
+// generic "never moved the task on" line.
+func (opencode) OutputCapNoOutput(res Result) bool {
+	if res.Raw == nil {
+		return false
+	}
+	r, _ := res.Raw[TerminalReasonKey].(string)
+	return r == OutputCapReason
 }
 
 // No mid-stream token ceiling: opencode sums per-step usage but the adapter

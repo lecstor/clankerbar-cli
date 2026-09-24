@@ -2802,6 +2802,24 @@ func deadReason(res *harness.Result) string {
 	return harness.FinishReasonUnknown
 }
 
+// outputCapStallReasoning reports whether this session ended on the CLA-584
+// output-cap stall, and the stalled final step's own reasoning-token count when
+// it did. The question is asked of the adapter's own terminal_reason marker —
+// the same channel deadReason reads — never re-derived from the finish reason,
+// so a harness that cannot produce the stall simply never answers true.
+//
+// It exists so the hand-back can say WHY a session stopped holding a task it
+// never moved on: the MAK-123 post-mortem found only "the phase finished but
+// never moved the task on", with nothing in the daemon log saying the model had
+// spent its whole output budget thinking (reasoning=32000) and emitted nothing.
+func outputCapStallReasoning(res harness.Result) (int, bool) {
+	if r, _ := res.Raw[harness.TerminalReasonKey].(string); r != harness.OutputCapReason {
+		return 0, false
+	}
+	n, _ := res.Raw[harness.OutputCapReasoningKey].(int)
+	return n, true
+}
+
 // fleetTrip pauses a target whose fleet dead-phase counter has reached
 // fleetDeadBound (CLA-396): that many consecutive dead phases across tasks mean
 // the harness or provider is broken right now, not the tasks, and every further
@@ -3065,10 +3083,26 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		// Leaving the lease alone is right — see Releasable. Whether it is also a
 		// FAILURE depends entirely on which call site got here; only that caller
 		// knows, so only that caller says so.
+		//
+		// CLA-584: a session the adapter marked as an output-cap stall is named
+		// by its cause, in place of the generic line — the operator reading
+		// daemon.log after MAK-123 could only see "the phase finished but never
+		// moved the task on", which says nothing about what stopped it.
+		stallReason, stalled := outputCapStallReasoning(res)
 		if countUndeclared {
 			d.undeclared++
+			if stalled {
+				log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d)",
+					labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
+				return false
+			}
 			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
 				labelOf(t), res.Claim.TaskID, d.undeclared)
+			return false
+		}
+		if stalled {
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives",
+				labelOf(t), stallReason, claimLabel(res.Claim))
 			return false
 		}
 		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
@@ -3078,6 +3112,14 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 	if t.Releaser == nil {
 		return false
 	}
+	// A stalled session is named by its cause on THIS path too (CLA-584), not
+	// only on the held-with-work branch above: a stall that never pushed a
+	// branch is the shape that leaves nothing behind, so "handed back to the
+	// queue" alone would send the next clanker to rediscover the cause — the
+	// MAK-123 post-mortem's complaint. Computed before the release so the line
+	// that reports its outcome can carry it; the named line REPLACES the
+	// generic one on success, as it does above.
+	stallReason, stalled := outputCapStallReasoning(res)
 	// Detach from ctx: a cancelled run (Ctrl-C, SIGTERM) is exactly when a claim
 	// would otherwise be abandoned, so the handback has to outlive the signal that
 	// prompted it. Bounded, so a wedged plane cannot hold up the shutdown.
@@ -3089,6 +3131,11 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			log.Printf("%scould not hand %s back: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
 		}
 		return false
+	}
+	if stalled {
+		log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s; handed it back to the queue for another clanker",
+			labelOf(t), stallReason, claimLabel(res.Claim))
+		return true
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
 	return true
