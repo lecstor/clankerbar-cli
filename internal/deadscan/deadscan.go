@@ -21,6 +21,14 @@
 //     without a final answer), and NO branch was recorded on the task — the
 //     "produced nothing" shape. A session that recorded a branch and THEN died
 //     still produced something, so it is not dead.
+//   - a session is STALLED when it got past its claim and its final step_finish
+//     carried reason "length" with ZERO output tokens (CLA-584): the model hit
+//     its output ceiling while thinking and emitted nothing. It gets its own
+//     column, separate from the dead count — the end is a different shape (the
+//     session was alive and the adapter resumes it once with a steer), and
+//     folding the two together would hide which fix moved which number. The
+//     branch conjunct deliberately does not apply: a stalled session is stalled
+//     whether or not work was already pushed.
 //   - a session whose log carries the adapter's own cap/failure markers (a raw
 //     "!! session outlived its wall-clock cap" / "!! session crossed its
 //     per-session token ceiling" / "!! stream read failed" console line) ended
@@ -80,6 +88,11 @@ type Log struct {
 	// branch, no cap marker.
 	Dead bool
 
+	// Stalled is the CLA-584 output-cap stall: got past its claim, the FINAL
+	// step_finish carried reason "length" with zero output tokens, and no cap
+	// marker. Counted in its own column, never in Dead — see the package doc.
+	Stalled bool
+
 	// APIErrors are the structured error events this log carried (name + data),
 	// for the FindErrors known-positive control. Text an agent merely READ is
 	// not an error event and never lands here.
@@ -90,6 +103,9 @@ type Log struct {
 type Cell struct {
 	Day, Phase, Harness string
 	Run, Dead           int
+	// Stalled is the CLA-584 output-cap stall count, reported as its own
+	// column so it can be read without touching the dead rate.
+	Stalled int
 }
 
 // Rate is dead/run as a percentage, 0 when nothing ran.
@@ -157,6 +173,9 @@ func Summarize(logs []Log) []Cell {
 		c.Run++
 		if l.Dead {
 			c.Dead++
+		}
+		if l.Stalled {
+			c.Stalled++
 		}
 	}
 	sort.Slice(cells, func(i, j int) bool {
@@ -227,7 +246,7 @@ func classify(path string) (Log, error) {
 		return l, err
 	}
 	l.Harness = harnessOf(data)
-	l.GotPastClaim, l.BranchRecorded, l.LastReason, l.APIErrors, l.Dead =
+	l.GotPastClaim, l.BranchRecorded, l.LastReason, l.APIErrors, l.Dead, l.Stalled =
 		classifyEvents(l.Harness, data)
 	return l, nil
 }
@@ -269,11 +288,15 @@ func harnessOf(data []byte) string {
 // counter. Codex and opencode2 emit no claim state the scan can read, so their
 // sessions count as run only when a claim marker appears; they can never be
 // dead either way (no step_finish reason on either surface).
-func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded bool, lastReason string, apiErrors []string, dead bool) {
+func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded bool, lastReason string, apiErrors []string, dead, stalled bool) {
 	// The driver's dead conjuncts, mirrored from the log:
 	//   reason "unknown" AND no branch AND got past its claim AND not a cap.
 	reasonUnknown := false
 	capKilled := false
+	// lastOut is the FINAL step_finish's own output-token count, tracked
+	// alongside lastReason so the two always describe the same step — the
+	// CLA-584 stall is exactly that pair: reason "length", output 0.
+	lastOut := 0
 	for _, line := range splitLines(data) {
 		if len(line) == 0 || line[0] != '{' {
 			// Raw console line: the adapter's own backstop markers, or the
@@ -313,10 +336,17 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 		case "step_finish":
 			var part struct {
 				Reason string `json:"reason"`
+				Tokens *struct {
+					Output int `json:"output"`
+				} `json:"tokens"`
 			}
 			_ = json.Unmarshal(ev.Part, &part)
 			if part.Reason != "" {
 				lastReason = part.Reason
+				lastOut = 0
+				if part.Tokens != nil {
+					lastOut = part.Tokens.Output
+				}
 				if part.Reason == "unknown" {
 					reasonUnknown = true
 				} else {
@@ -336,7 +366,13 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 		}
 	}
 	dead = gotPastClaim && reasonUnknown && !branchRecorded && !capKilled
-	return gotPastClaim, branchRecorded, lastReason, apiErrors, dead
+	// The stall is the OTHER terminal step reason, so dead and stalled can
+	// never both fire for one session. It is its own column (the live adapter
+	// resumes it once, and the dead rate must not absorb the resumable end),
+	// and the branch conjunct is deliberately absent: pushing a branch first
+	// does not un-stall a step that then burned its whole output budget.
+	stalled = gotPastClaim && lastReason == "length" && lastOut == 0 && !capKilled
+	return gotPastClaim, branchRecorded, lastReason, apiErrors, dead, stalled
 }
 
 // noteTool mirrors the shared claim observer (harness.noteToolUse /

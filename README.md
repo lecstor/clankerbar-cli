@@ -645,6 +645,12 @@ clankerbar dead-rate
 clankerbar dead-rate --error tool_count_limit   # logs whose APIError events match
 ```
 
+A session that ended on the **output-cap stall** (see the harness section: final
+step reason `length`, zero output) is reported in its own `stalled` column,
+never in `dead`. The two are different ends — a stall is a live, resumable
+session, a dead one is not — and folding them together would hide which fix
+moved which number. The `rate` column stays dead/run.
+
 The scan is verified against known-positive controls. `--error tool_count_limit`
 finds exactly the three 2026-08-19 logs that carry it as an APIError event, not
 the later logs where the same string appears as task-body text an agent merely
@@ -1411,6 +1417,17 @@ resumes the SAME session in place (`opencode run --session <id>`), and asks the
 agent to prove it is intact by naming its task ref. A mechanical match continues
 the session where it left off (bounded at 5 resurrections per session, one probe
 per death); a failed probe falls through to the dead-phase path unchanged.
+
+**The output-cap stall (CLA-584).** A session whose FINAL `step_finish` carries
+reason `length` with zero output tokens is a different end: the model spent the
+whole step's output budget thinking and emitted nothing. It is not the quiet
+death (that is reason `unknown` with all-zero usage, and its stream was dropped)
+— opencode ended this turn normally and the session is alive, so the adapter
+resumes it exactly ONCE with a steer: do not retry the approach, and upload file
+contents by path rather than transcribing them into a tool argument. A second
+consecutive stall ends the session, and the daemon log names it
+(`stalled: output cap hit with no output (reasoning=<n>)`) instead of reporting
+a bare "never moved the task on".
 
 **What gets read as a failure.** A session's output is the whole event stream, and
 the events quote the backlog verbatim — the task the session claimed is sitting in

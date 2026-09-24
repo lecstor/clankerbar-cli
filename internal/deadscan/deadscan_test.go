@@ -120,6 +120,35 @@ const quotedTextLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_quote
 {"type":"step_finish","timestamp":3,"sessionID":"ses_quote","part":{"id":"p2","reason":"stop","tokens":{"total":10,"input":5,"output":5}}}
 `
 
+// A STALLED opencode session (CLA-584): the shape MAK-123 left on 2026-09-24 —
+// claimed work (here via a completed heartbeat, the resumed-phase form), did
+// real paid work, then the FINAL step_finish carried reason "length" with ZERO
+// output tokens while burning 32000 reasoning tokens. It is a run, never dead —
+// and it is STALLED, its own column.
+const stalledLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_stall","part":{"id":"p1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_get_task","callID":"c1","state":{"status":"completed","input":{"taskId":"t9"},"output":"{\"task\":{\"id\":\"t9\",\"ref\":\"MAK-123\"}}"}}}
+{"type":"tool_use","timestamp":3,"sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_heartbeat","callID":"c2","state":{"status":"completed","input":{"runId":"r-1"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","timestamp":4,"sessionID":"ses_stall","part":{"id":"p2","reason":"tool-calls","tokens":{"total":270003,"input":483,"output":109,"reasoning":483,"cache":{"write":0,"read":268928}},"cost":0.001234434}}
+{"type":"step_start","timestamp":5,"sessionID":"ses_stall","part":{"id":"p3","type":"step-start"}}
+{"type":"step_finish","timestamp":6,"sessionID":"ses_stall","part":{"id":"p4","reason":"length","tokens":{"total":306592,"input":5280,"output":0,"reasoning":32000,"cache":{"write":0,"read":269312}},"cost":0.020799936}}
+`
+
+// The near-miss the stall classification must NOT take: an EARLIER step burned
+// its output budget with no output, and the session then finished normally. The
+// stall is a property of the FINAL step only.
+const stallThenRecoveredLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_was_stall","part":{"id":"p1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_was_stall","part":{"type":"tool","tool":"clankerbar_heartbeat","callID":"c1","state":{"status":"completed","input":{"runId":"r-1"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_was_stall","part":{"id":"p2","reason":"length","tokens":{"total":306592,"input":5280,"output":0,"reasoning":32000,"cache":{"write":0,"read":269312}},"cost":0.020799936}}
+{"type":"step_start","timestamp":4,"sessionID":"ses_was_stall","part":{"id":"p3","type":"step-start"}}
+{"type":"step_finish","timestamp":5,"sessionID":"ses_was_stall","part":{"id":"p4","reason":"stop","tokens":{"total":306900,"input":5300,"output":120,"reasoning":32000,"cache":{"write":0,"read":269400}},"cost":0.021}}
+`
+
+// A length stop that DID produce output: a long answer, not a stall.
+const longAnswerLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_long","part":{"id":"p1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_long","part":{"type":"tool","tool":"clankerbar_heartbeat","callID":"c1","state":{"status":"completed","input":{"runId":"r-1"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_long","part":{"id":"p2","reason":"length","tokens":{"total":306592,"input":5280,"output":42,"reasoning":100,"cache":{"write":0,"read":269312}},"cost":0.02}}
+`
+
 func scanFixtures(t *testing.T, files map[string]string) []Log {
 	t.Helper()
 	logs, err := Scan(fixtureRoot(t, files))
@@ -302,5 +331,67 @@ func TestScan_ClassifiesCodexHarness(t *testing.T) {
 	l := byName(t, scanFixtures(t, files), "iteration-20260819-070000-d1-pimplement-a0-9b3f1d44.log")
 	if l.Harness != "codex" {
 		t.Errorf("codex fixture: Harness = %q, want %q", l.Harness, "codex")
+	}
+}
+
+// The CLA-584 stall is its own classification, separate from dead (the two
+// terminal step reasons are mutually exclusive), and the near-miss fixtures
+// must not land in it: an earlier stalled step followed by a normal finish, and
+// a length stop that produced output.
+func TestScan_ClassifiesTheOutputCapStall(t *testing.T) {
+	files := map[string]string{
+		"w1/iteration-20260924-133347-d15-preview-a0-ca2a5eb5.log":   stalledLog,
+		"w1/iteration-20260820-004335-d3-pimplement-a0-5ff482cb.log": deadLog,
+		"w1/iteration-20260924-140000-d1-preview-a0-a1b2c3d4.log":    stallThenRecoveredLog,
+		"w1/iteration-20260924-150000-d2-preview-a0-e5f6a7b8.log":    longAnswerLog,
+	}
+	logs := scanFixtures(t, files)
+
+	stalled := byName(t, logs, "iteration-20260924-133347-d15-preview-a0-ca2a5eb5.log")
+	if !stalled.GotPastClaim || !stalled.Stalled {
+		t.Errorf("stall fixture misclassified: gotPastClaim=%v stalled=%v", stalled.GotPastClaim, stalled.Stalled)
+	}
+	if stalled.Dead {
+		t.Error("a length/zero-output stall must not count as dead — it is its own column")
+	}
+	if stalled.LastReason != "length" {
+		t.Errorf("stall fixture lastReason = %q, want %q", stalled.LastReason, "length")
+	}
+
+	dead := byName(t, logs, "iteration-20260820-004335-d3-pimplement-a0-5ff482cb.log")
+	if dead.Stalled {
+		t.Error("the unknown-reason death must not read as a stall")
+	}
+
+	recovered := byName(t, logs, "iteration-20260924-140000-d1-preview-a0-a1b2c3d4.log")
+	if recovered.Stalled {
+		t.Error("an EARLIER stalled step followed by a normal finish is not a stall — only the final step decides")
+	}
+
+	long := byName(t, logs, "iteration-20260924-150000-d2-preview-a0-e5f6a7b8.log")
+	if long.Stalled {
+		t.Error("a length stop that produced output is a long answer, not a stall")
+	}
+}
+
+// The stall gets its own column in the report, and never inflates the dead
+// count or the denominator semantics of the dead rate.
+func TestSummarize_StalledIsItsOwnColumn(t *testing.T) {
+	files := map[string]string{
+		"w1/iteration-20260924-133347-d15-preview-a0-ca2a5eb5.log":   stalledLog,
+		"w1/iteration-20260820-004335-d3-pimplement-a0-5ff482cb.log": deadLog,
+		"w1/iteration-20260820-141405-d4-pimplement-a0-d869542f.log": healthyLog,
+	}
+	cells := Summarize(scanFixtures(t, files))
+	if len(cells) != 2 {
+		t.Fatalf("got %d cells, want 2 (one per day): %+v", len(cells), cells)
+	}
+	// 08-20 implement: a dead and a healthy session, no stalls.
+	if c := cells[0]; c.Run != 2 || c.Dead != 1 || c.Stalled != 0 {
+		t.Errorf("08-20 cell = %+v, want run=2 dead=1 stalled=0", c)
+	}
+	// 09-24 review: the stalled session — counted BESIDE the dead, not inside it.
+	if c := cells[1]; c.Run != 1 || c.Dead != 0 || c.Stalled != 1 {
+		t.Errorf("09-24 cell = %+v, want run=1 dead=0 stalled=1 — the stall is its own column", c)
 	}
 }

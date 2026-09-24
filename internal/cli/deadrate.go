@@ -10,6 +10,11 @@ package cli
 // exclusion (a session that never got past its claim counts toward neither
 // counter), applied to the logs, so the historical rate and the live rate
 // measure the same thing.
+//
+// Sessions that ended on the CLA-584 output-cap stall (final step reason
+// "length", zero output) are reported in their own `stalled` column, never in
+// `dead`: they are a different, resumable end, and mixing them would blur both
+// measurements.
 
 import (
 	"context"
@@ -76,19 +81,24 @@ func DeadRate(ctx context.Context, args []string) error {
 }
 
 func printTable(w io.Writer, cells []deadscan.Cell) {
-	fmt.Fprintf(w, "%-12s %-12s %-10s %5s %5s %7s\n", "day", "phase", "harness", "run", "dead", "rate")
-	var totRun, totDead int
+	// `dead` and `stalled` are separate columns on purpose (CLA-584): a stalled
+	// session — final step reason "length" with zero output — is a different end
+	// from a quiet death, and folding it into the dead count would hide which
+	// fix moved which number. The rate stays dead/run.
+	fmt.Fprintf(w, "%-12s %-12s %-10s %5s %5s %8s %7s\n", "day", "phase", "harness", "run", "dead", "stalled", "rate")
+	var totRun, totDead, totStalled int
 	for _, c := range cells {
-		fmt.Fprintf(w, "%-12s %-12s %-10s %5d %5d %6.1f%%\n",
-			c.Day, c.Phase, c.Harness, c.Run, c.Dead, c.Rate())
+		fmt.Fprintf(w, "%-12s %-12s %-10s %5d %5d %8d %6.1f%%\n",
+			c.Day, c.Phase, c.Harness, c.Run, c.Dead, c.Stalled, c.Rate())
 		totRun += c.Run
 		totDead += c.Dead
+		totStalled += c.Stalled
 	}
 	rate := 0.0
 	if totRun > 0 {
 		rate = 100 * float64(totDead) / float64(totRun)
 	}
-	fmt.Fprintf(w, "%-12s %-12s %-10s %5d %5d %6.1f%%\n", "total", "", "", totRun, totDead, rate)
+	fmt.Fprintf(w, "%-12s %-12s %-10s %5d %5d %8d %6.1f%%\n", "total", "", "", totRun, totDead, totStalled, rate)
 }
 
 func printErrorMatches(w io.Writer, logs []deadscan.Log, text string) {
