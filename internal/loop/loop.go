@@ -1570,10 +1570,13 @@ type phaseEnd struct {
 	// when the branch-less evidence forms were consulted and showed nothing).
 	emptyWhy string
 
-	// branch is the verified branch name when this phase checkpointed — the
-	// plane-record evidence the checkpoint is now gated on (CLA-457), carried
-	// here so the successor's brief can name it instead of asserting an
-	// unverified phase-1 success. Folded onto the carried claim by the seam.
+	// branch is the branch name when this phase checkpointed — the
+	// plane-record evidence the checkpoint is gated on (CLA-457), carried here
+	// so the successor's brief can name it instead of asserting an unverified
+	// phase-1 success. Folded onto the carried claim by the seam, which marks
+	// it UNVERIFIED (CLA-576) when the origin could not be read; the brief
+	// selection reads that mark, so the branch reaches the successor named but
+	// never presented as verified.
 	branch string
 
 	// releasedToQueue reports that this phase's handback ACTUALLY returned the
@@ -1815,15 +1818,20 @@ func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Resu
 	return st, false, fmt.Sprintf("the plane's record shows no exit evidence either (status %q, no no-code delivery)", st.Status)
 }
 
-// verifiedBranch returns the branch the previous phase recorded and verified —
-// the hand-off the successor's brief names (CLA-457). The seam folds the
-// VERIFIED branch onto the carried claim when it checkpoints, so the claim's
-// branch IS the verified one for a checkpointed phase; the recorded-Branches
-// fallback covers a claim that was never re-judged (a resumed-with-WIP
-// predecessor, or a defensive hole). The predecessor's checkpoint is gated on
-// this same evidence, so an empty return here is a misconfigured sequence
-// announcing itself via a standing {{branch}} placeholder rather than a
-// plausible runtime state.
+// verifiedBranch returns the branch the previous phase recorded — the hand-off
+// the successor's brief names (CLA-457). The seam folds the branch onto the
+// carried claim when it checkpoints, so for a checkpointed phase the claim's
+// branch is the one the evidence gate judged; the recorded-Branches fallback
+// covers a claim that was never re-judged (a resumed-with-WIP predecessor, or
+// a defensive hole). The predecessor's checkpoint is gated on this same
+// evidence, so an empty return here is a misconfigured sequence announcing
+// itself via a standing {{branch}} placeholder rather than a plausible runtime
+// state.
+//
+// CLA-576: for an UNVERIFIED checkpoint — the origin could not be read — the
+// returned branch is recorded but NOT verified, and the caller that builds the
+// successor's brief must read Result.CheckpointUnverified and select the
+// unverified brief: this function names the branch, it does not vouch for it.
 func verifiedBranch(res *harness.Result) string {
 	if res == nil {
 		return ""
