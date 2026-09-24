@@ -460,6 +460,17 @@ type Result struct {
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
 
+	// CheckpointUnverified marks this Result as the hand-off for a phase that
+	// reached its checkpoint on an UNVERIFIED branch (CLA-576): the phase
+	// recorded Claim.Branch on the plane, but the driver's read of the origin
+	// remote failed (network, a GitHub outage, a credential problem), so it is
+	// unknown whether the branch was ever pushed. The branch is still carried —
+	// the review phase is the backstop — but the successor's brief must not
+	// describe it as verified on the origin remote (CLA-457), and the review
+	// session is told to verify the hand-off itself. False for every verified
+	// checkpoint and for the branch-less plane-record forms (CLA-497).
+	CheckpointUnverified bool
+
 	// onClaim is the Invocation.OnClaim callback bound into this Result at
 	// construction (newSessionResult), so the shared observer can notify it
 	// without threading the Invocation through every parse helper. Unexported,

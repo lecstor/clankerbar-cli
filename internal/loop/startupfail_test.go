@@ -59,7 +59,7 @@ func TestStartupBound_FourSidelineFifthPausesAndRaises(t *testing.T) {
 		steps := []invokeStep{}
 		for i := 0; i < alphaFails; i++ {
 			steps = append(steps, invokeStep{res: okResult(0, 0)}) // beta
-			steps = append(steps, invokeStep{err: startupErr()})  // alpha
+			steps = append(steps, invokeStep{err: startupErr()})   // alpha
 		}
 		return steps
 	}
@@ -140,7 +140,7 @@ func TestStartupBound_FourSidelineFifthPausesAndRaises(t *testing.T) {
 }
 
 // A sixth consecutive failure while the pause is in force raises nothing more
-//  -  exactly one question per episode  -  and the paused target stops draining.
+//   - exactly one question per episode  -  and the paused target stops draining.
 func TestStartupTrip_RaisesOncePerEpisode(t *testing.T) {
 	// 5 alpha fails to trip (10 drains) + one more beta drain while paused = 11.
 	steps := []invokeStep{}
@@ -294,13 +294,13 @@ func TestStartupSuccessResetsTheCounter(t *testing.T) {
 	// alpha ok (success resets), beta ok, alpha err (fresh run of one).
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: okResult(0, 0)}, // drain 1 beta
-		{err: startupErr()},  // drain 2 alpha fail 1
+		{err: startupErr()},   // drain 2 alpha fail 1
 		{res: okResult(0, 0)}, // drain 3 beta
-		{err: startupErr()},  // drain 4 alpha fail 2
+		{err: startupErr()},   // drain 4 alpha fail 2
 		{res: okResult(0, 0)}, // drain 5 beta
 		{res: okResult(0, 0)}, // drain 6 alpha SUCCESS
 		{res: okResult(0, 0)}, // drain 7 beta
-		{err: startupErr()},  // drain 8 alpha fail 1 (fresh)
+		{err: startupErr()},   // drain 8 alpha fail 1 (fresh)
 	}}
 	alpha := &fakePoller{sum: backlog.Summary{Claimable: 1}}
 	beta := &fakePoller{sum: backlog.Summary{Claimable: 1}}
