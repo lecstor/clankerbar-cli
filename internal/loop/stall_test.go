@@ -99,3 +99,59 @@ func TestReleaseHeldClaim_NamesTheStallWithoutTheCounter(t *testing.T) {
 		t.Errorf("countUndeclared=false must not report the undeclared counter; got: %q", out)
 	}
 }
+
+// A stalled session with NO pushed work is releasable, so it goes back to the
+// queue — and the log still says why it stopped, in place of the generic
+// hand-back line. This is the shape that leaves nothing behind (a stall before
+// any branch was pushed), where "handed back to the queue" alone would send the
+// next clanker to rediscover the cause.
+func TestReleaseHeldClaim_NamesTheStallOnTheReleasePath(t *testing.T) {
+	logs := captureLogs(t)
+	rel := &fakeReleaser{}
+	d := &Driver{}
+	res := stalledHeldResult()
+	res.Claim.HasWIP = false
+	res.Claim.Branch = ""
+
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true); !released {
+		t.Error("a stalled claim with no pushed work must still be released to the queue")
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "stalled: output cap hit with no output (reasoning=32000)") {
+		t.Errorf("the release path must name the stall too; got: %q", out)
+	}
+	if !strings.Contains(out, "MAK-123") {
+		t.Errorf("the named release line must carry the task ref; got: %q", out)
+	}
+	if strings.Contains(out, "(the session ended still holding it)") {
+		t.Errorf("the named line must replace the generic hand-back line for a stall, not join it; got: %q", out)
+	}
+	if len(rel.calls) != 1 || rel.calls[0].taskID != res.Claim.TaskID {
+		t.Errorf("the release must still reach the plane once for this task; calls = %+v", rel.calls)
+	}
+}
+
+// A releasable claim that did NOT stall keeps the generic hand-back line: only
+// the stall is named, not every release.
+func TestReleaseHeldClaim_KeepsTheGenericLineOnTheReleasePathWithoutAStall(t *testing.T) {
+	logs := captureLogs(t)
+	rel := &fakeReleaser{}
+	d := &Driver{}
+	res := stalledHeldResult()
+	res.Claim.HasWIP = false
+	delete(res.Raw, harness.TerminalReasonKey)
+	delete(res.Raw, harness.OutputCapReasoningKey)
+
+	if released := d.releaseHeldClaim(context.Background(), Target{Name: "makespdf", Releaser: rel}, res, true); !released {
+		t.Error("a releasable claim must be handed back")
+	}
+
+	out := logs.String()
+	if !strings.Contains(out, "(the session ended still holding it)") {
+		t.Errorf("a non-stall release must keep the generic hand-back line; got: %q", out)
+	}
+	if strings.Contains(out, "stalled:") {
+		t.Errorf("a non-stall release must not be named as the stall; got: %q", out)
+	}
+}

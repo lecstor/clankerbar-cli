@@ -149,6 +149,26 @@ const longAnswerLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_long"
 {"type":"step_finish","timestamp":3,"sessionID":"ses_long","part":{"id":"p2","reason":"length","tokens":{"total":306592,"input":5280,"output":42,"reasoning":100,"cache":{"write":0,"read":269312}},"cost":0.02}}
 `
 
+// A reason-less step_finish is not a step either the reason or the output
+// figure may be read from: lastReason and lastOut must describe ONE reasoned
+// event. These two fixtures pin both directions of that rule, and the adapter
+// mirrors them (opencode_stall_test.go): classifying the same log differently
+// from the live path would report a session in the wrong column, and in the
+// first direction it would resume a session the scan reads as a long answer.
+const reasonlessFinalStepLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_nor","part":{"id":"p1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_nor","part":{"type":"tool","tool":"clankerbar_heartbeat","callID":"c1","state":{"status":"completed","input":{"runId":"r-1"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_nor","part":{"id":"p2","reason":"length","tokens":{"total":306592,"input":5280,"output":3000,"reasoning":100,"cache":{"write":0,"read":269312}},"cost":0.02}}
+{"type":"step_finish","timestamp":4,"sessionID":"ses_nor","part":{"id":"p3","tokens":{"total":306900,"input":5280,"output":0,"reasoning":5,"cache":{"write":0,"read":269312}},"cost":0.021}}
+`
+
+// The mirror: the last REASONED step is the length/zero stall, and the
+// reason-less step after it does not un-stall it.
+const reasonlessStepAfterStallLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_nor2","part":{"id":"p1","type":"step-start"}}
+{"type":"tool_use","timestamp":2,"sessionID":"ses_nor2","part":{"type":"tool","tool":"clankerbar_heartbeat","callID":"c1","state":{"status":"completed","input":{"runId":"r-1"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","timestamp":3,"sessionID":"ses_nor2","part":{"id":"p2","reason":"length","tokens":{"total":306592,"input":5280,"output":0,"reasoning":900,"cache":{"write":0,"read":269312}},"cost":0.02}}
+{"type":"step_finish","timestamp":4,"sessionID":"ses_nor2","part":{"id":"p3","tokens":{"total":307000,"input":5330,"output":500,"reasoning":5,"cache":{"write":0,"read":269312}},"cost":0.022}}
+`
+
 func scanFixtures(t *testing.T, files map[string]string) []Log {
 	t.Helper()
 	logs, err := Scan(fixtureRoot(t, files))
@@ -371,6 +391,30 @@ func TestScan_ClassifiesTheOutputCapStall(t *testing.T) {
 	long := byName(t, logs, "iteration-20260924-150000-d2-preview-a0-e5f6a7b8.log")
 	if long.Stalled {
 		t.Error("a length stop that produced output is a long answer, not a stall")
+	}
+}
+
+// The reason/output pair must describe ONE reasoned step_finish: a reason-less
+// event is skipped for both figures, so the column and the live adapter (which
+// mirrors this rule) classify the same log the same way.
+func TestScan_ReasonlessFinalStepIsNotAStepForTheStall(t *testing.T) {
+	files := map[string]string{
+		"w1/iteration-20260924-160000-d1-preview-a0-11111111.log": reasonlessFinalStepLog,
+		"w1/iteration-20260924-170000-d2-preview-a0-22222222.log": reasonlessStepAfterStallLog,
+	}
+	logs := scanFixtures(t, files)
+
+	// A productive length step followed by a reason-less zero-output step: the
+	// previous step's "length" must NOT be paired with the reason-less event's
+	// zero, or a mere long answer would land in the stall column.
+	if l := byName(t, logs, "iteration-20260924-160000-d1-preview-a0-11111111.log"); l.Stalled {
+		t.Errorf("a reason-less final step lent its zero output to the previous step's \"length\": lastReason=%q — the pair must describe one reasoned event", l.LastReason)
+	}
+
+	// The mirror: the last reasoned step is the length/zero stall and the
+	// reason-less step after it changes nothing.
+	if l := byName(t, logs, "iteration-20260924-170000-d2-preview-a0-22222222.log"); !l.Stalled {
+		t.Errorf("a reason-less step after a length/zero step must not un-stall the step that hit the cap (lastReason=%q)", l.LastReason)
 	}
 }
 

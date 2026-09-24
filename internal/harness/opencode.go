@@ -1019,7 +1019,9 @@ type opencodeParse struct {
 	// output — and it is deliberately not the all-zero test above: the recorded
 	// MAK-123 stall carried reasoning=32000 and a nonzero total, so only the
 	// output figure sees it. lastStepReason rides onto the Result for the
-	// daemon's named log line. Reset per step, like lastStepZeroUsage.
+	// daemon's named log line. Both move only with a step_finish that carried a
+	// reason, so they always describe the same event as lastReason (deadscan's
+	// rule, kept in step so the two classifiers cannot disagree).
 	lastStepOut, lastStepReason           int
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
@@ -1092,6 +1094,14 @@ func (p *opencodeParse) line(line []byte) {
 		// whether a final answer was produced.
 		if ev.Part.Reason != "" {
 			p.lastReason = ev.Part.Reason
+			// CLA-584: the stalled step's own figures move WITH the reason, so
+			// the pair always describes ONE event. A reason-less step_finish is
+			// skipped for this pair exactly as deadscan skips it for its own —
+			// otherwise the previous step's "length" would be paired with THIS
+			// event's zero output (or its output paired with the previous
+			// reason), and the live adapter would resume a session the
+			// retrospective scan reads as a mere long answer.
+			p.lastStepOut, p.lastStepReason = 0, 0
 		}
 		// tokens and cost are siblings on the part; count each independently so
 		// a step that reports one without the other still lands in the budget.
@@ -1102,10 +1112,6 @@ func (p *opencodeParse) line(line []byte) {
 		// feed the budget are not the discriminator, the last step's own block
 		// is. Reset per step; the final value is the one that survives.
 		p.lastStepZeroUsage = true
-		// The stalled step's own figures (CLA-584) reset with it: a final step
-		// that carries no tokens block at all reports the same zero output the
-		// stall is defined on, and must not inherit the PREVIOUS step's counts.
-		p.lastStepOut, p.lastStepReason = 0, 0
 		if tk := ev.Part.Tokens; tk != nil {
 			p.total += tk.Total
 			p.in += tk.Input
@@ -1113,8 +1119,10 @@ func (p *opencodeParse) line(line []byte) {
 			p.reason += tk.Reasoning
 			p.cWrite += tk.Cache.Write
 			p.cRead += tk.Cache.Read
-			p.lastStepOut = tk.Output
-			p.lastStepReason = tk.Reasoning
+			if ev.Part.Reason != "" {
+				p.lastStepOut = tk.Output
+				p.lastStepReason = tk.Reasoning
+			}
 			if tk.Total != 0 {
 				p.lastStepZeroUsage = false
 			}

@@ -205,6 +205,9 @@ func opencodeResumeArgs(in Invocation, sid, prompt string) []string {
 //     quiet-death mark (the loop and the driver both read it), while a
 //     continuation that itself died quietly keeps it — which is what lets the
 //     caller's loop take its next round.
+//     OutputCapReasoningKey (CLA-584) is recomputed the same way: it is the
+//     stalled STEP's own count, so a second stall must replace the first's
+//     figure rather than add to it.
 func mergeResume(base *Result, add Result) {
 	base.ExitCode = add.ExitCode
 	base.ExitSignal = add.ExitSignal
@@ -228,8 +231,8 @@ func mergeResume(base *Result, add Result) {
 		base.Raw = map[string]any{}
 	}
 	for k, v := range add.Raw {
-		if k == TerminalReasonKey || k == FinishReasonKey {
-			continue // both recomputed below, never inherited blind
+		if k == TerminalReasonKey || k == FinishReasonKey || k == OutputCapReasoningKey {
+			continue // all three recomputed below, never inherited blind
 		}
 		if nv, ok := v.(int); ok {
 			if bv, ok := base.Raw[k].(int); ok {
@@ -255,6 +258,18 @@ func mergeResume(base *Result, add Result) {
 		base.Raw[FinishReasonKey] = fr
 	} else {
 		delete(base.Raw, FinishReasonKey)
+	}
+	// The stall's reasoning count is recomputed from the continuation for the
+	// same reason as the two verdict keys above: it describes ONE step — the
+	// one OutputCapReason names — so it may not be SUMMED. Stall 1 (32000) into
+	// a resume that stalls again (28000) would otherwise leave 60000, a figure
+	// no step ever burned, and the driver's named line prints this exact
+	// number. Absent on a recovered continuation, it is cleared with the
+	// marker, so Raw never carries a count for a stall that no longer stands.
+	if n, ok := add.Raw[OutputCapReasoningKey].(int); ok {
+		base.Raw[OutputCapReasoningKey] = n
+	} else {
+		delete(base.Raw, OutputCapReasoningKey)
 	}
 }
 

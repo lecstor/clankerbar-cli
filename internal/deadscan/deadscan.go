@@ -25,10 +25,13 @@
 //     carried reason "length" with ZERO output tokens (CLA-584): the model hit
 //     its output ceiling while thinking and emitted nothing. It gets its own
 //     column, separate from the dead count — the end is a different shape (the
-//     session was alive and the adapter resumes it once with a steer), and
-//     folding the two together would hide which fix moved which number. The
-//     branch conjunct deliberately does not apply: a stalled session is stalled
-//     whether or not work was already pushed.
+//     session was alive, and the opencode adapter resumes it once with a steer
+//     where it sees it), and folding the two together would hide which fix
+//     moved which number. The count is read off the logs' shape and is NOT a
+//     list of sessions the live driver acted on: another harness emitting the
+//     same shape is still counted here. The branch conjunct deliberately does
+//     not apply: a stalled session is stalled whether or not work was already
+//     pushed.
 //   - a session whose log carries the adapter's own cap/failure markers (a raw
 //     "!! session outlived its wall-clock cap" / "!! session crossed its
 //     per-session token ceiling" / "!! stream read failed" console line) ended

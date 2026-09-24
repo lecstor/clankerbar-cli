@@ -421,7 +421,10 @@ const OutputCapReason = "output_cap_no_output"
 // OutputCapReasoningKey is the Result.Raw key carrying the stalled final step's
 // OWN reasoning-token count, which is what makes the stall legible in a log
 // line — how much thinking bought nothing. Read by the driver's named
-// `stalled: output cap hit with no output (reasoning=<n>)` line.
+// `stalled: output cap hit with no output (reasoning=<n>)` line. Because it
+// describes ONE step, mergeResume recomputes it from the continuation rather
+// than summing it: a second consecutive stall replaces the first's figure, and
+// a recovered resume clears it with the marker.
 const OutputCapReasoningKey = "output_cap_reasoning"
 
 type Result struct {

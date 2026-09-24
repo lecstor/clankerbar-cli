@@ -649,7 +649,9 @@ A session that ended on the **output-cap stall** (see the harness section: final
 step reason `length`, zero output) is reported in its own `stalled` column,
 never in `dead`. The two are different ends — a stall is a live, resumable
 session, a dead one is not — and folding them together would hide which fix
-moved which number. The `rate` column stays dead/run.
+moved which number. The `rate` column stays dead/run. The column counts that
+shape in the logs, whatever harness wrote them; the resume-with-a-steer below is
+the opencode adapter's response to it, not a condition of the count.
 
 The scan is verified against known-positive controls. `--error tool_count_limit`
 finds exactly the three 2026-08-19 logs that carry it as an APIError event, not

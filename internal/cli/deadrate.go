@@ -13,8 +13,9 @@ package cli
 //
 // Sessions that ended on the CLA-584 output-cap stall (final step reason
 // "length", zero output) are reported in their own `stalled` column, never in
-// `dead`: they are a different, resumable end, and mixing them would blur both
-// measurements.
+// `dead`: they are a different end — on the opencode adapter a live, resumable
+// one — and mixing them would blur both measurements. The count is the shape
+// read off the logs, not a list of sessions the live driver resumed.
 
 import (
 	"context"

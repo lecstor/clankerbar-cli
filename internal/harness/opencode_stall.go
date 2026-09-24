@@ -67,8 +67,19 @@ func outputCapStallReasoning(res Result) int {
 //   - never on an unreadable stream: the marker itself was parsed from the
 //     bytes that may have been dropped whole (CLA-262), and the same gate keeps
 //     the adapter and the driver's classifications agreeing about what ended;
+//   - never once the run is being torn down: a cancelled context means the
+//     phase is already ending (Ctrl-C, SIGTERM, a supervised drain), and the
+//     resume would be killed on arrival — the sibling CLA-406 loop returns on
+//     ctx.Done for the same reason. Nothing is said in that case: an operator's
+//     teardown is not a stall diagnostic;
 //   - no session id, no resume — a stream that died before its first event has
-//     nothing on opencode's side to continue;
+//     nothing on opencode's side to continue. NO CLAIM GATE, deliberately,
+//     unlike CLA-406's probe path: the probe needs a held ref to verify
+//     coherence against and declines without one, while this resume asks
+//     nothing of the session and carries a steer that answers the shape itself.
+//     A session that burned its whole output budget before claiming is the same
+//     failure (and re-sends a tiny transcript, since the stalled step emitted
+//     nothing), so it is resumed on the same terms;
 //   - the wall-clock budget is re-checked first, then INHERITED by the resume
 //     (MaxSessionWallClock = what remains), so a stall cannot hand the session a
 //     fresh full cap the original never had;
@@ -78,6 +89,14 @@ func outputCapStallReasoning(res Result) int {
 //   - the resume's spend is never lost: mergeResume sums it on the success
 //     path, and an errored resume charges it explicitly — a resume re-sends the
 //     whole transcript, so it is real money even when it fails to help;
+//   - the resumed turn's CLAIM observation is folded even when the resume
+//     ERRORS, under the probe's own guard (trusted capture, same task): the
+//     turn may have recorded a branch or settled the task before the failure,
+//     and dropping that would let the driver release a task on the strength of
+//     the pre-resume claim — posting `ready` over work the resume just pushed.
+//     The guard's `Names` conjunct means a claim-less stall (see above) cannot
+//     fold a claim its resume made — a conservative miss, matching the probe's
+//     fold exactly, and not a guard to "fix" without changing both;
 //   - a clean resume is merged with mergeResume, so the driver sees ONE session
 //     that was stalled and carried on rather than two.
 //
@@ -86,6 +105,13 @@ func outputCapStallReasoning(res Result) int {
 // continuation), and NO further resume is attempted — the second consecutive
 // stall is terminal, as designed.
 func (o opencode) resumeOutputCapStall(ctx context.Context, in Invocation, res *Result, deadline time.Time) {
+	if ctx.Err() != nil {
+		// The run is ending under us; there is no turn left to save and a
+		// resume would be killed on arrival. The stall stands unremarked, as
+		// it would have without this path (see the ctx.Done arm of the
+		// CLA-406 loop, which does the same).
+		return
+	}
 	if res.Untrusted != "" {
 		return
 	}
@@ -117,6 +143,15 @@ func (o opencode) resumeOutputCapStall(ctx context.Context, in Invocation, res *
 		res.Tokens += contRes.Tokens
 		res.CostUSD += contRes.CostUSD
 		res.UsageReported = res.UsageReported || contRes.UsageReported
+		// The claim observation folds even here, under the probe's guard: an
+		// errored resume still ran a real turn, and one that recorded a branch
+		// (or settled the task) before the failure is describing STATE THIS
+		// SESSION REACHED. Dropping it would let releaseHeldClaim act on the
+		// stale pre-resume claim and hand a task back to `ready` over work the
+		// resume just pushed.
+		if contRes.Untrusted == "" && contRes.Claim.Names(res.Claim.TaskID) {
+			mergeObservation(res, contRes)
+		}
 		if in.Console != nil {
 			fmt.Fprintf(in.Console, "!! stall resume errored (%v) — leaving the stall\n", contErr)
 		}

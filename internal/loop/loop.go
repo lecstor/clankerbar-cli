@@ -3112,6 +3112,14 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 	if t.Releaser == nil {
 		return false
 	}
+	// A stalled session is named by its cause on THIS path too (CLA-584), not
+	// only on the held-with-work branch above: a stall that never pushed a
+	// branch is the shape that leaves nothing behind, so "handed back to the
+	// queue" alone would send the next clanker to rediscover the cause — the
+	// MAK-123 post-mortem's complaint. Computed before the release so the line
+	// that reports its outcome can carry it; the named line REPLACES the
+	// generic one on success, as it does above.
+	stallReason, stalled := outputCapStallReasoning(res)
 	// Detach from ctx: a cancelled run (Ctrl-C, SIGTERM) is exactly when a claim
 	// would otherwise be abandoned, so the handback has to outlive the signal that
 	// prompted it. Bounded, so a wedged plane cannot hold up the shutdown.
@@ -3123,6 +3131,11 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			log.Printf("%scould not hand %s back: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
 		}
 		return false
+	}
+	if stalled {
+		log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s; handed it back to the queue for another clanker",
+			labelOf(t), stallReason, claimLabel(res.Claim))
+		return true
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
 	return true
