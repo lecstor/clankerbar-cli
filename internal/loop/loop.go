@@ -1672,13 +1672,29 @@ func recordedBranches(res harness.Result) []string {
 // claimed, recorded no branch, and left the task sitting in `ready` is STILL
 // an empty exit — "nothing happened" — whatever this function would have said
 // about its manners.
-func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.Result, workdir string) (branch string, ok bool, why string) {
+//
+// CLA-576: an Unknown from form (a) is the ORIGIN being unreadable, not the
+// branch being absent, and it is returned as its own outcome (unverified=true,
+// ok=true) rather than flattened into the refusal. The phase is an UNVERIFIED
+// checkpoint: the review phase spawns, carrying the recorded branch, and is
+// told to verify the hand-off itself. A Fail — the origin was read and the
+// branch is not there — keeps today's refusal exactly. The accepted cost is a
+// narrow loosening of CLA-457: a session that recorded a branch it never
+// pushed, during a remote outage, reaches a review phase, which is the
+// backstop.
+func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.Result, workdir string) (branch string, ok bool, unverified bool, why string) {
 	branches := recordedBranches(res)
 
 	// Form (a): the recorded-branch check. Remember the first failure for the
 	// diagnostic; fall through to the plane-record forms when nothing here
 	// passes.
 	firstB, firstWhy := "", ""
+	// The first recorded branch whose check returned Unknown, kept apart from
+	// the Fail diagnostic: it is the branch an unverified checkpoint carries
+	// and the detail its log names (CLA-576). The bool is the discriminator, not
+	// the detail string: an Unknown check with an empty Detail is still an
+	// unreadable origin.
+	unknownB, unknownWhy, unknownSeen := "", "", false
 	if len(branches) > 0 {
 		if d.newVerifier == nil || workdir == "" {
 			firstB, firstWhy = branches[0], fmt.Sprintf("branch %q recorded but could not be checked (no working tree)", branches[0])
@@ -1697,11 +1713,14 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 						continue
 					}
 					if c.Status == delivery.Pass {
-						return b, true, ""
+						return b, true, false, ""
 					}
 					// Fail and Unknown both mean "not evidence" for THIS branch: an
 					// unreachable branch, or one we could not check. Keep scanning; a
 					// later recorded branch may be the one that is really there.
+					if c.Status == delivery.Unknown && !unknownSeen {
+						unknownB, unknownWhy, unknownSeen = b, c.Detail, true
+					}
 					if firstWhy == "" {
 						firstB, firstWhy = b, c.Detail
 					}
@@ -1714,7 +1733,19 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 	// Forms (b) and (c): the plane's own record of the task.
 	_, recordOK, recordWhy := d.planeExitRecord(ctx, t, res)
 	if recordOK {
-		return "", true, ""
+		return "", true, false, ""
+	}
+
+	// CLA-576: the origin could not be READ for at least one recorded branch,
+	// and no stronger form held. That is an unverified checkpoint, not an empty
+	// exit: carry the branch whose check was Unknown — never one the origin was
+	// read and refuted — and hand the review phase the Unknown detail so it can
+	// verify the hand-off itself. The unverified form is checked BEFORE the
+	// Fail-only diagnostic because a branch absent from a readable origin and a
+	// branch whose origin could not be read at all are different facts, and only
+	// the second one is a checkpoint.
+	if unknownSeen {
+		return unknownB, true, true, unknownWhy
 	}
 
 	// No form held. Compose the diagnostic from whichever legs ran: the plane's
@@ -1722,15 +1753,15 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 	// ran), else the legacy branch-only reasons, unchanged.
 	switch {
 	case firstWhy != "" && recordWhy != "":
-		return firstB, false, firstWhy + "; " + recordWhy
+		return firstB, false, false, firstWhy + "; " + recordWhy
 	case recordWhy != "":
-		return "", false, recordWhy
+		return "", false, false, recordWhy
 	case firstWhy != "":
-		return firstB, false, firstWhy
+		return firstB, false, false, firstWhy
 	case len(branches) > 0:
-		return "", false, "none of the recorded branches could be verified on the origin remote"
+		return "", false, false, "none of the recorded branches could be verified on the origin remote"
 	default:
-		return "", false, "no branch recorded on the task"
+		return "", false, false, "no branch recorded on the task"
 	}
 }
 
@@ -2142,9 +2173,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// re-judged as the bare exit it really is, and this is the only place the
 		// verification can run.
 		evidenceOK := true
+		evidenceUnverified := false
 		evidenceWhy := ""
 		if !last && canCheckpoint {
-			end.branch, evidenceOK, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir)
+			end.branch, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir)
 		}
 		// A held-but-empty exit (2026-08-24): a would-be checkpoint refused by the
 		// evidence gate — not by any of the older vetoes (dead, untrusted, not
@@ -2173,15 +2205,26 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// ride into the successor's brief, which names {{branch}} as
 				// verified on the origin remote (CLA-457), and the no-code
 				// brief is selected exactly on an empty claim branch.
+				//
+				// CLA-576: an UNVERIFIED checkpoint is the one exception, and it
+				// is marked rather than hidden. Its branch rides the claim (the
+				// review phase needs the name to verify it) with
+				// CheckpointUnverified set, so the successor's brief is the
+				// unverified variant - never the verified wording, which this
+				// checkpoint cannot support.
 				if end.branch != "" {
 					end.claim.Claim.Branch = end.branch
 				} else {
 					end.claim.Claim.Branch = ""
 				}
+				end.claim.CheckpointUnverified = evidenceUnverified
 			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
 					labelOf(t), drainNum, res.Claim.TaskID)
+			} else if end.branch != "" && evidenceUnverified {
+				log.Printf("%siteration %d: phase reached an UNVERIFIED checkpoint holding %s (branch %s recorded, but the origin remote could not be read: %s) — keeping the lease for the next phase; the review phase must verify the branch itself",
+					labelOf(t), drainNum, res.Claim.TaskID, end.branch, evidenceWhy)
 			} else if end.branch != "" {
 				log.Printf("%siteration %d: phase reached its checkpoint holding %s (branch %s verified on the origin remote) — keeping the lease for the next phase",
 					labelOf(t), drainNum, res.Claim.TaskID, end.branch)
@@ -2263,7 +2306,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				!res.Claim.Held() && (res.ExitCode == 0 || capped || ceiling || wallclock) {
 				if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask); claim != nil {
 					end.claim = claim
-					end.branch, evidenceOK, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir)
+					end.branch, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir)
 					if evidenceOK {
 						// Fold the VERIFIED branch onto the carried claim, exactly as
 						// the observed-claim checkpoint above does: a recovered claim
@@ -2272,11 +2315,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 						// invariant "the carried claim's branch is the verified one"
 						// is what verifiedBranch and the takeover hand-off depend on,
 						// so hold it by construction rather than by coincidence of a
-						// single-source read.
+						// single-source read. CLA-576: an unverified recovery rides
+						// the same way, marked so its brief is the unverified variant.
 						end.claim.Claim.Branch = end.branch
+						end.claim.CheckpointUnverified = evidenceUnverified
 						end.checkpoint = true
-						log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s verified on the origin remote — treating it as the phase checkpoint and keeping the lease for the next phase",
-							labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, end.branch)
+						if evidenceUnverified {
+							log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s recorded — the origin remote could not be read (%s), so this is an UNVERIFIED checkpoint: keeping the lease for the next phase; the review phase must verify the branch itself",
+								labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, end.branch, evidenceWhy)
+						} else {
+							log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s verified on the origin remote — treating it as the phase checkpoint and keeping the lease for the next phase",
+								labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, end.branch)
+						}
 					} else {
 						log.Printf("%siteration %d: the plane holds %s (run %s) with branch %q recorded, but that branch could not be verified on the origin remote (%s) — not treating it as a checkpoint; the lease expires with its hand-off intact",
 							labelOf(t), drainNum, claim.Claim.TaskID, claim.Claim.RunID, end.branch, evidenceWhy)
@@ -3844,9 +3894,20 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// prompt owns its own wording. The empty claim branch is the
 		// discriminator because drainPhase holds "claim.Branch is the verified
 		// branch, or empty when the evidence was branch-less" by construction.
+		//
+		// CLA-576: an UNVERIFIED checkpoint carries its recorded branch but no
+		// verification - the origin could not be read - so the branch-shaped
+		// builtin brief's "a branch the driver verified to exist on the origin
+		// remote" is the one claim that must not reach the successor. It gets
+		// the unverified variant instead, again for the built-in prompt only.
 		prompt := inv.Prompt
-		if prev.Claim.Branch == "" && prompt == config.BuiltinReviewBrief() {
-			prompt = config.NoCodeReviewBrief()
+		if prompt == config.BuiltinReviewBrief() {
+			switch {
+			case prev.Claim.Branch == "":
+				prompt = config.NoCodeReviewBrief()
+			case prev.CheckpointUnverified:
+				prompt = config.UnverifiedReviewBrief()
+			}
 		}
 		inv.Prompt = strings.NewReplacer(
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,

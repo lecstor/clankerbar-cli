@@ -607,6 +607,41 @@ const noCodeReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder
 	"the record (update_task, record_decision) - never by inventing code, a branch or a PR." + rerunGuidance +
 	noCodeReviewTerminalStep + handoffGuidance
 
+// unverifiedReviewBrief is the review brief for a checkpoint the driver could
+// NOT verify against the origin remote (CLA-576): the implement phase recorded
+// branch {{branch}} on the plane, but the driver's read of the remote failed
+// (network, a GitHub outage, a credential problem), so whether the branch was
+// ever pushed — and whether phase 1 did anything at all — is unknown. The
+// branch-shaped builtin brief would tell the successor "a branch the driver
+// verified to exist on the origin remote with its tip reachable, so phase 1
+// really did implement, commit and push", which is exactly the claim this
+// checkpoint cannot support. The successor is told the truth instead, and told
+// to verify the hand-off itself before reviewing anything: the review phase is
+// the backstop the 2026-09-24 decision accepted for the narrow loosening of
+// CLA-457 (a session that recorded a branch it never pushed, during an outage,
+// still reaches a review phase).
+const unverifiedReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase " +
+	"recorded branch " + PhaseBranchPlaceholder + " on the plane — but the driver could NOT verify that branch on " +
+	"the origin remote: its read of the remote failed (network, a GitHub outage, a credential problem), so whether " +
+	"phase 1 pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a " +
+	"verified hand-off: do NOT assume the branch exists, and do NOT assume phase 1 implemented, committed and " +
+	"pushed. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. " +
+	"Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true " +
+	"to re-read the bar and the standing decisions. FIRST verify the hand-off yourself, before any review: read " +
+	"branch " + PhaseBranchPlaceholder + " from the origin remote (git ls-remote origin " + PhaseBranchPlaceholder +
+	", or fetch it) and confirm it carries phase 1's work. If the branch is not on the origin remote, phase 1 did " +
+	"NOT deliver: report the failed hand-off in your outcome and hand the task over for a human decision — do not " +
+	"review a phantom diff. If the remote still cannot be read, say the hand-off could not be verified and end " +
+	"without inventing work. If the branch is there, work in the worktree for branch " + PhaseBranchPlaceholder +
+	" recorded on the task, and never commit to the integration branch (staging) - a session whose cwd is already " +
+	"the main checkout sitting on staging is not a decision to commit where you are, it is this failure mode. Read " +
+	"the diff on that branch. Then run the adversarial review gate, fix what it finds, and re-verify SCOPED to " +
+	"those fixes: brief the follow-up reviewer with the findings you fixed, by name, and point it at the fix " +
+	"commits (or, if not yet committed, the fix diff) and the regression surface they touch - not at the whole " +
+	"diff, whose full pass already happened. A full second pass is the exception you state a reason for (a fix " +
+	"that had to reach outside its own area), never the default." + rerunGuidance + reviewTerminalStep +
+	handoffGuidance
+
 // BuiltinReviewBrief returns the shipped review brief, so the driver can tell
 // whether a phase runs the built-in brief (vs an operator's custom prompt)
 // when it must choose a variant (CLA-497): a checkpoint evidenced by the
@@ -617,6 +652,11 @@ func BuiltinReviewBrief() string { return builtinPhasePrompts[ReviewPhaseName] }
 // NoCodeReviewBrief returns the review brief for a checkpoint evidenced by the
 // plane's record (CLA-497) - see noCodeReviewBrief.
 func NoCodeReviewBrief() string { return noCodeReviewBrief }
+
+// UnverifiedReviewBrief returns the review brief for a checkpoint the driver
+// could not verify against the origin remote (CLA-576) - see
+// unverifiedReviewBrief.
+func UnverifiedReviewBrief() string { return unverifiedReviewBrief }
 
 // NoCodeHandoffContinuation is HandoffContinuation for a no-code review
 // handoff (CLA-497): the branch-shaped reviewTerminalStep would tell the
