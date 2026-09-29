@@ -84,26 +84,50 @@ func contentTypeFor(path string) (string, bool) {
 	return t, ok
 }
 
+// checkReadable refuses a path that is missing or not a regular file, without
+// reading a byte of it. Both commands run this BEFORE their extension checks so
+// an unreadable file is reported as exactly that, rather than as a content-type
+// problem that --type cannot fix.
+func checkReadable(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fileError(path, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%q is not a regular file", path)
+	}
+	return nil
+}
+
+// fileError renders a filesystem failure with the path quoted. The operating
+// system's own rendering embeds the raw path (`open <path>: ...`), so a path
+// containing a newline would otherwise split a one-line stderr reason across
+// two lines; rebuilding the message from the wrapped cause is what makes the
+// quoted form the whole path, and it keeps errors.Is working against the cause.
+func fileError(path string, err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		return fmt.Errorf("%s %q: %w", pe.Op, path, pe.Err)
+	}
+	return fmt.Errorf("%q: %w", path, err)
+}
+
 // hashFile returns the file's sha256 (lowercase hex) and size, streaming it so
 // a large file is never held in memory. The plane verifies both against the
 // bytes the PUT delivers, so they are the declaration's whole substance.
 func hashFile(path string) (string, int64, error) {
-	fi, err := os.Stat(path)
-	if err != nil {
-		return "", 0, fmt.Errorf("open %s: %w", path, err)
-	}
-	if !fi.Mode().IsRegular() {
-		return "", 0, fmt.Errorf("%s is not a regular file", path)
+	if err := checkReadable(path); err != nil {
+		return "", 0, err
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", 0, fmt.Errorf("open %s: %w", path, err)
+		return "", 0, fileError(path, err)
 	}
 	defer f.Close()
 	h := sha256.New()
 	n, err := io.Copy(h, f)
 	if err != nil {
-		return "", 0, fmt.Errorf("read %s: %w", path, err)
+		return "", 0, fileError(path, err)
 	}
 	return hex.EncodeToString(h.Sum(nil)), n, nil
 }
@@ -200,11 +224,15 @@ func uploadRun(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return err
 	}
 
+	if err := checkReadable(path); err != nil {
+		return err
+	}
+
 	contentType := strings.TrimSpace(f.mime)
 	if contentType == "" {
 		detected, ok := contentTypeFor(path)
 		if !ok {
-			return fmt.Errorf("cannot tell the content type of %s from its extension - pass --type <mime> (e.g. --type image/png)", path)
+			return fmt.Errorf("cannot tell the content type of %q from its extension - pass --type <mime> (e.g. --type image/png)", path)
 		}
 		contentType = detected
 	}
@@ -243,19 +271,19 @@ func declareAndSend(ctx context.Context, api plane.UploadAPI, path, contentType,
 		return "", fmt.Errorf("upload: %w", err)
 	}
 	if ticket.AlreadyStored {
-		fmt.Fprintf(stderr, "%s is already stored in this project (%s, %d bytes) - reusing asset:%s\n",
+		fmt.Fprintf(stderr, "%q is already stored in this project (%q, %d bytes) - reusing asset:%s\n",
 			path, contentType, size, ticket.AssetID)
 		return ticket.AssetID, nil
 	}
 	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("open %s: %w", path, err)
+		return "", fileError(path, err)
 	}
 	defer f.Close()
 	if err := api.PutUpload(ctx, ticket.UploadURL, f, size, contentType); err != nil {
 		return "", fmt.Errorf("upload: %w", err)
 	}
-	fmt.Fprintf(stderr, "uploaded %s (%s, %d bytes) as asset:%s\n", path, contentType, size, ticket.AssetID)
+	fmt.Fprintf(stderr, "uploaded %q (%q, %d bytes) as asset:%s\n", path, contentType, size, ticket.AssetID)
 	return ticket.AssetID, nil
 }
 
@@ -278,11 +306,14 @@ func deckRun(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if strings.TrimSpace(f.task) == "" {
 		return errors.New("--task is required: a deck reviews one task, so the task it binds to must be named")
 	}
+	if err := checkReadable(path); err != nil {
+		return err
+	}
 	// A deck is HTML by definition; `upload_review_deck` only serves a ready
 	// text/html asset, so anything else is refused here rather than declared as
 	// HTML and refused there. .html/.htm is the only spelling accepted.
 	if t, ok := contentTypeFor(path); !ok || t != "text/html" {
-		return fmt.Errorf("deck expects an HTML file (a .html or .htm file): %s is not one", path)
+		return fmt.Errorf("deck expects an HTML file (a .html or .htm file): %q is not one", path)
 	}
 
 	sha, size, err := hashFile(path)
@@ -301,7 +332,7 @@ func deckRun(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	if err != nil {
 		return fmt.Errorf("deck: %w", err)
 	}
-	fmt.Fprintf(stderr, "deck for %s is live (asset:%s)\n", f.task, assetID)
+	fmt.Fprintf(stderr, "deck for %q is live (asset:%s)\n", f.task, assetID)
 	fmt.Fprintln(stdout, reviewURL)
 	return nil
 }

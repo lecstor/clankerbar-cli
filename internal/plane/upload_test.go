@@ -82,6 +82,52 @@ func TestCreateUpload_RefusalIsAnError(t *testing.T) {
 	}
 }
 
+// TestCreateUpload_UrlLessTicketIsNotStored: an answer carrying neither a status
+// nor a URL is uninterpretable, and must NOT read as "already stored" — that
+// would print a success for bytes the client never sent. AlreadyStored stays
+// false, and the empty URL is then refused by PutUpload.
+func TestCreateUpload_UrlLessTicketIsNotStored(t *testing.T) {
+	srv, _ := serve(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{\"assetId\":\"a-pending\"}"}]}}`)
+
+	ticket, err := NewUploadAPI(srv.URL+"/mcp/demo", "k-1").CreateUpload(context.Background(), CreateUploadRequest{
+		ContentType: "image/png",
+		SizeBytes:   3,
+		SHA256:      "x",
+	})
+	if err != nil {
+		t.Fatalf("CreateUpload: %v", err)
+	}
+	if ticket.AlreadyStored {
+		t.Error("AlreadyStored = true for a ticket with neither status:ready nor an upload URL")
+	}
+	if err := NewUploadAPI(srv.URL+"/mcp/demo", "k-1").PutUpload(context.Background(), ticket.UploadURL, strings.NewReader("x"), 1, "image/png"); err == nil {
+		t.Error("PutUpload with the empty URL = nil, want a refusal")
+	}
+}
+
+// TestCreateUpload_ZeroSizeRelaysThePlaneRefusal: a zero-byte file's size is a
+// declaration the plane owns (`invalid_size`), so the client must send it and
+// relay the refusal rather than invent a local message that misnames the fields
+// the caller does have.
+func TestCreateUpload_ZeroSizeRelaysThePlaneRefusal(t *testing.T) {
+	body := `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"{\"error\":{\"code\":\"invalid_size\",\"message\":\"sizeBytes must be a positive integer - the file's exact size in bytes.\"}}"}]}}`
+	srv, got := serve(t, http.StatusOK, body)
+
+	_, err := NewUploadAPI(srv.URL+"/mcp/demo", "k-1").CreateUpload(context.Background(), CreateUploadRequest{
+		ContentType: "image/png",
+		SizeBytes:   0,
+		SHA256:      strings.Repeat("ab", 32),
+	})
+	if err == nil || !strings.Contains(err.Error(), "invalid_size") {
+		t.Fatalf("err = %v, want the plane's invalid_size refusal carried through", err)
+	}
+	params, _ := got.body["params"].(map[string]any)
+	args, _ := params["arguments"].(map[string]any)
+	if args["sizeBytes"] != float64(0) {
+		t.Errorf("sizeBytes sent = %v, want 0 (the declaration the plane rules on)", args["sizeBytes"])
+	}
+}
+
 // TestPutUpload_NoKeyAndDeclaredLength: the token in the URL IS the auth, so
 // the account key must not ride along; the length is declared so the route can
 // refuse a mismatch before receiving a body.

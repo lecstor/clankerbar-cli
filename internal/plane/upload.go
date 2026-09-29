@@ -38,8 +38,8 @@ type CreateUploadRequest struct {
 
 // UploadTicket is what create_upload handed back. UploadURL is the single-use,
 // token-authenticated PUT target; AlreadyStored is the plane's "these exact
-// bytes are already in this project" answer, in which case no URL is returned
-// and the asset id is the whole result.
+// bytes are already in this project" answer — `status: "ready"` — in which case
+// no URL is returned and the asset id is the whole result.
 type UploadTicket struct {
 	AssetID       string
 	UploadURL     string
@@ -103,8 +103,14 @@ const uploadTimeout = 5 * time.Minute
 
 // CreateUpload calls the plane's create_upload.
 func (r *mcpReleaser) CreateUpload(ctx context.Context, req CreateUploadRequest) (UploadTicket, error) {
-	if req.ContentType == "" || req.SizeBytes <= 0 || req.SHA256 == "" {
-		return UploadTicket{}, errors.New("create upload: contentType, sizeBytes and sha256 are all required")
+	// Only the two fields this client always fills are checked here. Size is
+	// deliberately NOT: zero bytes is a declaration only the plane rules on
+	// (`invalid_size`), and a local refusal would both misname the fields the
+	// caller does have and duplicate a rule the design says the plane owns. An
+	// empty file reaches the plane, and the plane's own refusal is what the
+	// caller sees.
+	if req.ContentType == "" || req.SHA256 == "" {
+		return UploadTicket{}, errors.New("create upload: contentType and sha256 are required")
 	}
 	args := map[string]any{
 		"contentType": req.ContentType,
@@ -134,10 +140,13 @@ func (r *mcpReleaser) CreateUpload(ctx context.Context, req CreateUploadRequest)
 		AssetID:   wire.AssetID,
 		UploadURL: wire.UploadURL,
 		ExpiresAt: wire.ExpiresAt,
-		// The already-stored answer carries `status: "ready"` and no URL. Both
-		// are read: a "ready" asset is never re-uploaded, and a response with no
-		// URL has nothing to PUT to either way.
-		AlreadyStored: wire.Status == "ready" || wire.UploadURL == "",
+		// The already-stored answer is the one the plane labels `status: "ready"`
+		// and returns with no URL. Deliberately NOT `|| wire.UploadURL == ""`: an
+		// answer carrying neither is uninterpretable, and reading it as stored
+		// would print a success for bytes that were never sent. Required, such a
+		// ticket falls through to PutUpload, which refuses it as "no upload URL"
+		// instead of claiming a store that did not happen.
+		AlreadyStored: wire.Status == "ready",
 	}, nil
 }
 

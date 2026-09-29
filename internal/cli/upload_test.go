@@ -149,12 +149,33 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// testKey is distinctive enough that a substring check means something: the
+// requirement is that the account key appears NOWHERE, success or failure, and
+// a one-letter key would make `strings.Contains` trivially true everywhere.
+const testKey = "test-key-do-not-print"
+
+// assertNoKey fails when the account key appears in the command's output or in
+// its returned error. The happy-path tests pin stdout already; this is the same
+// requirement applied to every refusal, where an interpolated key would
+// otherwise ship unremarked.
+func assertNoKey(t *testing.T, err error, stdout, stderr *bytes.Buffer) {
+	t.Helper()
+	for _, s := range []string{stdout.String(), stderr.String()} {
+		if strings.Contains(s, testKey) {
+			t.Errorf("the API key appears in output: %q", s)
+		}
+	}
+	if err != nil && strings.Contains(err.Error(), testKey) {
+		t.Errorf("the API key appears in the error: %v", err)
+	}
+}
+
 // TestUploadStdoutCarriesOnlyTheAssetRef is the compose-in-a-script contract:
 // `IMG=$(clankerbar upload shot.png)` must capture the reference and nothing
 // else, while the human line goes to stderr.
 func TestUploadStdoutCarriesOnlyTheAssetRef(t *testing.T) {
 	plane := newFakePlane(t)
-	t.Setenv("CLANKERBAR_API_KEY", "test-key-do-not-print")
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
 	img := writeUploadFile(t, "shot.png", []byte("\x89PNG\r\n\x1a\n not really a png"))
 	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
 
@@ -169,7 +190,7 @@ func TestUploadStdoutCarriesOnlyTheAssetRef(t *testing.T) {
 	if stderr.Len() == 0 {
 		t.Error("stderr carries no human line")
 	}
-	if strings.Contains(stderr.String(), "test-key-do-not-print") || strings.Contains(stdout.String(), "test-key-do-not-print") {
+	if strings.Contains(stderr.String(), testKey) || strings.Contains(stdout.String(), testKey) {
 		t.Error("the API key appears in the command's output")
 	}
 
@@ -180,7 +201,7 @@ func TestUploadStdoutCarriesOnlyTheAssetRef(t *testing.T) {
 	if calls[0].path != "/mcp/acme" {
 		t.Errorf("MCP path = %q, want the config's /mcp/acme", calls[0].path)
 	}
-	if calls[0].auth != "Bearer test-key-do-not-print" {
+	if calls[0].auth != "Bearer "+testKey {
 		t.Errorf("MCP Authorization = %q, want the CLANKERBAR_API_KEY bearer", calls[0].auth)
 	}
 	if got := calls[0].args["contentType"]; got != "image/png" {
@@ -333,11 +354,65 @@ func TestUploadAlreadyStoredSkipsThePut(t *testing.T) {
 	}
 }
 
+// TestUploadUrlLessTicketIsNotASuccess: a declaration answer carrying neither a
+// status nor a URL is uninterpretable. Reading it as already-stored would print
+// `asset:<id>` and exit 0 for bytes that were never sent; it must fail instead,
+// with nothing on stdout.
+func TestUploadUrlLessTicketIsNotASuccess(t *testing.T) {
+	plane := newFakePlane(t)
+	plane.createUploadBody = `{"assetId":"asset-pending"}`
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
+	img := writeUploadFile(t, "shot.png", []byte("png"))
+	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
+
+	var stdout, stderr bytes.Buffer
+	err := uploadRun(context.Background(), []string{"-c", cfg, img}, &stdout, &stderr)
+	if err == nil {
+		t.Fatal("err = nil, want a refusal for a ticket with no upload URL")
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing", stdout.String())
+	}
+	assertNoKey(t, err, &stdout, &stderr)
+	if _, _, puts := plane.snapshot(); len(puts) != 0 {
+		t.Errorf("PUTs = %+v, want none (there is no URL to PUT to)", puts)
+	}
+}
+
+// TestUploadEmptyFileRelaysThePlaneRefusal: a zero-byte file is a declaration
+// the plane rules on (invalid_size); the CLI sends it and relays the plane's
+// words instead of inventing a local refusal that misnames the fields.
+func TestUploadEmptyFileRelaysThePlaneRefusal(t *testing.T) {
+	plane := newFakePlane(t)
+	plane.createUploadError = true
+	plane.createUploadBody = `{"error":{"code":"invalid_size","message":"sizeBytes must be a positive integer - the file's exact size in bytes."}}`
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
+	empty := writeUploadFile(t, "empty.png", nil)
+	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
+
+	var stdout, stderr bytes.Buffer
+	err := uploadRun(context.Background(), []string{"-c", cfg, empty}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "invalid_size") {
+		t.Fatalf("err = %v, want the plane's invalid_size refusal carried through", err)
+	}
+	if stdout.Len() != 0 {
+		t.Errorf("stdout = %q, want nothing", stdout.String())
+	}
+	assertNoKey(t, err, &stdout, &stderr)
+	_, calls, _ := plane.snapshot()
+	if len(calls) != 1 || calls[0].name != "create_upload" {
+		t.Fatalf("MCP calls = %+v, want exactly one create_upload", calls)
+	}
+	if calls[0].args["sizeBytes"] != float64(0) {
+		t.Errorf("declared sizeBytes = %v, want 0 sent to the plane", calls[0].args["sizeBytes"])
+	}
+}
+
 // Each error exit gets a named reason on stderr (via main's log.Fatal) and,
 // where the failure precedes any network call, must not touch the plane.
 func TestUploadErrorExits(t *testing.T) {
 	plane := newFakePlane(t)
-	t.Setenv("CLANKERBAR_API_KEY", "k")
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
 	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
 	png := writeUploadFile(t, "shot.png", []byte("png"))
 	unknown := writeUploadFile(t, "archive.xyz", []byte("?"))
@@ -355,6 +430,7 @@ func TestUploadErrorExits(t *testing.T) {
 		if stdout.Len() != 0 {
 			t.Errorf("stdout = %q, want nothing", stdout.String())
 		}
+		assertNoKey(t, err, &stdout, &stderr)
 	})
 
 	t.Run("directory is not a file", func(t *testing.T) {
@@ -363,6 +439,7 @@ func TestUploadErrorExits(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "not a regular file") {
 			t.Fatalf("err = %v, want a not-a-file refusal", err)
 		}
+		assertNoKey(t, err, &stdout, &stderr)
 	})
 
 	t.Run("unknown type without --type", func(t *testing.T) {
@@ -371,6 +448,22 @@ func TestUploadErrorExits(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "--type") {
 			t.Fatalf("err = %v, want a refusal naming --type", err)
 		}
+		assertNoKey(t, err, &stdout, &stderr)
+	})
+
+	t.Run("missing file beats the unknown extension", func(t *testing.T) {
+		// The file is unreadable AND untypeable; the reason must be the one
+		// --type cannot fix.
+		var stdout, stderr bytes.Buffer
+		missing := filepath.Join(t.TempDir(), "gone.xyz")
+		err := uploadRun(context.Background(), []string{"-c", cfg, missing}, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "gone.xyz") {
+			t.Fatalf("err = %v, want one naming the missing file", err)
+		}
+		if strings.Contains(err.Error(), "pass --type") {
+			t.Errorf("err = %v, want the unreadable file blamed, not the extension", err)
+		}
+		assertNoKey(t, err, &stdout, &stderr)
 	})
 
 	t.Run("missing api key", func(t *testing.T) {
@@ -380,6 +473,7 @@ func TestUploadErrorExits(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "CLANKERBAR_API_KEY") {
 			t.Fatalf("err = %v, want a refusal naming CLANKERBAR_API_KEY", err)
 		}
+		assertNoKey(t, err, &stdout, &stderr)
 	})
 
 	// Every subtest above failed before the plane was touched.
@@ -394,7 +488,7 @@ func TestUploadPlaneRefusalPassesThrough(t *testing.T) {
 	plane := newFakePlane(t)
 	plane.createUploadError = true
 	plane.createUploadBody = `{"error":{"code":"unsupported_content_type","message":"Content type 'application/pdf' is not allowed. Allowed: image/png, text/html."}}`
-	t.Setenv("CLANKERBAR_API_KEY", "k")
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
 	doc := writeUploadFile(t, "doc.pdf", []byte("%PDF"))
 	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
 
@@ -411,6 +505,7 @@ func TestUploadPlaneRefusalPassesThrough(t *testing.T) {
 	if stdout.Len() != 0 {
 		t.Errorf("stdout = %q, want nothing on a refused upload", stdout.String())
 	}
+	assertNoKey(t, err, &stdout, &stderr)
 	_, _, puts := plane.snapshot()
 	if len(puts) != 0 {
 		t.Errorf("PUTs = %+v, want none after a refused declaration", puts)
@@ -422,7 +517,7 @@ func TestUploadPlaneRefusalPassesThrough(t *testing.T) {
 // cannot be mistaken for one another.
 func TestUploadPutRefusalNamesItsCause(t *testing.T) {
 	plane := newFakePlane(t)
-	t.Setenv("CLANKERBAR_API_KEY", "k")
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
 	img := writeUploadFile(t, "shot.png", []byte("png"))
 	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
 
@@ -472,6 +567,7 @@ func TestUploadPutRefusalNamesItsCause(t *testing.T) {
 			if stdout.Len() != 0 {
 				t.Errorf("stdout = %q, want nothing on a failed PUT", stdout.String())
 			}
+			assertNoKey(t, err, &stdout, &stderr)
 		})
 	}
 }
@@ -480,7 +576,7 @@ func TestUploadPutRefusalNamesItsCause(t *testing.T) {
 // no single answer, and the refusal names the flag that fixes it.
 func TestUploadMultiProjectNeedsProject(t *testing.T) {
 	plane := newFakePlane(t)
-	t.Setenv("CLANKERBAR_API_KEY", "k")
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
 	img := writeUploadFile(t, "shot.png", []byte("png"))
 	cfgPath := filepath.Join(t.TempDir(), "config.json")
 	body := fmt.Sprintf(`{"backlog_url":%q,"projects":[{"slug":"one"},{"slug":"two"}]}`, plane.srv.URL)
@@ -493,6 +589,7 @@ func TestUploadMultiProjectNeedsProject(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "--project") {
 		t.Fatalf("err = %v, want a refusal naming --project", err)
 	}
+	assertNoKey(t, err, &stdout, &stderr)
 	if events, _, _ := plane.snapshot(); len(events) != 0 {
 		t.Errorf("the plane was called without a project: %v", events)
 	}
@@ -502,7 +599,7 @@ func TestUploadMultiProjectNeedsProject(t *testing.T) {
 // the task, and prints exactly the review URL for scripts to capture.
 func TestDeckPrintsTheReviewURL(t *testing.T) {
 	plane := newFakePlane(t)
-	t.Setenv("CLANKERBAR_API_KEY", "test-key-do-not-print")
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
 	html := []byte("<!doctype html><title>deck</title>")
 	deck := writeUploadFile(t, "deck.html", html)
 	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
@@ -514,9 +611,10 @@ func TestDeckPrintsTheReviewURL(t *testing.T) {
 	if got, want := stdout.String(), "https://clankerbar.com/review/abc\n"; got != want {
 		t.Errorf("stdout = %q, want exactly the review URL %q", got, want)
 	}
-	if strings.Contains(stdout.String(), "test-key-do-not-print") {
+	if strings.Contains(stdout.String(), testKey) {
 		t.Error("the API key appears in stdout")
 	}
+	assertNoKey(t, nil, &stdout, &stderr)
 
 	events, calls, puts := plane.snapshot()
 	if len(calls) != 2 {
@@ -542,7 +640,7 @@ func TestDeckPrintsTheReviewURL(t *testing.T) {
 
 func TestDeckErrorExits(t *testing.T) {
 	plane := newFakePlane(t)
-	t.Setenv("CLANKERBAR_API_KEY", "k")
+	t.Setenv("CLANKERBAR_API_KEY", testKey)
 	cfg := writeUploadConfig(t, plane.srv.URL+"/mcp/acme")
 	deck := writeUploadFile(t, "deck.html", []byte("<html></html>"))
 	png := writeUploadFile(t, "shot.png", []byte("png"))
@@ -553,6 +651,7 @@ func TestDeckErrorExits(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "--task") {
 			t.Fatalf("err = %v, want a refusal naming --task", err)
 		}
+		assertNoKey(t, err, &stdout, &stderr)
 	})
 
 	t.Run("non-HTML file refused before any call", func(t *testing.T) {
@@ -561,6 +660,22 @@ func TestDeckErrorExits(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "HTML") {
 			t.Fatalf("err = %v, want a refusal naming HTML", err)
 		}
+		assertNoKey(t, err, &stdout, &stderr)
+	})
+
+	t.Run("missing file beats the HTML check", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		missing := filepath.Join(t.TempDir(), "gone.png")
+		err := deckRun(context.Background(), []string{"-c", cfg, "--task", "CB-1", missing}, &stdout, &stderr)
+		if err == nil || !strings.Contains(err.Error(), "gone.png") {
+			t.Fatalf("err = %v, want one naming the missing file", err)
+		}
+		// The sentinel is the refusal's own phrase, not "HTML": the temp path
+		// carries the subtest's name, which contains it.
+		if strings.Contains(err.Error(), "deck expects") {
+			t.Errorf("err = %v, want the unreadable file blamed, not the extension", err)
+		}
+		assertNoKey(t, err, &stdout, &stderr)
 	})
 
 	if events, _, _ := plane.snapshot(); len(events) != 0 {
