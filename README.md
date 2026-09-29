@@ -390,6 +390,8 @@ clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
 clankerbar ctl restart -c ./clankerbar.json   # tell the RUNNING daemon to re-exec
 clankerbar ctl reload  -c ./clankerbar.json   # re-read the config file, no exec
 clankerbar propose-config                     # import this file into the plane (PENDING)
+clankerbar upload shot.png                    # print asset:<id> (the bytes never leave the shell)
+clankerbar deck deck.html --task CLA-581      # upload a review deck, print its review URL
 ```
 
 ### The fleet supervisor: bare `clankerbar`
@@ -662,6 +664,42 @@ dead; the CLA-386 takeover held WIP inherited through its own claim result, so
 it ran but did not die; the two CLA-390 sessions never got past their claim and
 count toward neither counter; and two further deaths fall after the mid-day
 snapshot. Over the full day the scan reports 5 dead of 23.
+
+### Uploads: `clankerbar upload` and `clankerbar deck`
+
+Two agent-facing subcommands put a file into a project's asset store and hand
+back a reference to paste, so a screenshot, a video or a review deck is
+described by its **path** rather than typed into a tool argument as base64. The
+bytes are sent by the CLI itself, straight from the file on disk: what leaves
+the shell is the file's path, content type, size and sha256 — never its
+contents.
+
+```sh
+IMG=$(clankerbar upload shot.png)                 # stdout is exactly asset:<id>
+clankerbar upload clip.mp4 --task CLA-581         # attribute the file to a task
+clankerbar upload shot.bin --type image/png       # when the extension doesn't say
+URL=$(clankerbar deck deck.html --task CLA-581)   # stdout is exactly the review URL
+```
+
+`upload` prints **exactly** `asset:<id>` on stdout — `IMG=$(clankerbar upload
+shot.png)` is the whole point — and `deck` prints exactly the review URL;
+everything a human wants to read goes to stderr. `deck` uploads the HTML as a
+`text/html` asset and binds it to the task, so the task's review URL points at
+the rendered deck.
+
+The plane owns the rules: the content-type allowlist and the size caps are
+checked on the declaration, and its refusal text is what you see, not a
+paraphrase. The commands exit non-zero with a one-line stderr reason when the
+file is unreadable, the type cannot be told and no `--type` was given, the plane
+refuses the declaration, or the upload fails — the last names the HTTP status
+and the plane's own error code, so a 401/403 is never mistaken for a hash or
+size mismatch.
+
+Auth is the same `CLANKERBAR_API_KEY` the daemon uses, and the project comes
+from the daemon config or `--project <slug>`; the key is never printed,
+including in errors. A **headless** session fails closed, so grant both
+commands in its policy (`headless.json`) or they are refused with no prompt:
+`Bash(clankerbar upload:*)` and `Bash(clankerbar deck:*)`.
 
 ### Sleep, on laptops
 
