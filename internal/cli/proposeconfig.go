@@ -61,7 +61,7 @@ func ProposeConfig(ctx context.Context, args []string) error {
 		return err
 	}
 
-	slug, err := pickSlug(cfg, f.slug)
+	slug, err := pickSlug(cfg, f.slug, "--slug")
 	if err != nil {
 		return err
 	}
@@ -100,10 +100,13 @@ func ProposeConfig(ctx context.Context, args []string) error {
 	return nil
 }
 
-// pickSlug resolves the ONE project the import targets. Multi-project configs
-// share their top-level dials across every entry today, so the honest import is
-// one project at a time, named explicitly rather than fanned out silently.
-func pickSlug(cfg *config.Config, want string) (string, error) {
+// pickSlug resolves the ONE project a command targets when the caller named
+// none. Multi-project configs have no single answer, so the caller's own flag
+// (named here so its rejections point at the flag that fixes them) is required
+// explicitly rather than one entry being fanned out silently.
+//
+// Called by propose-config with --slug and by upload/deck with --project.
+func pickSlug(cfg *config.Config, want, flag string) (string, error) {
 	switch {
 	case want != "":
 		for _, p := range cfg.Projects {
@@ -116,7 +119,7 @@ func pickSlug(cfg *config.Config, want string) (string, error) {
 			for _, p := range cfg.Projects {
 				have = append(have, p.Slug)
 			}
-			return "", fmt.Errorf("--slug %q matches no configured project (have: %s)", want, strings.Join(have, ", "))
+			return "", fmt.Errorf("%s %q matches no configured project (have: %s)", flag, want, strings.Join(have, ", "))
 		}
 		return want, nil
 	case len(cfg.Projects) == 1:
@@ -126,14 +129,14 @@ func pickSlug(cfg *config.Config, want string) (string, error) {
 		for _, p := range cfg.Projects {
 			have = append(have, p.Slug)
 		}
-		return "", fmt.Errorf("--slug is required when the config names more than one project (have: %s)", strings.Join(have, ", "))
+		return "", fmt.Errorf("%s is required when the config names more than one project (have: %s)", flag, strings.Join(have, ", "))
 	default:
 		// Single-project mode: the .mcp.json's /mcp/<slug> URL names the project
 		// the same way the poll does. No slug there means the operator must say.
 		if slug := cfg.Slug(); slug != "" {
 			return slug, nil
 		}
-		return "", errors.New("--slug is required: neither a projects[] entry nor an .mcp.json naming /mcp/<slug> says which project to propose against")
+		return "", fmt.Errorf("%s is required: neither a projects[] entry nor an .mcp.json naming /mcp/<slug> says which project to target", flag)
 	}
 }
 

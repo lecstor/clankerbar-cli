@@ -215,6 +215,10 @@ func wiredClient(mcpURL, apiKey string) *mcpReleaser {
 		endpoint: strings.TrimRight(mcpURL, "/"),
 		apiKey:   apiKey,
 		client:   &http.Client{Timeout: 20 * time.Second, CheckRedirect: noDowngradeRedirect},
+		// The PUT carries a whole file, so it gets its own, longer deadline
+		// (see uploadTimeout); same redirect rule, since a downgrade would put
+		// the URL's capability token on the wire in cleartext.
+		upload: &http.Client{Timeout: uploadTimeout, CheckRedirect: noDowngradeRedirect},
 	}
 }
 
@@ -222,6 +226,7 @@ type mcpReleaser struct {
 	endpoint string
 	apiKey   string
 	client   *http.Client
+	upload   *http.Client
 }
 
 func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
