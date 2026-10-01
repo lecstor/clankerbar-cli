@@ -39,10 +39,17 @@ import (
 // happened, do not repeat it, and the specific redirect the MAK-123 shape
 // needs. Kept short because the session keeps its whole transcript — everything
 // else it needs is already there.
+//
+// The redirect names the commands (CLA-581) rather than only saying "upload it
+// by path": nothing else the session reads does — the served review-deck skill
+// still teaches data: URIs, the MAK-123 path itself — so a steer without the
+// command leaves the model to guess, and a second stall is terminal.
 const opencodeStallSteerPrompt = `Your previous step hit the output token limit while thinking and produced no output; ` +
 	`you are resumed in place and your transcript is intact. Do not retry the same approach. If you were ` +
 	`about to transcribe file contents (for example base64 image data) into a tool argument, do not: write ` +
-	`the file to disk and upload it by path instead. Then continue where you left off.`
+	`the file to disk and upload it by path instead. Run "clankerbar upload <file>" and use the asset:<id> it ` +
+	`prints on stdout as the reference; for a review deck, run "clankerbar deck <file.html> --task <ref>", which ` +
+	`prints the review URL. Then continue where you left off.`
 
 // opencodeStallWallClockMsg is the console line for the one place the wall-clock
 // gate can decline the stall resume: the remaining budget is under the
