@@ -394,12 +394,38 @@ const TerminalReasonKey = "terminal_reason"
 // "stop" on a healthy completion.
 const FinishReasonUnknown = "unknown"
 
+// FinishReasonLength is opencode's step_finish reason for a step the model
+// ended by hitting its output token limit: the cap, not a completed answer and
+// not a silent death. A FINAL "length" step that produced zero output tokens is
+// the CLA-584 output-cap stall — the model spent the step's whole output budget
+// reasoning and emitted nothing (the MAK-123 shape: reasoning=32000, output=0).
+const FinishReasonLength = "length"
+
 // ZeroUsageReason is the terminal_reason the opencode adapter writes into a
 // Result when the session's final step_finish carried reason "unknown" with
 // all-zero usage — the CLA-398 quiet-death signature, read back through
 // Adapter.ZeroUsageUnknown. Like the finish_reason key it lives on Result.Raw,
 // which is the adapter-to-driver channel the loop already reads.
 const ZeroUsageReason = "zero_usage_unknown"
+
+// OutputCapReason is the terminal_reason the opencode adapter writes into a
+// Result when the session's final step_finish carried reason "length" with
+// ZERO output tokens — the CLA-584 output-cap stall, read back through
+// opencode.OutputCapNoOutput. It is a DIFFERENT end from the CLA-398 quiet
+// death: the model ran, spent real output budget on reasoning and emitted
+// nothing, and opencode ended the turn cleanly — so the session is alive and
+// resumable, where the quiet death's stream was dropped. The driver names the
+// end with it in place of its generic "never moved the task on" line.
+const OutputCapReason = "output_cap_no_output"
+
+// OutputCapReasoningKey is the Result.Raw key carrying the stalled final step's
+// OWN reasoning-token count, which is what makes the stall legible in a log
+// line — how much thinking bought nothing. Read by the driver's named
+// `stalled: output cap hit with no output (reasoning=<n>)` line. Because it
+// describes ONE step, mergeResume recomputes it from the continuation rather
+// than summing it: a second consecutive stall replaces the first's figure, and
+// a recovered resume clears it with the marker.
+const OutputCapReasoningKey = "output_cap_reasoning"
 
 type Result struct {
 	ExitCode int
@@ -459,6 +485,17 @@ type Result struct {
 	// Claim is the backlog task this session was still holding when it ended, so
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
+
+	// CheckpointUnverified marks this Result as the hand-off for a phase that
+	// reached its checkpoint on an UNVERIFIED branch (CLA-576): the phase
+	// recorded Claim.Branch on the plane, but the driver's read of the origin
+	// remote failed (network, a GitHub outage, a credential problem), so it is
+	// unknown whether the branch was ever pushed. The branch is still carried —
+	// the review phase is the backstop — but the successor's brief must not
+	// describe it as verified on the origin remote (CLA-457), and the review
+	// session is told to verify the hand-off itself. False for every verified
+	// checkpoint and for the branch-less plane-record forms (CLA-497).
+	CheckpointUnverified bool
 
 	// onClaim is the Invocation.OnClaim callback bound into this Result at
 	// construction (newSessionResult), so the shared observer can notify it

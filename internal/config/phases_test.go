@@ -878,6 +878,71 @@ func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
 	}
 }
 
+// CLA-576: an unverified checkpoint - the implement phase recorded a branch,
+// but the driver's read of the origin remote failed - must not reach its
+// successor with the branch-shaped brief's "a branch the driver verified to
+// exist on the origin remote ... so phase 1 really did implement, commit and
+// push". The unverified brief states the checkpoint is unverified, tells the
+// review phase to verify the hand-off itself first, and still carries the
+// review contract: resume-don't-claim, the adversarial gate, the scoped
+// re-verification, the staging rule and the pinned terminal step.
+func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
+	for _, want := range []string{
+		// The honest state of the checkpoint.
+		"could NOT verify that branch on the origin remote",
+		"UNKNOWN",
+		"UNVERIFIED",
+		"do NOT assume phase 1 implemented, committed and pushed",
+		// The cause is the CHECK not completing, never a remote-read failure
+		// asserted as fact: delivery.Unknown also covers a check that never
+		// reached the remote (no local branch to compare, an ambiguous repo).
+		"its check did not complete",
+		"a check that never reached the remote is possible too",
+		// The self-verification step, before any review.
+		"FIRST verify the hand-off yourself",
+		"git ls-remote origin " + PhaseBranchPlaceholder,
+		// The absent-branch outcome: report it, never review a phantom diff.
+		"do not review a phantom diff",
+		// The still-unreadable arm names the hand-over rather than leaving the
+		// session to end holding the task against the terminal step.
+		"hand the task over as the terminal step below requires",
+		// The resume contract and the review gate survive.
+		"do not call next_task",
+		"heartbeat(",
+		"get_task with includeDecisions: true",
+		"adversarial review gate",
+		"re-verify SCOPED to those fixes",
+		// The branch still names the worktree, with the staging rule.
+		"worktree for branch " + PhaseBranchPlaceholder,
+		"never commit to the integration branch",
+	} {
+		if !strings.Contains(unverifiedReviewBrief, want) {
+			t.Errorf("unverified review brief does not say %q:\n%s", want, unverifiedReviewBrief)
+		}
+	}
+	// The verified claim itself must be ABSENT: it is exactly what this
+	// checkpoint cannot support, and the trap CLA-576 names.
+	if strings.Contains(unverifiedReviewBrief, "verified to exist on the origin remote") ||
+		strings.Contains(unverifiedReviewBrief, "really did implement, commit and push") {
+		t.Errorf("the unverified review brief asserts the verified-branch claim it cannot support:\n%s", unverifiedReviewBrief)
+	}
+	// The no-code brief's shape must not be reused either: there IS a branch,
+	// and its empty-branch discriminator must stay the no-code form's alone.
+	if strings.Contains(unverifiedReviewBrief, "There is NO branch") {
+		t.Errorf("the unverified review brief tells the successor there is no branch:\n%s", unverifiedReviewBrief)
+	}
+	// Position, like the other built-in review briefs: the terminal step is the
+	// last thing before the shared handoff guidance.
+	if !strings.HasSuffix(unverifiedReviewBrief, reviewTerminalStep+handoffGuidance) {
+		t.Errorf("the unverified terminal step is not the last thing before the handoff guidance:\n%s", unverifiedReviewBrief)
+	}
+	// And it is a variant, not the branch-shaped brief itself, so the driver's
+	// selection is meaningful: an unverified checkpoint swaps one for the other.
+	if unverifiedReviewBrief == builtinPhasePrompts[ReviewPhaseName] {
+		t.Error("the unverified brief is the branch-shaped built-in brief")
+	}
+}
+
 // CLA-353: a handoff respawn replaces ph.Prompt wholesale with
 // config.HandoffPreamble plus the predecessor's self-authored prompt (CLA-352) —
 // the built-in brief text, including reviewTerminalStep, is not otherwise part of

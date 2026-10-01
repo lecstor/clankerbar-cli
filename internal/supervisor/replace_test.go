@@ -323,6 +323,7 @@ func TestReplaceMidDrainFleetStopAbortsWithoutFallingThroughToReconcile(t *testi
 		}
 	})
 }
+
 // The replacement is scoped to local placement (Decision 7): the drain acts
 // on the supervisor's own instances, which reconcile builds from local
 // entries only — a remote entry never becomes an instance, so it is never

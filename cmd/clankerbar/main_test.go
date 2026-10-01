@@ -66,6 +66,8 @@ func TestHelpAndVersionExitZero(t *testing.T) {
 		{"clankerbar", "help"},
 		{"clankerbar", "version"},
 		{"clankerbar", "supervise", "--help"},
+		{"clankerbar", "upload", "--help"},
+		{"clankerbar", "deck", "--help"},
 	} {
 		if code := run(args); code != 0 {
 			t.Fatalf("%v exited %d, want 0", args, code)

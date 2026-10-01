@@ -40,6 +40,18 @@ Usage:
                                 phase and per harness, how many sessions ran and
                                 how many died producing nothing (the dead-phase
                                 rate).
+  clankerbar upload <file>      Upload a file (screenshot, video, HTML) as a
+                                project asset and print exactly asset:<id> on
+                                stdout. The byte-free path: only the file's
+                                path, type, size and sha256 leave the shell —
+                                its bytes are sent by this process, never
+                                through a model or a tool argument. --task
+                                attributes the file to a task; --type overrides
+                                the content type its extension implies.
+  clankerbar deck <file.html>   Upload a self-contained review deck for a task
+    --task <ref|id>             and print its review URL. Same byte-free path:
+                                the HTML goes up as a text/html asset, then
+                                binds to the task as its review deck.
   clankerbar supervise roll    Roll the fleet onto the version THIS binary
                                 runs, one child at a time: install the new
                                 build at the fleet's launch path and run this
@@ -62,7 +74,7 @@ Usage:
   clankerbar help               Show this help.
 
 Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
---help', 'clankerbar doctor --help' or 'clankerbar propose-config --help' for
-their flags.
+--help', 'clankerbar doctor --help', 'clankerbar propose-config --help',
+'clankerbar upload --help' or 'clankerbar deck --help' for their flags.
 `)
 }
