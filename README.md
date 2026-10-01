@@ -1464,7 +1464,8 @@ whole step's output budget thinking and emitted nothing. It is not the quiet
 death (that is reason `unknown` with all-zero usage, and its stream was dropped)
 — opencode ended this turn normally and the session is alive, so the adapter
 resumes it exactly ONCE with a steer: do not retry the approach, and upload file
-contents by path rather than transcribing them into a tool argument. A second
+contents by path (`clankerbar upload` / `clankerbar deck`, which the steer names)
+rather than transcribing them into a tool argument. A second
 consecutive stall ends the session, and the daemon log names it
 (`stalled: output cap hit with no output (reasoning=<n>)`) instead of reporting
 a bare "never moved the task on".

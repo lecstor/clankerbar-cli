@@ -113,6 +113,13 @@ esac
 	if !strings.Contains(runs[1], "hit the output token limit") {
 		t.Errorf("the resume did not carry the steer: %q", runs[1])
 	}
+	// The redirect must name the commands: "upload it by path" alone points at
+	// a method nothing else the session reads describes.
+	for _, cmd := range []string{"clankerbar upload <file>", "clankerbar deck <file.html> --task <ref>"} {
+		if !strings.Contains(runs[1], cmd) {
+			t.Errorf("the steer does not name %q: %q", cmd, runs[1])
+		}
+	}
 
 	if (opencode{}).OutputCapNoOutput(res) {
 		t.Error("a recovered stall must not keep the stall marker")
