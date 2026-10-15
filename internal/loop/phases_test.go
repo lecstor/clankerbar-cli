@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"path/filepath"
 
 	"strings"
 	"testing"
@@ -12,6 +13,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
 // phaseDriver builds a driver over one target carrying a releaser, a real state
@@ -39,6 +41,11 @@ func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Drive
 	// drive real repositories, and are untouched by this default.
 	d.cfg.WorkDir = t.TempDir()
 	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	// The PR-base probe (CLA-608) is stubbed to "the configured integration
+	// branch exists on origin", so a phase prompt fills {{prBase}} with the
+	// config's own branch and no test reaches git or the network. The tests
+	// that pin the RESOLUTION override this with their own fake.
+	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
 	return d, rel
 }
 
@@ -396,7 +403,7 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	d.cfg.Budget = config.Budget{MaxTokens: 75_000_000}
 
 	ph := d.cfg.EffectivePhases()[0]
-	inv, err := d.invocationFor(d.targets[0], 0, ph, nil, "")
+	inv, err := d.invocationFor(d.targets[0], 0, ph, nil, "", "")
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}
@@ -740,14 +747,14 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	d.cfg.MaxSessionWallClock = config.Duration(time.Hour)
 
 	phases := d.cfg.EffectivePhases()
-	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "")
+	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "")
 	if err != nil {
 		t.Fatalf("invocationFor phase 1: %v", err)
 	}
 	if got := inv1.MaxSessionWallClock; got != 20*time.Minute {
 		t.Errorf("phase 1 invocation carries %s, want its own 20m", got)
 	}
-	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "")
+	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "", "")
 	if err != nil {
 		t.Fatalf("invocationFor phase 2: %v", err)
 	}
@@ -1606,5 +1613,170 @@ func TestDrainPhases_AResumedPhaseDeathIsNotDeadClassified(t *testing.T) {
 	}
 	if len(rel.parks) != 0 {
 		t.Errorf("parked %d times, want 0 — the retry-then-park budget is the implement phase's", len(rel.parks))
+	}
+}
+
+// CLA-608: the phase briefs used to hard-code "(staging)" as the PR base for
+// every repo of every project — wrong for the makesPDF plugin repos (no staging
+// branch; PRs target main), wrong for lecstor/makespdf and lecstor/clankerbar
+// (PRs target integration), and raised as a decision on every task in them.
+// prBaseFor resolves it per repo at spawn time: the operator's pr_base override
+// wins outright; else the project's integration_branch when origin has it; else
+// origin's default branch; and a probe that cannot run falls back to the
+// integration branch, the text the briefs carried before this feature.
+//
+// The assertion is on the PROMPT a session would receive — both phases, since
+// the implement brief's resumed-work rule names the branch too — driven end to
+// end rather than through the helper alone, so a resolution that never reaches
+// invocationFor fails here.
+func TestPRBaseResolution_ShapesBothPhaseBriefsPerRepo(t *testing.T) {
+	const pluginRepo = "makesPDF/makespdf-obsidian-plugin"
+	cases := []struct {
+		name      string
+		repo      string
+		prBase    map[string]string
+		onOrigin  bool
+		defaultBr string
+		probeErr  error
+		want      string
+		// probe calls expected: once per phase, and NONE when an override
+		// answers the question without touching the network.
+		wantProbes int
+	}{
+		{
+			name:       "no override and no staging on origin: origin's default branch",
+			repo:       pluginRepo,
+			onOrigin:   false,
+			defaultBr:  "main",
+			want:       "main",
+			wantProbes: 2,
+		},
+		{
+			name:       "the per-repo override wins outright, no probe",
+			repo:       "lecstor/makespdf",
+			prBase:     map[string]string{"lecstor/makespdf": "integration"},
+			onOrigin:   true,
+			defaultBr:  "main",
+			want:       "integration",
+			wantProbes: 0,
+		},
+		{
+			name:       "integration branch present on origin still wins over the default",
+			repo:       "lecstor/ezyapp",
+			onOrigin:   true,
+			defaultBr:  "main",
+			want:       "staging",
+			wantProbes: 2,
+		},
+		{
+			name:       "a probe that cannot run falls back to the integration branch",
+			repo:       pluginRepo,
+			probeErr:   errors.New("could not read remote"),
+			want:       "staging",
+			wantProbes: 2,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: checkpointed(1, 0)},
+				{res: okResult(1, 0)},
+			}}
+			cfg := fastCfg()
+			cfg.Phases = twoPhases()
+			cfg.Prompt = ""
+			cfg.PRBase = tc.prBase
+			parent := t.TempDir()
+			checkout := gitCheckout(t, filepath.Join(parent, "checkout"))
+			rel := &repoReleaser{
+				next:     plane.NextTask{TaskID: "t-1", Repo: tc.repo},
+				taskRepo: map[string]string{"t-1": tc.repo},
+			}
+			d := NewMulti(cfg, h, []Target{{
+				Poller:   busyPoller(),
+				WorkDir:  parent,
+				Repos:    map[string]string{tc.repo: checkout},
+				Releaser: rel,
+			}})
+			openTestStateDir(t, d)
+			d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+			probes := 0
+			d.probePRBase = func(_ context.Context, dir, integration string) (bool, string, error) {
+				probes++
+				if dir != checkout {
+					t.Errorf("probe ran in %q, want the task repo's checkout %q", dir, checkout)
+				}
+				if integration != config.DefaultIntegrationBranch {
+					t.Errorf("probe asked about %q, want the configured integration branch %q", integration, config.DefaultIntegrationBranch)
+				}
+				return tc.onOrigin, tc.defaultBr, tc.probeErr
+			}
+
+			if _, _, _, err := drainPhasesOnce(t, d); err != nil {
+				t.Fatalf("drainPhases: %v", err)
+			}
+			if h.invokeCalls != 2 {
+				t.Fatalf("spawned %d sessions, want 2", h.invokeCalls)
+			}
+			for i, label := range []string{"phase 1 (implement)", "phase 2 (review)"} {
+				prompt := h.invocations[i].Prompt
+				if !strings.Contains(prompt, "PR base branch ("+tc.want+")") {
+					t.Errorf("%s brief does not name %q as the PR base:\n%s", label, tc.want, prompt)
+				}
+				if strings.Contains(prompt, config.PhasePRBasePlaceholder) {
+					t.Errorf("%s brief still carries the unfilled %s placeholder:\n%s", label, config.PhasePRBasePlaceholder, prompt)
+				}
+			}
+			if probes != tc.wantProbes {
+				t.Errorf("origin was probed %d times, want %d — once per phase, never when the override answers", probes, tc.wantProbes)
+			}
+		})
+	}
+}
+
+// A handoff respawn rebuilds the phase's prompt from the predecessor's own text
+// plus config.HandoffContinuation, which carries reviewTerminalStep — itself a
+// {{prBase}} carrier since CLA-608. So the substitution must reach handoff
+// prompts too, or the successor gets a literal placeholder where the PR target
+// should be. The existing handoff test pins the terminal step's presence; this
+// pins that its branch has actually been resolved.
+func TestPRBaseResolution_ReachesHandoffRespawnPrompts(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: handoffResult("finish the review")},
+		{res: okResult(1, 0)},
+	}}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	parent := t.TempDir()
+	checkout := gitCheckout(t, filepath.Join(parent, "checkout"))
+	rel := &repoReleaser{
+		next:     plane.NextTask{TaskID: "t-1", Repo: "makesPDF/makespdf-obsidian-plugin"},
+		taskRepo: map[string]string{"t-1": "makesPDF/makespdf-obsidian-plugin"},
+	}
+	d := NewMulti(cfg, h, []Target{{
+		Poller:   busyPoller(),
+		WorkDir:  parent,
+		Repos:    map[string]string{"makesPDF/makespdf-obsidian-plugin": checkout},
+		Releaser: rel,
+	}})
+	openTestStateDir(t, d)
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return false, "main", nil }
+
+	if _, _, _, _, err := drainPhasesHandoffs(t, d, 1); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (implement, review, handoff respawn)", h.invokeCalls)
+	}
+	successor := h.invocations[2].Prompt
+	if !strings.Contains(successor, "PR base branch (main)") {
+		t.Errorf("the handoff successor's PR step does not name the resolved branch:\n%s", successor)
+	}
+	if strings.Contains(successor, config.PhasePRBasePlaceholder) {
+		t.Errorf("the handoff successor still carries the unfilled %s placeholder:\n%s", config.PhasePRBasePlaceholder, successor)
 	}
 }

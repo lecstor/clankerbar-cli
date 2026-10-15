@@ -225,3 +225,41 @@ func TestReposForProjectOverride(t *testing.T) {
 		t.Errorf("ReposFor(\"\") = %v, want the top-level map for a single-project run", got)
 	}
 }
+
+// CLA-608: the per-repo PR base resolves like the repos map itself - a
+// matching project's NON-EMPTY map REPLACES the top-level one (no merge), and
+// the lookup the driver makes is by the task's full identity first, then its
+// bare name (the spelling local checkouts are named by, and the same fallback
+// ResolveCheckout applies). Empty means "nothing overridden", never "no
+// branch" - the driver goes to origin for the answer.
+func TestPRBaseFor_ProjectReplaceAndBareNameMatch(t *testing.T) {
+	cfg := &Config{
+		PRBase: map[string]string{"top/one": "main", "two": "release"},
+		Projects: []Project{
+			{Slug: "mine", PRBase: map[string]string{"p/r": "integration"}},
+			{Slug: "inherit"},
+		},
+	}
+	if got := cfg.PRBaseFor("mine", "p/r"); got != "integration" {
+		t.Errorf("PRBaseFor(mine, p/r) = %q, want the project's own entry", got)
+	}
+	// Replace, not merge: the project's map does not inherit the top-level one.
+	if got := cfg.PRBaseFor("mine", "top/one"); got != "" {
+		t.Errorf("PRBaseFor(mine, top/one) = %q, want empty - a project's map replaces the top-level one", got)
+	}
+	if got := cfg.PRBaseFor("inherit", "top/one"); got != "main" {
+		t.Errorf("PRBaseFor(inherit, top/one) = %q, want the top-level identity entry", got)
+	}
+	// Full identity first, bare name second: "other/two" has no identity entry,
+	// and the bare "two" entry is what an operator writing local-checkout
+	// spellings gets.
+	if got := cfg.PRBaseFor("", "other/two"); got != "release" {
+		t.Errorf("PRBaseFor(\"\", other/two) = %q, want the bare-name fallback to match", got)
+	}
+	if got := cfg.PRBaseFor("", ""); got != "" {
+		t.Errorf("PRBaseFor with no repo = %q, want empty - nothing to key a lookup by", got)
+	}
+	if got := cfg.PRBaseFor("", "nowhere/at-all"); got != "" {
+		t.Errorf("PRBaseFor(nowhere/at-all) = %q, want empty - the driver resolves against origin instead", got)
+	}
+}

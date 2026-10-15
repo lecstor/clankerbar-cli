@@ -167,20 +167,24 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 	// promises to catch.
 	//
 	// Stating the WHOLE of the brief's provenance closes it: the operator's
-	// config, with exactly three claim-derived values substituted, and nothing
-	// else. Any field that ever reaches the prompt makes it differ.
+	// config, with exactly three claim-derived values substituted — plus
+	// {{prBase}}, which is not claim-derived but config-derived (CLA-608: the
+	// stubbed probe says the integration branch is on origin, so it resolves to
+	// the config's own default) — and nothing else. Any field that ever reaches
+	// the prompt makes it differ.
 	//
-	// The third value — {{branch}} — joined in CLA-457 and is the one deliberate
-	// exception to "no stream-derived text in the brief": it is the branch the
-	// checkpoint VERIFIED on the origin remote, legitimately a branch name and
-	// nothing a session could smuggle prose through. The implementing session
-	// still cannot frame its own reviewer: an arbitrary branch name changes what
-	// the reviewer works in, never what it is told to attack.
+	// The third claim value — {{branch}} — joined in CLA-457 and is the one
+	// deliberate exception to "no stream-derived text in the brief": it is the
+	// branch the checkpoint VERIFIED on the origin remote, legitimately a branch
+	// name and nothing a session could smuggle prose through. The implementing
+	// session still cannot frame its own reviewer: an arbitrary branch name
+	// changes what the reviewer works in, never what it is told to attack.
 	claim := openClaim()
 	want := strings.NewReplacer(
 		config.PhaseTaskPlaceholder, claim.TaskID,
 		config.PhaseRunPlaceholder, claim.RunID,
 		config.PhaseBranchPlaceholder, "clanker/x",
+		config.PhasePRBasePlaceholder, config.DefaultIntegrationBranch,
 	).Replace(d.cfg.EffectivePhases()[1].Prompt)
 	if h.invocations[1].Prompt != want {
 		t.Fatalf("phase 2's brief carried something other than config + the three claim-derived values:\n got: %q\nwant: %q",
