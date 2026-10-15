@@ -1099,3 +1099,35 @@ func TestRerunGuidancePointsAtWaitingRatherThanRestatingIt(t *testing.T) {
 		t.Errorf("rerunGuidance does not scope the waiting pointer to keeping the task; unscoped, Rule 1 reads as permission to release mid-phase:\n%s", rerunGuidance)
 	}
 }
+
+// CLA-608: the branch that phase briefs name as the PR target is resolved per
+// repo at spawn time, so every shipped brief that names one must carry the
+// {{prBase}} placeholder — and none may carry a literal branch name, which is
+// the bug being fixed (any literal is wrong for some repo in some project).
+// The no-code brief names no branch at all and is deliberately exempt.
+func TestBuiltinBriefsCarryThePRBasePlaceholder(t *testing.T) {
+	for name, brief := range builtinPhasePrompts {
+		if !strings.Contains(brief, PhasePRBasePlaceholder) {
+			t.Errorf("the %q brief never carries %s, so its PR base is either absent or hard-coded:\n%s", name, PhasePRBasePlaceholder, brief)
+		}
+		if strings.Contains(brief, "(staging)") {
+			t.Errorf("the %q brief still hard-codes the old (staging) literal:\n%s", name, brief)
+		}
+	}
+	if !strings.Contains(unverifiedReviewBrief, PhasePRBasePlaceholder) {
+		t.Errorf("the unverified review brief never carries %s:\n%s", PhasePRBasePlaceholder, unverifiedReviewBrief)
+	}
+	if !strings.Contains(reviewTerminalStep, PhasePRBasePlaceholder) {
+		t.Errorf("reviewTerminalStep does not carry %s, so the PR step's target cannot be resolved:\n%s", PhasePRBasePlaceholder, reviewTerminalStep)
+	}
+	if !strings.Contains(implementResumedBranchRule, PhasePRBasePlaceholder) {
+		t.Errorf("implementResumedBranchRule does not carry %s, so a resumed branch is synced against the wrong branch:\n%s", PhasePRBasePlaceholder, implementResumedBranchRule)
+	}
+	// The placeholder is unresolved text: a phase-0 prompt carrying the RESUME
+	// placeholders is refused (see the presence check in Validate), and {{prBase}}
+	// is deliberately not one of those — it needs no claim — so this pins that it
+	// is NOT smuggled into that refusal set.
+	if strings.Contains(implementCommitEarlyRule, PhasePRBasePlaceholder) {
+		t.Errorf("the commit-early rule carries %s; it belongs where a branch is named, not in entry guidance:\n%s", PhasePRBasePlaceholder, implementCommitEarlyRule)
+	}
+}

@@ -4274,14 +4274,22 @@ func runOriginLsRemote(ctx context.Context, dir, integration string, extraEnv []
 		}
 		return false, "", fmt.Errorf("git ls-remote: %w", err)
 	}
+	onOrigin, defaultBranch := parseOriginRefs(stdout.String(), integration)
+	return onOrigin, defaultBranch, nil
+}
+
+// parseOriginRefs reads runOriginLsRemote's output: the "ref: refs/heads/X
+// HEAD" symref line when the remote's HEAD is symbolic, and any line naming
+// refs/heads/<integration>. A detached remote HEAD prints no symref line, so
+// the default comes back empty and prBaseFor falls back. Exact-field matching,
+// never substring: "refs/heads/staging" must not be read as a match for an
+// integration branch named "ging".
+func parseOriginRefs(out, integration string) (onOrigin bool, defaultBranch string) {
 	want := "refs/heads/" + integration
-	onOrigin := false
-	defaultBranch := ""
-	for _, line := range strings.Split(stdout.String(), "\n") {
+	for _, line := range strings.Split(out, "\n") {
 		fields := strings.Fields(line)
 		switch {
 		case len(fields) == 3 && fields[0] == "ref:" && fields[2] == "HEAD":
-			// "ref: refs/heads/main\tHEAD" — the remote's default branch.
 			if target, ok := strings.CutPrefix(fields[1], "refs/heads/"); ok {
 				defaultBranch = target
 			}
@@ -4289,7 +4297,7 @@ func runOriginLsRemote(ctx context.Context, dir, integration string, extraEnv []
 			onOrigin = true
 		}
 	}
-	return onOrigin, defaultBranch, nil
+	return onOrigin, defaultBranch
 }
 
 // firstLineOf trims a git stderr message to its first line, so a two-line
