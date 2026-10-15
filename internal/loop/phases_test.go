@@ -39,6 +39,11 @@ func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Drive
 	// drive real repositories, and are untouched by this default.
 	d.cfg.WorkDir = t.TempDir()
 	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	// The PR-base probe (CLA-608) is stubbed to "the configured integration
+	// branch exists on origin", so a phase prompt fills {{prBase}} with the
+	// config's own branch and no test reaches git or the network. The tests
+	// that pin the RESOLUTION override this with their own fake.
+	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
 	return d, rel
 }
 
@@ -396,7 +401,7 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	d.cfg.Budget = config.Budget{MaxTokens: 75_000_000}
 
 	ph := d.cfg.EffectivePhases()[0]
-	inv, err := d.invocationFor(d.targets[0], 0, ph, nil, "")
+	inv, err := d.invocationFor(d.targets[0], 0, ph, nil, "", "")
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}
@@ -740,14 +745,14 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	d.cfg.MaxSessionWallClock = config.Duration(time.Hour)
 
 	phases := d.cfg.EffectivePhases()
-	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "")
+	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "")
 	if err != nil {
 		t.Fatalf("invocationFor phase 1: %v", err)
 	}
 	if got := inv1.MaxSessionWallClock; got != 20*time.Minute {
 		t.Errorf("phase 1 invocation carries %s, want its own 20m", got)
 	}
-	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "")
+	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "", "")
 	if err != nil {
 		t.Fatalf("invocationFor phase 2: %v", err)
 	}

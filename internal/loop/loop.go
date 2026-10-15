@@ -8,6 +8,7 @@
 package loop
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -327,6 +328,16 @@ type Driver struct {
 	// shape and the same reason as newVerifier.
 	newSalvager func(workdir string) workSalvager
 
+	// probePRBase reads the origin remote of the checkout in dir to resolve a
+	// repo's PR base when no pr_base override names one (CLA-608): whether
+	// refs/heads/<integration> exists on origin, and origin's default branch
+	// (its symbolic HEAD target). A field so tests can substitute one;
+	// production always runs git. Errors are NOT failures — the caller falls
+	// back to the configured integration_branch, exactly the text the briefs
+	// carried before this feature — so a probe that cannot run degrades to
+	// today's behaviour, never blocks a spawn.
+	probePRBase func(ctx context.Context, dir, integration string) (integrationOnOrigin bool, defaultBranch string, err error)
+
 	// newAdapter resolves a harness NAME to its adapter, for a sequence whose
 	// phases are not all on one harness (CLA-366). Production is harness.Get; a
 	// field so tests can hand out their own fakes per name.
@@ -473,6 +484,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		},
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
+		probePRBase: probeOriginPRBase,
 	}
 	for i := range d.rcVersions {
 		d.rcVersions[i] = -1 // unfetched; 0 is a REAL answer (nothing stored)
@@ -1966,10 +1978,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// a resumed phase, the spawn-time queue-head peek for a fresh one. Held onto
 	// here because the seam needs it AFTER the session ends — it is the one task
 	// the driver can ask the plane about when the stream carried no claim state.
-	spawnDir, briefedTask, serr := d.sessionDir(ctx, t, prev)
+	spawnDir, briefedTask, briefedRepo, serr := d.sessionDir(ctx, t, prev)
 	if serr != nil {
 		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), serr)
 	}
+	// The branch this task's repo PRs target, resolved ONCE per phase like the
+	// spawn directory above, and for the same reason: it does not change between
+	// attempts. Filled into the prompt's {{prBase}} placeholder by invocationFor
+	// (CLA-608). Never fails here: an unresolvable probe falls back to the
+	// configured integration branch, which is the text the briefs carried
+	// before this feature existed.
+	prBase := d.prBaseFor(ctx, t, spawnDir, briefedRepo)
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -
 	// the spend the budget breaker above can never see (CLA-288).
@@ -2034,7 +2053,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv, ierr := d.invocationFor(t, phaseIdx, ph, prev, spawnDir)
+		inv, ierr := d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase)
 		if ierr != nil {
 			// The session env refused to resolve (a failing or empty-output
 			// fromCommand, an unreadable @path file — the error names the
@@ -3861,7 +3880,13 @@ func droppedNote(dropped int64) string {
 // A placeholder with no claim to fill it is LEFT STANDING rather than blanked.
 // A literal {{runId}} in the log is a misconfigured sequence announcing itself;
 // an empty string is a session quietly deciding to claim fresh work instead.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir string) (harness.Invocation, error) {
+//
+// prBase is the branch this task's repo PRs target, resolved per phase by
+// drainPhase (CLA-608), and fills {{prBase}} in EVERY phase: the other three
+// placeholders are per-run facts only a claim can carry, while the implement
+// brief — phase 1, claim-free at spawn time — is itself one of the carriers, in
+// its resumed-work rule. Empty leaves the placeholder standing, like the rest.
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string) (harness.Invocation, error) {
 	tc := d.targetCfg(t)
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
@@ -3990,6 +4015,13 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// switched off.
 		inv.ResumeClaim = prev.Claim
 	}
+	// CLA-608 after the variant selection above, deliberately: that compares the
+	// prompt against BuiltinReviewBrief, which carries {{prBase}} unresolved, so
+	// substituting first would make every checkpoint look like a custom prompt
+	// and every variant swap silently stop.
+	if prBase != "" {
+		inv.Prompt = strings.NewReplacer(config.PhasePRBasePlaceholder, prBase).Replace(inv.Prompt)
+	}
 	return inv, nil
 }
 
@@ -4071,7 +4103,12 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 // per-task directory (it falls through to the primary-repo chain), never the
 // iteration — the session about to spawn needs the plane too, and it can resolve
 // nothing either way.
-func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, string, error) {
+//
+// The same read yields the task's repo IDENTITY, returned alongside so the
+// caller can key the pr_base override by it (CLA-608) without a second plane
+// read; "" is the same best-effort empty the checkout resolution already
+// tolerates, and means only "no override can match".
+func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result) (string, string, string, error) {
 	repo := ""
 	briefed := ""
 	if prev != nil && prev.Claim.Held() {
@@ -4106,7 +4143,162 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 		workdir = d.cfg.WorkDir
 	}
 	dir, err := config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
-	return dir, briefed, err
+	return dir, briefed, repo, err
+}
+
+// prBaseProbeTimeout bounds the one network round-trip prBaseFor runs. It is a
+// var so tests can shrink it rather than waiting out the real bound, the same
+// discipline deployGitTimeout sets in internal/cli.
+var prBaseProbeTimeout = 30 * time.Second
+
+// prBaseFor resolves the branch this task's repo PRs target, substituted into
+// the phase briefs as {{prBase}} (CLA-608). Resolution order, first match wins:
+//
+//  1. the operator's pr_base override for the repo, which needs no probe — the
+//     one way to name a branch that is not derivable (lecstor/makespdf PRs
+//     merge into `integration` while it deploys `staging`);
+//  2. the project's integration_branch, when that branch EXISTS on origin
+//     (repos that integrate through staging: clankerbar-cli, ezyapp);
+//  3. origin's default branch (the makesPDF plugins carry only main);
+//  4. the project's integration_branch anyway — the pre-CLA-608 text — when the
+//     probe could not run at all (no dir, no origin, offline, no git). The
+//     degradation is deliberate: failing the spawn would be worse than a brief
+//     naming today's default, and a probe that cannot read origin has no
+//     better answer to offer.
+//
+// It never fails, so a spawn is never blocked on it. The probe runs afresh per
+// phase rather than caching: a phase is spawned at most a few times per task,
+// and a cache keyed on remote state would outlive the branch creations it is
+// supposed to observe.
+func (d *Driver) prBaseFor(ctx context.Context, t Target, dir, repo string) string {
+	tc := d.targetCfg(t)
+	if b := tc.PRBaseFor(t.Name, repo); b != "" {
+		log.Printf("%spr_base override: %s PRs target %q", labelOf(t), displayRepo(dir, repo), b)
+		return b
+	}
+	integration := tc.IntegrationBranchFor(t.Name)
+	if d.probePRBase == nil || dir == "" {
+		return integration
+	}
+	onOrigin, def, err := d.probePRBase(ctx, dir, integration)
+	switch {
+	case err != nil:
+		log.Printf("%scould not read origin to resolve the PR base of %s (%v) — the brief names the integration branch %q",
+			labelOf(t), displayRepo(dir, repo), err, integration)
+		return integration
+	case onOrigin:
+		return integration
+	case def != "":
+		log.Printf("%s%s has no %q on origin — its PRs target origin's default branch %q",
+			labelOf(t), displayRepo(dir, repo), integration, def)
+		return def
+	default:
+		return integration
+	}
+}
+
+// displayRepo names the subject of a prBaseFor log line: the task's repo
+// identity when the plane supplied one, else the checkout the probe ran in.
+func displayRepo(dir, repo string) string {
+	if repo != "" {
+		return repo
+	}
+	return dir
+}
+
+// probeOriginPRBase asks the origin remote of dir two questions in ONE network
+// round-trip: whether refs/heads/<integration> exists there, and what its
+// symbolic HEAD points at — the answers prBaseFor's resolution order needs.
+//
+// `git ls-remote --symref origin HEAD refs/heads/<integration>` prints the
+// symref line ("ref: refs/heads/main	HEAD") plus each matching ref, so one call
+// answers both. Reading origin is deliberate and the local origin/HEAD symref
+// is NOT an alternative: it is unset in some of this fleet's clones (the
+// makespdf-zed-extension and clankerbar-cli checkouts the task that filed this
+// recorded), and where it is set it can be stale. A remote whose HEAD is
+// detached prints no symref line: the default is then unknown and prBaseFor
+// falls back.
+//
+// The read is scoped to the account owning the remote (delivery.ScopeRemoteEnv,
+// CLA-458) exactly as the delivery verifier's own ls-remote is: without it an
+// HTTPS github origin that names no account is read as whichever gh account is
+// ACTIVE, which on the operator's machine cannot see the private lecstor repos,
+// and every probe would silently degrade to the integration-branch fallback —
+// the feature would never fire where it was filed from. Any scoping failure
+// degrades to running unscoped, the same fail-open shape delivery keeps; the
+// probe has no correctness cliff on top of it because its own failure mode is
+// prBaseFor's fallback.
+func probeOriginPRBase(ctx context.Context, dir, integration string) (bool, string, error) {
+	ctx, cancel := context.WithTimeout(ctx, prBaseProbeTimeout)
+	defer cancel()
+	remoteURL, _ := originRemoteURL(ctx, dir)
+	extraEnv := delivery.ScopeRemoteEnv(ctx, dir, "gh", remoteURL)
+	return runOriginLsRemote(ctx, dir, integration, extraEnv)
+}
+
+// originRemoteURL reads origin's URL in dir for the credential-scoping lookup.
+// A local read: it never consults credentials, and an error (no origin, not a
+// repository) leaves the scoping empty, which means "run unscoped".
+func originRemoteURL(ctx context.Context, dir string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "remote", "get-url", "origin")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// runOriginLsRemote is probeOriginPRBase's one git exec, split out so the probe
+// reads as its two answers. The environment discipline is delivery.Verifier's
+// gitRun: an unattended run has no terminal, and a git that decides to ask for
+// a password would hang the phase rather than answer. WaitDelay reaps the
+// helpers ls-remote spawns — they inherit the pipes behind these buffers, and a
+// killed git can otherwise leave the call sitting past its deadline.
+func runOriginLsRemote(ctx context.Context, dir, integration string, extraEnv []string) (bool, string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", dir, "ls-remote", "--symref", "origin", "HEAD", "refs/heads/"+integration)
+	cmd.Env = append(os.Environ(),
+		"GIT_TERMINAL_PROMPT=0",
+		"GIT_ASKPASS=echo",
+		"SSH_ASKPASS=echo",
+		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
+		"GCM_INTERACTIVE=never",
+	)
+	cmd.Env = append(cmd.Env, extraEnv...)
+	cmd.WaitDelay = 5 * time.Second
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return false, "", fmt.Errorf("git ls-remote: %w: %s", err, firstLineOf(msg))
+		}
+		return false, "", fmt.Errorf("git ls-remote: %w", err)
+	}
+	want := "refs/heads/" + integration
+	onOrigin := false
+	defaultBranch := ""
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		fields := strings.Fields(line)
+		switch {
+		case len(fields) == 3 && fields[0] == "ref:" && fields[2] == "HEAD":
+			// "ref: refs/heads/main\tHEAD" — the remote's default branch.
+			if target, ok := strings.CutPrefix(fields[1], "refs/heads/"); ok {
+				defaultBranch = target
+			}
+		case len(fields) == 2 && fields[1] == want:
+			onOrigin = true
+		}
+	}
+	return onOrigin, defaultBranch, nil
+}
+
+// firstLineOf trims a git stderr message to its first line, so a two-line
+// remote error does not run into the log's next sentence.
+func firstLineOf(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // extraDirsFor lists the directories a session's permission policy must cover

@@ -313,8 +313,14 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 // earlier would make it LESS likely to survive, not more - a step mentioned before
 // an emphatic final call loses to it. So the PR step is folded into this same
 // terminal block, before the update_task sentence, not left in the paragraph above.
-const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's integration " +
-	"branch (staging) if no PR exists yet for this branch - push, then the PR, in that order, before the " +
+//
+// CLA-608: the target was the literal "(staging)" here and in the never-commit
+// rule below. Neither read the config nor the task's repo, so every task in a
+// repo with no staging branch (the makesPDF plugins; lecstor/makespdf, whose
+// PRs target integration) was told to open its PR against a branch that does
+// not exist. The target is now {{prBase}}, resolved per repo by the driver.
+const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
+	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
 	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
 	"update_task(taskId, runId, status: \"in_review\", outcome: ...), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
@@ -460,9 +466,17 @@ const rerunGuidance = " RERUN BOUND: every rerun of a verification command is an
 // tip - or salvage only what still adds value; never re-verify and push stale work.
 //
 // Harness-neutral on purpose: one wording serves every harness's implement phase.
+//
+// CLA-608: the branch to merge in is the repo's PR BASE ({{prBase}}), resolved
+// per repo by the driver, not necessarily the project's integration_branch. The
+// resumed branch forked from its PR base and will merge back into it, so the
+// superseding commits to sync against land there; for a repo whose PRs target
+// main (the makesPDF plugins) the integration_branch would name a branch that
+// does not exist, and for lecstor/makespdf it would sync against the deploy
+// branch while the PR merges elsewhere.
 const implementResumedBranchRule = "RESUMED WORK comes first when you find it: if the claim hands you an EXISTING branch or " +
 	"worktree for this task (a recovered stale claim, a prior session's WIP - check the repo yourself whatever " +
-	"the claim's hasWip flag said), your FIRST step is to merge the project's integration branch into it - a " +
+	"the claim's hasWip flag said), your FIRST step is to merge the repo's PR base branch (" + PhasePRBasePlaceholder + ") into it - a " +
 	"merge, NEVER a rebase: the branch may already be pushed, and rewriting pushed history invalidates the " +
 	"daemon's phase-boundary check, which compares the pushed origin tip to your local tip. THEN re-validate " +
 	"the task against the merged tip BEFORE doing or verifying any of the found work: a clean merge is not " +
@@ -571,8 +585,8 @@ var builtinPhasePrompts = map[string]string{
 		PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the " +
 		"bar and the standing decisions. An empty branch field on the task is a FAILED hand-off to report, not " +
 		"work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
-		" recorded on the task, and never commit to the integration branch (staging) - a session whose cwd is " +
-		"already the main checkout sitting on staging is not a decision to commit where you are, it is this " +
+		" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is " +
+		"already the main checkout sitting on that branch is not a decision to commit where you are, it is this " +
 		"failure mode. Read the diff on that branch. Then run the adversarial review gate, fix what it finds, " +
 		"and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you fixed, by name, " +
 		"and point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
@@ -638,8 +652,8 @@ const unverifiedReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceho
 	"review a phantom diff. If the remote still cannot be read, the hand-off could not be verified: say exactly " +
 	"that in your outcome and hand the task over as the terminal step below requires — do not invent work. If the " +
 	"branch is there, work in the worktree for branch " + PhaseBranchPlaceholder +
-	" recorded on the task, and never commit to the integration branch (staging) - a session whose cwd is already " +
-	"the main checkout sitting on staging is not a decision to commit where you are, it is this failure mode. Read " +
+	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already " +
+	"the main checkout sitting on that branch is not a decision to commit where you are, it is this failure mode. Read " +
 	"the diff on that branch. Then run the adversarial review gate, fix what it finds, and re-verify SCOPED to " +
 	"those fixes: brief the follow-up reviewer with the findings you fixed, by name, and point it at the fix " +
 	"commits (or, if not yet committed, the fix diff) and the regression surface they touch - not at the whole " +
@@ -679,10 +693,20 @@ var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 // hand-off branch (CLA-457): the implement phase's checkpoint is gated on it
 // being real and on the origin remote, so the review brief can name it rather
 // than asserting an unverified "an earlier session already implemented".
+//
+// {{prBase}} names the branch the TASK'S REPO's PRs target (CLA-608), resolved
+// per repo at phase-spawn time (config.PRBaseFor, else loop.Driver.prBaseFor).
+// Unlike the other three it is not a per-run fact and rides EVERY built-in
+// phase, the implement phase included: the implement brief's resumed-work rule
+// needs a branch to name, and that rule runs in phase 1, before any claim
+// exists for the other placeholders to come from. It replaced literal
+// "(staging)" text in these briefs — the literal was wrong for every repo
+// whose PRs do not target staging, and the resolution above is what knows.
 const (
 	PhaseTaskPlaceholder   = "{{taskId}}"
 	PhaseRunPlaceholder    = "{{runId}}"
 	PhaseBranchPlaceholder = "{{branch}}"
+	PhasePRBasePlaceholder = "{{prBase}}"
 )
 
 // Config is the resolved loop configuration. The comments here are the source of
@@ -968,7 +992,35 @@ type Config struct {
 	// NOT come from delivery.Claim.IntegrationBranch: that is a per-session
 	// declaration of where one commit landed, while this is standing per-project
 	// configuration about how releases flow.
+	//
+	// It is NOT what the phase briefs call the PR base (CLA-608): a repo can
+	// deploy from one branch while its PRs target another (lecstor/makespdf
+	// deploys staging but merges task branches into integration), and a repo in
+	// a driven project can have no integration branch at all (the makesPDF
+	// plugin repos carry only main). See PRBase for the override that names a
+	// PR base explicitly; without one, each repo's PR base is resolved against
+	// the origin remote at phase-spawn time.
 	IntegrationBranch string `json:"integration_branch"`
+
+	// PRBase maps a repo identity ("owner/name", or its bare name) to the branch
+	// that repo's PRs TARGET - the branch a task branch forks from and merges
+	// back into, substituted into the phase briefs as {{prBase}} (CLA-608).
+	//
+	// It exists because the briefs used to hard-code "(staging)" for every repo
+	// of every project: the makesPDF plugins have no staging branch (their PRs
+	// all target main), and lecstor/makespdf and lecstor/clankerbar merge into
+	// integration - so a session was told to open its PR against a branch its
+	// repo does not have, and the setting raised itself as a decision on every
+	// task. An entry here wins outright, no probe: name the branch when the
+	// convention is not derivable. Without an entry the driver resolves per
+	// repo at phase-spawn time: the project's integration_branch when it
+	// exists on the origin remote, else origin's default branch (see
+	// loop.Driver.prBaseFor).
+	//
+	// This is deliberately NOT integration_branch renamed: that one keeps
+	// meaning the branch whose tip doctor's deploy_lag check judges, so a repo
+	// that deploys staging and merges integration needs both to stay truthful.
+	PRBase map[string]string `json:"pr_base"`
 
 	// AllowLocalMCPServers names the MCP server entries an operator means to run
 	// from a DISCOVERED `<workdir>/.mcp.json` — the file Validate adopts by
@@ -1108,6 +1160,12 @@ type Project struct {
 	// Config.IntegrationBranch for what it means; the default is staging.
 	IntegrationBranch string `json:"integration_branch"`
 
+	// PRBase is this project's repo -> PR-base-branch map, REPLACING the
+	// top-level map of the same name for this project when it declares
+	// anything; an entry that sets none inherits the top-level one. See
+	// Config.PRBase for what the map holds and how an unmatched repo resolves.
+	PRBase map[string]string `json:"pr_base"`
+
 	// AllowLocalMCPServers is this project's CLA-266 allowlist, REPLACING the
 	// top-level list of the same name for this project's discovered MCP config
 	// when it names anything; an entry that sets none inherits the top-level
@@ -1212,6 +1270,38 @@ func firstNonEmpty(values ...string) string {
 	return ""
 }
 
+// PRBaseFor resolves the operator's per-repo PR-base override for one project
+// and one task repo: a matching projects[] entry's own NON-EMPTY map replaces
+// the top-level one (the same replace-not-merge shape ReposFor uses), and the
+// map is then consulted by the FULL identity ("owner/name") first, then by the
+// bare name — the common spelling, and the same fallback ResolveCheckout
+// applies to checkouts (CLA-608).
+//
+// Empty means "nothing overridden": the caller resolves the branch against
+// the origin remote instead. It does NOT mean "no branch" — a validated map
+// entry always names one.
+func (c *Config) PRBaseFor(slug, repo string) string {
+	if strings.TrimSpace(repo) == "" {
+		return ""
+	}
+	m := c.PRBase
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.PRBase) > 0 {
+			m = p.PRBase
+			break
+		}
+	}
+	if v, ok := m[repo]; ok {
+		return v
+	}
+	if i := strings.LastIndex(repo, "/"); i >= 0 {
+		if v, ok := m[repo[i+1:]]; ok {
+			return v
+		}
+	}
+	return ""
+}
+
 // validateHealthURL holds a health_url to "an absolute http(s) URL with a
 // host". It is deliberately weaker than backlog_url's TLS floor: /health is a
 // public endpoint read without credentials, so there is no bearer token to
@@ -1259,6 +1349,32 @@ func validateIntegrationBranch(raw, label string) error {
 			r == '/', r == '.', r == '_', r == '-':
 		default:
 			return fmt.Errorf("%s: %q must be a plain branch name ([A-Za-z0-9/._-])", label, raw)
+		}
+	}
+	return nil
+}
+
+// validatePRBase holds every pr_base entry to a bare branch name, one level
+// deeper than validateIntegrationBranch's own field: each VALUE reaches the
+// phase briefs and (through them) `git`/`gh pr create` arguments, so it carries
+// the same refspec-injection hazards a bad integration_branch does, plus the
+// extra one of being substituted into prose. An empty value is refused rather
+// than passed through: validateIntegrationBranch reads empty as "the default
+// branch", but a map entry saying nothing is a half-written override whose
+// silence would read as "resolved per repo" when the operator plainly meant to
+// name a branch — omit the entry instead. Keys are held to non-blank, sorted so
+// the reported entry does not change between runs on unchanged input.
+func validatePRBase(m map[string]string, label string) error {
+	for _, repo := range sortedKeys(m) {
+		if strings.TrimSpace(repo) == "" {
+			return fmt.Errorf("%s: a repo key is empty", label)
+		}
+		branch := m[repo]
+		if strings.TrimSpace(branch) == "" {
+			return fmt.Errorf("%s[%q]: names no branch (omit the entry to let the repo's PR base resolve against origin)", label, repo)
+		}
+		if err := validateIntegrationBranch(branch, fmt.Sprintf("%s[%q]", label, repo)); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -1899,6 +2015,7 @@ var topLevelConfigKeys = map[string]bool{
 	"models":                  true,
 	"phases":                  true,
 	"poll_interval":           true,
+	"pr_base":                 true,
 	"primary_repo":            true,
 	"projects":                true,
 	"prompt":                  true,
@@ -2432,6 +2549,11 @@ func (c *Config) Validate() error {
 	if err := validateIntegrationBranch(c.IntegrationBranch, "integration_branch"); err != nil {
 		return err
 	}
+	// pr_base values reach the phase briefs and the remote checks behind them,
+	// so they are held to the same ref-name shape (CLA-608).
+	if err := validatePRBase(c.PRBase, "pr_base"); err != nil {
+		return err
+	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
@@ -2548,6 +2670,9 @@ func (c *Config) Validate() error {
 			return err
 		}
 		if err := validateIntegrationBranch(p.IntegrationBranch, fmt.Sprintf("projects[%d].integration_branch", i)); err != nil {
+			return err
+		}
+		if err := validatePRBase(p.PRBase, fmt.Sprintf("projects[%d].pr_base", i)); err != nil {
 			return err
 		}
 		// The slug decides which queue is POLLED; the .mcp.json decides which
