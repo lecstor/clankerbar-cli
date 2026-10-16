@@ -85,7 +85,7 @@ func TestSessionDir_FreshPhaseResolvesTheQueueHead(t *testing.T) {
 	rel := &repoReleaser{next: plane.NextTask{TaskID: "t-1", Repo: "acme/repo-b"}}
 	target.Releaser = rel
 
-	dir, briefed, err := d0(target).sessionDir(context.Background(), target, nil)
+	dir, briefed, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil {
 		t.Fatalf("sessionDir: %v", err)
 	}
@@ -106,7 +106,7 @@ func TestSessionDir_ResumePhaseReadsTheExactTask(t *testing.T) {
 	rel := &repoReleaser{taskRepo: map[string]string{"t-9": "acme/repo-b"}}
 	target.Releaser = rel
 
-	dir, briefed, err := d0(target).sessionDir(context.Background(), target, prev)
+	dir, briefed, _, err := d0(target).sessionDir(context.Background(), target, prev)
 	if err != nil {
 		t.Fatalf("sessionDir: %v", err)
 	}
@@ -125,7 +125,7 @@ func TestSessionDir_NoRepoFallsBackToPrimaryNeverWorkdir(t *testing.T) {
 	parent, dirA, _, target := twoRepos(t)
 	target.Releaser = &repoReleaser{} // the queue head carries NO repo
 
-	dir, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil {
 		t.Fatalf("sessionDir: %v", err)
 	}
@@ -138,7 +138,7 @@ func TestSessionDir_LegacyWhenNothingConfigured(t *testing.T) {
 	d := New(fastCfg(), nil, nil)
 	target := Target{Poller: busyPoller(), WorkDir: "/repos/parent", Releaser: &fakeReleaser{}}
 
-	dir, _, err := d.sessionDir(context.Background(), target, nil)
+	dir, _, _, err := d.sessionDir(context.Background(), target, nil)
 	if err != nil || dir != "" {
 		t.Errorf("got (%q, %v); with nothing declared resolution has no opinion and the spawn keeps its legacy workdir", dir, err)
 	}
@@ -149,7 +149,7 @@ func TestSessionDir_LookupFailureDegradesThenRefusesAmbiguity(t *testing.T) {
 	// A peek blip is degradation: no identity is known, so the fallback chain runs.
 	rel := &repoReleaser{peekErr: errors.New("plane 503")}
 	target.Releaser = rel
-	dir, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	dir, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if err != nil {
 		t.Fatalf("with a resolvable primary a peek blip must degrade, not fail: %v", err)
 	}
@@ -164,7 +164,7 @@ func TestSessionDir_LookupFailureDegradesThenRefusesAmbiguity(t *testing.T) {
 		Repos:    map[string]string{"acme/a": "/repos/a", "acme/b": "/repos/b"},
 		Releaser: &repoReleaser{peekErr: errors.New("plane 503")},
 	}
-	if _, _, err := d0(amb).sessionDir(context.Background(), amb, nil); !errors.Is(err, config.ErrRepoNotFound) {
+	if _, _, _, err := d0(amb).sessionDir(context.Background(), amb, nil); !errors.Is(err, config.ErrRepoNotFound) {
 		t.Errorf("err = %v, want ErrRepoNotFound for an ambiguous config that cannot even learn the task", err)
 	}
 }
@@ -173,7 +173,7 @@ func TestSessionDir_UnknownRepoIsLoud(t *testing.T) {
 	_, _, _, target := twoRepos(t)
 	target.Releaser = &repoReleaser{next: plane.NextTask{TaskID: "t-2", Repo: "other/nowhere"}}
 
-	_, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	_, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
 	if !errors.Is(err, config.ErrRepoNotFound) || !strings.Contains(err.Error(), "repo_not_found") {
 		t.Fatalf("err = %v, want the literal repo_not_found failure", err)
 	}

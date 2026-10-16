@@ -1341,6 +1341,40 @@ The conventional task-worktree area beside a checkout (`<checkout>-wt` as its
 sibling) joins the grant list automatically whenever that directory exists, so
 a session can create and edit the worktree it is told to work in.
 
+### PR bases: `pr_base`
+
+The phase briefs tell a session which branch its PR targets, and which branch a
+resumed task branch must be synced with before its work is trusted. That branch
+is a per-REPO fact, not per project: the makesPDF plugin repos merge into
+`main`, lecstor/makespdf and lecstor/clankerbar merge into `integration`, and
+this repo's PRs target `staging`.
+
+`pr_base` maps a repo identity (full `owner/name`, or the bare name) to the
+branch that repo's PRs target - top level, or per project in multi-project
+mode, where a project's own non-empty map replaces the top-level one:
+
+```jsonc
+{
+  "pr_base": {
+    "lecstor/makespdf": "integration",
+    "lecstor/clankerbar": "integration"
+  }
+}
+```
+
+Without an entry, the driver resolves the branch per repo at phase-spawn time:
+the project's `integration_branch`, when that branch exists on the origin
+remote, else origin's default branch (both read with a scoped
+`git ls-remote --symref origin HEAD`, so a private github remote is read as
+the account that owns it). A probe that cannot run - offline, no origin, no
+git - falls back to `integration_branch`, which is what the briefs said before
+`pr_base` existed, and a fallback never blocks a spawn.
+
+`integration_branch` keeps its own meaning unchanged: the branch whose tip
+`doctor`'s deploy_lag check judges the deployed build against. A repo can
+deploy from one branch while its PRs target another, which is exactly why the
+two knobs are separate.
+
 ### Execution config from the plane
 
 A project's execution dials - harness, model, tier buckets, budget, review-tier

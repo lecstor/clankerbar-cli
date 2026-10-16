@@ -82,9 +82,11 @@ func TestBuiltinImplementPhaseTellsTheSessionToStopAtTheCheckpoint(t *testing.T)
 // ever syncing staging in - staging had superseded the branch's whole fix a day
 // earlier, and the review phase paid for the archaeology and salvage a cheap
 // up-front check would have made unnecessary. The brief must carry all three
-// parts of the rule: merge the integration branch (never rebase), re-validate
-// the task against the merged tip before working, and on supersession record
-// the decision and park the task instead of re-verifying stale work.
+// parts of the rule: merge the branch the task's PRs will merge into (never
+// rebase) - CLA-608 makes that a resolved per-repo fact, {{prBase}}, not the
+// hard-wired integration branch - re-validate the task against the merged tip
+// before working, and on supersession record the decision and park the task
+// instead of re-verifying stale work.
 //
 // The content assertions are FULL directional phrases, not fragments: an
 // earlier draft pinned "doing or verifying" alone, and a mutation flipping the
@@ -101,7 +103,7 @@ func TestBuiltinImplementBriefPinsTheResumedBranchRule(t *testing.T) {
 	for _, want := range []string{
 		"existing branch or worktree",
 		"haswip",
-		"your first step is to merge the project's integration branch into it",
+		"your first step is to merge the repo's pr base branch ({{prbase}}) into it",
 		"a merge, never a rebase",
 		"phase-boundary check",
 		"then re-validate the task against the merged tip before doing or verifying any of the found work",
@@ -760,20 +762,26 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 // that was wrong. This pins the fix's three parts: the PR step itself, its
 // position relative to the terminal update_task call (CLA-384 made that call
 // emphatic and final, which pulls harder on anything mentioned before it), and
-// the worktree/never-commit-to-staging rule that names the failure mode rather
-// than leaving "commit where I am" looking like no decision at all.
+// the worktree/never-commit-to-the-base-branch rule that names the failure mode
+// rather than leaving "commit where I am" looking like no decision at all.
+//
+// Since CLA-608 the target is the {{prBase}} placeholder rather than a literal
+// branch name: the shipped text is shared by every repo of every project, and
+// the branch is resolved per repo at spawn time. A literal name here (any name,
+// "staging" included) would be the CLA-608 bug again - wrong for every repo it
+// does not happen to match.
 func TestReviewBriefStatesThePRStep(t *testing.T) {
 	brief, ok := builtinPhasePrompts[ReviewPhaseName]
 	if !ok {
 		t.Fatalf("no built-in brief for phase %q", ReviewPhaseName)
 	}
 
-	prIdx := strings.Index(brief, "PR")
+	prIdx := strings.Index(brief, "Open a PR")
 	if prIdx == -1 {
 		t.Fatalf("the review brief never mentions opening a PR:\n%s", brief)
 	}
-	if !strings.Contains(brief, "staging") {
-		t.Errorf("the review brief never names staging as the PR's target:\n%s", brief)
+	if !strings.Contains(brief, "PR base branch ("+PhasePRBasePlaceholder+")") {
+		t.Errorf("the review brief does not name the resolved PR base as the PR's target:\n%s", brief)
 	}
 	if !strings.Contains(brief, "if no PR exists") {
 		t.Errorf("the review brief does not say the PR step is a no-op when a PR already exists for the branch:\n%s", brief)
@@ -815,7 +823,9 @@ func TestReviewBriefStatesTheWorktreeRuleAndTheEmptyBranchRule(t *testing.T) {
 		// the verified branch ({{branch}}) rather than asserting an unverified
 		// phase-1 success.
 		"worktree for branch " + PhaseBranchPlaceholder + " recorded on the task",
-		"never commit to the integration branch",
+		// CLA-608: the branch the session must not commit onto is the resolved PR
+		// base, not a literal.
+		"never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ")",
 		"empty branch",
 		"FAILED hand-off",
 	} {
@@ -912,9 +922,9 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 		"get_task with includeDecisions: true",
 		"adversarial review gate",
 		"re-verify SCOPED to those fixes",
-		// The branch still names the worktree, with the staging rule.
+		// The branch still names the worktree, with the resolved-PR-base rule.
 		"worktree for branch " + PhaseBranchPlaceholder,
-		"never commit to the integration branch",
+		"never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ")",
 	} {
 		if !strings.Contains(unverifiedReviewBrief, want) {
 			t.Errorf("unverified review brief does not say %q:\n%s", want, unverifiedReviewBrief)
@@ -1087,5 +1097,37 @@ func TestRerunGuidancePointsAtWaitingRatherThanRestatingIt(t *testing.T) {
 	// the task.
 	if !strings.Contains(rerunGuidance, "keeping hold of this task") {
 		t.Errorf("rerunGuidance does not scope the waiting pointer to keeping the task; unscoped, Rule 1 reads as permission to release mid-phase:\n%s", rerunGuidance)
+	}
+}
+
+// CLA-608: the branch that phase briefs name as the PR target is resolved per
+// repo at spawn time, so every shipped brief that names one must carry the
+// {{prBase}} placeholder — and none may carry a literal branch name, which is
+// the bug being fixed (any literal is wrong for some repo in some project).
+// The no-code brief names no branch at all and is deliberately exempt.
+func TestBuiltinBriefsCarryThePRBasePlaceholder(t *testing.T) {
+	for name, brief := range builtinPhasePrompts {
+		if !strings.Contains(brief, PhasePRBasePlaceholder) {
+			t.Errorf("the %q brief never carries %s, so its PR base is either absent or hard-coded:\n%s", name, PhasePRBasePlaceholder, brief)
+		}
+		if strings.Contains(brief, "(staging)") {
+			t.Errorf("the %q brief still hard-codes the old (staging) literal:\n%s", name, brief)
+		}
+	}
+	if !strings.Contains(unverifiedReviewBrief, PhasePRBasePlaceholder) {
+		t.Errorf("the unverified review brief never carries %s:\n%s", PhasePRBasePlaceholder, unverifiedReviewBrief)
+	}
+	if !strings.Contains(reviewTerminalStep, PhasePRBasePlaceholder) {
+		t.Errorf("reviewTerminalStep does not carry %s, so the PR step's target cannot be resolved:\n%s", PhasePRBasePlaceholder, reviewTerminalStep)
+	}
+	if !strings.Contains(implementResumedBranchRule, PhasePRBasePlaceholder) {
+		t.Errorf("implementResumedBranchRule does not carry %s, so a resumed branch is synced against the wrong branch:\n%s", PhasePRBasePlaceholder, implementResumedBranchRule)
+	}
+	// The placeholder is unresolved text: a phase-0 prompt carrying the RESUME
+	// placeholders is refused (see the presence check in Validate), and {{prBase}}
+	// is deliberately not one of those — it needs no claim — so this pins that it
+	// is NOT smuggled into that refusal set.
+	if strings.Contains(implementCommitEarlyRule, PhasePRBasePlaceholder) {
+		t.Errorf("the commit-early rule carries %s; it belongs where a branch is named, not in entry guidance:\n%s", PhasePRBasePlaceholder, implementCommitEarlyRule)
 	}
 }

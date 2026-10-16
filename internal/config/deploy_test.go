@@ -195,3 +195,63 @@ func TestValidateAcceptsPlainIntegrationBranches(t *testing.T) {
 		}
 	}
 }
+
+// --- pr_base validation (CLA-608) ----------------------------------------------
+//
+// pr_base values reach the phase briefs and the branch names inside them, so
+// each one gets the same bare-ref-name check integration_branch gets - and an
+// empty value is refused rather than read as "the default branch": in a map,
+// an entry saying nothing is a half-written override whose silence would look
+// like "resolved per repo" when the operator plainly meant to name a branch.
+
+func TestValidateAcceptsPRBase(t *testing.T) {
+	c := &Config{
+		Harness: "claude",
+		Prompt:  "Work the backlog.",
+		PRBase:  map[string]string{"lecstor/makespdf": "integration", "two": "main"},
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("a well-formed pr_base map should validate, got %v", err)
+	}
+
+	c = &Config{
+		Harness:  "claude",
+		Prompt:   "Work the backlog.",
+		Projects: []Project{{Slug: "acme", PRBase: map[string]string{"acme/a": "release/2026-08"}}},
+	}
+	if err := c.Validate(); err != nil {
+		t.Errorf("a well-formed per-project pr_base should validate, got %v", err)
+	}
+}
+
+func TestValidateRefusesBadPRBaseValues(t *testing.T) {
+	for _, bad := range []string{"staging:refs/heads/evil", "--upload-pack=evil", "sta ging", "release~2026", ""} {
+		c := &Config{
+			Harness: "claude",
+			Prompt:  "Work the backlog.",
+			PRBase:  map[string]string{"lecstor/makespdf": bad},
+		}
+		if err := c.Validate(); err == nil {
+			t.Errorf("pr_base value %q must be refused", bad)
+		}
+	}
+
+	c := &Config{
+		Harness:  "claude",
+		Prompt:   "Work the backlog.",
+		Projects: []Project{{Slug: "acme", PRBase: map[string]string{"acme/a": "main:x"}}},
+	}
+	if err := c.Validate(); err == nil {
+		t.Error("the per-project pr_base gets the same value check")
+	}
+}
+
+// topLevelConfigKeys is kept in lockstep with the Config struct's json tags:
+// adding a knob without adding its key here would quietly stop the supervisor
+// from recognising the files that set it, and pr_base is a knob an operator
+// sets (the follow-up config entries the task that filed CLA-608 names).
+func TestPRBaseIsARecognizedTopLevelConfigKey(t *testing.T) {
+	if !LooksLikeConfig([]byte(`{"pr_base": {"lecstor/makespdf": "integration"}}`)) {
+		t.Error("a config setting only pr_base must be recognised as a clankerbar config")
+	}
+}
