@@ -1928,8 +1928,10 @@ func recordedBranches(res harness.Result) []string {
 //
 // read is the tri-state the freshness check needs: false means the baseline
 // could not be read (no plane reader, a failed read, no task id on the carried
-// claim), and the gate then refuses rather than pretending an unread outcome
-// was unchanged. baseline is meaningful only when read is true.
+// claim). Since CLA-663 that is refused BEFORE the phase spawns — a full
+// review session whose checkpoint the seam would refuse anyway is pure waste,
+// and the claim would lapse into a takeover that re-runs implement and review.
+// baseline is meaningful only when read is true.
 //
 // Since CLA-637 the gate itself is the DURABLE review record (B1), keyed on
 // the run that wrote it: role names the record this phase's session writes
@@ -2298,12 +2300,12 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 		//
 		// Fail-closed, like every other evidence form: a record that cannot be
 		// read — or cannot be found — is not a review that happened. The cost
-		// is a re-run of the review; the alternative is an unreviewed PR.
+		// is a re-run of the review; the alternative is an unreviewed PR. An
+		// unread BASELINE never reaches this gate: an unreadable baseline is
+		// refused before the review spawns (CLA-663), so this switch judges
+		// only tasks both reads could see.
 		if review.required {
-			switch {
-			case !review.read:
-				return branch, tip, false, false, "the task could not be read before the review phase spawned, so this phase's record cannot be judged against the task it found — the next phase would risk advancing on an unverified review"
-			case !recordRead:
+			if !recordRead {
 				return branch, tip, false, false, "the task's review records could not be read after the review phase ended, so a durable review record cannot be verified — the next phase would risk running on a record that does not exist"
 			}
 			rec, matched := matchingReviewRecord(record.Reviews, review.role, res.Claim.RunID, tip, unverified)
@@ -2420,19 +2422,57 @@ func (d *Driver) readTaskOutcome(ctx context.Context, t Target, prev *harness.Re
 	return st.Outcome, true
 }
 
+// reviewBaselineReadAttempts bounds the baseline read's retries at review spawn
+// (CLA-663): the initial attempt plus two more. The failure this recovers from
+// is a plane blip — a dropped response, a read that timed out — and one retry
+// pair around a 20-second read is enough for that without turning an outage
+// into a long stall. Deliberately no sleep between attempts: the read's own
+// timeout is the pacing, and the whole point of a bounded retry here is to
+// avoid paying for a session, not to wait for a sick plane.
+const reviewBaselineReadAttempts = 3
+
 // readReviewBaseline reads the task's outcome as it stands BEFORE the review
 // phase spawns, so the seam can require the record to have changed. The task id
 // comes from the carried claim (the predecessor phase's), which is exact for a
 // resumed phase and is why this runs inside drainPhase, where `prev` is still
 // in hand.
 //
-// Best-effort like every other plane read: a failure returns read=false, and
-// the gate then refuses the checkpoint rather than guessing whether the outcome
-// changed. No second read is needed here for a target with no plane wiring —
-// the same wiring the seam read already requires.
+// Best-effort like every other plane read, with one difference CLA-663 added:
+// the read is RETRIED up to reviewBaselineReadAttempts times, because a blip
+// here does not degrade to "judge on other evidence" — it fails the whole
+// sequence closed. A failure still returns read=false, and the caller refuses
+// to spawn the review rather than letting it run a session whose checkpoint the
+// seam would reject. No retries are spent on a target with no plane wiring or
+// no task id to ask about: those cannot be fixed by asking again.
 func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
-	return d.readTaskOutcome(ctx, t, prev,
-		"before the review phase spawned", "the review→fix gate cannot judge its record against the task it found")
+	if prev == nil || prev.Claim.TaskID == "" {
+		return "", false
+	}
+	src, wired := t.Releaser.(plane.TaskStateSource)
+	if !wired {
+		return "", false
+	}
+	lastErr := ""
+	for attempt := 1; attempt <= reviewBaselineReadAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return "", false
+		}
+		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		st, err := src.TaskState(sctx, prev.Claim.TaskID)
+		cancel()
+		switch {
+		case err == nil:
+			return st.Outcome, true
+		case errors.Is(err, plane.ErrNotWired):
+			// No wiring to retry against; the gate refuses at the spawn guard.
+			return "", false
+		default:
+			lastErr = err.Error()
+		}
+	}
+	log.Printf("%scould not read the plane's record of %s before the review phase spawned, after %d attempts (%s) — the review→fix gate cannot judge its record against the task it found",
+		labelOf(t), prev.Claim.TaskID, reviewBaselineReadAttempts, lastErr)
+	return "", false
 }
 
 // closeReviewRound releases a review round's sealed findings (CLA-637) by
@@ -2609,13 +2649,35 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// the phase's outcome as the review found it. A handoff respawn re-enters
 	// drainPhase with the same carried claim and takes a fresh baseline, so a
 	// successor must still write the record its own session is responsible for.
-	// The reviewer role is the other half of the gate's key: one name, read from
-	// the same resolved config the brief is built from, so the session records
-	// under exactly the role the seam will match.
+	//
+	// CLA-663: an unreadable baseline refuses the phase BEFORE it spawns. The
+	// seam cannot prove a record is this trip's from a baseline it never read —
+	// so the old order spawned the full review session and then threw its
+	// checkpoint away, and the claim (HasWIP) lapsed into a takeover that
+	// re-ran implement AND review. Refusing here pays the read — already
+	// retried by readReviewBaseline — and nothing else, and leaves the claim
+	// with the same disposition a seam refusal leaves it: released when it is
+	// releasable, left to lapse into a takeover when it carries pushed work.
+	//
+	// The reviewer role is the other half of the gate's key (CLA-637): one
+	// name, read from the same resolved config the brief is built from, so the
+	// session records under exactly the role the seam will match.
 	review := reviewGate{required: requireReviewRecord}
 	if review.required {
 		review.role = reviewerRoleFor(ephases, phaseIdx)
 		review.baseline, review.read = d.readReviewBaseline(ctx, t, prev)
+		if !review.read {
+			log.Printf("%siteration %d: refusing to spawn the %s phase: the task could not be read before it spawned, so this phase's record cannot be judged against the task it found — the sequence ends here without the review; the claim is released when it is releasable, else left to lapse into a takeover",
+				labelOf(t), drainNum, ph.Label(phaseIdx))
+			end.empty = true
+			end.emptyWhy = "the task's outcome could not be read before the review phase spawned"
+			if prev != nil {
+				end.claim = prev
+				end.released = prev.Claim.Held()
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
+			}
+			return 0, 0, false, end, nil
+		}
 	}
 	// The adapter for THIS phase, resolved once: everything below — the spawn, the
 	// classification of what came back, and the probe of any usage limit it hit —

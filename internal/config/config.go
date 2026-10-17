@@ -511,8 +511,9 @@ const fixTerminalRecord = " BEFORE the handover call (which ends the run and cle
 	"unknown id or a still-sealed round refuses it, so send it BEFORE the handover - before the call that " +
 	"moves the task to in_review, even when that same call carries your outcome. An empty array is refused; if " +
 	"the review found nothing, skip the call. THEN hand the task over: the " +
-	"outcome MUST keep everything the existing outcome carries ABOVE the review's `" + ReviewRecordHeading +
-	"` block (phase 1's delivery record, or an earlier round's) unchanged, keep the review's block VERBATIM " +
+	"outcome MUST keep everything the existing outcome carries ABOVE the LAST `" + ReviewRecordHeading + "` block " +
+	"(phase 1's delivery record plus any earlier rounds, their `" + ReviewRecordHeading + "` blocks included) " +
+	"unchanged, keep that LAST block VERBATIM " +
 	"(verdict, every finding by ID, its required fix, and the attribution it already carries — do not restate " +
 	"that attribution from this brief), and add a `### Fixes` list saying, for every finding, whether you fixed " +
 	"it (with the commit SHA, or for a no-code task the record change you made, or the ref of the real follow-up " +
@@ -1049,7 +1050,8 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
 	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
 	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
-	ReviewRecordHeading + "` block in the task's outcome for one release. It changed nothing. You are " +
+	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
+	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. You are " +
 	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true. " +
 	"Read BOTH the durable record and the block: `reviews.records` carries every released record in the newest " +
@@ -1084,7 +1086,8 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
 	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
 	"Then get_task with includeDecisions: true. Read the released durable record (`reviews.records`) and the " +
-	"outcome's legacy `" + ReviewRecordHeading + "` block. If there is neither, that is a FAILED hand-off: say so " +
+	"outcome's legacy `" + ReviewRecordHeading + "` block — the LAST such block, because an earlier one is an " +
+	"earlier round. If there is neither, that is a FAILED hand-off: say so " +
 	"in your outcome, and park the task if it is still in_progress - if phase 1 already settled it, leave it " +
 	"settled and end. Do not invent findings. Apply the findings by their PLANE ids, AMENDING THE RECORD " +
 	"(update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
@@ -2500,67 +2503,6 @@ func discover() string {
 		return p
 	}
 	return ""
-}
-
-// topLevelConfigKeys are the JSON keys Config unmarshals from. A file carrying
-// at least one of them IS a clankerbar config (or claims to be); the other JSON
-// that shares the config dir — MCP configs (`mcp`, `mcpServers`), headless
-// permission policies (`permissions`, `allow`, `deny`), opencode configs — carry
-// none. Kept in lockstep with the Config struct's json tags, which are the
-// source of truth: adding a knob without adding its key here would silently
-// stop the supervisor from recognising the files that set it.
-var topLevelConfigKeys = map[string]bool{
-	"allow_local_mcp_servers": true,
-	"allow_unchecked_pr":      true,
-	"backlog_url":             true,
-	"budget":                  true,
-	"config_dir":              true,
-	"env":                     true,
-	"escalation":              true,
-	"harness":                 true,
-	"harnesses":               true,
-	"health_url":              true,
-	"idle_poll_interval":      true,
-	"instance_name":           true,
-	"integration_branch":      true,
-	"max_iterations":          true,
-	"max_retries":             true,
-	"max_session_wall_clock":  true,
-	"max_turns":               true,
-	"max_zero_spend_attempts": true,
-	"mcp_config_path":         true,
-	"model":                   true,
-	"models":                  true,
-	"phases":                  true,
-	"poll_interval":           true,
-	"pr_base":                 true,
-	"primary_repo":            true,
-	"projects":                true,
-	"prompt":                  true,
-	"repos":                   true,
-	"retry_cap":               true,
-	"settings_path":           true,
-	"state_dir":               true,
-	"workdir":                 true,
-}
-
-// LooksLikeConfig reports whether data is JSON carrying at least one recognized
-// clankerbar config key. It is the supervisor's first filter over `*.json` in
-// the config dir: a file that fails it cannot be an instance config whatever
-// Load and Validate would say (a headless permission policy validates as an
-// empty config with defaults), so it is skipped without even being loaded.
-// Unparseable data is not a config.
-func LooksLikeConfig(data []byte) bool {
-	var keys map[string]json.RawMessage
-	if err := json.Unmarshal(data, &keys); err != nil {
-		return false
-	}
-	for k := range keys {
-		if topLevelConfigKeys[k] {
-			return true
-		}
-	}
-	return false
 }
 
 // refuseImplicitWorkDirConfig refuses to run when a `clankerbar.json` is sitting

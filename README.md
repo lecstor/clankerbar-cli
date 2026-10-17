@@ -107,23 +107,30 @@ replaces the field wholesale — and the driver refuses to advance to `fix` unle
 the plane serves a durable record **this run** wrote under this phase's
 reviewer role whose reviewed tip equals the branch tip the driver verified on
 origin: an earlier trip's record (a `request_changes` rework, a takeover) never
-satisfies it. Before spawning `fix` the driver **closes the round**, which is
-what releases the sealed findings to the fixer. The claim is held across the
-seam, so the task is never posted back to the queue mid-sequence.
+satisfies it. Before a review session is spawned at all, the driver reads the
+task's baseline and retries the read; if it stays unread the sequence ends
+without the review — a session whose record the seam could not judge against
+the task it found is pure waste (CLA-663). Before spawning `fix` the driver
+**closes the round**, which is what releases the sealed findings to the fixer.
+The claim is held across the seam, so the task is never posted back to the queue
+mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
-same run, reads the review block back with `get_task`, checks the reviewed tip
-still matches the worktree's HEAD, and applies every finding by ID. The driver
-has already read the record and listed the graded findings in the fix brief,
-applying the structural check the fixer must not second-guess: a `must` recorded
-without an evidence kind or payload is listed as a `should`. Every listed `must`
-is fixed, or refuted with evidence recorded in its outcome — a `must` is never
-downgraded, and one raised by a single reviewer is never dropped because nobody
-else raised it. Cheap `should`s are fixed; `nit`s and the rest are recorded as
-not done with a reason (a follow-up task only for a `should` worth doing). The
-fixer re-verifies scoped to those fixes, commits and pushes them, opens a PR
-targeting the repo's PR base if none exists yet for the branch, and hands the
-task to `in_review`. Its outcome keeps everything above the review block and
+same run, reads the released durable record back with `get_task` — and, for one
+release, the **last** `## Review` block beside it, because a re-trip can carry
+several — checks the record's reviewed tip still matches the worktree's HEAD,
+and applies every finding by its plane ID
+(or records why not). The driver has already read the record and listed the
+graded findings in the fix brief, applying the structural check the fixer must
+not second-guess: a `must` recorded without an evidence kind or payload is
+listed as a `should`. Every listed `must` is fixed, or refuted with evidence
+recorded in its outcome — a `must` is never downgraded, and one raised by a
+single reviewer is never dropped because nobody else raised it. Cheap `should`s
+are fixed; `nit`s and the rest are recorded as not done with a reason (a
+follow-up task only for a `should` worth doing). The fixer re-verifies scoped to
+those fixes, commits and pushes them, opens a PR targeting the repo's PR base if
+none exists yet for the branch, and hands the task to `in_review`. Its outcome
+keeps everything above that **last** block — earlier rounds included — and
 carries the review forward with a `### Fixes` list and both sides' attribution,
 so the task holds the whole round: who reviewed, what was found, what was done
 about it. See
