@@ -180,12 +180,29 @@ func TestDrainPhases_TheResumingBriefIsNotBuiltFromThePreviousSessionsOutput(t *
 	// session still cannot frame its own reviewer: an arbitrary branch name
 	// changes what the reviewer works in, never what it is told to attack.
 	claim := openClaim()
+	// The attribution and position values are CONFIG-derived, not session-derived:
+	// the reviewing phase's own harness/model, the implement phase's, and the
+	// sequence position. They joined the substitution set with the review split,
+	// and they must be in this expectation or the property this test exists for -
+	// "no stream-derived text reaches the reviewing brief" - would be weakened by
+	// a blanket exclusion rather than stated.
+	phases := d.cfg.EffectivePhases()
+	reviewer, implementer := phases[1], phases[0]
+	tc := d.targetCfg(d.targets[0])
+	reviewModel, _ := tc.ModelForPhase(reviewer)
+	implementModel, _ := tc.ModelForPhase(implementer)
 	want := strings.NewReplacer(
 		config.PhaseTaskPlaceholder, claim.TaskID,
 		config.PhaseRunPlaceholder, claim.RunID,
 		config.PhaseBranchPlaceholder, "clanker/x",
 		config.PhasePRBasePlaceholder, config.DefaultIntegrationBranch,
-	).Replace(d.cfg.EffectivePhases()[1].Prompt)
+		config.PhaseHarnessPlaceholder, attributionOr(tc.HarnessFor(reviewer), "unknown harness"),
+		config.PhaseModelPlaceholder, attributionOr(reviewModel, "harness default"),
+		config.PhasePrevHarnessPlaceholder, attributionOr(tc.HarnessFor(implementer), "unknown harness"),
+		config.PhasePrevModelPlaceholder, attributionOr(implementModel, "harness default"),
+		config.PhaseNumberPlaceholder, "2",
+		config.PhaseTotalPlaceholder, "2",
+	).Replace(reviewer.Prompt)
 	if h.invocations[1].Prompt != want {
 		t.Fatalf("phase 2's brief carried something other than config + the three claim-derived values:\n got: %q\nwant: %q",
 			h.invocations[1].Prompt, want)

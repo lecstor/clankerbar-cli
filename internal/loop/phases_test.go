@@ -1780,3 +1780,107 @@ func TestPRBaseResolution_ReachesHandoffRespawnPrompts(t *testing.T) {
 		t.Errorf("the handoff successor still carries the unfilled %s placeholder:\n%s", config.PhasePRBasePlaceholder, successor)
 	}
 }
+
+// The split this feature ships: implement, review-only, fix. The review phase
+// must be read-only (no PR, no commit, no in_review) and must record its findings
+// on the task; the fix phase must be the last one, carry the terminal step, and
+// name both sides' attribution. The count in each brief is the SEQUENCE's, not
+// the old hard-coded "of 2".
+func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
+	phases := []config.Phase{
+		{Name: config.ImplementPhaseName, Tier: "cheap"},
+		{Name: config.ReviewPhaseName, Tier: "strong"},
+		{Name: config.FixPhaseName, Tier: "cheap"},
+	}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, phases)
+	d.cfg.Models = map[string]string{"strong": "opus-test", "cheap": "cheap-test"}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — implement, review-only, fix", h.invokeCalls)
+	}
+
+	p1, p2, p3 := h.invocations[0].Prompt, h.invocations[1].Prompt, h.invocations[2].Prompt
+	for i, p := range []string{p1, p2, p3} {
+		if strings.Contains(p, "{{") {
+			t.Errorf("phase %d's prompt still carries an unresolved placeholder:\n%s", i+1, p)
+		}
+	}
+	if !strings.Contains(p1, "PHASE 1 of 3") {
+		t.Errorf("the implement brief does not count the three-phase sequence:\n%s", p1)
+	}
+	if !strings.Contains(p2, "PHASE 2 of 3") || !strings.Contains(p2, "REVIEW-ONLY gate") {
+		t.Errorf("phase 2 is not the review-only gate of a 3-phase sequence:\n%s", p2)
+	}
+	// The review must not be told to do the fix phase's job. "Open a PR" in the
+	// positive is the tell; the review's own "do not open a PR" is lowercase.
+	if strings.Contains(p2, "Open a PR") || strings.Contains(p2, `status: "in_review"`) {
+		t.Errorf("the review-only phase carries the fix phase's terminal actions:\n%s", p2)
+	}
+	if !strings.Contains(p2, "reviewed by: harness claude, model opus-test") ||
+		!strings.Contains(p2, "implemented by: harness claude, model cheap-test") {
+		t.Errorf("the review record does not name both sides' resolved attribution:\n%s", p2)
+	}
+
+	if !strings.Contains(p3, "PHASE 3 of 3") || !strings.Contains(p3, "FIX phase and the LAST phase") {
+		t.Errorf("phase 3 is not the fix phase of a 3-phase sequence:\n%s", p3)
+	}
+	for _, want := range []string{
+		"Open a PR",
+		`status: "in_review"`,
+		"fixed by: harness claude, model cheap-test",
+		"### Fixes",
+	} {
+		if !strings.Contains(p3, want) {
+			t.Errorf("the fix brief does not carry %q:\n%s", want, p3)
+		}
+	}
+
+	logs := strings.Join(iterationLogs(t, d.state.Path()), " ")
+	for _, tag := range []string{"-pimplement-", "-preview-", "-pfix-"} {
+		if !strings.Contains(logs, tag) {
+			t.Errorf("no iteration log carries the phase tag %q: %s", tag, logs)
+		}
+	}
+}
+
+// A handoff inside the review-only phase must carry the record-then-hold ending,
+// never the commit/push/PR/in_review terminal step. This is the seam a wording
+// change in the first session's brief cannot reach.
+func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: handoffResult("Review half done: the API surface is cleared, the storage layer is next.")},
+		{res: checkpointed(5, 0.50)},
+		{res: okResult(1, 0)},
+	}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	})
+
+	if _, _, _, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4: implement, review, its handoff successor, fix", h.invokeCalls)
+	}
+	successor := h.invocations[2].Prompt
+	if !strings.Contains(successor, "review-only ending") {
+		t.Errorf("the review-only handoff successor did not get the review-only ending:\n%s", successor)
+	}
+	if strings.Contains(successor, "Open a PR") || strings.Contains(successor, `status: "in_review"`) {
+		t.Errorf("the review-only handoff successor was told to finish the task:\n%s", successor)
+	}
+	if !strings.Contains(h.invocations[3].Prompt, "PHASE 3 of 3") {
+		t.Errorf("the fix phase did not run after the review-only handoff chain:\n%s", h.invocations[3].Prompt)
+	}
+}

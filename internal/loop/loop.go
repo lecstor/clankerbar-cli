@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1200,10 +1201,21 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// branchlessCheckpoint records the checkpoint that opened this
 				// phase (captured at the seam from the carried claim), so the
 				// continuation matches the brief this phase's first session ran.
-				if ph.Name == config.ReviewPhaseName && branchlessCheckpoint {
+				//
+				// The split adds the POSITION-dependent review mode: a handoff
+				// during a review-only phase must carry the record-then-hold
+				// ending, never the commit/push/PR/in_review terminal step. A
+				// fix phase carries that terminal step by name.
+				reviewOnly := ph.Name == config.ReviewPhaseName && i < len(phases)-1
+				switch {
+				case ph.Name == config.ReviewPhaseName && branchlessCheckpoint && reviewOnly:
+					continuation = config.NoCodeReviewOnlyHandoffContinuation()
+				case ph.Name == config.ReviewPhaseName && branchlessCheckpoint:
 					continuation = config.NoCodeHandoffContinuation()
-				} else {
-					continuation = config.HandoffContinuation(ph.Name)
+				case ph.Name == config.FixPhaseName && branchlessCheckpoint:
+					continuation = config.NoCodeHandoffContinuation()
+				default:
+					continuation = config.HandoffContinuationFor(ph.Name, reviewOnly)
 				}
 			}
 			ph.Prompt = config.HandoffPreamble + nextPrompt + continuation
@@ -1863,6 +1875,16 @@ func verifiedBranch(res *harness.Result) string {
 		return bs[0]
 	}
 	return ""
+}
+
+// attributionOr renders a harness/model value for a phase brief's record block.
+// An empty model is normal (the harness default) and must not render as the bare
+// word "model" followed by nothing, which reads like a truncated write.
+func attributionOr(v, fallback string) string {
+	if strings.TrimSpace(v) == "" {
+		return fallback
+	}
+	return v
 }
 
 // peekCheckpointClaim asks the plane whether the task this phase was BRIEFED on
@@ -3994,14 +4016,29 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// builtin brief's "a branch the driver verified to exist on the origin
 		// remote" is the one claim that must not reach the successor. It gets
 		// the unverified variant instead, again for the built-in prompt only.
+		//
+		// The split adds a THIRD mode: a non-final review runs the review-only
+		// brief, whose variants must stay review-only (record, never fix or
+		// hand over). The mode is selected by the resolved prompt text, not by a
+		// flag, so a custom prompt is never rewritten into a shipped one.
 		prompt := inv.Prompt
-		if prompt == config.BuiltinReviewBrief() {
+		switch {
+		case prompt == config.ReviewOnlyBrief():
+			switch {
+			case prev.Claim.Branch == "":
+				prompt = config.NoCodeReviewOnlyBrief()
+			case prev.CheckpointUnverified:
+				prompt = config.UnverifiedReviewOnlyBrief()
+			}
+		case prompt == config.BuiltinReviewBrief():
 			switch {
 			case prev.Claim.Branch == "":
 				prompt = config.NoCodeReviewBrief()
 			case prev.CheckpointUnverified:
 				prompt = config.UnverifiedReviewBrief()
 			}
+		case prompt == config.FixBrief() && prev.Claim.Branch == "":
+			prompt = config.NoCodeFixBrief()
 		}
 		inv.Prompt = strings.NewReplacer(
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
@@ -4022,6 +4059,34 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	if prBase != "" {
 		inv.Prompt = strings.NewReplacer(config.PhasePRBasePlaceholder, prBase).Replace(inv.Prompt)
 	}
+	// Attribution and position, for EVERY phase: a brief may name this phase's
+	// harness/model, its predecessor's, and where it sits in the sequence. These
+	// are facts only the driver has: a session cannot reliably report its own
+	// model, and it cannot see the previous phase's at all. Substituted after the
+	// variant selection above, deliberately: those comparisons are against the
+	// UNSUBSTITUTED built-in text, and filling these first would make every
+	// built-in look like an operator's custom prompt.
+	//
+	// An empty model is normal (the harness default), and rendering it as an
+	// empty string would leave a record reading "model " with nothing after it -
+	// indistinguishable from a truncated write. The fallback says the fact out
+	// loud instead.
+	phases := tc.EffectivePhases()
+	phaseTotal := len(phases)
+	prevHarness, prevModel := "", ""
+	if phaseIdx > 0 && phaseIdx-1 < len(phases) {
+		prevPh := phases[phaseIdx-1]
+		prevHarness = tc.HarnessFor(prevPh)
+		prevModel, _ = tc.ModelForPhase(prevPh)
+	}
+	inv.Prompt = strings.NewReplacer(
+		config.PhaseHarnessPlaceholder, attributionOr(tc.HarnessFor(ph), "unknown harness"),
+		config.PhaseModelPlaceholder, attributionOr(model, "harness default"),
+		config.PhasePrevHarnessPlaceholder, attributionOr(prevHarness, "unknown harness"),
+		config.PhasePrevModelPlaceholder, attributionOr(prevModel, "harness default"),
+		config.PhaseNumberPlaceholder, strconv.Itoa(phaseIdx+1),
+		config.PhaseTotalPlaceholder, strconv.Itoa(phaseTotal),
+	).Replace(inv.Prompt)
 	return inv, nil
 }
 

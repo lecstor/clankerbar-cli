@@ -1131,3 +1131,249 @@ func TestBuiltinBriefsCarryThePRBasePlaceholder(t *testing.T) {
 		t.Errorf("the commit-early rule carries %s; it belongs where a branch is named, not in entry guidance:\n%s", PhasePRBasePlaceholder, implementCommitEarlyRule)
 	}
 }
+
+// The split's mode is POSITIONAL: a review with a phase after it is the
+// read-only gate; a final review keeps the historical review-and-fix brief so
+// an existing two-phase config still reaches in_review. Pinning both arms is
+// what stops a later edit from silently flipping every existing config into a
+// sequence that stops at a checkpoint with no successor.
+func TestEffectivePhases_ReviewIsOnlyWhenAPhaseFollowsIt(t *testing.T) {
+	three := defaults()
+	three.Prompt = ""
+	three.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+
+	got := three.EffectivePhases()
+	if len(got) != 3 {
+		t.Fatalf("got %d phases, want 3", len(got))
+	}
+	if got[1].Prompt != reviewOnlyBrief {
+		t.Errorf("a non-final review did not resolve to the review-only brief:\n%s", got[1].Prompt)
+	}
+	if got[2].Prompt != fixBrief {
+		t.Errorf("the fix phase did not resolve to the fix brief:\n%s", got[2].Prompt)
+	}
+
+	two := defaults()
+	two.Prompt = ""
+	two.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}}
+	got = two.EffectivePhases()
+	if got[1].Prompt != builtinPhasePrompts[ReviewPhaseName] {
+		t.Errorf("a FINAL review lost the historical review-and-fix brief, so an existing two-phase config would stop at the checkpoint:\n%s", got[1].Prompt)
+	}
+
+	// An operator's own prompt is never rewritten by the positional rule.
+	custom := defaults()
+	custom.Prompt = ""
+	custom.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName, Prompt: "my gate"}, {Name: FixPhaseName}}
+	if got := custom.EffectivePhases()[1].Prompt; got != "my gate" {
+		t.Errorf("the positional rule overwrote a custom review prompt with %q", got)
+	}
+}
+
+// The review-only brief is the whole cost argument: the expensive model reads
+// and judges, and changes nothing. Pin the prohibitions and the record, not
+// merely the presence of the word "review" — a brief that says "review only"
+// and then asks it to fix what it finds is the thing being removed.
+func TestBuiltinReviewOnlyBriefStatesItsScopeAndRecord(t *testing.T) {
+	brief := reviewOnlyBrief
+	lower := strings.ToLower(brief)
+
+	for _, want := range []string{
+		"review-only gate",
+		"find issues",
+		"specify fixes",
+		"review only",
+		"do not edit, create or delete a source file",
+		"do not commit",
+		"do not push",
+		"do not open a pr",
+		"## review (round 1)",
+		"reviewed tip",
+		"verdict: pass",
+		"verdict: findings",
+		"r1 [must|should|nit]",
+		"required fix",
+		"failed hand-off",
+		"heartbeat(",
+		"get_task with includedecisions: true",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the review-only brief never says %q:\n%s", want, brief)
+		}
+	}
+	// Placeholders are case-sensitive: the lowercased copy cannot carry them.
+	for _, want := range []string{
+		PhaseTaskPlaceholder,
+		PhaseRunPlaceholder,
+		PhaseBranchPlaceholder,
+		PhaseHarnessPlaceholder,
+		PhaseModelPlaceholder,
+		PhasePrevHarnessPlaceholder,
+		PhasePrevModelPlaceholder,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the review-only brief never carries %s:\n%s", want, brief)
+		}
+	}
+
+	// The actions that belong to the fix phase must be ABSENT, not merely
+	// contradicted somewhere else: a session reads the brief linearly, and a
+	// dangling "Then COMMIT and PUSH" is an instruction whatever the paragraph
+	// above said.
+	for _, banned := range []string{
+		"Open a PR", "COMMIT and PUSH", `status: "in_review"`, "fix what it finds",
+	} {
+		if strings.Contains(brief, banned) {
+			t.Errorf("the review-only brief carries %q, which is the fix phase's job:\n%s", banned, brief)
+		}
+	}
+
+	// Position: the record-then-hold ending is the last thing before the shared
+	// handoff guidance, in the same emphatic shape CLA-384 pinned on the old
+	// terminal step.
+	if !strings.HasSuffix(brief, reviewOnlyTerminalStep+handoffGuidance) {
+		t.Errorf("the review-only ending is not the last thing before the handoff guidance:\n%s", brief)
+	}
+	if !strings.Contains(reviewOnlyTerminalStep, "do NOT COMMIT, PUSH or open a PR") {
+		t.Errorf("the review-only terminal step does not forbid the fix phase's actions:\n%s", reviewOnlyTerminalStep)
+	}
+}
+
+// The fix brief is the one that must land the PR and the hand-off, and it must
+// carry the review forward: once it overwrites the review's outcome, the review
+// block in its own outcome is the only durable record of what was found and
+// what was done about it.
+func TestBuiltinFixBriefCarriesTheReviewForwardAndTheTerminalStep(t *testing.T) {
+	brief := fixBrief
+	lower := strings.ToLower(brief)
+
+	for _, want := range []string{
+		"the fix phase and the last phase",
+		"## review",
+		"each by id",
+		"reviewed tip",
+		"git rev-parse head",
+		"park the task",
+		"### fixes",
+		"names the reviewer",
+		"fixed by: harness",
+		"failed hand-off",
+		"do not review the work yourself",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the fix brief never says %q:\n%s", want, brief)
+		}
+	}
+	for _, want := range []string{
+		PhaseTaskPlaceholder,
+		PhaseRunPlaceholder,
+		PhaseBranchPlaceholder,
+		PhasePRBasePlaceholder,
+		PhaseHarnessPlaceholder,
+		PhaseModelPlaceholder,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the fix brief never carries %s:\n%s", want, brief)
+		}
+	}
+
+	// The PR and in_review step is the shared terminal block, in its pinned
+	// position: a fix phase that ends without it is the CLA-384 failure again,
+	// with the added cost that the findings were recorded and then stranded.
+	if !strings.HasSuffix(brief, reviewTerminalStep+handoffGuidance) {
+		t.Errorf("the fix brief does not end on the shared terminal step:\n%s", brief)
+	}
+}
+
+func TestValidate_FixPhaseRules(t *testing.T) {
+	tests := []struct {
+		name   string
+		phases []Phase
+		want   string
+	}{
+		{
+			name:   "fix must be last",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}, {Name: "closer", Prompt: "finish"}},
+			want:   "LAST",
+		},
+		{
+			name:   "fix needs a review before it",
+			phases: []Phase{{Name: "builder", Prompt: "claim and build"}, {Name: FixPhaseName}},
+			want:   ReviewPhaseName,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := defaults()
+			c.Prompt = ""
+			c.Phases = tc.phases
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted %+v", tc.phases)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the rejection does not name %q: %v", tc.want, err)
+			}
+		})
+	}
+
+	// The shipped sequence is the one that must validate.
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate refused the shipped implement/review/fix sequence: %v", err)
+	}
+}
+
+// A first phase has no predecessor to name. The review brief's attribution
+// placeholders are refused there for the same reason the resume placeholders
+// are: a literal {{prevModel}} in a log is a misconfiguration announcing itself,
+// but there is no reason to spend a session discovering it.
+func TestValidate_RefusesPrevAttributionInFirstPosition(t *testing.T) {
+	for _, ph := range []string{PhasePrevHarnessPlaceholder, PhasePrevModelPlaceholder} {
+		c := defaults()
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: "solo", Prompt: "do the thing " + ph}}
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("Validate accepted %s in phase 0; there is no previous phase to fill it from", ph)
+			continue
+		}
+		if !strings.Contains(err.Error(), ph) {
+			t.Errorf("the rejection does not name %s: %v", ph, err)
+		}
+	}
+}
+
+// A handoff must not be a way to lose the mode. Review-only carries the
+// record-then-hold ending; the fix phase carries the PR/in_review terminal step;
+// the branchless review-only carries neither the PR step nor the no-code
+// handover, which belongs to the fix phase.
+func TestHandoffContinuation_CarriesThePhaseModeForward(t *testing.T) {
+	reviewOnly := HandoffContinuationFor(ReviewPhaseName, true)
+	if !strings.Contains(reviewOnly, reviewOnlyTerminalStep) {
+		t.Errorf("a review-only handoff does not carry the record-then-hold ending:\n%s", reviewOnly)
+	}
+	if strings.Contains(reviewOnly, reviewTerminalStep) {
+		t.Errorf("a review-only handoff carries the commit/push/PR/in_review terminal step:\n%s", reviewOnly)
+	}
+
+	combined := HandoffContinuationFor(ReviewPhaseName, false)
+	if !strings.Contains(combined, reviewTerminalStep) {
+		t.Errorf("a final review handoff lost the terminal step:\n%s", combined)
+	}
+
+	fix := HandoffContinuationFor(FixPhaseName, false)
+	if !strings.Contains(fix, reviewTerminalStep) {
+		t.Errorf("a fix-phase handoff lost the terminal step:\n%s", fix)
+	}
+
+	noCode := NoCodeReviewOnlyHandoffContinuation()
+	if !strings.Contains(noCode, noCodeReviewOnlyTerminalStep) {
+		t.Errorf("a branchless review-only handoff does not carry its ending:\n%s", noCode)
+	}
+	if strings.Contains(noCode, noCodeReviewTerminalStep) {
+		t.Errorf("a branchless review-only handoff carries the no-code handover, which is the fix phase's:\n%s", noCode)
+	}
+}
