@@ -3282,7 +3282,14 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 	// live claim upstream.
 	held := end.claim.Claim.Held()
 	d.releaseCarried(ctx, t, end.claim)
-	return phaseEnd{released: held}
+	// The session rides the reconstruction (CLA-630): it is record data for the
+	// fleet iteration record, not a hold to undo, and the pass it names really
+	// did spawn. The limit branch calls this BEFORE its stop paths return — a
+	// reset past the run's ceiling, a stop during the wait, a retry that fails
+	// to launch — and dropping the field there would omit a spawned session
+	// from the record. On the paths that loop back, the next attempt's own end
+	// replaces this one, so carrying it costs nothing.
+	return phaseEnd{released: held, session: end.session}
 }
 
 // countUndeclared says whether THIS call site is the one where a held-with-work

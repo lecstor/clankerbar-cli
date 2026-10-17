@@ -722,6 +722,48 @@ func TestDrainPhases_IterationRecordSendsAnUnresolvedModelAsTheEmptyString(t *te
 	}
 }
 
+// A pass that hit a rolling usage limit still spawned its session, so the record
+// must name it even when the limit's wait is refused. The limit branch runs
+// BEFORE the exit-code branches, so a CHECKPOINTABLE session (clean exit, held
+// claim, verified branch) can hit a limit on its way out — and a reset past the
+// run's ceiling is exactly the path where the phase returns right after
+// releaseCarriedEnd rebuilt the end, which is the end whose session the record
+// reads. The reconstruction must carry the field: it is record data, not a hold
+// to undo.
+func TestDrainPhases_ALimitStoppedPassStillNamesItsSession(t *testing.T) {
+	// Checkpointable AND limited: exit 0, the claim held with a verified branch,
+	// and the limit notice the fake's DetectLimit reads.
+	limited := checkpointed(10, 0.10)
+	limited.Raw = map[string]any{"kind": "limit"}
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limited}},
+		limitResetAt: time.Now().Add(3 * time.Hour),
+	}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+	// The reset lands past the run's ceiling, so waitPastBudget refuses the
+	// wait and the phase returns stopped — the return whose end the record
+	// reads.
+	d.cfg.Budget = config.Budget{MaxWallClock: config.Duration(30 * time.Minute)}
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if !stop {
+		t.Fatal("a reset past the run's ceiling did not stop the run")
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{{Phase: "implement", Harness: "fake"}} // Model stays "": no model configured
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — the limited pass still spawned a session, and the record must name it", recs[0].Sessions, want)
+	}
+}
+
 // --- fail-soft: an outage touches neither timing nor outcomes -------------------
 
 func TestRun_ReportEndpointOutageLeavesTheLoopAlone(t *testing.T) {
