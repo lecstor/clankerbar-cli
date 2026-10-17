@@ -658,6 +658,17 @@ func NoCodeFixHandoffContinuation() string {
 		rerunGuidance + fixTerminalRecord + noCodeReviewTerminalStep
 }
 
+// FixVerifyHandoffContinuation is the fix phase's continuation when a
+// verification round follows (CLA-638): the successor must still answer every
+// finding, commit and push, and then STOP holding the task. Carrying the
+// legacy reviewTerminalStep here would tell it to open the PR and move the task
+// to in_review — the terminal actions the verifier owns, and precisely what
+// B12 says the fix phase must not do.
+func FixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixTerminalRecord + fixOnlyTerminalStep
+}
+
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
 // may hand the rest of its job to a fresh successor, and how. The trigger is
 // deliberately EVENT-shaped — a session cannot measure its own context (there
@@ -1243,9 +1254,10 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"record why the fix or the refutation does not stand. " +
 	"You may raise NEW MUSTs ONLY within the fix delta and its regression surface; the plane assigns their " +
 	"new ids. Do not re-raise an earlier finding as a new id: adjudicate the existing id. " +
-	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a " +
-	"PR — not even to fix a typo. The phase after you applies what you find, and a fix applied here is a fix " +
-	"it cannot attribute. " +
+	"REVIEW ONLY: you do not change code — do not edit, create or delete a source file, do not commit, and do " +
+	"not apply a fix yourself. The phase after you applies what you find, and a fix applied here is a fix it " +
+	"cannot attribute. The one exception is the hand-over below: when no MUST remains open, opening the PR " +
+	"(and pushing a fix commit that the fixer left local) is the terminal step, not a review change. " +
 	"RECORD THE ROUND IN BOTH FORMS: first append the legacy `" + ReviewRecordHeading + "` block to the task's " +
 	"outcome with update_task(taskId, runId, outcome: ...) — append, never replace what sits above it — then " +
 	"append the sealed durable record with update_task(taskId, runId, review: {...}) naming reviewerRole " +
@@ -1266,10 +1278,12 @@ var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is expected: " +
 	"the settlement IS the delivery, so proceed. Then get_task with includeDecisions: true. Review the record " +
 	"amendment the fix made: does it resolve each prior open MUST, is it evidence rather than assertion, does " +
-	"the task's record still match its doneWhen? Adjudicate every prior open MUST by its plane id, exactly as " +
-	"the verification contract requires: resolved (\"fixed\"), resolved by dispatch (\"filed\"), refutation " +
-	"accepted (\"refuted\"), or left open (\"open\") with the reason. You may raise new MUSTs only about the " +
-	"record changes and their regression surface. Do NOT invent code, a branch or a PR." +
+	"the task's record still match its doneWhen? ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID through " +
+	"update_task(review: {findingUpdates: [...]}): RESOLVED (status \"fixed\"), RESOLVED BY DISPATCH " +
+	"(status \"filed\" with the follow-up task ref), REFUTATION ACCEPTED (status \"refuted\" with the reason), " +
+	"or UNRESOLVED with the finding left \"open\" and the reason in this round's record. You may raise new " +
+	"MUSTs only about the record changes and their regression surface. Do NOT invent code, a branch or a PR, " +
+	"and do NOT open a PR." +
 	verifyStoppingRule + noCodeReviewOnlyTerminalStep + rerunGuidance + handoffGuidance
 
 // BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can

@@ -3830,10 +3830,13 @@ func TestDrainPhases_VerificationRoundPassesWithNoOpenMust(t *testing.T) {
 		if i == 1 { // the review gate records round 1
 			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
 		}
-		if i == 3 { // the verify round records round 2 and the plane reads as clean
-			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+		if i == 3 { // the verify round records round 2 with a non-gating SHOULD
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 2, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{{ID: "2.review-2.1", Severity: "should", Status: "open", Summary: "tidy this"}},
+			})
 			rel.counted = 2
-			rel.openMusts = nil
+			rel.openMusts = nil // the plane's gate lists MUSTs only
 		}
 	}
 	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
@@ -4062,10 +4065,13 @@ func TestDrainPhases_VerificationReopenedFindingParks(t *testing.T) {
 	}
 }
 
-// TestDrainPhases_VerificationWithoutARecordParks: a verify session that wrote
-// no durable record cannot be judged — the stopping rule refuses to hand over
-// on nothing, and there is no next fix to spawn. The task parks.
-func TestDrainPhases_VerificationWithoutARecordParks(t *testing.T) {
+// TestDrainPhases_VerificationWithoutARecordEndsWithoutHandover: a verify
+// session that wrote no durable record cannot be judged. The driver refuses the
+// sequence fail-closed (no hand-over, no PR accepted from the round) and leaves
+// the claim to the takeover path — the same disposition CLA-637 gives a refused
+// review checkpoint. It does not PARK: a recordless round is a failed session,
+// not the reviewer/fixer disagreement the stopping rule parks for.
+func TestDrainPhases_VerificationWithoutARecordEndsWithoutHandover(t *testing.T) {
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
@@ -4086,8 +4092,8 @@ func TestDrainPhases_VerificationWithoutARecordParks(t *testing.T) {
 	if h.invokeCalls != 4 {
 		t.Fatalf("spawned %d sessions, want 4", h.invokeCalls)
 	}
-	if len(rel.parks) != 1 || !strings.Contains(rel.parks[0], "could not be judged") {
-		t.Fatalf("a recordless verification round did not park fail-closed: parks=%v", rel.parks)
+	if len(rel.parks) != 0 || len(rel.questions) != 0 {
+		t.Fatalf("a recordless verification round parked instead of ending the sequence fail-closed: parks=%v questions=%v", rel.parks, rel.questions)
 	}
 }
 

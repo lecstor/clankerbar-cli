@@ -138,6 +138,58 @@ about it. See
 `in_review` — merged by a clanker only once a human approves it, promoted to a
 release only by the operator.
 
+**The `verify` phase closes the loop (optional, and interim).** Add a fourth
+phase to re-review the fixes instead of trusting the fixer's own account:
+
+```json
+"phases": [
+  { "name": "implement" },
+  { "name": "review", "tier": "strong" },
+  { "name": "fix", "tier": "cheap" },
+  { "name": "verify" }
+]
+```
+
+With a `verify` phase configured, `fix` stops after committing and pushing: it
+does **not** open the PR or move the task to `in_review`. The verifier then
+reviews the **fix delta** — the reviewed tip the previous record names up to
+`HEAD`, plus the regression surface those fixes touch, not the whole diff again
+— and adjudicates every prior open MUST **by its plane finding id**
+(`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
+(`filed`), refutation accepted (`refuted`), or left open with a reason. It may
+raise new MUSTs only inside the delta.
+
+The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
+verification round that ends with none carries the terminal step — push check,
+PR, `update_task(status: "in_review", outcome: ...)` with a `**Tests**` section.
+A round with any open MUST ends **without** the PR and without moving the task;
+the driver spawns another `fix`, then verifies again. SHOULD and NIT findings are
+recorded and never gate: they ride to `in_review` in the outcome.
+
+Two bounds make the loop terminate:
+
+- **Round cap 3 per review cycle.** The plane counts non-void rounds, so a void
+  round (lease expiry or takeover) does not count and a human verdict starts a
+  new cycle; a takeover or reclaim does not reset the count. At the cap, any
+  open MUST **parks** the task with a question carrying the records — never one
+  more round. Only SHOULD/NIT may ride to `in_review`.
+- **Non-convergence breaker.** A MUST id still open after two fix attempts, or
+  one a verifier marked resolved that a later verifier reopens, parks the task
+  with a question instead of spending another round on the disagreement.
+
+The verifier is configurable like any phase (`harness`, `tier`). Left unset, it
+inherits the **fix** phase's harness and tier — the cheap, non-reviewer side of
+the split — because verification rounds are scoped and cheap and a reviewer's
+Claude subscription limit is shared with the operator's interactive use. In the
+shipped example above that means the verifier runs on opencode, not on the
+expensive review model.
+
+This loop is **interim**. It lives in the CLI's `drainPhases` because it ships
+before the state-machine reshape, which moves phase sequencing and the
+`agent_review → implementing` transition onto the plane (B10); the round and
+verification logic here is deliberately small so that reshape can replace it
+rather than untangle it.
+
 **A final `review` keeps the old combined brief.** The read-only mode is selected
 by position: a `review` with a phase after it is the gate, while a sequence
 ending on `review` still runs the historical review-and-fix brief, so an
@@ -146,9 +198,13 @@ existing config with a **custom-prompt phase after `review`** changes meaning in
 this release: that `review` used to run the combined review-and-fix brief and
 open the PR itself — it is now the read-only gate, and the custom phase after it
 is expected to apply the findings. New configs should use the three-phase shape
-— the saving is precisely the work that moves off the expensive model. `fix`
-must be the last phase and must follow a `review`; validation refuses a sequence
-that violates either. The full design, including the plane half that would store
+— the saving is precisely the work that moves off the expensive model — or the
+four-phase shape when the fixes need an independent verification round. `fix`
+must follow a `review` and is either the last phase or is followed directly by
+`verify`; `verify` must be last and must directly follow `fix`. Validation
+refuses a sequence that violates any of those rules, including a verification
+loop with no fix between its rounds (it could not make progress). The full
+design, including the plane half that would store
 review history durably, is in
 [`docs/review-split.md`](./docs/review-split.md).
 

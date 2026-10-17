@@ -1291,6 +1291,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					continuation = config.UnverifiedReviewOnlyHandoffContinuation()
 				case ph.Name == config.FixPhaseName && branchlessCheckpoint:
 					continuation = config.NoCodeFixHandoffContinuation()
+				case ph.Name == config.FixPhaseName && i+1 < len(phases) && isVerifyPhase(phases[i+1]):
+					// CLA-638: the successor of a mid-fix handoff must still stop
+					// before the PR; the verification round owns the hand-over.
+					continuation = config.FixVerifyHandoffContinuation()
 				default:
 					continuation = config.HandoffContinuationFor(ph.Name, reviewOnly)
 				}
@@ -1672,19 +1676,21 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				vres = *end.claim
 			}
 			if end.verifyFailure != "" {
-				d.parkVerification(ctx, t, vres,
-					"the round could not be judged: "+end.verifyFailure,
-					end.verifyRound, end.verifyCounted, end.verifyOpenMusts)
-				parkFired = true
-				carried = nil
+				// The seam could not judge the round: no durable record this run
+				// wrote, a round that would not close, or a task that could not
+				// be read back. That is the same fail-closed shape CLA-637 gives
+				// a refused review checkpoint — the drain ends without the
+				// hand-over and the claim is released/lapses, so a takeover can
+				// retry it. It is not the stopping rule parking a disagreement.
+				log.Printf("%siteration %d: the %s phase's round could not be judged (%s) — refusing the sequence: no hand-over, and no PR was accepted from this round",
+					labelOf(t), drainNum, ph.Label(i), end.verifyFailure)
 				break
 			}
 			if !end.verifyChecked {
-				d.parkVerification(ctx, t, vres,
-					"the round produced no review record this run wrote, so the stopping rule has nothing to judge",
-					end.verifyRound, end.verifyCounted, nil)
-				parkFired = true
-				carried = nil
+				// A verification session that died or produced no judgeable exit.
+				// End the sequence; the normal takeover path retries it.
+				log.Printf("%siteration %d: the %s phase produced no judgeable verification round — ending the sequence without a hand-over",
+					labelOf(t), drainNum, ph.Label(i))
 				break
 			}
 			if len(end.verifyOpenMusts) == 0 {
@@ -1694,7 +1700,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			}
 			reason := nonConvergenceReason(end.verifyOpenMusts, end.verifyRound, verifyResolved)
 			capHit := end.verifyCounted >= config.ReviewRoundCap
-			if reason == "" && !capHit && end.checkpoint && carried != nil {
+			if reason == "" && !capHit && fixIdx >= 0 && end.checkpoint && carried != nil {
 				for _, id := range end.verifyResolvedIDs {
 					verifyResolved[id] = true
 				}
@@ -1704,11 +1710,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				i = fixIdx
 				continue
 			}
-			switch {
-			case reason == "" && capHit:
-				reason = fmt.Sprintf("the %d-round cap for this review cycle is reached", config.ReviewRoundCap)
-			case reason == "":
-				reason = "the round ended without holding the task, so no fix can be spawned against its open MUSTs"
+			if reason == "" {
+				switch {
+				case capHit:
+					reason = fmt.Sprintf("the %d-round cap for this review cycle is reached", config.ReviewRoundCap)
+				case fixIdx < 0:
+					reason = "the sequence has no fix phase to run between verification rounds"
+				default:
+					reason = "the round ended without holding the task, so no fix can be spawned against its open MUSTs"
+				}
 			}
 			d.parkVerification(ctx, t, vres, reason, end.verifyRound, end.verifyCounted, end.verifyOpenMusts)
 			parkFired = true
