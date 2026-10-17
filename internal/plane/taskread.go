@@ -246,11 +246,12 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 		w = *payload.Task
 		// The plane serves the `reviews` block as a SIBLING of `task` in the
 		// get_task response (server.ts spreads reviewsFor at the top level),
-		// not inside it. Reading it only from the task object left every
-		// durable record unseen in production, so the review and verify seams
-		// refused every healthy review.
-		if w.Reviews == nil {
-			w.Reviews = payload.taskHolderWire.Reviews
+		// and has never put it inside the task object. Reading it only from
+		// the task object left every durable record unseen in production, so
+		// the review and verify seams refused every healthy review. The
+		// top-level block wins; a nested one is read only when it is absent.
+		if top := payload.taskHolderWire.Reviews; top != nil {
+			w.Reviews = top
 		}
 	}
 	return TaskState{
