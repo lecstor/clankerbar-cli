@@ -152,7 +152,8 @@ against a run the plane has swept. So there the **sequence** ends instead —
 the lease is left to lapse into a takeover with its branch recorded — but the
 **run** does not: it waits the limit out holding no lease, probing exactly as
 it would have inside the phase, and carries on polling when the cap lifts.
-Only a hard stop (`lim.Stop`, credit exhausted) ends the daemon there.
+Only a hard stop (`lim.Stop`, credit exhausted) — or a reset landing past the
+run's remaining `budget.max_wall_clock` — ends the daemon there.
 
 A transient server/network blip on a resumed phase ends its sequence for the
 same lease reason — the backoff ladder would walk past the 30-minute lease —
