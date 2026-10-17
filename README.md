@@ -113,7 +113,12 @@ without the review — a session whose record the seam could not judge against
 the task it found is pure waste (CLA-663). Before spawning `fix` the driver
 **closes the round**, which is what releases the sealed findings to the fixer.
 The claim is held across the seam, so the task is never posted back to the queue
-mid-sequence.
+mid-sequence. One variant is the deliberate exception (question 03a12578,
+option 1): a **branchless** (settled-task) checkpoint keeps the legacy block
+gate above, because the plane accepts review writes only from the task's LIVE
+holder and no run holds a task its own session settled — its brief prescribes
+the `## Review` block alone, no round exists to close, and the fix phase that
+follows reads that block alone too.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
 same run, reads the released durable record back with `get_task` — and, for one

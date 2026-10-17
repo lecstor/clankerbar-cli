@@ -143,20 +143,20 @@ branch — would pass it with nothing recorded at all. Two guards close that:
    the driver reads the task's `reviews` block at the seam and refuses a
    checkpoint unless it carries a record this run wrote, under this phase's
    reviewer role, whose `reviewedTip` equals the branch tip the driver verified
-   on origin (a non-empty tip when the origin could not be read; identity only
-   for a branchless checkpoint). A request_changes re-trip or a takeover runs
-   under a NEW run id, so the previous trip's record — however complete — can
-   never satisfy the gate, and a voided round (lease expiry or takeover) never
-   matches either. The task's baseline read at spawn is retried a bounded
-   number of times, and one that stays unread refuses the phase BEFORE the
-   review spawns (CLA-663) — a full review session whose checkpoint could not
-   be judged against the task it found is pure waste — with the same claim
-   disposition a seam refusal leaves. Fail-closed: a session that burned its
-   turns, hit its ceiling, or died on a silent EOT ends the drain, and because
-   the resumed claim carries the branch (`HasWIP`) the driver does not release
-   it to the queue — the lease lapses and a takeover picks the work up.
-   (Pre-split, a dead review was the last phase, so it ended the drain with no
-   PR — this guard preserves that property across the seam.)
+   on origin (a non-empty tip when the origin could not be read). A
+   request_changes re-trip or a takeover runs under a NEW run id, so the
+   previous trip's record — however complete — can never satisfy the gate, and
+   a voided round (lease expiry or takeover) never matches either. The task's
+   baseline read at spawn is retried a bounded number of times, and one that
+   stays unread refuses the phase BEFORE the review spawns (CLA-663) — a full
+   review session whose checkpoint could not be judged against the task it
+   found is pure waste — with the same claim disposition a seam refusal leaves.
+   Fail-closed: a session that burned its turns, hit its ceiling, or died on a
+   silent EOT ends the drain, and because the resumed claim carries the branch
+   (`HasWIP`) the driver does not release it to the queue — the lease lapses
+   and a takeover picks the work up. (Pre-split, a dead review was the last
+   phase, so it ended the drain with no PR — this guard preserves that property
+   across the seam.)
 
    The driver then CLOSES the round before spawning `fix`, which is what
    releases the sealed findings to the fixer; a close that fails refuses the
@@ -164,6 +164,18 @@ branch — would pass it with nothing recorded at all. Two guards close that:
    release — older planes and readers expect it — but it is not what the gate
    reads: the outcome snapshot exists only for the pre-spawn read's tri-state
    and the refusal's diagnostic.
+
+   One variant keeps the pre-636 gate, by the operator's decision on question
+   03a12578 (option 1): a **branchless** checkpoint — a task its own session
+   settled, so no run holds it — cannot write the durable record at all (the
+   plane accepts review writes only from the task's live holder), and the seam
+   gates it on the legacy block instead: the outcome changed since the spawn,
+   a `## Review` heading on its own line, and a LAST block the spawn-time
+   baseline did not carry. Its brief prescribes the block alone, and there is
+   no round to close; the fix brief that follows reads that block alone too —
+   with no durable record there is no plane finding id to apply by and no
+   `findingUpdates` call to make. Every branch-carrying variant gates on the
+   record.
 
    One handoff residue, stated rather than hidden: a handoff respawn re-enters
    the phase under the SAME run and role, so a review session that writes its

@@ -1993,8 +1993,11 @@ func reviewerRoleFor(phases []config.Phase, idx int) string {
 //   - unverified (CLA-576): the driver has no tip, so the reviewer established
 //     one itself; the record must name one, because the fix phase compares it
 //     with the worktree.
-//   - branchless: there is no revision at all (the review is of the plane's
-//     record), so only the record's identity is checked.
+//
+// A BRANCHLESS checkpoint does not reach this matcher at all: the plane accepts
+// review writes only from the task's live holder, and a settled task has none,
+// so that variant keeps the legacy `## Review` block gate (the CLA-634 decision
+// on question 03a12578, option 1).
 //
 // The newest match wins, so a retried attempt's record supersedes an earlier
 // one in the same run.
@@ -2027,6 +2030,54 @@ func matchingReviewRecord(records []plane.ReviewRecordState, role, runID, tip st
 // reads as the heading.
 func isReviewHeading(line string) bool {
 	return strings.TrimRight(line, " \t\r") == config.ReviewRecordHeading
+}
+
+// reviewRecordLine reports whether outcome carries the review heading as its
+// own line. The BRANCHLESS review-only checkpoint gates on it (CLA-634
+// decision, question 03a12578, option 1): a settled task cannot write the
+// durable record — the plane accepts review writes only from the live holder —
+// so that variant keeps the legacy block gate. The exact line keeps a
+// look-alike heading (`## Reviewer notes`, or prose that merely mentions the
+// words) from standing in for the block. Trailing whitespace is ignored — the
+// plane stores text as sent, and a CRLF paste or a stray trailing space is
+// still the heading — while leading whitespace is not: a heading the session
+// indented into a code block is not the block the fix phase will find.
+func reviewRecordLine(outcome string) bool {
+	for _, line := range strings.Split(outcome, "\n") {
+		if isReviewHeading(line) {
+			return true
+		}
+	}
+	return false
+}
+
+// lastReviewBlock returns the outcome's text from its LAST `## Review` heading
+// line to the end — the block a fix session is to read and apply. A task that
+// went through a request_changes re-trip, or a takeover, can carry several
+// blocks: both the review and the fix APPEND, so round 1's block stays in the
+// outcome above round 2's, and "the `## Review` block" is ambiguous unless it
+// means the last one (which is why every fix brief says so). The heading line
+// itself is included: a block whose text is only its heading would otherwise
+// decode to "", which is a substring of everything. It recognises the heading
+// exactly as reviewRecordLine does, so the two agree on what a block is.
+//
+// The BRANCHLESS review-only checkpoint's stale-round guard reads it: a
+// session that makes some other statusless outcome edit while leaving an
+// earlier round's block as the last one recorded nothing this trip. Empty when
+// the outcome carries no heading line at all; the gate checks reviewRecordLine
+// first, so an empty return there is not a block, not an old one.
+func lastReviewBlock(outcome string) string {
+	start, offset := -1, 0
+	for _, line := range strings.SplitAfter(outcome, "\n") {
+		if isReviewHeading(strings.TrimSuffix(line, "\n")) {
+			start = offset
+		}
+		offset += len(line)
+	}
+	if start < 0 {
+		return ""
+	}
+	return outcome[start:]
 }
 
 // reviewFinding is one parsed line of a review record's `### Findings` list.
@@ -2319,7 +2370,29 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 		// only tasks both reads could see.
 		if review.required {
 			if !recordRead {
+				if branch == "" && !unverified {
+					return branch, tip, false, false, fmt.Sprintf("the task could not be read after the review phase ended, so its %q block cannot be verified — the next phase would have nothing to apply", config.ReviewRecordHeading)
+				}
 				return branch, tip, false, false, "the task's review records could not be read after the review phase ended, so a durable review record cannot be verified — the next phase would risk running on a record that does not exist"
+			}
+			// CLA-634 decision (question 03a12578, option 1): a BRANCHLESS
+			// (settled-task) review-only checkpoint cannot write the durable
+			// record — the plane accepts review writes only from the task's
+			// live holder, and no run holds a settled task — so this variant
+			// keeps the legacy `## Review` block gate: changed since the spawn,
+			// a heading on its own line, and a LAST block the spawn-time
+			// baseline did not carry. Every branch-carrying variant still gates
+			// on the record.
+			if branch == "" && !unverified {
+				switch {
+				case record.Outcome == review.baseline:
+					return branch, tip, false, false, fmt.Sprintf("the task's outcome is unchanged since the review phase spawned — the review recorded no new %q block, so the next phase would have nothing to apply", config.ReviewRecordHeading)
+				case !reviewRecordLine(record.Outcome):
+					return branch, tip, false, false, fmt.Sprintf("the review recorded no %q block in the task's outcome — the next phase would have nothing to apply", config.ReviewRecordHeading)
+				case strings.Contains(review.baseline, lastReviewBlock(record.Outcome)):
+					return branch, tip, false, false, fmt.Sprintf("the task's LAST %q block already appears in the outcome the review phase found — the review wrote no NEW block this trip, so the next phase would apply an earlier round's record", config.ReviewRecordHeading)
+				}
+				return branch, tip, true, false, ""
 			}
 			rec, matched := matchingReviewRecord(record.Reviews, review.role, res.Claim.RunID, tip, unverified)
 			if !matched {

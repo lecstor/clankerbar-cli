@@ -3254,11 +3254,15 @@ func TestDrainPhases_AFailedBaselineReadIsRetried(t *testing.T) {
 	}
 }
 
-// The freshness gate on the BRANCHLESS path: form (b)/(c) evidence has no
-// branch at all, so the review record is the only proof the review phase did
-// anything, and the same "changed since spawn" rule applies. The no-code fix
-// variant must spawn on a fresh record and not without one.
-func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
+// The BRANCHLESS (settled-task) review-only checkpoint gates on the legacy
+// `## Review` block (CLA-634 decision, question 03a12578, option 1): the plane
+// accepts review writes only from the task's LIVE holder, and a settled task
+// has none, so the durable record this variant cannot write is not demanded —
+// the block IS the record. Changed + a heading on its own line + a LAST block
+// the spawn-time baseline did not carry advances; an unchanged outcome and a
+// re-trip that leaves an earlier round's block last are refused. No round is
+// closed, because there is no durable round.
+func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 	phases := []config.Phase{
 		{Name: config.ImplementPhaseName},
 		{Name: config.ReviewPhaseName},
@@ -3266,18 +3270,17 @@ func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
 	}
 	settled := plane.TaskState{Status: "in_review", Outcome: "no-code delivery: the task body was updated\n"}
 
-	t.Run("a fresh record advances to the no-code fix", func(t *testing.T) {
+	t.Run("a fresh block advances to the no-code fix", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: held(okResult(1, 0), openClaim())}, // no branch: form (b) settles the task
-			{res: held(okResult(1, 0), openClaim())}, // review-only: records and holds
+			{res: held(okResult(1, 0), openClaim())}, // review-only: appends its block and holds
 			{res: okResult(1, 0)},                    // no-code fix
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 		h.onInvoke = func(i int) {
-			if i == 1 { // the review records both halves: the block, then the durable record with no tip
+			if i == 1 { // the review appends its block; a durable record is NOT attempted for a settled task
 				st := rel.state["t-1"]
 				st.Outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: none (no branch - the plane record was reviewed)\n- verdict: pass\n"
-				st.Reviews = append(st.Reviews, recordFor(1, "review-1", "r-1", "", "sealed"))
 				rel.state["t-1"] = st
 			}
 		}
@@ -3287,28 +3290,47 @@ func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
 			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 		}
 		if h.invokeCalls != 3 {
-			t.Fatalf("spawned %d sessions, want 3 — a fresh record advances the no-code seam", h.invokeCalls)
+			t.Fatalf("spawned %d sessions, want 3 — a fresh block advances the no-code seam", h.invokeCalls)
 		}
 		p3 := h.invocations[2].Prompt
 		if !strings.Contains(p3, "there is NO branch") {
 			t.Errorf("the successor is not the no-code fix brief:\n%s", p3)
 		}
-		if len(rel.closes) != 1 || rel.closes[0] != 1 {
-			t.Fatalf("closed rounds = %v, want exactly [1] — the no-code round must be released too", rel.closes)
+		if len(rel.closes) != 0 {
+			t.Fatalf("closed rounds = %v, want none — a branchless checkpoint carries no durable round to close", rel.closes)
 		}
 	})
 
-	t.Run("the legacy block alone no longer carries the seam", func(t *testing.T) {
+	t.Run("an unchanged outcome is refused", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: held(okResult(1, 0), openClaim())},
-			{res: held(okResult(1, 0), openClaim())}, // review appends the legacy block but NO durable record
+			{res: held(okResult(1, 0), openClaim())}, // review records nothing
 			{res: okResult(1, 0)},                    // must NEVER run
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		d := phaseDriverWithReleaser(t, h, phases, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 2 {
+			t.Fatalf("spawned %d sessions, want 2 — the no-code fix must not run on an unchanged outcome", h.invokeCalls)
+		}
+	})
+
+	t.Run("a re-trip that leaves the old block last is refused", func(t *testing.T) {
+		oldBlock := "delivered\n\n" + config.ReviewRecordHeading +
+			"\n- verdict: findings\n### Findings\n- R1 [must] a.go:1 - old. Required fix: none.\n"
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(1, 0), openClaim())},
+			{res: held(okResult(1, 0), openClaim())}, // review edits the outcome without adding a block
+			{res: okResult(1, 0)},                    // must NEVER run
+		}}
+		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": {Status: "in_review", Outcome: oldBlock}}}
 		h.onInvoke = func(i int) {
-			if i == 1 {
+			if i == 1 { // some other statusless edit; the old block is still the last one
 				st := rel.state["t-1"]
-				st.Outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: pass\n"
+				st.Outcome = "could not verify the record against the origin remote\n" + st.Outcome
 				rel.state["t-1"] = st
 			}
 		}
@@ -3318,7 +3340,7 @@ func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
 			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 		}
 		if h.invokeCalls != 2 {
-			t.Fatalf("spawned %d sessions, want 2 — the fix must not run on a block with no durable record behind it", h.invokeCalls)
+			t.Fatalf("spawned %d sessions, want 2 — a re-trip leaving the previous round's block last recorded no new block", h.invokeCalls)
 		}
 	})
 }
@@ -3377,13 +3399,74 @@ func TestDrainPhases_ReviewSeamRefusesACheckpointItCannotReread(t *testing.T) {
 	}
 }
 
+// The branchless gate's half of the interface: the heading counts only as its
+// own line. A substring match was the bug — `## Reviewer notes`, prose
+// mentioning the words, or an indented heading inside a code block all passed
+// it.
+func TestReviewRecordLine(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome string
+		want    bool
+	}{
+		{"empty", "", false},
+		{"the heading alone", config.ReviewRecordHeading, true},
+		{"the heading on its own line", "delivered\n" + config.ReviewRecordHeading + "\n- verdict: pass\n", true},
+		{"a CRLF heading is still the heading", config.ReviewRecordHeading + "\r\n- verdict: pass\r\n", true},
+		{"a trailing space is still the heading", config.ReviewRecordHeading + "  \n", true},
+		{"a look-alike heading", "## Reviewer notes\n- verdict: pass\n", false},
+		{"the words inside prose", "the review block (## Review) is missing\n", false},
+		{"an indented heading", "  " + config.ReviewRecordHeading + "\n", false},
+		{"a heading glued to text", "x" + config.ReviewRecordHeading + "\n", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reviewRecordLine(tc.outcome); got != tc.want {
+				t.Errorf("reviewRecordLine(%q) = %v, want %v", tc.outcome, got, tc.want)
+			}
+		})
+	}
+}
+
+// The helper the branchless gate's stale-round guard reads: lastReviewBlock
+// must return the LAST block — heading line to the end — so an appended round
+// is the one judged, and it must recognise the heading exactly as
+// reviewRecordLine does.
+func TestLastReviewBlock(t *testing.T) {
+	head := config.ReviewRecordHeading
+	tests := []struct {
+		name    string
+		outcome string
+		want    string
+	}{
+		{"empty", "", ""},
+		{"no heading", "delivered: pushed clanker/x\n", ""},
+		{"the heading alone", head, head},
+		{"one block runs to the end", "delivered\n" + head + "\n- verdict: pass\n", head + "\n- verdict: pass\n"},
+		{"the LAST of two blocks", head + "\n- round 1\n" + head + "\n- round 2\n", head + "\n- round 2\n"},
+		{"a CRLF heading is still the heading", head + "\r\n- verdict: pass\r\n", head + "\r\n- verdict: pass\r\n"},
+		{"a trailing space is still the heading", head + "  \n- verdict: pass\n", head + "  \n- verdict: pass\n"},
+		{"an indented heading is not a block", "  " + head + "\n- verdict: pass\n", ""},
+		{"a heading glued to text is not a block", "x" + head + "\n", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lastReviewBlock(tc.outcome); got != tc.want {
+				t.Errorf("lastReviewBlock(%q) = %q, want %q", tc.outcome, got, tc.want)
+			}
+		})
+	}
+}
+
 // The CLA-637 seam gate's record matcher (B1): the durable record must be THIS
 // run's, under this reviewer role, and name the revision the driver verified.
 // Each subtest is one way a record can FAIL to satisfy the gate — the shapes
 // the doneWhen names (a request_changes re-trip, a takeover) plus the tip
 // mismatches, a voided round, and the unverified checkpoint's non-empty-tip
-// requirement. The happy cases pin the newest-match rule and the branchless
-// form's identity-only check.
+// requirement. The happy cases pin the newest-match rule. A BRANCHLESS
+// checkpoint never reaches this matcher (it gates on the legacy block — the
+// plane takes review writes only from a live holder); that routing is pinned by
+// TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock.
 func TestMatchingReviewRecord(t *testing.T) {
 	rec := func(round int, role, run, tip, state string) plane.ReviewRecordState {
 		return plane.ReviewRecordState{Round: round, ReviewerRole: role, RunID: run, ReviewedTip: tip, State: state}
@@ -3452,12 +3535,6 @@ func TestMatchingReviewRecord(t *testing.T) {
 			name:    "an unverified checkpoint accepts the tip the reviewer established",
 			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "sha1", "sealed")},
 			role:    "review-1", run: "r-1", needsTip: true,
-			want: 1,
-		},
-		{
-			name:    "a branchless checkpoint checks the record's identity only",
-			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "", "sealed")},
-			role:    "review-1", run: "r-1",
 			want: 1,
 		},
 	}
