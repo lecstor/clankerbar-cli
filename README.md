@@ -1145,12 +1145,13 @@ be named - `clankerbar run -c ./clankerbar.json` - and an unnamed
 read**; [where the key may go](#where-the-account-scoped-key-is-allowed-to-go)
 says why. (JSON today; TOML is the likely final format.)
 
-Under the fleet supervisor, that same directory is the whole fleet: every
-`*.json` in it that carries at least one recognized config key and validates
-is a daemon the supervisor starts (see [The fleet
-supervisor](#the-fleet-supervisor-bare-clankerbar)). `config.json` is just one
-instance among them, and a per-daemon file like `clanker2.json` needs no
-special treatment — the filename is the instance discriminator.
+Under the fleet supervisor, that same directory's machine-layer role is just
+the one discovered file: `config.json` is the **base config** each supervised
+child's own config is generated from (see [The fleet
+supervisor](#the-fleet-supervisor-bare-clankerbar)). Which instances run - and
+under what identity - comes from the plane's account-scoped roster, not from
+files in the directory: a per-daemon file like `clanker2.json` is not an
+instance the supervisor reads.
 
 ```json
 {
