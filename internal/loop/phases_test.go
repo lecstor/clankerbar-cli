@@ -4351,6 +4351,16 @@ func TestDrainPhases_VerificationCapParksWithTheRecords(t *testing.T) {
 	if !strings.Contains(rel.questions[0], "a fresh delta-only MUST") {
 		t.Errorf("the question names the id but not the finding's substance:\n%s", rel.questions[0])
 	}
+	// The plane opens a new cycle only on a human verdict, which it records only
+	// on an in_review task: an unpark from here stays in the capped cycle. The
+	// question must say so rather than offer a "fresh review cycle" it cannot
+	// deliver.
+	if strings.Contains(rel.questions[0], "fresh review cycle") {
+		t.Errorf("the question still offers a fresh review cycle the plane cannot start from parked:\n%s", rel.questions[0])
+	}
+	if !strings.Contains(rel.questions[0], "does NOT give it another review cycle") || !strings.Contains(rel.questions[0], "new task") {
+		t.Errorf("the question does not say an unpark stays in this cycle and a retry needs a new task:\n%s", rel.questions[0])
+	}
 }
 
 // TestDrainPhases_VerificationNonConvergenceParks: a MUST left open after two

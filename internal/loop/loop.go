@@ -3001,19 +3001,19 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 		detailList = "\n- " + strings.Join(details, "\n- ")
 	}
 	outcome := fmt.Sprintf(
-		"Parked on the review stopping rule: %s. Round %d of the %d-round cap this cycle (non-void rounds counted by the plane); open MUSTs: %s. The durable review records are on the task (`reviews.records`); the operator decides whether to continue, re-scope or drop it.",
+		"Parked on the review stopping rule: %s. Round %d of the %d-round cap this cycle (non-void rounds counted by the plane); open MUSTs: %s. The durable review records are on the task (`reviews.records`). Setting this task back to ready does not start a new review cycle: the plane counts cycles by human verdicts, which it records only on an in_review task, so another run would reach the cap and park again. The operator settles the open MUST(s) by hand, or re-files the work as a new task, or drops it.",
 		reason, round, config.ReviewRoundCap, openList)
 	body := fmt.Sprintf(
 		"**%s needs a human decision: the fix-verification loop stopped.** %s\n\n"+
 			"Round %d closed; the plane has counted %d non-void round(s) in this review cycle and the cap is %d. "+
 			"Open MUST finding(s): %s\n\n"+
 			"The evidence is in the task's durable review records (`reviews.records`; every finding is `must`/`should`/`nit` with its status, and the legacy `## Review` block is in the outcome). "+
-			"The stopping rule exists so two agents cannot argue past a bound: the reviewer's findings, the fixer's answers and the verifier's adjudication are all on the task, and the disagreement is the question.",
+			"The stopping rule exists so two agents cannot argue past a bound: the reviewer's findings, the fixer's answers and the verifier's adjudication are all on the task, and the disagreement is the question.\n\n"+
+			"Setting this task back to `ready` does NOT give it another review cycle. The plane opens a new cycle only on a human verdict, and it records a verdict only on an `in_review` task, so a re-run stays in this cycle, reaches the cap and parks again. To have the fleet try again, re-file the work as a new task with whatever re-scoping the open MUST(s) need.",
 		ref, reason, round, counted, config.ReviewRoundCap, detailList)
 	options := []string{
-		"Continue with a fresh review cycle — I have judged the open MUST(s)",
-		"Leave it parked — I will settle the MUST(s) myself",
-		"The open MUST(s) need re-scoping before anyone tries again",
+		"I will settle the open MUST(s) myself — fix it by hand and close the task",
+		"Re-file it as a new task, re-scoped so the open MUST(s) can be met — archive this one",
 		"Drop it — the task is not worth another round",
 	}
 	pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
