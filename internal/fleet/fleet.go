@@ -77,14 +77,28 @@ type State struct {
 	Phase   string // phase label, when Kind is iteration
 }
 
+// Session is one harness session an iteration spawned: which phase it ran,
+// which harness ran it, and the model it was spawned with (CLA-630). The values
+// are exactly what the loop's spawn line prints — the phase label, the phase's
+// resolved harness, and the resolved model after tier resolution and any
+// run-config overlay. Model is the EMPTY string when no model was resolved (the
+// harness default applied); the plane stores that as "not resolved", never a
+// guessed name, so an empty value must ride as empty rather than be filled in.
+type Session struct {
+	Phase   string // phase label the session ran under
+	Harness string // the harness that ran it
+	Model   string // resolved model id; "" when the harness default applied
+}
+
 // Iteration is one finished loop step: what ran, how it ended, what it cost.
 type Iteration struct {
-	TaskID          string   // task UUID, when a claim was observed
-	TaskRef         string   // qualified ref ("CLA-466"), when known
-	Phases          []string // distinct phase labels attempted, in order
-	Outcome         string   // one of the Outcome* constants
-	DurationSeconds float64  // wall clock for the whole drain
-	Tokens          int      // the drain's total reported token spend
+	TaskID          string    // task UUID, when a claim was observed
+	TaskRef         string    // qualified ref ("CLA-466"), when known
+	Phases          []string  // distinct phase labels attempted, in order
+	Sessions        []Session // one per session the drain spawned, in spawn order
+	Outcome         string    // one of the Outcome* constants
+	DurationSeconds float64   // wall clock for the whole drain
+	Tokens          int       // the drain's total reported token spend
 }
 
 // Identity is what every beacon carries about THIS daemon: who and where it is,
@@ -330,13 +344,22 @@ type wireState struct {
 	Phase   string `json:"phase,omitempty"`
 }
 
+type wireSession struct {
+	Phase   string `json:"phase"`
+	Harness string `json:"harness"`
+	// Model is deliberately not omitempty: the plane stores the empty string as
+	// null ("not resolved"), and sending it explicitly is CLA-630's contract.
+	Model string `json:"model"`
+}
+
 type wireIteration struct {
-	TaskID          string   `json:"taskId,omitempty"`
-	TaskRef         string   `json:"taskRef,omitempty"`
-	Phases          []string `json:"phases,omitempty"`
-	Outcome         string   `json:"outcome"`
-	DurationSeconds float64  `json:"durationSeconds,omitempty"`
-	Tokens          int      `json:"tokens,omitempty"`
+	TaskID          string        `json:"taskId,omitempty"`
+	TaskRef         string        `json:"taskRef,omitempty"`
+	Phases          []string      `json:"phases,omitempty"`
+	Sessions        []wireSession `json:"sessions,omitempty"`
+	Outcome         string        `json:"outcome"`
+	DurationSeconds float64       `json:"durationSeconds,omitempty"`
+	Tokens          int           `json:"tokens,omitempty"`
 }
 
 type wireReport struct {
@@ -378,12 +401,46 @@ func marshalReport(rep Report) ([]byte, error) {
 			TaskID:          it.TaskID,
 			TaskRef:         it.TaskRef,
 			Phases:          it.Phases,
+			Sessions:        wireSessions(it.Sessions),
 			Outcome:         it.Outcome,
 			DurationSeconds: it.DurationSeconds,
 			Tokens:          it.Tokens,
 		})
 	}
 	return json.Marshal(w)
+}
+
+// maxSessionsPerIteration mirrors the plane's MAX_SESSIONS_PER_ITERATION
+// (apps/web/src/server/fleet-report.ts). The plane refuses the WHOLE report —
+// all-or-nothing, presence refresh included — when an iteration carries more,
+// so the cap is an interface this side has to honour rather than a bound the
+// plane silently sheds. The shipped phase sequences cannot reach it (handoff
+// respawns are capped per phase and dead retries per task), but a many-phase
+// config plus respawns on each could; clamping the tail keeps the report — and
+// with it the iteration record and presence — valid, at the cost of the
+// least-important entries.
+const maxSessionsPerIteration = 20
+
+// wireSessions converts one iteration's sessions to the wire shape, clamping at
+// the plane's per-iteration cap. The FIRST entries in spawn order are kept: the
+// configured phases lead the list, and it is the tail of respawns that a run
+// long enough to cross the cap has accumulated. The clamp is logged because it
+// means the reporter overran a contract the plane will not forgive — a loop bug
+// to see, not a normal path.
+func wireSessions(sessions []Session) []wireSession {
+	if len(sessions) == 0 {
+		return nil // no key on the wire: the pre-CLA-630 shape, which stays valid
+	}
+	if len(sessions) > maxSessionsPerIteration {
+		log.Printf("fleet: iteration spawned %d sessions, over the plane's per-iteration cap of %d — reporting the first %d in spawn order and dropping %d, or the plane would refuse the whole report",
+			len(sessions), maxSessionsPerIteration, maxSessionsPerIteration, len(sessions)-maxSessionsPerIteration)
+		sessions = sessions[:maxSessionsPerIteration]
+	}
+	out := make([]wireSession, 0, len(sessions))
+	for _, s := range sessions {
+		out = append(out, wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model})
+	}
+	return out
 }
 
 // ── Probe ─────────────────────────────────────────────────────────────────────

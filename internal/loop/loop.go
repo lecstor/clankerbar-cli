@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -1158,10 +1159,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	drainStart := time.Now()
 	var (
 		phasesRun []string // distinct phase labels attempted, in order
-		seen      harness.Claim
-		parkFired bool // the per-task dead budget parked the task
-		tripFired bool // the fleet dead counter tripped and paused this target
-		finalDisp string
+		// CLA-630: one entry per session this drain spawned, in spawn order —
+		// every pass through the loop below (a configured phase, a handoff
+		// respawn, a dead- or empty-retry re-run), with the harness and model
+		// each actually spawned with. A retry ladder INSIDE one phase is one
+		// session re-run, not a new one; see drainPhase's phaseEnd.session.
+		sessionsRun []fleet.Session
+		seen        harness.Claim
+		parkFired   bool // the per-task dead budget parked the task
+		tripFired   bool // the fleet dead counter tripped and paused this target
+		finalDisp   string
 		// CLA-631/CLA-651/CLA-662: the wait a RESUMED phase's sequence-end
 		// signal asks the run for. A rolling limit (CLA-631) hands its reset
 		// down here; the transient arm (CLA-662) hands its backoff rung down as
@@ -1197,6 +1204,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			TaskID:          seen.TaskID,
 			TaskRef:         seen.Ref,
 			Phases:          phasesRun,
+			Sessions:        sessionsRun,
 			Outcome:         outcome,
 			DurationSeconds: time.Since(drainStart).Seconds(),
 			Tokens:          tokens,
@@ -1332,6 +1340,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		})
 		tokens += ptokens
 		cost += pcost
+		// CLA-630: one entry per session this pass spawned, in spawn order. nil
+		// means the pass never launched a session (a harness or spawn-dir
+		// refusal above), which is nothing to record.
+		if end.session != nil {
+			sessionsRun = append(sessionsRun, *end.session)
+		}
 		finalDead = end.dead
 		lastProducedNothing = end.producedNothing
 		// CLA-466: the record's task identity and claim disposition follow EVERY
@@ -1732,6 +1746,13 @@ type phaseEnd struct {
 	// seam, whose !last gating is pinned by its own tests.
 	producedNothing bool
 
+	// session is the harness session this pass spawned, for the fleet record's
+	// sessions list (CLA-630): the phase label, the resolved harness and the
+	// resolved model the spawn line named. Only the fleet record reads it.
+	// nil means the pass spawned nothing (a harness or spawn-dir resolution
+	// refused before any Invoke), which is not a session to report.
+	session *fleet.Session
+
 	// empty reports a held-but-empty exit — the 2026-08-24 fleet-incident shape:
 	// the phase ended cleanly still holding the task with NO durable,
 	// origin-reachable branch evidence on the plane record. It is a FAILED phase,
@@ -1887,11 +1908,133 @@ type reviewGate struct {
 // will find.
 func reviewRecordLine(outcome string) bool {
 	for _, line := range strings.Split(outcome, "\n") {
-		if strings.TrimRight(line, " \t\r") == config.ReviewRecordHeading {
+		if isReviewHeading(line) {
 			return true
 		}
 	}
 	return false
+}
+
+// isReviewHeading reports whether a line is the review block's heading, with
+// trailing whitespace tolerated exactly as reviewRecordLine tolerates it.
+func isReviewHeading(line string) bool {
+	return strings.TrimRight(line, " \t\r") == config.ReviewRecordHeading
+}
+
+// reviewFinding is one parsed line of a review record's `### Findings` list.
+// The driver parses the block it told the review to write (CLA-635) to build
+// the fix phase's graded list, so the fields here are an interface with the
+// shape in config.reviewOnlyRecordShape, not a convenience.
+type reviewFinding struct {
+	ID       string // the record's own id, e.g. "R1"
+	Severity string // canonical lowercase: must | should | nit
+	Kind     string // MUST evidence kind (the token in parentheses), "" when absent
+	Evidence string // MUST evidence payload (the text after the kind's colon), "" when absent
+	// Rest is the finding line from just after the severity bracket onwards —
+	// evidence prefix, location, summary and required fix — so the digest can
+	// reprint the finding verbatim without re-joining fields it did not parse.
+	Rest string
+}
+
+// downgraded reports whether B5's structural check demotes this finding: a
+// `must` written without an evidence kind, or with one but no evidence payload,
+// is treated as a `should`. Only presence is checked — whether the evidence is
+// any GOOD is a verifier's call in the next round, never the driver's.
+func (f reviewFinding) downgraded() bool {
+	return f.Severity == "must" && (f.Kind == "" || f.Evidence == "")
+}
+
+// gradedSeverity is the severity the fix phase is held to, after the
+// structural downgrade.
+func (f reviewFinding) gradedSeverity() string {
+	if f.downgraded() {
+		return "should"
+	}
+	return f.Severity
+}
+
+var (
+	// A finding line as config.reviewOnlyRecordShape prescribes it: an id, a
+	// bracketed severity, then the rest of the line. Malformed lines are
+	// skipped, not guessed at — the fix phase still reads the raw block.
+	reviewFindingLineRE = regexp.MustCompile(`^\s*[-*]\s+(R\d+)\s+\[([A-Za-z]+)\](.*)$`)
+	// The evidence prefix: `(<kind>): <evidence>`. A colon is required, so
+	// `(gate) go test fails` — kind without the prescribed prefix — reads as
+	// no kind at all and downgrades the MUST.
+	reviewEvidenceRE = regexp.MustCompile(`^\s*\(([^)]*)\)\s*:\s*(.*)$`)
+)
+
+// parseReviewFindings extracts the findings of the NEWEST review block in
+// outcome. Newest, not first: a request_changes re-trip or a takeover returns
+// the task with an earlier round's block still in the outcome, and the fix
+// phase applies THIS round's review. Empty when there is no block or no line
+// in it parses.
+func parseReviewFindings(outcome string) []reviewFinding {
+	lines := strings.Split(outcome, "\n")
+	start := -1
+	for i, line := range lines {
+		if isReviewHeading(line) {
+			start = i
+		}
+	}
+	if start < 0 {
+		return nil
+	}
+	var out []reviewFinding
+	for _, line := range lines[start+1:] {
+		// A new level-2 heading ends the block. `### Findings` is
+		// level-3 and does not match the "## " prefix.
+		if strings.HasPrefix(strings.TrimRight(line, " \t\r"), "## ") {
+			break
+		}
+		m := reviewFindingLineRE.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		sev := strings.ToLower(m[2])
+		switch sev {
+		case "must", "should", "nit":
+		default:
+			continue
+		}
+		f := reviewFinding{ID: m[1], Severity: sev, Rest: m[3]}
+		if em := reviewEvidenceRE.FindStringSubmatch(f.Rest); em != nil {
+			f.Kind = strings.TrimSpace(em[1])
+			f.Evidence = strings.TrimSpace(em[2])
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
+// reviewFindingsDigest is the driver's graded list of a review record's
+// findings, prepended to the fix phase's prompt (CLA-635). It exists because
+// B5's structural downgrade is the DRIVER's to apply: a `must` recorded without
+// an evidence kind or payload is listed here as a SHOULD, so the fixer is held
+// to the same grade the record will be read with later. The severities are the
+// ones the fix brief's obligation speaks about; the raw block stays in the
+// outcome for the record.
+//
+// Empty when the record carries no parseable findings — the fix brief then
+// works from the raw block alone, exactly as before this existed.
+func reviewFindingsDigest(outcome string) string {
+	findings := parseReviewFindings(outcome)
+	if len(findings) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("The driver read the review record and graded its findings structurally: a finding recorded as a " +
+		"MUST with no evidence kind (a parenthesised token right after the severity) or no evidence text is listed " +
+		"below as a SHOULD, not a MUST. The severities below are the ones this phase is held to:\n")
+	for _, f := range findings {
+		b.WriteString("- " + f.ID + " [" + strings.ToUpper(f.gradedSeverity()) + "]" + f.Rest)
+		if f.downgraded() {
+			b.WriteString(" [downgraded: recorded as a MUST with no evidence kind or payload]")
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n")
+	return b.String()
 }
 
 // checkpointEvidence reports whether the plane's record carries the phase's
@@ -2136,17 +2279,13 @@ func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Resu
 	return st, read, false, fmt.Sprintf("the plane's record shows no exit evidence either (status %q, no no-code delivery)", st.Status)
 }
 
-// readReviewBaseline reads the task's outcome as it stands BEFORE the review
-// phase spawns, so the seam can require the record to have changed. The task id
-// comes from the carried claim (the predecessor phase's), which is exact for a
-// resumed phase and is why this runs inside drainPhase, where `prev` is still
-// in hand.
-//
-// Best-effort like every other plane read: a failure returns read=false, and
-// the gate then refuses the checkpoint rather than guessing whether the outcome
-// changed. No second read is needed here for a target with no plane wiring —
-// the same wiring the seam read already requires.
-func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
+// readTaskOutcome reads the claimed task's outcome from the plane, best-effort:
+// a failure returns read=false and the caller decides what to do without it.
+// purpose and consequence compose the log line, because two callers read the
+// same field for different reasons — the review seam's freshness baseline, and
+// the fix phase's structural grading (CLA-635) — and a shared message would
+// misname one of them.
+func (d *Driver) readTaskOutcome(ctx context.Context, t Target, prev *harness.Result, purpose, consequence string) (string, bool) {
 	if prev == nil || prev.Claim.TaskID == "" {
 		return "", false
 	}
@@ -2159,11 +2298,26 @@ func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness
 	st, err := src.TaskState(sctx, prev.Claim.TaskID)
 	if err != nil {
 		if !errors.Is(err, plane.ErrNotWired) {
-			log.Printf("%scould not read the plane's record of %s before the review phase spawned (%v) — the review→fix gate cannot prove its record is new this trip", labelOf(t), prev.Claim.TaskID, err)
+			log.Printf("%scould not read the plane's record of %s %s (%v) — %s", labelOf(t), prev.Claim.TaskID, purpose, err, consequence)
 		}
 		return "", false
 	}
 	return st.Outcome, true
+}
+
+// readReviewBaseline reads the task's outcome as it stands BEFORE the review
+// phase spawns, so the seam can require the record to have changed. The task id
+// comes from the carried claim (the predecessor phase's), which is exact for a
+// resumed phase and is why this runs inside drainPhase, where `prev` is still
+// in hand.
+//
+// Best-effort like every other plane read: a failure returns read=false, and
+// the gate then refuses the checkpoint rather than guessing whether the outcome
+// changed. No second read is needed here for a target with no plane wiring —
+// the same wiring the seam read already requires.
+func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
+	return d.readTaskOutcome(ctx, t, prev,
+		"before the review phase spawned", "the review→fix gate cannot prove its record is new this trip")
 }
 
 // verifiedBranch returns the branch the previous phase recorded — the hand-off
@@ -2346,6 +2500,30 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// configured integration branch, which is the text the briefs carried
 	// before this feature existed.
 	prBase := d.prBaseFor(ctx, t, spawnDir, briefedRepo)
+	// CLA-635: the FIX phase's brief carries the driver's structural grading of
+	// the review record (B5). Read once per phase, before the attempt ladder —
+	// the record cannot change while this phase runs except by this phase
+	// itself, and every attempt must see the same grade. A read that fails
+	// leaves the digest empty and the brief falls back to the raw block, which
+	// the fix phase reads with get_task anyway.
+	//
+	// Like requireReviewRecord above, the signal is the RESOLVED config, not
+	// ph.Prompt: a handoff respawn replaces ph.Prompt with the successor's
+	// continuation wholesale, and the successor of a mid-fix handoff needs the
+	// same graded list its predecessor got — its continuation (fixTerminalRecord)
+	// already holds it to the grade, so the grade itself must be the one thing
+	// the respawn does not drop. The resolved prompt is the builtin fix brief
+	// exactly when the operator left the phase's own Prompt empty; a custom fix
+	// prompt owns its wording and gets no digest, the same convention the
+	// variant swap in invocationFor follows.
+	fixGrading := ""
+	if ephases := tc.EffectivePhases(); phaseIdx < len(ephases) && ephases[phaseIdx].Prompt == config.FixBrief() {
+		if outcome, read := d.readTaskOutcome(ctx, t, prev,
+			"to grade the review record for the fix phase",
+			"the fix brief will carry the raw record without the driver's structural grading"); read {
+			fixGrading = reviewFindingsDigest(outcome)
+		}
+	}
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -
 	// the spend the budget breaker above can never see (CLA-288).
@@ -2419,6 +2597,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// retryable failure — nothing was spawned and the cause is config,
 			// not a blip — so it fails the phase like a bad spawnDir does.
 			return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: refusing to spawn: %w", drainNum, ph.Label(phaseIdx), ierr)
+		}
+		// The graded list is PREPENDED after placeholder substitution, never
+		// run through the one-pass replacer: it is driver-read text from the
+		// plane, and a finding quoting `{{model}}` must stay a quote.
+		if fixGrading != "" {
+			inv.Prompt = fixGrading + inv.Prompt
 		}
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
@@ -2553,6 +2737,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		if res.Claim.TaskID != "" {
 			end.claim = &res
 		}
+		// CLA-630: the session this pass actually spawned, in exactly the words
+		// the spawn line above used — the phase's label, the phase's resolved
+		// harness, and the resolved model (empty when the harness default
+		// applied; never guessed). Set on every attempt, so the LAST attempt's
+		// values are the ones that ride: a retry within the ladder is the same
+		// session re-run, and the only way its values can differ between
+		// attempts is a reload landing mid-ladder.
+		end.session = &fleet.Session{Phase: ph.Label(phaseIdx), Harness: a.Name(), Model: inv.Model}
 		// The wider classification rides the end for the fleet record only — see
 		// phaseEnd.producedNothing.
 		end.producedNothing = producedNothing
@@ -3449,7 +3641,14 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 	// live claim upstream.
 	held := end.claim.Claim.Held()
 	d.releaseCarried(ctx, t, end.claim)
-	return phaseEnd{released: held}
+	// The session rides the reconstruction (CLA-630): it is record data for the
+	// fleet iteration record, not a hold to undo, and the pass it names really
+	// did spawn. The limit branch calls this BEFORE its stop paths return — a
+	// reset past the run's ceiling, a stop during the wait, a retry that fails
+	// to launch — and dropping the field there would omit a spawned session
+	// from the record. On the paths that loop back, the next attempt's own end
+	// replaces this one, so carrying it costs nothing.
+	return phaseEnd{released: held, session: end.session}
 }
 
 // countUndeclared says whether THIS call site is the one where a held-with-work
