@@ -1136,6 +1136,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// layer over the durable round-prefix check, which survives a takeover on
 	// its own because it reads the plane's round numbers.
 	verifyResolved := map[string]bool{}
+	// Verification rounds this drain has actually closed. The plane's counted is
+	// the cap of record (it survives takeovers and ignores void rounds); this
+	// local count is the last-resort bound that keeps the loop finite even if a
+	// plane read serves no count at all, which would otherwise make "counted >=
+	// 3" unreachable and the fix→verify pair unbounded.
+	verifyRoundsRun := 0
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
@@ -1698,8 +1704,9 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					drainNum, ph.Label(i), end.verifyRound)
 				break
 			}
+			verifyRoundsRun++
 			reason := nonConvergenceReason(end.verifyOpenMusts, end.verifyRound, verifyResolved)
-			capHit := end.verifyCounted >= config.ReviewRoundCap
+			capHit := end.verifyCounted >= config.ReviewRoundCap || verifyRoundsRun >= config.ReviewRoundCap
 			if reason == "" && !capHit && fixIdx >= 0 && end.checkpoint && carried != nil {
 				for _, id := range end.verifyResolvedIDs {
 					verifyResolved[id] = true
@@ -1720,7 +1727,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					reason = "the round ended without holding the task, so no fix can be spawned against its open MUSTs"
 				}
 			}
-			d.parkVerification(ctx, t, vres, reason, end.verifyRound, end.verifyCounted, end.verifyOpenMusts)
+			d.parkVerification(ctx, t, vres, reason, end.verifyRound, end.verifyCounted, end.verifyOpenMusts, end.verifyOpenDetails)
 			parkFired = true
 			carried = nil
 			break
@@ -1939,6 +1946,10 @@ type phaseEnd struct {
 	// passed: the verifier's own record was closed, so its new findings (if any)
 	// are included. The driver loops another fix when it is non-empty.
 	verifyOpenMusts []string
+	// verifyOpenDetails is the same list with each finding's summary appended,
+	// for the park's question: "carrying the records" means the operator reads
+	// WHAT is open, not only its id.
+	verifyOpenDetails []string
 	// verifyCounted is the plane's count of NON-VOID rounds in the newest
 	// record's cycle, read after the close. The round cap reads it; a void round
 	// does not count (B4/B8).
@@ -2758,6 +2769,32 @@ func resolvedFindingIDs(records []plane.ReviewRecordState) []string {
 	return out
 }
 
+// openMustDetails pairs each open MUST id with its served summary, so the park
+// question carries what is actually open rather than only the ids. A finding
+// the read did not serve is still named by id.
+func openMustDetails(openIDs []string, records []plane.ReviewRecordState) []string {
+	summary := map[string]string{}
+	for _, r := range records {
+		if r.State == "sealed" || r.State == "void" {
+			continue
+		}
+		for _, f := range r.Findings {
+			if s := strings.TrimSpace(f.Summary); s != "" {
+				summary[f.ID] = s
+			}
+		}
+	}
+	out := make([]string, 0, len(openIDs))
+	for _, id := range openIDs {
+		if s, ok := summary[id]; ok {
+			out = append(out, id+" — "+s)
+		} else {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
 // nonConvergenceReason reports why the round loop must stop and park rather than
 // spawn another fix (CLA-638, A6): a MUST a previous verifier marked resolved
 // that the latest round has open again, or a MUST still open after two fix
@@ -2791,7 +2828,7 @@ func nonConvergenceReason(open []string, round int, resolved map[string]bool) st
 // un-block it to `ready`, handing the same open MUSTs straight back to a fleet
 // whose cycle counter has not moved — the cap would park it again). The park's
 // outcome stands alone if the question insert fails.
-func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Result, reason string, round, counted int, open []string) {
+func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Result, reason string, round, counted int, open, details []string) {
 	if res.Claim.TaskID == "" {
 		log.Printf("%sverification park: no claim observed, so there is no task to park (%s)", labelOf(t), reason)
 		return
@@ -2804,8 +2841,12 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 	}
 	ref := claimLabel(res.Claim)
 	openList := "none"
+	detailList := "none"
 	if len(open) > 0 {
 		openList = strings.Join(open, ", ")
+	}
+	if len(details) > 0 {
+		detailList = "\n- " + strings.Join(details, "\n- ")
 	}
 	outcome := fmt.Sprintf(
 		"Parked on the review stopping rule: %s. Round %d of the %d-round cap this cycle (non-void rounds counted by the plane); open MUSTs: %s. The durable review records are on the task (`reviews.records`); the operator decides whether to continue, re-scope or drop it.",
@@ -2813,10 +2854,10 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 	body := fmt.Sprintf(
 		"**%s needs a human decision: the fix-verification loop stopped.** %s\n\n"+
 			"Round %d closed; the plane has counted %d non-void round(s) in this review cycle and the cap is %d. "+
-			"Open MUST finding id(s): %s.\n\n"+
+			"Open MUST finding(s): %s\n\n"+
 			"The evidence is in the task's durable review records (`reviews.records`; every finding is `must`/`should`/`nit` with its status, and the legacy `## Review` block is in the outcome). "+
 			"The stopping rule exists so two agents cannot argue past a bound: the reviewer's findings, the fixer's answers and the verifier's adjudication are all on the task, and the disagreement is the question.",
-		ref, reason, round, counted, config.ReviewRoundCap, openList)
+		ref, reason, round, counted, config.ReviewRoundCap, detailList)
 	options := []string{
 		"Continue with a fresh review cycle — I have judged the open MUST(s)",
 		"Leave it parked — I will settle the MUST(s) myself",
@@ -3392,6 +3433,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 						evidenceWhy = "the task could not be read after the verification round closed, so its open MUSTs cannot be judged"
 					} else {
 						end.verifyOpenMusts = append([]string(nil), st.ReviewOpenMustIDs...)
+						end.verifyOpenDetails = openMustDetails(st.ReviewOpenMustIDs, st.Reviews)
 						end.verifyCounted = st.ReviewCounted
 						end.verifyResolvedIDs = resolvedFindingIDs(st.Reviews)
 					}

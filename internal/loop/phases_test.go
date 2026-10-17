@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"path/filepath"
 
@@ -3975,6 +3976,9 @@ func TestDrainPhases_VerificationCapParksWithTheRecords(t *testing.T) {
 	if !strings.Contains(rel.questions[0], "1.review-1.1") || !strings.Contains(rel.questions[0], "reviews.records") {
 		t.Errorf("the question does not carry the records:\n%s", rel.questions[0])
 	}
+	if !strings.Contains(rel.questions[0], "the seam is untested") {
+		t.Errorf("the question names the id but not the finding's substance:\n%s", rel.questions[0])
+	}
 }
 
 // TestDrainPhases_VerificationNonConvergenceParks: a MUST left open after two
@@ -4173,5 +4177,49 @@ func TestVerificationDigest(t *testing.T) {
 	}, nil)
 	if !strings.Contains(clean, "NO OPEN MUST") || !strings.Contains(clean, "aaaa") {
 		t.Errorf("a clean digest must still name the delta base and the clear gate:\n%s", clean)
+	}
+}
+
+// TestDrainPhases_VerificationLocalRoundBound: if the plane serves no round
+// count at all (an older plane, a degraded read), the driver's own count of
+// closed verification rounds still terminates the fix→verify pair at the cap.
+// The loop must never be unbounded because a read came back zero.
+func TestDrainPhases_VerificationLocalRoundBound(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	steps := []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review
+	}
+	for i := 0; i < 3; i++ {
+		steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // fix
+		steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // verify
+	}
+	steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // would be a fourth fix
+	h := &fakeAdapter{steps: steps}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1:
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		case 3, 5, 7:
+			round := 2 + (i-3)/2
+			rel.records = append(rel.records, recordFor(round, "review-2", "r-1", testCheckpointTip, "sealed"))
+			// A NEW id each round: no id is unresolved twice, so only the cap
+			// can stop the loop.
+			rel.openMusts = []string{fmt.Sprintf("%d.review-2.1", round)}
+			rel.counted = 0 // the degraded plane read
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	// implement + review + three fix/verify pairs = 8; a 9th would be the
+	// forbidden "one more round".
+	if h.invokeCalls != 8 {
+		t.Fatalf("spawned %d sessions, want 8 — the local round bound must stop the pair", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 || !strings.Contains(rel.parks[0], "cap") {
+		t.Fatalf("the local round bound did not park at the cap: parks=%v", rel.parks)
 	}
 }
