@@ -1079,13 +1079,19 @@ type Config struct {
 	// checkpoint the model cannot reach itself. See Phase for why this exists.
 	//
 	// OPT-IN, and deliberately so. Left empty, a task runs exactly as it always
-	// has: one session, asked Prompt. Two phases mean a task that reaches its
-	// checkpoint and stops there is only HALF finished until the next session
+	// has: one session, asked Prompt. Two or more phases mean a task that reaches
+	// its checkpoint and stops there is only HALF finished until the next session
 	// runs, so switching it on before the sequence has been watched end to end
 	// would turn a driver bug into tasks that silently never reach review. An
 	// operator opts in per config, and the shipped briefs are one line each:
 	//
-	//	"phases": [{"name": "implement"}, {"name": "review"}]
+	//	"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
+	//
+	// The three-phase shape is the shipped one: `review` with a phase after it is
+	// the REVIEW-ONLY gate (it records findings and changes nothing), and `fix`
+	// is the last phase and owns the PR plus in_review. A FINAL `review` keeps the
+	// historical review-and-fix brief, so an existing two-phase config still
+	// finishes its tasks; the mode is chosen by position, not by a second name.
 	//
 	// Naming a phase and leaving its prompt empty takes the built-in brief for
 	// that name; set `prompt` to override it, and `max_turns` to cap it.
