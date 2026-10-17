@@ -120,13 +120,13 @@ func TestOpencodeInvokeReturnsAParsedResultAlongsideAWaitDelayDeath(t *testing.T
 	// opencode_resume_test.go); the grandchild inherits stdout, so the pipe stays
 	// open past WaitDelay after the parent exits 0.
 	script := `#!/bin/sh
-echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
 echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"done"}}'
 echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":1200,"input":200,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.5}}'
 sleep 8 &
 exit 0
 `
-	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
+	if err := os.WriteFile(stub, []byte(withExportRefused(script)), 0o755); err != nil {
 		t.Fatalf("writing stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))

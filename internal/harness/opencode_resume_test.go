@@ -115,7 +115,7 @@ func TestProbeCoherent(t *testing.T) {
 func TestOpencodeResumeArgs(t *testing.T) {
 	in := Invocation{Model: "opencode/x-preview-f-free"}
 	got := opencodeResumeArgs(in, "ses_dead", "Continue.")
-	want := []string{"run", "--format", "json", "-s", "ses_dead", "--model", "opencode/x-preview-f-free", "--", "Continue."}
+	want := []string{"run", "--standalone", "--format", "json", "-s", "ses_dead", "--model", "opencode/x-preview-f-free", "--", opencodePrompt("Continue.")}
 	if len(got) != len(want) {
 		t.Fatalf("args = %v, want %v", got, want)
 	}
@@ -126,7 +126,7 @@ func TestOpencodeResumeArgs(t *testing.T) {
 	}
 
 	got = opencodeResumeArgs(Invocation{}, "ses_dead", "Continue.")
-	if strings.Join(got, " ") != "run --format json -s ses_dead -- Continue." {
+	if strings.Join(got, " ") != "run --standalone --format json -s ses_dead -- "+opencodePrompt("Continue.") {
 		t.Errorf("no-model args = %v", got)
 	}
 }
@@ -231,7 +231,7 @@ func TestMergeResumeReasonlessContinuationClearsFinishReason(t *testing.T) {
 
 const (
 	// The first call: the session claims EZY-196, then dies the quiet death.
-	resumeClaimEvent = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}` + "\n" + `{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`
+	resumeClaimEvent = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}` + "\n" + `{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`
 	// A coherent probe reply: names the claimed ref.
 	resumeProbeOK = `{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-196 — last action: ran go test."}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}`
@@ -239,7 +239,7 @@ const (
 	resumeProbeWrong = `{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-260 — continuing that one."}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}`
 	// The continuation: does the work (update_task settle + branch), ends clean.
-	resumeContinuation = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
+	resumeContinuation = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`
 )
 
@@ -261,11 +261,11 @@ case "$*" in
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *"Continue exactly where you left off"*)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
     ;;
   *)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
     ;;
 esac
@@ -325,7 +325,7 @@ case "$*" in
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
     ;;
 esac
@@ -370,7 +370,7 @@ case "$*" in
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
     ;;
   *)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
     ;;
 esac
@@ -397,7 +397,7 @@ func TestResurrectionInvokePaidUnknownNotResurrected(t *testing.T) {
 	console := &bytes.Buffer{}
 	opencodeStub(t, `#!/bin/sh
 echo "$*" >> "`+dir+`/log"
-echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
 echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
 `)
 
@@ -434,7 +434,7 @@ func TestResurrectionInvokeProbeObservationSurvives(t *testing.T) {
 	opencodeStub(t, `#!/bin/sh
 case "$*" in
   *"Confirm you are intact"*)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *"Continue exactly where you left off"*)
@@ -442,7 +442,7 @@ case "$*" in
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
     ;;
   *)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
     ;;
 esac
@@ -484,7 +484,7 @@ case "$*" in
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
     ;;
 esac
@@ -571,7 +571,7 @@ func TestMergeResumeEscalatedContinuationKeepsClaimIdentity(t *testing.T) {
 
 	seeded := Invocation{Prompt: "Work."}
 	seeded.ResumeClaim = base.Claim
-	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_escalate_question","callID":"c2","state":{"status":"completed","input":{"questionId":"q1"},"output":"{\"ok\":true}"}}}
+	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_escalate_question","id":"c2","state":{"status":"completed","input":{"questionId":"q1"},"output":"{\"ok\":true}"}}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
 
 	if !cont.Claim.Settled {
@@ -607,7 +607,7 @@ func TestMergeResumeLaterReportWinsStatusUpgrade(t *testing.T) {
 	// its update_task would be unobserved and there would be nothing to dedupe.
 	seeded := Invocation{Prompt: "Work."}
 	seeded.ResumeClaim = Claim{TaskID: "uuid-1", Ref: "EZY-196", RunID: "run-1"}
-	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"done","branch":"clanker/x","delivery":{"commit":"abc123","integrationBranch":"staging"}},"output":"{\"ok\":true}"}}}
+	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"done","branch":"clanker/x","delivery":{"commit":"abc123","integrationBranch":"staging"}},"output":"{\"ok\":true}"}}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
 	mergeResume(&base, cont)
 

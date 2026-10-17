@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -16,23 +17,31 @@ import (
 
 func init() { Register(opencode{}) }
 
-// opencode drives the open, provider-agnostic opencode CLI (`opencode run`). It is
-// the adapter that proves the loop isn't Claude-shaped: opencode points at
-// OpenRouter / opencode Zen / opencode Go / any provider, and the model choice
-// lives in opencode's own config (invisible here). Divergences this adapter
-// absorbs, verified against opencode 1.18.2:
+// opencode drives the open, provider-agnostic opencode CLI, 2.x line (`opencode
+// run`). It is the adapter that proves the loop isn't Claude-shaped: opencode
+// points at OpenRouter / opencode Zen / opencode Go / any provider, and the model
+// choice lives in opencode's own config (invisible here). The 1.x line is no
+// longer supported upstream and this adapter no longer speaks its dialect
+// (CLA-675). Divergences it absorbs, verified against opencode 2.0.32 with a
+// hermetic fake provider and fake MCP server (docs/opencode-build.md):
 //
-//   - Headless entry point is `opencode run <message> --format json`, which emits
-//     one JSON event per line. There is NO per-run --mcp-config flag: MCP servers,
-//     the model, providers and auth all come from opencode's config dir, so
-//     ConfigDir → OPENCODE_CONFIG_DIR is the parity of claude's CLAUDE_CONFIG_DIR.
-//   - Permissions are set via the OPENCODE_PERMISSION env var (a JSON allow/ask/deny
-//     policy), not a run flag. We fail closed: a drain allows read/edit/bash within
-//     the run's workdir subtree (path-scoped PermissionConfig — the session's
-//     worktrees live under it) but denies the exfil tools (webfetch/websearch) and
-//     everything outside the subtree; a probe / read-only run denies edits and
-//     shell too. (We never pass --auto, which blanket-approves everything not
-//     explicitly denied.)
+//   - Headless entry point is `opencode run --standalone --format json [--model
+//     m] -- <message>`, one JSON event per line. `--standalone` is load-bearing:
+//     2.x is client/server and `run` otherwise attaches to the managed background
+//     service, whose own config then wins over everything this adapter sets.
+//     Stdin is left nil: a non-TTY stdin left open hangs `run`, and piped stdin
+//     is appended to the prompt.
+//   - Permissions come from a config `permission` block. 2.x ignores the
+//     OPENCODE_PERMISSION env var entirely, and its default with no policy is
+//     fail-OPEN (write, shell and webfetch all execute, inside the workdir or
+//     not). The adapter therefore writes its fail-closed policy into the
+//     OPENCODE_CONFIG_CONTENT layer it pins on every spawn, which 2.x merges
+//     last. We never pass --auto, which approves every `ask`.
+//   - MCP servers default to Code Mode in 2.x: their tools are not top-level but
+//     callable only from inside the `execute` tool, whose stream shows no
+//     per-call output (so no claim can be observed) and whose sandbox reached the
+//     network with webfetch denied. The adapter sets `codemode: false` on every
+//     server it hands over and denies `execute`.
 //   - Billing depends on the configured backend, not opencode: metered pay-per-token
 //     (OpenRouter / Zen) or a monthly-limit subscription (opencode Go). NONE impose a
 //     short rolling-window cap, so there is no supervised-wait/early-reset case here.
@@ -40,28 +49,28 @@ func init() { Register(opencode{}) }
 //     "out of credits" / "monthly limit reached") and flags Limit.Stop so the loop
 //     stops cleanly rather than waiting for a reset that never comes. The
 //     self-accounted budget breaker is the primary control; ReadUsage is unsupported.
+//   - Usage: 2.x emits step_finish only for tool-call steps, never for the final
+//     answer, so the stream under-counts. After each process exits the adapter
+//     reads `opencode session export --standalone <sid>` for the authoritative
+//     figures (see opencode_export.go).
 type opencode struct{}
 
 func (opencode) Name() string { return "opencode" }
 
-// opencode DOES receive mcp_config_path - as OPENCODE_CONFIG (see env below) -
-// and that is exactly why "does the adapter hand it over" was the wrong question
-// to gate a preflight on. What arrives has to be an opencode config, whose
-// servers live under `mcp`; the Claude-shaped `.mcp.json` that config.Validate
-// auto-discovers from the workdir is a different schema, and opencode does not
-// ignore the difference. Verified against opencode 1.18.2:
-//
-//	$ OPENCODE_CONFIG=<dir>/.mcp.json opencode run --format json ... -- hi
-//	Error: Configuration is invalid at <dir>/.mcp.json
-//	  Unrecognized key: mcpServers
-//
-// So every session dies at startup, which is why doctor treats that combination
-// as a FAIL rather than a missing-tools WARN (CLA-263).
+// opencode DOES receive mcp_config_path - as OPENCODE_CONFIG and, rewritten, as
+// OPENCODE_CONFIG_CONTENT (see env below) - and that is exactly why "does the
+// adapter hand it over" was the wrong question to gate a preflight on. What
+// arrives has to be an opencode config, whose servers live under `mcp` (1.x
+// dialect, still accepted) or `mcp.servers` (2.x dialect); the Claude-shaped
+// `.mcp.json` that config.Validate auto-discovers from the workdir is a
+// different schema, and opencode refuses to start on a key it does not know.
+// So every session would die at startup, which is why doctor treats that
+// combination as a FAIL rather than a missing-tools WARN (CLA-263).
 func (opencode) MCPConfigUse() MCPConfigUse {
 	return MCPConfigUse{
 		Schema: MCPConfigNative,
-		Note: "the opencode adapter passes mcp_config_path as OPENCODE_CONFIG, which must be an opencode " +
-			"config (servers under `mcp`, not Claude's `mcpServers`) - opencode refuses to start on a file it cannot parse",
+		Note: "the opencode adapter passes mcp_config_path as OPENCODE_CONFIG (plus a rewritten copy as OPENCODE_CONFIG_CONTENT), which must be an opencode " +
+			"config (servers under `mcp` or `mcp.servers`, not Claude's `mcpServers`) - opencode refuses to start on a file it cannot parse",
 	}
 }
 
@@ -353,6 +362,10 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	p := newOpencodeParse(in, console)
 	captured := newCapture(p.line)
 	captured.attach(cmd, console)
+	// Taken before the spawn, so every message this process adds to the session
+	// is stamped after it: applyExport attributes export figures to THIS run by
+	// that window (a resumed session's export also carries the earlier runs).
+	started := time.Now()
 	runErr := cmd.Run()
 
 	res := captured.result("opencode")
@@ -400,6 +413,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// salvage, handback and spend are computed from res before any error
 		// check either way, and the cancelled driver ctx stops the run one spawn
 		// later — so the noise is left standing rather than guarded against.
+		o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
 		return res, nil
 	} else if runErr != nil && !timedOut {
 		// A launch failure (bad PATH, unreadable config): nothing was emitted,
@@ -410,6 +424,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// and not a verdict. The marker above is the verdict.
 		res.ExitCode = -1
 	}
+	o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
 	return res, nil
 }
 
@@ -420,18 +435,43 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 // codexArgs: it is a bare positional, and a prompt that is itself a flag token
 // would otherwise be parsed as a flag rather than as the message.
 func opencodeArgs(in Invocation) []string {
-	prompt := in.Prompt
+	prompt := opencodePrompt(in.Prompt)
 	if in.Probe {
 		// The cheapest possible request: a trivial prompt, tools all denied by the
 		// read-only permission policy (see env) — just enough to see whether the
 		// provider still answers or is budget-exhausted.
 		prompt = "."
 	}
-	args := []string{"run", "--format", "json"}
+	args := []string{"run", "--standalone", "--format", "json"}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}
 	return append(args, "--", prompt)
+}
+
+// opencodeMCPWarmupNote is prepended to every prompt that does work. 2.x
+// connects MCP servers asynchronously: verified against 2.0.32 with a fake MCP
+// server, the clankerbar tools were absent from the session's first LLM request
+// and arrived on the second, so a first-turn `claim_task` comes back as the
+// tool error "No tool named ... is currently available". The model sees that
+// error and decides what to do next; without being told, it can read it as a
+// missing integration and give up on the backlog. A retry inside the adapter
+// was the alternative and was not chosen: the failed call is an ordinary turn
+// the model already gets to react to, and re-spawning the session would pay for
+// the whole prompt again to fix something one sentence of brief fixes.
+const opencodeMCPWarmupNote = "Note: this session's MCP servers connect in the background. " +
+	"If an MCP tool (for example clankerbar_claim_task) reports that no tool by that name is currently available, " +
+	"it is still connecting: call it again on your next step rather than concluding it is missing. "
+
+// opencodePrompt is the message a working (non-probe) run sends. It carries the
+// MCP warm-up note ahead of the caller's prompt; see opencodeMCPWarmupNote. The
+// note is one line and ends in a space, so the prompt keeps its own first line.
+// An empty prompt stays empty so the CLI's own handling of it is unchanged.
+func opencodePrompt(prompt string) string {
+	if prompt == "" {
+		return prompt
+	}
+	return opencodeMCPWarmupNote + prompt
 }
 
 // opencodeMCPResourcePattern is the pattern shape opencode's MCP resource tools
@@ -441,8 +481,9 @@ func opencodeArgs(in Invocation) []string {
 // the URL-shaped resource URIs the clankerbar plane serves its protocol at.
 const opencodeMCPResourcePattern = "mcp:*"
 
-// opencodePermission is the fail-closed OPENCODE_PERMISSION policy: a path-scoped
-// PermissionConfig, not a flat tool map. The run's workdir subtree is the working
+// opencodePermission is the fail-closed policy the adapter writes into the
+// `permission` key of the config it pins via OPENCODE_CONFIG_CONTENT (see
+// opencodeSessionConfig): a path-scoped PermissionConfig, not a flat tool map. The run's workdir subtree is the working
 // set — `read`/`edit` are allowed there and `external_directory` (opencode's gate
 // for any path-taking tool whose target is outside the project directory) allows
 // the same subtree, so the session's own worktrees, which live under the workdir
@@ -453,39 +494,37 @@ const opencodeMCPResourcePattern = "mcp:*"
 //
 // EXTRA DIRECTORIES (CLA-437, agent-rule-scoping piece 2): each entry in
 // extraDirs — the project's other declared repos, plus any conventional worktree
-// area beside the spawn checkout — is granted the same reach the workdir has,
-// whatever directory the session starts in. Two layers, because the ask shapes
-// differ by where the session runs:
+// area beside the spawn checkout — is granted the same reach the workdir has:
+// an absolute external_directory allow, and a read/edit allow in the
+// instance-relative "../<dir>/**" form, which sorts after the blanket "../**"
+// deny and so wins for exactly the declared trees. See scopeExtraDirs.
 //
-//   - A session spawned OUTSIDE a git repo (the multi-repo parent, today's
-//     default) asks read/edit with worktree-relative paths whose worktree is "/",
-//     i.e. the absolute path minus its leading slash. Each extra dir therefore
-//     gains its own root-relative allow, exactly like the workdir's.
-//   - A session spawned INSIDE a checkout (the new normal once the driver starts
-//     sessions in the task's repo) gets that checkout as its git worktree, so
-//     in-tree files ask as plain relative paths ("internal/x.go") and other
-//     trees ask with "../sibling/file"-style paths. Neither form can match a
-//     root-relative pattern, so this shape adds three rules: read/edit allow
-//     "**" (every plain-relative ask is in-tree by construction), deny "../**"
-//     (escapes fail closed), then allow each extra dir's "../name/**" form,
-//     which sorts AFTER the blanket "../**" deny and therefore wins for exactly
-//     the declared trees. Absolute-form asks cannot occur with a git worktree,
-//     and external_directory still gates every path-taking tool before its ask,
-//     so the boundary holds even where the pattern layer is redundant.
+// `shell` (1.x called it `bash`; 2.x accepts both names) stays TOOL-LEVEL: its
+// permission patterns match parsed COMMANDS ("git status --porcelain"), not
+// paths, so a path rule can never express it. On 1.x, commands whose file
+// arguments fell outside the project boundary were gated separately via
+// external_directory. 2.x DROPPED THAT: verified against 2.0.32, under this policy
+// `touch /abs/outside` and `cat /etc/hosts` both ran, and only the shell tool's
+// own `workdir` argument reaches external_directory. The operator accepted that
+// gap on 2026-10-18 (CLA-675): an unattended session can already run arbitrary
+// commands inside the workdir, so no sandbox and no absolute-path shell deny
+// patterns were added (docs/opencode-build.md, "Shell is not path-gated").
 //
-// With no extraDirs the emitted policy is byte-identical to what shipped before
-// CLA-437 for every existing config — the fake-provider matrix depends on it.
+// `execute` is denied by name. It is 2.x's Code Mode tool: MCP tools left in Code
+// Mode are callable only through it, its stream carries no per-call output (no
+// claim could be observed), and code run inside it reached the network with
+// webfetch denied. The catch-all already denies it; naming it keeps that from
+// depending on the catch-all. Every MCP server the adapter hands over is moved
+// out of Code Mode instead (opencodeSessionConfig), so `*_*` below is what
+// reaches them.
 //
-// `bash` stays TOOL-LEVEL: its permission patterns match parsed COMMANDS ("git
-// status --porcelain"), not paths, so a path rule can never express it. Commands
-// whose file arguments fall outside the project boundary are gated separately via
-// external_directory, which IS scoped above — that is the carve-out that fixes
-// the old heuristic denials ("cp is denied but sed -i works").
-//
-// Five opencode quirks the emitted shape is fitted to (verified against opencode
-// 1.18.16 source, and the MCP-resource one re-verified against the shipped 1.18.18
-// bundle: permission/index.ts, session/tools.ts, tool/read.ts, tool/edit.ts,
-// tool/external-directory.ts):
+// Five quirks the emitted shape is fitted to. They were read out of opencode
+// 1.18.16 source (permission/index.ts, session/tools.ts, tool/read.ts,
+// tool/edit.ts, tool/external-directory.ts). Against 2.0.32 the first three were
+// re-checked behaviourally (last-match-wins, `<server>_<tool>` MCP names,
+// external_directory for out-of-tree file tools); the MCP-resource one no
+// longer applies the same way, because 2.x registers the resource tools in Code
+// Mode only, so with `execute` denied a session has no resource tools at all:
 //
 //   - Rules are evaluated LAST-MATCH-WINS on a flattened ruleset, so the specific
 //     rules must sort AFTER the `*` catch-all or the catch-all overrides them.
@@ -547,42 +586,39 @@ const opencodeMCPResourcePattern = "mcp:*"
 //     (CLA-390). `list` is allowed for the same read-only reason so a future
 //     opencode upgrade does not re-break directory listing the way grep/glob
 //     broke.
-//   - read/edit asks carry the path RELATIVE TO THE GIT WORKTREE
-//     (path.relative(worktree, file)); a session whose cwd is not inside a git
-//     repo — the multi-repo-parent case, workdir=~/dev — gets worktree "/", so
-//     its patterns are the absolute path minus the leading slash
-//     ("Users/jason/dev/..."). The read/edit patterns are therefore emitted in
-//     that same root-relative form. external_directory patterns are absolute
-//     globs (path.join(dir, "*")), so that rule uses the absolute form.
+//   - read/edit asks carry the path RELATIVE TO THE INSTANCE DIRECTORY on 2.x
+//     (verified against 2.0.32: in a git checkout's subdirectory a write of
+//     "w1.txt" asked "w1.txt", not "sub/w1.txt", and outside any repo it asked
+//     "w1.txt", not the root-relative form 1.x used). An in-tree ask is a plain
+//     relative path, so "**" allows the working set, and an escape is
+//     "../"-prefixed, so "../**" denies it. The deny sorts first ("*" 0x2a
+//     before "." 0x2e), so a declared extra dir's own "../<dir>/**" allow still
+//     wins on last-match-wins. external_directory patterns are absolute globs,
+//     and external_directory is judged against the instance directory too (a
+//     read of "../top.txt" from a checkout's subdirectory was refused there, git
+//     worktree or not), so that rule uses the absolute workdir form.
 //
-// THE INSTANCE DIRECTORY DECIDES WHICH OF THOSE TWO ASK SHAPES ARRIVES, and both
-// are emitted (CLA-441). Until that task the root-relative form was the only one
-// the BASE policy carried, and it is the form a session asks with only when its
-// instance directory is outside every git repo. Two shipped changes moved the
-// live case away from that: CLA-437 started each session in the TASK'S CHECKOUT,
-// and the PWD pin above made the instance directory actually be that checkout.
-// A session inside a repo asks "AGENTS.md", which "Users/jason/dev/**" can never
-// match, so every file tool fell through to the `*` catch-all deny - with the
-// grants apparently in place, which is why widening their SCOPE never helped and
-// four tasks stalled against it (CLA-182, CLA-435, CLA-437, and this one three
-// times). scopeInstanceDir adds the in-checkout layer; the root-relative layer
-// stays for the non-repo shape, so one policy is correct wherever it lands
-// rather than correct for whichever shape was in fashion.
+// 1.x made those asks relative to the git WORKTREE (or to "/" outside a repo),
+// which is why this policy used to carry a root-relative layer and an
+// in-checkout layer chosen by walking up for a .git entry (CLA-441). On 2.x the
+// instance directory alone decides the shape, so there is one layer, and the
+// PWD pin (pinPWD) is what makes the instance directory the workdir.
 func opencodePermission(readOnly bool, workdir string, extraDirs []string) string {
-	rootRel, abs := opencodeWorkdirPatterns(workdir)
-	// The exact (non-wildcard) workdir pattern, so reading the workdir root
-	// itself — a directory listing of ~/dev, pattern "Users/jason/dev" — is
-	// allowed along with everything under it.
-	exact := strings.TrimSuffix(rootRel, "/**")
-	read := map[string]string{rootRel: "allow", exact: "allow", opencodeMCPResourcePattern: "allow"}
-	edit := map[string]string{rootRel: "allow", exact: "allow"}
+	b, _ := json.Marshal(opencodePermissionPolicy(readOnly, workdir, extraDirs))
+	return string(b)
+}
+
+// opencodePermissionPolicy is opencodePermission before marshalling, so the
+// session config can embed it as an object rather than a string.
+func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string) map[string]any {
+	_, abs := opencodeWorkdirPatterns(workdir)
+	// "**" is everything under the instance directory, the root included;
+	// "../**" is every escape from it. See the function doc for why these are
+	// the only two shapes a 2.x ask can take.
+	read := map[string]string{"**": "allow", "../**": "deny", opencodeMCPResourcePattern: "allow"}
+	edit := map[string]string{"**": "allow", "../**": "deny"}
 	ext := map[string]string{"*": "deny", abs: "allow"}
-	// The worktree opencode will resolve AT THE INSTANCE DIRECTORY - which the
-	// PWD pin has made be workdir - and which therefore decides the shape of
-	// every read/edit ask this policy is judged against.
-	worktree, inCheckout := opencodeWorktreeRoot(workdir)
-	scopeInstanceDir(read, edit, worktree, workdir, inCheckout)
-	scopeExtraDirs(read, edit, ext, worktree, extraDirs, inCheckout)
+	scopeExtraDirs(read, edit, ext, opencodeInstanceDir(workdir), extraDirs)
 	perm := map[string]any{
 		// The working set: read/edit scoped to the workdir subtree (root
 		// included), plus the external_directory carve-out for the same
@@ -613,132 +649,60 @@ func opencodePermission(readOnly bool, workdir string, extraDirs []string) strin
 		"webfetch":  "deny",
 		"websearch": "deny",
 	}
+	// Code Mode, denied by name: see the function doc.
+	perm["execute"] = "deny"
 	if readOnly {
 		perm["edit"] = "deny"
-		perm["bash"] = "deny"
+		perm["shell"] = "deny"
 	} else {
-		perm["bash"] = "allow"
+		perm["shell"] = "allow"
 	}
 	// The catch-all: anything not named above — lsp/task/skill, reads or edits
 	// outside the workdir — is denied rather than asked. Sorts first (see the
 	// doc), so every specific rule wins the last-match-wins evaluation.
 	perm["*"] = "deny"
-	b, _ := json.Marshal(perm)
-	return string(b)
+	return perm
 }
 
-// scopeExtraDirs widens the policy's three path-scoped rules to cover extraDirs,
-// per the two ask-shape layers in opencodePermission's doc. It mutates the maps
-// in place so the base construction above stays the single description of the
-// legacy shape.
-func scopeExtraDirs(read, edit, ext map[string]string, worktree string, extraDirs []string, inCheckout bool) {
-	if len(extraDirs) == 0 {
-		return
-	}
+// scopeExtraDirs widens the policy's three path-scoped rules to cover extraDirs:
+// the absolute external_directory allow, and the instance-relative read/edit
+// form. It mutates the maps in place so the base construction stays the single
+// description of the working set.
+//
+// A tree INSIDE the instance directory needs no read/edit rule ("**" covers it).
+// A tree that CONTAINS the instance directory is skipped, and that skip is
+// load-bearing rather than tidy. filepath.Rel returns a pure dot-dot chain for
+// an ancestor ("..", "../.."), and opencode's matcher reads `*` as any run of
+// characters including "/", so "../**" is not "that directory" - it is
+// everything outside the instance directory. Emitting it would either overwrite
+// the "../**" deny with an allow or sort after it and beat it ("../../**"),
+// turning the policy's only stated escape boundary into an allow of the whole
+// filesystem. There is no bounded glob to give it ("../*" spans "/" exactly as
+// "../**" does), so the choice is that or an escape, and fail-closed wins
+// (CLA-441 reviews). The cost is a WITHDRAWN grant: a declared tree containing
+// the workdir is unreadable outside the workdir itself.
+func scopeExtraDirs(read, edit, ext map[string]string, base string, extraDirs []string) {
 	for _, dir := range extraDirs {
 		if dir == "" {
 			continue
 		}
-		rootRel, abs := opencodeWorkdirPatterns(dir)
-		exactDir := strings.TrimSuffix(rootRel, "/**")
-		read[rootRel] = "allow"
-		edit[rootRel] = "allow"
-		read[exactDir] = "allow"
-		edit[exactDir] = "allow"
+		_, abs := opencodeWorkdirPatterns(dir)
 		ext[abs] = "allow"
-		if inCheckout {
-			// The in-checkout ask form for this tree. Relative to the WORKTREE
-			// ROOT, not to the workdir: that is the base opencode's
-			// path.relative() uses, and the two are the same directory only
-			// when the session starts at the top of its checkout (CLA-441).
-			// Sibling trees come out with a "../" prefix, which the blanket
-			// "../**" deny scopeInstanceDir laid down covers and this specific
-			// allow re-opens on last-match-wins.
-			//
-			// A tree that CONTAINS the worktree is skipped, and that skip is
-			// load-bearing rather than tidy. filepath.Rel returns a pure
-			// dot-dot chain for an ancestor ("..", "../.."), and opencode's
-			// matcher reads `*` as any run of characters including "/", so
-			// "../**" is not "that directory" - it is everything outside the
-			// worktree. Emitting it would either overwrite the "../**" deny
-			// with an allow (a declared parent of a submodule) or sort after it
-			// and beat it ("../../**"), turning the policy's only stated escape
-			// boundary into an allow of the whole filesystem.
-			//
-			// Be honest about the cost: this is a WITHDRAWN GRANT, not a
-			// narrowed one. An in-checkout session asks only in the
-			// worktree-relative form (ReadTool passes
-			// path.relative(worktree, file)), so the root-relative and
-			// external_directory allows written just above serve the OTHER
-			// shape and do nothing for this session - a declared tree
-			// containing its worktree is simply unreadable to it. There is no
-			// bounded glob to give it ("../*" spans "/" exactly as "../**"
-			// does), so the choice is that or an escape, and fail-closed wins
-			// (CLA-441 reviews).
-			if rel, err := filepath.Rel(worktree, dir); err == nil && rel != "." && !isDotDotChain(rel) {
-				relGlob := filepath.ToSlash(rel) + "/**"
-				read[relGlob] = "allow"
-				edit[relGlob] = "allow"
-			}
+		rel, err := filepath.Rel(base, absOrSelf(dir))
+		if err != nil || rel == "." || isDotDotChain(rel) || !strings.HasPrefix(filepath.ToSlash(rel), "../") {
+			continue
 		}
+		relGlob := filepath.ToSlash(rel)
+		read[relGlob+"/**"] = "allow"
+		edit[relGlob+"/**"] = "allow"
+		read[relGlob] = "allow"
+		edit[relGlob] = "allow"
 	}
-}
-
-// scopeInstanceDir adds the read/edit patterns for the ask shape a session gets
-// when its INSTANCE DIRECTORY is inside a git checkout: paths relative to the
-// worktree root rather than to "/". It is a no-op outside a checkout, where the
-// base root-relative patterns are already the right shape.
-//
-// Two cases, and they are not the same policy:
-//
-//   - The session starts AT the worktree root (the live case: CLA-437 spawns
-//     into the task's checkout). Every in-tree ask is a plain relative path, so
-//     "**" allows the working set, and an escape is "../"-prefixed, so "../**"
-//     denies everything outside it. The deny sorts first ("*" 0x2a before "."
-//     0x2e), so a declared extra dir's own "../<dir>/**" allow still wins.
-//   - The session starts in a SUBDIRECTORY of a checkout. The worktree root is
-//     an ancestor, so asks for the working set carry the subdirectory's own
-//     prefix, and a bare "**" allow would hand the session the whole repo above
-//     it. Only the prefixed form is allowed, and NOTHING is denied here: the
-//     policy's own `*` catch-all already denies every ask no rule allows, so an
-//     in-repo path outside the workdir falls to it untouched.
-//
-// Writing no deny in that second case is deliberate, and the first draft did
-// write one ("**": "deny", beaten by the prefixed allow on last-match-wins).
-// That put a DIRECTORY NAME into a sort-order argument, and the argument is
-// false: ten byte values that can legally start a path component (space, and
-// `!"#$%&'()`) sort BELOW "*" (0x2a), so a workdir named `!important` emitted
-// its allow before the deny and locked the session out of its own tree - the
-// same silent total denial CLA-441 spent four tasks on, in a new dress. The
-// deny that remains, "../**" in the worktree-root case, is a fixed string
-// beaten by nothing that depends on a name (CLA-441 review).
-//
-// It mutates the maps in place so the base construction stays the single
-// description of the non-repo shape.
-func scopeInstanceDir(read, edit map[string]string, worktree, workdir string, inCheckout bool) {
-	if !inCheckout {
-		return
-	}
-	rel := "."
-	if r, err := filepath.Rel(worktree, absOrSelf(workdir)); err == nil {
-		rel = filepath.ToSlash(r)
-	}
-	if rel == "." {
-		read["**"] = "allow"
-		edit["**"] = "allow"
-		read["../**"] = "deny"
-		edit["../**"] = "deny"
-		return
-	}
-	read[rel+"/**"] = "allow"
-	edit[rel+"/**"] = "allow"
-	read[rel] = "allow"
-	edit[rel] = "allow"
 }
 
 // isDotDotChain reports whether a slash-separated relative path is nothing but
 // ".." components - what filepath.Rel returns for a directory that CONTAINS the
-// base. Such a path has no bounded glob form in opencode's worktree-relative ask
+// base. Such a path has no bounded glob form in opencode's instance-relative ask
 // shape, which is why scopeExtraDirs refuses to emit one.
 func isDotDotChain(rel string) bool {
 	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
@@ -749,38 +713,16 @@ func isDotDotChain(rel string) bool {
 	return true
 }
 
-// opencodeWorktreeRoot resolves the git worktree opencode will discover for an
-// instance directory: the nearest ancestor of dir (dir itself included) carrying
-// a .git entry — a DIRECTORY in a normal checkout, a FILE in a linked worktree
-// of one. It returns ("", false) when there is none, which is opencode's
-// worktree-"/" case.
-//
-// It WALKS UP rather than testing dir alone, because git does and so opencode
-// does: a session started in <repo>/internal is inside <repo>'s worktree and
-// asks with "internal/..." patterns, and a policy that read that directory as
-// "not a repo" would emit the root-relative shape and lock the session out
-// exactly as CLA-441 describes. An empty dir resolves against the process cwd
-// for the same reason opencodeWorkdirPatterns does - that is where the session
-// would actually run.
-func opencodeWorktreeRoot(dir string) (string, bool) {
-	if dir == "" {
-		cwd, err := os.Getwd()
-		if err != nil {
-			return "", false
+// opencodeInstanceDir is the directory a session's asks are relative to: the
+// workdir, or the process cwd when the workdir is empty (where the session
+// would actually run).
+func opencodeInstanceDir(workdir string) string {
+	if workdir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			return cwd
 		}
-		dir = cwd
 	}
-	cur := absOrSelf(dir)
-	for {
-		if hasGitEntry(cur) {
-			return cur, true
-		}
-		parent := filepath.Dir(cur)
-		if parent == cur {
-			return "", false
-		}
-		cur = parent
-	}
+	return absOrSelf(workdir)
 }
 
 func absOrSelf(dir string) string {
@@ -790,24 +732,11 @@ func absOrSelf(dir string) string {
 	return dir
 }
 
-// hasGitEntry reports whether dir carries a .git entry — a directory in a normal
-// checkout, a FILE in a worktree of one. Either means opencode will discover a
-// git worktree there and shape its read/edit asks relative to it, which is what
-// decides which pattern layer the policy needs.
-func hasGitEntry(dir string) bool {
-	if dir == "" {
-		return false
-	}
-	_, err := os.Stat(filepath.Join(dir, ".git"))
-	return err == nil
-}
-
-// opencodeWorkdirPatterns derives the two pattern forms the policy needs from
-// the run's workdir. rootRel is the pattern for read/edit asks — opencode's
-// path.relative(worktree, file) form, i.e. the absolute path minus its leading
-// separator (and drive letter on Windows) — so "Users/jason/dev/**" matches the
-// patterns a session with worktree "/" asks for files under /Users/jason/dev.
-// abs is the pattern for external_directory asks, which are absolute globs. An
+// opencodeWorkdirPatterns derives two pattern forms from a directory. abs is the
+// pattern for external_directory asks, which are absolute globs. rootRel is the
+// root-relative form 1.x read/edit asks used (the absolute path minus its
+// leading separator); 2.x never asks in it, and the policy no longer emits it,
+// but the helper keeps returning it for the tests that pin its derivation. An
 // empty workdir (the config default: run in the driver's cwd) falls back to the
 // resolved cwd so the policy still scopes the session to where it actually runs.
 func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
@@ -835,91 +764,209 @@ func (opencode) env(in Invocation) ([]string, error) {
 	// cwd, so this is what decides which project-level opencode.json it merges
 	// and which git worktree its read/edit asks are relative to - see pinPWD.
 	env := pinPWD(os.Environ(), in.WorkDir)
-	// Fail-closed permission policy. Set before in.Env so an explicit caller
-	// OPENCODE_PERMISSION in in.Env still wins (exec takes the last of a dup key),
-	// but the ambient environment never silently loosens an unattended run.
-	env = append(env, "OPENCODE_PERMISSION="+opencodePermission(in.Probe, in.WorkDir, in.ExtraDirs))
-	// Pin the config dir so a headless session loads the SAME MCP servers,
-	// providers, model and auth as the interactive one (the claude/CODEX parity).
+	// Pin the config dir so a headless session loads the SAME providers, model
+	// and plugins as the interactive one (the claude/CODEX parity). On 2.x
+	// OPENCODE_CONFIG_DIR REPLACES the global config dir (~/.config/opencode)
+	// rather than adding a layer after it. Auth is not here on 2.x: credentials
+	// live in the data dir's opencode.db, which this does not move.
 	if in.ConfigDir != "" {
 		env = append(env, "OPENCODE_CONFIG_DIR="+in.ConfigDir)
 	}
 	// opencode has no per-run MCP flag; when a caller supplies a config file path
 	// (in opencode's own schema, carrying the mcp block) point OPENCODE_CONFIG at
-	// it. The Claude-shaped .mcp.json is a different schema and is ignored here.
+	// it. The Claude-shaped .mcp.json is a different schema and is refused by
+	// doctor, not handed over.
 	if in.MCPConfigPath != "" {
 		env = append(env, "OPENCODE_CONFIG="+in.MCPConfigPath)
-		// ...and hand the SAME bytes over again as OPENCODE_CONFIG_CONTENT,
-		// which opencode merges after every layer this driver or a checkout can
-		// write (CLA-441). OPENCODE_CONFIG is an early layer: opencode merges
-		// the global config, then this file, then every project-level
-		// opencode.json it discovers from the instance directory, then the
-		// OPENCODE_CONFIG_DIR directory again, THEN this. Both of those later
-		// layers have been observed redirecting `mcp.clankerbar` at ANOTHER
-		// project - a global block did it for sessions whose instance dir was
-		// ~/dev, a checked-in repo-level opencode.json did it for sessions whose
-		// instance dir was a repo - so naming the file does not pin which
-		// backlog an unattended session works. The content layer does, and it
-		// costs one read of a file this process already trusts.
-		//
-		// "Merged last" is deliberately not said: read out of 1.18.19's
-		// Config.loadInstanceState, THREE layers still follow it - the console
-		// active-org remote config, a managed (MDM) config dir, and managed
-		// preferences. None is reachable on an ordinary developer machine, and
-		// none is anything a repo or this driver can write, so the pin holds;
-		// but a future reader should not be told a false absolute.
-		//
-		// This does not make the PWD pin redundant, nor it this: the content
-		// layer settles which MCP server the session talks to, the instance
-		// directory settles which repo it reads, edits and asks permission for.
-		//
-		// Two costs of moving a file's bytes into the environment, neither
-		// large enough to change the call: a credential written LITERALLY into
-		// the mcp config (rather than as `{env:CLANKERBAR_API_KEY}`) is now in
-		// the child's environment, where a process listing or a crash dump
-		// reaches it and a 0600 file did not; and environment plus argv is
-		// capped around 1 MB on macOS, so an enormous config would fail the
-		// spawn with E2BIG rather than merely being ignored.
-		content, err := os.ReadFile(in.MCPConfigPath)
-		if err != nil {
-			// FAIL CLOSED. The alternative - spawn with OPENCODE_CONFIG alone -
-			// is a session that starts, looks healthy, and claims from whichever
-			// project the ambient config names. A session that never starts is a
-			// loud, correct outage; a session draining somebody else's backlog
-			// is the defect this change exists to end.
-			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
-		}
-		env = append(env, "OPENCODE_CONFIG_CONTENT="+string(content))
 	}
+	// ...and hand the session config over again as OPENCODE_CONFIG_CONTENT,
+	// which opencode merges after every layer this driver or a checkout can
+	// write (CLA-441; re-verified on 2.0.32, where the content layer's
+	// `permission` beat a project-level opencode.json). OPENCODE_CONFIG is an
+	// early layer: the global dir, then that file, then every project-level
+	// opencode.json and .opencode/opencode.json discovered from the instance
+	// directory, THEN this. Later layers have been observed redirecting
+	// `mcp.clankerbar` at ANOTHER project, so naming the file does not pin which
+	// backlog an unattended session works. The content layer does.
+	//
+	// On 2.x it is also the ONLY place the permission policy can live: the
+	// OPENCODE_PERMISSION variable 1.x read is ignored (the string is absent from
+	// the 2.0.32 binary), and with no policy 2.x runs every tool. So the content
+	// is ALWAYS set, with or without an mcp config - see opencodeSessionConfig.
+	//
+	// This does not make the PWD pin redundant, nor it this: the content layer
+	// settles which MCP server the session talks to and what it may do, the
+	// instance directory settles which repo it reads, edits and asks permission
+	// for.
+	//
+	// Two costs of moving a file's bytes into the environment, neither large
+	// enough to change the call: a credential written LITERALLY into the mcp
+	// config (rather than as `{env:CLANKERBAR_API_KEY}`) is now in the child's
+	// environment, where a process listing or a crash dump reaches it and a 0600
+	// file did not; and environment plus argv is capped around 1 MB on macOS, so
+	// an enormous config would fail the spawn with E2BIG rather than merely being
+	// ignored.
+	content, err := opencodeSessionConfig(in)
+	if err != nil {
+		// FAIL CLOSED. The alternative - spawn without the content layer - is a
+		// session with no permission policy at all on 2.x, claiming from whichever
+		// project the ambient config names. A session that never starts is a loud,
+		// correct outage.
+		return nil, err
+	}
+	env = append(env, "OPENCODE_CONFIG_CONTENT="+string(content))
+	// Set last so an explicit caller value in in.Env still wins (exec takes the
+	// last of a duplicate key). doctor warns when a config declares
+	// OPENCODE_CONFIG_CONTENT, because that replaces the policy wholesale.
 	env = append(env, in.Env...)
 	return env, nil
+}
+
+// opencodeSessionConfig builds the document pinned as OPENCODE_CONFIG_CONTENT:
+// the mcp config file's own keys, with every MCP server moved out of Code Mode
+// and the fail-closed permission policy under `permission`.
+//
+// The file is parsed as strict JSON, the same rule config applies to every file
+// the driver names (readMCPFile): those feed fail-closed gates, and a lenient
+// parse here would let the adapter accept what config refused. Numbers are kept
+// as written (UseNumber) so a re-marshalled timeout or port is byte-for-byte the
+// operator's value.
+//
+// The file's own `permission` key, if any, is replaced rather than merged.
+// config.Validate already refuses a `permission` key in the named file
+// (checkDiscoveredMCPConfig), so this only matters for a caller that bypassed
+// it, and replacing is the fail-closed choice.
+func opencodeSessionConfig(in Invocation) ([]byte, error) {
+	doc := map[string]any{}
+	if in.MCPConfigPath != "" {
+		data, err := os.ReadFile(in.MCPConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("mcp config %s: not a JSON object: %w", in.MCPConfigPath, err)
+		}
+		if doc == nil {
+			doc = map[string]any{}
+		}
+		if err := opencodeMCPOutOfCodeMode(doc); err != nil {
+			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
+		}
+	}
+	doc["permission"] = opencodePermissionPolicy(in.Probe, in.WorkDir, in.ExtraDirs)
+	return json.Marshal(doc)
+}
+
+// opencodeMCPOutOfCodeMode rewrites a config's `mcp` block in place so every
+// server it declares is in the 2.x dialect (`mcp.servers.<name>`) with
+// `codemode: false`.
+//
+// Why both halves are needed, verified against 2.0.32:
+//
+//   - With Code Mode on (the 2.x default) a server's tools are reachable only
+//     from inside the `execute` tool, which this adapter denies, and whose
+//     stream would not show the claim anyway. `codemode: false` puts them back
+//     at the top level as `<server>_<tool>`, with input and output on the
+//     tool_use event as on 1.x.
+//   - `codemode` is only honoured in the 2.x dialect. A 1.x-dialect entry
+//     (`mcp.<name>` with a `type`) is still accepted by 2.x, but a `codemode`
+//     key on it is ignored and the tools stay in Code Mode. So 1.x entries are
+//     moved under `servers`, translating the one key whose spelling changed
+//     (1.x `enabled: false` is 2.x `disabled: true`).
+//
+// A server declared in both dialects under one name is refused rather than
+// guessed at. A key under `mcp` that is not a server entry is left alone for
+// opencode to judge.
+func opencodeMCPOutOfCodeMode(doc map[string]any) error {
+	raw, ok := doc["mcp"]
+	if !ok || raw == nil {
+		return nil
+	}
+	mcp, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("`mcp` is not an object")
+	}
+	servers := map[string]any{}
+	if rs, present := mcp["servers"]; present {
+		s, ok := rs.(map[string]any)
+		if !ok {
+			return fmt.Errorf("`mcp.servers` is not an object")
+		}
+		servers = s
+	}
+	for name, v := range mcp {
+		if name == "servers" {
+			continue
+		}
+		entry, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, typed := entry["type"].(string); !typed {
+			continue
+		}
+		if _, dup := servers[name]; dup {
+			return fmt.Errorf("MCP server %q is declared both as `mcp.%s` and `mcp.servers.%s`", name, name, name)
+		}
+		if enabled, isBool := entry["enabled"].(bool); isBool {
+			delete(entry, "enabled")
+			if !enabled {
+				entry["disabled"] = true
+			}
+		}
+		servers[name] = entry
+		delete(mcp, name)
+	}
+	for name, v := range servers {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("`mcp.servers.%s` is not an object", name)
+		}
+		entry["codemode"] = false
+	}
+	mcp["servers"] = servers
+	return nil
 }
 
 // opencodeEvent is one line of `opencode run --format json`. The stream is a
 // sequence of typed events, each wrapping a message part; this captures only the
 // fields the loop needs and tolerates the rest.
 //
-// Success shape (verified against opencode 1.18.2):
+// Shapes, recorded against opencode 2.0.32 (every event also carries a
+// top-level `timestamp`):
 //
-//	{"type":"step_start","part":{"type":"step-start",...}}
-//	{"type":"text","part":{"type":"text","text":"OK",...}}
-//	{"type":"step_finish","part":{"type":"step-finish","reason":"stop",
-//	   "tokens":{"total":18909,"input":3,"output":4,"reasoning":0,
-//	             "cache":{"write":18902,"read":0}},"cost":0.0236505}}
+//	{"type":"step_start","sessionID":"ses_...","part":{"id":"prt_...","messageID":"msg_...","type":"step-start"}}
+//	{"type":"text","sessionID":"ses_...","part":{"id":"prt_...","type":"text","text":"DONE",...}}
+//	{"type":"step_finish","sessionID":"ses_...","part":{"type":"step-finish","reason":"tool-calls",
+//	   "cost":0.055563,"tokens":{"input":18511,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}
+//	{"type":"error","sessionID":"ses_...","error":{"type":"provider.auth","message":"...","status":401,...}}
 //
-// Error shape:
-//
-//	{"type":"error","error":{"name":"APIError","data":{
-//	   "message":"...","statusCode":401,"isRetryable":false,...}}}
+// step_finish is emitted for TOOL-CALL steps only: the step that ends the
+// session with a plain answer emits none, so neither the final reason nor the
+// final step's usage is on the stream. That is what the session export after
+// exit is for (opencode_export.go); the stream figures are the fallback.
 type opencodeEvent struct {
-	Type string        `json:"type"`
-	Part *opencodePart `json:"part"`
+	Type  string              `json:"type"`
+	Part  *opencodePart       `json:"part"`
+	Error *opencodeErrorEvent `json:"error"`
 
 	// SessionID is the opencode session every event of one run belongs to. It
 	// rides at the TOP level of each event, not on the part, and is constant for
-	// a run — captured once and used by the CLA-406 resurrection path as the
-	// handle a follow-up `opencode run --session <id>` continues.
+	// a run — captured once and used as the handle a follow-up `opencode run -s
+	// <id>` continues and `opencode session export` reads.
 	SessionID string `json:"sessionID"`
+}
+
+// opencodeErrorEvent is the typed error 2.x puts on a {"type":"error"} event.
+// The type is a stable dotted name ("provider.auth", "provider.rate-limit",
+// "provider.no-route", "provider.invalid-output"), which classification keys on
+// before it falls back to the word classes.
+type opencodeErrorEvent struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Status  int    `json:"status"`
 }
 
 type opencodePart struct {
@@ -932,42 +979,47 @@ type opencodePart struct {
 	// (CLA-288).
 	Cost *float64 `json:"cost"`
 
-	// tool parts, which arrive on a "tool_use" event.
+	// Tool parts, which arrive on a "tool_use" event. On 2.x the call id is
+	// `id` (1.x called it `callID`) and the part's own id moves to `partID`.
+	// The call id is the PROVIDER's, so it is not unique across steps - the
+	// fake provider used in the conformance suite numbers every step's calls
+	// from call_0 - which is why replays are recognised by partID.
 	Tool   string             `json:"tool"`
-	CallID string             `json:"callID"`
+	ID     string             `json:"id"`
+	PartID string             `json:"partID"`
 	State  *opencodeToolState `json:"state"`
 }
 
 // opencodeToolState is a tool call's lifecycle slot on its part. Where claude
 // splits a call across an `assistant` tool_use block and a later `user`
-// tool_result block, opencode re-emits the same part as its status advances and
-// carries the arguments and the result TOGETHER on the terminal one (recorded
-// against opencode 1.18.16, CLA-365):
+// tool_result block, opencode emits the part once it has settled and carries
+// the arguments and the result TOGETHER (recorded against opencode 2.0.32 with
+// the MCP server out of Code Mode):
 //
-//	{"type":"tool_use","part":{"type":"tool","tool":"clankerbar_claim_task",
-//	  "callID":"call_00_9Mb...","state":{"status":"completed",
-//	    "input":{"taskId":"e1d01dae-..."},
-//	    "output":"{\"task\":{\"id\":\"e1d01dae-...\",\"ref\":\"CLA-371\"},\"run\":{...}}"}}}
+//	{"type":"tool_use","part":{"partID":"prt_...","type":"tool","id":"call_0",
+//	  "tool":"clankerbar_claim_task","state":{"status":"completed",
+//	    "input":{"taskId":"T-9"},
+//	    "output":"{\"task\": {\"id\": \"T-9\", \"ref\": \"CLA-1\"}, \"run\": {\"id\": \"run-1\"}}",
+//	    "title":"clankerbar_claim_task","metadata":{...}}}}
 //
-// A refusal takes the other terminal status and puts the plane's error where the
-// output would have been. There is no `is_error` flag to read — the STATUS is the
-// flag, which is why a status this adapter does not recognise must never be
-// treated as success:
+// A refusal takes the other terminal status and puts the error where the output
+// would have been. There is no `is_error` flag to read — the STATUS is the flag,
+// which is why a status this adapter does not recognise must never be treated as
+// success:
 //
 //	{"state":{"status":"error","input":{...},
-//	  "error":"{\"error\":{\"code\":\"not_ready\",\"message\":\"...\"}}"}}
+//	  "error":"No tool named \"clankerbar_claim_task\" is currently available. ..."}}
 //
 // `output` is a STRING, not an object: an MCP tool's result arrives flattened to
 // its text content, which is the shape noteClaimed already parses.
 //
-// No spill envelope has been seen here. The `claim_task` result in the recording
-// was ~21 KB and arrived INLINE (the committed fixture is ~3 KB, because most of
-// that was a decisions block redacted out of it), where Claude Code substitutes a pointer
-// to a file above its own threshold and broke the phase seam doing it (CLA-330,
-// docs/large-tool-results.md). noteClaimed's rehydration still runs on this path,
-// so an opencode that grows the same behaviour with the same envelope is handled;
-// one with a DIFFERENT envelope would be a new bug, and the diagnostic noteClaimed
-// prints on an unparseable result is what would surface it.
+// No spill envelope has been seen here: a large claim_task result arrived
+// INLINE on 1.x, where Claude Code substitutes a pointer to a file above its own
+// threshold and broke the phase seam doing it (CLA-330,
+// docs/large-tool-results.md). noteClaimed's rehydration still runs on this
+// path, so an opencode that grows the same behaviour with the same envelope is
+// handled; one with a DIFFERENT envelope would be a new bug, and the diagnostic
+// noteClaimed prints on an unparseable result is what would surface it.
 type opencodeToolState struct {
 	Status string          `json:"status"`
 	Input  json.RawMessage `json:"input"`
@@ -1039,9 +1091,15 @@ type opencodeParse struct {
 	// past, so anything written into it during the stream would be discarded.
 	observed Result
 	console  io.Writer
-	// settledCalls is the callIDs already acted on, so a re-delivered terminal
-	// event cannot rebuild a claim that a later call has since settled.
+	// settledCalls is the tool parts already acted on (by partID), so a
+	// re-delivered terminal event cannot rebuild a claim that a later call has
+	// since settled.
 	settledCalls map[string]bool
+
+	// errorType is the type of the last typed {"type":"error"} event
+	// ("provider.auth", ...), recorded on Result.Raw for diagnostics and the
+	// conformance suite. Classification itself reads the event text.
+	errorType string
 }
 
 // newOpencodeParse builds the parser a session streams into. It exists so the
@@ -1074,16 +1132,29 @@ func (p *opencodeParse) line(line []byte) {
 	if json.Unmarshal([]byte(trimmed), &ev) != nil {
 		return // partial/non-JSON line — skip
 	}
-	if ev.Part == nil {
-		return
-	}
 	// Every event names its session; the first one seen wins (they all agree
-	// within a run). Empty on malformed events, which the Part check above
-	// already mostly filters.
+	// within a run). Taken before the Part check, because an error event carries
+	// no part and can be the only event a failed run emits.
 	if p.sessionID == "" && ev.SessionID != "" {
 		p.sessionID = ev.SessionID
 	}
+	if ev.Type == "error" && ev.Error != nil && ev.Error.Type != "" {
+		p.errorType = ev.Error.Type
+	}
+	if ev.Part == nil {
+		return
+	}
 	switch ev.Type {
+	case "step_start":
+		// A new step has begun, so the previous step is no longer the final one.
+		// The final step of a 2.x session (the plain answer) emits no
+		// step_finish, so without this reset the last TOOL step's "tool-calls"
+		// would be reported as how the session ended. With it, a session whose
+		// last step never finished on the stream reports no streamed reason, and
+		// the export supplies the real one.
+		p.lastReason = ""
+		p.lastStepOut, p.lastStepReason = 0, 0
+		p.lastStepZeroUsage = false
 	case "text":
 		if t := strings.TrimSpace(ev.Part.Text); t != "" {
 			p.lastText = t
@@ -1145,9 +1216,10 @@ func (p *opencodeParse) line(line []byte) {
 //
 // Only a TERMINAL state is acted on, and that is FUTURE-PROOFING rather than a
 // filter this stream needs today: `opencode run --format json` forwards a tool
-// part only once it has settled (cli/cmd/run.ts gates the emit on status
-// completed-or-error), which is why the recorded fixture carries exactly one
-// event per callID. The check is here because the status is the ONLY error flag
+// part only once it has settled (true of 1.x source, cli/cmd/run.ts, and of
+// every 2.0.32 stream recorded for this adapter), which is why the recorded
+// fixtures carry exactly one event per tool part. The check is here because the
+// status is the ONLY error flag
 // opencode gives — there is no is_error sibling — so a version that started
 // forwarding in-flight parts would otherwise have us read a call that had not
 // returned as a success. An unrecognised status is ignored for the same reason:
@@ -1155,11 +1227,10 @@ func (p *opencodeParse) line(line []byte) {
 // task back — one expiring lease), against a claim recorded for a call that
 // failed, which is a task the driver believes it holds and does not.
 //
-// A callID is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so a
-// re-delivered terminal event for a claim already settled by a later update_task
-// would resurrect it — and the driver would post `ready` over a task that is in
-// review. Upstream transitions a part to terminal only from `running`
-// (session/processor.ts), so this is insurance, not an observed bug.
+// A tool part is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so
+// a re-delivered terminal event for a claim already settled by a later
+// update_task would resurrect it — and the driver would post `ready` over a task
+// that is in review. This is insurance, not an observed bug.
 //
 // # What this shape cannot do, and what it costs
 //
@@ -1176,8 +1247,8 @@ func (p *opencodeParse) line(line []byte) {
 func (p *opencodeParse) noteTool(part *opencodePart) {
 	st := part.State
 	// part.Type ("tool") is deliberately not checked: only a tool part carries a
-	// callID and a state, so the fields below are the discriminator.
-	if st == nil || part.CallID == "" {
+	// call id and a state, so the fields below are the discriminator.
+	if st == nil || part.ID == "" {
 		return
 	}
 	if st.Status != "completed" && st.Status != "error" {
@@ -1187,22 +1258,29 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	if name == "" {
 		return
 	}
-	if p.settledCalls[part.CallID] {
+	// Replays are recognised by the part id, not the call id: the call id is
+	// the provider's and repeats across steps (see opencodePart), so keying on
+	// it would drop a later, genuine call.
+	key := part.PartID
+	if key == "" {
+		key = part.ID
+	}
+	if p.settledCalls[key] {
 		return
 	}
 	if p.settledCalls == nil {
 		p.settledCalls = map[string]bool{}
 	}
-	p.settledCalls[part.CallID] = true
+	p.settledCalls[key] = true
 
-	noteToolUse(name, part.CallID, st.Input, &p.observed)
+	noteToolUse(name, part.ID, st.Input, &p.observed)
 	// The result text is handed over as JSON so it reaches noteClaimed by the same
 	// road claude's string-shaped tool_result content does. Marshalling a string
 	// cannot fail (invalid UTF-8 is replaced, not rejected), and the error is
 	// swallowed rather than returned on purpose: bailing here would strand the
 	// delivery Report noteToolUse just armed, unresolved and silently dropped.
 	content, _ := json.Marshal(st.Output)
-	noteToolResult(&p.observed, part.CallID, st.Status == "error", content, p.diag())
+	noteToolResult(&p.observed, part.ID, st.Status == "error", content, p.diag())
 }
 
 // opencodeClankerbarTool maps an opencode tool name onto the namespaced name the
@@ -1298,6 +1376,12 @@ func (p *opencodeParse) finish(res *Result) {
 		}
 		res.Raw[opencodeSessionIDKey] = p.sessionID
 	}
+	if p.errorType != "" {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[OpencodeErrorTypeKey] = p.errorType
+	}
 }
 
 // opencodeBudgetRe recognizes a HARD budget/credit-exhaustion stop from the
@@ -1382,7 +1466,13 @@ const opencodeFatalWords = `(authentication( \w+)? (failed|error|rejected)` +
 	`|unauthorized|forbidden|permission denied` +
 	`|invalid api key|api key (is )?(invalid|missing|not found|expired))`
 
-var opencodeFatalRe = regexp.MustCompile(`(?i)"status(code)?": ?40[13]` +
+// 2.x types its errors, and two of the types are fatal by definition, verified
+// against 2.0.32: `provider.auth` (a 401, exit 1, no retry) and
+// `provider.no-route` (an unknown provider or model, exit 1, no request sent).
+// Neither can be fixed by trying again, and a no-route carries no status code
+// for the arms below to read.
+var opencodeFatalRe = regexp.MustCompile(`(?i)"type": ?"provider\.(auth|no-route)"` +
+	`|"status(code)?": ?40[13]` +
 	`|"message": ?"[^"]*` + opencodeFatalWords +
 	`|error: ?[^\n]*` + opencodeFatalWords)
 
@@ -1418,7 +1508,14 @@ var opencodeFatalRe = regexp.MustCompile(`(?i)"status(code)?": ?40[13]` +
 // CLA-382 wired opencode to one) matched, and a stop became an unbounded retry.
 // The claude adapter anchors its provider arms on `api error:` for the same
 // reason.
-var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d\d)` +
+//
+// 2.x's `provider.rate-limit` is the typed form of the 429 arm. 2.0.32 retries a
+// 429 itself (about ten attempts over ~82s) before it exits 1 with that type,
+// so by the time the adapter sees it the burst has lasted a minute and a half;
+// it is still a rate limit and still rides the loop's backoff, and a budget
+// stop worded inside it is caught first by opencodeBudgetRe.
+var opencodeTransientRe = regexp.MustCompile(`(?i)"type": ?"provider\.rate-limit"` +
+	`|"status(code)?": ?(408|429|5\d\d)` +
 	`|"isretryable": ?true` +
 	`|overloaded|too many requests|rate ?limit` +
 	`|unsupported_tool_schema|tool_count_limit` +
@@ -1499,7 +1596,9 @@ func (opencode) OutputCapNoOutput(res Result) bool {
 // never kills the process, so no exit of its can be attributed to one.
 func (opencode) TokenCeilingHit(Result) bool { return false }
 
-// TracksClaims is true as of CLA-365: opencode's `--format json` stream carries
+// TracksClaims is true as of CLA-365, and on 2.x only because the adapter takes
+// every MCP server out of Code Mode (opencodeMCPOutOfCodeMode): opencode's
+// `--format json` stream then carries
 // each tool call's arguments AND its result on one terminal `tool_use` event, so
 // the adapter reads the claim off the session the same way claude does and
 // populates Result.Claim. That is what config.Validate gates `phases` on, so this
@@ -1507,9 +1606,12 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 //
 // HonoursMaxTurns stays false — Invocation.MaxTurns still never reaches the CLI.
 //
-// ReportsCost is true: opencode's step_finish parts carry a `cost` sibling to the
-// token counts, and opencodeParse sums it into Result.CostUSD, so
-// `budget.max_cost_usd` is a live ceiling here (CLA-288).
+// ReportsCost is true: on 2.x the authoritative figure is the session export
+// read after each process exits (opencode_export.go), with the step_finish
+// `cost` siblings summed from the stream as the fallback when the export fails,
+// so `budget.max_cost_usd` is a live ceiling here (CLA-288). The cost is only
+// non-zero when the model's provider config declares a `cost` block; a model
+// without one reports tokens and $0.
 //
 // HonoursSessionWallClock is true and HonoursMaxTurns is false, which is the
 // whole point of the pair: this is the adapter whose CLI takes no turn flag, so

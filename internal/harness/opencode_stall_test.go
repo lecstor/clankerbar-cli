@@ -24,7 +24,7 @@ const outputCapStallLine = `{"type":"step_finish","timestamp":1790224963298,"ses
 
 // stallClaimEvent is the session getting past its claim before it stalls, so
 // the resume's claim seed has something real to observe.
-const stallClaimEvent = `{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"CLA-584\"},\"run\":{\"id\":\"run-1\"}}"}}}`
+const stallClaimEvent = `{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"CLA-584\"},\"run\":{\"id\":\"run-1\"}}"}}}`
 
 // The recorded signature classifies, and lands the two figures the daemon's
 // named log line reads: the terminal marker and the step's own reasoning count.
@@ -85,7 +85,7 @@ func TestOutputCapStall_InvokeResumesOnceWithTheSteer(t *testing.T) {
 echo "$*" >> "`+logPath+`"
 case "$*" in
   *"hit the output token limit"*)
-    echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_stall","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *)
@@ -278,7 +278,7 @@ func TestOutputCapStall_ErroredResumeKeepsTheClaimObservation(t *testing.T) {
 	logPath := filepath.Join(dir, "log")
 	opencodeStub(t, `#!/bin/sh
 echo "$*" >> "`+logPath+`"
-echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
 `)
 
 	rec := &failWriter{}

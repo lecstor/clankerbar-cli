@@ -32,38 +32,46 @@ func mcpConfigNaming(t *testing.T, dir, name, slug string) string {
 	return path
 }
 
-// opencodeResolveClankerbarURL replicates the way opencode resolves `mcp` across
-// its config layers, applied to an environment this adapter produced. The merge
-// order is opencode's own (1.18.x), and it is the whole reason this test exists
-// rather than an assertion that OPENCODE_CONFIG holds the right path:
+// opencodeResolveClankerbarURL replicates the way opencode 2.x resolves `mcp`
+// across its config layers, applied to an environment this adapter produced.
+// The order is opencode's own, read off `opencode debug config` against 2.0.32,
+// and it is the whole reason this test exists rather than an assertion that
+// OPENCODE_CONFIG holds the right path:
 //
-//  1. the global config in OPENCODE_CONFIG_DIR
+//  1. the global config dir (OPENCODE_CONFIG_DIR replaces ~/.config/opencode)
 //  2. OPENCODE_CONFIG - the file the driver names
-//  3. project-level opencode.json, discovered from the INSTANCE DIRECTORY, which
-//     is $PWD (see pinPWD - that is what makes this the same defect)
-//  4. the OPENCODE_CONFIG_DIR directory, merged again
-//  5. OPENCODE_CONFIG_CONTENT
+//  3. project-level opencode.json and .opencode/opencode.json, discovered from
+//     the INSTANCE DIRECTORY, which is $PWD (see pinPWD)
+//  4. OPENCODE_CONFIG_CONTENT
 //
-// Layers 3 and 4 are the two that beat the driver's file; layer 5 is the one the
-// driver now uses. Three further layers exist below it in loadInstanceState (the
-// console active-org config, a managed config dir, managed preferences); they are
-// not modelled because nothing a repo or this driver writes can reach them. Later layers overwrite earlier ones KEY BY KEY, which is why
-// only a block named `clankerbar` can displace ours.
+// Layer 3 is the one that beats the driver's file; layer 4 is the one the
+// driver uses. Both dialects are read (`mcp.<name>` and `mcp.servers.<name>`),
+// and later layers overwrite earlier ones key by key, which is why only a block
+// named `clankerbar` can displace ours.
 func opencodeResolveClankerbarURL(t *testing.T, env []string, skipContent bool) string {
 	t.Helper()
 	get := func(k string) string { return lastValue(env, k) }
 	url := ""
 	apply := func(data []byte) {
 		var f struct {
-			MCP map[string]struct {
-				URL string `json:"url"`
-			} `json:"mcp"`
+			MCP map[string]json.RawMessage `json:"mcp"`
 		}
 		if json.Unmarshal(data, &f) != nil {
 			return
 		}
-		if entry, ok := f.MCP["clankerbar"]; ok {
+		var entry struct {
+			URL string `json:"url"`
+		}
+		if raw, ok := f.MCP["clankerbar"]; ok && json.Unmarshal(raw, &entry) == nil && entry.URL != "" {
 			url = entry.URL
+		}
+		var servers map[string]struct {
+			URL string `json:"url"`
+		}
+		if raw, ok := f.MCP["servers"]; ok && json.Unmarshal(raw, &servers) == nil {
+			if e, ok := servers["clankerbar"]; ok && e.URL != "" {
+				url = e.URL
+			}
 		}
 	}
 	applyFile := func(path string) {
@@ -74,13 +82,12 @@ func opencodeResolveClankerbarURL(t *testing.T, env []string, skipContent bool) 
 			apply(data)
 		}
 	}
-	globalDir := get("OPENCODE_CONFIG_DIR")
-	applyFile(filepath.Join(globalDir, "opencode.json"))  // 1
-	applyFile(get("OPENCODE_CONFIG"))                     // 2
-	applyFile(filepath.Join(get("PWD"), "opencode.json")) // 3
-	applyFile(filepath.Join(globalDir, "opencode.json"))  // 4
+	applyFile(filepath.Join(get("OPENCODE_CONFIG_DIR"), "opencode.json")) // 1
+	applyFile(get("OPENCODE_CONFIG"))                                     // 2
+	applyFile(filepath.Join(get("PWD"), "opencode.json"))                 // 3
+	applyFile(filepath.Join(get("PWD"), ".opencode", "opencode.json"))    // 3
 	if !skipContent {
-		if content := get("OPENCODE_CONFIG_CONTENT"); content != "" { // 5
+		if content := get("OPENCODE_CONFIG_CONTENT"); content != "" { // 4
 			apply([]byte(content))
 		}
 	}
@@ -121,21 +128,36 @@ func TestSpawnedSessionResolvesItsOwnProjectMCP(t *testing.T) {
 	}
 }
 
-// The content layer carries the named file BYTE FOR BYTE. It is the same file
-// OPENCODE_CONFIG names, re-sent at a layer nothing merges after, so nothing
-// about the project's config is re-authored on the way through.
-func TestOpencodeConfigContentIsTheNamedFile(t *testing.T) {
+// The content layer carries the named file's servers, moved out of Code Mode
+// and into the 2.x dialect, plus the permission policy. OPENCODE_CONFIG still
+// names the file itself.
+func TestOpencodeConfigContentCarriesTheNamedFile(t *testing.T) {
 	path := mcpConfigNaming(t, t.TempDir(), "opencode-mcp.json", "acme")
-	want, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read: %v", err)
-	}
 	env, err := opencode{}.env(Invocation{WorkDir: t.TempDir(), MCPConfigPath: path})
 	if err != nil {
 		t.Fatalf("env: %v", err)
 	}
-	if got := lastValue(env, "OPENCODE_CONFIG_CONTENT"); got != string(want) {
-		t.Errorf("OPENCODE_CONFIG_CONTENT = %q, want the named file's exact bytes %q", got, want)
+	var doc struct {
+		MCP struct {
+			Servers map[string]map[string]any `json:"servers"`
+		} `json:"mcp"`
+		Permission map[string]any `json:"permission"`
+	}
+	if err := json.Unmarshal([]byte(lastValue(env, "OPENCODE_CONFIG_CONTENT")), &doc); err != nil {
+		t.Fatalf("content is not JSON: %v", err)
+	}
+	cb := doc.MCP.Servers["clankerbar"]
+	if cb["url"] != "https://clankerbar.com/mcp/acme" || cb["type"] != "remote" {
+		t.Errorf("clankerbar server = %v, want the named file's url and type", cb)
+	}
+	if cb["codemode"] != false {
+		t.Errorf("codemode = %v, want false", cb["codemode"])
+	}
+	if _, ok := cb["enabled"]; ok {
+		t.Errorf("the 1.x `enabled` key survived into the 2.x dialect: %v", cb)
+	}
+	if doc.Permission["*"] != "deny" {
+		t.Errorf("permission = %v, want the fail-closed policy", doc.Permission)
 	}
 	if got := lastValue(env, "OPENCODE_CONFIG"); got != path {
 		t.Errorf("OPENCODE_CONFIG = %q, want %q - the path is still named, the content merely wins later", got, path)
