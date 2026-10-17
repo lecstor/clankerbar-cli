@@ -182,7 +182,7 @@ priorities and retries, and no driver-level repeat machinery is needed. But it
   acting as the cycle, and it should stay that way. The alternative confuses the
   pre-PR agentic gate with the post-PR human gate.
 
-**Answer:** the user's intuition is half right. The queue *is* a cycle, and it is
+**Answer:** the intuition is half right. The queue *is* a cycle, and it is
 the correct one for a human request-changes round. It does **not** remove the need
 for a driver-level bound on the agentic review↔fix loop, and for pre-PR findings
 the linear fix phase is strictly simpler: one task, one branch, one PR, one
