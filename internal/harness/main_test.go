@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -14,6 +16,10 @@ import (
 // `command` at this binary with the variable set, so the fake needs nothing
 // installed beyond Go (no python, no node).
 const fakeMCPDirEnv = "CLANKERBAR_FAKE_MCP_DIR"
+
+// fakeMCPPadEnv pads the fake's claim_task result with a decisions block of
+// that many bytes, to push it past opencode's 51,200-byte truncation.
+const fakeMCPPadEnv = "CLANKERBAR_FAKE_MCP_PAD"
 
 func TestMain(m *testing.M) {
 	if dir := os.Getenv(fakeMCPDirEnv); dir != "" {
@@ -91,7 +97,9 @@ func runFakeMCP(dir string) {
 			}
 			text := `{"summary":"empty"}`
 			if p.Name == "claim_task" {
-				text = fmt.Sprintf(`{"task":{"id":%q,"ref":"CLA-1"},"run":{"id":"run-1"}}`, p.Arguments["taskId"])
+				pad, _ := strconv.Atoi(os.Getenv(fakeMCPPadEnv))
+				text = fmt.Sprintf(`{"task":{"id":%q,"ref":"CLA-1"},"run":{"id":"run-1"},"decisions":[{"id":"d0","body":%q}]}`,
+					p.Arguments["taskId"], strings.Repeat("x", pad))
 			}
 			reply(map[string]any{"content": []map[string]any{{"type": "text", "text": text}}})
 		default:

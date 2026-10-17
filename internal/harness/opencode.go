@@ -443,7 +443,7 @@ func opencodeArgs(in Invocation) []string {
 		// provider still answers or is budget-exhausted.
 		prompt = "."
 	}
-	args := []string{"run", "--standalone", "--format", "json"}
+	args := []string{"run", "--standalone", "--format", "json", "--agent", opencodeAgent}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}
@@ -858,7 +858,24 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
 		}
 	}
-	doc["permission"] = opencodePermissionPolicy(in.Probe, in.WorkDir, in.ExtraDirs)
+	policy := opencodePermissionPolicy(in.Probe, in.WorkDir, in.ExtraDirs)
+	doc["permission"] = policy
+	// Pin the same policy on every built-in agent. Verified against 2.0.32: an
+	// agent-level permission block in ANY layer (1.x `agent.<name>.permission`
+	// or 2.x `agents.<name>.permissions`) overrides the top-level one for that
+	// agent. With `{"agent":{"build":{"permission":{"external_directory":
+	// "allow",...}}}}` in a project opencode.json - a file a session can write
+	// into its own checkout for the next spawn - out-of-tree reads and writes
+	// succeeded and webfetch was offered. With this pin in the content layer
+	// they were refused again, in both dialects, and in-tree writes still
+	// landed. The file's own `agent` key is replaced, not merged.
+	agents := map[string]any{}
+	for _, name := range opencodePinnedAgents {
+		agents[name] = map[string]any{"permission": policy}
+	}
+	doc["agent"] = agents
+	delete(doc, "agents")
+	delete(doc, "default_agent")
 	return json.Marshal(doc)
 }
 
@@ -869,6 +886,17 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 func OpencodeSessionConfig(mcpConfigPath, workdir string, readOnly bool) ([]byte, error) {
 	return opencodeSessionConfig(Invocation{MCPConfigPath: mcpConfigPath, WorkDir: workdir, Probe: readOnly})
 }
+
+// opencodePinnedAgents are the agents the session config pins the policy on:
+// opencodeAgent, which every run selects explicitly, and the other agents
+// 2.0.32 defines. The session's own policy denies the subagent tool, so the
+// others are pinned as a second line, not because a session can reach them.
+var opencodePinnedAgents = []string{opencodeAgent, "plan", "general", "explore"}
+
+// opencodeAgent is the agent every run selects with --agent. Selecting it
+// explicitly means an ambient `default_agent` cannot route the session to an
+// agent whose permissions this adapter never pinned.
+const opencodeAgent = "build"
 
 // opencodeMCPOutOfCodeMode rewrites a config's `mcp` block in place so every
 // server it declares is in the 2.x dialect (`mcp.servers.<name>`) with
@@ -1024,18 +1052,27 @@ type opencodePart struct {
 // `output` is a STRING, not an object: an MCP tool's result arrives flattened to
 // its text content, which is the shape noteClaimed already parses.
 //
-// No spill envelope has been seen here: a large claim_task result arrived
-// INLINE on 1.x, where Claude Code substitutes a pointer to a file above its own
-// threshold and broke the phase seam doing it (CLA-330,
-// docs/large-tool-results.md). noteClaimed's rehydration still runs on this
-// path, so an opencode that grows the same behaviour with the same envelope is
-// handled; one with a DIFFERENT envelope would be a new bug, and the diagnostic
-// noteClaimed prints on an unparseable result is what would surface it.
+// A large result is TRUNCATED on 2.x, the same failure Claude Code's spill
+// caused on the phase seam (CLA-330, docs/large-tool-results.md). Verified
+// against 2.0.32: an MCP result above 51,200 bytes arrives as
+//
+//	"output":"[showing 0 lines of 1; full output saved to <data>/opencode/tool-output/tool_...]",
+//	"metadata":{"metadata":{"truncated":true,"outputPath":"<the same path>"},...}
+//
+// and the full text is in that file. Plane payloads reach that size (a
+// claim_task carrying decisions, a get_task at 56 KB). opencodeTruncatedOutput
+// rehydrates it from the file, under the guards that function states.
 type opencodeToolState struct {
-	Status string          `json:"status"`
-	Input  json.RawMessage `json:"input"`
-	Output string          `json:"output"`
-	Error  string          `json:"error"`
+	Status   string          `json:"status"`
+	Input    json.RawMessage `json:"input"`
+	Output   string          `json:"output"`
+	Error    string          `json:"error"`
+	Metadata *struct {
+		Metadata *struct {
+			Truncated  bool   `json:"truncated"`
+			OutputPath string `json:"outputPath"`
+		} `json:"metadata"`
+	} `json:"metadata"`
 }
 
 type opencodeTokens struct {
@@ -1107,6 +1144,11 @@ type opencodeParse struct {
 	// since settled.
 	settledCalls map[string]bool
 
+	// toolOutputDir is where this session's opencode saves truncated tool
+	// output: <data home>/opencode/tool-output, resolved from the session's own
+	// environment. The only directory a truncated result is read back from.
+	toolOutputDir string
+
 	// errorType is the type of the last typed {"type":"error"} event
 	// ("provider.auth", ...), recorded on Result.Raw for diagnostics and the
 	// conformance suite. Classification itself reads the event text.
@@ -1120,7 +1162,7 @@ type opencodeParse struct {
 // would be false for the phase that pushes the branch and opens the PR. Assigned
 // inline in Invoke, deleting it would leave the whole suite green.
 func newOpencodeParse(in Invocation, console io.Writer) opencodeParse {
-	return opencodeParse{observed: newSessionResult(in), console: console}
+	return opencodeParse{observed: newSessionResult(in), console: console, toolOutputDir: opencodeToolOutputDir(in)}
 }
 
 // diag is where a claim diagnostic goes. The zero opencodeParse has no console (a
@@ -1290,8 +1332,93 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	// cannot fail (invalid UTF-8 is replaced, not rejected), and the error is
 	// swallowed rather than returned on purpose: bailing here would strand the
 	// delivery Report noteToolUse just armed, unresolved and silently dropped.
-	content, _ := json.Marshal(st.Output)
+	output := st.Output
+	if full, ok, err := opencodeTruncatedOutput(st, p.toolOutputDir); err != nil {
+		// Fail safe: the envelope goes on as the result, which no consumer can
+		// parse, so a claim is NOT tracked - the same outcome as any unreadable
+		// claim result, with the reason said first.
+		fmt.Fprintf(p.diag(), "  · %s result was truncated by opencode and could not be read back: %v\n", part.Tool, err)
+	} else if ok {
+		output = full
+	}
+	content, _ := json.Marshal(output)
 	noteToolResult(&p.observed, part.ID, st.Status == "error", content, p.diag())
+}
+
+// opencodeTruncatedOutput returns the full text of a tool result 2.x truncated
+// (see opencodeToolState), ok=false when the result was not truncated.
+//
+// The path comes from the event's own metadata, which opencode writes, not
+// from the output text a tool or the backlog controls. It is still checked
+// before anything is read, because a path that is merely read and parsed as a
+// claim is a way to hand the driver a claim on a task nobody asked for (the
+// threat injection_test.go covers):
+//
+//   - it must be a file directly inside dir, the session's own
+//     <data home>/opencode/tool-output, compared after resolving symlinks;
+//   - its name must start with "tool_", opencode's naming;
+//   - it must be a regular file, not a symlink;
+//   - the read is bounded by readSpilled, the same cap as Claude's spill.
+//
+// Any failure is returned as an error; the caller fails safe.
+func opencodeTruncatedOutput(st *opencodeToolState, dir string) (string, bool, error) {
+	if st.Metadata == nil || st.Metadata.Metadata == nil || !st.Metadata.Metadata.Truncated {
+		return "", false, nil
+	}
+	path := st.Metadata.Metadata.OutputPath
+	if path == "" || !filepath.IsAbs(path) {
+		return "", false, fmt.Errorf("no absolute outputPath in the truncation metadata (%q)", path)
+	}
+	if dir == "" {
+		return "", false, fmt.Errorf("the session's tool-output directory is unknown")
+	}
+	wantDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", false, fmt.Errorf("tool-output directory %s: %w", dir, err)
+	}
+	gotDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil || gotDir != wantDir {
+		return "", false, fmt.Errorf("%s is not in this session's tool-output directory %s", path, dir)
+	}
+	if !strings.HasPrefix(filepath.Base(path), "tool_") {
+		return "", false, fmt.Errorf("%s is not an opencode tool-output file", path)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return "", false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", false, fmt.Errorf("%s is not a regular file", path)
+	}
+	b, err := readSpilled(path)
+	if err != nil {
+		return "", false, err
+	}
+	return string(b), true, nil
+}
+
+// opencodeToolOutputDir is <data home>/opencode/tool-output for the session in:
+// XDG_DATA_HOME, else HOME/.local/share, each read from the session's own
+// environment (in.Env wins over the inherited one, as it does on exec).
+func opencodeToolOutputDir(in Invocation) string {
+	get := func(k string) string {
+		v := os.Getenv(k)
+		for _, kv := range in.Env {
+			if name, val, ok := strings.Cut(kv, "="); ok && name == k {
+				v = val
+			}
+		}
+		return v
+	}
+	data := get("XDG_DATA_HOME")
+	if data == "" {
+		home := get("HOME")
+		if home == "" {
+			return ""
+		}
+		data = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(data, "opencode", "tool-output")
 }
 
 // opencodeClankerbarTool maps an opencode tool name onto the namespaced name the
