@@ -500,7 +500,14 @@ func TestDrainPhases_AResumedPhaseTransientExitDoesNotTickTheDeadCounters(t *tes
 		{res: held(blip, openClaim())},
 		{res: okResult(1, 0)}, // phase 3 would land here; it must not
 	}}
-	d, rel := phaseDriver(t, h, three)
+	// The resumed phase is the review-only one, whose spawn reads the task's
+	// outcome for the seam's freshness baseline (CLA-663): a wired plane is the
+	// production shape, and an unwired one would be refused before the blip
+	// this test is about could happen.
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: "implemented: pushed clanker/x\n"}
+	}}
+	d := phaseDriverWithReleaser(t, h, three, rel)
 
 	_, _, stop, err := drainPhasesOnce(t, d)
 	if err != nil {
@@ -696,7 +703,13 @@ func TestDrainPhases_AResumedPhaseLimitDoesNotAdvanceToTheNextPhase(t *testing.T
 		},
 		limitResetAt: time.Now().Add(2 * time.Hour),
 	}
-	d, _ := phaseDriver(t, h, three)
+	// The resumed phase is the review-only one, whose spawn reads the task's
+	// outcome for the seam's freshness baseline (CLA-663): the wired plane is
+	// the production shape.
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: "implemented: pushed clanker/x\n"}
+	}}
+	d := phaseDriverWithReleaser(t, h, three, rel)
 
 	_, _, stop, err := drainPhasesOnce(t, d)
 	if err != nil {
@@ -2214,6 +2227,21 @@ func TestDrainPhases_ADeadOnADifferentTaskDoesNotParkTheSecondTask(t *testing.T)
 	}
 }
 
+// wiredParkingReleaser is parkingReleaser plus the plane's single-task read
+// (plane.TaskStateSource). The resumed phase in the test below is the
+// REVIEW-only phase, whose spawn reads the task's outcome for the seam's
+// freshness baseline (CLA-663), so a target with no state reader is refused
+// before the phase runs — and the park behaviour this test pins could never be
+// reached.
+type wiredParkingReleaser struct {
+	parkingReleaser
+	outcome string
+}
+
+func (w *wiredParkingReleaser) TaskState(context.Context, string) (plane.TaskState, error) {
+	return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: w.outcome}, nil
+}
+
 // A dead phase on a RESUMED middle phase is not retried: the retry cannot be
 // re-seeded — invocationFor only substitutes the task/run placeholders when the
 // predecessor claim is present, which the dead handback cleared — so retrying it
@@ -2229,7 +2257,7 @@ func TestDrainPhases_AResumedPhaseDeathIsNotDeadClassified(t *testing.T) {
 		{res: checkpointed(1, 0)},              // phase 1 checkpoints, holding the claim
 		{res: held(deadResult(), openClaim())}, // resumed phase 2 dies producing nothing
 	}}
-	rel := &parkingReleaser{}
+	rel := &wiredParkingReleaser{outcome: "implemented: pushed clanker/x\n"}
 	cfg := fastCfg()
 	cfg.Phases = three
 	cfg.Prompt = ""
@@ -2488,6 +2516,9 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 		`status: "in_review"`,
 		"fixed by: harness claude, model cheap-test",
 		"### Fixes",
+		// The rendered fix prompt must point at the LAST `## Review` block: a
+		// re-trip can carry several (CLA-663).
+		"LAST `" + config.ReviewRecordHeading + "`",
 	} {
 		if !strings.Contains(p3, want) {
 			t.Errorf("the fix brief does not carry %q:\n%s", want, p3)
@@ -2722,6 +2753,19 @@ func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testin
 			write:    func(old string) string { return old },
 		},
 		{
+			// The outcome CHANGED, so the equality arm passes it, and a heading
+			// is present, so the presence arm does too: only the last-block arm
+			// refuses. This is scenario B — the review made some other statusless
+			// outcome edit and wrote no block of its own, so the "new" outcome's
+			// last `## Review` block is still round 1's.
+			name:     "a re-trip that edits the outcome without adding a block",
+			baseline: staleBlock,
+			first:    openClaim(),
+			write: func(old string) string {
+				return "could not verify the branch against the origin remote\n" + old
+			},
+		},
+		{
 			name:     "a look-alike heading is not the record",
 			baseline: "",
 			first:    openClaim(),
@@ -2767,6 +2811,187 @@ func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testin
 			// waiting. The lease lapses and a takeover picks it up.
 			if len(rel.calls) != 0 {
 				t.Errorf("the refused review checkpoint released the task (%+v); a HasWIP claim must be left to lapse into a takeover", rel.calls)
+			}
+		})
+	}
+}
+
+// The reverse of the stale block, and the shape a request_changes re-trip
+// produces when the review does its job: the outcome still carries round 1's
+// block, and the review APPENDS round 2's below it. Refusing merely because a
+// `## Review` heading was already in the baseline would stall every re-trip, so
+// the gate must pass on the NEW last block.
+func TestDrainPhases_ReviewSeamAcceptsANewLastBlockOnARetrip(t *testing.T) {
+	round1 := "delivered: pushed clanker/x\n\n" + config.ReviewRecordHeading +
+		"\n- reviewed tip: oldsha\n- verdict: findings\n### Findings\n- R1 [must] a.go:1 - stale. Required fix: none.\n### Fixes\n- R1 fixed in deadbeef\n"
+	outcome := round1
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: resumedCheckpointed(5, 0.50)}, // the review appends round 2 below round 1
+		{res: okResult(5, 0.05)},            // the fix runs on the new block
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: newsha\n- verdict: pass\n"
+		}
+	}
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+	}}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — a NEW last `## Review` block must advance a re-trip", h.invokeCalls)
+	}
+}
+
+// CLA-663: a baseline read that fails would once spawn the full review session
+// anyway, and the seam then refused its checkpoint — the review's whole spend
+// thrown away, the HasWIP claim lapsed into a takeover, and the takeover re-ran
+// implement AND review. The read is retried a bounded number of times; if it is
+// still unread the review must not spawn at all, the reason must be logged, and
+// the claim must get the disposition a seam refusal leaves it.
+func TestDrainPhases_AnUnreadableBaselineRefusesBeforeTheReviewSpawns(t *testing.T) {
+	phases := []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}
+
+	t.Run("a HasWIP claim is left to lapse into a takeover", func(t *testing.T) {
+		logs := captureLogs(t)
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: resumedCheckpointed(10, 0.10)},
+			{res: resumedCheckpointed(5, 0.50)}, // must NEVER run: no readable baseline
+			{res: okResult(5, 0.05)},            // must NEVER run: nothing to apply
+		}}
+		rel := &wiredReleaser{
+			state: func() plane.TaskState {
+				return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+			},
+			err: func() error { return errors.New("plane blip: read timeout") },
+		}
+		d := phaseDriverWithReleaser(t, h, phases, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 1 {
+			t.Fatalf("spawned %d sessions, want 1 — the review must not spawn with an unreadable baseline, and the fix has nothing to apply", h.invokeCalls)
+		}
+		if rel.reads != reviewBaselineReadAttempts {
+			t.Errorf("the baseline read was attempted %d times, want the bound (%d) before refusing", rel.reads, reviewBaselineReadAttempts)
+		}
+		if len(rel.calls) != 0 {
+			t.Errorf("the refusal released the task (%+v); a HasWIP claim must be left to lapse into a takeover, exactly as a seam refusal leaves it", rel.calls)
+		}
+		if out := logs.String(); !strings.Contains(out, "refusing to spawn the review") {
+			t.Errorf("the refusal is not logged in the daemon log:\n%s", out)
+		}
+	})
+
+	t.Run("a releasable claim is handed back", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(10, 0.10)},
+			{res: resumedCheckpointed(5, 0.50)}, // must NEVER run
+			{res: okResult(5, 0.05)},            // must NEVER run
+		}}
+		rel := &wiredReleaser{
+			state: func() plane.TaskState {
+				return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+			},
+			err: func() error { return errors.New("plane blip") },
+		}
+		d := phaseDriverWithReleaser(t, h, phases, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 1 {
+			t.Fatalf("spawned %d sessions, want 1 — the review must not spawn with an unreadable baseline", h.invokeCalls)
+		}
+		if len(rel.calls) != 1 || rel.calls[0].taskID != "t-1" {
+			t.Errorf("a releasable claim was not handed back (%+v); a seam refusal releases what the plane will accept and leaves only pushed work to lapse", rel.calls)
+		}
+	})
+}
+
+// The retry is the point, not the refusal: a baseline read that fails once and
+// succeeds on the next attempt must let the whole sequence run — review and fix
+// included — exactly as if the blip had not happened.
+func TestDrainPhases_AFailedBaselineReadIsRetried(t *testing.T) {
+	outcome := "implemented: pushed the branch\n"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: resumedCheckpointed(5, 0.50)},
+		{res: okResult(5, 0.05)},
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review records its block
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+		}
+	}
+	fails := 1
+	rel := &wiredReleaser{
+		state: func() plane.TaskState {
+			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+		},
+		err: func() error {
+			if fails > 0 {
+				fails--
+				return errors.New("plane blip")
+			}
+			return nil
+		},
+	}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — a retried baseline read must not stop the sequence", h.invokeCalls)
+	}
+	if fails != 0 {
+		t.Errorf("the injected blip was never consumed by a retry (fails=%d, reads=%d)", fails, rel.reads)
+	}
+}
+
+// The helper the stale-block arm reads: lastReviewBlock must return the LAST
+// block — heading line to the end — so an appended round is the one judged, and
+// it must recognise the heading exactly as reviewRecordLine does.
+func TestLastReviewBlock(t *testing.T) {
+	head := config.ReviewRecordHeading
+	tests := []struct {
+		name    string
+		outcome string
+		want    string
+	}{
+		{"empty", "", ""},
+		{"no heading", "delivered: pushed clanker/x\n", ""},
+		{"the heading alone", head, head},
+		{"one block runs to the end", "delivered\n" + head + "\n- verdict: pass\n", head + "\n- verdict: pass\n"},
+		{"the LAST of two blocks", head + "\n- round 1\n" + head + "\n- round 2\n", head + "\n- round 2\n"},
+		{"a CRLF heading is still the heading", head + "\r\n- verdict: pass\r\n", head + "\r\n- verdict: pass\r\n"},
+		{"a trailing space is still the heading", head + "  \n- verdict: pass\n", head + "  \n- verdict: pass\n"},
+		{"an indented heading is not a block", "  " + head + "\n- verdict: pass\n", ""},
+		{"a heading glued to text is not a block", "x" + head + "\n", ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lastReviewBlock(tc.outcome); got != tc.want {
+				t.Errorf("lastReviewBlock(%q) = %q, want %q", tc.outcome, got, tc.want)
 			}
 		})
 	}
@@ -2836,9 +3061,10 @@ func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
 // two reads — the baseline read clean at spawn, the seam read failing after a
 // review that DID record — must be refused fail-closed: an unreadable outcome
 // cannot prove the record, and the alternative is advancing on the branch the
-// review phase merely inherited. This is the `!recordRead` arm of the gate, the
-// one arm no other fixture reaches: an unwired or always-erroring plane refuses
-// via the baseline arm (`!review.read`) before the seam read is ever attempted.
+// review phase merely inherited. This is the `!recordRead` arm of the gate, and
+// the fixture has to fail BETWEEN the reads: since CLA-663 a plane that is
+// unwired or erroring at spawn is refused before the review ever runs, so only
+// a mid-sequence blip reaches this arm at all.
 func TestDrainPhases_ReviewSeamRefusesACheckpointItCannotReread(t *testing.T) {
 	outcome := "implemented: pushed the branch\n"
 	h := &fakeAdapter{steps: []invokeStep{
@@ -3045,10 +3271,10 @@ func TestDrainPhases_UnwiredPlaneJudgesOnBranchEvidence(t *testing.T) {
 		}
 	})
 
-	t.Run("the review-only seam refuses rather than advancing on the branch alone", func(t *testing.T) {
+	t.Run("the review-only phase refuses at spawn rather than advancing on the branch alone", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: checkpointed(10, 0.10)},
-			{res: resumedCheckpointed(5, 0.50)}, // holds the branch, records nothing the driver can read
+			{res: resumedCheckpointed(5, 0.50)}, // must NEVER run: no reader, so no baseline
 			{res: okResult(5, 0.05)},            // must NEVER run
 		}}
 		d, _ := phaseDriver(t, h, []config.Phase{
@@ -3059,8 +3285,8 @@ func TestDrainPhases_UnwiredPlaneJudgesOnBranchEvidence(t *testing.T) {
 		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 		}
-		if h.invokeCalls != 2 {
-			t.Fatalf("spawned %d sessions, want 2 — with no task-state reader the seam cannot prove a review happened, so the fix must not spawn", h.invokeCalls)
+		if h.invokeCalls != 1 {
+			t.Fatalf("spawned %d sessions, want 1 — with no task-state reader the review's freshness baseline can never be read, so it must be refused before a session is spent on it (CLA-663)", h.invokeCalls)
 		}
 	})
 }
@@ -3104,6 +3330,16 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	}
 	if !strings.Contains(inv.Prompt, "there is NO branch") || strings.Contains(inv.Prompt, "Open a PR") {
 		t.Errorf("a branchless checkpoint did not get the no-code fix brief:\n%s", inv.Prompt)
+	}
+	if !strings.Contains(inv.Prompt, "LAST `"+config.ReviewRecordHeading+"`") {
+		t.Errorf("the no-code fix prompt does not point at the LAST %q block:\n%s", config.ReviewRecordHeading, inv.Prompt)
+	}
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging")
+	if err != nil {
+		t.Fatalf("invocationFor fix: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "LAST `"+config.ReviewRecordHeading+"`") {
+		t.Errorf("the branch-shaped fix prompt does not point at the LAST %q block:\n%s", config.ReviewRecordHeading, inv.Prompt)
 	}
 
 	// Unverified (the origin could not be read): the review verifies the hand-off

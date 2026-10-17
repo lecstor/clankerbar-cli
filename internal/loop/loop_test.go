@@ -2002,9 +2002,11 @@ type wiredReleaser struct {
 	fakeReleaser
 	state func() plane.TaskState
 	err   func() error // nil means every read succeeds
+	reads int          // TaskState calls made, for the baseline retry bound (CLA-663)
 }
 
 func (w *wiredReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	w.reads++
 	if w.err != nil {
 		if err := w.err(); err != nil {
 			return plane.TaskState{}, err

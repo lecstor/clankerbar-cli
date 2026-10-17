@@ -426,8 +426,8 @@ const reviewMUSTBar = " GRADE EVERY FINDING. A severity in brackets is `[must]`,
 // replaces the field wholesale, so a final outcome built only from the review
 // block and ### Fixes would erase it.
 const fixTerminalRecord = " When you hand the task over, the outcome MUST keep everything the existing outcome " +
-	"carries ABOVE the review's `" + ReviewRecordHeading + "` block (phase 1's delivery record, or an earlier " +
-	"round's) unchanged, keep the review's block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
+	"carries ABOVE the LAST `" + ReviewRecordHeading + "` block (phase 1's delivery record plus any earlier " +
+	"rounds, their `" + ReviewRecordHeading + "` blocks included) unchanged, keep that LAST block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
 	"it already carries — do not restate that attribution from this brief), and add a `### Fixes` list saying, " +
 	"for every finding, whether you fixed it (with the commit SHA, or for a no-code task the record change you " +
 	"made, or the ref of the real follow-up task a code-needing finding was dispatched to) or did not " +
@@ -951,13 +951,14 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
 	PhaseBranchPlaceholder + " and recorded its findings in the task's outcome; it changed nothing, and its " +
-	"`" + ReviewRecordHeading + "` block names the reviewer. You are " +
+	"LAST `" + ReviewRecordHeading + "` block names the reviewer — an earlier `" + ReviewRecordHeading +
+	"` block is an earlier round, so read past it. You are " +
 	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true " +
-	"and read the outcome's `" + ReviewRecordHeading + "` block. If the outcome carries no review block, that is a FAILED " +
+	"and read the LAST `" + ReviewRecordHeading + "` block in the outcome. If the outcome carries no review block, that is a FAILED " +
 	"hand-off: park the task with update_task(status: \"parked\", outcome: ...) naming the missing record - do " +
-	"NOT review the work yourself, do NOT invent findings, and do NOT open a PR over unreviewed work. Read the " +
-	"record's reviewed tip and compare it with " +
+	"NOT review the work yourself, do NOT invent findings, and do NOT open a PR over unreviewed work. Read that " +
+	"block's reviewed tip and compare it with " +
 	"`git rev-parse HEAD` in the worktree: if they differ, the branch moved after the review, so do NOT apply " +
 	"stale findings - park the task with update_task(status: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
 	PhaseBranchPlaceholder + " recorded on the task, and never commit to the repo's PR base branch (" +
@@ -982,7 +983,8 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
 	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
-	"Then get_task with includeDecisions: true and read the outcome's `" + ReviewRecordHeading + "` block. If it carries no " +
+	"Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading + "` block in the outcome — an " +
+	"earlier one is an earlier round, so read past it. If it carries no " +
 	"review block, that is a FAILED hand-off: say so in your outcome, and park the task if it is still " +
 	"in_progress - if phase 1 already settled it, leave it settled and end. Do not invent findings. Apply the " +
 	"findings by AMENDING THE RECORD (update_task, record_decision) - never by " +

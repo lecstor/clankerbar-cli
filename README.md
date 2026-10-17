@@ -99,24 +99,35 @@ without a measurement, documentation wording, or missing tests the bar does not
 require — and where a repo hard rule concerns style, prose or documentation
 wording, that never-`must` list wins. The block is
 **appended below** whatever the outcome already carries — a statusless outcome
-replaces the field wholesale — and the driver refuses to advance to `fix` unless
-this trip's session actually changed the outcome and wrote the block. The claim
-is held across the seam, so the task is never posted back to the queue
+replaces the field wholesale, and a re-trip (a request-changes rework, a
+takeover) can leave more than one `## Review` block in it — so a later round's
+block is the outcome's **last** one. The driver refuses to advance to `fix`
+unless: the outcome changed since the review spawned, a `## Review` heading
+sits on its own line, and the outcome's last `## Review` block — heading line to
+the end — is not one the outcome already carried. An edit that leaves an old
+block as the last one is refused; an edit that appends a *new* block below the
+old one still passes the seam, and the `fix` phase's reviewed-tip check
+backstops that residue. Before a review session is spawned at all, the driver
+reads that baseline and retries the read; if it stays unread the sequence ends
+without the review rather than paying for a session whose checkpoint the seam
+would refuse.
+The claim is held across the seam, so the task is never posted back to the queue
 mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
-same run, reads the review block back with `get_task`, checks the reviewed tip
-still matches the worktree's HEAD, and applies every finding by ID. The driver
-has already read the record and listed the graded findings in the fix brief,
-applying the structural check the fixer must not second-guess: a `must` recorded
-without an evidence kind or payload is listed as a `should`. Every listed `must`
-is fixed, or refuted with evidence recorded in its outcome — a `must` is never
-downgraded, and one raised by a single reviewer is never dropped because nobody
-else raised it. Cheap `should`s are fixed; `nit`s and the rest are recorded as
-not done with a reason (a follow-up task only for a `should` worth doing). The
-fixer re-verifies scoped to those fixes, commits and pushes them, opens a PR
-targeting the repo's PR base if none exists yet for the branch, and hands the
-task to `in_review`. Its outcome keeps everything above the review block and
+same run, reads the **last** `## Review` block back with `get_task`, checks the
+reviewed tip still matches the worktree's HEAD, and applies every finding by ID
+(or records why not). The driver has already read the record and listed the
+graded findings in the fix brief, applying the structural check the fixer must
+not second-guess: a `must` recorded without an evidence kind or payload is
+listed as a `should`. Every listed `must` is fixed, or refuted with evidence
+recorded in its outcome — a `must` is never downgraded, and one raised by a
+single reviewer is never dropped because nobody else raised it. Cheap `should`s
+are fixed; `nit`s and the rest are recorded as not done with a reason (a
+follow-up task only for a `should` worth doing). The fixer re-verifies scoped to
+those fixes, commits and pushes them, opens a PR targeting the repo's PR base if
+none exists yet for the branch, and hands the task to `in_review`. Its outcome
+keeps everything above that **last** block — earlier rounds included — and
 carries the review forward with a `### Fixes` list and both sides' attribution,
 so the task holds the whole round: who reviewed, what was found, what was done
 about it. See
