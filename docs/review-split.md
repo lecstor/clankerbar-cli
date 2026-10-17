@@ -121,13 +121,13 @@ cannot see its predecessor's.
 `update_task(outcome: ...)` replaces it wholesale. A second round would overwrite
 the first unless the second session copies it forward, so both shipped briefs say
 to append: the review copies the existing outcome unchanged and adds its block
-  below it, and the fix keeps everything above the **last** review block while
-  adding `### Fixes`. The linear sequence has no second review, but
-  request_changes and takeovers ARE second rounds — they return the task with
-  the previous round's block still in the outcome — so the driver snapshots the
-  outcome when the review phase spawns and its seam refuses a checkpoint whose
-  outcome has not changed since. Each round records its own block. It is still
-  not the long-term shape.
+below it, and the fix keeps everything above the **last** review block while
+adding `### Fixes`. The linear sequence has no second review, but
+request_changes and takeovers ARE second rounds — they return the task with
+the previous round's block still in the outcome — so the driver snapshots the
+outcome when the review phase spawns and its seam refuses a checkpoint whose
+outcome has not changed since. Each round records its own block. It is still
+not the long-term shape.
 
 ### Two seam guards the split needs
 
