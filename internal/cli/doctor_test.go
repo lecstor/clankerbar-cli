@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1509,8 +1510,8 @@ func TestPermissionsClaudeValidSettingsPasses(t *testing.T) {
 	}
 }
 
-// exec takes the LAST duplicate env key, so an operator's own OPENCODE_PERMISSION
-// silently replaces the adapter's fail-closed policy.
+// opencode 2.x ignores OPENCODE_PERMISSION, so a declared one is a WARN that
+// says so: the operator is editing a knob that does nothing.
 func TestPermissionsOpencodeEnvOverrideWarns(t *testing.T) {
 	cfg := &config.Config{
 		Harness: "opencode",
@@ -1522,8 +1523,88 @@ func TestPermissionsOpencodeEnvOverrideWarns(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if c := checkPermissions(cfg); c.status != warn || !strings.Contains(c.detail, "ignores it") {
+		t.Errorf("opencode permission override: got %v %q, want a WARN saying 2.x ignores it", c.status, c.detail)
+	}
+}
+
+// The posture doctor reports is the adapter's own session config: fail-closed,
+// every MCP server out of Code Mode, and the accepted shell gap stated as
+// information rather than a failure (CLA-675).
+func TestPermissionsOpencodeReportsThePinnedPosture(t *testing.T) {
+	mcp := filepath.Join(t.TempDir(), "opencode-mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/p"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), MCPConfigPath: mcp}
+	c := checkPermissions(cfg)
+	if c.status != pass {
+		t.Fatalf("got %v %q, want PASS", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "1 MCP server out of Code Mode") {
+		t.Errorf("detail = %q", c.detail)
+	}
+	if !slices.ContainsFunc(c.info, func(s string) bool { return strings.Contains(s, "accepted gap") }) {
+		t.Errorf("info = %v, want the accepted shell gap stated", c.info)
+	}
+
+	// An env OPENCODE_CONFIG_CONTENT replaces the whole pinned document.
+	cfg.Env = config.EnvMap{"OPENCODE_CONFIG_CONTENT": {Literal: `{}`}}
 	if c := checkPermissions(cfg); c.status != warn {
-		t.Errorf("opencode permission override: got %v, want WARN", c.status)
+		t.Errorf("content override: got %v, want WARN", c.status)
+	}
+
+	// A config the adapter refuses to build from is a FAIL: no session spawns.
+	if err := os.WriteFile(mcp, []byte(`{"mcp": // not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Env = nil
+	if c := checkPermissions(cfg); c.status != fail {
+		t.Errorf("unparseable mcp config: got %v, want FAIL", c.status)
+	}
+}
+
+func TestOpencodeVersionCheck(t *testing.T) {
+	for ver, want := range map[string]status{
+		"opencode v2.0.32":            pass,
+		"2.1.0":                       pass,
+		"1.18.27":                     fail,
+		"opencode2 v0.0.0-beta-18314": fail,
+		"weird":                       warn,
+	} {
+		c := check{status: pass}
+		checkOpencodeVersion(&c, ver)
+		if c.status != want {
+			t.Errorf("%q: got %v, want %v", ver, c.status, want)
+		}
+	}
+}
+
+// The auth check counts credentials per provider through the seam and never
+// fails the run: a key can also come from the provider config.
+func TestOpencodeAuthCheck(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", data)
+	cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir()}
+	e := doctorEnv{opencodeCredentials: func(context.Context, string) (map[string]int, error) {
+		return map[string]int{"opencode-go": 1}, nil
+	}}
+	if got := checkOpencodeAuth(context.Background(), cfg, e); len(got) != 1 || got[0].status != warn {
+		t.Fatalf("no db: got %+v, want one WARN", got)
+	}
+	if err := os.MkdirAll(filepath.Join(data, "opencode"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "opencode", "opencode.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := checkOpencodeAuth(context.Background(), cfg, e)
+	if len(got) != 1 || got[0].status != pass || !strings.Contains(got[0].detail, "opencode-go") {
+		t.Fatalf("got %+v, want PASS naming opencode-go", got)
+	}
+	cfg.Harness = "claude"
+	if got := checkOpencodeAuth(context.Background(), cfg, e); len(got) != 0 {
+		t.Errorf("a run that spawns no opencode got %+v", got)
 	}
 }
 

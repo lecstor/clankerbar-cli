@@ -859,6 +859,14 @@ func opencodeSessionConfig(in Invocation) ([]byte, error) {
 	return json.Marshal(doc)
 }
 
+// OpencodeSessionConfig is the document the opencode adapter pins as
+// OPENCODE_CONFIG_CONTENT for a session with these inputs. Exported so doctor
+// reports the posture the adapter will actually hand over, from the same code,
+// rather than re-deriving it.
+func OpencodeSessionConfig(mcpConfigPath, workdir string, readOnly bool) ([]byte, error) {
+	return opencodeSessionConfig(Invocation{MCPConfigPath: mcpConfigPath, WorkDir: workdir, Probe: readOnly})
+}
+
 // opencodeMCPOutOfCodeMode rewrites a config's `mcp` block in place so every
 // server it declares is in the 2.x dialect (`mcp.servers.<name>`) with
 // `codemode: false`.

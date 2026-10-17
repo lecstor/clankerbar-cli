@@ -113,6 +113,11 @@ type doctorEnv struct {
 	// for one project's MCP endpoint. Production is plane.NewRunConfigAPI; a
 	// field so tests serve stored documents from an httptest plane.
 	newRCfgAPI func(mcpURL, apiKey string) plane.RunConfigAPI
+
+	// The opencode auth check's seam (CLA-675): count the rows of opencode
+	// 2.x's credential store, per provider, without reading any secret.
+	// Production runs sqlite3 read-only; tests substitute counts.
+	opencodeCredentials func(ctx context.Context, dbPath string) (map[string]int, error)
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -146,9 +151,10 @@ func defaultDoctorEnv() doctorEnv {
 		runEnvCmd: func(ctx context.Context, command string) (string, error) {
 			return config.RunEnvCommand(command)
 		},
-		envPath:    config.VerifyEnvFilePath,
-		fleetProbe: fleet.Probe,
-		newRCfgAPI: plane.NewRunConfigAPI,
+		envPath:             config.VerifyEnvFilePath,
+		fleetProbe:          fleet.Probe,
+		newRCfgAPI:          plane.NewRunConfigAPI,
+		opencodeCredentials: sqliteOpencodeCredentials,
 	}
 }
 
@@ -254,6 +260,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkSessions(cfg)...)
 	checks = append(checks, checkStranded(ctx, cfg, e))
 	checks = append(checks, checkMCPServers(cfg), checkOpencodeAmbientConfigs(cfg))
+	checks = append(checks, checkOpencodeAuth(ctx, cfg, e)...)
 	checks = append(checks, checkPermissionsAll(cfg)...)
 	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(cfg, e))
 }
@@ -538,6 +545,9 @@ func checkHarnessNamed(ctx context.Context, label, bin string, e doctorEnv) chec
 	}
 	c.status = pass
 	c.detail = path + " (" + ver + ")"
+	if bin == "opencode" {
+		checkOpencodeVersion(&c, ver)
+	}
 	return c
 }
 
@@ -550,10 +560,11 @@ func checkHarnessNamed(ctx context.Context, label, bin string, e doctorEnv) chec
 // system keychain instead of the config dir, so a missing marker means "I cannot
 // confirm this", never "this is broken".
 var authMarkers = map[string][]string{
-	"claude":    {".credentials.json", ".claude.json", "settings.json"},
-	"codex":     {"auth.json", "config.toml"},
-	"opencode":  {"auth.json", "config.json"},
-	"opencode2": {"opencode.json", "opencode.jsonc", "auth.json"}, // the 2.x preview config lives at ~/.config/opencode2/opencode.json (verified against beta-18314 via `opencode2 debug config`); auth.json covers the credentials file it keeps
+	"claude": {".credentials.json", ".claude.json", "settings.json"},
+	"codex":  {"auth.json", "config.toml"},
+	// 2.x keeps its config here and its credentials in the data dir's
+	// opencode.db, which the opencode_auth check reports on separately.
+	"opencode": {"opencode.json", "opencode.jsonc", "config.json"},
 }
 
 // checkConfigDir reports on the run harness's config dir. See checkConfigDirs,
@@ -1995,9 +2006,10 @@ func anyProjectAllowlists(cfg *config.Config) bool {
 
 // --- 9. permission policy ----------------------------------------------------
 
-// opencodePermissionOverride finds an OPENCODE_PERMISSION declaration that
-// would override the adapter's own fail-closed export — exec takes the last
-// duplicate key, so ANY declared value wins — across all four env levels. It
+// opencodeEnvOverride finds a declaration of key that would override the
+// adapter's own export of it — exec takes the last duplicate key, so ANY
+// declared value wins — across all four env levels. On 2.x the key that matters
+// is OPENCODE_CONFIG_CONTENT, which carries the fail-closed policy. It
 // scans MOST-SPECIFIC-FIRST inside each project's scope (the
 // project-per-harness block for this harness, then the project block), then the
 // harness block, then top level: SessionEnv composes the child env per key by
@@ -2008,8 +2020,7 @@ func anyProjectAllowlists(cfg *config.Config) bool {
 // its own project's layers, so no single entry wins a whole multi-project run.
 // The value reported is the declared source — the literal, or the command that
 // produces it — never the resolved output.
-func opencodePermissionOverride(cfg *config.Config, harnessName string) (where, value string, ok bool) {
-	const key = "OPENCODE_PERMISSION"
+func opencodeEnvOverride(cfg *config.Config, harnessName, key string) (where, value string, ok bool) {
 	scan := func(label string, m config.EnvMap) (string, string, bool) {
 		if v, found := m[key]; found {
 			if v.IsCommand() {
@@ -2101,34 +2112,7 @@ func checkPermissionsNamed(cfg *config.Config, label, harnessName string) check 
 		c.detail = "adapter pins --sandbox workspace-write --ask-for-approval never"
 
 	case "opencode":
-		// The adapter always exports a fail-closed OPENCODE_PERMISSION — but exec
-		// takes the LAST duplicate key, so an operator's own env silently wins.
-		// Since CLA-462 that env is declared at four levels; any of them wins.
-		if where, v, ok := opencodePermissionOverride(cfg, harnessName); ok {
-			c.status = warn
-			c.detail = "env overrides the adapter's fail-closed OPENCODE_PERMISSION (declared at " + where + ")"
-			c.remedy = "drop it, or confirm it denies what an unattended run must not call: " + truncate(v, 60)
-			return c
-		}
-		c.status = pass
-		c.detail = "adapter exports a fail-closed OPENCODE_PERMISSION"
-
-	case "opencode2":
-		// The adapter exports the SAME fail-closed OPENCODE_PERMISSION as the
-		// stable adapter — one policy to maintain, belt-and-braces for a build
-		// that honors it. The override audit is deliberately NOT applied here:
-		// on beta-18314 the env var is NOT honored at all (verified 2026-08-28:
-		// with `--auto` + `{"*": "deny"}` the write tool still executed, and
-		// with no env var the same write was declined), so an operator's
-		// OPENCODE_PERMISSION cannot loosen anything — warning about an
-		// override would send them to edit a knob this build ignores. The
-		// fail-closed property of an unattended run comes from the HEADLESS
-		// DEFAULT: without `--auto`, every tool call is declined ("The user
-		// declined this tool call"), and this adapter never passes `--auto`.
-		// This case is what makes doctor truthful for a registered harness
-		// that reads the same ambient configs as opencode (docs/opencode2.md).
-		c.status = pass
-		c.detail = "adapter exports a fail-closed OPENCODE_PERMISSION (same policy as opencode), and never passes --auto; beta-18314 does not honor the env var but its headless default declines every tool call — see docs/opencode2.md"
+		return checkOpencodePermissions(cfg, label, harnessName)
 
 	default:
 		c.status = pass

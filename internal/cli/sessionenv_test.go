@@ -153,7 +153,7 @@ func TestOpencodePermissionOverrideNamesTheWinningLayer(t *testing.T) {
 		"opencode": {Env: config.EnvMap{"OPENCODE_PERMISSION": {Literal: `{"bash":"allow"}`}}},
 	}
 
-	where, v, ok := opencodePermissionOverride(cfg, "opencode")
+	where, v, ok := opencodeEnvOverride(cfg, "opencode", "OPENCODE_PERMISSION")
 	if !ok {
 		t.Fatal("want a found override")
 	}
@@ -170,7 +170,7 @@ func TestOpencodePermissionOverrideNamesTheWinningLayer(t *testing.T) {
 		EnvPerHarness: map[string]config.EnvMap{
 			"opencode": {"OPENCODE_PERMISSION": config.CommandEnv("gh auth token -u x")},
 		}}}
-	where, _, ok = opencodePermissionOverride(cfg, "opencode")
+	where, _, ok = opencodeEnvOverride(cfg, "opencode", "OPENCODE_PERMISSION")
 	if !ok || where != "projects[0].env_per_harness.opencode" {
 		t.Fatalf("named %q (ok=%v), want the project-per-harness block", where, ok)
 	}
