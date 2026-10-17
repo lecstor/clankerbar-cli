@@ -1764,12 +1764,15 @@ func recordedBranches(res harness.Result) []string {
 // to the queue without clearing it. A review session that then dies having
 // recorded nothing would leave an outcome that still carries a heading — so a
 // bare presence check passes on a record from the PREVIOUS trip and spawns the
-// fixer over an unreviewed revision.
+// fixer over an unreviewed revision. The seam requires the outcome's LAST
+// `## Review` block (heading line to the end) to be absent from this baseline.
 //
 // read is the tri-state the freshness check needs: false means the baseline
 // could not be read (no plane reader, a failed read, no task id on the carried
-// claim), and the gate then refuses rather than pretending an unread outcome
-// was unchanged. baseline is meaningful only when read is true.
+// claim). Since CLA-663 that is refused BEFORE the phase spawns — a full
+// review session whose checkpoint the seam would refuse anyway is pure waste,
+// and the claim would lapse into a takeover that re-runs implement and review.
+// baseline is meaningful only when read is true.
 type reviewGate struct {
 	required bool
 	read     bool
@@ -1791,6 +1794,33 @@ func reviewRecordLine(outcome string) bool {
 		}
 	}
 	return false
+}
+
+// lastReviewBlock returns the outcome's text from its LAST `## Review` heading
+// line to the end — the block a fix session is to read and apply. A task that
+// went through a request_changes re-trip, or a takeover, can carry several
+// blocks: both the review and the fix APPEND, so round 1's block stays in the
+// outcome above round 2's, and "the `## Review` block" is ambiguous unless it
+// means the last one (which is why every fix brief says so). The heading line
+// itself is included: a block whose text is only its heading would otherwise
+// decode to "", which is a substring of everything. It recognises the heading
+// exactly as reviewRecordLine does, so the two agree on what a block is.
+//
+// Empty when the outcome carries no heading line at all; the gate checks
+// reviewRecordLine before calling this, so an empty return there is not a
+// block, not an old one.
+func lastReviewBlock(outcome string) string {
+	start, offset := -1, 0
+	for _, line := range strings.SplitAfter(outcome, "\n") {
+		if strings.TrimRight(strings.TrimSuffix(line, "\n"), " \t\r") == config.ReviewRecordHeading {
+			start = offset
+		}
+		offset += len(line)
+	}
+	if start < 0 {
+		return ""
+	}
+	return outcome[start:]
 }
 
 // checkpointEvidence reports whether the plane's record carries the phase's
@@ -1946,22 +1976,27 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 		// alone is not enough: a task that already went implement -> review -> fix
 		// carries the previous trip's block, and request_changes (or a takeover)
 		// leaves it in the outcome. The spawn-time baseline is what tells the two
-		// apart; the exact-line heading is what keeps `## Reviewer notes` from
-		// standing in for it.
+		// apart, and the comparison is the LAST block — heading line to the end —
+		// because an appended round leaves the previous block above it, so the last
+		// one is the round this phase was to write. The exact-line heading is what
+		// keeps `## Reviewer notes` from standing in for it.
 		//
 		// Fail-closed, like every other evidence form: a record that cannot be read
 		// on either side of the phase is not a review that happened. The cost is a
-		// re-run of the review; the alternative is an unreviewed PR.
+		// re-run of the review; the alternative is an unreviewed PR. The unread
+		// BASELINE never reaches this gate: an unreadable baseline is refused
+		// before the review spawns (CLA-663), so this switch judges only outcomes
+		// both reads could see.
 		if review.required {
 			switch {
-			case !review.read:
-				return branch, false, false, "the task's outcome could not be read before the review phase spawned, so a review record cannot be proven to have been written by this phase — the next phase would risk applying an earlier trip's record"
 			case !recordRead:
 				return branch, false, false, fmt.Sprintf("the task's outcome could not be read after the review phase ended, so its %q block cannot be verified — the next phase would risk running on a record that does not exist", config.ReviewRecordHeading)
 			case record.Outcome == review.baseline:
 				return branch, false, false, fmt.Sprintf("the task's outcome is unchanged since the review phase spawned — the review recorded no new %q block, so the next phase would have nothing to apply", config.ReviewRecordHeading)
 			case !reviewRecordLine(record.Outcome):
 				return branch, false, false, fmt.Sprintf("the review recorded no %q block in the task's outcome — the next phase would have nothing to apply", config.ReviewRecordHeading)
+			case strings.Contains(review.baseline, lastReviewBlock(record.Outcome)):
+				return branch, false, false, fmt.Sprintf("the task's LAST %q block already appears in the outcome the review phase found — the review wrote no NEW block this trip, so the next phase would apply an earlier round's record", config.ReviewRecordHeading)
 			}
 		}
 		return branch, true, unverified, why
@@ -2035,16 +2070,28 @@ func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Resu
 	return st, read, false, fmt.Sprintf("the plane's record shows no exit evidence either (status %q, no no-code delivery)", st.Status)
 }
 
+// reviewBaselineReadAttempts bounds the baseline read's retries at review spawn
+// (CLA-663): the initial attempt plus two more. The failure this recovers from
+// is a plane blip — a dropped response, a read that timed out — and one retry
+// pair around a 20-second read is enough for that without turning an outage
+// into a long stall. Deliberately no sleep between attempts: the read's own
+// timeout is the pacing, and the whole point of a bounded retry here is to
+// avoid paying for a session, not to wait for a sick plane.
+const reviewBaselineReadAttempts = 3
+
 // readReviewBaseline reads the task's outcome as it stands BEFORE the review
 // phase spawns, so the seam can require the record to have changed. The task id
 // comes from the carried claim (the predecessor phase's), which is exact for a
 // resumed phase and is why this runs inside drainPhase, where `prev` is still
 // in hand.
 //
-// Best-effort like every other plane read: a failure returns read=false, and
-// the gate then refuses the checkpoint rather than guessing whether the outcome
-// changed. No second read is needed here for a target with no plane wiring —
-// the same wiring the seam read already requires.
+// Best-effort like every other plane read, with one difference CLA-663 added:
+// the read is RETRIED up to reviewBaselineReadAttempts times, because a blip
+// here does not degrade to "judge on other evidence" — it fails the whole
+// sequence closed. A failure still returns read=false, and the caller refuses
+// to spawn the review rather than letting it run a session whose checkpoint the
+// seam would reject. No retries are spent on a target with no plane wiring or
+// no task id to ask about: those cannot be fixed by asking again.
 func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
 	if prev == nil || prev.Claim.TaskID == "" {
 		return "", false
@@ -2053,16 +2100,27 @@ func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness
 	if !wired {
 		return "", false
 	}
-	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	st, err := src.TaskState(sctx, prev.Claim.TaskID)
-	if err != nil {
-		if !errors.Is(err, plane.ErrNotWired) {
-			log.Printf("%scould not read the plane's record of %s before the review phase spawned (%v) — the review→fix gate cannot prove its record is new this trip", labelOf(t), prev.Claim.TaskID, err)
+	lastErr := ""
+	for attempt := 1; attempt <= reviewBaselineReadAttempts; attempt++ {
+		if ctx.Err() != nil {
+			return "", false
 		}
-		return "", false
+		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		st, err := src.TaskState(sctx, prev.Claim.TaskID)
+		cancel()
+		switch {
+		case err == nil:
+			return st.Outcome, true
+		case errors.Is(err, plane.ErrNotWired):
+			// No wiring to retry against; the gate refuses at the spawn guard.
+			return "", false
+		default:
+			lastErr = err.Error()
+		}
 	}
-	return st.Outcome, true
+	log.Printf("%scould not read the plane's record of %s before the review phase spawned, after %d attempts (%s) — the review→fix gate cannot prove its record is new this trip",
+		labelOf(t), prev.Claim.TaskID, reviewBaselineReadAttempts, lastErr)
+	return "", false
 }
 
 // verifiedBranch returns the branch the previous phase recorded — the hand-off
@@ -2210,9 +2268,30 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// the phase's outcome as the review found it. A handoff respawn re-enters
 	// drainPhase with the same carried claim and takes a fresh baseline, so a
 	// successor must still write the record its own session is responsible for.
+	//
+	// CLA-663: an unreadable baseline refuses the phase BEFORE it spawns. The
+	// seam cannot prove a record is this trip's from a baseline it never read —
+	// so the old order spawned the full review session and then threw its
+	// checkpoint away, and the claim (HasWIP) lapsed into a takeover that
+	// re-ran implement AND review. Refusing here pays the read — already
+	// retried by readReviewBaseline — and nothing else, and leaves the claim
+	// with the same disposition a seam refusal leaves it: released when it is
+	// releasable, left to lapse into a takeover when it carries pushed work.
 	review := reviewGate{required: requireReviewRecord}
 	if review.required {
 		review.baseline, review.read = d.readReviewBaseline(ctx, t, prev)
+		if !review.read {
+			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's outcome could not be read before it spawned, so a review record could not be proven new this trip — the sequence ends here without the review; the lease lapses into a takeover",
+				labelOf(t), drainNum, ph.Label(phaseIdx))
+			end.empty = true
+			end.emptyWhy = "the task's outcome could not be read before the review phase spawned"
+			if prev != nil {
+				end.claim = prev
+				end.released = prev.Claim.Held()
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
+			}
+			return 0, 0, false, end, nil
+		}
 	}
 	// The adapter for THIS phase, resolved once: everything below — the spawn, the
 	// classification of what came back, and the probe of any usage limit it hit —

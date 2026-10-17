@@ -1318,10 +1318,29 @@ func TestBuiltinReviewAndFixBriefsPreserveWhatSitsAboveTheBlock(t *testing.T) {
 	}
 	for name, brief := range fixBriefs {
 		lower := strings.ToLower(brief)
-		for _, want := range []string{"above the review", "verbatim", "### fixes"} {
+		for _, want := range []string{"above the last", "verbatim", "### fixes"} {
 			if !strings.Contains(lower, want) {
 				t.Errorf("the %s never says %q, so the final outcome can lose what sat above the review block:\n%s", name, want, brief)
 			}
+		}
+	}
+}
+
+// The fix phase can face more than one `## Review` block: both the review and
+// the fix APPEND, so a request_changes re-trip leaves round 1's block above
+// round 2's. Every fix brief and every continuation that reaches a fix session
+// must say which block is the round to apply — the LAST one — or the session
+// applies an earlier round's findings, whose reviewed tip is stale by design.
+func TestFixBriefsAndHandoffsPointAtTheLastReviewBlock(t *testing.T) {
+	fixBriefs := map[string]string{
+		"fix brief":            fixBrief,
+		"no-code fix brief":    noCodeFixBrief,
+		"fix handoff":          NoCodeFixHandoffContinuation(),
+		"fix handoff (branch)": HandoffContinuation(FixPhaseName),
+	}
+	for name, brief := range fixBriefs {
+		if !strings.Contains(brief, "LAST `"+ReviewRecordHeading+"`") {
+			t.Errorf("the %s never points the session at the LAST %q block:\n%s", name, ReviewRecordHeading, brief)
 		}
 	}
 }

@@ -85,20 +85,29 @@ review record on the task (`update_task(outcome: ...)`, no status move), a fixed
 block carrying the reviewed tip, the implementer's and reviewer's harness/model,
 a `verdict`, and every finding by ID with the required fix. The block is
 **appended below** whatever the outcome already carries — a statusless outcome
-replaces the field wholesale — and the driver refuses to advance to `fix` unless
-this trip's session actually changed the outcome and wrote the block. The claim
-is held across the seam, so the task is never posted back to the queue
-mid-sequence.
+replaces the field wholesale, and a re-trip (a request-changes rework, a
+takeover) can leave more than one `## Review` block in it — so a later round's
+block is the outcome's **last** one. The driver refuses to advance to `fix`
+unless: the outcome changed since the review spawned, a `## Review` heading
+sits on its own line, and the outcome's last `## Review` block — heading line to
+the end — is not one the outcome already carried (an edit that writes no block,
+or leaves an old one last, is refused). It cannot prove everything from the
+plane's record alone — a review edit appended *below* the old block passes the
+seam — so the `fix` phase's reviewed-tip check backstops the rest. Before a
+review session is spawned at all, the driver reads that baseline and retries the
+read; if it stays unread the sequence ends without the review rather than paying
+for a session whose checkpoint the seam would refuse. The claim is held across
+the seam, so the task is never posted back to the queue mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
-same run, reads the review block back with `get_task`, checks the reviewed tip
-still matches the worktree's HEAD, applies every finding by ID (or records why
-not), re-verifies scoped to those fixes, commits and pushes them, opens a PR
-targeting the repo's PR base if none exists yet for the branch, and hands the
-task to `in_review`. Its outcome keeps everything above the review block and
-carries the review forward with a `### Fixes` list and both sides' attribution,
-so the task holds the whole round: who reviewed, what was found, what was done
-about it. See
+same run, reads the **last** `## Review` block back with `get_task`, checks the
+reviewed tip still matches the worktree's HEAD, applies every finding by ID (or
+records why not), re-verifies scoped to those fixes, commits and pushes them,
+opens a PR targeting the repo's PR base if none exists yet for the branch, and
+hands the task to `in_review`. Its outcome keeps everything above that **last**
+block — earlier rounds included — and carries the review forward with a
+`### Fixes` list and both sides' attribution, so the task holds the whole round:
+who reviewed, what was found, what was done about it. See
 [`docs/releases.md`](./docs/releases.md) for what happens to that PR after
 `in_review` — merged by a clanker only once a human approves it, promoted to a
 release only by the operator.
