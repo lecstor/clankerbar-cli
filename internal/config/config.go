@@ -357,33 +357,100 @@ const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the pha
 // finding ID, so the IDs are what make "fixed R2, declined R3" auditable rather
 // than a paragraph a reader has to reconstruct.
 //
+// The shape is an INTERFACE, not prose: the driver parses it back (see
+// reviewFindingsDigest in internal/loop) to grade the findings it hands the fix
+// phase, so the severity bracket and the `(<kind>): <evidence>` prefix after it
+// are load-bearing.
+//
+// It APPENDS below the outcome as it stands. The plane's statusless outcome is
+// a full replacement, and the outcome may already carry phase 1's delivery
+// record (or, on a request_changes re-trip or a takeover, an earlier trip's
+// round); writing a fresh block over it would lose that record. The fix phase
+// keeps everything above the block for the same reason.
+//
 // Attribution is injected by the driver from the phases' RESOLVED harness and
 // model ({{prevHarness}}/{{prevModel}} are the implement phase's,
 // {{harness}}/{{model}} this review phase's), because a session cannot reliably
 // name its own model and neither can it see its predecessor's.
-const reviewOnlyRecordShape = " THE REVIEW RECORD IS THE DELIVERABLE. Record it with update_task(taskId, runId, outcome: ...), " +
-	"as a compact block in exactly this shape: a `" + ReviewRecordHeading + "` heading; then `- reviewed tip: <the SHA " +
+const reviewOnlyRecordShape = " THE REVIEW RECORD IS THE DELIVERABLE. First get_task and read the outcome as it " +
+	"stands: a statusless update_task outcome replaces the WHOLE field, so preserve it. Record with " +
+	"update_task(taskId, runId, outcome: ...) by copying the existing outcome's text unchanged, then APPENDING, " +
+	"below it, a compact block in exactly this shape: a `" + ReviewRecordHeading + "` heading; then `- reviewed tip: <the SHA " +
 	"git rev-parse HEAD prints in the worktree>`; `- implemented by: harness " + PhasePrevHarnessPlaceholder +
 	", model " + PhasePrevModelPlaceholder + "`; `- reviewed by: harness " + PhaseHarnessPlaceholder + ", model " +
 	PhaseModelPlaceholder + "`; `- verdict: pass` or `- verdict: findings`; then a `### Findings` heading with " +
-	"one line per finding: `- R1 [must|should|nit] <file:line> - <what is wrong>. Required fix: <the smallest " +
-	"change that makes it right>.` Give every finding its own ID. If there are none, write `- none` under " +
+	"one line per finding: `- R1 [must|should|nit]` followed, for a MUST, by ` (<kind>): <evidence>`, then " +
+	"` <file:line> - <what is wrong>. Required fix: <the smallest change that makes it right>.` Give every " +
+	"finding its own ID. If there are none, write `- none` under " +
 	"Findings and `verdict: pass`. Do not pad the list, and do not fix anything yourself - not even a typo: a " +
-	"fix applied here is a fix the next phase cannot attribute and may undo."
+	"fix applied here is a fix the next phase cannot attribute and may undo." +
+	reviewMUSTBar
+
+// reviewMUSTBar is the accepted bar for a MUST (task CLA-635; the review-panel
+// design's section 14 A2 as amended by B5/B6, decisions 3a57db6a and 60ed0748
+// superseding it): the evidence a MUST must cite, the seventh kind the operator
+// added after the second review, and the things that are never a MUST however
+// confident the reviewer is.
+//
+// Only PRESENCE is checked structurally - here as the reviewer's own
+// obligation, and by the driver when it parses the block back
+// (loop.reviewFindingsDigest). The VALIDITY of the evidence is judged by a
+// verifier in the next round, never by the fixer: a fixer that disagrees with a
+// MUST refutes it with evidence, it does not downgrade it. Where a repo hard
+// rule concerns style, prose or documentation wording, the not-a-MUST list wins
+// over it (B6); missing tests stay not-a-MUST except the untested-guard case.
+const reviewMUSTBar = " GRADE EVERY FINDING. A severity in brackets is `[must]`, `[should]` or `[nit]`; " +
+	"MUST is the only gating grade and the only one that must carry evidence. A MUST must be followed by " +
+	"`(<kind>): <evidence>`, where <kind> is one of: doneWhen - quote the clause of the task's doneWhen the change " +
+	"violates; gate - name a repo gate (a test, typecheck, lint, build, CI check, or a check the repo's agent " +
+	"instructions require) that fails or would fail, with the command and the failing output or the reason it " +
+	"would fail; failure - a concrete input or state and the wrong output, crash, data loss or stuck state it " +
+	"produces in changed code or its direct regression surface; security - credential exposure, an authorization " +
+	"bypass, injection, or a widened permission, with the path; decision - a recorded standing decision it " +
+	"contradicts (cite its id) or a hard rule in the repo's agent instructions (cite the file and the rule); " +
+	"irreversible - an irreversible migration, deletion or publish step without the guard the repo requires; " +
+	"untested - a new or changed guard, gate or state transition with no test that pins it (cite its file:line " +
+	"and the missing test). NEVER a MUST, however confident you are: style, naming, a design you would prefer, a " +
+	"performance concern without a measurement, missing tests the doneWhen does not require (except untested), or " +
+	"documentation wording - and where a repo hard rule concerns style, prose or documentation wording, this " +
+	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. Every finding in the block is " +
+	"attributed by the block's own `- reviewed by:` line."
 
 // fixTerminalRecord is the fix phase's extra outcome requirement, stated BEFORE
 // the shared reviewTerminalStep so the emphatic final block still ends the brief
 // (the CLA-384 property). It carries the review forward: the final outcome is the
 // only durable task-record the round has until the plane stores reviews
 // separately, so dropping the review block here would lose the very record the
-// split exists to keep.
-const fixTerminalRecord = " When you hand the task over, the outcome MUST also carry the review forward: keep the review's " +
-	"`" + ReviewRecordHeading + "` block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
-	"it already carries — do not restate that attribution from this brief) and add a `### Fixes` list saying, " +
+// split exists to keep. It must also keep everything ABOVE the block: that is
+// phase 1's delivery record (or an earlier round's), and the statusless outcome
+// replaces the field wholesale, so a final outcome built only from the review
+// block and ### Fixes would erase it.
+const fixTerminalRecord = " When you hand the task over, the outcome MUST keep everything the existing outcome " +
+	"carries ABOVE the review's `" + ReviewRecordHeading + "` block (phase 1's delivery record, or an earlier " +
+	"round's) unchanged, keep the review's block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
+	"it already carries — do not restate that attribution from this brief), and add a `### Fixes` list saying, " +
 	"for every finding, whether you fixed it (with the commit SHA, or for a no-code task the record change you " +
-	"made) or did not (with the reason), plus " +
+	"made, or the ref of the real follow-up task a code-needing finding was dispatched to) or did not " +
+	"(with the reason — for a MUST that reason must be a refutation carrying its evidence, " +
+	"because a MUST is never downgraded), plus " +
 	"'fixed by: harness " + PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder + "'. A finding " +
 	"you neither fix nor answer is this phase failing."
+
+// fixGradingRule is the fix briefs' shared obligation for acting on the graded
+// review record (CLA-635): every MUST fixed or refuted with evidence, never
+// downgraded by the fixer, and SHOULD/NIT handled by the filing rule. B5's
+// structural check runs driver-side, so a MUST that reaches this brief has
+// already been judged to carry evidence; the fixer may not second-guess the
+// grade - it refutes the finding with evidence of its own, or fixes it. A1 is
+// restated because the interim record may hold a single reviewer: disagreement
+// is not a second opinion, and a lone reviewer's MUST still gates.
+const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
+	"recorded in your outcome - a refutation must actually refute the finding, and a MUST you neither fix nor " +
+	"refute is this phase failing. You may not downgrade a MUST: the driver has already applied its structural " +
+	"check, listing a recorded MUST with no evidence kind or no evidence payload as a SHOULD, and a MUST raised " +
+	"by a single reviewer is never dropped because nobody else raised it. Fix the SHOULDs that are cheap; record " +
+	"NITs and the SHOULDs you do not fix in your outcome as not done, with the reason, and file a follow-up task " +
+	"only for a SHOULD worth doing."
 
 // noCodeReviewTerminalStep is the no-code review brief's LAST instruction
 // (CLA-497), the counterpart of reviewTerminalStep for a phase-1 exit that was
@@ -865,8 +932,9 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 	"to the review below. Then get_task with includeDecisions: true to re-read the bar and the standing " +
 	"decisions. Review the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the " +
 	"decisions recorded on this task or its siblings: is the settlement honest, does the record carry what the " +
-	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend the " +
-	"record here either - the phase after you applies what you find - and do not invent code, a branch or a PR." +
+	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend what " +
+	"phase 1 wrote - the phase after you applies what you find - but DO append your review block below it so " +
+	"its delivery record survives; and do not invent code, a branch or a PR." +
 	reviewOnlyRecordShape + rerunGuidance + noCodeReviewOnlyTerminalStep + handoffGuidance
 
 // fixBrief is the phase that APPLIES a review's findings. It is deliberately not
@@ -894,9 +962,9 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 	"stale findings - park the task with update_task(status: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
 	PhaseBranchPlaceholder + " recorded on the task, and never commit to the repo's PR base branch (" +
 	PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout sitting on that branch is " +
-	"not a decision to commit where you are, it is this failure mode. Apply the review's findings, each by ID. " +
-	"For every finding do one of two things: fix it, or leave it and record exactly why it is wrong or out of " +
-	"scope - a finding you neither fix nor answer is this phase failing. If the review found nothing " +
+	"not a decision to commit where you are, it is this failure mode. Apply the review's findings, each by ID." +
+	fixGradingRule +
+	" A finding you neither fix nor answer is this phase failing. If the review found nothing " +
 	"(verdict: pass), there is nothing to fix: still open the PR if none exists and hand over. The review " +
 	"ran checks, so the worktree may carry generated or cache files it did not commit: stage only the fixes " +
 	"you made, never those. Re-verify " +
@@ -918,8 +986,11 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"review block, that is a FAILED hand-off: say so in your outcome, and park the task if it is still " +
 	"in_progress - if phase 1 already settled it, leave it settled and end. Do not invent findings. Apply the " +
 	"findings by AMENDING THE RECORD (update_task, record_decision) - never by " +
-	"inventing code, a branch or a PR. A finding that needs CODE cannot be fixed here: file it as its own task " +
-	"(create_task, with a real doneWhen) and say so in your outcome - do not re-open this task, do not rewrite " +
+	"inventing code, a branch or a PR." + fixGradingRule +
+	" A finding that needs CODE cannot be fixed here: file it as its own task " +
+	"(create_task, with a real doneWhen) and say so in your outcome - for a MUST, that filed task is this " +
+	"phase's fix of it (record the new task's ref in your outcome as the fix; a dispatched MUST is fixed this " +
+	"way, not refuted, and not a failure) - do not re-open this task, do not rewrite " +
 	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
 	fixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
 
@@ -1014,8 +1085,9 @@ const (
 // ReviewRecordHeading is the marker of the block a review-only phase records in
 // the task's outcome. It is an INTERFACE, not prose: the review writes it, the
 // fix phase reads it, and the driver's review→fix seam gate refuses a checkpoint
-// when the task's outcome does not carry it. All three read this constant so a
-// rewording cannot desynchronise them.
+// unless the outcome CHANGED since the review spawned and carries this heading
+// as a line of its own — a stale block from an earlier trip is not a record.
+// All three read this constant so a rewording cannot desynchronise them.
 //
 // It deliberately carries no round number. A hard-coded "round 1" would be false
 // on any later run of the same task (a request-changes re-work, say), and the

@@ -24,12 +24,21 @@ import (
 // nothing about which of the two the driver actually reads.
 func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Driver, *fakeReleaser) {
 	t.Helper()
+	rel := &fakeReleaser{}
+	return phaseDriverWithReleaser(t, h, phases, rel), rel
+}
+
+// phaseDriverWithReleaser is phaseDriver with the Releaser supplied by the
+// caller — the seam the review-split tests use to wire the plane's TaskState
+// read (wiredReleaser) while every other phase test stays on the plain,
+// unwired fake.
+func phaseDriverWithReleaser(t *testing.T, h harness.Adapter, phases []config.Phase, rel plane.Releaser) *Driver {
+	t.Helper()
 	cfg := fastCfg()
 	cfg.Phases = phases
 	if len(phases) > 0 {
 		cfg.Prompt = ""
 	}
-	rel := &fakeReleaser{}
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	openTestStateDir(t, d)
 	// The implement phase's checkpoint since CLA-457 requires the recorded branch
@@ -46,7 +55,7 @@ func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Drive
 	// config's own branch and no test reaches git or the network. The tests
 	// that pin the RESOLUTION override this with their own fake.
 	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
-	return d, rel
+	return d
 }
 
 // drainPhasesOnce drives one phase sequence under the same safety timeout the
@@ -2194,16 +2203,26 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 		{Name: config.ReviewPhaseName, Tier: "strong"},
 		{Name: config.FixPhaseName, Tier: "cheap"},
 	}
+	// The outcome the plane serves, mutated where the review session writes:
+	// the seam gate requires the record to be NEW this trip, so a healthy
+	// fixture must show the outcome changing between the review's spawn and its
+	// seam — exactly what the shipped append instruction produces.
+	outcome := "implemented: pushed the branch\n"
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
 		{res: checkpointed(5, 0.50)},
 		{res: okResult(5, 0.05)},
 	}}
-	d, rel := phaseDriver(t, h, phases)
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review-only session appends its block below the record
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+		}
+	}
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+	}}
+	d := phaseDriverWithReleaser(t, h, phases, rel)
 	d.cfg.Models = map[string]string{"strong": "opus-test", "cheap": "cheap-test"}
-	// The review-only seam gate reads the task's outcome off the plane and
-	// refuses a checkpoint without the record. A healthy fixture records one.
-	rel.state = plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: config.ReviewRecordHeading + "\n- verdict: pass\n"}
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -2256,22 +2275,155 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 	}
 }
 
+// CLA-635: the fix phase's prompt carries the driver's graded list of the
+// review's findings, prepended before the brief — a grounded MUST keeps its
+// grade, an evidence-less MUST is listed as a SHOULD (B5's structural check is
+// the driver's to run), and the fix brief itself states the obligations the
+// grade imposes.
+func TestDrainPhases_FixBriefCarriesTheGradedFindings(t *testing.T) {
+	phases := []config.Phase{
+		{Name: config.ImplementPhaseName, Tier: "cheap"},
+		{Name: config.ReviewPhaseName, Tier: "strong"},
+		{Name: config.FixPhaseName, Tier: "cheap"},
+	}
+	outcome := "implemented: pushed the branch\n"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: okResult(5, 0.05)},
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review session appends its block below the record
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: findings\n### Findings\n" +
+				"- R1 [must] (gate): `go test ./...` fails on the new seam at loop.go:42 - the guard is untested. Required fix: pin it.\n" +
+				"- R2 [must] internal/loop/loop.go:77 - this line names no evidence. Required fix: give it a test.\n" +
+				"- R3 [should] internal/loop/loop.go:90 - tidy the wording. Required fix: tidy it.\n" +
+				"- R4 [nit] internal/loop/loop.go:97 - a nit. Required fix: none.\n"
+		}
+	}
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+	}}
+	d := phaseDriverWithReleaser(t, h, phases, rel)
+	d.cfg.Models = map[string]string{"strong": "opus-test", "cheap": "cheap-test"}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — implement, review-only, fix", h.invokeCalls)
+	}
+
+	p3 := h.invocations[2].Prompt
+	for _, want := range []string{
+		"R1 [MUST]", "R2 [SHOULD]", "R3 [SHOULD]", "R4 [NIT]",
+		"downgraded: recorded as a MUST with no evidence kind or payload",
+	} {
+		if !strings.Contains(p3, want) {
+			t.Errorf("the fix phase's prompt does not carry %q:\n%s", want, p3)
+		}
+	}
+	if strings.Contains(p3, "R2 [MUST]") {
+		t.Errorf("the evidence-less MUST was not downgraded in the fix phase's prompt:\n%s", p3)
+	}
+	// The graded list PRECEDES the brief: it is the driver's read of the record
+	// the session is about to act on, not an afterthought to it.
+	if i, j := strings.Index(p3, "R1 [MUST]"), strings.Index(p3, "the FIX phase and the LAST phase"); i < 0 || j < 0 || i > j {
+		t.Errorf("the graded findings do not sit before the fix brief (finding at %d, brief at %d):\n%s", i, j, p3)
+	}
+	// And the brief itself states the obligations the grade imposes (A1/B5):
+	// every MUST fixed or refuted, never downgraded, a lone reviewer's MUST
+	// never dropped.
+	for _, want := range []string{
+		"fixed, or REFUTED with evidence",
+		"may not downgrade a MUST",
+		"a MUST raised by a single reviewer is never dropped",
+	} {
+		if !strings.Contains(p3, want) {
+			t.Errorf("the fix brief does not carry %q:\n%s", want, p3)
+		}
+	}
+}
+
+// CLA-635 fix-pass finding: a handoff respawn of the FIX phase replaces
+// ph.Prompt with the successor's continuation, so keying the driver's graded
+// list on the per-call prompt text would drop it exactly where the
+// continuation (fixTerminalRecord) still holds the successor to the grade. The
+// successor of a mid-fix handoff must carry the same digest its predecessor
+// got — an evidence-less MUST must reach it already downgraded, not as a
+// gating MUST it may not downgrade itself.
+func TestDrainPhases_FixHandoffSuccessorKeepsTheGradedFindings(t *testing.T) {
+	outcome := "implemented: pushed the branch\n"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: handoffResult("R1 is fixed and committed; grading R2's evidence is next, then the PR.")},
+		{res: okResult(5, 0.05)},
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review session appends its block below the record
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: findings\n### Findings\n" +
+				"- R1 [must] (gate): `go test ./...` fails on the new seam at loop.go:42 - the guard is untested. Required fix: pin it.\n" +
+				"- R2 [must] internal/loop/loop.go:77 - this line names no evidence. Required fix: give it a test.\n"
+		}
+	}
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+	}}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+
+	if _, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop || handoffs != 1 {
+		t.Fatalf("drainPhases: err=%v stop=%v handoffs=%d (want 1)", err, stop, handoffs)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — implement, review, fix, its handoff successor", h.invokeCalls)
+	}
+	successor := h.invocations[3].Prompt
+	for _, want := range []string{
+		"R1 [MUST]",
+		"R2 [SHOULD]", // the evidence-less MUST reaches the successor already downgraded
+		"downgraded: recorded as a MUST with no evidence kind or payload",
+	} {
+		if !strings.Contains(successor, want) {
+			t.Errorf("the fix handoff successor's prompt does not carry %q:\n%s", want, successor)
+		}
+	}
+	if strings.Contains(successor, "R2 [MUST]") {
+		t.Errorf("the evidence-less MUST reached the fix handoff successor ungraded:\n%s", successor)
+	}
+}
+
 // A handoff inside the review-only phase must carry the record-then-hold ending,
 // never the commit/push/PR/in_review terminal step. This is the seam a wording
 // change in the first session's brief cannot reach.
 func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
+	// The handoff successor continues the SAME phase, so it takes a fresh
+	// freshness baseline: the first review session records nothing (it hands
+	// off mid-review), and only the successor's own record satisfies the gate.
+	outcome := "implemented: pushed the branch\n"
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
 		{res: handoffResult("Review half done: the API surface is cleared, the storage layer is next.")},
 		{res: checkpointed(5, 0.50)},
 		{res: okResult(1, 0)},
 	}}
-	d, rel := phaseDriver(t, h, []config.Phase{
+	h.onInvoke = func(i int) {
+		if i == 2 { // the handoff successor appends the record the seam requires
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+		}
+	}
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+	}}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
 		{Name: config.ImplementPhaseName},
 		{Name: config.ReviewPhaseName},
 		{Name: config.FixPhaseName},
-	})
-	rel.state = plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: config.ReviewRecordHeading + "\n- verdict: pass\n"}
+	}, rel)
 
 	if _, _, _, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -2291,38 +2443,399 @@ func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 	}
 }
 
+// resumedCheckpointed is checkpointed with the claim a RESUMED phase really
+// carries: HasWIP, from the branch its predecessor recorded. That flag is
+// load-bearing for the refusal tests below — it is why the driver leaves the
+// lease to lapse into a takeover instead of handing the task back to the queue
+// over pushed work (Claim.Releasable).
+func resumedCheckpointed(tokens int, cost float64) harness.Result {
+	return reported(held(okResult(tokens, cost), harness.Claim{
+		TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x",
+	}), branchReport())
+}
+
 // The review-only seam must not advance to fix on the implementer's branch
 // alone. That branch is INHERITED (HasWIP from phase 1), so every existing
 // evidence form passes for a review session that recorded nothing at all — a
-// session that burned its turns, hit its ceiling, or died on a silent EOT. The
-// gate is the task's OWN record: no `## Review` block, no checkpoint. Without
-// this, an unreviewed PR reaches in_review, which is the regression the
-// split must not introduce (pre-split, a dead review was the last phase and
-// ended the drain with no PR).
-func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutTheRecord(t *testing.T) {
-	h := &fakeAdapter{steps: []invokeStep{
-		{res: checkpointed(10, 0.10)},
-		{res: checkpointed(5, 0.50)}, // holds the task and phase 1's branch, but records nothing
-		{res: okResult(5, 0.05)},     // must NEVER run
-	}}
-	d, rel := phaseDriver(t, h, []config.Phase{
+// session that burned its turns, hit its ceiling, or died on a silent EOT.
+// The gate is the task's OWN record, and it must be one THIS trip wrote: a
+// task that already went implement -> review -> fix keeps the previous trip's
+// `## Review` block in its outcome, and a human request_changes (or a takeover
+// after the lease lapsed) returns the task to the queue without clearing it.
+// A bare presence check would read that old block and spawn the fixer over an
+// unreviewed revision. Without the gate at all, an unreviewed PR reaches
+// in_review — the regression the split must not introduce.
+func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testing.T) {
+	staleBlock := "delivered: pushed clanker/x\n\n" + config.ReviewRecordHeading +
+		"\n- reviewed tip: oldsha\n- verdict: findings\n### Findings\n- R1 [must] a.go:1 - stale. Required fix: none.\n### Fixes\n- R1 fixed in deadbeef\n"
+	takeover := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+
+	tests := []struct {
+		name     string
+		baseline string                  // the outcome the review phase finds on the task
+		first    harness.Claim           // phase 1's claim: a takeover seeds WIP
+		write    func(old string) string // what the review session records (identity records nothing)
+	}{
+		{
+			name:     "the review records nothing",
+			baseline: "",
+			first:    openClaim(),
+			write:    func(old string) string { return old },
+		},
+		{
+			name:     "a request_changes re-trip keeps the previous trip's block",
+			baseline: staleBlock,
+			first:    openClaim(),
+			write:    func(old string) string { return old },
+		},
+		{
+			name:     "a takeover keeps the previous trip's block",
+			baseline: staleBlock,
+			first:    takeover,
+			write:    func(old string) string { return old },
+		},
+		{
+			name:     "a look-alike heading is not the record",
+			baseline: "",
+			first:    openClaim(),
+			write: func(old string) string {
+				return old + "\n## Reviewer notes\n- reviewed tip: sha1\n- verdict: pass\n"
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			outcome := tc.baseline
+			h := &fakeAdapter{steps: []invokeStep{
+				// Phase 1's session: on a takeover its claim already carries the
+				// branch and WIP flag of the found work.
+				{res: reported(held(okResult(10, 0.10), tc.first), branchReport())},
+				{res: resumedCheckpointed(5, 0.50)}, // holds the task and phase 1's branch, but records nothing
+				{res: okResult(5, 0.05)},            // must NEVER run
+			}}
+			h.onInvoke = func(i int) {
+				if i == 1 {
+					outcome = tc.write(outcome)
+				}
+			}
+			rel := &wiredReleaser{state: func() plane.TaskState {
+				return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+			}}
+			d := phaseDriverWithReleaser(t, h, []config.Phase{
+				{Name: config.ImplementPhaseName},
+				{Name: config.ReviewPhaseName},
+				{Name: config.FixPhaseName},
+			}, rel)
+
+			_, _, stop, err := drainPhasesOnce(t, d)
+			if err != nil || stop {
+				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+			}
+			if h.invokeCalls != 2 {
+				t.Fatalf("spawned %d sessions, want 2 — the fix phase must not run without a review record", h.invokeCalls)
+			}
+			// The resumed review claim carries HasWIP, so the refusal must NOT
+			// hand the task back to the queue: releasing it would throw away
+			// the takeover flag that tells the next clanker pushed work is
+			// waiting. The lease lapses and a takeover picks it up.
+			if len(rel.calls) != 0 {
+				t.Errorf("the refused review checkpoint released the task (%+v); a HasWIP claim must be left to lapse into a takeover", rel.calls)
+			}
+		})
+	}
+}
+
+// The freshness gate on the BRANCHLESS path: form (b)/(c) evidence has no
+// branch at all, so the review record is the only proof the review phase did
+// anything, and the same "changed since spawn" rule applies. The no-code fix
+// variant must spawn on a fresh record and not without one.
+func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
+	phases := []config.Phase{
 		{Name: config.ImplementPhaseName},
 		{Name: config.ReviewPhaseName},
 		{Name: config.FixPhaseName},
-	})
-	// rel.state is the zero TaskState: held, no outcome. The record is absent.
-	rel.state = plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+	}
+	settled := plane.TaskState{Status: "in_review", Outcome: "no-code delivery: the task body was updated\n"}
 
-	_, _, stop, err := drainPhasesOnce(t, d)
-	if err != nil || stop {
+	t.Run("a fresh record advances to the no-code fix", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(1, 0), openClaim())}, // no branch: form (b) settles the task
+			{res: held(okResult(1, 0), openClaim())}, // review-only: records and holds
+			{res: okResult(1, 0)},                    // no-code fix
+		}}
+		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		h.onInvoke = func(i int) {
+			if i == 1 { // the review appends its block below phase 1's record
+				st := rel.state["t-1"]
+				st.Outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: pass\n"
+				rel.state["t-1"] = st
+			}
+		}
+		d := phaseDriverWithReleaser(t, h, phases, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 3 {
+			t.Fatalf("spawned %d sessions, want 3 — a fresh record advances the no-code seam", h.invokeCalls)
+		}
+		p3 := h.invocations[2].Prompt
+		if !strings.Contains(p3, "there is NO branch") {
+			t.Errorf("the successor is not the no-code fix brief:\n%s", p3)
+		}
+	})
+
+	t.Run("an unchanged outcome is refused", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(1, 0), openClaim())},
+			{res: held(okResult(1, 0), openClaim())}, // review records nothing
+			{res: okResult(1, 0)},                    // must NEVER run
+		}}
+		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		d := phaseDriverWithReleaser(t, h, phases, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 2 {
+			t.Fatalf("spawned %d sessions, want 2 — the no-code fix must not run without a fresh record", h.invokeCalls)
+		}
+	})
+}
+
+// The seam's second read is as load-bearing as its first: the baseline the
+// freshness gate compares against is only worth having if the outcome can be
+// read AGAIN once the review session has ended. A plane that blips between the
+// two reads — the baseline read clean at spawn, the seam read failing after a
+// review that DID record — must be refused fail-closed: an unreadable outcome
+// cannot prove the record, and the alternative is advancing on the branch the
+// review phase merely inherited. This is the `!recordRead` arm of the gate, the
+// one arm no other fixture reaches: an unwired or always-erroring plane refuses
+// via the baseline arm (`!review.read`) before the seam read is ever attempted.
+func TestDrainPhases_ReviewSeamRefusesACheckpointItCannotReread(t *testing.T) {
+	outcome := "implemented: pushed the branch\n"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: resumedCheckpointed(5, 0.50)}, // records the block, healthy in every other way
+		{res: okResult(5, 0.05)},            // must NEVER run
+	}}
+	// The plane blips between the review's own session and the seam's read:
+	// the baseline read (before the attempt ladder) still succeeds, the
+	// review session records its block, and only the reread fails.
+	blip := false
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+			blip = true
+		}
+	}
+	rel := &wiredReleaser{
+		state: func() plane.TaskState {
+			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+		},
+		err: func() error {
+			if blip {
+				return errors.New("plane blip: read timeout")
+			}
+			return nil
+		},
+	}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
 	if h.invokeCalls != 2 {
-		t.Fatalf("spawned %d sessions, want 2 — the fix phase must not run without a review record", h.invokeCalls)
+		t.Fatalf("spawned %d sessions, want 2 — a checkpoint whose outcome cannot be reread cannot prove the record the fix phase would apply", h.invokeCalls)
 	}
-	if len(rel.calls) == 0 {
-		t.Error("the refused review checkpoint did not hand the task back; it would be stranded on an expiring lease")
+}
+
+// The gate's half of the interface: the heading counts only as its own line.
+// A substring match was the bug — `## Reviewer notes`, prose mentioning the
+// words, or an indented heading inside a code block all passed it.
+func TestReviewRecordLine(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome string
+		want    bool
+	}{
+		{"empty", "", false},
+		{"the heading alone", config.ReviewRecordHeading, true},
+		{"the heading on its own line", "delivered\n" + config.ReviewRecordHeading + "\n- verdict: pass\n", true},
+		{"a CRLF heading is still the heading", config.ReviewRecordHeading + "\r\n- verdict: pass\r\n", true},
+		{"a trailing space is still the heading", config.ReviewRecordHeading + "  \n", true},
+		{"a look-alike heading", "## Reviewer notes\n- verdict: pass\n", false},
+		{"the words inside prose", "the review block (## Review) is missing\n", false},
+		{"an indented heading", "  " + config.ReviewRecordHeading + "\n", false},
+		{"a heading glued to text", "x" + config.ReviewRecordHeading + "\n", false},
 	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reviewRecordLine(tc.outcome); got != tc.want {
+				t.Errorf("reviewRecordLine(%q) = %v, want %v", tc.outcome, got, tc.want)
+			}
+		})
+	}
+}
+
+// CLA-635/B5: the driver's structural read of the review record. Whatever the
+// reviewer wrote, the fix phase is listed the GRADE the driver computed: a MUST
+// with no evidence kind (the parenthesised token right after the severity) or
+// no evidence payload is a SHOULD; grounded MUSTs, SHOULDs and NITs keep their
+// grade. The digest is empty when there is nothing parseable to list, and it
+// reads the NEWEST block only, because that is the review this round is
+// applying.
+func TestReviewFindingsDigest(t *testing.T) {
+	const h = config.ReviewRecordHeading
+	round := func(findings ...string) string {
+		return "implemented: pushed\n\n" + h + "\n- reviewed tip: sha1\n- reviewed by: harness claude, model opus-test\n- verdict: findings\n### Findings\n" +
+			strings.Join(findings, "\n") + "\n"
+	}
+	tests := []struct {
+		name     string
+		outcome  string
+		want     []string // substrings the digest must carry
+		wantNone []string // substrings it must not
+	}{
+		{
+			name:    "a grounded MUST keeps its grade",
+			outcome: round("- R1 [must] (gate): `go test ./...` fails at loop.go:42 - the guard is unpinned. Required fix: pin it."),
+			want:    []string{"R1 [MUST]", "gate"},
+		},
+		{
+			name:     "a MUST with no evidence kind is listed as a SHOULD",
+			outcome:  round("- R1 [must] internal/loop/loop.go:7 - no evidence here. Required fix: add some."),
+			want:     []string{"R1 [SHOULD]", "downgraded"},
+			wantNone: []string{"R1 [MUST]"},
+		},
+		{
+			name:     "a MUST whose kind carries no payload is listed as a SHOULD",
+			outcome:  round("- R1 [must] (gate):"),
+			want:     []string{"R1 [SHOULD]", "downgraded"},
+			wantNone: []string{"R1 [MUST]"},
+		},
+		{
+			name:     "a kind with only whitespace after the colon is no payload",
+			outcome:  round("- R1 [must] (gate):   "),
+			want:     []string{"R1 [SHOULD]", "downgraded"},
+			wantNone: []string{"R1 [MUST]"},
+		},
+		{
+			name:     "a kind without the prescribed colon is no kind at all",
+			outcome:  round("- R1 [must] (gate) go test fails - internal/loop/loop.go:7 - the prefix is missing. Required fix: use `(gate):`."),
+			want:     []string{"R1 [SHOULD]"},
+			wantNone: []string{"R1 [MUST]"},
+		},
+		{
+			name:    "the severity token is case-insensitive and gets canonicalised",
+			outcome: round("- R1 [MUST] (doneWhen): \"PR into staging\" - x.go:1 - not met. Required fix: open it."),
+			want:    []string{"R1 [MUST]", "doneWhen"},
+		},
+		{
+			name:     "a downgraded uppercase MUST is still downgraded",
+			outcome:  round("- R1 [MUST] x.go:1 - no evidence. Required fix: add it."),
+			want:     []string{"R1 [SHOULD]", "downgraded"},
+			wantNone: []string{"R1 [MUST]"},
+		},
+		{
+			name:    "SHOULDs and NITs keep their grade and carry no downgrade note",
+			outcome: round("- R2 [should] x.go:2 - tidy. Required fix: tidy it.", "- R3 [nit] x.go:3 - wording. Required fix: none."),
+			want:    []string{"R2 [SHOULD]", "R3 [NIT]"},
+			// The raw finding text may itself say "downgraded"; the note only
+			// ever rides a demoted MUST, and neither line is one.
+			wantNone: []string{"[downgraded:"},
+		},
+		{
+			name:     "a malformed severity line is skipped, not guessed",
+			outcome:  round("- R1 [blocker] x.go:1 - not a grade. Required fix: none."),
+			wantNone: []string{"R1"},
+		},
+		{
+			name:     "the verdict-pass placeholder is not a finding",
+			outcome:  "done\n\n" + h + "\n- verdict: pass\n### Findings\n- none\n",
+			wantNone: []string{"The driver read"},
+		},
+		{
+			name:     "no block, no digest",
+			outcome:  "implemented: pushed\n",
+			wantNone: []string{"The driver read"},
+		},
+		{
+			name: "only the newest block is graded",
+			outcome: round("- R9 [must] old.go:1 - a previous round's finding. Required fix: ignore me.") +
+				"\n\nmore work\n\n" + h + "\n- reviewed tip: sha2\n- verdict: findings\n### Findings\n- R1 [should] new.go:2 - this round. Required fix: tidy.",
+			want:     []string{"R1 [SHOULD]"},
+			wantNone: []string{"R9"},
+		},
+		{
+			name:     "a later level-2 heading ends the block",
+			outcome:  round("- R1 [should] x.go:1 - tidy. Required fix: tidy.") + "\n## Fixes\n- R9 [must] x.go:9 - not in the review block. Required fix: ignore.",
+			want:     []string{"R1 [SHOULD]"},
+			wantNone: []string{"R9"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			digest := reviewFindingsDigest(tc.outcome)
+			for _, want := range tc.want {
+				if !strings.Contains(digest, want) {
+					t.Errorf("the digest does not carry %q:\n%s", want, digest)
+				}
+			}
+			for _, banned := range tc.wantNone {
+				if strings.Contains(digest, banned) {
+					t.Errorf("the digest carries %q, which it must not:\n%s", banned, digest)
+				}
+			}
+		})
+	}
+}
+
+// The unwired plane, pinned explicitly. fakeReleaser is a Releaser and nothing
+// more, so every test on it exercises the branch-evidence path the driver had
+// before the plane's task read existed. That path must stay intact for the
+// ordinary two-phase flow, and the review-only gate must fail CLOSED — not
+// open — when a target has no task-state reader to ask.
+func TestDrainPhases_UnwiredPlaneJudgesOnBranchEvidence(t *testing.T) {
+	t.Run("a non-final checkpoint still advances on the verified branch", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(10, 0.10)},
+			{res: okResult(5, 0.05)},
+		}}
+		d, rel := phaseDriver(t, h, twoPhases()) // final review: no record requirement
+		if _, wired := plane.Releaser(rel).(plane.TaskStateSource); wired {
+			t.Fatal("fakeReleaser implements TaskStateSource, so this test no longer exercises the unwired plane")
+		}
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 2 {
+			t.Fatalf("spawned %d sessions, want 2 — a verified branch is the whole checkpoint on an unwired plane", h.invokeCalls)
+		}
+	})
+
+	t.Run("the review-only seam refuses rather than advancing on the branch alone", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(10, 0.10)},
+			{res: resumedCheckpointed(5, 0.50)}, // holds the branch, records nothing the driver can read
+			{res: okResult(5, 0.05)},            // must NEVER run
+		}}
+		d, _ := phaseDriver(t, h, []config.Phase{
+			{Name: config.ImplementPhaseName},
+			{Name: config.ReviewPhaseName},
+			{Name: config.FixPhaseName},
+		})
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 2 {
+			t.Fatalf("spawned %d sessions, want 2 — with no task-state reader the seam cannot prove a review happened, so the fix must not spawn", h.invokeCalls)
+		}
+	})
 }
 
 // The variant arms of the review/fix selection are prompt-invisible to the
@@ -2390,11 +2903,17 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 // review's own record forbids and (b) push a tip past the reviewed one, making
 // the fix phase park a healthy task on a mismatch the DRIVER created.
 func TestSalvage_SkipsTheReviewOnlyPhase(t *testing.T) {
+	outcome := "implemented: pushed the branch\n"
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(1, 0)}, // implement: salvage runs
 		{res: checkpointed(1, 0)}, // review-only: must NOT salvage
 		{res: okResult(1, 0)},     // fix (no claim on the fixture, so nothing to salvage)
 	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review session records the block the seam requires
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+		}
+	}
 	cfg := fastCfg()
 	cfg.Prompt = ""
 	cfg.Phases = []config.Phase{
@@ -2402,7 +2921,9 @@ func TestSalvage_SkipsTheReviewOnlyPhase(t *testing.T) {
 		{Name: config.ReviewPhaseName},
 		{Name: config.FixPhaseName},
 	}
-	rel := &fakeReleaser{state: plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: config.ReviewRecordHeading}}
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+	}}
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	openTestStateDir(t, d)
 	d.cfg.WorkDir = t.TempDir()
