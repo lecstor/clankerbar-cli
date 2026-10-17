@@ -1633,6 +1633,18 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// The wait is bounded by retry_cap like every backoff(n), and STOP /
 	// RESTART / RELOAD are honoured through waitOrStop exactly as they are
 	// during the limit wait; the drain returns when it ends and Run polls again.
+	//
+	// Deliberately NOT fed into sidelineTarget, which the task that added this
+	// asked us to consider: a sideline says "this target's harness is broken,
+	// bench it" — its counters and log line are built for a drain that FAILED
+	// to run a session — and this end returns err == nil. Run's success branch
+	// would immediately clear the failure counter it read while leaving the
+	// 15m+ skipUntil in place, so the log would report "the harness succeeded
+	// again — rejoining the rotation" against a target still benched by a
+	// sit-out nothing would then account for. Doing it properly means
+	// redefining what a successful drain proves about the harness, well beyond
+	// this bound's need: the ladder's growth, capped by retry_cap, plus
+	// max_iterations is the brake the un-waited re-drain was missing.
 	if transientRung > 0 {
 		wait := d.resumedTransientDuration(transientRung)
 		log.Printf("iteration %d: the sequence is over and no lease is held — waiting %s before polling again (transient failure %d in a row on %s; the run stays up)",
