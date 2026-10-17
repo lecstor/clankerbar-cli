@@ -887,8 +887,9 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true " +
 	"and read the outcome's `" + ReviewRecordHeading + "` block. If the outcome carries no review block, that is a FAILED " +
-	"hand-off: say so in your outcome and hand the task over as the terminal step below requires - do NOT " +
-	"review the work yourself and do NOT invent findings. Read the record's reviewed tip and compare it with " +
+	"hand-off: park the task with update_task(status: \"parked\", outcome: ...) naming the missing record - do " +
+	"NOT review the work yourself, do NOT invent findings, and do NOT open a PR over unreviewed work. Read the " +
+	"record's reviewed tip and compare it with " +
 	"`git rev-parse HEAD` in the worktree: if they differ, the branch moved after the review, so do NOT apply " +
 	"stale findings - park the task with update_task(status: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
 	PhaseBranchPlaceholder + " recorded on the task, and never commit to the repo's PR base branch (" +
@@ -914,8 +915,9 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
 	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
 	"Then get_task with includeDecisions: true and read the outcome's `" + ReviewRecordHeading + "` block. If it carries no " +
-	"review block, that is a FAILED hand-off: say so and hand over as the terminal step below requires - do " +
-	"not invent findings. Apply the findings by AMENDING THE RECORD (update_task, record_decision) - never by " +
+	"review block, that is a FAILED hand-off: say so in your outcome, and park the task if it is still " +
+	"in_progress - if phase 1 already settled it, leave it settled and end. Do not invent findings. Apply the " +
+	"findings by AMENDING THE RECORD (update_task, record_decision) - never by " +
 	"inventing code, a branch or a PR. A finding that needs CODE cannot be fixed here: file it as its own task " +
 	"(create_task, with a real doneWhen) and say so in your outcome - do not re-open this task, do not rewrite " +
 	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
