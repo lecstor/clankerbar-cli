@@ -1248,25 +1248,34 @@ var noCodeFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + 
 	"hand-over. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
 	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the " +
 	"heartbeat because the task already left in_progress, that refusal is expected: the settlement IS the " +
-	"delivery, so proceed. Then get_task with includeDecisions: true. Read the released durable record " +
-	"(`reviews.records`) and the outcome's legacy `" + ReviewRecordHeading + "` block — the LAST such block, " +
-	"because an earlier one is an earlier round. Apply the findings by their PLANE ids, AMENDING THE RECORD " +
-	"(update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
+	"delivery, so proceed. Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading +
+	"` block in the outcome — an earlier one is an earlier round, so read past it. That block IS the round's " +
+	"record: the branchless review writes no durable record (question 03a12578, option 1), so read and apply " +
+	"from the block alone and do not treat an empty record set as a failed hand-off. Apply the findings by " +
+	"AMENDING THE RECORD (update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
 	" A finding that needs CODE cannot be fixed here: file it as its own task (create_task, with a real " +
 	"doneWhen) and say so in your outcome - for a MUST, that filed task is this phase's fix of it. If the " +
 	"review found nothing, change nothing." + rerunGuidance + fixTerminalRecord + noCodeFixOnlyTerminalStep +
 	handoffGuidance
 
-// verifyStoppingRule is the stopping rule every verification round runs under
-// (CLA-638, D7/A6/B7/B12/B13). It is shared by the code and no-code variants so
-// the bar cannot drift between them.
+// verifyStoppingRule is the stopping rule's core: what counts as a MUST that is
+// still open (CLA-638, D7/A6/B7/B12/B13). It is shared by the code and no-code
+// variants so the bar cannot drift between them; the ID-based machinery that
+// enforces it — the round cap and the non-convergence breaker — is
+// verifyDriverBounds, because the branchless variant has no plane finding ids
+// to count or park on.
 const verifyStoppingRule = " THE STOPPING RULE IS A BAR, NOT A FEELING. The gate is NO OPEN MUST. A MUST is open " +
 	"until it is fixed, filed as its own task, or refuted with evidence — a prior MUST that is neither stays " +
-	"open, and a refutation you reject also stays open. SHOULD and NIT findings are recorded, never gating. " +
-	"The driver counts rounds: this is a hard cap of three non-void rounds per review cycle (a human verdict " +
-	"starts a new cycle; a takeover or reclaim does not). At the cap, any open MUST is the driver's park, " +
-	"never another round. Non-convergence is also the driver's: a MUST left unresolved after two fix attempts, " +
-	"or an id a previous verifier marked resolved that you reopen, parks the task for a human."
+	"open, and a refutation you reject also stays open. SHOULD and NIT findings are recorded, never gating."
+
+// verifyDriverBounds is the id-based machinery the CODE-shaped verification
+// round runs under: the driver's round cap and non-convergence breaker, both
+// read from the plane's durable records.
+const verifyDriverBounds = " The driver counts rounds: this is a hard cap of three non-void rounds per review " +
+	"cycle (a human verdict starts a new cycle; a takeover or reclaim does not). At the cap, any open MUST is " +
+	"the driver's park, never another round. Non-convergence is also the driver's: a MUST left unresolved " +
+	"after two fix attempts, or an id a previous verifier marked resolved that you reopen, parks the task for " +
+	"a human."
 
 // verifyTerminalStep ends a verification round: the hand-over only when no MUST
 // remains open, otherwise a silent hold for the driver to spawn another fix.
@@ -1286,31 +1295,31 @@ const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. 
 	"no longer accepts a close from this run. Never decide to run one more round yourself."
 
 // noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
-// counterpart of verifyTerminalStep, and the move the fix-verify brief promises
-// the verifier makes ("the VERIFICATION round after you carries that terminal
-// step"). It must be this constant and not noCodeReviewOnlyTerminalStep: a
-// review-only phase hands the ending to the phase after it, while the verifier
-// is the LAST phase and there is nothing after it to hand over for it. There is
-// no PR to open and no push to check on a no-code delivery, so when no MUST
-// remains open the status move IS the whole hand-over — and the round close must
-// ride the same call, because after the task leaves in_progress the plane
-// refuses a close from this run. The fix phase has already written the
-// **Tests** section the in_review guard reads.
+// counterpart of verifyTerminalStep. This shape writes no durable record
+// (question 03a12578, option 1 — the branchless review writes none either), so
+// there is no round to release and no closeRound to make: the verifier appends
+// its OWN `## Review` block, which IS the record the driver's checkpoint reads,
+// and the disposition is an operator park (open MUST — the id-based loop the
+// driver runs cannot exist without plane finding ids) or the status move
+// (clean — the verifier carries the hand-over, and the fix phase has already
+// written the **Tests** section the in_review guard reads).
 const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
-	"any MUST is still open after your adjudication, and the round number the append returned.\n\n" +
-	"If ANY MUST remains open: release this round with ONE call — update_task(taskId, runId, review: " +
-	"{ closeRound: <the round the append returned> }) — then do NOT change the task's status and do NOT invent " +
-	"code, a branch or a PR. End holding the task. The driver spawns another fix against the released " +
-	"findings, or parks the task at the round cap.\n\n" +
-	"If NO MUST remains open, hand the task over in the SAME call that releases the round: there is no PR to " +
-	"open and nothing to push for a no-code delivery, so the status move is the whole hand-over — call " +
-	"update_task(taskId, runId, status: \"in_review\", review: { closeRound: <the round the append returned> }). " +
-	"Do NOT send an outcome in that call: your own sealed record makes the plane refuse a sealed holder's " +
-	"outcome write (review_sealed), and the fix phase has already written the **Tests** section the in_review " +
-	"guard reads. Releasing the round in the same call is what makes the status move legal — after the task " +
-	"leaves in_progress the plane no longer accepts a close from this run. If the task already left " +
-	"in_progress, do NOT re-open or re-settle it: verify the record reads honestly and end. Never decide to " +
-	"run one more round yourself."
+	"any MUST is still open after your adjudication, and whether the task still sits in_progress. The " +
+	"id-based machinery is the driver's and needs plane finding ids this shape does not have, so this " +
+	"terminal step is this shape's whole disposition.\n\n" +
+	"Append YOUR OWN legacy `" + ReviewRecordHeading + "` block to the task's outcome with " +
+	"update_task(taskId, runId, outcome: ...) — append, never replace what sits above it: the block IS this " +
+	"shape's round record, and the driver's checkpoint reads exactly it. There is no durable record to " +
+	"append, no round to close and no PR to open for a no-code delivery.\n\n" +
+	"If ANY MUST remains open: do NOT hand the task over — park it with update_task(taskId, runId, status: " +
+	"\"parked\", outcome: ...), carrying the open MUST(s) and why the amendment does not resolve them; the " +
+	"same disposition the round cap gives the id-based shape. If the task already left in_progress, do NOT " +
+	"re-open it: leave your block as the record and end.\n\n" +
+	"If NO MUST remains open: hand the task over. If it still sits in_progress with its no-code delivery " +
+	"declared, move it with update_task(taskId, runId, status: \"in_review\") — do NOT send an outcome in " +
+	"that call; your block write already landed and the fix phase wrote the **Tests** section the in_review " +
+	"guard reads. If it already left in_progress, the hand-over already happened: verify the record reads " +
+	"honestly and end. Never decide to run one more round yourself."
 
 // verifyBrief is the fix-verification round (CLA-638): review the fix delta plus
 // its regression surface, adjudicate every prior open MUST by its plane id, and
@@ -1359,7 +1368,7 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"(`<reviewedTip>..HEAD`), a verdict of pass or findings, and every new finding graded must/should/nit with " +
 	"the evidence a MUST requires. The durable record is the driver's seam evidence; the block is the " +
 	"one-release compatibility copy." +
-	verifyStoppingRule + verifyTerminalStep + rerunGuidance + handoffGuidance
+	verifyStoppingRule + verifyDriverBounds + verifyTerminalStep + rerunGuidance + handoffGuidance
 
 // noCodeVerifyBrief is verifyBrief for a branchless checkpoint: there is no
 // code delta to re-review, so the verification is of the plane record and the
@@ -1368,18 +1377,19 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 // nothing after it can carry the move the review-only ending defers).
 var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the VERIFICATION round for a task whose correct delivery is NO CODE. There is " +
-	"NO branch and no diff; the fix round amended the PLANE'S RECORD. The driver has prepended the PRIOR " +
-	"OPEN MUST ids with their findings. You are RESUMING that run, not starting a new one: do not call " +
-	"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - " +
-	"if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is expected: " +
-	"the settlement IS the delivery, so proceed. Then get_task with includeDecisions: true. Review the record " +
-	"amendment the fix made: does it resolve each prior open MUST, is it evidence rather than assertion, does " +
-	"the task's record still match its doneWhen? ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID through " +
-	"update_task(review: {findingUpdates: [...]}): RESOLVED (status \"fixed\"), RESOLVED BY DISPATCH " +
-	"(status \"filed\" with the follow-up task ref), REFUTATION ACCEPTED (status \"refuted\" with the reason), " +
-	"or UNRESOLVED with the finding left \"open\" and the reason in this round's record. You may raise new " +
-	"MUSTs only about the record changes and their regression surface. Do NOT invent code, a branch or a PR, " +
-	"and do NOT open a PR." +
+	"NO branch and no diff; the fix round amended the PLANE'S RECORD. The driver has prepended the LAST `" +
+	ReviewRecordHeading + "` block of the task's outcome — that block, not a durable record, is this shape's " +
+	"round record (question 03a12578, option 1). You are RESUMING that run, not starting a new one: do not " +
+	"call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
+	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"expected: the settlement IS the delivery, so proceed. Then get_task with includeDecisions: true. Review " +
+	"the amendment the fix made: does it resolve each prior open MUST, is it evidence rather than assertion, " +
+	"does the task's record still match its doneWhen? ADJUDICATE EVERY PRIOR OPEN MUST in the BLOCK's own " +
+	"terms — resolved, resolved by dispatch (the follow-up task's ref), refuted with evidence, or left open " +
+	"with your reason — and check on the ground what the amendment claims where you can. There are no plane " +
+	"finding ids to update on this shape, and do not treat the empty durable record set as a failed " +
+	"hand-off. You may raise new MUSTs only about the record changes and their regression surface. Do NOT " +
+	"invent code, a branch or a PR, and do NOT open a PR." +
 	verifyStoppingRule + noCodeVerifyTerminalStep + rerunGuidance + handoffGuidance
 
 // BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can

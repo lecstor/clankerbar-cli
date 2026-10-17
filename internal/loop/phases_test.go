@@ -4535,29 +4535,34 @@ func TestDrainPhases_VerificationSelfClosedRoundIsNotClosedTwice(t *testing.T) {
 }
 
 // TestDrainPhases_AHandoffDuringBranchlessFixVerifyStopsBeforeTheHandover: the
-// four-phase shape on a BRANCHLESS checkpoint. A fix session that hands off
-// mid-phase must not hand its successor the legacy no-code fix continuation,
-// which tells it to move the task to in_review — the move the verification
-// round after the fix owns (B12). The successor gets the no-code fix-verify
-// terminal instead, and the loop then runs its clean verification round, which
-// carries the no-code hand-over itself.
+// four-phase shape on a BRANCHLESS checkpoint, where the round's record is the
+// legacy `## Review` block and no durable record is written (CLA-670, question
+// 03a12578 option 1). A fix session that hands off mid-phase must not hand its
+// successor the legacy no-code fix continuation, which tells it to move the
+// task to in_review — the move the verification round after the fix owns
+// (B12). The successor gets the no-code fix-verify terminal instead, and the
+// branchless verification round then rests on its own block: the driver names
+// that shape rather than claiming the id-based stopping rule ran, and closes no
+// round because there is none.
 func TestDrainPhases_AHandoffDuringBranchlessFixVerifyStopsBeforeTheHandover(t *testing.T) {
+	logs := captureLogs(t)
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "declared no-code delivery\n", noCode: true}
 	h := &fakeAdapter{steps: []invokeStep{
-		{res: held(okResult(10, 0.10), openClaim())},                                               // implement: branchless checkpoint (plane record)
-		{res: held(okResult(5, 0.50), openClaim())},                                                // review: branchless record round
-		{res: handoffResult("Amended the record for the open MUST; the remaining findings next.")}, // fix hands off
-		{res: held(okResult(5, 0.05), openClaim())},                                                // the fix's successor
-		{res: held(okResult(5, 0.05), openClaim())},                                                // verify: clean, carries the hand-over
+		{res: held(okResult(10, 0.10), openClaim())},                                              // implement: branchless checkpoint (plane record)
+		{res: held(okResult(5, 0.50), openClaim())},                                               // review: appends its block
+		{res: handoffResult("Amended the block for the open MUST; the remaining findings next.")}, // fix hands off
+		{res: held(okResult(5, 0.05), openClaim())},                                               // the fix's successor
+		{res: held(okResult(5, 0.05), openClaim())},                                               // verify: appends its block, hands over
 	}}
 	h.onInvoke = func(i int) {
-		if i == 1 { // the branchless review records round 1
-			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", "", "sealed"))
+		if i == 1 { // the branchless review appends its block — no durable record on this shape
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: findings\n### Findings\n- R1 [must] the record is stale. Required fix: amend it.\n"
 		}
-		if i == 4 { // the verifier records round 2 and hands the task over itself
-			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", "", "sealed"))
-			rel.counted = 2
-			rel.openMusts = nil
+		if i == 3 { // the fix's successor amends the block
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: amendments\n### Fixes\n- R1: the record now reads honestly (no code delivery).\n"
+		}
+		if i == 4 { // the verifier appends its own block and carries the hand-over
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: pass\n### Findings\n- none\n"
 			rel.status = "in_review"
 		}
 	}
@@ -4579,11 +4584,42 @@ func TestDrainPhases_AHandoffDuringBranchlessFixVerifyStopsBeforeTheHandover(t *
 	if !strings.Contains(successor, "RERUN BOUND") {
 		t.Errorf("the branchless fix's handoff successor lost the rerun bound:\n%s", successor)
 	}
-	if len(rel.closes) != 2 || rel.closes[0] != 1 || rel.closes[1] != 2 {
-		t.Fatalf("closed rounds = %v, want [1 2] — the review and the verification round", rel.closes)
+	// The verifier is handed the branchless digest: the LAST block is the round
+	// record, and the empty durable record set is expected.
+	verifier := h.invocations[4].Prompt
+	for _, want := range []string{"BRANCHLESS task", "question 03a12578", "the record now reads honestly"} {
+		if !strings.Contains(verifier, want) {
+			t.Errorf("the branchless verification prompt does not carry %q:\n%s", want, verifier)
+		}
+	}
+	if len(rel.closes) != 0 {
+		t.Fatalf("closed rounds = %v, want none — the branchless shape writes no durable round", rel.closes)
 	}
 	if len(rel.parks) != 0 {
 		t.Fatalf("a clean branchless round parked: %v", rel.parks)
+	}
+	if out := logs.String(); !strings.Contains(out, "rests on the legacy") {
+		t.Errorf("the driver did not name the branchless round's shape in its log:\n%s", out)
+	}
+}
+
+// branchlessVerificationDigest: the no-code round adjudicates the block, not
+// plane ids, and the digest must carry the LAST block verbatim — and must not
+// read an empty durable set as a failed hand-off.
+func TestBranchlessVerificationDigest(t *testing.T) {
+	block := config.ReviewRecordHeading + "\n- verdict: findings\n### Findings\n- R1 [must] the record is stale.\n"
+	got := branchlessVerificationDigest("declared no-code delivery\n\n" + block)
+	for _, want := range []string{"BRANCHLESS task", "question 03a12578", "the LAST `" + config.ReviewRecordHeading + "` block below IS this round's record", block} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the branchless digest does not carry %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "reviews.records") {
+		t.Errorf("the branchless digest points at durable records, which this shape does not write:\n%s", got)
+	}
+	empty := branchlessVerificationDigest("declared no-code delivery\n")
+	if !strings.Contains(empty, "failed hand-off") || !strings.Contains(empty, config.ReviewRecordHeading) {
+		t.Errorf("a blockless branchless digest must name the missing block as a failed hand-off:\n%s", empty)
 	}
 }
 

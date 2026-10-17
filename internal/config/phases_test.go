@@ -1842,26 +1842,31 @@ func TestValidate_VerifyPhaseRules(t *testing.T) {
 // terminal step. A paraphrase that drops any of these reopens the loop the
 // stopping rule exists to close.
 func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
+	// The core bar is shared by both variants: the gate is no open MUST, and
+	// SHOULD/NIT never gate.
 	for name, brief := range map[string]string{
 		"verify":         verifyBrief,
 		"no-code verify": noCodeVerifyBrief,
 	} {
 		for _, want := range []string{
-			"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
-			"RESOLVED",
-			"REFUTATION ACCEPTED",
-			"UNRESOLVED",
+			"THE STOPPING RULE IS A BAR, NOT A FEELING",
 			"NO OPEN MUST",
-			"findingUpdates",
-			"three non-void rounds",
-			"takeover or reclaim does not",
 		} {
 			if !strings.Contains(brief, want) {
 				t.Errorf("%s brief does not carry %q", name, want)
 			}
 		}
 	}
+	// The ID-based machinery is the CODE shape's: plane ids to adjudicate by,
+	// the driver's round cap, and the non-convergence breaker.
 	for _, want := range []string{
+		"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
+		"RESOLVED",
+		"REFUTATION ACCEPTED",
+		"UNRESOLVED",
+		"findingUpdates",
+		"three non-void rounds",
+		"takeover or reclaim does not",
 		"fix-delta",
 		"ONLY within the fix delta",
 		`status: "in_review"`,
@@ -1874,29 +1879,35 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 			t.Errorf("the code verify brief does not carry %q", want)
 		}
 	}
-	if !strings.Contains(noCodeVerifyBrief, "do NOT open a PR") {
-		t.Errorf("the no-code verify brief must not hand over a PR:\n%s", noCodeVerifyBrief)
-	}
-	// The no-code verifier is the LAST phase, so IT carries the hand-over: the
-	// review-only ending (which defers to "the phase after you" and forbids the
-	// in_review move) would leave a branchless task unable to ever leave
-	// in_progress. The no-code terminal must carry the same round-close-and-move
-	// contract as the branch-shaped one, minus the PR and the push.
+	// The no-code variant is BLOCK-based (CLA-670, question 03a12578 option 1):
+	// no plane ids, no durable round to close, and its own terminal carries the
+	// hand-over (clean) or the operator park (open MUST) — the verifier is the
+	// LAST phase, so nothing after it can carry the move the review-only ending
+	// defers.
 	for _, want := range []string{
-		"NO MUST remains open",
+		"ADJUDICATE EVERY PRIOR OPEN MUST",
+		"the BLOCK's own terms",
+		"no durable record",
+		"no plane finding ids",
+		"the LAST",
 		`status: "in_review"`,
-		"closeRound",
-		"review_sealed",
+		`status: "parked"`,
+		"do NOT open a PR",
 	} {
 		if !strings.Contains(noCodeVerifyBrief, want) {
-			t.Errorf("the no-code verify brief does not carry %q, so its clean round could never hand the task over", want)
+			t.Errorf("the no-code verify brief does not carry %q", want)
 		}
 	}
-	if strings.Contains(noCodeVerifyBrief, "The phase after you decides") {
-		t.Errorf("the no-code verify brief defers the hand-over to a phase after it — there is none, and the fix-verify brief promised the verifier carries it:\n%s", noCodeVerifyBrief)
-	}
-	if strings.Contains(noCodeVerifyBrief, "COMMIT and PUSH") {
-		t.Errorf("the no-code verify brief tells a branchless verifier to commit and push:\n%s", noCodeVerifyBrief)
+	for _, unwanted := range []string{
+		"closeRound",
+		"review_sealed",
+		"findingUpdates",
+		"The phase after you decides",
+		"COMMIT and PUSH",
+	} {
+		if strings.Contains(noCodeVerifyBrief, unwanted) {
+			t.Errorf("the no-code verify brief carries %q — the branchless shape writes no durable round and has no plane ids", unwanted)
+		}
 	}
 }
 

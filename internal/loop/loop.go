@@ -1724,6 +1724,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					log.Printf("%siteration %d: the %s phase closed round %d with NO open MUST but left the task %q — it recorded a pass but did not carry the terminal step (push check, PR, in_review); the sequence ends without a hand-over for the operator to see",
 						labelOf(t), drainNum, ph.Label(i), end.verifyRound, end.verifyStatus)
 				}
+				if end.verifyRound == 0 {
+					// CLA-638 × CLA-670: a BRANCHLESS round. Its record is the
+					// legacy `## Review` block, so there is no plane open-MUST set
+					// for the id-based gate to read — the verifier's own block
+					// carried the verdict, and the sequence ends without claiming
+					// the id-based stopping rule ran (it cannot, on this shape).
+					log.Printf("iteration %d: the %s phase's verification round rests on the legacy %q block (this shape writes no durable record) — no plane open-MUST set to judge; ending the sequence",
+						drainNum, ph.Label(i), config.ReviewRecordHeading)
+					break
+				}
 				log.Printf("iteration %d: the %s phase closed round %d with NO open MUST — the stopping rule is satisfied and the sequence is done",
 					drainNum, ph.Label(i), end.verifyRound)
 				break
@@ -2856,6 +2866,23 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string)
 	return b.String()
 }
 
+// branchlessVerificationDigest is verificationDigest for a BRANCHLESS task
+// (CLA-638 × CLA-670): the branchless review writes no durable record (question
+// 03a12578, option 1), so there are no plane finding ids for the round to
+// adjudicate. The digest therefore hands the verifier the LAST `## Review`
+// block itself — the block IS this shape's round record — and says so up front,
+// because the empty record set is expected here and must not read as a failed
+// hand-off.
+func branchlessVerificationDigest(outcome string) string {
+	block := lastReviewBlock(outcome)
+	if block == "" {
+		return "The driver read the task before this round. This is a BRANCHLESS task (its correct delivery is no code) and the outcome carries NO `" +
+			config.ReviewRecordHeading + "` block: the review round either did not run or recorded nothing. Report that as a failed hand-off in your own block and hand over to a human; do not invent findings.\n\n"
+	}
+	return "The driver read the task before this round. This is a BRANCHLESS task (its correct delivery is no code): the branchless review writes no durable record and there are no plane finding ids (question 03a12578, option 1), so the LAST `" +
+		config.ReviewRecordHeading + "` block below IS this round's record — adjudicate it in its own terms, not by a plane id. The fix round amended it; verify the amendment.\n\n" + block + "\n"
+}
+
 // resolvedFindingIDs lists the MUST ids on released records that a verifier has
 // ALREADY marked resolved (fixed, filed or refuted). The driver remembers them
 // across the round loop: an id that is open again in a later round was reopened
@@ -3255,10 +3282,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		}
 		st, read := d.readTaskState(ctx, t, taskID)
 		if !read {
-			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's released review records could not be read, so the round would not know which MUST ids to adjudicate — the sequence ends here; the claim is released when it is releasable, else left to lapse into a takeover",
+			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's record could not be read, so the round would not know what to adjudicate — the sequence ends here; the claim is released when it is releasable, else left to lapse into a takeover",
 				labelOf(t), drainNum, ph.Label(phaseIdx))
 			end.empty = true
-			end.emptyWhy = "the task's released review records could not be read before the verification round spawned"
+			end.emptyWhy = "the task's record could not be read before the verification round spawned"
 			if prev != nil {
 				end.claim = prev
 				end.released = prev.Claim.Held()
@@ -3266,7 +3293,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			}
 			return 0, 0, false, end, nil
 		}
-		verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs)
+		if prev != nil && prev.Claim.Branch == "" {
+			// CLA-638 × CLA-670: a BRANCHLESS verification round has no plane
+			// finding ids to adjudicate (the branchless review writes no durable
+			// record), so the digest hands it the LAST legacy block instead.
+			verifyDigest = branchlessVerificationDigest(st.Outcome)
+		} else {
+			verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs)
+		}
 	}
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -
@@ -3567,6 +3601,22 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 						end.verifyResolvedIDs = resolvedFindingIDs(st.Reviews)
 						end.verifyStatus = st.Status
 					}
+				}
+			} else if evidenceOK && review.required {
+				// CLA-638 × CLA-670: the checkpoint rested on the legacy `## Review`
+				// block (the branchless arm of the gate), so there is no durable
+				// round to release and no plane open-MUST set to judge — the block
+				// is this shape's record. Read the task back anyway, for the status
+				// the hand-over log needs: a branchless verifier that recorded its
+				// pass but left the task in_progress must be named loudly, exactly
+				// as the id-based shape names it. A failed read ends the sequence
+				// fail-closed, like every other unreadable seam.
+				end.verifyRound = 0
+				if st, read := d.readTaskState(ctx, t, res.Claim.TaskID); !read {
+					evidenceOK = false
+					evidenceWhy = "the task could not be read after the branchless verification round, so its hand-over cannot be judged"
+				} else {
+					end.verifyStatus = st.Status
 				}
 			}
 			if !evidenceOK {

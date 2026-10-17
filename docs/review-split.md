@@ -176,7 +176,11 @@ branch — would pass it with nothing recorded at all. Two guards close that:
    no round to close; the fix brief that follows reads that block alone too —
    with no durable record there is no plane finding id to apply by and no
    `findingUpdates` call to make. Every branch-carrying variant gates on the
-   record.
+   record. A `verify` phase on a branchless task inherits the same shape: it
+   adjudicates the block, appends its own, and the driver neither counts rounds
+   nor reads plane ids for it — there are none — so a MUST the verifier leaves
+   open is a park (its brief says so), the same disposition the round cap gives
+   the id-based shape.
 
    One handoff residue, stated rather than hidden: a handoff respawn re-enters
    the phase under the SAME run and role, so a review session that writes its
@@ -269,6 +273,13 @@ records), and it adjudicates each one **by its plane id**
 (`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
 (`filed`), refutation accepted (`refuted`), or left open with a reason. New
 MUSTs are allowed only inside the delta and get new ids.
+
+On a **branchless** task (the CLA-670 shape above) the verifier follows the
+review's block-only path instead: no durable record, no plane finding ids, no
+round to close — it adjudicates the block and appends its own, and the driver's
+cap and breaker do not apply (there is nothing for them to count). The no-code
+brief's terminal carries that shape's disposition: the `in_review` move when it
+judges no MUST open, and a park for the operator when it leaves one open.
 
 The bounds are driver-enforced, because a conditional phase alone is not a
 bound:

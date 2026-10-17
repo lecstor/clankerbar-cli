@@ -118,7 +118,11 @@ option 1): a **branchless** (settled-task) checkpoint keeps the legacy block
 gate above, because the plane accepts review writes only from the task's LIVE
 holder and no run holds a task its own session settled — its brief prescribes
 the `## Review` block alone, no round exists to close, and the fix phase that
-follows reads that block alone too.
+follows reads that block alone too. A `verify` phase on such a task follows the
+same shape: it adjudicates the block, appends its own, and hands the task over
+when it judges no MUST open — the driver neither loops nor counts rounds there
+(the id-based machinery needs plane finding ids this shape does not have), and
+a MUST the verifier leaves open is **parked** for the operator instead.
 
 The **`fix`** phase is the last one and runs on the cheap harness — unless a
 `verify` phase follows it, in which case the PR and hand-over belong to the
