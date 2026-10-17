@@ -1126,10 +1126,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	drainStart := time.Now()
 	var (
 		phasesRun []string // distinct phase labels attempted, in order
-		seen      harness.Claim
-		parkFired bool // the per-task dead budget parked the task
-		tripFired bool // the fleet dead counter tripped and paused this target
-		finalDisp string
+		// CLA-630: one entry per session this drain spawned, in spawn order —
+		// every pass through the loop below (a configured phase, a handoff
+		// respawn, a dead- or empty-retry re-run), with the harness and model
+		// each actually spawned with. A retry ladder INSIDE one phase is one
+		// session re-run, not a new one; see drainPhase's phaseEnd.session.
+		sessionsRun []fleet.Session
+		seen        harness.Claim
+		parkFired   bool // the per-task dead budget parked the task
+		tripFired   bool // the fleet dead counter tripped and paused this target
+		finalDisp   string
 		// CLA-631/CLA-651: the wait a RESUMED phase's sequence-end signal asks
 		// the run for (nil when the signal owes none). Waitable ends — a rolling
 		// limit — are owed AFTER the sequence's handback, so the wait is taken
@@ -1160,6 +1166,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			TaskID:          seen.TaskID,
 			TaskRef:         seen.Ref,
 			Phases:          phasesRun,
+			Sessions:        sessionsRun,
 			Outcome:         outcome,
 			DurationSeconds: time.Since(drainStart).Seconds(),
 			Tokens:          tokens,
@@ -1289,6 +1296,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		})
 		tokens += ptokens
 		cost += pcost
+		// CLA-630: one entry per session this pass spawned, in spawn order. nil
+		// means the pass never launched a session (a harness or spawn-dir
+		// refusal above), which is nothing to record.
+		if end.session != nil {
+			sessionsRun = append(sessionsRun, *end.session)
+		}
 		finalDead = end.dead
 		lastProducedNothing = end.producedNothing
 		// CLA-466: the record's task identity and claim disposition follow EVERY
@@ -1633,6 +1646,13 @@ type phaseEnd struct {
 	// final-phase death — so it deliberately does not feed the counters or the
 	// seam, whose !last gating is pinned by its own tests.
 	producedNothing bool
+
+	// session is the harness session this pass spawned, for the fleet record's
+	// sessions list (CLA-630): the phase label, the resolved harness and the
+	// resolved model the spawn line named. Only the fleet record reads it.
+	// nil means the pass spawned nothing (a harness or spawn-dir resolution
+	// refused before any Invoke), which is not a session to report.
+	session *fleet.Session
 
 	// empty reports a held-but-empty exit — the 2026-08-24 fleet-incident shape:
 	// the phase ended cleanly still holding the task with NO durable,
@@ -2616,6 +2636,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		if res.Claim.TaskID != "" {
 			end.claim = &res
 		}
+		// CLA-630: the session this pass actually spawned, in exactly the words
+		// the spawn line above used — the phase's label, the phase's resolved
+		// harness, and the resolved model (empty when the harness default
+		// applied; never guessed). Set on every attempt, so the LAST attempt's
+		// values are the ones that ride: a retry within the ladder is the same
+		// session re-run, and the only way its values can differ between
+		// attempts is a reload landing mid-ladder.
+		end.session = &fleet.Session{Phase: ph.Label(phaseIdx), Harness: a.Name(), Model: inv.Model}
 		// The wider classification rides the end for the fleet record only — see
 		// phaseEnd.producedNothing.
 		end.producedNothing = producedNothing
@@ -3509,7 +3537,14 @@ func (d *Driver) releaseCarriedEnd(ctx context.Context, t Target, end phaseEnd) 
 	// live claim upstream.
 	held := end.claim.Claim.Held()
 	d.releaseCarried(ctx, t, end.claim)
-	return phaseEnd{released: held}
+	// The session rides the reconstruction (CLA-630): it is record data for the
+	// fleet iteration record, not a hold to undo, and the pass it names really
+	// did spawn. The limit branch calls this BEFORE its stop paths return — a
+	// reset past the run's ceiling, a stop during the wait, a retry that fails
+	// to launch — and dropping the field there would omit a spawned session
+	// from the record. On the paths that loop back, the next attempt's own end
+	// replaces this one, so carrying it costs nothing.
+	return phaseEnd{released: held, session: end.session}
 }
 
 // countUndeclared says whether THIS call site is the one where a held-with-work
