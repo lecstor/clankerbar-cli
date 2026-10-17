@@ -64,6 +64,92 @@ type TaskState struct {
 	// (CLA-451), extended rather than duplicated (CLA-497) — so a reader of
 	// the holder state never needs a second round-trip to learn it.
 	DeliveryNoCode bool
+
+	// Outcome is the task's outcome text. The review seam reads the legacy
+	// `## Review` block off it (CLA-637 keeps writing that block for one
+	// release), and the fix phase's structural grading falls back to it when no
+	// durable record is available. The field is descriptive like the rest: a
+	// caller that does not need it ignores it.
+	Outcome string
+
+	// Reviews is the task's durable per-reviewer review records, as get_task
+	// serves them (CLA-636/637). The review→fix seam gate keys on one record's
+	// round, reviewer role, run and reviewed tip; the fix phase's digest reads
+	// the released findings. Records still sealed in an open round carry no
+	// findings, by the plane's design — the driver gates on their metadata.
+	Reviews []ReviewRecordState
+	// ReviewCounted is the plane's count of non-void rounds in the newest
+	// record's cycle. Zero when the task has no reviews.
+	ReviewCounted int
+	// ReviewOpenMustIDs is every open MUST on a RELEASED record, by the plane's
+	// finding id. Empty while a round is sealed.
+	ReviewOpenMustIDs []string
+	// ReviewsTotal is how many durable records the task has. The plane serves
+	// only the newest few in Reviews, so a total above len(Reviews) means older
+	// records were left out.
+	ReviewsTotal int
+}
+
+// ReviewRecordState is one durable review record's metadata (and, once the
+// round is closed, its findings). The wire shape is the compact `reviews`
+// block on get_task; see clankerbar's CLA-636 for the store.
+type ReviewRecordState struct {
+	ID           string
+	Round        int
+	Cycle        int
+	ReviewerRole string
+	// RunID is the run that wrote the record — the seam gate's freshness key.
+	// A record from an earlier trip has a different run and cannot satisfy it.
+	RunID       string
+	Harness     string
+	Model       string
+	Branch      string
+	ReviewedTip string
+	Scope       ReviewScopeState
+	Verdict     string
+	// State is the plane's seal state: sealed (round open, findings withheld),
+	// open (round closed, findings released) or void (aborted by lease expiry
+	// or takeover).
+	State         string
+	Counts        ReviewSeverityCounts
+	FindingsTotal int
+	At            string
+	Findings      []ReviewFindingState
+}
+
+// ReviewScopeState is what a record says it reviewed.
+type ReviewScopeState struct {
+	Kind  string
+	Base  string
+	Range string
+}
+
+// ReviewSeverityCounts is the compact per-severity count on every record,
+// served even while sealed.
+type ReviewSeverityCounts struct {
+	Must   int
+	Should int
+	Nit    int
+}
+
+// ReviewFindingState is one graded finding as the plane serves it. ID is the
+// plane-assigned key (`<round>.<reviewer role>.<n>`) the fix phase updates by;
+// RaisedByModel is the per-finding attribution the analytics need.
+type ReviewFindingState struct {
+	ID            string
+	Severity      string
+	EvidenceKind  string
+	Evidence      string
+	File          string
+	Line          int
+	Kind          string
+	Summary       string
+	RequiredFix   string
+	RaisedByModel string
+	Status        string
+	FixCommit     string
+	RefutedReason string
+	FiledTaskRef  string
 }
 
 // TaskStateSource reads one task's holder state, for the CLA-451 checkpoint
@@ -160,11 +246,16 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 		w = *payload.Task
 	}
 	return TaskState{
-		Status:         wireString(w.Status),
-		Ref:            wireString(w.Ref),
-		ClaimedByRun:   wireString(w.ClaimedByRun),
-		Branch:         wireString(w.Branch),
-		DeliveryNoCode: w.Delivery != nil && wireBool(w.Delivery.NoCode),
+		Status:            wireString(w.Status),
+		Ref:               wireString(w.Ref),
+		ClaimedByRun:      wireString(w.ClaimedByRun),
+		Branch:            wireString(w.Branch),
+		DeliveryNoCode:    w.Delivery != nil && wireBool(w.Delivery.NoCode),
+		Outcome:           wireString(w.Outcome),
+		Reviews:           wireReviews(w.Reviews),
+		ReviewCounted:     wireReviewsCounted(w.Reviews),
+		ReviewsTotal:      wireReviewsTotal(w.Reviews),
+		ReviewOpenMustIDs: wireReviewsOpenMustIDs(w.Reviews),
 	}, nil
 }
 
@@ -174,9 +265,186 @@ type taskHolderWire struct {
 	Ref          any `json:"ref"`
 	ClaimedByRun any `json:"claimedByRun"`
 	Branch       any `json:"branch"`
+	Outcome      any `json:"outcome"`
 	Delivery     *struct {
 		NoCode any `json:"noCode"`
 	} `json:"delivery"`
+	// The compact `reviews` block (CLA-636): present only when the task has
+	// durable review records.
+	Reviews *reviewsWire `json:"reviews"`
+}
+
+// reviewsWire is the compact reviews block get_task serves when a task has
+// durable records. OpenMustIDs is only present when a RELEASED record has open
+// MUSTs; absent on a task with no reviews or a sealed round.
+type reviewsWire struct {
+	Records     []reviewRecordWire `json:"records"`
+	Total       any                `json:"total"`
+	Counted     any                `json:"counted"`
+	OpenMustIDs any                `json:"openMustIds"`
+}
+
+// reviewRecordWire is one record of the get_task `reviews` block. Every field
+// is decoded through a narrowing helper: the block is descriptive, and one
+// unexpected shape must not fail a seam decision that the branch evidence can
+// still answer.
+type reviewRecordWire struct {
+	ID           any `json:"id"`
+	Round        any `json:"round"`
+	Cycle        any `json:"cycle"`
+	ReviewerRole any `json:"reviewerRole"`
+	RunID        any `json:"runId"`
+	Harness      any `json:"harness"`
+	Model        any `json:"model"`
+	Branch       any `json:"branch"`
+	ReviewedTip  any `json:"reviewedTip"`
+	Scope        *struct {
+		Kind  any `json:"kind"`
+		Base  any `json:"base"`
+		Range any `json:"range"`
+	} `json:"scope"`
+	Verdict any `json:"verdict"`
+	State   any `json:"state"`
+	Counts  *struct {
+		Must   any `json:"must"`
+		Should any `json:"should"`
+		Nit    any `json:"nit"`
+	} `json:"counts"`
+	FindingsTotal any           `json:"findingsTotal"`
+	At            any           `json:"at"`
+	Findings      []findingWire `json:"findings"`
+}
+
+type findingWire struct {
+	ID            any `json:"id"`
+	Severity      any `json:"severity"`
+	EvidenceKind  any `json:"evidenceKind"`
+	Evidence      any `json:"evidence"`
+	File          any `json:"file"`
+	Line          any `json:"line"`
+	Kind          any `json:"kind"`
+	Summary       any `json:"summary"`
+	RequiredFix   any `json:"requiredFix"`
+	RaisedByModel any `json:"raisedByModel"`
+	Status        any `json:"status"`
+	FixCommit     any `json:"fixCommit"`
+	RefutedReason any `json:"refutedReason"`
+	FiledTaskRef  any `json:"filedTaskRef"`
+}
+
+// wireReviews shapes the compact reviews block into the driver's view. A nil
+// block (no records, or an older plane) yields nil, which is exactly "nothing
+// durable to gate on".
+func wireReviews(block *reviewsWire) []ReviewRecordState {
+	if block == nil {
+		return nil
+	}
+	out := make([]ReviewRecordState, 0, len(block.Records))
+	for _, r := range block.Records {
+		rec := ReviewRecordState{
+			ID:            wireString(r.ID),
+			Round:         wireInt(r.Round),
+			Cycle:         wireInt(r.Cycle),
+			ReviewerRole:  wireString(r.ReviewerRole),
+			RunID:         wireString(r.RunID),
+			Harness:       wireString(r.Harness),
+			Model:         wireString(r.Model),
+			Branch:        wireString(r.Branch),
+			ReviewedTip:   wireString(r.ReviewedTip),
+			Verdict:       wireString(r.Verdict),
+			State:         wireString(r.State),
+			FindingsTotal: wireInt(r.FindingsTotal),
+			At:            wireString(r.At),
+		}
+		if r.Scope != nil {
+			rec.Scope = ReviewScopeState{
+				Kind:  wireString(r.Scope.Kind),
+				Base:  wireString(r.Scope.Base),
+				Range: wireString(r.Scope.Range),
+			}
+		}
+		if r.Counts != nil {
+			rec.Counts = ReviewSeverityCounts{
+				Must:   wireInt(r.Counts.Must),
+				Should: wireInt(r.Counts.Should),
+				Nit:    wireInt(r.Counts.Nit),
+			}
+		}
+		for _, f := range r.Findings {
+			rec.Findings = append(rec.Findings, ReviewFindingState{
+				ID:            wireString(f.ID),
+				Severity:      wireString(f.Severity),
+				EvidenceKind:  wireString(f.EvidenceKind),
+				Evidence:      wireString(f.Evidence),
+				File:          wireString(f.File),
+				Line:          wireInt(f.Line),
+				Kind:          wireString(f.Kind),
+				Summary:       wireString(f.Summary),
+				RequiredFix:   wireString(f.RequiredFix),
+				RaisedByModel: wireString(f.RaisedByModel),
+				Status:        wireString(f.Status),
+				FixCommit:     wireString(f.FixCommit),
+				RefutedReason: wireString(f.RefutedReason),
+				FiledTaskRef:  wireString(f.FiledTaskRef),
+			})
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+// wireReviewsCounted is the non-void round count the plane serves beside the
+// records. Zero when the block or the field is absent (no reviews, old plane).
+func wireReviewsCounted(block *reviewsWire) int {
+	if block == nil {
+		return 0
+	}
+	return wireInt(block.Counted)
+}
+
+// wireReviewsTotal is the task's full record count, served beside the newest
+// records get_task carries.
+func wireReviewsTotal(block *reviewsWire) int {
+	if block == nil {
+		return 0
+	}
+	return wireInt(block.Total)
+}
+
+// wireReviewsOpenMustIDs is the released open-MUST list, absent while a round
+// is sealed or when the task has no reviews.
+func wireReviewsOpenMustIDs(block *reviewsWire) []string {
+	if block == nil {
+		return nil
+	}
+	return wireStrings(block.OpenMustIDs)
+}
+
+// wireInt narrows a decoded JSON number. JSON decodes numbers as float64 into
+// an `any`; a non-number is absent, like every other descriptive field.
+func wireInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	}
+	return 0
+}
+
+// wireStrings narrows a decoded JSON string array (openMustIds).
+func wireStrings(v any) []string {
+	raw, ok := v.([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if s, ok := item.(string); ok && s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 // wireString narrows a decoded JSON field the plane sends as a string or null

@@ -118,6 +118,13 @@ type Check struct {
 	// it happened: it names what is unpushed or unmerged, not just that something
 	// is wrong.
 	Detail string
+	// Tip is the REMOTE commit a passing BranchPushed check read (CLA-637) —
+	// the origin tip the hand-off names, carried so the driver's checkpoint can
+	// hand the review phase the exact revision to review and its seam can
+	// require the durable review record to name that same revision. Full SHA,
+	// because the reviewer compares it with `git rev-parse HEAD`. Empty on
+	// anything but a Pass: there is no verified remote tip to name.
+	Tip string
 }
 
 // Report is everything the driver learned about one session's delivery claim.
@@ -394,7 +401,7 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 			branch, remote, short(local), repo)}
 	}
 	if remoteSHA == local {
-		return Check{Kind: BranchPushed, Status: Pass, Detail: fmt.Sprintf(
+		return Check{Kind: BranchPushed, Status: Pass, Tip: remoteSHA, Detail: fmt.Sprintf(
 			"%s/%s is at %s, matching the local tip", remote, branch, short(local))}
 	}
 
@@ -412,7 +419,7 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 	}
 
 	if v.isAncestor(ctx, repo, local, remoteSHA) {
-		return Check{Kind: BranchPushed, Status: Pass, Detail: fmt.Sprintf(
+		return Check{Kind: BranchPushed, Status: Pass, Tip: remoteSHA, Detail: fmt.Sprintf(
 			"local tip %s is an ancestor of %s/%s (%s)", short(local), remote, branch, short(remoteSHA))}
 	}
 	return Check{Kind: BranchPushed, Status: Fail, Detail: fmt.Sprintf(

@@ -55,10 +55,14 @@ harness-agnostic, where `--autocompact` is Claude-only. The two compose, and
 trying autocompact inside a long phase costs nothing.
 
 `phases` splits one task across several sessions, so the context resets at that
-checkpoint:
+checkpoint. The shipped shape is three phases:
 
 ```json
-"phases": [{ "name": "implement" }, { "name": "review" }]
+"phases": [
+  { "name": "implement" },
+  { "name": "review", "tier": "strong" },
+  { "name": "fix", "tier": "cheap" }
+]
 ```
 
 Phase 1 claims the task, implements it in a worktree cut from the repo's
@@ -69,17 +73,181 @@ step is to merge the integration branch into it - a merge, never a rebase,
 since rewriting pushed history breaks tip comparison - and re-validate the task
 against the merged tip before touching what it found: superseded means record
 the decision and park the task with an outcome saying so, or salvage only what
-still adds value - never verify-and-push stale work. Phase 2 starts on a
-**fresh context**, resumes the *same* run (the driver substitutes the task and
-run ids into its brief, so it calls `heartbeat` instead of claiming), re-reads
-the bar and the standing decisions from the plane, works in
-that same worktree — never on the integration branch itself — runs the
-adversarial review, fixes what it finds, pushes, opens a PR targeting the
-integration branch if no PR exists yet for the branch, and hands the task to
-`in_review`. The claim is held across the seam, so the task is never posted back
-to the queue mid-sequence. See [`docs/releases.md`](./docs/releases.md) for what
-happens to that PR after `in_review` — merged by a clanker only once a human
-approves it, promoted to a release only by the operator.
+still adds value - never verify-and-push stale work.
+
+The **`review`** phase starts on a **fresh context**, resumes the *same* run (the
+driver substitutes the task and run ids into its brief, so it calls `heartbeat`
+instead of claiming), re-reads the bar and the standing decisions from the
+plane, works in that same worktree — never on the integration branch itself —
+reads the diff and runs the adversarial review gate. It is **review only**: it
+does not edit, commit, push, open a PR, or move the task. Its deliverable is the
+review record on the task: a sealed per-reviewer durable record written through
+`update_task(review: ...)` — round, reviewer role, the phase's resolved
+harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
+severity grade and `raisedByModel` — plus, for one release, the legacy block
+in the outcome (`update_task(outcome: ...)`, no status move) carrying the
+reviewed tip, both sides' harness/model, the `verdict`, and every finding by ID
+with the required fix. Findings are graded
+— `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
+evidence, one of: a quoted `doneWhen` clause the change violates; a repo gate
+that fails or would fail (with the command and the output, or why it would
+fail); a concrete failure scenario in the change or its direct regression
+surface; a security exposure (credential exposure, an authorization bypass,
+injection, a widened permission — with the path); a contradicted standing
+decision (by id) or a hard rule in the repo's agent instructions (file + rule);
+an irreversible migration, deletion or publish step missing the guard the repo
+requires; or a new or changed guard, gate or state transition with no test that
+pins it (its file:line and the missing test). Never a `must`, however confident
+the reviewer: style, naming, a design they would prefer, a performance concern
+without a measurement, documentation wording, or missing tests the bar does not
+require — and where a repo hard rule concerns style, prose or documentation
+wording, that never-`must` list wins. The block is
+**appended below** whatever the outcome already carries — a statusless outcome
+replaces the field wholesale — and the driver refuses to advance to `fix` unless
+the plane serves a durable record **this run** wrote under this phase's
+reviewer role whose reviewed tip equals the branch tip the driver verified on
+origin: an earlier trip's record (a `request_changes` rework, a takeover) never
+satisfies it. Before a review session is spawned at all, the driver reads the
+task's baseline and retries the read; if it stays unread the sequence ends
+without the review — a session whose record the seam could not judge against
+the task it found is pure waste (CLA-663). Before spawning `fix` the driver
+**closes the round**, which is what releases the sealed findings to the fixer.
+The claim is held across the seam, so the task is never posted back to the queue
+mid-sequence. One variant is the deliberate exception (question 03a12578,
+option 1): a **branchless** (settled-task) checkpoint keeps the legacy block
+gate above, because the plane accepts review writes only from the task's LIVE
+holder and no run holds a task its own session settled — its brief prescribes
+the `## Review` block alone, no round exists to close, and the fix phase that
+follows reads that block alone too. A `verify` phase on such a task follows the
+same shape: it adjudicates the block, appends its own, and hands the task over
+when it judges no MUST open — the driver neither loops nor counts rounds there
+(the id-based machinery needs plane finding ids this shape does not have), and
+a MUST the verifier leaves open is **parked** for the operator instead.
+
+The **`fix`** phase is the last one and runs on the cheap harness — unless a
+`verify` phase follows it, in which case the PR and hand-over belong to the
+verifier (see below). It resumes the
+same run, reads the released durable record back with `get_task` — and, for one
+release, the **last** `## Review` block beside it, because a re-trip can carry
+several — checks the record's reviewed tip still matches the worktree's HEAD,
+and applies every finding by its plane ID
+(or records why not). The driver has already read the record and listed the
+graded findings in the fix brief, applying the structural check the fixer must
+not second-guess: a `must` recorded without an evidence kind or payload is
+listed as a `should`. Every listed `must` is fixed, or refuted with evidence
+recorded in its outcome — a `must` is never downgraded, and one raised by a
+single reviewer is never dropped because nobody else raised it. Cheap `should`s
+are fixed; `nit`s and the rest are recorded as not done with a reason (a
+follow-up task only for a `should` worth doing). The fixer re-verifies scoped to
+those fixes, commits and pushes them, opens a PR targeting the repo's PR base if
+none exists yet for the branch, and hands the task to `in_review`. Its outcome
+keeps everything above that **last** block — earlier rounds included — and
+carries the review forward with a `### Fixes` list and both sides' attribution,
+so the task holds the whole round: who reviewed, what was found, what was done
+about it. See
+[`docs/releases.md`](./docs/releases.md) for what happens to that PR after
+`in_review` — merged by a clanker only once a human approves it, promoted to a
+release only by the operator.
+
+**The `verify` phase closes the loop (optional, and interim).** Add a fourth
+phase to re-review the fixes instead of trusting the fixer's own account:
+
+```json
+"phases": [
+  { "name": "implement" },
+  { "name": "review", "tier": "strong" },
+  { "name": "fix", "tier": "cheap" },
+  { "name": "verify" }
+]
+```
+
+With a `verify` phase configured, `fix` stops after committing and pushing: it
+does **not** open the PR or move the task to `in_review`. The verifier then
+reviews the **fix delta** — the reviewed tip the previous record names up to
+`HEAD`, plus the regression surface those fixes touch, not the whole diff again
+— and adjudicates every prior open MUST **by its plane finding id**
+(`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
+(`filed`), refutation accepted (`refuted`), or left open with a reason. It may
+raise new MUSTs only inside the delta. The fixer marks the MUSTs it answers itself, so the driver
+also hands the verifier every MUST of the current review cycle already marked
+`fixed`, `refuted` or `filed`, with the fixer's evidence: a refutation changes
+no code and would not show in the delta. The verifier confirms each marking or
+sets it back to open, which keeps the gate shut. A fix round after a
+verification round is handed every MUST still open on any released record, not
+only the newest record's findings.
+
+The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
+verification round that ends with none carries the terminal step — push check,
+PR, and a `status: "in_review"` move. It releases its own round in that same
+`update_task` call (`review: {closeRound: …}`), because the plane refuses a
+sealed holder's outcome write and refuses a close after the task has left
+`in_progress`; the fix phase has already written the outcome with the
+`**Tests**` section the `in_review` guard reads. A round with any open MUST
+releases its round the same way but ends **without** the PR and without moving
+the task; the driver spawns another `fix`, then verifies again. SHOULD and NIT
+findings are recorded and never gate: they ride to `in_review` in the outcome.
+
+Two bounds make the loop terminate:
+
+- **Round cap 3 per review cycle.** The plane counts non-void rounds, so a void
+  round (lease expiry or takeover) does not count and a human verdict starts a
+  new cycle; a takeover or reclaim does not reset the count. At the cap, any
+  open MUST **parks** the task with a question carrying the records — never one
+  more round. Only SHOULD/NIT may ride to `in_review`.
+- **Non-convergence breaker.** A MUST id still open after two fix attempts, or
+  one a verifier marked resolved that a later verifier reopens, parks the task
+  with a question instead of spending another round on the disagreement.
+
+The verifier is configurable like any phase (`harness`, `tier`). Left unset, it
+inherits the **fix** phase's harness and tier — the cheap, non-reviewer side of
+the split — because verification rounds are scoped and cheap and a reviewer's
+Claude subscription limit is shared with the operator's interactive use. In the
+shipped example above that means the verifier runs on opencode, not on the
+expensive review model.
+
+This loop is **interim**. It lives in the CLI's `drainPhases` because it ships
+before the state-machine reshape, which moves phase sequencing and the
+`agent_review → implementing` transition onto the plane (B10); the round and
+verification logic here is deliberately small so that reshape can replace it
+rather than untangle it.
+
+**A final `review` keeps the old combined brief.** The read-only mode is selected
+by position: a `review` with a phase after it is the gate, while a sequence
+ending on `review` still runs the historical review-and-fix brief, so an
+existing `[implement, review]` config keeps working exactly as it did. An
+existing config with a **custom-prompt phase after `review`** changes meaning in
+this release: that `review` used to run the combined review-and-fix brief and
+open the PR itself — it is now the read-only gate, and the custom phase after it
+is expected to apply the findings. New configs should use the three-phase shape
+— the saving is precisely the work that moves off the expensive model — or the
+four-phase shape when the fixes need an independent verification round. `fix`
+must follow a `review` and is either the last phase or is followed directly by
+`verify`; `verify` must be last and must directly follow `fix`. Validation
+refuses a sequence that violates any of those rules, including a verification
+loop with no fix between its rounds (it could not make progress). The full
+design, including the plane half that would store
+review history durably, is in
+[`docs/review-split.md`](./docs/review-split.md).
+
+A usage limit that lands on a **resumed** phase is the one exception to the
+driver waiting out caps inside the session that hit one: a wait of hours would
+outlive the 30-minute lease the resumed phase is working, re-spawning it
+against a run the plane has swept. So there the **sequence** ends instead —
+the lease is left to lapse into a takeover with its branch recorded — but the
+**run** does not: it waits the limit out holding no lease, probing exactly as
+it would have inside the phase, and carries on polling when the cap lifts.
+Only a hard stop (`lim.Stop`, credit exhausted) — or a reset landing past the
+run's remaining `budget.max_wall_clock` — ends the daemon there.
+
+A transient server/network blip on a resumed phase ends its sequence for the
+same lease reason — the backoff ladder would walk past the 30-minute lease —
+and the run stays up there too. There is no reset to wait out, but the
+sequence still owes a wait: the run waits a backoff that grows with the
+consecutive blips on that target and harness, and starts over the moment a
+resumed phase there completes. That reset-per-harness is what makes the bound
+real when the phases run on different providers — review on claude can keep
+blipping while implement on opencode stays healthy, and nothing else in the
+run would keep it from re-draining the instant the last sequence ended.
 
 The split works because each phase's prompt is a **scope** instruction — "your
 job this session is implementation only, then stop" — rather than a request that
@@ -94,8 +262,9 @@ runs, so this trades a driver that cannot lose a task for one that can leave it
 half-done if the sequence is interrupted. The budget breaker fires at the phase
 boundary too. Two other consequences worth knowing:
 
-- **`max_iterations` counts task sequences, not sessions.** A two-phase config
-  spawns roughly twice the sessions for the same limit.
+- **`max_iterations` counts task sequences, not sessions.** A three-phase config
+  spawns roughly three sessions for the same limit — and the middle one is the
+  expensive review.
 - **A multi-phase config requires a harness that observes the session's task
   claim**, which today means `claude` or `opencode`. The handback across a seam,
   the salvage and the delivery check all depend on it, so a config naming `codex`
@@ -174,15 +343,20 @@ never pointed at.
 A phase boundary fixes that structurally rather than by asking anyone to be
 fair-minded: **the driver is the caller, so the implementing session cannot write
 the reviewing session's prompt.** Phase N+1's brief is built from your config plus
-exactly two values off the held claim — the task id and the run id — and phase N's
-session output is not an input to it at all. A test pins that absence rather than
-the wording of the shipped brief, because the wording is the part that is allowed
-to change.
+the values the driver read off the held claim — the task id, the run id and the
+verified branch — and the phases' own resolved harness/model/position. Phase N's
+session output is not an input to it at all. (Its *findings* are, deliberately:
+the review record is the one thing that must cross the review→fix seam, and it
+crosses as a task record the plane stored, not as text the reviewing session
+smuggled into the fixer's prompt.) A test pins that absence rather than the
+wording of the shipped brief, because the wording is the part that is allowed to
+change.
 
-The second phase also puts the review behind the checkpoint, which is where a
+The review phase also puts the judgement behind the checkpoint, which is where a
 session's context peaks and so where a usage limit or a crash is most likely to
 land. Before the split, a death there destroyed the findings and the half-applied
-fixes together; now it costs the review, never the implementation.
+fixes together; now the findings are on the task before the expensive session
+ends, and a death costs the fix session, not the review.
 
 ### Per-phase models: a tier map you own
 
@@ -192,10 +366,19 @@ different phases run on different models:
 ```json
 "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
 "phases": [
-  { "name": "implement", "tier": "strong" },
-  { "name": "review",    "tier": "strong" }
+  { "name": "implement", "tier": "standard" },
+  { "name": "review",    "tier": "strong" },
+  { "name": "fix",       "tier": "cheap" }
 ]
 ```
+
+**One caveat that is not about models.** A `fix` phase that shares the review's
+Claude account can hit the same rolling usage limit the Opus review just consumed
+the tail of, because the fix session starts immediately after it. That no longer
+exits the daemon — the sequence ends and the run waits the reset out — but the
+task lapses into a takeover that pays `implement` again, plus the wait. Keep the
+three-phase shape, but run `fix` on a different provider — see
+[Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
 
 **The buckets are yours, and the indirection is the point.** clankerbar drives
 three harnesses and cannot know which models you have, nor which of them is
@@ -216,8 +399,12 @@ measured against — is worth the strong bucket, because a mis-recorded decision
 read for months by people who cannot see it was wrong. A phase that only
 compresses a large output into a small answer can take a cheap one, because the
 error is visible immediately to whoever asked the closed question. Nothing is
-tiered by default: an untouched config runs every phase on the run's model, and
-these two shipped phases both produce durable artifacts.
+tiered by default: an untouched config runs every phase on the run's model. The
+review split is the concrete case the rule is for: the review is judgement over a
+diff and a bar, so it takes the strong bucket; the fix applies findings that are
+already written down and re-runs the gates, so it can take the cheap one. Putting
+the review's model on the fix's typing was the $3.92-per-session mistake this
+split removes.
 
 ### Per-phase harnesses: implement on one, review on another
 
@@ -233,15 +420,25 @@ A phase can name the **harness** it runs on, not only the model:
 },
 "phases": [
   { "name": "implement", "harness": "opencode" },
-  { "name": "review" }
+  { "name": "review", "harness": "claude" },
+  { "name": "fix", "harness": "opencode" }
 ]
 ```
 
-That runs the implementation on a cheap provider-agnostic backend and keeps the
-adversarial review on the harness with the subagent machinery. Nothing in the
-seam resists it: each phase is already a fresh session seeded from the observed
-claim, so what crosses the boundary is a task id and a run id, and both live on
-the plane rather than in a session.
+That runs the implementation and the fixes on a cheap provider-agnostic backend
+and keeps the adversarial review on the harness with the subagent machinery.
+Nothing in the seam resists it: each phase is already a fresh session seeded from
+the observed claim, so what crosses the boundary is a task id and a run id, and
+both live on the plane rather than in a session.
+
+**Do not run `fix` on the review's Claude account.** A fix session that starts
+right after an Opus review can hit the same rolling usage limit the review just
+consumed the tail of. That no longer takes the daemon down — the sequence ends
+and the run waits the reset out holding no lease — but the task lapses into a
+takeover that pays `implement` again on top of the wait. Pair the review with a
+different provider for `fix` (opencode in the example above); an all-Claude
+three-phase config is the shape most exposed to this, and the example here is
+deliberately not one.
 
 **The harness-shaped fields stop being run-wide, and that is the whole of the
 configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and
@@ -383,7 +580,8 @@ Those promises harden at v1.0.
 ## Usage
 
 ```sh
-clankerbar                          # the fleet supervisor: every config in ~/.config/clankerbar
+clankerbar                          # the fleet supervisor: reconcile this machine
+                                    # against the plane's account roster
 clankerbar run --harness=claude
 clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
@@ -396,70 +594,96 @@ clankerbar deck deck.html --task CLA-581      # upload a review deck, print its 
 
 ### The fleet supervisor: bare `clankerbar`
 
-One config file is one daemon, and the config dir is where the fleet lives.
 `clankerbar` with **no subcommand** (equivalently `clankerbar supervise`) is the
-supervisor: it enumerates every `*.json` in `~/.config/clankerbar` that is
-actually an instance config, spawns `clankerbar run -c <file>` as a child per
-file, and supervises them. That ends the manual per-daemon chore: the operator
-no longer starts each daemon by hand, and stopping the fleet is one Ctrl-C.
+fleet supervisor: it reconciles this machine against your **account-scoped
+roster** on the plane, polled every 15 seconds from
+`<backlog_url>/api/daemon-roster`. The account key (`CLANKERBAR_API_KEY`) is
+required — a supervisor spans projects, so a project key will not do.
 
-The supervisor invents nothing — every mechanism already existed:
+Each roster entry declares one instance:
 
-- **Each child is the command the operator used to run by hand — on a config
-  the supervisor generates.** Instance identity (`hostname/basename(config)`),
-  per-instance state dirs, control markers and the fleet beacon all behave
-  exactly as before; each child beacons under the name derived from its own
-  source file.
-- **A child that exits unexpectedly is restarted, with backoff.** The delay
-  doubles from 2s to a 60s cap per consecutive unexpected exit; a run that
-  stayed up at least 2 minutes is treated as healthy and resets the ladder.
-- **SIGINT/SIGTERM to the supervisor is a fleet-wide stop.** Every child gets a
-  STOP marker written into its own state dir — the same marker a hand-written
-  `touch STOP` writes — so each daemon drains at its iteration boundary (an
-  in-flight session finishes) rather than being killed mid-session, and the
-  supervisor waits for all of them before exiting.
-- **A child that was told to stop is not restarted.** That covers the
-  supervisor's own fleet-wide stop, and the per-instance case: a `HALT` marker
-  (the one marker the daemon does NOT consume) left in a child's state dir
-  stops that instance for good — delete the marker and restart the supervisor
-  to resume it. A hand-written `STOP`, by contrast, is consumed by the daemon
-  when it honours it, so the supervisor cannot see it and reads the exit as
-  unexpected: **to stop ONE instance while the supervisor runs, touch `HALT`
-  in its state dir, not `STOP`.**
+- **`desiredState: running`** — a supervised child is kept up, spawned as
+  `clankerbar run -c <generated config>` in the child's own state dir. A child
+  that exits for any reason other than a stop it was told about is restarted,
+  with backoff: the delay doubles from 2s to a 60s cap per consecutive
+  unexpected exit, and a run that stayed up at least 2 minutes is treated as
+  healthy and resets the ladder.
+- **`desiredState: stopped`** — the supervisor writes the instance's STOP
+  marker into its state dir (the same marker a hand-written `touch STOP`
+  writes) and the daemon drains at its iteration boundary. Flipping desired
+  state in the console lands on the machine within one poll.
+- **`placement: remote`** — not implemented (Decision 7); the entry is ignored
+  with a log line. An entry deleted in the console has its child stopped and is
+  dropped.
 
-What the supervisor does NOT do (later phases of the proposal): no plane call,
-no roster, no desired state, no version check, no self-update. The config dir
-is enumerated **once, at startup** — add a config file and restart the
-supervisor to pick it up. The startup log names every file it picked up and
-every file it skipped, with the reason.
+**Stopping the supervisor stops the fleet.** SIGINT/SIGTERM to the supervisor
+writes a STOP marker into every child's own state dir, so each daemon drains at
+its iteration boundary (an in-flight session finishes) rather than being killed
+mid-session, and the supervisor waits for all of them before exiting. A child
+that was told to stop is not restarted; that covers the fleet-wide stop and the
+per-instance case — a `HALT` marker (the one marker the daemon does NOT
+consume) left in a child's state dir stops that instance for good; delete the
+marker and restart the supervisor to resume it. A hand-written `STOP`, by
+contrast, is consumed by the daemon when it honours it, so the supervisor
+cannot see it and reads the exit as unexpected: **to stop ONE instance while
+the supervisor runs, touch `HALT` in its state dir, not `STOP`.**
+
+**The base config is the machine layer.** The supervisor reads your local
+config from the one discovered location, `~/.config/clankerbar/config.json`
+(loaded exactly as `clankerbar run` loads it, or bare defaults when no file
+exists). When the file exists it is re-read on every reconcile, so an edit
+lands without a supervisor restart. Everything the plane may not set — `env`
+and `@file` secrets, `settings_path`, `config_dir`, `mcp_config_path`,
+`backlog_url` and the rest — comes from this file.
+
+**The roster names the projects; the base config wires them.** A roster entry
+carries the project(s) the instance drives. For each one the supervisor starts
+from the base config's matching `projects[]` entry — its `workdir`, `repos`
+map, `mcp_config_path` / `mcp_config_paths`, `pr_base` and every other
+per-project key — and takes only the project's slug and primary repo from the
+roster. A roster project with no matching base entry runs on the roster's slug
+and repo alone, with the top-level fallbacks; the roster's primary repo (the
+plane's `project.primary_repo`) is what the workdir derivation derives from.
+This is how an instance running e.g. implement-on-opencode / review-on-claude
+keeps one MCP file per project per harness (see "Multi-project runs need one
+MCP file per project per harness" above) instead of losing its wiring.
+
+**One-directional overrides.** A roster entry may carry exactly one class of
+override — `harness` and its per-harness block (`model` / `models`) — and
+nothing else: a machine-layer key (`env`, `settings_path`, `workdir`,
+`mcp_config_path`) or any other run-config key is **refused loudly** and named
+in the log, never silently dropped — a silent drop is how a daemon ends up
+looking configured and not being.
 
 **Workdir derivation (phase 2a).** Set `CLANKERBAR_WORKDIR_ROOT` to the
 machine's one checkout root and the supervisor derives each child's workdir as
-`<root>/<repo name>` for the repo its config names (`primary_repo`, per project
-when the config drives several). Derivation fails closed, both conditions
-learned from the CLA-441 wrong-workdir failure: if the derived directory does
-not exist, or is not a checkout of the expected repo (its origin remote names
-something else), that daemon is **refused at startup** — the path tried is
-reported, nothing is created, and the supervisor's own working directory is
-never used as a fallback. With the variable unset, derivation is off and
-children run on their config files' own workdirs, exactly as before.
+`<root>/<repo name>` for the repo its project's roster entry names
+(`primary_repo`, per project when the entry drives several). Derivation fails
+closed, both conditions learned from the CLA-441 wrong-workdir failure: if the
+derived directory does not exist, or is not a checkout of the expected repo
+(its origin remote names something else), that daemon is **refused** — never
+spawned, the path tried is reported, nothing is created, and the supervisor's
+own working directory is never used as a fallback. With the variable unset,
+derivation is off and children run on the base config's own workdirs, exactly
+as before.
 
 **Materialized configs (phase 2b).** Every child runs on a config the
-supervisor *generates*, not the file in the config dir: the child's effective
-config — the operator's declared intent plus the machine conventions, namely
-the derived workdir, the resolved `settings_path` / `config_dir` /
-`mcp_config_path` (documented defaults applied), the default `backlog_url`
-(the credential itself stays in `CLANKERBAR_API_KEY` in the environment,
-which the child inherits) — is written to `materialized.json` in the child's
-own state dir, and the child is started with `run -c` pointing at it. The
-generated file is a **cache**: regenerated on every reconcile (each spawn
-re-reads the source config), never hand-edited, and safe to delete while a
+supervisor *generates*, not a hand-maintained file: the child's effective
+config — the operator's machine layer plus the roster's projects and permitted
+override, with the machine conventions resolved (the derived workdir, the
+resolved `settings_path` / `config_dir` / `mcp_config_path` and the default
+`backlog_url`; the credential itself stays in `CLANKERBAR_API_KEY` in the
+environment, which the child inherits) — is written to `materialized.json` in
+the child's own state dir, and the child is started with `run -c` pointing at
+it. The generated file is a **cache**: regenerated on every reconcile (each
+spawn re-reads the base config), never hand-edited, and safe to delete while a
 child runs — the next spawn regenerates it. It is written to disk rather than
-held in memory so it doubles as the offline last-known-good once the roster
-drives the fleet (phase 3b): an unreachable plane means starting from cache,
-not starting nothing. The instance identity and the state dir are pinned
-inside it, so a daemon beacons and stops exactly as it did when its file
-lived in the config dir.
+held in memory so it doubles as the offline last-known-good: with the plane
+unreachable the supervisor reconciles against the cached roster and starts
+children from their materialized configs, rather than starting nothing (a cold
+start with no cache has nothing to supervise and says so). The instance
+identity and the state dir are pinned inside it, so a daemon beacons and stops
+exactly as it did when started by hand.
 
 **Permission policy gate (phase 2c).** The supervisor never starts a daemon
 without its permission policy: `settings_path` is the fail-closed headless
@@ -467,26 +691,36 @@ allow/deny policy, deliberately read-only to agents — a plane that could set
 it could hand a daemon a permissive policy — and the file it names must exist
 when the daemon starts. An instance whose policy file is absent is **refused**
 — no child is spawned, and the refusal names the daemon and the policy path
-tried. The gate is checked at enumeration and again at every (re)spawn, so a
-policy file deleted while the supervisor runs stops the next respawn, not the
+tried. The gate is checked at every reconcile and again at every (re)spawn, so
+a policy file deleted while the supervisor runs stops the next respawn, not the
 running child, and a restored file is picked up by the next backoff retry. A
 config that names no `settings_path` is unaffected — it runs on the ambient
 allowlist, which `doctor` already warns about.
 
-The config dir also holds JSON that is not instance configs — MCP configs
+**The log is a status surface.** On every change of the fleet the supervisor
+lists the version it itself runs and, per instance, the state and the version
+of the child serving it — so version skew between children (and between a
+child and the supervisor) is observable on the machine, not only on the fleet
+page. `clankerbar supervise roll` rolls the children onto a newly installed
+binary one at a time, verifying each one's next beacon reports it before the
+next is touched; `clankerbar supervise replace` drains the fleet and execs the
+running supervisor into a newly installed build. Neither fetches or installs
+anything — you install the new build at the fleet's launch path first.
+
+The config dir can hold more JSON than the base config — MCP configs
 (`opencode-mcp.json`), headless permission policies (`headless-drain.json`),
-opencode's own config (`opencode.json`) — and the supervisor tells them apart
-structurally: a file must carry at least one recognized clankerbar config key
-and pass the same Load + Validate `run` performs, or it is skipped loudly.
-(If `opencode.json` still parses as a valid config it IS supervised — move it
-out of the config dir if you do not want it started.)
+opencode's own config (`opencode.json`), leftovers from hand-started daemons
+(`clanker1.json`, ...). The supervisor reads none of them: its machine layer is
+`~/.config/clankerbar/config.json` alone, and which instances run comes from
+the roster, not from files in the directory. (`clankerbar run -c <file>` still
+runs any config you point it at by hand.)
 
 Two operational notes, both inherited from how `run` already behaves:
 
-- **The supervisor resolves each config from its own working directory.** A
-  config with a RELATIVE `workdir` resolves against wherever the supervisor
-  was started; the operator's daemon configs use absolute paths, and so should
-  a supervised one.
+- **The supervisor resolves each child's config from the supervisor's own
+  working directory.** A config with a RELATIVE `workdir` resolves against
+  wherever the supervisor was started; the operator's configs use absolute
+  paths, and so should the base config.
 - **The supervisor's children run with the supervisor's environment** — the
   account key, the harness binaries on PATH, everything. A child's `RESTART`
   marker re-execs the child in place (same pid, same launch path), so a
@@ -1035,12 +1269,13 @@ be named - `clankerbar run -c ./clankerbar.json` - and an unnamed
 read**; [where the key may go](#where-the-account-scoped-key-is-allowed-to-go)
 says why. (JSON today; TOML is the likely final format.)
 
-Under the fleet supervisor, that same directory is the whole fleet: every
-`*.json` in it that carries at least one recognized config key and validates
-is a daemon the supervisor starts (see [The fleet
-supervisor](#the-fleet-supervisor-bare-clankerbar)). `config.json` is just one
-instance among them, and a per-daemon file like `clanker2.json` needs no
-special treatment — the filename is the instance discriminator.
+Under the fleet supervisor, that same directory's machine-layer role is just
+the one discovered file: `config.json` is the **base config** each supervised
+child's own config is generated from (see [The fleet
+supervisor](#the-fleet-supervisor-bare-clankerbar)). Which instances run - and
+under what identity - comes from the plane's account-scoped roster, not from
+files in the directory: a per-daemon file like `clanker2.json` is not an
+instance the supervisor reads.
 
 ```json
 {

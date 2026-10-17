@@ -88,7 +88,30 @@ const MaxInstanceNameLen = 100
 const (
 	ImplementPhaseName = "implement"
 	ReviewPhaseName    = "review"
+	// FixPhaseName is the phase that APPLIES a review's findings. It is a
+	// separate name from ReviewPhaseName on purpose: the review phase's terminal
+	// step (PR, in_review) is injected by name, so a fix phase that reused the
+	// name would inherit review-only or review-and-fix wording it did not ask
+	// for. See reviewOnlyTerminalStep and the built-in briefs below.
+	FixPhaseName = "fix"
+	// VerifyPhaseName is the fix-verification round (CLA-638): it re-reviews the
+	// fix delta, adjudicates the prior round's open MUSTs by their plane finding
+	// ids, and carries the terminal step only when no MUST remains open. It is a
+	// review-shaped phase — it writes a sealed durable review record like the
+	// review gate — and it must be the LAST phase of the sequence, because the
+	// driver repeats the fix→verify pair after it until a round finds no open
+	// MUST or the round cap parks the task.
+	VerifyPhaseName = "verify"
 )
+
+// ReviewRoundCap is the hard round cap per review cycle (B8): a human verdict
+// starts a new cycle, a takeover or reclaim does not, and a void round does not
+// count. The plane derives the count from its non-void records and serves it as
+// `reviews.counted`; the driver refuses to spawn another fix after the third
+// round. It is a constant rather than a config knob on purpose: "never one more
+// round" is the stopping rule, not a tuning dial, and a config value of 0 would
+// be a sequence with no bound at all.
+const ReviewRoundCap = 3
 
 // Phase is one session in a task's sequence. A task runs as an ordered list of
 // them, each a separate harness process, so context resets between them.
@@ -328,6 +351,235 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
+// reviewOnlyTerminalStep ends the review-only phase. It is the counterpart of
+// reviewTerminalStep for a phase that must NOT fix, commit, push, open a PR or
+// hand the task to in_review: the review is a checkpoint, and the next (fix)
+// phase resumes the same run from the branch the implement phase recorded.
+//
+// The review's FINDINGS are the deliverable, and they are recorded on the task
+// with update_task(outcome: ...) — the plane's own documented way to correct or
+// write an outcome without a status move. That keeps the record durable across
+// the seam, readable by the fix phase's get_task, and attributed to the run that
+// wrote it. A file in the worktree was rejected: it is invisible to the plane,
+// dies with the worktree, and cannot be read from another machine.
+const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE TASK " +
+	"in BOTH forms the shape above prescribes, in that order - FIRST the legacy outcome block with " +
+	"update_task(taskId, runId, outcome: ...), THEN the sealed durable record with " +
+	"update_task(taskId, runId, review: {...}). The durable record is the driver's seam evidence; the block is " +
+	"the one-release compatibility copy. This is a CHECKPOINT, not a hand-off: " +
+	"keep holding the task - do NOT release it, do NOT move it to in_review, and do NOT COMMIT, PUSH or open a " +
+	"PR. The driver checkpoints on the branch the implement phase recorded, and the phase after you resumes " +
+	"this same run from it. Ending this session after recording the review is this phase " +
+	"FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
+
+// reviewRecordOutcomeShape is the LEGACY half of the review record: the
+// `## Review` block appended to the task's outcome. It is kept for one release
+// (CLA-637), so older planes and readers still find a review where they expect
+// one, while the durable per-reviewer record below is what the driver's seam
+// gate reads.
+//
+// It is a SHAPE, not a grade: the fix phase reads it back by finding ID, and
+// the driver still parses it (reviewFindingsDigest in internal/loop) when a
+// durable record is unavailable, so the severity bracket and the
+// `(<kind>): <evidence>` prefix after it are load-bearing.
+//
+// It APPENDS below the outcome as it stands. The plane's statusless outcome is
+// a full replacement, and the outcome may already carry phase 1's delivery
+// record (or, on a request_changes re-trip or a takeover, an earlier trip's
+// round); writing a fresh block over it would lose that record. The fix phase
+// keeps everything above the block for the same reason.
+const reviewRecordOutcomeShape = " THE REVIEW RECORD IS THE DELIVERABLE. First get_task and read the outcome as it " +
+	"stands: a statusless update_task outcome replaces the WHOLE field, so preserve it. Record the LEGACY block " +
+	"with update_task(taskId, runId, outcome: ...) by copying the existing outcome's text unchanged, then " +
+	"APPENDING, below it, a compact block in exactly this shape: a `" + ReviewRecordHeading + "` heading; then " +
+	"`- reviewed tip: <the SHA you actually reviewed>`; `- implemented by: harness " + PhasePrevHarnessPlaceholder +
+	", model " + PhasePrevModelPlaceholder + "`; `- reviewed by: harness " + PhaseHarnessPlaceholder + ", model " +
+	PhaseModelPlaceholder + "`; `- verdict: pass` or `- verdict: findings`; then a `### Findings` heading with " +
+	"one line per finding: `- R1 [must|should|nit]` followed, for a MUST, by ` (<kind>): <evidence>`, then " +
+	"` <file:line> - <what is wrong>. Required fix: <the smallest change that makes it right>.` Give every " +
+	"finding its own ID. If there are none, write `- none` under " +
+	"Findings and `verdict: pass`. Do not pad the list, and do not fix anything yourself - not even a typo: a " +
+	"fix applied here is a fix the next phase cannot attribute and may undo."
+
+// reviewRecordTipVerified tells the reviewer which commit the driver verified
+// and requires that exact tip in both halves of the record. Handing the SHA
+// over is not a shortcut around the check: the session must fetch and confirm
+// HEAD is that commit before reviewing, and the seam matches the recorded tip
+// against the origin tip the driver read.
+const reviewRecordTipVerified = " The driver verified the origin remote's tip for branch " + PhaseBranchPlaceholder +
+	" as `" + ReviewedTipPlaceholder + "`. Fetch and confirm the worktree is at that commit (`git rev-parse HEAD`) " +
+	"before you review, and record that SHA as `reviewedTip` in the durable record and on the block's " +
+	"`- reviewed tip:` line."
+
+// reviewRecordTipUnverified is the counterpart for a checkpoint the driver could
+// NOT verify against the origin remote (CLA-576): there is no driver-known tip,
+// so the reviewer establishes it itself, and the seam requires the record to
+// carry a non-empty tip rather than matching one it never had.
+const reviewRecordTipUnverified = " The driver could NOT verify the origin remote's tip, so there is no " +
+	"driver-verified tip to record: establish it yourself. Read the branch from the origin remote " +
+	"(`git ls-remote origin " + PhaseBranchPlaceholder + "`, or fetch it), check out the commit it names, review " +
+	"that revision, and record that SHA as `reviewedTip` in the durable record and on the block's " +
+	"`- reviewed tip:` line. If the branch is absent or the remote cannot be read, record the failed hand-off " +
+	"and end holding the task - do not invent a tip and do not review a phantom diff."
+
+// reviewRecordTipNone is the branchless counterpart: there is no branch and no
+// commit to review, and — per the operator's decision on question 03a12578,
+// option 1 — no durable record either. The plane accepts review writes only
+// from the task's LIVE holder: a settled task (phase 1's own session settled
+// it) refuses the append outright, and on a still-held no-code task it would
+// seal a round this variant's driver never closes, blocking the run's own
+// outcome writes. The legacy block IS this variant's record, and the driver's
+// seam gates on the block.
+const reviewRecordTipNone = " There is NO branch and NO tip to review: this record is about the PLANE'S RECORD of " +
+	"what phase 1 did. Write `- reviewed tip: none (no branch - the plane record was reviewed)` on the block's " +
+	"`- reviewed tip:` line. Do NOT append a durable review record: a settled task has no live holder to accept " +
+	"it, and on a still-held no-code task it would seal a round this variant never closes - the legacy block IS " +
+	"this variant's review record, and the driver gates the seam on it."
+
+// reviewRecordDurableShape is the durable half (CLA-637): one sealed
+// per-reviewer record per run, written through update_task.review. It is the
+// driver's seam evidence — round, role, run and reviewed tip are what the gate
+// matches — and per-finding `raisedByModel` is what the analytics need.
+//
+// ORDER IS LOAD-BEARING. While a run has a sealed record in an open round the
+// plane refuses that run's outcome, body and decision writes (CLA-636 B3), so
+// the legacy outcome block must be written FIRST. The driver closes the round
+// before spawning the fix phase, which releases the findings to it.
+const reviewRecordDurableShape = " THEN, and only after that outcome write has SUCCEEDED, append THIS run's durable " +
+	"review record with update_task(taskId, runId, review: {...}). This order is load-bearing: the plane seals the " +
+	"record's round, and a sealed record makes this run's outcome, body and decision writes illegal - so the legacy " +
+	"block above must already be on the task. The durable record is what the driver's review->fix seam checks; a " +
+	"missing or mismatched one means the fix phase does not spawn. Send exactly: reviewerRole: \"" +
+	ReviewerRolePlaceholder + "\" (this phase's role; the plane assigns the round and cycle from it), verdict: " +
+	"\"pass\" or \"findings\", harness: \"" + PhaseHarnessPlaceholder + "\", model: \"" + PhaseModelPlaceholder +
+	"\", branch: \"" + PhaseBranchPlaceholder + "\", reviewedTip as above, scope: {kind: \"full-diff\", base: \"" +
+	PhasePRBasePlaceholder + "\", range: \"" + PhasePRBasePlaceholder + "..<reviewedTip>\"} (the plane caps range at 100 " +
+	"characters, so never put the branch name there), and findings: one object per finding in the block, in " +
+	"the same order, at most 20 (the plane refuses a record with more: keep every MUST, then the most important " +
+	"of the rest, and say in the block how many you left out): {severity: \"must\" | \"should\" | \"nit\", " +
+	"evidenceKind: <the MUST's kind token>, evidence: <its payload>, file: <path>, line: <number>, kind: <short category>, summary: <what is " +
+	"wrong>, requiredFix: <the smallest fix>, raisedByModel: \"" + PhaseModelPlaceholder + "\"}. The plane assigns " +
+	"each finding's id (`<round>.<reviewer role>.<n>`); do NOT invent one - the fix phase updates by that id. A " +
+	"RETRY proves itself here: get_task before writing, and if a record for your reviewer role and THIS run is " +
+	"already there (records show the run id WITHOUT its secret: compare only the part of " + PhaseRunPlaceholder +
+	" before its first dot) in an open round, the record is written and its block landed before " +
+	"it (the plane seals the outcome once the record exists) - skip both writes and end. If instead the plane " +
+	"refuses the append with duplicate_reviewer, the same follows: a record for this role and round is already " +
+	"written, that refusal is the idempotency signal, and retrying it changes nothing. If there are no findings, " +
+	"send no findings (or an empty array), write `- none` under Findings, and verdict: pass."
+
+// reviewOnlyRecordShape is the verified review-only phase's full record
+// contract: the legacy outcome block, then the durable record. The driver
+// injected the phases' RESOLVED harness/model and the verified round, role and
+// tip, because a session cannot reliably name its own model, cannot see its
+// predecessor's, and cannot see whether the branch tip it read is the one the
+// driver verified.
+const reviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipVerified +
+	reviewRecordDurableShape + reviewMUSTBar
+
+// unverifiedReviewOnlyRecordShape is reviewOnlyRecordShape for a checkpoint the
+// driver could not verify on the origin remote (CLA-576): the reviewer
+// establishes the tip itself, and the seam demands a non-empty one.
+const unverifiedReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipUnverified +
+	reviewRecordDurableShape + reviewMUSTBar
+
+// noCodeReviewOnlyRecordShape is the branchless review-only phase's record
+// contract: the LEGACY outcome block alone, with no durable-record half —
+// the plane accepts review writes only from the task's LIVE holder and a
+// settled task has none (operator decision on question 03a12578, option 1), so
+// the seam gates this variant on the block (changed since the spawn, heading on
+// its own line, and a last block the baseline did not carry).
+const noCodeReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipNone + reviewMUSTBar
+
+// reviewMUSTBar is the accepted bar for a MUST (task CLA-635; the review-panel
+// design's section 14 A2 as amended by B5/B6, decisions 3a57db6a and 60ed0748
+// superseding it): the evidence a MUST must cite, the seventh kind the operator
+// added after the second review, and the things that are never a MUST however
+// confident the reviewer is.
+//
+// Only PRESENCE is checked structurally - here as the reviewer's own
+// obligation, and by the driver when it parses the block back
+// (loop.reviewFindingsDigest). The VALIDITY of the evidence is judged by a
+// verifier in the next round, never by the fixer: a fixer that disagrees with a
+// MUST refutes it with evidence, it does not downgrade it. Where a repo hard
+// rule concerns style, prose or documentation wording, the not-a-MUST list wins
+// over it (B6); missing tests stay not-a-MUST except the untested-guard case.
+const reviewMUSTBar = " GRADE EVERY FINDING. A severity in brackets is `[must]`, `[should]` or `[nit]`; " +
+	"MUST is the only gating grade and the only one that must carry evidence. A MUST must be followed by " +
+	"`(<kind>): <evidence>`, where <kind> is one of: doneWhen - quote the clause of the task's doneWhen the change " +
+	"violates; gate - name a repo gate (a test, typecheck, lint, build, CI check, or a check the repo's agent " +
+	"instructions require) that fails or would fail, with the command and the failing output or the reason it " +
+	"would fail; failure - a concrete input or state and the wrong output, crash, data loss or stuck state it " +
+	"produces in changed code or its direct regression surface; security - credential exposure, an authorization " +
+	"bypass, injection, or a widened permission, with the path; decision - a recorded standing decision it " +
+	"contradicts (cite its id) or a hard rule in the repo's agent instructions (cite the file and the rule); " +
+	"irreversible - an irreversible migration, deletion or publish step without the guard the repo requires; " +
+	"untested - a new or changed guard, gate or state transition with no test that pins it (cite its file:line " +
+	"and the missing test). NEVER a MUST, however confident you are: style, naming, a design you would prefer, a " +
+	"performance concern without a measurement, missing tests the doneWhen does not require (except untested), or " +
+	"documentation wording - and where a repo hard rule concerns style, prose or documentation wording, this " +
+	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. Every finding in the block is " +
+	"attributed by the block's own `- reviewed by:` line, and the durable record carries `raisedByModel` on every " +
+	"finding so the review is attributable per finding, not only per block."
+
+// fixOutcomeRecord is the fix phase's outcome requirement, shared by both fix
+// variants. It carries the review forward: the final outcome is the only
+// durable task-record the round has (the ledgers excepted), so dropping the
+// review block here would lose the very record the split exists to keep. And it
+// must keep everything ABOVE the block: that is phase 1's delivery record (or
+// an earlier round's), and the statusless outcome replaces the field wholesale,
+// so a final outcome built only from the review block and ### Fixes would erase
+// it.
+const fixOutcomeRecord = "the outcome MUST keep everything the existing outcome carries ABOVE the LAST `" +
+	ReviewRecordHeading + "` block " +
+	"(phase 1's delivery record plus any earlier rounds, their `" + ReviewRecordHeading + "` blocks included) " +
+	"unchanged, keep that LAST block VERBATIM " +
+	"(verdict, every finding by ID, its required fix, and the attribution it already carries — do not restate " +
+	"that attribution from this brief), and add a `### Fixes` list saying, for every finding, whether you fixed " +
+	"it (with the commit SHA, or for a no-code task the record change you made, or the ref of the real follow-up " +
+	"task a code-needing finding was dispatched to) or did not (with the reason — for a MUST that reason must be " +
+	"a refutation carrying its evidence, because a MUST is never downgraded), plus 'fixed by: harness " +
+	PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder + "'. A finding you neither fix nor answer is " +
+	"this phase failing."
+
+// fixTerminalRecord is the BRANCH fix phase's record requirement, stated BEFORE
+// the shared reviewTerminalStep so the emphatic final block still ends the brief
+// (the CLA-384 property): the durable finding updates go out before the call
+// that ends the run and clears the holder, then the outcome requirement
+// (fixOutcomeRecord) carries the review forward.
+const fixTerminalRecord = " BEFORE the handover call (which ends the run and clears the holder), update every finding's " +
+	"status on the DURABLE review record with update_task(taskId, runId, review: {findingUpdates: [...]}) — one " +
+	"entry per finding, by the plane-assigned `id` the record gave you: {findingId, status: \"fixed\", " +
+	"fixCommit: <the commit SHA>} for a fixed finding; {findingId, status: \"refuted\", refutedReason: <the " +
+	"evidence that refutes it>} for a MUST you did not fix; {findingId, status: \"filed\", filedTaskRef: <the " +
+	"follow-up task's ref>} for a code-needing finding dispatched instead. The batch is all-or-nothing: an " +
+	"unknown id or a still-sealed round refuses it, so send it BEFORE the handover - before the call that " +
+	"moves the task to in_review, even when that same call carries your outcome. An empty array is refused; if " +
+	"the review found nothing, skip the call. THEN hand the task over: " + fixOutcomeRecord
+
+// noCodeFixTerminalRecord is the BRANCHLESS fix phase's counterpart (question
+// 03a12578, option 1): the branchless review writes no durable record — a
+// settled task has no live holder to accept one — so there is no findingUpdates
+// call to make and no plane-assigned id to send. The record requirement is the
+// outcome alone, exactly as fixTerminalRecord's second half states it.
+const noCodeFixTerminalRecord = " When you hand the task over, " + fixOutcomeRecord
+
+// fixGradingRule is the fix briefs' shared obligation for acting on the graded
+// review record (CLA-635): every MUST fixed or refuted with evidence, never
+// downgraded by the fixer, and SHOULD/NIT handled by the filing rule. B5's
+// structural check runs driver-side, so a MUST that reaches this brief has
+// already been judged to carry evidence; the fixer may not second-guess the
+// grade - it refutes the finding with evidence of its own, or fixes it. A1 is
+// restated because the interim record may hold a single reviewer: disagreement
+// is not a second opinion, and a lone reviewer's MUST still gates.
+const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
+	"recorded in your outcome - a refutation must actually refute the finding, and a MUST you neither fix nor " +
+	"refute is this phase failing. You may not downgrade a MUST: the driver has already applied its structural " +
+	"check, listing a recorded MUST with no evidence kind or no evidence payload as a SHOULD, and a MUST raised " +
+	"by a single reviewer is never dropped because nobody else raised it. Fix the SHOULDs that are cheap; record " +
+	"NITs and the SHOULDs you do not fix in your outcome as not done, with the reason, and file a follow-up task " +
+	"only for a SHOULD worth doing."
+
 // noCodeReviewTerminalStep is the no-code review brief's LAST instruction
 // (CLA-497), the counterpart of reviewTerminalStep for a phase-1 exit that was
 // evidenced by the plane's record rather than a branch. There is nothing to
@@ -372,8 +624,88 @@ func HandoffContinuation(phaseName string) string {
 		return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + reviewTerminalStep
 	case ImplementPhaseName:
 		return "\n\nThe phase's rerun bound is unchanged by handing off:" + rerunGuidance
+	case FixPhaseName:
+		// The fix phase owns the branch-shaped terminal step, exactly as a final
+		// review did before the split. A handoff mid-fix must not be a way to
+		// lose the commit/push/PR/in_review sequence, NOR the record contract:
+		// fixTerminalRecord is what makes the successor keep the review block
+		// verbatim and add the ### Fixes list. Dropping it here loses the only
+		// durable record of the round, which is the exact loss the split exists
+		// to prevent.
+		return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+			rerunGuidance + fixTerminalRecord + reviewTerminalStep
 	}
 	return ""
+}
+
+// HandoffContinuationFor is HandoffContinuation for a review phase whose mode is
+// POSITION-dependent (see EffectivePhases): a review-only phase has no terminal
+// step to carry, only the record-then-hold ending, and appending the shared
+// reviewTerminalStep would tell its successor to commit, push, open a PR and
+// hand the task to in_review — the exact actions the review-only mode forbids.
+//
+// It carries reviewOnlyRecordShape as well as the ending: the ending says
+// "in the shape above", and a respawned successor never saw the shape. The
+// driver's review→fix gate matches the DURABLE record, so a successor that
+// invented its own shape (or skipped the append) would fail the seam.
+//
+// The flag is only meaningful for ReviewPhaseName; every other phase ignores it.
+func HandoffContinuationFor(phaseName string, reviewOnly bool) string {
+	if phaseName == ReviewPhaseName && reviewOnly {
+		return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+			rerunGuidance + reviewOnlyRecordShape + reviewOnlyTerminalStep
+	}
+	return HandoffContinuation(phaseName)
+}
+
+// NoCodeReviewOnlyHandoffContinuation is the branchless review-only counterpart:
+// the record shape and record-then-hold ending without the branch-shaped PR step
+// or the no-code handover (which belongs to the fix phase).
+func NoCodeReviewOnlyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+		rerunGuidance + noCodeReviewOnlyRecordShape + noCodeReviewOnlyTerminalStep
+}
+
+// UnverifiedReviewOnlyHandoffContinuation is the review-only handoff for a
+// checkpoint the driver could NOT verify on the origin remote (CLA-576): the
+// successor must establish the tip itself, exactly as the first session was
+// told to, or its durable record cannot satisfy the seam.
+func UnverifiedReviewOnlyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+		rerunGuidance + unverifiedReviewOnlyRecordShape + reviewOnlyTerminalStep
+}
+
+// NoCodeFixHandoffContinuation is the fix phase's continuation for a branchless
+// checkpoint: the outcome requirement and the no-code handover, and never the
+// branch-shaped PR step. There is no durable record for this variant (question
+// 03a12578, option 1 — the branchless review writes none), so the continuation
+// carries noCodeFixTerminalRecord, not the branch fix's findingUpdates demand.
+func NoCodeFixHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + noCodeFixTerminalRecord + noCodeReviewTerminalStep
+}
+
+// FixVerifyHandoffContinuation is the fix phase's continuation when a
+// verification round follows (CLA-638): the successor must still answer every
+// finding, commit and push, and then STOP holding the task. Carrying the
+// legacy reviewTerminalStep here would tell it to open the PR and move the task
+// to in_review — the terminal actions the verifier owns, and precisely what
+// B12 says the fix phase must not do.
+func FixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixTerminalRecord + fixOnlyTerminalStep
+}
+
+// NoCodeFixVerifyHandoffContinuation is FixVerifyHandoffContinuation for a
+// BRANCHLESS fix: the amendment is to the plane's record, so there is nothing
+// to commit or push, but the terminal step still belongs to the verifier.
+// NoCodeFixHandoffContinuation would carry the legacy no-code hand-over and tell
+// the successor to move the task to in_review before the verification round has
+// seen the amendment — the same B12 leak the branch-shaped variant exists to
+// close.
+func NoCodeFixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixTerminalRecord + noCodeFixOnlyTerminalStep
 }
 
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
@@ -562,14 +894,20 @@ const implementCommitEarlyRule = " COMMIT EARLY, PUSH EARLY, RECORD EARLY: get a
 
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
-// The split is implement, then review-and-fix, and that grouping is deliberate:
-// the reviewing session dispatches the review itself, so it holds the findings
-// while it fixes them. A third "fix" phase would hold neither the implementation
-// nor the review context and would re-acquire both — which is why the repo's own
-// workflow puts implementation and fix in ONE actor and the review in a separate
-// read-only one. Splitting where that workflow already splits is the whole idea.
+// The split is implement, review, fix. The review phase's brief is chosen by
+// POSITION rather than a second name (see EffectivePhases): a review with a
+// phase after it is the read-only gate (reviewOnlyBrief), and a FINAL review
+// keeps this historical review-and-fix brief so an existing two-phase config
+// still reaches in_review. The fix phase applies the findings on a cheaper
+// harness and owns the PR/in_review terminal step.
+//
+// An earlier version of this comment argued a fix phase was wrong because it
+// "would hold neither the implementation nor the review context". That is still
+// true, and it was never an argument about COST. The review record on the task
+// (reviewOnlyRecordShape) is what replaces the shared context: the fix phase
+// re-reads it from the plane, the way any resumed phase re-reads the bar.
 var builtinPhasePrompts = map[string]string{
-	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + ", and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
 		implementCloseOutRule + " " +
 		implementResumedBranchRule +
 		implementCommitEarlyRule +
@@ -578,7 +916,7 @@ var builtinPhasePrompts = map[string]string{
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
 		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,
 
-	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase recorded " +
+	ReviewPhaseName: "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " + PhaseTaskPlaceholder + ", whose implement phase recorded " +
 		"branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin " +
 		"remote with its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that " +
 		"run, not starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
@@ -593,6 +931,10 @@ var builtinPhasePrompts = map[string]string{
 		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception you " +
 		"state a reason for (a fix that had to reach outside its own area), never the default." + rerunGuidance +
 		reviewTerminalStep + handoffGuidance,
+
+	FixPhaseName: fixBrief,
+
+	VerifyPhaseName: verifyBrief,
 }
 
 // noCodeReviewBrief is the review brief for a phase-1 exit evidenced by the
@@ -605,7 +947,7 @@ var builtinPhasePrompts = map[string]string{
 // report" instruction contradicts the checkpoint the driver just recorded. The
 // no-code review runs the adversarial gate over the plane's record of what
 // phase 1 did, and its terminal step is the handover alone - no commit, no PR.
-const noCodeReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase's " +
+const noCodeReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " + PhaseTaskPlaceholder + ", whose implement phase's " +
 	"exit was evidenced by the PLANE'S RECORD rather than a branch: the task left `ready` (in_review / done / " +
 	"parked / blocked - its own session settled it) or carries a declared no-code delivery. There is NO " +
 	"branch, because this task's correct delivery is no code - nothing to check out, no worktree to work " +
@@ -637,7 +979,7 @@ const noCodeReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder
 // the backstop the 2026-09-24 decision accepted for the narrow loosening of
 // CLA-457 (a session that recorded a branch it never pushed, during an outage,
 // still reaches a review phase).
-const unverifiedReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", whose implement phase " +
+const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " + PhaseTaskPlaceholder + ", whose implement phase " +
 	"recorded branch " + PhaseBranchPlaceholder + " on the plane — but the driver could NOT verify that branch on " +
 	"the origin remote: its check did not complete — most often because the remote could not be read (network, a " +
 	"GitHub outage, a credential problem), but a check that never reached the remote is possible too — so whether " +
@@ -661,12 +1003,479 @@ const unverifiedReviewBrief = "You are PHASE 2 of 2 on task " + PhaseTaskPlaceho
 	"that had to reach outside its own area), never the default." + rerunGuidance + reviewTerminalStep +
 	handoffGuidance
 
-// BuiltinReviewBrief returns the shipped review brief, so the driver can tell
-// whether a phase runs the built-in brief (vs an operator's custom prompt)
+// reviewOnlyBrief is the review phase's brief when a LATER phase will apply its
+// findings (the shipped [implement, review, fix] sequence). It is the split's
+// whole point: the expensive model reads and judges, and changes nothing.
+//
+// A final `review` phase keeps the historical review-AND-fix brief
+// (builtinPhasePrompts[ReviewPhaseName]) so a two-phase config written before
+// this split keeps reaching in_review instead of silently stopping at a
+// checkpoint with no successor. The position, not a second name, selects the
+// mode; EffectivePhases resolves it, and the driver's variant selection matches
+// on the resolved prompt text.
+//
+// "Review only" is enforced as a scope, not a capability: the phase is told what
+// it may not do, and the fix phase is told to treat any fix it did not make as
+// its own job by ID. A session that edits anyway is a failure the fix phase can
+// still absorb - it re-reads the branch - which is why the prohibition is worded
+// as the default rather than as an impossible act.
+var reviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: you find issues " +
+	"and specify fixes; the phase after you applies them. The implement phase (harness " +
+	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") recorded branch " +
+	PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin remote with " +
+	"its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that run, not " +
+	"starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
+	PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the bar " +
+	"and the standing decisions. An empty branch field on the task is a FAILED hand-off to report in the record " +
+	"below, not work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
+	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
+	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
+	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate. " +
+	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
+	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
+	"and a fix applied here is a fix it cannot attribute." +
+	reviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep + handoffGuidance
+
+// unverifiedReviewOnlyBrief is reviewOnlyBrief for a checkpoint the driver could
+// NOT verify against the origin remote (CLA-576). The verified claim above is
+// exactly what such a checkpoint cannot support, so the session verifies the
+// hand-off itself before reviewing anything.
+var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder +
+	" on task " + PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: " +
+	"you find issues and specify fixes; the phase after you applies them. The implement phase (harness " +
+	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") recorded branch " +
+	PhaseBranchPlaceholder + " on the plane — but the driver could NOT verify that branch on the origin " +
+	"remote: its check did not complete — most often because the remote could not be read (network, a GitHub " +
+	"outage, a credential problem), but a check that never reached the remote is possible too — so whether " +
+	"phase 1 pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a " +
+	"verified hand-off: do NOT assume the branch exists, and do NOT assume phase 1 implemented, committed and " +
+	"pushed. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
+	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with " +
+	"includeDecisions: true to re-read the bar and the standing decisions. FIRST verify the hand-off yourself, " +
+	"before any review: read branch " + PhaseBranchPlaceholder + " from the origin remote (git ls-remote " +
+	"origin " + PhaseBranchPlaceholder + ", or fetch it) and confirm it carries phase 1's work. If the branch " +
+	"is not on the origin remote, phase 1 did NOT deliver: record that failed hand-off in the review record " +
+	"below and end holding the task — do not review a phantom diff. If the remote still cannot be read, say " +
+	"exactly that in the record and end holding the task; do not invent work. If the branch is there, work in " +
+	"the worktree for branch " + PhaseBranchPlaceholder + " recorded on the task, and never commit to the " +
+	"repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout " +
+	"sitting on that branch is not a decision to commit where you are, it is this failure mode. Read the diff " +
+	"against the PR base (git diff " + PhasePRBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
+	"the adversarial review gate. REVIEW ONLY: do not edit, create or delete a source " +
+	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. Do NOT fix what you " +
+	"find: the phase after you is responsible for applying it, and a fix you apply here is a fix it cannot " +
+	"attribute." + unverifiedReviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep +
+	handoffGuidance
+
+// noCodeReviewOnlyTerminalStep ends a branchless review-only phase. There is no
+// branch to keep a lease on and the task may already be settled by phase 1, so
+// the terminal step records the review and leaves the task's own status alone;
+// the fix phase decides whether a finding requires re-opening it. The record
+// here is the LEGACY block alone (operator decision on question 03a12578,
+// option 1): the durable table takes writes only from the task's live holder —
+// a settled task has none, and a still-held no-code task's write would seal a
+// round this variant never closes — so attempting the append would be a
+// refused call at best and a wedged run at worst, and the seam does not need it.
+const noCodeReviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
+	"TASK with update_task(taskId, runId, outcome: ...), in the shape above - the LEGACY `" + ReviewRecordHeading +
+	"` block ONLY. Do NOT attempt update_task(review: ...) here: a settled task has no live holder to accept it, " +
+	"and on a still-held no-code task it would seal a round this variant never closes - the block IS this " +
+	"variant's review record and the driver's seam gates on it. This " +
+	"is a CHECKPOINT, not a " +
+	"hand-off: do NOT change the task's status, delivery or body here, do NOT re-open it, do NOT invent code, a " +
+	"branch or a PR, and do NOT move it to in_review. If phase 1 already settled it, leave it settled; the " +
+	"phase after you decides whether a finding needs more than a record change. Ending this session after " +
+	"recording the review is this phase FINISHING."
+
+// noCodeReviewOnlyBrief is reviewOnlyBrief for a checkpoint evidenced by the
+// PLANE'S RECORD rather than a branch (CLA-497): there is nothing to check out
+// and nothing for the fix phase to edit, so the review is of the record itself.
+var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: you find issues " +
+	"and specify fixes; the phase after you applies them. The implement phase's exit was evidenced by the " +
+	"PLANE'S RECORD rather than a branch: the task left `ready` (in_review / done / parked / blocked - its own " +
+	"session settled it) or carries a declared no-code delivery. There is NO branch, because this task's " +
+	"correct delivery is no code - nothing to check out, no worktree to work in, no PR to open. The empty " +
+	"branch field is NOT a failed hand-off: the driver recorded this checkpoint on exactly that record. You " +
+	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
+	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed " +
+	"to the review below. Then get_task with includeDecisions: true to re-read the bar and the standing " +
+	"decisions. Review the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the " +
+	"decisions recorded on this task or its siblings: is the settlement honest, does the record carry what the " +
+	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend what " +
+	"phase 1 wrote - the phase after you applies what you find - but DO append your legacy review block below " +
+	"it so its delivery record survives (the block, not a durable record: see the shape below); and do not " +
+	"invent code, a branch or a PR." +
+	noCodeReviewOnlyRecordShape + rerunGuidance + noCodeReviewOnlyTerminalStep + handoffGuidance
+
+// fixBrief is the phase that APPLIES a review's findings. It is deliberately not
+// named "review": reviewTerminalStep is injected by phase name, and a fix phase
+// that reused the name would be told it was review-only (or review-and-fix)
+// rather than the one actor that changes code.
+//
+// Why a separate phase at all, when the review used to fix its own findings: the
+// review model is the expensive one, and the fixing - apply, re-verify, commit,
+// push, open the PR - is the bulk of a review session's tool calls and context.
+// The reviewer keeps the judgement; the cheap harness gets the typing. The cost
+// is one more session startup and a hand-off the fixer must read; the review
+// record on the task is what makes that hand-off cheap and auditable.
+// fixCore is the part both fix variants share: read the released record, check
+// the reviewed tip, apply every finding by its plane id, re-verify scoped. The
+// variants differ ONLY in their terminal step, because whether the fix phase is
+// the last one depends on whether a verification round follows it (CLA-638).
+const fixCore = "Read BOTH the durable record and the block: `reviews.records` carries every released record in the newest " +
+	"round, each with its findings[] and the plane-assigned id (`<round>.<reviewer role>.<n>`) you update by; " +
+	"the outcome's `" + ReviewRecordHeading + "` block is the legacy copy. On a later fix round (after a " +
+	"verification round) the newest record carries only the verifier's NEW findings: the work list is every " +
+	"MUST the plane still shows OPEN on ANY released record (get_task's `reviews.openMustIds`), which the driver " +
+	"prepends when it can read it - an open MUST from an earlier round is yours to fix or refute too. If there is neither a released review " +
+	"record nor a review block, that is a FAILED hand-off: park the task with update_task(status: \"parked\", " +
+	"outcome: ...) naming the missing record - do NOT review the work yourself, do NOT invent findings, and do " +
+	"NOT open a PR over unreviewed work. Read the record's reviewedTip and compare it with " +
+	"`git rev-parse HEAD` in the worktree: if they differ, the branch moved after the review, so do NOT apply " +
+	"stale findings - park the task with update_task(status: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
+	PhaseBranchPlaceholder + " recorded on the task, and never commit to the repo's PR base branch (" +
+	PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout sitting on that branch is " +
+	"not a decision to commit where you are, it is this failure mode. Apply the review's findings, each by its " +
+	"PLANE id from the durable record - the block's R-numbers are labels, not the keys you update by." +
+	fixGradingRule +
+	" A finding you neither fix nor answer is this phase failing. The review " +
+	"ran checks, so the worktree may carry generated or cache files it did not commit: stage only the fixes " +
+	"you made, never those. Re-verify " +
+	"SCOPED to those fixes: run the gates the repo's own instructions name, and any check a finding says was " +
+	"red, not the whole suite again for no reason."
+
+// fixBrief is the phase that APPLIES a review's findings when it is the LAST
+// phase of the sequence. It is deliberately not named "review":
+// reviewTerminalStep is injected by phase name, and a fix phase that reused the
+// name would be told it was review-only (or review-and-fix) rather than the one
+// actor that changes code.
+//
+// Why a separate phase at all, when the review used to fix its own findings: the
+// review model is the expensive one, and the fixing - apply, re-verify, commit,
+// push, open the PR - is the bulk of a review session's tool calls and context.
+// The reviewer keeps the judgement; the cheap harness gets the typing. The cost
+// is one more session startup and a hand-off the fixer must read; the review
+// record on the task is what makes that hand-off cheap and auditable.
+var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
+	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
+	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
+	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
+	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. You are " +
+	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true. " +
+	fixCore +
+	" If the review found nothing " +
+	"(verdict: pass), there is nothing to fix: still open the PR if none exists and hand over." +
+	rerunGuidance + fixTerminalRecord + reviewTerminalStep + handoffGuidance
+
+// fixVerifyBrief is the fix phase when a VERIFICATION round follows it (CLA-638,
+// B12). The verification round re-reviews the delta and adjudicates the prior
+// MUSTs, and IT carries the PR/in_review terminal step; a fix session that
+// opened the PR here would ship fixes no verifier has looked at. The rest of the
+// contract is identical, because it reads the same record and applies the same
+// findings.
+var fixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed branch " +
+	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
+	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
+	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
+	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. A VERIFICATION round " +
+	"runs after you: it re-reviews your fix delta and adjudicates the prior open MUSTs, and IT opens the PR " +
+	"and hands the task to in_review once no MUST remains open. You are RESUMING that run, not starting a " +
+	"new one: do not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder +
+	"\") to resume the run, then get_task with includeDecisions: true. " +
+	fixCore +
+	" If the review found nothing (verdict: pass), there is nothing to fix: commit nothing, leave the branch " +
+	"as it is, and end holding the task — the verification round still runs and carries the terminal step." +
+	rerunGuidance + fixTerminalRecord + fixOnlyTerminalStep + handoffGuidance
+
+// fixOnlyTerminalStep ends a fix phase that is NOT the sequence's last one
+// (CLA-638): the verification round owns the PR and in_review hand-over.
+const fixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes " +
+	"you made, append an outcome with update_task(taskId, runId, outcome: ...) that carries the fixes and a " +
+	"**Tests** section saying what you actually verified — the plane requires that section on the task before " +
+	"the verifier can hand it to in_review, and the verifier cannot write the outcome itself once its own " +
+	"review record is sealed — then STOP still holding the task. Do NOT open a PR and do NOT move the task to " +
+	"in_review: the VERIFICATION round after you carries that terminal step once it finds no open MUST. A PR " +
+	"opened here would ship fixes the verifier never saw. Ending this session holding the task is the " +
+	"checkpoint the verification round resumes from."
+
+// noCodeFixOnlyTerminalStep is fixOnlyTerminalStep for a branchless fix: it
+// still records an outcome the in_review guard can read, but there is nothing to
+// commit or push.
+const noCodeFixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: append an outcome with " +
+	"update_task(taskId, runId, outcome: ...) that carries what you amended and a **Tests** section (\"**Tests** " +
+	"— none, no-code delivery.\" is honest and valid) — the plane reads that section on the in_review move the " +
+	"verifier makes, and the verifier cannot write the outcome itself once its own review record is sealed. " +
+	"Do NOT open a PR and do NOT move the task to in_review: the VERIFICATION round after you carries that " +
+	"terminal step once it finds no open MUST. End holding the task."
+
+// noCodeFixBrief is fixBrief for a branchless checkpoint: the review judged the
+// plane's record, and the fix is an amendment to that record, never invented
+// code. The branchless review writes no durable record (question 03a12578,
+// option 1), so this brief reads the legacy `## Review` block ALONE and applies
+// its findings by amending the task's record - there is no `reviews.records`
+// entry and no plane-assigned id to update. Its terminal step is the no-code
+// handover alone.
+var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed the " +
+	"PLANE'S RECORD of what the implement phase did - there is NO branch, because this task's correct " +
+	"delivery is no code. You " +
+	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
+	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
+	"Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading + "` block in the " +
+	"outcome — an earlier one is an earlier round, so read past it. That block IS the round's record: the " +
+	"branchless review writes no durable record (question 03a12578, option 1), so read and apply from the " +
+	"block alone and do not treat an empty record set as a failed hand-off. If the outcome carries no `" +
+	ReviewRecordHeading + "` block, that is a FAILED hand-off: say so " +
+	"in your outcome, and park the task if it is still in_progress - if phase 1 already settled it, leave it " +
+	"settled and end. Do not invent findings. Apply the findings by AMENDING THE RECORD " +
+	"(update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
+	" A finding that needs CODE cannot be fixed here: file it as its own task " +
+	"(create_task, with a real doneWhen) and say so in your outcome - for a MUST, that filed task is this " +
+	"phase's fix of it (record the new task's ref in your outcome as the fix; a dispatched MUST is fixed this " +
+	"way, not refuted, and not a failure) - do not re-open this task, do not rewrite " +
+	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
+	noCodeFixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
+
+// noCodeFixVerifyBrief is the branchless fix phase when a verification round
+// follows: the amendment is to the plane's record, and the terminal step is the
+// silent hold — the verification round carries the hand-over.
+var noCodeFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed the PLANE'S RECORD of what the " +
+	"implement phase did - there is NO branch, because this task's correct delivery is no code. A " +
+	"VERIFICATION round runs after you and adjudicates the open MUSTs, so it, not you, decides the " +
+	"hand-over. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
+	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the " +
+	"heartbeat because the task already left in_progress, that refusal is expected: the settlement IS the " +
+	"delivery, so proceed. Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading +
+	"` block in the outcome — an earlier one is an earlier round, so read past it. That block IS the round's " +
+	"record: the branchless review writes no durable record (question 03a12578, option 1), so read and apply " +
+	"from the block alone and do not treat an empty record set as a failed hand-off. Apply the findings by " +
+	"AMENDING THE RECORD (update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
+	" A finding that needs CODE cannot be fixed here: file it as its own task (create_task, with a real " +
+	"doneWhen) and say so in your outcome - for a MUST, that filed task is this phase's fix of it. If the " +
+	"review found nothing, change nothing." + rerunGuidance + fixTerminalRecord + noCodeFixOnlyTerminalStep +
+	handoffGuidance
+
+// verifyStoppingRule is the stopping rule's core: what counts as a MUST that is
+// still open (CLA-638, D7/A6/B7/B12/B13). It is shared by the code and no-code
+// variants so the bar cannot drift between them; the ID-based machinery that
+// enforces it — the round cap and the non-convergence breaker — is
+// verifyDriverBounds, because the branchless variant has no plane finding ids
+// to count or park on.
+const verifyStoppingRule = " THE STOPPING RULE IS A BAR, NOT A FEELING. The gate is NO OPEN MUST. A MUST is open " +
+	"until it is fixed, filed as its own task, or refuted with evidence — a prior MUST that is neither stays " +
+	"open, and a refutation you reject also stays open. SHOULD and NIT findings are recorded, never gating."
+
+// verifyDriverBounds is the id-based machinery the CODE-shaped verification
+// round runs under: the driver's round cap and non-convergence breaker, both
+// read from the plane's durable records.
+const verifyDriverBounds = " The driver counts rounds: this is a hard cap of three non-void rounds per review " +
+	"cycle (a human verdict starts a new cycle; a takeover or reclaim does not). At the cap, any open MUST is " +
+	"the driver's park, never another round. Non-convergence is also the driver's: a MUST left unresolved " +
+	"after two fix attempts, or an id a previous verifier marked resolved that you reopen, parks the task for " +
+	"a human."
+
+// verifyTerminalStep ends a verification round: the hand-over only when no MUST
+// remains open, otherwise a silent hold for the driver to spawn another fix.
+const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and the round number the append returned.\n\n" +
+	"If ANY MUST remains open: release this round with ONE call — update_task(taskId, runId, review: " +
+	"{ closeRound: <the round the append returned> }) — then do NOT open a PR, do NOT move the task to " +
+	"in_review, and do NOT change its status. End holding the task. The driver spawns another fix against " +
+	"the released findings, or parks the task at the round cap.\n\n" +
+	"If NO MUST remains open, carry the hand-over in the SAME call that releases the round: confirm the " +
+	"branch is pushed (push any fix commit that is still local), open a PR targeting the repo's PR base (" +
+	PhasePRBasePlaceholder + ") if none exists for the branch, then call update_task(taskId, runId, status: " +
+	"\"in_review\", review: { closeRound: <the round the append returned> }). Do NOT send an outcome in " +
+	"that call: your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), " +
+	"and the fix phase has already written the **Tests** section the in_review guard reads. Releasing the " +
+	"round in the same call is what makes the status move legal — after the task leaves in_progress the plane " +
+	"no longer accepts a close from this run. Never decide to run one more round yourself."
+
+// noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
+// counterpart of verifyTerminalStep. This shape writes no durable record
+// (question 03a12578, option 1 — the branchless review writes none either), so
+// there is no round to release and no closeRound to make: the verifier appends
+// its OWN `## Review` block, which IS the record the driver's checkpoint reads,
+// and the disposition is an operator park (open MUST — the id-based loop the
+// driver runs cannot exist without plane finding ids) or the status move
+// (clean — the verifier carries the hand-over, and the fix phase has already
+// written the **Tests** section the in_review guard reads).
+const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and whether the task still sits in_progress. The " +
+	"id-based machinery is the driver's and needs plane finding ids this shape does not have, so this " +
+	"terminal step is this shape's whole disposition.\n\n" +
+	"Append YOUR OWN legacy `" + ReviewRecordHeading + "` block to the task's outcome with " +
+	"update_task(taskId, runId, outcome: ...) — append, never replace what sits above it: the block IS this " +
+	"shape's round record, and the driver's checkpoint reads exactly it. There is no durable record to " +
+	"append, no round to close and no PR to open for a no-code delivery.\n\n" +
+	"If ANY MUST remains open: do NOT hand the task over — park it with update_task(taskId, runId, status: " +
+	"\"parked\", outcome: ...), carrying the open MUST(s) and why the amendment does not resolve them; the " +
+	"same disposition the round cap gives the id-based shape. If the task already left in_progress, do NOT " +
+	"re-open it: leave your block as the record and end.\n\n" +
+	"If NO MUST remains open: hand the task over. If it still sits in_progress with its no-code delivery " +
+	"declared, move it with update_task(taskId, runId, status: \"in_review\") — do NOT send an outcome in " +
+	"that call; your block write already landed and the fix phase wrote the **Tests** section the in_review " +
+	"guard reads. If it already left in_progress, the hand-over already happened: verify the record reads " +
+	"honestly and end. Never decide to run one more round yourself."
+
+// verifyBrief is the fix-verification round (CLA-638): review the fix delta plus
+// its regression surface, adjudicate every prior open MUST by its plane id, and
+// gate on no open MUST. It is review-shaped — it writes a sealed durable review
+// record and the driver closes the round at the seam — so it uses the same
+// record machinery as the review gate, with `scope: fix-delta` and the prior
+// round's reviewed tip as the delta base.
+//
+// The driver prepends the prior open MUST ids (and their findings) to this
+// brief: the list is plane state, not config, and the driver reads it from the
+// released records before spawning. The wording below assumes that block is
+// present and tells the session what to do if it is not.
+var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the VERIFICATION round. A review round found issues and a fix round applied " +
+	"them; your job is to verify the FIXES, not to review the whole diff again. The driver has closed the " +
+	"previous round, so get_task releases the records. You are RESUMING that run, not starting a new one: do " +
+	"not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume " +
+	"the run, then get_task with includeDecisions: true. The driver has prepended the PRIOR OPEN MUST ids with " +
+	"their findings, and every MUST of this review cycle already MARKED settled; if that block is missing, read " +
+	"the released records yourself and list every finding with severity must, both those with status open and " +
+	"those of this cycle marked fixed, refuted or filed. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - " +
+	"a session whose cwd is already the main checkout sitting on that branch is not a decision to commit " +
+	"where you are, it is this failure mode. " +
+	"SCOPE: the fix delta is the reviewed tip the LAST released record names (`reviewedTip`) up to HEAD " +
+	"(`git diff <reviewedTip>..HEAD`), PLUS the regression surface those fixes touch. Do not re-review the " +
+	"whole diff, whose full pass already happened; a full second pass is the exception you state a reason for " +
+	"in the record. " +
+	"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID — exactly one disposition each, recorded through " +
+	"update_task(review: {findingUpdates: [...]}) on the CLOSED record it belongs to: " +
+	"(1) RESOLVED — the fix is present and correct: status \"fixed\" with fixCommit. " +
+	"(2) RESOLVED BY DISPATCH — the fix is a follow-up task: status \"filed\" with filedTaskRef. " +
+	"(3) REFUTATION ACCEPTED — the fixer's evidence shows the finding was wrong: status \"refuted\" with " +
+	"refutedReason. " +
+	"(4) UNRESOLVED or REFUTATION REJECTED — leave the finding's status \"open\" and record in this round's " +
+	"record why the fix or the refutation does not stand. " +
+	"A MUST the fix phase already MARKED fixed, refuted or filed is not settled by that marking: the fixer " +
+	"marks what it answers, and a refutation changes no code, so the delta will not show it. Check each one " +
+	"the same way. Confirm it by leaving its status; reject it by setting its status back to \"open\" with " +
+	"findingUpdates and recording why — that is disposition (4), and the gate then sees it open. " +
+	"You may raise NEW MUSTs ONLY within the fix delta and its regression surface; the plane assigns their " +
+	"new ids. Do not re-raise an earlier finding as a new id: adjudicate the existing id. " +
+	"REVIEW ONLY: you do not change code — do not edit, create or delete a source file, do not commit, and do " +
+	"not apply a fix yourself. The phase after you applies what you find, and a fix applied here is a fix it " +
+	"cannot attribute. The one exception is the hand-over below: when no MUST remains open, opening the PR " +
+	"(and pushing a fix commit that the fixer left local) is the terminal step, not a review change. " +
+	"RECORD THE ROUND IN BOTH FORMS: first append the legacy `" + ReviewRecordHeading + "` block to the task's " +
+	"outcome with update_task(taskId, runId, outcome: ...) — append, never replace what sits above it — then " +
+	"append the sealed durable record with update_task(taskId, runId, review: {...}) naming reviewerRole " +
+	"\"{{reviewerRole}}\", reviewedTip `git rev-parse HEAD`, scope kind \"fix-delta\" with base and range " +
+	"(`<reviewedTip>..HEAD`), a verdict of pass or findings, and every new finding graded must/should/nit with " +
+	"the evidence a MUST requires. The durable record is the driver's seam evidence; the block is the " +
+	"one-release compatibility copy." +
+	verifyStoppingRule + verifyDriverBounds + verifyTerminalStep + rerunGuidance + handoffGuidance
+
+// noCodeVerifyBrief is verifyBrief for a branchless checkpoint: there is no
+// code delta to re-review, so the verification is of the plane record and the
+// fix's record amendments. It never opens a PR or invents code, and its
+// terminal step is the no-code hand-over (the verifier is the LAST phase, so
+// nothing after it can carry the move the review-only ending defers).
+var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the VERIFICATION round for a task whose correct delivery is NO CODE. There is " +
+	"NO branch and no diff; the fix round amended the PLANE'S RECORD. The driver has prepended the LAST `" +
+	ReviewRecordHeading + "` block of the task's outcome — that block, not a durable record, is this shape's " +
+	"round record (question 03a12578, option 1). You are RESUMING that run, not starting a new one: do not " +
+	"call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
+	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"expected: the settlement IS the delivery, so proceed. Then get_task with includeDecisions: true. Review " +
+	"the amendment the fix made: does it resolve each prior open MUST, is it evidence rather than assertion, " +
+	"does the task's record still match its doneWhen? ADJUDICATE EVERY PRIOR OPEN MUST in the BLOCK's own " +
+	"terms — resolved, resolved by dispatch (the follow-up task's ref), refuted with evidence, or left open " +
+	"with your reason — and check on the ground what the amendment claims where you can. There are no plane " +
+	"finding ids to update on this shape, and do not treat the empty durable record set as a failed " +
+	"hand-off. You may raise new MUSTs only about the record changes and their regression surface. Do NOT " +
+	"invent code, a branch or a PR, and do NOT open a PR." +
+	verifyStoppingRule + noCodeVerifyTerminalStep + rerunGuidance + handoffGuidance
+
+// BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can
+// tell whether a phase runs the built-in brief (vs an operator's custom prompt)
 // when it must choose a variant (CLA-497): a checkpoint evidenced by the
 // plane's record names no branch, and the branch-shaped brief would tell the
 // successor its hand-off FAILED.
 func BuiltinReviewBrief() string { return builtinPhasePrompts[ReviewPhaseName] }
+
+// ReviewShaped reports whether a RESOLVED phase prompt is one of the review-only
+// briefs whose deliverable is the durable review record (CLA-637). It is the
+// driver's single "requires a review record" predicate: the seam gate must apply
+// to every review-shaped brief, not only the exact built-in review-only prompt
+// it was originally keyed to, so every variant — and, as later phases land,
+// every verifier and panel brief — is added HERE rather than in a second
+// condition that can drift.
+//
+// The resolved prompt, not the configured one: EffectivePhases swaps in
+// reviewOnlyBrief by position, and invocationFor later swaps the branchless and
+// unverified variants. A handoff continuation replaces the prompt wholesale, so
+// the caller reads this from EffectivePhases before any of that.
+func ReviewShaped(prompt string) bool {
+	switch prompt {
+	case reviewOnlyBrief, unverifiedReviewOnlyBrief, noCodeReviewOnlyBrief,
+		verifyBrief, noCodeVerifyBrief:
+		return true
+	}
+	return false
+}
+
+// VerifyShaped reports whether a RESOLVED prompt is a fix-verification round
+// (CLA-638). It is deliberately narrower than ReviewShaped: a verifier writes a
+// durable record and is gated the same way, but it also adjudicates prior
+// findings and its terminal step depends on whether any MUST is still open, so
+// the driver must not mistake an ordinary review for it.
+func VerifyShaped(prompt string) bool {
+	switch prompt {
+	case verifyBrief, noCodeVerifyBrief:
+		return true
+	}
+	return false
+}
+
+// ReviewOnlyBrief returns the review-only brief a non-final review phase runs.
+func ReviewOnlyBrief() string { return reviewOnlyBrief }
+
+// NoCodeReviewOnlyBrief returns the review-only brief for a branchless
+// checkpoint (a no-code delivery or an already-settled task).
+func NoCodeReviewOnlyBrief() string { return noCodeReviewOnlyBrief }
+
+// UnverifiedReviewOnlyBrief returns the review-only brief for a checkpoint the
+// driver could not verify against the origin remote.
+func UnverifiedReviewOnlyBrief() string { return unverifiedReviewOnlyBrief }
+
+// FixBrief returns the fix phase's shipped brief.
+func FixBrief() string { return fixBrief }
+
+// FixVerifyBrief returns the fix phase's brief when a verification round
+// follows it: it applies findings and stops holding the task; the verifier owns
+// the PR and in_review hand-over.
+func FixVerifyBrief() string { return fixVerifyBrief }
+
+// VerifyBrief returns the verification round's shipped brief.
+func VerifyBrief() string { return verifyBrief }
+
+// NoCodeVerifyBrief returns the verification round's brief for a branchless
+// checkpoint.
+func NoCodeVerifyBrief() string { return noCodeVerifyBrief }
+
+// NoCodeFixVerifyBrief returns the branchless fix phase's brief when a
+// verification round follows it.
+func NoCodeFixVerifyBrief() string { return noCodeFixVerifyBrief }
+
+// NoCodeFixBrief returns the fix phase's brief for a branchless checkpoint.
+func NoCodeFixBrief() string { return noCodeFixBrief }
 
 // NoCodeReviewBrief returns the review brief for a checkpoint evidenced by the
 // plane's record (CLA-497) - see noCodeReviewBrief.
@@ -707,7 +1516,54 @@ const (
 	PhaseRunPlaceholder    = "{{runId}}"
 	PhaseBranchPlaceholder = "{{branch}}"
 	PhasePRBasePlaceholder = "{{prBase}}"
+
+	// PhaseHarnessPlaceholder and PhaseModelPlaceholder name the phase's OWN
+	// resolved harness and model. They are per-phase facts the driver knows and a
+	// session cannot reliably report for itself ("what model are you?" is a guess
+	// even when the provider exposes one), so the review record's attribution is
+	// injected rather than remembered.
+	PhaseHarnessPlaceholder = "{{harness}}"
+	PhaseModelPlaceholder   = "{{model}}"
+
+	// PhasePrevHarnessPlaceholder and PhasePrevModelPlaceholder name the phase
+	// BEFORE this one — for the review, the implementer whose work is being
+	// judged. Empty in phase 0, which has no predecessor, so a first-phase
+	// prompt carrying them is refused rather than spawned with a literal.
+	PhasePrevHarnessPlaceholder = "{{prevHarness}}"
+	PhasePrevModelPlaceholder   = "{{prevModel}}"
+
+	// PhaseNumberPlaceholder and PhaseTotalPlaceholder are this phase's 1-based
+	// position and the sequence length. The briefs used to say "PHASE 2 of 2"
+	// as text, which became a lie the moment a fix phase could follow: a
+	// three-phase review is phase 2 of 3, and a brief that miscounts the
+	// sequence is a session reasoning about a shape that is not there.
+	PhaseNumberPlaceholder = "{{phaseNumber}}"
+	PhaseTotalPlaceholder  = "{{phaseTotal}}"
+
+	// ReviewerRolePlaceholder and ReviewedTipPlaceholder are the durable review
+	// record's identity (CLA-637). The plane assigns the round and the cycle,
+	// so neither is a placeholder: the driver reads them back off the record it
+	// matches. The driver resolves the role from the phase and the reviewed tip
+	// from the checkpoint it VERIFIED on the origin remote, so the session
+	// records what the seam gate will match rather than inventing it. The role
+	// is unique per review phase (`review-1`, ...) so a panel member each
+	// appends its own record; the tip is the origin commit the reviewer must
+	// check out and review.
+	ReviewerRolePlaceholder = "{{reviewerRole}}"
+	ReviewedTipPlaceholder  = "{{reviewedTip}}"
 )
+
+// ReviewRecordHeading is the marker of the LEGACY block a review-only phase
+// still records in the task's outcome for one release (CLA-637), so older
+// planes and readers keep seeing a review where they expect one. The durable
+// per-reviewer record written through update_task.review is the interface the
+// driver's review→fix seam gate reads now; this block is carried for
+// compatibility, and the fix phase keeps it verbatim in its own outcome.
+//
+// It deliberately carries no round number. The round lives in the durable
+// record, assigned by the plane; a hard-coded "round 1" would be false on any
+// later run of the same task.
+const ReviewRecordHeading = "## Review"
 
 // Config is the resolved loop configuration. The comments here are the source of
 // truth for each knob until the README/docs catch up.
@@ -788,13 +1644,19 @@ type Config struct {
 	// checkpoint the model cannot reach itself. See Phase for why this exists.
 	//
 	// OPT-IN, and deliberately so. Left empty, a task runs exactly as it always
-	// has: one session, asked Prompt. Two phases mean a task that reaches its
-	// checkpoint and stops there is only HALF finished until the next session
+	// has: one session, asked Prompt. Two or more phases mean a task that reaches
+	// its checkpoint and stops there is only HALF finished until the next session
 	// runs, so switching it on before the sequence has been watched end to end
 	// would turn a driver bug into tasks that silently never reach review. An
 	// operator opts in per config, and the shipped briefs are one line each:
 	//
-	//	"phases": [{"name": "implement"}, {"name": "review"}]
+	//	"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
+	//
+	// The three-phase shape is the shipped one: `review` with a phase after it is
+	// the REVIEW-ONLY gate (it records findings and changes nothing), and `fix`
+	// is the last phase and owns the PR plus in_review. A FINAL `review` keeps the
+	// historical review-and-fix brief, so an existing two-phase config still
+	// finishes its tasks; the mode is chosen by position, not by a second name.
 	//
 	// Naming a phase and leaving its prompt empty takes the built-in brief for
 	// that name; set `prompt` to override it, and `max_turns` to cap it.
@@ -1650,16 +2512,65 @@ func (c *Config) EffectivePhases() []Phase {
 	out := make([]Phase, len(phases))
 	for i, ph := range phases {
 		if ph.Prompt == "" {
-			ph.Prompt = builtinPhasePrompts[ph.Name]
+			// The review phase's MODE is positional: a review with a phase after
+			// it is the read-only gate, and a final review keeps the historical
+			// review-and-fix brief so a two-phase config still finishes. See
+			// reviewOnlyBrief and the builtinPhasePrompts comment.
+			//
+			// The fix phase's TERMINAL is positional for the same reason: a fix
+			// followed by a verification round must not open the PR (CLA-638,
+			// B12), because the verifier carries that terminal step only after it
+			// finds no open MUST.
+			switch {
+			case ph.Name == ReviewPhaseName && i < len(phases)-1:
+				ph.Prompt = reviewOnlyBrief
+			case ph.Name == FixPhaseName && i+1 < len(phases) && phases[i+1].Name == VerifyPhaseName && phases[i+1].Prompt == "":
+				ph.Prompt = fixVerifyBrief
+			default:
+				ph.Prompt = builtinPhasePrompts[ph.Name]
+			}
 		}
-		ph.MaxTurns = c.resolveMaxTurns(ph.MaxTurns)
-		ph.MaxWallClock = c.resolveWallClock(ph.MaxWallClock)
+		out[i] = ph
+	}
+	// A verify phase that names neither a harness nor a tier would otherwise run
+	// on the REVIEWER'S model — the one that raised the findings — which A5
+	// (throughput, not only dollars) says is the wrong default: verification
+	// rounds are scoped and cheap, and a Claude subscription limit is shared with
+	// the operator's interactive use. So it inherits the FIX phase's harness and
+	// tier instead (the shipped shape has fix on a cheap non-Claude harness), and
+	// an explicit harness/tier on the verify phase always wins. Configurable,
+	// never silent magic: the resolved values are what the spawn line stamps.
+	//
+	// Keyed on the RESOLVED built-in brief, not the name: an operator's own
+	// prompt under the name "verify" owns its own contract (the same convention
+	// every other variant follows — verifyBrief is what the driver treats as a
+	// verifier), so it must not silently inherit the fix phase's knobs.
+	if len(c.Phases) > 1 {
+		lastFix := -1
+		for i := range out {
+			if out[i].Name == FixPhaseName {
+				lastFix = i
+				continue
+			}
+			if out[i].Name != VerifyPhaseName || out[i].Prompt != verifyBrief || lastFix < 0 {
+				continue
+			}
+			if out[i].Harness == "" {
+				out[i].Harness = out[lastFix].Harness
+			}
+			if out[i].Tier == "" {
+				out[i].Tier = out[lastFix].Tier
+			}
+		}
+	}
+	for i := range out {
+		out[i].MaxTurns = c.resolveMaxTurns(out[i].MaxTurns)
+		out[i].MaxWallClock = c.resolveWallClock(out[i].MaxWallClock)
 		// Resolve the harness here too, so every phase the driver iterates NAMES
 		// the harness it runs on and nothing downstream has to re-derive it from
 		// the config. The synthesized single phase of an unphased run gets the
 		// run-wide harness by the same rule, which is what it always ran on.
-		ph.Harness = c.HarnessFor(ph)
-		out[i] = ph
+		out[i].Harness = c.HarnessFor(out[i])
 	}
 	return out
 }
@@ -1968,81 +2879,6 @@ func discover() string {
 		return p
 	}
 	return ""
-}
-
-// ConfigDir returns the directory instance configs live in: the parent of the
-// one auto-discovered file (homeConfigRelPath), i.e. `~/.config/clankerbar` by
-// default. The fleet supervisor (CLA-525) enumerates every `*.json` in it; Load
-// with an empty path reads `config.json` inside it. Same home-relative
-// construction as discover, so the two can never disagree about where configs
-// live.
-func ConfigDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("config dir: %w", err)
-	}
-	return filepath.Dir(filepath.Join(home, homeConfigRelPath)), nil
-}
-
-// topLevelConfigKeys are the JSON keys Config unmarshals from. A file carrying
-// at least one of them IS a clankerbar config (or claims to be); the other JSON
-// that shares the config dir — MCP configs (`mcp`, `mcpServers`), headless
-// permission policies (`permissions`, `allow`, `deny`), opencode configs — carry
-// none. Kept in lockstep with the Config struct's json tags, which are the
-// source of truth: adding a knob without adding its key here would silently
-// stop the supervisor from recognising the files that set it.
-var topLevelConfigKeys = map[string]bool{
-	"allow_local_mcp_servers": true,
-	"allow_unchecked_pr":      true,
-	"backlog_url":             true,
-	"budget":                  true,
-	"config_dir":              true,
-	"env":                     true,
-	"escalation":              true,
-	"harness":                 true,
-	"harnesses":               true,
-	"health_url":              true,
-	"idle_poll_interval":      true,
-	"instance_name":           true,
-	"integration_branch":      true,
-	"max_iterations":          true,
-	"max_retries":             true,
-	"max_session_wall_clock":  true,
-	"max_turns":               true,
-	"max_zero_spend_attempts": true,
-	"mcp_config_path":         true,
-	"model":                   true,
-	"models":                  true,
-	"phases":                  true,
-	"poll_interval":           true,
-	"pr_base":                 true,
-	"primary_repo":            true,
-	"projects":                true,
-	"prompt":                  true,
-	"repos":                   true,
-	"retry_cap":               true,
-	"settings_path":           true,
-	"state_dir":               true,
-	"workdir":                 true,
-}
-
-// LooksLikeConfig reports whether data is JSON carrying at least one recognized
-// clankerbar config key. It is the supervisor's first filter over `*.json` in
-// the config dir: a file that fails it cannot be an instance config whatever
-// Load and Validate would say (a headless permission policy validates as an
-// empty config with defaults), so it is skipped without even being loaded.
-// Unparseable data is not a config.
-func LooksLikeConfig(data []byte) bool {
-	var keys map[string]json.RawMessage
-	if err := json.Unmarshal(data, &keys); err != nil {
-		return false
-	}
-	for k := range keys {
-		if topLevelConfigKeys[k] {
-			return true
-		}
-	}
-	return false
 }
 
 // refuseImplicitWorkDirConfig refuses to run when a `clankerbar.json` is sitting
@@ -2483,9 +3319,9 @@ func (c *Config) Validate() error {
 			if effective == "" {
 				effective = builtinPhasePrompts[ph.Name]
 			}
-			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder, PhaseBranchPlaceholder} {
+			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder, PhaseBranchPlaceholder, PhasePrevHarnessPlaceholder, PhasePrevModelPlaceholder, ReviewerRolePlaceholder, ReviewedTipPlaceholder} {
 				if strings.Contains(effective, pl) {
-					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim to fill it from — it claims a task of its own, so a resume brief cannot go first",
+					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim or phase to fill it from — it claims a task of its own, so a resume brief cannot go first",
 						ph.Label(0), pl)
 				}
 			}
@@ -2499,6 +3335,97 @@ func (c *Config) Validate() error {
 		if lastPh.Prompt == "" && lastPh.Name == ImplementPhaseName {
 			return fmt.Errorf("phases[%d]: the sequence ends on the %q brief, which tells its session to stop at the checkpoint — nothing would ever hand a task to review (add a %q phase, or give this one its own prompt)",
 				n-1, ImplementPhaseName, ReviewPhaseName)
+		}
+	}
+	// The fix phase is the one that carries the branch-shaped terminal step (PR,
+	// in_review), so it must be LAST: a non-final fix would open the PR and hand
+	// the task over, and the phase after it would resume a task that has already
+	// left the run. It also needs a preceding review phase by name, because its
+	// shipped brief's first act is to read the review record's `## Review` block
+	// from the task — a fix with no review before it can only report a failed
+	// hand-off. Both rules apply to the BUILT-IN brief only; an operator's own
+	// prompt owns its own ordering.
+	//
+	// CLA-638 relaxes the LAST rule for exactly one successor: a built-in
+	// VERIFICATION phase. EffectivePhases swaps the fix's resolved prompt to the
+	// no-PR variant; the verifier then carries the terminal step, and the driver
+	// repeats the fix→verify pair until a round finds no open MUST or the round
+	// cap parks the task.
+	if n := len(c.Phases); n > 0 {
+		for i, ph := range c.Phases {
+			if ph.Prompt != "" || ph.Name != FixPhaseName {
+				continue
+			}
+			verifyFollows := i+1 < n && c.Phases[i+1].Name == VerifyPhaseName && c.Phases[i+1].Prompt == ""
+			if i != n-1 && !verifyFollows {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is the LAST phase of a sequence — it opens the PR and hands the task to in_review, so a phase after it would be spawned on a task that has already left the run (move %q to the end, or give this phase its own prompt)",
+					i, ph.Label(i), FixPhaseName, FixPhaseName)
+			}
+			reviewed := false
+			for _, prev := range c.Phases[:i] {
+				if prev.Name == ReviewPhaseName {
+					reviewed = true
+					break
+				}
+			}
+			if !reviewed {
+				return fmt.Errorf("phases[%d] (%q): the %q brief applies a review's findings, but no %q phase precedes it — there would be no review record to read, and its only honest outcome is a reported failed hand-off (add a %q phase, or give this one its own prompt)",
+					i, ph.Label(i), FixPhaseName, ReviewPhaseName, ReviewPhaseName)
+			}
+		}
+	}
+	// The verification round (CLA-638) has one legal position and one legal
+	// predecessor. Position: LAST, because the driver repeats the fix→verify pair
+	// after it and a phase after the verifier would never be reached. Predecessor:
+	// the built-in fix brief, because there must be a phase that applies findings
+	// between the verifier's rounds — without it the loop cannot make progress,
+	// which is exactly the non-terminating sequence this rule refuses. The
+	// verifier also needs an earlier review phase whose MUSTs it adjudicates; a
+	// sequence with no review has no findings and no ids to verify.
+	if n := len(c.Phases); n > 0 {
+		for i, ph := range c.Phases {
+			if ph.Prompt != "" || ph.Name != VerifyPhaseName {
+				continue
+			}
+			if i != n-1 {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is the LAST phase of a sequence — it ends the verification loop (no open MUST), so a phase after it would never run (move %q to the end)",
+					i, ph.Label(i), VerifyPhaseName, VerifyPhaseName)
+			}
+			if i == 0 || c.Phases[i-1].Prompt != "" || c.Phases[i-1].Name != FixPhaseName {
+				return fmt.Errorf("phases[%d] (%q): the %q brief verifies a fix round, so it must directly follow the %q brief — with no fix between verification rounds the loop cannot make progress (add a %q phase before %q)",
+					i, ph.Label(i), VerifyPhaseName, FixPhaseName, FixPhaseName, VerifyPhaseName)
+			}
+			reviewed := false
+			for _, prev := range c.Phases[:i] {
+				if prev.Name == ReviewPhaseName {
+					reviewed = true
+					break
+				}
+			}
+			if !reviewed {
+				return fmt.Errorf("phases[%d] (%q): the %q brief adjudicates a review's open MUSTs by id, but no %q phase precedes the fix it verifies — there would be no finding ids to adjudicate (add a %q phase before %q)",
+					i, ph.Label(i), VerifyPhaseName, ReviewPhaseName, ReviewPhaseName, FixPhaseName)
+			}
+		}
+	}
+	// A non-final BUILT-IN review names the phase after it as the one that applies
+	// its findings, and the driver's review→fix seam requires the review record to
+	// have been written. A built-in phase there that is NOT the fix brief cannot
+	// satisfy either (the other built-ins claim a task, or run the combined
+	// review-and-fix brief and re-review from scratch), so a config that names one
+	// is refused at startup rather than spending a review to discover it. A phase
+	// with its OWN prompt is allowed: applying the findings is then the operator's
+	// own contract.
+	if n := len(c.Phases); n > 1 {
+		for i, ph := range c.Phases[:n-1] {
+			if ph.Prompt != "" || ph.Name != ReviewPhaseName {
+				continue
+			}
+			next := c.Phases[i+1]
+			if next.Prompt == "" && next.Name != FixPhaseName {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is REVIEW-ONLY — it records findings and changes nothing — so the phase after it must be the %q brief (or carry its own prompt saying who applies the findings); %q resolves to the %q built-in, which does neither",
+					i, ph.Label(i), ReviewPhaseName, FixPhaseName, next.Label(i+1), next.Name)
+			}
 		}
 	}
 

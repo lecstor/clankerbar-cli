@@ -953,6 +953,94 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 	}
 }
 
+// CLA-637: the review-only brief is the CLI's whole lever on the durable
+// record's shape — the SESSION writes the record through its own MCP client —
+// so the tokens the plane and the seam gate read are pinned here: the
+// update_task field names, the identity the driver fills in, the per-finding
+// attribution the analytics need, and the append order the plane's channel
+// seal forces. The NO-CODE variant is the exception the operator decided
+// (question 03a12578, option 1): a settled task has no live holder, so the
+// plane would refuse the durable write and this brief prescribes the legacy
+// block ALONE — pinned both ways below.
+func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
+	for name, brief := range map[string]string{
+		"review-only brief":            reviewOnlyBrief,
+		"unverified review-only brief": unverifiedReviewOnlyBrief,
+	} {
+		for _, want := range []string{
+			"update_task(taskId, runId, review: {...})",
+			`reviewerRole: "` + ReviewerRolePlaceholder + `"`,
+			"reviewedTip",
+			"raisedByModel",
+			`scope: {kind: "full-diff", base: "` + PhasePRBasePlaceholder,
+			"duplicate_reviewer",
+			// The plane seals the round on append and then refuses this run's
+			// outcome writes, so the legacy block must land first.
+			"only after that outcome write has SUCCEEDED",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("the %s does not prescribe %q, so the durable record the seam gates on is not what the session writes:\n%s", name, want, brief)
+			}
+		}
+	}
+	// Both halves are prescribed, in that order: the legacy block first, the
+	// durable record below it.
+	block := strings.Index(reviewOnlyRecordShape, "Record the LEGACY block")
+	durable := strings.Index(reviewOnlyRecordShape, "append THIS run's durable")
+	if block < 0 || durable < 0 || block > durable {
+		t.Errorf("the record shape does not put the legacy outcome block before the durable record (block at %d, durable at %d)", block, durable)
+	}
+
+	// The branchless variant prescribes the block ALONE: it must name the block
+	// write, must NOT name the durable-record call (the plane would refuse it
+	// for a settled task), and its terminal step must say so.
+	if !strings.Contains(noCodeReviewOnlyBrief, "update_task(taskId, runId, outcome: ...)") {
+		t.Errorf("the no-code review-only brief does not prescribe the legacy block write:\n%s", noCodeReviewOnlyBrief)
+	}
+	for _, banned := range []string{"update_task(taskId, runId, review: {...})", "THEN append THIS run's durable"} {
+		if strings.Contains(noCodeReviewOnlyBrief, banned) {
+			t.Errorf("the no-code review-only brief prescribes %q, but the plane refuses every review write on a settled task (question 03a12578, option 1):\n%s", banned, noCodeReviewOnlyBrief)
+		}
+	}
+	if !strings.Contains(noCodeReviewOnlyTerminalStep, "Do NOT attempt update_task(review: ...) here") {
+		t.Errorf("the no-code terminal step does not tell the session the durable write is not attempted:\n%s", noCodeReviewOnlyTerminalStep)
+	}
+}
+
+// ReviewShaped is the driver's single "this phase owes a durable review
+// record" predicate (CLA-637): true for every review-ONLY variant the briefs
+// ship — the seam gate and the round close apply to all of them, not only the
+// exact built-in prompt the gate was first keyed to — and false for everything
+// else. The final combined review brief does its own fixing and hands the task
+// over, so it records no durable round; an operator's custom prompt owns its
+// own contract.
+func TestReviewShaped(t *testing.T) {
+	tests := []struct {
+		name   string
+		prompt string
+		want   bool
+	}{
+		{"the review-only brief", reviewOnlyBrief, true},
+		{"the unverified review-only brief", unverifiedReviewOnlyBrief, true},
+		{"the no-code review-only brief", noCodeReviewOnlyBrief, true},
+		{"the verification brief", verifyBrief, true},
+		{"the no-code verification brief", noCodeVerifyBrief, true},
+		{"the final combined review brief", builtinPhasePrompts[ReviewPhaseName], false},
+		{"the fix brief", fixBrief, false},
+		{"the fix-with-verification brief", fixVerifyBrief, false},
+		{"the implement brief", builtinPhasePrompts[ImplementPhaseName], false},
+		{"an operator's custom prompt", "Do your own review-shaped job, whatever that means here.", false},
+		{"an empty prompt", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReviewShaped(tc.prompt); got != tc.want {
+				t.Errorf("ReviewShaped(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 // CLA-353: a handoff respawn replaces ph.Prompt wholesale with
 // config.HandoffPreamble plus the predecessor's self-authored prompt (CLA-352) —
 // the built-in brief text, including reviewTerminalStep, is not otherwise part of
@@ -1129,5 +1217,772 @@ func TestBuiltinBriefsCarryThePRBasePlaceholder(t *testing.T) {
 	// is NOT smuggled into that refusal set.
 	if strings.Contains(implementCommitEarlyRule, PhasePRBasePlaceholder) {
 		t.Errorf("the commit-early rule carries %s; it belongs where a branch is named, not in entry guidance:\n%s", PhasePRBasePlaceholder, implementCommitEarlyRule)
+	}
+}
+
+// The split's mode is POSITIONAL: a review with a phase after it is the
+// read-only gate; a final review keeps the historical review-and-fix brief so
+// an existing two-phase config still reaches in_review. Pinning both arms is
+// what stops a later edit from silently flipping every existing config into a
+// sequence that stops at a checkpoint with no successor.
+func TestEffectivePhases_ReviewIsOnlyWhenAPhaseFollowsIt(t *testing.T) {
+	three := defaults()
+	three.Prompt = ""
+	three.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+
+	got := three.EffectivePhases()
+	if len(got) != 3 {
+		t.Fatalf("got %d phases, want 3", len(got))
+	}
+	if got[1].Prompt != reviewOnlyBrief {
+		t.Errorf("a non-final review did not resolve to the review-only brief:\n%s", got[1].Prompt)
+	}
+	if got[2].Prompt != fixBrief {
+		t.Errorf("the fix phase did not resolve to the fix brief:\n%s", got[2].Prompt)
+	}
+
+	two := defaults()
+	two.Prompt = ""
+	two.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}}
+	got = two.EffectivePhases()
+	if got[1].Prompt != builtinPhasePrompts[ReviewPhaseName] {
+		t.Errorf("a FINAL review lost the historical review-and-fix brief, so an existing two-phase config would stop at the checkpoint:\n%s", got[1].Prompt)
+	}
+
+	// An operator's own prompt is never rewritten by the positional rule.
+	custom := defaults()
+	custom.Prompt = ""
+	custom.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName, Prompt: "my gate"}, {Name: FixPhaseName}}
+	if got := custom.EffectivePhases()[1].Prompt; got != "my gate" {
+		t.Errorf("the positional rule overwrote a custom review prompt with %q", got)
+	}
+}
+
+// The review-only brief is the whole cost argument: the expensive model reads
+// and judges, and changes nothing. Pin the prohibitions and the record, not
+// merely the presence of the word "review" — a brief that says "review only"
+// and then asks it to fix what it finds is the thing being removed.
+func TestBuiltinReviewOnlyBriefStatesItsScopeAndRecord(t *testing.T) {
+	brief := reviewOnlyBrief
+	lower := strings.ToLower(brief)
+
+	for _, want := range []string{
+		"review-only gate",
+		"find issues",
+		"specify fixes",
+		"review only",
+		"do not edit, create or delete a source file",
+		"do not commit",
+		"do not push",
+		"do not open a pr",
+		"reviewed tip",
+		"verdict: pass",
+		"verdict: findings",
+		"r1 [must|should|nit]",
+		"required fix",
+		"failed hand-off",
+		"heartbeat(",
+		"get_task with includedecisions: true",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the review-only brief never says %q:\n%s", want, brief)
+		}
+	}
+	if !strings.Contains(brief, ReviewRecordHeading) {
+		t.Errorf("the review-only brief never carries the record heading %q the seam gate looks for:\n%s", ReviewRecordHeading, brief)
+	}
+	// Placeholders are case-sensitive: the lowercased copy cannot carry them.
+	for _, want := range []string{
+		PhaseTaskPlaceholder,
+		PhaseRunPlaceholder,
+		PhaseBranchPlaceholder,
+		PhaseHarnessPlaceholder,
+		PhaseModelPlaceholder,
+		PhasePrevHarnessPlaceholder,
+		PhasePrevModelPlaceholder,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the review-only brief never carries %s:\n%s", want, brief)
+		}
+	}
+
+	// The actions that belong to the fix phase must be ABSENT, not merely
+	// contradicted somewhere else: a session reads the brief linearly, and a
+	// dangling "Then COMMIT and PUSH" is an instruction whatever the paragraph
+	// above said.
+	for _, banned := range []string{
+		"Open a PR", "COMMIT and PUSH", `status: "in_review"`, "fix what it finds",
+	} {
+		if strings.Contains(brief, banned) {
+			t.Errorf("the review-only brief carries %q, which is the fix phase's job:\n%s", banned, brief)
+		}
+	}
+
+	// Position: the record-then-hold ending is the last thing before the shared
+	// handoff guidance, in the same emphatic shape CLA-384 pinned on the old
+	// terminal step.
+	if !strings.HasSuffix(brief, reviewOnlyTerminalStep+handoffGuidance) {
+		t.Errorf("the review-only ending is not the last thing before the handoff guidance:\n%s", brief)
+	}
+	if !strings.Contains(reviewOnlyTerminalStep, "do NOT COMMIT, PUSH or open a PR") {
+		t.Errorf("the review-only terminal step does not forbid the fix phase's actions:\n%s", reviewOnlyTerminalStep)
+	}
+}
+
+// CLA-635: every review-only variant — the three briefs and the two handoff
+// continuations that carry the record shape — states the accepted MUST bar: the
+// seven evidence kinds with their payloads, and the not-a-MUST list, whose
+// precedence over a repo hard rule about style, prose or doc wording is B6.
+func TestReviewOnlyVariantsCarryTheMUSTBar(t *testing.T) {
+	variants := map[string]string{
+		"review-only brief":            reviewOnlyBrief,
+		"no-code review-only brief":    noCodeReviewOnlyBrief,
+		"unverified review-only brief": unverifiedReviewOnlyBrief,
+		"review-only handoff":          HandoffContinuationFor(ReviewPhaseName, true),
+		"no-code review-only handoff":  NoCodeReviewOnlyHandoffContinuation(),
+	}
+	for name, brief := range variants {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{
+			"grade every finding",
+			"must is the only gating grade",
+			"donewhen - quote the clause",
+			"gate - name a repo gate",
+			"failure - a concrete input or state",
+			"security - credential exposure",
+			"decision - a recorded standing decision",
+			"irreversible - an irreversible migration",
+			"untested - a new or changed guard",
+			"never a must, however confident",
+			"missing tests the donewhen does not require (except untested)",
+			"not-a-must list wins",
+			"they need no evidence",
+		} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never states %q, so the bar it reviews against is unstated:\n%s", name, want, brief)
+			}
+		}
+	}
+}
+
+// CLA-635: the record format the review fills in carries, per finding, its id,
+// severity, evidence kind and evidence, file:line, summary and required fix;
+// the block attributes the reviewer (harness/model) once, and every finding in
+// it inherits that attribution.
+func TestReviewOnlyRecordFormatCarriesTheGradedFindingFields(t *testing.T) {
+	for _, want := range []string{
+		"R1 [must|should|nit]",
+		"(<kind>): <evidence>",
+		"<file:line> - <what is wrong>",
+		"Required fix:",
+		"- reviewed by: harness " + PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder,
+	} {
+		if !strings.Contains(reviewOnlyRecordShape, want) {
+			t.Errorf("the review record shape does not carry %q, so the fix phase cannot read it back:\n%s", want, reviewOnlyRecordShape)
+		}
+	}
+}
+
+// CLA-635: the fix briefs hold the fixer to the grade (A1/B5): every MUST is
+// fixed or refuted with evidence in the outcome, the fixer may not downgrade a
+// MUST, a single reviewer's MUST is never dropped because it stands alone, and
+// SHOULD/NIT get the filing rule.
+func TestBuiltinFixBriefsHoldTheFixerToTheGrade(t *testing.T) {
+	for name, brief := range map[string]string{
+		"fix brief":         fixBrief,
+		"no-code fix brief": noCodeFixBrief,
+	} {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{
+			"every must is fixed, or refuted with evidence recorded in your outcome",
+			"you may not downgrade a must",
+			"a must raised by a single reviewer is never dropped because nobody else raised it",
+			"listing a recorded must with no evidence kind or no evidence payload as a should",
+			"record nits and the shoulds you do not fix in your outcome as not done, with the reason",
+			"file a follow-up task only for a should worth doing",
+		} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never states %q, so the fix phase can drop or silently downgrade a MUST:\n%s", name, want, brief)
+			}
+		}
+	}
+	// The ### Fixes obligation keeps that promise in the durable record: a MUST
+	// left unfixed must be a refutation carrying its evidence.
+	if !strings.Contains(strings.ToLower(fixTerminalRecord), "for a must that reason must be a refutation carrying its evidence") {
+		t.Errorf("the fix record requirement does not say an unfixed MUST must be a refutation with evidence:\n%s", fixTerminalRecord)
+	}
+	// The no-code brief's one unreachable case must not contradict the grade: a
+	// code-needing MUST can be neither fixed nor refuted there, so dispatching
+	// it to a real follow-up task has to count as the fix — and the record
+	// requirement has to accept the task ref as that fix's evidence, or the
+	// dispatched MUST still reads as "did not (with a reason)".
+	if !strings.Contains(strings.ToLower(noCodeFixBrief), "for a must, that filed task is this phase's fix of it") {
+		t.Errorf("the no-code fix brief leaves a dispatched MUST contradicting the fix-or-refute rule:\n%s", noCodeFixBrief)
+	}
+	if !strings.Contains(strings.ToLower(fixTerminalRecord), "the ref of the real follow-up task a code-needing finding was dispatched to") {
+		t.Errorf("the fix record requirement does not name a dispatch as a fix's evidence:\n%s", fixTerminalRecord)
+	}
+}
+
+// The fix brief is the one that must land the PR and the hand-off, and it must
+// carry the review forward: once it overwrites the review's outcome, the review
+// block in its own outcome is the only durable record of what was found and
+// what was done about it.
+func TestBuiltinFixBriefCarriesTheReviewForwardAndTheTerminalStep(t *testing.T) {
+	brief := fixBrief
+	lower := strings.ToLower(brief)
+
+	for _, want := range []string{
+		"the fix phase and the last phase",
+		"## review",
+		"each by its plane id",
+		"reviewedtip",
+		"git rev-parse head",
+		"park the task",
+		"### fixes",
+		"reviews.records",
+		"durable review record",
+		"fixed by: harness",
+		"failed hand-off",
+		"do not review the work yourself",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("the fix brief never says %q:\n%s", want, brief)
+		}
+	}
+	for _, want := range []string{
+		PhaseTaskPlaceholder,
+		PhaseRunPlaceholder,
+		PhaseBranchPlaceholder,
+		PhasePRBasePlaceholder,
+		PhaseHarnessPlaceholder,
+		PhaseModelPlaceholder,
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the fix brief never carries %s:\n%s", want, brief)
+		}
+	}
+
+	// The PR and in_review step is the shared terminal block, in its pinned
+	// position: a fix phase that ends without it is the CLA-384 failure again,
+	// with the added cost that the findings were recorded and then stranded.
+	if !strings.HasSuffix(brief, reviewTerminalStep+handoffGuidance) {
+		t.Errorf("the fix brief does not end on the shared terminal step:\n%s", brief)
+	}
+}
+
+// The exemption's fix-side half (question 03a12578, option 1): the branchless
+// review writes no durable record, so the fix brief that follows must read the
+// legacy block alone. A brief that demanded `reviews.records`, a PLANE id or a
+// `findingUpdates` call would be unexecutable on every branchless round — the
+// exact dead-end the exemption removes, one phase later.
+func TestNoCodeFixBriefReadsTheBlockAlone(t *testing.T) {
+	for _, banned := range []string{
+		"reviews.records",
+		"PLANE ids",
+		"findingUpdates",
+		"durable review record",
+		"update_task(taskId, runId, review: {...})",
+	} {
+		if strings.Contains(noCodeFixBrief, banned) {
+			t.Errorf("the no-code fix brief prescribes %q, but a branchless round writes no durable record (question 03a12578, option 1):\n%s", banned, noCodeFixBrief)
+		}
+	}
+	for _, want := range []string{
+		"read the LAST `" + ReviewRecordHeading + "` block",
+		"read and apply from the block alone",
+		"AMENDING THE RECORD",
+	} {
+		if !strings.Contains(noCodeFixBrief, want) {
+			t.Errorf("the no-code fix brief does not %q:\n%s", want, noCodeFixBrief)
+		}
+	}
+	// Its terminal record is the outcome requirement alone — no findingUpdates
+	// half — and the no-code handover ends the brief.
+	if !strings.Contains(noCodeFixBrief, noCodeFixTerminalRecord) {
+		t.Errorf("the no-code fix brief does not carry the outcome-only terminal record:\n%s", noCodeFixBrief)
+	}
+	if strings.Contains(noCodeFixTerminalRecord, "findingUpdates") {
+		t.Errorf("the no-code terminal record demands a durable findingUpdates call:\n%s", noCodeFixTerminalRecord)
+	}
+	if !strings.HasSuffix(noCodeFixBrief, noCodeReviewTerminalStep+handoffGuidance) {
+		t.Errorf("the no-code fix brief does not end on the no-code handover:\n%s", noCodeFixBrief)
+	}
+}
+
+// A statusless update_task outcome REPLACES the whole field on the plane, so a
+// review-only brief that writes only its own block erases phase 1's delivery
+// record, and a fix brief that rebuilds the outcome from the review block plus
+// ### Fixes erases it again. Both must state the append/keep-above contract,
+// handoff continuations included — a respawned successor never saw the original
+// brief, and it is the session most likely to have only its own block in hand.
+func TestBuiltinReviewAndFixBriefsPreserveWhatSitsAboveTheBlock(t *testing.T) {
+	reviewBriefs := map[string]string{
+		"review-only brief":            reviewOnlyBrief,
+		"no-code review-only brief":    noCodeReviewOnlyBrief,
+		"unverified review-only brief": unverifiedReviewOnlyBrief,
+		"review-only handoff":          HandoffContinuationFor(ReviewPhaseName, true),
+		"no-code review-only handoff":  NoCodeReviewOnlyHandoffContinuation(),
+	}
+	for name, brief := range reviewBriefs {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{"existing outcome", "appending", "unchanged"} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never says %q, so a review session can erase the outcome it found:\n%s", name, want, brief)
+			}
+		}
+	}
+
+	fixBriefs := map[string]string{
+		"fix brief":            fixBrief,
+		"no-code fix brief":    noCodeFixBrief,
+		"fix handoff":          NoCodeFixHandoffContinuation(),
+		"fix handoff (branch)": HandoffContinuation(FixPhaseName),
+	}
+	for name, brief := range fixBriefs {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{"above the last", "verbatim", "### fixes"} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never says %q, so the final outcome can lose what sat above the review block:\n%s", name, want, brief)
+			}
+		}
+	}
+}
+
+// The fix phase can face more than one `## Review` block: both the review and
+// the fix APPEND, so a request_changes re-trip leaves round 1's block above
+// round 2's. Every fix brief and every continuation that reaches a fix session
+// must say which block is the round to apply — the LAST one — or the session
+// applies an earlier round's findings, whose reviewed tip is stale by design.
+func TestFixBriefsAndHandoffsPointAtTheLastReviewBlock(t *testing.T) {
+	fixBriefs := map[string]string{
+		"fix brief":            fixBrief,
+		"no-code fix brief":    noCodeFixBrief,
+		"fix handoff":          NoCodeFixHandoffContinuation(),
+		"fix handoff (branch)": HandoffContinuation(FixPhaseName),
+	}
+	for name, brief := range fixBriefs {
+		if !strings.Contains(brief, "LAST `"+ReviewRecordHeading+"`") {
+			t.Errorf("the %s never points the session at the LAST %q block:\n%s", name, ReviewRecordHeading, brief)
+		}
+	}
+}
+
+func TestValidate_FixPhaseRules(t *testing.T) {
+	tests := []struct {
+		name   string
+		phases []Phase
+		want   string
+	}{
+		{
+			name:   "fix must be last",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}, {Name: "closer", Prompt: "finish"}},
+			want:   "LAST",
+		},
+		{
+			name:   "fix needs a review before it",
+			phases: []Phase{{Name: "builder", Prompt: "claim and build"}, {Name: FixPhaseName}},
+			want:   ReviewPhaseName,
+		},
+		{
+			name:   "a review-only phase must not be followed by another builtin that does not apply findings",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: ReviewPhaseName}},
+			want:   FixPhaseName,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := defaults()
+			c.Prompt = ""
+			c.Phases = tc.phases
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted %+v", tc.phases)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the rejection does not name %q: %v", tc.want, err)
+			}
+		})
+	}
+
+	// A phase carrying its OWN prompt is a legitimate applier — the operator owns
+	// what runs after the review-only gate — so the rule must not refuse it.
+	custom := defaults()
+	custom.Prompt = ""
+	custom.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: "ship-it", Prompt: "apply the review's findings, push and hand over"}}
+	if err := custom.Validate(); err != nil {
+		t.Errorf("Validate refused a custom phase after the review-only gate: %v", err)
+	}
+
+	// The shipped sequence is the one that must validate.
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate refused the shipped implement/review/fix sequence: %v", err)
+	}
+}
+
+// A first phase has no predecessor to name. The review brief's attribution
+// placeholders are refused there for the same reason the resume placeholders
+// are: a literal {{prevModel}} in a log is a misconfiguration announcing itself,
+// but there is no reason to spend a session discovering it.
+func TestValidate_RefusesPrevAttributionInFirstPosition(t *testing.T) {
+	for _, ph := range []string{PhasePrevHarnessPlaceholder, PhasePrevModelPlaceholder} {
+		c := defaults()
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: "solo", Prompt: "do the thing " + ph}}
+		err := c.Validate()
+		if err == nil {
+			t.Errorf("Validate accepted %s in phase 0; there is no previous phase to fill it from", ph)
+			continue
+		}
+		if !strings.Contains(err.Error(), ph) {
+			t.Errorf("the rejection does not name %s: %v", ph, err)
+		}
+	}
+}
+
+// A handoff must not be a way to lose the mode. Review-only carries the
+// record-then-hold ending; the fix phase carries the PR/in_review terminal step;
+// the branchless review-only carries neither the PR step nor the no-code
+// handover, which belongs to the fix phase.
+func TestHandoffContinuation_CarriesThePhaseModeForward(t *testing.T) {
+	reviewOnly := HandoffContinuationFor(ReviewPhaseName, true)
+	if !strings.Contains(reviewOnly, reviewOnlyTerminalStep) {
+		t.Errorf("a review-only handoff does not carry the record-then-hold ending:\n%s", reviewOnly)
+	}
+	// The ending says "in the shape above"; a respawned successor never saw the
+	// shape, and the seam gate refuses a record that does not carry the heading.
+	if !strings.Contains(reviewOnly, reviewOnlyRecordShape) {
+		t.Errorf("a review-only handoff does not carry the record shape its ending refers to:\n%s", reviewOnly)
+	}
+	if strings.Contains(reviewOnly, reviewTerminalStep) {
+		t.Errorf("a review-only handoff carries the commit/push/PR/in_review terminal step:\n%s", reviewOnly)
+	}
+
+	combined := HandoffContinuationFor(ReviewPhaseName, false)
+	if !strings.Contains(combined, reviewTerminalStep) {
+		t.Errorf("a final review handoff lost the terminal step:\n%s", combined)
+	}
+
+	fix := HandoffContinuationFor(FixPhaseName, false)
+	if !strings.Contains(fix, reviewTerminalStep) {
+		t.Errorf("a fix-phase handoff lost the terminal step:\n%s", fix)
+	}
+	// The record requirement must ride too: a mid-fix handoff that dropped it
+	// would overwrite the task's outcome without the review block, losing the
+	// only durable record of the round.
+	if !strings.Contains(fix, fixTerminalRecord) {
+		t.Errorf("a fix-phase handoff lost the requirement to carry the review block forward:\n%s", fix)
+	}
+
+	noCode := NoCodeReviewOnlyHandoffContinuation()
+	if !strings.Contains(noCode, noCodeReviewOnlyTerminalStep) {
+		t.Errorf("a branchless review-only handoff does not carry its ending:\n%s", noCode)
+	}
+	if !strings.Contains(noCode, noCodeReviewOnlyRecordShape) {
+		t.Errorf("a branchless review-only handoff does not carry the no-tip record shape:\n%s", noCode)
+	}
+	if strings.Contains(noCode, noCodeReviewTerminalStep) {
+		t.Errorf("a branchless review-only handoff carries the no-code handover, which is the fix phase's:\n%s", noCode)
+	}
+
+	// An UNVERIFIED checkpoint has no driver-known tip either, so its successor
+	// must get the shape that tells it to establish the revision itself; the
+	// verified shape's {{reviewedTip}} could never be filled (CLA-576/637).
+	unverified := UnverifiedReviewOnlyHandoffContinuation()
+	if !strings.Contains(unverified, reviewOnlyTerminalStep) {
+		t.Errorf("an unverified review-only handoff does not carry the record-then-hold ending:\n%s", unverified)
+	}
+	if !strings.Contains(unverified, unverifiedReviewOnlyRecordShape) {
+		t.Errorf("an unverified review-only handoff does not carry the self-established-tip record shape:\n%s", unverified)
+	}
+	if strings.Contains(unverified, ReviewedTipPlaceholder) {
+		t.Errorf("an unverified review-only handoff carries the verified tip placeholder, which nothing can fill:\n%s", unverified)
+	}
+
+	noCodeFix := NoCodeFixHandoffContinuation()
+	if !strings.Contains(noCodeFix, noCodeReviewTerminalStep) || !strings.Contains(noCodeFix, noCodeFixTerminalRecord) {
+		t.Errorf("a branchless fix handoff does not carry the no-code terminal step and the review block requirement:\n%s", noCodeFix)
+	}
+	if strings.Contains(noCodeFix, "Open a PR") {
+		t.Errorf("a branchless fix handoff carries the branch-shaped PR step:\n%s", noCodeFix)
+	}
+	// The exemption's fix-side half (question 03a12578, option 1): the
+	// branchless review writes no durable record, so a continuation that
+	// demanded a findingUpdates call would fail every branchless round closed.
+	if strings.Contains(noCodeFix, "findingUpdates") || strings.Contains(noCodeFix, "DURABLE review record") {
+		t.Errorf("a branchless fix handoff demands the durable record the branchless review cannot write:\n%s", noCodeFix)
+	}
+}
+
+// CLA-638: a fix followed by a verification round must not carry the PR terminal
+// step; the verifier owns it. The legacy three-phase shape keeps the old brief.
+func TestEffectivePhases_FixAndVerifyVariantsByPosition(t *testing.T) {
+	four := defaults()
+	four.Prompt = ""
+	four.Phases = []Phase{
+		{Name: ImplementPhaseName},
+		{Name: ReviewPhaseName, Tier: "strong"},
+		{Name: FixPhaseName, Tier: "cheap"},
+		{Name: VerifyPhaseName},
+	}
+	got := four.EffectivePhases()
+	if len(got) != 4 {
+		t.Fatalf("got %d phases, want 4", len(got))
+	}
+	if got[2].Prompt != fixVerifyBrief {
+		t.Errorf("a fix followed by a verification round did not resolve to the no-PR variant:\n%s", got[2].Prompt)
+	}
+	if got[3].Prompt != verifyBrief {
+		t.Errorf("the named verify phase did not resolve to its built-in brief:\n%s", got[3].Prompt)
+	}
+	if strings.Contains(got[2].Prompt, "Open a PR targeting") {
+		t.Errorf("the fix brief still carries the PR terminal step with a verifier after it:\n%s", got[2].Prompt)
+	}
+
+	three := defaults()
+	three.Prompt = ""
+	three.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+	if got := three.EffectivePhases()[2].Prompt; got != fixBrief {
+		t.Errorf("the legacy three-phase fix lost its terminal-step brief")
+	}
+}
+
+// A5: the verifier defaults to the FIX phase's harness and tier — the cheap,
+// non-raise side of the split — and an explicit choice always wins. This is what
+// keeps a bare verify phase off the expensive reviewer's model and, in the
+// shipped shape, off Claude.
+func TestEffectivePhases_VerifyInheritsTheFixHarnessAndTier(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Harness = "claude"
+	c.Harnesses = map[string]HarnessConfig{"opencode": {MCPConfigPath: "/tmp/oc.json", ConfigDir: "/tmp/oc"}}
+	c.Phases = []Phase{
+		{Name: ImplementPhaseName},
+		{Name: ReviewPhaseName, Tier: "strong"},
+		{Name: FixPhaseName, Harness: "opencode", Tier: "cheap"},
+		{Name: VerifyPhaseName},
+	}
+	got := c.EffectivePhases()
+	if got[3].Harness != "opencode" || got[3].Tier != "cheap" {
+		t.Errorf("verify defaults = harness %q tier %q, want the fix phase's opencode/cheap", got[3].Harness, got[3].Tier)
+	}
+
+	c.Phases[3].Harness = "claude"
+	c.Phases[3].Tier = "strong"
+	got = c.EffectivePhases()
+	if got[3].Harness != "claude" || got[3].Tier != "strong" {
+		t.Errorf("an explicit verify harness/tier was overwritten: harness %q tier %q", got[3].Harness, got[3].Tier)
+	}
+
+	// A CUSTOM prompt under the name "verify" is the operator's own phase: the
+	// inheritance keys on the built-in brief, so it keeps the run-wide harness
+	// and tier instead of silently inheriting the fix phase's.
+	c.Phases[3].Harness = ""
+	c.Phases[3].Tier = ""
+	c.Phases[3].Prompt = "Verify whatever you like, your own way."
+	got = c.EffectivePhases()
+	if got[3].Harness != "claude" || got[3].Tier != "" {
+		t.Errorf("a custom-prompt verify phase inherited the fix phase's knobs: harness %q tier %q, want the run-wide harness and no tier", got[3].Harness, got[3].Tier)
+	}
+}
+
+// CLA-638: the verification round's one legal position is last, directly after
+// the built-in fix, with a review before it. A sequence that cannot make progress
+// between verification rounds is refused at validation rather than paid for.
+func TestValidate_VerifyPhaseRules(t *testing.T) {
+	tests := []struct {
+		name   string
+		phases []Phase
+		want   string
+	}{
+		{
+			name:   "verify must be last",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}, {Name: VerifyPhaseName}, {Name: FixPhaseName}},
+			want:   VerifyPhaseName,
+		},
+		{
+			name:   "verify must directly follow fix",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: VerifyPhaseName}},
+			want:   FixPhaseName,
+		},
+		{
+			name:   "verify needs a review whose findings it adjudicates",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: FixPhaseName}, {Name: VerifyPhaseName}},
+			want:   ReviewPhaseName,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := defaults()
+			c.Prompt = ""
+			c.Phases = tc.phases
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted %+v", tc.phases)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the rejection does not name %q: %v", tc.want, err)
+			}
+		})
+	}
+
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}, {Name: VerifyPhaseName}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate refused the shipped implement/review/fix/verify sequence: %v", err)
+	}
+}
+
+// The verify brief is an interface: it must prescribe the by-id adjudication,
+// the delta scope, the new-MUST limit, the no-open-MUST gate and the conditional
+// terminal step. A paraphrase that drops any of these reopens the loop the
+// stopping rule exists to close.
+func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
+	// The core bar is shared by both variants: the gate is no open MUST, and
+	// SHOULD/NIT never gate.
+	for name, brief := range map[string]string{
+		"verify":         verifyBrief,
+		"no-code verify": noCodeVerifyBrief,
+	} {
+		for _, want := range []string{
+			"THE STOPPING RULE IS A BAR, NOT A FEELING",
+			"NO OPEN MUST",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("%s brief does not carry %q", name, want)
+			}
+		}
+	}
+	// The ID-based machinery is the CODE shape's: plane ids to adjudicate by,
+	// the driver's round cap, and the non-convergence breaker.
+	for _, want := range []string{
+		"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
+		"RESOLVED",
+		"REFUTATION ACCEPTED",
+		"UNRESOLVED",
+		"findingUpdates",
+		"three non-void rounds",
+		"takeover or reclaim does not",
+		"fix-delta",
+		"ONLY within the fix delta",
+		`status: "in_review"`,
+		"closeRound",
+		"review_sealed",
+		"do NOT open a PR",
+		"{{reviewerRole}}",
+	} {
+		if !strings.Contains(verifyBrief, want) {
+			t.Errorf("the code verify brief does not carry %q", want)
+		}
+	}
+	// The no-code variant is BLOCK-based (CLA-670, question 03a12578 option 1):
+	// no plane ids, no durable round to close, and its own terminal carries the
+	// hand-over (clean) or the operator park (open MUST) — the verifier is the
+	// LAST phase, so nothing after it can carry the move the review-only ending
+	// defers.
+	for _, want := range []string{
+		"ADJUDICATE EVERY PRIOR OPEN MUST",
+		"the BLOCK's own terms",
+		"no durable record",
+		"no plane finding ids",
+		"the LAST",
+		`status: "in_review"`,
+		`status: "parked"`,
+		"do NOT open a PR",
+	} {
+		if !strings.Contains(noCodeVerifyBrief, want) {
+			t.Errorf("the no-code verify brief does not carry %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"closeRound",
+		"review_sealed",
+		"findingUpdates",
+		"The phase after you decides",
+		"COMMIT and PUSH",
+	} {
+		if strings.Contains(noCodeVerifyBrief, unwanted) {
+			t.Errorf("the no-code verify brief carries %q — the branchless shape writes no durable round and has no plane ids", unwanted)
+		}
+	}
+}
+
+// The no-code fix variant that a verifier follows holds the task; the verifier
+// decides the hand-over.
+func TestNoCodeFixVerifyBriefStopsBeforeTheHandover(t *testing.T) {
+	if !strings.Contains(noCodeFixVerifyBrief, "Do NOT open a PR") {
+		t.Errorf("the no-code fix-verify brief does not forbid the PR:\n%s", noCodeFixVerifyBrief)
+	}
+	if strings.Contains(noCodeFixVerifyBrief, "Open a PR targeting") {
+		t.Errorf("the no-code fix-verify brief carries the terminal step:\n%s", noCodeFixVerifyBrief)
+	}
+	if !strings.Contains(noCodeFixVerifyBrief, "**Tests**") {
+		t.Errorf("the no-code fix-verify brief does not write the outcome the in_review guard reads:\n%s", noCodeFixVerifyBrief)
+	}
+	if strings.Contains(noCodeFixVerifyBrief, "COMMIT and PUSH") {
+		t.Errorf("the no-code fix-verify brief tells a branchless fix to commit and push:\n%s", noCodeFixVerifyBrief)
+	}
+}
+
+// VerifyShaped is deliberately narrower than ReviewShaped: every verifier is a
+// review-shaped record writer, but an ordinary review must not be mistaken for
+// the stopping-rule gate.
+func TestVerifyShaped(t *testing.T) {
+	tests := []struct {
+		name   string
+		prompt string
+		want   bool
+	}{
+		{"the verification brief", verifyBrief, true},
+		{"the no-code verification brief", noCodeVerifyBrief, true},
+		{"the review-only brief", reviewOnlyBrief, false},
+		{"the fix-with-verification brief", fixVerifyBrief, false},
+		{"an operator's custom prompt", "verify whatever you like", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VerifyShaped(tc.prompt); got != tc.want {
+				t.Errorf("VerifyShaped(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// CLA-638: a fix session that hands off while a verifier follows must carry the
+// no-PR terminal step forward — otherwise the successor opens the PR the fix
+// phase was told not to open, and the verifier gates a task already in_review.
+func TestFixVerifyHandoffContinuationStopsBeforeThePR(t *testing.T) {
+	got := FixVerifyHandoffContinuation()
+	if !strings.Contains(got, fixOnlyTerminalStep) {
+		t.Errorf("the fix-verify handoff does not carry the no-PR terminal step:\n%s", got)
+	}
+	if strings.Contains(got, "Open a PR targeting") || strings.Contains(got, `status: "in_review"`) {
+		t.Errorf("the fix-verify handoff carries the verifier's hand-over:\n%s", got)
+	}
+	legacy := HandoffContinuationFor(FixPhaseName, false)
+	if !strings.Contains(legacy, reviewTerminalStep) {
+		t.Errorf("the legacy fix handoff lost its PR terminal step:\n%s", legacy)
+	}
+
+	// The BRANCHLESS variant: the same B12 boundary, with the no-code terminal
+	// step. The legacy branchless fix continuation carries noCodeReviewTerminalStep,
+	// which DOES move the task to in_review — the exact move the verifier owns.
+	noCodeGot := NoCodeFixVerifyHandoffContinuation()
+	if !strings.Contains(noCodeGot, noCodeFixOnlyTerminalStep) {
+		t.Errorf("the branchless fix-verify handoff does not carry the no-code hold terminal step:\n%s", noCodeGot)
+	}
+	if strings.Contains(noCodeGot, `status: "in_review"`) || strings.Contains(noCodeGot, "no-code delivery declared") {
+		t.Errorf("the branchless fix-verify handoff carries the no-code hand-over the verifier owns:\n%s", noCodeGot)
+	}
+	if !strings.Contains(noCodeGot, "RERUN BOUND") {
+		t.Errorf("the branchless fix-verify handoff lost the rerun bound:\n%s", noCodeGot)
+	}
+	noCodeLegacy := NoCodeFixHandoffContinuation()
+	if !strings.Contains(noCodeLegacy, noCodeReviewTerminalStep) {
+		t.Errorf("the legacy branchless fix handoff lost its no-code hand-over:\n%s", noCodeLegacy)
 	}
 }

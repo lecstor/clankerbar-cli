@@ -15,6 +15,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -1963,6 +1964,11 @@ func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
 
 type releaseCall struct{ taskID, runID string }
 
+// fakeReleaser is the plain Releaser fake: it can hand a claim back and
+// nothing else. It deliberately does NOT implement plane.TaskStateSource — a
+// test on this fake runs the UNWIRED-plane path, where every seam is judged on
+// branch evidence alone (CLA-457) and the review-only outcome gate has nothing
+// to read. Tests that need the plane's task state use wiredReleaser below.
 type fakeReleaser struct {
 	calls  []releaseCall
 	err    error
@@ -1975,6 +1981,41 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 		f.onCall()
 	}
 	return f.err
+}
+
+// wiredReleaser is fakeReleaser plus the plane's single-task read
+// (plane.TaskStateSource): the shape the review-split seam tests need, where
+// the outcome on the task decides whether a checkpoint advances. `state` is
+// called on every read, so a test can let the review phase's own session change
+// the answer mid-drain (see the split tests' fakeAdapter.onInvoke hooks), and
+// `err` — also consulted on every read — is how a test blips the plane between
+// the review seam's two reads: a baseline that reads clean and a seam read that
+// fails is the shape the `!recordRead` refusal exists for.
+//
+// Kept separate rather than added to fakeReleaser: when the plain fake
+// satisfied the interface, every older loop test silently moved from the
+// unwired-plane path to a wired one — the driver began asking the plane where
+// it used to judge on branch evidence alone, with nothing in those tests
+// saying so. The explicit unwired-plane test pins the path that change
+// removed.
+type wiredReleaser struct {
+	fakeReleaser
+	state func() plane.TaskState
+	err   func() error // nil means every read succeeds
+	reads int          // TaskState calls made, for the baseline retry bound (CLA-663)
+}
+
+func (w *wiredReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	w.reads++
+	if w.err != nil {
+		if err := w.err(); err != nil {
+			return plane.TaskState{}, err
+		}
+	}
+	if w.state == nil {
+		return plane.TaskState{}, nil
+	}
+	return w.state(), nil
 }
 
 // parkCall is one driver-side park: the task it moved, the run signing it, and
