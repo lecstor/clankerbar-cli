@@ -80,8 +80,24 @@ exposed.
   - reviewed by: harness <h>, model <m>
   - verdict: pass | findings
   ### Findings
-  - R1 [must|should|nit] <file:line> — <what is wrong>. Required fix: <smallest change>.
+  - R1 [must] (<kind>): <evidence> — <file:line> — <what is wrong>. Required fix: <smallest change>.
+  - R2 [should] <file:line> — <what is wrong>. Required fix: <smallest change>.
   ```
+
+  Findings are graded `must` / `should` / `nit`, and only a `must` gates. A
+  `must` must cite evidence of one of seven kinds: a quoted `doneWhen` clause it
+  violates; a repo gate that fails or would fail (command + output or reason); a
+  concrete failure scenario in the change or its regression surface; a security
+  exposure with the path; a contradicted standing decision (id) or repo hard
+  rule (file + rule); an unguarded irreversible operation; or a new/changed
+  guard, gate or state transition with no test pinning it (file:line + the
+  missing test). Style, naming, preferred designs, unmeasured performance,
+  documentation wording and missing tests outside that last kind are never
+  `must`s. The driver parses the block back and lists the findings it will hold
+  the fixer to; a recorded `must` with no evidence kind or payload is listed as
+  a `should` (the structural downgrade), and the fixer may not re-grade — a
+  `must` is fixed or refuted with evidence, and a single reviewer's `must` is
+  never dropped.
 
   The heading carries no round number: a hard-coded "round 1" would be false on
   a later run of the same task (a request-changes re-work), and the driver has no
