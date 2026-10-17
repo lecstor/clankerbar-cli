@@ -3161,6 +3161,57 @@ func TestDrainPhases_ReviewSeamRefusesWhenTheRoundCannotClose(t *testing.T) {
 	}
 }
 
+// CLA-637: a review session that records its durable record and THEN emits a
+// handoff block leaves the round sealed on purpose — its successor was going to
+// close it at its own seam. When the handoff guards REFUSE that successor (the
+// chain cap, max-iterations spent), the stage is over after all, and the round
+// must be closed before the checkpoint advances: a fix phase spawned against a
+// sealed round can neither read the findings (get_task withholds them) nor
+// answer them (finding_sealed) — it would be spawned to apply nothing.
+func TestDrainPhases_RefusedReviewHandoffClosesTheRoundBeforeAdvancing(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	// The review session both checkpointed (branch verified, record written) AND
+	// handed off — the shape that defers the close to the successor.
+	midReview := checkpointed(5, 0.50)
+	midReview.FinalMessage = "The record is written; the storage layer is next.\n" + config.HandoffMarker + "\nContinue the review."
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: midReview},         // review: records, then hands off (refused below)
+		{res: okResult(5, 0.05)}, // fix: must spawn only after the round is released
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+		if i == 2 { // the fix session: the round must ALREADY be closed
+			if len(rel.closes) != 1 {
+				t.Errorf("the fix phase spawned with the review round not yet closed (closes=%v) — it would be unable to read or answer the findings it was told to apply", rel.closes)
+			}
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+	d.cfg.MaxIterations = 1 // the respawn would be iteration 2: refused
+
+	if _, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	} else if handoffs != 0 {
+		t.Errorf("handoffs = %d, want 0 — the refused handoff never spawned a successor", handoffs)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — implement, review, fix; the refused handoff advances on the recorded review", h.invokeCalls)
+	}
+	// The driver closed exactly the round the review record landed in, BEFORE the
+	// fix phase spawned (asserted from the fix session's onInvoke above).
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Fatalf("closed rounds = %v, want exactly [1] — the fix phase depends on the round being released", rel.closes)
+	}
+}
+
 // CLA-576 + CLA-637: when the driver could not verify the origin tip, the
 // review brief has the reviewer establish the revision itself, and the seam
 // then demands the durable record NAME a tip — the fix phase compares it with

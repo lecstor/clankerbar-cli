@@ -1576,6 +1576,24 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// here: the exit is re-judged as the bare exit it really is (CLA-457).
 			// With no durable, origin-reachable branch evidence that is a FAILED
 			// empty phase — logged, tallied, never handed to the review brief.
+			//
+			// CLA-637: the review stage is over after all. drainPhase deliberately
+			// left the matched review round SEALED when it detected the handoff —
+			// the successor was going to close it at its own seam — but the refused
+			// respawn is the last session that continuation was ever going to get,
+			// so the round must be released HERE, before the checkpoint advances: a
+			// fix phase spawned against a sealed round can neither read nor answer
+			// (finding_sealed) the findings it was told to apply. A close that
+			// fails refuses the checkpoint, exactly as the seam's own close does.
+			nextReviewShaped := i+1 < len(phases) && config.ReviewShaped(phases[i+1].Prompt)
+			if end.reviewRound > 0 && end.checkpoint && end.claim != nil && !nextReviewShaped {
+				if cerr := d.closeReviewRound(ctx, t, *end.claim, end.reviewRound); cerr != nil {
+					log.Printf("%siteration %d: the %s phase's review round %d could not be closed after its handoff was refused (%v) — refusing the checkpoint, because the next phase would be spawned against findings the plane still has sealed",
+						labelOf(t), drainNum, ph.Label(i), end.reviewRound, cerr)
+					d.tallyEmpty(ph.Label(i), tc.HarnessFor(ph))
+					break
+				}
+			}
 			if !last && end.empty {
 				log.Printf("%siteration %d: the %s phase ended holding a task with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns (its handoff was refused)",
 					labelOf(t), drainNum, ph.Label(i), end.emptyWhy)
@@ -1805,6 +1823,17 @@ type phaseEnd struct {
 	// chain cap, max-iterations, the budget breaker — and either respawns on it
 	// or falls back to the standard path (CLA-352).
 	handoff string
+
+	// reviewRound is the review round the seam gate MATCHED this pass (CLA-637),
+	// zero when the phase is not review-shaped or no record matched. The round is
+	// normally closed inside drainPhase the moment the stage is over — but a
+	// DETECTED handoff defers that close to the successor's seam, and the
+	// remaining handoff guards (chain cap, max-iterations) live in drainPhases:
+	// when they REFUSE the respawn, the stage is over after all, and drainPhases
+	// closes this round before advancing — otherwise the fix phase would spawn
+	// against findings the plane still holds sealed, which it can neither read
+	// nor answer (finding_sealed).
+	reviewRound int
 
 	// sequenceEnd, when non-nil, reports that this RESUMED phase ended the
 	// sequence without completing it, and the RUN must not end with it. Two
@@ -2893,6 +2922,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		evidenceTip := ""
 		if !last && canCheckpoint {
 			end.branch, evidenceTip, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, &review)
+			// The matched round rides the end (CLA-637): drainPhases closes it if
+			// the handoff guards refuse the respawn this detected handoff asked
+			// for — the one advance path drainPhase cannot close on itself.
+			end.reviewRound = review.round
 			// CLA-637: the review phase's durable record is SEALED — the plane
 			// withholds its findings from every reader until the driver closes
 			// the round. The close is the driver's, made when the review stage
@@ -3053,6 +3086,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					end.claim = claim
 					var evidenceTip string
 					end.branch, evidenceTip, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir, &review)
+					end.reviewRound = review.round
 					// The review round's close rides this path too (CLA-637): a
 					// recovered review checkpoint whose round stayed sealed would
 					// spawn the fix phase against findings it cannot read. No
