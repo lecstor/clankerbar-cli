@@ -1128,7 +1128,10 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 // the last one depends on whether a verification round follows it (CLA-638).
 const fixCore = "Read BOTH the durable record and the block: `reviews.records` carries every released record in the newest " +
 	"round, each with its findings[] and the plane-assigned id (`<round>.<reviewer role>.<n>`) you update by; " +
-	"the outcome's `" + ReviewRecordHeading + "` block is the legacy copy. If there is neither a released review " +
+	"the outcome's `" + ReviewRecordHeading + "` block is the legacy copy. On a later fix round (after a " +
+	"verification round) the newest record carries only the verifier's NEW findings: the work list is every " +
+	"MUST the plane still shows OPEN on ANY released record (get_task's `reviews.openMustIds`), which the driver " +
+	"prepends when it can read it - an open MUST from an earlier round is yours to fix or refute too. If there is neither a released review " +
 	"record nor a review block, that is a FAILED hand-off: park the task with update_task(status: \"parked\", " +
 	"outcome: ...) naming the missing record - do NOT review the work yourself, do NOT invent findings, and do " +
 	"NOT open a PR over unreviewed work. Read the record's reviewedTip and compare it with " +
@@ -1341,8 +1344,9 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"previous round, so get_task releases the records. You are RESUMING that run, not starting a new one: do " +
 	"not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume " +
 	"the run, then get_task with includeDecisions: true. The driver has prepended the PRIOR OPEN MUST ids with " +
-	"their findings; if that block is missing, read the released records yourself and list every finding with " +
-	"severity must and status open. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	"their findings, and every MUST of this review cycle already MARKED settled; if that block is missing, read " +
+	"the released records yourself and list every finding with severity must, both those with status open and " +
+	"those of this cycle marked fixed, refuted or filed. Work in the worktree for branch " + PhaseBranchPlaceholder +
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - " +
 	"a session whose cwd is already the main checkout sitting on that branch is not a decision to commit " +
 	"where you are, it is this failure mode. " +
@@ -1358,6 +1362,10 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"refutedReason. " +
 	"(4) UNRESOLVED or REFUTATION REJECTED — leave the finding's status \"open\" and record in this round's " +
 	"record why the fix or the refutation does not stand. " +
+	"A MUST the fix phase already MARKED fixed, refuted or filed is not settled by that marking: the fixer " +
+	"marks what it answers, and a refutation changes no code, so the delta will not show it. Check each one " +
+	"the same way. Confirm it by leaving its status; reject it by setting its status back to \"open\" with " +
+	"findingUpdates and recording why — that is disposition (4), and the gate then sees it open. " +
 	"You may raise NEW MUSTs ONLY within the fix delta and its regression surface; the plane assigns their " +
 	"new ids. Do not re-raise an earlier finding as a new id: adjudicate the existing id. " +
 	"REVIEW ONLY: you do not change code — do not edit, create or delete a source file, do not commit, and do " +
