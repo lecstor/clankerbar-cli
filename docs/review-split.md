@@ -1,8 +1,9 @@
 # Splitting review from fix
 
 Status: implemented in the CLI (`[implement, review, fix]`); the plane half is
-already tracked as CLA-629 (per-phase harness/model, in progress) and CLA-210
-(structured review record, parked), so this change files no duplicate task.
+tracked as CLA-629 (per-phase harness/model, done) and the durable review record
+(CLA-636 plane, CLA-637 CLI — both landed), so this change files no duplicate
+task. CLA-210 (the parked structured-record task) was archived by CLA-636.
 
 ## Why
 
@@ -133,29 +134,36 @@ The review-only phase inherits phase 1's recorded branch (`HasWIP`), so the
 existing evidence gate — which was written for a phase whose deliverable IS the
 branch — would pass it with nothing recorded at all. Two guards close that:
 
-1. **The review→fix checkpoint requires a record from THIS trip.** For a
-   built-in review-only phase the driver snapshots the task's outcome when the
-   phase spawns, then reads it again at the seam and refuses a checkpoint unless
-   the outcome changed and carries `ReviewRecordHeading` as a line of its own.
-   Presence alone is not enough: a request_changes re-trip or a takeover returns
-   the task with the previous round's block still in the outcome, and a review
-   session that then dies having recorded nothing would otherwise advance to the
-   fixer over an unreviewed revision. The exact line keeps a look-alike heading
-   (`## Reviewer notes`) from standing in for the block. Fail-closed: a session
-   that burned its turns, hit its ceiling, or died on a silent EOT ends the
-   drain, and because the resumed claim carries the branch (`HasWIP`) the driver
-   does not release it to the queue — the lease lapses and a takeover picks the
-   work up. (Pre-split, a dead review was the last phase, so it ended the drain
-   with no PR — this guard preserves that property across the seam.)
+1. **The review→fix checkpoint requires a durable record from THIS run.** Since
+   CLA-636/637 the review phase's deliverable is a sealed per-reviewer record
+   written through `update_task(review: ...)`, and the seam gate is that record:
+   the driver reads the task's `reviews` block at the seam and refuses a
+   checkpoint unless it carries a record this run wrote, under this phase's
+   reviewer role, whose `reviewedTip` equals the branch tip the driver verified
+   on origin (a non-empty tip when the origin could not be read; identity only
+   for a branchless checkpoint). A request_changes re-trip or a takeover runs
+   under a NEW run id, so the previous trip's record — however complete — can
+   never satisfy the gate, and a voided round (lease expiry or takeover) never
+   matches either. Fail-closed: a session that burned its turns, hit its
+   ceiling, or died on a silent EOT ends the drain, and because the resumed
+   claim carries the branch (`HasWIP`) the driver does not release it to the
+   queue — the lease lapses and a takeover picks the work up. (Pre-split, a dead
+   review was the last phase, so it ended the drain with no PR — this guard
+   preserves that property across the seam.)
 
-   One residue of the snapshot, stated rather than hidden: a handoff respawn
-   re-enters the phase and takes a FRESH baseline, so a review session that
-   records its block and THEN hands off leaves its successor a baseline that
-   already carries the record — the successor must record its own block (its
-   handoff continuation carries the record shape, so the passing outcome holds
-   two blocks; a successor that records nothing is refused and the round
-   re-runs). The fresh baseline is the point: it is what keeps a handoff from
-   laundering a previous trip's block through the seam.
+   The driver then CLOSES the round before spawning `fix`, which is what
+   releases the sealed findings to the fixer; a close that fails refuses the
+   checkpoint. The legacy `## Review` outcome block is still written for one
+   release — older planes and readers expect it — but it is not what the gate
+   reads: the outcome snapshot exists only for the pre-spawn read's tri-state
+   and the refusal's diagnostic.
+
+   One handoff residue, stated rather than hidden: a handoff respawn re-enters
+   the phase under the SAME run and role, so a review session that writes its
+   record and THEN hands off leaves a record the successor's seam already
+   accepts — the phase's deliverable is written, and a successor that added
+   nothing is a successor with nothing left to add. A successor on a phase that
+   never recorded still fails the gate as any recording-less session does.
 2. **The salvage is skipped for the review-only phase.** Its deliverable is the
    plane record, not the tree. Anything uncommitted in its worktree is generated
    output from running checks; committing and pushing it would (a) commit the
@@ -173,21 +181,22 @@ hand-off's real state, and its `reviewed tip == HEAD` comparison fails closed if
 the branch is missing — a third brief would only restate what the record already
 says.
 
-### Plane half (already filed — do not duplicate)
+### Plane half (filed and landed — do not duplicate)
 
-Two existing backlog tasks own this, and this change deliberately does not
-re-file them:
+The backlog tasks that own this, so this change does not re-file them:
 
-- **CLA-629** (in progress, `lecstor/clankerbar`) — record which harness and model
+- **CLA-629** (done, `lecstor/clankerbar`) — record which harness and model
   ran each phase, durably. Its wire is an optional per-iteration
   `sessions: [{phase, harness, model}]` on the fleet report (bounds decided:
   20 per iteration, 200 per report, 100-char strings, all-or-nothing refusal),
   landing as a `phase_session` task event that survives the 30-day iteration
   prune. **CLA-630** (`lecstor/clankerbar-cli`, ready, depends on CLA-629) sends
   it from the CLI. That is the attribution half of "which model reviewed this".
-- **CLA-210** (parked) — "The section 5 adversarial review has no structured
-  record". That is the findings/fixes half. This change's outcome block is the
-  interim record; CLA-210 is where a durable `task_review` shape belongs.
+- **CLA-636** (done, `lecstor/clankerbar`) — the durable per-reviewer
+  `task_review` store written through `update_task(review: ...)`, sealed until
+  the round closes. **CLA-637** (this work, `lecstor/clankerbar-cli`) makes the
+  review phase write it, gates the seam on it and closes the round before `fix`.
+  CLA-210 was archived pointing at CLA-636 and the `agent_review` state.
 
 If the operator wants the full multi-round history, unpark CLA-210 and give it
 this shape:
@@ -280,7 +289,7 @@ close-out.
 | linear `[implement, review, fix]` | **done**: 2 briefs + variants, positional selection, attribution/position placeholders, validation, tests | none for the first round; the review record is an `outcome` block | low — no new loop control | now |
 | bounded second review | one more brief + a conditional-phase predicate in `drainPhases` | none | medium — conditional spawning is new control flow | after a live run measures the split |
 | new task on the branch | no CLI change | task-linking + round counter + close-out semantics | high — two tasks per unit of work | not recommended pre-PR |
-| durable review history | none in this change | CLA-210 (parked) + CLA-629/630 for attribution | low/medium — additive, token-budgeted | when the operator unparks it |
+| durable review history | **done** (CLA-637): the record is a sealed per-reviewer row written via `update_task(review: ...)`; the seam gates on it and the driver closes the round | CLA-636 (done): the append-only `task_review` store; CLA-629/630 carry the attribution | low — additive, bounded, token-budgeted | shipped alongside this doc's split |
 
 ## Answers, explicitly
 

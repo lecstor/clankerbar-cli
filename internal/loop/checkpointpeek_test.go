@@ -31,10 +31,22 @@ type peekReleaser struct {
 	state    map[string]plane.TaskState
 	stateErr error
 	asked    []string // task ids TaskState was called with, in order
+	// CLA-637: the round close the review→fix seam performs, and an error a
+	// test can inject to drive the close-failure refusal.
+	closes   []int
+	closeErr error
 }
 
 func (r *peekReleaser) PeekNextTask(context.Context) (plane.NextTask, error) {
 	return r.next, nil
+}
+
+func (r *peekReleaser) CloseReviewRound(_ context.Context, _, _ string, round int) error {
+	if r.closeErr != nil {
+		return r.closeErr
+	}
+	r.closes = append(r.closes, round)
+	return nil
 }
 
 func (r *peekReleaser) TaskState(_ context.Context, taskID string) (plane.TaskState, error) {

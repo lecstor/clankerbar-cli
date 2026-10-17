@@ -953,6 +953,74 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 	}
 }
 
+// CLA-637: the review-only brief is the CLI's whole lever on the durable
+// record's shape — the SESSION writes the record through its own MCP client —
+// so the tokens the plane and the seam gate read are pinned here, for every
+// variant: the update_task field names, the identity the driver fills in, the
+// per-finding attribution the analytics need, and the append order the plane's
+// channel seal forces.
+func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
+	for name, brief := range map[string]string{
+		"review-only brief":            reviewOnlyBrief,
+		"unverified review-only brief": unverifiedReviewOnlyBrief,
+		"no-code review-only brief":    noCodeReviewOnlyBrief,
+	} {
+		for _, want := range []string{
+			"update_task(taskId, runId, review: {...})",
+			`reviewerRole: "` + ReviewerRolePlaceholder + `"`,
+			"reviewedTip",
+			"raisedByModel",
+			`scope: {kind: "full-diff", base: "` + PhasePRBasePlaceholder,
+			"duplicate_reviewer",
+			// The plane seals the round on append and then refuses this run's
+			// outcome writes, so the legacy block must land first.
+			"only after that outcome write has SUCCEEDED",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("the %s does not prescribe %q, so the durable record the seam gates on is not what the session writes:\n%s", name, want, brief)
+			}
+		}
+	}
+	// Both halves are prescribed, in that order: the legacy block first, the
+	// durable record below it.
+	block := strings.Index(reviewOnlyRecordShape, "Record the LEGACY block")
+	durable := strings.Index(reviewOnlyRecordShape, "append THIS run's durable")
+	if block < 0 || durable < 0 || block > durable {
+		t.Errorf("the record shape does not put the legacy outcome block before the durable record (block at %d, durable at %d)", block, durable)
+	}
+}
+
+// ReviewShaped is the driver's single "this phase owes a durable review
+// record" predicate (CLA-637): true for every review-ONLY variant the briefs
+// ship — the seam gate and the round close apply to all of them, not only the
+// exact built-in prompt the gate was first keyed to — and false for everything
+// else. The final combined review brief does its own fixing and hands the task
+// over, so it records no durable round; an operator's custom prompt owns its
+// own contract.
+func TestReviewShaped(t *testing.T) {
+	tests := []struct {
+		name   string
+		prompt string
+		want   bool
+	}{
+		{"the review-only brief", reviewOnlyBrief, true},
+		{"the unverified review-only brief", unverifiedReviewOnlyBrief, true},
+		{"the no-code review-only brief", noCodeReviewOnlyBrief, true},
+		{"the final combined review brief", builtinPhasePrompts[ReviewPhaseName], false},
+		{"the fix brief", fixBrief, false},
+		{"the implement brief", builtinPhasePrompts[ImplementPhaseName], false},
+		{"an operator's custom prompt", "Do your own review-shaped job, whatever that means here.", false},
+		{"an empty prompt", "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReviewShaped(tc.prompt); got != tc.want {
+				t.Errorf("ReviewShaped(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
 // CLA-353: a handoff respawn replaces ph.Prompt wholesale with
 // config.HandoffPreamble plus the predecessor's self-authored prompt (CLA-352) —
 // the built-in brief text, including reviewTerminalStep, is not otherwise part of
@@ -1347,12 +1415,13 @@ func TestBuiltinFixBriefCarriesTheReviewForwardAndTheTerminalStep(t *testing.T) 
 	for _, want := range []string{
 		"the fix phase and the last phase",
 		"## review",
-		"each by id",
-		"reviewed tip",
+		"each by its plane id",
+		"reviewedtip",
 		"git rev-parse head",
 		"park the task",
 		"### fixes",
-		"names the reviewer",
+		"reviews.records",
+		"durable review record",
 		"fixed by: harness",
 		"failed hand-off",
 		"do not review the work yourself",
@@ -1534,11 +1603,25 @@ func TestHandoffContinuation_CarriesThePhaseModeForward(t *testing.T) {
 	if !strings.Contains(noCode, noCodeReviewOnlyTerminalStep) {
 		t.Errorf("a branchless review-only handoff does not carry its ending:\n%s", noCode)
 	}
-	if !strings.Contains(noCode, reviewOnlyRecordShape) {
-		t.Errorf("a branchless review-only handoff does not carry the record shape:\n%s", noCode)
+	if !strings.Contains(noCode, noCodeReviewOnlyRecordShape) {
+		t.Errorf("a branchless review-only handoff does not carry the no-tip record shape:\n%s", noCode)
 	}
 	if strings.Contains(noCode, noCodeReviewTerminalStep) {
 		t.Errorf("a branchless review-only handoff carries the no-code handover, which is the fix phase's:\n%s", noCode)
+	}
+
+	// An UNVERIFIED checkpoint has no driver-known tip either, so its successor
+	// must get the shape that tells it to establish the revision itself; the
+	// verified shape's {{reviewedTip}} could never be filled (CLA-576/637).
+	unverified := UnverifiedReviewOnlyHandoffContinuation()
+	if !strings.Contains(unverified, reviewOnlyTerminalStep) {
+		t.Errorf("an unverified review-only handoff does not carry the record-then-hold ending:\n%s", unverified)
+	}
+	if !strings.Contains(unverified, unverifiedReviewOnlyRecordShape) {
+		t.Errorf("an unverified review-only handoff does not carry the self-established-tip record shape:\n%s", unverified)
+	}
+	if strings.Contains(unverified, ReviewedTipPlaceholder) {
+		t.Errorf("an unverified review-only handoff carries the verified tip placeholder, which nothing can fill:\n%s", unverified)
 	}
 
 	noCodeFix := NoCodeFixHandoffContinuation()

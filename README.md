@@ -81,9 +81,13 @@ instead of claiming), re-reads the bar and the standing decisions from the
 plane, works in that same worktree — never on the integration branch itself —
 reads the diff and runs the adversarial review gate. It is **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
-review record on the task (`update_task(outcome: ...)`, no status move), a fixed
-block carrying the reviewed tip, the implementer's and reviewer's harness/model,
-a `verdict`, and every finding by ID with the required fix. Findings are graded
+review record on the task: a sealed per-reviewer durable record written through
+`update_task(review: ...)` — round, reviewer role, the phase's resolved
+harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
+severity grade and `raisedByModel` — plus, for one release, the legacy block
+in the outcome (`update_task(outcome: ...)`, no status move) carrying the
+reviewed tip, both sides' harness/model, the `verdict`, and every finding by ID
+with the required fix. Findings are graded
 — `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
 evidence, one of: a quoted `doneWhen` clause the change violates; a repo gate
 that fails or would fail (with the command and the output, or why it would
@@ -100,9 +104,12 @@ require — and where a repo hard rule concerns style, prose or documentation
 wording, that never-`must` list wins. The block is
 **appended below** whatever the outcome already carries — a statusless outcome
 replaces the field wholesale — and the driver refuses to advance to `fix` unless
-this trip's session actually changed the outcome and wrote the block. The claim
-is held across the seam, so the task is never posted back to the queue
-mid-sequence.
+the plane serves a durable record **this run** wrote under this phase's
+reviewer role whose reviewed tip equals the branch tip the driver verified on
+origin: an earlier trip's record (a `request_changes` rework, a takeover) never
+satisfies it. Before spawning `fix` the driver **closes the round**, which is
+what releases the sealed findings to the fixer. The claim is held across the
+seam, so the task is never posted back to the queue mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
 same run, reads the review block back with `get_task`, checks the reviewed tip

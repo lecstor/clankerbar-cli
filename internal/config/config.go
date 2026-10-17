@@ -399,7 +399,7 @@ const reviewRecordTipVerified = " The driver verified the origin remote's tip fo
 // so the reviewer establishes it itself, and the seam requires the record to
 // carry a non-empty tip rather than matching one it never had.
 const reviewRecordTipUnverified = " The driver could NOT verify the origin remote's tip, so there is no " +
-	ReviewedTipPlaceholder + " to record: establish it yourself. Read the branch from the origin remote " +
+	"driver-verified tip to record: establish it yourself. Read the branch from the origin remote " +
 	"(`git ls-remote origin " + PhaseBranchPlaceholder + "`, or fetch it), check out the commit it names, review " +
 	"that revision, and record that SHA as `reviewedTip` in the durable record and on the block's " +
 	"`- reviewed tip:` line. If the branch is absent or the remote cannot be read, record the failed hand-off " +
@@ -433,11 +433,13 @@ const reviewRecordDurableShape = " THEN, and only after that outcome write has S
 	"in the block, in the same order: {severity: \"must\" | \"should\" | \"nit\", evidenceKind: <the MUST's kind " +
 	"token>, evidence: <its payload>, file: <path>, line: <number>, kind: <short category>, summary: <what is " +
 	"wrong>, requiredFix: <the smallest fix>, raisedByModel: \"" + PhaseModelPlaceholder + "\"}. The plane assigns " +
-	"each finding's id (`<round>.<reviewer role>.<n>`); do NOT invent one - the fix phase updates by that id. If " +
-	"the plane refuses the append with duplicate_reviewer, a record for this role and round is already written: " +
-	"that refusal is the idempotency signal, so do not retry it. If there are no findings, send no findings (or an " +
-	"empty array), write `- none` under Findings, and verdict: pass. This record is round " + ReviewRoundPlaceholder +
-	"."
+	"each finding's id (`<round>.<reviewer role>.<n>`); do NOT invent one - the fix phase updates by that id. A " +
+	"RETRY proves itself here: get_task before writing, and if a record for your reviewer role and THIS run (" +
+	PhaseRunPlaceholder + ") is already there in an open round, the record is written and its block landed before " +
+	"it (the plane seals the outcome once the record exists) - skip both writes and end. If instead the plane " +
+	"refuses the append with duplicate_reviewer, the same follows: a record for this role and round is already " +
+	"written, that refusal is the idempotency signal, and retrying it changes nothing. If there are no findings, " +
+	"send no findings (or an empty array), write `- none` under Findings, and verdict: pass."
 
 // reviewOnlyRecordShape is the verified review-only phase's full record
 // contract: the legacy outcome block, then the durable record. The driver
@@ -1200,15 +1202,15 @@ const (
 	PhaseNumberPlaceholder = "{{phaseNumber}}"
 	PhaseTotalPlaceholder  = "{{phaseTotal}}"
 
-	// ReviewRoundPlaceholder, ReviewerRolePlaceholder and ReviewedTipPlaceholder
-	// are the durable review record's identity (CLA-637). The plane assigns the
-	// round and the cycle; the driver resolves the role from the phase and the
-	// reviewed tip from the checkpoint it VERIFIED on the origin remote, so the
-	// session records what the seam gate will match rather than inventing it.
-	// The role is round-scoped (`review-1`, ...) so a panel member each appends
-	// its own record; the tip is the origin commit the reviewer must check out
-	// and review.
-	ReviewRoundPlaceholder  = "{{reviewRound}}"
+	// ReviewerRolePlaceholder and ReviewedTipPlaceholder are the durable review
+	// record's identity (CLA-637). The plane assigns the round and the cycle,
+	// so neither is a placeholder: the driver reads them back off the record it
+	// matches. The driver resolves the role from the phase and the reviewed tip
+	// from the checkpoint it VERIFIED on the origin remote, so the session
+	// records what the seam gate will match rather than inventing it. The role
+	// is unique per review phase (`review-1`, ...) so a panel member each
+	// appends its own record; the tip is the origin commit the reviewer must
+	// check out and review.
 	ReviewerRolePlaceholder = "{{reviewerRole}}"
 	ReviewedTipPlaceholder  = "{{reviewedTip}}"
 )
@@ -2999,7 +3001,7 @@ func (c *Config) Validate() error {
 			if effective == "" {
 				effective = builtinPhasePrompts[ph.Name]
 			}
-			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder, PhaseBranchPlaceholder, PhasePrevHarnessPlaceholder, PhasePrevModelPlaceholder, ReviewRoundPlaceholder, ReviewerRolePlaceholder, ReviewedTipPlaceholder} {
+			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder, PhaseBranchPlaceholder, PhasePrevHarnessPlaceholder, PhasePrevModelPlaceholder, ReviewerRolePlaceholder, ReviewedTipPlaceholder} {
 				if strings.Contains(effective, pl) {
 					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim or phase to fill it from — it claims a task of its own, so a resume brief cannot go first",
 						ph.Label(0), pl)
