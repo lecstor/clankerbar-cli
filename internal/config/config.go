@@ -669,6 +669,18 @@ func FixVerifyHandoffContinuation() string {
 		rerunGuidance + fixTerminalRecord + fixOnlyTerminalStep
 }
 
+// NoCodeFixVerifyHandoffContinuation is FixVerifyHandoffContinuation for a
+// BRANCHLESS fix: the amendment is to the plane's record, so there is nothing
+// to commit or push, but the terminal step still belongs to the verifier.
+// NoCodeFixHandoffContinuation would carry the legacy no-code hand-over and tell
+// the successor to move the task to in_review before the verification round has
+// seen the amendment — the same B12 leak the branch-shaped variant exists to
+// close.
+func NoCodeFixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixTerminalRecord + noCodeFixOnlyTerminalStep
+}
+
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
 // may hand the rest of its job to a fresh successor, and how. The trigger is
 // deliberately EVENT-shaped — a session cannot measure its own context (there
@@ -1236,6 +1248,33 @@ const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. 
 	"round in the same call is what makes the status move legal — after the task leaves in_progress the plane " +
 	"no longer accepts a close from this run. Never decide to run one more round yourself."
 
+// noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
+// counterpart of verifyTerminalStep, and the move the fix-verify brief promises
+// the verifier makes ("the VERIFICATION round after you carries that terminal
+// step"). It must be this constant and not noCodeReviewOnlyTerminalStep: a
+// review-only phase hands the ending to the phase after it, while the verifier
+// is the LAST phase and there is nothing after it to hand over for it. There is
+// no PR to open and no push to check on a no-code delivery, so when no MUST
+// remains open the status move IS the whole hand-over — and the round close must
+// ride the same call, because after the task leaves in_progress the plane
+// refuses a close from this run. The fix phase has already written the
+// **Tests** section the in_review guard reads.
+const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and the round number the append returned.\n\n" +
+	"If ANY MUST remains open: release this round with ONE call — update_task(taskId, runId, review: " +
+	"{ closeRound: <the round the append returned> }) — then do NOT change the task's status and do NOT invent " +
+	"code, a branch or a PR. End holding the task. The driver spawns another fix against the released " +
+	"findings, or parks the task at the round cap.\n\n" +
+	"If NO MUST remains open, hand the task over in the SAME call that releases the round: there is no PR to " +
+	"open and nothing to push for a no-code delivery, so the status move is the whole hand-over — call " +
+	"update_task(taskId, runId, status: \"in_review\", review: { closeRound: <the round the append returned> }). " +
+	"Do NOT send an outcome in that call: your own sealed record makes the plane refuse a sealed holder's " +
+	"outcome write (review_sealed), and the fix phase has already written the **Tests** section the in_review " +
+	"guard reads. Releasing the round in the same call is what makes the status move legal — after the task " +
+	"leaves in_progress the plane no longer accepts a close from this run. If the task already left " +
+	"in_progress, do NOT re-open or re-settle it: verify the record reads honestly and end. Never decide to " +
+	"run one more round yourself."
+
 // verifyBrief is the fix-verification round (CLA-638): review the fix delta plus
 // its regression surface, adjudicate every prior open MUST by its plane id, and
 // gate on no open MUST. It is review-shaped — it writes a sealed durable review
@@ -1287,7 +1326,9 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 
 // noCodeVerifyBrief is verifyBrief for a branchless checkpoint: there is no
 // code delta to re-review, so the verification is of the plane record and the
-// fix's record amendments. It never opens a PR or invents code.
+// fix's record amendments. It never opens a PR or invents code, and its
+// terminal step is the no-code hand-over (the verifier is the LAST phase, so
+// nothing after it can carry the move the review-only ending defers).
 var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the VERIFICATION round for a task whose correct delivery is NO CODE. There is " +
 	"NO branch and no diff; the fix round amended the PLANE'S RECORD. The driver has prepended the PRIOR " +
@@ -1302,7 +1343,7 @@ var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Pha
 	"or UNRESOLVED with the finding left \"open\" and the reason in this round's record. You may raise new " +
 	"MUSTs only about the record changes and their regression surface. Do NOT invent code, a branch or a PR, " +
 	"and do NOT open a PR." +
-	verifyStoppingRule + noCodeReviewOnlyTerminalStep + rerunGuidance + handoffGuidance
+	verifyStoppingRule + noCodeVerifyTerminalStep + rerunGuidance + handoffGuidance
 
 // BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can
 // tell whether a phase runs the built-in brief (vs an operator's custom prompt)
@@ -2441,6 +2482,11 @@ func (c *Config) EffectivePhases() []Phase {
 	// tier instead (the shipped shape has fix on a cheap non-Claude harness), and
 	// an explicit harness/tier on the verify phase always wins. Configurable,
 	// never silent magic: the resolved values are what the spawn line stamps.
+	//
+	// Keyed on the RESOLVED built-in brief, not the name: an operator's own
+	// prompt under the name "verify" owns its own contract (the same convention
+	// every other variant follows — verifyBrief is what the driver treats as a
+	// verifier), so it must not silently inherit the fix phase's knobs.
 	if len(c.Phases) > 1 {
 		lastFix := -1
 		for i := range out {
@@ -2448,7 +2494,7 @@ func (c *Config) EffectivePhases() []Phase {
 				lastFix = i
 				continue
 			}
-			if out[i].Name != VerifyPhaseName || lastFix < 0 {
+			if out[i].Name != VerifyPhaseName || out[i].Prompt != verifyBrief || lastFix < 0 {
 				continue
 			}
 			if out[i].Harness == "" {

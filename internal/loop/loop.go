@@ -1308,6 +1308,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					continuation = config.NoCodeHandoffContinuation()
 				case ph.Name == config.ReviewPhaseName && reviewOnly && unverifiedCheckpoint:
 					continuation = config.UnverifiedReviewOnlyHandoffContinuation()
+				case ph.Name == config.FixPhaseName && branchlessCheckpoint && i+1 < len(phases) && isVerifyPhase(phases[i+1]):
+					// CLA-638: a BRANCHLESS fix whose verify round follows must
+					// still stop before the hand-over — the legacy no-code fix
+					// continuation would tell its successor to move the task to
+					// in_review (noCodeReviewTerminalStep), which is the
+					// verifier's move.
+					continuation = config.NoCodeFixVerifyHandoffContinuation()
 				case ph.Name == config.FixPhaseName && branchlessCheckpoint:
 					continuation = config.NoCodeFixHandoffContinuation()
 				case ph.Name == config.FixPhaseName && i+1 < len(phases) && isVerifyPhase(phases[i+1]):

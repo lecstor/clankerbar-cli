@@ -2662,6 +2662,11 @@ type reviewReleaser struct {
 	counted   int
 	openMusts []string
 
+	// noCode is the plane's first-class "this task shipped no code" declaration:
+	// set for the branchless checkpoint fixtures (CLA-497), whose exit evidence
+	// is the plane's record rather than a branch.
+	noCode bool
+
 	// readErr, when set, is consulted on every TaskState read: a test injects a
 	// failing read (consumed once, say) to drive the CLA-663 baseline-read retry
 	// without a second fake. reads counts every read served.
@@ -2689,6 +2694,7 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 		Status:            r.status,
 		ClaimedByRun:      r.holder,
 		Outcome:           r.outcome,
+		DeliveryNoCode:    r.noCode,
 		Reviews:           r.records,
 		ReviewCounted:     r.counted,
 		ReviewOpenMustIDs: r.openMusts,
@@ -4448,5 +4454,127 @@ func TestDrainPhases_VerificationSelfClosedRoundIsNotClosedTwice(t *testing.T) {
 	}
 	if len(rel.parks) != 0 {
 		t.Fatalf("a self-closed clean round parked: %v", rel.parks)
+	}
+}
+
+// TestDrainPhases_AHandoffDuringBranchlessFixVerifyStopsBeforeTheHandover: the
+// four-phase shape on a BRANCHLESS checkpoint. A fix session that hands off
+// mid-phase must not hand its successor the legacy no-code fix continuation,
+// which tells it to move the task to in_review — the move the verification
+// round after the fix owns (B12). The successor gets the no-code fix-verify
+// terminal instead, and the loop then runs its clean verification round, which
+// carries the no-code hand-over itself.
+func TestDrainPhases_AHandoffDuringBranchlessFixVerifyStopsBeforeTheHandover(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "declared no-code delivery\n", noCode: true}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(okResult(10, 0.10), openClaim())},                                               // implement: branchless checkpoint (plane record)
+		{res: held(okResult(5, 0.50), openClaim())},                                                // review: branchless record round
+		{res: handoffResult("Amended the record for the open MUST; the remaining findings next.")}, // fix hands off
+		{res: held(okResult(5, 0.05), openClaim())},                                                // the fix's successor
+		{res: held(okResult(5, 0.05), openClaim())},                                                // verify: clean, carries the hand-over
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the branchless review records round 1
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", "", "sealed"))
+		}
+		if i == 4 { // the verifier records round 2 and hands the task over itself
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", "", "sealed"))
+			rel.counted = 2
+			rel.openMusts = nil
+			rel.status = "in_review"
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 5 {
+		t.Fatalf("spawned %d sessions, want 5: implement, review, fix, its handoff successor, verify", h.invokeCalls)
+	}
+	successor := h.invocations[3].Prompt
+	if strings.Contains(successor, `status: "in_review"`) {
+		t.Errorf("the branchless fix's handoff successor was told to move the task to in_review before verification:\n%s", successor)
+	}
+	if !strings.Contains(successor, "the VERIFICATION round after you carries") {
+		t.Errorf("the branchless fix's handoff successor lost the verifier-owns-the-hand-over instruction:\n%s", successor)
+	}
+	if !strings.Contains(successor, "RERUN BOUND") {
+		t.Errorf("the branchless fix's handoff successor lost the rerun bound:\n%s", successor)
+	}
+	if len(rel.closes) != 2 || rel.closes[0] != 1 || rel.closes[1] != 2 {
+		t.Fatalf("closed rounds = %v, want [1 2] — the review and the verification round", rel.closes)
+	}
+	if len(rel.parks) != 0 {
+		t.Fatalf("a clean branchless round parked: %v", rel.parks)
+	}
+}
+
+// TestInvocationForSelectsTheVerifyVariants: the CLA-638 arms are
+// prompt-invisible to the config tests — only a driver call shows which brief
+// the four-phase shape actually spawns with. The fix gets the no-PR variant
+// (both shapes), the verifier gets its brief with the terminal hand-over, and
+// the branchless pair get the no-code variants that never touch a PR.
+func TestInvocationForSelectsTheVerifyVariants(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+		{Name: config.VerifyPhaseName},
+	})
+	phases := d.cfg.EffectivePhases()
+	if len(phases) != 4 {
+		t.Fatalf("EffectivePhases = %d phases, want 4", len(phases))
+	}
+	// A verified branch: the fix is the no-PR variant, the verifier its brief
+	// with the role the seam keys the durable record on.
+	verified := &harness.Result{
+		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
+		CheckpointTip: testCheckpointTip,
+	}
+	inv, err := d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging", phases)
+	if err != nil {
+		t.Fatalf("invocationFor fix: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "Do NOT open a PR") || strings.Contains(inv.Prompt, "Open a PR targeting") {
+		t.Errorf("the four-phase fix did not get the no-PR variant:\n%s", inv.Prompt)
+	}
+	inv, err = d.invocationFor(d.targets[0], 3, phases[3], verified, "", "staging", phases)
+	if err != nil {
+		t.Fatalf("invocationFor verify: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "VERIFICATION round") || !strings.Contains(inv.Prompt, `"review-2"`) {
+		t.Errorf("the verify phase did not get the verification brief with its plane role:\n%s", inv.Prompt)
+	}
+	if !strings.Contains(inv.Prompt, `status: "in_review"`) || !strings.Contains(inv.Prompt, "closeRound") {
+		t.Errorf("the verification brief does not carry the terminal hand-over:\n%s", inv.Prompt)
+	}
+	if strings.Contains(inv.Prompt, "{{") {
+		t.Errorf("the verification brief carries an unresolved placeholder:\n%s", inv.Prompt)
+	}
+
+	// Branchless: the no-code fix-verify and the no-code verification brief,
+	// neither of which may open a PR or commit anything.
+	branchless := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}}
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging", phases)
+	if err != nil {
+		t.Fatalf("invocationFor branchless fix: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "there is NO branch") || strings.Contains(inv.Prompt, "Open a PR targeting") {
+		t.Errorf("a branchless four-phase fix did not get the no-code fix-verify brief:\n%s", inv.Prompt)
+	}
+	if !strings.Contains(inv.Prompt, "the VERIFICATION round after you carries") {
+		t.Errorf("the branchless fix-verify brief does not promise the verifier's hand-over:\n%s", inv.Prompt)
+	}
+	inv, err = d.invocationFor(d.targets[0], 3, phases[3], branchless, "", "staging", phases)
+	if err != nil {
+		t.Fatalf("invocationFor branchless verify: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "NO CODE") || !strings.Contains(inv.Prompt, `status: "in_review"`) {
+		t.Errorf("a branchless verification round did not get its brief with the hand-over:\n%s", inv.Prompt)
+	}
+	if strings.Contains(inv.Prompt, "COMMIT and PUSH") {
+		t.Errorf("the no-code verification brief tells the verifier to commit and push:\n%s", inv.Prompt)
 	}
 }

@@ -1714,6 +1714,17 @@ func TestEffectivePhases_VerifyInheritsTheFixHarnessAndTier(t *testing.T) {
 	if got[3].Harness != "claude" || got[3].Tier != "strong" {
 		t.Errorf("an explicit verify harness/tier was overwritten: harness %q tier %q", got[3].Harness, got[3].Tier)
 	}
+
+	// A CUSTOM prompt under the name "verify" is the operator's own phase: the
+	// inheritance keys on the built-in brief, so it keeps the run-wide harness
+	// and tier instead of silently inheriting the fix phase's.
+	c.Phases[3].Harness = ""
+	c.Phases[3].Tier = ""
+	c.Phases[3].Prompt = "Verify whatever you like, your own way."
+	got = c.EffectivePhases()
+	if got[3].Harness != "claude" || got[3].Tier != "" {
+		t.Errorf("a custom-prompt verify phase inherited the fix phase's knobs: harness %q tier %q, want the run-wide harness and no tier", got[3].Harness, got[3].Tier)
+	}
 }
 
 // CLA-638: the verification round's one legal position is last, directly after
@@ -1804,6 +1815,27 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 	if !strings.Contains(noCodeVerifyBrief, "do NOT open a PR") {
 		t.Errorf("the no-code verify brief must not hand over a PR:\n%s", noCodeVerifyBrief)
 	}
+	// The no-code verifier is the LAST phase, so IT carries the hand-over: the
+	// review-only ending (which defers to "the phase after you" and forbids the
+	// in_review move) would leave a branchless task unable to ever leave
+	// in_progress. The no-code terminal must carry the same round-close-and-move
+	// contract as the branch-shaped one, minus the PR and the push.
+	for _, want := range []string{
+		"NO MUST remains open",
+		`status: "in_review"`,
+		"closeRound",
+		"review_sealed",
+	} {
+		if !strings.Contains(noCodeVerifyBrief, want) {
+			t.Errorf("the no-code verify brief does not carry %q, so its clean round could never hand the task over", want)
+		}
+	}
+	if strings.Contains(noCodeVerifyBrief, "The phase after you decides") {
+		t.Errorf("the no-code verify brief defers the hand-over to a phase after it — there is none, and the fix-verify brief promised the verifier carries it:\n%s", noCodeVerifyBrief)
+	}
+	if strings.Contains(noCodeVerifyBrief, "COMMIT and PUSH") {
+		t.Errorf("the no-code verify brief tells a branchless verifier to commit and push:\n%s", noCodeVerifyBrief)
+	}
 }
 
 // The no-code fix variant that a verifier follows holds the task; the verifier
@@ -1861,5 +1893,23 @@ func TestFixVerifyHandoffContinuationStopsBeforeThePR(t *testing.T) {
 	legacy := HandoffContinuationFor(FixPhaseName, false)
 	if !strings.Contains(legacy, reviewTerminalStep) {
 		t.Errorf("the legacy fix handoff lost its PR terminal step:\n%s", legacy)
+	}
+
+	// The BRANCHLESS variant: the same B12 boundary, with the no-code terminal
+	// step. The legacy branchless fix continuation carries noCodeReviewTerminalStep,
+	// which DOES move the task to in_review — the exact move the verifier owns.
+	noCodeGot := NoCodeFixVerifyHandoffContinuation()
+	if !strings.Contains(noCodeGot, noCodeFixOnlyTerminalStep) {
+		t.Errorf("the branchless fix-verify handoff does not carry the no-code hold terminal step:\n%s", noCodeGot)
+	}
+	if strings.Contains(noCodeGot, `status: "in_review"`) || strings.Contains(noCodeGot, "no-code delivery declared") {
+		t.Errorf("the branchless fix-verify handoff carries the no-code hand-over the verifier owns:\n%s", noCodeGot)
+	}
+	if !strings.Contains(noCodeGot, "RERUN BOUND") {
+		t.Errorf("the branchless fix-verify handoff lost the rerun bound:\n%s", noCodeGot)
+	}
+	noCodeLegacy := NoCodeFixHandoffContinuation()
+	if !strings.Contains(noCodeLegacy, noCodeReviewTerminalStep) {
+		t.Errorf("the legacy branchless fix handoff lost its no-code hand-over:\n%s", noCodeLegacy)
 	}
 }
