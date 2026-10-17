@@ -1120,6 +1120,21 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// changes harness/model/budget here, not on the shared base.
 	tc := d.targetCfg(t)
 	phases := tc.EffectivePhases()
+	// CLA-638: where the fix→verify pair lives, when the sequence has one. The
+	// verification round is last by validation, and the driver repeats the pair
+	// by rewinding to fixIdx after a round with open MUSTs. Zero when the
+	// sequence has no verification round (the legacy fix-is-terminal shape).
+	fixIdx := -1
+	for i := range phases {
+		if i+1 < len(phases) && phases[i].Name == config.FixPhaseName && isVerifyPhase(phases[i+1]) {
+			fixIdx = i
+		}
+	}
+	// MUST ids a verifier has already marked resolved in THIS drain. An id open
+	// again is non-convergence (A6). In-memory on purpose: it is a courtesy
+	// layer over the durable round-prefix check, which survives a takeover on
+	// its own because it reads the plane's round numbers.
+	verifyResolved := map[string]bool{}
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
@@ -1640,6 +1655,65 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				drainNum, ph.Label(i))
 			break
 		}
+		// CLA-638: the verification round is the stopping rule's gate. It is the
+		// LAST configured phase, so the generic `!last` branches above never
+		// applied to it; what follows is decided HERE from the durable records
+		// the round just released:
+		//
+		//   - no open MUST → the gate passed. The verifier carried the terminal
+		//     step (push check, PR, in_review) itself; the sequence is done.
+		//   - open MUST(s) → another fix is spawned, unless the round cap or the
+		//     non-convergence breaker parks the task first. Never one more round
+		//     on the driver's own initiative.
+		if isVerifyPhase(ph) {
+			vres := harness.Result{}
+			if end.claim != nil {
+				vres = *end.claim
+			}
+			if end.verifyFailure != "" {
+				d.parkVerification(ctx, t, vres,
+					"the round could not be judged: "+end.verifyFailure,
+					end.verifyRound, end.verifyCounted, end.verifyOpenMusts)
+				parkFired = true
+				carried = nil
+				break
+			}
+			if !end.verifyChecked {
+				d.parkVerification(ctx, t, vres,
+					"the round produced no review record this run wrote, so the stopping rule has nothing to judge",
+					end.verifyRound, end.verifyCounted, nil)
+				parkFired = true
+				carried = nil
+				break
+			}
+			if len(end.verifyOpenMusts) == 0 {
+				log.Printf("iteration %d: the %s phase closed round %d with NO open MUST — the stopping rule is satisfied and the sequence is done",
+					drainNum, ph.Label(i), end.verifyRound)
+				break
+			}
+			reason := nonConvergenceReason(end.verifyOpenMusts, end.verifyRound, verifyResolved)
+			capHit := end.verifyCounted >= config.ReviewRoundCap
+			if reason == "" && !capHit && end.checkpoint && carried != nil {
+				for _, id := range end.verifyResolvedIDs {
+					verifyResolved[id] = true
+				}
+				log.Printf("iteration %d: the %s phase closed round %d (%d non-void round(s) this cycle) with open MUST(s) [%s] — spawning another %s round against them",
+					drainNum, ph.Label(i), end.verifyRound, end.verifyCounted,
+					strings.Join(end.verifyOpenMusts, ", "), phases[fixIdx].Label(fixIdx))
+				i = fixIdx
+				continue
+			}
+			switch {
+			case reason == "" && capHit:
+				reason = fmt.Sprintf("the %d-round cap for this review cycle is reached", config.ReviewRoundCap)
+			case reason == "":
+				reason = "the round ended without holding the task, so no fix can be spawned against its open MUSTs"
+			}
+			d.parkVerification(ctx, t, vres, reason, end.verifyRound, end.verifyCounted, end.verifyOpenMusts)
+			parkFired = true
+			carried = nil
+			break
+		}
 		// A phase that ended dead was retried above and, on the retry, either
 		// parked or advanced — either way this phase's dead-phase budget is spent.
 		// Resetting on the advance keeps the retry per-PHASE rather than per-run:
@@ -1834,6 +1908,35 @@ type phaseEnd struct {
 	// against findings the plane still holds sealed, which it can neither read
 	// nor answer (finding_sealed).
 	reviewRound int
+
+	// verifyChecked reports that this pass was a fix-verification round and the
+	// driver evaluated its seam (CLA-638): matched the durable record, closed the
+	// round, and read the task's open MUSTs back. It is set even when the
+	// evaluation FAILED, so drainPhases can tell "verification was attempted and
+	// could not be judged" from "this was an ordinary phase".
+	verifyChecked bool
+	// verifyFailure is the reason a verification seam could not be evaluated
+	// (no record this run wrote, an unreadable task, a round that would not
+	// close). Non-empty means the driver must park rather than hand over or
+	// loop: an unverifiable round cannot be the gate.
+	verifyFailure string
+	// verifyRound is the round the verification record landed in — the plane
+	// assigns it, the driver reads it back.
+	verifyRound int
+	// verifyOpenMusts is every open MUST on a RELEASED record, by plane finding
+	// id, as of AFTER this verification round closed. Empty means the gate
+	// passed: the verifier's own record was closed, so its new findings (if any)
+	// are included. The driver loops another fix when it is non-empty.
+	verifyOpenMusts []string
+	// verifyCounted is the plane's count of NON-VOID rounds in the newest
+	// record's cycle, read after the close. The round cap reads it; a void round
+	// does not count (B4/B8).
+	verifyCounted int
+	// verifyResolvedIDs are the MUST ids on released records a verifier has
+	// already marked resolved (fixed/filed/refuted). The driver remembers them
+	// across the round loop: an id that is open AGAIN after being resolved is
+	// non-convergence, and parks the task (A6).
+	verifyResolvedIDs []string
 
 	// sequenceEnd, when non-nil, reports that this RESUMED phase ended the
 	// sequence without completing it, and the RUN must not end with it. Two
@@ -2496,6 +2599,216 @@ func (d *Driver) closeReviewRound(ctx context.Context, t Target, res harness.Res
 	return closer.CloseReviewRound(ctx, res.Claim.TaskID, res.Claim.RunID, round)
 }
 
+// readTaskState reads the plane's record of one task, for the verification
+// round's reads (CLA-638). Best-effort like every other plane read: ok is false
+// when there is no task id, no wired reader, or the read fails. The caller
+// decides what an unreadable task means; for the verification seam it is a
+// failed round, because open MUSTs cannot be judged from a record that cannot
+// be read.
+func (d *Driver) readTaskState(ctx context.Context, t Target, taskID string) (plane.TaskState, bool) {
+	if taskID == "" {
+		return plane.TaskState{}, false
+	}
+	src, wired := t.Releaser.(plane.TaskStateSource)
+	if !wired {
+		return plane.TaskState{}, false
+	}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	st, err := src.TaskState(sctx, taskID)
+	if err != nil {
+		if !errors.Is(err, plane.ErrNotWired) {
+			log.Printf("%scould not read the plane's record of %s for the verification round (%v)", labelOf(t), taskID, err)
+		}
+		return plane.TaskState{}, false
+	}
+	return st, true
+}
+
+// findingIDRound parses the round prefix out of a plane finding id
+// (`<round>.<reviewer role>.<n>`, B13). The plane assigns and serves these
+// namespaced ids (CLA-636); the driver reads the round back rather than
+// tracking one of its own, so the derivation survives a takeover.
+func findingIDRound(id string) (int, bool) {
+	dot := strings.Index(id, ".")
+	if dot <= 0 {
+		return 0, false
+	}
+	n, err := strconv.Atoi(id[:dot])
+	if err != nil || n <= 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+// verificationDigest is the driver's brief for a verification round (CLA-638):
+// the prior open MUST ids, their findings, and the delta base, read from the
+// plane's released records and PREPENDED to the verify brief the way the fix
+// phase's graded list is. It exists because ids and rounds are plane state, not
+// config: the driver reads them after the previous round closed and hands the
+// session exactly what it must adjudicate.
+//
+// A record still sealed or void contributes nothing: a sealed round's findings
+// are withheld by design (B2), and a void round never happened (B4). An empty
+// open list is not an empty digest — the session is still told the delta base
+// and that the gate currently reads as clear, so a verifier that sees a problem
+// states it rather than silently passing a hand-over it cannot explain.
+func verificationDigest(records []plane.ReviewRecordState) string {
+	var open []plane.ReviewFindingState
+	newestRound, newestTip := 0, ""
+	for _, r := range records {
+		if r.State == "sealed" || r.State == "void" {
+			continue
+		}
+		if r.Round > newestRound {
+			newestRound, newestTip = r.Round, r.ReviewedTip
+		}
+		for _, f := range r.Findings {
+			if f.Severity == "must" && f.Status == "open" {
+				open = append(open, f)
+			}
+		}
+	}
+	var b strings.Builder
+	b.WriteString("The driver read the released durable review records before this round. ")
+	if newestRound > 0 {
+		tip := newestTip
+		if tip == "" {
+			tip = "(the record names no tip)"
+		}
+		fmt.Fprintf(&b, "The newest released round is %d and its reviewed tip is %s — that tip is the fix delta's base (`git diff <reviewedTip>..HEAD`).\n", newestRound, tip)
+	} else {
+		b.WriteString("No RELEASED review record is on the task. If the review round did not run, that is a failed hand-off to report in your record and hand over to a human; do not invent findings.\n")
+	}
+	if len(open) == 0 {
+		b.WriteString("The plane currently shows NO OPEN MUST on a released record. Still verify the fix delta of the newest round and its regression surface; if it is clean, carry the terminal step. Everything you find goes in this round's own record.\n\n")
+		return b.String()
+	}
+	b.WriteString("The following MUST(s) are OPEN and this round MUST adjudicate each BY ITS PLANE ID — resolved (status \"fixed\"), resolved by dispatch (status \"filed\"), refutation accepted (status \"refuted\"), or left \"open\" with a recorded reason:\n")
+	for _, f := range open {
+		loc := f.File
+		if f.Line > 0 {
+			loc = fmt.Sprintf("%s:%d", f.File, f.Line)
+		}
+		if loc == "" {
+			loc = "(no location)"
+		}
+		round := "?"
+		if r, ok := findingIDRound(f.ID); ok {
+			round = strconv.Itoa(r)
+		}
+		summary := strings.TrimSpace(f.Summary)
+		required := strings.TrimSpace(f.RequiredFix)
+		if required == "" {
+			required = "(none stated)"
+		}
+		fmt.Fprintf(&b, "- %s [round %s, %s] %s Required fix: %s\n", f.ID, round, loc, summary, required)
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// resolvedFindingIDs lists the MUST ids on released records that a verifier has
+// ALREADY marked resolved (fixed, filed or refuted). The driver remembers them
+// across the round loop: an id that is open again in a later round was reopened
+// after a verifier marked it resolved, which is non-convergence and parks the
+// task (A6). Sealed and void records contribute nothing, exactly as in the
+// digest.
+func resolvedFindingIDs(records []plane.ReviewRecordState) []string {
+	var out []string
+	for _, r := range records {
+		if r.State == "sealed" || r.State == "void" {
+			continue
+		}
+		for _, f := range r.Findings {
+			if f.Severity == "must" && f.Status != "" && f.Status != "open" {
+				out = append(out, f.ID)
+			}
+		}
+	}
+	return out
+}
+
+// nonConvergenceReason reports why the round loop must stop and park rather than
+// spawn another fix (CLA-638, A6): a MUST a previous verifier marked resolved
+// that the latest round has open again, or a MUST still open after two fix
+// attempts (its id's round prefix is at least two behind the round that just
+// closed). Empty means the loop may continue. It reads plane state plus the
+// driver's in-memory resolved set, so a takeover (empty set) loses the reopened
+// half but the round-prefix half still holds.
+func nonConvergenceReason(open []string, round int, resolved map[string]bool) string {
+	for _, id := range open {
+		if resolved[id] {
+			return fmt.Sprintf("finding %s was marked resolved by an earlier verification round and is open again", id)
+		}
+	}
+	for _, id := range open {
+		if r, ok := findingIDRound(id); ok && round-r >= 2 {
+			return fmt.Sprintf("finding %s (raised in round %d) is still open in round %d after two fix attempts", id, r, round)
+		}
+	}
+	return ""
+}
+
+// parkVerification parks a task whose verification round cannot proceed
+// (CLA-638): the round cap with an open MUST (B7), the non-convergence breaker
+// (A6), or a round the driver could not judge. The question CARRIES THE RECORDS
+// — the open ids, the round, and where the durable records live — because the
+// operator is being asked to overrule the stopping rule, and that needs the
+// evidence.
+//
+// Non-blocking `clarification`, matching parkDeadPhase: the task is already
+// parked, so a blocking question would be the wrong shape (any answer would
+// un-block it to `ready`, handing the same open MUSTs straight back to a fleet
+// whose cycle counter has not moved — the cap would park it again). The park's
+// outcome stands alone if the question insert fails.
+func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Result, reason string, round, counted int, open []string) {
+	if res.Claim.TaskID == "" {
+		log.Printf("%sverification park: no claim observed, so there is no task to park (%s)", labelOf(t), reason)
+		return
+	}
+	pk, ok := t.Releaser.(plane.ParkAPI)
+	if !ok {
+		log.Printf("%sCANNOT PARK %s — the verification round cannot proceed (%s), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
+			labelOf(t), claimLabel(res.Claim), reason)
+		return
+	}
+	ref := claimLabel(res.Claim)
+	openList := "none"
+	if len(open) > 0 {
+		openList = strings.Join(open, ", ")
+	}
+	outcome := fmt.Sprintf(
+		"Parked on the review stopping rule: %s. Round %d of the %d-round cap this cycle (non-void rounds counted by the plane); open MUSTs: %s. The durable review records are on the task (`reviews.records`); the operator decides whether to continue, re-scope or drop it.",
+		reason, round, config.ReviewRoundCap, openList)
+	body := fmt.Sprintf(
+		"**%s needs a human decision: the fix-verification loop stopped.** %s\n\n"+
+			"Round %d closed; the plane has counted %d non-void round(s) in this review cycle and the cap is %d. "+
+			"Open MUST finding id(s): %s.\n\n"+
+			"The evidence is in the task's durable review records (`reviews.records`; every finding is `must`/`should`/`nit` with its status, and the legacy `## Review` block is in the outcome). "+
+			"The stopping rule exists so two agents cannot argue past a bound: the reviewer's findings, the fixer's answers and the verifier's adjudication are all on the task, and the disagreement is the question.",
+		ref, reason, round, counted, config.ReviewRoundCap, openList)
+	options := []string{
+		"Continue with a fresh review cycle — I have judged the open MUST(s)",
+		"Leave it parked — I will settle the MUST(s) myself",
+		"The open MUST(s) need re-scoping before anyone tries again",
+		"Drop it — the task is not worth another round",
+	}
+	pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer pcancel()
+	if err := pk.Park(pctx, res.Claim.TaskID, res.Claim.RunID, outcome); err != nil {
+		log.Printf("%sverification park failed for %s: %v — the task is left for the next claim to retry it again",
+			labelOf(t), ref, err)
+		return
+	}
+	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
+		log.Printf("%sparked %s — %s, but the question for the operator could not be filed: %v",
+			labelOf(t), ref, reason, err)
+		return
+	}
+	log.Printf("%sparked %s — %s; question filed for the operator", labelOf(t), ref, reason)
+}
+
 // verifiedBranch returns the branch the previous phase recorded — the hand-off
 // the successor's brief names (CLA-457). The seam folds the branch onto the
 // carried claim when it checkpoints, so for a checkpointed phase the claim's
@@ -2639,8 +2952,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	ephases := tc.EffectivePhases()
 	requireReviewRecord := false
 	nextReviewShaped := false
+	isVerify := false
 	if phaseIdx < len(ephases) {
 		requireReviewRecord = config.ReviewShaped(ephases[phaseIdx].Prompt)
+		isVerify = config.VerifyShaped(ephases[phaseIdx].Prompt)
 		if phaseIdx+1 < len(ephases) {
 			nextReviewShaped = config.ReviewShaped(ephases[phaseIdx+1].Prompt)
 		}
@@ -2727,12 +3042,39 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// prompt owns its wording and gets no digest, the same convention the
 	// variant swap in invocationFor follows.
 	fixGrading := ""
-	if phaseIdx < len(ephases) && ephases[phaseIdx].Prompt == config.FixBrief() {
+	if phaseIdx < len(ephases) && (ephases[phaseIdx].Prompt == config.FixBrief() || ephases[phaseIdx].Prompt == config.FixVerifyBrief()) {
 		if outcome, read := d.readTaskOutcome(ctx, t, prev,
 			"to grade the review record for the fix phase",
 			"the fix brief will carry the raw record without the driver's structural grading"); read {
 			fixGrading = reviewFindingsDigest(outcome)
 		}
+	}
+	// CLA-638: the VERIFICATION round's brief carries the prior open MUST ids and
+	// their findings, read from the plane's released records before the session
+	// spawns. Fail-closed: a round that cannot be told what it must adjudicate is
+	// refused before it is paid for, the same disposition CLA-663 gives the
+	// review baseline. The task id comes from the carried claim; the phase is
+	// resumed, so it is exact.
+	verifyDigest := ""
+	if isVerify {
+		taskID := ""
+		if prev != nil {
+			taskID = prev.Claim.TaskID
+		}
+		st, read := d.readTaskState(ctx, t, taskID)
+		if !read {
+			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's released review records could not be read, so the round would not know which MUST ids to adjudicate — the sequence ends here; the claim is released when it is releasable, else left to lapse into a takeover",
+				labelOf(t), drainNum, ph.Label(phaseIdx))
+			end.empty = true
+			end.emptyWhy = "the task's released review records could not be read before the verification round spawned"
+			if prev != nil {
+				end.claim = prev
+				end.released = prev.Claim.Held()
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
+			}
+			return 0, 0, false, end, nil
+		}
+		verifyDigest = verificationDigest(st.Reviews)
 	}
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -
@@ -2813,6 +3155,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// plane, and a finding quoting `{{model}}` must stay a quote.
 		if fixGrading != "" {
 			inv.Prompt = fixGrading + inv.Prompt
+		}
+		// The verification digest is the same contract for the verify phase
+		// (CLA-638): plane-read ids and findings, prepended verbatim.
+		if verifyDigest != "" {
+			inv.Prompt = verifyDigest + inv.Prompt
 		}
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
@@ -2964,6 +3311,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// live in drainPhases; if they refuse, the deferred handback there
 		// releases what this held.
 		handoff := detectHandoff(drainNum, t, res)
+		// CLA-638: a verification round does not chain via a handoff. Its record
+		// is the deliverable, and the DRIVER decides what follows (another fix, a
+		// park, or nothing) from the open MUSTs the record releases; a successor
+		// prompt here would have nothing to continue that this round has not
+		// already written, and honoring it would defer the close/evaluation the
+		// driver owes the round.
+		if isVerify && handoff != "" {
+			log.Printf("%siteration %d: the verification round emitted a handoff block; verification rounds do not chain — the driver judges the round's record and decides whether another fix runs", labelOf(t), drainNum)
+			handoff = ""
+		}
 		// The seam contender: an orderly end still holding the task, minus the dead
 		// signature. This is the gate the incident put in question — see below.
 		canCheckpoint := res.Untrusted == "" && checkpointable && res.Claim.Held() && !dead
@@ -2982,7 +3339,51 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		evidenceUnverified := false
 		evidenceWhy := ""
 		evidenceTip := ""
-		if !last && canCheckpoint {
+		if isVerify && res.Untrusted == "" && (res.ExitCode == 0 || capped || ceiling || wallclock) {
+			// The verification seam runs even on the LAST phase. Unlike every
+			// other terminal phase its evidence is not a checkpoint (nothing
+			// follows to resume) but the durable record plus the open-MUST set:
+			// that set is what decides whether ANOTHER fix is spawned, whether
+			// the sequence is done, or whether the round cap parks the task
+			// (CLA-638, B12).
+			end.verifyChecked = true
+			end.branch, evidenceTip, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, &review)
+			end.reviewRound = review.round
+			if evidenceOK && review.required && review.round > 0 {
+				if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
+					evidenceOK = false
+					evidenceWhy = fmt.Sprintf("verification round %d could not be closed (%v) — its findings would stay sealed and the next fix would have nothing to apply", review.round, cerr)
+				} else {
+					// Closed; the round is now released, so nothing downstream
+					// may try to close it again.
+					end.reviewRound = 0
+					end.verifyRound = review.round
+					if st, read := d.readTaskState(ctx, t, res.Claim.TaskID); !read {
+						evidenceOK = false
+						evidenceWhy = "the task could not be read after the verification round closed, so its open MUSTs cannot be judged"
+					} else {
+						end.verifyOpenMusts = append([]string(nil), st.ReviewOpenMustIDs...)
+						end.verifyCounted = st.ReviewCounted
+						end.verifyResolvedIDs = resolvedFindingIDs(st.Reviews)
+					}
+				}
+			}
+			if !evidenceOK {
+				end.verifyFailure = evidenceWhy
+			}
+			// Fold the verified branch/tip onto the claim exactly as the generic
+			// checkpoint path below does, so a fix spawned after an open-MUST
+			// round resumes with the verified hand-off.
+			if end.claim != nil && evidenceOK {
+				if end.branch != "" {
+					end.claim.Claim.Branch = end.branch
+				} else {
+					end.claim.Claim.Branch = ""
+				}
+				end.claim.CheckpointUnverified = evidenceUnverified
+				end.claim.CheckpointTip = evidenceTip
+			}
+		} else if !last && canCheckpoint {
 			end.branch, evidenceTip, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, &review)
 			// The matched round rides the end (CLA-637): drainPhases closes it if
 			// the handoff guards refuse the respawn this detected handoff asked
@@ -3020,7 +3421,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// gate exists to stop. The evidence gate governs only the bare seam
 		// advance to the NEXT configured phase (handoff == ""); a refused handoff
 		// is downgraded to that bare judgement in drainPhases.
-		if (!last || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK) {
+		//
+		// CLA-638: a verification round that left an OPEN MUST holds the seam
+		// even though it is the last phase, because the driver spawns another
+		// fix against it. A clean round does not hold.
+		verifyNeedsHold := isVerify && end.verifyChecked && end.verifyFailure == "" && len(end.verifyOpenMusts) > 0
+		if ((!last || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK)) ||
+			(verifyNeedsHold && canCheckpoint) {
 			end.checkpoint = true
 			end.handoff = handoff
 			if end.claim != nil {
@@ -4890,6 +5297,14 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 			// when the branch is missing, so a variant would only restate what the
 			// record already says.
 			prompt = config.NoCodeFixBrief()
+		case prompt == config.FixVerifyBrief() && prev.Claim.Branch == "":
+			// Same for the fix phase that a verification round follows, in the
+			// shape whose fix is a record amendment.
+			prompt = config.NoCodeFixVerifyBrief()
+		case prompt == config.VerifyBrief() && prev.Claim.Branch == "":
+			// A verification round on a branchless checkpoint has no code delta
+			// to re-review; its brief adjudicates the record's findings.
+			prompt = config.NoCodeVerifyBrief()
 		}
 		inv.Prompt = prompt
 		// Seed the claim as well as the prompt. The session is told not to claim,
@@ -5423,6 +5838,14 @@ func limitReason(lim harness.Limit) string {
 // custom prompts with no name are never treated as review for escalation.
 func isReviewPhase(ph config.Phase) bool {
 	return ph.Name == config.ReviewPhaseName
+}
+
+// isVerifyPhase reports whether a RESOLVED phase is the fix-verification round
+// (CLA-638). It keys on the resolved prompt, like every other review-shaped
+// predicate: a handoff respawn replaces the prompt, and an operator's custom
+// prompt named "verify" owns its own contract and is not one.
+func isVerifyPhase(ph config.Phase) bool {
+	return config.VerifyShaped(ph.Prompt)
 }
 
 // diffAgainstIntegration compares a pushed branch to the integration branch
