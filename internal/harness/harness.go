@@ -497,6 +497,15 @@ type Result struct {
 	// checkpoint and for the branch-less plane-record forms (CLA-497).
 	CheckpointUnverified bool
 
+	// CheckpointTip is the origin tip the driver VERIFIED for Claim.Branch at
+	// the checkpoint (CLA-637): the remote commit the branch was at when the
+	// evidence gate read it. The review phase's brief carries it as the tip the
+	// reviewer must check out and record, and the durable-record seam gate
+	// matches the record's reviewedTip against it. Empty for a branchless
+	// checkpoint and for an unverified one (where the driver never read a tip),
+	// which is exactly the pair of cases where no tip can be demanded.
+	CheckpointTip string
+
 	// onClaim is the Invocation.OnClaim callback bound into this Result at
 	// construction (newSessionResult), so the shared observer can notify it
 	// without threading the Invocation through every parse helper. Unexported,

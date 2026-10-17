@@ -81,9 +81,13 @@ instead of claiming), re-reads the bar and the standing decisions from the
 plane, works in that same worktree — never on the integration branch itself —
 reads the diff and runs the adversarial review gate. It is **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
-review record on the task (`update_task(outcome: ...)`, no status move), a fixed
-block carrying the reviewed tip, the implementer's and reviewer's harness/model,
-a `verdict`, and every finding by ID with the required fix. Findings are graded
+review record on the task: a sealed per-reviewer durable record written through
+`update_task(review: ...)` — round, reviewer role, the phase's resolved
+harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
+severity grade and `raisedByModel` — plus, for one release, the legacy block
+in the outcome (`update_task(outcome: ...)`, no status move) carrying the
+reviewed tip, both sides' harness/model, the `verdict`, and every finding by ID
+with the required fix. Findings are graded
 — `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
 evidence, one of: a quoted `doneWhen` clause the change violates; a repo gate
 that fails or would fail (with the command and the output, or why it would
@@ -99,24 +103,23 @@ without a measurement, documentation wording, or missing tests the bar does not
 require — and where a repo hard rule concerns style, prose or documentation
 wording, that never-`must` list wins. The block is
 **appended below** whatever the outcome already carries — a statusless outcome
-replaces the field wholesale, and a re-trip (a request-changes rework, a
-takeover) can leave more than one `## Review` block in it — so a later round's
-block is the outcome's **last** one. The driver refuses to advance to `fix`
-unless: the outcome changed since the review spawned, a `## Review` heading
-sits on its own line, and the outcome's last `## Review` block — heading line to
-the end — is not one the outcome already carried. An edit that leaves an old
-block as the last one is refused; an edit that appends a *new* block below the
-old one still passes the seam, and the `fix` phase's reviewed-tip check
-backstops that residue. Before a review session is spawned at all, the driver
-reads that baseline and retries the read; if it stays unread the sequence ends
-without the review rather than paying for a session whose checkpoint the seam
-would refuse.
+replaces the field wholesale — and the driver refuses to advance to `fix` unless
+the plane serves a durable record **this run** wrote under this phase's
+reviewer role whose reviewed tip equals the branch tip the driver verified on
+origin: an earlier trip's record (a `request_changes` rework, a takeover) never
+satisfies it. Before a review session is spawned at all, the driver reads the
+task's baseline and retries the read; if it stays unread the sequence ends
+without the review — a session whose record the seam could not judge against
+the task it found is pure waste (CLA-663). Before spawning `fix` the driver
+**closes the round**, which is what releases the sealed findings to the fixer.
 The claim is held across the seam, so the task is never posted back to the queue
 mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
-same run, reads the **last** `## Review` block back with `get_task`, checks the
-reviewed tip still matches the worktree's HEAD, and applies every finding by ID
+same run, reads the released durable record back with `get_task` — and, for one
+release, the **last** `## Review` block beside it, because a re-trip can carry
+several — checks the record's reviewed tip still matches the worktree's HEAD,
+and applies every finding by its plane ID
 (or records why not). The driver has already read the record and listed the
 graded findings in the fix brief, applying the structural check the fixer must
 not second-guess: a `must` recorded without an evidence kind or payload is
@@ -138,11 +141,15 @@ release only by the operator.
 **A final `review` keeps the old combined brief.** The read-only mode is selected
 by position: a `review` with a phase after it is the gate, while a sequence
 ending on `review` still runs the historical review-and-fix brief, so an
-existing `[implement, review]` config keeps working exactly as it did. New
-configs should use the three-phase shape — the saving is precisely the work that
-moves off the expensive model. `fix` must be the last phase and must follow a
-`review`; validation refuses a sequence that violates either. The full design,
-including the plane half that would store review history durably, is in
+existing `[implement, review]` config keeps working exactly as it did. An
+existing config with a **custom-prompt phase after `review`** changes meaning in
+this release: that `review` used to run the combined review-and-fix brief and
+open the PR itself — it is now the read-only gate, and the custom phase after it
+is expected to apply the findings. New configs should use the three-phase shape
+— the saving is precisely the work that moves off the expensive model. `fix`
+must be the last phase and must follow a `review`; validation refuses a sequence
+that violates either. The full design, including the plane half that would store
+review history durably, is in
 [`docs/review-split.md`](./docs/review-split.md).
 
 A usage limit that lands on a **resumed** phase is the one exception to the
@@ -152,7 +159,8 @@ against a run the plane has swept. So there the **sequence** ends instead —
 the lease is left to lapse into a takeover with its branch recorded — but the
 **run** does not: it waits the limit out holding no lease, probing exactly as
 it would have inside the phase, and carries on polling when the cap lifts.
-Only a hard stop (`lim.Stop`, credit exhausted) ends the daemon there.
+Only a hard stop (`lim.Stop`, credit exhausted) — or a reset landing past the
+run's remaining `budget.max_wall_clock` — ends the daemon there.
 
 A transient server/network blip on a resumed phase ends its sequence for the
 same lease reason — the backoff ladder would walk past the 30-minute lease —
@@ -287,11 +295,12 @@ different phases run on different models:
 ]
 ```
 
-**One caveat that is not about models.** Until CLA-631 lands, a `fix` phase that
-shares the review's Claude account can exit the daemon: the fix session starts
-immediately after the Opus review and can hit the same rolling usage limit the
-review just consumed the tail of. Keep the three-phase shape, but run `fix` on a
-different provider — see
+**One caveat that is not about models.** A `fix` phase that shares the review's
+Claude account can hit the same rolling usage limit the Opus review just consumed
+the tail of, because the fix session starts immediately after it. That no longer
+exits the daemon — the sequence ends and the run waits the reset out — but the
+task lapses into a takeover that pays `implement` again, plus the wait. Keep the
+three-phase shape, but run `fix` on a different provider — see
 [Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
 
 **The buckets are yours, and the indirection is the point.** clankerbar drives
@@ -345,13 +354,14 @@ Nothing in the seam resists it: each phase is already a fresh session seeded fro
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
 
-**Until CLA-631 lands, do not run `fix` on the review's Claude account.** A fix
-session that starts right after an Opus review can hit the same rolling usage
-limit the review just consumed the tail of, and the daemon exits on it instead of
-waiting — the same account-limit failure a resumed phase has. Pair the review
-with a different provider for `fix` (opencode in the example above); an
-all-Claude three-phase config is the shape most exposed to this, and the example
-here is deliberately not one.
+**Do not run `fix` on the review's Claude account.** A fix session that starts
+right after an Opus review can hit the same rolling usage limit the review just
+consumed the tail of. That no longer takes the daemon down — the sequence ends
+and the run waits the reset out holding no lease — but the task lapses into a
+takeover that pays `implement` again on top of the wait. Pair the review with a
+different provider for `fix` (opencode in the example above); an all-Claude
+three-phase config is the shape most exposed to this, and the example here is
+deliberately not one.
 
 **The harness-shaped fields stop being run-wide, and that is the whole of the
 configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and
