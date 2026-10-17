@@ -2312,20 +2312,6 @@ func discover() string {
 	return ""
 }
 
-// ConfigDir returns the directory instance configs live in: the parent of the
-// one auto-discovered file (homeConfigRelPath), i.e. `~/.config/clankerbar` by
-// default. The fleet supervisor (CLA-525) enumerates every `*.json` in it; Load
-// with an empty path reads `config.json` inside it. Same home-relative
-// construction as discover, so the two can never disagree about where configs
-// live.
-func ConfigDir() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("config dir: %w", err)
-	}
-	return filepath.Dir(filepath.Join(home, homeConfigRelPath)), nil
-}
-
 // topLevelConfigKeys are the JSON keys Config unmarshals from. A file carrying
 // at least one of them IS a clankerbar config (or claims to be); the other JSON
 // that shares the config dir — MCP configs (`mcp`, `mcpServers`), headless
