@@ -98,9 +98,8 @@ the four numeric-bounds keywords, `deepseek-v4-flash`, direct HTTPS to
 The rejection is a property of the **gateway**, not of the opencode client:
 [#43378](https://github.com/anomalyco/opencode/issues/43378) shows a completely
 different client (nanobot-ai, Python/httpx) hitting the same gateway rejection, so
-no client change lifts it. Switching opencode builds does not help either:
-`opencode2` exists on the machine but the binary name is hardcoded in the
-adapter, and the issue is upstream of any client.
+no client change lifts it. Switching opencode builds does not help either (the
+fleet moved to opencode 2.x in CLA-675): the issue is upstream of any client.
 
 ## What the CLI does about a recurrence
 

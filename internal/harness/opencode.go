@@ -61,16 +61,17 @@ func (opencode) Name() string { return "opencode" }
 // OPENCODE_CONFIG_CONTENT (see env below) - and that is exactly why "does the
 // adapter hand it over" was the wrong question to gate a preflight on. What
 // arrives has to be an opencode config, whose servers live under `mcp` (1.x
-// dialect, still accepted) or `mcp.servers` (2.x dialect); the Claude-shaped
+// dialect, still accepted) or `mcp.servers` (2.x dialect). The Claude-shaped
 // `.mcp.json` that config.Validate auto-discovers from the workdir is a
-// different schema, and opencode refuses to start on a key it does not know.
-// So every session would die at startup, which is why doctor treats that
-// combination as a FAIL rather than a missing-tools WARN (CLA-263).
+// different schema: 1.18.2 refused to start on it, and 1.18.18 and 2.0.32
+// silently skip its `mcpServers` key, so the session runs with no clankerbar
+// tools at all. Either way that combination is a doctor FAIL rather than a
+// missing-tools WARN (CLA-263).
 func (opencode) MCPConfigUse() MCPConfigUse {
 	return MCPConfigUse{
 		Schema: MCPConfigNative,
 		Note: "the opencode adapter passes mcp_config_path as OPENCODE_CONFIG (plus a rewritten copy as OPENCODE_CONFIG_CONTENT), which must be an opencode " +
-			"config (servers under `mcp` or `mcp.servers`, not Claude's `mcpServers`) - opencode refuses to start on a file it cannot parse",
+			"config (servers under `mcp` or `mcp.servers`, not Claude's `mcpServers`) - opencode skips a key it does not know, so a Claude-shaped file gives sessions no clankerbar tools",
 	}
 }
 
