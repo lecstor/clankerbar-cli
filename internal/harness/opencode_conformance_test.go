@@ -1,53 +1,32 @@
 package harness
 
-// Exec-binary conformance tests for the opencode adapter.
+// Exec-binary conformance tests for the opencode adapter against opencode 2.x.
 //
-// These are the "how we call opencode" tests: they run the REAL `opencode`
-// binary that execs on PATH through the REAL adapter (`opencode{}.Invoke`),
-// pointed at a hermetic fake OpenAI-compatible provider that scripts exactly
-// what "the model" returns — including the shape from
-// https://github.com/anomalyco/opencode/issues/43622 that makes opencode
-// process a response and hand the CLI a GARBLED/BROKEN result. Which garbled
-// shape depends on the build: <= v1.18.19 it is a final step reading
-// `reason: "unknown"` with all-zero usage and a silent exit 0; >= v1.18.20 the
-// same stream retries in a tight unbounded loop instead of exiting, and the
-// quiet-death test bounds that world with a wall-clock cap (see
-// TestOpencodeConformance_quietDeath).
+// These are the "how we call opencode" tests: they run the REAL opencode 2.x
+// binary through the REAL adapter (`opencode{}.Invoke`), pointed at a hermetic
+// fake OpenAI-compatible provider and a fake stdio MCP server (the test binary
+// itself, see main_test.go). Zero spend: no request leaves the machine, and
+// every test asserts the fake provider was actually hit.
 //
-// Everything else in this package parses SAVED opencode output; these tests
-// are the only ones that exec the binary, so they are opt-in:
+// Opt-in, skipped (free, no spawn) otherwise:
 //
 //	CLANKERBAR_OPCODE_CONFORMANCE=1 go test ./internal/harness -run OpencodeConformance -v
 //
-// and skipped (free, no network, no spawn) otherwise.
+// The binary is $CLANKERBAR_OPCODE_BIN, default ~/.opencode/bin/opencode (the
+// official installer's location). TestMain puts its directory first on PATH so
+// the adapter's plain `opencode` resolves to it; nothing here trusts whatever
+// else PATH holds (an `opencode2` there may be an old pnpm beta). The build that
+// ran is identified from the SESSION RECORD the run wrote (session_v2.version
+// in the isolated data dir's opencode.db), never from PATH or `--version`.
 //
-// Live mode, for one genuine paid turn against the provider configured on this
-// machine (the "is opencode adoption-ready" gate):
+// Isolation: HOME, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_CACHE_HOME and
+// XDG_STATE_HOME point at fresh temp dirs and config_dir is set, so neither the
+// operator's config, nor their auth database, nor the managed background
+// service is touched; `--standalone` (the adapter always passes it) spawns a
+// private server per run.
 //
-//	CLANKERBAR_OPCODE_CONFORMANCE_LIVE=1 \
-//	OPENCODE_LIVE_MODEL=opencode-go/deepseek-v4-flash \
-//	go test ./internal/harness -run OpencodeConformance_live -v
-//
-// Two findings that shaped this test, both verified against opencode 1.18.18:
-//
-//   - The model id MUST be provider-qualified ("fake/fake-model", never
-//     "fake-model"): a bare id does not resolve and opencode silently runs its
-//     own default provider (opencode-go) instead — which is how the very first
-//     draft of this test "passed" against a real backend. The provider's
-//     `npm: @ai-sdk/openai-compatible` is present in opencode's node_modules.
-//     Asserting the fake provider was actually HIT (never just reached) is the
-//     guard that makes "hit the fake, not opencode-go" a test property.
-//   - opencode run is client/server: a server already running holds the config,
-//     so `OPENCODE_CONFIG` alone is not enough to re-point a warm server. This
-//     test isolates the server's state via XDG_CONFIG_HOME/XDG_DATA_HOME/
-//     XDG_CACHE_HOME so each run spawns a fresh server that reads OUR config.
-//     The production fleet does not set these; it relies on config_dir pointing
-//     at the real config dir (see docs/harness-conformance.md).
-//
-// `config_dir` is set on the Invocation for fleet parity but appears inert on
-// 1.18.18 (OPENCODE_CONFIG_DIR is not a knob opencode honors); the XDG isolate
-// is what actually pins the config. Both facts are documented in
-// docs/harness-conformance.md.
+// The 429 case takes about 90 seconds: 2.0.32 retries a rate limit itself
+// (~10 attempts over ~82s) before it exits.
 
 import (
 	"context"
@@ -57,8 +36,11 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -66,343 +48,867 @@ import (
 
 const (
 	conformanceEnv    = "CLANKERBAR_OPCODE_CONFORMANCE"
+	conformanceBinEnv = "CLANKERBAR_OPCODE_BIN"
 	conformanceLive   = "CLANKERBAR_OPCODE_CONFORMANCE_LIVE"
 	conformanceModel  = "OPENCODE_LIVE_MODEL" // e.g. opencode-go/deepseek-v4-flash
 	conformancePrompt = "Reply with exactly: OK"
-	// conformanceTimeout bounds each exec'd session so a version that stalls
-	// talking to the fake provider fails fast with a targeted message instead of
-	// blocking until go test's default timeout. A plain context deadline — never
-	// Invocation.MaxSessionWallClock, which would add the wall_clock_capped
-	// terminal marker and muddy the quiet-death assertions.
+	// conformanceTimeout bounds each exec'd session. A plain context deadline,
+	// never Invocation.MaxSessionWallClock, which would add a terminal marker.
 	conformanceTimeout = 3 * time.Minute
+
+	// The fake's usage block, per answered request, and the per-request cost it
+	// comes to under fakeModelCost (3 $/M input, 15 $/M output).
+	fakePromptTokens     = 18511
+	fakeCompletionTokens = 2
+	fakeRequestTokens    = fakePromptTokens + fakeCompletionTokens
+	fakeRequestCost      = (fakePromptTokens*3 + fakeCompletionTokens*15) / 1e6
 )
 
-// fakeOpenAI is a minimal OpenAI-compatible streaming chat server. Each
-// instance scripts one response shape; opencode's session sees it as a real
-// provider. `hit` records that a /v1/chat/completions request arrived, which is
-// the proof the session ran against THIS provider and not opencode's built-in.
-type fakeOpenAI struct {
-	script string // "stop" (clean, with usage) or "quiet" (#43622 shape)
-	hit    atomic.Int64
+// conformanceBin is the opencode 2.x binary under test, or "" when it is not
+// installed.
+func conformanceBin() string {
+	bin := os.Getenv(conformanceBinEnv)
+	if bin == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return ""
+		}
+		bin = filepath.Join(home, ".opencode", "bin", "opencode")
+	}
+	if fi, err := os.Stat(bin); err != nil || fi.IsDir() {
+		return ""
+	}
+	return bin
 }
 
-// chat/completions streams chunks framed exactly as the AI SDK's
-// openai-compatible provider parses them. The ONLY variable between the two
-// scripts is whether any chunk carries a non-null finish_reason:
+func requireOpencodeConformance(t *testing.T) string {
+	t.Helper()
+	if os.Getenv(conformanceEnv) == "" {
+		t.Skipf("set %s=1 to exec the real opencode 2.x binary (see docs/harness-conformance.md)", conformanceEnv)
+	}
+	bin := conformanceBin()
+	if bin == "" {
+		t.Skipf("no opencode 2.x binary at $%s or ~/.opencode/bin/opencode", conformanceBinEnv)
+	}
+	// TestMain prepended its directory; prove the adapter's `opencode` is it.
+	got, err := exec.LookPath("opencode")
+	if err != nil || got != bin {
+		t.Fatalf("PATH resolves opencode to %q (err %v), want %q - the adapter would exec a different build", got, err, bin)
+	}
+	return bin
+}
+
+// fakeCall is one tool call the fake provider asks for.
+type fakeCall struct {
+	Name string
+	Args map[string]any
+}
+
+// fakeRequest is what one chat request carried, for assertions.
+type fakeRequest struct {
+	Tools       []string // tool names offered
+	ToolResults []string // tool-result message contents, raw
+	User        []string // user message contents, raw
+}
+
+// fakeOpenAI is a minimal OpenAI-compatible streaming chat server.
 //
-//   - stop:  a terminal chunk with finish_reason "stop" plus a usage block →
-//     opencode reports reason "stop" and the usage.
-//   - quiet: NO chunk ever carries a non-null finish_reason, no usage →
-//     opencode's final step reads reason "unknown", all-zero usage, and
-//     the process exits 0 with no error — the silent-death signature
-//     (anomalyco/opencode#43622, our CLA-398/401/406 family).
+//   - status != 0: every chat request fails with that HTTP status.
+//   - rounds set: a request that offers tools gets round k's tool calls, where
+//     k is the number of assistant tool-call turns already in the conversation;
+//     past the last round it answers "DONE". A request offering no tools (title
+//     generation) gets a plain answer.
+//   - otherwise: a plain "OK" answer with a usage block.
+type fakeOpenAI struct {
+	status int
+	rounds [][]fakeCall
+	delay  time.Duration
+
+	hit  atomic.Int64
+	mu   sync.Mutex
+	reqs []fakeRequest
+}
+
+func (f *fakeOpenAI) requests() []fakeRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakeRequest(nil), f.reqs...)
+}
+
 func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/v1/models":
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, `{"object":"list","data":[{"id":"fake-model","object":"model","owned_by":"fake"}]}`)
+		return
 	case "/v1/chat/completions":
-		f.hit.Add(1)
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		flusher, _ := w.(http.Flusher)
-		if flusher == nil {
-			// http.NotFoundWriter in httptest always flushes, but fail
-			// predictably if this fake is ever reused against a writer that does
-			// not implement Flusher rather than panicking mid-stream.
-			http.Error(w, "response writer does not support flushing", http.StatusInternalServerError)
-			return
-		}
-		chunk := func(delta map[string]any, finish any, usage any) {
-			c := make(map[string]any, len(delta)+1)
-			for k, v := range delta {
-				c[k] = v
-			}
-			c["finish_reason"] = finish
-			ch := map[string]any{
-				"id": "chatcmpl-1", "object": "chat.completion.chunk", "model": "fake-model",
-				"choices": []map[string]any{{"index": 0, "delta": c, "finish_reason": finish}},
-			}
-			if usage != nil {
-				ch["usage"] = usage
-			}
-			b, _ := json.Marshal(ch)
-			fmt.Fprintf(w, "data: %s\n\n", b)
-			flusher.Flush()
-		}
-		switch f.script {
-		case "quiet":
-			chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
-			chunk(map[string]any{"content": "OK"}, nil, nil)
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
-		default: // stop
-			chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
-			chunk(map[string]any{"content": "OK"}, nil, nil)
-			chunk(map[string]any{}, "stop", map[string]any{"prompt_tokens": 18511, "completion_tokens": 2, "total_tokens": 18513})
-			fmt.Fprint(w, "data: [DONE]\n\n")
-			flusher.Flush()
-		}
 	default:
 		http.NotFound(w, r)
+		return
+	}
+	f.hit.Add(1)
+	var body struct {
+		Tools []struct {
+			Function struct {
+				Name string `json:"name"`
+			} `json:"function"`
+		} `json:"tools"`
+		Messages []struct {
+			Role      string          `json:"role"`
+			Content   json.RawMessage `json:"content"`
+			ToolCalls []any           `json:"tool_calls"`
+		} `json:"messages"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	var rec fakeRequest
+	turns := 0
+	for _, t := range body.Tools {
+		rec.Tools = append(rec.Tools, t.Function.Name)
+	}
+	for _, m := range body.Messages {
+		switch {
+		case m.Role == "tool":
+			rec.ToolResults = append(rec.ToolResults, string(m.Content))
+		case m.Role == "user":
+			rec.User = append(rec.User, string(m.Content))
+		case m.Role == "assistant" && len(m.ToolCalls) > 0:
+			turns++
+		}
+	}
+	f.mu.Lock()
+	f.reqs = append(f.reqs, rec)
+	f.mu.Unlock()
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	if f.status != 0 {
+		w.Header().Set("Content-Type", "application/json")
+		if f.status == http.StatusTooManyRequests {
+			w.Header().Set("Retry-After", "1")
+		}
+		w.WriteHeader(f.status)
+		fmt.Fprintf(w, `{"error":{"message":"fake status %d","type":"fake_error","code":"fake_%d"}}`, f.status, f.status)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, _ := w.(http.Flusher)
+	chunk := func(delta map[string]any, finish any, usage any) {
+		ch := map[string]any{
+			"id": "chatcmpl-1", "object": "chat.completion.chunk", "model": "fake-model",
+			"choices": []map[string]any{{"index": 0, "delta": delta, "finish_reason": finish}},
+		}
+		if usage != nil {
+			ch["usage"] = usage
+		}
+		b, _ := json.Marshal(ch)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	usage := map[string]any{"prompt_tokens": fakePromptTokens, "completion_tokens": fakeCompletionTokens, "total_tokens": fakeRequestTokens}
+	chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	if len(f.rounds) > 0 && len(rec.Tools) > 0 && turns < len(f.rounds) {
+		for i, c := range f.rounds[turns] {
+			args, _ := json.Marshal(c.Args)
+			chunk(map[string]any{"tool_calls": []map[string]any{{
+				"index": i, "id": fmt.Sprintf("call_%d", i), "type": "function",
+				"function": map[string]any{"name": c.Name, "arguments": string(args)},
+			}}}, nil, nil)
+		}
+		chunk(map[string]any{}, "tool_calls", usage)
+	} else {
+		text := "OK"
+		if len(f.rounds) > 0 && len(rec.Tools) > 0 {
+			text = "DONE"
+		}
+		chunk(map[string]any{"content": text}, nil, nil)
+		chunk(map[string]any{}, "stop", usage)
+	}
+	fmt.Fprint(w, "data: [DONE]\n\n")
+	if flusher != nil {
+		flusher.Flush()
 	}
 }
 
-// opencodeFakeConfig writes the opencode-schema config that points opencode at
-// the fake provider. It is handed to the adapter exactly as the fleet hands
-// `harnesses.opencode.mcp_config_path` — via OPENCODE_CONFIG — so a file opencode
-// cannot parse (a Claude-shaped one) would die here, which is the CLA-263
-// surface. The fleet has no reason to pass --model (opencode owns its model in
-// its config), so the model lives in this file and must be provider-qualified.
-func opencodeFakeConfig(t *testing.T, providerURL string) string {
-	t.Helper()
-	cfg := fmt.Sprintf(`{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "fake/fake-model",
-  "provider": {
-    "fake": {
-      "npm": "@ai-sdk/openai-compatible",
-      "options": { "baseURL": %q, "apiKey": "test-key" },
-      "models": { "fake-model": { "name": "Fake Model" } }
-    }
-  }
-}`, providerURL+"/v1")
-	dir := t.TempDir()
-	if err := os.WriteFile(dir+"/opencode.json", []byte(cfg), 0o600); err != nil {
-		t.Fatalf("write opencode config: %v", err)
+// fakeConfigDoc is the opencode 2.x-dialect config pointing at the fake
+// provider, with a model `cost` block so cost accounting is exercised.
+func fakeConfigDoc(providerURL string) map[string]any {
+	return map[string]any{
+		"$schema": "https://opencode.ai/config.json",
+		"model":   map[string]any{"providerID": "fake", "model": "fake-model"},
+		"provider": map[string]any{"fake": map[string]any{
+			"npm":     "@ai-sdk/openai-compatible",
+			"options": map[string]any{"baseURL": providerURL + "/v1", "apiKey": "test-key"},
+			"models": map[string]any{"fake-model": map[string]any{
+				"name": "Fake Model",
+				"cost": map[string]any{"input": 3, "output": 15},
+			}},
+		}},
 	}
-	return dir + "/opencode.json"
 }
 
-// opencodeIsolateEnv redirects opencode's entire state (config, data, cache)
-// into fresh temp dirs so the client/server it spawns is guaranteed to read OUR
-// config and never a long-lived server holding the fleet's. This is the knob
-// that makes the test hermetic; it is the only env the test adds on top of what
-// the adapter itself sets (OPENCODE_PERMISSION / OPENCODE_CONFIG_DIR /
-// OPENCODE_CONFIG).
-func opencodeIsolateEnv(t *testing.T) []string {
+func writeJSON(t *testing.T, doc map[string]any) string {
 	t.Helper()
-	keys := []string{"XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME"}
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		out = append(out, k+"="+t.TempDir())
+	b, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "opencode.json")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// fakeMCPEntry is a local MCP server entry that runs this test binary as the
+// fake clankerbar server, logging calls into dir.
+func fakeMCPEntry(t *testing.T, dir string) map[string]any {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return map[string]any{
+		"type":        "local",
+		"command":     []string{self},
+		"environment": map[string]any{fakeMCPDirEnv: dir},
+	}
+}
+
+// conformanceIsolation is the env a conformance session runs under, plus the
+// data dir the session record lands in.
+type conformanceIsolation struct {
+	env     []string
+	dataDir string
+	cfgDir  string
+}
+
+func isolate(t *testing.T) conformanceIsolation {
+	t.Helper()
+	iso := conformanceIsolation{dataDir: t.TempDir(), cfgDir: t.TempDir()}
+	iso.env = []string{
+		"HOME=" + t.TempDir(),
+		"XDG_CONFIG_HOME=" + t.TempDir(),
+		"XDG_DATA_HOME=" + iso.dataDir,
+		"XDG_CACHE_HOME=" + t.TempDir(),
+		"XDG_STATE_HOME=" + t.TempDir(),
+	}
+	return iso
+}
+
+func (iso conformanceIsolation) invocation(prompt, workdir, cfg string) Invocation {
+	return Invocation{
+		Prompt:        prompt,
+		WorkDir:       workdir,
+		MCPConfigPath: cfg,
+		ConfigDir:     iso.cfgDir,
+		Env:           iso.env,
+	}
+}
+
+func invokeConformance(t *testing.T, in Invocation) Result {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+	res, err := (opencode{}).Invoke(ctx, in)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	return res
+}
+
+var versionLineRe = regexp.MustCompile(`version=([0-9][0-9A-Za-z._-]*)`)
+
+// sessionRecordVersion reads the version of the build that created sid from the
+// session record in the isolated data dir. sqlite3 reads session_v2.version;
+// without sqlite3 the `cli starting ... version=` line the same run wrote into
+// the isolated log is the fallback.
+func sessionRecordVersion(t *testing.T, dataDir, sid string) string {
+	t.Helper()
+	db := filepath.Join(dataDir, "opencode", "opencode.db")
+	if sq, err := exec.LookPath("sqlite3"); err == nil && sid != "" {
+		out, err := exec.Command(sq, "-readonly", db, "select version from session_v2 where id='"+strings.ReplaceAll(sid, "'", "")+"'").Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			return strings.TrimSpace(string(out))
+		}
+	}
+	data, err := os.ReadFile(filepath.Join(dataDir, "opencode", "log", "opencode.log"))
+	if err != nil {
+		t.Fatalf("no session record: %s unreadable and %v", db, err)
+	}
+	m := versionLineRe.FindSubmatch(data)
+	if m == nil {
+		t.Fatal("no version in the session record")
+	}
+	return string(m[1])
+}
+
+// requireV2Record fails unless the session was created by a 2.x build.
+func requireV2Record(t *testing.T, iso conformanceIsolation, res Result) {
+	t.Helper()
+	sid, _ := res.Raw[opencodeSessionIDKey].(string)
+	ver := sessionRecordVersion(t, iso.dataDir, sid)
+	t.Logf("session %s created by opencode %s (session record)", sid, ver)
+	major, err := strconv.Atoi(strings.SplitN(ver, ".", 2)[0])
+	if err != nil || major < 2 {
+		t.Fatalf("session record version %q is not 2.x", ver)
+	}
+}
+
+func requireHit(t *testing.T, f *fakeOpenAI) {
+	t.Helper()
+	if f.hit.Load() == 0 {
+		t.Fatal("fake provider was never hit - the session resolved a different provider. NOTE: that run may have spent real tokens")
+	}
+}
+
+// toolEvents returns the tool_use parts on a Result's retained stdout.
+func toolEvents(res Result) []opencodePart {
+	var out []opencodePart
+	for _, line := range strings.Split(res.Stdout, "\n") {
+		var ev opencodeEvent
+		if json.Unmarshal([]byte(strings.TrimSpace(line)), &ev) == nil && ev.Type == "tool_use" && ev.Part != nil {
+			out = append(out, *ev.Part)
+		}
 	}
 	return out
 }
 
-// invokeOpencode drives the REAL adapter: it execs `opencode run --format json`
-// exactly the way production does, on the caller's PATH, with the adapter's own
-// env (permission policy, config dir, OPENCODE_CONFIG) plus the isolate env. A
-// session that outlives conformanceTimeout is killed and the test fails rather
-// than hanging. maxWC bounds the session via Invocation.MaxSessionWallClock —
-// the quiet-death test needs it: on opencode >= 1.18.20 an empty stream RETRIES
-// instead of exiting, so without a cap the provocation never ends.
-func invokeOpencode(t *testing.T, cfgPath, workdir string, extraEnv []string, maxWC time.Duration) (Result, error) {
-	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
-	defer cancel()
-	in := Invocation{
-		Prompt:              conformancePrompt,
-		WorkDir:             workdir,
-		MCPConfigPath:       cfgPath, // → OPENCODE_CONFIG
-		ConfigDir:           t.TempDir(),
-		Env:                 extraEnv,
-		MaxSessionWallClock: maxWC,
+// describeTools renders the tool_use events for a failure message.
+func describeTools(res Result) string {
+	var b strings.Builder
+	for _, p := range toolEvents(res) {
+		if p.State != nil {
+			fmt.Fprintf(&b, "\n  %s %s %s %s", p.Tool, p.State.Status, p.State.Input, p.State.Error)
+		}
 	}
-	return (opencode{}).Invoke(ctx, in)
+	return b.String()
 }
 
-// requireOpencodeConformance skips unless the operator has explicitly opted in
-// AND the binary is on PATH. CI's `go test -race ./...` therefore stays green,
-// fast and free; the exec test is a local gate, not a gate on every push.
-func requireOpencodeConformance(t *testing.T) {
-	t.Helper()
-	if os.Getenv(conformanceEnv) == "" {
-		t.Skipf("set %s=1 to exec the real opencode binary (see docs/harness-conformance.md)", conformanceEnv)
+func indexOfTool(names []string, want string) int {
+	for i, n := range names {
+		if n == want {
+			return i
+		}
 	}
-	if _, err := exec.LookPath("opencode"); err != nil {
-		t.Skipf("no opencode binary on PATH: %v", err)
-	}
+	return -1
 }
 
-// logOpencodeBuild names the binary that is about to be executed — the fleet
-// runs Homebrew stable 1.18.x, and the docs warn that the abandoned opencode2
-// nightly can silently take over if its dir lands on PATH (docs/opencode-build.md).
-// Not a hard failure: a newer stable should not break the suite. It lets the
-// log say which build this result came from. The nightly's version is
-// `0.0.0-next-…`, so a warn keys on that prefix (a stable pre-release like
-// 1.19.0-rc is not flagged — the check is log-only either way).
-var opencodeVersionishRe = regexp.MustCompile(`^\d+\.\d+\.\d+`)
-
-func logOpencodeBuild(t *testing.T) {
-	t.Helper()
-	if bin, err := exec.LookPath("opencode"); err == nil {
-		t.Logf("execing opencode at %s", bin)
-	}
-	out, err := exec.Command("opencode", "--version").Output()
-	if err != nil {
-		t.Logf("opencode --version: %v", err)
-		return
-	}
-	ver := strings.TrimSpace(string(out))
-	t.Logf("opencode version: %s", ver)
-	if strings.HasPrefix(ver, "0.0.0") || !opencodeVersionishRe.MatchString(ver) {
-		t.Logf("WARNING: this does not look like the fleet's stable 1.18.x line — see docs/opencode-build.md")
-	}
-}
-
-// TestOpencodeConformance_control pins the healthy shape: a provider that
-// streams a finished answer (reason stop, with usage) makes the adapter report
-// a clean, spend-accounted, NOT-silent session.
-func TestOpencodeConformance_control(t *testing.T) {
+// A plain answer: exit 0, the final message, and usage read from the session
+// export. The stream carries NO usage for a plain answer on 2.x, so every
+// figure here comes from the export, title generation included.
+func TestOpencodeConformance_stop(t *testing.T) {
 	requireOpencodeConformance(t)
-	logOpencodeBuild(t)
-
-	fake := &fakeOpenAI{script: "stop"}
+	fake := &fakeOpenAI{}
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
-	cfg := opencodeFakeConfig(t, srv.URL)
+	iso := isolate(t)
+	res := invokeConformance(t, iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, fakeConfigDoc(srv.URL))))
+	requireHit(t, fake)
+	requireV2Record(t, iso, res)
 
-	res, err := invokeOpencode(t, cfg, t.TempDir(), opencodeIsolateEnv(t), 0)
-	if err != nil {
-		t.Fatalf("Invoke: %v", err)
-	}
-	if fake.hit.Load() == 0 {
-		t.Fatal("fake provider was never hit — opencode used a different (real) provider instead of fake/fake-model. NOTE: if the model id failed to resolve, that real run may have spent a real paid token before this failure")
-	}
 	if res.ExitCode != 0 {
-		t.Errorf("ExitCode = %d, want 0", res.ExitCode)
-	}
-	if !res.UsageReported {
-		t.Errorf("UsageReported = false, want true (the stop script carries a usage block)")
-	}
-	if res.Tokens == 0 {
-		t.Errorf("Tokens = 0, want > 0 (usage was sent)")
-	}
-	if got := res.Raw[FinishReasonKey]; got != "stop" {
-		t.Errorf("finish_reason = %v, want %q", got, "stop")
+		t.Errorf("ExitCode = %d, want 0 (stderr %.300s)", res.ExitCode, res.Stderr)
 	}
 	if res.FinalMessage != "OK" {
-		t.Errorf("FinalMessage = %q, want %q", res.FinalMessage, "OK")
+		t.Errorf("FinalMessage = %q, want OK", res.FinalMessage)
 	}
-	if (opencode{}).ZeroUsageUnknown(res) {
-		t.Error("ZeroUsageUnknown = true on a healthy stop session")
+	if res.Raw[opencodeUsageSourceKey] != opencodeUsageExport {
+		t.Fatalf("usage_source = %v, want %q - the session export was not read", res.Raw[opencodeUsageSourceKey], opencodeUsageExport)
+	}
+	if !res.UsageReported {
+		t.Error("UsageReported = false after a successful export")
+	}
+	hits := fake.hit.Load()
+	if want := int(hits) * fakeRequestTokens; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d (%d requests x %d, title generation included)", res.Tokens, want, hits, fakeRequestTokens)
+	}
+	if want := float64(hits) * fakeRequestCost; res.CostUSD < want*0.999 || res.CostUSD > want*1.001 {
+		t.Errorf("CostUSD = %v, want %v", res.CostUSD, want)
+	}
+	if got := res.Raw[FinishReasonKey]; got != "stop" {
+		t.Errorf("finish_reason = %v, want stop (from the export's final assistant message)", got)
+	}
+	if (opencode{}).ZeroUsageUnknown(res) || (opencode{}).OutputCapNoOutput(res) {
+		t.Error("a healthy session carries a terminal marker")
 	}
 }
 
-// TestOpencodeConformance_quietDeath pins the CLI's handling of the #43622
-// shape: opencode processes a model response whose stream never carries a
-// finish reason. What the CLI must do depends on which WORLD the binary on PATH
-// lives in, and the test is world-aware rather than world-anchored:
-//
-//   - v1.18.19 and older (the guillotine world): the session exits 0 silently
-//     with a final step reading reason "unknown" and all-zero usage, and the
-//     CLI MUST name it (ZeroUsageUnknown) rather than read it as a clean run.
-//   - v1.18.20+ (the retry world): the silent exit is fixed upstream by
-//     RETRYING the empty stream — which, against a persistently-empty stream,
-//     never terminates on its own (the hazard upstream #43622 warned about).
-//     The test bounds the provocation with a short wall-clock cap; the CLI must
-//     then BOTH name the death it saw on step 1 (ZeroUsageUnknown) AND end the
-//     session via its own cap (WallClockCapped) — which is the operational
-//     contract the fleet relies on: bounded, salvaged, never dropped.
-//   - A hypothetical proper-fix world (upstream lands an error-surfacing fix):
-//     the session ends on its own with neither signature, and the CLI must not
-//     fabricate the marker — the test turns green with a loud re-pin log.
-func TestOpencodeConformance_quietDeath(t *testing.T) {
+// The adapter's policy, enforced by the real binary: tool-level denies remove
+// the tools, external_directory refuses file tools outside the workdir, the
+// working set is writable, and a read-only (probe) run loses edit and shell.
+func TestOpencodeConformance_permissions(t *testing.T) {
 	requireOpencodeConformance(t)
-	logOpencodeBuild(t)
+	outside := t.TempDir()
+	calls := func() [][]fakeCall {
+		return [][]fakeCall{{
+			{"write", map[string]any{"path": "w1.txt", "content": "in"}},
+			{"write", map[string]any{"path": filepath.Join(outside, "w2.txt"), "content": "out"}},
+			{"shell", map[string]any{"command": "echo b1 > b1.txt", "description": "in"}},
+			{"shell", map[string]any{"command": "echo b2 > " + filepath.Join(outside, "b2.txt"), "description": "out"}},
+			{"read", map[string]any{"path": "/etc/hosts"}},
+			{"webfetch", map[string]any{"url": "http://127.0.0.1:1/"}},
+		}}
+	}
+	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
 
-	fake := &fakeOpenAI{script: "quiet"}
+	t.Run("drain", func(t *testing.T) {
+		fake := &fakeOpenAI{rounds: calls()}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+		iso := isolate(t)
+		work := t.TempDir()
+		res := invokeConformance(t, iso.invocation("work", work, writeJSON(t, fakeConfigDoc(srv.URL))))
+		requireHit(t, fake)
+		requireV2Record(t, iso, res)
+
+		var offered []string
+		for _, r := range fake.requests() {
+			if len(r.Tools) > 0 {
+				offered = r.Tools
+				break
+			}
+		}
+		t.Logf("tools offered under the drain policy: %v", offered)
+		for _, denied := range []string{"webfetch", "websearch", "execute", "question", "skill", "subagent"} {
+			if indexOfTool(offered, denied) >= 0 {
+				t.Errorf("%s was offered; a tool-level deny must remove it", denied)
+			}
+		}
+		for _, allowed := range []string{"read", "write", "edit", "shell", "glob", "grep"} {
+			if indexOfTool(offered, allowed) < 0 {
+				t.Errorf("%s was not offered; the drain policy allows it", allowed)
+			}
+		}
+		if !exists(filepath.Join(work, "w1.txt")) {
+			t.Errorf("write inside the workdir did not land; events %s", describeTools(res))
+		}
+		if exists(filepath.Join(outside, "w2.txt")) {
+			t.Error("write OUTSIDE the workdir landed; external_directory must refuse it")
+		}
+		if !exists(filepath.Join(work, "b1.txt")) {
+			t.Error("shell inside the workdir did not run")
+		}
+		denied := false
+		for _, p := range toolEvents(res) {
+			if p.Tool == "read" && p.State != nil && p.State.Status == "error" && strings.Contains(p.State.Error, "external_directory") {
+				denied = true
+			}
+		}
+		if !denied {
+			t.Error("read of /etc/hosts was not refused by external_directory")
+		}
+		// The accepted gap (operator decision 2026-10-18, CLA-675): 2.x does not
+		// path-gate the shell. Pinned as a log, not a failure, so a build that
+		// starts gating it is noticed and the docs re-pinned.
+		if exists(filepath.Join(outside, "b2.txt")) {
+			t.Log("accepted gap reproduced: shell wrote outside the workdir (2.x does not path-gate shell commands)")
+		} else {
+			t.Log("NOTE: shell did NOT write outside the workdir - this build path-gates the shell; re-pin docs/opencode-build.md")
+		}
+	})
+
+	t.Run("readonly", func(t *testing.T) {
+		fake := &fakeOpenAI{rounds: calls()}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+		iso := isolate(t)
+		work := t.TempDir()
+		in := iso.invocation("ignored", work, writeJSON(t, fakeConfigDoc(srv.URL)))
+		in.Probe = true
+		res := invokeConformance(t, in)
+		requireHit(t, fake)
+		requireV2Record(t, iso, res)
+		for _, r := range fake.requests() {
+			for _, gone := range []string{"edit", "write", "shell"} {
+				if indexOfTool(r.Tools, gone) >= 0 {
+					t.Errorf("%s offered to a read-only run", gone)
+				}
+			}
+		}
+		if exists(filepath.Join(work, "w1.txt")) || exists(filepath.Join(work, "b1.txt")) {
+			t.Error("a read-only run wrote into the workdir")
+		}
+	})
+
+	// A permission block in an ambient layer must not loosen the pinned policy.
+	// The project opencode.json sits in the session's own checkout, so a
+	// session can write it for the next spawn. Verified on 2.0.32: an
+	// agent-level block overrides a top-level policy unless the agent is
+	// pinned, and `default_agent` routes to an unpinned agent unless --agent is
+	// passed. Each case must leave out-of-tree reads/writes refused, webfetch
+	// unoffered, and in-tree writes working.
+	for name, ambient := range map[string]map[string]any{
+		"agent.build.permission": {"agent": map[string]any{"build": map[string]any{"permission": map[string]any{
+			"external_directory": "allow", "read": "allow", "edit": "allow", "webfetch": "allow", "subagent": "allow"}}}},
+		"agents.build.permissions": {"agents": map[string]any{"build": map[string]any{"permissions": []any{
+			map[string]any{"action": "*", "resource": "*", "effect": "allow"}}}}},
+		"default_agent": {"default_agent": "evil", "agent": map[string]any{"evil": map[string]any{
+			"mode": "primary", "permission": map[string]any{"*": "allow", "external_directory": "allow"}}}},
+		"top-level permission": {"permission": map[string]any{
+			"read": "allow", "edit": "allow", "external_directory": "allow", "webfetch": "allow"}},
+	} {
+		t.Run("ambient "+name, func(t *testing.T) {
+			fake := &fakeOpenAI{rounds: calls()}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			iso := isolate(t)
+			work := t.TempDir()
+			b, _ := json.Marshal(ambient)
+			if err := os.WriteFile(filepath.Join(work, "opencode.json"), b, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			res := invokeConformance(t, iso.invocation("work", work, writeJSON(t, fakeConfigDoc(srv.URL))))
+			requireHit(t, fake)
+			for _, r := range fake.requests() {
+				for _, gone := range []string{"webfetch", "websearch", "execute", "subagent", "question"} {
+					if indexOfTool(r.Tools, gone) >= 0 {
+						t.Errorf("%s offered despite the pinned policy", gone)
+					}
+				}
+			}
+			if exists(filepath.Join(outside, "w2.txt")) {
+				t.Errorf("out-of-tree write landed under an ambient %s block%s", name, describeTools(res))
+				os.Remove(filepath.Join(outside, "w2.txt"))
+			}
+			if !exists(filepath.Join(work, "w1.txt")) {
+				t.Errorf("in-tree write was locked out%s", describeTools(res))
+			}
+			os.Remove(filepath.Join(outside, "b2.txt"))
+		})
+	}
+
+	// Last-match-wins on patterns, which the policy's ordering depends on: a
+	// later, more specific deny beats an earlier allow. Exec'd raw, because the
+	// adapter's own policy has no shell pattern to show it with.
+	t.Run("pattern", func(t *testing.T) {
+		fake := &fakeOpenAI{rounds: [][]fakeCall{{
+			{"shell", map[string]any{"command": "git push origin main", "description": "push"}},
+			{"shell", map[string]any{"command": "echo ok > p.txt", "description": "ok"}},
+		}}}
+		srv := httptest.NewServer(fake)
+		defer srv.Close()
+		doc := fakeConfigDoc(srv.URL)
+		doc["permission"] = map[string]any{"*": "deny", "shell": map[string]any{"*": "allow", "git push*": "deny"}}
+		content, _ := json.Marshal(doc)
+		iso := isolate(t)
+		work := t.TempDir()
+		ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, "opencode", "run", "--standalone", "--format", "json", "--", "go")
+		cmd.Dir = work
+		// opencode takes its instance directory from $PWD, not the real cwd.
+		cmd.Env = append(append(os.Environ(), iso.env...), "PWD="+work, "OPENCODE_CONFIG_CONTENT="+string(content))
+		out, _ := cmd.Output()
+		requireHit(t, fake)
+		if !exists(filepath.Join(work, "p.txt")) {
+			t.Errorf("the allowed shell command did not run; stream:\n%.3000s", out)
+		}
+		pushDenied := false
+		for _, p := range toolEvents(Result{Stdout: string(out)}) {
+			if p.Tool == "shell" && p.State != nil && strings.Contains(string(p.State.Input), "git push") && p.State.Status == "error" {
+				pushDenied = true
+			}
+		}
+		if !pushDenied {
+			t.Errorf("git push was not denied by the later pattern; stream:\n%.2000s", out)
+		}
+	})
+}
+
+// MCP tools reach the session top-level (out of Code Mode), the claim is
+// observed off the stream, and the first-turn race is survived. Both config
+// dialects: the adapter rewrites 1.x `mcp.<name>` into `mcp.servers.<name>`.
+func TestOpencodeConformance_mcpClaim(t *testing.T) {
+	requireOpencodeConformance(t)
+	for _, dialect := range []string{"v1", "v2"} {
+		t.Run(dialect, func(t *testing.T) {
+			claim := []fakeCall{{"clankerbar_claim_task", map[string]any{"taskId": "T-9"}}}
+			// Two claim rounds: the first may land before the MCP server has
+			// connected; the model then calls again, as the warm-up note asks.
+			fake := &fakeOpenAI{rounds: [][]fakeCall{claim, claim}, delay: 300 * time.Millisecond}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			mcpDir := t.TempDir()
+			doc := fakeConfigDoc(srv.URL)
+			entry := fakeMCPEntry(t, mcpDir)
+			if dialect == "v1" {
+				entry["enabled"] = true
+				doc["mcp"] = map[string]any{"clankerbar": entry}
+			} else {
+				doc["mcp"] = map[string]any{"servers": map[string]any{"clankerbar": entry}}
+			}
+			iso := isolate(t)
+			res := invokeConformance(t, iso.invocation("work the backlog", t.TempDir(), writeJSON(t, doc)))
+			requireHit(t, fake)
+			requireV2Record(t, iso, res)
+
+			events := toolEvents(res)
+			var statuses []string
+			for _, p := range events {
+				if p.Tool == "execute" {
+					t.Error("a tool_use for `execute` - the MCP server stayed in Code Mode")
+				}
+				if p.Tool == "clankerbar_claim_task" && p.State != nil {
+					statuses = append(statuses, p.State.Status)
+					if p.State.Status == "error" && strings.Contains(p.State.Error, "No tool named") {
+						t.Log("first-turn MCP race reproduced: the first claim_task ran before the server connected")
+					}
+				}
+			}
+			if len(statuses) == 0 || statuses[len(statuses)-1] != "completed" {
+				t.Fatalf("no completed top-level clankerbar_claim_task tool_use (statuses %v); stdout:\n%.3000s", statuses, res.Stdout)
+			}
+			if !res.Claim.Held() || res.Claim.TaskID != "T-9" || res.Claim.RunID != "run-1" {
+				t.Errorf("Claim = %+v, want held T-9 / run-1", res.Claim)
+			}
+			if data, err := os.ReadFile(filepath.Join(mcpDir, "calls.jsonl")); err != nil || !strings.Contains(string(data), "claim_task") {
+				t.Errorf("the fake MCP server saw no claim_task call (%v)", err)
+			}
+			sawNote := false
+			for _, r := range fake.requests() {
+				for _, u := range r.User {
+					if strings.Contains(u, "connect in the background") {
+						sawNote = true
+					}
+				}
+			}
+			if !sawNote {
+				t.Error("the MCP warm-up note did not reach the model")
+			}
+			if want := int(fake.hit.Load()) * fakeRequestTokens; res.Tokens != want {
+				t.Errorf("Tokens = %d, want %d", res.Tokens, want)
+			}
+		})
+	}
+}
+
+// A claim_task result above 51,200 bytes is truncated by 2.x to a pointer at a
+// saved file; the claim must still be observed, rehydrated from that file.
+// Plane payloads reach this size (a get_task measured 56 KB).
+func TestOpencodeConformance_largeClaim(t *testing.T) {
+	requireOpencodeConformance(t)
+	claim := []fakeCall{{"clankerbar_claim_task", map[string]any{"taskId": "T-9"}}}
+	fake := &fakeOpenAI{rounds: [][]fakeCall{claim, claim}, delay: 300 * time.Millisecond}
 	srv := httptest.NewServer(fake)
 	defer srv.Close()
-	cfg := opencodeFakeConfig(t, srv.URL)
-
-	res, err := invokeOpencode(t, cfg, t.TempDir(), opencodeIsolateEnv(t), quietDeathCap)
-	if err != nil {
-		t.Fatalf("Invoke: %v", err)
+	mcpDir := t.TempDir()
+	entry := fakeMCPEntry(t, mcpDir)
+	entry["environment"].(map[string]any)[fakeMCPPadEnv] = "120000"
+	doc := fakeConfigDoc(srv.URL)
+	doc["mcp"] = map[string]any{"servers": map[string]any{"clankerbar": entry}}
+	iso := isolate(t)
+	console := &strings.Builder{}
+	in := iso.invocation("work the backlog", t.TempDir(), writeJSON(t, doc))
+	in.Console = console
+	res := invokeConformance(t, in)
+	requireHit(t, fake)
+	requireV2Record(t, iso, res)
+	truncated := false
+	for _, p := range toolEvents(res) {
+		if p.Tool == "clankerbar_claim_task" && p.State != nil && p.State.Metadata != nil &&
+			p.State.Metadata.Metadata != nil && p.State.Metadata.Metadata.Truncated {
+			truncated = true
+		}
 	}
-	if fake.hit.Load() == 0 {
-		t.Fatal("fake provider was never hit — opencode used a different (real) provider instead of fake/fake-model. NOTE: if the model id failed to resolve, that real run may have spent a real paid token before this failure")
+	if !truncated {
+		t.Fatal("the claim result was not truncated - this build no longer exercises the envelope; re-pin the threshold")
 	}
-
-	switch {
-	case (opencode{}).WallClockCapped(res):
-		// The retry world (opencode >= 1.18.20), bounded by our own cap. The
-		// session spun against the silently-empty stream, and the adapter
-		// killed it at the wall-clock dial. The composite marker
-		// (ZeroUsageUnknown) deliberately cedes to the cap marker — the driver
-		// keys its control flow off terminal_reason, which holds ONE value, and
-		// "capped" is the stronger fact for how to end the phase. What the test
-		// pins instead is the RAW signature, which markWallClockCapped
-		// preserves: the death must still be readable on the Result (finish
-		// reason unknown, all-zero usage) even on a capped end.
-		if fake.hit.Load() < 5 {
-			// A capped session that made almost no provider calls is NOT
-			// evidence of a spin — it may never have completed its FIRST
-			// request before the cap fired (cold start on a slow machine, or a
-			// build whose emptiness handling changed). Red either way, but name
-			// both readings rather than diagnosing the retry world by default.
-			t.Errorf("session was capped with only %d provider calls in %s — either the empty-stream retry never spun this fast (open >= 1.18.20) or the session never completed its first request (cap too tight on this machine)", fake.hit.Load(), quietDeathCap)
-		}
-		if reason, _ := res.Raw[FinishReasonKey].(string); reason != FinishReasonUnknown {
-			t.Errorf("capped retry-world session lost the death signature: finish_reason = %q, want %q", reason, FinishReasonUnknown)
-		}
-		if res.Tokens != 0 || res.CostUSD != 0 {
-			t.Errorf("capped retry-world session: Tokens/CostUSD = %d/$%.4f, want 0/0 (all-zero usage)", res.Tokens, res.CostUSD)
-		}
-		t.Logf("retry world bounded: opencode >=1.18.20 spun the empty stream (%d provider calls in %s); the CLI capped it and the raw death signature (reason unknown, all-zero usage) is preserved on the Result", fake.hit.Load(), quietDeathCap)
-		t.Log("NOTE for maintainers: on a capped end the composite ZeroUsageUnknown marker cedes to wall_clock_capped (one terminal_reason key). Whether a capped SPIN should also count in the dead-phase tally is an open decision for the 1.18.20+ world.")
-
-	case observedQuietDeath(res):
-		// The guillotine world (v1.18.19 and older): exit 0, reason unknown,
-		// all-zero usage, no retry. The CLI must name it. UsageReported is
-		// deliberately not asserted — opencode emits a (all-zero) tokens block
-		// even on this shape, and the adapter counts "the event existed" as
-		// reported (CLA-288); the discriminator is the all-zero SUM plus the
-		// unknown reason.
-		if !(opencode{}).ZeroUsageUnknown(res) {
-			t.Error("session carried the #43622 silent-death signature (exit 0, reason unknown, all-zero usage) but ZeroUsageUnknown is false — the CLI would read this death as a clean completion")
-		}
-		t.Log("reproduced the #43622 silent-death signature (exit 0, reason unknown, all-zero usage) and the CLI names it (ZeroUsageUnknown true)")
-
-	default:
-		// Some proper-fix world: the session ended on its own with neither
-		// signature. Green, because the CLI is not misclassifying anything —
-		// but it is a changed world the fixture was built for, so say so out
-		// loud rather than quietly passing.
-		if (opencode{}).ZeroUsageUnknown(res) {
-			t.Error("session carried neither the quiet-death nor the retry-world signature but ZeroUsageUnknown is true — a false positive")
-		}
-		t.Logf("WARNING: neither the #43622 signature nor the empty-stream retry reproduced with this opencode build (exit %d, finish %v) — re-pin docs/harness-conformance.md and reconsider CLA-406/ZeroUsageUnknown; this PASS is no longer coverage of the old bug", res.ExitCode, res.Raw[FinishReasonKey])
+	if !res.Claim.Held() || res.Claim.TaskID != "T-9" || res.Claim.RunID != "run-1" {
+		t.Errorf("Claim = %+v, want held T-9 / run-1 rehydrated from the saved output; console:\n%s", res.Claim, console)
 	}
 }
 
-// quietDeathCap bounds the empty-stream retry provocation so the test cannot
-// hang on an opencode that fixed the silent exit by retrying (v1.18.20+).
-// Fifteen seconds is plenty: the measured spin is ~18 requests/sec.
-const quietDeathCap = 15 * time.Second
+// Switching off a server the global config declares takes a FULL entry in the
+// mcp config: verified on 2.0.32, a partial `{"enabled": false}` (1.x) or
+// `servers.X: {"disabled": true}` (2.x) leaves it running, and doctor's
+// opencode_mcp_disables check says so. The full forms must keep it off; the
+// partial ones are logged so a build that changes this is noticed.
+func TestOpencodeConformance_mcpDisable(t *testing.T) {
+	requireOpencodeConformance(t)
+	clone := func(e map[string]any, k string, v any) map[string]any {
+		c := map[string]any{}
+		for key, val := range e {
+			c[key] = val
+		}
+		c[k] = v
+		return c
+	}
+	for _, c := range []struct {
+		name  string
+		block func(e map[string]any) map[string]any
+		full  bool
+	}{
+		{"full 1.x entry, enabled false", func(e map[string]any) map[string]any { return map[string]any{"other": clone(e, "enabled", false)} }, true},
+		{"full 2.x entry, disabled true", func(e map[string]any) map[string]any {
+			return map[string]any{"servers": map[string]any{"other": clone(e, "disabled", true)}}
+		}, true},
+		{"partial 1.x entry", func(map[string]any) map[string]any { return map[string]any{"other": map[string]any{"enabled": false}} }, false},
+		{"partial 2.x entry", func(map[string]any) map[string]any {
+			return map[string]any{"servers": map[string]any{"other": map[string]any{"disabled": true}}}
+		}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeOpenAI{delay: 1500 * time.Millisecond}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			iso := isolate(t)
+			mcpDir := t.TempDir()
+			entry := fakeMCPEntry(t, mcpDir)
+			global, _ := json.Marshal(map[string]any{"mcp": map[string]any{"other": entry}})
+			if err := os.WriteFile(filepath.Join(iso.cfgDir, "opencode.json"), global, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			doc := fakeConfigDoc(srv.URL)
+			doc["mcp"] = c.block(entry)
+			invokeConformance(t, iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, doc)))
+			requireHit(t, fake)
+			_, err := os.Stat(filepath.Join(mcpDir, "starts"))
+			started := err == nil
+			switch {
+			case c.full && started:
+				t.Error("a full entry with the off switch did not stop the server")
+			case !c.full && started:
+				t.Log("partial entry left the server running, as documented")
+			case !c.full:
+				t.Log("NOTE: a partial entry stopped the server on this build - re-pin docs/opencode-build.md and doctor's opencode_mcp_disables")
+			}
+		})
+	}
+}
 
-// observedQuietDeath reports whether THIS session, as produced by whatever
-// `opencode` binary just ran, carried the #43622 signature: exit 0 with a final
-// step whose reason is "unknown" and whose usage summed to zero. It is a
-// property of the WORLD (what the binary handed over), not of the CLI — the
-// CLI's obligation, asserted above, is to flag this signature whenever it sees
-// it and only when it sees it.
-func observedQuietDeath(res Result) bool {
-	if res.ExitCode != 0 {
-		return false
+// Resume with `-s <sid>` continues the SAME session headlessly, and the
+// resumed run is charged only for its own requests, not the session's total.
+func TestOpencodeConformance_resume(t *testing.T) {
+	requireOpencodeConformance(t)
+	fake := &fakeOpenAI{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	in := iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, fakeConfigDoc(srv.URL)))
+	first := invokeConformance(t, in)
+	requireHit(t, fake)
+	requireV2Record(t, iso, first)
+	sid, _ := first.Raw[opencodeSessionIDKey].(string)
+	if sid == "" {
+		t.Fatal("no session id on the first run's stream")
 	}
-	if reason, _ := res.Raw[FinishReasonKey].(string); reason != FinishReasonUnknown {
-		return false
+	before := fake.hit.Load()
+
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+	second, err := (opencode{}).runSession(ctx, in, opencodeResumeArgs(in, sid, "Reply with exactly: OK"))
+	if err != nil {
+		t.Fatalf("resume: %v", err)
 	}
-	return res.Tokens == 0 && res.CostUSD == 0
+	if got, _ := second.Raw[opencodeSessionIDKey].(string); got != sid {
+		t.Errorf("resumed run streamed session %q, want %q", got, sid)
+	}
+	if second.ExitCode != 0 || second.FinalMessage != "OK" {
+		t.Errorf("resumed run: exit %d, final %q", second.ExitCode, second.FinalMessage)
+	}
+	if want := int(fake.hit.Load()-before) * fakeRequestTokens; second.Tokens != want {
+		t.Errorf("resumed run Tokens = %d, want %d (its own requests only)", second.Tokens, want)
+	}
+	doc, err := (opencode{}).exportSession(ctx, in, sid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, m := range doc.Messages {
+		if m.Type == "assistant" {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Errorf("session holds %d assistant messages, want 2 (first run + resume)", n)
+	}
+}
+
+// Typed errors and how the adapter classifies them.
+func TestOpencodeConformance_errors(t *testing.T) {
+	requireOpencodeConformance(t)
+	cases := []struct {
+		name      string
+		status    int
+		model     string
+		wantType  string
+		transient bool
+	}{
+		{"auth", http.StatusUnauthorized, "", "provider.auth", false},
+		{"noroute", 0, "fake/no-such-model", "provider.no-route", false},
+		{"ratelimit", http.StatusTooManyRequests, "", "provider.rate-limit", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			fake := &fakeOpenAI{status: c.status}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			iso := isolate(t)
+			in := iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, fakeConfigDoc(srv.URL)))
+			in.Model = c.model
+			res := invokeConformance(t, in)
+			if c.name != "noroute" {
+				requireHit(t, fake)
+			} else if fake.hit.Load() != 0 {
+				t.Error("no-route sent a request")
+			}
+			if res.ExitCode != 1 {
+				t.Errorf("ExitCode = %d, want 1", res.ExitCode)
+			}
+			if got := res.Raw[OpencodeErrorTypeKey]; got != c.wantType {
+				t.Errorf("error type = %v, want %s", got, c.wantType)
+			}
+			if got := (opencode{}).IsTransient(res); got != c.transient {
+				t.Errorf("IsTransient = %v, want %v; diagnostic %.300s", got, c.transient, (opencode{}).Diagnostic(res))
+			}
+			if (opencode{}).DetectLimit(res).Limited {
+				t.Error("DetectLimit fired on a non-budget error")
+			}
+			if res.UsageReported {
+				t.Errorf("UsageReported = true for a run the provider never answered (tokens %d)", res.Tokens)
+			}
+		})
+	}
+}
+
+// The content layer is merged after OPENCODE_CONFIG. The adapter's permission
+// policy and MCP rewrite live in the content layer, so they hold only while that
+// ordering does. Exec'd raw: through the adapter both layers carry the same
+// provider, which would mask the ordering.
+func TestOpencodeConformance_contentPin(t *testing.T) {
+	requireOpencodeConformance(t)
+	fake := &fakeOpenAI{}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	dead := fakeConfigDoc("http://127.0.0.1:1")
+	dead["model"] = map[string]any{"providerID": "dead", "model": "fake-model"}
+	dead["provider"] = map[string]any{"dead": dead["provider"].(map[string]any)["fake"]}
+	content, _ := json.Marshal(fakeConfigDoc(srv.URL))
+	iso := isolate(t)
+	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "opencode", "run", "--standalone", "--format", "json", "--", conformancePrompt)
+	cmd.Dir = t.TempDir()
+	cmd.Env = append(append(os.Environ(), iso.env...), "PWD="+cmd.Dir,
+		"OPENCODE_CONFIG="+writeJSON(t, dead), "OPENCODE_CONFIG_CONTENT="+string(content))
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("run: %v\n%s", err, out)
+	}
+	requireHit(t, fake)
+	if !strings.Contains(string(out), `"text":"OK"`) {
+		t.Errorf("final answer not on the stream: %.300s", out)
+	}
 }
 
 // TestOpencodeConformance_live is the paid, non-hermetic gate: ONE real turn
-// against whatever provider this machine has configured (it must be named via
-// OPENCODE_LIVE_MODEL), to confirm the adapter reaches a real provider and its
-// stream parses end to end. Opt-in via CLANKERBAR_OPCODE_CONFORMANCE_LIVE=1.
-// Run it before flipping the fleet back to opencode; see docs/harness-conformance.md.
+// against whatever provider this machine has configured (named via
+// OPENCODE_LIVE_MODEL). Opt-in via CLANKERBAR_OPCODE_CONFORMANCE_LIVE=1, and it
+// uses the operator's real config and auth.
 func TestOpencodeConformance_live(t *testing.T) {
 	if os.Getenv(conformanceLive) == "" {
 		t.Skipf("set %s=1 (and %s) for the live one-turn gate", conformanceLive, conformanceModel)
@@ -414,34 +920,17 @@ func TestOpencodeConformance_live(t *testing.T) {
 	if _, err := exec.LookPath("opencode"); err != nil {
 		t.Skipf("no opencode binary on PATH: %v", err)
 	}
-	logOpencodeBuild(t)
-
-	in := Invocation{
-		Prompt:  conformancePrompt,
-		Model:   model,
-		WorkDir: t.TempDir(),
-		// No XDG isolate: the live gate uses the operator's real auth/config.
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), conformanceTimeout)
 	defer cancel()
-	res, err := (opencode{}).Invoke(ctx, in)
+	res, err := (opencode{}).Invoke(ctx, Invocation{Prompt: conformancePrompt, Model: model, WorkDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 	if res.ExitCode != 0 {
 		t.Errorf("ExitCode = %d, want 0 (stderr: %s)", res.ExitCode, res.Stderr)
 	}
-	reason, _ := res.Raw[FinishReasonKey].(string)
-	if reason == "" {
-		t.Errorf("finish_reason is empty — a live provider should end with a reason (exit was clean otherwise)")
-	} else {
-		t.Logf("finish_reason = %q (a trivial \"Reply with exactly: OK\" turn should be \"stop\", but the gate is NOT being a quiet death, not the exact reason)", reason)
-	}
 	if !res.UsageReported {
-		t.Errorf("UsageReported = false — expected the real provider to report usage")
+		t.Error("UsageReported = false - expected the session export to report usage")
 	}
-	if (opencode{}).ZeroUsageUnknown(res) {
-		t.Error("ZeroUsageUnknown = true on a live provider run")
-	}
-	t.Logf("live turn: tokens=%d cost=$%.4f final=%q", res.Tokens, res.CostUSD, res.FinalMessage)
+	t.Logf("live turn: tokens=%d cost=$%.4f final=%q source=%v", res.Tokens, res.CostUSD, res.FinalMessage, res.Raw[opencodeUsageSourceKey])
 }

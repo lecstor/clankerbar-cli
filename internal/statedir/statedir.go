@@ -5,7 +5,7 @@
 // It exists because that directory is the daemon's blind spot. The daemon runs
 // OUTSIDE the confinement its own sessions run inside — claude gets
 // `--permission-mode acceptEdits` plus a deny policy, codex `--sandbox
-// workspace-write`, opencode a fail-closed `OPENCODE_PERMISSION` — so a session
+// workspace-write`, opencode a fail-closed pinned `permission` block — so a session
 // cannot write outside its workdir, but the daemon can write anywhere. Before
 // CLA-259 the state dir sat at `<workdir>/.clankerbar-loop`, i.e. squarely
 // inside the one tree the session IS allowed to write, with 0755/0644 modes and

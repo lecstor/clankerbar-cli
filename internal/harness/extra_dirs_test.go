@@ -33,22 +33,10 @@ func has(rules []string, want string) bool {
 	return false
 }
 
-// hasRelFormAllow reports whether one of rules allows "<dir>/**" in opencode's
-// root-relative form (the absolute path minus its leading separator), matched by
-// suffix because filepath.Abs inside the policy can differ from the caller's
-// spelling on macOS (/var vs /private/var).
-func hasRelFormAllow(rules []string, dir string) bool {
-	suffix := strings.TrimPrefix(filepath.ToSlash(dir), "/") + "/**:allow"
-	for _, r := range rules {
-		if strings.HasSuffix(r, suffix) {
-			return true
-		}
-	}
-	return false
-}
-
-// hasAbsAllow is hasRelFormAllow for the absolute-form patterns
-// external_directory asks with.
+// hasAbsAllow reports whether one of rules allows "<dir>/**" in the absolute
+// form external_directory asks with, matched by suffix because filepath.Abs
+// inside the policy can differ from the caller's spelling on macOS (/var vs
+// /private/var).
 func hasAbsAllow(rules []string, dir string) bool {
 	suffix := filepath.ToSlash(dir) + "/**:allow"
 	for _, r := range rules {
@@ -60,11 +48,9 @@ func hasAbsAllow(rules []string, dir string) bool {
 }
 
 // The headline case from the doneWhen: a TWO-REPO project's policy covers both
-// paths. The session starts inside repo A's checkout (the new normal once the
-// driver spawns into the task repo), so repo B must be reachable through BOTH
-// ask shapes opencode produces: the worktree-relative "../repo-b/**" form its
-// git worktree produces for sibling trees, and the absolute-minus-slash form a
-// "/"-worktree session would ask with.
+// paths. The session starts inside repo A's checkout, so repo B is reached
+// through the instance-relative "../repo-b/**" form 2.x asks with, and through
+// the absolute external_directory allow.
 func TestOpencodeTwoRepoPolicyCoversBothPaths(t *testing.T) {
 	parent := t.TempDir()
 	repoA := checkoutWithGit(t, filepath.Join(parent, "repo-a"))
@@ -73,19 +59,14 @@ func TestOpencodeTwoRepoPolicyCoversBothPaths(t *testing.T) {
 	p := parsePolicy(t, opencodePermission(false, repoA, []string{repoB}))
 
 	read, edit := rules(p, "read"), rules(p, "edit")
-	// The relative-form layer, only for an in-checkout spawn.
 	if !has(read, "**:allow") || !has(edit, "**:allow") {
-		t.Errorf("read=%v edit=%v; an in-checkout session's plain-relative asks need **:allow", read, edit)
+		t.Errorf("read=%v edit=%v; plain-relative asks need **:allow", read, edit)
 	}
 	if !has(read, "../**:deny") || !has(edit, "../**:deny") {
 		t.Errorf("read=%v edit=%v; undeclared escapes must fail closed via ../**:deny", read, edit)
 	}
 	if !has(read, "../repo-b/**:allow") || !has(edit, "../repo-b/**:allow") {
 		t.Errorf("read=%v edit=%v; the declared sibling's ../-form allow is missing", read, edit)
-	}
-	// The absolute-form layer, for both tools.
-	if !hasRelFormAllow(read, repoB) || !hasRelFormAllow(edit, repoB) {
-		t.Errorf("read=%v edit=%v; absolute-form allow for %s missing", read, edit, repoB)
 	}
 	// external_directory gates every path-taking tool before its ask: BOTH repos
 	// allowed absolutely, the catch-all deny kept for everything else.
@@ -120,19 +101,19 @@ func TestOpencodeTwoRepoPolicyCoversBothPaths(t *testing.T) {
 	assertNetworkDenied(t, p)
 }
 
-// A session spawned OUTSIDE any git repo (today's multi-repo parent) keeps the
-// legacy shape plus per-directory root-relative allows only: no relative-form
-// layer there, whose asks are absolute-form. And with no extras at all, no
-// trace of the new layer anywhere - the pre-CLA-437 policy, byte for byte.
-func TestOpencodePolicyExtraDirsLegacySpawn(t *testing.T) {
-	wd := t.TempDir() // exists, but carries no .git entry: legacy shape
-	extra := checkoutWithGit(t, filepath.Join(t.TempDir(), "sibling-repo"))
+// A session spawned OUTSIDE any git repo gets the same shape: on 2.x the
+// instance directory, not git, decides it. With no extras, nothing names any
+// other tree.
+func TestOpencodePolicyExtraDirsOutsideACheckout(t *testing.T) {
+	parent := t.TempDir()
+	wd := filepath.Join(parent, "work")
+	if err := os.MkdirAll(wd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	extra := checkoutWithGit(t, filepath.Join(parent, "sibling-repo"))
 
 	with := parsePolicy(t, opencodePermission(false, wd, []string{extra}))
-	if has(rules(with, "read"), "**:allow") {
-		t.Errorf("a non-git spawn must NOT gain the ** layer (its asks are absolute-form): read=%v", with["read"])
-	}
-	if !hasRelFormAllow(rules(with, "read"), extra) {
+	if !has(rules(with, "read"), "../sibling-repo/**:allow") {
 		t.Errorf("declared sibling missing from read: %v", with["read"])
 	}
 	if !hasAbsAllow(rules(with, "external_directory"), extra) {
@@ -140,8 +121,8 @@ func TestOpencodePolicyExtraDirsLegacySpawn(t *testing.T) {
 	}
 
 	base := parsePolicy(t, opencodePermission(false, "/Users/jason/dev", nil))
-	if has(rules(base, "read"), "**:allow") || has(rules(base, "edit"), "../**:deny") {
-		t.Errorf("no-extras policy grew CLA-437 rules: read=%v edit=%v", base["read"], base["edit"])
+	if got := base["read"]; got != "**:allow ../**:deny mcp:*:allow" {
+		t.Errorf("no-extras read = %q", got)
 	}
 }
 

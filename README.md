@@ -1372,7 +1372,7 @@ The default is applied regardless of harness, so this matters the moment you swi
 | --- | --- |
 | `claude` | passed as `--mcp-config` (with `--strict-mcp-config`) and read as Claude's `.mcp.json`. |
 | `codex` | **ignored.** codex has no per-run MCP flag; its servers come from `[mcp_servers]` in `config.toml` under `CODEX_HOME` (which `config_dir` pins). |
-| `opencode` | passed as `OPENCODE_CONFIG`, and **must be an opencode config** - servers under `mcp`, not Claude's `mcpServers`. Pointed at a Claude-shaped `.mcp.json`, opencode refuses to start and every session dies at spawn. |
+| `opencode` | passed as `OPENCODE_CONFIG`, plus a rewritten copy (every server out of Code Mode, the permission policy added) as `OPENCODE_CONFIG_CONTENT`. It **must be a strict-JSON opencode config** - servers under `mcp` (1.x dialect, rewritten) or `mcp.servers` (2.x), not Claude's `mcpServers`. opencode 2.x skips a Claude-shaped file's `mcpServers` key, so every session would run with no clankerbar tools. |
 
 Under `opencode`, set `mcp_config_path` **explicitly** to an opencode config. Leaving
 it out does not opt out: an empty value re-runs the `<workdir>/.mcp.json` discovery,
@@ -1566,7 +1566,8 @@ repo B:
   per extra checkout (the flag is variadic over separate elements). The
   settings file's deny rules still govern what it may actually do there.
 - **`opencode`**: an `external_directory` allow per declared checkout in the
-  `OPENCODE_PERMISSION` policy, matched absolutely regardless of cwd.
+  pinned `permission` policy, matched absolutely regardless of cwd, plus a
+  read/edit allow in the instance-relative `../<checkout>/**` form.
 - **`codex`**: nothing on argv. Codex's sandbox has no per-invocation flag for
   extra writable roots; declare them yourself under
   `[sandbox_workspace_write] writable_roots` in your `config.toml`. The driver
@@ -1713,22 +1714,24 @@ tool understands, and the honest number of guesses is small at any budget. If yo
 hit it, the error text is the thing to report — it is a failure shape the adapter
 should learn a pattern for.
 
-**The quiet-death signature.** A session that dies with a final `step_finish`
-reason of `unknown` and all-zero usage on its own last step is the quiet-death
-signature. The cause is an opencode client defect, not the provider - see
+**The quiet-death signature.** A session that dies with a final step whose
+reason is `unknown` and whose own usage is all-zero is the quiet-death
+signature. On opencode 2.x the final step is read from the session export,
+because the stream no longer reports it. The cause was a 1.x client defect, not
+the provider - see
 [`docs/opencode-build.md`](./docs/opencode-build.md). The marker itself is
 described in
 [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md),
 which is a separate failure with a separate cause.
 
 Since v0.10.1 the adapter does not accept the signature as terminal: it backs off,
-resumes the SAME session in place (`opencode run --session <id>`), and asks the
+resumes the SAME session in place (`opencode run -s <id>`), and asks the
 agent to prove it is intact by naming its task ref. A mechanical match continues
 the session where it left off (bounded at 5 resurrections per session, one probe
 per death); a failed probe falls through to the dead-phase path unchanged.
 
-**The output-cap stall (CLA-584).** A session whose FINAL `step_finish` carries
-reason `length` with zero output tokens is a different end: the model spent the
+**The output-cap stall (CLA-584).** A session whose FINAL step carries
+reason `length` with zero output tokens (read from the session export on 2.x) is a different end: the model spent the
 whole step's output budget thinking and emitted nothing. It is not the quiet
 death (that is reason `unknown` with all-zero usage, and its stream was dropped)
 — opencode ended this turn normally and the session is alive, so the adapter
@@ -1895,114 +1898,107 @@ alternatives, in order of preference:
 |---|---|
 | Claude Code (`claude`) | primary |
 | Codex (`codex`) | adapter present; parsing being hardened |
-| OpenCode (`opencode`) | adapter present; provider-agnostic (model comes from opencode's own config) |
+| OpenCode (`opencode`) | opencode **2.x** only (1.x and the `opencode2` harness name are retired); provider-agnostic (model comes from opencode's own config) |
 
 New harnesses are a small adapter (`internal/harness`). Contributions welcome.
 
 **Permissions are set per harness, and the loop fails closed under all of them.**
 `claude` gets its allowlist from the settings file (`--settings`), `codex` from
-`config.toml`, and `opencode` from `OPENCODE_PERMISSION` — a JSON policy baked
-into the spawned process env. The opencode policy is a **path-scoped
-PermissionConfig**: the run's workdir subtree (where the session's per-task
-worktrees live, e.g. `~/dev/clankerbar-cli-wt/<task>`) is allowed for
-`read`/`edit` (the workdir root's own listing included), `external_directory`
-— opencode's gate for any path-taking tool on a path outside the project
-boundary — allows the same subtree while **denying every other path** (so
-`bash cp ~/.ssh/...` stays blocked, exactly as before), and `bash` stays
+`config.toml`, and `opencode` from a `permission` block the adapter writes into
+the `OPENCODE_CONFIG_CONTENT` layer it pins on every spawn. opencode 2.x ignores
+the `OPENCODE_PERMISSION` variable 1.x read, and with no policy it runs every
+tool, so the content layer is set whether or not an mcp config is named.
+
+The opencode policy is a **path-scoped PermissionConfig**. 2.x makes read/edit
+asks relative to the session's instance directory - the task's repo checkout the
+driver spawns it in, not the project `workdir` - so `read` and
+`edit` allow `**` and deny `../**`; `external_directory` - opencode's gate for a
+path-taking file tool whose target is outside the instance directory - allows
+that checkout absolutely and **denies every other path**. The same policy is
+pinned on every built-in agent and the run passes `--agent build`, because on
+2.x an agent-level permission block or a `default_agent` in any config layer -
+including a project opencode.json the session could write into its own
+checkout - otherwise overrides the top-level policy. `shell` is
 allowed tool-level (its permission patterns match parsed commands, not paths).
-Everything else — reads or edits outside the workdir, `lsp`/`task`/`skill`,
-and the network tools (`webfetch`, `websearch`) in every shape — is denied by
-a `*` catch-all rather than asked, and denied tools are hidden from the
-session's catalog entirely. The read-only search tools are an exception
-(CLA-390): `grep`, `glob` and `list` are allowed so a session can search the
-code it is editing instead of burning turns on `bash` fallbacks. Their asks
-carry the search pattern (a regex, a glob, a directory) rather than a
-workdir-relative path, so the workdir boundary cannot live in the ask for
-them — it lives in `external_directory`, which each tool runs before
-searching and which stays scoped to the workdir subtree, so they reach
-exactly what `read` already can and nothing more. Three more exceptions keep
-the session alive inside that catch-all: `*_*` allows the MCP tools (tool
-names are `<server>_<tool>` in opencode — `clankerbar_get_backlog_summary`,
-`context7_query-docs`, `chrome-devtools_click` — and the plane itself is
-reached over MCP); `read` also allows `mcp:*`, because opencode's MCP
-**resource** tools
-(`list_mcp_resources`, `list_mcp_resource_templates`, `read_mcp_resource`) do
-*not* ask under their own names — they ask under `read`, with
-`mcp:<server>:<uri>` patterns that the path-scoped `read` rules never matched,
-so the catch-all denied every one of them and a session could call the plane's
-tools while being unable to read the protocol served over the same connection;
-and a probe/read-only run additionally denies `edit` and `bash` for zero
-writes. The policy is pinned by unit tests in `opencode_test.go`, including
-the JSON key order the catch-all depends on and a replica of opencode's rule
-evaluator over a table of effective decisions.
+Everything else - `lsp`, `subagent`, `skill`, `question`, the network tools
+(`webfetch`, `websearch`) and `execute` - is denied by a `*` catch-all or by
+name, and denied tools are hidden from the session's catalog entirely. `grep`,
+`glob` and `list` are allowed (CLA-390): their asks carry the search pattern,
+not a path, so their boundary is the `external_directory` gate. `*_*` allows the
+MCP tools (`<server>_<tool>`: `clankerbar_get_backlog_summary`,
+`context7_query-docs`), and a probe/read-only run additionally denies `edit` and
+`shell` for zero writes. The policy is pinned by unit tests in
+`opencode_test.go` and `instancedir_test.go` (including the JSON key order the
+catch-all depends on and a replica of opencode's rule evaluator), and against
+the real binary by the conformance suite.
 
-**Verifying the policy against a live session.** The unit tests replicate
-opencode's evaluator; to watch the real one decide, run a session with the
-policy in `OPENCODE_PERMISSION` and read the `evaluated permission=... pattern=...
-action.action=...` lines in `~/.local/share/opencode/log/opencode.log` — one
-line per ask, naming the rule that won. That log is the cheapest live proof
-available, because it records the decision whether or not the session goes on
-to produce any output.
+**opencode 2.x does not path-gate the shell tool.** Only the shell tool's own
+`workdir` argument hits `external_directory`; the paths inside a command do not,
+so `touch /abs/outside` runs. The operator accepted this gap on 2026-10-18
+(CLA-675), because an unattended session can already run arbitrary commands
+inside the workdir; `doctor` states it as a known, accepted gap.
 
-**The policy covers both instance-directory shapes, and it did not always.**
-opencode makes its read/edit asks relative to the git worktree it resolves at
-the session's instance directory, so there are two ask forms and which one
-arrives is not the policy's choice. Outside any repo - the multi-repo parent,
-`~/dev` - the worktree is `/` and asks are the absolute path minus its leading
-slash (`Users/jason/dev/...`). Inside a checkout the worktree is the repo root
-and asks are repo-relative (`AGENTS.md`). Until CLA-441 only the first form was
-emitted, which was fine while every session ran in the parent and silently fatal
-once they did not: the second form matched no rule, fell to the `*` catch-all,
-and every structured Read/Edit was denied with no error and with the grants
-apparently in place. Widening their *scope* could not help, because the shape
-was wrong rather than the reach. Both forms are emitted now, and a session
-started in a *subdirectory* of a checkout is scoped to that subdirectory rather
-than to the repo above it.
+**MCP servers are taken out of Code Mode.** By default 2.x exposes an MCP
+server's tools only inside its `execute` tool, where no claim can be observed.
+The adapter sets `codemode: false` on every server in the content layer
+(rewriting 1.x `mcp.<name>` entries to `mcp.servers.<name>`, the only dialect
+where the key is honoured) and denies `execute`. 2.x registers the MCP
+*resource* tools in Code Mode only, so a session cannot read MCP resources; the
+policy's `mcp:*` read allow is kept for a build that exposes them again. 2.x
+also connects MCP servers after the first model request, so the adapter prefixes
+working prompts with one sentence telling the model to call a not-yet-available
+MCP tool again. A result above 51,200 bytes is truncated by 2.x to a pointer at
+a saved file; the adapter reads a truncated `claim_task` result back from the
+session's own tool-output directory, so a large claim is still tracked.
+Switching off a server the global opencode config declares takes a full entry
+(`type` plus `command`/`url`) with the off switch; a partial
+`{"enabled": false}` leaves it running, and `doctor` WARNs on one.
 
-**Each session's instance directory is pinned to its workdir.** `cmd.Dir` sets
+**Verifying the policy against a live session.** To watch opencode decide, read
+the permission lines in `~/.local/share/opencode/log/opencode.log`, or run the
+conformance suite (`docs/harness-conformance.md`), which drives the real binary
+against the adapter's policy with a fake provider.
+
+**Each session's instance directory is pinned to the directory it is spawned in**
+(the task's repo checkout, or the project workdir when no repo resolves). `cmd.Dir` sets
 the child's real cwd and nothing else; the inherited `PWD` still named wherever
-the daemon was started, and opencode honours `$PWD` - it creates a second
-instance there and runs the session in it. So every session every daemon spawned
-ran in the daemon's start directory whatever the project's `workdir` said, which
-is the same defect as the wrong project's MCP server (below), the wrong ask shape
-(above), and the wrong repo's `AGENTS.md`. Every adapter now sets `PWD` to the
-directory it is about to run in and drops `OLDPWD`.
+the daemon was started, and opencode honours `$PWD`. So every session every
+daemon spawned ran in the daemon's start directory whatever the project's
+`workdir` said, which is the same defect as the wrong project's MCP server
+(below), the wrong ask shape, and the wrong repo's `AGENTS.md`. Every adapter now
+sets `PWD` to the directory it is about to run in and drops `OLDPWD`.
 
 **And the project's MCP block is pinned past every layer opencode merges after
-it.** opencode's config order is: its global file, then `OPENCODE_CONFIG` (the
-file the driver names), then any project-level `opencode.json` discovered from
-the instance directory, then the `OPENCODE_CONFIG_DIR` directory again, then
-`OPENCODE_CONFIG_CONTENT`. Two of those layers land *after* the driver's file,
-and both were observed redirecting the `clankerbar` server at another project -
-a global block for sessions running in `~/dev`, a committed repo-level
-`opencode.json` for sessions running in a checkout. The named file's bytes are
-therefore also sent as `OPENCODE_CONFIG_CONTENT`, which opencode merges after
-every layer this driver or a checkout can write, so a drain session reaches the
-backlog it polls. (Three layers do follow it - the console active-org config, a
-managed config directory, and managed preferences - none of them writable by a
-repo or by us.) A file that still names another
-project is reported by `doctor`'s `opencode_ambient_config` check and logged once
-at startup - a warning, not a refusal, since spawned sessions are pinned past it
-and the file is often a checked-in artifact of somebody else's repo, but every
-*interactive* session in that tree still gets the wrong backlog. The same scan
-covers opencode's global config directory (`$XDG_CONFIG_HOME/opencode`, then
-`~/.opencode`, then whatever `config_dir` names) and reports a second kind of
-finding that the content pin does *not* mitigate: a discovered config carrying
-`permission`, `plugin`, an `agent` with tool or permission authority, or an
-`mcp` server that starts a local process. `mcp_config_path` files are refused
-for those keys; a file opencode discovers by itself is not, and it is merged
-into every session started in that tree. `permission` is the sharpest of them -
-the env policy is applied after every config layer, but the merge is per key and
-the flatten is in insertion order, so a file declaring `permission.read` moves
-that key ahead of the sorted-first `*` catch-all and the catch-all matches last,
-denying everything.
+it.** opencode 2.x's config order is: its global config dir
+(`$XDG_CONFIG_HOME/opencode`, replaced by `config_dir` via
+`OPENCODE_CONFIG_DIR`), then `OPENCODE_CONFIG` (the file the driver names), then
+the project-level `opencode.json` and `.opencode/opencode.json` discovered from
+the instance directory, then `OPENCODE_CONFIG_CONTENT`. The project layer lands
+*after* the driver's file, and on 1.x a committed repo-level `opencode.json` and
+a global block were both observed redirecting the `clankerbar` server at
+another project. The content layer is merged last, so a drain session reaches
+the backlog it polls. A file that still names another project is reported by
+`doctor`'s `opencode_ambient_config` check and logged once at startup - a
+warning, not a refusal, since spawned sessions are pinned past it and the file
+is often a checked-in artifact of somebody else's repo, but every *interactive*
+session in that tree still gets the wrong backlog. The same scan reports a
+second kind of finding that the content pin does *not* mitigate: a discovered
+config carrying `permission`, `plugin`, an `agent` with tool or permission
+authority, or an `mcp` server that starts a local process. A *discovered*
+`mcp_config_path` is refused for those keys and a named one carrying
+`permission` is a doctor WARN; a file opencode discovers by itself is merged
+into every session started in that tree. `permission` is the sharpest of them:
+the merge is per key and in insertion order, so a file declaring
+`permission.read` moves that key ahead of the pinned policy's `*` catch-all and
+the catch-all matches last, denying every read.
 
 ## Docs
 
 - [`docs/releases.md`](./docs/releases.md) - the release/publish pipeline: how a change gets from a task PR to a published binary.
 - [`docs/large-tool-results.md`](./docs/large-tool-results.md) - how the driver reads a tool_result that Claude Code persisted to a file instead of inlining.
 - [`docs/opencode-tool-schema-limits.md`](./docs/opencode-tool-schema-limits.md) - the opencode-go request-time tool-schema rejection family (`unsupported_tool_schema` / `tool_count_limit`): the incident, the real root cause behind the misleading error code, and what the CLI does about a recurrence.
-- [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs and why not `opencode2`, how to tell which one actually ran, and the upstream defect that makes a session exit 0 having done nothing. Start here for a session that dies with `reason: "unknown"` and zero usage.
+- [`docs/opencode-build.md`](./docs/opencode-build.md) - which opencode build the fleet runs (2.x), how to tell which one actually ran, how the adapter drives it (permissions, Code Mode, usage via the session export, resume, typed errors), the accepted shell path gap, and what an operator configures.
+- [`docs/harness-conformance.md`](./docs/harness-conformance.md) - the hermetic conformance suite that execs the real opencode binary against a fake provider and MCP server.
 
 ## License
 

@@ -72,7 +72,7 @@ type Log struct {
 
 	Day     string // "2026-08-20"
 	Phase   string // the -p<phase> filename tag; "unphased" when absent
-	Harness string // inferred from content: opencode / claude / codex / opencode2
+	Harness string // inferred from content: opencode / claude / codex
 
 	// GotPastClaim reports whether the session got past its claim: a completed
 	// claim_task, or a completed heartbeat on a resumed phase. A refused claim
@@ -84,7 +84,10 @@ type Log struct {
 	BranchRecorded bool
 	// LastReason is the final step_finish part's reason, as the driver reads it
 	// off FinishReasonKey. Empty for harnesses that emit no step_finish (claude,
-	// codex, opencode2) — and therefore never dead.
+	// codex) — and therefore never dead. opencode 2.x emits step_finish only for
+	// tool-call steps, so a 2.x log's final step usually carries none either;
+	// the live adapter reads that verdict from the session export instead, which
+	// this scan of console logs cannot see.
 	LastReason string
 
 	// Dead is the classification: got past its claim, reason "unknown", no
@@ -258,8 +261,8 @@ func classify(path string) (Log, error) {
 // step events (step_start/step_finish/tool_use); codex emits `thread.`/`item.`/
 // `turn.`-prefixed JSON (internal/harness/codex.go: thread.started,
 // item.started/item.completed, turn.completed — verified against codex.go's
-// own test fixtures, not guessed); opencode2 emits only text-part JSON; claude
-// emits rendered text.
+// own test fixtures, not guessed); an opencode 2.x log of a plain answer can
+// carry only text-part JSON, which is opencode too; claude emits rendered text.
 func harnessOf(data []byte) string {
 	for _, line := range splitLines(data) {
 		var ev struct {
@@ -274,7 +277,7 @@ func harnessOf(data []byte) string {
 		case strings.HasPrefix(ev.Type, "thread.") || strings.HasPrefix(ev.Type, "item.") || strings.HasPrefix(ev.Type, "turn."):
 			return "codex"
 		case ev.Type == "text":
-			return "opencode2"
+			return "opencode"
 		}
 	}
 	return "claude"
@@ -288,9 +291,9 @@ func harnessOf(data []byte) string {
 // its claim observation shows as a "· holding" console line (noteClaimed) and a
 // resumed phase's heartbeat as a "→ mcp__clankerbar__heartbeat" marker, and
 // without reading those a claude session that ran would count toward neither
-// counter. Codex and opencode2 emit no claim state the scan can read, so their
+// counter. Codex emits no claim state the scan can read, so its
 // sessions count as run only when a claim marker appears; they can never be
-// dead either way (no step_finish reason on either surface).
+// dead either way (no step_finish reason on that surface).
 func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded bool, lastReason string, apiErrors []string, dead, stalled bool) {
 	// The driver's dead conjuncts, mirrored from the log:
 	//   reason "unknown" AND no branch AND got past its claim AND not a cap.

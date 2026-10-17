@@ -87,20 +87,22 @@ func (c *Config) checkDiscoveredMCPConfig(path, label string, allow []string) er
 		what string
 	}{
 		// The mechanism behind this one, measured in 1.18.19 (CLA-441). The
-		// obvious reading is that it cannot bite - OPENCODE_PERMISSION is
-		// applied after every config layer, so surely it overwrites the file's
-		// block. It does not. That merge is recursive and PER KEY, `fromConfig`
+		// obvious reading is that it cannot bite - the driver's policy is
+		// applied after every config layer (on 2.x in OPENCODE_CONFIG_CONTENT),
+		// so surely it overwrites the file's block. It does not. That merge is recursive and PER KEY, `fromConfig`
 		// flattens the result in INSERTION order rather than sorted, and
 		// `evaluate` is findLast over that order. Our document is marshalled
 		// from a Go map, so it arrives sorted with the `*` catch-all first,
 		// which is the whole basis of the fail-closed posture. A file that
 		// declares `permission.read` gives `read` ITS position in the merged
-		// object - ahead of the `*` deny, which is env-only and lands last - so
+		// object - ahead of the `*` deny, which the driver adds in the last layer - so
 		// the catch-all matches last and every read in the session is denied.
 		// Not a loosening, a total lockout, which is the CLA-441 wall itself.
 		{"permission", f.Permission, "permission rules, which merge into the policy this driver exports and reorder it"},
 		{"plugin", f.Plugin, "code loaded and run at startup"},
 		{"agent", f.Agent, "agent definitions, including their modes and permissions"},
+		{"agents", f.Agents, "agent definitions (2.x dialect), including their permissions"},
+		{"default_agent", f.DefaultAgent, "the agent a session starts on"},
 	} {
 		if !rawSet(k.raw) {
 			continue
