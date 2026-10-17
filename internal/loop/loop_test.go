@@ -1987,7 +1987,10 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 // (plane.TaskStateSource): the shape the review-split seam tests need, where
 // the outcome on the task decides whether a checkpoint advances. `state` is
 // called on every read, so a test can let the review phase's own session change
-// the answer mid-drain (see the split tests' fakeAdapter.onInvoke hooks).
+// the answer mid-drain (see the split tests' fakeAdapter.onInvoke hooks), and
+// `err` — also consulted on every read — is how a test blips the plane between
+// the review seam's two reads: a baseline that reads clean and a seam read that
+// fails is the shape the `!recordRead` refusal exists for.
 //
 // Kept separate rather than added to fakeReleaser: when the plain fake
 // satisfied the interface, every older loop test silently moved from the
@@ -1998,9 +2001,15 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 type wiredReleaser struct {
 	fakeReleaser
 	state func() plane.TaskState
+	err   func() error // nil means every read succeeds
 }
 
 func (w *wiredReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	if w.err != nil {
+		if err := w.err(); err != nil {
+			return plane.TaskState{}, err
+		}
+	}
 	if w.state == nil {
 		return plane.TaskState{}, nil
 	}

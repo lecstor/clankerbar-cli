@@ -2079,6 +2079,57 @@ func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
 	})
 }
 
+// The seam's second read is as load-bearing as its first: the baseline the
+// freshness gate compares against is only worth having if the outcome can be
+// read AGAIN once the review session has ended. A plane that blips between the
+// two reads — the baseline read clean at spawn, the seam read failing after a
+// review that DID record — must be refused fail-closed: an unreadable outcome
+// cannot prove the record, and the alternative is advancing on the branch the
+// review phase merely inherited. This is the `!recordRead` arm of the gate, the
+// one arm no other fixture reaches: an unwired or always-erroring plane refuses
+// via the baseline arm (`!review.read`) before the seam read is ever attempted.
+func TestDrainPhases_ReviewSeamRefusesACheckpointItCannotReread(t *testing.T) {
+	outcome := "implemented: pushed the branch\n"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: resumedCheckpointed(5, 0.50)}, // records the block, healthy in every other way
+		{res: okResult(5, 0.05)},            // must NEVER run
+	}}
+	// The plane blips between the review's own session and the seam's read:
+	// the baseline read (before the attempt ladder) still succeeds, the
+	// review session records its block, and only the reread fails.
+	blip := false
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+			blip = true
+		}
+	}
+	rel := &wiredReleaser{
+		state: func() plane.TaskState {
+			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+		},
+		err: func() error {
+			if blip {
+				return errors.New("plane blip: read timeout")
+			}
+			return nil
+		},
+	}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — a checkpoint whose outcome cannot be reread cannot prove the record the fix phase would apply", h.invokeCalls)
+	}
+}
+
 // The gate's half of the interface: the heading counts only as its own line.
 // A substring match was the bug — `## Reviewer notes`, prose mentioning the
 // words, or an indented heading inside a code block all passed it.
