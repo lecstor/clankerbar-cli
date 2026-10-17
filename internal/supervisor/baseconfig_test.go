@@ -10,9 +10,11 @@ package supervisor
 // one MCP file per project per harness").
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
@@ -343,5 +345,74 @@ func TestBuildConfigOperatorThreeProjectShapeValidates(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(stateDir, statedir.MaterializedConfigName)); err != nil {
 		t.Errorf("materialized config missing: %v", err)
+	}
+}
+
+// The inherited wiring must reach the harness-swap guard (CLA-475). Before the
+// fix the supervisor's harness override was decided over bare {Slug,
+// PrimaryRepo} rows, so the guard's per-project branch — a project's own
+// mcp_config_path re-homing onto the new top-level harness through
+// ResolveMCPConfig — never saw an input from this door and a swap silently
+// inherited the old harness's dialect. With the wiring inherited, the same
+// override is refused unless the base declares the new harness's own
+// per-project file.
+func TestBuildConfigHarnessOverrideSeesInheritedProjectWiring(t *testing.T) {
+	mcp := writeMCPFile(t, "acme", "opencode")
+	entry := func() *RosterEntry {
+		return &RosterEntry{
+			Name:         "fleet-one",
+			DesiredState: RosterDesiredRunning,
+			Placement:    RosterPlacementLocal,
+			Projects:     []RosterProject{{Slug: "acme"}},
+			Overrides: map[string]json.RawMessage{
+				"harness": json.RawMessage(`"opencode"`),
+			},
+		}
+	}
+
+	// Refused: the base (defaults run on claude) wires the project's
+	// mcp_config_path, the entry re-points the harness, and nothing declares
+	// the new harness's own per-project file.
+	cacheDir := t.TempDir()
+	o := materializeOptions(t, cacheDir, "")
+	o.BaseCfg = baseWithProject(t, config.Project{
+		Slug:          "acme",
+		WorkDir:       t.TempDir(),
+		MCPConfigPath: mcp,
+	})
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
+	_, _, err := d.buildConfig(entry())
+	if err == nil {
+		t.Fatal("a harness override over inherited per-project wiring was applied; want a refusal")
+	}
+	for _, want := range []string{"fleet-one", "projects[acme].mcp_config_path"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+
+	// Accepted: the base declares the new harness's own per-project file, so
+	// the override inherits nothing — it lands, and the wiring survives it.
+	o2 := materializeOptions(t, cacheDir, "")
+	o2.BaseCfg = baseWithProject(t, config.Project{
+		Slug:    "acme",
+		WorkDir: t.TempDir(),
+		MCPConfigPaths: map[string]string{
+			"claude":   writeMCPFile(t, "acme", "claude"),
+			"opencode": mcp,
+		},
+	})
+	d2 := &Supervisor{o: o2, hostname: "testhost", cacheDir: cacheDir}
+	cfg, _, err := d2.buildConfig(entry())
+	if err != nil {
+		t.Fatalf("an override with the new harness's own per-project file was refused: %v", err)
+	}
+	if cfg.Harness != "opencode" {
+		t.Errorf("harness = %q, want opencode", cfg.Harness)
+	}
+	for _, harness := range []string{"claude", "opencode"} {
+		if got := cfg.Projects[0].MCPConfigPaths[harness]; got == "" {
+			t.Errorf("mcp_config_paths.%s did not survive the harness override", harness)
+		}
 	}
 }

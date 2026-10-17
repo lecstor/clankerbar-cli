@@ -559,10 +559,10 @@ runs any config you point it at by hand.)
 
 Two operational notes, both inherited from how `run` already behaves:
 
-- **The supervisor resolves each child's config from its own working
-  directory.** A config with a RELATIVE `workdir` resolves against wherever the
-  supervisor was started; the operator's configs use absolute paths, and so
-  should the base config.
+- **The supervisor resolves each child's config from the supervisor's own
+  working directory.** A config with a RELATIVE `workdir` resolves against
+  wherever the supervisor was started; the operator's configs use absolute
+  paths, and so should the base config.
 - **The supervisor's children run with the supervisor's environment** — the
   account key, the harness binaries on PATH, everything. A child's `RESTART`
   marker re-execs the child in place (same pid, same launch path), so a
