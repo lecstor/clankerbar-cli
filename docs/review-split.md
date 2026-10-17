@@ -172,7 +172,10 @@ branch — would pass it with nothing recorded at all. Two guards close that:
    gates it on the legacy block instead: the outcome changed since the spawn,
    a `## Review` heading on its own line, and a LAST block the spawn-time
    baseline did not carry. Its brief prescribes the block alone, and there is
-   no round to close. Every branch-carrying variant gates on the record.
+   no round to close; the fix brief that follows reads that block alone too —
+   with no durable record there is no plane finding id to apply by and no
+   `findingUpdates` call to make. Every branch-carrying variant gates on the
+   record.
 
    One handoff residue, stated rather than hidden: a handoff respawn re-enters
    the phase under the SAME run and role, so a review session that writes its

@@ -1468,6 +1468,45 @@ func TestBuiltinFixBriefCarriesTheReviewForwardAndTheTerminalStep(t *testing.T) 
 	}
 }
 
+// The exemption's fix-side half (question 03a12578, option 1): the branchless
+// review writes no durable record, so the fix brief that follows must read the
+// legacy block alone. A brief that demanded `reviews.records`, a PLANE id or a
+// `findingUpdates` call would be unexecutable on every branchless round — the
+// exact dead-end the exemption removes, one phase later.
+func TestNoCodeFixBriefReadsTheBlockAlone(t *testing.T) {
+	for _, banned := range []string{
+		"reviews.records",
+		"PLANE ids",
+		"findingUpdates",
+		"durable review record",
+		"update_task(taskId, runId, review: {...})",
+	} {
+		if strings.Contains(noCodeFixBrief, banned) {
+			t.Errorf("the no-code fix brief prescribes %q, but a branchless round writes no durable record (question 03a12578, option 1):\n%s", banned, noCodeFixBrief)
+		}
+	}
+	for _, want := range []string{
+		"read the LAST `" + ReviewRecordHeading + "` block",
+		"read and apply from the block alone",
+		"AMENDING THE RECORD",
+	} {
+		if !strings.Contains(noCodeFixBrief, want) {
+			t.Errorf("the no-code fix brief does not %q:\n%s", want, noCodeFixBrief)
+		}
+	}
+	// Its terminal record is the outcome requirement alone — no findingUpdates
+	// half — and the no-code handover ends the brief.
+	if !strings.Contains(noCodeFixBrief, noCodeFixTerminalRecord) {
+		t.Errorf("the no-code fix brief does not carry the outcome-only terminal record:\n%s", noCodeFixBrief)
+	}
+	if strings.Contains(noCodeFixTerminalRecord, "findingUpdates") {
+		t.Errorf("the no-code terminal record demands a durable findingUpdates call:\n%s", noCodeFixTerminalRecord)
+	}
+	if !strings.HasSuffix(noCodeFixBrief, noCodeReviewTerminalStep+handoffGuidance) {
+		t.Errorf("the no-code fix brief does not end on the no-code handover:\n%s", noCodeFixBrief)
+	}
+}
+
 // A statusless update_task outcome REPLACES the whole field on the plane, so a
 // review-only brief that writes only its own block erases phase 1's delivery
 // record, and a fix brief that rebuilds the outcome from the review block plus
@@ -1661,10 +1700,16 @@ func TestHandoffContinuation_CarriesThePhaseModeForward(t *testing.T) {
 	}
 
 	noCodeFix := NoCodeFixHandoffContinuation()
-	if !strings.Contains(noCodeFix, noCodeReviewTerminalStep) || !strings.Contains(noCodeFix, fixTerminalRecord) {
+	if !strings.Contains(noCodeFix, noCodeReviewTerminalStep) || !strings.Contains(noCodeFix, noCodeFixTerminalRecord) {
 		t.Errorf("a branchless fix handoff does not carry the no-code terminal step and the review block requirement:\n%s", noCodeFix)
 	}
 	if strings.Contains(noCodeFix, "Open a PR") {
 		t.Errorf("a branchless fix handoff carries the branch-shaped PR step:\n%s", noCodeFix)
+	}
+	// The exemption's fix-side half (question 03a12578, option 1): the
+	// branchless review writes no durable record, so a continuation that
+	// demanded a findingUpdates call would fail every branchless round closed.
+	if strings.Contains(noCodeFix, "findingUpdates") || strings.Contains(noCodeFix, "DURABLE review record") {
+		t.Errorf("a branchless fix handoff demands the durable record the branchless review cannot write:\n%s", noCodeFix)
 	}
 }

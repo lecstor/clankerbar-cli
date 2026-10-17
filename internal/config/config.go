@@ -408,14 +408,16 @@ const reviewRecordTipUnverified = " The driver could NOT verify the origin remot
 // reviewRecordTipNone is the branchless counterpart: there is no branch and no
 // commit to review, and — per the operator's decision on question 03a12578,
 // option 1 — no durable record either. The plane accepts review writes only
-// from the task's LIVE holder, and a settled task has none (phase 1's own
-// session settled it), so the append would be refused; the legacy block IS
-// this variant's record, and the driver's seam gates on the block.
+// from the task's LIVE holder: a settled task (phase 1's own session settled
+// it) refuses the append outright, and on a still-held no-code task it would
+// seal a round this variant's driver never closes, blocking the run's own
+// outcome writes. The legacy block IS this variant's record, and the driver's
+// seam gates on the block.
 const reviewRecordTipNone = " There is NO branch and NO tip to review: this record is about the PLANE'S RECORD of " +
 	"what phase 1 did. Write `- reviewed tip: none (no branch - the plane record was reviewed)` on the block's " +
-	"`- reviewed tip:` line. Do NOT append a durable review record: the plane accepts one only from the task's " +
-	"live holder, and this checkpoint is a task its own session settled (no run holds it), so that write would " +
-	"be refused - the legacy block IS this variant's review record, and the driver gates the seam on it."
+	"`- reviewed tip:` line. Do NOT append a durable review record: a settled task has no live holder to accept " +
+	"it, and on a still-held no-code task it would seal a round this variant never closes - the legacy block IS " +
+	"this variant's review record, and the driver gates the seam on it."
 
 // reviewRecordDurableShape is the durable half (CLA-637): one sealed
 // per-reviewer record per run, written through update_task.review. It is the
@@ -500,25 +502,16 @@ const reviewMUSTBar = " GRADE EVERY FINDING. A severity in brackets is `[must]`,
 	"attributed by the block's own `- reviewed by:` line, and the durable record carries `raisedByModel` on every " +
 	"finding so the review is attributable per finding, not only per block."
 
-// fixTerminalRecord is the fix phase's extra outcome requirement, stated BEFORE
-// the shared reviewTerminalStep so the emphatic final block still ends the brief
-// (the CLA-384 property). It carries the review forward: the final outcome is the
-// only durable task-record the round has until the plane stores reviews
-// separately, so dropping the review block here would lose the very record the
-// split exists to keep. It must also keep everything ABOVE the block: that is
-// phase 1's delivery record (or an earlier round's), and the statusless outcome
-// replaces the field wholesale, so a final outcome built only from the review
-// block and ### Fixes would erase it.
-const fixTerminalRecord = " BEFORE the handover call (which ends the run and clears the holder), update every finding's " +
-	"status on the DURABLE review record with update_task(taskId, runId, review: {findingUpdates: [...]}) — one " +
-	"entry per finding, by the plane-assigned `id` the record gave you: {findingId, status: \"fixed\", " +
-	"fixCommit: <the commit SHA>} for a fixed finding; {findingId, status: \"refuted\", refutedReason: <the " +
-	"evidence that refutes it>} for a MUST you did not fix; {findingId, status: \"filed\", filedTaskRef: <the " +
-	"follow-up task's ref>} for a code-needing finding dispatched instead. The batch is all-or-nothing: an " +
-	"unknown id or a still-sealed round refuses it, so send it BEFORE the handover - before the call that " +
-	"moves the task to in_review, even when that same call carries your outcome. An empty array is refused; if " +
-	"the review found nothing, skip the call. THEN hand the task over: the " +
-	"outcome MUST keep everything the existing outcome carries ABOVE the LAST `" + ReviewRecordHeading + "` block " +
+// fixOutcomeRecord is the fix phase's outcome requirement, shared by both fix
+// variants. It carries the review forward: the final outcome is the only
+// durable task-record the round has (the ledgers excepted), so dropping the
+// review block here would lose the very record the split exists to keep. And it
+// must keep everything ABOVE the block: that is phase 1's delivery record (or
+// an earlier round's), and the statusless outcome replaces the field wholesale,
+// so a final outcome built only from the review block and ### Fixes would erase
+// it.
+const fixOutcomeRecord = "the outcome MUST keep everything the existing outcome carries ABOVE the LAST `" +
+	ReviewRecordHeading + "` block " +
 	"(phase 1's delivery record plus any earlier rounds, their `" + ReviewRecordHeading + "` blocks included) " +
 	"unchanged, keep that LAST block VERBATIM " +
 	"(verdict, every finding by ID, its required fix, and the attribution it already carries — do not restate " +
@@ -528,6 +521,28 @@ const fixTerminalRecord = " BEFORE the handover call (which ends the run and cle
 	"a refutation carrying its evidence, because a MUST is never downgraded), plus 'fixed by: harness " +
 	PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder + "'. A finding you neither fix nor answer is " +
 	"this phase failing."
+
+// fixTerminalRecord is the BRANCH fix phase's record requirement, stated BEFORE
+// the shared reviewTerminalStep so the emphatic final block still ends the brief
+// (the CLA-384 property): the durable finding updates go out before the call
+// that ends the run and clears the holder, then the outcome requirement
+// (fixOutcomeRecord) carries the review forward.
+const fixTerminalRecord = " BEFORE the handover call (which ends the run and clears the holder), update every finding's " +
+	"status on the DURABLE review record with update_task(taskId, runId, review: {findingUpdates: [...]}) — one " +
+	"entry per finding, by the plane-assigned `id` the record gave you: {findingId, status: \"fixed\", " +
+	"fixCommit: <the commit SHA>} for a fixed finding; {findingId, status: \"refuted\", refutedReason: <the " +
+	"evidence that refutes it>} for a MUST you did not fix; {findingId, status: \"filed\", filedTaskRef: <the " +
+	"follow-up task's ref>} for a code-needing finding dispatched instead. The batch is all-or-nothing: an " +
+	"unknown id or a still-sealed round refuses it, so send it BEFORE the handover - before the call that " +
+	"moves the task to in_review, even when that same call carries your outcome. An empty array is refused; if " +
+	"the review found nothing, skip the call. THEN hand the task over: " + fixOutcomeRecord
+
+// noCodeFixTerminalRecord is the BRANCHLESS fix phase's counterpart (question
+// 03a12578, option 1): the branchless review writes no durable record — a
+// settled task has no live holder to accept one — so there is no findingUpdates
+// call to make and no plane-assigned id to send. The record requirement is the
+// outcome alone, exactly as fixTerminalRecord's second half states it.
+const noCodeFixTerminalRecord = " When you hand the task over, " + fixOutcomeRecord
 
 // fixGradingRule is the fix briefs' shared obligation for acting on the graded
 // review record (CLA-635): every MUST fixed or refuted with evidence, never
@@ -641,11 +656,13 @@ func UnverifiedReviewOnlyHandoffContinuation() string {
 }
 
 // NoCodeFixHandoffContinuation is the fix phase's continuation for a branchless
-// checkpoint: the record requirement plus the no-code handover, and never the
-// branch-shaped PR step.
+// checkpoint: the outcome requirement and the no-code handover, and never the
+// branch-shaped PR step. There is no durable record for this variant (question
+// 03a12578, option 1 — the branchless review writes none), so the continuation
+// carries noCodeFixTerminalRecord, not the branch fix's findingUpdates demand.
 func NoCodeFixHandoffContinuation() string {
 	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
-		rerunGuidance + fixTerminalRecord + noCodeReviewTerminalStep
+		rerunGuidance + noCodeFixTerminalRecord + noCodeReviewTerminalStep
 }
 
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
@@ -1012,14 +1029,15 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 // the terminal step records the review and leaves the task's own status alone;
 // the fix phase decides whether a finding requires re-opening it. The record
 // here is the LEGACY block alone (operator decision on question 03a12578,
-// option 1): the durable table takes writes only from the task's live holder,
-// and a settled task has none, so attempting the append would be a refused call
-// the seam does not need.
+// option 1): the durable table takes writes only from the task's live holder —
+// a settled task has none, and a still-held no-code task's write would seal a
+// round this variant never closes — so attempting the append would be a
+// refused call at best and a wedged run at worst, and the seam does not need it.
 const noCodeReviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
 	"TASK with update_task(taskId, runId, outcome: ...), in the shape above - the LEGACY `" + ReviewRecordHeading +
-	"` block ONLY. Do NOT attempt update_task(review: ...) here: the plane accepts a durable record only from " +
-	"the task's LIVE holder, and this checkpoint is a task its own session settled (no run holds it), so the " +
-	"write would be refused - the block IS this variant's review record and the driver's seam gates on it. This " +
+	"` block ONLY. Do NOT attempt update_task(review: ...) here: a settled task has no live holder to accept it, " +
+	"and on a still-held no-code task it would seal a round this variant never closes - the block IS this " +
+	"variant's review record and the driver's seam gates on it. This " +
 	"is a CHECKPOINT, not a " +
 	"hand-off: do NOT change the task's status, delivery or body here, do NOT re-open it, do NOT invent code, a " +
 	"branch or a PR, and do NOT move it to in_review. If phase 1 already settled it, leave it settled; the " +
@@ -1090,7 +1108,11 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 
 // noCodeFixBrief is fixBrief for a branchless checkpoint: the review judged the
 // plane's record, and the fix is an amendment to that record, never invented
-// code. Its terminal step is the no-code handover alone.
+// code. The branchless review writes no durable record (question 03a12578,
+// option 1), so this brief reads the legacy `## Review` block ALONE and applies
+// its findings by amending the task's record - there is no `reviews.records`
+// entry and no plane-assigned id to update. Its terminal step is the no-code
+// handover alone.
 var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed the " +
 	"PLANE'S RECORD of what the implement phase did - there is NO branch, because this task's correct " +
@@ -1098,18 +1120,20 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
 	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
-	"Then get_task with includeDecisions: true. Read the released durable record (`reviews.records`) and the " +
-	"outcome's legacy `" + ReviewRecordHeading + "` block — the LAST such block, because an earlier one is an " +
-	"earlier round. If there is neither, that is a FAILED hand-off: say so " +
+	"Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading + "` block in the " +
+	"outcome — an earlier one is an earlier round, so read past it. That block IS the round's record: the " +
+	"branchless review writes no durable record (question 03a12578, option 1), so read and apply from the " +
+	"block alone and do not treat an empty record set as a failed hand-off. If the outcome carries no `" +
+	ReviewRecordHeading + "` block, that is a FAILED hand-off: say so " +
 	"in your outcome, and park the task if it is still in_progress - if phase 1 already settled it, leave it " +
-	"settled and end. Do not invent findings. Apply the findings by their PLANE ids, AMENDING THE RECORD " +
+	"settled and end. Do not invent findings. Apply the findings by AMENDING THE RECORD " +
 	"(update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
 	" A finding that needs CODE cannot be fixed here: file it as its own task " +
 	"(create_task, with a real doneWhen) and say so in your outcome - for a MUST, that filed task is this " +
 	"phase's fix of it (record the new task's ref in your outcome as the fix; a dispatched MUST is fixed this " +
 	"way, not refuted, and not a failure) - do not re-open this task, do not rewrite " +
 	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
-	fixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
+	noCodeFixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
 
 // BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can
 // tell whether a phase runs the built-in brief (vs an operator's custom prompt)
