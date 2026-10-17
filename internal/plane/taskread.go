@@ -244,6 +244,14 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 	w := payload.taskHolderWire
 	if payload.Task != nil {
 		w = *payload.Task
+		// The plane serves the `reviews` block as a SIBLING of `task` in the
+		// get_task response (server.ts spreads reviewsFor at the top level),
+		// not inside it. Reading it only from the task object left every
+		// durable record unseen in production, so the review and verify seams
+		// refused every healthy review.
+		if w.Reviews == nil {
+			w.Reviews = payload.taskHolderWire.Reviews
+		}
 	}
 	return TaskState{
 		Status:            wireString(w.Status),
