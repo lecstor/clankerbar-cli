@@ -955,15 +955,17 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 
 // CLA-637: the review-only brief is the CLI's whole lever on the durable
 // record's shape — the SESSION writes the record through its own MCP client —
-// so the tokens the plane and the seam gate read are pinned here, for every
-// variant: the update_task field names, the identity the driver fills in, the
-// per-finding attribution the analytics need, and the append order the plane's
-// channel seal forces.
+// so the tokens the plane and the seam gate read are pinned here: the
+// update_task field names, the identity the driver fills in, the per-finding
+// attribution the analytics need, and the append order the plane's channel
+// seal forces. The NO-CODE variant is the exception the operator decided
+// (question 03a12578, option 1): a settled task has no live holder, so the
+// plane would refuse the durable write and this brief prescribes the legacy
+// block ALONE — pinned both ways below.
 func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	for name, brief := range map[string]string{
 		"review-only brief":            reviewOnlyBrief,
 		"unverified review-only brief": unverifiedReviewOnlyBrief,
-		"no-code review-only brief":    noCodeReviewOnlyBrief,
 	} {
 		for _, want := range []string{
 			"update_task(taskId, runId, review: {...})",
@@ -987,6 +989,21 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	durable := strings.Index(reviewOnlyRecordShape, "append THIS run's durable")
 	if block < 0 || durable < 0 || block > durable {
 		t.Errorf("the record shape does not put the legacy outcome block before the durable record (block at %d, durable at %d)", block, durable)
+	}
+
+	// The branchless variant prescribes the block ALONE: it must name the block
+	// write, must NOT name the durable-record call (the plane would refuse it
+	// for a settled task), and its terminal step must say so.
+	if !strings.Contains(noCodeReviewOnlyBrief, "update_task(taskId, runId, outcome: ...)") {
+		t.Errorf("the no-code review-only brief does not prescribe the legacy block write:\n%s", noCodeReviewOnlyBrief)
+	}
+	for _, banned := range []string{"update_task(taskId, runId, review: {...})", "THEN append THIS run's durable"} {
+		if strings.Contains(noCodeReviewOnlyBrief, banned) {
+			t.Errorf("the no-code review-only brief prescribes %q, but the plane refuses every review write on a settled task (question 03a12578, option 1):\n%s", banned, noCodeReviewOnlyBrief)
+		}
+	}
+	if !strings.Contains(noCodeReviewOnlyTerminalStep, "Do NOT attempt update_task(review: ...) here") {
+		t.Errorf("the no-code terminal step does not tell the session the durable write is not attempted:\n%s", noCodeReviewOnlyTerminalStep)
 	}
 }
 

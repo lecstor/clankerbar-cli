@@ -406,11 +406,16 @@ const reviewRecordTipUnverified = " The driver could NOT verify the origin remot
 	"and end holding the task - do not invent a tip and do not review a phantom diff."
 
 // reviewRecordTipNone is the branchless counterpart: there is no branch and no
-// commit to review, so neither half records a tip, and the seam checks the
-// record's identity rather than a SHA it cannot have.
+// commit to review, and — per the operator's decision on question 03a12578,
+// option 1 — no durable record either. The plane accepts review writes only
+// from the task's LIVE holder, and a settled task has none (phase 1's own
+// session settled it), so the append would be refused; the legacy block IS
+// this variant's record, and the driver's seam gates on the block.
 const reviewRecordTipNone = " There is NO branch and NO tip to review: this record is about the PLANE'S RECORD of " +
 	"what phase 1 did. Write `- reviewed tip: none (no branch - the plane record was reviewed)` on the block's " +
-	"`- reviewed tip:` line and omit `reviewedTip` from the durable record."
+	"`- reviewed tip:` line. Do NOT append a durable review record: the plane accepts one only from the task's " +
+	"live holder, and this checkpoint is a task its own session settled (no run holds it), so that write would " +
+	"be refused - the legacy block IS this variant's review record, and the driver gates the seam on it."
 
 // reviewRecordDurableShape is the durable half (CLA-637): one sealed
 // per-reviewer record per run, written through update_task.review. It is the
@@ -456,11 +461,13 @@ const reviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipVerified
 const unverifiedReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipUnverified +
 	reviewRecordDurableShape + reviewMUSTBar
 
-// noCodeReviewOnlyRecordShape is reviewOnlyRecordShape for a branchless
-// checkpoint: the review is of the plane's record, so neither half carries a
-// tip and the seam matches the record's round, role and run.
-const noCodeReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipNone +
-	reviewRecordDurableShape + reviewMUSTBar
+// noCodeReviewOnlyRecordShape is the branchless review-only phase's record
+// contract: the LEGACY outcome block alone, with no durable-record half —
+// the plane accepts review writes only from the task's LIVE holder and a
+// settled task has none (operator decision on question 03a12578, option 1), so
+// the seam gates this variant on the block (changed since the spawn, heading on
+// its own line, and a last block the baseline did not carry).
+const noCodeReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipNone + reviewMUSTBar
 
 // reviewMUSTBar is the accepted bar for a MUST (task CLA-635; the review-panel
 // design's section 14 A2 as amended by B5/B6, decisions 3a57db6a and 60ed0748
@@ -1003,12 +1010,17 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 // noCodeReviewOnlyTerminalStep ends a branchless review-only phase. There is no
 // branch to keep a lease on and the task may already be settled by phase 1, so
 // the terminal step records the review and leaves the task's own status alone;
-// the fix phase decides whether a finding requires re-opening it.
+// the fix phase decides whether a finding requires re-opening it. The record
+// here is the LEGACY block alone (operator decision on question 03a12578,
+// option 1): the durable table takes writes only from the task's live holder,
+// and a settled task has none, so attempting the append would be a refused call
+// the seam does not need.
 const noCodeReviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
-	"TASK in BOTH forms the shape above prescribes, in that order - FIRST the legacy outcome block with " +
-	"update_task(taskId, runId, outcome: ...), THEN the sealed durable record with " +
-	"update_task(taskId, runId, review: {...}). The durable record is the driver's seam evidence; the block is " +
-	"the one-release compatibility copy. This is a CHECKPOINT, not a " +
+	"TASK with update_task(taskId, runId, outcome: ...), in the shape above - the LEGACY `" + ReviewRecordHeading +
+	"` block ONLY. Do NOT attempt update_task(review: ...) here: the plane accepts a durable record only from " +
+	"the task's LIVE holder, and this checkpoint is a task its own session settled (no run holds it), so the " +
+	"write would be refused - the block IS this variant's review record and the driver's seam gates on it. This " +
+	"is a CHECKPOINT, not a " +
 	"hand-off: do NOT change the task's status, delivery or body here, do NOT re-open it, do NOT invent code, a " +
 	"branch or a PR, and do NOT move it to in_review. If phase 1 already settled it, leave it settled; the " +
 	"phase after you decides whether a finding needs more than a record change. Ending this session after " +
@@ -1032,7 +1044,8 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 	"decisions recorded on this task or its siblings: is the settlement honest, does the record carry what the " +
 	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend what " +
 	"phase 1 wrote - the phase after you applies what you find - but DO append your legacy review block below " +
-	"it so its delivery record survives, THEN append the durable record; and do not invent code, a branch or a PR." +
+	"it so its delivery record survives (the block, not a durable record: see the shape below); and do not " +
+	"invent code, a branch or a PR." +
 	noCodeReviewOnlyRecordShape + rerunGuidance + noCodeReviewOnlyTerminalStep + handoffGuidance
 
 // fixBrief is the phase that APPLIES a review's findings. It is deliberately not
