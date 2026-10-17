@@ -15,6 +15,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -1964,9 +1965,11 @@ func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
 type releaseCall struct{ taskID, runID string }
 
 type fakeReleaser struct {
-	calls  []releaseCall
-	err    error
-	onCall func() // fired inside Release, to observe what has NOT happened yet
+	calls    []releaseCall
+	err      error
+	onCall   func() // fired inside Release, to observe what has NOT happened yet
+	state    plane.TaskState
+	stateErr error
 }
 
 func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error {
@@ -1975,6 +1978,17 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 		f.onCall()
 	}
 	return f.err
+}
+
+// TaskState answers the CLA-451 checkpoint peek. The zero value is "held with
+// nothing recorded" — no delivery, no outcome — which is what makes a
+// review-only phase's seam gate refuse a checkpoint until a test sets `state`
+// with a review record (or the test is exercising that refusal on purpose).
+func (f *fakeReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	if f.stateErr != nil {
+		return plane.TaskState{}, f.stateErr
+	}
+	return f.state, nil
 }
 
 // parkCall is one driver-side park: the task it moved, the run signing it, and

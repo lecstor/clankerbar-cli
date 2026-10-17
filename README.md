@@ -55,10 +55,14 @@ harness-agnostic, where `--autocompact` is Claude-only. The two compose, and
 trying autocompact inside a long phase costs nothing.
 
 `phases` splits one task across several sessions, so the context resets at that
-checkpoint:
+checkpoint. The shipped shape is three phases:
 
 ```json
-"phases": [{ "name": "implement" }, { "name": "review" }]
+"phases": [
+  { "name": "implement" },
+  { "name": "review", "tier": "strong" },
+  { "name": "fix", "tier": "cheap" }
+]
 ```
 
 Phase 1 claims the task, implements it in a worktree cut from the repo's
@@ -69,17 +73,40 @@ step is to merge the integration branch into it - a merge, never a rebase,
 since rewriting pushed history breaks tip comparison - and re-validate the task
 against the merged tip before touching what it found: superseded means record
 the decision and park the task with an outcome saying so, or salvage only what
-still adds value - never verify-and-push stale work. Phase 2 starts on a
-**fresh context**, resumes the *same* run (the driver substitutes the task and
-run ids into its brief, so it calls `heartbeat` instead of claiming), re-reads
-the bar and the standing decisions from the plane, works in
-that same worktree — never on the integration branch itself — runs the
-adversarial review, fixes what it finds, pushes, opens a PR targeting the
-integration branch if no PR exists yet for the branch, and hands the task to
-`in_review`. The claim is held across the seam, so the task is never posted back
-to the queue mid-sequence. See [`docs/releases.md`](./docs/releases.md) for what
-happens to that PR after `in_review` — merged by a clanker only once a human
-approves it, promoted to a release only by the operator.
+still adds value - never verify-and-push stale work.
+
+The **`review`** phase starts on a **fresh context**, resumes the *same* run (the
+driver substitutes the task and run ids into its brief, so it calls `heartbeat`
+instead of claiming), re-reads the bar and the standing decisions from the
+plane, works in that same worktree — never on the integration branch itself —
+reads the diff and runs the adversarial review gate. It is **review only**: it
+does not edit, commit, push, open a PR, or move the task. Its deliverable is the
+review record on the task (`update_task(outcome: ...)`, no status move), a fixed
+block carrying the reviewed tip, the implementer's and reviewer's harness/model,
+a `verdict`, and every finding by ID with the required fix. The claim is held
+across the seam, so the task is never posted back to the queue mid-sequence.
+
+The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
+same run, reads the review block back with `get_task`, checks the reviewed tip
+still matches the worktree's HEAD, applies every finding by ID (or records why
+not), re-verifies scoped to those fixes, commits and pushes them, opens a PR
+targeting the repo's PR base if none exists yet for the branch, and hands the
+task to `in_review`. Its outcome carries the review forward with a `### Fixes`
+list and both sides' attribution, so the task holds the whole round: who
+reviewed, what was found, what was done about it. See
+[`docs/releases.md`](./docs/releases.md) for what happens to that PR after
+`in_review` — merged by a clanker only once a human approves it, promoted to a
+release only by the operator.
+
+**A final `review` keeps the old combined brief.** The read-only mode is selected
+by position: a `review` with a phase after it is the gate, while a sequence
+ending on `review` still runs the historical review-and-fix brief, so an
+existing `[implement, review]` config keeps working exactly as it did. New
+configs should use the three-phase shape — the saving is precisely the work that
+moves off the expensive model. `fix` must be the last phase and must follow a
+`review`; validation refuses a sequence that violates either. The full design,
+including the plane half that would store review history durably, is in
+[`docs/review-split.md`](./docs/review-split.md).
 
 A usage limit that lands on a **resumed** phase is the one exception to the
 driver waiting out caps inside the session that hit one: a wait of hours would
@@ -103,8 +130,9 @@ runs, so this trades a driver that cannot lose a task for one that can leave it
 half-done if the sequence is interrupted. The budget breaker fires at the phase
 boundary too. Two other consequences worth knowing:
 
-- **`max_iterations` counts task sequences, not sessions.** A two-phase config
-  spawns roughly twice the sessions for the same limit.
+- **`max_iterations` counts task sequences, not sessions.** A three-phase config
+  spawns roughly three sessions for the same limit — and the middle one is the
+  expensive review.
 - **A multi-phase config requires a harness that observes the session's task
   claim**, which today means `claude` or `opencode`. The handback across a seam,
   the salvage and the delivery check all depend on it, so a config naming `codex`
@@ -183,15 +211,20 @@ never pointed at.
 A phase boundary fixes that structurally rather than by asking anyone to be
 fair-minded: **the driver is the caller, so the implementing session cannot write
 the reviewing session's prompt.** Phase N+1's brief is built from your config plus
-exactly two values off the held claim — the task id and the run id — and phase N's
-session output is not an input to it at all. A test pins that absence rather than
-the wording of the shipped brief, because the wording is the part that is allowed
-to change.
+the values the driver read off the held claim — the task id, the run id and the
+verified branch — and the phases' own resolved harness/model/position. Phase N's
+session output is not an input to it at all. (Its *findings* are, deliberately:
+the review record is the one thing that must cross the review→fix seam, and it
+crosses as a task record the plane stored, not as text the reviewing session
+smuggled into the fixer's prompt.) A test pins that absence rather than the
+wording of the shipped brief, because the wording is the part that is allowed to
+change.
 
-The second phase also puts the review behind the checkpoint, which is where a
+The review phase also puts the judgement behind the checkpoint, which is where a
 session's context peaks and so where a usage limit or a crash is most likely to
 land. Before the split, a death there destroyed the findings and the half-applied
-fixes together; now it costs the review, never the implementation.
+fixes together; now the findings are on the task before the expensive session
+ends, and a death costs the fix session, not the review.
 
 ### Per-phase models: a tier map you own
 
@@ -201,8 +234,9 @@ different phases run on different models:
 ```json
 "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
 "phases": [
-  { "name": "implement", "tier": "strong" },
-  { "name": "review",    "tier": "strong" }
+  { "name": "implement", "tier": "standard" },
+  { "name": "review",    "tier": "strong" },
+  { "name": "fix",       "tier": "cheap" }
 ]
 ```
 
@@ -225,8 +259,12 @@ measured against — is worth the strong bucket, because a mis-recorded decision
 read for months by people who cannot see it was wrong. A phase that only
 compresses a large output into a small answer can take a cheap one, because the
 error is visible immediately to whoever asked the closed question. Nothing is
-tiered by default: an untouched config runs every phase on the run's model, and
-these two shipped phases both produce durable artifacts.
+tiered by default: an untouched config runs every phase on the run's model. The
+review split is the concrete case the rule is for: the review is judgement over a
+diff and a bar, so it takes the strong bucket; the fix applies findings that are
+already written down and re-runs the gates, so it can take the cheap one. Putting
+the review's model on the fix's typing was the $3.92-per-session mistake this
+split removes.
 
 ### Per-phase harnesses: implement on one, review on another
 
@@ -242,15 +280,16 @@ A phase can name the **harness** it runs on, not only the model:
 },
 "phases": [
   { "name": "implement", "harness": "opencode" },
-  { "name": "review" }
+  { "name": "review", "harness": "claude" },
+  { "name": "fix", "harness": "opencode" }
 ]
 ```
 
-That runs the implementation on a cheap provider-agnostic backend and keeps the
-adversarial review on the harness with the subagent machinery. Nothing in the
-seam resists it: each phase is already a fresh session seeded from the observed
-claim, so what crosses the boundary is a task id and a run id, and both live on
-the plane rather than in a session.
+That runs the implementation and the fixes on a cheap provider-agnostic backend
+and keeps the adversarial review on the harness with the subagent machinery.
+Nothing in the seam resists it: each phase is already a fresh session seeded from
+the observed claim, so what crosses the boundary is a task id and a run id, and
+both live on the plane rather than in a session.
 
 **The harness-shaped fields stop being run-wide, and that is the whole of the
 configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and

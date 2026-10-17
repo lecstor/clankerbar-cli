@@ -161,12 +161,12 @@ func TestTaskRepo(t *testing.T) {
 func TestTaskState(t *testing.T) {
 	ctx := context.Background()
 	t.Run("wrapped envelope", func(t *testing.T) {
-		srv, got := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","ref":"CLA-451","status":"in_progress","claimedByRun":"r-9","branch":"clanker/x"}}`))
+		srv, got := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","ref":"CLA-451","status":"in_progress","claimedByRun":"r-9","branch":"clanker/x","outcome":"## Review\nverdict: pass"}}`))
 		st, err := mustClient(t, srv).TaskState(ctx, "t-1")
 		if err != nil {
 			t.Fatalf("TaskState: %v", err)
 		}
-		want := TaskState{Status: "in_progress", Ref: "CLA-451", ClaimedByRun: "r-9", Branch: "clanker/x"}
+		want := TaskState{Status: "in_progress", Ref: "CLA-451", ClaimedByRun: "r-9", Branch: "clanker/x", Outcome: "## Review\nverdict: pass"}
 		if st != want {
 			t.Errorf("state = %+v, want %+v", st, want)
 		}
