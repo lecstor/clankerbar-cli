@@ -138,11 +138,15 @@ release only by the operator.
 **A final `review` keeps the old combined brief.** The read-only mode is selected
 by position: a `review` with a phase after it is the gate, while a sequence
 ending on `review` still runs the historical review-and-fix brief, so an
-existing `[implement, review]` config keeps working exactly as it did. New
-configs should use the three-phase shape — the saving is precisely the work that
-moves off the expensive model. `fix` must be the last phase and must follow a
-`review`; validation refuses a sequence that violates either. The full design,
-including the plane half that would store review history durably, is in
+existing `[implement, review]` config keeps working exactly as it did. An
+existing config with a **custom-prompt phase after `review`** changes meaning in
+this release: that `review` used to run the combined review-and-fix brief and
+open the PR itself — it is now the read-only gate, and the custom phase after it
+is expected to apply the findings. New configs should use the three-phase shape
+— the saving is precisely the work that moves off the expensive model. `fix`
+must be the last phase and must follow a `review`; validation refuses a sequence
+that violates either. The full design, including the plane half that would store
+review history durably, is in
 [`docs/review-split.md`](./docs/review-split.md).
 
 A usage limit that lands on a **resumed** phase is the one exception to the
@@ -287,11 +291,12 @@ different phases run on different models:
 ]
 ```
 
-**One caveat that is not about models.** Until CLA-631 lands, a `fix` phase that
-shares the review's Claude account can exit the daemon: the fix session starts
-immediately after the Opus review and can hit the same rolling usage limit the
-review just consumed the tail of. Keep the three-phase shape, but run `fix` on a
-different provider — see
+**One caveat that is not about models.** A `fix` phase that shares the review's
+Claude account can hit the same rolling usage limit the Opus review just consumed
+the tail of, because the fix session starts immediately after it. That no longer
+exits the daemon — the sequence ends and the run waits the reset out — but the
+task lapses into a takeover that pays `implement` again, plus the wait. Keep the
+three-phase shape, but run `fix` on a different provider — see
 [Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
 
 **The buckets are yours, and the indirection is the point.** clankerbar drives
@@ -345,13 +350,14 @@ Nothing in the seam resists it: each phase is already a fresh session seeded fro
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
 
-**Until CLA-631 lands, do not run `fix` on the review's Claude account.** A fix
-session that starts right after an Opus review can hit the same rolling usage
-limit the review just consumed the tail of, and the daemon exits on it instead of
-waiting — the same account-limit failure a resumed phase has. Pair the review
-with a different provider for `fix` (opencode in the example above); an
-all-Claude three-phase config is the shape most exposed to this, and the example
-here is deliberately not one.
+**Do not run `fix` on the review's Claude account.** A fix session that starts
+right after an Opus review can hit the same rolling usage limit the review just
+consumed the tail of. That no longer takes the daemon down — the sequence ends
+and the run waits the reset out holding no lease — but the task lapses into a
+takeover that pays `implement` again on top of the wait. Pair the review with a
+different provider for `fix` (opencode in the example above); an all-Claude
+three-phase config is the shape most exposed to this, and the example here is
+deliberately not one.
 
 **The harness-shaped fields stop being run-wide, and that is the whole of the
 configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and
