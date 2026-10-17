@@ -11,14 +11,16 @@ func Usage(w io.Writer) {
 	fmt.Fprint(w, `clankerbar — drive a coding agent through your clankerbar backlog, unattended.
 
 Usage:
-  clankerbar                    THE FLEET SUPERVISOR: start every daemon whose
-                                config file is in ~/.config/clankerbar as a
-                                supervised child ("run -c <file>" per file),
-                                restart one that exits unexpectedly (with
-                                backoff), and on SIGINT/SIGTERM stop them all
-                                by writing each one's STOP marker, so every
-                                daemon drains at its iteration boundary.
-                                Same as "clankerbar supervise".
+  clankerbar                    THE FLEET SUPERVISOR: reconcile this machine
+                                against the plane's account-scoped roster: a
+                                supervised child per entry with desiredState:
+                                running (placement local), restarted with
+                                backoff if it exits unexpectedly; a stopped
+                                entry is drained by its STOP marker; and
+                                SIGINT/SIGTERM drains the whole fleet. Each
+                                child runs on a config generated from the base
+                                config (~/.config/clankerbar/config.json) and
+                                its roster entry. Same as "clankerbar supervise".
   clankerbar run [flags]        Start the loop: respawn fresh harness sessions that
                                 work the backlog one task at a time, surviving usage
                                 limits. The "prompt" config knob changes how much a
