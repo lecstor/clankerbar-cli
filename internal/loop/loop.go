@@ -2810,7 +2810,7 @@ func findingIDRound(id string) (int, bool) {
 // open list is not an empty digest — the session is still told the delta base
 // and that the gate currently reads as clear, so a verifier that sees a problem
 // states it rather than silently passing a hand-over it cannot explain.
-func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string) string {
+func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string, recordsTotal int) string {
 	byID := map[string]plane.ReviewFindingState{}
 	newestRound, newestTip, newestCycle := 0, "", 0
 	for _, r := range records {
@@ -2869,6 +2869,26 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string)
 		settledIDs = append(settledIDs, id)
 	}
 	sort.Strings(settledIDs)
+	// The plane serves only the newest records, and their findings within a byte
+	// budget (get_task's reviews block); open MUST ids survive the trim, settled
+	// ones do not. Say what was left out, so a verifier never reads a partial
+	// settled list as the whole of it.
+	var unserved []string
+	for _, r := range records {
+		if r.State == "sealed" || r.State == "void" {
+			continue
+		}
+		if newestCycle > 0 && r.Cycle != newestCycle {
+			continue
+		}
+		if r.FindingsTotal > len(r.Findings) {
+			unserved = append(unserved, fmt.Sprintf("round %d: %d of %d finding(s) not served", r.Round, r.FindingsTotal-len(r.Findings), r.FindingsTotal))
+		}
+	}
+	sort.Strings(unserved)
+	if recordsTotal > len(records) {
+		unserved = append(unserved, fmt.Sprintf("%d older review record(s) not served", recordsTotal-len(records)))
+	}
 	var b strings.Builder
 	b.WriteString("The driver read the released durable review records before this round. ")
 	if newestRound > 0 {
@@ -2880,13 +2900,16 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string)
 	} else {
 		b.WriteString("No RELEASED review record is on the task. If the review round did not run, that is a failed hand-off to report in your record and hand over to a human; do not invent findings.\n")
 	}
-	if len(openIDs) == 0 && len(settledIDs) == 0 {
+	if len(openIDs) == 0 && len(settledIDs) == 0 && len(unserved) == 0 {
 		b.WriteString("The plane currently shows NO OPEN MUST on a released record. Still verify the fix delta of the newest round and its regression surface; if it is clean, carry the terminal step. Everything you find goes in this round's own record.\n\n")
 		return b.String()
 	}
-	if len(openIDs) == 0 {
+	switch {
+	case len(openIDs) == 0 && len(settledIDs) == 0:
+		b.WriteString("The plane currently shows NO OPEN MUST on a released record, but it did not serve every finding (below).\n")
+	case len(openIDs) == 0:
 		b.WriteString("The plane currently shows NO OPEN MUST, but the MUST(s) below are only MARKED settled; adjudicate each before you carry the terminal step.\n")
-	} else {
+	default:
 		b.WriteString("The following MUST(s) are OPEN and this round MUST adjudicate each BY ITS PLANE ID — resolved (status \"fixed\"), resolved by dispatch (status \"filed\"), refutation accepted (status \"refuted\"), or left \"open\" with a recorded reason:\n")
 		for _, id := range openIDs {
 			b.WriteString(digestFindingLine(id, byID))
@@ -2898,9 +2921,19 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string)
 			b.WriteString(digestFindingLine(id, byID))
 		}
 	}
+	if len(unserved) > 0 {
+		b.WriteString("The plane did NOT serve every review finding (" + strings.Join(unserved, "; ") + "), so a MUST marked settled in what was left out is not listed above. Before you carry the terminal step, read the full records (export_project carries every record in full, and the task's console page renders them) and adjudicate every MUST of this cycle marked settled there too. If you cannot read them, do NOT carry the terminal step: record in this round's record that it could not see every settled MUST, and end, so a human looks.\n")
+	}
 	b.WriteString("\n")
 	return b.String()
 }
+
+// planeUnparkOption is the plane's own unpark offer, byte for byte
+// (ESCALATION_UNPARK_OPTION, apps/web/src/server/mcp/stale.ts). The console acts
+// on an answered question by VALUE: when the operator picks exactly this string,
+// it sets the task back to ready. Any other wording is prose the plane does not
+// act on, so the round-cap park offers this one verbatim for the unpark path.
+const planeUnparkOption = "Set it back to `ready` — the blocker is gone, let the fleet try again"
 
 // openMustFixDigest is the fix phase's work list across rounds (CLA-671): every
 // MUST the plane shows open on any released record, with its detail. Empty when
@@ -3095,7 +3128,7 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 		detailList = "\n- " + strings.Join(details, "\n- ")
 	}
 	outcome := fmt.Sprintf(
-		"Parked on the review stopping rule: %s. Round %d of the %d-round cap this cycle (non-void rounds counted by the plane); open MUSTs: %s. The durable review records are on the task (`reviews.records`). Setting this task back to ready does not start a new review cycle: the plane counts cycles by human verdicts, which it records only on an in_review task, so another run would reach the cap and park again. The operator settles the open MUST(s) by hand, or re-files the work as a new task, or drops it.",
+		"Parked on the review stopping rule: %s. Round %d of the %d-round cap this cycle (non-void rounds counted by the plane); open MUSTs: %s. The durable review records are on the task (`reviews.records`). Setting this task back to ready does not start a new review cycle (the plane counts cycles by human verdicts, which it records only on an in_review task): a re-run gets one more review, fix and verification round, and parks again if any MUST is still open after it. The operator unparks it for that attempt, settles the open MUST(s) by hand, re-files the work as a new task, or drops it.",
 		reason, round, config.ReviewRoundCap, openList)
 	body := fmt.Sprintf(
 		"**%s needs a human decision: the fix-verification loop stopped.** %s\n\n"+
@@ -3103,9 +3136,10 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 			"Open MUST finding(s): %s\n\n"+
 			"The evidence is in the task's durable review records (`reviews.records`; every finding is `must`/`should`/`nit` with its status, and the legacy `## Review` block is in the outcome). "+
 			"The stopping rule exists so two agents cannot argue past a bound: the reviewer's findings, the fixer's answers and the verifier's adjudication are all on the task, and the disagreement is the question.\n\n"+
-			"Setting this task back to `ready` does NOT give it another review cycle. The plane opens a new cycle only on a human verdict, and it records a verdict only on an `in_review` task, so a re-run stays in this cycle, reaches the cap and parks again. To have the fleet try again, re-file the work as a new task with whatever re-scoping the open MUST(s) need.",
+			"Setting this task back to `ready` does NOT give it another review cycle. The plane opens a new cycle only on a human verdict, and it records a verdict only on an `in_review` task, so a re-run stays in this cycle: it gets exactly one more review, fix and verification round, and any MUST still open after that verification round parks the task again. For more rounds than that, re-file the work as a new task with whatever re-scoping the open MUST(s) need.",
 		ref, reason, round, counted, config.ReviewRoundCap, detailList)
 	options := []string{
+		planeUnparkOption,
 		"I will settle the open MUST(s) myself — fix it by hand and close the task",
 		"Re-file it as a new task, re-scoped so the open MUST(s) can be met — archive this one",
 		"Drop it — the task is not worth another round",
@@ -3421,7 +3455,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// record), so the digest hands it the LAST legacy block instead.
 			verifyDigest = branchlessVerificationDigest(st.Outcome)
 		} else {
-			verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs)
+			verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs, st.ReviewsTotal)
 		}
 	}
 	retries := 0

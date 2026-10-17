@@ -2681,6 +2681,7 @@ type reviewReleaser struct {
 	// something happened.
 	parks     []string
 	questions []string
+	options   [][]string
 }
 
 func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
@@ -2722,8 +2723,9 @@ func (r *reviewReleaser) Park(_ context.Context, taskID, runID, outcome string) 
 	return nil
 }
 
-func (r *reviewReleaser) AskQuestion(_ context.Context, _, body string, _ []string, _ bool, _ string) error {
+func (r *reviewReleaser) AskQuestion(_ context.Context, _, body string, options []string, _ bool, _ string) error {
 	r.questions = append(r.questions, body)
+	r.options = append(r.options, options)
 	return nil
 }
 
@@ -4363,8 +4365,14 @@ func TestDrainPhases_VerificationCapParksWithTheRecords(t *testing.T) {
 	if strings.Contains(rel.questions[0], "fresh review cycle") {
 		t.Errorf("the question still offers a fresh review cycle the plane cannot start from parked:\n%s", rel.questions[0])
 	}
-	if !strings.Contains(rel.questions[0], "does NOT give it another review cycle") || !strings.Contains(rel.questions[0], "new task") {
-		t.Errorf("the question does not say an unpark stays in this cycle and a retry needs a new task:\n%s", rel.questions[0])
+	if !strings.Contains(rel.questions[0], "does NOT give it another review cycle") || !strings.Contains(rel.questions[0], "exactly one more review, fix and verification round") {
+		t.Errorf("the question does not say what an unpark actually buys (one more round in this cycle):\n%s", rel.questions[0])
+	}
+	// The unpark offer must be the plane's own string, byte for byte: the
+	// console acts on an answer by value, so any other wording does nothing.
+	const planeUnpark = "Set it back to `ready` — the blocker is gone, let the fleet try again"
+	if len(rel.options) != 1 || len(rel.options[0]) == 0 || rel.options[0][0] != planeUnpark {
+		t.Errorf("the park question does not offer the plane's unpark option verbatim: %q", rel.options)
 	}
 }
 
@@ -4547,7 +4555,7 @@ func TestVerificationDigest(t *testing.T) {
 			mustFinding("2.review-2.1", "open", "sealed, must not leak"),
 		}},
 	}
-	got := verificationDigest(records, []string{"1.review-1.1"})
+	got := verificationDigest(records, []string{"1.review-1.1"}, len(records))
 	if !strings.Contains(got, "1.review-1.1") || !strings.Contains(got, "the seam is untested") {
 		t.Errorf("the digest omits the open MUST:\n%s", got)
 	}
@@ -4566,7 +4574,7 @@ func TestVerificationDigest(t *testing.T) {
 	}
 	clean := verificationDigest([]plane.ReviewRecordState{
 		{Round: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open"},
-	}, nil)
+	}, nil, 1)
 	if !strings.Contains(clean, "NO OPEN MUST") || !strings.Contains(clean, "aaaa") {
 		t.Errorf("a clean digest must still name the delta base and the clear gate:\n%s", clean)
 	}
@@ -4585,7 +4593,7 @@ func TestVerificationDigestListsAFixerRefutation(t *testing.T) {
 		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "old", State: "open", Findings: []plane.ReviewFindingState{earlier}},
 		{Round: 2, Cycle: 2, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", Findings: []plane.ReviewFindingState{refuted}},
 	}
-	got := verificationDigest(records, nil)
+	got := verificationDigest(records, nil, len(records))
 	if strings.Contains(got, "carry the terminal step. Everything you find") {
 		t.Errorf("with a refuted MUST to adjudicate, the digest told the verifier the gate is clear:\n%s", got)
 	}
@@ -4596,6 +4604,32 @@ func TestVerificationDigestListsAFixerRefutation(t *testing.T) {
 	}
 	if strings.Contains(got, "1.review-1.9") {
 		t.Errorf("the digest lists a MUST from a previous review cycle:\n%s", got)
+	}
+}
+
+// The plane serves only the newest records, and their findings within a byte
+// budget; settled MUSTs in what it left out cannot be listed. The digest must
+// say so, and must not tell the verifier the gate is clear.
+func TestVerificationDigestNamesWhatThePlaneDidNotServe(t *testing.T) {
+	records := []plane.ReviewRecordState{
+		{Round: 2, Cycle: 1, ReviewerRole: "review-2", ReviewedTip: "bbbb", State: "open", FindingsTotal: 0},
+		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", FindingsTotal: 4,
+			Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "served")}},
+	}
+	got := verificationDigest(records, []string{"1.review-1.1"}, 2)
+	if !strings.Contains(got, "round 1: 3 of 4 finding(s) not served") || !strings.Contains(got, "export_project") {
+		t.Errorf("the digest does not name the findings the plane left out:\n%s", got)
+	}
+	trimmed := verificationDigest([]plane.ReviewRecordState{
+		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", FindingsTotal: 2},
+	}, nil, 3)
+	if strings.Contains(trimmed, "carry the terminal step. Everything you find") {
+		t.Errorf("with findings and records left out, the digest told the verifier the gate is clear:\n%s", trimmed)
+	}
+	for _, want := range []string{"2 of 2 finding(s) not served", "2 older review record(s) not served", "do NOT carry the terminal step"} {
+		if !strings.Contains(trimmed, want) {
+			t.Errorf("the digest is missing %q:\n%s", want, trimmed)
+		}
 	}
 }
 
