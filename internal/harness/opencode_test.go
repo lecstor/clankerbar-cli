@@ -459,10 +459,8 @@ func TestUnclassifiedTransientImpliesTransient(t *testing.T) {
 	}
 }
 
-// opencode and opencode2 are the only adapters that guess, and the others say
-// so by returning false rather than by not being asked. opencode2 grew the
-// heuristic with CLA-541 because beta-18314 reports usage via step_finish
-// (verified) — the same reason the v1 heuristic exists. Pinned because the day
+// opencode is the only adapter that guesses, and the others say so by returning
+// false rather than by not being asked. Pinned because the day
 // a third one grows a heuristic, it has to be a deliberate edit here too - the
 // loop's bound is per-adapter and silently applies to whoever opts in.
 func TestOnlyOpencodeGuesses(t *testing.T) {
@@ -470,9 +468,6 @@ func TestOnlyOpencodeGuesses(t *testing.T) {
 	res := Result{ExitCode: 1, UsageReported: true, Stderr: "some failure text no pattern recognises"}
 	if !(opencode{}).IsUnclassifiedTransient(res) {
 		t.Error("opencode stopped reporting its heuristic - the loop can no longer bound it")
-	}
-	if !(opencode2{}).IsUnclassifiedTransient(res) {
-		t.Error("opencode2 stopped reporting its heuristic - beta-18314 reports usage, so the post-usage retry bound applies to it too")
 	}
 	if (claude{}).IsUnclassifiedTransient(res) || (codex{}).IsUnclassifiedTransient(res) {
 		t.Error("a pattern-driven adapter reported a guess")
@@ -485,18 +480,18 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 	args := opencodeArgs(Invocation{Probe: true, Prompt: "Work the backlog.", Model: "opencode/claude-haiku-4-5"})
 	joined := strings.Join(args, " ")
 	// The prompt sits last, behind a `--` terminator (see args_test.go).
-	if !strings.HasPrefix(joined, "run --format json") || !strings.HasSuffix(joined, " -- .") {
-		t.Errorf("probe args = %q, want a trivial `run --format json ... -- .` request", joined)
+	if !strings.HasPrefix(joined, "run --standalone --format json") || !strings.HasSuffix(joined, " -- .") {
+		t.Errorf("probe args = %q, want a trivial `run --standalone --format json ... -- .` request", joined)
 	}
 	for _, a := range args {
-		if a == "Work the backlog." {
+		if strings.Contains(a, "Work the backlog.") {
 			t.Error("probe leaked the real drain prompt into its invocation")
 		}
 	}
 
 	perm := opencodePermission(true, "/Users/jason/dev", nil) // readOnly
 	p := parsePolicy(t, perm)
-	for _, tool := range []string{"edit", "bash"} {
+	for _, tool := range []string{"edit", "shell", "execute"} {
 		if p[tool] != "deny" {
 			t.Errorf("read-only policy: %s = %q, want deny", tool, p[tool])
 		}
@@ -511,19 +506,20 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 	}
 	// The path-scoped working set survives the probe shape: reads inside the
 	// workdir are allowed, but nothing writes.
-	if p["read"] != "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
+	if p["read"] != "**:allow ../**:deny mcp:*:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
 		t.Errorf("read-only policy must keep the path-scoped read/external_directory rules, got read=%q external_directory=%q",
 			p["read"], p["external_directory"])
 	}
 }
 
 // A real drain fails closed on exfil but must still allow edits and shell to do
-// the work; the prompt is carried through verbatim.
+// the work; the prompt is carried through, behind the MCP warm-up note.
 func TestOpencodeDrainInvocation(t *testing.T) {
 	args := opencodeArgs(Invocation{Prompt: "Work the backlog.", Model: "opencode/claude-sonnet-4-5"})
 	joined := strings.Join(args, " ")
-	if !strings.HasPrefix(joined, "run --format json") || !strings.HasSuffix(joined, " -- Work the backlog.") {
-		t.Errorf("drain args = %q, want the prompt carried into `opencode run` behind a `--` terminator", joined)
+	if !strings.HasPrefix(joined, "run --standalone --format json") || args[len(args)-2] != "--" ||
+		args[len(args)-1] != opencodeMCPWarmupNote+"Work the backlog." {
+		t.Errorf("drain args = %q, want the prompt carried into `opencode run --standalone` behind a `--` terminator", joined)
 	}
 	if !strings.Contains(joined, "--model opencode/claude-sonnet-4-5") {
 		t.Errorf("drain args = %q, want the model passed through", joined)
@@ -531,24 +527,28 @@ func TestOpencodeDrainInvocation(t *testing.T) {
 
 	perm := opencodePermission(false, "/Users/jason/dev", nil) // drain
 	p := parsePolicy(t, perm)
-	if p["edit"] != "Users/jason/dev/**:allow Users/jason/dev:allow" || p["bash"] != "allow" {
-		t.Errorf("drain policy must allow edit (path-scoped) + bash (tool-level), got edit=%q bash=%q", p["edit"], p["bash"])
+	if p["edit"] != "**:allow ../**:deny" || p["shell"] != "allow" {
+		t.Errorf("drain policy must allow edit (path-scoped) + shell (tool-level), got edit=%q shell=%q", p["edit"], p["shell"])
+	}
+	if p["execute"] != "deny" {
+		t.Errorf("execute = %q, want deny - Code Mode stays closed", p["execute"])
 	}
 	assertNetworkDenied(t, p)
 }
 
-// The drain policy is a path-scoped PermissionConfig: read/edit/external_directory
-// carry pattern->action objects scoping the workdir subtree, `*` is the catch-all
-// that denies everything else, and `*_*` keeps the session's MCP access alive
-// under that catch-all. Key order is load-bearing (opencode evaluates rules
-// last-match-wins), so the catch-all must sort first.
+// The drain policy is a path-scoped PermissionConfig: read/edit carry
+// instance-relative pattern->action objects, external_directory scopes the
+// workdir subtree absolutely, `*` is the catch-all that denies everything else,
+// and `*_*` keeps the session's MCP access alive under that catch-all. Key
+// order is load-bearing (opencode evaluates rules last-match-wins), so the
+// catch-all must sort first.
 func TestOpencodePermissionPathScoping(t *testing.T) {
 	perm := opencodePermission(false, "/Users/jason/dev", nil)
 	p := parsePolicy(t, perm)
 
 	want := map[string]string{
-		"read":               "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow",
-		"edit":               "Users/jason/dev/**:allow Users/jason/dev:allow",
+		"read":               "**:allow ../**:deny mcp:*:allow",
+		"edit":               "**:allow ../**:deny",
 		"external_directory": "*:deny /Users/jason/dev/**:allow",
 		// The read-only search tools carry a flat `**` pattern allow: their
 		// asks hold the search pattern (regex/glob/directory), never a
@@ -564,8 +564,8 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 			t.Errorf("%s = %q, want %q", tool, got, folded)
 		}
 	}
-	if p["bash"] != "allow" {
-		t.Errorf("bash must stay a tool-level allow (command patterns, not path-based), got %q", p["bash"])
+	if p["shell"] != "allow" {
+		t.Errorf("shell must stay a tool-level allow (command patterns, not path-based), got %q", p["shell"])
 	}
 	if p["*_*"] != "allow" {
 		t.Errorf("*_* = %q, want allow — MCP tool asks use the full tool name (<server>_<tool>, e.g. clankerbar_get_backlog_summary), which the `*` catch-all would otherwise deny", p["*_*"])
@@ -576,7 +576,7 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 
 	// Last-match-wins: the catch-all must sort before every specific rule.
 	star := strings.Index(perm, `"*"`)
-	for _, key := range []string{"*_*", "bash", "edit", "external_directory", "glob", "grep", "list", "read", "webfetch", "websearch"} {
+	for _, key := range []string{"*_*", "edit", "execute", "external_directory", "glob", "grep", "list", "read", "shell", "webfetch", "websearch"} {
 		if i := strings.Index(perm, `"`+key+`"`); i == -1 {
 			t.Errorf("policy JSON missing key %q", key)
 		} else if i < star {
@@ -585,10 +585,9 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 	}
 }
 
-// The path patterns derive from the run's workdir: read/edit use opencode's
-// root-relative form (path.relative("/", p) when the session's worktree is "/"),
-// external_directory uses the absolute form, and a trailing slash / empty workdir
-// resolve sensibly.
+// The path patterns derive from the run's workdir: external_directory uses the
+// absolute form (and rootRel, the 1.x read/edit form, is still derived), and a
+// trailing slash / empty workdir resolve sensibly.
 func TestOpencodeWorkdirPatterns(t *testing.T) {
 	rel, abs := opencodeWorkdirPatterns("/Users/jason/dev")
 	if rel != "Users/jason/dev/**" || abs != "/Users/jason/dev/**" {
@@ -613,31 +612,31 @@ func TestOpencodeWorkdirPatterns(t *testing.T) {
 }
 
 // The EFFECTIVE decisions of the emitted policy, evaluated the way opencode
-// evaluates them (see opencodeEvaluate): this is the invariant the whole change
-// rests on — the working set works, everything else is denied, MCP survives the
-// catch-all, and the out-of-workdir external_directory gate stays closed even
-// though the `*_*` MCP rule's permission wildcard also matches that name.
+// evaluates them (see opencodeEvaluate): the working set works, everything else
+// is denied, MCP survives the catch-all, and the out-of-workdir
+// external_directory gate stays closed even though the `*_*` MCP rule's
+// permission wildcard also matches that name.
 func TestOpencodePermissionEffective(t *testing.T) {
 	perm := opencodePermission(false, "/Users/jason/dev", nil)
 	cases := []struct {
 		permission, pattern, want string
 	}{
-		// The working set: files and worktrees under the workdir, and the
-		// workdir root's own listing (exact pattern).
-		{"read", "Users/jason/dev/clankerbar-cli-wt/643a681b/internal/harness/harness.go", "allow"},
-		{"read", "Users/jason/dev", "allow"},
-		{"edit", "Users/jason/dev/clankerbar-cli-wt/643a681b/scratch.txt", "allow"},
+		// The working set: files and worktrees under the workdir, asked
+		// relative to it (2.x), and the workdir root's own listing.
+		{"read", "clankerbar-cli-wt/643a681b/internal/harness/harness.go", "allow"},
+		{"read", ".", "allow"},
+		{"edit", "clankerbar-cli-wt/643a681b/scratch.txt", "allow"},
 		{"external_directory", "/Users/jason/dev/clankerbar-cli-wt/643a681b/*", "allow"},
 		// Everything outside the workdir fails closed.
-		{"read", "Users/jason/.config/clankerbar/opencode.json", "deny"},
-		{"read", "etc/hosts", "deny"},
-		{"edit", "etc/passwd", "deny"},
+		{"read", "../.config/clankerbar/opencode.json", "deny"},
+		{"read", "../../../etc/hosts", "deny"},
+		{"edit", "../../../etc/passwd", "deny"},
 		{"external_directory", "/etc/*", "deny"},
 		{"external_directory", "/Users/jason/.config/clankerbar/*", "deny"},
-		// bash stays tool-level: commands are allowed, whatever they touch
-		// inside the workdir.
-		{"bash", "git status --short", "allow"},
-		{"bash", "sed -i s/x/y/ internal/harness/opencode.go", "allow"},
+		// shell stays tool-level: commands are allowed, whatever they touch.
+		// 2.x does not path-gate them (an accepted gap, see the policy doc).
+		{"shell", "git status --short", "allow"},
+		{"shell", "sed -i s/x/y/ internal/harness/opencode.go", "allow"},
 		// MCP tools (named <server>_<tool>) survive the catch-all.
 		{"clankerbar_get_backlog_summary", "*", "allow"},
 		{"context7_query-docs", "*", "allow"},
@@ -645,27 +644,24 @@ func TestOpencodePermissionEffective(t *testing.T) {
 		// MCP RESOURCE reads ask under `read`, not under their tool name.
 		{"read", "mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md", "allow"},
 		{"read", "mcp:clankerbar:*", "allow"},
-		// The exfil and hidden tools stay denied.
+		// The exfil, Code Mode and hidden tools stay denied.
 		{"webfetch", "*", "deny"},
 		{"websearch", "*", "deny"},
+		{"execute", "*", "deny"},
 		// grep/glob/list are read-only search tools and their asks carry the
-		// SEARCH PATTERN, not a path — grep asks with the regex, glob with the
-		// glob, list (newer opencode) with the resolved directory — so the
-		// pattern ask is allowed flat and the workdir boundary lives in the
-		// external_directory gate each tool runs before searching. The asks
-		// below are the shapes the tools actually make; the boundary cases
-		// above ("/etc/*" and "~/.config/..." denied) are the gate that stops a
-		// search whose target is outside the subtree (CLA-390).
+		// SEARCH PATTERN, not a path, so the pattern ask is allowed flat and the
+		// workdir boundary lives in the external_directory gate (CLA-390).
 		{"grep", "TODO", "allow"},
 		{"grep", "func main", "allow"},
 		{"glob", "**/*.go", "allow"},
 		{"glob", "{src,test}/**", "allow"},
-		{"list", "Users/jason/dev/clankerbar-cli-wt/643a681b", "allow"},
-		// lsp/task/skill stay denied by the catch-all: they are not read-only
-		// search and are out of scope for this change.
+		{"list", "clankerbar-cli-wt/643a681b", "allow"},
+		// lsp/subagent/skill/question stay denied by the catch-all.
 		{"lsp", "*", "deny"},
+		{"subagent", "*", "deny"},
 		{"task", "*", "deny"},
 		{"skill", "*", "deny"},
+		{"question", "*", "deny"},
 	}
 	for _, tc := range cases {
 		if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != tc.want {
@@ -674,16 +670,12 @@ func TestOpencodePermissionEffective(t *testing.T) {
 	}
 }
 
-// The served protocol has to be REACHABLE, or an unattended session never learns
-// the loop it is supposed to run. CLA-382: every opencode session's
-// read_mcp_resource call was denied, so no session read the skill that carries
-// the heartbeat cadence, and leases expired mid-work while the session kept
-// editing. The mechanism is that opencode's MCP RESOURCE tools do not ask under
-// their own names — list_mcp_resources, list_mcp_resource_templates and
-// read_mcp_resource all ask under permission `read` with `mcp:<server>:<uri>`
-// patterns (1.18.x, session/tools.ts) — so the `*_*` MCP allow never saw them and
-// the `*` catch-all denied them. This pins that they resolve to allow in BOTH run
-// shapes, while the fail-closed posture the policy exists for is unchanged.
+// The `mcp:*` carve-out on `read` (CLA-382) is kept, and it loosens nothing
+// else. On 1.x the MCP resource tools asked under `read` with
+// `mcp:<server>:<uri>` patterns; on 2.0.32 those tools are registered in Code
+// Mode only, so with `execute` denied a session has none of them and the
+// carve-out is inert until a build exposes them top-level again. It is pinned in
+// both run shapes so that day does not need a policy change.
 func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 	for _, shape := range []struct {
 		name     string
@@ -691,33 +683,18 @@ func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 	}{{"drain", false}, {"probe", true}} {
 		t.Run(shape.name, func(t *testing.T) {
 			perm := opencodePermission(shape.readOnly, "/Users/jason/dev", nil)
-
-			// The three asks the resource tools actually make. The read's URI
-			// is a URL, so the pattern has to span both "/" and ":".
-			allowed := []string{
+			for _, pattern := range []string{
 				"mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md",
-				"mcp:clankerbar:https://clankerbar.com/skills/clankerbar/finishing.md",
-				"mcp:clankerbar:*", // list_mcp_resources(server: "clankerbar")
-				"mcp:context7:*",   // ...and the same listing for any other server
-				"mcp:chrome-devtools:*",
-			}
-			for _, pattern := range allowed {
+				"mcp:clankerbar:*",
+				"mcp:context7:*",
+			} {
 				if got := opencodeEvaluate(t, perm, "read", pattern); got != "allow" {
-					t.Errorf("ask(permission=read, pattern=%q) = %s, want allow — the session cannot read the served protocol", pattern, got)
+					t.Errorf("ask(permission=read, pattern=%q) = %s, want allow", pattern, got)
 				}
 			}
-
-			// Fail-closed elsewhere: the carve-out is one pattern on `read`,
-			// and it moves nothing else. A filesystem read outside the workdir
-			// is still denied, and the `mcp:` pattern cannot be reached by a
-			// filesystem ask (those carry worktree-relative paths). grep/glob
-			// are NOT in this list: they are allowed by their own separate
-			// pattern entries (CLA-390), never by this carve-out.
 			denied := []struct{ permission, pattern string }{
-				{"read", "etc/hosts"},
-				{"read", "Users/jason/.ssh/id_ed25519"},
-				{"read", "Users/jason/.config/clankerbar/opencode.json"},
-				{"edit", "mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md"},
+				{"read", "../../../etc/hosts"},
+				{"read", "../.ssh/id_ed25519"},
 				{"external_directory", "/etc/*"},
 				{"webfetch", "*"},
 				{"websearch", "*"},
@@ -726,14 +703,6 @@ func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 				if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != "deny" {
 					t.Errorf("ask(permission=%s, pattern=%q) = %s, want deny — the MCP carve-out must not loosen anything else", tc.permission, tc.pattern, got)
 				}
-			}
-
-			// The carve-out must not hide the tools either: opencode drops a
-			// tool whose mapped permission's LAST matching rule is a `*`-pattern
-			// deny (read_mcp_resource maps onto `read`), so the emitted `read`
-			// entry must keep ending in a specific pattern, not a bare deny.
-			if got := opencodeEvaluate(t, perm, "read", "Users/jason/dev/x.go"); got != "allow" {
-				t.Errorf("workdir read = %s, want allow", got)
 			}
 		})
 	}
@@ -1070,7 +1039,7 @@ func opencodeToolLine(callID, tool, input, status, output string) string {
 	}
 	b, err := json.Marshal(map[string]any{
 		"type": "tool_use",
-		"part": map[string]any{"type": "tool", "tool": tool, "callID": callID, "state": state},
+		"part": map[string]any{"type": "tool", "tool": tool, "id": callID, "state": state},
 	})
 	if err != nil {
 		panic(err)

@@ -286,7 +286,7 @@ type Invocation struct {
 	// piece 2 — permissions follow the project, not the cwd). Empty on every run
 	// whose project declares no repos, which leaves each adapter's policy exactly
 	// as it was. Each adapter expresses these in its own dialect — opencode's
-	// generated OPENCODE_PERMISSION gains read/edit/external_directory scope,
+	// pinned `permission` block gains read/edit/external_directory scope,
 	// claude gets --add-dir — and an adapter with no such concept ignores them;
 	// see the adapters for what each does and documents.
 	ExtraDirs []string

@@ -37,11 +37,15 @@ var terminatorAdapters = []struct {
 	// silently not applied at all - the sandbox pin would be absent rather than
 	// overridden, and codex's own default would decide the session's write access.
 	wantFlags []string
+	// message is the positional the adapter sends for a prompt: the prompt
+	// itself, or (opencode) the prompt behind the MCP warm-up note. Either way
+	// it is ONE argument after the terminator.
+	message func(string) string
 }{
 	{"codex", codexArgs, []string{
 		"--json", "--sandbox", "workspace-write", "--ask-for-approval", "never", "-m", "some/model",
-	}},
-	{"opencode", opencodeArgs, []string{"--format", "json", "--model", "some/model"}},
+	}, func(p string) string { return p }},
+	{"opencode", opencodeArgs, []string{"--standalone", "--format", "json", "--agent", "build", "--model", "some/model"}, opencodePrompt},
 }
 
 // promptsTheParserWouldSteal are the shapes that actually bite: a bare
@@ -86,7 +90,7 @@ func TestAPromptTheParserWouldStealArrivesAsTheMessage(t *testing.T) {
 				if args[cut] != "--" {
 					t.Fatalf("%s built %q with no `--` terminator before the prompt - the child parses it as a flag", a.name, args)
 				}
-				if args[len(args)-1] != prompt {
+				if args[len(args)-1] != a.message(prompt) {
 					t.Fatalf("%s built %q: want the prompt last, got %q", a.name, args, args[len(args)-1])
 				}
 
@@ -111,7 +115,7 @@ func TestOrdinaryPromptIsUnaffectedByTheTerminator(t *testing.T) {
 	for _, a := range terminatorAdapters {
 		t.Run(a.name, func(t *testing.T) {
 			args := a.args(Invocation{Prompt: prompt, Model: "some/model"})
-			if args[len(args)-1] != prompt {
+			if args[len(args)-1] != a.message(prompt) {
 				t.Errorf("%s built %q: the prompt must be the final argument", a.name, args)
 			}
 			if got := strings.Count(strings.Join(args, " "), prompt); got != 1 {

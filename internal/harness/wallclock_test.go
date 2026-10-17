@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -16,10 +17,23 @@ import (
 func opencodeStub(t *testing.T, script string) {
 	t.Helper()
 	dir := t.TempDir()
+	script = withExportRefused(script)
 	if err := os.WriteFile(filepath.Join(dir, "opencode"), []byte(script), 0o755); err != nil {
 		t.Fatalf("writing stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// withExportRefused makes a stub script fail `opencode session export` before
+// its own logic runs, so a stub written for `run` is not re-entered by the
+// adapter's post-exit export (opencode_export.go) and the adapter keeps the
+// stream's figures. Tests of the export path serve one explicitly instead.
+func withExportRefused(script string) string {
+	const guard = "if [ \"$1\" = session ] && [ \"$2\" = export ]; then exit 1; fi\n"
+	if nl := strings.IndexByte(script, '\n'); nl >= 0 && strings.HasPrefix(script, "#!") {
+		return script[:nl+1] + guard + script[nl+1:]
+	}
+	return guard + script
 }
 
 // A session that spends its usage and then keeps running: the cap fires, the

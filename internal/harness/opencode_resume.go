@@ -16,7 +16,7 @@ import (
 //
 // It does not have to be. The session transcript survives on opencode's side —
 // only the in-flight turn died — so the session can be RESUMED in place via
-// `opencode run --session <id>`, exactly as an interactive operator types
+// `opencode run -s <id>`, exactly as an interactive operator types
 // "continue" after a cutoff. One small probe call risks recovering minutes to
 // hours of accumulated session work; a failed probe costs only the wait it
 // already took to reach this branch.
@@ -156,9 +156,17 @@ func probeCoherent(reply, ref string) bool {
 
 // opencodeResumeArgs builds the args for a continuation run into an existing
 // session: the same dialect as opencodeArgs, plus `-s <id>` and WITHOUT the
-// phase prompt — a continuation carries its own short message.
+// phase prompt — a continuation carries its own short message, behind the same
+// MCP warm-up note (each `run` process connects its MCP servers afresh).
+//
+// sid must be an id this adapter SAW on a session's stream (resumeTargets reads
+// it off Result.Raw, which only the stream parser writes). 2.x does not refuse
+// an unknown id: verified against 2.0.32, `-s <unknown>` silently creates a new,
+// empty session, so a made-up id would "resume" into amnesia. Every caller
+// checks for an empty sid before it gets here.
 func opencodeResumeArgs(in Invocation, sid, prompt string) []string {
-	args := []string{"run", "--format", "json", "-s", sid}
+	prompt = opencodePrompt(prompt)
+	args := []string{"run", "--standalone", "--format", "json", "--agent", opencodeAgent, "-s", sid}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}

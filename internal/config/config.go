@@ -3146,7 +3146,7 @@ func (c *Config) Validate() error {
 	// rejected here before harness.Get is consulted, and a newly registered adapter is
 	// accepted automatically. harness does not import config, so there is no cycle.
 	if !harness.Known(c.Harness) {
-		return fmt.Errorf("unknown harness %q (want: %s)", c.Harness, strings.Join(harness.Names(), ", "))
+		return fmt.Errorf("unknown harness %q (want: %s)%s", c.Harness, strings.Join(harness.Names(), ", "), retiredHarnessHint(c.Harness))
 	}
 	// A per-harness block keyed by a name no adapter answers to is a ceiling that
 	// can never trip: nothing is ever charged to it, so the run is unbounded on
@@ -3157,7 +3157,7 @@ func (c *Config) Validate() error {
 	// one, exactly as for the dials beside it — see checkBudget.
 	for _, name := range slices.Sorted(maps.Keys(c.Budget.PerHarness)) {
 		if !harness.Known(name) {
-			return fmt.Errorf("budget.per_harness[%q]: unknown harness (want: %s)", name, strings.Join(harness.Names(), ", "))
+			return fmt.Errorf("budget.per_harness[%q]: unknown harness (want: %s)%s", name, strings.Join(harness.Names(), ", "), retiredHarnessHint(name))
 		}
 	}
 	if c.MaxTurns < 0 {
@@ -3234,8 +3234,8 @@ func (c *Config) Validate() error {
 	for i, ph := range c.Phases {
 		h := c.HarnessFor(ph)
 		if !harness.Known(h) {
-			return fmt.Errorf("phases[%d] (%q): unknown harness %q (want: %s)",
-				i, ph.Label(i), h, strings.Join(harness.Names(), ", "))
+			return fmt.Errorf("phases[%d] (%q): unknown harness %q (want: %s)%s",
+				i, ph.Label(i), h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
 		}
 		// A phase on some OTHER harness inherits none of the run-wide
 		// harness-shaped fields, by design (see HarnessConfig), so with no block
@@ -4151,6 +4151,19 @@ func mcpURLFromConfig(path string) string {
 		if s.usesKey {
 			return s.url
 		}
+	}
+	return ""
+}
+
+// retiredHarnessHint names what replaced a harness that used to be registered,
+// so a config written for it fails with the fix in the message rather than a
+// bare "unknown harness". `opencode2` drove the 2.x preview; since CLA-675 the
+// `opencode` harness drives 2.x itself and the preview adapter is gone. It is
+// not kept as an alias: one name per adapter keeps the binary doctor looks up,
+// the harnesses block, budgets and logs all agreeing.
+func retiredHarnessHint(name string) string {
+	if name == "opencode2" {
+		return ` - "opencode2" was retired: the "opencode" harness now drives opencode 2.x; rename it (and any harnesses.opencode2 block) to "opencode"`
 	}
 	return ""
 }
