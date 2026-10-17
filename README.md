@@ -231,6 +231,13 @@ different phases run on different models:
 ]
 ```
 
+**One caveat that is not about models.** Until CLA-631 lands, a `fix` phase that
+shares the review's Claude account can exit the daemon: the fix session starts
+immediately after the Opus review and can hit the same rolling usage limit the
+review just consumed the tail of. Keep the three-phase shape, but run `fix` on a
+different provider — see
+[Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
+
 **The buckets are yours, and the indirection is the point.** clankerbar drives
 three harnesses and cannot know which models you have, nor which of them is
 cheaper — that needs a price table, which goes stale silently and in the direction
@@ -281,6 +288,14 @@ and keeps the adversarial review on the harness with the subagent machinery.
 Nothing in the seam resists it: each phase is already a fresh session seeded from
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
+
+**Until CLA-631 lands, do not run `fix` on the review's Claude account.** A fix
+session that starts right after an Opus review can hit the same rolling usage
+limit the review just consumed the tail of, and the daemon exits on it instead of
+waiting — the same account-limit failure a resumed phase has. Pair the review
+with a different provider for `fix` (opencode in the example above); an
+all-Claude three-phase config is the shape most exposed to this, and the example
+here is deliberately not one.
 
 **The harness-shaped fields stop being run-wide, and that is the whole of the
 configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and

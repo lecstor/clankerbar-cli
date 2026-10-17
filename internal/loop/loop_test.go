@@ -1964,12 +1964,15 @@ func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
 
 type releaseCall struct{ taskID, runID string }
 
+// fakeReleaser is the plain Releaser fake: it can hand a claim back and
+// nothing else. It deliberately does NOT implement plane.TaskStateSource — a
+// test on this fake runs the UNWIRED-plane path, where every seam is judged on
+// branch evidence alone (CLA-457) and the review-only outcome gate has nothing
+// to read. Tests that need the plane's task state use wiredReleaser below.
 type fakeReleaser struct {
-	calls    []releaseCall
-	err      error
-	onCall   func() // fired inside Release, to observe what has NOT happened yet
-	state    plane.TaskState
-	stateErr error
+	calls  []releaseCall
+	err    error
+	onCall func() // fired inside Release, to observe what has NOT happened yet
 }
 
 func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error {
@@ -1980,15 +1983,28 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 	return f.err
 }
 
-// TaskState answers the CLA-451 checkpoint peek. The zero value is "held with
-// nothing recorded" — no delivery, no outcome — which is what makes a
-// review-only phase's seam gate refuse a checkpoint until a test sets `state`
-// with a review record (or the test is exercising that refusal on purpose).
-func (f *fakeReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
-	if f.stateErr != nil {
-		return plane.TaskState{}, f.stateErr
+// wiredReleaser is fakeReleaser plus the plane's single-task read
+// (plane.TaskStateSource): the shape the review-split seam tests need, where
+// the outcome on the task decides whether a checkpoint advances. `state` is
+// called on every read, so a test can let the review phase's own session change
+// the answer mid-drain (see the split tests' fakeAdapter.onInvoke hooks).
+//
+// Kept separate rather than added to fakeReleaser: when the plain fake
+// satisfied the interface, every older loop test silently moved from the
+// unwired-plane path to a wired one — the driver began asking the plane where
+// it used to judge on branch evidence alone, with nothing in those tests
+// saying so. The explicit unwired-plane test pins the path that change
+// removed.
+type wiredReleaser struct {
+	fakeReleaser
+	state func() plane.TaskState
+}
+
+func (w *wiredReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	if w.state == nil {
+		return plane.TaskState{}, nil
 	}
-	return f.state, nil
+	return w.state(), nil
 }
 
 // parkCall is one driver-side park: the task it moved, the run signing it, and

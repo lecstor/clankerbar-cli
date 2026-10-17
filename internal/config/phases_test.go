@@ -1287,6 +1287,44 @@ func TestBuiltinFixBriefCarriesTheReviewForwardAndTheTerminalStep(t *testing.T) 
 	}
 }
 
+// A statusless update_task outcome REPLACES the whole field on the plane, so a
+// review-only brief that writes only its own block erases phase 1's delivery
+// record, and a fix brief that rebuilds the outcome from the review block plus
+// ### Fixes erases it again. Both must state the append/keep-above contract,
+// handoff continuations included — a respawned successor never saw the original
+// brief, and it is the session most likely to have only its own block in hand.
+func TestBuiltinReviewAndFixBriefsPreserveWhatSitsAboveTheBlock(t *testing.T) {
+	reviewBriefs := map[string]string{
+		"review-only brief":           reviewOnlyBrief,
+		"no-code review-only brief":   noCodeReviewOnlyBrief,
+		"review-only handoff":         HandoffContinuationFor(ReviewPhaseName, true),
+		"no-code review-only handoff": NoCodeReviewOnlyHandoffContinuation(),
+	}
+	for name, brief := range reviewBriefs {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{"existing outcome", "appending", "unchanged"} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never says %q, so a review session can erase the outcome it found:\n%s", name, want, brief)
+			}
+		}
+	}
+
+	fixBriefs := map[string]string{
+		"fix brief":            fixBrief,
+		"no-code fix brief":    noCodeFixBrief,
+		"fix handoff":          NoCodeFixHandoffContinuation(),
+		"fix handoff (branch)": HandoffContinuation(FixPhaseName),
+	}
+	for name, brief := range fixBriefs {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{"above the review", "verbatim", "### fixes"} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never says %q, so the final outcome can lose what sat above the review block:\n%s", name, want, brief)
+			}
+		}
+	}
+}
+
 func TestValidate_FixPhaseRules(t *testing.T) {
 	tests := []struct {
 		name   string

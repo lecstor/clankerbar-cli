@@ -1662,6 +1662,42 @@ func recordedBranches(res harness.Result) []string {
 	return out
 }
 
+// reviewGate is the review-only phase's seam contract: whether a review record
+// is required, and the outcome as it stood BEFORE the phase spawned. The
+// baseline is what makes the record this-trip rather than last-trip: a task
+// that went implement -> review -> fix -> in_review keeps its `## Review` block
+// in the outcome, and a human request_changes (or a takeover) returns the task
+// to the queue without clearing it. A review session that then dies having
+// recorded nothing would leave an outcome that still carries a heading — so a
+// bare presence check passes on a record from the PREVIOUS trip and spawns the
+// fixer over an unreviewed revision.
+//
+// read is the tri-state the freshness check needs: false means the baseline
+// could not be read (no plane reader, a failed read, no task id on the carried
+// claim), and the gate then refuses rather than pretending an unread outcome
+// was unchanged. baseline is meaningful only when read is true.
+type reviewGate struct {
+	required bool
+	read     bool
+	baseline string
+}
+
+// reviewRecordLine reports whether outcome carries the review heading as its
+// own line. The gate uses this instead of strings.Contains so a look-alike
+// heading (`## Reviewer notes`, or prose that merely mentions the words) is not
+// mistaken for the block the review is required to record. Trailing CR/strip is
+// ignored because the plane stores text as sent and a CRLF paste is still the
+// heading; leading whitespace is not, because a heading the session indented
+// into a code block is not a heading the fix phase will find.
+func reviewRecordLine(outcome string) bool {
+	for _, line := range strings.Split(outcome, "\n") {
+		if strings.TrimRight(line, "\r") == config.ReviewRecordHeading {
+			return true
+		}
+	}
+	return false
+}
+
 // checkpointEvidence reports whether the plane's record carries the phase's
 // exit evidence, and returns the branch that evidence names (empty for the
 // branch-less forms). Held-ness alone is NOT the evidence: since CLA-358 the
@@ -1709,7 +1745,7 @@ func recordedBranches(res harness.Result) []string {
 // narrow loosening of CLA-457: a session that recorded a branch it never
 // pushed, during a remote outage, reaches a review phase, which is the
 // backstop.
-func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.Result, workdir string, requireReview bool) (branch string, ok bool, unverified bool, why string) {
+func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.Result, workdir string, review reviewGate) (branch string, ok bool, unverified bool, why string) {
 	branches := recordedBranches(res)
 
 	// Form (a): the recorded-branch check. Remember the first failure for the
@@ -1768,13 +1804,13 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 	// the plane anyway was never the contract. A review-only phase is the one
 	// exception, because its checkpoint additionally needs the record's OUTCOME
 	// (below), so it pays the one extra read.
-	if foundOK && !requireReview {
+	if foundOK && !review.required {
 		return foundBranch, true, false, ""
 	}
 
 	// Forms (b) and (c): the plane's own record of the task, read ONCE here so the
 	// review-record gate below can use it without a second round-trip.
-	record, recordOK, recordWhy := d.planeExitRecord(ctx, t, res)
+	record, recordRead, recordOK, recordWhy := d.planeExitRecord(ctx, t, res)
 
 	// Resolve the pre-gate verdict from the strongest form that held. Form (a)
 	// outranks the plane's record: a verified branch is the implementer's own
@@ -1808,15 +1844,29 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 		// form above, so without this gate a review session that burned its turns,
 		// hit its ceiling, or died on a silent EOT — having recorded nothing —
 		// would still advance, and the next phase would be told to apply findings
-		// that do not exist. The check is the plane's own record of the task's
-		// outcome, read above: the review writes ReviewRecordHeading there, and a
-		// phase that did not is an EMPTY exit, not a checkpoint.
+		// that do not exist.
+		//
+		// The record must be NEW this trip and a heading in its own right. Presence
+		// alone is not enough: a task that already went implement -> review -> fix
+		// carries the previous trip's block, and request_changes (or a takeover)
+		// leaves it in the outcome. The spawn-time baseline is what tells the two
+		// apart; the exact-line heading is what keeps `## Reviewer notes` from
+		// standing in for it.
 		//
 		// Fail-closed, like every other evidence form: a record that cannot be read
-		// is not a review that happened. The cost is a re-run of the review; the
-		// alternative is an unreviewed PR.
-		if requireReview && !strings.Contains(record.Outcome, config.ReviewRecordHeading) {
-			return branch, false, false, fmt.Sprintf("the review recorded no %q block in the task's outcome — the next phase would have nothing to apply", config.ReviewRecordHeading)
+		// on either side of the phase is not a review that happened. The cost is a
+		// re-run of the review; the alternative is an unreviewed PR.
+		if review.required {
+			switch {
+			case !review.read:
+				return branch, false, false, "the task's outcome could not be read before the review phase spawned, so a review record cannot be proven to have been written by this phase — the next phase would risk applying an earlier trip's record"
+			case !recordRead:
+				return branch, false, false, fmt.Sprintf("the task's outcome could not be read after the review phase ended, so its %q block cannot be verified — the next phase would risk running on a record that does not exist", config.ReviewRecordHeading)
+			case record.Outcome == review.baseline:
+				return branch, false, false, fmt.Sprintf("the task's outcome is unchanged since the review phase spawned — the review recorded no new %q block, so the next phase would have nothing to apply", config.ReviewRecordHeading)
+			case !reviewRecordLine(record.Outcome):
+				return branch, false, false, fmt.Sprintf("the review recorded no %q block in the task's outcome — the next phase would have nothing to apply", config.ReviewRecordHeading)
+			}
 		}
 		return branch, true, unverified, why
 	}
@@ -1857,35 +1907,66 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 // holds the lease — held-ness alone was CLA-457's original false positive and
 // stays worthless here — and a task still sitting in `ready` is still the
 // empty exit, however orderly the session that said nothing about it.
-func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Result) (st plane.TaskState, ok bool, why string) {
+func (d *Driver) planeExitRecord(ctx context.Context, t Target, res harness.Result) (st plane.TaskState, read bool, ok bool, why string) {
 	taskID := res.Claim.TaskID
 	src, wired := t.Releaser.(plane.TaskStateSource)
 	if taskID == "" || !wired {
-		return plane.TaskState{}, false, ""
+		return plane.TaskState{}, false, false, ""
 	}
 	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	st, err := src.TaskState(sctx, taskID)
 	switch {
 	case err == nil:
+		read = true
 	case errors.Is(err, plane.ErrNotWired):
-		return plane.TaskState{}, false, ""
+		return plane.TaskState{}, false, false, ""
 	default:
 		log.Printf("%scould not read the plane's record of %s for phase exit evidence (%v) — judging the exit on branch evidence alone", labelOf(t), taskID, err)
-		return plane.TaskState{}, false, ""
+		return plane.TaskState{}, false, false, ""
 	}
 	switch st.Status {
 	case "in_review", "done", "parked", "blocked":
 		// Form (b): the task LEFT `ready`. Its session settled it on the plane,
 		// which for a no-code task is the strongest statement there is.
-		return st, true, ""
+		return st, read, true, ""
 	}
 	if st.DeliveryNoCode {
 		// Form (c): a declared no-code delivery — the plane's own record that
 		// this task's correct delivery is no code, held lease or not.
-		return st, true, ""
+		return st, read, true, ""
 	}
-	return st, false, fmt.Sprintf("the plane's record shows no exit evidence either (status %q, no no-code delivery)", st.Status)
+	return st, read, false, fmt.Sprintf("the plane's record shows no exit evidence either (status %q, no no-code delivery)", st.Status)
+}
+
+// readReviewBaseline reads the task's outcome as it stands BEFORE the review
+// phase spawns, so the seam can require the record to have changed. The task id
+// comes from the carried claim (the predecessor phase's), which is exact for a
+// resumed phase and is why this runs inside drainPhase, where `prev` is still
+// in hand.
+//
+// Best-effort like every other plane read: a failure returns read=false, and
+// the gate then refuses the checkpoint rather than guessing whether the outcome
+// changed. No second read is needed here for a target with no plane wiring —
+// the same wiring the seam read already requires.
+func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
+	if prev == nil || prev.Claim.TaskID == "" {
+		return "", false
+	}
+	src, wired := t.Releaser.(plane.TaskStateSource)
+	if !wired {
+		return "", false
+	}
+	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	st, err := src.TaskState(sctx, prev.Claim.TaskID)
+	if err != nil {
+		if !errors.Is(err, plane.ErrNotWired) {
+			log.Printf("%scould not read the plane's record of %s before the review phase spawned (%v) — the review→fix gate cannot prove its record is new this trip", labelOf(t), prev.Claim.TaskID, err)
+		}
+		return "", false
+	}
+	return st.Outcome, true
 }
 
 // verifiedBranch returns the branch the previous phase recorded — the hand-off
@@ -2028,6 +2109,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	requireReviewRecord := false
 	if ephases := tc.EffectivePhases(); phaseIdx < len(ephases) {
 		requireReviewRecord = ephases[phaseIdx].Prompt == config.ReviewOnlyBrief()
+	}
+	// The review seam's freshness baseline, read ONCE before the attempt ladder:
+	// the phase's outcome as the review found it. A handoff respawn re-enters
+	// drainPhase with the same carried claim and takes a fresh baseline, so a
+	// successor must still write the record its own session is responsible for.
+	review := reviewGate{required: requireReviewRecord}
+	if review.required {
+		review.baseline, review.read = d.readReviewBaseline(ctx, t, prev)
 	}
 	// The adapter for THIS phase, resolved once: everything below — the spawn, the
 	// classification of what came back, and the probe of any usage limit it hit —
@@ -2294,7 +2383,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		evidenceUnverified := false
 		evidenceWhy := ""
 		if !last && canCheckpoint {
-			end.branch, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, requireReviewRecord)
+			end.branch, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, review)
 		}
 		// A held-but-empty exit (2026-08-24): a would-be checkpoint refused by the
 		// evidence gate — not by any of the older vetoes (dead, untrusted, not
@@ -2430,7 +2519,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				!res.Claim.Held() && (res.ExitCode == 0 || capped || ceiling || wallclock) {
 				if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask); claim != nil {
 					end.claim = claim
-					end.branch, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir, requireReviewRecord)
+					end.branch, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, *claim, inv.WorkDir, review)
 					if evidenceOK {
 						// Fold the VERIFIED branch onto the carried claim, exactly as
 						// the observed-claim checkpoint above does: a recovered claim
