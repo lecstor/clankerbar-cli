@@ -2385,8 +2385,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// itself, and every attempt must see the same grade. A read that fails
 	// leaves the digest empty and the brief falls back to the raw block, which
 	// the fix phase reads with get_task anyway.
+	//
+	// Like requireReviewRecord above, the signal is the RESOLVED config, not
+	// ph.Prompt: a handoff respawn replaces ph.Prompt with the successor's
+	// continuation wholesale, and the successor of a mid-fix handoff needs the
+	// same graded list its predecessor got — its continuation (fixTerminalRecord)
+	// already holds it to the grade, so the grade itself must be the one thing
+	// the respawn does not drop. The resolved prompt is the builtin fix brief
+	// exactly when the operator left the phase's own Prompt empty; a custom fix
+	// prompt owns its wording and gets no digest, the same convention the
+	// variant swap in invocationFor follows.
 	fixGrading := ""
-	if ph.Prompt == config.FixBrief() {
+	if ephases := tc.EffectivePhases(); phaseIdx < len(ephases) && ephases[phaseIdx].Prompt == config.FixBrief() {
 		if outcome, read := d.readTaskOutcome(ctx, t, prev,
 			"to grade the review record for the fix phase",
 			"the fix brief will carry the raw record without the driver's structural grading"); read {

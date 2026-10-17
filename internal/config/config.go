@@ -430,7 +430,8 @@ const fixTerminalRecord = " When you hand the task over, the outcome MUST keep e
 	"round's) unchanged, keep the review's block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
 	"it already carries — do not restate that attribution from this brief), and add a `### Fixes` list saying, " +
 	"for every finding, whether you fixed it (with the commit SHA, or for a no-code task the record change you " +
-	"made) or did not (with the reason — for a MUST that reason must be a refutation carrying its evidence, " +
+	"made, or the ref of the real follow-up task a code-needing finding was dispatched to) or did not " +
+	"(with the reason — for a MUST that reason must be a refutation carrying its evidence, " +
 	"because a MUST is never downgraded), plus " +
 	"'fixed by: harness " + PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder + "'. A finding " +
 	"you neither fix nor answer is this phase failing."
@@ -987,7 +988,9 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"findings by AMENDING THE RECORD (update_task, record_decision) - never by " +
 	"inventing code, a branch or a PR." + fixGradingRule +
 	" A finding that needs CODE cannot be fixed here: file it as its own task " +
-	"(create_task, with a real doneWhen) and say so in your outcome - do not re-open this task, do not rewrite " +
+	"(create_task, with a real doneWhen) and say so in your outcome - for a MUST, that filed task is this " +
+	"phase's fix of it (record the new task's ref in your outcome as the fix; a dispatched MUST is fixed this " +
+	"way, not refuted, and not a failure) - do not re-open this task, do not rewrite " +
 	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
 	fixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
 

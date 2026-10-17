@@ -2345,6 +2345,58 @@ func TestDrainPhases_FixBriefCarriesTheGradedFindings(t *testing.T) {
 	}
 }
 
+// CLA-635 fix-pass finding: a handoff respawn of the FIX phase replaces
+// ph.Prompt with the successor's continuation, so keying the driver's graded
+// list on the per-call prompt text would drop it exactly where the
+// continuation (fixTerminalRecord) still holds the successor to the grade. The
+// successor of a mid-fix handoff must carry the same digest its predecessor
+// got — an evidence-less MUST must reach it already downgraded, not as a
+// gating MUST it may not downgrade itself.
+func TestDrainPhases_FixHandoffSuccessorKeepsTheGradedFindings(t *testing.T) {
+	outcome := "implemented: pushed the branch\n"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: handoffResult("R1 is fixed and committed; grading R2's evidence is next, then the PR.")},
+		{res: okResult(5, 0.05)},
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review session appends its block below the record
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: findings\n### Findings\n" +
+				"- R1 [must] (gate): `go test ./...` fails on the new seam at loop.go:42 - the guard is untested. Required fix: pin it.\n" +
+				"- R2 [must] internal/loop/loop.go:77 - this line names no evidence. Required fix: give it a test.\n"
+		}
+	}
+	rel := &wiredReleaser{state: func() plane.TaskState {
+		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+	}}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+
+	if _, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop || handoffs != 1 {
+		t.Fatalf("drainPhases: err=%v stop=%v handoffs=%d (want 1)", err, stop, handoffs)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — implement, review, fix, its handoff successor", h.invokeCalls)
+	}
+	successor := h.invocations[3].Prompt
+	for _, want := range []string{
+		"R1 [MUST]",
+		"R2 [SHOULD]", // the evidence-less MUST reaches the successor already downgraded
+		"downgraded: recorded as a MUST with no evidence kind or payload",
+	} {
+		if !strings.Contains(successor, want) {
+			t.Errorf("the fix handoff successor's prompt does not carry %q:\n%s", want, successor)
+		}
+	}
+	if strings.Contains(successor, "R2 [MUST]") {
+		t.Errorf("the evidence-less MUST reached the fix handoff successor ungraded:\n%s", successor)
+	}
+}
+
 // A handoff inside the review-only phase must carry the record-then-hold ending,
 // never the commit/push/PR/in_review terminal step. This is the seam a wording
 // change in the first session's brief cannot reach.

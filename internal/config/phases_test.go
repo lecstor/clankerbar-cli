@@ -1323,6 +1323,17 @@ func TestBuiltinFixBriefsHoldTheFixerToTheGrade(t *testing.T) {
 	if !strings.Contains(strings.ToLower(fixTerminalRecord), "for a must that reason must be a refutation carrying its evidence") {
 		t.Errorf("the fix record requirement does not say an unfixed MUST must be a refutation with evidence:\n%s", fixTerminalRecord)
 	}
+	// The no-code brief's one unreachable case must not contradict the grade: a
+	// code-needing MUST can be neither fixed nor refuted there, so dispatching
+	// it to a real follow-up task has to count as the fix — and the record
+	// requirement has to accept the task ref as that fix's evidence, or the
+	// dispatched MUST still reads as "did not (with a reason)".
+	if !strings.Contains(strings.ToLower(noCodeFixBrief), "for a must, that filed task is this phase's fix of it") {
+		t.Errorf("the no-code fix brief leaves a dispatched MUST contradicting the fix-or-refute rule:\n%s", noCodeFixBrief)
+	}
+	if !strings.Contains(strings.ToLower(fixTerminalRecord), "the ref of the real follow-up task a code-needing finding was dispatched to") {
+		t.Errorf("the fix record requirement does not name a dispatch as a fix's evidence:\n%s", fixTerminalRecord)
+	}
 }
 
 // The fix brief is the one that must land the PR and the hand-off, and it must
