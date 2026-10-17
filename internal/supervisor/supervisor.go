@@ -614,18 +614,32 @@ func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error)
 		}
 	}
 	cfg := base.Clone()
-	// The roster owns the projects: each entry names the project(s) it
-	// drives, and each project's primary repo is what the workdir derivation
-	// derives from (the plane's `project.primary_repo` in place of the local
-	// declaration phase 2a read).
+	// The roster owns WHICH projects an instance drives; the base config owns
+	// HOW this machine reaches them (the machine-layer rule). A roster project
+	// whose slug matches a `projects[]` entry in the base config starts from
+	// that entry — its workdir, repos map, mcp_config_path(s), pr_base and
+	// every other per-project key — with Slug and PrimaryRepo taken from the
+	// roster. A roster project with no base entry is built from the roster
+	// alone, exactly as before, and derivation (resolveInstance) still
+	// overrides WORKDIR only. CLA-632: the replacement used to drop the
+	// machine wiring, so a multi-project run whose phases span harnesses was
+	// refused outright for want of the per-project mcp_config_paths.
 	cfg.InstanceName = e.Name
 	cfg.StateDir = rosterStateDir(d.cacheDir, e.Name)
 	cfg.Projects = make([]config.Project, 0, len(e.Projects))
 	for _, p := range e.Projects {
-		cfg.Projects = append(cfg.Projects, config.Project{
-			Slug:        strings.TrimSpace(p.Slug),
-			PrimaryRepo: strings.TrimSpace(p.PrimaryRepo),
-		})
+		slug := strings.TrimSpace(p.Slug)
+		// No match yields the zero Project: the roster alone, as before.
+		proj, _ := baseProjectFor(base, slug)
+		proj.Slug = slug
+		// The roster's primary repo is the plane's word and wins the workdir
+		// derivation; an absent one is the config's own "no opinion" (see
+		// PrimaryRepoFor), so the base entry's primary_repo survives it rather
+		// than being cleared by omission.
+		if primary := strings.TrimSpace(p.PrimaryRepo); primary != "" {
+			proj.PrimaryRepo = primary
+		}
+		cfg.Projects = append(cfg.Projects, proj)
 	}
 	// Decision 1: harness and its per-harness block are the ONLY per-instance
 	// policy overrides. checkEntry has already refused every other key; what
@@ -675,6 +689,30 @@ func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error)
 		}
 	}
 	return d.resolveInstance(cfg)
+}
+
+// baseProjectFor returns the base config's projects[] entry for one slug — the
+// machine wiring a roster project inherits when it names the same project.
+// The MCPConfigPaths map is cloned because Validate normalizes it IN PLACE
+// (projects[i].mcp_config_paths.<harness> is rewritten with the resolved
+// path), and the base config may be shared across builds (Options.BaseCfg
+// without a source); the other map fields are treated read-only on the copy,
+// exactly as Clone's contract does.
+func baseProjectFor(base *config.Config, slug string) (config.Project, bool) {
+	for _, p := range base.Projects {
+		if p.Slug != slug {
+			continue
+		}
+		if p.MCPConfigPaths != nil {
+			paths := make(map[string]string, len(p.MCPConfigPaths))
+			for k, v := range p.MCPConfigPaths {
+				paths[k] = v
+			}
+			p.MCPConfigPaths = paths
+		}
+		return p, true
+	}
+	return config.Project{}, false
 }
 
 // loadMaterialized loads an instance's last-known-good materialized config

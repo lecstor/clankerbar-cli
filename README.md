@@ -422,7 +422,8 @@ Those promises harden at v1.0.
 ## Usage
 
 ```sh
-clankerbar                          # the fleet supervisor: every config in ~/.config/clankerbar
+clankerbar                          # the fleet supervisor: reconcile this machine
+                                    # against the plane's account roster
 clankerbar run --harness=claude
 clankerbar run --harness=claude --model=opus --max-iterations=10
 clankerbar run --config ./clankerbar.json     # or: -c ./clankerbar.json
@@ -435,70 +436,96 @@ clankerbar deck deck.html --task CLA-581      # upload a review deck, print its 
 
 ### The fleet supervisor: bare `clankerbar`
 
-One config file is one daemon, and the config dir is where the fleet lives.
 `clankerbar` with **no subcommand** (equivalently `clankerbar supervise`) is the
-supervisor: it enumerates every `*.json` in `~/.config/clankerbar` that is
-actually an instance config, spawns `clankerbar run -c <file>` as a child per
-file, and supervises them. That ends the manual per-daemon chore: the operator
-no longer starts each daemon by hand, and stopping the fleet is one Ctrl-C.
+fleet supervisor: it reconciles this machine against your **account-scoped
+roster** on the plane, polled every 15 seconds from
+`<backlog_url>/api/daemon-roster`. The account key (`CLANKERBAR_API_KEY`) is
+required — a supervisor spans projects, so a project key will not do.
 
-The supervisor invents nothing — every mechanism already existed:
+Each roster entry declares one instance:
 
-- **Each child is the command the operator used to run by hand — on a config
-  the supervisor generates.** Instance identity (`hostname/basename(config)`),
-  per-instance state dirs, control markers and the fleet beacon all behave
-  exactly as before; each child beacons under the name derived from its own
-  source file.
-- **A child that exits unexpectedly is restarted, with backoff.** The delay
-  doubles from 2s to a 60s cap per consecutive unexpected exit; a run that
-  stayed up at least 2 minutes is treated as healthy and resets the ladder.
-- **SIGINT/SIGTERM to the supervisor is a fleet-wide stop.** Every child gets a
-  STOP marker written into its own state dir — the same marker a hand-written
-  `touch STOP` writes — so each daemon drains at its iteration boundary (an
-  in-flight session finishes) rather than being killed mid-session, and the
-  supervisor waits for all of them before exiting.
-- **A child that was told to stop is not restarted.** That covers the
-  supervisor's own fleet-wide stop, and the per-instance case: a `HALT` marker
-  (the one marker the daemon does NOT consume) left in a child's state dir
-  stops that instance for good — delete the marker and restart the supervisor
-  to resume it. A hand-written `STOP`, by contrast, is consumed by the daemon
-  when it honours it, so the supervisor cannot see it and reads the exit as
-  unexpected: **to stop ONE instance while the supervisor runs, touch `HALT`
-  in its state dir, not `STOP`.**
+- **`desiredState: running`** — a supervised child is kept up, spawned as
+  `clankerbar run -c <generated config>` in the child's own state dir. A child
+  that exits for any reason other than a stop it was told about is restarted,
+  with backoff: the delay doubles from 2s to a 60s cap per consecutive
+  unexpected exit, and a run that stayed up at least 2 minutes is treated as
+  healthy and resets the ladder.
+- **`desiredState: stopped`** — the supervisor writes the instance's STOP
+  marker into its state dir (the same marker a hand-written `touch STOP`
+  writes) and the daemon drains at its iteration boundary. Flipping desired
+  state in the console lands on the machine within one poll.
+- **`placement: remote`** — not implemented (Decision 7); the entry is ignored
+  with a log line. An entry deleted in the console has its child stopped and is
+  dropped.
 
-What the supervisor does NOT do (later phases of the proposal): no plane call,
-no roster, no desired state, no version check, no self-update. The config dir
-is enumerated **once, at startup** — add a config file and restart the
-supervisor to pick it up. The startup log names every file it picked up and
-every file it skipped, with the reason.
+**Stopping the supervisor stops the fleet.** SIGINT/SIGTERM to the supervisor
+writes a STOP marker into every child's own state dir, so each daemon drains at
+its iteration boundary (an in-flight session finishes) rather than being killed
+mid-session, and the supervisor waits for all of them before exiting. A child
+that was told to stop is not restarted; that covers the fleet-wide stop and the
+per-instance case — a `HALT` marker (the one marker the daemon does NOT
+consume) left in a child's state dir stops that instance for good; delete the
+marker and restart the supervisor to resume it. A hand-written `STOP`, by
+contrast, is consumed by the daemon when it honours it, so the supervisor
+cannot see it and reads the exit as unexpected: **to stop ONE instance while
+the supervisor runs, touch `HALT` in its state dir, not `STOP`.**
+
+**The base config is the machine layer.** The supervisor reads your local
+config from the one discovered location, `~/.config/clankerbar/config.json`
+(loaded exactly as `clankerbar run` loads it, or bare defaults when no file
+exists). When the file exists it is re-read on every reconcile, so an edit
+lands without a supervisor restart. Everything the plane may not set — `env`
+and `@file` secrets, `settings_path`, `config_dir`, `mcp_config_path`,
+`backlog_url` and the rest — comes from this file.
+
+**The roster names the projects; the base config wires them.** A roster entry
+carries the project(s) the instance drives. For each one the supervisor starts
+from the base config's matching `projects[]` entry — its `workdir`, `repos`
+map, `mcp_config_path` / `mcp_config_paths`, `pr_base` and every other
+per-project key — and takes only the project's slug and primary repo from the
+roster. A roster project with no matching base entry runs on the roster's slug
+and repo alone, with the top-level fallbacks; the roster's primary repo (the
+plane's `project.primary_repo`) is what the workdir derivation derives from.
+This is how an instance running e.g. implement-on-opencode / review-on-claude
+keeps one MCP file per project per harness (see "Multi-project runs need one
+MCP file per project per harness" above) instead of losing its wiring.
+
+**One-directional overrides.** A roster entry may carry exactly one class of
+override — `harness` and its per-harness block (`model` / `models`) — and
+nothing else: a machine-layer key (`env`, `settings_path`, `workdir`,
+`mcp_config_path`) or any other run-config key is **refused loudly** and named
+in the log, never silently dropped — a silent drop is how a daemon ends up
+looking configured and not being.
 
 **Workdir derivation (phase 2a).** Set `CLANKERBAR_WORKDIR_ROOT` to the
 machine's one checkout root and the supervisor derives each child's workdir as
-`<root>/<repo name>` for the repo its config names (`primary_repo`, per project
-when the config drives several). Derivation fails closed, both conditions
-learned from the CLA-441 wrong-workdir failure: if the derived directory does
-not exist, or is not a checkout of the expected repo (its origin remote names
-something else), that daemon is **refused at startup** — the path tried is
-reported, nothing is created, and the supervisor's own working directory is
-never used as a fallback. With the variable unset, derivation is off and
-children run on their config files' own workdirs, exactly as before.
+`<root>/<repo name>` for the repo its project's roster entry names
+(`primary_repo`, per project when the entry drives several). Derivation fails
+closed, both conditions learned from the CLA-441 wrong-workdir failure: if the
+derived directory does not exist, or is not a checkout of the expected repo
+(its origin remote names something else), that daemon is **refused** — never
+spawned, the path tried is reported, nothing is created, and the supervisor's
+own working directory is never used as a fallback. With the variable unset,
+derivation is off and children run on the base config's own workdirs, exactly
+as before.
 
 **Materialized configs (phase 2b).** Every child runs on a config the
-supervisor *generates*, not the file in the config dir: the child's effective
-config — the operator's declared intent plus the machine conventions, namely
-the derived workdir, the resolved `settings_path` / `config_dir` /
-`mcp_config_path` (documented defaults applied), the default `backlog_url`
-(the credential itself stays in `CLANKERBAR_API_KEY` in the environment,
-which the child inherits) — is written to `materialized.json` in the child's
-own state dir, and the child is started with `run -c` pointing at it. The
-generated file is a **cache**: regenerated on every reconcile (each spawn
-re-reads the source config), never hand-edited, and safe to delete while a
+supervisor *generates*, not a hand-maintained file: the child's effective
+config — the operator's machine layer plus the roster's projects and permitted
+override, with the machine conventions resolved (the derived workdir, the
+resolved `settings_path` / `config_dir` / `mcp_config_path` and the default
+`backlog_url`; the credential itself stays in `CLANKERBAR_API_KEY` in the
+environment, which the child inherits) — is written to `materialized.json` in
+the child's own state dir, and the child is started with `run -c` pointing at
+it. The generated file is a **cache**: regenerated on every reconcile (each
+spawn re-reads the base config), never hand-edited, and safe to delete while a
 child runs — the next spawn regenerates it. It is written to disk rather than
-held in memory so it doubles as the offline last-known-good once the roster
-drives the fleet (phase 3b): an unreachable plane means starting from cache,
-not starting nothing. The instance identity and the state dir are pinned
-inside it, so a daemon beacons and stops exactly as it did when its file
-lived in the config dir.
+held in memory so it doubles as the offline last-known-good: with the plane
+unreachable the supervisor reconciles against the cached roster and starts
+children from their materialized configs, rather than starting nothing (a cold
+start with no cache has nothing to supervise and says so). The instance
+identity and the state dir are pinned inside it, so a daemon beacons and stops
+exactly as it did when started by hand.
 
 **Permission policy gate (phase 2c).** The supervisor never starts a daemon
 without its permission policy: `settings_path` is the fail-closed headless
@@ -506,26 +533,36 @@ allow/deny policy, deliberately read-only to agents — a plane that could set
 it could hand a daemon a permissive policy — and the file it names must exist
 when the daemon starts. An instance whose policy file is absent is **refused**
 — no child is spawned, and the refusal names the daemon and the policy path
-tried. The gate is checked at enumeration and again at every (re)spawn, so a
-policy file deleted while the supervisor runs stops the next respawn, not the
+tried. The gate is checked at every reconcile and again at every (re)spawn, so
+a policy file deleted while the supervisor runs stops the next respawn, not the
 running child, and a restored file is picked up by the next backoff retry. A
 config that names no `settings_path` is unaffected — it runs on the ambient
 allowlist, which `doctor` already warns about.
 
-The config dir also holds JSON that is not instance configs — MCP configs
+**The log is a status surface.** On every change of the fleet the supervisor
+lists the version it itself runs and, per instance, the state and the version
+of the child serving it — so version skew between children (and between a
+child and the supervisor) is observable on the machine, not only on the fleet
+page. `clankerbar supervise roll` rolls the children onto a newly installed
+binary one at a time, verifying each one's next beacon reports it before the
+next is touched; `clankerbar supervise replace` drains the fleet and execs the
+running supervisor into a newly installed build. Neither fetches or installs
+anything — you install the new build at the fleet's launch path first.
+
+The config dir can hold more JSON than the base config — MCP configs
 (`opencode-mcp.json`), headless permission policies (`headless-drain.json`),
-opencode's own config (`opencode.json`) — and the supervisor tells them apart
-structurally: a file must carry at least one recognized clankerbar config key
-and pass the same Load + Validate `run` performs, or it is skipped loudly.
-(If `opencode.json` still parses as a valid config it IS supervised — move it
-out of the config dir if you do not want it started.)
+opencode's own config (`opencode.json`), leftovers from hand-started daemons
+(`clanker1.json`, ...). The supervisor reads none of them: its machine layer is
+`~/.config/clankerbar/config.json` alone, and which instances run comes from
+the roster, not from files in the directory. (`clankerbar run -c <file>` still
+runs any config you point it at by hand.)
 
 Two operational notes, both inherited from how `run` already behaves:
 
-- **The supervisor resolves each config from its own working directory.** A
-  config with a RELATIVE `workdir` resolves against wherever the supervisor
-  was started; the operator's daemon configs use absolute paths, and so should
-  a supervised one.
+- **The supervisor resolves each child's config from its own working
+  directory.** A config with a RELATIVE `workdir` resolves against wherever the
+  supervisor was started; the operator's configs use absolute paths, and so
+  should the base config.
 - **The supervisor's children run with the supervisor's environment** — the
   account key, the harness binaries on PATH, everything. A child's `RESTART`
   marker re-execs the child in place (same pid, same launch path), so a

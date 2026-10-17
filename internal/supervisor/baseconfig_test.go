@@ -228,6 +228,43 @@ func TestBuildConfigRosterProjectWithoutBaseEntryUnchanged(t *testing.T) {
 	}
 }
 
+// The inherited MCPConfigPaths map must be a COPY: Validate normalizes each
+// per-harness path IN PLACE, and Options.BaseCfg may be shared across builds
+// (no source file to re-read), so writing through would let one build resolve
+// paths into the base the next build — possibly under another instance's
+// derived workdir — reads.
+func TestBuildConfigDoesNotWriteThroughToTheSharedBaseProject(t *testing.T) {
+	cacheDir := t.TempDir()
+	workdir := t.TempDir()
+	o := materializeOptions(t, cacheDir, "")
+	o.BaseCfg = baseWithProject(t, config.Project{
+		Slug:    "acme",
+		WorkDir: workdir,
+		MCPConfigPaths: map[string]string{
+			"opencode": "mcp/oc.json",
+			"claude":   "mcp/cl.json",
+		},
+	})
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
+
+	entry := RosterEntry{
+		Name:         "fleet-one",
+		DesiredState: RosterDesiredRunning,
+		Placement:    RosterPlacementLocal,
+		Projects:     []RosterProject{{Slug: "acme"}},
+	}
+	cfg, _, err := d.buildConfig(&entry)
+	if err != nil {
+		t.Fatalf("buildConfig: %v", err)
+	}
+	if got := cfg.Projects[0].MCPConfigPaths["opencode"]; got != filepath.Join(workdir, "mcp/oc.json") {
+		t.Errorf("resolved mcp_config_paths.opencode = %q, want %q", got, filepath.Join(workdir, "mcp/oc.json"))
+	}
+	if got := o.BaseCfg.Projects[0].MCPConfigPaths["opencode"]; got != "mcp/oc.json" {
+		t.Errorf("base config was written through: mcp_config_paths.opencode = %q, want the declared \"mcp/oc.json\"", got)
+	}
+}
+
 // The operator's shape (CLA-633): a three-project roster entry over a base
 // config with implement on opencode, review on claude and one MCP file per
 // project per harness. Before CLA-632 the replacement projects carried no
