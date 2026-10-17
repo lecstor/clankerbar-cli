@@ -1337,7 +1337,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
-		})
+		}, phases)
 		tokens += ptokens
 		cost += pcost
 		// CLA-630: one entry per session this pass spawned, in spawn order. nil
@@ -2494,8 +2494,9 @@ func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int
 // default turn cap (CLA-343), which is precisely what the inline zero-value
 // version failed to do.
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
-	ph := d.targetCfg(t).EffectivePhases()[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior)
+	phases := d.targetCfg(t).EffectivePhases()
+	ph := phases[0]
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior, phases)
 	return tokens, cost, stop, err
 }
 
@@ -2521,19 +2522,33 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // back to "phase 2". An unphased drain passes 0 and never reaches those lines.
 // ti is the target's index, for the fleet claim reflector wired into the lease
 // renewer below (CLA-510).
-func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+//
+// phases is the sequence as CAPTURED when the drain started — the same slice
+// drainPhases iterates. It is what this phase's IDENTITY is read from (its
+// built-in brief, its position in the sequence), never the live config
+// (CLA-664): a RELOAD marker is applied inside waitOrStop, which runs during a
+// first-phase limit wait or a transient backoff in THIS drain, so the live
+// config can be a DIFFERENT sequence than the one in flight. Reading it here
+// would let the two disagree — the in-flight review gated by the reloaded
+// position, the "PHASE i of N" text rewritten — while drainPhases still walks
+// the captured slice. The rule the capture enforces: a RELOAD takes effect at
+// the next drain, never mid-sequence.
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend, phases []config.Phase) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	tc := d.targetCfg(t)
+	// captured is this phase as the sequence was captured at drain start, before
+	// a handoff respawn replaced ph.Prompt with the successor's continuation: the
+	// mode must survive a handoff exactly as the record requirement does.
+	captured := config.Phase{}
+	if phaseIdx < len(phases) {
+		captured = phases[phaseIdx]
+	}
 	// Whether this phase is the BUILT-IN review-only gate: its deliverable is
 	// the review record on the task, and the seam below refuses it a checkpoint
-	// without one. Read from the resolved config, NOT from ph.Prompt: a handoff
-	// respawn REPLACES ph.Prompt with the successor's continuation, and the gate
-	// must survive a handoff exactly as the record requirement does. An
+	// without one. Read off the CAPTURED phase, never the live config (CLA-664)
+	// and never ph.Prompt (a handoff respawn replaces that wholesale). An
 	// operator's own "review" prompt owns its own contract, so the signal is the
 	// shipped brief itself.
-	requireReviewRecord := false
-	if ephases := tc.EffectivePhases(); phaseIdx < len(ephases) {
-		requireReviewRecord = ephases[phaseIdx].Prompt == config.ReviewOnlyBrief()
-	}
+	requireReviewRecord := captured.Prompt == config.ReviewOnlyBrief()
 	// The review seam's freshness baseline, read ONCE before the attempt ladder:
 	// the phase's outcome as the review found it. A handoff respawn re-enters
 	// drainPhase with the same carried claim and takes a fresh baseline, so a
@@ -2601,17 +2616,17 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// leaves the digest empty and the brief falls back to the raw block, which
 	// the fix phase reads with get_task anyway.
 	//
-	// Like requireReviewRecord above, the signal is the RESOLVED config, not
-	// ph.Prompt: a handoff respawn replaces ph.Prompt with the successor's
-	// continuation wholesale, and the successor of a mid-fix handoff needs the
-	// same graded list its predecessor got — its continuation (fixTerminalRecord)
-	// already holds it to the grade, so the grade itself must be the one thing
-	// the respawn does not drop. The resolved prompt is the builtin fix brief
-	// exactly when the operator left the phase's own Prompt empty; a custom fix
-	// prompt owns its wording and gets no digest, the same convention the
-	// variant swap in invocationFor follows.
+	// Like requireReviewRecord above, the signal is the CAPTURED phase, not
+	// ph.Prompt and not the live config: a handoff respawn replaces ph.Prompt
+	// with the successor's continuation wholesale, and the successor of a
+	// mid-fix handoff needs the same graded list its predecessor got — its
+	// continuation (fixTerminalRecord) already holds it to the grade, so the
+	// grade itself must be the one thing the respawn does not drop. The resolved
+	// prompt is the builtin fix brief exactly when the operator left the phase's
+	// own Prompt empty; a custom fix prompt owns its wording and gets no digest,
+	// the same convention the variant swap in invocationFor follows.
 	fixGrading := ""
-	if ephases := tc.EffectivePhases(); phaseIdx < len(ephases) && ephases[phaseIdx].Prompt == config.FixBrief() {
+	if captured.Prompt == config.FixBrief() {
 		if outcome, read := d.readTaskOutcome(ctx, t, prev,
 			"to grade the review record for the fix phase",
 			"the fix brief will carry the raw record without the driver's structural grading"); read {
@@ -2682,7 +2697,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
 		// refuses an existing path either way; this stops it turning into a denial
 		// of the log itself.
-		inv, ierr := d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase)
+		inv, ierr := d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases)
 		if ierr != nil {
 			// The session env refused to resolve (a failing or empty-output
 			// fromCommand, an unreadable @path file — the error names the
@@ -4595,7 +4610,13 @@ func droppedNote(dropped int64) string {
 // placeholders are per-run facts only a claim can carry, while the implement
 // brief — phase 1, claim-free at spawn time — is itself one of the carriers, in
 // its resumed-work rule. Empty leaves the placeholder standing, like the rest.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string) (harness.Invocation, error) {
+//
+// phases is the sequence as CAPTURED when the drain started, and supplies every
+// positional/attribution fact here — the "PHASE i of N" total and the previous
+// phase's harness/model. A RELOAD applied inside a wait swaps the live config
+// under an in-flight sequence (CLA-664), and the sequence must keep its own
+// shape and attribution until the next drain.
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase) (harness.Invocation, error) {
 	tc := d.targetCfg(t)
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
@@ -4753,7 +4774,10 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// model from the static config, which is exact for the shipped shapes: tier
 	// escalation applies only to a review phase, and the shipped consumer of
 	// {{prevModel}} is a review brief naming the IMPLEMENT phase.
-	phases := tc.EffectivePhases()
+	// The positional/attribution values are facts of the sequence that was
+	// captured at drain start (CLA-664), not of the live config: a RELOAD landing
+	// mid-drain must not rewrite the "PHASE i of N" text of the sequence already
+	// in flight, nor attribute the previous phase to a shape it never ran.
 	phaseTotal := len(phases)
 	prevHarness, prevModel := "", ""
 	if phaseIdx > 0 && phaseIdx-1 < len(phases) {
