@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2653,8 +2654,8 @@ func findingIDRound(id string) (int, bool) {
 // open list is not an empty digest — the session is still told the delta base
 // and that the gate currently reads as clear, so a verifier that sees a problem
 // states it rather than silently passing a hand-over it cannot explain.
-func verificationDigest(records []plane.ReviewRecordState) string {
-	var open []plane.ReviewFindingState
+func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string) string {
+	byID := map[string]plane.ReviewFindingState{}
 	newestRound, newestTip := 0, ""
 	for _, r := range records {
 		if r.State == "sealed" || r.State == "void" {
@@ -2664,11 +2665,24 @@ func verificationDigest(records []plane.ReviewRecordState) string {
 			newestRound, newestTip = r.Round, r.ReviewedTip
 		}
 		for _, f := range r.Findings {
-			if f.Severity == "must" && f.Status == "open" {
-				open = append(open, f)
-			}
+			byID[f.ID] = f
 		}
 	}
+	// The plane's openMustIds is the authoritative gate input (CLA-636); the
+	// records supply the finding detail. Union them, so a findings block
+	// truncated by the read budget still yields every id it must adjudicate.
+	openIDs := append([]string(nil), openMustIDs...)
+	seen := map[string]bool{}
+	for _, id := range openMustIDs {
+		seen[id] = true
+	}
+	for id, f := range byID {
+		if f.Severity == "must" && f.Status == "open" && !seen[id] {
+			openIDs = append(openIDs, id)
+			seen[id] = true
+		}
+	}
+	sort.Strings(openIDs)
 	var b strings.Builder
 	b.WriteString("The driver read the released durable review records before this round. ")
 	if newestRound > 0 {
@@ -2680,12 +2694,17 @@ func verificationDigest(records []plane.ReviewRecordState) string {
 	} else {
 		b.WriteString("No RELEASED review record is on the task. If the review round did not run, that is a failed hand-off to report in your record and hand over to a human; do not invent findings.\n")
 	}
-	if len(open) == 0 {
+	if len(openIDs) == 0 {
 		b.WriteString("The plane currently shows NO OPEN MUST on a released record. Still verify the fix delta of the newest round and its regression surface; if it is clean, carry the terminal step. Everything you find goes in this round's own record.\n\n")
 		return b.String()
 	}
 	b.WriteString("The following MUST(s) are OPEN and this round MUST adjudicate each BY ITS PLANE ID — resolved (status \"fixed\"), resolved by dispatch (status \"filed\"), refutation accepted (status \"refuted\"), or left \"open\" with a recorded reason:\n")
-	for _, f := range open {
+	for _, id := range openIDs {
+		f, ok := byID[id]
+		if !ok {
+			fmt.Fprintf(&b, "- %s [finding detail not served — read it from `reviews.records`]\n", id)
+			continue
+		}
 		loc := f.File
 		if f.Line > 0 {
 			loc = fmt.Sprintf("%s:%d", f.File, f.Line)
@@ -3074,7 +3093,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			}
 			return 0, 0, false, end, nil
 		}
-		verifyDigest = verificationDigest(st.Reviews)
+		verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs)
 	}
 	retries := 0
 	// Consecutive attempts that ended without the harness reporting any usage -

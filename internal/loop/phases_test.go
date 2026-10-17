@@ -2470,6 +2470,13 @@ type reviewReleaser struct {
 	holder  string
 	records []plane.ReviewRecordState
 
+	// counted and openMusts are the plane's phase-4 answers (CLA-636/638): the
+	// non-void round count in the newest record's cycle and the open MUST ids on
+	// released records. A test mutates them from fakeAdapter.onInvoke, the way a
+	// real verify session's record append and a round close land.
+	counted   int
+	openMusts []string
+
 	// readErr, when set, is consulted on every TaskState read: a test injects a
 	// failing read (consumed once, say) to drive the CLA-663 baseline-read retry
 	// without a second fake. reads counts every read served.
@@ -2478,6 +2485,12 @@ type reviewReleaser struct {
 
 	closes   []int
 	closeErr error
+
+	// parks and questions are what the driver sent when the stopping rule parked
+	// the task (CLA-638), so a test asserts the disposition, not only that
+	// something happened.
+	parks     []string
+	questions []string
 }
 
 func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
@@ -2488,10 +2501,12 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 		}
 	}
 	return plane.TaskState{
-		Status:       r.status,
-		ClaimedByRun: r.holder,
-		Outcome:      r.outcome,
-		Reviews:      r.records,
+		Status:            r.status,
+		ClaimedByRun:      r.holder,
+		Outcome:           r.outcome,
+		Reviews:           r.records,
+		ReviewCounted:     r.counted,
+		ReviewOpenMustIDs: r.openMusts,
 	}, nil
 }
 
@@ -2499,7 +2514,29 @@ func (r *reviewReleaser) CloseReviewRound(_ context.Context, _, _ string, round 
 	if r.closeErr != nil {
 		return r.closeErr
 	}
+	// The real plane releases the round's findings on close (state sealed -> open,
+	// CLA-636); the fake must too, or a later digest/resolved read would see the
+	// records exactly as the seal left them.
+	for i := range r.records {
+		if r.records[i].Round == round && r.records[i].State == "sealed" {
+			r.records[i].State = "open"
+		}
+	}
 	r.closes = append(r.closes, round)
+	return nil
+}
+
+func (r *reviewReleaser) Park(_ context.Context, taskID, runID, outcome string) error {
+	r.parks = append(r.parks, outcome)
+	return nil
+}
+
+func (r *reviewReleaser) AskQuestion(_ context.Context, _, body string, _ []string, _ bool, _ string) error {
+	r.questions = append(r.questions, body)
+	return nil
+}
+
+func (r *reviewReleaser) AskProjectQuestion(_ context.Context, _ string, _ []string, _ string) error {
 	return nil
 }
 
@@ -3758,5 +3795,377 @@ func TestSalvage_SkipsTheReviewOnlyPhase(t *testing.T) {
 	}
 	if len(s.calls) != 1 {
 		t.Fatalf("salvaged %d times, want exactly 1 (the implement phase): %+v", len(s.calls), s.calls)
+	}
+}
+
+// ── CLA-638: fix-verification rounds and the stopping rule ──────────────────
+
+// mustFinding is one plane-served finding, shapes for the verification fixtures.
+func mustFinding(id, status, summary string) plane.ReviewFindingState {
+	return plane.ReviewFindingState{ID: id, Severity: "must", Status: status, Summary: summary}
+}
+
+// verifyPhases is the shipped four-phase shape the CLA-638 tests drive.
+func verifyPhases() []config.Phase {
+	return []config.Phase{
+		{Name: config.ImplementPhaseName, Tier: "cheap"},
+		{Name: config.ReviewPhaseName, Tier: "strong"},
+		{Name: config.FixPhaseName, Tier: "cheap"},
+		{Name: config.VerifyPhaseName},
+	}
+}
+
+// TestDrainPhases_VerificationRoundPassesWithNoOpenMust: a verify round that
+// closes with no open MUST ends the sequence; the verifier carried the terminal
+// step itself, and the driver neither spawns another fix nor parks.
+func TestDrainPhases_VerificationRoundPassesWithNoOpenMust(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review gate records round 1
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+		if i == 3 { // the verify round records round 2 and the plane reads as clean
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.openMusts = nil
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — implement, review, fix, verify", h.invokeCalls)
+	}
+	if len(rel.closes) != 2 || rel.closes[0] != 1 || rel.closes[1] != 2 {
+		t.Fatalf("closed rounds = %v, want [1 2] — the review and the verification round must both be released", rel.closes)
+	}
+	if len(rel.parks) != 0 || len(rel.questions) != 0 {
+		t.Fatalf("a clean verification round parked the task: parks=%v questions=%v", rel.parks, rel.questions)
+	}
+}
+
+// TestDrainPhases_VerificationOpenMustSpawnsAnotherFix: a verify round with an
+// open MUST does NOT hand over — the driver spawns another fix and verifies
+// again, closing each round as it goes. It also pins the brief split: the fix
+// phase must not carry the terminal step when a verifier follows, and the
+// verifier must be handed the prior open MUST ids.
+func TestDrainPhases_VerificationOpenMustSpawnsAnotherFix(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+	}}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1: // the review raises the MUST the verifier will adjudicate
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+			rel.openMusts = []string{"1.review-1.1"}
+		case 3: // verify round 2 leaves the MUST open
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.openMusts = []string{"1.review-1.1"}
+		case 5: // verify round 3 resolves it
+			rel.records = append(rel.records, recordFor(3, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 3
+			rel.openMusts = nil
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 6 {
+		t.Fatalf("spawned %d sessions, want 6 — implement, review, fix, verify, fix, verify", h.invokeCalls)
+	}
+	if len(rel.parks) != 0 {
+		t.Fatalf("the loop parked before the cap: %v", rel.parks)
+	}
+	if len(rel.closes) != 3 {
+		t.Fatalf("closed rounds = %v, want three closes (1, 2, 3)", rel.closes)
+	}
+	// The fix prompt is the no-PR variant while a verifier follows.
+	fix1, fix2 := h.invocations[2].Prompt, h.invocations[4].Prompt
+	for i, p := range []string{fix1, fix2} {
+		if strings.Contains(p, "Open a PR targeting") {
+			t.Errorf("fix session %d carries the PR terminal step even though a verification round follows:\n%s", i+1, p)
+		}
+		if !strings.Contains(p, "Do NOT open a PR") {
+			t.Errorf("fix session %d does not tell the fixer the verifier owns the hand-over:\n%s", i+1, p)
+		}
+	}
+	// The verifier is handed the prior open MUST ids and the gate contract.
+	v1, v2 := h.invocations[3].Prompt, h.invocations[5].Prompt
+	if !strings.Contains(v1, "1.review-1.1") {
+		t.Errorf("the verification brief does not list the prior open MUST id:\n%s", v1)
+	}
+	for i, p := range []string{v1, v2} {
+		for _, want := range []string{
+			"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
+			"fix-delta",
+			"NO OPEN MUST",
+			"status: \"in_review\"",
+		} {
+			if !strings.Contains(p, want) {
+				t.Errorf("the verification brief %d does not carry %q:\n%s", i+1, want, p)
+			}
+		}
+	}
+}
+
+// TestDrainPhases_VerificationCapParksWithTheRecords: at the round cap (the
+// plane counts non-void rounds), an open MUST parks the task with a question
+// carrying the records — never one more round. The cap is read from the plane,
+// so a takeover that starts with the counter already at 3 parks immediately.
+func TestDrainPhases_VerificationCapParksWithTheRecords(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)}, // a fifth session would be the forbidden "one more round"
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review raises the MUST
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+			rel.openMusts = []string{"1.review-1.1"}
+		}
+		if i == 3 { // round 3 closed with an open MUST: the cap is spent
+			rel.records = append(rel.records, recordFor(3, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 3
+			rel.openMusts = []string{"1.review-1.1"}
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions after the cap, want 4 — never one more round", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 || len(rel.questions) != 1 {
+		t.Fatalf("cap did not park with a question: parks=%v questions=%v", rel.parks, rel.questions)
+	}
+	if !strings.Contains(rel.parks[0], "1.review-1.1") || !strings.Contains(rel.parks[0], "3-round cap") {
+		t.Errorf("the park outcome does not carry the records:\n%s", rel.parks[0])
+	}
+	if !strings.Contains(rel.questions[0], "1.review-1.1") || !strings.Contains(rel.questions[0], "reviews.records") {
+		t.Errorf("the question does not carry the records:\n%s", rel.questions[0])
+	}
+}
+
+// TestDrainPhases_VerificationNonConvergenceParks: a MUST left open after two
+// fix attempts (its id's round prefix is two or more behind the closing round)
+// parks the task even when the plane's count is below the cap — the void-round
+// case where the cap alone would not stop the loop.
+func TestDrainPhases_VerificationNonConvergenceParks(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)}, // a fifth session would be the forbidden "one more round"
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the review raises the MUST
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+			rel.openMusts = []string{"1.review-1.1"}
+		}
+		if i == 3 { // round 3 (a round 2 was voided): the round-1 MUST is still open
+			rel.records = append(rel.records, recordFor(3, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.openMusts = []string{"1.review-1.1"}
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — the two-attempt breaker must stop the loop", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 || !strings.Contains(rel.parks[0], "after two fix attempts") {
+		t.Fatalf("the non-convergence breaker did not park: parks=%v", rel.parks)
+	}
+}
+
+// TestDrainPhases_VerificationReopenedFindingParks: an id a previous verifier
+// marked resolved that the next verifier reopens parks the task (A6's second
+// arm). It needs two open findings to keep the loop alive between the resolve
+// and the reopen, which is exactly the shape the breaker exists for.
+func TestDrainPhases_VerificationReopenedFindingParks(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)}, // would be round 4: forbidden
+	}}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1: // the review raises A and B
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "A"), mustFinding("1.review-1.2", "open", "B")},
+			})
+		case 3: // verify round 2 marks A fixed, leaves B open
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.records[0].Findings[0].Status = "fixed"
+			rel.counted = 2
+			rel.openMusts = []string{"1.review-1.2"}
+		case 5: // verify round 3 marks B fixed but REOPENS A
+			rel.records = append(rel.records, recordFor(3, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.records[0].Findings[0].Status = "open"
+			rel.records[0].Findings[1].Status = "fixed"
+			rel.counted = 3
+			rel.openMusts = []string{"1.review-1.1"}
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 6 {
+		t.Fatalf("spawned %d sessions, want 6 — the loop runs to the round that reopens the finding", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 || !strings.Contains(rel.parks[0], "open again") {
+		t.Fatalf("a reopened finding did not park with the non-convergence reason: parks=%v", rel.parks)
+	}
+}
+
+// TestDrainPhases_VerificationWithoutARecordParks: a verify session that wrote
+// no durable record cannot be judged — the stopping rule refuses to hand over
+// on nothing, and there is no next fix to spawn. The task parks.
+func TestDrainPhases_VerificationWithoutARecordParks(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)}, // the verifier records nothing
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4", h.invokeCalls)
+	}
+	if len(rel.parks) != 1 || !strings.Contains(rel.parks[0], "could not be judged") {
+		t.Fatalf("a recordless verification round did not park fail-closed: parks=%v", rel.parks)
+	}
+}
+
+// TestNonConvergenceReason pins the two arms directly, including the void-round
+// case the driver's round-prefix arithmetic exists for.
+func TestNonConvergenceReason(t *testing.T) {
+	resolved := map[string]bool{"1.review-1.1": true}
+	tests := []struct {
+		name     string
+		open     []string
+		round    int
+		want     string
+		resolved map[string]bool
+	}{
+		{"a fresh id is not non-convergence", []string{"2.review-2.1"}, 2, "", resolved},
+		{"reopened after resolved", []string{"1.review-1.1"}, 3, "open again", resolved},
+		{"unresolved after two attempts", []string{"1.review-1.2"}, 3, "after two fix attempts", map[string]bool{}},
+		{"one attempt is not two", []string{"2.review-1.1"}, 3, "", map[string]bool{}},
+		{"unparseable id never fires the round arm", []string{"legacy-id"}, 3, "", map[string]bool{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := nonConvergenceReason(tc.open, tc.round, tc.resolved)
+			if tc.want == "" {
+				if got != "" {
+					t.Fatalf("nonConvergenceReason = %q, want empty", got)
+				}
+				return
+			}
+			if !strings.Contains(got, tc.want) {
+				t.Fatalf("nonConvergenceReason = %q, want it to contain %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFindingIDRound pins the namespace parse (B13): the driver reads the round
+// back off the plane-assigned `<round>.<role>.<n>` rather than tracking one.
+func TestFindingIDRound(t *testing.T) {
+	if r, ok := findingIDRound("2.review-1.3"); !ok || r != 2 {
+		t.Errorf("findingIDRound(2.review-1.3) = %d,%v", r, ok)
+	}
+	if _, ok := findingIDRound("legacy"); ok {
+		t.Error("a prefix-less id parsed as a round")
+	}
+}
+
+// TestVerificationDigest: the driver's brief lists exactly the OPEN MUSTs on
+// released records, with their plane ids, and names the delta base. Sealed and
+// void records contribute nothing; the empty-open case still names the base so
+// the round knows what delta to verify.
+func TestVerificationDigest(t *testing.T) {
+	records := []plane.ReviewRecordState{
+		{Round: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", Findings: []plane.ReviewFindingState{
+			mustFinding("1.review-1.1", "open", "the seam is untested"),
+			mustFinding("1.review-1.2", "fixed", "already fixed"),
+		}},
+		{Round: 2, ReviewerRole: "review-2", ReviewedTip: "bbbb", State: "sealed", Findings: []plane.ReviewFindingState{
+			mustFinding("2.review-2.1", "open", "sealed, must not leak"),
+		}},
+	}
+	got := verificationDigest(records, []string{"1.review-1.1"})
+	if !strings.Contains(got, "1.review-1.1") || !strings.Contains(got, "the seam is untested") {
+		t.Errorf("the digest omits the open MUST:\n%s", got)
+	}
+	if strings.Contains(got, "1.review-1.2") || strings.Contains(got, "2.review-2.1") {
+		t.Errorf("the digest lists a resolved or sealed finding:\n%s", got)
+	}
+	if !strings.Contains(got, "aaaa") {
+		t.Errorf("the digest does not name the newest RELEASED tip as the delta base:\n%s", got)
+	}
+	if strings.Contains(got, "bbbb") {
+		t.Errorf("the digest names a sealed record's tip as the delta base (a sealed round's findings are withheld):\n%s", got)
+	}
+	clean := verificationDigest([]plane.ReviewRecordState{
+		{Round: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open"},
+	}, nil)
+	if !strings.Contains(clean, "NO OPEN MUST") || !strings.Contains(clean, "aaaa") {
+		t.Errorf("a clean digest must still name the delta base and the clear gate:\n%s", clean)
 	}
 }
