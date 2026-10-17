@@ -177,6 +177,17 @@ func checkOpencodePermissions(cfg *config.Config, label, harnessName string) che
 		return c
 	}
 	c.info = append(c.info, opencodeShellGapNote)
+	if sess.MCPConfigPath != "" {
+		var named map[string]json.RawMessage
+		if data, err := os.ReadFile(sess.MCPConfigPath); err == nil && json.Unmarshal(data, &named) == nil {
+			if raw, ok := named["permission"]; ok && string(raw) != "null" {
+				c.status = warn
+				c.detail = sess.MCPConfigPath + " declares its own `permission` block; it is also loaded as OPENCODE_CONFIG, where opencode merges it key by key under the pinned policy and its keys sort ahead of the `*` catch-all"
+				c.remedy = "remove `permission` from the mcp config; the adapter supplies the policy"
+				return c
+			}
+		}
+	}
 	if where, v, ok := opencodeEnvOverride(cfg, harnessName, "OPENCODE_CONFIG_CONTENT"); ok {
 		c.status = warn
 		c.detail = "env replaces the adapter's OPENCODE_CONFIG_CONTENT (declared at " + where + "), and with it the fail-closed permission block"

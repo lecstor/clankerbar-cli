@@ -832,10 +832,12 @@ func (opencode) env(in Invocation) ([]string, error) {
 // as written (UseNumber) so a re-marshalled timeout or port is byte-for-byte the
 // operator's value.
 //
-// The file's own `permission` key, if any, is replaced rather than merged.
-// config.Validate already refuses a `permission` key in the named file
-// (checkDiscoveredMCPConfig), so this only matters for a caller that bypassed
-// it, and replacing is the fail-closed choice.
+// The file's own `permission` key, if any, is replaced here rather than merged.
+// That does not neutralise it: the same file is also loaded as OPENCODE_CONFIG,
+// an earlier layer, and opencode merges permission blocks key by key in
+// insertion order, so a key the file declares sorts ahead of this policy's `*`
+// catch-all. doctor WARNs on a named file carrying one (and config refuses one
+// in a DISCOVERED file, checkDiscoveredMCPConfig).
 func opencodeSessionConfig(in Invocation) ([]byte, error) {
 	doc := map[string]any{}
 	if in.MCPConfigPath != "" {

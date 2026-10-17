@@ -1554,6 +1554,15 @@ func TestPermissionsOpencodeReportsThePinnedPosture(t *testing.T) {
 		t.Errorf("content override: got %v, want WARN", c.status)
 	}
 
+	// A named file with its own permission block merges under the policy.
+	cfg.Env = nil
+	if err := os.WriteFile(mcp, []byte(`{"permission":{"read":"allow"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkPermissions(cfg); c.status != warn || !strings.Contains(c.detail, "permission") {
+		t.Errorf("named permission block: got %v %q, want WARN", c.status, c.detail)
+	}
+
 	// A config the adapter refuses to build from is a FAIL: no session spawns.
 	if err := os.WriteFile(mcp, []byte(`{"mcp": // not json`), 0o600); err != nil {
 		t.Fatal(err)
