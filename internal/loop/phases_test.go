@@ -967,9 +967,9 @@ func TestRun_ResumedPhaseLimitWaitHonoursMarkers(t *testing.T) {
 // The incident CLA-651 exists for, end to end: one transient blip (a claude
 // 5xx, a stream drop) landing on a resumed phase — the review phase of every
 // task — must not take the whole daemon down. The sequence ends, the run stays
-// up and polls again; a second sequence spawning is the proof. No wait is owed
-// for a blip: the re-drain's first-phase arm owns the backoff ladder, and the
-// run-level loop adds no pause of its own.
+// up and polls again; a second sequence spawning is the proof. Since CLA-662
+// the poll is not immediate: the run owes the target's transient backoff rung,
+// taken after the sequence's handback with no lease held.
 func TestRun_ResumedPhaseTransientFailureKeepsTheDaemonDraining(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(1, 0)},                   // iteration 1: implement checkpoints
@@ -977,8 +977,23 @@ func TestRun_ResumedPhaseTransientFailureKeepsTheDaemonDraining(t *testing.T) {
 		{res: checkpointed(1, 0)},                   // iteration 2: implement spawns again
 		{res: okResult(1, 0)},                       // iteration 2: review runs
 	}}
-	d, _ := phaseDriver(t, h, twoPhases())
+	d, rel := phaseDriver(t, h, twoPhases())
 	d.cfg.MaxIterations = 2
+
+	var waitAt time.Time
+	d.resumedTransientWait = func(n int) time.Duration {
+		if n != 1 {
+			t.Errorf("the first blip waited rung %d, want 1", n)
+		}
+		waitAt = time.Now()
+		return time.Millisecond
+	}
+	var firstRelease time.Time
+	rel.onCall = func() {
+		if firstRelease.IsZero() {
+			firstRelease = time.Now()
+		}
+	}
 
 	logs := captureLogs(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -994,11 +1009,223 @@ func TestRun_ResumedPhaseTransientFailureKeepsTheDaemonDraining(t *testing.T) {
 		t.Errorf("the session spawned after the blip is not a fresh sequence: %q", got)
 	}
 	if h.probeCalls != 0 {
-		t.Errorf("probed %d times — a blip has no reset to wait out, and the run must not add a wait of its own", h.probeCalls)
+		t.Errorf("probed %d times — a blip has no reset to wait out; the wait owed is the transient ladder, not a supervised limit wait", h.probeCalls)
 	}
-	if out := logs.String(); !strings.Contains(out, "the run stays up to poll again") {
-		t.Errorf("the log must say the run is staying up, not only that the sequence ended; log was:\n%s", out)
+	if waitAt.IsZero() {
+		t.Fatal("the run re-drained without a wait of its own — with the resumed phase on another harness nothing else bounds the loop")
 	}
+	// The handback for the failed sequence runs BEFORE the wait (drainPhases'
+	// deferred release, then the wait block): the wait is taken holding no
+	// lease. The drain's own final handback releases again later in the run,
+	// so the FIRST release is the one the wait must follow.
+	if firstRelease.IsZero() || !firstRelease.Before(waitAt) {
+		t.Errorf("the wait must come after the failed sequence's handback, holding no lease; first release at %s, wait at %s",
+			firstRelease, waitAt)
+	}
+	if out := logs.String(); !strings.Contains(out, "the run stays up to poll again") || !strings.Contains(out, "transient failure 1 in a row") {
+		t.Errorf("the log must say the run is staying up and name the streak the wait is on; log was:\n%s", out)
+	}
+}
+
+// CLA-662, the gap CLA-651 left: the resumed phase runs on a DIFFERENT harness
+// from the one that claims the queue — the README's own per-phase example
+// (implement opencode, review claude) — so the first-phase transient arm never
+// sees the failure and nothing in the run bounds the re-drain. Each drain
+// claims a task, implements and pushes it, and the review blips instantly; with
+// no wait owed, the run re-drains at once and strands a task per cycle. The run
+// must instead wait a backoff that GROWS with the consecutive blips, and start
+// the ladder over as soon as a resumed phase on that target completes.
+func TestRun_ResumedPhaseTransientBackoffGrowsAndResets(t *testing.T) {
+	impl := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},
+		{res: checkpointed(1, 0)},
+		{res: checkpointed(1, 0)},
+		{res: checkpointed(1, 0)},
+		{res: checkpointed(1, 0)},
+		{res: checkpointed(1, 0)},
+	}}
+	blip := func() invokeStep { return invokeStep{res: held(transientResult(), openClaim())} }
+	review := &fakeAdapter{steps: []invokeStep{
+		blip(),
+		blip(),
+		blip(),
+		{res: okResult(1, 0)}, // review completes: the streak resets...
+		blip(),                // ...so this blip is the first rung again
+		{res: okResult(1, 0)}, // and the run ends on a completed sequence
+	}}
+	d := mixedDriver(t, impl, review)
+	d.cfg.MaxIterations = 6
+
+	var rungs []int
+	type waitRec struct {
+		rung int
+		at   time.Time
+	}
+	var waits []waitRec
+	d.resumedTransientWait = func(n int) time.Duration {
+		rungs = append(rungs, n)
+		waits = append(waits, waitRec{n, time.Now()})
+		return time.Duration(n) * 50 * time.Millisecond
+	}
+	var implAt []time.Time
+	impl.onInvoke = func(int) { implAt = append(implAt, time.Now()) }
+
+	logs := captureLogs(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	want := []int{1, 2, 3, 1}
+	if len(rungs) != len(want) {
+		t.Fatalf("waited backoff rungs %v, want %v — each consecutive blip on the target owes the next rung, and a completed review resets the ladder", rungs, want)
+	}
+	for i := range want {
+		if rungs[i] != want[i] {
+			t.Fatalf("waited backoff rungs %v, want %v — the ladder must grow with consecutive blips and reset when a resumed phase on the target completes", rungs, want)
+		}
+	}
+	if impl.invokeCalls != 6 || review.invokeCalls != 6 {
+		t.Fatalf("implement ran %d session(s), review %d, want 6 each — the run must keep draining while the blips persist", impl.invokeCalls, review.invokeCalls)
+	}
+	// The waits are real, not bookkeeping: the implement of the NEXT drain
+	// starts only after the rung's floor has elapsed (50ms a rung). A rung
+	// that did not grow would fail the floor below, not just the rung list.
+	// The rung list alone cannot map waits to drains — drain 4 completes and
+	// owes none — so each wait is judged against the next implement after it.
+	for _, w := range waits {
+		next := time.Time{}
+		for _, at := range implAt {
+			if !at.Before(w.at) {
+				next = at
+				break
+			}
+		}
+		if next.IsZero() {
+			t.Fatalf("rung %d's wait was never followed by another implement — the fixture does not cover the wait it owes", w.rung)
+		}
+		if gap := next.Sub(w.at); gap < time.Duration(w.rung)*50*time.Millisecond {
+			t.Errorf("the implement after rung %d's wait started %s after the wait began, less than the rung's floor %s",
+				w.rung, gap.Round(time.Millisecond), time.Duration(w.rung)*50*time.Millisecond)
+		}
+	}
+	if out := logs.String(); !strings.Contains(out, "transient failure 3 in a row") {
+		t.Errorf("the log must name the streak the wait is on; log was:\n%s", out)
+	}
+}
+
+// The transient wait is waitOrStop's — the same machinery the limit wait uses —
+// so the control markers land here too: STOP/RESTART stop the run through it
+// (consumed by the WAIT, which is what the log line distinguishes), and RELOAD
+// applies in place and lets the wait finish so the run keeps draining.
+func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
+	t.Run("STOP lands in the wait and stops the run", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(1, 0)},
+			{res: held(transientResult(), openClaim())},
+		}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		d.cfg.MaxIterations = 10
+		h.onInvoke = func(call int) {
+			if call == 0 {
+				writeMarker(t, d.state.Path(), "STOP", "")
+			}
+		}
+
+		logs := captureLogs(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if h.invokeCalls != 2 {
+			t.Errorf("spawned %d sessions; a STOP dropped during the failing sequence must land in the wait, before the next sequence", h.invokeCalls)
+		}
+		if markerPresent(t, d.state.Path(), "STOP") {
+			t.Error("STOP must be consumed when honoured")
+		}
+		if out := logs.String(); !strings.Contains(out, "STOP requested during wait") {
+			t.Errorf("the STOP must be consumed by the WAIT, not by a boundary after it; log was:\n%s", out)
+		}
+	})
+
+	t.Run("RESTART lands in the wait and asks for the re-exec", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(1, 0)},
+			{res: held(transientResult(), openClaim())},
+		}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		d.cfg.MaxIterations = 10
+		h.onInvoke = func(call int) {
+			if call == 0 {
+				writeMarker(t, d.state.Path(), MarkerRestart, "new build installed")
+			}
+		}
+
+		logs := captureLogs(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if !d.restartRequested.Load() {
+			t.Error("a RESTART dropped during the resumed-phase transient wait did not ask for the re-exec")
+		}
+		if h.invokeCalls != 2 {
+			t.Errorf("spawned %d sessions; the RESTART must stop the run at the wait", h.invokeCalls)
+		}
+		if markerPresent(t, d.state.Path(), MarkerRestart) {
+			t.Error("RESTART must be consumed when honoured")
+		}
+		if out := logs.String(); !strings.Contains(out, "RESTART requested during wait") {
+			t.Errorf("the restart must be logged as landing IN the wait; log was:\n%s", out)
+		}
+	})
+
+	t.Run("RELOAD applies in the wait and the run keeps draining", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(1, 0)},
+			{res: held(transientResult(), openClaim())},
+			{res: checkpointed(1, 0)},
+			{res: okResult(1, 0)},
+		}}
+		d, _ := phaseDriver(t, h, twoPhases())
+		d.cfg.MaxIterations = 10
+		reloads := 0
+		d.SetReloader(func() (*config.Config, error) {
+			reloads++
+			fresh := *d.cfg
+			// Proof the reload really landed mid-wait: the fresh document
+			// stops the run after the second drain.
+			fresh.MaxIterations = 2
+			return &fresh, nil
+		})
+		h.onInvoke = func(call int) {
+			if call == 0 {
+				writeMarker(t, d.state.Path(), MarkerReload, "")
+			}
+		}
+
+		logs := captureLogs(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if reloads != 1 {
+			t.Errorf("the reloader ran %d time(s), want 1 — the wait must consume the marker and apply it", reloads)
+		}
+		if h.invokeCalls != 4 {
+			t.Errorf("spawned %d sessions, want 4 — a reload must not cut the wait's run short; it applies in place and the run keeps draining", h.invokeCalls)
+		}
+		if markerPresent(t, d.state.Path(), MarkerReload) {
+			t.Error("RELOAD must be consumed when honoured")
+		}
+		if out := logs.String(); !strings.Contains(out, "RELOAD requested during wait") {
+			t.Errorf("the reload must be logged as landing IN the wait; log was:\n%s", out)
+		}
+	})
 }
 
 func TestDrainPhases_SumsSpendAcrossPhases(t *testing.T) {
