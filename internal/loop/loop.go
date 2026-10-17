@@ -2302,7 +2302,7 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 		// read — or cannot be found — is not a review that happened. The cost
 		// is a re-run of the review; the alternative is an unreviewed PR. An
 		// unread BASELINE never reaches this gate: an unreadable baseline is
-		// refused before the review spawns (CLA-663), so this switch judges
+		// refused before the review spawns (CLA-663), so this gate judges
 		// only tasks both reads could see.
 		if review.required {
 			if !recordRead {
