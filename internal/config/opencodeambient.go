@@ -288,16 +288,21 @@ func readOpencodeConfig(path string) (mcpFile, bool) {
 // `mcp_config_path` resolved to - a file opencode discovers by itself never
 // reaches that gate, and it is merged into every session all the same.
 //
-// `permission` is on the list because the merge is recursive and PER KEY: on
-// 2.x the adapter's policy rides in OPENCODE_CONFIG_CONTENT, the last layer,
-// but a key an ambient file declared keeps ITS position in the merged object
-// and the evaluator is last-match-wins over that insertion order. Read out of
-// 1.18.19 (`o={...r,...a}` then a recursive descent, flattened with
-// Object.entries); 2.x accepts the same block shape and its ordering was not
-// re-derived from source, so the report stands on the 1.x reading. Let an
-// ambient file declare `permission.read` and `read` sorts AHEAD of the policy's
-// `*` deny, which then becomes the final match for every read - the CLA-441
-// wall arrived at from the other direction (CLA-441 second review).
+// `permission` is on the list, though on 2.x a top-level block in a lower
+// layer was observed to neither loosen nor lock out the policy the adapter pins
+// (CLA-675 review, 2.0.32). It still shapes every INTERACTIVE session in that
+// tree, which is what this report is for. (On 1.x it was worse: the merge kept
+// the file's key order ahead of the policy's `*` catch-all and could deny every
+// read, CLA-441.)
+//
+// An agent-level permission block - 1.x `agent.<name>.permission`, 2.x
+// `agents.<name>.permissions` - and `default_agent` are the 2.x mechanism that
+// DOES bite: verified on 2.0.32, an agent's own block overrides the top-level
+// policy for that agent, and default_agent routes a session to an agent of the
+// file's choosing. The adapter pins the policy on every built-in agent and
+// passes --agent build, which the conformance suite shows defeats both, so this
+// is reported rather than refused: refusing would stop the fleet over a file the
+// pin already neutralises, often a checked-in file of somebody else's repo.
 //
 // `plugin` is code opencode loads and runs at session start. An `mcp` entry
 // with a `command` is the same threat wearing a different key, and
@@ -312,13 +317,19 @@ func readOpencodeConfig(path string) (mcpFile, bool) {
 func sessionShapingKeys(f mcpFile) []string {
 	var out []string
 	if rawSet(f.Permission) {
-		out = append(out, "`permission` (rules merged into the session's own policy, which reorders it and can deny everything)")
+		out = append(out, "`permission` (applies to every interactive session in that tree; spawned sessions are pinned past it)")
 	}
 	if rawSet(f.Plugin) {
 		out = append(out, "`plugin` (code run at session start)")
 	}
 	if names := authorityAgents(f.Agent); len(names) > 0 {
 		out = append(out, "`agent` with tool or permission authority ("+strings.Join(names, ", ")+")")
+	}
+	if names := authorityAgents(f.Agents); len(names) > 0 {
+		out = append(out, "`agents` with tool or permission authority ("+strings.Join(names, ", ")+")")
+	}
+	if rawSet(f.DefaultAgent) {
+		out = append(out, "`default_agent` (routes every interactive session to that agent; spawned sessions select build)")
 	}
 	if names := localProcessServers(f); len(names) > 0 {
 		out = append(out, "an `mcp` server that starts a local process ("+strings.Join(names, ", ")+")")
@@ -345,7 +356,7 @@ func authorityAgents(raw json.RawMessage) []string {
 	}
 	var out []string
 	for _, name := range sortedRawKeys(block) {
-		for _, key := range []string{"permission", "tools", "mode", "disable", "prompt"} {
+		for _, key := range []string{"permission", "permissions", "tools", "mode", "disable", "prompt"} {
 			if rawSet(block[name][key]) {
 				out = append(out, name)
 				break

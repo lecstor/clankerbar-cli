@@ -1554,13 +1554,14 @@ func TestPermissionsOpencodeReportsThePinnedPosture(t *testing.T) {
 		t.Errorf("content override: got %v, want WARN", c.status)
 	}
 
-	// A named file with its own permission block merges under the policy.
+	// A named file with its own permission block has no effect on 2.x: said
+	// as information, not warned.
 	cfg.Env = nil
 	if err := os.WriteFile(mcp, []byte(`{"permission":{"read":"allow"}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if c := checkPermissions(cfg); c.status != warn || !strings.Contains(c.detail, "permission") {
-		t.Errorf("named permission block: got %v %q, want WARN", c.status, c.detail)
+	if c := checkPermissions(cfg); c.status != pass || !slices.ContainsFunc(c.info, func(s string) bool { return strings.Contains(s, "no effect") }) {
+		t.Errorf("named permission block: got %v %q %v, want PASS with an info line", c.status, c.detail, c.info)
 	}
 
 	// A config the adapter refuses to build from is a FAIL: no session spawns.
@@ -2873,5 +2874,30 @@ func TestDoctorWarnsOnAnAmbientOpencodeConfigNamingAnotherProject(t *testing.T) 
 	}
 	if c := checkOpencodeAmbientConfigs(cfg); c.status != pass {
 		t.Errorf("status = %v, want PASS once the file names the project this run drains (%s)", c.status, c.detail)
+	}
+}
+
+// Typeless MCP entries meant as disables are flagged with the full-entry remedy
+// (CLA-675 review S2): on 2.x they leave the globally declared server running.
+func TestOpencodeMCPDisablesCheck(t *testing.T) {
+	mcp := filepath.Join(t.TempDir(), "opencode-mcp.json")
+	body := `{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/p","enabled":true},"context7":{"enabled":false},"servers":{"chrome":{"disabled":true}}}}`
+	if err := os.WriteFile(mcp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), MCPConfigPath: mcp}
+	got := checkOpencodeMCPDisables(cfg)
+	if len(got) != 1 || got[0].status != warn || !strings.Contains(got[0].detail, "mcp.context7") ||
+		!strings.Contains(got[0].detail, "mcp.servers.chrome") || strings.Contains(got[0].detail, "clankerbar") {
+		t.Fatalf("got %+v", got)
+	}
+	if !strings.Contains(got[0].remedy, `"type"`) {
+		t.Errorf("remedy = %q, want the full-entry shape", got[0].remedy)
+	}
+	if err := os.WriteFile(mcp, []byte(`{"mcp":{"context7":{"type":"remote","url":"u","enabled":false}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := checkOpencodeMCPDisables(cfg); got[0].status != pass {
+		t.Errorf("a full disable entry was flagged: %+v", got)
 	}
 }

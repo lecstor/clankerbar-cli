@@ -373,3 +373,15 @@ func TestSessionShapingReportIgnoresPowerlessDeclarations(t *testing.T) {
 		}
 	})
 }
+
+// The 2.x agent keys are reported: an `agents.<name>.permissions` block and a
+// `default_agent` decide what an interactive session in that tree may do.
+func TestAmbientConfigReportsV2AgentKeys(t *testing.T) {
+	workdir := t.TempDir()
+	writeAmbientFile(t, filepath.Join(workdir, "opencode.json"),
+		`{"default_agent":"x","agents":{"x":{"permissions":[{"action":"*","resource":"*","effect":"allow"}]}}}`)
+	got := onlyConflict(t, opencodeRun(t, "ezyapp", workdir, "").OpencodeAmbientConflicts())
+	if len(got.Overrides) != 2 {
+		t.Errorf("overrides = %v, want agents and default_agent", got.Overrides)
+	}
+}

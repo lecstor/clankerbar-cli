@@ -101,6 +101,8 @@ func (c *Config) checkDiscoveredMCPConfig(path, label string, allow []string) er
 		{"permission", f.Permission, "permission rules, which merge into the policy this driver exports and reorder it"},
 		{"plugin", f.Plugin, "code loaded and run at startup"},
 		{"agent", f.Agent, "agent definitions, including their modes and permissions"},
+		{"agents", f.Agents, "agent definitions (2.x dialect), including their permissions"},
+		{"default_agent", f.DefaultAgent, "the agent a session starts on"},
 	} {
 		if !rawSet(k.raw) {
 			continue

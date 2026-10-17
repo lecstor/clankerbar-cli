@@ -721,6 +721,64 @@ func TestOpencodeConformance_largeClaim(t *testing.T) {
 	}
 }
 
+// Switching off a server the global config declares takes a FULL entry in the
+// mcp config: verified on 2.0.32, a partial `{"enabled": false}` (1.x) or
+// `servers.X: {"disabled": true}` (2.x) leaves it running, and doctor's
+// opencode_mcp_disables check says so. The full forms must keep it off; the
+// partial ones are logged so a build that changes this is noticed.
+func TestOpencodeConformance_mcpDisable(t *testing.T) {
+	requireOpencodeConformance(t)
+	clone := func(e map[string]any, k string, v any) map[string]any {
+		c := map[string]any{}
+		for key, val := range e {
+			c[key] = val
+		}
+		c[k] = v
+		return c
+	}
+	for _, c := range []struct {
+		name  string
+		block func(e map[string]any) map[string]any
+		full  bool
+	}{
+		{"full 1.x entry, enabled false", func(e map[string]any) map[string]any { return map[string]any{"other": clone(e, "enabled", false)} }, true},
+		{"full 2.x entry, disabled true", func(e map[string]any) map[string]any {
+			return map[string]any{"servers": map[string]any{"other": clone(e, "disabled", true)}}
+		}, true},
+		{"partial 1.x entry", func(map[string]any) map[string]any { return map[string]any{"other": map[string]any{"enabled": false}} }, false},
+		{"partial 2.x entry", func(map[string]any) map[string]any {
+			return map[string]any{"servers": map[string]any{"other": map[string]any{"disabled": true}}}
+		}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fake := &fakeOpenAI{delay: 1500 * time.Millisecond}
+			srv := httptest.NewServer(fake)
+			defer srv.Close()
+			iso := isolate(t)
+			mcpDir := t.TempDir()
+			entry := fakeMCPEntry(t, mcpDir)
+			global, _ := json.Marshal(map[string]any{"mcp": map[string]any{"other": entry}})
+			if err := os.WriteFile(filepath.Join(iso.cfgDir, "opencode.json"), global, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			doc := fakeConfigDoc(srv.URL)
+			doc["mcp"] = c.block(entry)
+			invokeConformance(t, iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, doc)))
+			requireHit(t, fake)
+			_, err := os.Stat(filepath.Join(mcpDir, "starts"))
+			started := err == nil
+			switch {
+			case c.full && started:
+				t.Error("a full entry with the off switch did not stop the server")
+			case !c.full && started:
+				t.Log("partial entry left the server running, as documented")
+			case !c.full:
+				t.Log("NOTE: a partial entry stopped the server on this build - re-pin docs/opencode-build.md and doctor's opencode_mcp_disables")
+			}
+		})
+	}
+}
+
 // Resume with `-s <sid>` continues the SAME session headlessly, and the
 // resumed run is charged only for its own requests, not the session's total.
 func TestOpencodeConformance_resume(t *testing.T) {

@@ -49,6 +49,12 @@ func runFakeMCP(dir string) {
 		}},
 		{"name": "get_backlog_summary", "description": "Summary", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{}}},
 	}
+	// Record that the server was started at all, for the tests that check a
+	// disabled server stays off.
+	if f, err := os.OpenFile(filepath.Join(dir, "starts"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+		f.WriteString("start\n")
+		f.Close()
+	}
 	out := bufio.NewWriter(os.Stdout)
 	send := func(v any) {
 		b, _ := json.Marshal(v)

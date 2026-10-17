@@ -88,6 +88,10 @@ type mcpFile struct {
 	Permission json.RawMessage `json:"permission"`
 	Plugin     json.RawMessage `json:"plugin"`
 	Agent      json.RawMessage `json:"agent"`
+	// Agents and DefaultAgent are the 2.x spellings: `agents.<name>` (with a
+	// `permissions` list) and the agent a session starts on.
+	Agents       json.RawMessage `json:"agents"`
+	DefaultAgent json.RawMessage `json:"default_agent"`
 }
 
 // UnmarshalJSON decodes the union mcpFile shape and additionally flattens the
@@ -113,12 +117,15 @@ func (f *mcpFile) UnmarshalJSON(data []byte) error {
 		Permission json.RawMessage     `json:"permission"`
 		Plugin     json.RawMessage     `json:"plugin"`
 		Agent      json.RawMessage     `json:"agent"`
+		Agents     json.RawMessage     `json:"agents"`
+		Default    json.RawMessage     `json:"default_agent"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return err
 	}
 	f.MCPServers = raw.MCPServers
 	f.Permission, f.Plugin, f.Agent = raw.Permission, raw.Plugin, raw.Agent
+	f.Agents, f.DefaultAgent = raw.Agents, raw.Default
 	if len(raw.MCP) == 0 || string(raw.MCP) == "null" {
 		return nil
 	}

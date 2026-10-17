@@ -55,9 +55,12 @@ func opencodeDataDir() string {
 	return filepath.Join(home, ".local", "share", "opencode")
 }
 
-// sqliteOpencodeCredentials counts the rows of opencode.db's credential table
-// per integration. It selects the integration id and a count only: no column
-// holding a secret is ever read. The database is opened read-only.
+// sqliteOpencodeCredentials counts the ACTIVE rows of opencode.db's credential
+// table per integration. It selects the integration id, the `active` flag and a
+// count only: no column holding a secret is ever read. The database is opened
+// read-only. A row whose `active` is 0 is not counted; NULL counts as active.
+// The table records no expiry, so a counted credential may still be expired or
+// revoked at the provider - presence is not validity, and the check says so.
 func sqliteOpencodeCredentials(ctx context.Context, dbPath string) (map[string]int, error) {
 	sq, err := exec.LookPath("sqlite3")
 	if err != nil {
@@ -66,7 +69,7 @@ func sqliteOpencodeCredentials(ctx context.Context, dbPath string) (map[string]i
 	ctx, cancel := context.WithTimeout(ctx, binVersionTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, sq, "-readonly", "-separator", "\t", dbPath,
-		"select coalesce(integration_id, ''), count(*) from credential group by 1").Output()
+		"select coalesce(integration_id, ''), count(*) from credential where coalesce(active, 1) != 0 group by 1").Output()
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +118,7 @@ func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []c
 	}
 	if len(counts) == 0 {
 		c.status = warn
-		c.detail = db + " holds no credential"
+		c.detail = db + " holds no active credential"
 		c.remedy = "run `opencode auth login`, or give the provider its key in the opencode config"
 		return []check{c}
 	}
@@ -125,7 +128,7 @@ func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []c
 	}
 	sort.Strings(names)
 	c.status = pass
-	c.detail = fmt.Sprintf("%s holds credentials for: %s (values not read)", db, strings.Join(names, ", "))
+	c.detail = fmt.Sprintf("%s holds active credentials for: %s (values not read; presence is not validity - the store records no expiry, so a revoked or expired key still counts)", db, strings.Join(names, ", "))
 	return []check{c}
 }
 
@@ -181,10 +184,10 @@ func checkOpencodePermissions(cfg *config.Config, label, harnessName string) che
 		var named map[string]json.RawMessage
 		if data, err := os.ReadFile(sess.MCPConfigPath); err == nil && json.Unmarshal(data, &named) == nil {
 			if raw, ok := named["permission"]; ok && string(raw) != "null" {
-				c.status = warn
-				c.detail = sess.MCPConfigPath + " declares its own `permission` block; it is also loaded as OPENCODE_CONFIG, where opencode merges it key by key under the pinned policy and its keys sort ahead of the `*` catch-all"
-				c.remedy = "remove `permission` from the mcp config; the adapter supplies the policy"
-				return c
+				// Verified on 2.0.32 (CLA-675 review): a top-level permission
+				// block in the OPENCODE_CONFIG layer neither loosened nor locked
+				// out the pinned policy. Said, not warned: it does nothing.
+				c.info = append(c.info, sess.MCPConfigPath+" declares a top-level `permission` block; on opencode 2.x the pinned policy wins over it, so it has no effect - remove it to avoid confusion")
 			}
 		}
 	}
@@ -204,4 +207,83 @@ func checkOpencodePermissions(cfg *config.Config, label, harnessName string) che
 	c.detail = fmt.Sprintf("fail-closed `permission` block pinned via OPENCODE_CONFIG_CONTENT (execute, webfetch, websearch denied); %d MCP %s out of Code Mode",
 		len(parsed.MCP.Servers), plural(len(parsed.MCP.Servers), "server", "servers"))
 	return c
+}
+
+// checkOpencodeMCPDisables flags MCP entries in the opencode mcp config files
+// that carry no `type`: partial entries such as `"context7": {"enabled":
+// false}`, meant to switch off a server the global config declares. Verified
+// on 2.0.32 (CLA-675 review), a partial entry in a later layer does NOT stop
+// that server, in either dialect (`servers.X: {"disabled": true}` included);
+// only a full entry with its `type` and `command`/`url` and the off switch
+// does. The adapter cannot repair it either: it moves only typed entries out of
+// the 1.x dialect, because a typeless one is not a server it can describe.
+func checkOpencodeMCPDisables(cfg *config.Config) []check {
+	if !slices.Contains(cfg.SpawnedHarnesses(), "opencode") {
+		return nil
+	}
+	paths := []string{}
+	if p := cfg.SessionFor("opencode").MCPConfigPath; p != "" {
+		paths = append(paths, p)
+	}
+	for _, pr := range cfg.Projects {
+		if p := pr.MCPConfigPaths["opencode"]; p != "" && !slices.Contains(paths, p) {
+			paths = append(paths, p)
+		}
+	}
+	c := check{name: "opencode_mcp_disables", status: pass, detail: "no partial MCP entries in the opencode mcp config"}
+	var found []string
+	for _, p := range paths {
+		for _, name := range opencodePartialMCPEntries(p) {
+			found = append(found, fmt.Sprintf("%s: %s", p, name))
+		}
+	}
+	if len(found) == 0 {
+		return []check{c}
+	}
+	c.status = warn
+	c.detail = "MCP entries with no `type` do not switch anything off on opencode 2.x: " + strings.Join(found, "; ")
+	c.remedy = "repeat the server's full entry from the global opencode config with the switch added, e.g. " +
+		`"context7": {"type": "remote", "url": "<its url>", "enabled": false}` +
+		" (or under mcp.servers with \"disabled\": true), or remove the entry and the server from the global config"
+	return []check{c}
+}
+
+// opencodePartialMCPEntries names the entries under `mcp` (1.x dialect) and
+// `mcp.servers` (2.x) of one file that carry no `type`. An unreadable file
+// yields nothing: other checks report that.
+func opencodePartialMCPEntries(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var f struct {
+		MCP map[string]json.RawMessage `json:"mcp"`
+	}
+	if json.Unmarshal(data, &f) != nil {
+		return nil
+	}
+	var out []string
+	typeless := func(prefix string, raw json.RawMessage) {
+		var e map[string]json.RawMessage
+		if json.Unmarshal(raw, &e) != nil {
+			return
+		}
+		if _, ok := e["type"]; !ok {
+			out = append(out, prefix)
+		}
+	}
+	for name, raw := range f.MCP {
+		if name == "servers" {
+			var servers map[string]json.RawMessage
+			if json.Unmarshal(raw, &servers) == nil {
+				for sn, sraw := range servers {
+					typeless("mcp.servers."+sn, sraw)
+				}
+			}
+			continue
+		}
+		typeless("mcp."+name, raw)
+	}
+	sort.Strings(out)
+	return out
 }
