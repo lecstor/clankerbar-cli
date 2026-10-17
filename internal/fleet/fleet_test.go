@@ -10,6 +10,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -55,6 +56,11 @@ func TestSendPostsThePlaneShape(t *testing.T) {
 			Outcome         string   `json:"outcome"`
 			DurationSeconds float64  `json:"durationSeconds"`
 			Tokens          int      `json:"tokens"`
+			Sessions        []struct {
+				Phase   string `json:"phase"`
+				Harness string `json:"harness"`
+				Model   string `json:"model"`
+			} `json:"sessions"`
 		} `json:"iterations"`
 	}
 	got := make(chan arrived, 1)
@@ -75,6 +81,12 @@ func TestSendPostsThePlaneShape(t *testing.T) {
 		State:    State{Kind: StateIteration, N: 2, TaskRef: "CLA-466", Phase: "review"},
 		Iterations: []Iteration{{
 			TaskID: "uuid-1", TaskRef: "CLA-466", Phases: []string{"implement", "review"},
+			Sessions: []Session{
+				{Phase: "implement", Harness: "opencode", Model: "opencode-go/deepseek-v4-flash"},
+				// An unresolved model rides as "" — the harness default applied —
+				// and must decode as present-but-empty, not vanish.
+				{Phase: "review", Harness: "claude"},
+			},
 			Outcome: OutcomeReleased, DurationSeconds: 12.5, Tokens: 4321,
 		}},
 	})
@@ -94,6 +106,17 @@ func TestSendPostsThePlaneShape(t *testing.T) {
 		if it.TaskID != "uuid-1" || it.TaskRef != "CLA-466" || it.Outcome != "released" ||
 			it.DurationSeconds != 12.5 || it.Tokens != 4321 || len(it.Phases) != 2 {
 			t.Errorf("iteration row = %+v", it)
+		}
+		// CLA-630: one entry per spawned session, in spawn order, with the
+		// resolved model — empty when the harness default applied.
+		if len(it.Sessions) != 2 {
+			t.Fatalf("iteration sessions = %+v, want one entry per spawned session", it.Sessions)
+		}
+		if s := it.Sessions[0]; s.Phase != "implement" || s.Harness != "opencode" || s.Model != "opencode-go/deepseek-v4-flash" {
+			t.Errorf("session[0] = %+v, want the implement session's harness and model", s)
+		}
+		if s := it.Sessions[1]; s.Phase != "review" || s.Harness != "claude" || s.Model != "" {
+			t.Errorf("session[1] = %+v, want the review session with its unresolved model as the empty string", s)
 		}
 		// The field names above are exactly what parseFleetReport reads; if this
 		// decode succeeded, the plane's validator would too. The auth header is
@@ -122,6 +145,85 @@ func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 		Iterations: []Iteration{{Outcome: "done"}},
 	}); err == nil {
 		t.Error("an outcome outside the four-word vocabulary must be refused client-side: it would 400 the whole report plane-side")
+	}
+}
+
+// CLA-630: the exact wire shape the plane's parsePhaseSessions reads —
+// sessions:[{phase,harness,model}] in spawn order, the model present even when
+// empty (the plane stores "" as null, "not resolved"), and no key at all on an
+// iteration that spawned nothing, so a pre-CLA-630 shape stays valid.
+func TestMarshalReport_SessionsWireShape(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		Iterations: []Iteration{{
+			Outcome: OutcomeReleased,
+			Sessions: []Session{
+				{Phase: "implement", Harness: "opencode", Model: "opencode-go/deepseek-v4-flash"},
+				{Phase: "review", Harness: "claude"}, // unresolved: rides as ""
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	want := `"sessions":[{"phase":"implement","harness":"opencode","model":"opencode-go/deepseek-v4-flash"},{"phase":"review","harness":"claude","model":""}]`
+	if !strings.Contains(string(b), want) {
+		t.Errorf("report JSON does not carry the plane's sessions shape\nwant substring: %s\ngot: %s", want, b)
+	}
+
+	// An iteration with no sessions must not grow a sessions key: the field is
+	// optional end to end, and older shapes stay byte-compatible.
+	b, err = marshalReport(Report{
+		Identity:   Identity{Instance: "x"},
+		Iterations: []Iteration{{Outcome: OutcomeReleased, Phases: []string{"1"}}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), "sessions") {
+		t.Errorf("an iteration that spawned no sessions grew a sessions key: %s", b)
+	}
+}
+
+// CLA-630: the plane refuses the WHOLE report (all-or-nothing, presence
+// included) when one iteration carries more than its per-iteration session cap,
+// so the reporter clamps at the same bound. The first entries in spawn order are
+// kept: the configured phases lead the list, the tail is respawns.
+func TestMarshalReport_ClampsSessionsPerIteration(t *testing.T) {
+	var sessions []Session
+	for i := 0; i < maxSessionsPerIteration+1; i++ {
+		sessions = append(sessions, Session{
+			Phase:   fmt.Sprintf("phase-%02d", i),
+			Harness: "fake",
+			Model:   "m",
+		})
+	}
+	b, err := marshalReport(Report{
+		Identity:   Identity{Instance: "x"},
+		Iterations: []Iteration{{Outcome: OutcomeReleased, Sessions: sessions}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		Iterations []struct {
+			Sessions []Session `json:"sessions"`
+		} `json:"iterations"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Iterations) != 1 {
+		t.Fatalf("iterations = %+v, want one", got.Iterations)
+	}
+	gotSessions := got.Iterations[0].Sessions
+	if len(gotSessions) != maxSessionsPerIteration {
+		t.Fatalf("clamped to %d session(s), want %d", len(gotSessions), maxSessionsPerIteration)
+	}
+	for i, s := range gotSessions {
+		if want := fmt.Sprintf("phase-%02d", i); s.Phase != want {
+			t.Errorf("session[%d].phase = %q, want %q — the clamp keeps the first entries in spawn order", i, s.Phase, want)
+		}
 	}
 }
 

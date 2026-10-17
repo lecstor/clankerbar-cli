@@ -626,6 +626,102 @@ func TestDrainPhases_ARetriedDeathDoesNotOutcomeTheRecordDead(t *testing.T) {
 	}
 }
 
+// --- CLA-630: which harness and model each phase session ran on -----------------
+
+// The iteration record names every session the drain spawned, in order: a
+// two-phase sequence on different harnesses (implement on opencode, review on
+// claude) carries one entry per phase, with the phase's own resolved harness and
+// model — exactly what each spawn line printed.
+func TestDrainPhases_IterationRecordNamesEachSessionsHarnessAndModel(t *testing.T) {
+	impl := &fakeAdapter{steps: []invokeStep{{res: checkpointed(10, 0.10)}}}
+	// Named like production's registry adapter (Name() == the run harness), so
+	// the record's harness is the one the spawn line would print.
+	review := &fakeAdapter{name: "claude", steps: []invokeStep{{res: okResult(5, 0.05)}}}
+	d := mixedDriver(t, impl, review)
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{
+		{Phase: "implement", Harness: "opencode", Model: "opencode-go/deepseek-v4-flash"},
+		{Phase: "review", Harness: "claude", Model: "claude-opus-5"},
+	}
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — one entry per phase, in order, with the phase's own resolved harness and model", recs[0].Sessions, want)
+	}
+}
+
+// A handoff respawn is a session of its own: the phase the predecessor handed
+// off gets two entries for its two sessions, in spawn order, ahead of the next
+// phase's entry.
+func TestDrainPhases_IterationRecordCountsAHandoffRespawnInOrder(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: handoffResult("Resume: finish the implementation.")},
+		{res: checkpointed(10, 0.10)},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	_, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if handoffs != 1 {
+		t.Fatalf("handoffs = %d, want 1", handoffs)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{
+		{Phase: "implement", Harness: "fake"},
+		{Phase: "implement", Harness: "fake"}, // the handoff successor: same phase, its own session
+		{Phase: "review", Harness: "fake"},
+	}
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — the handoff respawn is a spawned session and must appear in spawn order", recs[0].Sessions, want)
+	}
+}
+
+// No model resolved (the operator configured none, so the harness ran its own
+// default) rides as the empty string: the record says "not resolved" and never
+// guesses a name. The same record still carries the other phase's resolved model.
+func TestDrainPhases_IterationRecordSendsAnUnresolvedModelAsTheEmptyString(t *testing.T) {
+	impl := &fakeAdapter{steps: []invokeStep{{res: checkpointed(10, 0.10)}}}
+	review := &fakeAdapter{name: "claude", steps: []invokeStep{{res: okResult(5, 0.05)}}}
+	d := mixedDriver(t, impl, review)
+	// Drop the opencode harness's model: the implement session runs on its
+	// default, and only the review phase has a resolved model.
+	d.cfg.Harnesses["opencode"] = config.HarnessConfig{
+		ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json",
+	}
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{
+		{Phase: "implement", Harness: "opencode"}, // Model stays "" on purpose
+		{Phase: "review", Harness: "claude", Model: "claude-opus-5"},
+	}
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — an unresolved model must be the empty string, never a guess", recs[0].Sessions, want)
+	}
+}
+
 // --- fail-soft: an outage touches neither timing nor outcomes -------------------
 
 func TestRun_ReportEndpointOutageLeavesTheLoopAlone(t *testing.T) {
