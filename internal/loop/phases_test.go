@@ -2021,6 +2021,64 @@ func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testin
 	}
 }
 
+// The freshness gate on the BRANCHLESS path: form (b)/(c) evidence has no
+// branch at all, so the review record is the only proof the review phase did
+// anything, and the same "changed since spawn" rule applies. The no-code fix
+// variant must spawn on a fresh record and not without one.
+func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
+	phases := []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}
+	settled := plane.TaskState{Status: "in_review", Outcome: "no-code delivery: the task body was updated\n"}
+
+	t.Run("a fresh record advances to the no-code fix", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(1, 0), openClaim())}, // no branch: form (b) settles the task
+			{res: held(okResult(1, 0), openClaim())}, // review-only: records and holds
+			{res: okResult(1, 0)},                    // no-code fix
+		}}
+		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		h.onInvoke = func(i int) {
+			if i == 1 { // the review appends its block below phase 1's record
+				st := rel.state["t-1"]
+				st.Outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: pass\n"
+				rel.state["t-1"] = st
+			}
+		}
+		d := phaseDriverWithReleaser(t, h, phases, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 3 {
+			t.Fatalf("spawned %d sessions, want 3 — a fresh record advances the no-code seam", h.invokeCalls)
+		}
+		p3 := h.invocations[2].Prompt
+		if !strings.Contains(p3, "there is NO branch") {
+			t.Errorf("the successor is not the no-code fix brief:\n%s", p3)
+		}
+	})
+
+	t.Run("an unchanged outcome is refused", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(1, 0), openClaim())},
+			{res: held(okResult(1, 0), openClaim())}, // review records nothing
+			{res: okResult(1, 0)},                    // must NEVER run
+		}}
+		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		d := phaseDriverWithReleaser(t, h, phases, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 2 {
+			t.Fatalf("spawned %d sessions, want 2 — the no-code fix must not run without a fresh record", h.invokeCalls)
+		}
+	})
+}
+
 // The gate's half of the interface: the heading counts only as its own line.
 // A substring match was the bug — `## Reviewer notes`, prose mentioning the
 // words, or an indented heading inside a code block all passed it.
