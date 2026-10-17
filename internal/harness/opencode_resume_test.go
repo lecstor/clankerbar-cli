@@ -115,7 +115,7 @@ func TestProbeCoherent(t *testing.T) {
 func TestOpencodeResumeArgs(t *testing.T) {
 	in := Invocation{Model: "opencode/x-preview-f-free"}
 	got := opencodeResumeArgs(in, "ses_dead", "Continue.")
-	want := []string{"run", "--standalone", "--format", "json", "-s", "ses_dead", "--model", "opencode/x-preview-f-free", "--", opencodePrompt("Continue.")}
+	want := []string{"run", "--standalone", "--format", "json", "--agent", "build", "-s", "ses_dead", "--model", "opencode/x-preview-f-free", "--", opencodePrompt("Continue.")}
 	if len(got) != len(want) {
 		t.Fatalf("args = %v, want %v", got, want)
 	}
@@ -126,7 +126,7 @@ func TestOpencodeResumeArgs(t *testing.T) {
 	}
 
 	got = opencodeResumeArgs(Invocation{}, "ses_dead", "Continue.")
-	if strings.Join(got, " ") != "run --standalone --format json -s ses_dead -- "+opencodePrompt("Continue.") {
+	if strings.Join(got, " ") != "run --standalone --format json --agent build -s ses_dead -- "+opencodePrompt("Continue.") {
 		t.Errorf("no-model args = %v", got)
 	}
 }

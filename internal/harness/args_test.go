@@ -45,7 +45,7 @@ var terminatorAdapters = []struct {
 	{"codex", codexArgs, []string{
 		"--json", "--sandbox", "workspace-write", "--ask-for-approval", "never", "-m", "some/model",
 	}, func(p string) string { return p }},
-	{"opencode", opencodeArgs, []string{"--standalone", "--format", "json", "--model", "some/model"}, opencodePrompt},
+	{"opencode", opencodeArgs, []string{"--standalone", "--format", "json", "--agent", "build", "--model", "some/model"}, opencodePrompt},
 }
 
 // promptsTheParserWouldSteal are the shapes that actually bite: a bare

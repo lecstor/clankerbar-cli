@@ -166,7 +166,7 @@ func probeCoherent(reply, ref string) bool {
 // checks for an empty sid before it gets here.
 func opencodeResumeArgs(in Invocation, sid, prompt string) []string {
 	prompt = opencodePrompt(prompt)
-	args := []string{"run", "--standalone", "--format", "json", "-s", sid}
+	args := []string{"run", "--standalone", "--format", "json", "--agent", opencodeAgent, "-s", sid}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}

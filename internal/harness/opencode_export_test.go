@@ -293,8 +293,8 @@ func TestOpencodeSessionConfig(t *testing.T) {
 			t.Fatal(err)
 		}
 		m := decode(t, b)
-		if len(m) != 1 || m["permission"].(map[string]any)["*"] != "deny" {
-			t.Errorf("content = %s, want only the fail-closed permission block", b)
+		if len(m) != 2 || m["permission"].(map[string]any)["*"] != "deny" || m["agent"] == nil {
+			t.Errorf("content = %s, want only the fail-closed permission block and its agent pins", b)
 		}
 	})
 }
@@ -357,5 +357,41 @@ func TestOpencodeRepeatedCallIDsAcrossStepsAreBothObserved(t *testing.T) {
 	res = opencodeParsed(ok + "\n" + ok)
 	if !res.Claim.Held() {
 		t.Errorf("Claim = %+v", res.Claim)
+	}
+}
+
+// Every built-in agent carries the pinned policy and the run selects one
+// explicitly, so neither an ambient agent-level permission block nor an
+// ambient default_agent can route the session around it (CLA-675 review).
+func TestOpencodeSessionConfigPinsEveryAgent(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "m.json")
+	if err := os.WriteFile(p, []byte(`{"agent":{"build":{"permission":{"*":"allow"}}},"agents":{"x":{}},"default_agent":"x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	b, err := opencodeSessionConfig(Invocation{MCPConfigPath: p, WorkDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Permission map[string]any            `json:"permission"`
+		Agent      map[string]map[string]any `json:"agent"`
+		Agents     any                       `json:"agents"`
+		Default    any                       `json:"default_agent"`
+	}
+	if err := json.Unmarshal(b, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"build", "plan", "general", "explore"} {
+		perm, _ := doc.Agent[name]["permission"].(map[string]any)
+		if perm["*"] != "deny" || perm["execute"] != "deny" {
+			t.Errorf("agent %s permission = %v, want the pinned policy", name, perm)
+		}
+	}
+	if doc.Agents != nil || doc.Default != nil {
+		t.Errorf("the file's agents/default_agent survived: %s", b)
+	}
+	args := opencodeArgs(Invocation{Prompt: "x"})
+	if i := indexOf(args, "--agent"); i < 0 || args[i+1] != opencodeAgent || indexOf(args, "--") < i {
+		t.Errorf("args = %v, want --agent %s ahead of the terminator", args, opencodeAgent)
 	}
 }
