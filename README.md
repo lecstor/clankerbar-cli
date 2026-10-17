@@ -115,7 +115,9 @@ the task it found is pure waste (CLA-663). Before spawning `fix` the driver
 The claim is held across the seam, so the task is never posted back to the queue
 mid-sequence.
 
-The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
+The **`fix`** phase is the last one and runs on the cheap harness — unless a
+`verify` phase follows it, in which case the PR and hand-over belong to the
+verifier (see below). It resumes the
 same run, reads the released durable record back with `get_task` — and, for one
 release, the **last** `## Review` block beside it, because a re-trip can carry
 several — checks the record's reviewed tip still matches the worktree's HEAD,
@@ -161,10 +163,14 @@ raise new MUSTs only inside the delta.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, `update_task(status: "in_review", outcome: ...)` with a `**Tests**` section.
-A round with any open MUST ends **without** the PR and without moving the task;
-the driver spawns another `fix`, then verifies again. SHOULD and NIT findings are
-recorded and never gate: they ride to `in_review` in the outcome.
+PR, and a `status: "in_review"` move. It releases its own round in that same
+`update_task` call (`review: {closeRound: …}`), because the plane refuses a
+sealed holder's outcome write and refuses a close after the task has left
+`in_progress`; the fix phase has already written the outcome with the
+`**Tests**` section the `in_review` guard reads. A round with any open MUST
+releases its round the same way but ends **without** the PR and without moving
+the task; the driver spawns another `fix`, then verifies again. SHOULD and NIT
+findings are recorded and never gate: they ride to `in_review` in the outcome.
 
 Two bounds make the loop terminate:
 

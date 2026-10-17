@@ -1792,6 +1792,8 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 		"fix-delta",
 		"ONLY within the fix delta",
 		`status: "in_review"`,
+		"closeRound",
+		"review_sealed",
 		"do NOT open a PR",
 		"{{reviewerRole}}",
 	} {
@@ -1812,6 +1814,12 @@ func TestNoCodeFixVerifyBriefStopsBeforeTheHandover(t *testing.T) {
 	}
 	if strings.Contains(noCodeFixVerifyBrief, "Open a PR targeting") {
 		t.Errorf("the no-code fix-verify brief carries the terminal step:\n%s", noCodeFixVerifyBrief)
+	}
+	if !strings.Contains(noCodeFixVerifyBrief, "**Tests**") {
+		t.Errorf("the no-code fix-verify brief does not write the outcome the in_review guard reads:\n%s", noCodeFixVerifyBrief)
+	}
+	if strings.Contains(noCodeFixVerifyBrief, "COMMIT and PUSH") {
+		t.Errorf("the no-code fix-verify brief tells a branchless fix to commit and push:\n%s", noCodeFixVerifyBrief)
 	}
 }
 

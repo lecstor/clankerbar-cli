@@ -2092,6 +2092,11 @@ type reviewGate struct {
 	baseline string
 	role     string
 	round    int
+	// state is the matched record's plane state (sealed / open / void). The
+	// driver closes only a SEALED round: a verifier releases its own round in
+	// the same call that hands the task over (CLA-638), and a second close would
+	// fail with no_open_round. Void records never match.
+	state string
 }
 
 // reviewerRoleFor is the reviewer role of the review-shaped phase at idx
@@ -2471,6 +2476,7 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 				return branch, tip, false, false, "the task carries no durable review record " + expect + ", so the next phase would have nothing to apply" + detail
 			}
 			review.round = rec.Round
+			review.state = rec.State
 		}
 		return branch, tip, true, unverified, why
 	}
@@ -3454,14 +3460,21 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// (CLA-638, B12).
 			end.verifyChecked = true
 			end.branch, evidenceTip, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, &review)
-			end.reviewRound = review.round
+			if review.state == "sealed" {
+				end.reviewRound = review.round
+			}
 			if evidenceOK && review.required && review.round > 0 {
-				if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
-					evidenceOK = false
-					evidenceWhy = fmt.Sprintf("verification round %d could not be closed (%v) — its findings would stay sealed and the next fix would have nothing to apply", review.round, cerr)
-				} else {
-					// Closed; the round is now released, so nothing downstream
-					// may try to close it again.
+				if review.state == "sealed" {
+					// The verifier did not release its own round; the driver does,
+					// exactly as for the review gate.
+					if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
+						evidenceOK = false
+						evidenceWhy = fmt.Sprintf("verification round %d could not be closed (%v) — its findings would stay sealed and the next fix would have nothing to apply", review.round, cerr)
+					}
+				}
+				if evidenceOK {
+					// Closed (or already released by the verifier's terminal call);
+					// nothing downstream may try to close it again.
 					end.reviewRound = 0
 					end.verifyRound = review.round
 					if st, read := d.readTaskState(ctx, t, res.Claim.TaskID); !read {
@@ -3495,8 +3508,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			end.branch, evidenceTip, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, &review)
 			// The matched round rides the end (CLA-637): drainPhases closes it if
 			// the handoff guards refuse the respawn this detected handoff asked
-			// for — the one advance path drainPhase cannot close on itself.
-			end.reviewRound = review.round
+			// for — the one advance path drainPhase cannot close on itself. Only a
+			// still-sealed round is ours to close: a verifier closes its own in the
+			// terminal call (CLA-638).
+			if review.state == "sealed" {
+				end.reviewRound = review.round
+			}
 			// CLA-637: the review phase's durable record is SEALED — the plane
 			// withholds its findings from every reader until the driver closes
 			// the round. The close is the driver's, made when the review stage
@@ -3507,7 +3524,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// findings). A close that fails REFUSES the checkpoint, fail-closed:
 			// the alternative is a fix phase spawned against findings the plane
 			// still has sealed, which can only park the task.
-			if evidenceOK && review.required && review.round > 0 && handoff == "" && !nextReviewShaped {
+			if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && handoff == "" && !nextReviewShaped {
 				if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
 					evidenceOK = false
 					evidenceWhy = fmt.Sprintf("review round %d could not be closed (%v) — refusing the checkpoint, because the fix phase would be spawned against findings the plane still has sealed", review.round, cerr)
@@ -3670,7 +3687,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					// handoff is possible here (detectHandoff refuses an
 					// unobserved claim), so the only skip is a following
 					// review-shaped phase.
-					if evidenceOK && review.required && review.round > 0 && !nextReviewShaped {
+					if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && !nextReviewShaped {
 						if cerr := d.closeReviewRound(ctx, t, *claim, review.round); cerr != nil {
 							evidenceOK = false
 							evidenceWhy = fmt.Sprintf("review round %d could not be closed (%v) — refusing the checkpoint, because the fix phase would be spawned against findings the plane still has sealed", review.round, cerr)

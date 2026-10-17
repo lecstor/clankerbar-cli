@@ -1148,10 +1148,23 @@ var fixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 // fixOnlyTerminalStep ends a fix phase that is NOT the sequence's last one
 // (CLA-638): the verification round owns the PR and in_review hand-over.
 const fixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes " +
-	"you made, then STOP still holding the task. Do NOT open a PR and do NOT move the task to in_review — " +
-	"the VERIFICATION round after you carries that terminal step once it finds no open MUST. A PR opened " +
-	"here would ship fixes the verifier never saw. Ending this session holding the task is the checkpoint " +
-	"the verification round resumes from."
+	"you made, append an outcome with update_task(taskId, runId, outcome: ...) that carries the fixes and a " +
+	"**Tests** section saying what you actually verified — the plane requires that section on the task before " +
+	"the verifier can hand it to in_review, and the verifier cannot write the outcome itself once its own " +
+	"review record is sealed — then STOP still holding the task. Do NOT open a PR and do NOT move the task to " +
+	"in_review: the VERIFICATION round after you carries that terminal step once it finds no open MUST. A PR " +
+	"opened here would ship fixes the verifier never saw. Ending this session holding the task is the " +
+	"checkpoint the verification round resumes from."
+
+// noCodeFixOnlyTerminalStep is fixOnlyTerminalStep for a branchless fix: it
+// still records an outcome the in_review guard can read, but there is nothing to
+// commit or push.
+const noCodeFixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: append an outcome with " +
+	"update_task(taskId, runId, outcome: ...) that carries what you amended and a **Tests** section (\"**Tests** " +
+	"— none, no-code delivery.\" is honest and valid) — the plane reads that section on the in_review move the " +
+	"verifier makes, and the verifier cannot write the outcome itself once its own review record is sealed. " +
+	"Do NOT open a PR and do NOT move the task to in_review: the VERIFICATION round after you carries that " +
+	"terminal step once it finds no open MUST. End holding the task."
 
 // noCodeFixBrief is fixBrief for a branchless checkpoint: the review judged the
 // plane's record, and the fix is an amendment to that record, never invented
@@ -1192,7 +1205,7 @@ var noCodeFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + 
 	"(update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
 	" A finding that needs CODE cannot be fixed here: file it as its own task (create_task, with a real " +
 	"doneWhen) and say so in your outcome - for a MUST, that filed task is this phase's fix of it. If the " +
-	"review found nothing, change nothing." + rerunGuidance + fixTerminalRecord + fixOnlyTerminalStep +
+	"review found nothing, change nothing." + rerunGuidance + fixTerminalRecord + noCodeFixOnlyTerminalStep +
 	handoffGuidance
 
 // verifyStoppingRule is the stopping rule every verification round runs under
@@ -1208,15 +1221,20 @@ const verifyStoppingRule = " THE STOPPING RULE IS A BAR, NOT A FEELING. The gate
 
 // verifyTerminalStep ends a verification round: the hand-over only when no MUST
 // remains open, otherwise a silent hold for the driver to spawn another fix.
-const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Count the open MUSTs after your " +
-	"adjudication. If there are NONE, carry the hand-over: confirm the branch is pushed (push any fix commit " +
-	"that is still local), open a PR targeting the repo's PR base (" + PhasePRBasePlaceholder + ") if none exists " +
-	"for the branch, and call update_task(taskId, runId, status: \"in_review\", outcome: ...) with a **Tests** " +
-	"section saying what you actually verified — without one the plane REFUSES the call, so a session that " +
-	"leaves it out has not handed over. If ANY MUST remains open, do NOT open a PR, do NOT move the task to " +
-	"in_review, and do NOT change its status: record your round in BOTH forms the shape above prescribes and " +
-	"end holding the task. The driver spawns another fix after you, or parks the task at the round cap. Never " +
-	"decide to run one more round yourself."
+const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and the round number the append returned.\n\n" +
+	"If ANY MUST remains open: release this round with ONE call — update_task(taskId, runId, review: " +
+	"{ closeRound: <the round the append returned> }) — then do NOT open a PR, do NOT move the task to " +
+	"in_review, and do NOT change its status. End holding the task. The driver spawns another fix against " +
+	"the released findings, or parks the task at the round cap.\n\n" +
+	"If NO MUST remains open, carry the hand-over in the SAME call that releases the round: confirm the " +
+	"branch is pushed (push any fix commit that is still local), open a PR targeting the repo's PR base (" +
+	PhasePRBasePlaceholder + ") if none exists for the branch, then call update_task(taskId, runId, status: " +
+	"\"in_review\", review: { closeRound: <the round the append returned> }). Do NOT send an outcome in " +
+	"that call: your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), " +
+	"and the fix phase has already written the **Tests** section the in_review guard reads. Releasing the " +
+	"round in the same call is what makes the status move legal — after the task leaves in_progress the plane " +
+	"no longer accepts a close from this run. Never decide to run one more round yourself."
 
 // verifyBrief is the fix-verification round (CLA-638): review the fix delta plus
 // its regression surface, adjudicate every prior open MUST by its plane id, and

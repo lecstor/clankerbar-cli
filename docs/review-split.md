@@ -243,10 +243,16 @@ round cap parks the task. With a verifier configured, `fix` no longer opens the
 PR: a clean verification round carries the terminal step (push check, PR,
 `in_review`), and a round with an open MUST ends holding so another fix can run.
 
-The verifier is review-shaped (it writes a sealed durable record the driver
-closes at the seam) and is scoped to the **fix delta** — the reviewed tip the
-previous record names through `HEAD`, plus the regression surface the fixes
-touch. Its brief lists the prior open MUST ids (read from the plane's released
+The verifier is review-shaped (it writes a durable record like the review gate)
+and is scoped to the **fix delta** — the reviewed tip the previous record names
+through `HEAD`, plus the regression surface the fixes touch. Unlike the review
+gate, the verifier releases its OWN round in its terminal call: the plane
+refuses a sealed holder's outcome write, and the close must ride the same
+`update_task` call as the `in_review` move, because after the status move the
+run is no longer the task's live holder and cannot close. The driver accepts
+either state — sealed (it closes, as it does for the review gate) or already
+released — and never closes twice. Its brief lists the prior open MUST ids
+(read from the plane's released
 records), and it adjudicates each one **by its plane id**
 (`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
 (`filed`), refutation accepted (`refuted`), or left open with a reason. New

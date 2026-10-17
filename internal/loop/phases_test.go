@@ -4411,3 +4411,42 @@ func TestDrainPhases_VerificationLocalRoundBound(t *testing.T) {
 		t.Fatalf("the local round bound did not park at the cap: parks=%v", rel.parks)
 	}
 }
+
+// TestDrainPhases_VerificationSelfClosedRoundIsNotClosedTwice: a verifier
+// releases its own round in the terminal call — it has to, because the plane
+// refuses a sealed holder's outcome write and its close must ride the same call
+// as the in_review move. The driver must accept that released record and not
+// attempt a second close (which the plane would refuse with no_open_round).
+func TestDrainPhases_VerificationSelfClosedRoundIsNotClosedTwice(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)},
+		{res: checkpointed(5, 0.05)},
+		{res: checkpointed(5, 0.05)},
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+		if i == 3 { // the verifier appended AND released its own round, then handed over
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "open"))
+			rel.counted = 2
+			rel.status = "in_review"
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4", h.invokeCalls)
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Fatalf("driver closes = %v, want exactly [1] — the verifier's own round must not be closed twice", rel.closes)
+	}
+	if len(rel.parks) != 0 {
+		t.Fatalf("a self-closed clean round parked: %v", rel.parks)
+	}
+}
