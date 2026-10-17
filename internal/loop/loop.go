@@ -1423,11 +1423,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		}
 
 		// CLA-662: a resumed phase that ended any OTHER way than the transient
-		// sequence-end above — completed, settled, died, was turned away by a
-		// limit — breaks its target's streak: the next blip on that
-		// target+harness is not consecutive with the last, and starts the
-		// ladder over. Reset on the seam BETWEEN the two arms, so "consecutive"
-		// means exactly what it says: the arm above extends, this one clears.
+		// sequence-end above — completed, settled, died — breaks its target's
+		// streak: the next blip on that target+harness is not consecutive with
+		// the last, and starts the ladder over. The other sequence-end arm, a
+		// rolling limit, also breaks out above and so neither extends nor
+		// clears: the reset the run waits out is its own bound. Reset on the
+		// seam BETWEEN the arms, so "consecutive" means exactly what it says:
+		// the arm above extends, this one clears.
 		if phaseResumed {
 			d.clearResumedTransient(resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)})
 		}
