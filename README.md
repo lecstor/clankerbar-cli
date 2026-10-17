@@ -1910,10 +1910,15 @@ the `OPENCODE_PERMISSION` variable 1.x read, and with no policy it runs every
 tool, so the content layer is set whether or not an mcp config is named.
 
 The opencode policy is a **path-scoped PermissionConfig**. 2.x makes read/edit
-asks relative to the session's instance directory (its workdir), so `read` and
+asks relative to the session's instance directory - the task's repo checkout the
+driver spawns it in, not the project `workdir` - so `read` and
 `edit` allow `**` and deny `../**`; `external_directory` - opencode's gate for a
 path-taking file tool whose target is outside the instance directory - allows
-the workdir subtree absolutely and **denies every other path**. `shell` is
+that checkout absolutely and **denies every other path**. The same policy is
+pinned on every built-in agent and the run passes `--agent build`, because on
+2.x an agent-level permission block or a `default_agent` in any config layer -
+including a project opencode.json the session could write into its own
+checkout - otherwise overrides the top-level policy. `shell` is
 allowed tool-level (its permission patterns match parsed commands, not paths).
 Everything else - `lsp`, `subagent`, `skill`, `question`, the network tools
 (`webfetch`, `websearch`) and `execute` - is denied by a `*` catch-all or by
@@ -1942,14 +1947,20 @@ where the key is honoured) and denies `execute`. 2.x registers the MCP
 policy's `mcp:*` read allow is kept for a build that exposes them again. 2.x
 also connects MCP servers after the first model request, so the adapter prefixes
 working prompts with one sentence telling the model to call a not-yet-available
-MCP tool again.
+MCP tool again. A result above 51,200 bytes is truncated by 2.x to a pointer at
+a saved file; the adapter reads a truncated `claim_task` result back from the
+session's own tool-output directory, so a large claim is still tracked.
+Switching off a server the global opencode config declares takes a full entry
+(`type` plus `command`/`url`) with the off switch; a partial
+`{"enabled": false}` leaves it running, and `doctor` WARNs on one.
 
 **Verifying the policy against a live session.** To watch opencode decide, read
 the permission lines in `~/.local/share/opencode/log/opencode.log`, or run the
 conformance suite (`docs/harness-conformance.md`), which drives the real binary
 against the adapter's policy with a fake provider.
 
-**Each session's instance directory is pinned to its workdir.** `cmd.Dir` sets
+**Each session's instance directory is pinned to the directory it is spawned in**
+(the task's repo checkout, or the project workdir when no repo resolves). `cmd.Dir` sets
 the child's real cwd and nothing else; the inherited `PWD` still named wherever
 the daemon was started, and opencode honours `$PWD`. So every session every
 daemon spawned ran in the daemon's start directory whatever the project's

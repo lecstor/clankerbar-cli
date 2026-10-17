@@ -603,7 +603,9 @@ const opencodeMCPResourcePattern = "mcp:*"
 // which is why this policy used to carry a root-relative layer and an
 // in-checkout layer chosen by walking up for a .git entry (CLA-441). On 2.x the
 // instance directory alone decides the shape, so there is one layer, and the
-// PWD pin (pinPWD) is what makes the instance directory the workdir.
+// PWD pin (pinPWD) is what makes the instance directory Invocation.WorkDir -
+// which the driver sets to the task's repo checkout (loop sessionDir), not the
+// project workdir.
 func opencodePermission(readOnly bool, workdir string, extraDirs []string) string {
 	b, _ := json.Marshal(opencodePermissionPolicy(readOnly, workdir, extraDirs))
 	return string(b)
