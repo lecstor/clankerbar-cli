@@ -1128,6 +1128,11 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		parkFired bool // the per-task dead budget parked the task
 		tripFired bool // the fleet dead counter tripped and paused this target
 		finalDisp string
+		// CLA-631: a rolling usage limit that ended a RESUMED phase's sequence.
+		// The sequence stops here like any other end, but the run does not: the
+		// wait this asks for is owed AFTER the sequence's handback, so that it
+		// is taken holding no lease.
+		limitWait *phaseLimitWait
 		// finalDead / lastProducedNothing are the FINAL attempt's dead
 		// classifications (the seam's, and the tally's wider one): a death that
 		// was retried past must not brand the record, and a LAST-phase death
@@ -1331,6 +1336,20 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			break
 		}
 
+		// CLA-631: a rolling usage limit ended a RESUMED phase's sequence. The
+		// sequence stops exactly like the pstop above — the claim is not handed
+		// back to the queue, so the lease lapses into a takeover with its branch
+		// recorded — but the RUN carries on: the wait is owed below, after the
+		// sequence's deferred handback, holding no lease. Broken here rather
+		// than flowing into the checks below because those read a session that
+		// merely got turned away: the dead/fleet counters would tick on a
+		// limit's "unknown" finish reason, and the empty retry would re-spawn a
+		// phase against a limit that is still down.
+		if end.limitWait != nil {
+			limitWait = end.limitWait
+			break
+		}
+
 		// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
 		// not "ended without holding the task" either — it never finished the job
 		// it was spawned to do. The claim was released back in drainPhase (a retry
@@ -1521,6 +1540,40 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// phase; owed at the one that did not — including a final-phase handoff the
 	// guards above refused, whose claim was held for a successor that never ran.
 	carried = d.releaseCarried(ctx, t, carried)
+
+	// CLA-631: the sequence ended on a rolling usage limit and the run is owed
+	// its wait — after the handback above, deliberately, so the wait is taken
+	// with NO lease held: the claim is back in the queue or, with pushed work,
+	// left to lapse into a takeover exactly as the old stop path left it. The
+	// wait itself is the first-phase path's own machinery, reused: the same
+	// budget breaker inside supervisedWait, the same STOP/RESTART/RELOAD reads
+	// in waitOrStop, the same probes on the harness that hit the limit, and the
+	// same stated-reset handling — the difference is only that there is no
+	// session left to re-run when it lifts, so the drain returns and Run polls
+	// again. waitPastBudget is consulted first, exactly as on the first-phase
+	// path: a reset beyond the run's remaining ceiling is not worth sleeping
+	// through, so the run stops and says when to start a fresh one.
+	if limitWait != nil {
+		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
+		if until, over := waitPastBudget(limitWait.lim.ResetAt, remaining, bounded); over {
+			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
+				drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
+			stop = true
+		} else {
+			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
+				drainNum, resetSuffix(limitWait.lim.ResetAt))
+			ptokens, pcost, pstop := d.supervisedWait(ctx, limitWait.lim, limitWait.a, limitWait.ph, t, spend{
+				start:  prior.start,
+				tokens: prior.tokens + tokens,
+				cost:   prior.cost + cost,
+			})
+			tokens += ptokens
+			cost += pcost
+			if pstop {
+				stop = true
+			}
+		}
+	}
 	return tokens, cost, handoffs, stop, err
 }
 
@@ -1606,6 +1659,27 @@ type phaseEnd struct {
 	// chain cap, max-iterations, the budget breaker — and either respawns on it
 	// or falls back to the standard path (CLA-352).
 	handoff string
+
+	// limitWait, when non-nil, reports that this RESUMED phase ended the
+	// sequence on a ROLLING usage limit (CLA-631). The sequence ends exactly as
+	// the old stop did — the claim is not handed back to the queue, so the lease
+	// lapses into a takeover with its branch recorded — but the RUN must not end
+	// with it: drainPhases waits the limit out (holding no lease, on the harness
+	// that hit it) and returns to Run, which carries on polling. Nil on the
+	// first-phase path, which waits inline and retries the same session, and nil
+	// for a hard stop (lim.Stop), which still stops the run in drainPhase.
+	limitWait *phaseLimitWait
+}
+
+// phaseLimitWait is the wait a rolling usage limit owes a run whose RESUMED
+// phase was turned away: a request for drainPhases to wait the limit out after
+// the sequence's handback, with no lease held — the shape the resumed phase
+// itself must never take, because the wait would outlive its 30-minute lease
+// (CLA-631).
+type phaseLimitWait struct {
+	lim harness.Limit   // the rolling limit, for the reset and its reason
+	ph  config.Phase    // the phase whose harness was turned away
+	a   harness.Adapter // that harness, so the probes run on the account that is limited
 }
 
 // deadPhase reports the CLA-386 dead-phase signature: the session's final step
@@ -2438,17 +2512,22 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
-			// A RESUMED phase must not wait one out. It is working a live lease —
-			// 30 minutes, and nothing driver-side heartbeats it — so a supervised
-			// wait of hours would re-spawn the phase against a run the plane has
-			// long since swept or handed to another clanker, with a runId in its
-			// prompt that no longer means anything. End the sequence instead: the
-			// branch is pushed, the lease lapses, and the task comes back as a
-			// takeover, which is the designed recovery for exactly this.
+			// A RESUMED phase must not wait one out (CLA-631). It is working a
+			// live lease — 30 minutes, and nothing driver-side heartbeats it — so
+			// a supervised wait of hours would re-spawn the phase against a run
+			// the plane has long since swept or handed to another clanker, with a
+			// runId in its prompt that no longer means anything. End the sequence
+			// instead: the branch is pushed, the lease lapses, and the task comes
+			// back as a takeover, which is the designed recovery for exactly
+			// this. The RUN, though, must not end with it — exiting the daemon
+			// left a whole fleet idle until an operator noticed — so the wait is
+			// handed to drainPhases, which owes it only once the sequence's
+			// handback has run and no lease is held.
 			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a 30-minute lease; the task returns as a takeover with its branch recorded",
+				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a 30-minute lease; the task returns as a takeover with its branch recorded, and the run stays up to wait for the reset instead of exiting",
 					drainNum)
-				return tokens, cost, true, end, nil
+				end.limitWait = &phaseLimitWait{lim: lim, ph: ph, a: a}
+				return tokens, cost, false, end, nil
 			}
 			// Whatever this attempt held open is not held open any more: every path
 			// below either waits or retries with a FRESH session, which re-claims.
