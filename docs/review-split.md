@@ -54,13 +54,14 @@ the three-phase one.
 `fix` is a separate name on purpose. `reviewTerminalStep` is injected by phase
 name; a fix phase called `review` would inherit the wrong contract.
 
-**Until CLA-631 lands, run `fix` on a different provider from the review.** A fix
-session that starts immediately after an Opus review can hit the same rolling
-usage limit the review just consumed the tail of, and the daemon exits on it
-rather than waiting — the account-limit failure a resumed phase already has. The
-README's per-phase harness example (implement and fix on opencode, review on
-claude) is the shape to copy; an all-`claude` three-phase config is the one most
-exposed.
+**Run `fix` on a different provider from the review.** A fix session that starts
+immediately after an Opus review can hit the same rolling usage limit the review
+just consumed the tail of. CLA-631 changed what that costs, not whether to avoid
+it: the sequence ends and the run waits the reset out instead of the daemon
+exiting, but the task still lapses into a takeover that pays `implement` again,
+plus the wait. The README's per-phase harness example (implement and fix on
+opencode, review on claude) is the shape to copy; an all-`claude` three-phase
+config is the one most exposed.
 
 ## Where the review artifact lives
 
