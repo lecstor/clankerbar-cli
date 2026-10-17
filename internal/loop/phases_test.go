@@ -4022,6 +4022,7 @@ func TestDrainPhases_VerificationRoundPassesWithNoOpenMust(t *testing.T) {
 			})
 			rel.counted = 2
 			rel.openMusts = nil // the plane's gate lists MUSTs only
+			rel.status = "in_review"
 		}
 	}
 	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
@@ -4137,10 +4138,13 @@ func TestDrainPhases_VerificationCapParksWithTheRecords(t *testing.T) {
 			})
 			rel.openMusts = []string{"1.review-1.1"}
 		}
-		if i == 3 { // round 3 closed with an open MUST: the cap is spent
-			rel.records = append(rel.records, recordFor(3, "review-2", "r-1", testCheckpointTip, "sealed"))
+		if i == 3 { // round 3 raises a FRESH MUST and the cap is spent
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 3, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("3.review-2.1", "open", "a fresh delta-only MUST")},
+			})
 			rel.counted = 3
-			rel.openMusts = []string{"1.review-1.1"}
+			rel.openMusts = []string{"3.review-2.1"}
 		}
 	}
 	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
@@ -4154,13 +4158,13 @@ func TestDrainPhases_VerificationCapParksWithTheRecords(t *testing.T) {
 	if len(rel.parks) != 1 || len(rel.questions) != 1 {
 		t.Fatalf("cap did not park with a question: parks=%v questions=%v", rel.parks, rel.questions)
 	}
-	if !strings.Contains(rel.parks[0], "1.review-1.1") || !strings.Contains(rel.parks[0], "3-round cap") {
+	if !strings.Contains(rel.parks[0], "3.review-2.1") || !strings.Contains(rel.parks[0], "3-round cap") {
 		t.Errorf("the park outcome does not carry the records:\n%s", rel.parks[0])
 	}
-	if !strings.Contains(rel.questions[0], "1.review-1.1") || !strings.Contains(rel.questions[0], "reviews.records") {
+	if !strings.Contains(rel.questions[0], "3.review-2.1") || !strings.Contains(rel.questions[0], "reviews.records") {
 		t.Errorf("the question does not carry the records:\n%s", rel.questions[0])
 	}
-	if !strings.Contains(rel.questions[0], "the seam is untested") {
+	if !strings.Contains(rel.questions[0], "a fresh delta-only MUST") {
 		t.Errorf("the question names the id but not the finding's substance:\n%s", rel.questions[0])
 	}
 }

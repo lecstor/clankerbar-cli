@@ -1713,6 +1713,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				break
 			}
 			if len(end.verifyOpenMusts) == 0 {
+				if end.verifyStatus == "in_progress" || end.verifyStatus == "ready" {
+					log.Printf("%siteration %d: the %s phase closed round %d with NO open MUST but left the task %q — it recorded a pass but did not carry the terminal step (push check, PR, in_review); the sequence ends without a hand-over for the operator to see",
+						labelOf(t), drainNum, ph.Label(i), end.verifyRound, end.verifyStatus)
+				}
 				log.Printf("iteration %d: the %s phase closed round %d with NO open MUST — the stopping rule is satisfied and the sequence is done",
 					drainNum, ph.Label(i), end.verifyRound)
 				break
@@ -1972,6 +1976,11 @@ type phaseEnd struct {
 	// across the round loop: an id that is open AGAIN after being resolved is
 	// non-convergence, and parks the task (A6).
 	verifyResolvedIDs []string
+	// verifyStatus is the task's plane status after the round closed: a clean
+	// round must have handed the task off (in_review/done/...); one that left it
+	// in_progress recorded a pass but did not carry the terminal step, which the
+	// driver says loudly rather than mistaking for a hand-over.
+	verifyStatus string
 
 	// sequenceEnd, when non-nil, reports that this RESUMED phase ended the
 	// sequence without completing it, and the RUN must not end with it. Two
@@ -3463,6 +3472,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 						end.verifyOpenDetails = openMustDetails(st.ReviewOpenMustIDs, st.Reviews)
 						end.verifyCounted = st.ReviewCounted
 						end.verifyResolvedIDs = resolvedFindingIDs(st.Reviews)
+						end.verifyStatus = st.Status
 					}
 				}
 			}
