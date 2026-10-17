@@ -421,22 +421,93 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 // the same heartbeat(runId) brief — and MaxRetries defaults to 0, "never give
 // up", so the ladder walks past the 30-minute lease and re-spawns indefinitely
 // against a run the plane has swept.
+// CLA-651: a resumed phase must not RETRY a transient failure — the backoff
+// ladder walks past the 30-minute lease nothing driver-side renews — and it
+// must not exit the DAEMON either: a single provider blip landing on the
+// review phase of every task used to take the whole fleet down, the same
+// failure CLA-631 fixed for usage limits. The sequence ends on its own, the
+// run carries on, and the claim is disposed of exactly as the usage-limit
+// arm's is: pushed work keeps its takeover hand-off, a releasable claim goes
+// back to the queue.
 func TestDrainPhases_AResumedPhaseDoesNotRetryATransientFailure(t *testing.T) {
+	t.Run("pushed work keeps its takeover hand-off", func(t *testing.T) {
+		wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(1, 0)},
+			{res: held(transientResult(), wip)},
+		}}
+		d, rel := phaseDriver(t, h, twoPhases())
+
+		_, _, stop, err := drainPhasesOnce(t, d)
+		if err != nil {
+			t.Fatalf("drainPhases: %v", err)
+		}
+		if stop {
+			t.Error("a resumed phase hit a transient failure and the run stopped; the sequence must end without the daemon exiting")
+		}
+		if h.invokeCalls != 2 {
+			t.Errorf("spawned %d sessions; a resumed phase must not be retried on a lease nothing renews", h.invokeCalls)
+		}
+		if len(rel.calls) != 0 {
+			t.Errorf("handed the task back to the queue: %+v — pushed work must keep its takeover hand-off", rel.calls)
+		}
+	})
+
+	t.Run("a claim with nothing pushed is released", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(1, 0)},
+			{res: held(transientResult(), openClaim())},
+		}}
+		d, rel := phaseDriver(t, h, twoPhases())
+
+		_, _, stop, err := drainPhasesOnce(t, d)
+		if err != nil {
+			t.Fatalf("drainPhases: %v", err)
+		}
+		if stop {
+			t.Error("a resumed phase hit a transient failure and the run stopped")
+		}
+		if h.invokeCalls != 2 {
+			t.Errorf("spawned %d sessions; a resumed phase must not be retried on a lease nothing renews", h.invokeCalls)
+		}
+		if len(rel.calls) != 1 {
+			t.Fatalf("handed the task back %d times, want 1: %+v — a claim with nothing pushed is releasable, exactly as on the limit arm", len(rel.calls), rel.calls)
+		}
+	})
+}
+
+// The sequence-end break lands BEFORE the dead/fleet/empty arms, so a blip's
+// exit shape must not feed the dead-phase machinery: those counters would tick
+// on a transient failure that happens to wear the "unknown" finish reason, and
+// the park/fleet machinery exists for silent deaths the provider did not own.
+// Three phases so the resumed phase is not last, where the dead signature is
+// live; the exit is BOTH transient and dead-shaped.
+func TestDrainPhases_AResumedPhaseTransientExitDoesNotTickTheDeadCounters(t *testing.T) {
+	blip := transientResult()
+	blip.Raw[harness.FinishReasonKey] = harness.FinishReasonUnknown
+	three := []config.Phase{{Name: "implement"}, {Name: "review"}, {Name: "publish"}}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(1, 0)},
-		{res: held(transientResult(), openClaim())},
+		{res: held(blip, openClaim())},
+		{res: okResult(1, 0)}, // phase 3 would land here; it must not
 	}}
-	d, _ := phaseDriver(t, h, twoPhases())
+	d, rel := phaseDriver(t, h, three)
 
 	_, _, stop, err := drainPhasesOnce(t, d)
 	if err != nil {
 		t.Fatalf("drainPhases: %v", err)
 	}
-	if !stop {
-		t.Error("a resumed phase hit a transient failure and the run did not stop")
+	if stop {
+		t.Error("a resumed phase hit a transient failure and the run stopped")
 	}
 	if h.invokeCalls != 2 {
-		t.Errorf("spawned %d sessions; a resumed phase must not be retried on a lease nothing renews", h.invokeCalls)
+		t.Errorf("spawned %d sessions; the sequence must end at the blipped phase, not advance past it", h.invokeCalls)
+	}
+	if got := d.fleetDead[0]; got != 0 {
+		t.Errorf("fleet dead counter = %d, want 0 — the break must land before the dead arm, or a provider blip ticks a counter that exists to catch silent deaths", got)
+	}
+	if len(rel.calls) != 1 {
+		t.Fatalf("handed the task back %d times, want 1: %+v — a claim with nothing pushed is releasable", len(rel.calls), rel.calls)
 	}
 }
 
@@ -882,6 +953,43 @@ func TestRun_ResumedPhaseLimitWaitHonoursMarkers(t *testing.T) {
 			t.Errorf("the wait and the HALT must both appear in the log; log was:\n%s", out)
 		}
 	})
+}
+
+// The incident CLA-651 exists for, end to end: one transient blip (a claude
+// 5xx, a stream drop) landing on a resumed phase — the review phase of every
+// task — must not take the whole daemon down. The sequence ends, the run stays
+// up and polls again; a second sequence spawning is the proof. No wait is owed
+// for a blip: the re-drain's first-phase arm owns the backoff ladder, and the
+// run-level loop adds no pause of its own.
+func TestRun_ResumedPhaseTransientFailureKeepsTheDaemonDraining(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},                   // iteration 1: implement checkpoints
+		{res: held(transientResult(), openClaim())}, // iteration 1: review blips
+		{res: checkpointed(1, 0)},                   // iteration 2: implement spawns again
+		{res: okResult(1, 0)},                       // iteration 2: review runs
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	d.cfg.MaxIterations = 2
+
+	logs := captureLogs(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — the daemon must poll on after the blip rather than exiting with the first sequence", h.invokeCalls)
+	}
+	if got := h.invocations[2].Prompt; !strings.Contains(got, "PHASE 1") {
+		t.Errorf("the session spawned after the blip is not a fresh sequence: %q", got)
+	}
+	if h.probeCalls != 0 {
+		t.Errorf("probed %d times — a blip has no reset to wait out, and the run must not add a wait of its own", h.probeCalls)
+	}
+	if out := logs.String(); !strings.Contains(out, "the run stays up to poll again") {
+		t.Errorf("the log must say the run is staying up, not only that the sequence ended; log was:\n%s", out)
+	}
 }
 
 func TestDrainPhases_SumsSpendAcrossPhases(t *testing.T) {
