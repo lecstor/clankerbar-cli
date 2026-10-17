@@ -237,6 +237,24 @@ func TestTaskState(t *testing.T) {
 // descriptive, so an unexpected shape in one field must not fail the read.
 func TestTaskState_ReviewsDecode(t *testing.T) {
 	ctx := context.Background()
+	// The production shape (plane server.ts get_task): `reviews` is a SIBLING
+	// of `task`, not inside it. Captured from MAK-274 on 2026-10-18, where the
+	// CLI read no record and refused a healthy Opus review.
+	t.Run("reviews served beside the task object", func(t *testing.T) {
+		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","status":"in_progress","heldByRun":true,"branch":"clanker/x"},"reviews":{"records":[
+			{"id":"rec-1","round":1,"cycle":1,"reviewerRole":"review-1","runId":"94392efc-4272-4d4e-b733-acbe48478110","harness":"claude","model":"claude-opus-5-5","branch":"clanker/x","reviewedTip":"443e2c8d","scope":{"kind":"full-diff","base":"staging","range":"staging..443e2c8d"},"verdict":"findings","state":"sealed","counts":{"must":3,"should":2,"nit":2},"findingsTotal":7,"at":"2026-10-17T15:04:41.000Z"}
+		],"total":1,"counted":1}}`))
+		st, err := mustClient(t, srv).TaskState(ctx, "t-1")
+		if err != nil {
+			t.Fatalf("TaskState: %v", err)
+		}
+		if len(st.Reviews) != 1 || st.Reviews[0].RunID != "94392efc-4272-4d4e-b733-acbe48478110" || st.Reviews[0].ReviewerRole != "review-1" {
+			t.Fatalf("the top-level reviews block was not read: %+v", st.Reviews)
+		}
+		if st.ReviewCounted != 1 || st.ReviewsTotal != 1 || st.Status != "in_progress" || st.Branch != "clanker/x" {
+			t.Errorf("counted=%d total=%d status=%q branch=%q", st.ReviewCounted, st.ReviewsTotal, st.Status, st.Branch)
+		}
+	})
 	t.Run("sealed metadata and released findings", func(t *testing.T) {
 		srv, _ := serve(t, http.StatusOK, mcpTextBody(t, `{"task":{"id":"t-1","status":"in_progress","claimedByRun":"r-1","reviews":{"records":[
 			{"id":"rec-1","round":1,"cycle":1,"reviewerRole":"review-1","runId":"r-1","harness":"claude","model":"opus-test","branch":"clanker/x","reviewedTip":"sha1","scope":{"kind":"full-diff","base":"staging","range":"clanker/x"},"verdict":"findings","state":"sealed","counts":{"must":1,"should":2,"nit":3},"findingsTotal":6,"at":"2026-10-17T10:00:00.000Z"},
