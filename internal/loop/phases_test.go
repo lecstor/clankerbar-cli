@@ -3531,6 +3531,26 @@ func TestMatchingReviewRecord(t *testing.T) {
 			want: 1,
 		},
 		{
+			// The production shape (CLA-509): the claim hands the driver the
+			// run credential, the plane serves the record under the bare id.
+			name:    "a credential-bound claim matches its record served under the bare run id",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "sha1", "sealed")},
+			role:    "review-1", run: "r-1.s3cret", tip: "sha1",
+			want: 1,
+		},
+		{
+			name:    "a credential for another run does not match",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-old", "sha1", "sealed")},
+			role:    "review-1", run: "r-1.s3cret", tip: "sha1",
+			want: 0,
+		},
+		{
+			name:    "a run id that only prefixes the record's is a different run",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-12", "sha1", "sealed")},
+			role:    "review-1", run: "r-1.s3cret", tip: "sha1",
+			want: 0,
+		},
+		{
 			name:    "a request_changes re-trip's previous record is a different run",
 			records: []plane.ReviewRecordState{rec(1, "review-1", "r-old", "sha1", "open")},
 			role:    "review-1", run: "r-1", tip: "sha1",
@@ -4071,6 +4091,87 @@ func TestSalvage_SkipsTheReviewOnlyPhase(t *testing.T) {
 // mustFinding is one plane-served finding, shapes for the verification fixtures.
 func mustFinding(id, status, summary string) plane.ReviewFindingState {
 	return plane.ReviewFindingState{ID: id, Severity: "must", Status: status, Summary: summary}
+}
+
+// withCredential gives a fixture's claim the run id production claims carry
+// since CLA-509: the credential `<uuid>.<secret>`, whose uuid is the bare "r-1"
+// the plane stores records under.
+func withCredential(res harness.Result) harness.Result {
+	if res.Claim.RunID != "" {
+		res.Claim.RunID = "r-1.s3cret"
+	}
+	return res
+}
+
+// The seams compared the claim's run CREDENTIAL with the plane's bare run id,
+// so in production no durable record ever matched: the review gate refused
+// every healthy review, the HasWIP claim lapsed into a takeover that re-ran
+// implement and the review, and a verify round failed the same way. Every
+// other fixture uses the bare id on both sides, which is how it shipped green.
+func TestDrainPhases_ACredentialBoundClaimPassesTheReviewAndVerifySeams(t *testing.T) {
+	t.Run("review -> fix", func(t *testing.T) {
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: withCredential(checkpointed(10, 0.10))},
+			{res: withCredential(checkpointed(5, 0.50))},
+			{res: okResult(5, 0.05)},
+		}}
+		h.onInvoke = func(i int) {
+			if i == 1 {
+				rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+				rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+			}
+		}
+		d := phaseDriverWithReleaser(t, h, []config.Phase{
+			{Name: config.ImplementPhaseName},
+			{Name: config.ReviewPhaseName},
+			{Name: config.FixPhaseName},
+		}, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 3 {
+			t.Fatalf("spawned %d sessions, want 3 — the record written under the bare run id must satisfy a credential-bound claim's seam", h.invokeCalls)
+		}
+		if len(rel.closes) != 1 || rel.closes[0] != 1 {
+			t.Fatalf("closed rounds = %v, want [1]", rel.closes)
+		}
+	})
+
+	t.Run("verify hands over", func(t *testing.T) {
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: withCredential(checkpointed(10, 0.10))},
+			{res: withCredential(checkpointed(5, 0.50))},
+			{res: withCredential(checkpointed(5, 0.05))},
+			{res: withCredential(checkpointed(5, 0.05))},
+		}}
+		h.onInvoke = func(i int) {
+			if i == 1 {
+				rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+			}
+			if i == 3 {
+				rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+				rel.counted = 2
+				rel.status = "in_review"
+			}
+		}
+		d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 4 {
+			t.Fatalf("spawned %d sessions, want 4 — implement, review, fix, verify", h.invokeCalls)
+		}
+		if len(rel.closes) != 2 || rel.closes[0] != 1 || rel.closes[1] != 2 {
+			t.Fatalf("closed rounds = %v, want [1 2] — the verify seam must match its record too", rel.closes)
+		}
+		if len(rel.parks) != 0 {
+			t.Fatalf("a clean verification round parked the task: %v", rel.parks)
+		}
+	})
 }
 
 // verifyPhases is the shipped four-phase shape the CLA-638 tests drive.

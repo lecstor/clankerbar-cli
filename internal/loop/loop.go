@@ -2155,13 +2155,17 @@ func reviewerRoleFor(phases []config.Phase, idx int) string {
 // so that variant keeps the legacy `## Review` block gate (the CLA-634 decision
 // on question 03a12578, option 1).
 //
+// The run ids are compared by runUUID: the claim hands the driver the run
+// CREDENTIAL, while the plane stores and serves a record's run as the bare id.
+//
 // The newest match wins, so a retried attempt's record supersedes an earlier
 // one in the same run.
 func matchingReviewRecord(records []plane.ReviewRecordState, role, runID, tip string, requireTip bool) (plane.ReviewRecordState, bool) {
 	var best plane.ReviewRecordState
 	found := false
+	want := runUUID(runID)
 	for _, r := range records {
-		if r.RunID != runID || r.ReviewerRole != role || r.State == "void" {
+		if runUUID(r.RunID) != want || r.ReviewerRole != role || r.State == "void" {
 			continue
 		}
 		switch {
@@ -2179,6 +2183,19 @@ func matchingReviewRecord(records []plane.ReviewRecordState, role, runID, tip st
 		}
 	}
 	return best, found
+}
+
+// runUUID is a run id's identity: the part before the first dot. Since CLA-509
+// claim_task returns a run as the credential `<uuid>.<secret>`, but the plane
+// keys everything it stores (review records, claimedByRun) on the bare uuid,
+// so two ids name the same run exactly when their uuids match. A bare id (a
+// run claimed before credentials, or one read back from the plane) is its own
+// uuid. This is the plane's own split (parseRunCredential).
+func runUUID(id string) string {
+	if i := strings.IndexByte(id, '.'); i >= 0 {
+		return id[:i]
+	}
+	return id
 }
 
 // isReviewHeading reports whether a line is the review block's heading, with
@@ -2552,7 +2569,7 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 			}
 			rec, matched := matchingReviewRecord(record.Reviews, review.role, res.Claim.RunID, tip, unverified)
 			if !matched {
-				expect := fmt.Sprintf("for reviewer role %q written by this run (%s)", review.role, res.Claim.RunID)
+				expect := fmt.Sprintf("for reviewer role %q written by this run (%s)", review.role, runUUID(res.Claim.RunID))
 				switch {
 				case tip != "":
 					expect += " with reviewed tip " + tip

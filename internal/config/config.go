@@ -453,13 +453,16 @@ const reviewRecordDurableShape = " THEN, and only after that outcome write has S
 	ReviewerRolePlaceholder + "\" (this phase's role; the plane assigns the round and cycle from it), verdict: " +
 	"\"pass\" or \"findings\", harness: \"" + PhaseHarnessPlaceholder + "\", model: \"" + PhaseModelPlaceholder +
 	"\", branch: \"" + PhaseBranchPlaceholder + "\", reviewedTip as above, scope: {kind: \"full-diff\", base: \"" +
-	PhasePRBasePlaceholder + "\", range: \"" + PhaseBranchPlaceholder + "\"}, and findings: one object per finding " +
-	"in the block, in the same order: {severity: \"must\" | \"should\" | \"nit\", evidenceKind: <the MUST's kind " +
-	"token>, evidence: <its payload>, file: <path>, line: <number>, kind: <short category>, summary: <what is " +
+	PhasePRBasePlaceholder + "\", range: \"" + PhasePRBasePlaceholder + "..<reviewedTip>\"} (the plane caps range at 100 " +
+	"characters, so never put the branch name there), and findings: one object per finding in the block, in " +
+	"the same order, at most 20 (the plane refuses a record with more: keep every MUST, then the most important " +
+	"of the rest, and say in the block how many you left out): {severity: \"must\" | \"should\" | \"nit\", " +
+	"evidenceKind: <the MUST's kind token>, evidence: <its payload>, file: <path>, line: <number>, kind: <short category>, summary: <what is " +
 	"wrong>, requiredFix: <the smallest fix>, raisedByModel: \"" + PhaseModelPlaceholder + "\"}. The plane assigns " +
 	"each finding's id (`<round>.<reviewer role>.<n>`); do NOT invent one - the fix phase updates by that id. A " +
-	"RETRY proves itself here: get_task before writing, and if a record for your reviewer role and THIS run (" +
-	PhaseRunPlaceholder + ") is already there in an open round, the record is written and its block landed before " +
+	"RETRY proves itself here: get_task before writing, and if a record for your reviewer role and THIS run is " +
+	"already there (records show the run id WITHOUT its secret: compare only the part of " + PhaseRunPlaceholder +
+	" before its first dot) in an open round, the record is written and its block landed before " +
 	"it (the plane seals the outcome once the record exists) - skip both writes and end. If instead the plane " +
 	"refuses the append with duplicate_reviewer, the same follows: a record for this role and round is already " +
 	"written, that refusal is the idempotency signal, and retrying it changes nothing. If there are no findings, " +
