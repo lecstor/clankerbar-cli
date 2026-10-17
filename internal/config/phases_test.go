@@ -1241,6 +1241,90 @@ func TestBuiltinReviewOnlyBriefStatesItsScopeAndRecord(t *testing.T) {
 	}
 }
 
+// CLA-635: every review-only variant — the three briefs and the two handoff
+// continuations that carry the record shape — states the accepted MUST bar: the
+// seven evidence kinds with their payloads, and the not-a-MUST list, whose
+// precedence over a repo hard rule about style, prose or doc wording is B6.
+func TestReviewOnlyVariantsCarryTheMUSTBar(t *testing.T) {
+	variants := map[string]string{
+		"review-only brief":            reviewOnlyBrief,
+		"no-code review-only brief":    noCodeReviewOnlyBrief,
+		"unverified review-only brief": unverifiedReviewOnlyBrief,
+		"review-only handoff":          HandoffContinuationFor(ReviewPhaseName, true),
+		"no-code review-only handoff":  NoCodeReviewOnlyHandoffContinuation(),
+	}
+	for name, brief := range variants {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{
+			"grade every finding",
+			"must is the only gating grade",
+			"donewhen - quote the clause",
+			"gate - name a repo gate",
+			"failure - a concrete input or state",
+			"security - credential exposure",
+			"decision - a recorded standing decision",
+			"irreversible - an irreversible migration",
+			"untested - a new or changed guard",
+			"never a must, however confident",
+			"missing tests the donewhen does not require (except untested)",
+			"not-a-must list wins",
+			"they need no evidence",
+		} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never states %q, so the bar it reviews against is unstated:\n%s", name, want, brief)
+			}
+		}
+	}
+}
+
+// CLA-635: the record format the review fills in carries, per finding, its id,
+// severity, evidence kind and evidence, file:line, summary and required fix;
+// the block attributes the reviewer (harness/model) once, and every finding in
+// it inherits that attribution.
+func TestReviewOnlyRecordFormatCarriesTheGradedFindingFields(t *testing.T) {
+	for _, want := range []string{
+		"R1 [must|should|nit]",
+		"(<kind>): <evidence>",
+		"<file:line> - <what is wrong>",
+		"Required fix:",
+		"- reviewed by: harness " + PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder,
+	} {
+		if !strings.Contains(reviewOnlyRecordShape, want) {
+			t.Errorf("the review record shape does not carry %q, so the fix phase cannot read it back:\n%s", want, reviewOnlyRecordShape)
+		}
+	}
+}
+
+// CLA-635: the fix briefs hold the fixer to the grade (A1/B5): every MUST is
+// fixed or refuted with evidence in the outcome, the fixer may not downgrade a
+// MUST, a single reviewer's MUST is never dropped because it stands alone, and
+// SHOULD/NIT get the filing rule.
+func TestBuiltinFixBriefsHoldTheFixerToTheGrade(t *testing.T) {
+	for name, brief := range map[string]string{
+		"fix brief":         fixBrief,
+		"no-code fix brief": noCodeFixBrief,
+	} {
+		lower := strings.ToLower(brief)
+		for _, want := range []string{
+			"every must is fixed, or refuted with evidence recorded in your outcome",
+			"you may not downgrade a must",
+			"a must raised by a single reviewer is never dropped because nobody else raised it",
+			"listing a recorded must with no evidence kind or no evidence payload as a should",
+			"record nits and the shoulds you do not fix in your outcome as not done, with the reason",
+			"file a follow-up task only for a should worth doing",
+		} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s never states %q, so the fix phase can drop or silently downgrade a MUST:\n%s", name, want, brief)
+			}
+		}
+	}
+	// The ### Fixes obligation keeps that promise in the durable record: a MUST
+	// left unfixed must be a refutation carrying its evidence.
+	if !strings.Contains(strings.ToLower(fixTerminalRecord), "for a must that reason must be a refutation carrying its evidence") {
+		t.Errorf("the fix record requirement does not say an unfixed MUST must be a refutation with evidence:\n%s", fixTerminalRecord)
+	}
+}
+
 // The fix brief is the one that must land the PR and the hand-off, and it must
 // carry the review forward: once it overwrites the review's outcome, the review
 // block in its own outcome is the only durable record of what was found and
