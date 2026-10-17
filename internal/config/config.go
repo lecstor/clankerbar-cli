@@ -443,7 +443,7 @@ const fixTerminalRecord = " When you hand the task over, the outcome MUST keep e
 // grade - it refutes the finding with evidence of its own, or fixes it. A1 is
 // restated because the interim record may hold a single reviewer: disagreement
 // is not a second opinion, and a lone reviewer's MUST still gates.
-const fixGradingRule = " Work the review's findings against the grade: every MUST is fixed, or REFUTED with evidence " +
+const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
 	"recorded in your outcome - a refutation must actually refute the finding, and a MUST you neither fix nor " +
 	"refute is this phase failing. You may not downgrade a MUST: the driver has already applied its structural " +
 	"check, listing a recorded MUST with no evidence kind or no evidence payload as a SHOULD, and a MUST raised " +
