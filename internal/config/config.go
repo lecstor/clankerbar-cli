@@ -94,7 +94,24 @@ const (
 	// name would inherit review-only or review-and-fix wording it did not ask
 	// for. See reviewOnlyTerminalStep and the built-in briefs below.
 	FixPhaseName = "fix"
+	// VerifyPhaseName is the fix-verification round (CLA-638): it re-reviews the
+	// fix delta, adjudicates the prior round's open MUSTs by their plane finding
+	// ids, and carries the terminal step only when no MUST remains open. It is a
+	// review-shaped phase — it writes a sealed durable review record like the
+	// review gate — and it must be the LAST phase of the sequence, because the
+	// driver repeats the fix→verify pair after it until a round finds no open
+	// MUST or the round cap parks the task.
+	VerifyPhaseName = "verify"
 )
+
+// ReviewRoundCap is the hard round cap per review cycle (B8): a human verdict
+// starts a new cycle, a takeover or reclaim does not, and a void round does not
+// count. The plane derives the count from its non-void records and serves it as
+// `reviews.counted`; the driver refuses to spawn another fix after the third
+// round. It is a constant rather than a config knob on purpose: "never one more
+// round" is the stopping rule, not a tuning dial, and a config value of 0 would
+// be a sequence with no bound at all.
+const ReviewRoundCap = 3
 
 // Phase is one session in a task's sequence. A task runs as an ordered list of
 // them, each a separate harness process, so context resets between them.
@@ -665,6 +682,29 @@ func NoCodeFixHandoffContinuation() string {
 		rerunGuidance + noCodeFixTerminalRecord + noCodeReviewTerminalStep
 }
 
+// FixVerifyHandoffContinuation is the fix phase's continuation when a
+// verification round follows (CLA-638): the successor must still answer every
+// finding, commit and push, and then STOP holding the task. Carrying the
+// legacy reviewTerminalStep here would tell it to open the PR and move the task
+// to in_review — the terminal actions the verifier owns, and precisely what
+// B12 says the fix phase must not do.
+func FixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixTerminalRecord + fixOnlyTerminalStep
+}
+
+// NoCodeFixVerifyHandoffContinuation is FixVerifyHandoffContinuation for a
+// BRANCHLESS fix: the amendment is to the plane's record, so there is nothing
+// to commit or push, but the terminal step still belongs to the verifier.
+// NoCodeFixHandoffContinuation would carry the legacy no-code hand-over and tell
+// the successor to move the task to in_review before the verification round has
+// seen the amendment — the same B12 leak the branch-shaped variant exists to
+// close.
+func NoCodeFixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixTerminalRecord + noCodeFixOnlyTerminalStep
+}
+
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
 // may hand the rest of its job to a fresh successor, and how. The trigger is
 // deliberately EVENT-shaped — a session cannot measure its own context (there
@@ -890,6 +930,8 @@ var builtinPhasePrompts = map[string]string{
 		reviewTerminalStep + handoffGuidance,
 
 	FixPhaseName: fixBrief,
+
+	VerifyPhaseName: verifyBrief,
 }
 
 // noCodeReviewBrief is the review brief for a phase-1 exit evidenced by the
@@ -1077,15 +1119,11 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 // The reviewer keeps the judgement; the cheap harness gets the typing. The cost
 // is one more session startup and a hand-off the fixer must read; the review
 // record on the task is what makes that hand-off cheap and auditable.
-var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
-	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
-	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
-	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
-	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
-	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. You are " +
-	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
-	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true. " +
-	"Read BOTH the durable record and the block: `reviews.records` carries every released record in the newest " +
+// fixCore is the part both fix variants share: read the released record, check
+// the reviewed tip, apply every finding by its plane id, re-verify scoped. The
+// variants differ ONLY in their terminal step, because whether the fix phase is
+// the last one depends on whether a verification round follows it (CLA-638).
+const fixCore = "Read BOTH the durable record and the block: `reviews.records` carries every released record in the newest " +
 	"round, each with its findings[] and the plane-assigned id (`<round>.<reviewer role>.<n>`) you update by; " +
 	"the outcome's `" + ReviewRecordHeading + "` block is the legacy copy. If there is neither a released review " +
 	"record nor a review block, that is a FAILED hand-off: park the task with update_task(status: \"parked\", " +
@@ -1098,13 +1136,78 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 	"not a decision to commit where you are, it is this failure mode. Apply the review's findings, each by its " +
 	"PLANE id from the durable record - the block's R-numbers are labels, not the keys you update by." +
 	fixGradingRule +
-	" A finding you neither fix nor answer is this phase failing. If the review found nothing " +
-	"(verdict: pass), there is nothing to fix: still open the PR if none exists and hand over. The review " +
+	" A finding you neither fix nor answer is this phase failing. The review " +
 	"ran checks, so the worktree may carry generated or cache files it did not commit: stage only the fixes " +
 	"you made, never those. Re-verify " +
 	"SCOPED to those fixes: run the gates the repo's own instructions name, and any check a finding says was " +
-	"red, not the whole suite again for no reason." + rerunGuidance + fixTerminalRecord + reviewTerminalStep +
-	handoffGuidance
+	"red, not the whole suite again for no reason."
+
+// fixBrief is the phase that APPLIES a review's findings when it is the LAST
+// phase of the sequence. It is deliberately not named "review":
+// reviewTerminalStep is injected by phase name, and a fix phase that reused the
+// name would be told it was review-only (or review-and-fix) rather than the one
+// actor that changes code.
+//
+// Why a separate phase at all, when the review used to fix its own findings: the
+// review model is the expensive one, and the fixing - apply, re-verify, commit,
+// push, open the PR - is the bulk of a review session's tool calls and context.
+// The reviewer keeps the judgement; the cheap harness gets the typing. The cost
+// is one more session startup and a hand-off the fixer must read; the review
+// record on the task is what makes that hand-off cheap and auditable.
+var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
+	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
+	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
+	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
+	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. You are " +
+	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true. " +
+	fixCore +
+	" If the review found nothing " +
+	"(verdict: pass), there is nothing to fix: still open the PR if none exists and hand over." +
+	rerunGuidance + fixTerminalRecord + reviewTerminalStep + handoffGuidance
+
+// fixVerifyBrief is the fix phase when a VERIFICATION round follows it (CLA-638,
+// B12). The verification round re-reviews the delta and adjudicates the prior
+// MUSTs, and IT carries the PR/in_review terminal step; a fix session that
+// opened the PR here would ship fixes no verifier has looked at. The rest of the
+// contract is identical, because it reads the same record and applies the same
+// findings.
+var fixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed branch " +
+	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
+	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
+	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
+	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. A VERIFICATION round " +
+	"runs after you: it re-reviews your fix delta and adjudicates the prior open MUSTs, and IT opens the PR " +
+	"and hands the task to in_review once no MUST remains open. You are RESUMING that run, not starting a " +
+	"new one: do not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder +
+	"\") to resume the run, then get_task with includeDecisions: true. " +
+	fixCore +
+	" If the review found nothing (verdict: pass), there is nothing to fix: commit nothing, leave the branch " +
+	"as it is, and end holding the task — the verification round still runs and carries the terminal step." +
+	rerunGuidance + fixTerminalRecord + fixOnlyTerminalStep + handoffGuidance
+
+// fixOnlyTerminalStep ends a fix phase that is NOT the sequence's last one
+// (CLA-638): the verification round owns the PR and in_review hand-over.
+const fixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes " +
+	"you made, append an outcome with update_task(taskId, runId, outcome: ...) that carries the fixes and a " +
+	"**Tests** section saying what you actually verified — the plane requires that section on the task before " +
+	"the verifier can hand it to in_review, and the verifier cannot write the outcome itself once its own " +
+	"review record is sealed — then STOP still holding the task. Do NOT open a PR and do NOT move the task to " +
+	"in_review: the VERIFICATION round after you carries that terminal step once it finds no open MUST. A PR " +
+	"opened here would ship fixes the verifier never saw. Ending this session holding the task is the " +
+	"checkpoint the verification round resumes from."
+
+// noCodeFixOnlyTerminalStep is fixOnlyTerminalStep for a branchless fix: it
+// still records an outcome the in_review guard can read, but there is nothing to
+// commit or push.
+const noCodeFixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: append an outcome with " +
+	"update_task(taskId, runId, outcome: ...) that carries what you amended and a **Tests** section (\"**Tests** " +
+	"— none, no-code delivery.\" is honest and valid) — the plane reads that section on the in_review move the " +
+	"verifier makes, and the verifier cannot write the outcome itself once its own review record is sealed. " +
+	"Do NOT open a PR and do NOT move the task to in_review: the VERIFICATION round after you carries that " +
+	"terminal step once it finds no open MUST. End holding the task."
 
 // noCodeFixBrief is fixBrief for a branchless checkpoint: the review judged the
 // plane's record, and the fix is an amendment to that record, never invented
@@ -1135,6 +1238,160 @@ var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseT
 	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
 	noCodeFixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
 
+// noCodeFixVerifyBrief is the branchless fix phase when a verification round
+// follows: the amendment is to the plane's record, and the terminal step is the
+// silent hold — the verification round carries the hand-over.
+var noCodeFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed the PLANE'S RECORD of what the " +
+	"implement phase did - there is NO branch, because this task's correct delivery is no code. A " +
+	"VERIFICATION round runs after you and adjudicates the open MUSTs, so it, not you, decides the " +
+	"hand-over. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
+	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the " +
+	"heartbeat because the task already left in_progress, that refusal is expected: the settlement IS the " +
+	"delivery, so proceed. Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading +
+	"` block in the outcome — an earlier one is an earlier round, so read past it. That block IS the round's " +
+	"record: the branchless review writes no durable record (question 03a12578, option 1), so read and apply " +
+	"from the block alone and do not treat an empty record set as a failed hand-off. Apply the findings by " +
+	"AMENDING THE RECORD (update_task, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
+	" A finding that needs CODE cannot be fixed here: file it as its own task (create_task, with a real " +
+	"doneWhen) and say so in your outcome - for a MUST, that filed task is this phase's fix of it. If the " +
+	"review found nothing, change nothing." + rerunGuidance + fixTerminalRecord + noCodeFixOnlyTerminalStep +
+	handoffGuidance
+
+// verifyStoppingRule is the stopping rule's core: what counts as a MUST that is
+// still open (CLA-638, D7/A6/B7/B12/B13). It is shared by the code and no-code
+// variants so the bar cannot drift between them; the ID-based machinery that
+// enforces it — the round cap and the non-convergence breaker — is
+// verifyDriverBounds, because the branchless variant has no plane finding ids
+// to count or park on.
+const verifyStoppingRule = " THE STOPPING RULE IS A BAR, NOT A FEELING. The gate is NO OPEN MUST. A MUST is open " +
+	"until it is fixed, filed as its own task, or refuted with evidence — a prior MUST that is neither stays " +
+	"open, and a refutation you reject also stays open. SHOULD and NIT findings are recorded, never gating."
+
+// verifyDriverBounds is the id-based machinery the CODE-shaped verification
+// round runs under: the driver's round cap and non-convergence breaker, both
+// read from the plane's durable records.
+const verifyDriverBounds = " The driver counts rounds: this is a hard cap of three non-void rounds per review " +
+	"cycle (a human verdict starts a new cycle; a takeover or reclaim does not). At the cap, any open MUST is " +
+	"the driver's park, never another round. Non-convergence is also the driver's: a MUST left unresolved " +
+	"after two fix attempts, or an id a previous verifier marked resolved that you reopen, parks the task for " +
+	"a human."
+
+// verifyTerminalStep ends a verification round: the hand-over only when no MUST
+// remains open, otherwise a silent hold for the driver to spawn another fix.
+const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and the round number the append returned.\n\n" +
+	"If ANY MUST remains open: release this round with ONE call — update_task(taskId, runId, review: " +
+	"{ closeRound: <the round the append returned> }) — then do NOT open a PR, do NOT move the task to " +
+	"in_review, and do NOT change its status. End holding the task. The driver spawns another fix against " +
+	"the released findings, or parks the task at the round cap.\n\n" +
+	"If NO MUST remains open, carry the hand-over in the SAME call that releases the round: confirm the " +
+	"branch is pushed (push any fix commit that is still local), open a PR targeting the repo's PR base (" +
+	PhasePRBasePlaceholder + ") if none exists for the branch, then call update_task(taskId, runId, status: " +
+	"\"in_review\", review: { closeRound: <the round the append returned> }). Do NOT send an outcome in " +
+	"that call: your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), " +
+	"and the fix phase has already written the **Tests** section the in_review guard reads. Releasing the " +
+	"round in the same call is what makes the status move legal — after the task leaves in_progress the plane " +
+	"no longer accepts a close from this run. Never decide to run one more round yourself."
+
+// noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
+// counterpart of verifyTerminalStep. This shape writes no durable record
+// (question 03a12578, option 1 — the branchless review writes none either), so
+// there is no round to release and no closeRound to make: the verifier appends
+// its OWN `## Review` block, which IS the record the driver's checkpoint reads,
+// and the disposition is an operator park (open MUST — the id-based loop the
+// driver runs cannot exist without plane finding ids) or the status move
+// (clean — the verifier carries the hand-over, and the fix phase has already
+// written the **Tests** section the in_review guard reads).
+const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and whether the task still sits in_progress. The " +
+	"id-based machinery is the driver's and needs plane finding ids this shape does not have, so this " +
+	"terminal step is this shape's whole disposition.\n\n" +
+	"Append YOUR OWN legacy `" + ReviewRecordHeading + "` block to the task's outcome with " +
+	"update_task(taskId, runId, outcome: ...) — append, never replace what sits above it: the block IS this " +
+	"shape's round record, and the driver's checkpoint reads exactly it. There is no durable record to " +
+	"append, no round to close and no PR to open for a no-code delivery.\n\n" +
+	"If ANY MUST remains open: do NOT hand the task over — park it with update_task(taskId, runId, status: " +
+	"\"parked\", outcome: ...), carrying the open MUST(s) and why the amendment does not resolve them; the " +
+	"same disposition the round cap gives the id-based shape. If the task already left in_progress, do NOT " +
+	"re-open it: leave your block as the record and end.\n\n" +
+	"If NO MUST remains open: hand the task over. If it still sits in_progress with its no-code delivery " +
+	"declared, move it with update_task(taskId, runId, status: \"in_review\") — do NOT send an outcome in " +
+	"that call; your block write already landed and the fix phase wrote the **Tests** section the in_review " +
+	"guard reads. If it already left in_progress, the hand-over already happened: verify the record reads " +
+	"honestly and end. Never decide to run one more round yourself."
+
+// verifyBrief is the fix-verification round (CLA-638): review the fix delta plus
+// its regression surface, adjudicate every prior open MUST by its plane id, and
+// gate on no open MUST. It is review-shaped — it writes a sealed durable review
+// record and the driver closes the round at the seam — so it uses the same
+// record machinery as the review gate, with `scope: fix-delta` and the prior
+// round's reviewed tip as the delta base.
+//
+// The driver prepends the prior open MUST ids (and their findings) to this
+// brief: the list is plane state, not config, and the driver reads it from the
+// released records before spawning. The wording below assumes that block is
+// present and tells the session what to do if it is not.
+var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the VERIFICATION round. A review round found issues and a fix round applied " +
+	"them; your job is to verify the FIXES, not to review the whole diff again. The driver has closed the " +
+	"previous round, so get_task releases the records. You are RESUMING that run, not starting a new one: do " +
+	"not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume " +
+	"the run, then get_task with includeDecisions: true. The driver has prepended the PRIOR OPEN MUST ids with " +
+	"their findings; if that block is missing, read the released records yourself and list every finding with " +
+	"severity must and status open. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - " +
+	"a session whose cwd is already the main checkout sitting on that branch is not a decision to commit " +
+	"where you are, it is this failure mode. " +
+	"SCOPE: the fix delta is the reviewed tip the LAST released record names (`reviewedTip`) up to HEAD " +
+	"(`git diff <reviewedTip>..HEAD`), PLUS the regression surface those fixes touch. Do not re-review the " +
+	"whole diff, whose full pass already happened; a full second pass is the exception you state a reason for " +
+	"in the record. " +
+	"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID — exactly one disposition each, recorded through " +
+	"update_task(review: {findingUpdates: [...]}) on the CLOSED record it belongs to: " +
+	"(1) RESOLVED — the fix is present and correct: status \"fixed\" with fixCommit. " +
+	"(2) RESOLVED BY DISPATCH — the fix is a follow-up task: status \"filed\" with filedTaskRef. " +
+	"(3) REFUTATION ACCEPTED — the fixer's evidence shows the finding was wrong: status \"refuted\" with " +
+	"refutedReason. " +
+	"(4) UNRESOLVED or REFUTATION REJECTED — leave the finding's status \"open\" and record in this round's " +
+	"record why the fix or the refutation does not stand. " +
+	"You may raise NEW MUSTs ONLY within the fix delta and its regression surface; the plane assigns their " +
+	"new ids. Do not re-raise an earlier finding as a new id: adjudicate the existing id. " +
+	"REVIEW ONLY: you do not change code — do not edit, create or delete a source file, do not commit, and do " +
+	"not apply a fix yourself. The phase after you applies what you find, and a fix applied here is a fix it " +
+	"cannot attribute. The one exception is the hand-over below: when no MUST remains open, opening the PR " +
+	"(and pushing a fix commit that the fixer left local) is the terminal step, not a review change. " +
+	"RECORD THE ROUND IN BOTH FORMS: first append the legacy `" + ReviewRecordHeading + "` block to the task's " +
+	"outcome with update_task(taskId, runId, outcome: ...) — append, never replace what sits above it — then " +
+	"append the sealed durable record with update_task(taskId, runId, review: {...}) naming reviewerRole " +
+	"\"{{reviewerRole}}\", reviewedTip `git rev-parse HEAD`, scope kind \"fix-delta\" with base and range " +
+	"(`<reviewedTip>..HEAD`), a verdict of pass or findings, and every new finding graded must/should/nit with " +
+	"the evidence a MUST requires. The durable record is the driver's seam evidence; the block is the " +
+	"one-release compatibility copy." +
+	verifyStoppingRule + verifyDriverBounds + verifyTerminalStep + rerunGuidance + handoffGuidance
+
+// noCodeVerifyBrief is verifyBrief for a branchless checkpoint: there is no
+// code delta to re-review, so the verification is of the plane record and the
+// fix's record amendments. It never opens a PR or invents code, and its
+// terminal step is the no-code hand-over (the verifier is the LAST phase, so
+// nothing after it can carry the move the review-only ending defers).
+var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the VERIFICATION round for a task whose correct delivery is NO CODE. There is " +
+	"NO branch and no diff; the fix round amended the PLANE'S RECORD. The driver has prepended the LAST `" +
+	ReviewRecordHeading + "` block of the task's outcome — that block, not a durable record, is this shape's " +
+	"round record (question 03a12578, option 1). You are RESUMING that run, not starting a new one: do not " +
+	"call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
+	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"expected: the settlement IS the delivery, so proceed. Then get_task with includeDecisions: true. Review " +
+	"the amendment the fix made: does it resolve each prior open MUST, is it evidence rather than assertion, " +
+	"does the task's record still match its doneWhen? ADJUDICATE EVERY PRIOR OPEN MUST in the BLOCK's own " +
+	"terms — resolved, resolved by dispatch (the follow-up task's ref), refuted with evidence, or left open " +
+	"with your reason — and check on the ground what the amendment claims where you can. There are no plane " +
+	"finding ids to update on this shape, and do not treat the empty durable record set as a failed " +
+	"hand-off. You may raise new MUSTs only about the record changes and their regression surface. Do NOT " +
+	"invent code, a branch or a PR, and do NOT open a PR." +
+	verifyStoppingRule + noCodeVerifyTerminalStep + rerunGuidance + handoffGuidance
+
 // BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can
 // tell whether a phase runs the built-in brief (vs an operator's custom prompt)
 // when it must choose a variant (CLA-497): a checkpoint evidenced by the
@@ -1156,7 +1413,21 @@ func BuiltinReviewBrief() string { return builtinPhasePrompts[ReviewPhaseName] }
 // the caller reads this from EffectivePhases before any of that.
 func ReviewShaped(prompt string) bool {
 	switch prompt {
-	case reviewOnlyBrief, unverifiedReviewOnlyBrief, noCodeReviewOnlyBrief:
+	case reviewOnlyBrief, unverifiedReviewOnlyBrief, noCodeReviewOnlyBrief,
+		verifyBrief, noCodeVerifyBrief:
+		return true
+	}
+	return false
+}
+
+// VerifyShaped reports whether a RESOLVED prompt is a fix-verification round
+// (CLA-638). It is deliberately narrower than ReviewShaped: a verifier writes a
+// durable record and is gated the same way, but it also adjudicates prior
+// findings and its terminal step depends on whether any MUST is still open, so
+// the driver must not mistake an ordinary review for it.
+func VerifyShaped(prompt string) bool {
+	switch prompt {
+	case verifyBrief, noCodeVerifyBrief:
 		return true
 	}
 	return false
@@ -1175,6 +1446,22 @@ func UnverifiedReviewOnlyBrief() string { return unverifiedReviewOnlyBrief }
 
 // FixBrief returns the fix phase's shipped brief.
 func FixBrief() string { return fixBrief }
+
+// FixVerifyBrief returns the fix phase's brief when a verification round
+// follows it: it applies findings and stops holding the task; the verifier owns
+// the PR and in_review hand-over.
+func FixVerifyBrief() string { return fixVerifyBrief }
+
+// VerifyBrief returns the verification round's shipped brief.
+func VerifyBrief() string { return verifyBrief }
+
+// NoCodeVerifyBrief returns the verification round's brief for a branchless
+// checkpoint.
+func NoCodeVerifyBrief() string { return noCodeVerifyBrief }
+
+// NoCodeFixVerifyBrief returns the branchless fix phase's brief when a
+// verification round follows it.
+func NoCodeFixVerifyBrief() string { return noCodeFixVerifyBrief }
 
 // NoCodeFixBrief returns the fix phase's brief for a branchless checkpoint.
 func NoCodeFixBrief() string { return noCodeFixBrief }
@@ -2218,20 +2505,61 @@ func (c *Config) EffectivePhases() []Phase {
 			// it is the read-only gate, and a final review keeps the historical
 			// review-and-fix brief so a two-phase config still finishes. See
 			// reviewOnlyBrief and the builtinPhasePrompts comment.
-			if ph.Name == ReviewPhaseName && i < len(phases)-1 {
+			//
+			// The fix phase's TERMINAL is positional for the same reason: a fix
+			// followed by a verification round must not open the PR (CLA-638,
+			// B12), because the verifier carries that terminal step only after it
+			// finds no open MUST.
+			switch {
+			case ph.Name == ReviewPhaseName && i < len(phases)-1:
 				ph.Prompt = reviewOnlyBrief
-			} else {
+			case ph.Name == FixPhaseName && i+1 < len(phases) && phases[i+1].Name == VerifyPhaseName && phases[i+1].Prompt == "":
+				ph.Prompt = fixVerifyBrief
+			default:
 				ph.Prompt = builtinPhasePrompts[ph.Name]
 			}
 		}
-		ph.MaxTurns = c.resolveMaxTurns(ph.MaxTurns)
-		ph.MaxWallClock = c.resolveWallClock(ph.MaxWallClock)
+		out[i] = ph
+	}
+	// A verify phase that names neither a harness nor a tier would otherwise run
+	// on the REVIEWER'S model — the one that raised the findings — which A5
+	// (throughput, not only dollars) says is the wrong default: verification
+	// rounds are scoped and cheap, and a Claude subscription limit is shared with
+	// the operator's interactive use. So it inherits the FIX phase's harness and
+	// tier instead (the shipped shape has fix on a cheap non-Claude harness), and
+	// an explicit harness/tier on the verify phase always wins. Configurable,
+	// never silent magic: the resolved values are what the spawn line stamps.
+	//
+	// Keyed on the RESOLVED built-in brief, not the name: an operator's own
+	// prompt under the name "verify" owns its own contract (the same convention
+	// every other variant follows — verifyBrief is what the driver treats as a
+	// verifier), so it must not silently inherit the fix phase's knobs.
+	if len(c.Phases) > 1 {
+		lastFix := -1
+		for i := range out {
+			if out[i].Name == FixPhaseName {
+				lastFix = i
+				continue
+			}
+			if out[i].Name != VerifyPhaseName || out[i].Prompt != verifyBrief || lastFix < 0 {
+				continue
+			}
+			if out[i].Harness == "" {
+				out[i].Harness = out[lastFix].Harness
+			}
+			if out[i].Tier == "" {
+				out[i].Tier = out[lastFix].Tier
+			}
+		}
+	}
+	for i := range out {
+		out[i].MaxTurns = c.resolveMaxTurns(out[i].MaxTurns)
+		out[i].MaxWallClock = c.resolveWallClock(out[i].MaxWallClock)
 		// Resolve the harness here too, so every phase the driver iterates NAMES
 		// the harness it runs on and nothing downstream has to re-derive it from
 		// the config. The synthesized single phase of an unphased run gets the
 		// run-wide harness by the same rule, which is what it always ran on.
-		ph.Harness = c.HarnessFor(ph)
-		out[i] = ph
+		out[i].Harness = c.HarnessFor(out[i])
 	}
 	return out
 }
@@ -3006,12 +3334,19 @@ func (c *Config) Validate() error {
 	// from the task — a fix with no review before it can only report a failed
 	// hand-off. Both rules apply to the BUILT-IN brief only; an operator's own
 	// prompt owns its own ordering.
+	//
+	// CLA-638 relaxes the LAST rule for exactly one successor: a built-in
+	// VERIFICATION phase. EffectivePhases swaps the fix's resolved prompt to the
+	// no-PR variant; the verifier then carries the terminal step, and the driver
+	// repeats the fix→verify pair until a round finds no open MUST or the round
+	// cap parks the task.
 	if n := len(c.Phases); n > 0 {
 		for i, ph := range c.Phases {
 			if ph.Prompt != "" || ph.Name != FixPhaseName {
 				continue
 			}
-			if i != n-1 {
+			verifyFollows := i+1 < n && c.Phases[i+1].Name == VerifyPhaseName && c.Phases[i+1].Prompt == ""
+			if i != n-1 && !verifyFollows {
 				return fmt.Errorf("phases[%d] (%q): the %q brief is the LAST phase of a sequence — it opens the PR and hands the task to in_review, so a phase after it would be spawned on a task that has already left the run (move %q to the end, or give this phase its own prompt)",
 					i, ph.Label(i), FixPhaseName, FixPhaseName)
 			}
@@ -3025,6 +3360,40 @@ func (c *Config) Validate() error {
 			if !reviewed {
 				return fmt.Errorf("phases[%d] (%q): the %q brief applies a review's findings, but no %q phase precedes it — there would be no review record to read, and its only honest outcome is a reported failed hand-off (add a %q phase, or give this one its own prompt)",
 					i, ph.Label(i), FixPhaseName, ReviewPhaseName, ReviewPhaseName)
+			}
+		}
+	}
+	// The verification round (CLA-638) has one legal position and one legal
+	// predecessor. Position: LAST, because the driver repeats the fix→verify pair
+	// after it and a phase after the verifier would never be reached. Predecessor:
+	// the built-in fix brief, because there must be a phase that applies findings
+	// between the verifier's rounds — without it the loop cannot make progress,
+	// which is exactly the non-terminating sequence this rule refuses. The
+	// verifier also needs an earlier review phase whose MUSTs it adjudicates; a
+	// sequence with no review has no findings and no ids to verify.
+	if n := len(c.Phases); n > 0 {
+		for i, ph := range c.Phases {
+			if ph.Prompt != "" || ph.Name != VerifyPhaseName {
+				continue
+			}
+			if i != n-1 {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is the LAST phase of a sequence — it ends the verification loop (no open MUST), so a phase after it would never run (move %q to the end)",
+					i, ph.Label(i), VerifyPhaseName, VerifyPhaseName)
+			}
+			if i == 0 || c.Phases[i-1].Prompt != "" || c.Phases[i-1].Name != FixPhaseName {
+				return fmt.Errorf("phases[%d] (%q): the %q brief verifies a fix round, so it must directly follow the %q brief — with no fix between verification rounds the loop cannot make progress (add a %q phase before %q)",
+					i, ph.Label(i), VerifyPhaseName, FixPhaseName, FixPhaseName, VerifyPhaseName)
+			}
+			reviewed := false
+			for _, prev := range c.Phases[:i] {
+				if prev.Name == ReviewPhaseName {
+					reviewed = true
+					break
+				}
+			}
+			if !reviewed {
+				return fmt.Errorf("phases[%d] (%q): the %q brief adjudicates a review's open MUSTs by id, but no %q phase precedes the fix it verifies — there would be no finding ids to adjudicate (add a %q phase before %q)",
+					i, ph.Label(i), VerifyPhaseName, ReviewPhaseName, ReviewPhaseName, FixPhaseName)
 			}
 		}
 	}

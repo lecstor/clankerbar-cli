@@ -1023,8 +1023,11 @@ func TestReviewShaped(t *testing.T) {
 		{"the review-only brief", reviewOnlyBrief, true},
 		{"the unverified review-only brief", unverifiedReviewOnlyBrief, true},
 		{"the no-code review-only brief", noCodeReviewOnlyBrief, true},
+		{"the verification brief", verifyBrief, true},
+		{"the no-code verification brief", noCodeVerifyBrief, true},
 		{"the final combined review brief", builtinPhasePrompts[ReviewPhaseName], false},
 		{"the fix brief", fixBrief, false},
+		{"the fix-with-verification brief", fixVerifyBrief, false},
 		{"the implement brief", builtinPhasePrompts[ImplementPhaseName], false},
 		{"an operator's custom prompt", "Do your own review-shaped job, whatever that means here.", false},
 		{"an empty prompt", "", false},
@@ -1711,5 +1714,275 @@ func TestHandoffContinuation_CarriesThePhaseModeForward(t *testing.T) {
 	// demanded a findingUpdates call would fail every branchless round closed.
 	if strings.Contains(noCodeFix, "findingUpdates") || strings.Contains(noCodeFix, "DURABLE review record") {
 		t.Errorf("a branchless fix handoff demands the durable record the branchless review cannot write:\n%s", noCodeFix)
+	}
+}
+
+// CLA-638: a fix followed by a verification round must not carry the PR terminal
+// step; the verifier owns it. The legacy three-phase shape keeps the old brief.
+func TestEffectivePhases_FixAndVerifyVariantsByPosition(t *testing.T) {
+	four := defaults()
+	four.Prompt = ""
+	four.Phases = []Phase{
+		{Name: ImplementPhaseName},
+		{Name: ReviewPhaseName, Tier: "strong"},
+		{Name: FixPhaseName, Tier: "cheap"},
+		{Name: VerifyPhaseName},
+	}
+	got := four.EffectivePhases()
+	if len(got) != 4 {
+		t.Fatalf("got %d phases, want 4", len(got))
+	}
+	if got[2].Prompt != fixVerifyBrief {
+		t.Errorf("a fix followed by a verification round did not resolve to the no-PR variant:\n%s", got[2].Prompt)
+	}
+	if got[3].Prompt != verifyBrief {
+		t.Errorf("the named verify phase did not resolve to its built-in brief:\n%s", got[3].Prompt)
+	}
+	if strings.Contains(got[2].Prompt, "Open a PR targeting") {
+		t.Errorf("the fix brief still carries the PR terminal step with a verifier after it:\n%s", got[2].Prompt)
+	}
+
+	three := defaults()
+	three.Prompt = ""
+	three.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+	if got := three.EffectivePhases()[2].Prompt; got != fixBrief {
+		t.Errorf("the legacy three-phase fix lost its terminal-step brief")
+	}
+}
+
+// A5: the verifier defaults to the FIX phase's harness and tier — the cheap,
+// non-raise side of the split — and an explicit choice always wins. This is what
+// keeps a bare verify phase off the expensive reviewer's model and, in the
+// shipped shape, off Claude.
+func TestEffectivePhases_VerifyInheritsTheFixHarnessAndTier(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Harness = "claude"
+	c.Harnesses = map[string]HarnessConfig{"opencode": {MCPConfigPath: "/tmp/oc.json", ConfigDir: "/tmp/oc"}}
+	c.Phases = []Phase{
+		{Name: ImplementPhaseName},
+		{Name: ReviewPhaseName, Tier: "strong"},
+		{Name: FixPhaseName, Harness: "opencode", Tier: "cheap"},
+		{Name: VerifyPhaseName},
+	}
+	got := c.EffectivePhases()
+	if got[3].Harness != "opencode" || got[3].Tier != "cheap" {
+		t.Errorf("verify defaults = harness %q tier %q, want the fix phase's opencode/cheap", got[3].Harness, got[3].Tier)
+	}
+
+	c.Phases[3].Harness = "claude"
+	c.Phases[3].Tier = "strong"
+	got = c.EffectivePhases()
+	if got[3].Harness != "claude" || got[3].Tier != "strong" {
+		t.Errorf("an explicit verify harness/tier was overwritten: harness %q tier %q", got[3].Harness, got[3].Tier)
+	}
+
+	// A CUSTOM prompt under the name "verify" is the operator's own phase: the
+	// inheritance keys on the built-in brief, so it keeps the run-wide harness
+	// and tier instead of silently inheriting the fix phase's.
+	c.Phases[3].Harness = ""
+	c.Phases[3].Tier = ""
+	c.Phases[3].Prompt = "Verify whatever you like, your own way."
+	got = c.EffectivePhases()
+	if got[3].Harness != "claude" || got[3].Tier != "" {
+		t.Errorf("a custom-prompt verify phase inherited the fix phase's knobs: harness %q tier %q, want the run-wide harness and no tier", got[3].Harness, got[3].Tier)
+	}
+}
+
+// CLA-638: the verification round's one legal position is last, directly after
+// the built-in fix, with a review before it. A sequence that cannot make progress
+// between verification rounds is refused at validation rather than paid for.
+func TestValidate_VerifyPhaseRules(t *testing.T) {
+	tests := []struct {
+		name   string
+		phases []Phase
+		want   string
+	}{
+		{
+			name:   "verify must be last",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}, {Name: VerifyPhaseName}, {Name: FixPhaseName}},
+			want:   VerifyPhaseName,
+		},
+		{
+			name:   "verify must directly follow fix",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: VerifyPhaseName}},
+			want:   FixPhaseName,
+		},
+		{
+			name:   "verify needs a review whose findings it adjudicates",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: FixPhaseName}, {Name: VerifyPhaseName}},
+			want:   ReviewPhaseName,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := defaults()
+			c.Prompt = ""
+			c.Phases = tc.phases
+			err := c.Validate()
+			if err == nil {
+				t.Fatalf("Validate accepted %+v", tc.phases)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the rejection does not name %q: %v", tc.want, err)
+			}
+		})
+	}
+
+	c := defaults()
+	c.Prompt = ""
+	c.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}, {Name: VerifyPhaseName}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate refused the shipped implement/review/fix/verify sequence: %v", err)
+	}
+}
+
+// The verify brief is an interface: it must prescribe the by-id adjudication,
+// the delta scope, the new-MUST limit, the no-open-MUST gate and the conditional
+// terminal step. A paraphrase that drops any of these reopens the loop the
+// stopping rule exists to close.
+func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
+	// The core bar is shared by both variants: the gate is no open MUST, and
+	// SHOULD/NIT never gate.
+	for name, brief := range map[string]string{
+		"verify":         verifyBrief,
+		"no-code verify": noCodeVerifyBrief,
+	} {
+		for _, want := range []string{
+			"THE STOPPING RULE IS A BAR, NOT A FEELING",
+			"NO OPEN MUST",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("%s brief does not carry %q", name, want)
+			}
+		}
+	}
+	// The ID-based machinery is the CODE shape's: plane ids to adjudicate by,
+	// the driver's round cap, and the non-convergence breaker.
+	for _, want := range []string{
+		"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
+		"RESOLVED",
+		"REFUTATION ACCEPTED",
+		"UNRESOLVED",
+		"findingUpdates",
+		"three non-void rounds",
+		"takeover or reclaim does not",
+		"fix-delta",
+		"ONLY within the fix delta",
+		`status: "in_review"`,
+		"closeRound",
+		"review_sealed",
+		"do NOT open a PR",
+		"{{reviewerRole}}",
+	} {
+		if !strings.Contains(verifyBrief, want) {
+			t.Errorf("the code verify brief does not carry %q", want)
+		}
+	}
+	// The no-code variant is BLOCK-based (CLA-670, question 03a12578 option 1):
+	// no plane ids, no durable round to close, and its own terminal carries the
+	// hand-over (clean) or the operator park (open MUST) — the verifier is the
+	// LAST phase, so nothing after it can carry the move the review-only ending
+	// defers.
+	for _, want := range []string{
+		"ADJUDICATE EVERY PRIOR OPEN MUST",
+		"the BLOCK's own terms",
+		"no durable record",
+		"no plane finding ids",
+		"the LAST",
+		`status: "in_review"`,
+		`status: "parked"`,
+		"do NOT open a PR",
+	} {
+		if !strings.Contains(noCodeVerifyBrief, want) {
+			t.Errorf("the no-code verify brief does not carry %q", want)
+		}
+	}
+	for _, unwanted := range []string{
+		"closeRound",
+		"review_sealed",
+		"findingUpdates",
+		"The phase after you decides",
+		"COMMIT and PUSH",
+	} {
+		if strings.Contains(noCodeVerifyBrief, unwanted) {
+			t.Errorf("the no-code verify brief carries %q — the branchless shape writes no durable round and has no plane ids", unwanted)
+		}
+	}
+}
+
+// The no-code fix variant that a verifier follows holds the task; the verifier
+// decides the hand-over.
+func TestNoCodeFixVerifyBriefStopsBeforeTheHandover(t *testing.T) {
+	if !strings.Contains(noCodeFixVerifyBrief, "Do NOT open a PR") {
+		t.Errorf("the no-code fix-verify brief does not forbid the PR:\n%s", noCodeFixVerifyBrief)
+	}
+	if strings.Contains(noCodeFixVerifyBrief, "Open a PR targeting") {
+		t.Errorf("the no-code fix-verify brief carries the terminal step:\n%s", noCodeFixVerifyBrief)
+	}
+	if !strings.Contains(noCodeFixVerifyBrief, "**Tests**") {
+		t.Errorf("the no-code fix-verify brief does not write the outcome the in_review guard reads:\n%s", noCodeFixVerifyBrief)
+	}
+	if strings.Contains(noCodeFixVerifyBrief, "COMMIT and PUSH") {
+		t.Errorf("the no-code fix-verify brief tells a branchless fix to commit and push:\n%s", noCodeFixVerifyBrief)
+	}
+}
+
+// VerifyShaped is deliberately narrower than ReviewShaped: every verifier is a
+// review-shaped record writer, but an ordinary review must not be mistaken for
+// the stopping-rule gate.
+func TestVerifyShaped(t *testing.T) {
+	tests := []struct {
+		name   string
+		prompt string
+		want   bool
+	}{
+		{"the verification brief", verifyBrief, true},
+		{"the no-code verification brief", noCodeVerifyBrief, true},
+		{"the review-only brief", reviewOnlyBrief, false},
+		{"the fix-with-verification brief", fixVerifyBrief, false},
+		{"an operator's custom prompt", "verify whatever you like", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := VerifyShaped(tc.prompt); got != tc.want {
+				t.Errorf("VerifyShaped(%s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// CLA-638: a fix session that hands off while a verifier follows must carry the
+// no-PR terminal step forward — otherwise the successor opens the PR the fix
+// phase was told not to open, and the verifier gates a task already in_review.
+func TestFixVerifyHandoffContinuationStopsBeforeThePR(t *testing.T) {
+	got := FixVerifyHandoffContinuation()
+	if !strings.Contains(got, fixOnlyTerminalStep) {
+		t.Errorf("the fix-verify handoff does not carry the no-PR terminal step:\n%s", got)
+	}
+	if strings.Contains(got, "Open a PR targeting") || strings.Contains(got, `status: "in_review"`) {
+		t.Errorf("the fix-verify handoff carries the verifier's hand-over:\n%s", got)
+	}
+	legacy := HandoffContinuationFor(FixPhaseName, false)
+	if !strings.Contains(legacy, reviewTerminalStep) {
+		t.Errorf("the legacy fix handoff lost its PR terminal step:\n%s", legacy)
+	}
+
+	// The BRANCHLESS variant: the same B12 boundary, with the no-code terminal
+	// step. The legacy branchless fix continuation carries noCodeReviewTerminalStep,
+	// which DOES move the task to in_review — the exact move the verifier owns.
+	noCodeGot := NoCodeFixVerifyHandoffContinuation()
+	if !strings.Contains(noCodeGot, noCodeFixOnlyTerminalStep) {
+		t.Errorf("the branchless fix-verify handoff does not carry the no-code hold terminal step:\n%s", noCodeGot)
+	}
+	if strings.Contains(noCodeGot, `status: "in_review"`) || strings.Contains(noCodeGot, "no-code delivery declared") {
+		t.Errorf("the branchless fix-verify handoff carries the no-code hand-over the verifier owns:\n%s", noCodeGot)
+	}
+	if !strings.Contains(noCodeGot, "RERUN BOUND") {
+		t.Errorf("the branchless fix-verify handoff lost the rerun bound:\n%s", noCodeGot)
+	}
+	noCodeLegacy := NoCodeFixHandoffContinuation()
+	if !strings.Contains(noCodeLegacy, noCodeReviewTerminalStep) {
+		t.Errorf("the legacy branchless fix handoff lost its no-code hand-over:\n%s", noCodeLegacy)
 	}
 }

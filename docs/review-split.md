@@ -1,6 +1,7 @@
 # Splitting review from fix
 
-Status: implemented in the CLI (`[implement, review, fix]`); the plane half is
+Status: implemented in the CLI (`[implement, review, fix]`, plus an optional
+`verify` round for the fix delta — CLA-638); the plane half is
 tracked as CLA-629 (per-phase harness/model, done) and the durable review record
 (CLA-636 plane, CLA-637 CLI — both landed), so this change files no duplicate
 task. CLA-210 (the parked structured-record task) was archived by CLA-636.
@@ -175,7 +176,11 @@ branch — would pass it with nothing recorded at all. Two guards close that:
    no round to close; the fix brief that follows reads that block alone too —
    with no durable record there is no plane finding id to apply by and no
    `findingUpdates` call to make. Every branch-carrying variant gates on the
-   record.
+   record. A `verify` phase on a branchless task inherits the same shape: it
+   adjudicates the block, appends its own, and the driver neither counts rounds
+   nor reads plane ids for it — there are none — so a MUST the verifier leaves
+   open is a park (its brief says so), the same disposition the round cap gives
+   the id-based shape.
 
    One handoff residue, stated rather than hidden: a handoff respawn re-enters
    the phase under the SAME run and role, so a review session that writes its
@@ -247,27 +252,58 @@ review split does not depend on either; it ships with the outcome block.
 
 ## Review → fix → review
 
-**Design, not built. Keep it bounded.**
+**Implemented as an optional `verify` phase (CLA-638).** Configure
+`[implement, review, fix, verify]` and the driver repeats the `fix` →
+`verify` pair until a verification round closes with **no open MUST**, or the
+round cap parks the task. With a verifier configured, `fix` no longer opens the
+PR: a clean verification round carries the terminal step (push check, PR,
+`in_review`), and a round with an open MUST ends holding so another fix can run.
 
-The linear split is one review pass. A second pass is worth paying for only when
-the first pass found something and the fix was non-trivial. Two viable bounds:
+The verifier is review-shaped (it writes a durable record like the review gate)
+and is scoped to the **fix delta** — the reviewed tip the previous record names
+through `HEAD`, plus the regression surface the fixes touch. Unlike the review
+gate, the verifier releases its OWN round in its terminal call: the plane
+refuses a sealed holder's outcome write, and the close must ride the same
+`update_task` call as the `in_review` move, because after the status move the
+run is no longer the task's live holder and cannot close. The driver accepts
+either state — sealed (it closes, as it does for the review gate) or already
+released — and never closes twice. Its brief lists the prior open MUST ids
+(read from the plane's released
+records), and it adjudicates each one **by its plane id**
+(`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
+(`filed`), refutation accepted (`refuted`), or left open with a reason. New
+MUSTs are allowed only inside the delta and get new ids.
 
-1. **A conditional second phase (recommended if it is built).** Add an optional
-   `review` after `fix` with a distinct name (`verify`) and a rule: it runs only
-   when the fix outcome reports `verdict: findings`. The driver gains a
-   conditional-phase predicate, a second hand-off, and a second expensive
-   session. Effort: medium. Risk: low, because the loop is still finite and the
-   phase list is static.
-2. **A round cap in the sequence.** `[implement, review, fix, verify]` where
-   `verify` is read-only and hands over without fixing. Effort: small; it is one
-   more brief and no new driver logic. Risk: the second review is unconditional,
-   so a clean task pays for it. Bound it with `max_turns` and a tier; do not make
-   it the default.
+On a **branchless** task (the CLA-670 shape above) the verifier follows the
+review's block-only path instead: no durable record, no plane finding ids, no
+round to close — it adjudicates the block and appends its own, and the driver's
+cap and breaker do not apply (there is nothing for them to count). The no-code
+brief's terminal carries that shape's disposition: the `in_review` move when it
+judges no MUST open, and a park for the operator when it leaves one open.
 
-An **unbounded** review↔fix cycle is not recommended. The budget breaker fires at
-phase boundaries, but a cycle whose phases each checkpoint can spend the full
-budget one round at a time, and the failure ("the reviewer and fixer disagree")
-is exactly the one that produces infinite plausible rounds.
+The bounds are driver-enforced, because a conditional phase alone is not a
+bound:
+
+- **No open MUST** is the gate. SHOULD and NIT are recorded and never gate;
+  they ride to `in_review` in the outcome.
+- **Round cap 3 per review cycle.** The plane counts non-void rounds; a human
+  verdict starts a new cycle, a takeover or reclaim does not, and a void round
+  does not count. At the cap an open MUST parks the task with a question
+  carrying the records — never one more round.
+- **Non-convergence breaker.** A MUST still open after two fix attempts, or one
+  a verifier marked resolved that a later verifier reopens, parks the task with
+  a question rather than spending another round on the disagreement.
+
+An **unbounded** review↔fix cycle remains not recommended: the budget breaker
+fires at phase boundaries, but a cycle whose phases each checkpoint can spend
+the full budget one round at a time, and the failure ("the reviewer and fixer
+disagree") is exactly the one that produces infinite plausible rounds. The
+round cap and breaker above are the answer, not a bigger `max_iterations`.
+
+This loop is **interim**: it lives in `drainPhases` with the rest of the phase
+logic, and the state-machine reshape (task-state-machine build phase 4, B10)
+moves the transitions onto the plane. The CLI README documents the shipped
+shape; this file keeps the design rationale.
 
 ## The new-task alternative
 
