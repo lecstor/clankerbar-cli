@@ -90,14 +90,14 @@ takeover) can leave more than one `## Review` block in it — so a later round's
 block is the outcome's **last** one. The driver refuses to advance to `fix`
 unless: the outcome changed since the review spawned, a `## Review` heading
 sits on its own line, and the outcome's last `## Review` block — heading line to
-the end — is not one the outcome already carried (an edit that writes no block,
-or leaves an old one last, is refused). It cannot prove everything from the
-plane's record alone — a review edit appended *below* the old block passes the
-seam — so the `fix` phase's reviewed-tip check backstops the rest. Before a
-review session is spawned at all, the driver reads that baseline and retries the
-read; if it stays unread the sequence ends without the review rather than paying
-for a session whose checkpoint the seam would refuse. The claim is held across
-the seam, so the task is never posted back to the queue mid-sequence.
+the end — is not one the outcome already carried. An edit that leaves an old
+block as the last one is refused; an edit that only appends *below* the old
+block still passes the seam, and the `fix` phase's reviewed-tip check backstops
+that residue. Before a review session is spawned at all, the driver reads that
+baseline and retries the read; if it stays unread the sequence ends without the
+review rather than paying for a session whose checkpoint the seam would refuse.
+The claim is held across the seam, so the task is never posted back to the queue
+mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
 same run, reads the **last** `## Review` block back with `get_task`, checks the

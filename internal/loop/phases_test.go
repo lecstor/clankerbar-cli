@@ -2289,6 +2289,9 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 		`status: "in_review"`,
 		"fixed by: harness claude, model cheap-test",
 		"### Fixes",
+		// The rendered fix prompt must point at the LAST `## Review` block: a
+		// re-trip can carry several (CLA-663).
+		"LAST `" + config.ReviewRecordHeading + "`",
 	} {
 		if !strings.Contains(p3, want) {
 			t.Errorf("the fix brief does not carry %q:\n%s", want, p3)
@@ -2865,6 +2868,16 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	}
 	if !strings.Contains(inv.Prompt, "there is NO branch") || strings.Contains(inv.Prompt, "Open a PR") {
 		t.Errorf("a branchless checkpoint did not get the no-code fix brief:\n%s", inv.Prompt)
+	}
+	if !strings.Contains(inv.Prompt, "LAST `"+config.ReviewRecordHeading+"`") {
+		t.Errorf("the no-code fix prompt does not point at the LAST %q block:\n%s", config.ReviewRecordHeading, inv.Prompt)
+	}
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging")
+	if err != nil {
+		t.Fatalf("invocationFor fix: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "LAST `"+config.ReviewRecordHeading+"`") {
+		t.Errorf("the branch-shaped fix prompt does not point at the LAST %q block:\n%s", config.ReviewRecordHeading, inv.Prompt)
 	}
 
 	// Unverified (the origin could not be read): the review verifies the hand-off
