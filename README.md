@@ -81,6 +81,15 @@ to the queue mid-sequence. See [`docs/releases.md`](./docs/releases.md) for what
 happens to that PR after `in_review` — merged by a clanker only once a human
 approves it, promoted to a release only by the operator.
 
+A usage limit that lands on a **resumed** phase is the one exception to the
+driver waiting out caps inside the session that hit one: a wait of hours would
+outlive the 30-minute lease the resumed phase is working, re-spawning it
+against a run the plane has swept. So there the **sequence** ends instead —
+the lease is left to lapse into a takeover with its branch recorded — but the
+**run** does not: it waits the limit out holding no lease, probing exactly as
+it would have inside the phase, and carries on polling when the cap lifts.
+Only a hard stop (`lim.Stop`, credit exhausted) ends the daemon there.
+
 The split works because each phase's prompt is a **scope** instruction — "your
 job this session is implementation only, then stop" — rather than a request that
 the model manage its own context. Naming a phase takes its built-in brief; set

@@ -604,6 +604,35 @@ func TestDrainPhases_AResumedPhaseLimitEndsTheSequenceButNotTheRun(t *testing.T)
 	}
 }
 
+// A resumed phase that is NOT the last must end the sequence too: the wait is
+// owed, but no later phase may spawn against a run whose lease is lapsing.
+func TestDrainPhases_AResumedPhaseLimitDoesNotAdvanceToTheNextPhase(t *testing.T) {
+	three := []config.Phase{{Name: "implement"}, {Name: "review"}, {Name: "publish"}}
+	h := &fakeAdapter{
+		steps: []invokeStep{
+			{res: checkpointed(1, 0)},
+			{res: held(limitResult(), openClaim())},
+			{res: okResult(1, 0)}, // phase 3 would land here; it must not
+		},
+		limitResetAt: time.Now().Add(2 * time.Hour),
+	}
+	d, _ := phaseDriver(t, h, three)
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if stop {
+		t.Error("the run stopped on a rolling limit a resumed phase hit")
+	}
+	if h.invokeCalls != 2 {
+		t.Errorf("spawned %d sessions; the sequence must end at the limited resumed phase, not advance to phase 3", h.invokeCalls)
+	}
+	if h.probeCalls == 0 {
+		t.Error("the limit was never waited out")
+	}
+}
+
 // The other disposition of the same path, unchanged from the old stop: a
 // resumed phase's limit turn-away with NO pushed work still hands the claim
 // back, because the takeover hand-off exists only to carry a branch.
@@ -738,6 +767,8 @@ func TestRun_ResumedPhaseLimitKeepsTheDaemonDraining(t *testing.T) {
 	}
 	d, _ := phaseDriver(t, h, twoPhases())
 	d.cfg.MaxIterations = 2
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
 
 	logs := captureLogs(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -758,6 +789,99 @@ func TestRun_ResumedPhaseLimitKeepsTheDaemonDraining(t *testing.T) {
 	if out := logs.String(); !strings.Contains(out, "waiting for the reset") {
 		t.Errorf("the log must say the run is waiting for the reset, not only that the sequence ended; log was:\n%s", out)
 	}
+	// The wait must not swallow the iteration record (CLA-466): one record per
+	// drain, and the limited drain's record still names the sequence it ran.
+	recs := ff.records()
+	if len(recs) != 2 {
+		t.Fatalf("posted %d iteration records, want one per drain (2): %+v", len(recs), recs)
+	}
+	if recs[0].TaskID != "t-1" || len(recs[0].Phases) != 2 {
+		t.Errorf("the limited drain's record is not the two-phase sequence it ran: %+v", recs[0])
+	}
+}
+
+// The wait is the first-phase path's own waitOrStop, so the control markers
+// that path honours land here too — STOP is pinned above; RESTART is tested
+// because it sets the re-exec flag, and HALT because it is deliberately NOT
+// read during a wait: it must survive the wait and land at the boundary after
+// it, exactly as on the first-phase path.
+func TestRun_ResumedPhaseLimitWaitHonoursMarkers(t *testing.T) {
+	t.Run("RESTART lands in the wait and asks for the re-exec", func(t *testing.T) {
+		h := &fakeAdapter{
+			steps: []invokeStep{
+				{res: checkpointed(1, 0)},
+				{res: held(limitResult(), openClaim())},
+			},
+			limitResetAt: time.Now().Add(2 * time.Hour),
+		}
+		d, _ := phaseDriver(t, h, twoPhases())
+		d.cfg.MaxIterations = 10
+		h.onInvoke = func(call int) {
+			if call == 1 {
+				writeMarker(t, d.state.Path(), MarkerRestart, "new build installed")
+			}
+		}
+
+		logs := captureLogs(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		if !d.restartRequested.Load() {
+			t.Error("a RESTART dropped during the resumed-phase limit wait did not ask for the re-exec")
+		}
+		if h.probeCalls != 0 {
+			t.Errorf("the wait probed %d times past a RESTART it should have consumed first", h.probeCalls)
+		}
+		if markerPresent(t, d.state.Path(), MarkerRestart) {
+			t.Error("RESTART must be consumed when honoured")
+		}
+		if out := logs.String(); !strings.Contains(out, "RESTART requested during wait") {
+			t.Errorf("the restart must be logged as landing IN the wait; log was:\n%s", out)
+		}
+	})
+
+	t.Run("HALT survives the wait and lands at the boundary after it", func(t *testing.T) {
+		h := &fakeAdapter{
+			steps: []invokeStep{
+				{res: checkpointed(1, 0)},
+				{res: held(limitResult(), openClaim())},
+			},
+			limitResetAt: time.Now().Add(2 * time.Hour),
+		}
+		d, _ := phaseDriver(t, h, twoPhases())
+		d.cfg.MaxIterations = 10
+		h.onInvoke = func(call int) {
+			if call == 1 {
+				writeMarker(t, d.state.Path(), "HALT", "wedged — needs a human")
+			}
+		}
+
+		logs := captureLogs(t)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := d.Run(ctx); err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+		// The limit was waited out (the run stayed up and probed) and only then
+		// did the boundary read find the HALT. If the wait had swallowed it, the
+		// daemon would have spawned another sequence; if the run had exited at
+		// the limit instead, no probe would have run at all.
+		if h.probeCalls == 0 {
+			t.Error("the run exited at the limit instead of waiting it out")
+		}
+		if h.invokeCalls != 2 {
+			t.Errorf("spawned %d sessions; the HALT must land before the next sequence", h.invokeCalls)
+		}
+		if !markerPresent(t, d.state.Path(), "HALT") {
+			t.Error("HALT must be left in place for the operator")
+		}
+		out := logs.String()
+		if !strings.Contains(out, "waiting for the reset") || !strings.Contains(out, "HALT present") {
+			t.Errorf("the wait and the HALT must both appear in the log; log was:\n%s", out)
+		}
+	})
 }
 
 func TestDrainPhases_SumsSpendAcrossPhases(t *testing.T) {
