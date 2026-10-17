@@ -84,6 +84,10 @@ type TaskState struct {
 	// ReviewOpenMustIDs is every open MUST on a RELEASED record, by the plane's
 	// finding id. Empty while a round is sealed.
 	ReviewOpenMustIDs []string
+	// ReviewsTotal is how many durable records the task has. The plane serves
+	// only the newest few in Reviews, so a total above len(Reviews) means older
+	// records were left out.
+	ReviewsTotal int
 }
 
 // ReviewRecordState is one durable review record's metadata (and, once the
@@ -250,6 +254,7 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 		Outcome:           wireString(w.Outcome),
 		Reviews:           wireReviews(w.Reviews),
 		ReviewCounted:     wireReviewsCounted(w.Reviews),
+		ReviewsTotal:      wireReviewsTotal(w.Reviews),
 		ReviewOpenMustIDs: wireReviewsOpenMustIDs(w.Reviews),
 	}, nil
 }
@@ -274,6 +279,7 @@ type taskHolderWire struct {
 // MUSTs; absent on a task with no reviews or a sealed round.
 type reviewsWire struct {
 	Records     []reviewRecordWire `json:"records"`
+	Total       any                `json:"total"`
 	Counted     any                `json:"counted"`
 	OpenMustIDs any                `json:"openMustIds"`
 }
@@ -394,6 +400,15 @@ func wireReviewsCounted(block *reviewsWire) int {
 		return 0
 	}
 	return wireInt(block.Counted)
+}
+
+// wireReviewsTotal is the task's full record count, served beside the newest
+// records get_task carries.
+func wireReviewsTotal(block *reviewsWire) int {
+	if block == nil {
+		return 0
+	}
+	return wireInt(block.Total)
 }
 
 // wireReviewsOpenMustIDs is the released open-MUST list, absent while a round

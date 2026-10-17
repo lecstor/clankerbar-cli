@@ -279,6 +279,9 @@ func TestTaskState_ReviewsDecode(t *testing.T) {
 		if st.ReviewCounted != 2 {
 			t.Errorf("ReviewCounted = %d, want 2", st.ReviewCounted)
 		}
+		if st.ReviewsTotal != 2 {
+			t.Errorf("ReviewsTotal = %d, want 2 — the plane's full record count", st.ReviewsTotal)
+		}
 		if len(st.ReviewOpenMustIDs) != 1 || st.ReviewOpenMustIDs[0] != "2.review-2.2" {
 			t.Errorf("ReviewOpenMustIDs = %v, want [2.review-2.2]", st.ReviewOpenMustIDs)
 		}

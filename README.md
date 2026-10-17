@@ -168,7 +168,13 @@ reviews the **fix delta** — the reviewed tip the previous record names up to
 — and adjudicates every prior open MUST **by its plane finding id**
 (`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
 (`filed`), refutation accepted (`refuted`), or left open with a reason. It may
-raise new MUSTs only inside the delta.
+raise new MUSTs only inside the delta. The fixer marks the MUSTs it answers itself, so the driver
+also hands the verifier every MUST of the current review cycle already marked
+`fixed`, `refuted` or `filed`, with the fixer's evidence: a refutation changes
+no code and would not show in the delta. The verifier confirms each marking or
+sets it back to open, which keeps the gate shut. A fix round after a
+verification round is handed every MUST still open on any released record, not
+only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,

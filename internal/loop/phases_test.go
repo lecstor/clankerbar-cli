@@ -2681,6 +2681,7 @@ type reviewReleaser struct {
 	// something happened.
 	parks     []string
 	questions []string
+	options   [][]string
 }
 
 func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
@@ -2722,8 +2723,9 @@ func (r *reviewReleaser) Park(_ context.Context, taskID, runID, outcome string) 
 	return nil
 }
 
-func (r *reviewReleaser) AskQuestion(_ context.Context, _, body string, _ []string, _ bool, _ string) error {
+func (r *reviewReleaser) AskQuestion(_ context.Context, _, body string, options []string, _ bool, _ string) error {
 	r.questions = append(r.questions, body)
+	r.options = append(r.options, options)
 	return nil
 }
 
@@ -3531,6 +3533,26 @@ func TestMatchingReviewRecord(t *testing.T) {
 			want: 1,
 		},
 		{
+			// The production shape (CLA-509): the claim hands the driver the
+			// run credential, the plane serves the record under the bare id.
+			name:    "a credential-bound claim matches its record served under the bare run id",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "sha1", "sealed")},
+			role:    "review-1", run: "r-1.s3cret", tip: "sha1",
+			want: 1,
+		},
+		{
+			name:    "a credential for another run does not match",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-old", "sha1", "sealed")},
+			role:    "review-1", run: "r-1.s3cret", tip: "sha1",
+			want: 0,
+		},
+		{
+			name:    "a run id that only prefixes the record's is a different run",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-12", "sha1", "sealed")},
+			role:    "review-1", run: "r-1.s3cret", tip: "sha1",
+			want: 0,
+		},
+		{
 			name:    "a request_changes re-trip's previous record is a different run",
 			records: []plane.ReviewRecordState{rec(1, "review-1", "r-old", "sha1", "open")},
 			role:    "review-1", run: "r-1", tip: "sha1",
@@ -4073,6 +4095,87 @@ func mustFinding(id, status, summary string) plane.ReviewFindingState {
 	return plane.ReviewFindingState{ID: id, Severity: "must", Status: status, Summary: summary}
 }
 
+// withCredential gives a fixture's claim the run id production claims carry
+// since CLA-509: the credential `<uuid>.<secret>`, whose uuid is the bare "r-1"
+// the plane stores records under.
+func withCredential(res harness.Result) harness.Result {
+	if res.Claim.RunID != "" {
+		res.Claim.RunID = "r-1.s3cret"
+	}
+	return res
+}
+
+// The seams compared the claim's run CREDENTIAL with the plane's bare run id,
+// so in production no durable record ever matched: the review gate refused
+// every healthy review, the HasWIP claim lapsed into a takeover that re-ran
+// implement and the review, and a verify round failed the same way. Every
+// other fixture uses the bare id on both sides, which is how it shipped green.
+func TestDrainPhases_ACredentialBoundClaimPassesTheReviewAndVerifySeams(t *testing.T) {
+	t.Run("review -> fix", func(t *testing.T) {
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: withCredential(checkpointed(10, 0.10))},
+			{res: withCredential(checkpointed(5, 0.50))},
+			{res: okResult(5, 0.05)},
+		}}
+		h.onInvoke = func(i int) {
+			if i == 1 {
+				rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+				rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+			}
+		}
+		d := phaseDriverWithReleaser(t, h, []config.Phase{
+			{Name: config.ImplementPhaseName},
+			{Name: config.ReviewPhaseName},
+			{Name: config.FixPhaseName},
+		}, rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 3 {
+			t.Fatalf("spawned %d sessions, want 3 — the record written under the bare run id must satisfy a credential-bound claim's seam", h.invokeCalls)
+		}
+		if len(rel.closes) != 1 || rel.closes[0] != 1 {
+			t.Fatalf("closed rounds = %v, want [1]", rel.closes)
+		}
+	})
+
+	t.Run("verify hands over", func(t *testing.T) {
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: withCredential(checkpointed(10, 0.10))},
+			{res: withCredential(checkpointed(5, 0.50))},
+			{res: withCredential(checkpointed(5, 0.05))},
+			{res: withCredential(checkpointed(5, 0.05))},
+		}}
+		h.onInvoke = func(i int) {
+			if i == 1 {
+				rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+			}
+			if i == 3 {
+				rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+				rel.counted = 2
+				rel.status = "in_review"
+			}
+		}
+		d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 4 {
+			t.Fatalf("spawned %d sessions, want 4 — implement, review, fix, verify", h.invokeCalls)
+		}
+		if len(rel.closes) != 2 || rel.closes[0] != 1 || rel.closes[1] != 2 {
+			t.Fatalf("closed rounds = %v, want [1 2] — the verify seam must match its record too", rel.closes)
+		}
+		if len(rel.parks) != 0 {
+			t.Fatalf("a clean verification round parked the task: %v", rel.parks)
+		}
+	})
+}
+
 // verifyPhases is the shipped four-phase shape the CLA-638 tests drive.
 func verifyPhases() []config.Phase {
 	return []config.Phase{
@@ -4181,6 +4284,11 @@ func TestDrainPhases_VerificationOpenMustSpawnsAnotherFix(t *testing.T) {
 			t.Errorf("fix session %d does not tell the fixer the verifier owns the hand-over:\n%s", i+1, p)
 		}
 	}
+	// CLA-671: the second fix round's newest record is the verifier's, which
+	// raised nothing new — the round-1 MUST still open must be on its work list.
+	if !strings.Contains(fix2, "1.review-1.1") || !strings.Contains(fix2, "ANY round") {
+		t.Errorf("the looped fix is not handed the MUST an earlier round left open:\n%s", fix2)
+	}
 	// The verifier is handed the prior open MUST ids and the gate contract.
 	v1, v2 := h.invocations[3].Prompt, h.invocations[5].Prompt
 	if !strings.Contains(v1, "1.review-1.1") {
@@ -4249,6 +4357,22 @@ func TestDrainPhases_VerificationCapParksWithTheRecords(t *testing.T) {
 	}
 	if !strings.Contains(rel.questions[0], "a fresh delta-only MUST") {
 		t.Errorf("the question names the id but not the finding's substance:\n%s", rel.questions[0])
+	}
+	// The plane opens a new cycle only on a human verdict, which it records only
+	// on an in_review task: an unpark from here stays in the capped cycle. The
+	// question must say so rather than offer a "fresh review cycle" it cannot
+	// deliver.
+	if strings.Contains(rel.questions[0], "fresh review cycle") {
+		t.Errorf("the question still offers a fresh review cycle the plane cannot start from parked:\n%s", rel.questions[0])
+	}
+	if !strings.Contains(rel.questions[0], "does NOT give it another review cycle") || !strings.Contains(rel.questions[0], "exactly one more review, fix and verification round") {
+		t.Errorf("the question does not say what an unpark actually buys (one more round in this cycle):\n%s", rel.questions[0])
+	}
+	// The unpark offer must be the plane's own string, byte for byte: the
+	// console acts on an answer by value, so any other wording does nothing.
+	const planeUnpark = "Set it back to `ready` — the blocker is gone, let the fleet try again"
+	if len(rel.options) != 1 || len(rel.options[0]) == 0 || rel.options[0][0] != planeUnpark {
+		t.Errorf("the park question does not offer the plane's unpark option verbatim: %q", rel.options)
 	}
 }
 
@@ -4416,10 +4540,11 @@ func TestFindingIDRound(t *testing.T) {
 	}
 }
 
-// TestVerificationDigest: the driver's brief lists exactly the OPEN MUSTs on
-// released records, with their plane ids, and names the delta base. Sealed and
-// void records contribute nothing; the empty-open case still names the base so
-// the round knows what delta to verify.
+// TestVerificationDigest: the driver's brief lists the OPEN MUSTs on released
+// records, with their plane ids, and names the delta base; it also lists, apart
+// from them, every MUST of this cycle already MARKED settled, because the fixer
+// marks its own answers (CLA-671). Sealed and void records contribute nothing;
+// the empty case still names the base so the round knows what delta to verify.
 func TestVerificationDigest(t *testing.T) {
 	records := []plane.ReviewRecordState{
 		{Round: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", Findings: []plane.ReviewFindingState{
@@ -4430,12 +4555,16 @@ func TestVerificationDigest(t *testing.T) {
 			mustFinding("2.review-2.1", "open", "sealed, must not leak"),
 		}},
 	}
-	got := verificationDigest(records, []string{"1.review-1.1"})
+	got := verificationDigest(records, []string{"1.review-1.1"}, len(records))
 	if !strings.Contains(got, "1.review-1.1") || !strings.Contains(got, "the seam is untested") {
 		t.Errorf("the digest omits the open MUST:\n%s", got)
 	}
-	if strings.Contains(got, "1.review-1.2") || strings.Contains(got, "2.review-2.1") {
-		t.Errorf("the digest lists a resolved or sealed finding:\n%s", got)
+	if strings.Contains(got, "2.review-2.1") {
+		t.Errorf("the digest lists a sealed finding:\n%s", got)
+	}
+	open, settled, found := strings.Cut(got, "already MARKED settled")
+	if !found || strings.Contains(open, "1.review-1.2") || !strings.Contains(settled, "1.review-1.2 ") || !strings.Contains(settled, "MARKED fixed") {
+		t.Errorf("the fixer-marked MUST must be listed apart from the open ones, as marked settled:\n%s", got)
 	}
 	if !strings.Contains(got, "aaaa") {
 		t.Errorf("the digest does not name the newest RELEASED tip as the delta base:\n%s", got)
@@ -4445,9 +4574,81 @@ func TestVerificationDigest(t *testing.T) {
 	}
 	clean := verificationDigest([]plane.ReviewRecordState{
 		{Round: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open"},
-	}, nil)
+	}, nil, 1)
 	if !strings.Contains(clean, "NO OPEN MUST") || !strings.Contains(clean, "aaaa") {
 		t.Errorf("a clean digest must still name the delta base and the clear gate:\n%s", clean)
+	}
+}
+
+// CLA-671: a fixer that refutes every MUST leaves the plane's open list empty,
+// and a refutation changes no code, so a verifier handed only the open list
+// passed it to in_review unexamined. The refuted MUST, its reason, and the
+// instruction to reopen it must reach the verifier; a previous cycle's MUSTs,
+// judged by the human verdict that started this cycle, must not.
+func TestVerificationDigestListsAFixerRefutation(t *testing.T) {
+	refuted := mustFinding("1.review-1.1", "refuted", "the seam is untested")
+	refuted.RefutedReason = "the gate is pinned by TestSeam"
+	earlier := mustFinding("1.review-1.9", "fixed", "a previous cycle's finding")
+	records := []plane.ReviewRecordState{
+		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "old", State: "open", Findings: []plane.ReviewFindingState{earlier}},
+		{Round: 2, Cycle: 2, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", Findings: []plane.ReviewFindingState{refuted}},
+	}
+	got := verificationDigest(records, nil, len(records))
+	if strings.Contains(got, "carry the terminal step. Everything you find") {
+		t.Errorf("with a refuted MUST to adjudicate, the digest told the verifier the gate is clear:\n%s", got)
+	}
+	for _, want := range []string{"1.review-1.1", "MARKED refuted", "pinned by TestSeam", `back to "open"`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the digest is missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "1.review-1.9") {
+		t.Errorf("the digest lists a MUST from a previous review cycle:\n%s", got)
+	}
+}
+
+// The plane serves only the newest records, and their findings within a byte
+// budget; settled MUSTs in what it left out cannot be listed. The digest must
+// say so, and must not tell the verifier the gate is clear.
+func TestVerificationDigestNamesWhatThePlaneDidNotServe(t *testing.T) {
+	records := []plane.ReviewRecordState{
+		{Round: 2, Cycle: 1, ReviewerRole: "review-2", ReviewedTip: "bbbb", State: "open", FindingsTotal: 0},
+		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", FindingsTotal: 4,
+			Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "served")}},
+	}
+	got := verificationDigest(records, []string{"1.review-1.1"}, 2)
+	if !strings.Contains(got, "round 1: 3 of 4 finding(s) not served") || !strings.Contains(got, "export_project") {
+		t.Errorf("the digest does not name the findings the plane left out:\n%s", got)
+	}
+	trimmed := verificationDigest([]plane.ReviewRecordState{
+		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", FindingsTotal: 2},
+	}, nil, 3)
+	if strings.Contains(trimmed, "carry the terminal step. Everything you find") {
+		t.Errorf("with findings and records left out, the digest told the verifier the gate is clear:\n%s", trimmed)
+	}
+	for _, want := range []string{"2 of 2 finding(s) not served", "2 older review record(s) not served", "do NOT carry the terminal step"} {
+		if !strings.Contains(trimmed, want) {
+			t.Errorf("the digest is missing %q:\n%s", want, trimmed)
+		}
+	}
+}
+
+// CLA-671: on a fix round after a verification round, the newest record holds
+// only the verifier's new findings, so the driver prepends every MUST still
+// open on any released record — from any round — to the fix brief.
+func TestOpenMustFixDigestListsEveryOpenMustAcrossRounds(t *testing.T) {
+	records := []plane.ReviewRecordState{
+		{Round: 1, ReviewerRole: "review-1", State: "open", Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "carried over")}},
+		{Round: 2, ReviewerRole: "review-2", State: "open", Findings: []plane.ReviewFindingState{mustFinding("2.review-2.1", "open", "raised by the verifier")}},
+	}
+	got := openMustFixDigest(records, []string{"2.review-2.1", "1.review-1.1"})
+	for _, want := range []string{"1.review-1.1", "carried over", "2.review-2.1", "ANY round"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("the fix digest is missing %q:\n%s", want, got)
+		}
+	}
+	if openMustFixDigest(records, nil) != "" {
+		t.Error("with nothing open the fix digest must be empty, leaving the review's own list")
 	}
 }
 
