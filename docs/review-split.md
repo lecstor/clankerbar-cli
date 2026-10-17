@@ -60,10 +60,12 @@ name; a fix phase called `review` would inherit the wrong contract.
 - The review phase calls `update_task(taskId, runId, outcome: ...)` with no status
   change — the plane's documented way to write or correct an outcome without a
   fake transition.
-- The record is a fixed, compact shape:
+- The record is a fixed, compact shape (the heading is a shared constant,
+  `config.ReviewRecordHeading`, because the review writes it, the fix reads it,
+  and the driver's seam gate refuses a checkpoint without it):
 
   ```markdown
-  ## Review (round 1)
+  ## Review
   - reviewed tip: <sha>
   - implemented by: harness <h>, model <m>
   - reviewed by: harness <h>, model <m>
@@ -71,6 +73,11 @@ name; a fix phase called `review` would inherit the wrong contract.
   ### Findings
   - R1 [must|should|nit] <file:line> — <what is wrong>. Required fix: <smallest change>.
   ```
+
+  The heading carries no round number: a hard-coded "round 1" would be false on
+  a later run of the same task (a request-changes re-work), and the driver has no
+  round counter to fill in. Per-round numbering is the plane's to store
+  (CLA-210).
 
 - The fix phase reads it with `get_task`, verifies `reviewed tip == git rev-parse
   HEAD`, applies findings by ID, and carries the block forward into its own
@@ -87,6 +94,36 @@ cannot see its predecessor's.
 would overwrite the first unless the second session copies it forward. The
 bounded first round has no second round, so this is honest today; it is not the
 long-term shape.
+
+### Two seam guards the split needs
+
+The review-only phase inherits phase 1's recorded branch (`HasWIP`), so the
+existing evidence gate — which was written for a phase whose deliverable IS the
+branch — would pass it with nothing recorded at all. Two guards close that:
+
+1. **The review→fix checkpoint requires the record.** For a built-in review-only
+   phase, the seam reads the task's outcome on the same plane peek it already
+   makes and refuses a checkpoint without `ReviewRecordHeading`. Fail-closed: a
+   session that burned its turns, hit its ceiling, or died on a silent EOT
+   returns the task to the queue instead of advancing to a fixer that would open
+   an unreviewed PR. (Pre-split, a dead review was the last phase, so it ended
+   the drain with no PR — this guard preserves that property across the seam.)
+2. **The salvage is skipped for the review-only phase.** Its deliverable is the
+   plane record, not the tree. Anything uncommitted in its worktree is generated
+   output from running checks; committing and pushing it would (a) commit the
+   unattributable change the review's own record forbids and (b) move the tip
+   past the `reviewed tip` it just recorded, so the fixer would park a healthy
+   task on a mismatch the driver created.
+
+The third guard is in the briefs: a handoff continuation carries the record shape
+and the record requirement, not only the terminal step, so a respawned successor
+can still write a record the gate will accept.
+
+The fix phase has **no** unverified variant, deliberately: its brief asserts no
+driver verification at all. It reads the review's record, which names the
+hand-off's real state, and its `reviewed tip == HEAD` comparison fails closed if
+the branch is missing — a third brief would only restate what the record already
+says.
 
 ### Plane half (already filed — do not duplicate)
 

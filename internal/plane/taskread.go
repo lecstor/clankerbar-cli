@@ -64,6 +64,13 @@ type TaskState struct {
 	// (CLA-451), extended rather than duplicated (CLA-497) — so a reader of
 	// the holder state never needs a second round-trip to learn it.
 	DeliveryNoCode bool
+
+	// Outcome is the task's outcome text, so a seam that is gated on WHAT the
+	// phase recorded (the review-only phase's `## Review` block) can read it
+	// off the same single get_task peek rather than making a second call. The
+	// field is descriptive like the rest: a caller that does not need it
+	// ignores it.
+	Outcome string
 }
 
 // TaskStateSource reads one task's holder state, for the CLA-451 checkpoint
@@ -165,6 +172,7 @@ func (r *mcpReleaser) TaskState(ctx context.Context, taskID string) (TaskState, 
 		ClaimedByRun:   wireString(w.ClaimedByRun),
 		Branch:         wireString(w.Branch),
 		DeliveryNoCode: w.Delivery != nil && wireBool(w.Delivery.NoCode),
+		Outcome:        wireString(w.Outcome),
 	}, nil
 }
 
@@ -174,6 +182,7 @@ type taskHolderWire struct {
 	Ref          any `json:"ref"`
 	ClaimedByRun any `json:"claimedByRun"`
 	Branch       any `json:"branch"`
+	Outcome      any `json:"outcome"`
 	Delivery     *struct {
 		NoCode any `json:"noCode"`
 	} `json:"delivery"`

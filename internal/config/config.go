@@ -348,8 +348,8 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE TASK " +
 	"with update_task(taskId, runId, outcome: ...) in the shape above. This is a CHECKPOINT, not a hand-off: " +
 	"keep holding the task - do NOT release it, do NOT move it to in_review, and do NOT COMMIT, PUSH or open a " +
-	"PR. The driver checkpoints on the branch the implement phase already recorded and verified, and the fix " +
-	"phase resumes this same run from it. Ending this session after recording the review is this phase " +
+	"PR. The driver checkpoints on the branch the implement phase recorded, and the phase after you resumes " +
+	"this same run from it. Ending this session after recording the review is this phase " +
 	"FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
 
 // reviewOnlyRecordShape is the fixed shape of the review record. It is a SHAPE,
@@ -362,7 +362,7 @@ const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the pha
 // {{harness}}/{{model}} this review phase's), because a session cannot reliably
 // name its own model and neither can it see its predecessor's.
 const reviewOnlyRecordShape = " THE REVIEW RECORD IS THE DELIVERABLE. Record it with update_task(taskId, runId, outcome: ...), " +
-	"as a compact block in exactly this shape: a `## Review (round 1)` heading; then `- reviewed tip: <the SHA " +
+	"as a compact block in exactly this shape: a `" + ReviewRecordHeading + "` heading; then `- reviewed tip: <the SHA " +
 	"git rev-parse HEAD prints in the worktree>`; `- implemented by: harness " + PhasePrevHarnessPlaceholder +
 	", model " + PhasePrevModelPlaceholder + "`; `- reviewed by: harness " + PhaseHarnessPlaceholder + ", model " +
 	PhaseModelPlaceholder + "`; `- verdict: pass` or `- verdict: findings`; then a `### Findings` heading with " +
@@ -378,7 +378,7 @@ const reviewOnlyRecordShape = " THE REVIEW RECORD IS THE DELIVERABLE. Record it 
 // separately, so dropping the review block here would lose the very record the
 // split exists to keep.
 const fixTerminalRecord = " When you hand the task over, the outcome MUST also carry the review forward: keep the review's " +
-	"`## Review (round 1)` block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
+	"`" + ReviewRecordHeading + "` block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
 	"it already carries — do not restate that attribution from this brief) and add a `### Fixes` list saying, " +
 	"for every finding, whether you fixed it (with the commit SHA, or for a no-code task the record change you " +
 	"made) or did not (with the reason), plus " +
@@ -432,8 +432,13 @@ func HandoffContinuation(phaseName string) string {
 	case FixPhaseName:
 		// The fix phase owns the branch-shaped terminal step, exactly as a final
 		// review did before the split. A handoff mid-fix must not be a way to
-		// lose the commit/push/PR/in_review sequence.
-		return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + reviewTerminalStep
+		// lose the commit/push/PR/in_review sequence, NOR the record contract:
+		// fixTerminalRecord is what makes the successor keep the review block
+		// verbatim and add the ### Fixes list. Dropping it here loses the only
+		// durable record of the round, which is the exact loss the split exists
+		// to prevent.
+		return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+			rerunGuidance + fixTerminalRecord + reviewTerminalStep
 	}
 	return ""
 }
@@ -444,19 +449,34 @@ func HandoffContinuation(phaseName string) string {
 // reviewTerminalStep would tell its successor to commit, push, open a PR and
 // hand the task to in_review — the exact actions the review-only mode forbids.
 //
+// It carries reviewOnlyRecordShape as well as the ending: the ending says
+// "in the shape above", and a respawned successor never saw the shape. The
+// driver's review→fix gate looks for ReviewRecordHeading in the task's outcome,
+// so a successor that invented its own shape would fail the seam.
+//
 // The flag is only meaningful for ReviewPhaseName; every other phase ignores it.
 func HandoffContinuationFor(phaseName string, reviewOnly bool) string {
 	if phaseName == ReviewPhaseName && reviewOnly {
-		return "\n\nThe phase's rerun bound and review-only ending are unchanged by handing off:" + rerunGuidance + reviewOnlyTerminalStep
+		return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+			rerunGuidance + reviewOnlyRecordShape + reviewOnlyTerminalStep
 	}
 	return HandoffContinuation(phaseName)
 }
 
 // NoCodeReviewOnlyHandoffContinuation is the branchless review-only counterpart:
-// the record-then-hold ending without the branch-shaped PR step or the no-code
-// handover (which belongs to the fix phase).
+// the record shape and record-then-hold ending without the branch-shaped PR step
+// or the no-code handover (which belongs to the fix phase).
 func NoCodeReviewOnlyHandoffContinuation() string {
-	return "\n\nThe phase's rerun bound and review-only ending are unchanged by handing off:" + rerunGuidance + noCodeReviewOnlyTerminalStep
+	return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+		rerunGuidance + reviewOnlyRecordShape + noCodeReviewOnlyTerminalStep
+}
+
+// NoCodeFixHandoffContinuation is the fix phase's continuation for a branchless
+// checkpoint: the record requirement plus the no-code handover, and never the
+// branch-shaped PR step.
+func NoCodeFixHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixTerminalRecord + noCodeReviewTerminalStep
 }
 
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
@@ -658,7 +678,7 @@ const implementCommitEarlyRule = " COMMIT EARLY, PUSH EARLY, RECORD EARLY: get a
 // (reviewOnlyRecordShape) is what replaces the shared context: the fix phase
 // re-reads it from the plane, the way any resumed phase re-reads the bar.
 var builtinPhasePrompts = map[string]string{
-	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of " + PhaseTotalPlaceholder + ", and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + ", and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
 		implementCloseOutRule + " " +
 		implementResumedBranchRule +
 		implementCommitEarlyRule +
@@ -761,7 +781,7 @@ const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of "
 // this split keeps reaching in_review instead of silently stopping at a
 // checkpoint with no successor. The position, not a second name, selects the
 // mode; EffectivePhases resolves it, and the driver's variant selection matches
-// on the resolved text (config.IsBuiltinReviewBrief).
+// on the resolved prompt text.
 //
 // "Review only" is enforced as a scope, not a capability: the phase is told what
 // it may not do, and the fix phase is told to treat any fix it did not make as
@@ -783,8 +803,8 @@ var reviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Phase
 	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
 	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate. " +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
-	"- not even to fix a typo. The next phase (harness " + PhaseHarnessPlaceholder + ", model " +
-	PhaseModelPlaceholder + ") applies what you find; a fix you apply here is a fix it cannot attribute." +
+	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
+	"and a fix applied here is a fix it cannot attribute." +
 	reviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep + handoffGuidance
 
 // unverifiedReviewOnlyBrief is reviewOnlyBrief for a checkpoint the driver could
@@ -813,9 +833,9 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 	"sitting on that branch is not a decision to commit where you are, it is this failure mode. Read the diff " +
 	"against the PR base (git diff " + PhasePRBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
 	"the adversarial review gate. REVIEW ONLY: do not edit, create or delete a source " +
-	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. The next phase (harness " +
-	PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder + ") applies what you find; a fix you apply " +
-	"here is a fix it cannot attribute." + reviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep +
+	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. Do NOT fix what you " +
+	"find: the phase after you is responsible for applying it, and a fix you apply here is a fix it cannot " +
+	"attribute." + reviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep +
 	handoffGuidance
 
 // noCodeReviewOnlyTerminalStep ends a branchless review-only phase. There is no
@@ -825,9 +845,9 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 const noCodeReviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
 	"TASK with update_task(taskId, runId, outcome: ...) in the shape above. This is a CHECKPOINT, not a " +
 	"hand-off: do NOT change the task's status, delivery or body here, do NOT re-open it, do NOT invent code, a " +
-	"branch or a PR, and do NOT move it to in_review. If phase 1 already settled it, leave it settled; the fix " +
-	"phase decides whether a finding requires re-opening it. Ending this session after recording the review is " +
-	"this phase FINISHING."
+	"branch or a PR, and do NOT move it to in_review. If phase 1 already settled it, leave it settled; the " +
+	"phase after you decides whether a finding needs more than a record change. Ending this session after " +
+	"recording the review is this phase FINISHING."
 
 // noCodeReviewOnlyBrief is reviewOnlyBrief for a checkpoint evidenced by the
 // PLANE'S RECORD rather than a branch (CLA-497): there is nothing to check out
@@ -846,7 +866,7 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 	"decisions. Review the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the " +
 	"decisions recorded on this task or its siblings: is the settlement honest, does the record carry what the " +
 	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend the " +
-	"record here either - the fix phase applies what you find - and do not invent code, a branch or a PR." +
+	"record here either - the phase after you applies what you find - and do not invent code, a branch or a PR." +
 	reviewOnlyRecordShape + rerunGuidance + noCodeReviewOnlyTerminalStep + handoffGuidance
 
 // fixBrief is the phase that APPLIES a review's findings. It is deliberately not
@@ -863,10 +883,10 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
 	PhaseBranchPlaceholder + " and recorded its findings in the task's outcome; it changed nothing, and its " +
-	"`## Review` block names the reviewer. You are " +
+	"`" + ReviewRecordHeading + "` block names the reviewer. You are " +
 	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true " +
-	"and read the outcome's `## Review` block. If the outcome carries no review block, that is a FAILED " +
+	"and read the outcome's `" + ReviewRecordHeading + "` block. If the outcome carries no review block, that is a FAILED " +
 	"hand-off: say so in your outcome and hand the task over as the terminal step below requires - do NOT " +
 	"review the work yourself and do NOT invent findings. Read the record's reviewed tip and compare it with " +
 	"`git rev-parse HEAD` in the worktree: if they differ, the branch moved after the review, so do NOT apply " +
@@ -887,16 +907,18 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 // plane's record, and the fix is an amendment to that record, never invented
 // code. Its terminal step is the no-code handover alone.
 var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
-	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase (harness " +
-	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") reviewed the PLANE'S RECORD of " +
-	"what the implement phase did - there is NO branch, because this task's correct delivery is no code. You " +
+	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed the " +
+	"PLANE'S RECORD of what the implement phase did - there is NO branch, because this task's correct " +
+	"delivery is no code. You " +
 	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
 	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
 	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
-	"Then get_task with includeDecisions: true and read the outcome's `## Review` block. If it carries no " +
+	"Then get_task with includeDecisions: true and read the outcome's `" + ReviewRecordHeading + "` block. If it carries no " +
 	"review block, that is a FAILED hand-off: say so and hand over as the terminal step below requires - do " +
 	"not invent findings. Apply the findings by AMENDING THE RECORD (update_task, record_decision) - never by " +
-	"inventing code, a branch or a PR. If the review found nothing, say so." + rerunGuidance +
+	"inventing code, a branch or a PR. A finding that needs CODE cannot be fixed here: file it as its own task " +
+	"(create_task, with a real doneWhen) and say so in your outcome - do not re-open this task, do not rewrite " +
+	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
 	fixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
 
 // BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can
@@ -922,19 +944,6 @@ func FixBrief() string { return fixBrief }
 
 // NoCodeFixBrief returns the fix phase's brief for a branchless checkpoint.
 func NoCodeFixBrief() string { return noCodeFixBrief }
-
-// IsBuiltinReviewBrief reports whether prompt is ANY shipped review brief, in
-// either mode. The driver uses it to decide whether a checkpoint variant may be
-// swapped in: an operator's custom prompt owns its own wording, and comparing
-// against one mode alone would silently stop selecting the other's variants.
-func IsBuiltinReviewBrief(prompt string) bool {
-	switch prompt {
-	case builtinPhasePrompts[ReviewPhaseName], reviewOnlyBrief, noCodeReviewBrief,
-		unverifiedReviewBrief, noCodeReviewOnlyBrief, unverifiedReviewOnlyBrief:
-		return true
-	}
-	return false
-}
 
 // NoCodeReviewBrief returns the review brief for a checkpoint evidenced by the
 // plane's record (CLA-497) - see noCodeReviewBrief.
@@ -999,6 +1008,18 @@ const (
 	PhaseNumberPlaceholder = "{{phaseNumber}}"
 	PhaseTotalPlaceholder  = "{{phaseTotal}}"
 )
+
+// ReviewRecordHeading is the marker of the block a review-only phase records in
+// the task's outcome. It is an INTERFACE, not prose: the review writes it, the
+// fix phase reads it, and the driver's review→fix seam gate refuses a checkpoint
+// when the task's outcome does not carry it. All three read this constant so a
+// rewording cannot desynchronise them.
+//
+// It deliberately carries no round number. A hard-coded "round 1" would be false
+// on any later run of the same task (a request-changes re-work, say), and the
+// driver has no round counter to fill in; per-round history is the plane's to
+// store (CLA-210), not a number a brief can assert.
+const ReviewRecordHeading = "## Review"
 
 // Config is the resolved loop configuration. The comments here are the source of
 // truth for each knob until the README/docs catch up.
@@ -2833,6 +2854,26 @@ func (c *Config) Validate() error {
 			if !reviewed {
 				return fmt.Errorf("phases[%d] (%q): the %q brief applies a review's findings, but no %q phase precedes it — there would be no review record to read, and its only honest outcome is a reported failed hand-off (add a %q phase, or give this one its own prompt)",
 					i, ph.Label(i), FixPhaseName, ReviewPhaseName, ReviewPhaseName)
+			}
+		}
+	}
+	// A non-final BUILT-IN review names the phase after it as the one that applies
+	// its findings, and the driver's review→fix seam requires the review record to
+	// have been written. A built-in phase there that is NOT the fix brief cannot
+	// satisfy either (the other built-ins claim a task, or run the combined
+	// review-and-fix brief and re-review from scratch), so a config that names one
+	// is refused at startup rather than spending a review to discover it. A phase
+	// with its OWN prompt is allowed: applying the findings is then the operator's
+	// own contract.
+	if n := len(c.Phases); n > 1 {
+		for i, ph := range c.Phases[:n-1] {
+			if ph.Prompt != "" || ph.Name != ReviewPhaseName {
+				continue
+			}
+			next := c.Phases[i+1]
+			if next.Prompt == "" && next.Name != FixPhaseName {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is REVIEW-ONLY — it records findings and changes nothing — so the phase after it must be the %q brief (or carry its own prompt saying who applies the findings); %q resolves to the %q built-in, which does neither",
+					i, ph.Label(i), ReviewPhaseName, FixPhaseName, next.Label(i+1), next.Name)
 			}
 		}
 	}

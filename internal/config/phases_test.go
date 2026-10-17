@@ -1187,7 +1187,6 @@ func TestBuiltinReviewOnlyBriefStatesItsScopeAndRecord(t *testing.T) {
 		"do not commit",
 		"do not push",
 		"do not open a pr",
-		"## review (round 1)",
 		"reviewed tip",
 		"verdict: pass",
 		"verdict: findings",
@@ -1200,6 +1199,9 @@ func TestBuiltinReviewOnlyBriefStatesItsScopeAndRecord(t *testing.T) {
 		if !strings.Contains(lower, want) {
 			t.Errorf("the review-only brief never says %q:\n%s", want, brief)
 		}
+	}
+	if !strings.Contains(brief, ReviewRecordHeading) {
+		t.Errorf("the review-only brief never carries the record heading %q the seam gate looks for:\n%s", ReviewRecordHeading, brief)
 	}
 	// Placeholders are case-sensitive: the lowercased copy cannot carry them.
 	for _, want := range []string{
@@ -1301,6 +1303,11 @@ func TestValidate_FixPhaseRules(t *testing.T) {
 			phases: []Phase{{Name: "builder", Prompt: "claim and build"}, {Name: FixPhaseName}},
 			want:   ReviewPhaseName,
 		},
+		{
+			name:   "a review-only phase must not be followed by another builtin that does not apply findings",
+			phases: []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: ReviewPhaseName}},
+			want:   FixPhaseName,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1315,6 +1322,15 @@ func TestValidate_FixPhaseRules(t *testing.T) {
 				t.Errorf("the rejection does not name %q: %v", tc.want, err)
 			}
 		})
+	}
+
+	// A phase carrying its OWN prompt is a legitimate applier — the operator owns
+	// what runs after the review-only gate — so the rule must not refuse it.
+	custom := defaults()
+	custom.Prompt = ""
+	custom.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: "ship-it", Prompt: "apply the review's findings, push and hand over"}}
+	if err := custom.Validate(); err != nil {
+		t.Errorf("Validate refused a custom phase after the review-only gate: %v", err)
 	}
 
 	// The shipped sequence is the one that must validate.
@@ -1355,6 +1371,11 @@ func TestHandoffContinuation_CarriesThePhaseModeForward(t *testing.T) {
 	if !strings.Contains(reviewOnly, reviewOnlyTerminalStep) {
 		t.Errorf("a review-only handoff does not carry the record-then-hold ending:\n%s", reviewOnly)
 	}
+	// The ending says "in the shape above"; a respawned successor never saw the
+	// shape, and the seam gate refuses a record that does not carry the heading.
+	if !strings.Contains(reviewOnly, reviewOnlyRecordShape) {
+		t.Errorf("a review-only handoff does not carry the record shape its ending refers to:\n%s", reviewOnly)
+	}
 	if strings.Contains(reviewOnly, reviewTerminalStep) {
 		t.Errorf("a review-only handoff carries the commit/push/PR/in_review terminal step:\n%s", reviewOnly)
 	}
@@ -1368,12 +1389,29 @@ func TestHandoffContinuation_CarriesThePhaseModeForward(t *testing.T) {
 	if !strings.Contains(fix, reviewTerminalStep) {
 		t.Errorf("a fix-phase handoff lost the terminal step:\n%s", fix)
 	}
+	// The record requirement must ride too: a mid-fix handoff that dropped it
+	// would overwrite the task's outcome without the review block, losing the
+	// only durable record of the round.
+	if !strings.Contains(fix, fixTerminalRecord) {
+		t.Errorf("a fix-phase handoff lost the requirement to carry the review block forward:\n%s", fix)
+	}
 
 	noCode := NoCodeReviewOnlyHandoffContinuation()
 	if !strings.Contains(noCode, noCodeReviewOnlyTerminalStep) {
 		t.Errorf("a branchless review-only handoff does not carry its ending:\n%s", noCode)
 	}
+	if !strings.Contains(noCode, reviewOnlyRecordShape) {
+		t.Errorf("a branchless review-only handoff does not carry the record shape:\n%s", noCode)
+	}
 	if strings.Contains(noCode, noCodeReviewTerminalStep) {
 		t.Errorf("a branchless review-only handoff carries the no-code handover, which is the fix phase's:\n%s", noCode)
+	}
+
+	noCodeFix := NoCodeFixHandoffContinuation()
+	if !strings.Contains(noCodeFix, noCodeReviewTerminalStep) || !strings.Contains(noCodeFix, fixTerminalRecord) {
+		t.Errorf("a branchless fix handoff does not carry the no-code terminal step and the review block requirement:\n%s", noCodeFix)
+	}
+	if strings.Contains(noCodeFix, "Open a PR") {
+		t.Errorf("a branchless fix handoff carries the branch-shaped PR step:\n%s", noCodeFix)
 	}
 }

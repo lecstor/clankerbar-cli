@@ -1797,8 +1797,11 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 		{res: checkpointed(5, 0.50)},
 		{res: okResult(5, 0.05)},
 	}}
-	d, _ := phaseDriver(t, h, phases)
+	d, rel := phaseDriver(t, h, phases)
 	d.cfg.Models = map[string]string{"strong": "opus-test", "cheap": "cheap-test"}
+	// The review-only seam gate reads the task's outcome off the plane and
+	// refuses a checkpoint without the record. A healthy fixture records one.
+	rel.state = plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: config.ReviewRecordHeading + "\n- verdict: pass\n"}
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -1861,11 +1864,12 @@ func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 		{res: checkpointed(5, 0.50)},
 		{res: okResult(1, 0)},
 	}}
-	d, _ := phaseDriver(t, h, []config.Phase{
+	d, rel := phaseDriver(t, h, []config.Phase{
 		{Name: config.ImplementPhaseName},
 		{Name: config.ReviewPhaseName},
 		{Name: config.FixPhaseName},
 	})
+	rel.state = plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: config.ReviewRecordHeading + "\n- verdict: pass\n"}
 
 	if _, _, _, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -1882,5 +1886,133 @@ func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 	}
 	if !strings.Contains(h.invocations[3].Prompt, "PHASE 3 of 3") {
 		t.Errorf("the fix phase did not run after the review-only handoff chain:\n%s", h.invocations[3].Prompt)
+	}
+}
+
+// The review-only seam must not advance to fix on the implementer's branch
+// alone. That branch is INHERITED (HasWIP from phase 1), so every existing
+// evidence form passes for a review session that recorded nothing at all — a
+// session that burned its turns, hit its ceiling, or died on a silent EOT. The
+// gate is the task's OWN record: no `## Review` block, no checkpoint. Without
+// this, an unreviewed PR reaches in_review, which is the regression the
+// split must not introduce (pre-split, a dead review was the last phase and
+// ended the drain with no PR).
+func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutTheRecord(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)}, // holds the task and phase 1's branch, but records nothing
+		{res: okResult(5, 0.05)},     // must NEVER run
+	}}
+	d, rel := phaseDriver(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	})
+	// rel.state is the zero TaskState: held, no outcome. The record is absent.
+	rel.state = plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1"}
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — the fix phase must not run without a review record", h.invokeCalls)
+	}
+	if len(rel.calls) == 0 {
+		t.Error("the refused review checkpoint did not hand the task back; it would be stranded on an expiring lease")
+	}
+}
+
+// The variant arms of the review/fix selection are prompt-invisible to the
+// content-pinning tests: only a driver call shows which brief a branchless or
+// unverified checkpoint actually spawns with. Each arm is asserted by a phrase
+// unique to its brief.
+func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	})
+	phases := d.cfg.EffectivePhases()
+
+	// A verified branch: the plain review-only brief, and the branch-shaped fix.
+	verified := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"}}
+	inv, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging")
+	if err != nil {
+		t.Fatalf("invocationFor review: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "REVIEW-ONLY gate") || strings.Contains(inv.Prompt, "could NOT verify") {
+		t.Errorf("a verified checkpoint did not get the plain review-only brief:\n%s", inv.Prompt)
+	}
+
+	// Branchless (the plane's record): the no-code review-only brief, and the
+	// no-code fix brief (which must NOT tell the session to open a PR).
+	branchless := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}}
+	inv, err = d.invocationFor(d.targets[0], 1, phases[1], branchless, "", "staging")
+	if err != nil {
+		t.Fatalf("invocationFor branchless review: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "PLANE'S RECORD") || strings.Contains(inv.Prompt, "verified to exist on the origin") {
+		t.Errorf("a branchless checkpoint did not get the no-code review-only brief:\n%s", inv.Prompt)
+	}
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging")
+	if err != nil {
+		t.Fatalf("invocationFor branchless fix: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "there is NO branch") || strings.Contains(inv.Prompt, "Open a PR") {
+		t.Errorf("a branchless checkpoint did not get the no-code fix brief:\n%s", inv.Prompt)
+	}
+
+	// Unverified (the origin could not be read): the review verifies the hand-off
+	// itself; the fix keeps the branch-shaped brief (the review already verified).
+	unverified := &harness.Result{
+		Claim:                harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
+		CheckpointUnverified: true,
+	}
+	inv, err = d.invocationFor(d.targets[0], 1, phases[1], unverified, "", "staging")
+	if err != nil {
+		t.Fatalf("invocationFor unverified review: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "could NOT verify") || !strings.Contains(inv.Prompt, "FIRST verify the hand-off yourself") {
+		t.Errorf("an unverified checkpoint did not get the unverified review-only brief:\n%s", inv.Prompt)
+	}
+	if strings.Contains(inv.Prompt, "verified to exist on the origin remote") {
+		t.Errorf("the unverified review-only brief asserts the verification it cannot support:\n%s", inv.Prompt)
+	}
+}
+
+// The review-only phase's deliverable is the plane record, not the tree. The
+// driver's salvage commits and pushes whatever a session leaves uncommitted, so
+// running it for a review phase would (a) commit the unattributable change the
+// review's own record forbids and (b) push a tip past the reviewed one, making
+// the fix phase park a healthy task on a mismatch the DRIVER created.
+func TestSalvage_SkipsTheReviewOnlyPhase(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)}, // implement: salvage runs
+		{res: checkpointed(1, 0)}, // review-only: must NOT salvage
+		{res: okResult(1, 0)},     // fix (no claim on the fixture, so nothing to salvage)
+	}}
+	cfg := fastCfg()
+	cfg.Prompt = ""
+	cfg.Phases = []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}
+	rel := &fakeReleaser{state: plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: config.ReviewRecordHeading}}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
+	s := &fakeSalvager{out: savedOutcome()}
+	d.newSalvager = func(string) workSalvager { return s }
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(s.calls) != 1 {
+		t.Fatalf("salvaged %d times, want exactly 1 (the implement phase): %+v", len(s.calls), s.calls)
 	}
 }
