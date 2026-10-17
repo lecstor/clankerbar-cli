@@ -93,14 +93,24 @@ func checkpointed(tokens int, cost float64) harness.Result {
 	return reported(held(okResult(tokens, cost), openClaim()), branchReport())
 }
 
+// testCheckpointTip is the origin tip the default verifier reports for a
+// passing branch check (CLA-637). It is what the implement checkpoint carries
+// into the review brief as the revision to review, and what a healthy review
+// fixture records as its reviewedTip — the seam matches the two by string
+// equality, exactly as the real driver matches the plane's SHAs.
+const testCheckpointTip = "cafe1234cafe1234cafe1234cafe1234cafe1234"
+
 // passVerifier is the default delivery verifier for the phase-seam tests: a
 // BranchPushed check that passes for every branch a fixture recorded, because a
 // checkpoint now MEANS a branch verified on the origin remote (CLA-457). The
-// tests that care what the verifier says override newVerifier with their own
-// fake (or a real repository).
+// tip rides the check because the review seam compares the durable record's
+// reviewedTip against it (CLA-637): a passing check that names no tip would be
+// a checkpoint the review brief cannot describe. The tests that care what the
+// verifier says override newVerifier with their own fake (or a real repository).
 func passVerifier() *fakeVerifier {
 	return &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{
-		Kind: delivery.BranchPushed, Status: delivery.Pass, Detail: "branch verified on the origin remote",
+		Kind: delivery.BranchPushed, Status: delivery.Pass, Tip: testCheckpointTip,
+		Detail: "branch verified on the origin remote",
 	}}}}
 }
 
@@ -2447,6 +2457,59 @@ func TestPRBaseResolution_ReachesHandoffRespawnPrompts(t *testing.T) {
 	}
 }
 
+// reviewReleaser is the CLA-637 seam's fake: the plane's single-task read
+// (TaskStateSource, serving the durable review records), and the round close
+// the driver performs at the review→fix seam (ReviewRoundCloser). State is read
+// through the helper fields so a test can mutate it from fakeAdapter.onInvoke —
+// the way a real review session's update_task(review: ...) lands — and the
+// closes record what the driver actually sent.
+type reviewReleaser struct {
+	fakeReleaser
+	status  string
+	outcome string
+	holder  string
+	records []plane.ReviewRecordState
+
+	// readErr, when set, is consulted on every TaskState read: a test injects a
+	// failing read (consumed once, say) to drive the CLA-663 baseline-read retry
+	// without a second fake. reads counts every read served.
+	readErr func() error
+	reads   int
+
+	closes   []int
+	closeErr error
+}
+
+func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	r.reads++
+	if r.readErr != nil {
+		if err := r.readErr(); err != nil {
+			return plane.TaskState{}, err
+		}
+	}
+	return plane.TaskState{
+		Status:       r.status,
+		ClaimedByRun: r.holder,
+		Outcome:      r.outcome,
+		Reviews:      r.records,
+	}, nil
+}
+
+func (r *reviewReleaser) CloseReviewRound(_ context.Context, _, _ string, round int) error {
+	if r.closeErr != nil {
+		return r.closeErr
+	}
+	r.closes = append(r.closes, round)
+	return nil
+}
+
+// recordFor is one durable review record as the plane would serve it after the
+// review session appended it: identity, the reviewed tip, the seal state, and
+// nothing else the gate reads.
+func recordFor(round int, role, run, tip, state string) plane.ReviewRecordState {
+	return plane.ReviewRecordState{Round: round, ReviewerRole: role, RunID: run, ReviewedTip: tip, State: state}
+}
+
 // The split this feature ships: implement, review-only, fix. The review phase
 // must be read-only (no PR, no commit, no in_review) and must record its findings
 // on the task; the fix phase must be the last one, carry the terminal step, and
@@ -2458,24 +2521,28 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 		{Name: config.ReviewPhaseName, Tier: "strong"},
 		{Name: config.FixPhaseName, Tier: "cheap"},
 	}
-	// The outcome the plane serves, mutated where the review session writes:
-	// the seam gate requires the record to be NEW this trip, so a healthy
-	// fixture must show the outcome changing between the review's spawn and its
-	// seam — exactly what the shipped append instruction produces.
-	outcome := "implemented: pushed the branch\n"
+	// The plane state the fixture serves, mutated where the review session
+	// writes: since CLA-637 the seam gate requires a durable review record
+	// written by THIS run, so a healthy fixture must show the review session
+	// appending one — and keeping the legacy block alongside it, which the
+	// shipped brief still prescribes for one release.
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
 		{res: checkpointed(5, 0.50)},
 		{res: okResult(5, 0.05)},
 	}}
 	h.onInvoke = func(i int) {
-		if i == 1 { // the review-only session appends its block below the record
-			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+		if i == 1 { // the review-only session records both halves
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+		if i == 2 { // the fix session: the round must ALREADY be closed
+			if len(rel.closes) != 1 {
+				t.Errorf("the fix phase spawned with the review round not yet closed (closes=%v) — it would be unable to read the findings it was told to apply", rel.closes)
+			}
 		}
 	}
-	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
-	}}
 	d := phaseDriverWithReleaser(t, h, phases, rel)
 	d.cfg.Models = map[string]string{"strong": "opus-test", "cheap": "cheap-test"}
 
@@ -2484,6 +2551,11 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 	}
 	if h.invokeCalls != 3 {
 		t.Fatalf("spawned %d sessions, want 3 — implement, review-only, fix", h.invokeCalls)
+	}
+	// The driver closed exactly the round the review record landed in — the
+	// round it MATCHED, not a predicted one (CLA-637).
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Fatalf("closed rounds = %v, want exactly [1] — the fix phase depends on the round being released", rel.closes)
 	}
 
 	p1, p2, p3 := h.invocations[0].Prompt, h.invocations[1].Prompt, h.invocations[2].Prompt
@@ -2507,6 +2579,15 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 		!strings.Contains(p2, "implemented by: harness claude, model cheap-test") {
 		t.Errorf("the review record does not name both sides' resolved attribution:\n%s", p2)
 	}
+	// CLA-637: the review brief carries the durable record's identity — the
+	// reviewer role the seam keys on and the verified tip the reviewer must
+	// check out and record — filled from the checkpoint, not left as text.
+	if !strings.Contains(p2, `"review-1"`) || !strings.Contains(p2, testCheckpointTip) {
+		t.Errorf("the review brief does not carry the durable record's role and reviewed tip:\n%s", p2)
+	}
+	if !strings.Contains(p2, "sealed durable") {
+		t.Errorf("the review brief does not describe the durable record it must append:\n%s", p2)
+	}
 
 	if !strings.Contains(p3, "PHASE 3 of 3") || !strings.Contains(p3, "FIX phase and the LAST phase") {
 		t.Errorf("phase 3 is not the fix phase of a 3-phase sequence:\n%s", p3)
@@ -2516,8 +2597,11 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 		`status: "in_review"`,
 		"fixed by: harness claude, model cheap-test",
 		"### Fixes",
-		// The rendered fix prompt must point at the LAST `## Review` block: a
-		// re-trip can carry several (CLA-663).
+		// CLA-637: the fix brief must tell the session to answer the released
+		// durable record by plane finding id before the hand-over.
+		"update every finding's status on the DURABLE review record",
+		// The rendered fix prompt must also point at the LAST `## Review` block:
+		// a re-trip can carry several (CLA-663).
 		"LAST `" + config.ReviewRecordHeading + "`",
 	} {
 		if !strings.Contains(p3, want) {
@@ -2544,24 +2628,22 @@ func TestDrainPhases_FixBriefCarriesTheGradedFindings(t *testing.T) {
 		{Name: config.ReviewPhaseName, Tier: "strong"},
 		{Name: config.FixPhaseName, Tier: "cheap"},
 	}
-	outcome := "implemented: pushed the branch\n"
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
 		{res: checkpointed(5, 0.50)},
 		{res: okResult(5, 0.05)},
 	}}
 	h.onInvoke = func(i int) {
-		if i == 1 { // the review session appends its block below the record
-			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: findings\n### Findings\n" +
+		if i == 1 { // the review session records both halves
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: findings\n### Findings\n" +
 				"- R1 [must] (gate): `go test ./...` fails on the new seam at loop.go:42 - the guard is untested. Required fix: pin it.\n" +
 				"- R2 [must] internal/loop/loop.go:77 - this line names no evidence. Required fix: give it a test.\n" +
 				"- R3 [should] internal/loop/loop.go:90 - tidy the wording. Required fix: tidy it.\n" +
 				"- R4 [nit] internal/loop/loop.go:97 - a nit. Required fix: none.\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
 		}
 	}
-	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
-	}}
 	d := phaseDriverWithReleaser(t, h, phases, rel)
 	d.cfg.Models = map[string]string{"strong": "opus-test", "cheap": "cheap-test"}
 
@@ -2611,7 +2693,7 @@ func TestDrainPhases_FixBriefCarriesTheGradedFindings(t *testing.T) {
 // got — an evidence-less MUST must reach it already downgraded, not as a
 // gating MUST it may not downgrade itself.
 func TestDrainPhases_FixHandoffSuccessorKeepsTheGradedFindings(t *testing.T) {
-	outcome := "implemented: pushed the branch\n"
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
 		{res: checkpointed(5, 0.50)},
@@ -2619,15 +2701,13 @@ func TestDrainPhases_FixHandoffSuccessorKeepsTheGradedFindings(t *testing.T) {
 		{res: okResult(5, 0.05)},
 	}}
 	h.onInvoke = func(i int) {
-		if i == 1 { // the review session appends its block below the record
-			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: findings\n### Findings\n" +
+		if i == 1 { // the review session records both halves
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: findings\n### Findings\n" +
 				"- R1 [must] (gate): `go test ./...` fails on the new seam at loop.go:42 - the guard is untested. Required fix: pin it.\n" +
 				"- R2 [must] internal/loop/loop.go:77 - this line names no evidence. Required fix: give it a test.\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
 		}
 	}
-	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
-	}}
 	d := phaseDriverWithReleaser(t, h, []config.Phase{
 		{Name: config.ImplementPhaseName},
 		{Name: config.ReviewPhaseName},
@@ -2661,22 +2741,30 @@ func TestDrainPhases_FixHandoffSuccessorKeepsTheGradedFindings(t *testing.T) {
 func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 	// The handoff successor continues the SAME phase, so it takes a fresh
 	// freshness baseline: the first review session records nothing (it hands
-	// off mid-review), and only the successor's own record satisfies the gate.
-	outcome := "implemented: pushed the branch\n"
+	// off mid-review), and only the successor's record satisfies the gate —
+	// same run, same role, and the round stays SEALED until the successor's
+	// own seam closes it.
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	// The handoff session is a RESUMED phase, so the adapters seed its claim
+	// from ResumeClaim (claude.go's Result{Claim: in.ResumeClaim}): the branch
+	// and WIP the implement checkpoint handed over survive into its result,
+	// which is what lets the successor's brief still name the verified branch
+	// and tip. handoffResult alone models a claim-less stream.
+	midReview := handoffResult("Review half done: the API surface is cleared, the storage layer is next.")
+	midReview.Claim.Branch = "clanker/x"
+	midReview.Claim.HasWIP = true
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
-		{res: handoffResult("Review half done: the API surface is cleared, the storage layer is next.")},
+		{res: midReview},
 		{res: checkpointed(5, 0.50)},
 		{res: okResult(1, 0)},
 	}}
 	h.onInvoke = func(i int) {
-		if i == 2 { // the handoff successor appends the record the seam requires
-			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+		if i == 2 { // the handoff successor records the durable record the seam requires
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
 		}
 	}
-	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
-	}}
 	d := phaseDriverWithReleaser(t, h, []config.Phase{
 		{Name: config.ImplementPhaseName},
 		{Name: config.ReviewPhaseName},
@@ -2696,6 +2784,14 @@ func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 	if strings.Contains(successor, "Open a PR") || strings.Contains(successor, `status: "in_review"`) {
 		t.Errorf("the review-only handoff successor was told to finish the task:\n%s", successor)
 	}
+	if !strings.Contains(successor, `"review-1"`) || !strings.Contains(successor, testCheckpointTip) {
+		t.Errorf("the handoff successor's brief does not carry the record's role and reviewed tip:\n%s", successor)
+	}
+	// The round is closed once — at the successor's seam, when the review
+	// stage is actually over — not at the session that handed off.
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Fatalf("closed rounds = %v, want exactly [1] at the successor's seam", rel.closes)
+	}
 	if !strings.Contains(h.invocations[3].Prompt, "PHASE 3 of 3") {
 		t.Errorf("the fix phase did not run after the review-only handoff chain:\n%s", h.invocations[3].Prompt)
 	}
@@ -2712,86 +2808,86 @@ func resumedCheckpointed(tokens int, cost float64) harness.Result {
 	}), branchReport())
 }
 
-// The review-only seam must not advance to fix on the implementer's branch
+// The review-shaped seam must not advance to fix on the implementer's branch
 // alone. That branch is INHERITED (HasWIP from phase 1), so every existing
 // evidence form passes for a review session that recorded nothing at all — a
 // session that burned its turns, hit its ceiling, or died on a silent EOT.
-// The gate is the task's OWN record, and it must be one THIS trip wrote: a
-// task that already went implement -> review -> fix keeps the previous trip's
-// `## Review` block in its outcome, and a human request_changes (or a takeover
-// after the lease lapsed) returns the task to the queue without clearing it.
-// A bare presence check would read that old block and spawn the fixer over an
-// unreviewed revision. Without the gate at all, an unreviewed PR reaches
-// in_review — the regression the split must not introduce.
+// Since CLA-637 the gate is the DURABLE record: this run's, under this
+// reviewer role, naming the tip the driver verified. Every way a record can
+// fail to be that — a different run (a request_changes re-trip), a voided
+// round (a takeover), a different role, a stale tip — must refuse here, or the
+// fixer runs over an unreviewed revision and an unreviewed PR reaches
+// in_review: the regression the split must not introduce.
 func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testing.T) {
+	// The stale artefacts every case carries: a task that already went
+	// implement -> review -> fix keeps the previous trip's `## Review` block in
+	// its outcome AND its durable record in the reviews block, and a human
+	// request_changes (or a takeover after the lease lapsed) returns the task
+	// to the queue without clearing either.
 	staleBlock := "delivered: pushed clanker/x\n\n" + config.ReviewRecordHeading +
 		"\n- reviewed tip: oldsha\n- verdict: findings\n### Findings\n- R1 [must] a.go:1 - stale. Required fix: none.\n### Fixes\n- R1 fixed in deadbeef\n"
+	staleRecord := recordFor(1, "review-1", "r-old", "oldsha", "open")
 	takeover := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
 
 	tests := []struct {
 		name     string
-		baseline string                  // the outcome the review phase finds on the task
-		first    harness.Claim           // phase 1's claim: a takeover seeds WIP
-		write    func(old string) string // what the review session records (identity records nothing)
+		prior    []plane.ReviewRecordState // records the plane already carries
+		baseline string                    // the outcome the review phase finds on the task
+		first    harness.Claim             // phase 1's claim: a takeover seeds WIP
+		write    func(rel *reviewReleaser) // what the review session records (identity records nothing)
 	}{
 		{
-			name:     "the review records nothing",
-			baseline: "",
-			first:    openClaim(),
-			write:    func(old string) string { return old },
+			name:  "the review records nothing",
+			first: openClaim(),
+			write: func(*reviewReleaser) {},
 		},
 		{
-			name:     "a request_changes re-trip keeps the previous trip's block",
+			name:     "a request_changes re-trip's previous record is a different run",
+			prior:    []plane.ReviewRecordState{staleRecord},
 			baseline: staleBlock,
 			first:    openClaim(),
-			write:    func(old string) string { return old },
+			write:    func(*reviewReleaser) {},
 		},
 		{
-			name:     "a takeover keeps the previous trip's block",
+			name:     "a takeover leaves the previous round void",
+			prior:    []plane.ReviewRecordState{recordFor(1, "review-1", "r-old", testCheckpointTip, "void")},
 			baseline: staleBlock,
 			first:    takeover,
-			write:    func(old string) string { return old },
+			write:    func(*reviewReleaser) {},
 		},
 		{
-			// The outcome CHANGED, so the equality arm passes it, and a heading
-			// is present, so the presence arm does too: only the last-block arm
-			// refuses. This is scenario B — the review made some other statusless
-			// outcome edit and wrote no block of its own, so the "new" outcome's
-			// last `## Review` block is still round 1's.
-			name:     "a re-trip that edits the outcome without adding a block",
-			baseline: staleBlock,
-			first:    openClaim(),
-			write: func(old string) string {
-				return "could not verify the branch against the origin remote\n" + old
+			name:  "a record this run wrote under another reviewer role is not the gate's record",
+			first: openClaim(),
+			write: func(rel *reviewReleaser) {
+				rel.records = append(rel.records, recordFor(1, "review-2", "r-1", testCheckpointTip, "sealed"))
 			},
 		},
 		{
-			name:     "a look-alike heading is not the record",
-			baseline: "",
-			first:    openClaim(),
-			write: func(old string) string {
-				return old + "\n## Reviewer notes\n- reviewed tip: sha1\n- verdict: pass\n"
+			name:  "a record naming a tip the driver did not verify is stale",
+			first: openClaim(),
+			write: func(rel *reviewReleaser) {
+				rel.records = append(rel.records, recordFor(1, "review-1", "r-1", "some-other-tip", "sealed"))
 			},
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			outcome := tc.baseline
+			rel := &reviewReleaser{
+				status: "in_progress", holder: "r-1", outcome: tc.baseline,
+				records: append([]plane.ReviewRecordState(nil), tc.prior...),
+			}
 			h := &fakeAdapter{steps: []invokeStep{
 				// Phase 1's session: on a takeover its claim already carries the
 				// branch and WIP flag of the found work.
 				{res: reported(held(okResult(10, 0.10), tc.first), branchReport())},
-				{res: resumedCheckpointed(5, 0.50)}, // holds the task and phase 1's branch, but records nothing
+				{res: resumedCheckpointed(5, 0.50)}, // holds the task and phase 1's branch, but records nothing the gate accepts
 				{res: okResult(5, 0.05)},            // must NEVER run
 			}}
 			h.onInvoke = func(i int) {
 				if i == 1 {
-					outcome = tc.write(outcome)
+					tc.write(rel)
 				}
 			}
-			rel := &wiredReleaser{state: func() plane.TaskState {
-				return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
-			}}
 			d := phaseDriverWithReleaser(t, h, []config.Phase{
 				{Name: config.ImplementPhaseName},
 				{Name: config.ReviewPhaseName},
@@ -2803,7 +2899,10 @@ func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testin
 				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 			}
 			if h.invokeCalls != 2 {
-				t.Fatalf("spawned %d sessions, want 2 — the fix phase must not run without a review record", h.invokeCalls)
+				t.Fatalf("spawned %d sessions, want 2 — the fix phase must not run without this run's review record", h.invokeCalls)
+			}
+			if len(rel.closes) != 0 {
+				t.Errorf("the refused review checkpoint closed a round (%v); nothing was released to close", rel.closes)
 			}
 			// The resumed review claim carries HasWIP, so the refusal must NOT
 			// hand the task back to the queue: releasing it would throw away
@@ -2816,28 +2915,32 @@ func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testin
 	}
 }
 
-// The reverse of the stale block, and the shape a request_changes re-trip
-// produces when the review does its job: the outcome still carries round 1's
-// block, and the review APPENDS round 2's below it. Refusing merely because a
-// `## Review` heading was already in the baseline would stall every re-trip, so
-// the gate must pass on the NEW last block.
-func TestDrainPhases_ReviewSeamAcceptsANewLastBlockOnARetrip(t *testing.T) {
+// The reverse of the stale record, and the shape a request_changes re-trip
+// produces when the review does its job: the task still carries round 1's
+// record and the outcome still carries round 1's block, and the review APPENDS
+// round 2's block below it and writes a NEW durable record under THIS run
+// (CLA-637). The gate must advance on the new record — refusing merely because
+// an earlier record exists would stall every re-trip — and the driver closes
+// the round the NEW record landed in.
+func TestDrainPhases_ReviewSeamAcceptsANewRecordOnARetrip(t *testing.T) {
 	round1 := "delivered: pushed clanker/x\n\n" + config.ReviewRecordHeading +
 		"\n- reviewed tip: oldsha\n- verdict: findings\n### Findings\n- R1 [must] a.go:1 - stale. Required fix: none.\n### Fixes\n- R1 fixed in deadbeef\n"
-	outcome := round1
+	rel := &reviewReleaser{
+		status: "in_progress", holder: "r-1",
+		outcome: round1,
+		records: []plane.ReviewRecordState{recordFor(1, "review-1", "r-old", "oldsha", "open")},
+	}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
-		{res: resumedCheckpointed(5, 0.50)}, // the review appends round 2 below round 1
-		{res: okResult(5, 0.05)},            // the fix runs on the new block
+		{res: resumedCheckpointed(5, 0.50)}, // the review appends round 2 below round 1, and records under this run
+		{res: okResult(5, 0.05)},            // the fix runs on the new record
 	}}
 	h.onInvoke = func(i int) {
 		if i == 1 {
-			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: newsha\n- verdict: pass\n"
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			rel.records = append(rel.records, recordFor(2, "review-1", "r-1", testCheckpointTip, "sealed"))
 		}
 	}
-	rel := &wiredReleaser{state: func() plane.TaskState {
-		return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
-	}}
 	d := phaseDriverWithReleaser(t, h, []config.Phase{
 		{Name: config.ImplementPhaseName},
 		{Name: config.ReviewPhaseName},
@@ -2848,7 +2951,10 @@ func TestDrainPhases_ReviewSeamAcceptsANewLastBlockOnARetrip(t *testing.T) {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
 	if h.invokeCalls != 3 {
-		t.Fatalf("spawned %d sessions, want 3 — a NEW last `## Review` block must advance a re-trip", h.invokeCalls)
+		t.Fatalf("spawned %d sessions, want 3 — a NEW record this run must advance a re-trip", h.invokeCalls)
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 2 {
+		t.Fatalf("closed rounds = %v, want exactly [2] — the round the new record landed in", rel.closes)
 	}
 }
 
@@ -2925,31 +3031,27 @@ func TestDrainPhases_AnUnreadableBaselineRefusesBeforeTheReviewSpawns(t *testing
 
 // The retry is the point, not the refusal: a baseline read that fails once and
 // succeeds on the next attempt must let the whole sequence run — review and fix
-// included — exactly as if the blip had not happened.
+// included — exactly as if the blip had not happened (CLA-663).
 func TestDrainPhases_AFailedBaselineReadIsRetried(t *testing.T) {
-	outcome := "implemented: pushed the branch\n"
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
 		{res: resumedCheckpointed(5, 0.50)},
 		{res: okResult(5, 0.05)},
 	}}
 	h.onInvoke = func(i int) {
-		if i == 1 { // the review records its block
-			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+		if i == 1 { // the review records both halves: its legacy block and the durable record
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
 		}
 	}
 	fails := 1
-	rel := &wiredReleaser{
-		state: func() plane.TaskState {
-			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
-		},
-		err: func() error {
-			if fails > 0 {
-				fails--
-				return errors.New("plane blip")
-			}
-			return nil
-		},
+	rel.readErr = func() error {
+		if fails > 0 {
+			fails--
+			return errors.New("plane blip")
+		}
+		return nil
 	}
 	d := phaseDriverWithReleaser(t, h, []config.Phase{
 		{Name: config.ImplementPhaseName},
@@ -2965,35 +3067,6 @@ func TestDrainPhases_AFailedBaselineReadIsRetried(t *testing.T) {
 	}
 	if fails != 0 {
 		t.Errorf("the injected blip was never consumed by a retry (fails=%d, reads=%d)", fails, rel.reads)
-	}
-}
-
-// The helper the stale-block arm reads: lastReviewBlock must return the LAST
-// block — heading line to the end — so an appended round is the one judged, and
-// it must recognise the heading exactly as reviewRecordLine does.
-func TestLastReviewBlock(t *testing.T) {
-	head := config.ReviewRecordHeading
-	tests := []struct {
-		name    string
-		outcome string
-		want    string
-	}{
-		{"empty", "", ""},
-		{"no heading", "delivered: pushed clanker/x\n", ""},
-		{"the heading alone", head, head},
-		{"one block runs to the end", "delivered\n" + head + "\n- verdict: pass\n", head + "\n- verdict: pass\n"},
-		{"the LAST of two blocks", head + "\n- round 1\n" + head + "\n- round 2\n", head + "\n- round 2\n"},
-		{"a CRLF heading is still the heading", head + "\r\n- verdict: pass\r\n", head + "\r\n- verdict: pass\r\n"},
-		{"a trailing space is still the heading", head + "  \n- verdict: pass\n", head + "  \n- verdict: pass\n"},
-		{"an indented heading is not a block", "  " + head + "\n- verdict: pass\n", ""},
-		{"a heading glued to text is not a block", "x" + head + "\n", ""},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := lastReviewBlock(tc.outcome); got != tc.want {
-				t.Errorf("lastReviewBlock(%q) = %q, want %q", tc.outcome, got, tc.want)
-			}
-		})
 	}
 }
 
@@ -3017,9 +3090,10 @@ func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 		h.onInvoke = func(i int) {
-			if i == 1 { // the review appends its block below phase 1's record
+			if i == 1 { // the review records both halves: the block, then the durable record with no tip
 				st := rel.state["t-1"]
-				st.Outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: pass\n"
+				st.Outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: none (no branch - the plane record was reviewed)\n- verdict: pass\n"
+				st.Reviews = append(st.Reviews, recordFor(1, "review-1", "r-1", "", "sealed"))
 				rel.state["t-1"] = st
 			}
 		}
@@ -3035,56 +3109,68 @@ func TestDrainPhases_NoCodeReviewSeamRequiresANewRecord(t *testing.T) {
 		if !strings.Contains(p3, "there is NO branch") {
 			t.Errorf("the successor is not the no-code fix brief:\n%s", p3)
 		}
+		if len(rel.closes) != 1 || rel.closes[0] != 1 {
+			t.Fatalf("closed rounds = %v, want exactly [1] — the no-code round must be released too", rel.closes)
+		}
 	})
 
-	t.Run("an unchanged outcome is refused", func(t *testing.T) {
+	t.Run("the legacy block alone no longer carries the seam", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: held(okResult(1, 0), openClaim())},
-			{res: held(okResult(1, 0), openClaim())}, // review records nothing
+			{res: held(okResult(1, 0), openClaim())}, // review appends the legacy block but NO durable record
 			{res: okResult(1, 0)},                    // must NEVER run
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		h.onInvoke = func(i int) {
+			if i == 1 {
+				st := rel.state["t-1"]
+				st.Outcome += "\n" + config.ReviewRecordHeading + "\n- verdict: pass\n"
+				rel.state["t-1"] = st
+			}
+		}
 		d := phaseDriverWithReleaser(t, h, phases, rel)
 
 		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 		}
 		if h.invokeCalls != 2 {
-			t.Fatalf("spawned %d sessions, want 2 — the no-code fix must not run without a fresh record", h.invokeCalls)
+			t.Fatalf("spawned %d sessions, want 2 — the fix must not run on a block with no durable record behind it", h.invokeCalls)
 		}
 	})
 }
 
 // The seam's second read is as load-bearing as its first: the baseline the
-// freshness gate compares against is only worth having if the outcome can be
-// read AGAIN once the review session has ended. A plane that blips between the
-// two reads — the baseline read clean at spawn, the seam read failing after a
-// review that DID record — must be refused fail-closed: an unreadable outcome
-// cannot prove the record, and the alternative is advancing on the branch the
-// review phase merely inherited. This is the `!recordRead` arm of the gate, and
-// the fixture has to fail BETWEEN the reads: since CLA-663 a plane that is
-// unwired or erroring at spawn is refused before the review ever runs, so only
-// a mid-sequence blip reaches this arm at all.
+// gate reads at spawn is only worth having if the task can be read AGAIN once
+// the review session has ended. A plane that blips between the two reads — the
+// read clean at spawn, the seam read failing after a review that DID record —
+// must be refused fail-closed: an unreadable reviews block cannot prove this
+// run's record, and the alternative is advancing on the branch the review
+// phase merely inherited. This is the `!recordRead` arm of the gate, and the
+// fixture has to fail BETWEEN the reads: since CLA-663 a plane that is unwired
+// or erroring at spawn is refused before the review ever runs, so only a
+// mid-sequence blip reaches this arm at all.
 func TestDrainPhases_ReviewSeamRefusesACheckpointItCannotReread(t *testing.T) {
 	outcome := "implemented: pushed the branch\n"
+	var reviews []plane.ReviewRecordState
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.10)},
-		{res: resumedCheckpointed(5, 0.50)}, // records the block, healthy in every other way
+		{res: resumedCheckpointed(5, 0.50)}, // records the durable record, healthy in every other way
 		{res: okResult(5, 0.05)},            // must NEVER run
 	}}
 	// The plane blips between the review's own session and the seam's read:
 	// the baseline read (before the attempt ladder) still succeeds, the
-	// review session records its block, and only the reread fails.
+	// review session records its record, and only the reread fails.
 	blip := false
 	h.onInvoke = func(i int) {
 		if i == 1 {
-			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+			outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			reviews = append(reviews, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
 			blip = true
 		}
 	}
 	rel := &wiredReleaser{
 		state: func() plane.TaskState {
-			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome, Reviews: reviews}
 		},
 		err: func() error {
 			if blip {
@@ -3107,29 +3193,281 @@ func TestDrainPhases_ReviewSeamRefusesACheckpointItCannotReread(t *testing.T) {
 	}
 }
 
-// The gate's half of the interface: the heading counts only as its own line.
-// A substring match was the bug — `## Reviewer notes`, prose mentioning the
-// words, or an indented heading inside a code block all passed it.
-func TestReviewRecordLine(t *testing.T) {
+// The CLA-637 seam gate's record matcher (B1): the durable record must be THIS
+// run's, under this reviewer role, and name the revision the driver verified.
+// Each subtest is one way a record can FAIL to satisfy the gate — the shapes
+// the doneWhen names (a request_changes re-trip, a takeover) plus the tip
+// mismatches, a voided round, and the unverified checkpoint's non-empty-tip
+// requirement. The happy cases pin the newest-match rule and the branchless
+// form's identity-only check.
+func TestMatchingReviewRecord(t *testing.T) {
+	rec := func(round int, role, run, tip, state string) plane.ReviewRecordState {
+		return plane.ReviewRecordState{Round: round, ReviewerRole: role, RunID: run, ReviewedTip: tip, State: state}
+	}
 	tests := []struct {
-		name    string
-		outcome string
-		want    bool
+		name     string
+		records  []plane.ReviewRecordState
+		role     string
+		run      string
+		tip      string
+		needsTip bool
+		want     int // the round of the expected match; 0 means no match
 	}{
-		{"empty", "", false},
-		{"the heading alone", config.ReviewRecordHeading, true},
-		{"the heading on its own line", "delivered\n" + config.ReviewRecordHeading + "\n- verdict: pass\n", true},
-		{"a CRLF heading is still the heading", config.ReviewRecordHeading + "\r\n- verdict: pass\r\n", true},
-		{"a trailing space is still the heading", config.ReviewRecordHeading + "  \n", true},
-		{"a look-alike heading", "## Reviewer notes\n- verdict: pass\n", false},
-		{"the words inside prose", "the review block (## Review) is missing\n", false},
-		{"an indented heading", "  " + config.ReviewRecordHeading + "\n", false},
-		{"a heading glued to text", "x" + config.ReviewRecordHeading + "\n", false},
+		{
+			name:    "this run's record with the verified tip",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "sha1", "sealed")},
+			role:    "review-1", run: "r-1", tip: "sha1",
+			want: 1,
+		},
+		{
+			name:    "a request_changes re-trip's previous record is a different run",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-old", "sha1", "open")},
+			role:    "review-1", run: "r-1", tip: "sha1",
+			want: 0,
+		},
+		{
+			name:    "a takeover leaves the previous record visible but not matching",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-old", "sha1", "void")},
+			role:    "review-1", run: "r-1", tip: "sha1",
+			want: 0,
+		},
+		{
+			name:    "this run's record under another reviewer role does not satisfy the gate",
+			records: []plane.ReviewRecordState{rec(1, "review-2", "r-1", "sha1", "open")},
+			role:    "review-1", run: "r-1", tip: "sha1",
+			want: 0,
+		},
+		{
+			name:    "a record whose reviewed tip is not the verified tip is stale",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "sha-old", "open")},
+			role:    "review-1", run: "r-1", tip: "sha1",
+			want: 0,
+		},
+		{
+			name:    "a void record never matches",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "sha1", "void")},
+			role:    "review-1", run: "r-1", tip: "sha1",
+			want: 0,
+		},
+		{
+			name: "the newest matching record wins",
+			records: []plane.ReviewRecordState{
+				rec(1, "review-1", "r-1", "sha1", "open"),
+				rec(2, "review-1", "r-1", "sha1", "sealed"),
+			},
+			role: "review-1", run: "r-1", tip: "sha1",
+			want: 2,
+		},
+		{
+			name:    "an unverified checkpoint demands a named tip",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "", "sealed")},
+			role:    "review-1", run: "r-1", needsTip: true,
+			want: 0,
+		},
+		{
+			name:    "an unverified checkpoint accepts the tip the reviewer established",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "sha1", "sealed")},
+			role:    "review-1", run: "r-1", needsTip: true,
+			want: 1,
+		},
+		{
+			name:    "a branchless checkpoint checks the record's identity only",
+			records: []plane.ReviewRecordState{rec(1, "review-1", "r-1", "", "sealed")},
+			role:    "review-1", run: "r-1",
+			want: 1,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := reviewRecordLine(tc.outcome); got != tc.want {
-				t.Errorf("reviewRecordLine(%q) = %v, want %v", tc.outcome, got, tc.want)
+			got, ok := matchingReviewRecord(tc.records, tc.role, tc.run, tc.tip, tc.needsTip)
+			if tc.want == 0 {
+				if ok {
+					t.Fatalf("matched round %d, want no match", got.Round)
+				}
+				return
+			}
+			if !ok || got.Round != tc.want {
+				t.Fatalf("matched (round %d, ok=%v), want round %d", got.Round, ok, tc.want)
+			}
+		})
+	}
+}
+
+// reviewerRoleFor (CLA-637): `review-N`, counting the review-shaped phases up
+// to and including this one — so the shipped single review phase is review-1,
+// and a second review phase (the panel shape, CLA-639) writes review-2, a
+// distinct role and therefore a distinct record in the same round. A phase
+// that is not review-shaped has no role at all.
+func TestReviewerRoleFor(t *testing.T) {
+	shipped := (&config.Config{Phases: []config.Phase{
+		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
+	}}).EffectivePhases()
+	if got := reviewerRoleFor(shipped, 1); got != "review-1" {
+		t.Errorf("the shipped review phase's role = %q, want review-1", got)
+	}
+	if got := reviewerRoleFor(shipped, 0); got != "" {
+		t.Errorf("the implement phase's role = %q, want none", got)
+	}
+	if got := reviewerRoleFor(shipped, 2); got != "" {
+		t.Errorf("the fix phase's role = %q, want none", got)
+	}
+
+	panel := (&config.Config{Phases: []config.Phase{
+		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
+	}}).EffectivePhases()
+	if got := reviewerRoleFor(panel, 1); got != "review-1" {
+		t.Errorf("the first panel member's role = %q, want review-1", got)
+	}
+	if got := reviewerRoleFor(panel, 2); got != "review-2" {
+		t.Errorf("the second panel member's role = %q, want review-2", got)
+	}
+}
+
+// CLA-637: the round is closed by the DRIVER, and a close that fails refuses
+// the checkpoint. The findings stay sealed when the close does not land, so a
+// fix phase spawned here would be told to apply findings it cannot read — the
+// refusal keeps it from running at all, and the task is re-drained.
+func TestDrainPhases_ReviewSeamRefusesWhenTheRoundCannotClose(t *testing.T) {
+	rel := &reviewReleaser{
+		status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n",
+		closeErr: errors.New("plane refused: no_open_round"),
+	}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: checkpointed(5, 0.50)}, // records a healthy durable record
+		{res: okResult(5, 0.05)},     // must NEVER run
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 — a fix phase must not spawn against a round the driver could not release", h.invokeCalls)
+	}
+	if len(rel.closes) != 0 {
+		t.Fatalf("closes = %v, want none — the injected close error must not be recorded as a close", rel.closes)
+	}
+}
+
+// CLA-637: a review session that records its durable record and THEN emits a
+// handoff block leaves the round sealed on purpose — its successor was going to
+// close it at its own seam. When the handoff guards REFUSE that successor (the
+// chain cap, max-iterations spent), the stage is over after all, and the round
+// must be closed before the checkpoint advances: a fix phase spawned against a
+// sealed round can neither read the findings (get_task withholds them) nor
+// answer them (finding_sealed) — it would be spawned to apply nothing.
+func TestDrainPhases_RefusedReviewHandoffClosesTheRoundBeforeAdvancing(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	// The review session both checkpointed (branch verified, record written) AND
+	// handed off — the shape that defers the close to the successor.
+	midReview := checkpointed(5, 0.50)
+	midReview.FinalMessage = "The record is written; the storage layer is next.\n" + config.HandoffMarker + "\nContinue the review."
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		{res: midReview},         // review: records, then hands off (refused below)
+		{res: okResult(5, 0.05)}, // fix: must spawn only after the round is released
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+		if i == 2 { // the fix session: the round must ALREADY be closed
+			if len(rel.closes) != 1 {
+				t.Errorf("the fix phase spawned with the review round not yet closed (closes=%v) — it would be unable to read or answer the findings it was told to apply", rel.closes)
+			}
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+	d.cfg.MaxIterations = 1 // the respawn would be iteration 2: refused
+
+	if _, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	} else if handoffs != 0 {
+		t.Errorf("handoffs = %d, want 0 — the refused handoff never spawned a successor", handoffs)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — implement, review, fix; the refused handoff advances on the recorded review", h.invokeCalls)
+	}
+	// The driver closed exactly the round the review record landed in, BEFORE the
+	// fix phase spawned (asserted from the fix session's onInvoke above).
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Fatalf("closed rounds = %v, want exactly [1] — the fix phase depends on the round being released", rel.closes)
+	}
+}
+
+// CLA-576 + CLA-637: when the driver could not verify the origin tip, the
+// review brief has the reviewer establish the revision itself, and the seam
+// then demands the durable record NAME a tip — the fix phase compares it with
+// the worktree, so an unnamed tip is an unverifiable hand-off. A record naming
+// the tip the reviewer established advances; one naming none is refused.
+func TestDrainPhases_UnverifiedReviewSeamDemandsANamedTip(t *testing.T) {
+	phases := []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}
+	tests := []struct {
+		name    string
+		tip     string // what the review session records as reviewedTip
+		wantFix bool
+	}{
+		{name: "the reviewer's established tip advances", tip: "self-found-tip", wantFix: true},
+		{name: "an unnamed tip is refused", tip: "", wantFix: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: checkpointed(10, 0.10)},
+				{res: resumedCheckpointed(5, 0.50)},
+				{res: okResult(5, 0.05)},
+			}}
+			h.onInvoke = func(i int) {
+				if i == 1 {
+					rel.records = append(rel.records, recordFor(1, "review-1", "r-1", tc.tip, "sealed"))
+				}
+			}
+			d := phaseDriverWithReleaser(t, h, phases, rel)
+			// Every branch check answers Unknown: the origin cannot be read, so
+			// the implement checkpoint is unverified (CLA-576) and the reviewer
+			// must establish the tip itself.
+			d.newVerifier = func(string, bool) deliveryVerifier { return branchStatusVerifier{} }
+
+			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+			}
+			want := 2
+			if tc.wantFix {
+				want = 3
+			}
+			if h.invokeCalls != want {
+				t.Fatalf("spawned %d sessions, want %d", h.invokeCalls, want)
+			}
+			p2 := h.invocations[1].Prompt
+			if !strings.Contains(p2, "could NOT verify") {
+				t.Errorf("the review phase did not get the unverified brief:\n%s", p2)
+			}
+			if strings.Contains(p2, "{{") {
+				t.Errorf("the unverified review brief carries an unresolved placeholder:\n%s", p2)
+			}
+			if tc.wantFix && (len(rel.closes) != 1 || rel.closes[0] != 1) {
+				t.Fatalf("closed rounds = %v, want exactly [1]", rel.closes)
 			}
 		})
 	}
@@ -3305,13 +3643,24 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	phases := d.cfg.EffectivePhases()
 
 	// A verified branch: the plain review-only brief, and the branch-shaped fix.
-	verified := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"}}
+	// The checkpoint's verified tip is what the brief must hand the reviewer as
+	// the revision to review and record (CLA-637).
+	verified := &harness.Result{
+		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
+		CheckpointTip: testCheckpointTip,
+	}
 	inv, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging")
 	if err != nil {
 		t.Fatalf("invocationFor review: %v", err)
 	}
 	if !strings.Contains(inv.Prompt, "REVIEW-ONLY gate") || strings.Contains(inv.Prompt, "could NOT verify") {
 		t.Errorf("a verified checkpoint did not get the plain review-only brief:\n%s", inv.Prompt)
+	}
+	if !strings.Contains(inv.Prompt, `"review-1"`) || !strings.Contains(inv.Prompt, testCheckpointTip) {
+		t.Errorf("the review brief does not carry the durable record's role and verified tip:\n%s", inv.Prompt)
+	}
+	if strings.Contains(inv.Prompt, "{{") {
+		t.Errorf("the review brief carries an unresolved placeholder:\n%s", inv.Prompt)
 	}
 
 	// Branchless (the plane's record): the no-code review-only brief, and the
@@ -3357,6 +3706,15 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	}
 	if strings.Contains(inv.Prompt, "verified to exist on the origin remote") {
 		t.Errorf("the unverified review-only brief asserts the verification it cannot support:\n%s", inv.Prompt)
+	}
+	// The unverified variant has no driver-known tip to name: it must not carry
+	// {{reviewedTip}} at all, filled or literal — the reviewer establishes the
+	// revision itself (CLA-637).
+	if strings.Contains(inv.Prompt, config.ReviewedTipPlaceholder) || strings.Contains(inv.Prompt, "{{") {
+		t.Errorf("the unverified review brief carries an unresolved placeholder:\n%s", inv.Prompt)
+	}
+	if !strings.Contains(inv.Prompt, `"review-1"`) {
+		t.Errorf("the unverified review brief does not carry the reviewer role the seam keys on:\n%s", inv.Prompt)
 	}
 }
 

@@ -81,9 +81,13 @@ instead of claiming), re-reads the bar and the standing decisions from the
 plane, works in that same worktree — never on the integration branch itself —
 reads the diff and runs the adversarial review gate. It is **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
-review record on the task (`update_task(outcome: ...)`, no status move), a fixed
-block carrying the reviewed tip, the implementer's and reviewer's harness/model,
-a `verdict`, and every finding by ID with the required fix. Findings are graded
+review record on the task: a sealed per-reviewer durable record written through
+`update_task(review: ...)` — round, reviewer role, the phase's resolved
+harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
+severity grade and `raisedByModel` — plus, for one release, the legacy block
+in the outcome (`update_task(outcome: ...)`, no status move) carrying the
+reviewed tip, both sides' harness/model, the `verdict`, and every finding by ID
+with the required fix. Findings are graded
 — `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
 evidence, one of: a quoted `doneWhen` clause the change violates; a repo gate
 that fails or would fail (with the command and the output, or why it would
@@ -99,24 +103,23 @@ without a measurement, documentation wording, or missing tests the bar does not
 require — and where a repo hard rule concerns style, prose or documentation
 wording, that never-`must` list wins. The block is
 **appended below** whatever the outcome already carries — a statusless outcome
-replaces the field wholesale, and a re-trip (a request-changes rework, a
-takeover) can leave more than one `## Review` block in it — so a later round's
-block is the outcome's **last** one. The driver refuses to advance to `fix`
-unless: the outcome changed since the review spawned, a `## Review` heading
-sits on its own line, and the outcome's last `## Review` block — heading line to
-the end — is not one the outcome already carried. An edit that leaves an old
-block as the last one is refused; an edit that appends a *new* block below the
-old one still passes the seam, and the `fix` phase's reviewed-tip check
-backstops that residue. Before a review session is spawned at all, the driver
-reads that baseline and retries the read; if it stays unread the sequence ends
-without the review rather than paying for a session whose checkpoint the seam
-would refuse.
+replaces the field wholesale — and the driver refuses to advance to `fix` unless
+the plane serves a durable record **this run** wrote under this phase's
+reviewer role whose reviewed tip equals the branch tip the driver verified on
+origin: an earlier trip's record (a `request_changes` rework, a takeover) never
+satisfies it. Before a review session is spawned at all, the driver reads the
+task's baseline and retries the read; if it stays unread the sequence ends
+without the review — a session whose record the seam could not judge against
+the task it found is pure waste (CLA-663). Before spawning `fix` the driver
+**closes the round**, which is what releases the sealed findings to the fixer.
 The claim is held across the seam, so the task is never posted back to the queue
 mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
-same run, reads the **last** `## Review` block back with `get_task`, checks the
-reviewed tip still matches the worktree's HEAD, and applies every finding by ID
+same run, reads the released durable record back with `get_task` — and, for one
+release, the **last** `## Review` block beside it, because a re-trip can carry
+several — checks the record's reviewed tip still matches the worktree's HEAD,
+and applies every finding by its plane ID
 (or records why not). The driver has already read the record and listed the
 graded findings in the fix brief, applying the structural check the fixer must
 not second-guess: a `must` recorded without an evidence kind or payload is

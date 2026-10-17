@@ -120,6 +120,22 @@ type Recorder interface {
 	RecordBranch(ctx context.Context, taskID, runID, branch string) error
 }
 
+// ReviewRoundCloser closes a durable review round (CLA-637), releasing its
+// sealed findings to the fix phase. It is what the driver calls at the
+// review->fix seam, after the seam gate has matched this run's record.
+//
+// A separate interface, like Attester and Recorder, so a not-wired plane or a
+// test double degrades loudly at the caller that needs it rather than failing to
+// compile. The driver refuses the checkpoint when the closer is unavailable: a
+// fix phase that cannot see the findings would be spawned to apply nothing.
+type ReviewRoundCloser interface {
+	// CloseReviewRound closes round on taskID through update_task(review:
+	// {closeRound: round}), signed by runID. The plane refuses a caller that is
+	// not the task's holding run, and answers no_open_round for a round that was
+	// already closed or voided - both are reported as errors.
+	CloseReviewRound(ctx context.Context, taskID, runID string, round int) error
+}
+
 // ParkAPI is the optional interface a Releaser may implement to let the driver
 // declare a failure the SESSION cannot: a phase that dies producing nothing is
 // dead, so nobody is left to move the task — the driver has to (CLA-386).
@@ -271,6 +287,29 @@ func (r *mcpReleaser) RecordBranch(ctx context.Context, taskID, runID, branch st
 		"taskId": taskID,
 		"runId":  runID,
 		"branch": branch,
+	})
+}
+
+// CloseReviewRound closes one round of the durable review record (CLA-637) in
+// the shape CLA-636 added: update_task(review: {closeRound: round}), signed by
+// the holding run. It sends nothing else - a close is not a revision, not a
+// status move and not an outcome write.
+//
+// The round is the driver's, not the reviewer's: the session writes the sealed
+// record and the driver closes it at the seam, which is what releases the
+// findings to the fix phase while keeping each reviewer's record sealed from
+// the next reviewer reading the task.
+func (r *mcpReleaser) CloseReviewRound(ctx context.Context, taskID, runID string, round int) error {
+	if taskID == "" || runID == "" {
+		return errors.New("close review round: taskId and runId are both required")
+	}
+	if round <= 0 {
+		return errors.New("close review round: round must be positive")
+	}
+	return r.call(ctx, "update_task", map[string]any{
+		"taskId": taskID,
+		"runId":  runID,
+		"review": map[string]any{"closeRound": round},
 	})
 }
 
