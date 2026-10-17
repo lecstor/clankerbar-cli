@@ -421,8 +421,8 @@ func TestDrainPhases_CarriesTheResolvedSessionTokenCeiling(t *testing.T) {
 	d, _ := phaseDriver(t, &fakeAdapter{}, twoPhases())
 	d.cfg.Budget = config.Budget{MaxTokens: 75_000_000}
 
-	ph := d.cfg.EffectivePhases()[0]
-	inv, err := d.invocationFor(d.targets[0], 0, ph, nil, "", "")
+	phases := d.cfg.EffectivePhases()
+	inv, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "", phases)
 	if err != nil {
 		t.Fatalf("invocationFor: %v", err)
 	}
@@ -1251,6 +1251,190 @@ func TestRun_ResumedPhaseTransientWaitHonoursMarkers(t *testing.T) {
 	})
 }
 
+// CLA-664: a RELOAD landing inside a drain's OWN first-phase wait (waitOrStop,
+// during the transient backoff) swaps d.cfg while the sequence the drain
+// captured at start is still in flight. The in-flight sequence must keep its
+// own shape — each phase's MODE, its salvage decision and its "PHASE i of N"
+// text — and the reloaded shape must take effect at the NEXT drain, not this
+// one. Before the fix, requireReviewRecord and the phase total were re-read
+// from the live config at each phase spawn (invocationFor too), while
+// drainPhases still walked the captured slice: a 2 -> 3 reload turned the
+// in-flight FINAL review into a gated review-only phase (salvage skipped,
+// "PHASE 2 of 3"), and a 3 -> 2 reload un-gated the review-only phase (it
+// checkpointed on the branch alone and spawned the fix over no record).
+func TestDrainPhases_AReloadMidDrainDoesNotReshapeTheInFlightSequence(t *testing.T) {
+	impl := config.Phase{Name: config.ImplementPhaseName}
+	review := config.Phase{Name: config.ReviewPhaseName}
+	fix := config.Phase{Name: config.FixPhaseName}
+
+	t.Run("2 to 3: the in-flight final review keeps its brief, salvage and count", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: transientResult()},  // implement attempt 1 blips; the backoff wait applies the RELOAD
+			{res: checkpointed(1, 0)}, // implement attempt 2: checkpoint
+			{res: checkpointed(1, 0)}, // in-flight FINAL review of the captured 2-phase shape
+			{res: checkpointed(1, 0)}, // next drain, new 3-phase shape: implement
+			{res: checkpointed(1, 0)}, // next drain: review-only (records its record below)
+			{res: okResult(1, 0)},     // next drain: fix
+		}}
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+		d := phaseDriverWithReleaser(t, h, []config.Phase{impl, review}, rel)
+		s := &fakeSalvager{out: savedOutcome()}
+		d.newSalvager = func(string) workSalvager { return s }
+		d.SetReloader(func() (*config.Config, error) {
+			fresh := *d.cfg
+			fresh.Phases = []config.Phase{impl, review, fix}
+			return &fresh, nil
+		})
+		h.onInvoke = func(call int) {
+			switch call {
+			case 0:
+				writeMarker(t, d.state.Path(), MarkerReload, "")
+			case 4: // the next drain's review-only session records the durable record the seam gate requires (CLA-637)
+				rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+				rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+			}
+		}
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("first drain: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 3 {
+			t.Fatalf("the first drain spawned %d sessions, want 3 — the transient retry of implement, then the in-flight final review", h.invokeCalls)
+		}
+		p := h.invocations[2].Prompt
+		if !strings.Contains(p, "PHASE 2 of 2") || strings.Contains(p, "PHASE 2 of 3") {
+			t.Errorf("the in-flight review's count came from the reloaded config, not the captured sequence:\n%s", p)
+		}
+		if !strings.Contains(p, "Open a PR") {
+			t.Errorf("the in-flight FINAL review lost the review-and-fix brief its captured position selects:\n%s", p)
+		}
+		if len(s.calls) != 2 {
+			t.Fatalf("the driver salvaged %d time(s), want 2 (the implement phase and the in-flight FINAL review) — a final review is review-AND-fix and its uncommitted work must still be rescued: %+v", len(s.calls), s.calls)
+		}
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("second drain: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 6 {
+			t.Fatalf("after the reload the second drain ran to %d sessions total, want 6 — the NEXT drain must run the reloaded shape", h.invokeCalls)
+		}
+		if p2 := h.invocations[4].Prompt; !strings.Contains(p2, "PHASE 2 of 3") || !strings.Contains(p2, "REVIEW-ONLY gate") {
+			t.Errorf("the drain after the reload did not run the new shape's review-only phase:\n%s", p2)
+		}
+		if p3 := h.invocations[5].Prompt; !strings.Contains(p3, "PHASE 3 of 3") {
+			t.Errorf("the drain after the reload did not run the new shape's fix phase:\n%s", p3)
+		}
+		if len(s.calls) != 3 {
+			t.Errorf("salvage ran %d time(s) in total, want 3 — the next drain's review-only phase must NOT salvage: %+v", len(s.calls), s.calls)
+		}
+	})
+
+	t.Run("3 to 2: the in-flight review-only keeps its gate and its skip-salvage", func(t *testing.T) {
+		outcome := "implemented: pushed the branch\n"
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: transientResult()},  // implement attempt 1 blips; the backoff wait applies the RELOAD
+			{res: checkpointed(1, 0)}, // implement attempt 2: checkpoint
+			{res: checkpointed(1, 0)}, // in-flight review-only: records NOTHING — the gate must refuse it
+			{res: checkpointed(1, 0)}, // next drain, new 2-phase shape: implement
+			{res: checkpointed(1, 0)}, // next drain: FINAL review
+		}}
+		rel := &wiredReleaser{state: func() plane.TaskState {
+			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+		}}
+		d := phaseDriverWithReleaser(t, h, []config.Phase{impl, review, fix}, rel)
+		s := &fakeSalvager{out: savedOutcome()}
+		d.newSalvager = func(string) workSalvager { return s }
+		d.SetReloader(func() (*config.Config, error) {
+			fresh := *d.cfg
+			fresh.Phases = []config.Phase{impl, review}
+			return &fresh, nil
+		})
+		h.onInvoke = func(call int) {
+			if call == 0 {
+				writeMarker(t, d.state.Path(), MarkerReload, "")
+			}
+		}
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("first drain: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 3 {
+			t.Fatalf("the first drain spawned %d sessions, want 3 — the review-only phase recorded nothing, so the gate must refuse it the checkpoint and no fix may spawn", h.invokeCalls)
+		}
+		p := h.invocations[2].Prompt
+		if !strings.Contains(p, "PHASE 2 of 3") || strings.Contains(p, "PHASE 2 of 2") {
+			t.Errorf("the in-flight review-only's count came from the reloaded config, not the captured sequence:\n%s", p)
+		}
+		if !strings.Contains(p, "REVIEW-ONLY gate") {
+			t.Errorf("the in-flight review lost the review-only brief its captured position selects:\n%s", p)
+		}
+		if len(s.calls) != 1 {
+			t.Fatalf("the driver salvaged %d time(s), want 1 (the implement phase only) — the review-only phase's deliverable is the plane record, not the tree: %+v", len(s.calls), s.calls)
+		}
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("second drain: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 5 {
+			t.Fatalf("after the reload the second drain ran to %d sessions total, want 5 — the NEXT drain must run the reloaded 2-phase shape", h.invokeCalls)
+		}
+		p2 := h.invocations[4].Prompt
+		if !strings.Contains(p2, "PHASE 2 of 2") || strings.Contains(p2, "REVIEW-ONLY") {
+			t.Errorf("the drain after the reload did not run the new shape's FINAL review:\n%s", p2)
+		}
+		if !strings.Contains(p2, "Open a PR") {
+			t.Errorf("the next drain's review did not keep the review-and-fix brief its final position selects:\n%s", p2)
+		}
+		if len(s.calls) != 3 {
+			t.Errorf("salvage ran %d time(s) in total, want 3 — the next drain's FINAL review must salvage (implement twice, review once): %+v", len(s.calls), s.calls)
+		}
+	})
+
+	t.Run("3 to 2: a handoff in the in-flight fix keeps its terminal step", func(t *testing.T) {
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: transientResult()},  // implement attempt 1 blips; the backoff wait applies the RELOAD
+			{res: checkpointed(1, 0)}, // implement attempt 2: checkpoint
+			{res: checkpointed(1, 0)}, // in-flight review-only: records the record below
+			{res: handoffResult("R1 is fixed and committed; the PR is next.")}, // in-flight fix hands off
+			{res: okResult(1, 0)}, // the fix successor ends the sequence
+		}}
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+		d := phaseDriverWithReleaser(t, h, []config.Phase{impl, review, fix}, rel)
+		d.SetReloader(func() (*config.Config, error) {
+			fresh := *d.cfg
+			fresh.Phases = []config.Phase{impl, review}
+			return &fresh, nil
+		})
+		h.onInvoke = func(call int) {
+			switch call {
+			case 0:
+				writeMarker(t, d.state.Path(), MarkerReload, "")
+			case 2: // the review-only session records the durable record the seam gate requires (CLA-637)
+				rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip + "\n- verdict: pass\n"
+				rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+			}
+		}
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drain: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 5 {
+			t.Fatalf("the drain spawned %d sessions, want 5 — implement's retry, the in-flight review-only, the fix, and the fix's handoff successor", h.invokeCalls)
+		}
+		// The continuation gate must read the CAPTURED sequence: the reloaded
+		// 2-phase config has no index 2, so a live read drops the fix phase's
+		// terminal step from the successor — the in-flight sequence reshaped
+		// by the reload (CLA-664), one phase later than the mode and count.
+		successor := h.invocations[4].Prompt
+		if !strings.Contains(successor, `status: "in_review"`) {
+			t.Errorf("the in-flight fix's handoff successor lost the terminal step its captured position selects:\n%s", successor)
+		}
+		if strings.Contains(successor, "review-only ending") {
+			t.Errorf("the in-flight fix's successor was handed the review-only ending:\n%s", successor)
+		}
+	})
+}
+
 func TestDrainPhases_SumsSpendAcrossPhases(t *testing.T) {
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: checkpointed(10, 0.50)},
@@ -1408,14 +1592,14 @@ func TestInvocationForCarriesTheResolvedWallClockCap(t *testing.T) {
 	d.cfg.MaxSessionWallClock = config.Duration(time.Hour)
 
 	phases := d.cfg.EffectivePhases()
-	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "")
+	inv1, err := d.invocationFor(d.targets[0], 0, phases[0], nil, "", "", phases)
 	if err != nil {
 		t.Fatalf("invocationFor phase 1: %v", err)
 	}
 	if got := inv1.MaxSessionWallClock; got != 20*time.Minute {
 		t.Errorf("phase 1 invocation carries %s, want its own 20m", got)
 	}
-	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "", "")
+	inv2, err := d.invocationFor(d.targets[0], 1, phases[1], nil, "", "", phases)
 	if err != nil {
 		t.Fatalf("invocationFor phase 2: %v", err)
 	}
@@ -3649,7 +3833,7 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
 		CheckpointTip: testCheckpointTip,
 	}
-	inv, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging")
+	inv, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging", phases)
 	if err != nil {
 		t.Fatalf("invocationFor review: %v", err)
 	}
@@ -3666,14 +3850,14 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	// Branchless (the plane's record): the no-code review-only brief, and the
 	// no-code fix brief (which must NOT tell the session to open a PR).
 	branchless := &harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-1"}}
-	inv, err = d.invocationFor(d.targets[0], 1, phases[1], branchless, "", "staging")
+	inv, err = d.invocationFor(d.targets[0], 1, phases[1], branchless, "", "staging", phases)
 	if err != nil {
 		t.Fatalf("invocationFor branchless review: %v", err)
 	}
 	if !strings.Contains(inv.Prompt, "PLANE'S RECORD") || strings.Contains(inv.Prompt, "verified to exist on the origin") {
 		t.Errorf("a branchless checkpoint did not get the no-code review-only brief:\n%s", inv.Prompt)
 	}
-	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging")
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], branchless, "", "staging", phases)
 	if err != nil {
 		t.Fatalf("invocationFor branchless fix: %v", err)
 	}
@@ -3683,7 +3867,7 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	if !strings.Contains(inv.Prompt, "LAST `"+config.ReviewRecordHeading+"`") {
 		t.Errorf("the no-code fix prompt does not point at the LAST %q block:\n%s", config.ReviewRecordHeading, inv.Prompt)
 	}
-	inv, err = d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging")
+	inv, err = d.invocationFor(d.targets[0], 2, phases[2], verified, "", "staging", phases)
 	if err != nil {
 		t.Fatalf("invocationFor fix: %v", err)
 	}
@@ -3697,7 +3881,7 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 		Claim:                harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
 		CheckpointUnverified: true,
 	}
-	inv, err = d.invocationFor(d.targets[0], 1, phases[1], unverified, "", "staging")
+	inv, err = d.invocationFor(d.targets[0], 1, phases[1], unverified, "", "staging", phases)
 	if err != nil {
 		t.Fatalf("invocationFor unverified review: %v", err)
 	}
