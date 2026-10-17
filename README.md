@@ -83,7 +83,21 @@ reads the diff and runs the adversarial review gate. It is **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task (`update_task(outcome: ...)`, no status move), a fixed
 block carrying the reviewed tip, the implementer's and reviewer's harness/model,
-a `verdict`, and every finding by ID with the required fix. The block is
+a `verdict`, and every finding by ID with the required fix. Findings are graded
+— `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
+evidence, one of: a quoted `doneWhen` clause the change violates; a repo gate
+that fails or would fail (with the command and the output, or why it would
+fail); a concrete failure scenario in the change or its direct regression
+surface; a security exposure (credential exposure, an authorization bypass,
+injection, a widened permission — with the path); a contradicted standing
+decision (by id) or a hard rule in the repo's agent instructions (file + rule);
+an irreversible migration, deletion or publish step missing the guard the repo
+requires; or a new or changed guard, gate or state transition with no test that
+pins it (its file:line and the missing test). Never a `must`, however confident
+the reviewer: style, naming, a design they would prefer, a performance concern
+without a measurement, documentation wording, or missing tests the bar does not
+require — and where a repo hard rule concerns style, prose or documentation
+wording, that never-`must` list wins. The block is
 **appended below** whatever the outcome already carries — a statusless outcome
 replaces the field wholesale — and the driver refuses to advance to `fix` unless
 this trip's session actually changed the outcome and wrote the block. The claim
@@ -92,8 +106,15 @@ mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
 same run, reads the review block back with `get_task`, checks the reviewed tip
-still matches the worktree's HEAD, applies every finding by ID (or records why
-not), re-verifies scoped to those fixes, commits and pushes them, opens a PR
+still matches the worktree's HEAD, and applies every finding by ID. The driver
+has already read the record and listed the graded findings in the fix brief,
+applying the structural check the fixer must not second-guess: a `must` recorded
+without an evidence kind or payload is listed as a `should`. Every listed `must`
+is fixed, or refuted with evidence recorded in its outcome — a `must` is never
+downgraded, and one raised by a single reviewer is never dropped because nobody
+else raised it. Cheap `should`s are fixed; `nit`s and the rest are recorded as
+not done with a reason (a follow-up task only for a `should` worth doing). The
+fixer re-verifies scoped to those fixes, commits and pushes them, opens a PR
 targeting the repo's PR base if none exists yet for the branch, and hands the
 task to `in_review`. Its outcome keeps everything above the review block and
 carries the review forward with a `### Fixes` list and both sides' attribution,
