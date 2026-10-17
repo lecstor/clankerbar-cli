@@ -2326,67 +2326,6 @@ func ConfigDir() (string, error) {
 	return filepath.Dir(filepath.Join(home, homeConfigRelPath)), nil
 }
 
-// topLevelConfigKeys are the JSON keys Config unmarshals from. A file carrying
-// at least one of them IS a clankerbar config (or claims to be); the other JSON
-// that shares the config dir — MCP configs (`mcp`, `mcpServers`), headless
-// permission policies (`permissions`, `allow`, `deny`), opencode configs — carry
-// none. Kept in lockstep with the Config struct's json tags, which are the
-// source of truth: adding a knob without adding its key here would silently
-// stop the supervisor from recognising the files that set it.
-var topLevelConfigKeys = map[string]bool{
-	"allow_local_mcp_servers": true,
-	"allow_unchecked_pr":      true,
-	"backlog_url":             true,
-	"budget":                  true,
-	"config_dir":              true,
-	"env":                     true,
-	"escalation":              true,
-	"harness":                 true,
-	"harnesses":               true,
-	"health_url":              true,
-	"idle_poll_interval":      true,
-	"instance_name":           true,
-	"integration_branch":      true,
-	"max_iterations":          true,
-	"max_retries":             true,
-	"max_session_wall_clock":  true,
-	"max_turns":               true,
-	"max_zero_spend_attempts": true,
-	"mcp_config_path":         true,
-	"model":                   true,
-	"models":                  true,
-	"phases":                  true,
-	"poll_interval":           true,
-	"pr_base":                 true,
-	"primary_repo":            true,
-	"projects":                true,
-	"prompt":                  true,
-	"repos":                   true,
-	"retry_cap":               true,
-	"settings_path":           true,
-	"state_dir":               true,
-	"workdir":                 true,
-}
-
-// LooksLikeConfig reports whether data is JSON carrying at least one recognized
-// clankerbar config key. It is the supervisor's first filter over `*.json` in
-// the config dir: a file that fails it cannot be an instance config whatever
-// Load and Validate would say (a headless permission policy validates as an
-// empty config with defaults), so it is skipped without even being loaded.
-// Unparseable data is not a config.
-func LooksLikeConfig(data []byte) bool {
-	var keys map[string]json.RawMessage
-	if err := json.Unmarshal(data, &keys); err != nil {
-		return false
-	}
-	for k := range keys {
-		if topLevelConfigKeys[k] {
-			return true
-		}
-	}
-	return false
-}
-
 // refuseImplicitWorkDirConfig refuses to run when a `clankerbar.json` is sitting
 // in the process working directory and no --config was given.
 //

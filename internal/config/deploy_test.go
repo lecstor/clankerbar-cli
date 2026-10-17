@@ -245,13 +245,3 @@ func TestValidateRefusesBadPRBaseValues(t *testing.T) {
 		t.Error("the per-project pr_base gets the same value check")
 	}
 }
-
-// topLevelConfigKeys is kept in lockstep with the Config struct's json tags:
-// adding a knob without adding its key here would quietly stop the supervisor
-// from recognising the files that set it, and pr_base is a knob an operator
-// sets (the follow-up config entries the task that filed CLA-608 names).
-func TestPRBaseIsARecognizedTopLevelConfigKey(t *testing.T) {
-	if !LooksLikeConfig([]byte(`{"pr_base": {"lecstor/makespdf": "integration"}}`)) {
-		t.Error("a config setting only pr_base must be recognised as a clankerbar config")
-	}
-}
