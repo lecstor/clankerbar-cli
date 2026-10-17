@@ -1335,14 +1335,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		branchlessCheckpoint = seamClaim != nil && seamClaim.Claim.Branch == ""
 
 		// A run-level stop wins over a dead phase. drainPhase returns stop=true
-		// for a budget trip, credit exhaustion (lim.Stop), and a resumed phase
-		// ending on a live lease — and on those paths end.dead can be set too (a
-		// credit-starved session is exactly the shape that dies on reason
-		// "unknown" with no branch). Retrying a dead phase against a stopped run
-		// burns another session into the same limit and, on the second, parks a
-		// task for what was actually a run-wide outage instead of stopping the
-		// daemon. A run stop is final; the dead branch only decides retry vs park
-		// when the run is continuing.
+		// for a budget trip and credit exhaustion (lim.Stop) — and on those
+		// paths end.dead can be set too (a credit-starved session is exactly the
+		// shape that dies on reason "unknown" with no branch). Retrying a dead
+		// phase against a stopped run burns another session into the same limit
+		// and, on the second, parks a task for what was actually a run-wide
+		// outage instead of stopping the daemon. A run stop is final; the dead
+		// branch only decides retry vs park when the run is continuing. (A
+		// resumed phase ending on a live lease is NOT one of those paths — see
+		// the sequence-end break below, deliberately before the dead arm,
+		// because that end leaves the run continuing.)
 		if pstop {
 			stop = true
 			break
@@ -1357,8 +1359,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// after the sequence's deferred handback, holding no lease. Broken here
 		// rather than flowing into the checks below because those read a session
 		// that merely got turned away: the dead/fleet counters would tick on a
-		// blip's exit shape (or a limit's "unknown" finish reason), and the
-		// empty retry would re-spawn a phase against a provider still down.
+		// blip's exit shape (or a limit's "unknown" finish reason), and none of
+		// that machinery applies to a sequence end the run is ordered to survive.
 		if end.sequenceEnd != nil {
 			limitWait = end.sequenceEnd.limitWait
 			break

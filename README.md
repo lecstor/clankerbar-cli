@@ -117,6 +117,11 @@ the lease is left to lapse into a takeover with its branch recorded — but the
 it would have inside the phase, and carries on polling when the cap lifts.
 Only a hard stop (`lim.Stop`, credit exhausted) ends the daemon there.
 
+A transient server/network blip on a resumed phase ends its sequence for the
+same lease reason — the backoff ladder would walk past the 30-minute lease —
+and the run stays up there too: there is no reset to wait out, so the next
+poll spawns a fresh sequence and the first-phase retry ladder owns the blip.
+
 The split works because each phase's prompt is a **scope** instruction — "your
 job this session is implementation only, then stop" — rather than a request that
 the model manage its own context. Naming a phase takes its built-in brief; set
