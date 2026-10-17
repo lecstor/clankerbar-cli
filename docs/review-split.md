@@ -131,6 +131,15 @@ branch — would pass it with nothing recorded at all. Two guards close that:
    does not release it to the queue — the lease lapses and a takeover picks the
    work up. (Pre-split, a dead review was the last phase, so it ended the drain
    with no PR — this guard preserves that property across the seam.)
+
+   One residue of the snapshot, stated rather than hidden: a handoff respawn
+   re-enters the phase and takes a FRESH baseline, so a review session that
+   records its block and THEN hands off leaves its successor a baseline that
+   already carries the record — the successor must record its own block (its
+   handoff continuation carries the record shape, so the passing outcome holds
+   two blocks; a successor that records nothing is refused and the round
+   re-runs). The fresh baseline is the point: it is what keeps a handoff from
+   laundering a previous trip's block through the seam.
 2. **The salvage is skipped for the review-only phase.** Its deliverable is the
    plane record, not the tree. Anything uncommitted in its worktree is generated
    output from running checks; committing and pushing it would (a) commit the
