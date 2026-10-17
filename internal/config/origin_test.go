@@ -471,10 +471,10 @@ func TestEquivalentOriginSpellingsAreAccepted(t *testing.T) {
 	}
 }
 
-// CLA-541: the opencode 2.x dialect puts servers under `mcp.servers` (verified
-// against beta-18314, docs/opencode2.md). The mcpFile decode flattens that
-// shape into MCP so every consumer — the gates, the slug derivation, the
-// ambient audit — sees an opencode2 config exactly as a v1 one.
+// CLA-541: the opencode 2.x dialect puts servers under `mcp.servers`. The
+// mcpFile decode flattens that shape into MCP so every consumer — the gates,
+// the slug derivation, the ambient audit — sees a 2.x config exactly as a 1.x
+// one.
 func TestMCPClankerbarV2Dialect(t *testing.T) {
 	_, path := writeMCP(t, `{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}}`)
 	url, ok := MCPClankerbar(path)
@@ -517,5 +517,15 @@ func TestV1ServerNamedServersStillDecodes(t *testing.T) {
 	url, ok := MCPClankerbar(path)
 	if !ok || url != "https://clankerbar.com/mcp/proj" {
 		t.Errorf("MCPClankerbar() = (%q, %v), want the v1 entry named servers", url, ok)
+	}
+}
+
+// A config still naming the retired opencode2 harness fails with the rename in
+// the message (CLA-675).
+func TestRetiredOpencode2HarnessNamesTheFix(t *testing.T) {
+	c := &Config{Harness: "opencode2", Prompt: "Work."}
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), `rename it`) {
+		t.Fatalf("Validate() = %v, want the opencode2 rename hint", err)
 	}
 }

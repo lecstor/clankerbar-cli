@@ -93,8 +93,10 @@ type mcpFile struct {
 // UnmarshalJSON decodes the union mcpFile shape and additionally flattens the
 // opencode 2.x `mcp.servers` dialect into MCP, so every consumer (the
 // credential-origin gates, the local-process disclosure, the ambient-config
-// audit, the slug derivation) sees an opencode2 config's servers exactly as a
-// v1 config's — verified dialect of the installed beta-18314, docs/opencode2.md.
+// audit, the slug derivation) sees an opencode 2.x config's servers exactly as
+// a 1.x config's. Both dialects are accepted by opencode 2.0.32, and the
+// adapter rewrites 1.x entries into `mcp.servers` before a session sees them
+// (docs/opencode-build.md).
 //
 // The two dialects cannot collide on a real file: opencode 1.x writes `mcp` as
 // a map of server-name -> entry, opencode 2.x writes it as an object with a
@@ -143,7 +145,7 @@ func (f *mcpFile) UnmarshalJSON(data []byte) error {
 // container (see mcpFile.UnmarshalJSON).
 func entryIsZero(e mcpEntry) bool {
 	return e.URL == "" && e.Headers == nil && e.Env == nil && e.Environment == nil &&
-		e.Command == nil && e.Args == nil && e.Enabled == nil
+		e.Command == nil && e.Args == nil && e.Enabled == nil && e.Disabled == nil
 }
 
 type mcpEntry struct {
@@ -176,11 +178,17 @@ type mcpEntry struct {
 	// opencodeConfigClankerbarSlug for why a security gate must keep looking at
 	// an entry the file merely CLAIMS is off.
 	Enabled *bool `json:"enabled"`
+
+	// Disabled is the 2.x spelling of the same switch, inverted: `"disabled":
+	// true` turns a server off. Read only where Enabled is, for the same reason.
+	Disabled *bool `json:"disabled"`
 }
 
-// disabled reports whether this entry is switched off by an explicit
-// `"enabled": false`.
-func (e mcpEntry) disabled() bool { return e.Enabled != nil && !*e.Enabled }
+// disabled reports whether this entry is switched off by an explicit 1.x
+// `"enabled": false` or 2.x `"disabled": true`.
+func (e mcpEntry) disabled() bool {
+	return (e.Enabled != nil && !*e.Enabled) || (e.Disabled != nil && *e.Disabled)
+}
 
 // startsProcess reports whether this entry would start a LOCAL PROCESS. A
 // `command` is what does it in both dialects — Claude's string-plus-args form

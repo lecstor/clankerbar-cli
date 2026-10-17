@@ -34,9 +34,8 @@ func clankerbarBlock(slug string) string {
 // `workdir`, with `configDir` as opencode's global config directory.
 func opencodeRun(t *testing.T, slug, workdir, configDir string) *Config {
 	t.Helper()
-	// opencode reads ~/.opencode as a global config directory whatever
-	// OPENCODE_CONFIG_DIR says, so HOME is isolated: without this these tests
-	// would pass or fail on what happens to be in the developer's home.
+	// HOME and XDG_CONFIG_HOME are isolated: without this these tests would
+	// pass or fail on what happens to be in the developer's home.
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	mcp := writeAmbientFile(t, filepath.Join(t.TempDir(), "opencode-mcp.json"), clankerbarBlock(slug))
@@ -214,18 +213,57 @@ func TestDisabledEntriesAreStillDisclosedToTheSecurityGates(t *testing.T) {
 	}
 }
 
-// ~/.opencode is opencode's OTHER global directory, read whatever config_dir
-// says - a live 1.18.19 run logs `loading path=/Users/jason/.opencode/opencode.json`
-// alongside the config_dir files. A block parked there reaches every session, so
-// it is checked too.
-func TestHomeOpencodeDirIsCheckedRegardlessOfConfigDir(t *testing.T) {
-	c := opencodeRun(t, "ezyapp", t.TempDir(), t.TempDir())
-	home := os.Getenv("HOME")
-	writeAmbientFile(t, filepath.Join(home, ".opencode", "opencode.json"), clankerbarBlock("clankerbar"))
+// ~/.opencode was a second global directory on 1.x; 2.x does not read it
+// (verified with `opencode debug config` against 2.0.32), so a block parked
+// there reaches no session and is not reported.
+func TestHomeOpencodeDirIsNotScanned(t *testing.T) {
+	c := opencodeRun(t, "ezyapp", t.TempDir(), "")
+	writeAmbientFile(t, filepath.Join(os.Getenv("HOME"), ".opencode", "opencode.json"), clankerbarBlock("clankerbar"))
+	if got := c.OpencodeAmbientConflicts(); len(got) != 0 {
+		t.Errorf("conflicts = %v, want none: 2.x does not read ~/.opencode", got)
+	}
+}
 
+// OPENCODE_CONFIG_DIR REPLACES the default global dir on 2.x, and the adapter
+// exports config_dir as it. With a config_dir set, the default dir is read by
+// no session, so a file there is not reported - and the config_dir's own is.
+func TestConfigDirReplacesTheDefaultGlobalDir(t *testing.T) {
+	configDir := t.TempDir()
+	c := opencodeRun(t, "ezyapp", t.TempDir(), configDir)
+	writeAmbientFile(t, filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "opencode", "opencode.json"), clankerbarBlock("default"))
+	writeAmbientFile(t, filepath.Join(configDir, "opencode.json"), clankerbarBlock("declared"))
 	got := onlyConflict(t, c.OpencodeAmbientConflicts())
-	if got.Scope != "global" || got.Got != "clankerbar" {
-		t.Errorf("conflict = %+v, want the ~/.opencode file flagged as a global one", got)
+	if got.Got != "declared" {
+		t.Errorf("conflict = %+v, want the config_dir file only", got)
+	}
+}
+
+// The 2.x project layer includes `.opencode/opencode.json` beside the
+// instance directory's own `opencode.json`.
+func TestProjectDotOpencodeConfigIsScanned(t *testing.T) {
+	workdir := t.TempDir()
+	writeAmbientFile(t, filepath.Join(workdir, ".opencode", "opencode.json"), clankerbarBlock("clankerbar"))
+	got := onlyConflict(t, opencodeRun(t, "ezyapp", workdir, "").OpencodeAmbientConflicts())
+	if got.Scope != "session directory" || got.Got != "clankerbar" {
+		t.Errorf("conflict = %+v, want the .opencode/opencode.json file flagged", got)
+	}
+}
+
+// A global file in the 2.x `mcp.servers` dialect is read like a 1.x one, and a
+// 2.x `disabled: true` server cannot redirect anything.
+func TestV2DialectGlobalFileIsFlagged(t *testing.T) {
+	c := opencodeRun(t, "proj", t.TempDir(), "")
+	global := filepath.Join(os.Getenv("XDG_CONFIG_HOME"), "opencode", "opencode.json")
+	writeAmbientFile(t, global,
+		`{"mcp":{"servers":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/other"}}}}`)
+	got := onlyConflict(t, c.OpencodeAmbientConflicts())
+	if got.Got != "other" || got.Want != "proj" || got.Scope != "global" {
+		t.Errorf("conflict = %+v, want other vs proj, global", got)
+	}
+	writeAmbientFile(t, global,
+		`{"mcp":{"servers":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/other","disabled":true}}}}`)
+	if got := c.OpencodeAmbientConflicts(); len(got) != 0 {
+		t.Errorf("conflicts = %v, want none for a disabled server", got)
 	}
 }
 
@@ -334,74 +372,4 @@ func TestSessionShapingReportIgnoresPowerlessDeclarations(t *testing.T) {
 			t.Errorf("overrides = %v, want the unparseable block reported - the shape nobody modelled is the one nobody has looked at", got.Overrides)
 		}
 	})
-}
-
-// CLA-541: an opencode2 run gets the same ambient-config audit as an opencode
-// one (spawnsOpencode covers both lines), it scans the v2 global config dir
-// (~/.config/opencode2 — the file an operator actually edits for the beta),
-// and the v2 `mcp.servers` dialect parses (verified against beta-18314,
-// docs/opencode2.md). The run's own slug is derived through the same dialect.
-func opencode2Run(t *testing.T, slug, workdir string) *Config {
-	t.Helper()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	mcp := writeAmbientFile(t, filepath.Join(t.TempDir(), "opencode2-mcp.json"),
-		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/`+slug+`"}}}}`)
-	return &Config{
-		Harness:       "opencode2",
-		Prompt:        "Work the next backlog item.",
-		WorkDir:       workdir,
-		MCPConfigPath: mcp,
-	}
-}
-
-func TestOpencode2RunScansItsGlobalDirAndDialect(t *testing.T) {
-	home := t.TempDir()
-	cfg := opencode2Run(t, "proj", t.TempDir())
-	t.Setenv("HOME", home)
-	// The v2 global config dir names a DIFFERENT project in the beta's own
-	// mcp.servers dialect.
-	writeAmbientFile(t, filepath.Join(home, ".config/opencode2/opencode.json"),
-		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}}`)
-	got := cfg.OpencodeAmbientConflicts()
-	c := onlyConflict(t, got)
-	if c.Got != "other" || c.Want != "proj" {
-		t.Errorf("conflict = %+v, want other vs proj", c)
-	}
-	if c.Scope != "global" {
-		t.Errorf("scope = %q, want global", c.Scope)
-	}
-}
-
-func TestOpencode2GlobalDirIsNotScannedForV1Runs(t *testing.T) {
-	// The v2 config dir is scanned for opencode2 runs only — a v1 run's audit
-	// must not send the operator to edit ~/.config/opencode2, a file no v1
-	// session loads.
-	cfg := opencodeRun(t, "proj", t.TempDir(), "")
-	writeAmbientFile(t, filepath.Join(t.TempDir(), ".config/opencode2/opencode.json"),
-		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}}`)
-	if got := cfg.OpencodeAmbientConflicts(); len(got) != 0 {
-		t.Errorf("v1 run flagged a v2-only config: %+v", got)
-	}
-}
-
-func TestOpencode2DeclaredConfigDirIsNotScanned(t *testing.T) {
-	// `harnesses.opencode2.config_dir` is INERT on the v2 adapter: the adapter
-	// deliberately never maps it to OPENCODE_CONFIG_DIR (which on the beta
-	// steers the PLUGIN dir, verified — redirecting plugins to the fleet's
-	// config dir would silently detach the operator's plugin setup), and the
-	// beta's config-file discovery is hardcoded. So no v2 session loads a file
-	// in the declared config_dir, and the audit must not report one there —
-	// reporting it would send the operator to edit a file no session loads
-	// (the same standard the v1 scan's comment states). The v1 line's tests
-	// scan the declared dir because the v1 adapter DOES map it to
-	// OPENCODE_CONFIG_DIR, a real merge layer for 1.x.
-	cfg := opencode2Run(t, "proj", t.TempDir())
-	dir := t.TempDir()
-	cfg.Harnesses = map[string]HarnessConfig{"opencode2": {ConfigDir: dir}}
-	writeAmbientFile(t, filepath.Join(dir, "opencode.json"),
-		`{"mcp":{"servers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}}`)
-	if got := cfg.OpencodeAmbientConflicts(); len(got) != 0 {
-		t.Errorf("inert declared config_dir must not be scanned: %+v", got)
-	}
 }

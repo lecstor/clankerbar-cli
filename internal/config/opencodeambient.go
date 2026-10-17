@@ -14,69 +14,54 @@ import (
 // MCP server at a different project than the sessions loading it are meant to
 // work?
 //
-// opencode discovers config on its own, in merge order: the global file under
-// its config dir, then OPENCODE_CONFIG (the file this driver names), then every
-// project-level `opencode.json` it finds from the INSTANCE DIRECTORY, then the
-// OPENCODE_CONFIG_DIR directory again, then OPENCODE_CONFIG_CONTENT. Three of
-// those five layers are not ours, and two of them merge AFTER the file we point
-// at - which is how sessions spawned for one project spent a fortnight claiming,
-// working and handing back another project's tasks: 14 CLA-* leases held by
-// sessions labelled [ezyapp], and no ezyapp task ever worked (CLA-441).
+// opencode 2.x discovers config on its own, in merge order (read off `opencode
+// debug config` against 2.0.32): the global config dir, then OPENCODE_CONFIG
+// (the file this driver names), then the project-level `opencode.json` and
+// `.opencode/opencode.json` it finds from the INSTANCE DIRECTORY, then
+// OPENCODE_CONFIG_CONTENT. The global dir and the project files are not ours,
+// and the project files merge AFTER the file we point at - which is how, on
+// 1.x, sessions spawned for one project spent a fortnight claiming, working and
+// handing back another project's tasks: 14 CLA-* leases held by sessions
+// labelled [ezyapp], and no ezyapp task ever worked (CLA-441).
 //
-// harness/opencode.go now pins the driver's own block through
+// harness/opencode.go pins the driver's own config through
 // OPENCODE_CONFIG_CONTENT, which opencode merges after every layer this driver
-// or a checkout can write (three managed/console layers follow it and none is
-// either of those - see that file), so none of these files can redirect a
-// spawned session any more. This check is what stops the fix from
-// being invisible: a file that still names the wrong project is a live trap for
-// every interactive session and for any future path that loses the content pin,
-// and it is one line of output to say so.
+// or a checkout can write, so none of these files can redirect a spawned
+// session any more. This check is what stops the fix from being invisible: a
+// file that still names the wrong project is a live trap for every interactive
+// session and for any future path that loses the content pin, and it is one
+// line of output to say so.
 //
 // It WARNS rather than refusing, deliberately - see OpencodeAmbientConflicts.
 
-// The file names opencode discovers by itself. Transcribed from what a live
-// 1.18.19 run logs it is `loading` at startup, not from the docs:
-//
-//	loading path=/Users/jason/.config/opencode/config.json
-//	loading path=/Users/jason/.config/opencode/opencode.json
-//	loading path=/Users/jason/.config/opencode/opencode.jsonc
-//	loading path=/Users/jason/.opencode/opencode.json
-//	loading path=/Users/jason/.opencode/opencode.jsonc
-//
-// Two spellings everywhere, because the global file is conventionally `.jsonc`
-// (it has comments) and a project-level one conventionally is not. `config.json`
-// is a GLOBAL name only: opencode reads it in its config directory, and a
-// project-level `config.json` is an ordinary file thousands of repos carry for
-// something else entirely.
+// The file names opencode discovers by itself. `opencode.json` is the name
+// 2.0.32 was observed loading in both the global dir and a project; the `.jsonc`
+// spelling and the global `config.json` are carried over from 1.x, where a live
+// run logged loading all three, and are scanned because a stale file there is
+// cheap to report and an unread one costs nothing. `config.json` is a GLOBAL
+// name only: a project-level `config.json` is an ordinary file thousands of
+// repos carry for something else entirely.
 var (
 	opencodeGlobalConfigNames  = []string{"config.json", "opencode.json", "opencode.jsonc"}
-	opencodeProjectConfigNames = []string{"opencode.json", "opencode.jsonc"}
+	opencodeProjectConfigNames = []string{"opencode.json", "opencode.jsonc", filepath.Join(".opencode", "opencode.json"), filepath.Join(".opencode", "opencode.jsonc")}
 )
 
-// opencodeGlobalConfigDirs are the directories opencode reads global config from
-// whatever OPENCODE_CONFIG_DIR says. Read out of 1.18.19's Config.getGlobal and
-// corroborated by the live log above, which shows both being loaded in one run:
-//
-//   - ONE slot with a default - `path.join(XDG_CONFIG_HOME || homedir()/".config",
-//     "opencode")`. It is the directory an operator actually edits, and it is NOT
-//     derived from OPENCODE_CONFIG_DIR; that variable only appends a directory to
-//     a later merge layer. A `config_dir` that is unset (it has no default in this
-//     package, and a mixed-harness run's opencode block often carries none) or
-//     pointed elsewhere does not move it, so scanning only what `config_dir` names
-//     misses exactly the file the operator has. One slot, not two: when
-//     XDG_CONFIG_HOME is set elsewhere, ~/.config/opencode is not read, and
-//     reporting on it would send the operator to edit a file no session loads
-//     (CLA-441 reviews).
-//   - ~/.opencode, its older sibling, read on top of that.
-//
-// The run's own `config_dir` is scanned beside them, because it IS merged - just
-// at a later layer - and because an operator who set it has put config there.
-func opencodeGlobalConfigDirs() []string {
+// opencodeGlobalConfigDirs is the directory opencode 2.x reads global config
+// from: `$XDG_CONFIG_HOME/opencode`, or `~/.config/opencode` when that is unset
+// - unless OPENCODE_CONFIG_DIR is set, which REPLACES it (verified against
+// 2.0.32). The adapter exports `config_dir` as OPENCODE_CONFIG_DIR, so a run
+// with a config_dir reads that directory and not the default one. 2.x does NOT
+// read ~/.opencode, ~/.claude, ~/.agents or ~/.config/opencode2 as config
+// (verified; 1.x read ~/.opencode).
+func opencodeGlobalConfigDirs(configDir string) []string {
+	if configDir != "" {
+		return []string{expandHome(configDir)}
+	}
 	base := os.Getenv("XDG_CONFIG_HOME")
 	if base == "" {
 		base = expandHome("~/.config")
 	}
-	return []string{filepath.Join(base, "opencode"), expandHome("~/.opencode")}
+	return []string{filepath.Join(base, "opencode")}
 }
 
 // OpencodeAmbientConflict is one discovered opencode config whose `clankerbar`
@@ -186,24 +171,7 @@ type ambientScope struct {
 func (c *Config) opencodeAmbientScopes() []ambientScope {
 	var scopes []ambientScope
 	if all := c.drainedSlugs(); len(all) > 0 {
-		globals := opencodeGlobalConfigDirs()
-		if dir := c.SessionFor("opencode").ConfigDir; dir != "" {
-			globals = append(globals, expandHome(dir))
-		}
-		// opencode2 reads its own config dir (~/.config/opencode2 by default,
-		// verified against beta-18314 via `opencode2 debug config`), plus its
-		// own hardcoded ~/.claude, <cwd>/.claude, ~/.agents and ~/.opencode
-		// discovery — XDG_CONFIG_HOME moves NONE of them. ~/.opencode is
-		// already in the v1 scan (opencodeGlobalConfigDirs), which the widened
-		// spawnsOpencode applies to both lines; ~/.claude and ~/.agents are NOT
-		// scanned by this audit for any harness (their file-level merge surface
-		// on the beta is unverified, and this audit only reports files a
-		// session actually loads). This function adds the one dir that is
-		// opencode2's own and would otherwise be invisible to the audit — the
-		// file an operator actually edits for the beta (docs/opencode2.md).
-		if c.spawnsOpencode2() {
-			globals = append(globals, opencode2GlobalConfigDirs()...)
-		}
+		globals := opencodeGlobalConfigDirs(c.SessionFor("opencode").ConfigDir)
 		seen := map[string]bool{}
 		for _, dir := range globals {
 			if dir == "" || seen[dir] {
@@ -259,44 +227,13 @@ func (c *Config) drainedSlugs() []string {
 	return out
 }
 
-// spawnsOpencode2 reports whether any session this run spawns runs on the
-// opencode2 line specifically — the v2 config dir is scanned for those runs
-// only (opencode2AmbientScopes).
-func (c *Config) spawnsOpencode2() bool {
-	for _, h := range c.SpawnedHarnesses() {
-		if h == "opencode2" {
-			return true
-		}
-	}
-	return false
-}
-
-// opencode2GlobalConfigDirs are the directories the opencode2 preview reads
-// global config from. VERIFIED against beta-18314 (`opencode2 debug config`
-// with XDG_CONFIG_HOME pointed elsewhere): ~/.config/opencode2 is read
-// HARDCODED — unlike the v1 line, XDG_CONFIG_HOME does not move it — and the
-// file there is the operator's real v2 config (docs/opencode2.md). The beta
-// also reads ~/.claude, ~/.agents and ~/.opencode hardcoded; ~/.opencode is
-// already in the v1 scan (opencodeGlobalConfigDirs) which the widened
-// spawnsOpencode applies to both lines, and ~/.claude / ~/.agents are the
-// CLAUDE adapter's own scan domain. This function adds the one dir that is
-// opencode2's own and would otherwise be invisible to the audit.
-func opencode2GlobalConfigDirs() []string {
-	return []string{expandHome("~/.config/opencode2")}
-}
-
-// spawnsOpencode reports whether any session this run spawns runs on opencode
-// OR opencode2. SPAWNED, not merely declared: an opencode block nothing ever
-// runs makes these files irrelevant, and a warning about an irrelevant file is
-// how an operator learns to skim the ones that matter. opencode2 is included
-// because it reads ambient configs too (the hardcoded v2 config dir plus the
-// shared ~/.claude / ~/.agents / ~/.opencode discovery — verified against
-// beta-18314, see docs/opencode2.md) and its adapter exports the same
-// fail-closed permission policy: a run on either line must get the same
-// ambient-config audit (CLA-541).
+// spawnsOpencode reports whether any session this run spawns runs on opencode.
+// SPAWNED, not merely declared: an opencode block nothing ever runs makes these
+// files irrelevant, and a warning about an irrelevant file is how an operator
+// learns to skim the ones that matter.
 func (c *Config) spawnsOpencode() bool {
 	for _, h := range c.SpawnedHarnesses() {
-		if h == "opencode" || h == "opencode2" {
+		if h == "opencode" {
 			return true
 		}
 	}
@@ -351,20 +288,16 @@ func readOpencodeConfig(path string) (mcpFile, bool) {
 // `mcp_config_path` resolved to - a file opencode discovers by itself never
 // reaches that gate, and it is merged into every session all the same.
 //
-// `permission` is on the list, and the road to that is worth writing down
-// because a plausible reading of 1.18.19 says it should not be. The
-// OPENCODE_PERMISSION env var IS applied after every config layer, so "the
-// file's block is simply overwritten" looks right and is wrong: the merge is
-// recursive and PER KEY (`o={...r,...a}` then a recursive descent on keys
-// present in both), and `fromConfig` flattens the result with Object.entries -
-// INSERTION ORDER, not sorted - while `evaluate` takes findLast over that
-// order. Our own document is marshalled from a Go map and so arrives sorted,
-// with the `*` catch-all first, which is exactly what the policy's fail-closed
-// posture depends on. Let an ambient file declare a `permission.read` block and
-// `read` takes ITS position in the merged object - ahead of the `*` deny, which
-// is env-only and lands last - so the catch-all becomes the final match and
-// every read in the session is denied. That is the CLA-441 wall itself, arrived
-// at from the other direction. Reported (CLA-441 second review).
+// `permission` is on the list because the merge is recursive and PER KEY: on
+// 2.x the adapter's policy rides in OPENCODE_CONFIG_CONTENT, the last layer,
+// but a key an ambient file declared keeps ITS position in the merged object
+// and the evaluator is last-match-wins over that insertion order. Read out of
+// 1.18.19 (`o={...r,...a}` then a recursive descent, flattened with
+// Object.entries); 2.x accepts the same block shape and its ordering was not
+// re-derived from source, so the report stands on the 1.x reading. Let an
+// ambient file declare `permission.read` and `read` sorts AHEAD of the policy's
+// `*` deny, which then becomes the final match for every read - the CLA-441
+// wall arrived at from the other direction (CLA-441 second review).
 //
 // `plugin` is code opencode loads and runs at session start. An `mcp` entry
 // with a `command` is the same threat wearing a different key, and
