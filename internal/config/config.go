@@ -870,7 +870,7 @@ var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPl
 	"hand-off: say so in your outcome and hand the task over as the terminal step below requires - do NOT " +
 	"review the work yourself and do NOT invent findings. Read the record's reviewed tip and compare it with " +
 	"`git rev-parse HEAD` in the worktree: if they differ, the branch moved after the review, so do NOT apply " +
-	"stale findings - park the task with an outcome naming the mismatch. Work in the worktree for branch " +
+	"stale findings - park the task with update_task(status: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
 	PhaseBranchPlaceholder + " recorded on the task, and never commit to the repo's PR base branch (" +
 	PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout sitting on that branch is " +
 	"not a decision to commit where you are, it is this failure mode. Apply the review's findings, each by ID. " +
