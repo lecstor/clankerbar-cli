@@ -83,17 +83,22 @@ reads the diff and runs the adversarial review gate. It is **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task (`update_task(outcome: ...)`, no status move), a fixed
 block carrying the reviewed tip, the implementer's and reviewer's harness/model,
-a `verdict`, and every finding by ID with the required fix. The claim is held
-across the seam, so the task is never posted back to the queue mid-sequence.
+a `verdict`, and every finding by ID with the required fix. The block is
+**appended below** whatever the outcome already carries — a statusless outcome
+replaces the field wholesale — and the driver refuses to advance to `fix` unless
+this trip's session actually changed the outcome and wrote the block. The claim
+is held across the seam, so the task is never posted back to the queue
+mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
 same run, reads the review block back with `get_task`, checks the reviewed tip
 still matches the worktree's HEAD, applies every finding by ID (or records why
 not), re-verifies scoped to those fixes, commits and pushes them, opens a PR
 targeting the repo's PR base if none exists yet for the branch, and hands the
-task to `in_review`. Its outcome carries the review forward with a `### Fixes`
-list and both sides' attribution, so the task holds the whole round: who
-reviewed, what was found, what was done about it. See
+task to `in_review`. Its outcome keeps everything above the review block and
+carries the review forward with a `### Fixes` list and both sides' attribution,
+so the task holds the whole round: who reviewed, what was found, what was done
+about it. See
 [`docs/releases.md`](./docs/releases.md) for what happens to that PR after
 `in_review` — merged by a clanker only once a human approves it, promoted to a
 release only by the operator.

@@ -1027,8 +1027,9 @@ const (
 // ReviewRecordHeading is the marker of the block a review-only phase records in
 // the task's outcome. It is an INTERFACE, not prose: the review writes it, the
 // fix phase reads it, and the driver's review→fix seam gate refuses a checkpoint
-// when the task's outcome does not carry it. All three read this constant so a
-// rewording cannot desynchronise them.
+// unless the outcome CHANGED since the review spawned and carries this heading
+// as a line of its own — a stale block from an earlier trip is not a record.
+// All three read this constant so a rewording cannot desynchronise them.
 //
 // It deliberately carries no round number. A hard-coded "round 1" would be false
 // on any later run of the same task (a request-changes re-work, say), and the

@@ -1295,10 +1295,11 @@ func TestBuiltinFixBriefCarriesTheReviewForwardAndTheTerminalStep(t *testing.T) 
 // brief, and it is the session most likely to have only its own block in hand.
 func TestBuiltinReviewAndFixBriefsPreserveWhatSitsAboveTheBlock(t *testing.T) {
 	reviewBriefs := map[string]string{
-		"review-only brief":           reviewOnlyBrief,
-		"no-code review-only brief":   noCodeReviewOnlyBrief,
-		"review-only handoff":         HandoffContinuationFor(ReviewPhaseName, true),
-		"no-code review-only handoff": NoCodeReviewOnlyHandoffContinuation(),
+		"review-only brief":            reviewOnlyBrief,
+		"no-code review-only brief":    noCodeReviewOnlyBrief,
+		"unverified review-only brief": unverifiedReviewOnlyBrief,
+		"review-only handoff":          HandoffContinuationFor(ReviewPhaseName, true),
+		"no-code review-only handoff":  NoCodeReviewOnlyHandoffContinuation(),
 	}
 	for name, brief := range reviewBriefs {
 		lower := strings.ToLower(brief)

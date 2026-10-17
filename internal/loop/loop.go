@@ -1685,13 +1685,14 @@ type reviewGate struct {
 // reviewRecordLine reports whether outcome carries the review heading as its
 // own line. The gate uses this instead of strings.Contains so a look-alike
 // heading (`## Reviewer notes`, or prose that merely mentions the words) is not
-// mistaken for the block the review is required to record. Trailing CR/strip is
-// ignored because the plane stores text as sent and a CRLF paste is still the
-// heading; leading whitespace is not, because a heading the session indented
-// into a code block is not a heading the fix phase will find.
+// mistaken for the block the review is required to record. Trailing whitespace
+// is ignored — the plane stores text as sent, and a CRLF paste or a stray
+// trailing space is still the heading — while leading whitespace is not: a
+// heading the session indented into a code block is not the block the fix phase
+// will find.
 func reviewRecordLine(outcome string) bool {
 	for _, line := range strings.Split(outcome, "\n") {
-		if strings.TrimRight(line, "\r") == config.ReviewRecordHeading {
+		if strings.TrimRight(line, " \t\r") == config.ReviewRecordHeading {
 			return true
 		}
 	}
@@ -1803,7 +1804,8 @@ func (d *Driver) checkpointEvidence(ctx context.Context, t Target, res harness.R
 	// record: a verified branch is the strongest evidence there is, and asking
 	// the plane anyway was never the contract. A review-only phase is the one
 	// exception, because its checkpoint additionally needs the record's OUTCOME
-	// (below), so it pays the one extra read.
+	// (below) and its freshness baseline (reviewGate), so it pays the extra
+	// reads.
 	if foundOK && !review.required {
 		return foundBranch, true, false, ""
 	}

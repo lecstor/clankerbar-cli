@@ -2021,6 +2021,34 @@ func TestDrainPhases_ReviewOnlySeamRefusesACheckpointWithoutANewRecord(t *testin
 	}
 }
 
+// The gate's half of the interface: the heading counts only as its own line.
+// A substring match was the bug — `## Reviewer notes`, prose mentioning the
+// words, or an indented heading inside a code block all passed it.
+func TestReviewRecordLine(t *testing.T) {
+	tests := []struct {
+		name    string
+		outcome string
+		want    bool
+	}{
+		{"empty", "", false},
+		{"the heading alone", config.ReviewRecordHeading, true},
+		{"the heading on its own line", "delivered\n" + config.ReviewRecordHeading + "\n- verdict: pass\n", true},
+		{"a CRLF heading is still the heading", config.ReviewRecordHeading + "\r\n- verdict: pass\r\n", true},
+		{"a trailing space is still the heading", config.ReviewRecordHeading + "  \n", true},
+		{"a look-alike heading", "## Reviewer notes\n- verdict: pass\n", false},
+		{"the words inside prose", "the review block (## Review) is missing\n", false},
+		{"an indented heading", "  " + config.ReviewRecordHeading + "\n", false},
+		{"a heading glued to text", "x" + config.ReviewRecordHeading + "\n", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reviewRecordLine(tc.outcome); got != tc.want {
+				t.Errorf("reviewRecordLine(%q) = %v, want %v", tc.outcome, got, tc.want)
+			}
+		})
+	}
+}
+
 // The unwired plane, pinned explicitly. fakeReleaser is a Releaser and nothing
 // more, so every test on it exercises the branch-evidence path the driver had
 // before the plane's task read existed. That path must stay intact for the

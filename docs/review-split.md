@@ -70,7 +70,8 @@ exposed.
   fake transition.
 - The record is a fixed, compact shape (the heading is a shared constant,
   `config.ReviewRecordHeading`, because the review writes it, the fix reads it,
-  and the driver's seam gate refuses a checkpoint without it):
+  and the driver's seam gate refuses a checkpoint unless the outcome changed
+  since the review spawned and carries the heading):
 
   ```markdown
   ## Review
@@ -88,9 +89,10 @@ exposed.
   (CLA-210).
 
 - The fix phase reads it with `get_task`, verifies `reviewed tip == git rev-parse
-  HEAD`, applies findings by ID, and carries the block forward into its own
-  terminal outcome with a `### Fixes` list. The final outcome on the task is
-  therefore the whole round: who reviewed, what was found, what was done.
+  HEAD`, applies findings by ID, and carries the block forward — with everything
+  that sat above it — into its own terminal outcome with a `### Fixes` list. The
+  final outcome on the task is therefore the whole round: who reviewed, what was
+  found, what was done.
 - No file in the worktree: a file is invisible to the plane, dies with the
   worktree, and cannot be read from another machine.
 
