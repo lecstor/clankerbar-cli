@@ -249,6 +249,28 @@ type Driver struct {
 	harnessFails []int
 	harnessErrs  []error
 
+	// The resumed-phase transient streak (CLA-662), keyed by the target that
+	// failed. A resumed phase's transient failure ends its sequence, and every
+	// counter the dead/fleet machinery keeps is deliberately skipped on that
+	// path — so without this the run re-drains AT ONCE, and when the failing
+	// phase runs on a different harness from the one the queue drains on
+	// (implement on opencode, review on claude — the README's own example),
+	// the first-phase transient arm never sees the failure at all. The streak
+	// is the rung of the backoff the run owes after the sequence's handback,
+	// before polling again. Per target AND per phase harness: the failure is
+	// the provider's, so a claude streak must climb while opencode stays
+	// healthy, and an opencode success must not vouch for claude. Reset the
+	// moment a resumed phase on the same target+harness ends any other way
+	// than the transient sequence-end — only a run of consecutive transient
+	// ends is what the growing wait is there to bound.
+	resumedTransients map[resumedTransientKey]int
+
+	// resumedTransientWait computes that wait from the streak: backoff(n) in
+	// production. A field so tests can observe the ladder and drive it without
+	// sleeping the real 30s/60s/... in the suite — the same reason waitGrace
+	// and restartPoll are fields. Nil means d.backoff.
+	resumedTransientWait func(n int) time.Duration
+
 	// The fleet dead-phase counter (CLA-396). Per-target because a multi-target
 	// driver runs several projects, and "the fleet" is one project's sessions:
 	// a run of dead phases on project A must not pause project B. The per-task
@@ -427,6 +449,17 @@ type Driver struct {
 	// an explicit --harness/--model still wins over a stored document. cli.Run
 	// sets them via SetOverrides; the zero value applies nothing.
 	overrides config.Overrides
+}
+
+// resumedTransientKey names the target a resumed phase's transient failure is
+// charged to (CLA-662): the project (its index in targets) and the harness the
+// failed phase runs on. The harness is part of the key because the failure is
+// the provider's, not the project's — the per-phase shape (implement on
+// opencode, review on claude) drains a healthy opencode while claude blips,
+// and a project-keyed streak would let an opencode success reset it.
+type resumedTransientKey struct {
+	target  int
+	harness string
 }
 
 // deliveryVerifier is the driver's view of internal/delivery, narrowed to the one
@@ -1136,11 +1169,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		parkFired   bool // the per-task dead budget parked the task
 		tripFired   bool // the fleet dead counter tripped and paused this target
 		finalDisp   string
-		// CLA-631/CLA-651: the wait a RESUMED phase's sequence-end signal asks
-		// the run for (nil when the signal owes none). Waitable ends — a rolling
-		// limit — are owed AFTER the sequence's handback, so the wait is taken
-		// holding no lease; a transient blip asks for nothing.
+		// CLA-631/CLA-651/CLA-662: the wait a RESUMED phase's sequence-end
+		// signal asks the run for. A rolling limit (CLA-631) hands its reset
+		// down here; the transient arm (CLA-662) hands its backoff rung down as
+		// transientRung/transientKey instead. Both waits are owed AFTER the
+		// sequence's handback, so both are taken holding no lease.
 		limitWait *phaseLimitWait
+		// CLA-662: the streak rung a transient sequence-end reached, and the
+		// target it belongs to — zero when no transient end happened.
+		transientRung int
+		transientKey  resumedTransientKey
 		// finalDead / lastProducedNothing are the FINAL attempt's dead
 		// classifications (the seam's, and the tally's wider one): a death that
 		// was retried past must not brand the record, and a LAST-phase death
@@ -1289,6 +1327,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		}
 		d.beginIteration(ti, t, drainNum, ref, ph.Label(i))
 
+		// CLA-662: whether this session RESUMED a predecessor's claim — the
+		// exact condition drainPhase's transient arm keys on (prev != nil), so
+		// the streak follows the ends that arm produces. Captured BEFORE the
+		// call: the seam below may replace `carried` with this phase's own
+		// claim, which says nothing about how the phase was entered.
+		phaseResumed := carried != nil
 		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, i, tag, ph, last, carried, t, spend{
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
@@ -1364,20 +1408,44 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			break
 		}
 
-		// CLA-631/CLA-651: a RESUMED phase ended the sequence without completing
-		// it — a rolling usage limit (CLA-631) or a transient failure (CLA-651) —
-		// and the RUN must not end with it. The sequence stops exactly like the
-		// pstop above — the claim is not handed back to the queue, so the lease
-		// lapses into a takeover with its branch recorded — but the run carries
-		// on: the wait the signal carries, when it carries one, is owed below,
+		// CLA-631/CLA-651/CLA-662: a RESUMED phase ended the sequence without
+		// completing it — a rolling usage limit (CLA-631) or a transient failure
+		// (CLA-651) — and the RUN must not end with it. The sequence stops
+		// exactly like the pstop above — the claim is not handed back to the
+		// queue, so the lease lapses into a takeover with its branch recorded —
+		// but the run carries on: the wait the signal owes is taken below,
 		// after the sequence's deferred handback, holding no lease. Broken here
 		// rather than flowing into the checks below because those read a session
 		// that merely got turned away: the dead/fleet counters would tick on a
 		// blip's exit shape (or a limit's "unknown" finish reason), and none of
 		// that machinery applies to a sequence end the run is ordered to survive.
+		//
+		// The transient arm ALSO extends its target's streak here (CLA-662):
+		// nothing else bounds a provider that keeps blipping the resumed phase
+		// while the implementing harness stays healthy — the drain is over, so
+		// drainPhase's retry ladder was never entered, and the re-drain would
+		// otherwise land the very next instant. A rolling limit extends no
+		// streak: its wait is a reset, not a rung, and the next drain is
+		// scheduled after it anyway.
 		if end.sequenceEnd != nil {
 			limitWait = end.sequenceEnd.limitWait
+			if limitWait == nil {
+				transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
+				transientRung = d.noteResumedTransient(transientKey)
+			}
 			break
+		}
+
+		// CLA-662: a resumed phase that ended any OTHER way than the transient
+		// sequence-end above — completed, settled, died — breaks its target's
+		// streak: the next blip on that target+harness is not consecutive with
+		// the last, and starts the ladder over. The other sequence-end arm, a
+		// rolling limit, also breaks out above and so neither extends nor
+		// clears: the reset the run waits out is its own bound. Reset on the
+		// seam BETWEEN the arms, so "consecutive" means exactly what it says:
+		// the arm above extends, this one clears.
+		if phaseResumed {
+			d.clearResumedTransient(resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)})
 		}
 
 		// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
@@ -1571,6 +1639,37 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// guards above refused, whose claim was held for a successor that never ran.
 	carried = d.releaseCarried(ctx, t, carried)
 
+	// CLA-662: the transient arm's wait, in the same place and for the same
+	// reason as the limit wait below — after the sequence's handback, with NO
+	// lease held. The rung is the target's streak of consecutive transient
+	// ends, so a provider that keeps blipping the resumed phase is slowed
+	// between drains instead of being re-drained the instant the last sequence
+	// died (and, with implement and the resumed phase on different harnesses,
+	// the only momentum the first-phase backoff could ever have was this).
+	// The wait is bounded by retry_cap like every backoff(n), and STOP /
+	// RESTART / RELOAD are honoured through waitOrStop exactly as they are
+	// during the limit wait; the drain returns when it ends and Run polls again.
+	//
+	// Deliberately NOT fed into sidelineTarget, which the task that added this
+	// asked us to consider: a sideline says "this target's harness is broken,
+	// bench it" — its counters and log line are built for a drain that FAILED
+	// to run a session — and this end returns err == nil. Run's success branch
+	// would immediately clear the failure counter it read while leaving the
+	// 15m+ skipUntil in place, so the log would report "the harness succeeded
+	// again — rejoining the rotation" against a target still benched by a
+	// sit-out nothing would then account for. Doing it properly means
+	// redefining what a successful drain proves about the harness, well beyond
+	// this bound's need: the ladder's growth, capped by retry_cap, plus
+	// max_iterations is the brake the un-waited re-drain was missing.
+	if transientRung > 0 {
+		wait := d.resumedTransientDuration(transientRung)
+		log.Printf("iteration %d: the sequence is over and no lease is held — waiting %s before polling again (transient failure %d in a row on %s; the run stays up)",
+			drainNum, wait, transientRung, transientKey.harness)
+		if d.waitOrStop(ctx, wait) {
+			stop = true
+		}
+	}
+
 	// CLA-631: the sequence ended on a rolling usage limit and the run is owed
 	// its wait — after the handback above, deliberately, so the wait is taken
 	// with NO lease held: the claim is back in the queue or, with pushed work,
@@ -1703,12 +1802,14 @@ type phaseEnd struct {
 	// (CLA-651). In both cases the sequence ends exactly as the old stop did —
 	// the claim is not handed back to the queue, so the lease lapses into a
 	// takeover with its branch recorded — but drainPhases returns to Run, which
-	// carries on polling. Its limitWait, when set, is the reset the run owes a
-	// wait for, taken after the sequence's deferred handback with no lease
-	// held; nil owes no wait (a blip has no reset to wait out, and the
-	// re-drain's first-phase arm owns the backoff that bounds the retry). Nil
-	// on every other path, including a hard stop (lim.Stop), which still stops
-	// the run in drainPhase.
+	// carries on polling. Both arms owe a wait, taken after the sequence's
+	// deferred handback with no lease held: a set limitWait is the reset the
+	// run waits out (CLA-631); a nil one is a transient blip, and the run waits
+	// the target's growing backoff rung instead (CLA-662) — because with the
+	// resumed phase on a DIFFERENT harness from the one that claims the queue
+	// (implement opencode, review claude), there is no first-phase failure for
+	// the in-drain ladder to see. Nil on every other path, including a hard
+	// stop (lim.Stop), which still stops the run in drainPhase.
 	sequenceEnd *phaseSequenceEnd
 }
 
@@ -1718,9 +1819,9 @@ type phaseEnd struct {
 type phaseSequenceEnd struct {
 	// limitWait, when non-nil, is the rolling usage limit whose reset the run
 	// owes a wait for after the sequence's handback, on the harness that hit
-	// it (CLA-631). Nil when nothing is owed: a transient failure has no reset
-	// to wait out, and the re-drain lands on the first-phase transient arm and
-	// its own backoff ladder (CLA-651).
+	// it (CLA-631). Nil means the TRANSIENT arm (CLA-651): there is no reset
+	// to wait out, so drainPhases instead extends the target's consecutive-
+	// transient streak and waits backoff(n) before polling again (CLA-662).
 	limitWait *phaseLimitWait
 }
 
@@ -3061,9 +3162,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// with it (CLA-651) — exiting the daemon on one provider blip left the
 			// fleet idle until an operator noticed, the same failure CLA-631 fixed
 			// for limits — so the sequence-end signal goes to drainPhases, which
-			// owes it no wait (there is no reset for a blip): Run polls again, and
-			// the re-drain's first-phase transient arm owns the backoff ladder
-			// that bounds the retry.
+			// owes it a wait (CLA-662): there is no reset for a blip, so the run
+			// waits the target's growing backoff rung after the handback and then
+			// polls again. The rung matters precisely when this phase's harness is
+			// NOT the one the queue drains on: an opencode implement start can
+			// never see the claude blip, so without the run-level wait the same
+			// implement-and-lose loop would repeat with nothing bounding it.
 			if prev != nil {
 				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying on a 30-minute lease nothing renews; the task returns as a takeover with its branch recorded, and the run stays up to poll again instead of exiting",
 					drainNum, res.ExitString())
@@ -4259,6 +4363,38 @@ func (d *Driver) backoff(n int) time.Duration {
 		return ceil
 	}
 	return b
+}
+
+// noteResumedTransient records one more consecutive transient sequence-end on
+// key and returns the new streak — the backoff rung the run owes after the
+// sequence's handback (CLA-662). The map is lazily built: a run with no
+// resumed-phase blip never allocates it.
+func (d *Driver) noteResumedTransient(key resumedTransientKey) int {
+	if d.resumedTransients == nil {
+		d.resumedTransients = map[resumedTransientKey]int{}
+	}
+	d.resumedTransients[key]++
+	return d.resumedTransients[key]
+}
+
+// clearResumedTransient resets key's streak: a resumed phase on that
+// target+harness ended some other way, so the next blip starts the ladder
+// over (CLA-662). Deleting from a nil map is a no-op — a run that never had a
+// streak has nothing to break.
+func (d *Driver) clearResumedTransient(key resumedTransientKey) {
+	delete(d.resumedTransients, key)
+}
+
+// resumedTransientDuration is the wait a resumed phase's transient
+// sequence-end owes before the next drain: backoff(n) in production, where n
+// is noteResumedTransient's streak. The field is a test seam so the ladder can
+// be observed and driven without sleeping the real 30s/60s/... in the suite —
+// the same reason waitGrace and restartPoll are fields.
+func (d *Driver) resumedTransientDuration(n int) time.Duration {
+	if d.resumedTransientWait != nil {
+		return d.resumedTransientWait(n)
+	}
+	return d.backoff(n)
 }
 
 func retryLabel(n, max int) string {

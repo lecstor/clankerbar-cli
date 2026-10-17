@@ -39,10 +39,12 @@ func run(args []string) int {
 
 	var err error
 	if len(args) < 2 {
-		// Bare `clankerbar` is the fleet supervisor (CLA-525): every daemon
-		// whose config file is in the config dir runs as a supervised child,
-		// and SIGINT/SIGTERM to this process is a fleet-wide stop. The old
-		// usage-and-exit-2 for a bare invocation is what this replaces.
+		// Bare `clankerbar` is the fleet supervisor (CLA-525): it reconciles
+		// this machine against the plane's account-scoped roster — a supervised
+		// child per entry with desiredState: running (placement local), a STOP
+		// marker for each stopped entry — and SIGINT/SIGTERM to this process
+		// drains the whole fleet. The old usage-and-exit-2 for a bare
+		// invocation is what this replaces.
 		err = cli.Supervise(ctx, nil)
 	} else {
 		switch args[1] {

@@ -145,8 +145,13 @@ Only a hard stop (`lim.Stop`, credit exhausted) ends the daemon there.
 
 A transient server/network blip on a resumed phase ends its sequence for the
 same lease reason — the backoff ladder would walk past the 30-minute lease —
-and the run stays up there too: there is no reset to wait out, so the next
-poll spawns a fresh sequence and the first-phase retry ladder owns the blip.
+and the run stays up there too. There is no reset to wait out, but the
+sequence still owes a wait: the run waits a backoff that grows with the
+consecutive blips on that target and harness, and starts over the moment a
+resumed phase there completes. That reset-per-harness is what makes the bound
+real when the phases run on different providers — review on claude can keep
+blipping while implement on opencode stays healthy, and nothing else in the
+run would keep it from re-draining the instant the last sequence ended.
 
 The split works because each phase's prompt is a **scope** instruction — "your
 job this session is implementation only, then stop" — rather than a request that
@@ -1166,12 +1171,13 @@ be named - `clankerbar run -c ./clankerbar.json` - and an unnamed
 read**; [where the key may go](#where-the-account-scoped-key-is-allowed-to-go)
 says why. (JSON today; TOML is the likely final format.)
 
-Under the fleet supervisor, that same directory is the whole fleet: every
-`*.json` in it that carries at least one recognized config key and validates
-is a daemon the supervisor starts (see [The fleet
-supervisor](#the-fleet-supervisor-bare-clankerbar)). `config.json` is just one
-instance among them, and a per-daemon file like `clanker2.json` needs no
-special treatment — the filename is the instance discriminator.
+Under the fleet supervisor, that same directory's machine-layer role is just
+the one discovered file: `config.json` is the **base config** each supervised
+child's own config is generated from (see [The fleet
+supervisor](#the-fleet-supervisor-bare-clankerbar)). Which instances run - and
+under what identity - comes from the plane's account-scoped roster, not from
+files in the directory: a per-daemon file like `clanker2.json` is not an
+instance the supervisor reads.
 
 ```json
 {
