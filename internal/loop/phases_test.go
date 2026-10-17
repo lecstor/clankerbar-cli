@@ -1381,6 +1381,52 @@ func TestDrainPhases_AReloadMidDrainDoesNotReshapeTheInFlightSequence(t *testing
 			t.Errorf("salvage ran %d time(s) in total, want 3 — the next drain's FINAL review must salvage (implement twice, review once): %+v", len(s.calls), s.calls)
 		}
 	})
+
+	t.Run("3 to 2: a handoff in the in-flight fix keeps its terminal step", func(t *testing.T) {
+		outcome := "implemented: pushed the branch\n"
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: transientResult()},  // implement attempt 1 blips; the backoff wait applies the RELOAD
+			{res: checkpointed(1, 0)}, // implement attempt 2: checkpoint
+			{res: checkpointed(1, 0)}, // in-flight review-only: records the block below
+			{res: handoffResult("R1 is fixed and committed; the PR is next.")}, // in-flight fix hands off
+			{res: okResult(1, 0)}, // the fix successor ends the sequence
+		}}
+		rel := &wiredReleaser{state: func() plane.TaskState {
+			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
+		}}
+		d := phaseDriverWithReleaser(t, h, []config.Phase{impl, review, fix}, rel)
+		d.SetReloader(func() (*config.Config, error) {
+			fresh := *d.cfg
+			fresh.Phases = []config.Phase{impl, review}
+			return &fresh, nil
+		})
+		h.onInvoke = func(call int) {
+			switch call {
+			case 0:
+				writeMarker(t, d.state.Path(), MarkerReload, "")
+			case 2: // the review-only session records the block the gate requires
+				outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: sha1\n- verdict: pass\n"
+			}
+		}
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drain: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 5 {
+			t.Fatalf("the drain spawned %d sessions, want 5 — implement's retry, the in-flight review-only, the fix, and the fix's handoff successor", h.invokeCalls)
+		}
+		// The continuation gate must read the CAPTURED sequence: the reloaded
+		// 2-phase config has no index 2, so a live read drops the fix phase's
+		// terminal step from the successor — the in-flight sequence reshaped
+		// by the reload (CLA-664), one phase later than the mode and count.
+		successor := h.invocations[4].Prompt
+		if !strings.Contains(successor, `status: "in_review"`) {
+			t.Errorf("the in-flight fix's handoff successor lost the terminal step its captured position selects:\n%s", successor)
+		}
+		if strings.Contains(successor, "review-only ending") {
+			t.Errorf("the in-flight fix's successor was handed the review-only ending:\n%s", successor)
+		}
+	})
 }
 
 func TestDrainPhases_SumsSpendAcrossPhases(t *testing.T) {

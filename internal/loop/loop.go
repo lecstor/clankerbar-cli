@@ -1120,6 +1120,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// changes harness/model/budget here, not on the shared base.
 	tc := d.targetCfg(t)
 	phases := tc.EffectivePhases()
+	// rawPhases is the same sequence BEFORE EffectivePhases resolved each
+	// phase's built-in brief — index-aligned 1:1 with phases (EffectivePhases
+	// never adds or drops an entry, though an unphased run's empty list is one
+	// synthesized entry there and here it is empty). The handoff branch below
+	// reads it to tell a built-in-brief phase from an operator's custom prompt,
+	// and it MUST be this captured copy (CLA-664): a live read would let a
+	// RELOAD applied mid-drain reshape the continuation of the sequence in
+	// flight — a 3 -> 2 reload drops the in-flight fix successor's terminal
+	// step, and a custom-prompt phase later covered by a built-in gains one.
+	rawPhases := tc.Phases
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
@@ -1240,12 +1250,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// force-injected into a handoff respawn of a brief that never
 			// established that contract in the first place — clashing with
 			// whatever terminal step their own prompt names, if any.
-			// d.cfg.Phases (the unresolved config, not EffectivePhases' output)
-			// is index-aligned with phases: EffectivePhases builds its slice
-			// 1:1 from c.Phases, never adding or dropping an entry.
+			// rawPhases (the unresolved sequence captured at drain start, not
+			// EffectivePhases' output) is index-aligned with phases:
+			// EffectivePhases builds its slice 1:1 from c.Phases, never adding
+			// or dropping an entry. Never re-read live: a RELOAD applied
+			// mid-drain must not reshape the in-flight sequence's continuation
+			// (CLA-664) — the same rule the mode and the count follow.
 			promptBytes = len(nextPrompt)
 			continuation := ""
-			if i < len(d.cfg.Phases) && d.cfg.Phases[i].Prompt == "" {
+			if i < len(rawPhases) && rawPhases[i].Prompt == "" {
 				// CLA-497: a handoff during a NO-CODE review must not append the
 				// branch-shaped reviewTerminalStep, which tells the successor to
 				// open a PR for a task that has no branch and no code.
