@@ -53,6 +53,14 @@ the three-phase one.
 `fix` is a separate name on purpose. `reviewTerminalStep` is injected by phase
 name; a fix phase called `review` would inherit the wrong contract.
 
+**Until CLA-631 lands, run `fix` on a different provider from the review.** A fix
+session that starts immediately after an Opus review can hit the same rolling
+usage limit the review just consumed the tail of, and the daemon exits on it
+rather than waiting — the account-limit failure a resumed phase already has. The
+README's per-phase harness example (implement and fix on opencode, review on
+claude) is the shape to copy; an all-`claude` three-phase config is the one most
+exposed.
+
 ## Where the review artifact lives
 
 **Today (CLI only, no plane change): the task's `outcome`.**
@@ -62,7 +70,8 @@ name; a fix phase called `review` would inherit the wrong contract.
   fake transition.
 - The record is a fixed, compact shape (the heading is a shared constant,
   `config.ReviewRecordHeading`, because the review writes it, the fix reads it,
-  and the driver's seam gate refuses a checkpoint without it):
+  and the driver's seam gate refuses a checkpoint unless the outcome changed
+  since the review spawned and carries the heading):
 
   ```markdown
   ## Review
@@ -80,9 +89,10 @@ name; a fix phase called `review` would inherit the wrong contract.
   (CLA-210).
 
 - The fix phase reads it with `get_task`, verifies `reviewed tip == git rev-parse
-  HEAD`, applies findings by ID, and carries the block forward into its own
-  terminal outcome with a `### Fixes` list. The final outcome on the task is
-  therefore the whole round: who reviewed, what was found, what was done.
+  HEAD`, applies findings by ID, and carries the block forward — with everything
+  that sat above it — into its own terminal outcome with a `### Fixes` list. The
+  final outcome on the task is therefore the whole round: who reviewed, what was
+  found, what was done.
 - No file in the worktree: a file is invisible to the plane, dies with the
   worktree, and cannot be read from another machine.
 
@@ -90,10 +100,16 @@ Attribution (`{{harness}}`, `{{model}}`, `{{prevHarness}}`, `{{prevModel}}`) is
 injected by the driver, because a session cannot reliably name its own model and
 cannot see its predecessor's.
 
-**Limit of the CLI-only record:** `outcome` is one text field. A second round
-would overwrite the first unless the second session copies it forward. The
-bounded first round has no second round, so this is honest today; it is not the
-long-term shape.
+**Limit of the CLI-only record:** `outcome` is one text field, and a statusless
+`update_task(outcome: ...)` replaces it wholesale. A second round would overwrite
+the first unless the second session copies it forward, so both shipped briefs say
+to append: the review copies the existing outcome unchanged and adds its block
+below it, and the fix keeps everything above the review block while adding
+`### Fixes`. The linear sequence has no second review, but request_changes and
+takeovers ARE second rounds — they return the task with the previous round's
+block still in the outcome — so the driver snapshots the outcome when the review
+phase spawns and its seam refuses a checkpoint whose outcome has not changed
+since. Each round records its own block. It is still not the long-term shape.
 
 ### Two seam guards the split needs
 
@@ -101,13 +117,29 @@ The review-only phase inherits phase 1's recorded branch (`HasWIP`), so the
 existing evidence gate — which was written for a phase whose deliverable IS the
 branch — would pass it with nothing recorded at all. Two guards close that:
 
-1. **The review→fix checkpoint requires the record.** For a built-in review-only
-   phase, the seam reads the task's outcome on the same plane peek it already
-   makes and refuses a checkpoint without `ReviewRecordHeading`. Fail-closed: a
-   session that burned its turns, hit its ceiling, or died on a silent EOT
-   returns the task to the queue instead of advancing to a fixer that would open
-   an unreviewed PR. (Pre-split, a dead review was the last phase, so it ended
-   the drain with no PR — this guard preserves that property across the seam.)
+1. **The review→fix checkpoint requires a record from THIS trip.** For a
+   built-in review-only phase the driver snapshots the task's outcome when the
+   phase spawns, then reads it again at the seam and refuses a checkpoint unless
+   the outcome changed and carries `ReviewRecordHeading` as a line of its own.
+   Presence alone is not enough: a request_changes re-trip or a takeover returns
+   the task with the previous round's block still in the outcome, and a review
+   session that then dies having recorded nothing would otherwise advance to the
+   fixer over an unreviewed revision. The exact line keeps a look-alike heading
+   (`## Reviewer notes`) from standing in for the block. Fail-closed: a session
+   that burned its turns, hit its ceiling, or died on a silent EOT ends the
+   drain, and because the resumed claim carries the branch (`HasWIP`) the driver
+   does not release it to the queue — the lease lapses and a takeover picks the
+   work up. (Pre-split, a dead review was the last phase, so it ended the drain
+   with no PR — this guard preserves that property across the seam.)
+
+   One residue of the snapshot, stated rather than hidden: a handoff respawn
+   re-enters the phase and takes a FRESH baseline, so a review session that
+   records its block and THEN hands off leaves its successor a baseline that
+   already carries the record — the successor must record its own block (its
+   handoff continuation carries the record shape, so the passing outcome holds
+   two blocks; a successor that records nothing is refused and the round
+   re-runs). The fresh baseline is the point: it is what keeps a handoff from
+   laundering a previous trip's block through the seam.
 2. **The salvage is skipped for the review-only phase.** Its deliverable is the
    plane record, not the tree. Anything uncommitted in its worktree is generated
    output from running checks; committing and pushing it would (a) commit the

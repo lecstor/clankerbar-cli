@@ -357,12 +357,20 @@ const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the pha
 // finding ID, so the IDs are what make "fixed R2, declined R3" auditable rather
 // than a paragraph a reader has to reconstruct.
 //
+// It APPENDS below the outcome as it stands. The plane's statusless outcome is
+// a full replacement, and the outcome may already carry phase 1's delivery
+// record (or, on a request_changes re-trip or a takeover, an earlier trip's
+// round); writing a fresh block over it would lose that record. The fix phase
+// keeps everything above the block for the same reason.
+//
 // Attribution is injected by the driver from the phases' RESOLVED harness and
 // model ({{prevHarness}}/{{prevModel}} are the implement phase's,
 // {{harness}}/{{model}} this review phase's), because a session cannot reliably
 // name its own model and neither can it see its predecessor's.
-const reviewOnlyRecordShape = " THE REVIEW RECORD IS THE DELIVERABLE. Record it with update_task(taskId, runId, outcome: ...), " +
-	"as a compact block in exactly this shape: a `" + ReviewRecordHeading + "` heading; then `- reviewed tip: <the SHA " +
+const reviewOnlyRecordShape = " THE REVIEW RECORD IS THE DELIVERABLE. First get_task and read the outcome as it " +
+	"stands: a statusless update_task outcome replaces the WHOLE field, so preserve it. Record with " +
+	"update_task(taskId, runId, outcome: ...) by copying the existing outcome's text unchanged, then APPENDING, " +
+	"below it, a compact block in exactly this shape: a `" + ReviewRecordHeading + "` heading; then `- reviewed tip: <the SHA " +
 	"git rev-parse HEAD prints in the worktree>`; `- implemented by: harness " + PhasePrevHarnessPlaceholder +
 	", model " + PhasePrevModelPlaceholder + "`; `- reviewed by: harness " + PhaseHarnessPlaceholder + ", model " +
 	PhaseModelPlaceholder + "`; `- verdict: pass` or `- verdict: findings`; then a `### Findings` heading with " +
@@ -376,10 +384,14 @@ const reviewOnlyRecordShape = " THE REVIEW RECORD IS THE DELIVERABLE. Record it 
 // (the CLA-384 property). It carries the review forward: the final outcome is the
 // only durable task-record the round has until the plane stores reviews
 // separately, so dropping the review block here would lose the very record the
-// split exists to keep.
-const fixTerminalRecord = " When you hand the task over, the outcome MUST also carry the review forward: keep the review's " +
-	"`" + ReviewRecordHeading + "` block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
-	"it already carries — do not restate that attribution from this brief) and add a `### Fixes` list saying, " +
+// split exists to keep. It must also keep everything ABOVE the block: that is
+// phase 1's delivery record (or an earlier round's), and the statusless outcome
+// replaces the field wholesale, so a final outcome built only from the review
+// block and ### Fixes would erase it.
+const fixTerminalRecord = " When you hand the task over, the outcome MUST keep everything the existing outcome " +
+	"carries ABOVE the review's `" + ReviewRecordHeading + "` block (phase 1's delivery record, or an earlier " +
+	"round's) unchanged, keep the review's block VERBATIM (verdict, every finding by ID, its required fix, and the attribution " +
+	"it already carries — do not restate that attribution from this brief), and add a `### Fixes` list saying, " +
 	"for every finding, whether you fixed it (with the commit SHA, or for a no-code task the record change you " +
 	"made) or did not (with the reason), plus " +
 	"'fixed by: harness " + PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder + "'. A finding " +
@@ -865,8 +877,9 @@ var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " +
 	"to the review below. Then get_task with includeDecisions: true to re-read the bar and the standing " +
 	"decisions. Review the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the " +
 	"decisions recorded on this task or its siblings: is the settlement honest, does the record carry what the " +
-	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend the " +
-	"record here either - the phase after you applies what you find - and do not invent code, a branch or a PR." +
+	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend what " +
+	"phase 1 wrote - the phase after you applies what you find - but DO append your review block below it so " +
+	"its delivery record survives; and do not invent code, a branch or a PR." +
 	reviewOnlyRecordShape + rerunGuidance + noCodeReviewOnlyTerminalStep + handoffGuidance
 
 // fixBrief is the phase that APPLIES a review's findings. It is deliberately not
@@ -1014,8 +1027,9 @@ const (
 // ReviewRecordHeading is the marker of the block a review-only phase records in
 // the task's outcome. It is an INTERFACE, not prose: the review writes it, the
 // fix phase reads it, and the driver's review→fix seam gate refuses a checkpoint
-// when the task's outcome does not carry it. All three read this constant so a
-// rewording cannot desynchronise them.
+// unless the outcome CHANGED since the review spawned and carries this heading
+// as a line of its own — a stale block from an earlier trip is not a record.
+// All three read this constant so a rewording cannot desynchronise them.
 //
 // It deliberately carries no round number. A hard-coded "round 1" would be false
 // on any later run of the same task (a request-changes re-work, say), and the

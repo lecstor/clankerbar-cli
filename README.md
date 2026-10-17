@@ -83,17 +83,22 @@ reads the diff and runs the adversarial review gate. It is **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task (`update_task(outcome: ...)`, no status move), a fixed
 block carrying the reviewed tip, the implementer's and reviewer's harness/model,
-a `verdict`, and every finding by ID with the required fix. The claim is held
-across the seam, so the task is never posted back to the queue mid-sequence.
+a `verdict`, and every finding by ID with the required fix. The block is
+**appended below** whatever the outcome already carries — a statusless outcome
+replaces the field wholesale — and the driver refuses to advance to `fix` unless
+this trip's session actually changed the outcome and wrote the block. The claim
+is held across the seam, so the task is never posted back to the queue
+mid-sequence.
 
 The **`fix`** phase is the last one and runs on the cheap harness. It resumes the
 same run, reads the review block back with `get_task`, checks the reviewed tip
 still matches the worktree's HEAD, applies every finding by ID (or records why
 not), re-verifies scoped to those fixes, commits and pushes them, opens a PR
 targeting the repo's PR base if none exists yet for the branch, and hands the
-task to `in_review`. Its outcome carries the review forward with a `### Fixes`
-list and both sides' attribution, so the task holds the whole round: who
-reviewed, what was found, what was done about it. See
+task to `in_review`. Its outcome keeps everything above the review block and
+carries the review forward with a `### Fixes` list and both sides' attribution,
+so the task holds the whole round: who reviewed, what was found, what was done
+about it. See
 [`docs/releases.md`](./docs/releases.md) for what happens to that PR after
 `in_review` — merged by a clanker only once a human approves it, promoted to a
 release only by the operator.
@@ -245,6 +250,13 @@ different phases run on different models:
 ]
 ```
 
+**One caveat that is not about models.** Until CLA-631 lands, a `fix` phase that
+shares the review's Claude account can exit the daemon: the fix session starts
+immediately after the Opus review and can hit the same rolling usage limit the
+review just consumed the tail of. Keep the three-phase shape, but run `fix` on a
+different provider — see
+[Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
+
 **The buckets are yours, and the indirection is the point.** clankerbar drives
 three harnesses and cannot know which models you have, nor which of them is
 cheaper — that needs a price table, which goes stale silently and in the direction
@@ -295,6 +307,14 @@ and keeps the adversarial review on the harness with the subagent machinery.
 Nothing in the seam resists it: each phase is already a fresh session seeded from
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
+
+**Until CLA-631 lands, do not run `fix` on the review's Claude account.** A fix
+session that starts right after an Opus review can hit the same rolling usage
+limit the review just consumed the tail of, and the daemon exits on it instead of
+waiting — the same account-limit failure a resumed phase has. Pair the review
+with a different provider for `fix` (opencode in the example above); an
+all-Claude three-phase config is the shape most exposed to this, and the example
+here is deliberately not one.
 
 **The harness-shaped fields stop being run-wide, and that is the whole of the
 configuration.** `config_dir`, `mcp_config_path`, `settings_path`, `model` and
