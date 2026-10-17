@@ -2281,7 +2281,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	if review.required {
 		review.baseline, review.read = d.readReviewBaseline(ctx, t, prev)
 		if !review.read {
-			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's outcome could not be read before it spawned, so a review record could not be proven new this trip — the sequence ends here without the review; the lease lapses into a takeover",
+			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's outcome could not be read before it spawned, so a review record could not be proven new this trip — the sequence ends here without the review; the claim is released when it is releasable, else left to lapse into a takeover",
 				labelOf(t), drainNum, ph.Label(phaseIdx))
 			end.empty = true
 			end.emptyWhy = "the task's outcome could not be read before the review phase spawned"

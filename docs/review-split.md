@@ -88,11 +88,12 @@ exposed.
   round counter to fill in. Per-round numbering is the plane's to store
   (CLA-210).
 
-- The fix phase reads it with `get_task`, verifies `reviewed tip == git rev-parse
-  HEAD`, applies findings by ID, and carries the block forward — with everything
-  that sat above it — into its own terminal outcome with a `### Fixes` list. The
-  final outcome on the task is therefore the whole round: who reviewed, what was
-  found, what was done.
+- The fix phase reads the outcome's **last** `## Review` block with `get_task`
+  (a re-trip can leave several; an earlier one is an earlier round), verifies
+  `reviewed tip == git rev-parse HEAD`, applies findings by ID, and carries that
+  block forward — with everything that sat above it — into its own terminal
+  outcome with a `### Fixes` list. The final outcome on the task is therefore
+  the whole round: who reviewed, what was found, what was done.
 - No file in the worktree: a file is invisible to the plane, dies with the
   worktree, and cannot be read from another machine.
 
@@ -104,12 +105,13 @@ cannot see its predecessor's.
 `update_task(outcome: ...)` replaces it wholesale. A second round would overwrite
 the first unless the second session copies it forward, so both shipped briefs say
 to append: the review copies the existing outcome unchanged and adds its block
-below it, and the fix keeps everything above the review block while adding
-`### Fixes`. The linear sequence has no second review, but request_changes and
-takeovers ARE second rounds — they return the task with the previous round's
-block still in the outcome — so the driver snapshots the outcome when the review
-phase spawns and its seam refuses a checkpoint whose outcome has not changed
-since. Each round records its own block. It is still not the long-term shape.
+  below it, and the fix keeps everything above the **last** review block while
+  adding `### Fixes`. The linear sequence has no second review, but
+  request_changes and takeovers ARE second rounds — they return the task with
+  the previous round's block still in the outcome — so the driver snapshots the
+  outcome when the review phase spawns and its seam refuses a checkpoint whose
+  outcome has not changed since. Each round records its own block. It is still
+  not the long-term shape.
 
 ### Two seam guards the split needs
 
@@ -120,16 +122,23 @@ branch — would pass it with nothing recorded at all. Two guards close that:
 1. **The review→fix checkpoint requires a record from THIS trip.** For a
    built-in review-only phase the driver snapshots the task's outcome when the
    phase spawns, then reads it again at the seam and refuses a checkpoint unless
-   the outcome changed and carries `ReviewRecordHeading` as a line of its own.
-   Presence alone is not enough: a request_changes re-trip or a takeover returns
-   the task with the previous round's block still in the outcome, and a review
-   session that then dies having recorded nothing would otherwise advance to the
-   fixer over an unreviewed revision. The exact line keeps a look-alike heading
-   (`## Reviewer notes`) from standing in for the block. Fail-closed: a session
-   that burned its turns, hit its ceiling, or died on a silent EOT ends the
-   drain, and because the resumed claim carries the branch (`HasWIP`) the driver
-   does not release it to the queue — the lease lapses and a takeover picks the
-   work up. (Pre-split, a dead review was the last phase, so it ended the drain
+   the outcome changed, carries `ReviewRecordHeading` as a line of its own, and
+   its **last** `## Review` block — heading line to the end — is one the
+   snapshot did not already carry: an edit that leaves an earlier round's block
+   as the last one recorded nothing this trip. Presence alone is not enough: a
+   request_changes re-trip or a takeover returns the task with the previous
+   round's block still in the outcome, and a review session that then dies
+   having recorded nothing would otherwise advance to the fixer over an
+   unreviewed revision. The exact line keeps a look-alike heading
+   (`## Reviewer notes`) from standing in for the block. The snapshot read
+   itself is retried a bounded number of times, and one that stays unread
+   refuses the phase BEFORE the review spawns (CLA-663) — a full review session
+   whose checkpoint the seam would refuse anyway is pure waste — with the same
+   claim disposition a seam refusal leaves. Fail-closed: a session that burned
+   its turns, hit its ceiling, or died on a silent EOT ends the drain, and
+   because the resumed claim carries the branch (`HasWIP`) the driver does not
+   release it to the queue — the lease lapses and a takeover picks the work
+   up. (Pre-split, a dead review was the last phase, so it ended the drain
    with no PR — this guard preserves that property across the seam.)
 
    One residue of the snapshot, stated rather than hidden: a handoff respawn
