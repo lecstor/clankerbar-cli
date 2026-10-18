@@ -370,3 +370,59 @@ func TestMergedFindingsDigest(t *testing.T) {
 		t.Errorf("a sealed record's findings reached the merged list:\n%s", got)
 	}
 }
+
+// TestDrainPhases_ReviewPanelBeforeAVerificationRound: the panel is upstream of
+// the whole stopping rule. Two members write one round, the panel's last member
+// closes it, the fix runs from the merged list, and the verifier adjudicates the
+// same round afterwards — no second panel and no unclosed round in between.
+func TestDrainPhases_ReviewPanelBeforeAVerificationRound(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review-1
+		{res: checkpointed(5, 0.50)},  // review-2 (last member, closes round 1)
+		{res: checkpointed(5, 0.05)},  // fix
+		{res: checkpointed(5, 0.05)},  // verify (round 2, no open MUST)
+	}}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+		case 2:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{{ID: "1.review-2.1", Severity: "should", Status: "open", Summary: "tidy the error"}},
+			})
+			rel.openMusts = []string{"1.review-1.1"}
+		case 4:
+			// The verifier writes round 2 SEALED and leaves the close to the driver,
+			// the variant this fixture's steps exercise. Its role is the next
+			// review-N after the two panel members.
+			rel.records = append(rel.records, recordFor(2, "review-3", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.openMusts = nil
+			rel.status = "in_review"
+		}
+	}
+	phases := append(panelPhases(), config.Phase{Name: config.VerifyPhaseName})
+	d := panelDriver(t, h, rel, panelMembers()[:2], phases)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 5 {
+		t.Fatalf("spawned %d sessions, want 5 — implement, two reviewers, fix, verify", h.invokeCalls)
+	}
+	if len(rel.closes) != 2 || rel.closes[0] != 1 || rel.closes[1] != 2 {
+		t.Fatalf("closed rounds = %v, want [1 2] — the panel closes its round before the fix, the verifier its own", rel.closes)
+	}
+	if len(rel.parks) != 0 {
+		t.Fatalf("a clean panel + verification parked the task: %v", rel.parks)
+	}
+	if !strings.Contains(h.invocations[4].Prompt, "1.review-1.1") {
+		t.Errorf("the verifier was not handed the panel's MUST to adjudicate:\n%s", h.invocations[4].Prompt)
+	}
+}
