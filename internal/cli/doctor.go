@@ -304,6 +304,14 @@ func checkConfig(cfg *config.Config) check {
 		}
 		c.info = append(c.info, "phase harnesses: "+strings.Join(pairs, ", "))
 	}
+	// CLA-639: the review panel, by member and model, whenever a review phase
+	// will actually expand one. The trial panel runs on EVERY task by default, so
+	// an operator who never wrote `review_panel` still needs to see where four
+	// review sessions will spend. Empty when the sequence has no built-in review
+	// phase, because then no panel runs at all.
+	if panel := panelLabels(cfg); len(panel) > 0 {
+		c.info = append(c.info, "review panel: "+strings.Join(panel, ", "))
+	}
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
 	// operator having to reason about which file won.
@@ -328,6 +336,30 @@ func checkConfig(cfg *config.Config) check {
 		c.info = append(c.info, "backlog: "+orNone(cfg.BacklogSummaryURL()))
 	}
 	return c
+}
+
+// panelLabels renders the review panel as `role -> harness/model` entries, in
+// the order the driver spawns them. It reads the EFFECTIVE sequence, so a
+// `review_panel` entry's own model (CLA-639) and a trial default are both shown
+// as they will actually run — an operator's preflight should not have to
+// re-derive the panel from a default they never wrote.
+//
+// Empty when no built-in review phase expands: a config whose review carries its
+// own prompt, or an unphased run, has no panel to report rather than an empty
+// one to apologise for.
+func panelLabels(cfg *config.Config) []string {
+	var out []string
+	for i, ph := range cfg.EffectivePhases() {
+		if !ph.IsPanelMember() {
+			continue
+		}
+		model, _ := cfg.ModelForPhase(ph)
+		if model == "" {
+			model = "harness default"
+		}
+		out = append(out, ph.Label(i)+" -> "+ph.Harness+"/"+model)
+	}
+	return out
 }
 
 // rangeEnvNames renders the config's declared session env as one line per

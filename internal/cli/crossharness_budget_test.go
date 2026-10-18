@@ -184,6 +184,9 @@ func TestBudget_DefaultTurnCapNoteFiresWhenClaudeRunsAnyPhase(t *testing.T) {
 	cfg.Harness = "opencode"
 	cfg.Phases = []config.Phase{{Name: "implement"}, {Name: "review", Harness: "claude"}}
 	cfg.Harnesses = map[string]config.HarnessConfig{"claude": {ConfigDir: t.TempDir()}}
+	// CLA-639: the panel from mixedDoctorCfg names claude explicitly, which is
+	// also the harness this test wants the review phase to run on.
+	cfg.ReviewPanel = []config.ReviewPanelMember{{Harness: "claude"}}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture does not validate: %v", err)
 	}
@@ -258,6 +261,10 @@ func TestBudget_ADeclaredHarnessNoPhaseRunsIsNotTreatedAsSpawned(t *testing.T) {
 				{Name: "review", Harness: "claude"},
 			},
 			Harnesses: map[string]config.HarnessConfig{"claude": {ConfigDir: t.TempDir()}},
+			// CLA-639: one reviewer inheriting the review phase's claude harness —
+			// the legacy single-review shape, spelled as a valid panel so Validate
+			// accepts it and no extra harness enters the answer under test.
+			ReviewPanel: []config.ReviewPanelMember{{}},
 		}
 		if err := cfg.Validate(); err != nil {
 			t.Fatalf("fixture does not validate: %v", err)
@@ -331,6 +338,9 @@ func TestToolchains_FallbackNamesOnlyTheHarnessesThatWillRun(t *testing.T) {
 			{Name: "review", Harness: "opencode"},
 		},
 		Harnesses: map[string]config.HarnessConfig{"opencode": {ConfigDir: t.TempDir()}},
+		// CLA-639: one reviewer inheriting the review phase's opencode harness, so
+		// the panel adds no harness this test is not about.
+		ReviewPanel: []config.ReviewPanelMember{{}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture does not validate: %v", err)

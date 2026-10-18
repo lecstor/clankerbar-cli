@@ -305,6 +305,66 @@ overstate the effect by a wide margin. A like-for-like measurement still does
 not exist, and it costs a full task run to get. Splitting thinner earns less
 each time while every extra boundary still pays a session's full startup cost.
 
+### The review panel: several reviewers, one revision, one merge
+
+One reviewer can return a confident all-clear on a diff that ships unreviewed
+work: the review/fix split was itself reviewed by two models on the same diff,
+and each found four issues the other did not. The panel is the answer — N
+independent review phases on the **same reviewed tip**, each writing its own
+sealed record, merged by the driver before the fix phase runs.
+
+```json
+"review_panel": [
+  { "harness": "opencode", "model": "opencode-go/gpt-6-luna" },
+  { "harness": "opencode", "model": "opencode-go/gpt-6-luna" },
+  { "harness": "opencode", "model": "opencode-go/gpt-6-luna" },
+  { "harness": "opencode", "model": "opencode-go/glm-5.3-flash" }
+]
+```
+
+Each entry is one reviewer and one review phase; the same model appearing more
+than once is deliberate, because each run is independent. **Unset, the trial
+panel above is the default on every task** (the operator chose it from a
+measured evaluation); a config with no built-in `review` phase has nothing to
+expand and runs exactly as it did before. `name` defaults to `review-1` ..
+`review-N` by position — that is the reviewer role the durable record is keyed
+on — and a member may set `tier` instead of `model` to resolve through a
+harness's tier map. A built-in review phase must have a phase after it (the fix
+phase) for the panel to apply; an unset panel on a config whose review is final
+keeps the historical combined brief.
+
+**Independence is a seal, not a promise.** The plane holds a round's records
+sealed: written, but with their findings withheld from every `get_task` until
+the round closes, and the driver does not close the round between members. So
+member 2 reads the metadata of member 1's record (that it exists, its counts)
+and never its findings — the same record shape the console will show later.
+Sealed records also cannot write the outcome, the task body or decisions, so a
+reviewer cannot leak its findings through a side channel. A later member's
+prompt is built by the driver and contains no earlier member's findings. The
+round closes once **every member has recorded or been recorded as failed**; a
+usage-limited, capped or dead member is recorded as incomplete and the round
+still closes, so the fix phase is never spawned against findings the plane still
+holds sealed. If the run cannot continue the panel (the lease was handed back),
+the round is closed anyway and the next drain re-claims the task.
+
+**The driver merges; the fixer never grades reviews.** Every MUST from ANY
+member is open — consensus never filters one out, because a blocker one reviewer
+found and another missed is exactly the case the panel exists for. SHOULD and
+NIT findings are listed with the members that raised them; they are recorded,
+never gating. The merged list names any member that recorded nothing, so the
+fixer knows it is seeing the union of the reviewers that ran, not the panel that
+was configured. Refuting a MUST is done by the fixer with evidence, never by
+dropping a finding another reviewer would have kept.
+
+The panel is **interim** and local config, like the phase sequencing it
+multiplies (B10). The state-machine reshape moves review sequencing and the
+`agent_review -> implementing` transition onto the plane, where panel membership
+becomes plane phase state; until then the members run sequentially in the CLI
+because parallel reviewers on one task need per-(task, phase) leases the plane
+does not yet model. `clankerbar doctor` prints the resolved panel, with each
+member's harness and model, so an overnight run's review spend is visible before
+it happens.
+
 ### Session-initiated handoff: a boundary the session chooses
 
 Phases cut at two fixed, driver-chosen points. A session can also choose its own
@@ -430,6 +490,11 @@ and keeps the adversarial review on the harness with the subagent machinery.
 Nothing in the seam resists it: each phase is already a fresh session seeded from
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
+
+**The review can be a panel.** Setting `review_panel` fans the one review phase
+out into one review phase per member; see [the review panel](#the-review-panel-several-reviewers-one-revision-one-merge)
+for the default (the trial panel, on every task), independence and the merge.
+Members name their own `harness`/`model`, so a panel can span harnesses too.
 
 **Do not run `fix` on the review's Claude account.** A fix session that starts
 right after an Opus review can hit the same rolling usage limit the review just
