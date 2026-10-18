@@ -90,6 +90,13 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	if loaded.Projects[0].WorkDir != filepath.Join(root, "acme") {
 		t.Errorf("projects[0].workdir = %q, want the derived project root %q", loaded.Projects[0].WorkDir, filepath.Join(root, "acme"))
 	}
+	if !loaded.ProjectRoot {
+		// The scope flag has to survive the round trip: it is what the DRIVER
+		// reads to widen a session's reach to the whole project (CLA-678), and
+		// it is written here precisely so the child never has to infer the
+		// layout from the filesystem.
+		t.Error("project_root = false, want true — the derivation's layout must be stated in the generated config")
+	}
 	if loaded.InstanceName != "daemon-one" {
 		t.Errorf("instance_name = %q, want the roster entry's name (daemon-one)", loaded.InstanceName)
 	}
