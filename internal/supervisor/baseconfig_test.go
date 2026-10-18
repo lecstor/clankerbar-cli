@@ -151,7 +151,7 @@ func TestBuildConfigRosterWithoutPrimaryRepoKeepsBaseWiring(t *testing.T) {
 // derived checkout.
 func TestBuildConfigWorkdirDerivationOverridesOnlyWorkdir(t *testing.T) {
 	root := t.TempDir()
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
 
 	cacheDir := t.TempDir()
 	baseWorkDir := t.TempDir()
@@ -179,8 +179,11 @@ func TestBuildConfigWorkdirDerivationOverridesOnlyWorkdir(t *testing.T) {
 		t.Fatalf("buildConfig: %v", err)
 	}
 	p := cfg.Projects[0]
-	if want := filepath.Join(root, "widgets"); p.WorkDir != want {
-		t.Errorf("workdir = %q, want the derived %q", p.WorkDir, want)
+	if want := filepath.Join(root, "acme"); p.WorkDir != want {
+		t.Errorf("workdir = %q, want the derived project root %q", p.WorkDir, want)
+	}
+	if _, err := os.Stat(filepath.Join(root, "acme", "widgets", ".git")); err != nil {
+		t.Errorf("the project's repo was not materialized under its root: %v", err)
 	}
 	if p.MCPConfigPath != mcp {
 		t.Errorf("mcp_config_path = %q, want the base entry's %q (derivation overrides workdir only)", p.MCPConfigPath, mcp)

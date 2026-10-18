@@ -1,12 +1,16 @@
 package supervisor
 
 // The workdir derivation's fail-closed branches (CLA-547, phase 2a of
-// docs/proposals/daemon-supervisor.md): the derived path is <root>/<repo name>,
-// and a missing directory or one that is not a checkout of the expected repo
-// is a refusal naming the path tried. The tests build real git checkouts so
-// the "is a checkout" branch is verified against actual remotes, not mocks.
+// docs/proposals/daemon-supervisor.md; the per-project root and the clone from
+// CLA-678): the derived path is <root>/<project slug>/<repo name> with the
+// project's worktrees under <root>/<project slug>/worktrees, a MISSING repo
+// directory is cloned into place, and a directory that exists but is not a
+// checkout of the expected repo is a refusal naming the path tried. The tests
+// build real git checkouts and real bare repositories so both branches are
+// verified against actual remotes and a real clone, not mocks.
 
 import (
+	"context"
 	"errors"
 	"os"
 	"os/exec"
@@ -38,114 +42,168 @@ func makeCheckout(t *testing.T, dir, repo string) {
 	gitRun(t, dir, "remote", "add", "origin", "https://github.com/"+repo+".git")
 }
 
-// The happy path: `~/dev` + `lecstor/clankerbar` resolves to `~/dev/clankerbar`
-// when that directory is a checkout of the expected repo, in both the https
-// and ssh remote spellings, and for a bare-name identity.
-func TestDeriveWorkdirResolvesRootAndRepo(t *testing.T) {
-	root := t.TempDir()
-	makeCheckout(t, filepath.Join(root, "clankerbar"), "lecstor/clankerbar")
+// makeBareRemote creates a bare repository at <base>/<owner>/<name>.git and
+// returns base, so a test can point cloneRemoteBase at it and exercise a real
+// clone without touching the network.
+func makeBareRemote(t *testing.T, repo string) string {
+	t.Helper()
+	base := t.TempDir()
+	dir := filepath.Join(base, repo+".git")
+	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	gitRun(t, base, "init", "--bare", dir)
+	return base
+}
 
-	got, err := DeriveWorkdir(root, "lecstor/clankerbar")
+// pointClonesAt makes every clone in this test read from base instead of the
+// network. Not parallel-safe: cloneRemoteBase is process-wide, like the rest of
+// this package's overridable externals.
+func pointClonesAt(t *testing.T, base string) {
+	t.Helper()
+	prev := cloneRemoteBase
+	cloneRemoteBase = "file://" + base + "/"
+	t.Cleanup(func() { cloneRemoteBase = prev })
+}
+
+// The happy path: <root>/<project>/<repo name> resolves to the project's own
+// clone when it exists and is a checkout of the expected repo, in both the
+// https and ssh remote spellings, and for a bare-name identity.
+func TestDeriveWorkdirResolvesProjectRootAndRepo(t *testing.T) {
+	root := t.TempDir()
+	pr := filepath.Join(root, "clankerbar")
+	makeCheckout(t, filepath.Join(pr, "clankerbar"), "lecstor/clankerbar")
+
+	got, err := DeriveWorkdir(context.Background(), root, "clankerbar", "lecstor/clankerbar")
 	if err != nil {
 		t.Fatalf("DeriveWorkdir: %v", err)
 	}
-	if want := filepath.Join(root, "clankerbar"); got != want {
+	if want := filepath.Join(pr, "clankerbar"); got != want {
 		t.Fatalf("DeriveWorkdir = %q, want %q", got, want)
 	}
 
 	// The ssh spelling of the same remote must match too.
 	gitRun(t, got, "remote", "set-url", "origin", "git@github.com:lecstor/clankerbar.git")
-	if _, err := DeriveWorkdir(root, "lecstor/clankerbar"); err != nil {
+	if _, err := DeriveWorkdir(context.Background(), root, "clankerbar", "lecstor/clankerbar"); err != nil {
 		t.Fatalf("DeriveWorkdir with an ssh origin: %v", err)
 	}
 
 	// A trailing slash on the identity is tolerated.
-	if _, err := DeriveWorkdir(root, "lecstor/clankerbar/"); err != nil {
+	if _, err := DeriveWorkdir(context.Background(), root, "clankerbar", "lecstor/clankerbar/"); err != nil {
 		t.Fatalf("DeriveWorkdir with a trailing slash: %v", err)
 	}
 
 	// A bare-name identity matches whatever owner hosts the checkout — the
 	// same owner-agnostic match the config's own resolution applies.
-	if _, err := DeriveWorkdir(root, "clankerbar"); err != nil {
+	if _, err := DeriveWorkdir(context.Background(), root, "clankerbar", "clankerbar"); err != nil {
 		t.Fatalf("DeriveWorkdir with a bare-name identity: %v", err)
 	}
 
-	// A relative root resolves against the cwd; pointing it at an empty dir
-	// must refuse (nothing named clankerbar sits there).
-	t.Chdir(t.TempDir())
-	if _, err := DeriveWorkdir(".", "clankerbar"); err == nil {
-		t.Fatal("DeriveWorkdir('.', 'clankerbar') resolved — nothing named clankerbar sits under the cwd")
+	// Two projects sharing one root never see each other's repos: the same repo
+	// name under a different slug is a different directory.
+	makeCheckout(t, filepath.Join(root, "other-project", "clankerbar"), "lecstor/clankerbar")
+	other, err := DeriveWorkdir(context.Background(), root, "other-project", "lecstor/clankerbar")
+	if err != nil {
+		t.Fatalf("DeriveWorkdir for a second project: %v", err)
 	}
-
-	// A ~ root expands like every other path this config accepts.
-	makeCheckout(t, filepath.Join(t.TempDir(), "tilde"), "acme/tilde")
-	if _, err := DeriveWorkdir("~", "acme/tilde"); err == nil {
-		t.Fatal("DeriveWorkdir('~', 'acme/tilde') resolved — ~ must expand to the home dir, not match a temp checkout")
+	if want := filepath.Join(root, "other-project", "clankerbar"); other != want {
+		t.Fatalf("DeriveWorkdir = %q, want %q (a project's repos are its own)", other, want)
+	}
+	if other == got {
+		t.Fatal("two projects resolved to one directory — a project's repos are its own")
 	}
 }
 
-// Fail-closed branch 1: the derived directory must exist. A missing directory
-// is refused with the path that was tried, and never created.
-func TestDeriveWorkdirRefusesMissingDirectory(t *testing.T) {
+// A MISSING repo directory is materialized by cloning it (CLA-678) — the fleet
+// works in its own clones, so nobody has to check anything out for it first.
+func TestDeriveWorkdirClonesAMissingRepo(t *testing.T) {
+	base := makeBareRemote(t, "acme/widgets")
+	pointClonesAt(t, base)
 	root := t.TempDir()
-	wantPath := filepath.Join(root, "ghost")
-	_, err := DeriveWorkdir(root, "acme/ghost")
+
+	got, err := DeriveWorkdir(context.Background(), root, "acme", "acme/widgets")
+	if err != nil {
+		t.Fatalf("DeriveWorkdir of a missing repo: %v", err)
+	}
+	if want := filepath.Join(root, "acme", "widgets"); got != want {
+		t.Fatalf("DeriveWorkdir = %q, want %q", got, want)
+	}
+	remote, err := checkoutOriginRemote(got)
+	if err != nil {
+		t.Fatalf("the clone is not an attributable checkout: %v", err)
+	}
+	if !strings.Contains(remote, "acme/widgets") {
+		t.Fatalf("the clone's origin is %q, want it to name acme/widgets", remote)
+	}
+
+	// A second derivation is a no-op: the clone exists, so nothing is re-cloned
+	// (which would destroy whatever the sessions have done in it).
+	marker := filepath.Join(got, "session-work")
+	if err := os.WriteFile(marker, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DeriveWorkdir(context.Background(), root, "acme", "acme/widgets"); err != nil {
+		t.Fatalf("second DeriveWorkdir: %v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("the existing clone was replaced by a second derivation: %v", err)
+	}
+}
+
+// A clone that cannot run leaves NO directory behind: a partial clone sitting
+// at the derived path would be indistinguishable from the developer's own tree,
+// which the next reconcile must refuse.
+func TestDeriveWorkdirFailedCloneLeavesNothing(t *testing.T) {
+	pointClonesAt(t, t.TempDir()) // a base with no such repo
+	root := t.TempDir()
+
+	_, err := DeriveWorkdir(context.Background(), root, "acme", "acme/ghost")
 	if err == nil {
-		t.Fatal("DeriveWorkdir resolved a missing checkout — fail-closed says refuse")
+		t.Fatal("DeriveWorkdir cloned a repo that does not exist")
 	}
 	if !errors.Is(err, ErrWorkdirRefused) {
 		t.Fatalf("err = %v, want the ErrWorkdirRefused sentinel", err)
 	}
-	if !strings.Contains(err.Error(), wantPath) {
-		t.Errorf("err %q does not name the path tried %q", err, wantPath)
+	if !strings.Contains(err.Error(), filepath.Join(root, "acme", "ghost")) {
+		t.Errorf("err %q does not name the path tried", err)
 	}
-	if _, statErr := os.Stat(wantPath); !os.IsNotExist(statErr) {
-		t.Errorf("derivation created %s — the derived directory must never be created", wantPath)
+	entries, readErr := os.ReadDir(filepath.Join(root, "acme"))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
 	}
-
-	// A path that exists but is a FILE is just as un-runnable.
-	filePath := filepath.Join(root, "file-repo")
-	if err := os.WriteFile(filePath, []byte("x"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := DeriveWorkdir(root, "acme/file-repo"); err == nil {
-		t.Fatal("DeriveWorkdir accepted a derived path that is a file")
-	}
-
-	// Missing inputs are refusals too: there is nothing to derive from.
-	if _, err := DeriveWorkdir("", "acme/ghost"); err == nil {
-		t.Fatal("DeriveWorkdir with no root must refuse")
-	}
-	if _, err := DeriveWorkdir(root, ""); err == nil {
-		t.Fatal("DeriveWorkdir with no repo must refuse")
+	for _, e := range entries {
+		t.Errorf("a failed clone left %s behind", e.Name())
 	}
 }
 
-// Fail-closed branch 2: the derived directory must be a checkout of the
-// EXPECTED repo. A plain directory, a checkout of a different repo, a repo
-// with no attributable remote — all refuse, naming the path tried.
+// Fail-closed: a derived directory that EXISTS but is not a checkout of the
+// expected repo refuses — and is never replaced. A plain directory, a checkout
+// of a different repo, a repo with no attributable remote: all refuse, naming
+// the path tried.
 func TestDeriveWorkdirRefusesNonMatchingCheckout(t *testing.T) {
+	ctx := context.Background()
 	root := t.TempDir()
 
 	// A plain directory with no .git at all.
-	plain := filepath.Join(root, "plain")
+	plain := filepath.Join(root, "acme", "plain")
 	if err := os.MkdirAll(plain, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := DeriveWorkdir(root, "acme/plain"); err == nil {
+	if _, err := DeriveWorkdir(ctx, root, "acme", "acme/plain"); err == nil {
 		t.Fatal("DeriveWorkdir accepted a plain directory as a checkout")
 	}
 
 	// A real checkout of a DIFFERENT repo: the derived path exists, but it is
 	// not the repo the project names. Same repo name, different owner — the
-	// derived path is identical, the attribution is not.
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
-	_, err := DeriveWorkdir(root, "other-owner/widgets")
+	// derived path is identical, the attribution is not. It must be refused and
+	// left exactly as it was.
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
+	_, err := DeriveWorkdir(ctx, root, "acme", "other-owner/widgets")
 	if err == nil {
 		t.Fatal("DeriveWorkdir accepted a checkout of the wrong repo")
 	}
-	if !strings.Contains(err.Error(), filepath.Join(root, "widgets")) {
-		t.Errorf("err %q does not name the path tried %q", err, filepath.Join(root, "widgets"))
+	if !strings.Contains(err.Error(), filepath.Join(root, "acme", "widgets")) {
+		t.Errorf("err %q does not name the path tried %q", err, filepath.Join(root, "acme", "widgets"))
 	}
 	if !strings.Contains(err.Error(), "other-owner/widgets") {
 		t.Errorf("err %q does not name the expected repo", err)
@@ -155,45 +213,87 @@ func TestDeriveWorkdirRefusesNonMatchingCheckout(t *testing.T) {
 	}
 
 	// The boundary pair this codebase exists to tell apart: `clankerbar` must
-	// never match `clankerbar-cli` (the project's own repo pair, CLA-351).
-	makeCheckout(t, filepath.Join(root, "clankerbar-cli"), "lecstor/clankerbar-cli")
-	if _, err := DeriveWorkdir(root, "lecstor/clankerbar"); err == nil {
+	// never match `clankerbar-cli` (the project's own repo pair, CLA-351). The
+	// derived path for lecstor/clankerbar IS <root>/acme/clankerbar, so the
+	// tree that sits there has to be materialized as the other repo of the pair.
+	makeCheckout(t, filepath.Join(root, "acme", "clankerbar"), "lecstor/clankerbar-cli")
+	if _, err := DeriveWorkdir(ctx, root, "acme", "lecstor/clankerbar"); err == nil {
 		t.Fatal("DeriveWorkdir matched lecstor/clankerbar against a clankerbar-cli checkout — the boundary rule is missing")
+	}
+	if _, err := os.Stat(filepath.Join(root, "acme", "clankerbar", ".git")); err != nil {
+		t.Fatalf("the refused checkout was removed: %v", err)
 	}
 
 	// A git repository with NO remotes cannot be attributed to any repo.
-	noRemote := filepath.Join(root, "noremote")
+	noRemote := filepath.Join(root, "acme", "noremote")
 	if err := os.MkdirAll(noRemote, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	gitRun(t, noRemote, "init", "-b", "main")
-	if _, err := DeriveWorkdir(root, "acme/noremote"); err == nil {
+	if _, err := DeriveWorkdir(ctx, root, "acme", "acme/noremote"); err == nil {
 		t.Fatal("DeriveWorkdir accepted a checkout with no remotes")
 	}
 
 	// Several remotes and no origin cannot be attributed either — refuse
 	// rather than guess.
-	twoRemotes := filepath.Join(root, "tworemotes")
+	twoRemotes := filepath.Join(root, "acme", "tworemotes")
 	if err := os.MkdirAll(twoRemotes, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	gitRun(t, twoRemotes, "init", "-b", "main")
 	gitRun(t, twoRemotes, "remote", "add", "upstream", "https://github.com/acme/tworemotes.git")
 	gitRun(t, twoRemotes, "remote", "add", "fork", "https://github.com/other/tworemotes.git")
-	if _, err := DeriveWorkdir(root, "acme/tworemotes"); err == nil {
+	if _, err := DeriveWorkdir(ctx, root, "acme", "acme/tworemotes"); err == nil {
 		t.Fatal("DeriveWorkdir accepted a checkout with two remotes and no origin")
 	}
 
 	// The one attribution fallback: a checkout whose ONLY remote is not named
 	// origin is still attributable — the single remote IS the repo.
-	onlyUpstream := filepath.Join(root, "onlyupstream")
+	onlyUpstream := filepath.Join(root, "acme", "onlyupstream")
 	if err := os.MkdirAll(onlyUpstream, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	gitRun(t, onlyUpstream, "init", "-b", "main")
 	gitRun(t, onlyUpstream, "remote", "add", "upstream", "https://github.com/acme/onlyupstream.git")
-	if _, err := DeriveWorkdir(root, "acme/onlyupstream"); err != nil {
+	if _, err := DeriveWorkdir(ctx, root, "acme", "acme/onlyupstream"); err != nil {
 		t.Fatalf("DeriveWorkdir refused a checkout whose only remote names the repo: %v", err)
+	}
+
+	// A FILE where the clone belongs is refused, not replaced: it is somebody's
+	// file, not a failed clone of ours.
+	filePath := filepath.Join(root, "acme", "file-repo")
+	if err := os.WriteFile(filePath, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DeriveWorkdir(ctx, root, "acme", "acme/file-repo"); err == nil {
+		t.Fatal("DeriveWorkdir accepted a file where the repo belongs")
+	}
+	if _, statErr := os.Stat(filePath); statErr != nil {
+		t.Fatalf("DeriveWorkdir removed a file it did not create: %v", statErr)
+	}
+}
+
+// Missing inputs, and a slug that is not one path segment, are refusals: there
+// is either nothing to derive from, or a path that would escape the root.
+func TestDeriveWorkdirRefusesMissingInputsAndBadSlugs(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+
+	if _, err := DeriveWorkdir(ctx, "", "acme", "acme/widgets"); err == nil {
+		t.Fatal("DeriveWorkdir with no root must refuse")
+	}
+	if _, err := DeriveWorkdir(ctx, root, "acme", ""); err == nil {
+		t.Fatal("DeriveWorkdir with no repo must refuse")
+	}
+	for _, slug := range []string{"..", ".", "a/b", ""} {
+		if _, err := DeriveWorkdir(ctx, root, slug, "acme/widgets"); err == nil {
+			t.Errorf("DeriveWorkdir accepted project slug %q", slug)
+		}
+	}
+	// A repo identity with no owner cannot be cloned from, so it cannot be
+	// derived: there is no clone URL to make.
+	if _, err := DeriveWorkdir(ctx, root, "acme", "widgets"); err == nil {
+		t.Fatal("DeriveWorkdir cloned from a bare-name identity — there is no owner to clone from")
 	}
 }
 
@@ -204,11 +304,12 @@ func TestDeriveWorkdirNeverFallsBackToTheSupervisorCwd(t *testing.T) {
 	// The supervisor sits in cwd; the root is a DIFFERENT directory.
 	cwd := t.TempDir()
 	t.Chdir(cwd)
+	t.Setenv("HOME", t.TempDir())
 	root := t.TempDir()
 
 	// The root's checkout is the derived path, never the cwd.
-	makeCheckout(t, filepath.Join(root, "clankerbar"), "lecstor/clankerbar")
-	got, err := DeriveWorkdir(root, "lecstor/clankerbar")
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
+	got, err := DeriveWorkdir(context.Background(), root, "acme", "acme/widgets")
 	if err != nil {
 		t.Fatalf("DeriveWorkdir: %v", err)
 	}
@@ -216,54 +317,96 @@ func TestDeriveWorkdirNeverFallsBackToTheSupervisorCwd(t *testing.T) {
 		t.Fatalf("DeriveWorkdir returned %q — the supervisor's cwd %q must never be a result", got, cwd)
 	}
 
-	// A missing checkout under the root refuses even though the cwd is a
-	// perfectly good directory to have fallen back to.
-	if _, err := DeriveWorkdir(root, "acme/ghost"); err == nil {
-		t.Fatal("DeriveWorkdir fell back to a runnable directory on a missing derivation — fail-closed says refuse")
+	// A ~ root expands like every other path this config accepts.
+	makeCheckout(t, filepath.Join(t.TempDir(), "tilde", "acme", "tilde"), "acme/tilde")
+	if _, err := DeriveWorkdir(context.Background(), "~", "acme", "acme/tilde"); err == nil {
+		t.Fatal("DeriveWorkdir('~', 'acme') resolved — ~ must expand to the home dir, not match a temp checkout")
 	}
 }
 
-// The per-instance seam derives one workdir per project from that project's
-// repo, with the config's documented primary/sole-repo resolution, and refuses
-// the whole instance when any project's derivation fails.
-func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
+// The worktree directory is the fleet's own, so unlike a repo clone it IS
+// created — and only ever inside the project root.
+func TestDeriveWorktreesDir(t *testing.T) {
 	root := t.TempDir()
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
-	makeCheckout(t, filepath.Join(root, "gadgets"), "acme/gadgets")
+	dir, err := DeriveWorktreesDir(root, "acme")
+	if err != nil {
+		t.Fatalf("DeriveWorktreesDir: %v", err)
+	}
+	if want := filepath.Join(root, "acme", WorktreesDirName); dir != want {
+		t.Fatalf("DeriveWorktreesDir = %q, want %q", dir, want)
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Fatalf("the worktree directory was not created: %v", err)
+	}
 
-	t.Run("single project uses the primary repo", func(t *testing.T) {
-		cfg := &config.Config{PrimaryRepo: "acme/widgets"}
-		got, err := deriveInstanceWorkdirs(cfg, root)
+	// It is inside the project root, which is what makes the project root a
+	// valid permission scope for every worktree a session makes here.
+	if _, err := DeriveWorktreesDir(root, ".."); err == nil {
+		t.Fatal("DeriveWorktreesDir accepted a slug that escapes the root")
+	}
+}
+
+// The per-instance seam derives one PROJECT ROOT per project, materializes that
+// project's repos and its worktree directory under it, and refuses the whole
+// instance when any project's derivation fails.
+func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
+	ctx := context.Background()
+	base := makeBareRemote(t, "acme/widgets")
+	gitRun(t, base, "init", "--bare", filepath.Join(base, "acme", "gadgets.git"))
+	pointClonesAt(t, base)
+
+	root := t.TempDir()
+	t.Run("single project takes its slug from the MCP endpoint", func(t *testing.T) {
+		cfg := &config.Config{
+			BacklogURL:  "https://clankerbar.com/mcp/acme",
+			PrimaryRepo: "acme/widgets",
+		}
+		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(got) != 1 || got[""] != filepath.Join(root, "widgets") {
-			t.Fatalf("deriveInstanceWorkdirs = %v, want {\"\": %q}", got, filepath.Join(root, "widgets"))
+		if len(got) != 1 || got["acme"] != filepath.Join(root, "acme") {
+			t.Fatalf("deriveInstanceWorkdirs = %v, want {\"acme\": %q}", got, filepath.Join(root, "acme"))
+		}
+		if _, err := os.Stat(filepath.Join(root, "acme", "widgets", ".git")); err != nil {
+			t.Fatalf("the project's repo was not materialized: %v", err)
+		}
+		if fi, err := os.Stat(filepath.Join(root, "acme", WorktreesDirName)); err != nil || !fi.IsDir() {
+			t.Fatalf("the project's worktree directory was not created: %v", err)
 		}
 	})
 
 	t.Run("a sole repos key is primary implicitly", func(t *testing.T) {
-		cfg := &config.Config{Repos: map[string]string{"acme/widgets": "/unused"}}
-		got, err := deriveInstanceWorkdirs(cfg, root)
+		cfg := &config.Config{
+			BacklogURL: "https://clankerbar.com/mcp/acme",
+			Repos:      map[string]string{"acme/widgets": ""},
+		}
+		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got[""] != filepath.Join(root, "widgets") {
-			t.Fatalf("deriveInstanceWorkdirs = %v, want the sole repos key derived", got)
+		if got["acme"] != filepath.Join(root, "acme") {
+			t.Fatalf("deriveInstanceWorkdirs = %v, want the sole repos key's project root", got)
 		}
 	})
 
-	t.Run("multi-project derives per project", func(t *testing.T) {
+	t.Run("multi-project derives per project and clones every declared repo", func(t *testing.T) {
 		cfg := &config.Config{Projects: []config.Project{
-			{Slug: "one", PrimaryRepo: "acme/widgets"},
+			{Slug: "one", PrimaryRepo: "acme/widgets", Repos: map[string]string{"acme/gadgets": ""}},
 			{Slug: "two", PrimaryRepo: "acme/gadgets"},
 		}}
-		got, err := deriveInstanceWorkdirs(cfg, root)
+		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if got["one"] != filepath.Join(root, "widgets") || got["two"] != filepath.Join(root, "gadgets") {
-			t.Fatalf("deriveInstanceWorkdirs = %v, want one -> widgets, two -> gadgets", got)
+		if got["one"] != filepath.Join(root, "one") || got["two"] != filepath.Join(root, "two") {
+			t.Fatalf("deriveInstanceWorkdirs = %v, want one and two as project roots", got)
+		}
+		// Both of project one's repos, and not project two's, sit under its root.
+		for _, repo := range []string{"widgets", "gadgets"} {
+			if _, err := os.Stat(filepath.Join(root, "one", repo, ".git")); err != nil {
+				t.Errorf("project one is missing its %s clone: %v", repo, err)
+			}
 		}
 	})
 
@@ -272,23 +415,30 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 			{Slug: "one", PrimaryRepo: "acme/widgets"},
 			{Slug: "two", PrimaryRepo: "acme/ghost"},
 		}}
-		_, err := deriveInstanceWorkdirs(cfg, root)
+		_, err := deriveInstanceWorkdirs(ctx, cfg, root)
 		if err == nil {
-			t.Fatal("deriveInstanceWorkdirs succeeded with a project whose checkout is missing")
+			t.Fatal("deriveInstanceWorkdirs succeeded with a project whose repo cannot be cloned")
 		}
-		if !strings.Contains(err.Error(), "project two") || !strings.Contains(err.Error(), filepath.Join(root, "ghost")) {
+		if !strings.Contains(err.Error(), "project two") || !strings.Contains(err.Error(), filepath.Join(root, "two", "ghost")) {
 			t.Fatalf("err %q does not name the failing project and the path tried", err)
 		}
 	})
 
 	t.Run("a project naming no repo is a refusal, not a skip", func(t *testing.T) {
-		cfg := &config.Config{PrimaryRepo: ""}
-		_, err := deriveInstanceWorkdirs(cfg, root)
+		cfg := &config.Config{BacklogURL: "https://clankerbar.com/mcp/acme", PrimaryRepo: ""}
+		_, err := deriveInstanceWorkdirs(ctx, cfg, root)
 		if err == nil {
 			t.Fatal("deriveInstanceWorkdirs succeeded with no repo declared")
 		}
 		if !strings.Contains(err.Error(), "primary_repo") {
 			t.Fatalf("err %q does not tell the operator what to declare", err)
+		}
+	})
+
+	t.Run("a config naming no project slug is a refusal", func(t *testing.T) {
+		cfg := &config.Config{PrimaryRepo: "acme/widgets"}
+		if _, err := deriveInstanceWorkdirs(ctx, cfg, root); err == nil {
+			t.Fatal("deriveInstanceWorkdirs succeeded with no project slug to root the layout on")
 		}
 	})
 }

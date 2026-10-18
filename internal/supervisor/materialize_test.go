@@ -41,12 +41,13 @@ func materializeOptions(t *testing.T, cacheDir, workdirRoot string) Options {
 // CLANKERBAR_API_KEY, which never lands in a file).
 func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	root := t.TempDir()
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
 	// A discovered <workdir>/.mcp.json must land in the materialized file via
 	// the documented mcp_config_path default, resolved against the DERIVED
-	// workdir.
+	// workdir — which is the PROJECT ROOT, the directory a session's reach is
+	// scoped to (CLA-678).
 	mcp := `{"mcpServers": {"clankerbar": {"type": "http", "url": "https://clankerbar.com/mcp/acme", "headers": {"Authorization": "Bearer ${CLANKERBAR_API_KEY}"}}}}`
-	if err := os.WriteFile(filepath.Join(root, "widgets", ".mcp.json"), []byte(mcp), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "acme", ".mcp.json"), []byte(mcp), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -80,14 +81,14 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	}
 
 	// The machine conventions are IN the file.
-	if loaded.WorkDir != filepath.Join(root, "widgets") {
-		t.Errorf("workdir = %q, want the derived %q", loaded.WorkDir, filepath.Join(root, "widgets"))
+	if loaded.WorkDir != filepath.Join(root, "acme") {
+		t.Errorf("workdir = %q, want the derived project root %q", loaded.WorkDir, filepath.Join(root, "acme"))
 	}
 	if len(loaded.Projects) != 1 {
 		t.Fatalf("projects = %d, want 1", len(loaded.Projects))
 	}
-	if loaded.Projects[0].WorkDir != filepath.Join(root, "widgets") {
-		t.Errorf("projects[0].workdir = %q, want the derived %q", loaded.Projects[0].WorkDir, filepath.Join(root, "widgets"))
+	if loaded.Projects[0].WorkDir != filepath.Join(root, "acme") {
+		t.Errorf("projects[0].workdir = %q, want the derived project root %q", loaded.Projects[0].WorkDir, filepath.Join(root, "acme"))
 	}
 	if loaded.InstanceName != "daemon-one" {
 		t.Errorf("instance_name = %q, want the roster entry's name (daemon-one)", loaded.InstanceName)
@@ -98,7 +99,7 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	if loaded.BacklogURL != "https://clankerbar.com" {
 		t.Errorf("backlog_url = %q, want the default plane origin", loaded.BacklogURL)
 	}
-	if loaded.MCPConfigPath != filepath.Join(root, "widgets", ".mcp.json") {
+	if loaded.MCPConfigPath != filepath.Join(root, "acme", ".mcp.json") {
 		t.Errorf("mcp_config_path = %q, want the discovered default resolved against the derived workdir", loaded.MCPConfigPath)
 	}
 }
@@ -108,8 +109,8 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 // at materialization time. The projects come from the roster entry.
 func TestMaterializedConfigConsumesPerProjectDerivedWorkdirs(t *testing.T) {
 	root := t.TempDir()
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
-	makeCheckout(t, filepath.Join(root, "gadgets"), "acme/gadgets")
+	makeCheckout(t, filepath.Join(root, "one", "widgets"), "acme/widgets")
+	makeCheckout(t, filepath.Join(root, "two", "gadgets"), "acme/gadgets")
 
 	cacheDir := t.TempDir()
 	entry := RosterEntry{
@@ -146,8 +147,8 @@ func TestMaterializedConfigConsumesPerProjectDerivedWorkdirs(t *testing.T) {
 	for _, p := range loaded.Projects {
 		got[p.Slug] = p.WorkDir
 	}
-	if got["one"] != filepath.Join(root, "widgets") || got["two"] != filepath.Join(root, "gadgets") {
-		t.Fatalf("project workdirs = %v, want one -> %q, two -> %q", got, filepath.Join(root, "widgets"), filepath.Join(root, "gadgets"))
+	if got["one"] != filepath.Join(root, "one") || got["two"] != filepath.Join(root, "two") {
+		t.Fatalf("project workdirs = %v, want one -> %q, two -> %q", got, filepath.Join(root, "one"), filepath.Join(root, "two"))
 	}
 }
 
