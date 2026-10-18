@@ -1229,6 +1229,7 @@ func TestEffectivePhases_ReviewIsOnlyWhenAPhaseFollowsIt(t *testing.T) {
 	three := defaults()
 	three.Prompt = ""
 	three.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+	noPanel(three)
 
 	got := three.EffectivePhases()
 	if len(got) != 3 {
@@ -1244,6 +1245,7 @@ func TestEffectivePhases_ReviewIsOnlyWhenAPhaseFollowsIt(t *testing.T) {
 	two := defaults()
 	two.Prompt = ""
 	two.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}}
+	noPanel(two)
 	got = two.EffectivePhases()
 	if got[1].Prompt != builtinPhasePrompts[ReviewPhaseName] {
 		t.Errorf("a FINAL review lost the historical review-and-fix brief, so an existing two-phase config would stop at the checkpoint:\n%s", got[1].Prompt)
@@ -1728,6 +1730,7 @@ func TestEffectivePhases_FixAndVerifyVariantsByPosition(t *testing.T) {
 		{Name: FixPhaseName, Tier: "cheap"},
 		{Name: VerifyPhaseName},
 	}
+	noPanel(four)
 	got := four.EffectivePhases()
 	if len(got) != 4 {
 		t.Fatalf("got %d phases, want 4", len(got))
@@ -1745,6 +1748,7 @@ func TestEffectivePhases_FixAndVerifyVariantsByPosition(t *testing.T) {
 	three := defaults()
 	three.Prompt = ""
 	three.Phases = []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}}
+	noPanel(three)
 	if got := three.EffectivePhases()[2].Prompt; got != fixBrief {
 		t.Errorf("the legacy three-phase fix lost its terminal-step brief")
 	}
@@ -1765,6 +1769,7 @@ func TestEffectivePhases_VerifyInheritsTheFixHarnessAndTier(t *testing.T) {
 		{Name: FixPhaseName, Harness: "opencode", Tier: "cheap"},
 		{Name: VerifyPhaseName},
 	}
+	noPanel(c)
 	got := c.EffectivePhases()
 	if got[3].Harness != "opencode" || got[3].Tier != "cheap" {
 		t.Errorf("verify defaults = harness %q tier %q, want the fix phase's opencode/cheap", got[3].Harness, got[3].Tier)
