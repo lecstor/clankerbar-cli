@@ -27,6 +27,31 @@ func workdirWith(t *testing.T, entries ...string) string {
 	return dir
 }
 
+// An EMPTY value names an identity the fleet derives itself (CLA-678): the
+// key declares the repo, the layout says where it lives, and resolution lands
+// on <workdir>/<name> exactly as if the key had been omitted.
+func TestResolveCheckoutEmptyValueMeansTheDerivedCheckout(t *testing.T) {
+	wd := workdirWith(t, "clankerbar-cli")
+	got, err := ResolveCheckout(map[string]string{"lecstor/clankerbar-cli": ""}, "", wd, "lecstor/clankerbar-cli")
+	if err != nil {
+		t.Fatalf("ResolveCheckout with an empty value: %v", err)
+	}
+	if want := filepath.Join(wd, "clankerbar-cli"); got != want {
+		t.Fatalf("ResolveCheckout = %q, want the derived %q", got, want)
+	}
+	// The empty value is not a wildcard: an identity with no checkout under
+	// the workdir still fails loudly, it just fails at resolution.
+	if _, err := ResolveCheckout(map[string]string{"lecstor/ghost": ""}, "", wd, "lecstor/ghost"); !errors.Is(err, ErrRepoNotFound) {
+		t.Fatalf("err = %v, want repo_not_found for an identity with no derived checkout", err)
+	}
+	// And it is the SCOPE's list too: the derived checkout is what the
+	// permission policy is told to cover.
+	gotDirs := DeclaredCheckouts(map[string]string{"lecstor/clankerbar-cli": ""}, "", wd)
+	if len(gotDirs) != 1 || gotDirs[0] != filepath.Join(wd, "clankerbar-cli") {
+		t.Fatalf("DeclaredCheckouts = %v, want the derived checkout", gotDirs)
+	}
+}
+
 // The four matching steps of ResolveCheckout's documented order, and their
 // precedence over one another.
 func TestResolveCheckoutOrder(t *testing.T) {
@@ -188,9 +213,9 @@ func TestValidateReposStructure(t *testing.T) {
 	base := func(repos map[string]string) *Config {
 		return &Config{Harness: "claude", Prompt: "Work the next backlog item.", Repos: repos}
 	}
-	if err := base(map[string]string{"o/r": ""}).Validate(); err == nil || !strings.Contains(err.Error(), "empty path") {
-		t.Errorf("err = %v, want an empty-path refusal", err)
-	}
+	// An empty VALUE is legal and means "the fleet derives this checkout"
+	// (CLA-678) — see the acceptance below, and the resolution test that pins
+	// what it resolves to.
 	if err := base(map[string]string{" ": "/x"}).Validate(); err == nil || !strings.Contains(err.Error(), "empty name") {
 		t.Errorf("err = %v, want an empty-name refusal", err)
 	}

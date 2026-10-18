@@ -1590,6 +1590,20 @@ replace the top-level ones:
 a directory path, relative to the workdir or starting with `~`. It holds paths,
 never credentials.
 
+The value may be **empty**, which means "the fleet derives this one": under the
+per-project layout (see "Workdir derivation" above) the repo is cloned to
+`<project root>/<repo name>` and that is where sessions for it start. Write the
+keys you want materialized and leave the values out — a path you do not write
+cannot go stale and quietly point a session at your own clone:
+
+```jsonc
+{
+  "project_root": true,
+  "repos": { "lecstor/clankerbar": "", "lecstor/clankerbar-cli": "" },
+  "primary_repo": "lecstor/clankerbar-cli"
+}
+```
+
 **`primary_repo`** names where a session starts when its task carries NO repo:
 a `repos` key, or any identity resolvable by the same steps below. With exactly
 one repo declared and no primary named, that one is primary implicitly. Left
