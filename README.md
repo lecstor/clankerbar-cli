@@ -655,17 +655,69 @@ nothing else: a machine-layer key (`env`, `settings_path`, `workdir`,
 in the log, never silently dropped — a silent drop is how a daemon ends up
 looking configured and not being.
 
-**Workdir derivation (phase 2a).** Set `CLANKERBAR_WORKDIR_ROOT` to the
-machine's one checkout root and the supervisor derives each child's workdir as
-`<root>/<repo name>` for the repo its project's roster entry names
-(`primary_repo`, per project when the entry drives several). Derivation fails
-closed, both conditions learned from the CLA-441 wrong-workdir failure: if the
-derived directory does not exist, or is not a checkout of the expected repo
-(its origin remote names something else), that daemon is **refused** — never
-spawned, the path tried is reported, nothing is created, and the supervisor's
-own working directory is never used as a fallback. With the variable unset,
-derivation is off and children run on the base config's own workdirs, exactly
-as before.
+**Workdir derivation (phase 2a) — the fleet's own clones.** Set
+`CLANKERBAR_WORKDIR_ROOT` to the machine's one root and the supervisor lays out
+one directory per project, and clones into it:
+
+```
+<root>/
+  <project slug>/                     the project root — a session's scope
+    <repo name>/                      one clone per repo the project names
+    worktrees/                        every worktree the fleet creates here
+```
+
+Each repo the project names — the keys of its `repos` map (whose VALUES are
+optional local-path overrides, not identities) plus its `primary_repo` — is
+derived as `<root>/<project slug>/<repo name>`. A repo that is **not there yet
+is cloned** from the plane's repo identity, so nobody has to check anything out
+for the fleet first; the clone reads the run's git credential (the same
+`gh auth token --user <owner>` scoping the delivery verifier uses, and the token
+travels in the child's environment, never on a command line). The project's
+`worktrees/` directory is created too: it is the fleet's own area, not the
+operator's.
+
+Derivation fails closed, on the conditions learned from the CLA-441
+wrong-workdir failure. A directory that **exists** is never replaced, adopted or
+cloned over: if it is not a checkout of the expected repo — a plain directory, a
+file, a checkout of a different repo, a repo whose origin cannot be attributed —
+that daemon is **refused**, the path tried is reported, and the supervisor's own
+working directory is never used as a fallback. A failed clone leaves nothing
+behind (it lands in a temporary sibling and is renamed into place). With the
+variable unset, derivation is off and children run on the base config's own
+workdirs, exactly as before.
+
+**These clones are the fleet's.** The fleet fetches in them, resets its own
+default checkout, creates and deletes branches and worktrees in them, and
+clones one in when it is missing. They are not a place to keep work that is not
+pushed. The derivation writes `project_root: true` into the generated config,
+which is what widens each session's permission scope to the whole project root
+(see "What each harness receives" below) and what `doctor`'s `project root`
+check verifies: every configured repo resolves INSIDE the project root, the
+clone's origin names the repo it sits under, and the worktree directory exists
+and is inside the root.
+
+**Working in the fleet's clones, or not.** The choice is yours:
+
+- **Work in them** and let the fleet manage them (the default the layout is
+  built for). Nothing to keep in sync: your checkout IS the fleet's.
+- **Keep your own clones** elsewhere (`~/dev/...`, wherever you like) and pull
+  the branches the fleet pushes. Costs disk for a second copy of every repo,
+  and you must not expect the fleet to touch your tree — it never reads or
+  writes outside `<root>`.
+- **Middle path: a worktree of a fleet clone.** `git worktree add` from
+  `<root>/<project slug>/<repo name>` gives you your own working tree sharing
+  the fleet clone's objects, with these caveats:
+  - git refuses to check out a branch that is checked out in another worktree,
+    in **either** direction: you cannot check out a branch a fleet worktree
+    holds, and the fleet cannot create a worktree for a branch you hold. Use
+    your own branch names, or `--detach`.
+  - refs and objects are shared, so a commit of yours is visible to the fleet
+    clone immediately, and a fleet `git worktree prune` / `gc` runs over your
+    worktree's metadata (safe while your worktree directory exists).
+  - if the fleet ever re-clones the repo, worktrees hanging off the old clone
+    break.
+  - the fleet's own default checkout (the repo directory itself) must be left
+    alone — that is where it reads, fetches and branches.
 
 **Materialized configs (phase 2b).** Every child runs on a config the
 supervisor *generates*, not a hand-maintained file: the child's effective
@@ -1576,6 +1628,17 @@ repo B:
 The conventional task-worktree area beside a checkout (`<checkout>-wt` as its
 sibling) joins the grant list automatically whenever that directory exists, so
 a session can create and edit the worktree it is told to work in.
+
+Under the per-project layout (`project_root`, see "Workdir derivation" above)
+the reach is the whole PROJECT instead: the project root and every directory
+inside it — each repo of the project, and `worktrees/` — are granted, whether
+or not they are declared, and a repo the fleet clones in later is in scope with
+no config edit. Everything outside the project root stays closed: a session in
+`<root>/<project slug>/<repo name>` cannot read a sibling project under the
+same root, nor anything above it. Because the grant is the project root rather
+than a declaration, it is asserted by the config flag and never inferred from
+the directory layout — a developer's multi-repo parent (`~/dev` and its ~150
+trees) is never widened just because a session runs inside it.
 
 ### PR bases: `pr_base`
 
