@@ -56,10 +56,10 @@ import (
 var ErrWorkdirRefused = errors.New("workdir_refused")
 
 // WorktreesDirName is the directory every worktree the fleet creates for a
-// project lives under: <root>/<project slug>/worktrees. It is a fixed name
-// rather than a config knob, because the permission scope (the project root)
-// and the briefs that name it have to agree on one spelling.
-const WorktreesDirName = "worktrees"
+// project lives under: <root>/<project slug>/worktrees (see config, which owns
+// the name because the driver's permission scope and the briefs that name it
+// have to agree on one spelling).
+const WorktreesDirName = config.WorktreesDirName
 
 // ProjectRoot maps the machine-stated root plus a project slug to the directory
 // that holds everything the fleet owns for that project:

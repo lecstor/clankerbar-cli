@@ -75,6 +75,7 @@ func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 		if dir, ok := derived[""]; ok {
 			cfg.WorkDir = dir
 		}
+		cfg.ProjectRoot = true
 		return
 	}
 	for i := range cfg.Projects {
@@ -87,6 +88,11 @@ func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 			cfg.WorkDir = dir
 		}
 	}
+	// Every workdir this call just wrote is a fleet project root by
+	// construction (CLA-678), so the derived config SAYS so: it is the flag a
+	// session's permission scope keys on, and a child that had to infer it
+	// would be guessing where a generated file can simply state the fact.
+	cfg.ProjectRoot = true
 }
 
 // materializeConfig builds the instance's effective config and writes it into

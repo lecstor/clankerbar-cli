@@ -275,6 +275,59 @@ func TestExtraDirsForIncludesConventionalWorktreeArea(t *testing.T) {
 	}
 }
 
+// extraDirsFor with a project-rooted config (CLA-678): the session's reach is
+// the whole project — the project root itself, every repo under it, and the
+// worktrees directory — found from the layout rather than from a declaration,
+// and NOTHING beside it.
+func TestExtraDirsForProjectRootCoversTheProject(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "acme")
+	repoA := gitCheckout(t, filepath.Join(project, "repo-a"))
+	repoB := gitCheckout(t, filepath.Join(project, "repo-b"))
+	worktrees := filepath.Join(project, config.WorktreesDirName)
+	if err := os.MkdirAll(worktrees, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A sibling PROJECT under the same root: in scope for nobody here.
+	otherProject := filepath.Join(root, "other")
+	if err := os.MkdirAll(otherProject, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	target := Target{
+		Poller:      busyPoller(),
+		WorkDir:     project,
+		Repos:       map[string]string{"acme/repo-a": repoA, "acme/repo-b": repoB},
+		PrimaryRepo: "acme/repo-a",
+		ProjectRoot: true,
+	}
+	got := d0(target).extraDirsFor(target, repoA)
+	if !containsPath(got, project) {
+		t.Errorf("extra dirs = %v, want the project root %q (the external_directory carve-out)", got, project)
+	}
+	if !containsPath(got, repoB) {
+		t.Errorf("extra dirs = %v, want the sibling repo %q", got, repoB)
+	}
+	if !containsPath(got, worktrees) {
+		t.Errorf("extra dirs = %v, want the worktrees directory %q", got, worktrees)
+	}
+	if containsPath(got, repoA) {
+		t.Errorf("extra dirs = %v; the spawn dir itself must be excluded", got)
+	}
+	if containsPath(got, otherProject) {
+		t.Errorf("extra dirs = %v; a sibling PROJECT must not be granted", got)
+	}
+
+	// The same tree WITHOUT the flag grants nothing beyond the declared
+	// checkouts: the scope is an assertion about the layout, never an
+	// inference from it.
+	target.ProjectRoot = false
+	got = d0(target).extraDirsFor(target, repoA)
+	if containsPath(got, project) || containsPath(got, worktrees) {
+		t.Errorf("extra dirs = %v; without project_root the layout must not be inferred", got)
+	}
+}
+
 // --- helpers -----------------------------------------------------------------
 
 type noopSalvager struct{}

@@ -1669,6 +1669,23 @@ type Config struct {
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
 	WorkDir string `json:"workdir"`
 
+	// ProjectRoot marks every workdir in this file as a FLEET PROJECT ROOT
+	// (CLA-678): `<machine root>/<project slug>`, holding that project's clones
+	// (<project root>/<repo name>) and its worktrees directory
+	// (<project root>/worktrees). The supervisor's workdir derivation sets it
+	// on the config it materializes; set it by hand to adopt the layout without
+	// the supervisor.
+	//
+	// It is what decides a session's permission SCOPE. With it, a session
+	// starting in one of the project's checkouts reaches its whole project —
+	// every repo under the project root and every worktree in it — and nothing
+	// outside; without it, the scope stays the session's own checkout, exactly
+	// as before. So a config whose workdir is a developer's multi-repo parent
+	// (`~/dev`, say) must NOT set it: the flag is an assertion about the
+	// layout, and granting a whole directory tree on a guess is the wrong
+	// direction to be wrong in.
+	ProjectRoot bool `json:"project_root"`
+
 	// ConfigDir pins the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
 	// headless session loads the same skills, plugins, and auth as the interactive
 	// one. Empty inherits the ambient environment — declare it for an unattended
