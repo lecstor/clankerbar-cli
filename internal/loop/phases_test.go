@@ -36,6 +36,10 @@ func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Drive
 func phaseDriverWithReleaser(t *testing.T, h harness.Adapter, phases []config.Phase, rel plane.Releaser) *Driver {
 	t.Helper()
 	cfg := fastCfg()
+	// CLA-639: these fixtures script one review session per phase, so they drive
+	// the LEGACY single-review shape. The trial panel is the shipped default for
+	// a phased config; the panel tests set their own members.
+	noPanel(cfg)
 	cfg.Phases = phases
 	if len(phases) > 0 {
 		cfg.Prompt = ""
@@ -2691,12 +2695,23 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 			return plane.TaskState{}, err
 		}
 	}
+	// The plane withholds a SEALED record's findings: the driver (and a later
+	// panel member reading get_task, CLA-639) sees its metadata and counts, never
+	// the text. The fake has to do the same, or an independence test could pass by
+	// reading state the real plane would never serve.
+	served := make([]plane.ReviewRecordState, 0, len(r.records))
+	for _, rec := range r.records {
+		if rec.State == "sealed" {
+			rec.Findings = nil
+		}
+		served = append(served, rec)
+	}
 	return plane.TaskState{
 		Status:            r.status,
 		ClaimedByRun:      r.holder,
 		Outcome:           r.outcome,
 		DeliveryNoCode:    r.noCode,
-		Reviews:           r.records,
+		Reviews:           served,
 		ReviewCounted:     r.counted,
 		ReviewOpenMustIDs: r.openMusts,
 	}, nil
@@ -3626,7 +3641,7 @@ func TestMatchingReviewRecord(t *testing.T) {
 // distinct role and therefore a distinct record in the same round. A phase
 // that is not review-shaped has no role at all.
 func TestReviewerRoleFor(t *testing.T) {
-	shipped := (&config.Config{Phases: []config.Phase{
+	shipped := noPanel(&config.Config{Phases: []config.Phase{
 		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
 	}}).EffectivePhases()
 	if got := reviewerRoleFor(shipped, 1); got != "review-1" {
@@ -3639,7 +3654,9 @@ func TestReviewerRoleFor(t *testing.T) {
 		t.Errorf("the fix phase's role = %q, want none", got)
 	}
 
-	panel := (&config.Config{Phases: []config.Phase{
+	// The legacy hand-expanded shape: two review phases the OPERATOR wrote. The
+	// panel expands the same way from one review, and takes the same roles.
+	panel := noPanel(&config.Config{Phases: []config.Phase{
 		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
 	}}).EffectivePhases()
 	if got := reviewerRoleFor(panel, 1); got != "review-1" {
@@ -3647,6 +3664,23 @@ func TestReviewerRoleFor(t *testing.T) {
 	}
 	if got := reviewerRoleFor(panel, 2); got != "review-2" {
 		t.Errorf("the second panel member's role = %q, want review-2", got)
+	}
+
+	// The expanded panel: one configured review, four members, roles by position
+	// (CLA-639). This is what the driver actually iterates.
+	expanded := (&config.Config{Phases: []config.Phase{
+		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
+	}}).EffectivePhases()
+	if len(expanded) != 6 {
+		t.Fatalf("a trial-panel sequence has %d phases, want 6 (implement + 4 reviewers + fix)", len(expanded))
+	}
+	for i, want := range map[int]string{1: "review-1", 2: "review-2", 3: "review-3", 4: "review-4"} {
+		if got := reviewerRoleFor(expanded, i); got != want {
+			t.Errorf("panel position %d role = %q, want %q", i, got, want)
+		}
+	}
+	if got := reviewerRoleFor(expanded, 5); got != "" {
+		t.Errorf("the fix phase after a panel has role %q, want none", got)
 	}
 }
 

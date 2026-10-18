@@ -33,6 +33,9 @@ func deadReleaserDriver(t *testing.T, h harness.Adapter) (*Driver, *parkingRelea
 	t.Helper()
 	rel := &parkingReleaser{}
 	cfg := fastCfg()
+	// CLA-639: the dead-phase fixtures drive the LEGACY two-phase shape; a panel
+	// would multiply the review sessions they script.
+	noPanel(cfg)
 	cfg.Phases = twoPhases()
 	cfg.Prompt = ""
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})

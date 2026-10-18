@@ -89,7 +89,7 @@ func TestRun_RunConfigAppliesAtTheIterationBoundary(t *testing.T) {
 		events: &events,
 	}
 
-	d := rcRunDriver(t, fastCfg(), []backlog.Summary{
+	d := rcRunDriver(t, panelCfg(), []backlog.Summary{
 		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
 		{Ready: 1, Claimable: 1, RunConfigVersion: 2},
 	}, rc, h)
@@ -117,7 +117,7 @@ func TestRun_TheConfigReaderIsNeverConsultedMidSession(t *testing.T) {
 	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
 	rc := &fakeRCfg{docs: map[int]string{1: `{"model":"m"}`}, events: &events}
 
-	rcRunDriver(t, fastCfg(), []backlog.Summary{
+	rcRunDriver(t, panelCfg(), []backlog.Summary{
 		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
 		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
 	}, rc, h)
@@ -183,7 +183,7 @@ func TestRun_AFailedFetchKeepsLocalThenTheNextVersionApplies(t *testing.T) {
 	var events []string
 	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
 	rc := &fakeRCfg{docs: map[int]string{2: `{"model":"plane-2"}`}, errOn: 1, events: &events}
-	cfg := fastCfg()
+	cfg := panelCfg()
 	cfg.Model = "local-model"
 
 	d := rcRunDriver(t, cfg, []backlog.Summary{
@@ -541,7 +541,7 @@ func (s *stableRCfg) RunConfig(context.Context) (*plane.RunConfigState, error) {
 // dropped.
 func TestRun_ReloadRebuildsAnInForceStoredOverlayOnTheFreshBase(t *testing.T) {
 	dir := t.TempDir()
-	base := fastCfg()
+	base := panelCfg()
 	base.StateDir = dir
 	base.Prompt = "original brief"
 	base.Model = "base-1"
@@ -567,7 +567,7 @@ func TestRun_ReloadRebuildsAnInForceStoredOverlayOnTheFreshBase(t *testing.T) {
 	d := NewMulti(base, h, []Target{{Poller: p, RCfg: rc}})
 	reloaded := false
 	d.SetReloader(func() (*config.Config, error) {
-		fresh := fastCfg()
+		fresh := panelCfg()
 		fresh.StateDir = dir
 		fresh.Prompt = "reloaded brief"
 		fresh.Model = "base-2"
