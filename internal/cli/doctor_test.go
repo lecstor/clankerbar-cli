@@ -1618,6 +1618,124 @@ func TestOpencodeAuthCheck(t *testing.T) {
 	}
 }
 
+// CLA-687: a store holding ANY credential is not a green. The check has to match
+// the providers the config's own models name — the operator's sessions run on
+// those, and a session whose provider has no stored credential dies with
+// `provider.auth` (401) on its first call, which is the failure the check exists
+// to catch early.
+func TestOpencodeAuthCheckMatchesTheConfiguredProviders(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", data)
+	if err := os.MkdirAll(filepath.Join(data, "opencode"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "opencode", "opencode.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withStore := func(counts map[string]int) doctorEnv {
+		return doctorEnv{opencodeCredentials: func(context.Context, string) (map[string]int, error) {
+			return counts, nil
+		}}
+	}
+
+	t.Run("a credential for a provider the models do not use is NOT a pass", func(t *testing.T) {
+		cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), Model: "opencode-go/deepseek-v4-flash"}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"google": 1}))
+		if len(got) != 1 || got[0].status == pass {
+			t.Fatalf("store holds only google, model runs on opencode-go: got %+v, want a non-PASS naming the gap", got)
+		}
+		if !strings.Contains(got[0].detail, "opencode-go") {
+			t.Errorf("detail %q should name the provider the models need", got[0].detail)
+		}
+		if !strings.Contains(got[0].remedy, "opencode-go") {
+			t.Errorf("remedy %q should name the provider to log in to", got[0].remedy)
+		}
+	})
+
+	t.Run("every provider the models name being covered still passes", func(t *testing.T) {
+		cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), Model: "opencode-go/deepseek-v4-flash"}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1, "google": 2}))
+		if len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS", got)
+		}
+		if !strings.Contains(got[0].detail, "opencode-go") {
+			t.Errorf("detail %q should name the provider that covers the configured models", got[0].detail)
+		}
+	})
+
+	// The models are read through the same chain the driver resolves, not off the
+	// raw `model` field: a phase's tier and a model-pinned review-panel member
+	// each decide a session's provider, and a report that ignored them would go
+	// green on exactly the configs that need it most.
+	t.Run("phase tiers and panel members decide the providers too", func(t *testing.T) {
+		cfg := &config.Config{
+			Harness: "opencode",
+			Prompt:  "x",
+			WorkDir: t.TempDir(),
+			Model:   "opencode-go/deepseek-v4-flash",
+			Models:  map[string]string{"cheap": "opencode-go/gpt-6-luna"},
+			Phases: []config.Phase{
+				{Name: "implement", Tier: "cheap"},
+				{Name: "review"},
+				{Name: "fix"},
+			},
+			ReviewPanel: []config.ReviewPanelMember{{Model: "anthropic/claude-opus-5"}},
+		}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1}))
+		if len(got) != 1 || got[0].status == pass {
+			t.Fatalf("the panel member runs on anthropic and the store has none: got %+v, want a non-PASS", got)
+		}
+		if !strings.Contains(got[0].detail, "anthropic") {
+			t.Errorf("detail %q should name anthropic, the provider only the panel member names", got[0].detail)
+		}
+		// Covering both providers covers the whole sequence.
+		got = checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1, "anthropic": 1}))
+		if len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS once every named provider has a credential", got)
+		}
+	})
+
+	// A mixed-harness config resolves each phase's model through its OWN
+	// harness's block: the opencode model lives under `harnesses.opencode`, which
+	// the run-wide `model` never mentions.
+	t.Run("a per-harness block's model decides the provider", func(t *testing.T) {
+		cfg := &config.Config{
+			Harness: "claude",
+			Prompt:  "x",
+			WorkDir: t.TempDir(),
+			Model:   "claude-opus-5",
+			Phases: []config.Phase{
+				{Name: "implement", Harness: "opencode"},
+				{Name: "review"},
+			},
+			Harnesses: map[string]config.HarnessConfig{
+				"opencode": {ConfigDir: "/oc/config", Model: "opencode-go/gpt-6-luna"},
+			},
+		}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"anthropic": 1}))
+		if len(got) != 1 || got[0].status == pass {
+			t.Fatalf("the opencode phase runs on opencode-go and the store has none: got %+v, want a non-PASS", got)
+		}
+		if !strings.Contains(got[0].detail, "opencode-go") {
+			t.Errorf("detail %q should name the provider the opencode phase's own block names", got[0].detail)
+		}
+		if got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1})); len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS once opencode-go is covered", got)
+		}
+	})
+
+	t.Run("a bare alias names no provider and is said so, not guessed at", func(t *testing.T) {
+		cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), Model: "claude-opus-5"}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"google": 1}))
+		if len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS: an alias with no <provider>/<model> form cannot be checked against the store", got)
+		}
+		if !slices.ContainsFunc(got[0].info, func(s string) bool { return strings.Contains(s, "claude-opus-5") }) {
+			t.Errorf("info %v should name the model id it could not attribute to a provider", got[0].info)
+		}
+	})
+}
+
 // --- budget ------------------------------------------------------------------
 
 func TestBudgetNegativeValuesFail(t *testing.T) {

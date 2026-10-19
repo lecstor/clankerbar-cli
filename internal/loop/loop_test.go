@@ -280,6 +280,11 @@ func (p *fakePoller) Poll(ctx context.Context) (backlog.Summary, error) {
 // ever sleeps for real. Crucially, RetryCap=1ms makes backoff() return the cap
 // for every retry n (the 30s base is always > the cap), so transient retries do
 // not incur the real 30s/60s/... backoff.
+//
+// It deliberately sets no `review_panel`: an absent panel is the historical
+// single review (CLA-639 is opt-in, with no default and no preset), which is the
+// shape every test that scripts one review phase per phase drives. The panel
+// tests set their own members.
 func fastCfg() *config.Config {
 	return &config.Config{
 		Harness:          "claude",

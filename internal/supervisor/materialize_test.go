@@ -111,6 +111,56 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	}
 }
 
+// TestMaterializedConfigWithoutAPanelRoundTrips (CLA-639 fix pass 3): a
+// supervised daemon's child config is materializeConfig's marshal, and before
+// the fix that marshal wrote `"review_panel": null` for a config with no panel.
+// Load treated the key's presence as "set", so the child refused the standard
+// [implement, review, fix] shape with "review_panel is empty" and the daemon
+// never started. The whole supervised path is exercised here: Load -> Validate
+// -> materialize -> Load -> Validate.
+func TestMaterializedConfigWithoutAPanelRoundTrips(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	workdir := t.TempDir()
+	src := filepath.Join(t.TempDir(), "source.json")
+	body := `{
+		"harness": "claude",
+		"workdir": "` + workdir + `",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
+	}`
+	if err := os.WriteFile(src, []byte(body), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	cfg, err := config.Load(src)
+	if err != nil {
+		t.Fatalf("Load(source): %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("source does not validate: %v", err)
+	}
+
+	cacheDir := t.TempDir()
+	stateDir := t.TempDir()
+	d := &Supervisor{o: materializeOptions(t, cacheDir, ""), hostname: "testhost", cacheDir: cacheDir}
+	inst := &Instance{name: "no-panel", cfg: cfg, stateDir: stateDir}
+	path, err := d.materializeConfig(inst)
+	if err != nil {
+		t.Fatalf("materializeConfig: %v", err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("the materialized config does not load: %v", err)
+	}
+	if err := loaded.Validate(); err != nil {
+		t.Fatalf("the materialized config does not validate, so a supervised daemon with no panel would not start: %v", err)
+	}
+	if len(loaded.Phases) != 3 {
+		t.Fatalf("materialized phases = %d, want 3", len(loaded.Phases))
+	}
+	if got := loaded.EffectivePanel(); len(got) != 0 {
+		t.Fatalf("the materialized config invented a panel of %d members", len(got))
+	}
+}
+
 // A multi-project instance derives one workdir per project, and the generated
 // config carries each project's derived workdir — the phase-2a value consumed
 // at materialization time. The projects come from the roster entry.

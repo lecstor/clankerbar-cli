@@ -310,10 +310,13 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			// (CLA-288).
 			Usage *usage `json:"usage"`
 		} `json:"message"`
-		Result         string  `json:"result"`
-		TerminalReason string  `json:"terminal_reason"`
-		TotalCostUSD   float64 `json:"total_cost_usd"`
-		Usage          usage   `json:"usage"`
+		Result         string `json:"result"`
+		TerminalReason string `json:"terminal_reason"`
+		// A POINTER, so a result event that carries no cost at all is
+		// distinguishable from one that reports 0 (CLA-691): only the latter is a
+		// figure the durable record may carry.
+		TotalCostUSD *float64 `json:"total_cost_usd"`
+		Usage        usage    `json:"usage"`
 	}
 	if json.Unmarshal(line, &ev) != nil {
 		return
@@ -343,6 +346,10 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			if tot := u.total(); tot > 0 {
 				res.Tokens += tot
 			}
+			// The normalised breakdown (CLA-691) is summed on the same terms as
+			// Tokens above: the API reports each turn's own usage, and the
+			// result event below overwrites both if the stream reaches it.
+			res.Usage.Add(u.normalised())
 		}
 	case "user":
 		// Tool results come back on a synthetic user turn.
@@ -354,12 +361,22 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		}
 	case "result":
 		res.FinalMessage = ev.Result
-		res.CostUSD = ev.TotalCostUSD
+		// The session's DOLLARS arrive here and nowhere else, so the flag that says
+		// "a cost figure was seen" (CLA-691) is set here too: a session killed
+		// before this event reported tokens but no money, and the durable record
+		// must carry the absence rather than a zero nobody measured.
+		if ev.TotalCostUSD != nil {
+			res.CostUSD = *ev.TotalCostUSD
+			res.CostReported = true
+		}
 		// The result event's usage is the session's CUMULATIVE total, so it
 		// overwrites the running sum rather than adding to it. On a stream that
 		// reached its end this is the number the budget sees; on a stream we
 		// killed for the ceiling it never arrives, and the sum stands.
 		res.Tokens = ev.Usage.total()
+		// The CUMULATIVE usage, so the breakdown is overwritten rather than added
+		// to, exactly as Tokens is above (CLA-691).
+		res.Usage = ev.Usage.normalised()
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
 		res.gotResult = true
 		// The session's own accounting arrived, whatever it adds up to - a
@@ -779,6 +796,21 @@ func (u usage) total() int {
 	return u.InputTokens + u.OutputTokens + u.CacheCreationTokens + u.CacheReadTokens
 }
 
+// normalised maps claude's report onto the CLI's own usage vocabulary (CLA-691).
+// The mapping is the identity on three fields because claude's `input_tokens` is
+// UNCACHED input only — the cache fields sit beside it, not inside it — and zero
+// on Reasoning because Anthropic folds thinking tokens into `output_tokens` and
+// reports no separate figure. Inventing one (or splitting output on a guess)
+// would make the buckets disagree with the harness's own total.
+func (u usage) normalised() TokenUsage {
+	return TokenUsage{
+		Input:      u.InputTokens,
+		Output:     u.OutputTokens,
+		CacheRead:  u.CacheReadTokens,
+		CacheWrite: u.CacheCreationTokens,
+	}
+}
+
 // probe runs the cheapest possible request (tiny prompt, no tools, plain json) to
 // answer "am I still limited?" — no streaming, no console.
 func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
@@ -878,9 +910,11 @@ func (claude) parse(res *Result) {
 	res.FinalMessage = p.Result
 	if p.TotalCostUSD != nil {
 		res.CostUSD = *p.TotalCostUSD
+		res.CostReported = true
 	}
 	if p.Usage != nil {
 		res.Tokens = p.Usage.total()
+		res.Usage = p.Usage.normalised()
 	}
 	res.UsageReported = p.TotalCostUSD != nil || p.Usage != nil
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}

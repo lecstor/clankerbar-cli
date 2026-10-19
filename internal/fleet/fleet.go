@@ -77,17 +77,78 @@ type State struct {
 	Phase   string // phase label, when Kind is iteration
 }
 
+// Usage is one session's token accounting, normalised across harnesses: the
+// same five DISJOINT buckets the CLI's adapters fill (harness.TokenUsage),
+// carried in the wire shape so the durable phase_session record is repriceable
+// later without knowing which harness ran the session (CLA-691).
+//
+// Kept as this package's own type rather than importing the harness one, the way
+// every other field of Session is: the loop is the boundary that translates. The
+// two are structurally identical and the loop converts with a struct conversion,
+// so a bucket added on one side and not the other stops compiling rather than
+// drifting.
+type TokenUsage struct {
+	Input      int
+	Output     int
+	Reasoning  int
+	CacheRead  int
+	CacheWrite int
+}
+
 // Session is one harness session an iteration spawned: which phase it ran,
-// which harness ran it, and the model it was spawned with (CLA-630). The values
-// are exactly what the loop's spawn line prints — the phase label, the phase's
-// resolved harness, and the resolved model after tier resolution and any
-// run-config overlay. Model is the EMPTY string when no model was resolved (the
-// harness default applied); the plane stores that as "not resolved", never a
-// guessed name, so an empty value must ride as empty rather than be filled in.
+// which harness ran it, the model it was spawned with (CLA-630), and what it
+// spent (CLA-691). The phase/harness/model values are exactly what the loop's
+// spawn line prints — the phase label, the phase's resolved harness, and the
+// resolved model after tier resolution and any run-config overlay. Model is the
+// EMPTY string when no model was resolved (the harness default applied); the
+// plane stores that as "not resolved", never a guessed name, so an empty value
+// must ride as empty rather than be filled in.
 type Session struct {
 	Phase   string // phase label the session ran under
 	Harness string // the harness that ran it
 	Model   string // resolved model id; "" when the harness default applied
+
+	// Usage is the session's normalised token breakdown, and UsageReported says
+	// the harness reported usage AT ALL — the same distinction Result carries,
+	// because a session killed before its harness said anything leaves every
+	// bucket zero and that zero is not an answer. The plane records both.
+	//
+	// A session that spanned a stall continuation (CLA-584) or a resurrection
+	// (CLA-406) reports its parts SUMMED here, because the CLI reports it as one
+	// session.
+	Usage         TokenUsage
+	UsageReported bool
+
+	// RunID is the run's UUID the session worked the task under, when there is
+	// one — empty for a session that never held a claim. It is deliberately NOT
+	// the run credential the session holds: that string is `<uuid>.<secret>` and
+	// the secret half authorises a write as that run, so telemetry the plane
+	// stores and serves back must not carry it (the loop's runUUID splits it off).
+	//
+	// It is what makes a durable per-session record join EXACTLY to the per-run
+	// records already on the plane: a review record carries the run that wrote it
+	// (task_review.run_id, itself a bare UUID), so "which model raised these
+	// findings, on what did it spend" is answerable per ROUND rather than only per
+	// task and phase label — a re-review runs the same phase labels again, so the
+	// label alone cannot tell two rounds apart.
+	//
+	// A session's own claim carries its run id. A later phase's session never
+	// calls claim_task (it heartbeats the run the predecessor left held), so the
+	// driver supplies the id it already wrote into that session's brief — the
+	// same value, from the same source.
+	RunID string
+
+	// CostUSD is the harness-reported dollar figure for this session, or nil
+	// when there is no figure to carry: the adapter never reports cost at all
+	// (Capabilities.ReportsCost false — codex today), or this session reported
+	// no usage, so a zero would claim a spend nobody measured. A harness that
+	// DID report zero is a zero here, which is why it is a pointer.
+	//
+	// Labelled as harness-reported on purpose: on a Claude subscription this is
+	// the API-rate equivalent, not what the operator paid, and the operator's
+	// own view is that the token breakdown above is the durable half because
+	// prices change.
+	CostUSD *float64
 }
 
 // Iteration is one finished loop step: what ran, how it ended, what it cost.
@@ -344,12 +405,34 @@ type wireState struct {
 	Phase   string `json:"phase,omitempty"`
 }
 
+// wireUsage is the normalised breakdown on the wire. Each key is omitted when
+// zero, so a session that reported usage with an empty bucket stays a compact
+// object rather than five zeroes.
+type wireUsage struct {
+	Input      int `json:"input,omitempty"`
+	Output     int `json:"output,omitempty"`
+	Reasoning  int `json:"reasoning,omitempty"`
+	CacheRead  int `json:"cacheRead,omitempty"`
+	CacheWrite int `json:"cacheWrite,omitempty"`
+}
+
 type wireSession struct {
 	Phase   string `json:"phase"`
 	Harness string `json:"harness"`
 	// Model is deliberately not omitempty: the plane stores the empty string as
 	// null ("not resolved"), and sending it explicitly is CLA-630's contract.
 	Model string `json:"model"`
+	// UsageReported, Usage and CostUSD are the CLA-691 additions, and each is
+	// omitted when there is nothing to say: an older CLI's entry — and a session
+	// that died before its harness reported anything — stays the pre-CLA-691
+	// shape byte for byte, so the plane's "no usage" case is representable.
+	UsageReported bool       `json:"usageReported,omitempty"`
+	Usage         *wireUsage `json:"usage,omitempty"`
+	// CostUSD is a pointer so a reported ZERO survives marshalling
+	// (omitempty drops a nil pointer, never a pointer to 0).
+	CostUSD *float64 `json:"costUsd,omitempty"`
+	// RunID omits itself when the session held no claim, like the rest.
+	RunID string `json:"runId,omitempty"`
 }
 
 type wireIteration struct {
@@ -438,7 +521,21 @@ func wireSessions(sessions []Session) []wireSession {
 	}
 	out := make([]wireSession, 0, len(sessions))
 	for _, s := range sessions {
-		out = append(out, wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model})
+		w := wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model, RunID: s.RunID}
+		if s.UsageReported {
+			w.UsageReported = true
+			w.Usage = &wireUsage{
+				Input:      s.Usage.Input,
+				Output:     s.Usage.Output,
+				Reasoning:  s.Usage.Reasoning,
+				CacheRead:  s.Usage.CacheRead,
+				CacheWrite: s.Usage.CacheWrite,
+			}
+		}
+		if s.CostUSD != nil {
+			w.CostUSD = s.CostUSD
+		}
+		out = append(out, w)
 	}
 	return out
 }

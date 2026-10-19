@@ -427,6 +427,62 @@ const OutputCapReason = "output_cap_no_output"
 // a recovered resume clears it with the marker.
 const OutputCapReasoningKey = "output_cap_reasoning"
 
+// Usage is one session's token accounting in the CLI's OWN normalised
+// vocabulary: every adapter's report mapped onto the same five buckets, so a
+// consumer can compare two models, or reprice an old session against today's
+// rates, without knowing which harness ran it (CLA-691).
+//
+// The buckets are DISJOINT and sum to the total the harness itself reported —
+// that is what makes repricing possible, and why each adapter is mapped by
+// MEANING rather than field-for-field by name:
+//
+//   - claude reports input_tokens exclusive of the two cache figures, so those
+//     are the three buckets directly; thinking tokens are inside output_tokens
+//     (Anthropic folds them in), so Reasoning stays zero rather than being
+//     invented.
+//   - opencode's per-step tokens are already disjoint — its own `total` sums
+//     input+output+reasoning+cache — so every bucket is reported directly.
+//   - codex reports INCLUSIVE counters: cached_input_tokens is a SUBSET of
+//     input_tokens, and reasoning_output_tokens a subset of output_tokens. A
+//     field-for-field copy of that report would double count both, so the
+//     cached reads are subtracted out of Input and the reasoning tokens out of
+//     Output. The five buckets then sum to codex's own total_tokens.
+//
+// A harness that reported no usage at all leaves this zero, and Result.UsageReported
+// — not a zero here — is what tells the two apart.
+type TokenUsage struct {
+	Input      int // fresh (uncached) prompt tokens
+	Output     int // generated tokens, minus any reasoning the harness counts separately
+	Reasoning  int // thinking tokens the harness counts as their own bucket
+	CacheRead  int // prompt tokens served from a prompt cache
+	CacheWrite int // prompt tokens written to a prompt cache
+}
+
+// Add folds another run's usage into this one. It is how a session that spanned
+// a stall continuation (CLA-584) or a resurrection (CLA-406) reports its parts
+// as ONE session's spend, exactly as Tokens and CostUSD are summed there.
+func (u *TokenUsage) Add(o TokenUsage) {
+	u.Input += o.Input
+	u.Output += o.Output
+	u.Reasoning += o.Reasoning
+	u.CacheRead += o.CacheRead
+	u.CacheWrite += o.CacheWrite
+}
+
+// Total is the sum of the buckets: the token figure the harness itself
+// reported, recomputed here so a consumer repricing bucket by bucket can add up
+// what it was given.
+//
+// For claude and opencode it equals Result.Tokens exactly. codex is the one
+// exception TODAY, and the divergence is a known defect of the BUDGET figure
+// rather than of these buckets: codex's `reasoning_output_tokens` is a subset of
+// its `output_tokens`, while Result.Tokens still adds the reasoning count a
+// second time (CLA-692 tracks the fix). These buckets sum to codex's own
+// total_tokens, which is the correct figure.
+func (u TokenUsage) Total() int {
+	return u.Input + u.Output + u.Reasoning + u.CacheRead + u.CacheWrite
+}
+
 type Result struct {
 	ExitCode int
 	// ExitSignal is the number of the signal that killed the child, 0 when the
@@ -441,6 +497,28 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// Usage is this session's token accounting normalised across harnesses (see
+	// TokenUsage's own comment for the buckets and the per-adapter mapping). It is
+	// the durable, repriceable form of what Tokens only totals, and it rides the
+	// fleet report's per-session entry (CLA-691) so a per-phase/per-reviewer
+	// cost analysis has something finer than the iteration's summed figure.
+	//
+	// Zero when the harness reported no usage, which UsageReported distinguishes
+	// from a reported zero.
+	Usage TokenUsage
+
+	// CostReported says the adapter actually SAW a cost figure for this session,
+	// as distinct from CostUSD merely being zero — the same question UsageReported
+	// answers for tokens, and NOT the same event.
+	//
+	// claude is why this is its own field: it reports per-turn TOKENS on the
+	// stream but the session's DOLLARS only on its terminal result event, so a
+	// claude session killed mid-stream (the token ceiling, the turn cap) has
+	// UsageReported true with CostUSD still 0 — a zero nobody measured. The fleet
+	// record's costUsd is nullable for exactly this reason, and this flag is what
+	// lets it stay absent instead of claiming "$0 spent".
+	CostReported bool
 
 	// UsageReported says the adapter actually SAW a usage-bearing event on this
 	// session's stream, as distinct from Tokens/CostUSD merely being zero.

@@ -223,7 +223,7 @@ func TestSupervisedWait_ProbesThePhasesOwnHarness(t *testing.T) {
 // separate figure (CLA-287), so the drain's returned totals are pinned too.
 func TestSupervisedWait_ResumedPhaseLimitProbesThePhasesOwnHarness(t *testing.T) {
 	impl := &fakeAdapter{steps: []invokeStep{{res: checkpointed(10, 0.50)}}} // claude: the driver's own, never limited
-	review := &fakeAdapter{ // opencode: the resumed phase, the one the cap closes
+	review := &fakeAdapter{                                                  // opencode: the resumed phase, the one the cap closes
 		steps:        []invokeStep{{res: held(limitResult(), openClaim())}},
 		probeTokens:  3,
 		probeCost:    0.25,

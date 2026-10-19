@@ -178,7 +178,9 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// observation folds separately, just as unconditionally.
 		res.Tokens += probeRes.Tokens
 		res.CostUSD += probeRes.CostUSD
+		res.Usage.Add(probeRes.Usage)
 		res.UsageReported = res.UsageReported || probeRes.UsageReported
+		res.CostReported = res.CostReported || probeRes.CostReported
 		// The claim observation folds ONLY when it is still about THIS task
 		// and arrived on a capture we may read: noteClaimed replaces a parser's
 		// claim WHOLESALE, so a decohered probe that re-claimed a different
@@ -239,7 +241,9 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			// Spend first, even on the error path.
 			res.Tokens += contRes.Tokens
 			res.CostUSD += contRes.CostUSD
+			res.Usage.Add(contRes.Usage)
 			res.UsageReported = res.UsageReported || contRes.UsageReported
+			res.CostReported = res.CostReported || contRes.CostReported
 			if console != nil {
 				fmt.Fprintf(console, "!! resurrection continuation errored (%v) — counting the death\n", contErr)
 			}
@@ -1128,6 +1132,12 @@ type opencodeParse struct {
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
+	// sawCost reports that a step_finish actually carried a cost figure
+	// (CLA-691). Deliberately separate from sawUsage: opencode reports a step's
+	// tokens and its cost as independent siblings, so a session can account for
+	// tokens and never for money, and the durable record carries the two
+	// questions apart.
+	sawCost bool
 
 	// sessionID is the opencode session this stream belongs to, taken from the
 	// top-level sessionID field every event carries. Constant for a run; the
@@ -1260,6 +1270,7 @@ func (p *opencodeParse) line(line []byte) {
 				p.lastStepZeroUsage = false
 			}
 			p.sawUsage = true
+			p.sawCost = true
 		}
 	case "tool_use":
 		p.noteTool(ev.Part)
@@ -1461,11 +1472,25 @@ func (p *opencodeParse) finish(res *Result) {
 	// Recorded whatever the figures come to: the driver bounds attempts that
 	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
 	res.UsageReported = p.sawUsage
+	// The cost figure is its own question (CLA-691): a stream whose steps carried
+	// tokens but no cost reported no money, and the durable record must say so
+	// rather than reporting 0.
+	res.CostReported = p.sawCost
 	if p.sawUsage {
 		// opencode's `total` already folds in input+output+reasoning+cache, so it
 		// is the honest spend figure for the budget.
 		res.Tokens = p.total
 		res.CostUSD = p.cost
+		// The normalised breakdown (CLA-691): opencode's step tokens are already
+		// disjoint across exactly these five buckets, so this is the report
+		// itself, summed over the session's steps.
+		res.Usage = TokenUsage{
+			Input:      p.in,
+			Output:     p.out,
+			Reasoning:  p.reason,
+			CacheRead:  p.cRead,
+			CacheWrite: p.cWrite,
+		}
 		res.Raw = map[string]any{
 			"input_tokens": p.in, "output_tokens": p.out, "reasoning_tokens": p.reason,
 			"cache_write_tokens": p.cWrite, "cache_read_tokens": p.cRead,

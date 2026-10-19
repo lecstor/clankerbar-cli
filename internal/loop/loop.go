@@ -398,6 +398,16 @@ type Driver struct {
 	// reported from Run. Lazily built; see tallyDead and logDeadTally.
 	deadTally map[tallyKey]*phaseTally
 
+	// panelFailStreak is how many consecutive TASKS each review-panel member has
+	// recorded nothing on (CLA-639 M4), keyed by the member's log label (the
+	// positional `review-N` when unnamed). Like deadTally it is the run's
+	// account: one flaky member is a blip, but the same member failing task
+	// after task is a fault in that member's harness, model or brief, and the
+	// warning it earns must not depend on the drain boundary. Cleared for a
+	// member the moment that member records. See panelMemberFailed /
+	// panelMemberRecorded.
+	panelFailStreak map[string]int
+
 	// restartRequested (CLA-461) flips when a RESTART / RESTART_NOW marker has
 	// been consumed and the run is unwinding toward a re-exec. Atomic because
 	// the RESTART_NOW watcher goroutine writes it while the loop reads it after
@@ -1129,16 +1139,23 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// changes harness/model/budget here, not on the shared base.
 	tc := d.targetCfg(t)
 	phases := tc.EffectivePhases()
-	// rawPhases is the same sequence BEFORE EffectivePhases resolved each
-	// phase's built-in brief — index-aligned 1:1 with phases (EffectivePhases
-	// never adds or drops an entry, though an unphased run's empty list is one
-	// synthesized entry there and here it is empty). The handoff branch below
-	// reads it to tell a built-in-brief phase from an operator's custom prompt,
-	// and it MUST be this captured copy (CLA-664): a live read would let a
-	// RELOAD applied mid-drain reshape the continuation of the sequence in
-	// flight — a 3 -> 2 reload drops the in-flight fix successor's terminal
-	// step, and a custom-prompt phase later covered by a built-in gains one.
-	rawPhases := tc.Phases
+	// rawPhases is the same sequence with every EXPANSION collapsed: index-
+	// aligned 1:1 with phases, but each review-panel member maps back to the one
+	// `review` phase the operator wrote (CLA-639), so a member is recognised as
+	// running the resolved built-in brief its configured phase asked for rather
+	// than a prompt of its own. The handoff branch below reads it to tell a
+	// built-in-brief phase from an operator's custom prompt, and it MUST be this
+	// captured copy (CLA-664): a live read would let a RELOAD applied mid-drain
+	// reshape the continuation of the sequence in flight — a 3 -> 2 reload drops
+	// the in-flight fix successor's terminal step, and a custom-prompt phase
+	// later covered by a built-in gains one.
+	rawPhases := make([]config.Phase, len(phases))
+	for i := range phases {
+		rawPhases[i] = phases[i]
+		if src := phases[i].ConfiguredIndex(); src < len(tc.Phases) {
+			rawPhases[i] = tc.Phases[src]
+		}
+	}
 	// CLA-638: where the fix→verify pair lives, when the sequence has one. The
 	// verification round is last by validation, and the driver repeats the pair
 	// by rewinding to fixIdx after a round with open MUSTs. Zero when the
@@ -1160,6 +1177,26 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// plane read serves no count at all, which would otherwise make "counted >=
 	// 3" unreachable and the fix→verify pair unbounded.
 	verifyRoundsRun := 0
+	// CLA-639: the panel's members that wrote no record this round, and the round
+	// the panel's released records landed in. A dead, capped or otherwise
+	// record-less member does not stop the panel: it is listed here, the round
+	// still closes, and the fix phase is told the panel was incomplete. The
+	// round number is the one the seam MATCHED on a member that did record, so a
+	// later member's failure can still release the records already written.
+	var (
+		panelIncomplete []string
+		panelRound      int
+	)
+	// CLA-639 M4: whether ANY member of this panel recorded, and why each member
+	// that did NOT failed. The first decides whether a failed LAST member hands
+	// the round to the fix phase (there is something to apply) or ends the drain;
+	// the second rides the fix brief, so "the panel was incomplete" names the
+	// members AND what happened to them.
+	panelRecorded := false
+	panelFailed := map[string]string{}
+	// CLA-639 M5: the branchless-panel skip says its piece once, not once per
+	// skipped member — N-1 identical lines would read as N problems.
+	branchlessPanelNoted := false
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
@@ -1228,6 +1265,20 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		lastProducedNothing bool
 	)
 	defer func() {
+		// CLA-639: the iteration record says the panel was incomplete, by member,
+		// whether the drain then reached the fix phase or stopped before it. The
+		// reviewers that DID record are what the fix phase receives; this names the
+		// ones that did not, so "the panel" never reads as the full panel when it
+		// was not.
+		if len(panelIncomplete) > 0 {
+			note := fmt.Sprintf("review panel INCOMPLETE: %s", strings.Join(panelIncomplete, "; "))
+			log.Printf("%siteration %d: %s", labelOf(t), drainNum, note)
+			if finalDisp == "" {
+				finalDisp = note
+			} else {
+				finalDisp += " — " + note
+			}
+		}
 		outcome := finalDisp
 		switch {
 		case parkFired:
@@ -1253,7 +1304,41 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 
 	for i := 0; i < len(phases); {
 		ph := phases[i]
+		// CLA-639: whether this position is one reviewer of a review panel. The
+		// members are consecutive review-shaped phases, so "before the next
+		// configured phase" is the same test the shipped sequence already uses.
+		// Captured BEFORE the handoff branch replaces ph.Prompt with a
+		// continuation: a panel member never honours a handoff, but the
+		// continuation's own review position must still be read from the phase
+		// identity, not from a prompt that is no longer a brief.
+		panelMember := ph.IsPanelMember()
 		last := i == len(phases)-1
+		// CLA-639 M5: a BRANCHLESS task cannot run a panel AT ALL, so its panel
+		// is one reviewer. This shape's review record is the legacy `## Review`
+		// block written to the task's outcome — the plane accepts a durable
+		// record only from the task's live holder, and a settled task has none
+		// (question 03a12578, option 1) — so a second member could record nothing
+		// a durable round could hold, and the block it would append is the FIRST
+		// member's own record. The first member runs with the brief it would have
+		// had anyway; the members after it are skipped, with one log line.
+		if panelMember && branchlessCheckpoint && i > 0 && phases[i-1].IsPanelMember() {
+			if !branchlessPanelNoted {
+				log.Printf("%siteration %d: this task's checkpoint is BRANCHLESS (its review record is the legacy %q block, not a durable one), so the review panel runs ONE reviewer: %s",
+					labelOf(t), drainNum, config.ReviewRecordHeading, phases[i-1].Label(i-1))
+				branchlessPanelNoted = true
+			}
+			i++
+			continue
+		}
+		// CLA-639: the panel's last member is the last REVIEW of the sequence even
+		// when a fix follows it, and the driver's plain-review seam must run for it
+		// (that is the seam that carries the record gate). Only a PANEL member gets
+		// this treatment: a shipped `review` before a fix is not "terminal", and
+		// passing that word over would tell it there is nothing to checkpoint for.
+		terminal := last
+		if panelMember && !last && !config.ReviewShaped(phases[i+1].Prompt) {
+			terminal = true
+		}
 		isHandoff := nextPrompt != ""
 		promptBytes := 0
 		if isHandoff {
@@ -1280,12 +1365,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// force-injected into a handoff respawn of a brief that never
 			// established that contract in the first place — clashing with
 			// whatever terminal step their own prompt names, if any.
-			// rawPhases (the unresolved sequence captured at drain start, not
-			// EffectivePhases' output) is index-aligned with phases:
-			// EffectivePhases builds its slice 1:1 from c.Phases, never adding
-			// or dropping an entry. Never re-read live: a RELOAD applied
-			// mid-drain must not reshape the in-flight sequence's continuation
-			// (CLA-664) — the same rule the mode and the count follow.
+			// rawPhases (the configured sequence captured at drain start, not
+			// EffectivePhases' output) is index-aligned with phases: a panel
+			// member maps back to the `review` phase it expanded from, and every
+			// other entry is its own configured phase. Never re-read live: a
+			// RELOAD applied mid-drain must not reshape the in-flight sequence's
+			// continuation (CLA-664) — the same rule the mode and the count follow.
 			promptBytes = len(nextPrompt)
 			continuation := ""
 			if i < len(rawPhases) && rawPhases[i].Prompt == "" {
@@ -1300,7 +1385,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// during a review-only phase must carry the record-then-hold
 				// ending, never the commit/push/PR/in_review terminal step. A
 				// fix phase carries that terminal step by name.
-				reviewOnly := ph.Name == config.ReviewPhaseName && i < len(phases)-1
+				reviewOnly := ph.Name == config.ReviewPhaseName && !terminal
 				// CLA-637: the checkpoint that OPENED this phase decides which
 				// review-only variant the successor continues. A branchless
 				// checkpoint's successor gets the no-tip shape; an UNVERIFIED
@@ -1397,11 +1482,11 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// call: the seam below may replace `carried` with this phase's own
 		// claim, which says nothing about how the phase was entered.
 		phaseResumed := carried != nil
-		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, i, tag, ph, last, carried, t, spend{
+		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, i, tag, ph, terminal, carried, t, spend{
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
-		}, phases)
+		}, phases, panelState{round: panelRound, failed: panelFailed})
 		tokens += ptokens
 		cost += pcost
 		// CLA-630: one entry per session this pass spawned, in spawn order. nil
@@ -1456,6 +1541,26 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// brief this phase's FIRST session ran, not what its last one recorded.
 		branchlessCheckpoint = seamClaim != nil && seamClaim.Claim.Branch == ""
 
+		// CLA-639 M4: a PANEL MEMBER that produced no record leaves the run
+		// resumable — the next member, or the fix phase, picks up the SAME run
+		// from the SAME verified checkpoint. Its own result is what carries the
+		// claim forward (the switch above), and a session that was turned away or
+		// died before reading the task reports no branch: without this, the next
+		// member's brief would be handed an empty branch and read as the
+		// BRANCHLESS variant, whose record is the legacy block the panel cannot
+		// use. So the checkpoint's resumption facts ride forward from the claim
+		// that opened this member, onto a claim that is still live and short of
+		// them. Only a member: every other phase's claim is its own.
+		if panelMember && !end.reviewRecorded && seamClaim != nil && carried != nil && carried.Claim.Held() {
+			if carried.Claim.Branch == "" {
+				carried.Claim.Branch = seamClaim.Claim.Branch
+			}
+			if carried.CheckpointTip == "" {
+				carried.CheckpointTip = seamClaim.CheckpointTip
+			}
+			carried.CheckpointUnverified = seamClaim.CheckpointUnverified
+		}
+
 		// A run-level stop wins over a dead phase. drainPhase returns stop=true
 		// for a budget trip and credit exhaustion (lim.Stop) — and on those
 		// paths end.dead can be set too (a credit-starved session is exactly the
@@ -1491,7 +1596,11 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// otherwise land the very next instant. A rolling limit extends no
 		// streak: its wait is a reset, not a rung, and the next drain is
 		// scheduled after it anyway.
-		if end.sequenceEnd != nil {
+		// CLA-639: a PANEL member's sequence-end is judged by the panel handler
+		// below first — it records the member as failed, closes the round that the
+		// earlier members wrote into, and only then lets the run-level wait take
+		// over. Every other resumed phase keeps the shipped break here.
+		if end.sequenceEnd != nil && !end.panelMember {
 			limitWait = end.sequenceEnd.limitWait
 			if limitWait == nil {
 				transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
@@ -1510,6 +1619,225 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// the arm above extends, this one clears.
 		if phaseResumed {
 			d.clearResumedTransient(resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)})
+		}
+
+		// CLA-639: the panel's members are skippable where a lone review phase is
+		// not. A member that recorded nothing — dead, capped before its record
+		// write, empty under the evidence gate, or turned away by a non-retryable
+		// error — is RECORDED AS FAILED and the panel moves on, instead of ending
+		// the drain with three reviewers still unrun. That is the panel's version
+		// of the doneWhen's "recorded or been recorded as failed/capped".
+		//
+		// Deliberately BEFORE the dead/fleet arms: those exist for a phase whose
+		// death leaves the task going nowhere, but a panel member's death is one
+		// reviewer lost, not the task lost. Counting it toward the fleet pause
+		// would let a flaky reviewer bench the whole target.
+		//
+		// The round is NOT closed while another member follows: closing it
+		// would release the earlier members' findings to that member, which is
+		// exactly the panel independence the seal exists to protect. It is closed
+		// when the panel is over, whichever way the last member ends.
+		if end.panelMember {
+			if round := end.reviewRound; round > 0 {
+				panelRound = round
+			}
+			// The member's reviewer ROLE is positional (CLA-639): the durable
+			// record and the seam gate are keyed on it, and the operator's `name`
+			// is only the log label. The incomplete list and the fix brief must
+			// therefore speak roles, or a named member would be reported missing
+			// while its role-keyed record is sitting right there.
+			role := reviewerRoleFor(phases, i)
+			member := ph.Label(i)
+			// CLA-639 M4: whether the NEXT member, or the fix phase after the
+			// panel, could still resume this run. The member's own claim is the
+			// live one when it observed any; a member that observed NOTHING (a
+			// launch failure) leaves the predecessor's carried claim in place, and
+			// that is still the run the panel is working. A claim the session
+			// settled itself, or one already handed back, is not live: nothing may
+			// be resumed from it, and only the live holder may close a round.
+			live := carried != nil && (end.claim == nil || end.claim.Claim.Held())
+			// A member ends the PANEL's stage when it recorded (its record passed
+			// the seam gate) or when no next member can run — the last member, a
+			// claim the failed member took with it, or a harness sequence-end.
+			// Only a failed member with a live claim and a member after it is
+			// skipped past.
+			//
+			// A member whose own round close failed DID record: the seam matched
+			// a record and the close is a later, separate step. Counting that as
+			// "recorded nothing" would name a reviewer INCOMPLETE and charge its
+			// failure streak for the plane's failure to release the round.
+			recorded := end.reviewRecorded || end.reviewCloseFailed
+			seqEnd := end.sequenceEnd
+			// A member that writes its durable record and only THEN ends the
+			// sequence (a usage limit or a transient failure) returns before the
+			// seam evaluates the record gate. Ask the plane the same question the
+			// seam asks, so the member is counted as recorded instead of unnamed
+			// INCOMPLETE and charged a failure for writing exactly what it owed
+			// (CLA-639 fix pass 4). Only the seam's own matcher inputs qualify: a
+			// verified tip (match it exactly) or the unverified mark (demand a
+			// tip). A carried claim with neither — a branch with no tip and no
+			// unverified mark, the shape the checkpoint-fact copy cannot fill
+			// when the claim is not held — would make the matcher accept any
+			// record by run and role, looser than the seam ever is, so it is left
+			// to the failure arm (CLA-639 fix pass 5).
+			if !recorded && seqEnd != nil && carried != nil && (carried.CheckpointTip != "" || carried.CheckpointUnverified) {
+				if rec, matched := d.panelMemberRecordMatch(ctx, t, *carried, role); matched {
+					recorded = true
+					if rec.Round > 0 {
+						panelRound = rec.Round
+					}
+				}
+			}
+			// endSequenceEnd is the shared tail of the panel's run-level endings:
+			// a usage limit or transient failure owes the run its wait after the
+			// sequence's handback, exactly as the single-review seam does.
+			endSequenceEnd := func() {
+				if seqEnd == nil {
+					return
+				}
+				limitWait = seqEnd.limitWait
+				if limitWait == nil {
+					transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
+					transientRung = d.noteResumedTransient(transientKey)
+				}
+			}
+			if recorded {
+				// The member recorded, so its failure streak is over (CLA-639
+				// M4): the next failure, if any, is not consecutive with the last.
+				d.panelMemberRecorded(member)
+			}
+			// A round that could not be closed is the single-review seam's
+			// fail-closed shape, for the panel: the member recorded, but the fix
+			// must not spawn against findings the plane still holds sealed. End
+			// the drain here (the deferred handback releases the claim exactly as
+			// the single-review close-failure path does) and say why.
+			if end.reviewCloseFailed {
+				log.Printf("%siteration %d: the %s panel member recorded, but the panel's round %d could not be closed (%s) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
+					labelOf(t), drainNum, member, panelRound, end.emptyWhy)
+				endSequenceEnd()
+				break
+			}
+			if !recorded {
+				reason := end.emptyWhy
+				switch {
+				case end.dead:
+					reason = "died producing nothing"
+				case seqEnd != nil && seqEnd.limitWait != nil:
+					reason = "hit a usage limit before recording"
+				case seqEnd != nil:
+					reason = "ended on a transient failure before recording"
+				case perr != nil:
+					reason = failureDetail(perr.Error())
+				case end.empty:
+					reason = end.emptyWhy
+				case reason == "":
+					reason = "recorded no durable review record"
+				}
+				panelIncomplete = append(panelIncomplete, role+": "+reason)
+				panelFailed[role] = reason
+				log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed", labelOf(t), drainNum, member, reason)
+				// CLA-639 M4: the member is a failure the operator has to be able
+				// to see, so it is counted in the run's per-harness dead-phase
+				// tally (CLA-402) — the rate that exists for exactly this shape —
+				// unless the seam's own classification already booked this exit
+				// (a dead session, or a held-but-empty one). And a member that
+				// keeps failing task after task is a fault in that member rather
+				// than bad luck: the streak is counted across tasks and said
+				// loudly once it reaches panelMemberFailBound. Deliberately NOT a
+				// park: one reviewer of several failing is not a reason to strand
+				// the panel's real findings.
+				if !end.deadBooked {
+					d.tallyEmpty(member, tc.HarnessFor(ph))
+				}
+				if n := d.panelMemberFailed(member); n >= panelMemberFailBound {
+					model, _ := tc.ModelForPhase(ph)
+					log.Printf("%siteration %d: WARNING — the %s review-panel member has recorded nothing on %d consecutive tasks (harness %s, model %s); the panel runs on and the fix applies what the other members found, but this member's harness, model or brief is not producing reviews — check its iteration logs",
+						labelOf(t), drainNum, member, n, tc.HarnessFor(ph), attributionOr(model, "harness default"))
+				}
+				if live && !end.panelLast {
+					// The next member resumes this claim: keep the panel going, and
+					// keep the round sealed — a close here would release the earlier
+					// members' findings to the next reviewer. ADVANCE, never re-run
+					// this member: the loop has no post statement, so a `continue`
+					// without the increment would re-spawn index i forever.
+					i++
+					continue
+				}
+				// The panel is over: nothing follows this member, or the claim it
+				// would have resumed is gone, or the harness ended the sequence.
+				// Release what the earlier members wrote rather than leave it
+				// sealed behind a lease that will lapse — BEFORE any handback,
+				// because the close is legal only while we are still the holder.
+				if panelRound > 0 && live {
+					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
+						log.Printf("%siteration %d: the panel's round %d could not be closed after %s failed (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
+							labelOf(t), drainNum, panelRound, member, cerr)
+						endSequenceEnd()
+						break
+					}
+				}
+				switch {
+				case live && panelRecorded && i+1 < len(phases):
+					// Earlier members DID record, so the panel hands over rather
+					// than ending: the phase after it (the fix) applies the merged
+					// list, which names this member as INCOMPLETE, and resumes the
+					// same run. Checked BEFORE the sequence-end arm on purpose — a
+					// member turned away by a usage limit is exactly the case the
+					// bar names ("a usage-limited or dead member does not stop the
+					// round"), and the sequence is not ending here: if the phase
+					// that follows hits the same limit it says so itself, with the
+					// wait that belongs to ITS end.
+					i++
+					continue
+				case seqEnd != nil:
+					// The run-level sequence-end break above was deferred for this
+					// member so the round could be released first; end the attempt
+					// here, with the run's wait machinery to follow.
+					endSequenceEnd()
+				}
+				break
+			}
+			panelRecorded = true
+			// This member recorded. A recorded mid-panel member whose session was
+			// then turned away by a run-level limit or transient failure continues
+			// the panel exactly as a failed one does: its deliverable is in the
+			// round, and the wait belongs to the end that actually stops the
+			// sequence.
+			//
+			// The LAST member is the panel's close, so its sequence-end must do
+			// what the failed last member's arm does: release the round while the
+			// holder is still live (a sealed round would be voided by the
+			// takeover, losing every member's record), then hand over to the fix
+			// that applies the merged list. A close that fails is fail-closed —
+			// the drain ends with the wait and no fix runs against a sealed
+			// round.
+			if seqEnd != nil {
+				if live && !end.panelLast && i+1 < len(phases) {
+					i++
+					continue
+				}
+				// Close only when the seam did not already close the round for
+				// this member. A session the adapter ALSO classifies as a limit
+				// or transient can exit cleanly (or be capped with WIP), so the
+				// seam runs first, matches the record and closes the round; the
+				// sequence-end is then read by the arm below. A second close is
+				// the plane's no_open_round, and failing closed on it would skip
+				// the fix against a round that is already released.
+				if live && panelRound > 0 && !end.reviewRecorded {
+					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
+						log.Printf("%siteration %d: the panel's round %d could not be closed after %s recorded but ended the sequence (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
+							labelOf(t), drainNum, panelRound, member, cerr)
+						endSequenceEnd()
+						break
+					}
+				}
+				if live && panelRecorded && i+1 < len(phases) {
+					i++
+					continue
+				}
+				endSequenceEnd()
+				break
+			}
 		}
 
 		// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
@@ -1748,7 +2076,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			}
 			verifyRoundsRun++
 			reason := nonConvergenceReason(end.verifyOpenMusts, end.verifyRound, verifyResolved)
-			capHit := end.verifyCounted >= config.ReviewRoundCap || verifyRoundsRun >= config.ReviewRoundCap
+			// The local fallback counts the same ROUNDS the plane does (CLA-686
+			// D2). A review cycle is one review round plus the verification
+			// rounds that follow it, and the plane's `counted` includes the
+			// review round — so comparing verification rounds ALONE against the
+			// cap allowed a cycle one round longer than the counted path, and
+			// the park then read "Round 4 of the 3-round cap". `+1` is the
+			// review round that opened this cycle.
+			localRounds := verifyRoundsRun + 1
+			capHit := end.verifyCounted >= config.ReviewRoundCap || localRounds >= config.ReviewRoundCap
 			if reason == "" && !capHit && fixIdx >= 0 && end.checkpoint && carried != nil {
 				for _, id := range end.verifyResolvedIDs {
 					verifyResolved[id] = true
@@ -1756,6 +2092,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				log.Printf("iteration %d: the %s phase closed round %d (%d non-void round(s) this cycle) with open MUST(s) [%s] — spawning another %s round against them",
 					drainNum, ph.Label(i), end.verifyRound, end.verifyCounted,
 					strings.Join(end.verifyOpenMusts, ", "), phases[fixIdx].Label(fixIdx))
+				// CLA-639: the merged panel list belongs to the FIRST fix after
+				// the panel, before any verification round has run. A verify
+				// rewind is a later fix round: its grading is the verifier's own
+				// record (plus the plane's open-MUST list), and reprinting the
+				// panel's list would replace the verifier's findings with a
+				// stale round. Clear the panel round so drainPhase falls back to
+				// the shipped single-review path unchanged.
+				panelRound = 0
 				i = fixIdx
 				continue
 			}
@@ -1792,6 +2136,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// implement" the reset is keyed to.
 		if ph.Name == config.ImplementPhaseName {
 			d.fleetDead[ti] = 0
+		}
+		// CLA-639: a member that DID record leaves its round open for the next
+		// member (the close belongs to the panel's last phase, not to each
+		// reviewer), so remember it — a later member that fails must still be able
+		// to release what the earlier ones wrote.
+		if panelMember && end.reviewRound > 0 {
+			panelRound = end.reviewRound
 		}
 		i++
 	}
@@ -1868,6 +2219,19 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	return tokens, cost, handoffs, stop, err
 }
 
+// panelState is what a phase following a review panel needs to know about it
+// (CLA-639): the round the panel's members' records landed in, and — for the
+// members that recorded NOTHING — why, keyed by reviewer role. Zero when the
+// phase does not follow a panel, or when the panel never got a record into a
+// round — which is exactly when there is no merged list to build.
+type panelState struct {
+	round int
+	// failed maps a member's role to the reason it recorded nothing, so the fix
+	// brief names the incomplete members AND what happened to them, not only
+	// that the list is short.
+	failed map[string]string
+}
+
 // phaseEnd is how a phase reports what it left behind, so drainPhases can decide
 // whether to run the next one and what is still owed a handback.
 //
@@ -1907,6 +2271,14 @@ type phaseEnd struct {
 	// final-phase death — so it deliberately does not feed the counters or the
 	// seam, whose !last gating is pinned by its own tests.
 	producedNothing bool
+
+	// deadBooked reports that the run's dead-phase tally (CLA-402) already
+	// counted THIS exit as a dead phase: either tallyDead's own predicate fired
+	// or the seam's held-but-empty branch booked it (tallyEmpty). The review
+	// panel's member handler books a failed member into the same tally (CLA-639
+	// M4), and this is how it avoids counting one exit twice — see
+	// notePanelMemberFailure's caller.
+	deadBooked bool
 
 	// session is the harness session this pass spawned, for the fleet record's
 	// sessions list (CLA-630): the phase label, the resolved harness and the
@@ -1957,6 +2329,28 @@ type phaseEnd struct {
 	// chain cap, max-iterations, the budget breaker — and either respawns on it
 	// or falls back to the standard path (CLA-352).
 	handoff string
+
+	// panelMember reports that this pass was one reviewer of a review panel
+	// (CLA-639), and panelLast that it was the panel's last member. drainPhases
+	// reads the pair to tell a skippable reviewer — a dead, capped or
+	// record-less member is recorded as failed and the round still closes — from
+	// a lone review phase, whose failure keeps the shipped fail-closed ending.
+	panelMember bool
+	panelLast   bool
+	// reviewRecorded reports that this pass's review seam gate PASSED — the
+	// member left a durable record behind. It is what the panel handler's
+	// "recorded or been recorded as failed" decision reads.
+	reviewRecorded bool
+
+	// reviewCloseFailed reports that this pass's review seam gate passed far
+	// enough to find a SEALED round, but the driver's own close of that round
+	// failed. The record exists (the reviewer did record), so the panel must not
+	// name the member INCOMPLETE or charge its failure streak; the drain must
+	// end without spawning the fix, because the fix would run against findings
+	// the plane still holds sealed. It is the close-failure half of
+	// reviewRecorded, kept separate because the evidence gate sets both to the
+	// same value everywhere else.
+	reviewCloseFailed bool
 
 	// reviewRound is the review round the seam gate MATCHED this pass (CLA-637),
 	// zero when the phase is not review-shaped or no record matched. The round is
@@ -2191,6 +2585,28 @@ func matchingReviewRecord(records []plane.ReviewRecordState, role, runID, tip st
 		}
 	}
 	return best, found
+}
+
+// panelMemberRecordMatch asks the plane whether a panel member's durable record
+// is already in the round, using the SAME evidence the review seam uses:
+// matchingReviewRecord keyed by this run and the member's positional role, at
+// the checkpoint's reviewed tip.
+//
+// The seam asks that question after a session ends. A member that writes its
+// record and only THEN ends the sequence — a usage limit or a transient failure
+// — returns from drainPhase before the seam runs, so the panel handler must ask
+// it here or the member is recorded as a failure while its record sits in the
+// round (CLA-639 fix pass 4). Best-effort: an unreadable task or an unwired
+// reader leaves the member classified as failed, exactly as before this check.
+func (d *Driver) panelMemberRecordMatch(ctx context.Context, t Target, res harness.Result, role string) (plane.ReviewRecordState, bool) {
+	if role == "" || res.Claim.TaskID == "" {
+		return plane.ReviewRecordState{}, false
+	}
+	st, ok := d.readTaskState(ctx, t, res.Claim.TaskID)
+	if !ok {
+		return plane.ReviewRecordState{}, false
+	}
+	return matchingReviewRecord(st.Reviews, role, res.Claim.RunID, res.CheckpointTip, res.CheckpointUnverified)
 }
 
 // runUUID is a run id's identity: the part before the first dot. Since CLA-509
@@ -2690,14 +3106,61 @@ func (d *Driver) readTaskOutcome(ctx context.Context, t Target, prev *harness.Re
 	return st.Outcome, true
 }
 
-// reviewBaselineReadAttempts bounds the baseline read's retries at review spawn
-// (CLA-663): the initial attempt plus two more. The failure this recovers from
-// is a plane blip — a dropped response, a read that timed out — and one retry
-// pair around a 20-second read is enough for that without turning an outage
-// into a long stall. Deliberately no sleep between attempts: the read's own
-// timeout is the pacing, and the whole point of a bounded retry here is to
-// avoid paying for a session, not to wait for a sick plane.
-const reviewBaselineReadAttempts = 3
+// planeSeamReadAttempts bounds the retries of a plane read whose failure fails
+// the sequence CLOSED (CLA-663 for the review baseline, CLA-686 D3 for the
+// verification round's spawn read): the initial attempt plus two more. The
+// failure this recovers from is a plane blip — a dropped response, a read that
+// timed out — and one retry pair around a 20-second read is enough for that
+// without turning an outage into a long stall. Deliberately no sleep between
+// attempts: the read's own timeout is the pacing, and the whole point of a
+// bounded retry here is to avoid paying for a session (or discarding one
+// already paid for), not to wait for a sick plane.
+const planeSeamReadAttempts = 3
+
+// planeTaskState reads the plane's record of one task, retrying a transient
+// failure up to `attempts` times. It is the single implementation behind every
+// seam read of the task — the review baseline and the verification round's
+// fail-closed reads share it precisely so their retry behaviour cannot drift
+// apart (CLA-686 D3: the verify spawn's read claimed to mirror the baseline's
+// and did not, one attempt against three).
+//
+// ok is false when there is no task id, no wired reader, or every attempt
+// failed; ErrNotWired is never retried, because asking an unwired client again
+// cannot wire it. `purpose` names the read in the log line only; the caller
+// decides what an unreadable task MEANS.
+func (d *Driver) planeTaskState(ctx context.Context, t Target, taskID string, attempts int, purpose string) (plane.TaskState, bool) {
+	if taskID == "" {
+		return plane.TaskState{}, false
+	}
+	src, wired := t.Releaser.(plane.TaskStateSource)
+	if !wired {
+		return plane.TaskState{}, false
+	}
+	lastErr := ""
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if ctx.Err() != nil {
+			return plane.TaskState{}, false
+		}
+		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		st, err := src.TaskState(sctx, taskID)
+		cancel()
+		switch {
+		case err == nil:
+			return st, true
+		case errors.Is(err, plane.ErrNotWired):
+			// No wiring to retry against; the caller refuses at its own guard.
+			return plane.TaskState{}, false
+		default:
+			lastErr = err.Error()
+		}
+	}
+	if attempts > 1 {
+		log.Printf("%scould not read the plane's record of %s %s, after %d attempts (%s)", labelOf(t), taskID, purpose, attempts, lastErr)
+	} else {
+		log.Printf("%scould not read the plane's record of %s %s (%s)", labelOf(t), taskID, purpose, lastErr)
+	}
+	return plane.TaskState{}, false
+}
 
 // readReviewBaseline reads the task's outcome as it stands BEFORE the review
 // phase spawns, so the seam can require the record to have changed. The task id
@@ -2706,41 +3169,20 @@ const reviewBaselineReadAttempts = 3
 // in hand.
 //
 // Best-effort like every other plane read, with one difference CLA-663 added:
-// the read is RETRIED up to reviewBaselineReadAttempts times, because a blip
-// here does not degrade to "judge on other evidence" — it fails the whole
-// sequence closed. A failure still returns read=false, and the caller refuses
-// to spawn the review rather than letting it run a session whose checkpoint the
-// seam would reject. No retries are spent on a target with no plane wiring or
-// no task id to ask about: those cannot be fixed by asking again.
+// the read is RETRIED up to planeSeamReadAttempts times, because a blip here
+// does not degrade to "judge on other evidence" — it fails the whole sequence
+// closed. A failure still returns read=false, and the caller refuses to spawn
+// the review rather than letting it run a session whose checkpoint the seam
+// would reject.
 func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
-	if prev == nil || prev.Claim.TaskID == "" {
+	if prev == nil {
 		return "", false
 	}
-	src, wired := t.Releaser.(plane.TaskStateSource)
-	if !wired {
+	st, ok := d.planeTaskState(ctx, t, prev.Claim.TaskID, planeSeamReadAttempts, "before the review phase spawned")
+	if !ok {
 		return "", false
 	}
-	lastErr := ""
-	for attempt := 1; attempt <= reviewBaselineReadAttempts; attempt++ {
-		if ctx.Err() != nil {
-			return "", false
-		}
-		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		st, err := src.TaskState(sctx, prev.Claim.TaskID)
-		cancel()
-		switch {
-		case err == nil:
-			return st.Outcome, true
-		case errors.Is(err, plane.ErrNotWired):
-			// No wiring to retry against; the gate refuses at the spawn guard.
-			return "", false
-		default:
-			lastErr = err.Error()
-		}
-	}
-	log.Printf("%scould not read the plane's record of %s before the review phase spawned, after %d attempts (%s) — the review→fix gate cannot judge its record against the task it found",
-		labelOf(t), prev.Claim.TaskID, reviewBaselineReadAttempts, lastErr)
-	return "", false
+	return st.Outcome, true
 }
 
 // closeReviewRound releases a review round's sealed findings (CLA-637) by
@@ -2765,29 +3207,28 @@ func (d *Driver) closeReviewRound(ctx context.Context, t Target, res harness.Res
 }
 
 // readTaskState reads the plane's record of one task, for the verification
-// round's reads (CLA-638). Best-effort like every other plane read: ok is false
-// when there is no task id, no wired reader, or the read fails. The caller
-// decides what an unreadable task means; for the verification seam it is a
-// failed round, because open MUSTs cannot be judged from a record that cannot
-// be read.
+// round's BEST-EFFORT reads (CLA-638): the fix phase's panel digest and its
+// open-MUST digest, where a failure degrades to "judge on other evidence" — the
+// fix brief's own instruction to read `reviews.openMustIds` itself. Best-effort
+// like every other plane read: ok is false when there is no task id, no wired
+// reader, or the read fails. The reads that fail the sequence CLOSED instead use
+// readTaskStateRetry, which shares this implementation with a retry bound.
 func (d *Driver) readTaskState(ctx context.Context, t Target, taskID string) (plane.TaskState, bool) {
-	if taskID == "" {
-		return plane.TaskState{}, false
-	}
-	src, wired := t.Releaser.(plane.TaskStateSource)
-	if !wired {
-		return plane.TaskState{}, false
-	}
-	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	st, err := src.TaskState(sctx, taskID)
-	if err != nil {
-		if !errors.Is(err, plane.ErrNotWired) {
-			log.Printf("%scould not read the plane's record of %s for the verification round (%v)", labelOf(t), taskID, err)
-		}
-		return plane.TaskState{}, false
-	}
-	return st, true
+	return d.planeTaskState(ctx, t, taskID, 1, "for the verification round")
+}
+
+// readTaskStateRetry is readTaskState for the verification round's FAIL-CLOSED
+// reads (CLA-686 D3): the round's spawn read, and the read the driver makes
+// after a closed round to judge its open-MUST set. A failure on any of them
+// fail-closes the sequence — the round cannot be told what to adjudicate, or
+// cannot be judged — so one plane blip there discards work that has already
+// been paid for: at the spawn, the fix round that just ran (the sequence ends,
+// the claim is released and the next claim re-runs the phases); after a closed
+// round, the verification round itself. That is exactly why the review baseline
+// read these claim parity with retries, and they now share its bound
+// (planeSeamReadAttempts) rather than taking a single attempt.
+func (d *Driver) readTaskStateRetry(ctx context.Context, t Target, taskID, purpose string) (plane.TaskState, bool) {
+	return d.planeTaskState(ctx, t, taskID, planeSeamReadAttempts, purpose)
 }
 
 // findingIDRound parses the round prefix out of a plane finding id
@@ -2942,6 +3383,195 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 // it sets the task back to ready. Any other wording is prose the plane does not
 // act on, so the round-cap park offers this one verbatim for the unpark path.
 const planeUnparkOption = "Set it back to `ready` — the blocker is gone, let the fleet try again"
+
+// mergedFindingsDigest is the fix phase's work list when the review ran as a
+// PANEL (CLA-639, B11): every finding from every member's released record, in
+// one list, with the union rule the design settled on (A1).
+//
+//   - Every MUST from ANY member is open and printed by its plane id. Consensus
+//     never filters a MUST out — the evidence that motivated the panel (section
+//     1.2) is two blockers a single reviewer missed entirely, so the union is the
+//     gate.
+//   - SHOULD and NIT are listed with the members that raised them, so the fixer
+//     can see which are opinions repeated by two reviewers and which are one
+//     reviewer's preference. They are recorded, never gating.
+//
+// The driver builds the list, never the fixer (B11/D3): the fixer applies it and
+// has no vote on severity — a MUST it disagrees with is refuted through the
+// plane, not downgraded here.
+//
+// expected is the panel's reviewer roles, in order, as the driver resolved them.
+// A role with no record in round is named INCOMPLETE: that is the member a
+// dead, capped or failed session never got to record, and the fixer must know
+// the list is the union of the reviewers that RAN, not of the panel that was
+// meant to. round is the panel's round; 0 means no record was matched at all.
+//
+// Round and status are BOTH filters (CLA-639 S1). The round is the one this
+// panel actually wrote: listing every released record would relist an earlier
+// cycle's findings after a verify rewind, and a member that recorded in an
+// earlier round would count as having recorded THIS one. The status filter
+// drops every finding the plane already shows settled — fixed, refuted or filed
+// by the fix phase's own findingUpdates, or by a verifier — because handing the
+// fixer a settled MUST back as open work is how a fix round spends itself
+// re-fixing what already landed. An open (`""`/`open`) finding is the list.
+//
+// Empty only when there is nothing to grade (no member recorded and none is
+// missing) — the shipped single-review path then keeps its own digest, so a
+// config with no panel is byte-for-byte unchanged.
+//
+// failed carries, per reviewer role, the reason that member recorded nothing
+// (CLA-639 M4): naming the missing member is not enough for the fixer to judge
+// whether the short list is bad luck or a member that never ran.
+func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, round int, failed map[string]string) string {
+	type merged struct {
+		finding plane.ReviewFindingState
+		record  plane.ReviewRecordState
+	}
+	byID := map[string]merged{}
+	var ids []string
+	recorded := map[string]bool{}
+	var unserved []string
+	settled := 0
+	for _, r := range records {
+		if r.State == "sealed" || r.State == "void" || (round > 0 && r.Round != round) {
+			continue
+		}
+		// Only a RELEASED record counts as this member having recorded — a sealed
+		// one exists but its findings are withheld, so the fixer is seeing the
+		// panel's shape without its content. It counts even when EVERY finding in
+		// it is settled: the member did record, and saying it did not would read
+		// as a lost reviewer.
+		recorded[r.ReviewerRole] = true
+		if r.FindingsTotal > len(r.Findings) {
+			unserved = append(unserved, fmt.Sprintf("%s: %d of %d finding(s) not served", r.ReviewerRole, r.FindingsTotal-len(r.Findings), r.FindingsTotal))
+		}
+		for _, f := range r.Findings {
+			// A finding the plane already shows settled is not open work. The
+			// statuses are the plane's own (CLA-636): "", "open", "fixed",
+			// "refuted", "filed", and any future one is treated as NOT open — a
+			// status the driver does not know is not evidence that work remains.
+			switch f.Status {
+			case "", "open":
+			default:
+				settled++
+				continue
+			}
+			if _, seen := byID[f.ID]; !seen {
+				ids = append(ids, f.ID)
+			}
+			byID[f.ID] = merged{finding: f, record: r}
+		}
+	}
+	var missing []string
+	for _, role := range expected {
+		if !recorded[role] {
+			missing = append(missing, role)
+		}
+	}
+	// Nothing to grade at all: no finding to list, no member missing, and nothing
+	// the plane shows settled either — the shipped single-review path then keeps
+	// its own digest, byte for byte. A round whose findings are ALL settled is
+	// not nothing: the fixer is told what this round holds and that every one of
+	// them is already answered.
+	if len(ids) == 0 && len(missing) == 0 && settled == 0 {
+		return ""
+	}
+	sort.Strings(ids)
+	sort.Strings(unserved)
+
+	var b strings.Builder
+	b.WriteString("The driver read the released durable review records of this review panel before this fix round. ")
+	b.WriteString("This is the MERGED list from every member that recorded: every MUST from ANY member is open and is yours to fix or refute by its plane id — a MUST raised by one reviewer is never dropped because another did not raise it. ")
+	b.WriteString("SHOULD and NIT findings are annotated with the members that raised them; they are recorded, never gating.\n")
+	if round > 0 {
+		fmt.Fprintf(&b, "The list is round %d's records only — an earlier round's findings, and anything already marked fixed, refuted or filed on the plane, are not relisted here.\n", round)
+	}
+	if settled > 0 {
+		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through update_task(review: {findingUpdates: [...]}), not by re-fixing it blind.\n", settled)
+	}
+	// CLA-639 M5: a panel member writes no `## Review` block — its record is the
+	// durable one — so the fixer must not wait for a block to preserve, and its
+	// own outcome is where this merged list reaches the task.
+	b.WriteString("No panel member wrote a `## Review` block into the task's outcome (each writes only its sealed record), so there is no block to keep verbatim and no legacy copy to rely on: your outcome is the only place this round's result reaches the task. Keep everything the outcome already carries unchanged, answer EVERY finding above in it by its plane id (severity, one line on what it was, and what you did about it), and add your `### Fixes` list.\n")
+	if len(missing) > 0 {
+		fmt.Fprintf(&b, "The panel was INCOMPLETE: %s recorded no review this round (dead, capped or failed before recording), so the merged list below is the union of the reviewers that ran, not of the panel that was configured.\n", strings.Join(missing, ", "))
+		for _, role := range missing {
+			if why := failed[role]; why != "" {
+				fmt.Fprintf(&b, "- %s: %s\n", role, why)
+			}
+		}
+	}
+	if len(unserved) > 0 {
+		fmt.Fprintf(&b, "The plane did not serve every finding (%s); read the full records before you close the round.\n", strings.Join(unserved, "; "))
+	}
+	b.WriteString("\n")
+	for _, sev := range []string{"must", "should", "nit"} {
+		var group []merged
+		for _, id := range ids {
+			if strings.EqualFold(byID[id].finding.Severity, sev) {
+				group = append(group, byID[id])
+			}
+		}
+		if len(group) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "%s (%d):\n", strings.ToUpper(sev), len(group))
+		for _, m := range group {
+			b.WriteString(mergedFindingLine(m.finding, m.record))
+			if sev != "must" {
+				fmt.Fprintf(&b, "  [raised by %s]\n", m.record.ReviewerRole)
+			}
+		}
+	}
+	b.WriteString("\n")
+	return b.String()
+}
+
+// mergedFindingLine is one finding as the merged list prints it: its plane id,
+// reviewer, location, summary and required fix — the same fields the shipped
+// digest prints, plus the member, because "who raised this" is the field the
+// panel exists to make visible.
+func mergedFindingLine(f plane.ReviewFindingState, r plane.ReviewRecordState) string {
+	loc := f.File
+	if f.Line > 0 {
+		loc = fmt.Sprintf("%s:%d", f.File, f.Line)
+	}
+	if loc == "" {
+		loc = "(no location)"
+	}
+	summary := strings.TrimSpace(f.Summary)
+	required := strings.TrimSpace(f.RequiredFix)
+	if required == "" {
+		required = "(none stated)"
+	}
+	line := fmt.Sprintf("- %s [%s, round %d, %s] %s Required fix: %s", f.ID, r.ReviewerRole, r.Round, loc, summary, required)
+	if evidence := strings.TrimSpace(f.Evidence); evidence != "" {
+		kind := strings.TrimSpace(f.EvidenceKind)
+		if kind == "" {
+			kind = "evidence"
+		}
+		line += fmt.Sprintf(" [%s: %s]", kind, evidence)
+	}
+	return line + "\n"
+}
+
+// panelRoles lists the reviewer roles a fix phase's prompt should treat as the
+// panel: the member phases immediately before it in the CAPTURED sequence.
+// Empty when the phase does not follow a panel, which is the shipped
+// single-review shape.
+//
+// The role is POSITIONAL (`reviewerRoleFor`), never the member's log label. The
+// durable record and the seam gate are keyed on the positional role, so a named
+// member (`alpha`) writes `review-1`; returning the label here would make the
+// merged list look for an `alpha` record and report a member that recorded as
+// INCOMPLETE (CLA-639).
+func panelRoles(phases []config.Phase, fixIdx int) []string {
+	var roles []string
+	for i := fixIdx - 1; i >= 0 && phases[i].IsPanelMember(); i-- {
+		roles = append([]string{reviewerRoleFor(phases, i)}, roles...)
+	}
+	return roles
+}
 
 // openMustFixDigest is the fix phase's work list across rounds (CLA-671): every
 // MUST the plane shows open on any released record, with its detail. Empty when
@@ -3270,7 +3900,7 @@ func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	phases := d.targetCfg(t).EffectivePhases()
 	ph := phases[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior, phases)
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior, phases, panelState{})
 	return tokens, cost, stop, err
 }
 
@@ -3307,7 +3937,13 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // position, the "PHASE i of N" text rewritten — while drainPhases still walks
 // the captured slice. The rule the capture enforces: a RELOAD takes effect at
 // the next drain, never mid-sequence.
-func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend, phases []config.Phase) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+//
+// panel is what the panel stage this phase follows left behind (CLA-639): the
+// round its members' records landed in, zero when no panel ran or no member
+// recorded. It is the fix phase's grading input (mergedFindingsDigest reads
+// that round and no other); the unphased drain and a phase that does not follow
+// a panel pass the zero value.
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend, phases []config.Phase, panel panelState) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	tc := d.targetCfg(t)
 	// captured is this phase as the sequence was captured at drain start, before
 	// a handoff respawn replaced ph.Prompt with the successor's continuation: the
@@ -3332,6 +3968,30 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	}
 	requireReviewRecord := config.ReviewShaped(captured.Prompt)
 	isVerify := config.VerifyShaped(captured.Prompt)
+	// CLA-639: whether this pass is one reviewer of a review panel, and whether
+	// it is the LAST one. The last member is the panel's seam: it runs the same
+	// record gate as the shipped single review, and it must run it even when the
+	// sequence ends there (a panel with no fix phase after it) — the round close
+	// and the merged list are owed to whoever reads the records next.
+	//
+	// A panel member is a review-shaped phase the operator did not write one at
+	// a time: EffectivePhases expanded one `review` into N. The distinction
+	// matters because the members are skippable — a dead or capped member is
+	// recorded as failed and the round still closes — while a lone review phase
+	// is the sequence's only record and keeps the shipped fail-closed path.
+	panelMember := captured.IsPanelMember()
+	panelLast := false
+	// A BRANCHLESS checkpoint runs exactly ONE reviewer: the record this shape
+	// can write is the legacy `## Review` block, not a durable one, so
+	// drainPhases skips the members after the first. That first member is the
+	// panel's last member in every sense the seam cares about — its record is
+	// the panel's only record and the "no member recorded → no fix" rule must
+	// apply to it — so the position test alone (`no review-shaped phase follows`)
+	// is not enough here.
+	branchlessPanel := panelMember && prev != nil && prev.Claim.Branch == ""
+	if panelMember && (!nextReviewShaped || branchlessPanel) {
+		panelLast = true
+	}
 	// The review seam's freshness baseline, read ONCE before the attempt ladder:
 	// the phase's outcome as the review found it. A handoff respawn re-enters
 	// drainPhase with the same carried claim and takes a fresh baseline, so a
@@ -3350,6 +4010,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// name, read from the same resolved config the brief is built from, so the
 	// session records under exactly the role the seam will match.
 	review := reviewGate{required: requireReviewRecord}
+	end.panelMember = panelMember
+	end.panelLast = panelLast
 	if review.required {
 		review.role = reviewerRoleFor(phases, phaseIdx)
 		review.baseline, review.read = d.readReviewBaseline(ctx, t, prev)
@@ -3420,6 +4082,27 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			"the fix brief will carry the raw record without the driver's structural grading"); read {
 			fixGrading = reviewFindingsDigest(outcome)
 		}
+		// CLA-639: when the fix follows a review PANEL, the driver's list is the
+		// merged one (B11) — every member's released record for the panel's round,
+		// MUSTs open from any member, SHOULD/NIT annotated with who raised them,
+		// and the members that never recorded named as incomplete. It REPLACES the
+		// legacy block's grading: the panel writes no block, so the legacy digest
+		// above has nothing to grade, and the fixer must not be handed one
+		// reviewer's list as though it were the panel's. The read is the same
+		// get_task; a failed read leaves the legacy digest above in place, exactly
+		// as before the panel existed.
+		//
+		// panel.round is the round the panel's records landed in (CLA-639 S1), and
+		// it is the ONLY round the merged list may read: with round 0 the digest
+		// would relist an earlier cycle's findings after a verify rewind and count
+		// a member that recorded in an earlier round as having recorded this one.
+		if roles := panelRoles(phases, phaseIdx); len(roles) > 0 && panel.round > 0 && prev != nil && prev.Claim.TaskID != "" {
+			if st, read := d.readTaskState(ctx, t, prev.Claim.TaskID); read {
+				if merged := mergedFindingsDigest(st.Reviews, roles, panel.round, panel.failed); merged != "" {
+					fixGrading = merged
+				}
+			}
+		}
 	}
 	// CLA-671: on a fix round after a verification round, the newest record
 	// holds only the verifier's NEW findings, so a MUST an earlier round left
@@ -3436,15 +4119,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// their findings, read from the plane's released records before the session
 	// spawns. Fail-closed: a round that cannot be told what it must adjudicate is
 	// refused before it is paid for, the same disposition CLA-663 gives the
-	// review baseline. The task id comes from the carried claim; the phase is
-	// resumed, so it is exact.
+	// review baseline — which includes its RETRY (CLA-686 D3): one plane blip
+	// here would otherwise discard the fix round that just ran and hand the
+	// sequence back to the queue, so this read shares the baseline's bound
+	// instead of taking a single attempt. The task id comes from the carried
+	// claim; the phase is resumed, so it is exact.
 	verifyDigest := ""
 	if isVerify {
 		taskID := ""
 		if prev != nil {
 			taskID = prev.Claim.TaskID
 		}
-		st, read := d.readTaskState(ctx, t, taskID)
+		st, read := d.readTaskStateRetry(ctx, t, taskID, "before the verification round spawned")
 		if !read {
 			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's record could not be read, so the round would not know what to adjudicate — the sequence ends here; the claim is released when it is releasable, else left to lapse into a takeover",
 				labelOf(t), drainNum, ph.Label(phaseIdx))
@@ -3489,6 +4175,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// shape of a provider degrading: real 5xx blips interleaved with stream drops
 	// nothing has a pattern for.
 	unclassified := 0
+	// The spend of THIS phase pass, summed across the ladder's attempts
+	// (CLA-691). One fleet-record entry is published per pass, and a pass that
+	// retried is several paid sessions, so every attempt the ladder spawned is
+	// folded in here where the entry is built.
+	pass := sessionSpend{}
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
 		// just waited — a supervised wait on a usage limit, an exponential backoff
@@ -3678,9 +4369,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// tally's dead classification deliberately drops the `!last` conjunct
 		// that guards the checkpoint veto — a dead LAST phase is still a dead
 		// phase, and the rate is a measurement, not a seam decision (see
-		// deadtally.go).
-		d.tallyDead(ph.Label(phaseIdx), tc.HarnessFor(ph), res, capped, ceiling, wallclock)
+		// deadtally.go). The report rides the end (CLA-639): the panel's member
+		// handler books a failed member into the same tally, and must not count
+		// an exit this call already booked.
+		bookedDead := d.tallyDead(ph.Label(phaseIdx), tc.HarnessFor(ph), res, capped, ceiling, wallclock)
 		end = phaseEnd{}
+		end.deadBooked = bookedDead
+		// CLA-639: the panel identity of this pass, for drainPhases' member
+		// handler. Set from the CAPTURED phase (a handoff respawn replaced
+		// ph.Prompt, never its identity), so a skipped member is recorded against
+		// the reviewer that was meant to run.
+		end.panelMember = panelMember
+		end.panelLast = panelLast
 		if res.Claim.TaskID != "" {
 			end.claim = &res
 		}
@@ -3688,10 +4388,22 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// the spawn line above used — the phase's label, the phase's resolved
 		// harness, and the resolved model (empty when the harness default
 		// applied; never guessed). Set on every attempt, so the LAST attempt's
-		// values are the ones that ride: a retry within the ladder is the same
-		// session re-run, and the only way its values can differ between
-		// attempts is a reload landing mid-ladder.
-		end.session = &fleet.Session{Phase: ph.Label(phaseIdx), Harness: a.Name(), Model: inv.Model}
+		// values are the ones that ride: the entry describes the PASS, and a
+		// retry within the ladder cannot change what the pass ran — only a
+		// reload landing mid-ladder can.
+		//
+		// CLA-691: its spend is filled in later, at the point the loop counts the
+		// attempt's spend toward the iteration (recordPassSpend), so the two can
+		// never disagree about which attempts were counted. The pass sums every
+		// counted attempt, because the loop counts each one as its own paid
+		// session: an entry reporting only the surviving attempt's money would
+		// not add up to the iteration total.
+		end.session = &fleet.Session{
+			Phase:   ph.Label(phaseIdx),
+			Harness: a.Name(),
+			Model:   inv.Model,
+			RunID:   sessionRunID(res, prev),
+		}
 		// The wider classification rides the end for the fleet record only — see
 		// phaseEnd.producedNothing.
 		end.producedNothing = producedNothing
@@ -3711,9 +4423,19 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			log.Printf("%siteration %d: the verification round emitted a handoff block; verification rounds do not chain — the driver judges the round's record and decides whether another fix runs", labelOf(t), drainNum)
 			handoff = ""
 		}
+		if panelMember && handoff != "" {
+			log.Printf("%siteration %d: the %s panel member emitted a handoff block; panel members do not chain — a successor would continue this reviewer's role, but the phase after it is the next member, and the member's record is its deliverable", labelOf(t), drainNum, ph.Label(phaseIdx))
+			handoff = ""
+		}
 		// The seam contender: an orderly end still holding the task, minus the dead
 		// signature. This is the gate the incident put in question — see below.
 		canCheckpoint := res.Untrusted == "" && checkpointable && res.Claim.Held() && !dead
+		// CLA-639: a panel member may be the LAST phase of the sequence when the
+		// operator wrote no fix after the review, and its record gate must still
+		// run — that is how the round closes and how the merged list is released.
+		// `panelLast` (rather than !last) admits it, and only its review record
+		// gate: a settled or non-checkpointable exit is excluded exactly as before.
+		reviewable := (!last || panelLast) && canCheckpoint
 		// CLA-457: held-ness alone must never advance the seam. Since CLA-358 the
 		// driver's lease renewer renews a claim for a session's whole lifetime, so
 		// ANY session that claimed ends held — "still holding" is a constant, not
@@ -3755,7 +4477,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					// nothing downstream may try to close it again.
 					end.reviewRound = 0
 					end.verifyRound = review.round
-					if st, read := d.readTaskState(ctx, t, res.Claim.TaskID); !read {
+					// Fail-closed, so retried like the spawn read (CLA-686 D3):
+					// one blip here ends a sequence the verification round has
+					// already been paid for.
+					if st, read := d.readTaskStateRetry(ctx, t, res.Claim.TaskID, "after the verification round closed"); !read {
 						evidenceOK = false
 						evidenceWhy = "the task could not be read after the verification round closed, so its open MUSTs cannot be judged"
 					} else {
@@ -3774,9 +4499,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// the hand-over log needs: a branchless verifier that recorded its
 				// pass but left the task in_progress must be named loudly, exactly
 				// as the id-based shape names it. A failed read ends the sequence
-				// fail-closed, like every other unreadable seam.
+				// fail-closed, like every other unreadable seam — so it retries
+				// like them too (CLA-686 D3).
 				end.verifyRound = 0
-				if st, read := d.readTaskState(ctx, t, res.Claim.TaskID); !read {
+				if st, read := d.readTaskStateRetry(ctx, t, res.Claim.TaskID, "after the branchless verification round"); !read {
 					evidenceOK = false
 					evidenceWhy = "the task could not be read after the branchless verification round, so its hand-over cannot be judged"
 				} else {
@@ -3798,7 +4524,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				end.claim.CheckpointUnverified = evidenceUnverified
 				end.claim.CheckpointTip = evidenceTip
 			}
-		} else if !last && canCheckpoint {
+		} else if reviewable {
 			end.branch, evidenceTip, evidenceOK, evidenceUnverified, evidenceWhy = d.checkpointEvidence(ctx, t, res, inv.WorkDir, &review)
 			// The matched round rides the end (CLA-637): drainPhases closes it if
 			// the handoff guards refuse the respawn this detected handoff asked
@@ -3818,9 +4544,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// findings). A close that fails REFUSES the checkpoint, fail-closed:
 			// the alternative is a fix phase spawned against findings the plane
 			// still has sealed, which can only park the task.
+			//
+			// CLA-639: for a panel, the stage is the whole panel. Every member
+			// but the last leaves the round sealed here; the last member's close
+			// is what releases them all to the fix phase, and it happens in the
+			// SAME condition below because nextReviewShaped is false only for
+			// the last member (the panel's last phase, when no fix follows).
 			if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && handoff == "" && !nextReviewShaped {
 				if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
 					evidenceOK = false
+					end.reviewCloseFailed = true
 					evidenceWhy = fmt.Sprintf("review round %d could not be closed (%v) — refusing the checkpoint, because the fix phase would be spawned against findings the plane still has sealed", review.round, cerr)
 				}
 			}
@@ -3832,9 +4565,19 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// the classification of record, and for a handoff it is what lets
 		// drainPhases downgrade the exit when the handoff is refused. An honored
 		// handoff never reaches that downgrade — the phase continues first.
-		empty := !last && canCheckpoint && !evidenceOK
+		//
+		// CLA-639: a panel member is not special-cased here. A member whose
+		// review record did not pass the gate is a FAILED member, and the panel
+		// handler in drainPhases is what records it as failed and keeps the round
+		// going; the flag is shared with the shipped single-review path, which
+		// still refuses to advance on it.
+		empty := reviewable && !evidenceOK
 		end.empty = empty
 		end.emptyWhy = evidenceWhy
+		// CLA-639: whether this pass left a review RECORD behind, for the panel's
+		// member handler. It is the seam gate's verdict, not the round number: a
+		// member whose envelope was sealed and closed still recorded.
+		end.reviewRecorded = reviewable && review.required && evidenceOK
 		// A handoff holds the seam OPEN even without evidence: its successor
 		// continues THIS phase's job, so it is not the false-premise advance the
 		// gate exists to stop. The evidence gate governs only the bare seam
@@ -3845,7 +4588,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// even though it is the last phase, because the driver spawns another
 		// fix against it. A clean round does not hold.
 		verifyNeedsHold := isVerify && end.verifyChecked && end.verifyFailure == "" && len(end.verifyOpenMusts) > 0
-		if ((!last || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK)) ||
+		if ((!last || panelLast || handoff != "") && canCheckpoint && (handoff != "" || evidenceOK)) ||
 			(verifyNeedsHold && canCheckpoint) {
 			end.checkpoint = true
 			end.handoff = handoff
@@ -3878,6 +4621,40 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// read (branchless or unverified), which is when no tip can be
 				// demanded of the reviewer either.
 				end.claim.CheckpointTip = evidenceTip
+				// CLA-685: a HANDOFF is the one checkpoint this session's own
+				// exit did not earn — it holds only because the successor
+				// continues THIS phase, which the claim carried in as `prev`
+				// opened. So when the exit evidenced NOTHING (evidenceOK false)
+				// the verdict just folded above is its REFUSAL's, not a
+				// checkpoint's: the record gate zeroes the unverified mark even
+				// though the branch leg had established it. The successor then
+				// reads carried.CheckpointUnverified as false, is handed the
+				// VERIFIED continuation - "The driver verified the origin
+				// remote's tip ... as {{reviewedTip}}" - for a tip this driver
+				// never read, and the placeholder stays literal, since it is
+				// filled only when the tip is non-empty.
+				//
+				// The exit's verdict about the checkpoint is empty exactly when
+				// it read no tip of its own: an evidenced branch leg always
+				// brings a tip (the verified form), and a non-empty tip implies
+				// unverified=false — the verified continuation, whose
+				// {{reviewedTip}} that tip then fills. So the opening
+				// checkpoint's mark is the only true one there, and it rides
+				// forward, as the panel-member block in drainPhases rides a
+				// claim's resumption facts onto the claim it hands on.
+				//
+				// The tip is carried only for the branch it was read for — it
+				// is `prev`'s, and a claim that now names another one must not
+				// be handed a tip that never belonged to it. The BRANCH stays as
+				// folded: it is the live truth about where the work is. An exit
+				// that WAS evidenced keeps its own verdict untouched, so the
+				// verified path is unaffected.
+				if handoff != "" && !evidenceOK && prev != nil && end.claim.CheckpointTip == "" {
+					end.claim.CheckpointUnverified = prev.CheckpointUnverified
+					if end.claim.Claim.Branch == prev.Claim.Branch {
+						end.claim.CheckpointTip = prev.CheckpointTip
+					}
+				}
 			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
@@ -3904,7 +4681,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// `released` records only a handback that could actually have happened:
 			// a zero Result from a failed launch releases nothing, and reporting it
 			// as released would erase a predecessor's claim that is still live.
-			end.released = res.Claim.Held()
+			//
+			// CLA-639 M4: a PANEL MEMBER that ended without a record does NOT hand
+			// its claim back here. Everything the panel handler must do about a
+			// failed member needs the claim to still be live: closing the round (only
+			// the LIVE holder may, and a failed close would leave the earlier
+			// members' findings sealed behind a lease that is already gone) and
+			// handing the next member — or the fix phase — the same run to resume.
+			// A member that genuinely lost the claim is not special-cased: Held() is
+			// false, so there is nothing to release either way. The handler owns the
+			// handback for this shape, and takes it AFTER the close (see
+			// drainPhases).
+			if !panelMember {
+				end.released = res.Claim.Held()
+			}
 			end.dead = dead
 			if end.empty {
 				log.Printf("%siteration %d: the %s phase ended holding %s with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns",
@@ -3912,7 +4702,30 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// Book it into the dead-phase tally (CLA-457): this is the
 				// "produced nothing" class the rate exists to measure, and a
 				// fleet-wide silent EOT is exactly the incident in question.
-				d.tallyEmpty(ph.Label(phaseIdx), tc.HarnessFor(ph))
+				//
+				// Unless the session's exit was already booked as the CLA-402
+				// SILENT death: a LAST phase can wear both shapes at once (its
+				// finish reason is "unknown" AND its evidence gate failed), and
+				// one session may not read as two dead ones out of one run —
+				// CLA-639 M4 needs this booking to be exactly one per failed
+				// panel member, and the operator's rate needs it to be honest.
+				//
+				// And unless this is a panel member whose review close failed
+				// (CLA-639 fix pass 3): a member that WROTE its record and whose
+				// round the plane then refused to release produced a review — the
+				// empty shape here would report it as a session that died
+				// producing nothing, which is the opposite of what happened. The
+				// skip is PANEL-ONLY: the plain single review keeps the untaxed
+				// CLA-457 booking it has had since the base commit, so an
+				// operator's dead-phase rate reads the same with no panel
+				// (CLA-639 fix pass 4).
+				if !bookedDead && !(panelMember && end.reviewCloseFailed) {
+					d.tallyEmpty(ph.Label(phaseIdx), tc.HarnessFor(ph))
+					// CLA-639 M4: this exit is booked, so the panel's member
+					// handler must not book it again when it records the member
+					// as failed.
+					end.deadBooked = true
+				}
 			}
 			// last && a clean exit is the shape CLA-384 is about: the phase ran to
 			// completion, pushed, and simply did not declare. A non-zero exit reached
@@ -3924,7 +4737,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// — the thing a bounded retry can re-claim. A release the plane refused
 			// (or that never ran) leaves the lease live, so a retry session would
 			// only be refused and burned.
-			end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+			if !panelMember {
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+			}
 
 			// CLA-451: the blind-spot convergence. Everything above learns about
 			// claims by parsing clankerbar tool calls out of the stream; a session
@@ -4038,6 +4853,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			if res.Untrusted == "" {
 				tokens += res.Tokens
 				cost += res.CostUSD
+				recordPassSpend(end.session, a, &pass, &res)
 				d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 			}
 			// A run failure that was not an exit status — a launch failure, or one
@@ -4053,6 +4869,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		if res.Untrusted != "" {
 			// held is nil here by construction — an untrusted stream never holds a
 			// phase open — so the sequence ends and nothing is carried forward.
+			//
+			// CLA-691: no spend figures were recorded on this pass's session entry
+			// either (recordPassSpend runs only where the loop counts an attempt),
+			// so the record says "unknown" instead of publishing a FLOOR from a
+			// stream with a hole in it as if it were a report.
 			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
@@ -4065,6 +4886,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
+		// The pass's own session entry takes the same figures, in the same breath
+		// (CLA-691): every attempt the loop counts is money the record attributes
+		// to the pass, and none it refuses is.
+		recordPassSpend(end.session, a, &pass, &res)
 		d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
@@ -5700,13 +6525,26 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// hand over). The mode is selected by the resolved prompt text, not by a
 		// flag, so a custom prompt is never rewritten into a shipped one.
 		prompt := inv.Prompt
+		// CLA-639 M5: a panel MEMBER writes the durable record and nothing else
+		// on the task, so its brief is the panel variant — same core, no outcome
+		// write. A branchless checkpoint has no panel variant and must not be
+		// given one: its record IS the legacy block (no live holder accepts a
+		// durable one), so the first member keeps the shipped no-code brief and
+		// the driver skips the members after it (see drainPhases).
+		panelMember := phaseIdx < len(phases) && phases[phaseIdx].IsPanelMember()
 		switch {
 		case prompt == config.ReviewOnlyBrief():
 			switch {
 			case prev.Claim.Branch == "":
 				prompt = config.NoCodeReviewOnlyBrief()
 			case prev.CheckpointUnverified:
-				prompt = config.UnverifiedReviewOnlyBrief()
+				if panelMember {
+					prompt = config.PanelMemberUnverifiedReviewOnlyBrief()
+				} else {
+					prompt = config.UnverifiedReviewOnlyBrief()
+				}
+			case panelMember:
+				prompt = config.PanelMemberReviewOnlyBrief()
 			}
 		case prompt == config.BuiltinReviewBrief():
 			switch {
@@ -5758,8 +6596,18 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// in flight, nor attribute the previous phase to a shape it never ran.
 	phaseTotal := len(phases)
 	prevHarness, prevModel := "", ""
-	if phaseIdx > 0 && phaseIdx-1 < len(phases) {
-		prevPh := phases[phaseIdx-1]
+	prevIdx := phaseIdx - 1
+	// CLA-639: inside a review panel every member's predecessor is the member
+	// before it, but the review briefs name {{prevHarness}}/{{prevModel}} as the
+	// IMPLEMENTER whose work is being judged. Walk back past the panel to the
+	// last non-review phase, so member 2 does not accuse member 1 of having
+	// implemented the branch. For the shipped single review this changes
+	// nothing: the phase before it is the implement phase.
+	for prevIdx >= 0 && config.ReviewShaped(phases[prevIdx].Prompt) && phases[prevIdx].IsPanelMember() {
+		prevIdx--
+	}
+	if prevIdx >= 0 && prevIdx < len(phases) {
+		prevPh := phases[prevIdx]
 		prevHarness = tc.HarnessFor(prevPh)
 		prevModel, _ = tc.ModelForPhase(prevPh)
 	}

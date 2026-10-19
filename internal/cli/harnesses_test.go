@@ -13,7 +13,10 @@ import (
 // run-wide `harness` never names, so a preflight that reports only that one
 // certifies half the run and stays green about the other half.
 
-// mixedDoctorCfg is implement-on-opencode / review-on-claude, validated.
+// mixedDoctorCfg is implement-on-opencode / review-on-claude, validated: the
+// legacy two-phase shape, one review session on the run's claude harness, which
+// is what the per-harness budget/ceiling reasoning here is about (a
+// `review_panel` would add harnesses this test is not about).
 func mixedDoctorCfg(t *testing.T) *config.Config {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
