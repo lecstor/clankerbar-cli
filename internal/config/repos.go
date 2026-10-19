@@ -191,27 +191,20 @@ func displayDir(dir string) string {
 }
 
 // validateRepos is the structural half of repo-map validation, run by Validate:
-// keys must be non-blank; a VALUE may be empty, which means "the fleet derives
-// this identity's checkout itself" (CLA-678): under the per-project layout a
-// repo the project names is materialized at <project root>/<repo name>, so an
-// operator who has adopted the layout has no path to write and must not be made
-// to invent one — a value that is not written cannot go stale and silently
-// re-point a session at the developer's own clone. Resolution already handles
-// it: lookupCheckout skips a blank value and falls through to the
-// workdir-convention steps, which is exactly the derived path. It deliberately
-// does NOT stat the
+// keys and values must be non-blank. It deliberately does NOT stat the
 // configured paths - a checkout that appears later (or sits on another machine
 // sharing the config) must not refuse every run; resolution fails the iteration
 // only when a session actually needs it, and doctor reports each entry's
 // reachability before that. A primary naming no declared key is likewise left
 // alone: the convention steps of the resolution can still legitimately match it.
 func validateRepos(repos map[string]string, label string) error {
-	for k := range repos {
+	for k, v := range repos {
 		if strings.TrimSpace(k) == "" {
 			return fmt.Errorf("%s: repos has an entry with an empty name", label)
 		}
-		// An empty value is not an error: it is the per-project layout's
-		// spelling of "the fleet clones this one" — see the doc above.
+		if strings.TrimSpace(v) == "" {
+			return fmt.Errorf("%s: repos.%s has an empty path", label, k)
+		}
 	}
 	return nil
 }

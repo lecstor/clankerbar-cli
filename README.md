@@ -774,7 +774,13 @@ one directory per project, and clones into it:
 
 Each repo the project names — the keys of its `repos` map (whose VALUES are
 optional local-path overrides, not identities) plus its `primary_repo` — is
-derived as `<root>/<project slug>/<repo name>`. A repo that is **not there yet
+derived as `<root>/<project slug>/<repo name>`. A bare `repos` key that names
+the same checkout as one of the project's full `owner/name` identities is that
+identity spelled short and is materialized under the full name, which is the
+only spelling a clone URL can come from; two DIFFERENT full identities that
+share a name (`acme/api` and `other/api`) cannot both live at
+`<project root>/api`, and the derivation refuses the instance naming both rather
+than cloning one over the other. A repo that is **not there yet
 is cloned** from the plane's repo identity, so nobody has to check anything out
 for the fleet first; the clone reads the run's git credential (the same
 `gh auth token --user <owner>` scoping the delivery verifier uses, and the token
@@ -785,10 +791,14 @@ operator's.
 Derivation fails closed, on the conditions learned from the CLA-441
 wrong-workdir failure. A directory that **exists** is never replaced, adopted or
 cloned over: if it is not a checkout of the expected repo — a plain directory, a
-file, a checkout of a different repo, a repo whose origin cannot be attributed —
-that daemon is **refused**, the path tried is reported, and the supervisor's own
-working directory is never used as a fallback. A failed clone leaves nothing
-behind (it lands in a temporary sibling and is renamed into place). With the
+file, a symlink, a checkout of a different repo, a repo whose origin cannot be
+attributed — that daemon is **refused**, the path tried is reported, and the
+supervisor's own working directory is never used as a fallback. A **symlink** at
+the project root, a repo clone or the `worktrees/` directory is refused too: it
+would put the project's clones, its worktrees and the sessions' scope outside the
+project root the layout promises, so those are always real directories. A failed
+clone leaves nothing behind (it lands in a temporary sibling and is renamed into
+place, and only onto a path nothing else created in the meantime). With the
 variable unset, derivation is off and children run on the base config's own
 workdirs, exactly as before.
 
@@ -798,9 +808,9 @@ clones one in when it is missing. They are not a place to keep work that is not
 pushed. The derivation writes `project_root: true` into the generated config,
 which is what widens each session's permission scope to the whole project root
 (see "What each harness receives" below) and what `doctor`'s `project root`
-check verifies: every configured repo resolves INSIDE the project root, the
-clone's origin names the repo it sits under, and the worktree directory exists
-and is inside the root.
+check verifies: every configured repo resolves INSIDE the project root, no path
+in the layout is a symlink out of it, the clone's origin names the repo it sits
+under, and the worktree directory exists and is inside the root.
 
 **Working in the fleet's clones, or not.** The choice is yours:
 
@@ -1710,20 +1720,6 @@ replace the top-level ones:
 `repo` field carries: the full `owner/name`, or just the bare name. The value is
 a directory path, relative to the workdir or starting with `~`. It holds paths,
 never credentials.
-
-The value may be **empty**, which means "the fleet derives this one": under the
-per-project layout (see "Workdir derivation" above) the repo is cloned to
-`<project root>/<repo name>` and that is where sessions for it start. Write the
-keys you want materialized and leave the values out — a path you do not write
-cannot go stale and quietly point a session at your own clone:
-
-```jsonc
-{
-  "project_root": true,
-  "repos": { "lecstor/clankerbar": "", "lecstor/clankerbar-cli": "" },
-  "primary_repo": "lecstor/clankerbar-cli"
-}
-```
 
 **`primary_repo`** names where a session starts when its task carries NO repo:
 a `repos` key, or any identity resolvable by the same steps below. With exactly
