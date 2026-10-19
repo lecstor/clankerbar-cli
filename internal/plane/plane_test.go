@@ -467,3 +467,126 @@ func TestHeartbeat_NotWiredDegradesCleanly(t *testing.T) {
 		t.Errorf("err = %v, want ErrNotWired", err)
 	}
 }
+
+// --- CLA-708: ending a dead session's lease ---------------------------------
+
+func TestExpireLease_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1"); err != nil {
+		t.Fatalf("ExpireLease: %v", err)
+	}
+	params, _ := got.body["params"].(map[string]any)
+	if params["name"] != "update_task" {
+		t.Errorf("tool = %v, want update_task", params["name"])
+	}
+	args, _ := params["arguments"].(map[string]any)
+	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
+		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
+	}
+	if args["expireLease"] != true {
+		t.Errorf("expireLease = %v, want true", args["expireLease"])
+	}
+	if args["driverReleased"] != true {
+		t.Errorf("driverReleased = %v, want true — the plane records this as a driver's call for a dead session", args["driverReleased"])
+	}
+	// `release` and `status` may not be paired with expireLease plane-side.
+	for _, forbidden := range []string{"release", "status", "delivery"} {
+		if _, present := args[forbidden]; present {
+			t.Errorf("expireLease must not carry %q: %+v", forbidden, args)
+		}
+	}
+}
+
+func TestReleaseDriver_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := New(srv.URL+"/mcp/demo", "k-1").ReleaseDriver(context.Background(), "t-1", "r-1"); err != nil {
+		t.Fatalf("ReleaseDriver: %v", err)
+	}
+	params, _ := got.body["params"].(map[string]any)
+	args, _ := params["arguments"].(map[string]any)
+	if args["release"] != true || args["driverReleased"] != true {
+		t.Errorf("arguments = %+v, want release=true driverReleased=true", args)
+	}
+	if _, present := args["expireLease"]; present {
+		t.Errorf("ReleaseDriver must not send expireLease: %+v", args)
+	}
+}
+
+// A plane older than CLA-707 refuses the FIELD, and the caller must be able to
+// tell that refusal from a real one so it can fall back to leaving the lease to
+// expire. Both calls classify it the same way.
+func TestUnsupportedField_IsDistinguishable(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		call  func(Releaser) error
+		field string
+	}{
+		{
+			name:  "expireLease",
+			field: "expireLease",
+			call: func(r Releaser) error {
+				return r.ExpireLease(context.Background(), "t-1", "r-1")
+			},
+		},
+		{
+			name:  "driverReleased",
+			field: "driverReleased",
+			call: func(r Releaser) error {
+				return r.ReleaseDriver(context.Background(), "t-1", "r-1")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			refusal := `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"update_task refused: Unrecognized key(s) in object: '` + tc.field + `'"}]}}`
+			srv, _ := serve(t, http.StatusOK, refusal)
+			err := tc.call(New(srv.URL+"/mcp/demo", "k-1"))
+			if !errors.Is(err, ErrFieldUnsupported) {
+				t.Fatalf("err = %v, want ErrFieldUnsupported", err)
+			}
+			if !strings.Contains(err.Error(), tc.field) {
+				t.Errorf("wrapped error lost the field name: %v", err)
+			}
+		})
+	}
+}
+
+// A refusal that is NOT about an unknown field stays a plain error: a
+// not_holding or a network failure must never be read as "the plane is old".
+func TestFieldRefusal_IsNotAnyRefusal(t *testing.T) {
+	for _, body := range []string{
+		`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"not_holding"}]}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"run_superseded"}]}}`,
+	} {
+		srv, _ := serve(t, http.StatusOK, body)
+		err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1")
+		if err == nil || errors.Is(err, ErrFieldUnsupported) {
+			t.Errorf("refusal %s classified as a field problem: %v", body, err)
+		}
+	}
+}
+
+func TestExpireLease_NotWired(t *testing.T) {
+	if err := New("", "").ExpireLease(context.Background(), "t-1", "r-1"); !errors.Is(err, ErrNotWired) {
+		t.Errorf("err = %v, want ErrNotWired", err)
+	}
+}
+
+func TestExpireLease_RequiresBothIDs(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+	r := New(srv.URL+"/mcp/demo", "k-1")
+	for _, tt := range []struct{ name, task, run string }{
+		{"no task", "", "r-1"},
+		{"no run", "t-1", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := r.ExpireLease(context.Background(), tt.task, tt.run); err == nil {
+				t.Fatal("expected an error")
+			}
+			if got.method != "" {
+				t.Errorf("must not have hit the network, but saw a %s", got.method)
+			}
+		})
+	}
+}

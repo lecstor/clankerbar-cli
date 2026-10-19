@@ -83,6 +83,13 @@ type leaseRenewer struct {
 	// with no fleet reporter, and nil in the heartbeat unit tests, which
 	// construct the renewer directly.
 	reflect func(harness.Claim)
+	// claimFile, when non-nil, is called synchronously from observe with every
+	// observed claim snapshot to maintain CURRENT_CLAIM (CLA-708) - the record
+	// a supervisor uses to hand a dead child's claim back. It must run before
+	// observe returns so a branch is never left queued behind a parked
+	// Heartbeat. Nil in the heartbeat unit tests, which construct the renewer
+	// directly.
+	claimFile func(harness.Claim)
 }
 
 // startLeaseRenewal begins renewing the spawned session's claim lease and
@@ -112,6 +119,10 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 		claims:   make(chan harness.Claim, 4),
 		done:     make(chan struct{}),
 		stopped:  make(chan struct{}),
+		// CURRENT_CLAIM (CLA-708): the same observation seam, a third consumer.
+		// The project rides along because a claim file outlives this process and
+		// the supervisor needs the endpoint the claim belongs to.
+		claimFile: func(c harness.Claim) { d.noteCurrentClaim(c, t.Name) },
 	}
 	if t.Fleet != nil {
 		// CLA-510: the fleet card's task ref rides the same observation seam
@@ -130,12 +141,21 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 // if the renewer has not drained the previous snapshot yet, it is dropped in
 // favour of this one - only the newest claim state can be true.
 //
+// CURRENT_CLAIM (CLA-708) is persisted HERE, synchronously, before this
+// callback returns, rather than from the renewer goroutine in apply. The
+// difference is a lost takeover: `update_task(branch: ...)` succeeds, then the
+// daemon dies while the renewer is still parked inside a Heartbeat call with
+// the branch snapshot queued, and the supervisor reads the old no-branch record
+// and sends `release` over pushed work. A local state-dir write is the one
+// thing this callback cannot defer; the queueing below stays non-blocking.
+//
 // Invocation.OnClaim asks for a non-blocking implementation, and this is one
-// except at one bound: if FOUR snapshots pile up undrained - which takes the
-// renewer stuck inside one Heartbeat call while four claim transitions stream
-// past - the fifth waits for that call's heartbeatBeatTimeout rather than drop
-// the newest state. Dropping the newest is the one loss this channel cannot
-// tolerate; the wait is bounded by stop() regardless.
+// except at that write and one bound: if FOUR snapshots pile up undrained -
+// which takes the renewer stuck inside one Heartbeat call while four claim
+// transitions stream past - the fifth waits for that call's
+// heartbeatBeatTimeout rather than drop the newest state. Dropping the newest
+// is the one loss this channel cannot tolerate; the wait is bounded by stop()
+// regardless.
 func (r *leaseRenewer) observe(c harness.Claim) {
 	if r == nil {
 		return
@@ -144,6 +164,9 @@ func (r *leaseRenewer) observe(c harness.Claim) {
 	case <-r.done:
 		return
 	default:
+	}
+	if r.claimFile != nil {
+		r.claimFile(c)
 	}
 	select {
 	case r.claims <- c:
@@ -167,14 +190,17 @@ func (r *leaseRenewer) observe(c harness.Claim) {
 // RunID is unchanged - which is exactly why the pause below keys off Held.
 //
 // The fleet reflector (CLA-510) runs here, on the renewer goroutine, before the
-// renewal state folds in - one choke point for both consumers of the snapshot.
-// The done-guard at the top bounds what can reach the reflector after stop():
-// stop()'s wait is bounded, so the goroutine can outlive it wedged in a
-// Heartbeat call, and a snapshot queued before the stop and picked up after it
-// must not revise the fleet row - the driver may already be into the next phase.
-// The guard is a check-then-act; the reflector's own write site re-checks done
-// under iterMu (see Driver.reflectClaim), so the no-reflect-after-stop
-// invariant holds by construction at the write, not only by interleaving luck.
+// renewal state folds in. The done-guard at the top bounds what can reach the
+// reflector after stop(): stop()'s wait is bounded, so the goroutine can
+// outlive it wedged in a Heartbeat call, and a snapshot queued before the stop
+// and picked up after it must not revise the fleet row - the driver may already
+// be into the next phase. The guard is a check-then-act; the reflector's own
+// write site re-checks done under iterMu (see Driver.reflectClaim), so the
+// no-reflect-after-stop invariant holds by construction at the write, not only
+// by interleaving luck.
+//
+// CURRENT_CLAIM is NOT written here: observe persists it synchronously so a
+// branch cannot be lost behind a parked Heartbeat (CLA-708, review 1.1).
 func (r *leaseRenewer) apply(c, current harness.Claim) harness.Claim {
 	select {
 	case <-r.done:

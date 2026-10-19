@@ -566,6 +566,10 @@ func TestOpenAdoptsAPreSentinelStateDir(t *testing.T) {
 		"RESTART":     "ctl\n",
 		"RESTART_NOW": "ctl --now\n",
 		"RELOAD":      "ctl\n",
+		// CLA-708: the daemon's claim record and the in-flight half of an
+		// atomic rewrite must not make an otherwise-ours directory unadoptable.
+		"CURRENT_CLAIM":     `{"taskId":"t-1","runId":"r-1"}`,
+		"CURRENT_CLAIM.tmp": `{"taskId":"t-1"}`,
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(path, name), []byte(body), 0o600); err != nil {
@@ -824,5 +828,75 @@ func TestOpenNamesEveryForeignEntryItRefusesOver(t *testing.T) {
 		if !strings.Contains(err.Error(), name) {
 			t.Errorf("error should name %s, got %v", name, err)
 		}
+	}
+}
+
+// --- atomic replacement (CLA-708) -------------------------------------------
+
+// CURRENT_CLAIM is rewritten while the daemon runs (the branch arrives after
+// the claim), so the writer must replace rather than refuse. WriteFile's
+// O_EXCL refusal is deliberate for markers; this is the one file we own and
+// must update.
+func TestWriteFileAtomic_ReplacesAndLeavesNoTemp(t *testing.T) {
+	path := tempStateDir(t)
+	d := mustOpen(t, path)
+
+	if err := d.WriteFileAtomic("CURRENT_CLAIM", []byte("one\n")); err != nil {
+		t.Fatalf("first write: %v", err)
+	}
+	if b, err := d.ReadFile("CURRENT_CLAIM"); err != nil || string(b) != "one\n" {
+		t.Fatalf("read back = %q, %v", b, err)
+	}
+	if err := d.WriteFileAtomic("CURRENT_CLAIM", []byte("two\n")); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+	if b, err := d.ReadFile("CURRENT_CLAIM"); err != nil || string(b) != "two\n" {
+		t.Fatalf("read back after replace = %q, %v", b, err)
+	}
+	if _, err := os.Lstat(filepath.Join(path, "CURRENT_CLAIM.tmp")); !os.IsNotExist(err) {
+		t.Errorf("temporary file survived the rename (err=%v)", err)
+	}
+}
+
+// A symlink planted at the destination must be REPLACED, never followed: the
+// daemon's state dir can sit inside a workdir a session may write.
+func TestWriteFileAtomic_ReplacesAPlantedSymlink(t *testing.T) {
+	path := tempStateDir(t)
+	d := mustOpen(t, path)
+
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("do not touch\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(path, "CURRENT_CLAIM")); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.WriteFileAtomic("CURRENT_CLAIM", []byte("ours\n")); err != nil {
+		t.Fatalf("write over a symlink: %v", err)
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "do not touch\n" {
+		t.Fatalf("the symlink target was written through: %q, %v", b, err)
+	}
+	fi, err := os.Lstat(filepath.Join(path, "CURRENT_CLAIM"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fi.Mode().IsRegular() {
+		t.Errorf("destination is not a regular file after replacement: %v", fi.Mode())
+	}
+}
+
+// A stale temporary from a killed process must not wedge the next write.
+func TestWriteFileAtomic_ReplacesAStaleTemporary(t *testing.T) {
+	path := tempStateDir(t)
+	d := mustOpen(t, path)
+	if err := os.WriteFile(filepath.Join(path, "CURRENT_CLAIM.tmp"), []byte("stale\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.WriteFileAtomic("CURRENT_CLAIM", []byte("fresh\n")); err != nil {
+		t.Fatalf("write with a stale temp: %v", err)
+	}
+	if b, _ := d.ReadFile("CURRENT_CLAIM"); string(b) != "fresh\n" {
+		t.Fatalf("read back = %q", b)
 	}
 }

@@ -122,6 +122,9 @@ func TestDrain_UntrustedDoesNotHandBackTheClaim(t *testing.T) {
 	if len(rel.calls) != 0 {
 		t.Errorf("released %+v off a truncated stream; the task may already be settled", rel.calls)
 	}
+	if len(rel.expireCalls) != 0 {
+		t.Errorf("expireLease called off a truncated stream (%+v); the caller may be wrong about whether the task is still held", rel.expireCalls)
+	}
 	if out := logs.String(); !strings.Contains(out, "leaving the lease to expire") {
 		t.Errorf("the refusal to release was not explained:\n%s", out)
 	}

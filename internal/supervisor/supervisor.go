@@ -70,6 +70,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
@@ -196,6 +197,13 @@ type Options struct {
 	// the drain happens before it, and a returned error resumes the loop with
 	// the marker already consumed.
 	ExecInPlace func(bin string, argv []string, env []string) error
+
+	// PlaneFor builds the write client the supervisor uses to hand a dead
+	// child's claim back (CLA-708). Nil = plane.New. The hook exists because the
+	// endpoint the supervisor resolves is the CHILD's production endpoint, which
+	// a test's fake plane is not; a test supplies a client pointed at its own
+	// server so the wire shape is exercised for real.
+	PlaneFor func(endpoint, apiKey string) plane.Releaser
 }
 
 // childVersionEnv is the environment variable the supervisor sets on every
@@ -975,6 +983,14 @@ func (d *Supervisor) spawn(inst *Instance) {
 // unexpected exit. Only the last respawns. at is when the Wait goroutine saw
 // the process end, carried onto the status row as `lastExit.at`.
 func (d *Supervisor) onExit(inst *Instance, err error, at time.Time) {
+	// A child that exited without letting go may have left its claim behind
+	// (CLA-708). Read it BEFORE deciding whether to respawn — the hand-back is
+	// what turns a dead session into an immediate takeover instead of a
+	// 30-minute lease. It applies to EVERY exit, including one the supervisor
+	// ordered: a drained child normally holds nothing (the record is removed on
+	// every let-go path), and a record found anyway means the drain did not let
+	// go, which is still the dead-session case.
+	d.handBackDeadClaim(inst)
 	// The exited flag is set BEFORE the ctx check, not after: the select loop
 	// may have picked this event in the same instant the fleet stop landed
 	// (ctx.Done), and stopAll counts live children from this flag. If the
@@ -1254,6 +1270,15 @@ func (d *Supervisor) stopAll() error {
 	for len(done) < len(d.instances) {
 		select {
 		case ev := <-d.exits:
+			// A child that exits during the drain may still hold its claim: the
+			// STOP marker only takes effect at an iteration boundary, and a
+			// daemon killed (or still settling) in the meantime leaves its
+			// CURRENT_CLAIM behind. onExit would have handed it back, but this
+			// loop is what consumes an exit once the fleet stop has begun, so
+			// the handback must happen here too or the claim waits out its
+			// 30-minute lease while the supervisor exits. A no-op when the
+			// record is absent.
+			d.handBackDeadClaim(ev.inst)
 			// The flags onExit would have set are set here too: this loop is
 			// what consumes an exit once the fleet stop has begun, and the
 			// status report (and its final `stopped` rows) reads them.

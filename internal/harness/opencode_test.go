@@ -1085,7 +1085,10 @@ func TestOpencodeObservesTheSettleAndTheDeliveryReport(t *testing.T) {
 	want := Claim{
 		TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun,
 		HasWIP: true, Settled: true, Category: "chore",
-		Branch: "clanker/e1d01dae-temp-fixture-recording-target-for-cla-36",
+		// The claim's branch was the HINT; the update_task branch is the branch
+		// the session actually recorded, and that is what CURRENT_CLAIM must
+		// carry (CLA-708) — it is the one a successor fetches.
+		Branch: opencodeFixtureBranch,
 	}
 	if res.Claim != want {
 		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
@@ -1121,6 +1124,9 @@ func TestOpencodeSeedsAResumedPhasesClaim(t *testing.T) {
 
 	if !res.Claim.HasWIP {
 		t.Error("update_task(branch:) did not set HasWIP on the seeded claim — the driver would read the task as safe to release and post it back to the queue over pushed work")
+	}
+	if res.Claim.Branch != "clanker/task-abc-work" {
+		t.Errorf("Claim.Branch = %q, want clanker/task-abc-work — CURRENT_CLAIM needs the NAME, not only the fact, to choose expireLease over release", res.Claim.Branch)
 	}
 	if !res.Claim.Settled {
 		t.Error("update_task(status: in_review) did not settle the seeded claim")
