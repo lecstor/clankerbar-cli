@@ -332,7 +332,7 @@ func TestExtraDirsForProjectRootCoversTheProject(t *testing.T) {
 
 type noopSalvager struct{}
 
-func (noopSalvager) Salvage(context.Context, string, string) salvage.Outcome {
+func (noopSalvager) Salvage(context.Context, string, string, ...string) salvage.Outcome {
 	return salvage.Outcome{Status: salvage.Nothing}
 }
 

@@ -1389,7 +1389,8 @@ of a day's spend, for work that was done twice.
 
 So when a session ends still holding a task, the driver looks for the worktree it
 was working in and, if anything is uncommitted, **commits it, pushes it, and
-records the branch on the task** — turning a redo into a takeover:
+records the branch on the task** — turning a redo into a takeover (with the one
+exception below, for a tip the session already delivered):
 
 ```
 salvaged CLA-314: committed the uncommitted work in /Users/you/dev/acme-wt/cc561415
@@ -1421,6 +1422,25 @@ merge, rebase, cherry-pick or revert) and a conflict nothing is holding open: a
 `git stash pop`, `git apply --3way` or `git checkout -m` leaves unmerged entries
 with no state file at all, so the unmerged index is checked as well as the
 operation. Either way it is logged as `STRANDED WORK LEFT AS IS` with the path.
+
+**Untracked files alone, at a tip the session already delivered, are left alone.**
+The driver asks the origin rather than the session: when the branch the session
+recorded is on the remote at **exactly** the worktree's HEAD, the work is pushed
+and there is nothing left to rescue, so the untracked files are left uncommitted
+and logged. What is in them is not known here — a `wrangler types` dump and a
+source file written after the last commit are the same shape in a status line —
+and only a reader can tell which of them is disposable. Committing them would push
+a **new** tip at the phase boundary, and every reader downstream — each
+review-panel member, the fix phase, the PR — would then review the salvage commit
+instead of the tip the session handed over, which is precisely what one implement
+phase cost before this rule existed.
+
+Delivery is the whole discriminator, and it is checked, not assumed: an edit to a
+**tracked** file is salvaged on top of a delivered tip like any other uncommitted
+work, and an undelivered session's untracked files — the new module it never
+staged — are salvaged in full, which is what the rescue above is for. If the origin
+cannot be read the answer is "not delivered" and the work is saved exactly as
+before: the failure mode of this check is the old behaviour, never a quiet loss.
 
 **It cannot touch a tree that is not this task's.** The worktree is identified by
 its checked-out branch carrying `clanker/<first 8 characters of the task id>` —
