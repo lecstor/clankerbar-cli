@@ -3815,6 +3815,13 @@ func TestDrainPhases_ReviewSeamRefusesWhenTheRoundCannotClose(t *testing.T) {
 	if len(rel.closes) != 0 {
 		t.Fatalf("closes = %v, want none — the injected close error must not be recorded as a close", rel.closes)
 	}
+	// The no-panel close failure keeps the CLA-457 empty booking it had before
+	// CLA-639 (CLA-639 fix pass 4): the skip is for PANEL members only, so the
+	// operator's dead-phase rate reads exactly as it did at the base commit.
+	cell := d.deadTally[tallyKey{phase: "review", harness: "claude"}]
+	if cell == nil || cell.run != 1 || cell.dead != 1 {
+		t.Errorf("dead-phase tally for review/claude = %+v, want 1 dead of 1 — a plain review whose round cannot close is the empty shape", cell)
+	}
 }
 
 // CLA-637: a review session that records its durable record and THEN emits a

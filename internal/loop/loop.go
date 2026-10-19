@@ -4536,12 +4536,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// CLA-639 M4 needs this booking to be exactly one per failed
 				// panel member, and the operator's rate needs it to be honest.
 				//
-				// And unless this is a review-close failure (CLA-639 fix pass
-				// 3): a member that WROTE its record and whose round the plane
-				// then refused to release produced a review — the empty shape
-				// here would report it as a session that died producing
-				// nothing, which is the opposite of what happened.
-				if !bookedDead && !end.reviewCloseFailed {
+				// And unless this is a panel member whose review close failed
+				// (CLA-639 fix pass 3): a member that WROTE its record and whose
+				// round the plane then refused to release produced a review — the
+				// empty shape here would report it as a session that died
+				// producing nothing, which is the opposite of what happened. The
+				// skip is PANEL-ONLY: the plain single review keeps the untaxed
+				// CLA-457 booking it has had since the base commit, so an
+				// operator's dead-phase rate reads the same with no panel
+				// (CLA-639 fix pass 4).
+				if !bookedDead && !(panelMember && end.reviewCloseFailed) {
 					d.tallyEmpty(ph.Label(phaseIdx), tc.HarnessFor(ph))
 					// CLA-639 M4: this exit is booked, so the panel's member
 					// handler must not book it again when it records the member
