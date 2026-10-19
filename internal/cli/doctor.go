@@ -345,16 +345,30 @@ func checkConfig(cfg *config.Config) check {
 // `review_panel` entry's own model (CLA-639) is shown as it will actually run —
 // an operator's preflight should not have to re-derive the panel from config.
 //
+// The role is POSITIONAL (`review-N`, counted over the review-shaped phases,
+// exactly as the driver derives the durable record's role). A member's `name` is
+// only its log label, so a named member is printed `review-N (label)` when the
+// two differ; printing the label alone would suggest the record is keyed on it.
+//
 // Empty when no panel is configured or none expands: a config whose review
 // carries its own prompt, an unphased run, or the absent key (the single
 // reviewer) has no panel to report rather than an empty one to apologise for.
 func panelLabels(cfg *config.Config) []string {
 	var out []string
+	role := 0
 	for i, ph := range cfg.EffectivePhases() {
+		if !config.ReviewShaped(ph.Prompt) {
+			continue
+		}
+		role++
 		if !ph.IsPanelMember() {
 			continue
 		}
-		out = append(out, ph.Label(i)+" -> "+reviewerHarnessModel(cfg, ph))
+		name := "review-" + strconv.Itoa(role)
+		if label := ph.Label(i); label != name {
+			name += " (" + label + ")"
+		}
+		out = append(out, name+" -> "+reviewerHarnessModel(cfg, ph))
 	}
 	return out
 }

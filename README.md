@@ -339,9 +339,12 @@ prompt owns its own contract; `review_panel` alongside either is refused rather
 than silently ignored. An empty array (`"review_panel": []`) is refused too:
 removing the key is how you ask for a single reviewer.
 
-`name` defaults to `review-1` .. `review-N` by position — that is the reviewer
-role the durable record is keyed on — and a member may set `tier` instead of
-`model` to resolve through a harness's tier map.
+Each member's reviewer role is **positional** — `review-1` .. `review-N`, counted
+over the review-shaped phases — and that is the role the durable record is keyed
+on. `name` is only the member's log label (it defaults to the same positional
+string); naming a member `alpha` changes what the logs call it, never which
+record it writes. A member may set `tier` instead of `model` to resolve through a
+harness's tier map.
 
 **Independence is a seal, not a promise.** The plane holds a round's records
 sealed: written, but with their findings withheld from every `get_task` until
@@ -361,14 +364,17 @@ a usage-limited, capped or dead member is recorded as failed — with its reason
 booked in the per-harness dead-phase tally — and the panel **moves on to the
 next member** rather than ending. After the last member the round closes (by
 the live holder, before anything hands the claim back) and the fix runs on the
-merged list, which names the incomplete member. Only a panel in which NO member
-recorded ends without a fix; a member that loses the claim ends the panel
-exactly as before. A panel that fails **one reviewer** therefore never strands
-the findings the others recorded, and the same member recording nothing on
-successive tasks is said loudly, with its harness and model. A **branchless**
-task cannot run a panel at all — its record is the legacy `## Review` block, and
-the plane takes no durable record from a settled task — so it runs one reviewer,
-with the brief it would have had anyway.
+merged list, which names the incomplete member. A panel whose round cannot be
+closed ends without a fix rather than spawning one against sealed findings
+(fail closed); otherwise, only a panel in which NO member recorded ends without
+a fix. A member that loses the claim ends the panel exactly as before. A panel
+that fails **one reviewer** therefore never strands the findings the others
+recorded, and the same member recording nothing on successive tasks is said
+loudly, with its harness and model. A **branchless** task cannot run a panel at
+all — its record is the legacy `## Review` block, and the plane takes no durable
+record from a settled task — so it runs one reviewer, with the brief it would
+have had anyway, and that reviewer is the panel's last: if it records nothing,
+no fix runs.
 
 **The driver merges; the fixer never grades reviews.** Every MUST from ANY
 member of the panel's round is open — consensus never filters one out, because a

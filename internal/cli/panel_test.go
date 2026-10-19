@@ -156,3 +156,36 @@ func TestDoctor_NoReviewLineWithoutAReviewPhase(t *testing.T) {
 		}
 	}
 }
+
+// TestDoctor_PanelMemberLabelsAreNotRoles (CLA-639 fix pass 3): a member's
+// name is its log label; the reviewer role the durable record is keyed on is
+// positional. Doctor prints the role, and the label in parentheses when the two
+// differ, so an operator naming a member does not read the name as the record
+// key.
+func TestDoctor_PanelMemberLabelsAreNotRoles(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness: "opencode",
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement"},
+			{Name: "review"},
+			{Name: "fix"},
+		},
+		ReviewPanel: []config.ReviewPanelMember{
+			{Name: "alpha", Model: "opencode-go/gpt-6-luna"},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+	line := ""
+	for _, l := range checkConfig(cfg).info {
+		if strings.HasPrefix(l, "review panel: ") {
+			line = l
+		}
+	}
+	if !strings.Contains(line, "review-1 (alpha) -> opencode/opencode-go/gpt-6-luna") {
+		t.Errorf("a named member is not reported as role (label): %s", line)
+	}
+}
