@@ -3804,7 +3804,7 @@ func (c *Config) Validate() error {
 		if name := strings.TrimSpace(m.Name); name != "" && panelMemberPositionRe.MatchString(name) {
 			derived := "review-" + strconv.Itoa(i+1)
 			if name != derived {
-				return fmt.Errorf("review_panel[%d]: name %q is a review-N label owned by another member's position; this member's derived label is %q — name it something of its own, or remove `name` to let the position derive it", i, name, derived)
+				return fmt.Errorf("review_panel[%d]: name %q is in the reserved review-N family; this member's derived label is %q — name it something of its own, or remove `name` to let the position derive it", i, name, derived)
 			}
 		}
 		// The label is also the iteration-log tag, the phasesRun entry and the
@@ -3823,7 +3823,7 @@ func (c *Config) Validate() error {
 				continue
 			}
 			if strings.TrimSpace(m.Name) == "" {
-				return fmt.Errorf("review_panel[%d]: member %d's derived label %q collides with phases[%d]; set `name` on this member to label it without shadowing the phase", i, i+1, label, j)
+				return fmt.Errorf("review_panel[%d]'s derived label %q collides with phases[%d]; set `name` on this member to label it without shadowing the phase", i, label, j)
 			}
 			return fmt.Errorf("review_panel[%d]: name %q is already the name of phases[%d]; a member's name labels its logs and dead-phase tally, so it must not merge with a configured phase", i, label, j)
 		}

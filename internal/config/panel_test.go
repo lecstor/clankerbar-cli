@@ -457,10 +457,10 @@ func TestReviewPanel_MemberNamesAreLogLabels(t *testing.T) {
 	t.Run("a review-N name from another position is refused", func(t *testing.T) {
 		// This also covers the derived/explicit collision the labels map used to
 		// catch last: `review-2` written on member 0 is refused here with a
-		// message that says whose label it is, before the map ever sees it.
+		// message that says which family owns it, before the map ever sees it.
 		cfg := writePanelConfig(t, base(`[{"name": "review-2"}, {}]`))
 		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "owned by another member's position") {
+		if err == nil || !strings.Contains(err.Error(), "reserved review-N family") {
 			t.Fatalf("Validate() = %v, want member 0's review-2 refused", err)
 		}
 	})
@@ -487,11 +487,23 @@ func TestReviewPanel_MemberNamesAreLogLabels(t *testing.T) {
 			t.Fatalf("Validate() = %v, want a configured phase name refused", err)
 		}
 	})
-	t.Run("a name owned by another member's position is refused", func(t *testing.T) {
+	t.Run("a review-N name is refused on any non-owning member", func(t *testing.T) {
 		cfg := writePanelConfig(t, base(`[{"name": "review-2"}, {"name": "alpha"}]`))
 		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "owned by another member's position") {
+		if err == nil || !strings.Contains(err.Error(), "reserved review-N family") {
 			t.Fatalf("Validate() = %v, want member 0's review-2 refused", err)
+		}
+	})
+	t.Run("a review-N name beyond the panel names no member but is refused", func(t *testing.T) {
+		// A single member named review-5: there is no member 5 to own it, so the
+		// message must speak about the family and this member's own label.
+		cfg := writePanelConfig(t, base(`[{"name": "review-5"}]`))
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "reserved review-N family") {
+			t.Fatalf("Validate() = %v, want review-5 refused as a family name", err)
+		}
+		if !strings.Contains(err.Error(), `"review-1"`) {
+			t.Errorf("the refusal does not name this member's derived label: %v", err)
 		}
 	})
 	t.Run("a member may name its own derived label", func(t *testing.T) {
@@ -518,6 +530,9 @@ func TestReviewPanel_MemberNamesAreLogLabels(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "derived label") {
 			t.Fatalf("Validate() = %v, want the derived-label collision named as such", err)
+		}
+		if !strings.Contains(err.Error(), "review_panel[0]'s derived label") {
+			t.Errorf("the derived-label refusal mixes 0- and 1-based numbering: %v", err)
 		}
 		if !strings.Contains(err.Error(), "set `name`") {
 			t.Errorf("the derived-label refusal does not tell the operator to set `name`: %v", err)
