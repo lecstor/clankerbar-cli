@@ -347,3 +347,118 @@ func TestDrainPhases_AnUnverifiedCheckpointNamesTheCheckNotTheRemoteAsTheCause(t
 		t.Errorf("the successor brief asserts a remote-read failure or origin verification the detail does not support:\n%s", p2)
 	}
 }
+
+// CLA-685, the handoff arm of the same split. An implement phase that ended at
+// an UNVERIFIED checkpoint (the origin could not be read at all), then a
+// review-only session that hands off BEFORE its durable record is written. The
+// handoff still checkpoints — its successor continues the same phase, which the
+// OPENING checkpoint governs — but the record gate REFUSES that exit
+// (`ok=false, unverified=false`, and, the branch leg having read nothing, a
+// `tip=""`), and those refused facts were folded onto the claim as if they were
+// the checkpoint's own. The successor was then handed the VERIFIED continuation
+// — "The driver verified the origin remote's tip ... as {{reviewedTip}}" — for a
+// tip this driver never read, with the placeholder left literal, since it is
+// filled only when the tip is non-empty.
+// UnverifiedReviewOnlyHandoffContinuation was written for exactly this
+// successor and was never selected.
+func TestDrainPhases_AnUnverifiedReviewHandoffKeepsTheUnverifiedContinuation(t *testing.T) {
+	// The review session ends with a handoff block, still holding the task AND
+	// the implement checkpoint's branch — the resumed claim, as a real adapter
+	// reports it back.
+	reviewHandoff := handoffResult("Review half done: the API surface is cleared, the storage layer is next.")
+	reviewHandoff.Claim = harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: reported(held(okResult(1, 0),
+			harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}), branchReport())},
+		{res: reviewHandoff},
+		{res: checkpointed(5, 0.50)}, // the successor, continuing the review
+	}}
+	// The task carries no durable review record, so the review seam's gate
+	// refuses the checkpoint: the handoff is the only reason it is one.
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+	d.newVerifier = func(string, bool) deliveryVerifier { return unreadableOriginVerifier() }
+
+	if _, _, _, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	// Three sessions: implement, review, its handoff successor. The FIX phase
+	// never runs — the successor recorded no durable record either, so its own
+	// exit is refused the checkpoint (the CLA-637 contract this test leans on)
+	// and the sequence ends with the task handed back.
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3: implement, review, its handoff successor", h.invokeCalls)
+	}
+
+	successor := h.invocations[2].Prompt
+	if !strings.Contains(successor, "could NOT verify the origin remote's tip") {
+		t.Errorf("the handoff successor did not get the unverified review-only continuation:\n%s", successor)
+	}
+	if strings.Contains(successor, "The driver verified the origin remote's tip") {
+		t.Errorf("the handoff successor was told the driver verified a tip it never read:\n%s", successor)
+	}
+	if strings.Contains(successor, "{{") {
+		t.Errorf("the handoff successor's prompt still carries an unresolved placeholder:\n%s", successor)
+	}
+}
+
+// CLA-685, the other half of the repair: the opening checkpoint was VERIFIED
+// (with an origin tip), and the handing-off session read no tip of its own — the
+// origin went unreadable before its exit. Its refusal carries no tip and no
+// unverified mark, so the successor's continuation must be backed by the opening
+// checkpoint's own facts: the VERIFIED shape, with the driver-read tip filled
+// in. The refusal must never be what reaches the successor's {{reviewedTip}}
+// placeholder.
+func TestDrainPhases_AHandoffAfterAVerifiedCheckpointKeepsTheOpeningTip(t *testing.T) {
+	reviewHandoff := handoffResult("Review half done: the API surface is cleared, the storage layer is next.")
+	reviewHandoff.Claim = harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: reported(held(okResult(1, 0),
+			harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}), branchReport())},
+		{res: reviewHandoff},
+		{res: checkpointed(5, 0.50)},
+	}}
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	d := phaseDriverWithReleaser(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+	}, rel)
+	// The implement checkpoint is VERIFIED, with the origin tip the review
+	// brief hands over...
+	d.newVerifier = func(string, bool) deliveryVerifier {
+		return &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{Kind: delivery.BranchPushed,
+			Status: delivery.Pass, Tip: testCheckpointTip, Detail: "branch verified on the origin remote"}}}}
+	}
+	// ...and by the review session's exit the origin cannot be read at all, so
+	// that session's own check carries no tip.
+	h.onInvoke = func(call int) {
+		if call == 1 {
+			d.newVerifier = func(string, bool) deliveryVerifier { return unreadableOriginVerifier() }
+		}
+	}
+
+	if _, _, _, stop, err := drainPhasesHandoffs(t, d, 1); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3: implement, review, its handoff successor", h.invokeCalls)
+	}
+
+	successor := h.invocations[2].Prompt
+	if !strings.Contains(successor, "The driver verified the origin remote's tip") {
+		t.Errorf("the handoff successor did not get the verified review-only continuation:\n%s", successor)
+	}
+	if !strings.Contains(successor, testCheckpointTip) {
+		t.Errorf("the handoff successor's verified continuation does not carry the tip the driver read:\n%s", successor)
+	}
+	if strings.Contains(successor, "{{") {
+		t.Errorf("the handoff successor's prompt still carries an unresolved placeholder:\n%s", successor)
+	}
+}
