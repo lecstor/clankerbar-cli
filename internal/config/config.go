@@ -772,18 +772,16 @@ const fixOutcomeRecord = "the outcome MUST keep everything the existing outcome 
 // without reference to WHO hands the task over — the last fix of a sequence
 // does, and a fix with a VERIFICATION round after it does not — so both
 // terminals can embed it without one contradicting the other (CLA-686 D1). The
-// ordering constraint it does carry is the plane's, not the phase's: the batch
-// is refused after whatever call hands the task over, so it belongs before that
-// call, whichever phase makes it.
+// ordering rule that DOES name the hand-over lives in fixTerminalRecord, where
+// the phase making that call is the one reading it.
 const fixFindingUpdates = " While you still hold the task, update every finding's " +
 	"status on the DURABLE review record with update_task(taskId, runId, review: {findingUpdates: [...]}) — one " +
 	"entry per finding, by the plane-assigned `id` the record gave you: {findingId, status: \"fixed\", " +
 	"fixCommit: <the commit SHA>} for a fixed finding; {findingId, status: \"refuted\", refutedReason: <the " +
 	"evidence that refutes it>} for a MUST you did not fix; {findingId, status: \"filed\", filedTaskRef: <the " +
 	"follow-up task's ref>} for a code-needing finding dispatched instead. The batch is all-or-nothing: an " +
-	"unknown id or a still-sealed round refuses it, so it must go out while this run is the holder - before " +
-	"ANY call that hands the task over, even when that same call carries your outcome. An empty array is " +
-	"refused; if the review found nothing, skip the call."
+	"unknown id or a still-sealed round refuses it, so it must go out while this run is the holder. An empty " +
+	"array is refused; if the review found nothing, skip the call."
 
 // fixTerminalRecord is the BRANCH fix phase's record requirement when this fix
 // OWNS the sequence's terminal step, stated BEFORE the shared reviewTerminalStep
@@ -791,7 +789,13 @@ const fixFindingUpdates = " While you still hold the task, update every finding'
 // durable finding updates go out before the call that ends the run and clears
 // the holder, then the hand-over carries the outcome requirement
 // (fixOutcomeRecord) forward.
-const fixTerminalRecord = fixFindingUpdates + " THEN hand the task over: " + fixOutcomeRecord
+//
+// The ordering sentence is here rather than in fixFindingUpdates because it is
+// advice about THIS phase's own hand-over call: the plane refuses the batch
+// after that call, even when the same call carries the outcome.
+const fixTerminalRecord = fixFindingUpdates + " It must go out BEFORE the hand-over call - before the call that " +
+	"moves the task to in_review, even when that same call carries your outcome. THEN hand the task over: " +
+	fixOutcomeRecord
 
 // fixVerifyRecord is the BRANCH fix phase's record requirement when a
 // VERIFICATION round FOLLOWS it (CLA-686 D1). fixVerifyBrief and its handoff
