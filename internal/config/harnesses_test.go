@@ -214,6 +214,36 @@ func TestValidate_RefusesAnUnknownPhaseHarness(t *testing.T) {
 	}
 }
 
+// A `harnesses` block keyed by a name no adapter answers to is INERT: nothing
+// ever looks the key up, so the block's model, tier map and paths are read by
+// nobody and the operator's settings quietly stop applying. CLA-687: the shape
+// is a real one, left behind by CLA-675's rename - a config that names the
+// `opencode` harness at the top level and still carries a `harnesses.opencode2`
+// block was accepted and silently ignored.
+func TestValidate_RefusesAnUnknownHarnessesBlockKey(t *testing.T) {
+	c := mixedCfg()
+	c.Harnesses["opencode2"] = HarnessConfig{ConfigDir: "/oc2/config", Model: "opencode-go/gpt-6-luna"}
+
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), `harnesses["opencode2"]`) {
+		t.Fatalf("Validate() = %v, want a refusal naming harnesses[\"opencode2\"]", err)
+	}
+	if !strings.Contains(err.Error(), "unknown harness") {
+		t.Errorf("refusal %q should say the key names no registered harness", err)
+	}
+	// The rename hint is what makes the refusal actionable; without it the
+	// operator has to work out that `opencode2` became `opencode`.
+	if !strings.Contains(err.Error(), "retired") {
+		t.Errorf("refusal %q should carry the opencode2 rename hint the `harness` check gives", err)
+	}
+	// A block keyed by a REAL harness beside the stale one is still accepted, so
+	// removing the stale key is the whole fix.
+	delete(c.Harnesses, "opencode2")
+	if err := c.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil once the stale key is gone", err)
+	}
+}
+
 // The phase-aware claim rule: it is the CLAIMING phase's harness that must
 // observe the claim, not the run's. Both directions matter — the old check read
 // the top-level harness, which would now certify the wrong session.

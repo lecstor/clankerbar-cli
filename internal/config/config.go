@@ -3131,6 +3131,41 @@ func (c *Config) ModelForPhase(ph Phase) (model string, ok bool) {
 	return dflt, false
 }
 
+// ModelIDsFor returns every model id the sessions on harnessName will actually
+// run with, deduplicated and sorted: each effective phase that resolves to that
+// harness (so the review panel and the unphased single phase are both included),
+// with its model resolved through the same chain the driver uses - Phase.Model,
+// else Phase.Tier through that harness's tier map, else that harness's default.
+//
+// It answers "which models is this config going to ask for", which is a question
+// about the RUN rather than about any one field, and there is exactly one caller
+// that needs it: `doctor`'s opencode credential check has to know which
+// providers those models name before it can say whether a stored credential
+// covers them (CLA-687). Reading `model` alone would miss the tier and panel
+// paths, which is precisely where a config pins a provider the top-level field
+// never mentions.
+//
+// An EMPTY id is skipped rather than reported: it means the harness's own
+// default model, which this config does not name and cannot check. A caller that
+// gets nothing back knows only that no session here names a model.
+func (c *Config) ModelIDsFor(harnessName string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, ph := range c.EffectivePhases() {
+		if c.HarnessFor(ph) != harnessName {
+			continue
+		}
+		id, _ := c.ModelForPhase(ph)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // ResolveMCPConfig picks the MCP config file one session gets, given the harness
 // it runs on and the project scope it runs in.
 //
@@ -3625,6 +3660,20 @@ func (c *Config) Validate() error {
 	// accepted automatically. harness does not import config, so there is no cycle.
 	if !harness.Known(c.Harness) {
 		return fmt.Errorf("unknown harness %q (want: %s)%s", c.Harness, strings.Join(harness.Names(), ", "), retiredHarnessHint(c.Harness))
+	}
+	// A `harnesses` block keyed by a name no adapter answers to is INERT: nothing
+	// ever looks that key up, so its model, tier map and paths are read by nobody
+	// and the operator's settings quietly stop applying. That is the shape a
+	// rename leaves behind - CLA-675 moved the 2.x preview onto `opencode`, and a
+	// config still carrying a `harnesses.opencode2` block (with the top-level
+	// `harness: opencode`) was accepted and ignored - so it is refused here,
+	// against the same registry as `harness` above and the budget blocks below,
+	// with the same rename hint. Names are checked in sorted order so the message
+	// does not depend on map iteration.
+	for _, name := range slices.Sorted(maps.Keys(c.Harnesses)) {
+		if !harness.Known(name) {
+			return fmt.Errorf("harnesses[%q]: unknown harness (want: %s)%s", name, strings.Join(harness.Names(), ", "), retiredHarnessHint(name))
+		}
 	}
 	// A per-harness block keyed by a name no adapter answers to is a ceiling that
 	// can never trip: nothing is ever charged to it, so the run is unbounded on

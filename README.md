@@ -523,6 +523,13 @@ Nothing in the seam resists it: each phase is already a fresh session seeded fro
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
 
+**Every key in `harnesses` must name a registered harness** — `claude`, `codex`,
+`opencode`. A block keyed by anything else is refused at startup rather than kept
+as dead config: nothing ever looks that key up, so its `model`, `models` and
+paths would silently stop applying. What that catches is the leftover of a
+rename — a `harnesses.opencode2` block from the retired 2.x preview harness
+(CLA-675) — and the refusal names the rename to make.
+
 **The review can be a panel.** Setting `review_panel` fans the one built-in,
 non-final review phase out into one review phase per member; see [the review
 panel](#the-review-panel-several-reviewers-one-revision-one-merge) for the
