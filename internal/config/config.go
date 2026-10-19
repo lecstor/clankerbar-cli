@@ -2028,7 +2028,14 @@ type Config struct {
 	// (`~/dev`, say) must NOT set it: the flag is an assertion about the
 	// layout, and granting a whole directory tree on a guess is the wrong
 	// direction to be wrong in.
-	ProjectRoot bool `json:"project_root"`
+	//
+	// `omitempty` is load-bearing: Config.Identity() hashes the marshalled
+	// form (see ReviewPanel for the same care), so the field must NOT alter the
+	// identity of a config that does not adopt the layout — an unset flag is
+	// the legacy shape, and a daemon's beacon must not report a config change
+	// just because this field exists. Set it, and the identity does change,
+	// correctly: the config now means something different.
+	ProjectRoot bool `json:"project_root,omitempty"`
 
 	// ConfigDir pins the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
 	// headless session loads the same skills, plugins, and auth as the interactive
