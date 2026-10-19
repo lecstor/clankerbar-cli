@@ -484,9 +484,8 @@ func (d *Dir) WriteFile(name string, data []byte) error {
 // WriteFileAtomic replaces name with data via a same-directory rename, so a
 // reader never sees a half-written file and a rewrite never follows a symlink
 // planted at name. The temporary name is ours by construction (fixed suffix,
-// O_EXCL, removed first), and the rename is the same atomic replacement
-// `ctl`'s marker writes rely on — needed by CURRENT_CLAIM, whose branch field
-// is updated while the daemon runs.
+// O_EXCL, removed first). It exists for CURRENT_CLAIM, whose branch field is
+// updated while the daemon runs.
 //
 // WriteFile cannot be used for that: its O_EXCL refusal is the point (a marker
 // that already exists is somebody else's decision), while a claim record is
