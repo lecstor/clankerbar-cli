@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/jsonc"
 )
 
 // CLA-441: opencode merges config files the driver never named - a global one
@@ -184,15 +186,15 @@ func TestJSONCParsesWhereStrictJSONWouldNot(t *testing.T) {
 // in one of these files contains "//".
 func TestStripJSONCLeavesStringsAlone(t *testing.T) {
 	in := `{"url":"https://clankerbar.com/mcp/x","q":"a /* b */ c"} // tail`
-	out := string(stripJSONC([]byte(in)))
+	out := string(jsonc.Strip([]byte(in)))
 	if !strings.Contains(out, `https://clankerbar.com/mcp/x`) {
-		t.Errorf("stripJSONC ate a URL: %q", out)
+		t.Errorf("Strip ate a URL: %q", out)
 	}
 	if !strings.Contains(out, `a /* b */ c`) {
-		t.Errorf("stripJSONC ate a quoted comment-looking string: %q", out)
+		t.Errorf("Strip ate a quoted comment-looking string: %q", out)
 	}
 	if strings.Contains(out, "// tail") {
-		t.Errorf("stripJSONC left a real comment behind: %q", out)
+		t.Errorf("Strip left a real comment behind: %q", out)
 	}
 }
 

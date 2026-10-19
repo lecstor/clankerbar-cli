@@ -4209,10 +4209,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		}
 	}
 	retries := 0
-	// CLA-703: the ONE retry a review-only phase gets when its session made no
-	// successful clankerbar MCP call and wrote no review record. Deliberately a
-	// separate counter from `retries`: this is not the transient/limit ladder,
-	// and its bound is one regardless of max_retries.
+	// CLA-703: the ONE retry a phase gets for an infrastructure miss. TWO arms
+	// spend this single budget, deliberately: an adapter preflight failure
+	// (ErrMCPNotConnected, any phase) and a review-only session that made no
+	// successful clankerbar MCP call and wrote no review record (the no_mcp
+	// backstop). They are not independent one-retry lanes — a preflight failure
+	// followed by a no-record end closes the round INCOMPLETE with no second
+	// backstop. Deliberately a separate counter from `retries`: this is not the
+	// transient/limit ladder, and its bound is one regardless of max_retries.
 	mcpRetried := false
 	// Consecutive attempts that ended without the harness reporting any usage -
 	// the spend the budget breaker above can never see (CLA-288).

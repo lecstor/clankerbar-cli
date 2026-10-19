@@ -15,10 +15,12 @@ package loop
 //     infrastructure, then fails the drain loudly.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
@@ -255,6 +257,36 @@ func TestDrainPhases_MCPPreflightFailureIsRetriedOnce(t *testing.T) {
 	}
 	if out := logs.String(); !strings.Contains(out, "MCP preflight failure") || !strings.Contains(out, "did not connect") {
 		t.Errorf("the driver did not log the preflight failure:\n%s", out)
+	}
+}
+
+// CLA-703 review, finding 4.1 (driver half): a shutdown that lands inside the
+// preflight window must take the driver's clean-stop path. The adapter returns
+// the cancellation as an error; the driver must not book a no_mcp cell, must not
+// spend the backstop retry, and must not spawn another session.
+func TestDrainPhases_MCPPreflightCancellationIsACleanStop(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &fakeAdapter{steps: []invokeStep{
+		{err: context.Canceled}, // what mcpPreflightFailure returns for a run-wide stop
+		{res: checkpointed(5, 0.50)},
+	}}
+	h.onInvoke = func(int) { cancel() }
+	d, _ := panelDriverWithFleet(t, h, rel, nil, panelPhases())
+	logs := captureLogs(t)
+
+	if _, _, _, stop, err := d.drainPhases(ctx, 1, 0, d.targets[0], spend{start: time.Now()}); err != nil || !stop {
+		t.Fatalf("drainPhases: err=%v stop=%v, want the clean-stop path", err, stop)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — a cancelled preflight must not be retried", h.invokeCalls)
+	}
+	if cell := d.deadTally[tallyKey{phase: "implement", harness: "opencode"}]; cell != nil && cell.noMCP != 0 {
+		t.Errorf("a cancelled preflight booked %d no_mcp, want 0", cell.noMCP)
+	}
+	if out := logs.String(); strings.Contains(out, "no_mcp") {
+		t.Errorf("a cancelled preflight was logged as no_mcp:\n%s", out)
 	}
 }
 

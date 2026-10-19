@@ -324,11 +324,19 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	runEnv := env
 	var srv *opencodeServer
 	if !in.Probe {
-		// Only a session that DECLARES a clankerbar server gets the preflight.
-		// No declared server means there is nothing to wait for by name; the
-		// `run --standalone` shape is left alone (a single-phase run with no
-		// backlog, a probe-style connectivity smoke, a test stub).
-		if names := opencodeMCPServers(in.MCPConfigPath); len(names) > 0 {
+		// Only a session with a clankerbar server gets the preflight. That
+		// server is resolved across the config layers opencode actually loads:
+		// the named file when there is one, otherwise the global config dir and
+		// the project-level files discovered from the instance directory. A
+		// layer that exists but cannot be read fails CLOSED — an unknown
+		// effective config is not evidence that no backlog server is declared —
+		// and a session that does declare one never gets its first turn until
+		// that server reports connected (CLA-703 review, findings 1.1 and 3.1).
+		names, err := opencodeEffectiveMCPServers(in, env)
+		if err != nil {
+			return mcpPreflightFailure(sctx, ctx, err)
+		}
+		if len(names) > 0 {
 			srv, err = startOpencodeServer(sctx, env, workDir)
 			if err != nil {
 				return mcpPreflightFailure(sctx, ctx, err)
