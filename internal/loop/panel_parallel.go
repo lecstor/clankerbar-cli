@@ -98,11 +98,10 @@ type panelRunOutcome struct {
 	// as the sequential member handler does.
 	limitWait     *phaseLimitWait
 	sequenceEnded bool
-	transientRung int
 	transientKey  resumedTransientKey
 
 	// claim is the last member claim observed, for the drain's iteration record
-	// and deferred handback. carried is kept when no member observed one.
+	// (the deferred handback keeps `carried`, the run the panel resumed).
 	claim       *harness.Result
 	disposition string
 
@@ -204,9 +203,6 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		if m.perr != nil && out.err == nil {
 			out.err = m.perr
 		}
-		if m.end.session != nil {
-			// Sessions are collected by the caller from members' ends.
-		}
 		if m.end.claim != nil {
 			out.claim = m.end.claim
 			out.disposition = claimDisposition(m.end.claim)
@@ -218,8 +214,9 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			out.sequenceEnded = true
 			out.limitWait = m.end.sequenceEnd.limitWait
 			if out.limitWait == nil {
+				// The drain notes the streak when it takes the wait; this is the
+				// target+harness whose ladder the failure belongs to.
 				out.transientKey = resumedTransientKey{target: ti, harness: d.targetCfg(t).HarnessFor(phases[start+k])}
-				out.transientRung = 0 // the drain notes the streak when it takes the wait
 			}
 		}
 	}
