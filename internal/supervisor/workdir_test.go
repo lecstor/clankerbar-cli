@@ -379,7 +379,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 	t.Run("a sole repos key is primary implicitly", func(t *testing.T) {
 		cfg := &config.Config{
 			BacklogURL: "https://clankerbar.com/mcp/acme",
-			Repos:      map[string]string{"acme/widgets": ""},
+			Repos:      map[string]string{"acme/widgets": "widgets"},
 		}
 		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
 		if err != nil {
@@ -392,7 +392,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 
 	t.Run("multi-project derives per project and clones every declared repo", func(t *testing.T) {
 		cfg := &config.Config{Projects: []config.Project{
-			{Slug: "one", PrimaryRepo: "acme/widgets", Repos: map[string]string{"acme/gadgets": ""}},
+			{Slug: "one", PrimaryRepo: "acme/widgets", Repos: map[string]string{"acme/gadgets": "gadgets"}},
 			{Slug: "two", PrimaryRepo: "acme/gadgets"},
 		}}
 		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
@@ -441,4 +441,173 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 			t.Fatal("deriveInstanceWorkdirs succeeded with no project slug to root the layout on")
 		}
 	})
+}
+
+// A SYMLINK at the derived repo path is refused, in both of the shapes the
+// project-root layout makes dangerous (CLA-678 review MUST 1.1 / 2.1):
+//
+//   - a link to a matching checkout OUTSIDE the project root would pass the
+//     origin check and be handed to sessions as the fleet's clone, so the
+//     session's project-root scope would reach outside the project and the
+//     fleet would read and edit a developer's own tree;
+//   - a link to anything else is the same escape with a wrong origin.
+//
+// Neither is adopted, and neither target is touched.
+func TestDeriveWorkdirRefusesASymlinkedRepo(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	pr := filepath.Join(root, "acme")
+	if err := os.MkdirAll(pr, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A developer's checkout outside the project root, with the EXPECTED origin:
+	// this is the shape that used to verify and be returned.
+	outside := filepath.Join(t.TempDir(), "widgets")
+	makeCheckout(t, outside, "acme/widgets")
+	if err := os.Symlink(outside, filepath.Join(pr, "widgets")); err != nil {
+		t.Fatal(err)
+	}
+	_, err := DeriveWorkdir(ctx, root, "acme", "acme/widgets")
+	if err == nil {
+		t.Fatal("DeriveWorkdir accepted a symlink to a matching checkout outside the project root")
+	}
+	if !errors.Is(err, ErrWorkdirRefused) {
+		t.Fatalf("err = %v, want the ErrWorkdirRefused sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("err %q does not say the path is a symlink", err)
+	}
+	// The developer's checkout is untouched.
+	if _, statErr := os.Stat(filepath.Join(outside, ".git")); statErr != nil {
+		t.Fatalf("the outside checkout was touched: %v", statErr)
+	}
+
+	// A dangling symlink is refused too, and not replaced by a clone.
+	if err := os.Remove(filepath.Join(pr, "widgets")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(t.TempDir(), "nowhere"), filepath.Join(pr, "widgets")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DeriveWorkdir(ctx, root, "acme", "acme/widgets"); err == nil {
+		t.Fatal("DeriveWorkdir accepted a dangling symlink")
+	}
+
+	// A symlink at the PROJECT ROOT relocates the whole project — every clone
+	// and the worktree directory — so it is refused before anything is derived.
+	realRoot := filepath.Join(t.TempDir(), "real")
+	if err := os.MkdirAll(realRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	linkedRoot := filepath.Join(t.TempDir(), "linked")
+	if err := os.Symlink(realRoot, linkedRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DeriveWorkdir(ctx, filepath.Dir(linkedRoot), "linked", "acme/widgets"); err == nil {
+		t.Fatal("DeriveWorkdir accepted a symlinked project root")
+	}
+}
+
+// A SYMLINK at the project's worktrees directory is refused: it is the fleet's
+// own area, and a link there would put every worktree a session creates (and
+// the scope granted for it) outside the project root.
+func TestDeriveWorktreesDirRefusesASymlink(t *testing.T) {
+	root := t.TempDir()
+	pr := filepath.Join(root, "acme")
+	if err := os.MkdirAll(pr, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(pr, WorktreesDirName)); err != nil {
+		t.Fatal(err)
+	}
+	_, err := DeriveWorktreesDir(root, "acme")
+	if err == nil {
+		t.Fatal("DeriveWorktreesDir accepted a symlinked worktree directory")
+	}
+	if !errors.Is(err, ErrWorkdirRefused) {
+		t.Fatalf("err = %v, want the ErrWorkdirRefused sentinel", err)
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("err %q does not say the directory is a symlink", err)
+	}
+	// Nothing was created through the link.
+	entries, readErr := os.ReadDir(outside)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("the outside directory gained %d entries through the link", len(entries))
+	}
+
+	// The project root itself being a symlink refuses the worktree derivation
+	// as well.
+	linkedRoot := filepath.Join(t.TempDir(), "linked")
+	if err := os.Symlink(pr, linkedRoot); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DeriveWorktreesDir(filepath.Dir(linkedRoot), "linked"); err == nil {
+		t.Fatal("DeriveWorktreesDir accepted a symlinked project root")
+	}
+}
+
+// A bare-name repos key that aliases the full primary identity is materialized
+// under the FULL identity: the bare name has no owner, so it cannot be cloned,
+// and attempting it first refused an instance whose primary already supplied
+// the clone URL (CLA-678 review MUST 3.2).
+func TestDeriveInstanceWorkdirsBareKeyAliasesThePrimary(t *testing.T) {
+	base := makeBareRemote(t, "acme/widgets")
+	pointClonesAt(t, base)
+	root := t.TempDir()
+
+	cfg := &config.Config{
+		BacklogURL:  "https://clankerbar.com/mcp/acme",
+		Repos:       map[string]string{"widgets": "/some/local/path"},
+		PrimaryRepo: "acme/widgets",
+	}
+	got, err := deriveInstanceWorkdirs(context.Background(), cfg, root)
+	if err != nil {
+		t.Fatalf("deriveInstanceWorkdirs refused a bare key aliasing the primary: %v", err)
+	}
+	if got["acme"] != filepath.Join(root, "acme") {
+		t.Fatalf("deriveInstanceWorkdirs = %v, want the project root", got)
+	}
+	// The clone was made from the FULL identity, under the shared checkout name.
+	remote, err := checkoutOriginRemote(filepath.Join(root, "acme", "widgets"))
+	if err != nil {
+		t.Fatalf("the alias's clone is not attributable: %v", err)
+	}
+	if !strings.Contains(remote, "acme/widgets") {
+		t.Fatalf("the clone's origin is %q, want acme/widgets", remote)
+	}
+}
+
+// Two FULL identities with the same checkout name cannot share one directory
+// under the project root: the conflict is reported BEFORE anything is cloned,
+// naming both identities, rather than surfacing as a wrong-origin refusal after
+// the first clone exists (CLA-678 review SHOULD 2.2).
+func TestDeriveInstanceWorkdirsRefusesDuplicateCheckoutNames(t *testing.T) {
+	root := t.TempDir()
+	cfg := &config.Config{
+		BacklogURL:  "https://clankerbar.com/mcp/acme",
+		Repos:       map[string]string{"other/api": "/some/local/path"},
+		PrimaryRepo: "acme/api",
+	}
+	_, err := deriveInstanceWorkdirs(context.Background(), cfg, root)
+	if err == nil {
+		t.Fatal("deriveInstanceWorkdirs accepted two repos deriving the same checkout name")
+	}
+	if !errors.Is(err, ErrWorkdirRefused) {
+		t.Fatalf("err = %v, want the ErrWorkdirRefused sentinel", err)
+	}
+	for _, want := range []string{"acme/api", "other/api", "api"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err %q does not name %q", err, want)
+		}
+	}
+	// Nothing was cloned for either identity.
+	if entries, readErr := os.ReadDir(filepath.Join(root, "acme")); readErr == nil && len(entries) > 0 {
+		t.Fatalf("the refused instance still materialized %d entries", len(entries))
+	}
 }

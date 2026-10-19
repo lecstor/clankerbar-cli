@@ -350,3 +350,27 @@ func containsPath(paths []string, want string) bool {
 	}
 	return false
 }
+
+// projectScope requires the session to start STRICTLY INSIDE the workdir. A
+// spawn dir exactly at the workdir's immediate parent has rel == "..", which is
+// neither "." nor "../"-prefixed, so it used to be reported as inside — the one
+// boundary value the documented contract excludes (CLA-678 review NIT 4.2).
+func TestProjectScopeRefusesTheImmediateParent(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "acme")
+	if err := os.MkdirAll(filepath.Join(project, "widgets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectScope(project, filepath.Join(project, "widgets")); got != project {
+		t.Fatalf("projectScope for a child = %q, want %q", got, project)
+	}
+	if got := projectScope(project, root); got != "" {
+		t.Fatalf("projectScope for the immediate parent = %q, want no scope", got)
+	}
+	if got := projectScope(project, project); got != "" {
+		t.Fatalf("projectScope for the workdir itself = %q, want no scope", got)
+	}
+	if got := projectScope(project, filepath.Join(root, "other", "x")); got != "" {
+		t.Fatalf("projectScope for a tree outside the workdir = %q, want no scope", got)
+	}
+}

@@ -58,8 +58,14 @@ var cloneTimeout = 5 * time.Minute
 // The clone lands in a temporary sibling and is RENAMED into place only once it
 // has succeeded, so a failed or interrupted clone can never leave a
 // directory-shaped failure at the derived path (the next reconcile would read
-// that as "exists but is not a checkout", which is the shape it must refuse)
-// and can never touch something that appeared at dir while the clone ran.
+// that as "exists but is not a checkout", which is the shape it must refuse).
+//
+// The install is NO-REPLACE. git clone runs for minutes, and a destination that
+// appears in the meantime belongs to whoever created it: Go's os.Rename already
+// refuses to replace an existing DIRECTORY (os/file_unix.go returns EEXIST), but
+// it does replace a file or a symlink, so the destination is Lstat-ed
+// immediately before the rename and every shape is refused. A raced-in path is
+// left exactly as it was and the clone is discarded.
 func cloneRepo(ctx context.Context, dir, repo string) error {
 	owner, name, err := splitRepoIdentity(repo)
 	if err != nil {
@@ -97,8 +103,32 @@ func cloneRepo(ctx context.Context, dir, repo string) error {
 		_ = os.RemoveAll(tmp)
 		return fmt.Errorf("git clone %s: %v: %s", url, err, firstLine(stderr.String()))
 	}
-	if err := os.Rename(tmp, dir); err != nil {
+	if err := installClone(tmp, dir, repo); err != nil {
 		_ = os.RemoveAll(tmp)
+		return err
+	}
+	return nil
+}
+
+// installClone moves a completed clone from tmp into dir with NO-REPLACE
+// semantics: git clone runs for minutes, and a destination that appears in the
+// meantime belongs to whoever created it. Go's os.Rename refuses to replace an
+// existing DIRECTORY (os/file_unix.go returns EEXIST) but WOULD replace a file
+// or a symlink, so every shape is checked here, immediately before the rename,
+// and a path that raced in while git ran is left untouched — the completed clone
+// is discarded rather than installed over somebody else's entry.
+//
+// The check and the rename are two calls, so a path created between them would
+// still be replaced; that window is microseconds rather than the whole clone,
+// which is the portable limit without a platform-specific no-replace rename
+// (renameat2/renamex_np) and a new dependency.
+func installClone(tmp, dir, repo string) error {
+	if _, err := os.Lstat(dir); err == nil {
+		return fmt.Errorf("%s appeared while %s was being cloned - refusing to replace a path the fleet did not create", dir, repo)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("cannot check the destination %s for the clone of %s: %v", dir, repo, err)
+	}
+	if err := os.Rename(tmp, dir); err != nil {
 		return fmt.Errorf("move the clone of %s into %s: %v", repo, dir, err)
 	}
 	return nil

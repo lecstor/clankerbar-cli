@@ -534,16 +534,28 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 	rootAbs = filepath.Clean(rootAbs)
 
 	var problems []string
+	// The project root and everything the layout puts under it are checked on
+	// CANONICAL paths: a lexical comparison says <root>/worktrees is inside
+	// <root> even when that name is a symlink to a directory on another disk.
+	// The supervisor refuses a symlink at any of these paths (see
+	// supervisor.DeriveWorkdir), so doctor must fail for the same layout rather
+	// than pass a config the derivation will refuse at reconcile time.
+	if fi, lerr := os.Lstat(rootAbs); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		problems = append(problems, "the project root "+rootAbs+" is a symlink to "+resolvePath(rootAbs)+" - it must be a real directory, never a link to a tree outside it")
+	}
 	if fi, statErr := os.Stat(rootAbs); statErr != nil || !fi.IsDir() {
 		problems = append(problems, "the project root "+rootAbs+" does not exist")
 	}
+	canonRoot := resolvePath(rootAbs)
 	// The worktree directory is the fleet's own, so it must be the fixed
 	// <project root>/worktrees - anything else means the layout is not what
 	// the sessions' scope (and their briefs) assume.
 	wt := filepath.Join(rootAbs, config.WorktreesDirName)
-	if fi, statErr := os.Stat(wt); statErr != nil || !fi.IsDir() {
+	if fi, lerr := os.Lstat(wt); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		problems = append(problems, "the worktree directory "+wt+" is a symlink to "+resolvePath(wt)+" - it must be a real directory inside the project root")
+	} else if fi, statErr := os.Stat(wt); statErr != nil || !fi.IsDir() {
 		problems = append(problems, "the worktree directory "+wt+" is missing (the fleet creates it at reconcile; `clankerbar supervise` makes it on its first derivation)")
-	} else if !insideDir(rootAbs, wt) {
+	} else if !insideDir(canonRoot, resolvePath(wt)) {
 		problems = append(problems, "the worktree directory "+wt+" is outside the project root")
 	}
 
@@ -555,6 +567,25 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 	if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
 		idents = append(idents, p)
 	}
+	// Two FULL identities that end in the same name derive the SAME directory
+	// (<project root>/<name>), so only one of them can ever be the clone there
+	// and the other reads as a wrong-origin checkout. Name the conflict here,
+	// where the operator can fix the config, rather than letting the layout
+	// report the symptom. A bare key beside a full identity of the same name is
+	// NOT a conflict: it is that repo spelled short, and the derivation
+	// materializes the full identity (the only spelling with a clone URL).
+	byBase := make(map[string]string, len(idents))
+	for _, id := range idents {
+		base := filepath.Base(id)
+		prev, ok := byBase[base]
+		if ok && prev != id && strings.Contains(prev, "/") && strings.Contains(id, "/") {
+			problems = append(problems, fmt.Sprintf("%s and %s both derive the directory %s - two repos cannot share one clone path; drop one from the project", prev, id, filepath.Join(rootAbs, base)))
+			continue
+		}
+		if !ok {
+			byBase[base] = id
+		}
+	}
 	for _, id := range idents {
 		dir, err := config.ResolveCheckout(repos, primary, rootAbs, id)
 		if err != nil {
@@ -562,7 +593,11 @@ func checkProjectRoot(label string, cfg *config.Config, repos map[string]string,
 			// this one is about the layout, so it stays quiet here.
 			continue
 		}
-		if !insideDir(rootAbs, dir) {
+		if fi, lerr := os.Lstat(dir); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			problems = append(problems, fmt.Sprintf("%s (%s) is a symlink to %s - the fleet's clone is a real directory inside the project root, never a link to a checkout outside it", id, dir, resolvePath(dir)))
+			continue
+		}
+		if !insideDir(canonRoot, resolvePath(dir)) {
 			problems = append(problems, fmt.Sprintf("%s resolves to %s, which is OUTSIDE the project root - a session's scope covers the project root, so it could not read it, and the fleet's own clone belongs at %s", id, dir, filepath.Join(rootAbs, filepath.Base(dir))))
 			continue
 		}

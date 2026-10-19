@@ -72,15 +72,20 @@ import (
 // supervisor happened to start rather than the project root the entry names.
 func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 	if len(cfg.Projects) == 0 {
-		if dir, ok := derived[""]; ok {
+		// The single-project config's derived root is keyed by the slug its MCP
+		// endpoint names (deriveInstanceWorkdirs), not by "". Only a root that
+		// was actually derived is applied — and only then is the scope flag
+		// asserted, because the flag claims the layout is in place.
+		if dir, ok := derived[cfg.Slug()]; ok {
 			cfg.WorkDir = dir
+			cfg.ProjectRoot = true
 		}
-		cfg.ProjectRoot = true
 		return
 	}
 	for i := range cfg.Projects {
 		if dir, ok := derived[cfg.Projects[i].Slug]; ok {
 			cfg.Projects[i].WorkDir = dir
+			cfg.ProjectRoot = true
 		}
 	}
 	if len(cfg.Projects) == 1 {
@@ -91,8 +96,9 @@ func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 	// Every workdir this call just wrote is a fleet project root by
 	// construction (CLA-678), so the derived config SAYS so: it is the flag a
 	// session's permission scope keys on, and a child that had to infer it
-	// would be guessing where a generated file can simply state the fact.
-	cfg.ProjectRoot = true
+	// would be guessing where a generated file can simply state the fact. Set
+	// only when a derived root was actually applied — the flag asserts the
+	// layout, so it must not claim one that was never written.
 }
 
 // materializeConfig builds the instance's effective config and writes it into

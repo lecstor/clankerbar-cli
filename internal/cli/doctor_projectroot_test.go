@@ -120,3 +120,75 @@ func TestCheckProjectRootIsSilentWithoutTheFlag(t *testing.T) {
 		t.Fatalf("checks = %+v, want none without project_root", got)
 	}
 }
+
+// A worktrees directory that is a SYMLINK to an external directory is a FAIL:
+// os.Stat follows the link and a lexical containment check says the name is
+// inside the root, so the layout and the sessions' scope would escape the
+// project root while doctor reported PASS (CLA-678 review MUST 3.1).
+func TestCheckProjectRootFailsForASymlinkedWorktreeDir(t *testing.T) {
+	root := layoutRoot(t, "acme/widgets")
+	if err := os.RemoveAll(filepath.Join(root, config.WorktreesDirName)); err != nil {
+		t.Fatal(err)
+	}
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(root, config.WorktreesDirName)); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{ProjectRoot: true, WorkDir: root, PrimaryRepo: "acme/widgets"}
+	got := checkProjectRoot("project root", cfg, cfg.ReposFor(""), cfg.PrimaryRepoFor(""), root)
+	if len(got) != 1 || got[0].status != fail {
+		t.Fatalf("checks = %+v, want one FAIL for a symlinked worktree directory", got)
+	}
+	if !strings.Contains(got[0].detail, "symlink") || !strings.Contains(got[0].detail, outside) {
+		t.Errorf("detail %q does not name the symlink and its external target", got[0].detail)
+	}
+}
+
+// A configured repo that is a SYMLINK to a matching checkout outside the root is
+// a FAIL, even though its origin is right: the session would read and edit a
+// tree outside its declared scope, and the fleet would adopt a developer's own
+// checkout (CLA-678 review MUST 1.1 / 2.1).
+func TestCheckProjectRootFailsForASymlinkedRepo(t *testing.T) {
+	root := layoutRoot(t, "acme/widgets")
+	outside := filepath.Join(t.TempDir(), "widgets")
+	doctorGit(t, outside, "init", "-b", "main")
+	doctorGit(t, outside, "remote", "add", "origin", "https://github.com/acme/widgets.git")
+	if err := os.RemoveAll(filepath.Join(root, "widgets")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "widgets")); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &config.Config{ProjectRoot: true, WorkDir: root, PrimaryRepo: "acme/widgets"}
+	got := checkProjectRoot("project root", cfg, cfg.ReposFor(""), cfg.PrimaryRepoFor(""), root)
+	if len(got) != 1 || got[0].status != fail {
+		t.Fatalf("checks = %+v, want one FAIL for a symlinked repo", got)
+	}
+	if !strings.Contains(got[0].detail, "symlink") || !strings.Contains(got[0].detail, outside) {
+		t.Errorf("detail %q does not name the symlink and its external target", got[0].detail)
+	}
+}
+
+// Two full identities sharing a checkout name cannot both live at
+// <project root>/<name>: doctor names the conflict rather than reporting the
+// wrong-origin symptom the derivation would hit after the first clone.
+func TestCheckProjectRootFailsForDuplicateCheckoutNames(t *testing.T) {
+	root := layoutRoot(t, "acme/api")
+	cfg := &config.Config{
+		ProjectRoot: true,
+		WorkDir:     root,
+		PrimaryRepo: "acme/api",
+		Repos:       map[string]string{"other/api": "api-other"},
+	}
+	got := checkProjectRoot("project root", cfg, cfg.ReposFor(""), cfg.PrimaryRepoFor(""), root)
+	if len(got) != 1 || got[0].status != fail {
+		t.Fatalf("checks = %+v, want one FAIL for a duplicate checkout name", got)
+	}
+	for _, want := range []string{"acme/api", "other/api"} {
+		if !strings.Contains(got[0].detail, want) {
+			t.Errorf("detail %q does not name %q", got[0].detail, want)
+		}
+	}
+}

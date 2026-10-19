@@ -315,3 +315,55 @@ func TestMaterializedConfigIsACache(t *testing.T) {
 		}
 	})
 }
+
+// applyDerivedWorkdirs' zero-projects branch must key on the slug the
+// derivation used (cfg.Slug(), from the MCP endpoint), not on "" — and it must
+// set the scope flag only when a derived root was actually applied (CLA-678
+// review SHOULD 4.1). Driven through resolveInstance, the documented
+// single-config shape.
+func TestResolveInstanceAppliesTheDerivedRootToAZeroProjectsConfig(t *testing.T) {
+	root := t.TempDir()
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
+	if err := os.MkdirAll(filepath.Join(root, "acme", config.WorktreesDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := t.TempDir()
+	o := materializeOptions(t, cacheDir, root)
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
+
+	cfg := &config.Config{
+		Harness:     "claude",
+		Prompt:      "Work the next backlog item.",
+		BacklogURL:  "https://clankerbar.com/mcp/acme",
+		PrimaryRepo: "acme/widgets",
+		WorkDir:     t.TempDir(), // NOT the derived root: the pin must replace it
+	}
+	got, _, err := d.resolveInstance(cfg)
+	if err != nil {
+		t.Fatalf("resolveInstance: %v", err)
+	}
+	if want := filepath.Join(root, "acme"); got.WorkDir != want {
+		t.Fatalf("workdir = %q, want the derived project root %q", got.WorkDir, want)
+	}
+	if !got.ProjectRoot {
+		t.Error("project_root = false, want true once a derived root was applied")
+	}
+
+	// A config whose derived map has no entry for its slug applies NOTHING and
+	// must not claim the layout either.
+	cfg = &config.Config{
+		Harness:     "claude",
+		Prompt:      "Work the next backlog item.",
+		BacklogURL:  "https://clankerbar.com/mcp/other",
+		PrimaryRepo: "acme/widgets",
+		WorkDir:     t.TempDir(),
+	}
+	applyDerivedWorkdirs(cfg, map[string]string{"acme": filepath.Join(root, "acme")})
+	if cfg.ProjectRoot {
+		t.Error("project_root = true although no derived root was applied")
+	}
+	if cfg.WorkDir == filepath.Join(root, "acme") {
+		t.Error("applyDerivedWorkdirs wrote another project's root into this config")
+	}
+}

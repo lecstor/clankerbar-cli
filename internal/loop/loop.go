@@ -7010,7 +7010,7 @@ func projectScope(workdir, spawnDir string) string {
 		return ""
 	}
 	rel, err := filepath.Rel(wd, sd)
-	if err != nil || rel == "." || strings.HasPrefix(filepath.ToSlash(rel), "../") {
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(filepath.ToSlash(rel), "../") {
 		return ""
 	}
 	return wd
