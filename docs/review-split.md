@@ -44,7 +44,7 @@ implement  →  review            →  fix
 | phase | actor | job | ends by |
 |---|---|---|---|
 | `implement` | cheap harness | claim, build, self-verify, commit, push, record branch | STOP holding the claim |
-| `review` (non-final) | the expensive reviewer | read the diff, run the adversarial gate, **record findings, change nothing** | `update_task(outcome)` then STOP holding the claim |
+| `review` (non-final) | the expensive reviewer | read the diff, run the adversarial gate (the record, not the repo's gates — see the brief's gate-scope rule), **record findings, change nothing** | `update_task(outcome)` then STOP holding the claim |
 | `fix` | cheap harness | apply findings by ID, re-verify scoped to them, commit, push, open the PR, hand over | `update_task(status: in_review, outcome)` |
 
 `review` selects the read-only brief **by position**: a review with a phase after

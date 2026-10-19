@@ -79,7 +79,11 @@ The **`review`** phase starts on a **fresh context**, resumes the *same* run (th
 driver substitutes the task and run ids into its brief, so it calls `heartbeat`
 instead of claiming), re-reads the bar and the standing decisions from the
 plane, works in that same worktree — never on the integration branch itself —
-reads the diff and runs the adversarial review gate. It is **review only**: it
+reads the diff and runs the adversarial review gate. It does **not** re-run the
+repo's gates: the implement phase self-verified at this tip and the fix and
+verify phases run them again over what they change, so a command here is only a
+targeted probe of a suspected defect, and the worktree is left clean. It is
+**review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task: a sealed per-reviewer durable record written through
 `update_task(review: ...)` — round, reviewer role, the phase's resolved
