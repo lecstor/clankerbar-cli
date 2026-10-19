@@ -1382,7 +1382,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			for runEnd < len(phases) && phases[runEnd].IsPanelMember() {
 				runEnd++
 			}
-			if n := runEnd - i; n > 1 && tc.EffectivePanelConcurrency(n) > 1 {
+			if n, conc := runEnd-i, tc.EffectivePanelConcurrency(runEnd-i); n > 1 && conc > 1 {
 				// The breaker at the boundary BEFORE the fan-out, exactly as the
 				// sequential path's per-spawn check would have stopped before the
 				// first member it could not afford.
@@ -1395,7 +1395,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 						break
 					}
 				}
-				if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, i, runEnd, tc.EffectivePanelConcurrency(n), carried, spend{
+				if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, i, runEnd, conc, carried, spend{
 					start:  prior.start,
 					tokens: prior.tokens + tokens,
 					cost:   prior.cost + cost,
@@ -1412,12 +1412,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 							phasesRun = append(phasesRun, label)
 						}
 					}
+					// The member claims are the same run the panel resumed; keep
+					// the CARRIED claim (with its verified branch and tip) rather
+					// than adopting one member's copy. A member that recorded
+					// nothing can end holding a claim that never had the tip
+					// folded onto it, and adopting that one would hand the fix
+					// phase an unverified-looking checkpoint.
 					if out.claim != nil && (carried == nil || out.claim.Claim.TaskID == carried.Claim.TaskID) {
 						seen = out.claim.Claim
 						finalDisp = out.disposition
-						if carried != nil && out.claim.Claim.Held() {
-							carried = out.claim
-						}
 					}
 					finalDead = out.finalDead
 					lastProducedNothing = out.lastProducedNothing
@@ -4022,6 +4025,34 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 	return tokens, cost, stop, err
 }
 
+// phaseRunOpts are the per-spawn facts a panel's parallel fan-out adds to
+// drainPhase (CLA-697). The zero value is every other caller: the phase runs in
+// the checkout sessionDir resolved, and drainPhase itself closes the review
+// round when the review stage is over.
+type phaseRunOpts struct {
+	// worktree, when non-empty, is the session's start directory instead of the
+	// one sessionDir resolved: the member's own DETACHED checkout at the reviewed
+	// tip. The brief tells the session it is there, so a member cannot wander
+	// into the shared task worktree.
+	worktree string
+
+	// panelParallel says the JOIN that spawned this member owns the review
+	// round's close. A member must not close it itself: its siblings may still be
+	// recording, and the close is what releases the findings they must not see.
+	panelParallel bool
+}
+
+// panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).
+// The shipped brief says to work in "the worktree for branch X", which is the
+// task's shared one; giving each member its own detached checkout would be
+// contradicted by that sentence, so the driver states the fact first.
+const panelWorktreeNote = "YOUR CHECKOUT: you are one member of a review PANEL running in PARALLEL " +
+	"with its siblings. The driver created a DETACHED worktree of the task's repository at the reviewed tip " +
+	"and started this session IN it; work here for the whole session. Do NOT switch to, edit, or leave " +
+	"artifacts in the task's shared worktree — another member and the fix phase use that one. This checkout " +
+	"is discarded when you end and is never salvaged, so put nothing you need in it. Nothing you do here can " +
+	"affect a sibling's checkout, so a probe is yours alone. "
+
 // drainPhase runs ONE phase to a clean finish, absorbing usage-limit pauses
 // (supervised wait) and transient blips (exponential backoff) by re-running the
 // SAME session — neither costs a drain count. Returns the tokens/cost consumed on
@@ -4061,34 +4092,6 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // recorded. It is the fix phase's grading input (mergedFindingsDigest reads
 // that round and no other); the unphased drain and a phase that does not follow
 // a panel pass the zero value.
-// phaseRunOpts are the per-spawn facts a panel's parallel fan-out adds to
-// drainPhase (CLA-697). The zero value is every other caller: the phase runs in
-// the checkout sessionDir resolved, and drainPhase itself closes the review
-// round when the review stage is over.
-type phaseRunOpts struct {
-	// worktree, when non-empty, is the session's start directory instead of the
-	// one sessionDir resolved: the member's own DETACHED checkout at the reviewed
-	// tip. The brief tells the session it is there, so a member cannot wander
-	// into the shared task worktree.
-	worktree string
-
-	// panelParallel says the JOIN that spawned this member owns the review
-	// round's close. A member must not close it itself: its siblings may still be
-	// recording, and the close is what releases the findings they must not see.
-	panelParallel bool
-}
-
-// panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).
-// The shipped brief says to work in "the worktree for branch X", which is the
-// task's shared one; giving each member its own detached checkout would be
-// contradicted by that sentence, so the driver states the fact first.
-const panelWorktreeNote = "YOUR CHECKOUT: you are one member of a review PANEL running in PARALLEL " +
-	"with its siblings. The driver created a DETACHED worktree of the task's repository at the reviewed tip " +
-	"and started this session IN it; work here for the whole session. Do NOT switch to, edit, or leave " +
-	"artifacts in the task's shared worktree — another member and the fix phase use that one. This checkout " +
-	"is discarded when you end and is never salvaged, so put nothing you need in it. Nothing you do here can " +
-	"affect a sibling's checkout, so a probe is yours alone. "
-
 func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend, phases []config.Phase, panel panelState, opts phaseRunOpts) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	tc := d.targetCfg(t)
 	// captured is this phase as the sequence was captured at drain start, before

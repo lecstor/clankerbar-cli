@@ -75,7 +75,6 @@ func (v *panelVerifier) Verify(context.Context, delivery.Claim) delivery.Report 
 // goroutines.
 type panelParallelAdapter struct {
 	*fakeAdapter
-	t       *testing.T
 	rel     *reviewReleaser
 	branch  string
 	tip     string
@@ -104,10 +103,9 @@ type panelParallelAdapter struct {
 	errs     []string
 }
 
-func newPanelParallelAdapter(t *testing.T, rel *reviewReleaser, branch, tip string, members int) *panelParallelAdapter {
+func newPanelParallelAdapter(rel *reviewReleaser, branch, tip string, members int) *panelParallelAdapter {
 	return &panelParallelAdapter{
 		fakeAdapter:      &fakeAdapter{},
-		t:                t,
 		rel:              rel,
 		branch:           branch,
 		tip:              tip,
@@ -294,7 +292,7 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	repo, branch, tip := panelParallelRepo(t)
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
 	members := panelMembers()
-	a := newPanelParallelAdapter(t, rel, branch, tip, len(members))
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
@@ -367,7 +365,7 @@ func TestDrainPhases_ParallelPanelOneMemberFailingStillRunsTheFix(t *testing.T) 
 	repo, branch, tip := panelParallelRepo(t)
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
 	members := panelMembers()
-	a := newPanelParallelAdapter(t, rel, branch, tip, len(members))
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	a.failLabel = "review-2"
 	a.wantRecords = len(members) - 1
 	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
@@ -407,7 +405,7 @@ func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
 	repo, branch, tip := panelParallelRepo(t)
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
 	members := panelMembers()
-	a := newPanelParallelAdapter(t, rel, branch, tip, len(members))
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	a.expectConcurrent = 1
 	d := panelParallelDriver(t, a, rel, members, repo, tip, 1)
 

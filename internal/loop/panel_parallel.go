@@ -49,6 +49,16 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
+const (
+	// panelFetchTimeout bounds the one network call a fan-out may need: fetching
+	// a reviewed tip this checkout does not yet hold.
+	panelFetchTimeout = 30 * time.Second
+	// panelCleanupTimeout bounds removing a member's throwaway worktree. It runs
+	// detached from the drain context so a cancelled run still cleans up, which
+	// means it needs a bound of its own.
+	panelCleanupTimeout = 30 * time.Second
+)
+
 // panelMemberOutcome is one member's finished pass, before the join folds it
 // into the drain's panel bookkeeping.
 type panelMemberOutcome struct {
@@ -161,16 +171,8 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		label := ph.Label(idx)
 		role := reviewerRoleFor(phases, idx)
 		last := idx == len(phases)-1
-		// terminal is the same positional fact the sequential loop computes: the
-		// last review of the stage. It only selects a handoff continuation, and a
-		// panel member never chains, but computing it identically keeps the two
-		// paths from drifting.
-		terminal := last
-		if !last && !config.ReviewShaped(phases[idx+1].Prompt) {
-			terminal = true
-		}
 		wg.Add(1)
-		go func(k, idx int, ph config.Phase, label, role string, last, terminal bool) {
+		go func(k, idx int, ph config.Phase, label, role string, last bool) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
@@ -189,7 +191,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 				ctx, drainNum, ti, idx, tag, ph, last, carried, t, prior, phases,
 				panelState{}, phaseRunOpts{worktree: dir, panelParallel: true})
 			out.members[k] = m
-		}(k, idx, ph, label, role, last, terminal)
+		}(k, idx, ph, label, role, last)
 	}
 	wg.Wait()
 
@@ -342,7 +344,10 @@ func panelReviewedTip(ctx context.Context, dir string, prev *harness.Result) (st
 		// this checkout has the object. Fetch the reviewed branch and demand the
 		// exact tip: a branch that moved since the checkpoint is not the revision
 		// the review is for, and the sequential path is the safe answer.
-		if _, err := panelGit(ctx, dir, "fetch", "--no-tags", "origin", prev.Claim.Branch); err == nil {
+		fctx, cancel := context.WithTimeout(ctx, panelFetchTimeout)
+		_, ferr := panelGit(fctx, dir, "fetch", "--no-tags", "origin", prev.Claim.Branch)
+		cancel()
+		if ferr == nil {
 			if got, gerr := panelGit(ctx, dir, "rev-parse", "FETCH_HEAD^{commit}"); gerr == nil && got == tip {
 				return tip, true
 			}
@@ -386,7 +391,9 @@ func (d *Driver) removePanelWorktree(repoRoot, dir string) {
 	if dir == "" {
 		return
 	}
-	if out, err := panelGit(context.Background(), dir, "status", "--porcelain"); err == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), panelCleanupTimeout)
+	defer cancel()
+	if out, err := panelGit(ctx, dir, "status", "--porcelain"); err == nil {
 		if dirty := strings.TrimSpace(out); dirty != "" {
 			lines := strings.Split(dirty, "\n")
 			if len(lines) > 5 {
@@ -396,10 +403,10 @@ func (d *Driver) removePanelWorktree(repoRoot, dir string) {
 				dir, strings.Join(lines, "; "))
 		}
 	}
-	if _, err := panelGit(context.Background(), repoRoot, "worktree", "remove", "--force", dir); err != nil {
+	if _, err := panelGit(ctx, repoRoot, "worktree", "remove", "--force", dir); err != nil {
 		log.Printf("review panel: could not remove the member worktree %s (%v) — removing the directory and pruning", dir, err)
 		_ = os.RemoveAll(dir)
-		_, _ = panelGit(context.Background(), repoRoot, "worktree", "prune")
+		_, _ = panelGit(ctx, repoRoot, "worktree", "prune")
 	}
 }
 
