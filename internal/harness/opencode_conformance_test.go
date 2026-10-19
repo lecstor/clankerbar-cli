@@ -690,6 +690,11 @@ func TestOpencodeConformance_mcpClaim(t *testing.T) {
 			if !res.Claim.Held() || res.Claim.TaskID != "T-9" || res.Claim.RunID != "run-1" {
 				t.Errorf("Claim = %+v, want held T-9 / run-1", res.Claim)
 			}
+			// The successful call is also the fact the driver's no-MCP backstop
+			// reads; it must be visible on the real stream, not only in a fixture.
+			if res.ClankerbarCalls < 1 {
+				t.Errorf("ClankerbarCalls = %d, want at least 1 for the completed claim_task", res.ClankerbarCalls)
+			}
 			if data, err := os.ReadFile(filepath.Join(mcpDir, "calls.jsonl")); err != nil || !strings.Contains(string(data), "claim_task") {
 				t.Errorf("the fake MCP server saw no claim_task call (%v)", err)
 			}
