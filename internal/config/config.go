@@ -1756,6 +1756,12 @@ func NoCodeHandoffContinuation() string {
 // iteration log's filename.
 var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
 
+// panelMemberPositionRe matches the DERIVED member-label family (`review-N`),
+// which is owned by member position (CLA-639). An explicit name from this family
+// must equal the member's own derived label; otherwise the logs, the INCOMPLETE
+// lines and the dead-phase tally would disagree about which member `review-2` is.
+var panelMemberPositionRe = regexp.MustCompile(`^review-[0-9]+$`)
+
 // The placeholders a phase prompt may carry, substituted by the driver from the
 // claim the previous phase left held. {{branch}} names the recorded, verified
 // hand-off branch (CLA-457): the implement phase's checkpoint is gated on it
@@ -3791,19 +3797,35 @@ func (c *Config) Validate() error {
 		if name := strings.TrimSpace(m.Name); name != "" && !phaseNameRe.MatchString(name) {
 			return fmt.Errorf("review_panel[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, name)
 		}
+		// The review-N family is owned by member POSITION: a member may write its
+		// own derived label, but not another member's, or the logs, the
+		// INCOMPLETE lines and the dead-phase tally would disagree about which
+		// member `review-2` is.
+		if name := strings.TrimSpace(m.Name); name != "" && panelMemberPositionRe.MatchString(name) {
+			derived := "review-" + strconv.Itoa(i+1)
+			if name != derived {
+				return fmt.Errorf("review_panel[%d]: name %q is a review-N label owned by another member's position; this member's derived label is %q — name it something of its own, or remove `name` to let the position derive it", i, name, derived)
+			}
+		}
 		// The label is also the iteration-log tag, the phasesRun entry and the
-		// dead-phase tally cell, so it must not shadow a phase. A member named
-		// `review` would merge with the real review phase in every log and tally
-		// (and ReviewShaped/escalation still key on the phase's prompt, so only
-		// the reporting would be a lie — which is enough). Refused instead of
-		// renamed: the operator wrote the name deliberately.
+		// dead-phase tally cell, so it must not shadow a phase either: a member
+		// named `review` would merge with the real review phase in every log and
+		// tally (ReviewShaped/escalation still key on the phase's prompt, so only
+		// the reporting would be a lie — which is enough). An explicit name is
+		// refused rather than renamed because the operator wrote it; a DERIVED
+		// label that collides is refused with the remedy (set `name`), because
+		// the position alone cannot avoid the collision.
 		if slices.Contains(BuiltinPhaseNames(), label) {
 			return fmt.Errorf("review_panel[%d]: name %q is a built-in phase name; a member's name is its log label and iteration-log tag, so it must not shadow the %q phase — give the member a name of its own", i, label, label)
 		}
 		for j, ph := range c.Phases {
-			if ph.Name == label {
-				return fmt.Errorf("review_panel[%d]: name %q is already the name of phases[%d]; a member's name labels its logs and dead-phase tally, so it must not merge with a configured phase", i, label, j)
+			if ph.Name != label {
+				continue
 			}
+			if strings.TrimSpace(m.Name) == "" {
+				return fmt.Errorf("review_panel[%d]: member %d's derived label %q collides with phases[%d]; set `name` on this member to label it without shadowing the phase", i, i+1, label, j)
+			}
+			return fmt.Errorf("review_panel[%d]: name %q is already the name of phases[%d]; a member's name labels its logs and dead-phase tally, so it must not merge with a configured phase", i, label, j)
 		}
 		h := strings.TrimSpace(m.Harness)
 		if h == "" {

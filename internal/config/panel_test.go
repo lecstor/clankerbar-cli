@@ -454,11 +454,14 @@ func TestReviewPanel_MemberNamesAreLogLabels(t *testing.T) {
 			t.Fatalf("Validate() = %v, want the duplicate-name refusal", err)
 		}
 	})
-	t.Run("a derived label that collides with an explicit one is refused", func(t *testing.T) {
+	t.Run("a review-N name from another position is refused", func(t *testing.T) {
+		// This also covers the derived/explicit collision the labels map used to
+		// catch last: `review-2` written on member 0 is refused here with a
+		// message that says whose label it is, before the map ever sees it.
 		cfg := writePanelConfig(t, base(`[{"name": "review-2"}, {}]`))
 		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "duplicate member name") {
-			t.Fatalf("Validate() = %v, want the derived/explicit collision refused", err)
+		if err == nil || !strings.Contains(err.Error(), "owned by another member's position") {
+			t.Fatalf("Validate() = %v, want member 0's review-2 refused", err)
 		}
 	})
 	t.Run("a member named after a built-in phase is refused", func(t *testing.T) {
@@ -482,6 +485,42 @@ func TestReviewPanel_MemberNamesAreLogLabels(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "already the name of phases[1]") {
 			t.Fatalf("Validate() = %v, want a configured phase name refused", err)
+		}
+	})
+	t.Run("a name owned by another member's position is refused", func(t *testing.T) {
+		cfg := writePanelConfig(t, base(`[{"name": "review-2"}, {"name": "alpha"}]`))
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "owned by another member's position") {
+			t.Fatalf("Validate() = %v, want member 0's review-2 refused", err)
+		}
+	})
+	t.Run("a member may name its own derived label", func(t *testing.T) {
+		cfg := writePanelConfig(t, base(`[{"name": "review-1"}, {}]`))
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want member 0's own review-1 accepted", err)
+		}
+		got := cfg.EffectivePhases()
+		if got[1].Name != "review-1" || got[2].Name != "review-2" {
+			t.Fatalf("member labels = %q, %q, want review-1, review-2", got[1].Name, got[2].Name)
+		}
+	})
+	t.Run("a derived label collision says it is derived", func(t *testing.T) {
+		cfg := writePanelConfig(t, `{
+			"harness": "claude",
+			"phases": [
+				{"name": "implement"},
+				{"name": "review-1", "prompt": "my own gate"},
+				{"name": "review"},
+				{"name": "fix"}
+			],
+			"review_panel": [{}, {}]
+		}`)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "derived label") {
+			t.Fatalf("Validate() = %v, want the derived-label collision named as such", err)
+		}
+		if !strings.Contains(err.Error(), "set `name`") {
+			t.Errorf("the derived-label refusal does not tell the operator to set `name`: %v", err)
 		}
 	})
 	t.Run("alpha and beta are accepted and keep their labels", func(t *testing.T) {
