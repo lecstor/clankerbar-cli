@@ -46,6 +46,33 @@ func TestDoctor_ReportsTheReviewPanel(t *testing.T) {
 		}
 	}
 
+	// A member that INHERITS its harness is reported with the harness it will
+	// actually run on (CLA-639 N1): the line names where the session runs, not
+	// the empty field on the member.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	inheriting := &config.Config{
+		Harness: "opencode",
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement"},
+			{Name: "review"},
+			{Name: "fix"},
+		},
+		ReviewPanel: []config.ReviewPanelMember{{Model: "opencode-go/gpt-6-luna"}},
+	}
+	if err := inheriting.Validate(); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+	inherited := ""
+	for _, l := range checkConfig(inheriting).info {
+		if strings.HasPrefix(l, "review panel: ") {
+			inherited = l
+		}
+	}
+	if !strings.Contains(inherited, "review-1 -> opencode/opencode-go/gpt-6-luna") {
+		t.Errorf("an inheriting member is not reported with the harness it runs on: %s", inherited)
+	}
+
 	// A config with no built-in review phase has no panel to report: the line is
 	// absent, not an empty one.
 	single := validCfg(t) // unphased

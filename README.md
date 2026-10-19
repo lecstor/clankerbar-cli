@@ -337,24 +337,40 @@ keeps the historical combined brief.
 sealed: written, but with their findings withheld from every `get_task` until
 the round closes, and the driver does not close the round between members. So
 member 2 reads the metadata of member 1's record (that it exists, its counts)
-and never its findings — the same record shape the console will show later.
-Sealed records also cannot write the outcome, the task body or decisions, so a
-reviewer cannot leak its findings through a side channel. A later member's
-prompt is built by the driver and contains no earlier member's findings. The
-round closes once **every member has recorded or been recorded as failed**; a
-usage-limited, capped or dead member is recorded as incomplete and the round
-still closes, so the fix phase is never spawned against findings the plane still
-holds sealed. If the run cannot continue the panel (the lease was handed back),
-the round is closed anyway and the next drain re-claims the task.
+and never its findings — the same record shape the console will show later. A
+panel member's brief is the **durable record alone**: it writes no outcome
+block, because member 1's block would land in the task and be the first thing
+member 2 read, and because the plane refuses this run's outcome writes anyway
+once its record seals the round. The panel's findings reach the outcome through
+the fix phase — the merged list it is handed, and the outcome it writes. A
+later member's prompt is built by the driver and contains no earlier member's
+findings.
+
+The round closes once **every member has recorded or been recorded as failed**:
+a usage-limited, capped or dead member is recorded as failed — with its reason,
+booked in the per-harness dead-phase tally — and the panel **moves on to the
+next member** rather than ending. After the last member the round closes (by
+the live holder, before anything hands the claim back) and the fix runs on the
+merged list, which names the incomplete member. Only a panel in which NO member
+recorded ends without a fix; a member that loses the claim ends the panel
+exactly as before. A panel that fails **one reviewer** therefore never strands
+the findings the others recorded, and the same member recording nothing on
+successive tasks is said loudly, with its harness and model. A **branchless**
+task cannot run a panel at all — its record is the legacy `## Review` block, and
+the plane takes no durable record from a settled task — so it runs one reviewer,
+with the brief it would have had anyway.
 
 **The driver merges; the fixer never grades reviews.** Every MUST from ANY
-member is open — consensus never filters one out, because a blocker one reviewer
-found and another missed is exactly the case the panel exists for. SHOULD and
-NIT findings are listed with the members that raised them; they are recorded,
-never gating. The merged list names any member that recorded nothing, so the
-fixer knows it is seeing the union of the reviewers that ran, not the panel that
-was configured. Refuting a MUST is done by the fixer with evidence, never by
-dropping a finding another reviewer would have kept.
+member of the panel's round is open — consensus never filters one out, because a
+blocker one reviewer found and another missed is exactly the case the panel
+exists for. Findings the plane already shows settled (`fixed`, `refuted`,
+`filed`) are not relisted as open work, and the list reads only the round the
+panel itself wrote, so a verify rewind does not resurrect an earlier cycle's
+findings. SHOULD and NIT findings are listed with the members that raised them;
+they are recorded, never gating. The merged list names any member that recorded
+nothing and why, so the fixer knows it is seeing the union of the reviewers that
+ran, not the panel that was configured. Refuting a MUST is done by the fixer
+with evidence, never by dropping a finding another reviewer would have kept.
 
 The panel is **interim** and local config, like the phase sequencing it
 multiplies (B10). The state-machine reshape moves review sequencing and the

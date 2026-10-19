@@ -357,7 +357,11 @@ func panelLabels(cfg *config.Config) []string {
 		if model == "" {
 			model = "harness default"
 		}
-		out = append(out, ph.Label(i)+" -> "+ph.Harness+"/"+model)
+		// HarnessFor, not ph.Harness: the effective sequence resolves the field
+		// today, but a member that INHERITS its harness carries an empty one until
+		// something resolves it, and a report that prints "review-2 -> /gpt-6"
+		// names the wrong thing (or nothing) about where the session will run.
+		out = append(out, ph.Label(i)+" -> "+cfg.HarnessFor(ph)+"/"+model)
 	}
 	return out
 }
