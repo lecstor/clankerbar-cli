@@ -489,7 +489,10 @@ type deliveryVerifier interface {
 
 // workSalvager is the driver's view of internal/salvage, narrowed the same way.
 type workSalvager interface {
-	Salvage(ctx context.Context, taskID, label string) salvage.Outcome
+	// Salvage rescues the work a dead session left in a worktree. recorded are
+	// the branches the session reported for the task, which is what "the session
+	// delivered" is judged against (CLA-695).
+	Salvage(ctx context.Context, taskID, label string, recorded ...string) salvage.Outcome
 }
 
 // New builds a single-project Driver — the original mode, driven entirely by the
@@ -4354,7 +4357,29 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// (`a`), never the run's: "did this session end on its own wall clock" is a
 		// question only the harness that RAN it can answer, and under per-phase
 		// harnesses (CLA-366) that harness is not necessarily d.h.
-		checkpointable := res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP)
+		// CLA-700: the exit status, and the ONE exception it does not decide. A
+		// stream that shows the session took a provider error and then RECOVERED
+		// from it — retried and carried on — ends on something other than the
+		// error, and opencode 2.x exits non-zero anyway (pinned by the
+		// conformance suite). Judging that exit by its status is what stranded two
+		// delivered phases on 2026-10-19: the driver read the status as "failed
+		// attempt" and either retried (a resumed phase ending the sequence, its
+		// lease left to lapse into a takeover) or stopped, with the pushed work
+		// already on the origin remote and the task held mid-sequence.
+		//
+		// So a recovered exit is asked the DELIVERY question instead, through the
+		// same evidence gate an orderly checkpoint uses, read once below. It is
+		// deliberately narrow: it needs the adapter's own marker (a stream whose
+		// events include a recovered error and no terminal one), so a plain exit 1
+		// from a harness with no such marker — or from a session that really did
+		// stop on an error — keeps every shipped classification. A recovered exit
+		// is eligible for a checkpoint on the evidence alone; when the evidence
+		// says it delivered nothing, it is the existing held-but-empty shape
+		// (retry once, then hand the task back), never a run-ending stop over an
+		// exit status the harness itself explains.
+		orderlyExit := res.ExitCode == 0 || capped || ceiling || wallclock
+		recoveredExit := !orderlyExit && res.Untrusted == "" && harness.RecoveredErrors(res) > 0
+		checkpointable := res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP) || recoveredExit
 		// CLA-386: a session whose final step finished with reason "unknown" and
 		// left no branch recorded produced NOTHING — a dead phase, not a completed
 		// one. It must not earn a checkpoint even on a zero exit, because a
@@ -4455,7 +4480,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		evidenceUnverified := false
 		evidenceWhy := ""
 		evidenceTip := ""
-		if isVerify && res.Untrusted == "" && (res.ExitCode == 0 || capped || ceiling || wallclock) {
+		if isVerify && res.Untrusted == "" && (orderlyExit || recoveredExit) {
 			// The verification seam runs even on the LAST phase. Unlike every
 			// other terminal phase its evidence is not a checkpoint (nothing
 			// follows to resume) but the durable record plus the open-MUST set:
@@ -4788,7 +4813,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// and a peek that fails or comes back not-held simply falls through
 			// to the standard ending below.
 			if end.claim == nil && !last && res.Untrusted == "" && !producedNothing &&
-				!res.Claim.Held() && (res.ExitCode == 0 || capped || ceiling || wallclock) {
+				!res.Claim.Held() && (res.ExitCode == 0 || capped || ceiling || wallclock || recoveredExit) {
 				if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask); claim != nil {
 					end.claim = claim
 					var evidenceTip string
@@ -5000,6 +5025,30 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			return tokens, cost, false, end, nil
 		}
 
+		// CLA-700: a session that recovered from its provider errors is not judged
+		// by its exit status — the stream shows the harness took the error, retried
+		// and carried the session on, and 2.x exits non-zero regardless (pinned by
+		// the conformance suite). Everything this exit could have meant was settled
+		// above by the DELIVERY question: either the phase checkpoints (its work is
+		// verified on the origin remote, or its review record appended) and the
+		// sequence advances, or it delivered nothing and ends the drain as the
+		// held-but-empty shape. Falling through to the classifiers here would undo
+		// both — the transient ladder retries a session whose work is already
+		// pushed, and the non-retryable stop ends the run over an exit status that
+		// names no failure.
+		//
+		// Deliberately HERE, after the untrusted and spend-accounting arms and
+		// after DetectLimit: a usage limit or budget stop is still honoured (its
+		// scan reads stderr and a TERMINAL error event, so a recovered blip cannot
+		// trip it while a genuine account stop still can), and the cap branches
+		// below are unreachable from here by construction — a capped exit is
+		// `orderlyExit`, so it never sets recoveredExit.
+		if recoveredExit {
+			log.Printf("iteration %d: the session's stream shows %d provider error event(s) it recovered from and no terminal one (exit %s) — judging this phase on its delivery, not on the exit status",
+				drainNum, harness.RecoveredErrors(res), res.ExitString())
+			return tokens, cost, false, end, nil
+		}
+
 		// A turn-capped end is this PHASE ending, never the run failing. It exits
 		// non-zero and matches neither the limit scan nor the transient one, so
 		// without this it would fall through to the non-retryable branch below and
@@ -5187,6 +5236,19 @@ func (d *Driver) endUntrustedDrain(t Target, drainNum int, harnessName string, r
 // it was not needed costs nothing — a clean worktree commits nothing, pushes
 // nothing and records nothing.
 //
+// # What it will not save (CLA-695)
+//
+// Untracked files alone, when the session DELIVERED — the branch it recorded for
+// the task is on the origin at exactly the worktree's HEAD. There is nothing to
+// rescue, and committing a generated file (a `wrangler types` dump, a report, a
+// build artifact) pushes a NEW tip at the phase boundary: every review-panel
+// member, the fix phase and the PR then ride a commit nobody chose, which is
+// exactly what happened on the first review-panel run. Tracked edits are still
+// salvaged on top of a delivered tip, and an undelivered session's untracked files
+// are still salvaged in full — new source files it never added are the work
+// CLA-314 exists to save. Delivery is the discriminator, and internal/salvage
+// checks it against the origin rather than taking the session's word for it.
+//
 // # Why it is safe on the untrusted path
 //
 // CLA-262 forbids acting on a truncated stream's CLAIM-STATE: a settle we never
@@ -5217,7 +5279,7 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), salvageTimeout)
 	defer cancel()
 
-	out := d.newSalvager(workdir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref)
+	out := d.newSalvager(workdir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref, recordedBranches(*res)...)
 	label := claimLabel(res.Claim)
 	switch out.Status {
 	case salvage.Nothing:
@@ -5240,6 +5302,24 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 				log.Printf("%snothing to salvage for %s: %s", labelOf(t), label, out.Detail)
 			}
 		}
+		return
+	case salvage.Untracked:
+		// CLA-695: the session DELIVERED — the branch it recorded is on the origin
+		// at exactly the worktree's HEAD — and left nothing but untracked files.
+		// There is nothing to rescue and nothing to record, so this is a report
+		// rather than an alarm: the paths are named because an untracked file can
+		// still be work (a source file written after the last commit), and only a
+		// reader can tell that from the generated output this rule exists for. The
+		// claim is left exactly as the Refused and Failed cases leave it — no
+		// branch recorded, so the ordinary handback rules apply unchanged.
+		left := strings.Join(out.Paths, ", ")
+		if left == "" {
+			// A salvager that names the paths only in its prose still gets them in
+			// front of the operator: a log line ending in a colon says nothing.
+			left = out.Detail
+		}
+		log.Printf("%sdelivered %s with only untracked files left in %s — committing them would move the branch later readers review, so they are left alone: %s",
+			labelOf(t), label, out.Worktree, left)
 		return
 	case salvage.Refused:
 		log.Printf("%sSTRANDED WORK LEFT AS IS — %s: %s", labelOf(t), label, out.Detail)

@@ -225,6 +225,19 @@ func TestOpencodeIsTransient(t *testing.T) {
 		// must NOT be read as a transient error — only opencodeErrorText is scanned.
 		{"assistant narration mentioning a rate limit does NOT trip", Result{Stdout: `{"type":"text","text":"Earlier I hit a rate limit and connection error, so I paused before retrying."}`}, false},
 		{"clean run", Result{Stdout: opencodeStream}, false},
+		// CLA-700, the 2026-10-19 incidents: an error event the session RECOVERED
+		// from classifies nothing. 2.x emits provider.invalid-output, retries the
+		// request itself and finishes the turn, but still exits 1 — so before this
+		// the whole delivered session read as a transient failure and its phase was
+		// abandoned mid-sequence. The rule is positional: only a stream that ENDS on
+		// the error event is a failure.
+		{"recovered error event followed by a step is NOT transient", recoveredFixture(t, opencodeRecoveredErrorStream(t)), false},
+		{"recovered error event followed by a final answer is NOT transient", recoveredFixture(t, opencodeRecoveredAnswerStream(t)), false},
+		{"a recovered error does not hide a TERMINAL one", Result{ExitCode: 1, UsageReported: true, Stdout: opencodeRecoveredErrorStream(t) + "\n" + `{"type":"error","error":{"data":{"statusCode":503}}}`}, true},
+		// The mirror: the same error text the incident hit, as the LAST event, is
+		// still a transient failure — recovery is what changed, not the wording.
+		{"a terminal invalid-output event is still transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"step_start"}
+{"type":"error","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}`}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,6 +254,99 @@ func TestOpencodeIsTransient(t *testing.T) {
 				t.Errorf("IsUnclassifiedTransient = true on a result IsTransient rejected")
 			}
 		})
+	}
+}
+
+// opencodeRecoveredErrorStream and opencodeRecoveredAnswerStream are the same
+// 2026-10-19 stream (CLA-700), captured verbatim in
+// testdata/opencode-recovered-provider-error.jsonl: a session whose first turn
+// ends with `provider.invalid-output` / "OpenAI Chat stream ended without
+// finish_reason" (status 200, anomalyco/opencode#43622), which 2.x then RETRIES
+// itself and completes — a second step_start and a final text part follow the
+// error. Read from disk rather than inlined so the fixture stays the captured
+// bytes.
+func opencodeRecoveredErrorStream(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "opencode-recovered-provider-error.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the 2026-10-19 recovered-provider-error fixture: %v", err)
+	}
+	return strings.TrimRight(string(b), "\n")
+}
+
+// opencodeRecoveredAnswerStream is the same capture with everything before the
+// recovered turn dropped: the error, then the retry's step and its final answer.
+func opencodeRecoveredAnswerStream(t *testing.T) string {
+	t.Helper()
+	lines := strings.Split(opencodeRecoveredErrorStream(t), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("fixture carries %d events, want 5 (2 before the error, the error, 2 after)", len(lines))
+	}
+	return strings.Join(lines[2:], "\n")
+}
+
+// recoveredFixture is a 2026-10-19 (CLA-700) stream shaped the way the ADAPTER
+// hands it to a classifier: parsed, non-zero exit, usage reported — the arm of
+// IsTransient's heuristic that would otherwise fire on the raw exit status.
+func recoveredFixture(t *testing.T, stdout string) Result {
+	t.Helper()
+	res := opencodeParsedFrom(Invocation{}, io.Discard, stdout)
+	res.ExitCode = 1
+	res.UsageReported = true
+	return res
+}
+
+// TestOpencodeRecoveredProviderErrorDoesNotClassifyTheSession is the CLA-700 rule
+// at the adapter: the 2026-10-19 stream's error event is followed by the retry's
+// own steps and final answer, so the session RECOVERED and none of the
+// classifiers may read it as a failure. IsTransient is the one that actually
+// stranded two delivered phases (opencodeTransientRe's `stream ... ended` arm
+// matched the recovered event, and once the event is out of the scan the
+// usage-gated heuristic had to be closed too — exit 1 plus reported usage is
+// exactly the shape it retries).
+func TestOpencodeRecoveredProviderErrorDoesNotClassifyTheSession(t *testing.T) {
+	// Through the PARSER, not hand-built: the marker the classifiers read is the
+	// parser's own output, and a Result assembled by hand would not prove it is
+	// written.
+	res := opencodeParsedFrom(Invocation{}, io.Discard, opencodeRecoveredErrorStream(t))
+	res.ExitCode = 1 // the status opencode 2.0.32 really exits with (probe + conformance suite)
+	// The session export reports the turn's usage on any real run of this shape,
+	// which is what arms the CLA-381 heuristic the classifiers below must not take.
+	res.UsageReported = true
+
+	if got := RecoveredErrors(res); got != 1 {
+		t.Fatalf("RecoveredErrors = %d, want 1 — the parser did not record the recovered error event (Raw: %v)", got, res.Raw)
+	}
+	if res.FinalMessage != "OK" {
+		t.Errorf("FinalMessage = %q, want OK — the recovered turn's answer is the session's final message", res.FinalMessage)
+	}
+	if (opencode{}).IsTransient(res) {
+		t.Errorf("IsTransient = true for a session that recovered from its error event; diagnostic = %q", (opencode{}).Diagnostic(res))
+	}
+	if (opencode{}).IsUnclassifiedTransient(res) {
+		t.Error("IsUnclassifiedTransient = true: the heuristic retried an exit status the harness's own recovery explains")
+	}
+	if (opencode{}).DetectLimit(res).Limited {
+		t.Error("DetectLimit fired on a recovered invalid-output event")
+	}
+	// The diagnosis is NOT the classification: opencodeErrorText (what IsTransient
+	// and Diagnostic share) carries no text for a recovered event, and the Raw
+	// diagnostic key still records what the stream saw. The two are deliberately
+	// different questions — "what did the session take?" vs "how did it end?".
+	if got := (opencode{}).Diagnostic(res); strings.Contains(got, "invalid-output") {
+		t.Errorf("Diagnostic quotes a recovered error event as if it were the failure: %q", got)
+	}
+	if got := res.Raw[OpencodeErrorTypeKey]; got != "provider.invalid-output" {
+		t.Errorf("opencode_error_type = %v, want the stream's error event recorded for diagnostics", got)
+	}
+	// And the terminal-error side is unchanged: a stream that ENDS on the same
+	// event is still a transient failure nothing about this fix softens.
+	terminal := opencodeParsedFrom(Invocation{}, io.Discard, strings.Split(opencodeRecoveredErrorStream(t), "\n")[2])
+	if (opencode{}).IsTransient(terminal) {
+		t.Errorf("a stream that ends ON the invalid-output event must stay transient; diagnostic = %q", (opencode{}).Diagnostic(terminal))
+	}
+	if RecoveredErrors(terminal) != 0 {
+		t.Errorf("RecoveredErrors = %d for a stream that ended on its error, want 0", RecoveredErrors(terminal))
 	}
 }
 
