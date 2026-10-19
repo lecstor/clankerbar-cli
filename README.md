@@ -897,7 +897,8 @@ lists the version it itself runs and, per instance, the state and the version
 of the child serving it — so version skew between children (and between a
 child and the supervisor) is observable on the machine, not only on the fleet
 page. Those lines, and its refuse/spawn/exit decisions, are also written to
-`<supervisor state dir>/supervise.log` (see [Visibility](#visibility)). `clankerbar supervise roll` rolls the children onto a newly installed
+`<supervisor state dir>/supervise.log` (see [Visibility](#visibility)).
+`clankerbar supervise roll` rolls the children onto a newly installed
 binary one at a time, verifying each one's next beacon reports it before the
 next is touched; `clankerbar supervise replace` drains the fleet and execs the
 running supervisor into a newly installed build. Neither fetches or installs
