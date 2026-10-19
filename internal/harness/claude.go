@@ -403,6 +403,17 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 	if toolUseID == "" {
 		return
 	}
+	// CLA-703: a clankerbar call's SUCCESS is the one fact that separates "the
+	// MCP server was not there" from "the session reached the backlog and still
+	// chose not to review". Every mapped call counts — a get_task or heartbeat
+	// proves the server just as well as a claim does — and a refusal counts for
+	// nothing, because that is the state the no-MCP arm is about.
+	if res.clankerbarCalls[toolUseID] {
+		delete(res.clankerbarCalls, toolUseID)
+		if !isError {
+			res.ClankerbarCalls++
+		}
+	}
 	// A delivery claim is kept only if the plane ACCEPTED the call that made it —
 	// same rule, same reason: a refused `update_task` recorded no branch and
 	// declared no delivery, so there is nothing to check and nothing to complain
@@ -435,7 +446,17 @@ const (
 	updateTaskTool       = "mcp__clankerbar__update_task"
 	askQuestionTool      = "mcp__clankerbar__ask_question"
 	escalateQuestionTool = "mcp__clankerbar__escalate_question"
+
+	// clankerbarToolPrefix is the namespace every clankerbar MCP tool carries,
+	// whichever adapter reported it. CLA-703 asks "did this session reach the
+	// backlog at all?", which is true of any successful call — get_task and
+	// heartbeat included — so the counter keys on the namespace, not on the
+	// handful of calls that carry claim state.
+	clankerbarToolPrefix = "mcp__clankerbar__"
 )
+
+// isClankerbarTool reports whether name is one of the clankerbar MCP tools.
+func isClankerbarTool(name string) bool { return strings.HasPrefix(name, clankerbarToolPrefix) }
 
 // noteToolUse records what a clankerbar call will mean once its result lands.
 //
@@ -447,6 +468,15 @@ const (
 // `ready` over a task that is waiting on the operator, dropping it back into the
 // claimable queue with the question unanswered.
 func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
+	// Remember the request so its RESULT can say whether the backlog was
+	// reachable (CLA-703). A call that never returns — killed mid-flight —
+	// counts for nothing, which is right: it proved nothing either way.
+	if toolUseID != "" && isClankerbarTool(name) {
+		if res.clankerbarCalls == nil {
+			res.clankerbarCalls = map[string]bool{}
+		}
+		res.clankerbarCalls[toolUseID] = true
+	}
 	switch name {
 	case claimTaskTool:
 		// The ids are in the RESULT, not the arguments. A claim that loses the

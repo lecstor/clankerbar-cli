@@ -688,16 +688,33 @@ func TestOpencodeConformance_mcpClaim(t *testing.T) {
 			if data, err := os.ReadFile(filepath.Join(mcpDir, "calls.jsonl")); err != nil || !strings.Contains(string(data), "claim_task") {
 				t.Errorf("the fake MCP server saw no claim_task call (%v)", err)
 			}
-			sawNote := false
+			// CLA-703: the race is removed, not described. The first request
+			// that carries tools must already offer the clankerbar tool, and
+			// the old warm-up note must be gone from every user message.
+			sawToolOnFirstToolRequest := false
 			for _, r := range fake.requests() {
 				for _, u := range r.User {
 					if strings.Contains(u, "connect in the background") {
-						sawNote = true
+						t.Error("the removed MCP warm-up note still reached the model")
 					}
 				}
+				if len(r.Tools) == 0 || sawToolOnFirstToolRequest {
+					continue
+				}
+				sawToolOnFirstToolRequest = true
+				found := false
+				for _, name := range r.Tools {
+					if strings.Contains(name, "clankerbar_claim_task") {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("the first tool-bearing request did not offer clankerbar_claim_task (tools: %v)", r.Tools)
+				}
 			}
-			if !sawNote {
-				t.Error("the MCP warm-up note did not reach the model")
+			if !sawToolOnFirstToolRequest {
+				t.Error("no tool-bearing request reached the fake provider")
 			}
 			if want := int(fake.hit.Load()) * fakeRequestTokens; res.Tokens != want {
 				t.Errorf("Tokens = %d, want %d", res.Tokens, want)

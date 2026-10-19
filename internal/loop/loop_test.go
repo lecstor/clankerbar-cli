@@ -2082,6 +2082,16 @@ func held(base harness.Result, c harness.Claim) harness.Result {
 
 func openClaim() harness.Claim { return harness.Claim{TaskID: "t-1", RunID: "r-1"} }
 
+// mcpReached marks a scripted result as one whose session successfully called a
+// clankerbar MCP tool. A review fixture that is meant to model a reviewer that
+// DID reach the backlog (and then recorded nothing, or made its own choices)
+// needs this: CLA-703's backstop otherwise reads the fixture's silence as a
+// missing MCP server and retries it.
+func mcpReached(r harness.Result) harness.Result {
+	r.ClankerbarCalls = 1
+	return r
+}
+
 // runWithReleaser drives one unnamed target that has both a poller and a releaser.
 func runWithReleaser(t *testing.T, cfg *config.Config, h harness.Adapter, p backlog.Poller, r *fakeReleaser) error {
 	t.Helper()

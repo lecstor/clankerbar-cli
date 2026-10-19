@@ -156,8 +156,10 @@ func probeCoherent(reply, ref string) bool {
 
 // opencodeResumeArgs builds the args for a continuation run into an existing
 // session: the same dialect as opencodeArgs, plus `-s <id>` and WITHOUT the
-// phase prompt — a continuation carries its own short message, behind the same
-// MCP warm-up note (each `run` process connects its MCP servers afresh).
+// phase prompt — a continuation carries its own short message. The adapter's
+// server preflight (CLA-703) applies to a continuation exactly as it does to a
+// first run: every non-probe session waits for the clankerbar MCP server before
+// its first turn.
 //
 // sid must be an id this adapter SAW on a session's stream (resumeTargets reads
 // it off Result.Raw, which only the stream parser writes). 2.x does not refuse

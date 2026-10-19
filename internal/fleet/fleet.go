@@ -69,6 +69,16 @@ const (
 	OutcomeDead       = "dead"
 )
 
+// Per-session causes that are not an outcome of the phase's own work. They ride
+// the session entry so the durable phase_session record can say WHY a session
+// that ran produced nothing, and analytics can exclude an infrastructure miss
+// from review-quality numbers (CLA-703).
+const (
+	// CauseNoMCP: the session made no successful clankerbar MCP call and wrote
+	// no review record — the backlog tools were not available to it.
+	CauseNoMCP = "no_mcp"
+)
+
 // State is the presence half of a report: what the daemon is doing right now.
 type State struct {
 	Kind    string // one of the State* constants
@@ -118,6 +128,13 @@ type Session struct {
 	// session.
 	Usage         TokenUsage
 	UsageReported bool
+
+	// Cause names a non-work reason this session produced nothing, using the
+	// Cause* vocabulary above. Empty for an ordinary session. It is carried on
+	// the session (not the iteration) because one reviewer can be an
+	// infrastructure miss while the rest of the panel and the fix run normally
+	// (CLA-703).
+	Cause string `json:"cause,omitempty"`
 
 	// RunID is the run's UUID the session worked the task under, when there is
 	// one — empty for a session that never held a claim. It is deliberately NOT
@@ -439,6 +456,11 @@ type wireSession struct {
 	CostUSD *float64 `json:"costUsd,omitempty"`
 	// RunID omits itself when the session held no claim, like the rest.
 	RunID string `json:"runId,omitempty"`
+	// Cause is omitted for an ordinary session, so an older plane sees the same
+	// bytes it always did. The current plane ignores unknown session keys; the
+	// classification is carried for the durable phase_session record to read
+	// once its parser stores it (CLA-703 follow-up).
+	Cause string `json:"cause,omitempty"`
 }
 
 type wireIteration struct {
@@ -532,7 +554,7 @@ func wireSessions(sessions []Session) []wireSession {
 	}
 	out := make([]wireSession, 0, len(sessions))
 	for _, s := range sessions {
-		w := wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model, RunID: s.RunID}
+		w := wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model, RunID: s.RunID, Cause: s.Cause}
 		if s.UsageReported {
 			w.UsageReported = true
 			w.Usage = &wireUsage{

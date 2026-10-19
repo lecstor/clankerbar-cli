@@ -596,6 +596,17 @@ type Result struct {
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
 
+	// ClankerbarCalls is how many clankerbar MCP tool calls this session got a
+	// SUCCESSFUL result for. A refused call (the tool was not connected yet, the
+	// plane rejected it) does not count: it says nothing about whether the
+	// backlog was reachable, and the driver's no-MCP classification is exactly
+	// the question "was the backlog reachable at all?".
+	//
+	// Only adapters that observe a session's clankerbar traffic populate it
+	// (Capabilities.TracksClaims); on any other adapter it stays zero and the
+	// driver must not read a zero as "the MCP server was missing".
+	ClankerbarCalls int
+
 	// CheckpointUnverified marks this Result as the hand-off for a phase that
 	// reached its checkpoint on an UNVERIFIED branch (CLA-576): the phase
 	// recorded Claim.Branch on the plane, but the driver's read of the origin
@@ -632,6 +643,13 @@ type Result struct {
 	// output: every clankerbar call that matters is judged on the plane's ANSWER,
 	// never on the request, because a refused call changes nothing.
 	pending map[string]pendingKind
+
+	// clankerbarCalls names the tool_use ids that are clankerbar calls, so the
+	// RESULT can decide ClankerbarCalls. It is separate from `pending` because
+	// most clankerbar calls (get_task, heartbeat, list_tasks) arm no claim or
+	// delivery state, yet a successful one still proves the MCP server was
+	// usable — which is the fact CLA-703's no-MCP classification needs.
+	clankerbarCalls map[string]bool
 
 	// pendingReports is the same discipline for delivery claims: an `update_task`
 	// REFUSED by the plane (a missing Tests header, a superseded run) recorded
@@ -1026,6 +1044,18 @@ var ErrUsageUnsupported = errors.New("usage introspection not supported by this 
 // the harness's output is unreadable, and a wait that keeps polling on it is
 // spending money no ceiling can see. loop.supervisedWait tells them apart.
 var ErrUntrusted = errors.New("untrusted harness output")
+
+// ErrMCPNotConnected marks a session that never reached its first model turn
+// because the clankerbar MCP server did not report connected in time. It is an
+// INFRASTRUCTURE failure, not a verdict on the phase: the session did no work
+// and recorded no review, and the driver must retry it as such rather than read
+// an empty result as "the session reviewed nothing" (CLA-703).
+//
+// It is an error rather than a zero Result on purpose. A zero Result is
+// indistinguishable from a session that ran and produced nothing — exactly the
+// silent "no record" shape the task exists to kill — while the error carries the
+// reason to the driver's log and to whatever retry decision it makes.
+var ErrMCPNotConnected = errors.New("the clankerbar MCP server did not connect")
 
 // probeVerdict turns a finished probe session into what the caller may act on.
 //

@@ -1275,9 +1275,9 @@ func TestDrainPhases_BranchlessPanelWithNoRecordEndsWithoutAFix(t *testing.T) {
 	run := func(t *testing.T, members []config.ReviewPanelMember) (*fakeAdapter, bool, error) {
 		t.Helper()
 		h := &fakeAdapter{steps: []invokeStep{
-			{res: held(okResult(1, 0), openClaim())}, // implement: no branch (the plane's record is the evidence)
-			{res: held(okResult(1, 0), openClaim())}, // the only reviewer: records NOTHING and holds
-			{res: okResult(1, 0)},                    // would be the fix
+			{res: held(okResult(1, 0), openClaim())},             // implement: no branch (the plane's record is the evidence)
+			{res: mcpReached(held(okResult(1, 0), openClaim()))}, // the only reviewer: reached the backlog, records NOTHING and holds
+			{res: okResult(1, 0)},                                // would be the fix
 			{res: okResult(1, 0)},
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
