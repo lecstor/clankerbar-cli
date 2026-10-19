@@ -1403,6 +1403,94 @@ func TestBuiltinReviewOnlyBriefStatesItsScopeAndRecord(t *testing.T) {
 	}
 }
 
+// CLA-696: the review-only phase is a READER, not a second gate run. On the
+// first review-panel run (MAK-266) the implement phase had already run the
+// repo's gates at its tip, and the brief was silent on whether "run the
+// adversarial review gate" included them - so one member re-ran typecheck,
+// build, the 2935-test web suite, the layout-engine suite and veraPDF on
+// effectively the same tree, two ran focused subsets, and one read code. With N
+// members that is up to N redundant full-gate runs per round, which is why the
+// rule is on all FOUR review-only briefs - the single reviewer's and the panel
+// member's, verified and unverified - and on no brief that owns the gates.
+func TestReviewOnlyBriefsDoNotRerunTheGates(t *testing.T) {
+	reviewOnly := map[string]string{
+		"review-only brief":             reviewOnlyBrief,
+		"unverified review-only brief":  unverifiedReviewOnlyBrief,
+		"panel member brief":            panelMemberReviewOnlyBrief,
+		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
+	}
+	for name, brief := range reviewOnly {
+		for _, want := range []string{
+			// The claim: the gates are another phase's job, at THIS tip.
+			"THE GATES ARE NOT YOURS TO RE-RUN",
+			"the fix and verify phases run the gates again over what they change",
+			// The prohibition names what was actually re-run, so "do not run
+			// the suite" cannot be read as "do not run a test".
+			"do NOT run the repo's full test suite, typecheck, build or long checks",
+			// The substitution: the reading that finds what a green build cannot.
+			"Spend the session READING",
+			"the code it touches that the diff does not show",
+			// The one exception, and its limit - the constraint is what keeps
+			// "a probe" from becoming a gate run under another name.
+			"only as a TARGETED probe",
+			"one test file, one package, one short repro script",
+			"never the repo's gate list",
+			// A probe that confirms a defect IS the finding's evidence, cited
+			// under the MUST bar's own kinds rather than a new one this brief
+			// alone would know.
+			"the probe's output IS that finding's evidence",
+			"`(gate): <the command and its failing output>`",
+			"`(failure): <the input and the wrong output>`",
+			// The worktree rule, and the panel's reason for it.
+			"leave the worktree as it found it",
+			"`git checkout -- <path>`",
+			"The panel shares this one worktree",
+		} {
+			if !strings.Contains(brief, want) {
+				t.Errorf("the %s never says %q, so the reviewer is left to decide for itself whether the gate means re-running the gates (CLA-696):\n%s", name, want, brief)
+			}
+		}
+		// Exactly once, and after the gate sentence it defines: the rule is a
+		// gloss on "run the adversarial review gate", not a free-standing
+		// paragraph a reader can arrive at cold.
+		if n := strings.Count(brief, reviewGateScope); n != 1 {
+			t.Errorf("the %s carries the gate scope %d times, want exactly once:\n%s", name, n, brief)
+		}
+		gate := strings.Index(brief, "adversarial review gate")
+		scope := strings.Index(brief, reviewGateScope)
+		if gate < 0 || scope < gate {
+			t.Errorf("the %s carries the gate scope before the gate instruction it qualifies (gate at %d, scope at %d):\n%s", name, gate, scope, brief)
+		}
+	}
+
+	// The gate-OWNING briefs must not carry it: implement self-verifies, and the
+	// fix and verify phases run the gates after their changes. A review rule
+	// pasted into any of them would tell a phase that must verify to stop.
+	//
+	// The BRANCHLESS review-only brief is excluded deliberately, and pinned
+	// here so the exclusion is a decision rather than an oversight: it reviews
+	// the plane's record with no branch, no diff and no worktree, so there is no
+	// tip whose gates could be skipped, and the "reading the diff" half has
+	// nothing to point at.
+	for name, brief := range map[string]string{
+		"implement brief":               builtinPhasePrompts[ImplementPhaseName],
+		"final review-and-fix brief":    builtinPhasePrompts[ReviewPhaseName],
+		"fix brief":                     fixBrief,
+		"fix-with-verify brief":         fixVerifyBrief,
+		"verify brief":                  verifyBrief,
+		"no-code fix brief":             noCodeFixBrief,
+		"no-code verify brief":          noCodeVerifyBrief,
+		"no-code fix-with-verify brief": noCodeFixVerifyBrief,
+		"no-code review-only brief":     noCodeReviewOnlyBrief,
+	} {
+		for _, banned := range []string{"THE GATES ARE NOT YOURS TO RE-RUN", "Spend the session READING"} {
+			if strings.Contains(brief, banned) {
+				t.Errorf("the %s carries the review-only gate scope (%q), but this brief is not a review-only phase:\n%s", name, banned, brief)
+			}
+		}
+	}
+}
+
 // CLA-635: every review-only variant — the three briefs and the two handoff
 // continuations that carry the record shape — states the accepted MUST bar: the
 // seven evidence kinds with their payloads, and the not-a-MUST list, whose
