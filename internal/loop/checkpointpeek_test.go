@@ -63,8 +63,6 @@ func (r *peekReleaser) TaskState(_ context.Context, taskID string) (plane.TaskSt
 func blindSpotDriver(t *testing.T, h *fakeAdapter, rel *peekReleaser) *Driver {
 	t.Helper()
 	cfg := fastCfg()
-	// CLA-639: the legacy two-phase shape, scripted below as exactly two sessions.
-	noPanel(cfg)
 	cfg.Phases = twoPhases()
 	cfg.Prompt = ""
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})

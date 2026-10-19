@@ -99,7 +99,7 @@ func TestModelForTier_ANoModelConfigResolvesToTheHarnessDefault(t *testing.T) {
 // A phase carrying a tier survives EffectivePhases, which is where a built-in
 // prompt is resolved and where a field could be dropped by rebuilding the struct.
 func TestEffectivePhases_CarriesTheTierThrough(t *testing.T) {
-	c := noPanel(&Config{Phases: []Phase{{Name: "implement", Tier: "strong"}, {Name: "review", Tier: "cheap"}}})
+	c := &Config{Phases: []Phase{{Name: "implement", Tier: "strong"}, {Name: "review", Tier: "cheap"}}}
 
 	got := c.EffectivePhases()
 	if len(got) != 2 {

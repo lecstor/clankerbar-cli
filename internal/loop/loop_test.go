@@ -280,40 +280,19 @@ func (p *fakePoller) Poll(ctx context.Context) (backlog.Summary, error) {
 // ever sleeps for real. Crucially, RetryCap=1ms makes backoff() return the cap
 // for every retry n (the 30s base is always > the cap), so transient retries do
 // not incur the real 30s/60s/... backoff.
+//
+// It deliberately sets no `review_panel`: an absent panel is the historical
+// single review (CLA-639 is opt-in, with no default and no preset), which is the
+// shape every test that scripts one review phase per phase drives. The panel
+// tests set their own members.
 func fastCfg() *config.Config {
-	cfg := &config.Config{
+	return &config.Config{
 		Harness:          "claude",
 		Prompt:           "Work the backlog.",
 		IdlePollInterval: config.Duration(time.Millisecond),
 		PollInterval:     config.Duration(time.Millisecond),
 		RetryCap:         config.Duration(time.Millisecond),
 	}
-	noPanel(cfg)
-	return cfg
-}
-
-// noPanel is the explicit legacy-single-review opt-out for a test config
-// (CLA-639): the same opt-out an operator writes as `"review_panel": []`. The
-// shipped default is the TRIAL panel, so a test that scripts one review session
-// per phase says which shape it drives; the panel tests set their own members
-// instead.
-func noPanel(cfg *config.Config) *config.Config {
-	cfg.ReviewPanel = []config.ReviewPanelMember{}
-	return cfg
-}
-
-// panelCfg is fastCfg with the shipped trial panel, for the tests whose config
-// goes through Validate (a nil panel resolves to the trial, but an explicitly
-// empty one is refused when a sequence names a review phase). The opencode
-// block is the minimum a validated config needs once a panel member names a
-// harness other than the run's.
-func panelCfg() *config.Config {
-	cfg := fastCfg()
-	cfg.ReviewPanel = config.TrialReviewPanel()
-	cfg.Harnesses = map[string]config.HarnessConfig{
-		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json"},
-	}
-	return cfg
 }
 
 // runLoop runs Run under a safety timeout so a control-flow regression that fails

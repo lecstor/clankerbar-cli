@@ -21,8 +21,9 @@ import (
 // These fixtures drive the driver directly and mutate a reviewReleaser from the
 // fake adapter's onInvoke, exactly as a real session's update_task(review: ...)
 // lands between two spawns. The member list is deliberately two models with one
-// repeated name shape (the trial panel's own pattern): the duplicate is an
-// independent run, not a duplicate to deduplicate.
+// repeated name shape: the duplicate is an independent run, not a duplicate to
+// deduplicate. The panel is SET on every one of them — an absent `review_panel`
+// is the single reviewer, so nothing here relies on a default.
 
 // panelPhases is the shipped three-phase sequence. EffectivePhases expands the
 // review phase into the panel below; the fix phase stays one phase and receives
@@ -35,8 +36,8 @@ func panelPhases() []config.Phase {
 	}
 }
 
-// panelMembers is the trial panel's shape, smaller: the same model twice plus
-// another model once.
+// panelMembers is the operator's own fleet as an example, smaller: the same
+// model twice plus another model once.
 func panelMembers() []config.ReviewPanelMember {
 	return []config.ReviewPanelMember{
 		{Name: "review-1", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},

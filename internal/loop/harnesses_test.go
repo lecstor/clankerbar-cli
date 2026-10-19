@@ -32,9 +32,6 @@ func (f namedFake) Name() string { return f.name }
 func mixedDriver(t *testing.T, impl, review *fakeAdapter) *Driver {
 	t.Helper()
 	cfg := fastCfg()
-	// CLA-639: the mixed-harness fixtures drive the LEGACY two-phase shape, one
-	// review session on the run's harness; the panel tests set their own members.
-	noPanel(cfg)
 	cfg.Prompt = ""
 	cfg.Model = "claude-opus-5"
 	cfg.ConfigDir = "/home/me/.claude"

@@ -46,7 +46,7 @@ func TestHarnessFor_PhaseOverridesTheRunWideHarness(t *testing.T) {
 }
 
 func TestEffectivePhases_CarriesTheResolvedHarness(t *testing.T) {
-	got := noPanel(mixedCfg()).EffectivePhases()
+	got := mixedCfg().EffectivePhases()
 	if got[0].Harness != "opencode" || got[1].Harness != "claude" {
 		t.Fatalf("EffectivePhases harnesses = %q/%q, want opencode/claude — the driver reads this and must not re-derive it",
 			got[0].Harness, got[1].Harness)
@@ -147,7 +147,7 @@ func TestModelForTier_UnphasedBehaviourIsUnchanged(t *testing.T) {
 }
 
 func TestPhaseHarnesses_ListsEveryHarnessTheConfigDeclares(t *testing.T) {
-	got := noPanel(mixedCfg()).PhaseHarnesses()
+	got := mixedCfg().PhaseHarnesses()
 	// Run-wide first, then sequence order, deduplicated: doctor prints these and
 	// the first one keeps the unqualified label.
 	if len(got) != 2 || got[0] != "claude" || got[1] != "opencode" {

@@ -36,10 +36,6 @@ func phaseDriver(t *testing.T, h harness.Adapter, phases []config.Phase) (*Drive
 func phaseDriverWithReleaser(t *testing.T, h harness.Adapter, phases []config.Phase, rel plane.Releaser) *Driver {
 	t.Helper()
 	cfg := fastCfg()
-	// CLA-639: these fixtures script one review session per phase, so they drive
-	// the LEGACY single-review shape. The trial panel is the shipped default for
-	// a phased config; the panel tests set their own members.
-	noPanel(cfg)
 	cfg.Phases = phases
 	if len(phases) > 0 {
 		cfg.Prompt = ""
@@ -3735,7 +3731,7 @@ func TestMatchingReviewRecord(t *testing.T) {
 // distinct role and therefore a distinct record in the same round. A phase
 // that is not review-shaped has no role at all.
 func TestReviewerRoleFor(t *testing.T) {
-	shipped := noPanel(&config.Config{Phases: []config.Phase{
+	shipped := (&config.Config{Phases: []config.Phase{
 		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
 	}}).EffectivePhases()
 	if got := reviewerRoleFor(shipped, 1); got != "review-1" {
@@ -3748,9 +3744,10 @@ func TestReviewerRoleFor(t *testing.T) {
 		t.Errorf("the fix phase's role = %q, want none", got)
 	}
 
-	// The legacy hand-expanded shape: two review phases the OPERATOR wrote. The
-	// panel expands the same way from one review, and takes the same roles.
-	panel := noPanel(&config.Config{Phases: []config.Phase{
+	// The legacy hand-expanded shape: two review phases the OPERATOR wrote. A
+	// panel expands into the same shape from one review, and takes the same
+	// roles.
+	panel := (&config.Config{Phases: []config.Phase{
 		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
 	}}).EffectivePhases()
 	if got := reviewerRoleFor(panel, 1); got != "review-1" {
@@ -3761,12 +3758,17 @@ func TestReviewerRoleFor(t *testing.T) {
 	}
 
 	// The expanded panel: one configured review, four members, roles by position
-	// (CLA-639). This is what the driver actually iterates.
-	expanded := (&config.Config{Phases: []config.Phase{
-		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
-	}}).EffectivePhases()
+	// (CLA-639). This is what the driver actually iterates. The panel is SET
+	// explicitly — an absent `review_panel` expands nothing (there is no
+	// default), so the roles below are the operator's own members.
+	expanded := (&config.Config{
+		Phases: []config.Phase{
+			{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
+		},
+		ReviewPanel: []config.ReviewPanelMember{{}, {}, {}, {}},
+	}).EffectivePhases()
 	if len(expanded) != 6 {
-		t.Fatalf("a trial-panel sequence has %d phases, want 6 (implement + 4 reviewers + fix)", len(expanded))
+		t.Fatalf("a four-member panel sequence has %d phases, want 6 (implement + 4 reviewers + fix)", len(expanded))
 	}
 	for i, want := range map[int]string{1: "review-1", 2: "review-2", 3: "review-3", 4: "review-4"} {
 		if got := reviewerRoleFor(expanded, i); got != want {
