@@ -771,6 +771,19 @@ contrast, is consumed by the daemon when it honours it, so the supervisor
 cannot see it and reads the exit as unexpected: **to stop ONE instance while
 the supervisor runs, touch `HALT` in its state dir, not `STOP`.**
 
+**A dead child's claim is handed back immediately.** A session that dies with
+the daemon process — a crash, a `kill`, the machine sleeping — would otherwise
+leave its lease ticking for the full 30 minutes with nobody working the task.
+While a daemon holds a claim it keeps `CURRENT_CLAIM` in its state dir (task id,
+run id, project, branch once one is recorded, and when the claim was taken) and
+removes it on every path where it lets go. When a child exits with the file
+still there, the supervisor makes the call the dead daemon could not, before any
+respawn: `release` when no branch was recorded, `expireLease` when one was, so
+pushed work comes back as an immediate takeover with its branch instead of
+waiting out the lease. The same happens inside the daemon when a phase is
+abandoned holding pushed work. A plane that refuses because the run already
+ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
+
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
 (loaded exactly as `clankerbar run` loads it, or bare defaults when no file

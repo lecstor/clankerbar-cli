@@ -422,6 +422,12 @@ type Driver struct {
 	// Run returns.
 	restartRequested atomic.Bool
 
+	// expireUnsupportedOnce says once, not once per abandoned phase, that the
+	// plane predates expireLease (CLA-707/708). Every such handback falls back
+	// to leaving the lease to expire, which is the old behaviour, so repeating
+	// the line adds nothing.
+	expireUnsupportedOnce sync.Once
+
 	// beaconWriteFailed is the streak latch for the LOCAL beacon write
 	// (loop/fleet.go): the first consecutive failure is logged, further ones
 	// stay silent, and recovery is logged once. Atomic because the claim
@@ -614,6 +620,12 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// cannot forget it. (The closure, not `defer d.sweepPendingStop(runErr)`:
 	// arguments evaluate at registration, and runErr is not assigned yet.)
 	defer func() { d.sweepPendingStop(runErr) }()
+	// A run that ends in an orderly way holds nothing, so nothing is left for a
+	// supervisor to hand back (CLA-708). Every let-go path removes this file as
+	// it happens; this is the backstop for a path that forgets. A process that is
+	// KILLED never reaches it, and that is exactly the case the supervisor's exit
+	// check exists for.
+	defer d.clearCurrentClaim()
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
@@ -3910,6 +3922,10 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 			labelOf(t), ref, err)
 		return
 	}
+	// The park moved the task out of the holding run: nothing is left for a
+	// supervisor to hand back (CLA-708), exactly as a settle observed from the
+	// stream would have said.
+	d.clearCurrentClaim()
 	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
 		log.Printf("%sparked %s — %s, but the question for the operator could not be filed: %v",
 			labelOf(t), ref, reason, err)
@@ -5089,19 +5105,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
-			// A RESUMED phase must not wait one out (CLA-631). It is working a
-			// live lease — 30 minutes, and nothing driver-side heartbeats it — so
-			// a supervised wait of hours would re-spawn the phase against a run
-			// the plane has long since swept or handed to another clanker, with a
-			// runId in its prompt that no longer means anything. End the sequence
-			// instead: the branch is pushed, the lease lapses, and the task comes
-			// back as a takeover, which is the designed recovery for exactly
-			// this. The RUN, though, must not end with it — exiting the daemon
-			// left a whole fleet idle until an operator noticed — so the wait is
-			// handed to drainPhases, which owes it only once the sequence's
+			// A RESUMED phase must not wait one out (CLA-631). The seam's handback
+			// has already ended the claim: `release` puts a no-work claim straight
+			// back in the queue, and `expireLease` ends a pushed-work claim's lease
+			// immediately, leaving the task an immediate takeover — so a supervised
+			// wait of hours would only run against a task this sequence no longer
+			// holds, with a runId in its prompt that no longer means anything. End
+			// the sequence instead. The RUN, though, must not end with it — exiting
+			// the daemon left a whole fleet idle until an operator noticed — so the
+			// wait is handed to drainPhases, which owes it only once the sequence's
 			// handback has run and no lease is held.
 			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a 30-minute lease; the task returns as a takeover with its branch recorded, and the run stays up to wait for the reset instead of exiting",
+				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting",
 					drainNum)
 				end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
 				return tokens, cost, false, end, nil
@@ -5267,23 +5282,23 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// out a usage limit — and this path is the more dangerous of the two,
 			// because MaxRetries defaults to 0, meaning never give up. Seeding the
 			// resumed claim made the seam's handback live for phase 2, so a blip
-			// here hands the task back mid-sequence while the retry is handed the
-			// very same heartbeat(runId) brief; and where the handback is declined
-			// (HasWIP), the backoff ladder walks past the 30-minute lease in about
-			// six steps and then re-spawns, indefinitely, against a run the plane
-			// has swept. End the sequence: the branch is pushed, the lease lapses,
-			// and the task comes back as a takeover. The RUN, though, must not end
-			// with it (CLA-651) — exiting the daemon on one provider blip left the
-			// fleet idle until an operator noticed, the same failure CLA-631 fixed
-			// for limits — so the sequence-end signal goes to drainPhases, which
-			// owes it a wait (CLA-662): there is no reset for a blip, so the run
-			// waits the target's growing backoff rung after the handback and then
-			// polls again. The rung matters precisely when this phase's harness is
-			// NOT the one the queue drains on: an opencode implement start can
-			// never see the claude blip, so without the run-level wait the same
-			// implement-and-lose loop would repeat with nothing bounding it.
+			// here hands the task back mid-sequence at once: `release` for a claim
+			// with nothing pushed, `expireLease` for pushed work, which ends that
+			// claim's lease immediately and leaves the task an immediate takeover.
+			// A retry would then be handed the very same heartbeat(runId) brief
+			// against a run that no longer holds anything. End the sequence. The
+			// RUN, though, must not end with it (CLA-651) — exiting the daemon on
+			// one provider blip left the fleet idle until an operator noticed, the
+			// same failure CLA-631 fixed for limits — so the sequence-end signal
+			// goes to drainPhases, which owes it a wait (CLA-662): there is no
+			// reset for a blip, so the run waits the target's growing backoff rung
+			// after the handback and then polls again. The rung matters precisely
+			// when this phase's harness is NOT the one the queue drains on: an
+			// opencode implement start can never see the claude blip, so without
+			// the run-level wait the same implement-and-lose loop would repeat with
+			// nothing bounding it.
 			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying on a 30-minute lease nothing renews; the task returns as a takeover with its branch recorded, and the run stays up to poll again instead of exiting",
+				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting",
 					drainNum, res.ExitString())
 				end.sequenceEnd = &phaseSequenceEnd{}
 				return tokens, cost, false, end, nil
@@ -5506,6 +5521,12 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 	// Only now. HasWIP is a statement about the TASK, not about the disk: it means
 	// the next clanker will be told there is work to fetch.
 	res.Claim.HasWIP = true
+	res.Claim.Branch = out.Branch
+	// The session is over, so no OnClaim snapshot will carry this branch to
+	// CURRENT_CLAIM; update the record directly, or a supervisor handing this
+	// claim back after the daemon dies would choose `release` (no branch) and
+	// post `ready` over the work just rescued.
+	d.noteCurrentClaim(res.Claim, t.Name)
 	log.Printf("%srecorded %s as the hand-off branch for %s — the next clanker takes it over instead of starting again",
 		labelOf(t), out.Branch, label)
 }
@@ -5727,6 +5748,9 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 			labelOf(t), claimLabel(res.Claim), err)
 		return
 	}
+	// Parked is a let-go: the record describes a run that no longer holds the
+	// task, and a supervisor must not try to hand it back (CLA-708).
+	d.clearCurrentClaim()
 	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
 		// The task IS parked — it will not be retried — so saying it was "left
 		// for the next claim" would be the opposite of what happened. The park
@@ -5827,33 +5851,47 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		return false
 	}
 	if !res.Claim.Releasable() {
-		// Leaving the lease alone is right — see Releasable. Whether it is also a
-		// FAILURE depends entirely on which call site got here; only that caller
-		// knows, so only that caller says so.
+		// CLA-708: the claim has pushed work, so Release is forbidden — it would
+		// post `ready` over the branch and throw away the takeover hand-off. The
+		// plane's expireLease ends the dead run's lease NOW and leaves the task an
+		// immediate takeover with its branch, which is the same disposition the
+		// lease's own expiry sweep produces, half an hour sooner.
 		//
-		// CLA-584: a session the adapter marked as an output-cap stall is named
-		// by its cause, in place of the generic line — the operator reading
-		// daemon.log after MAK-123 could only see "the phase finished but never
-		// moved the task on", which says nothing about what stopped it.
+		// Leaving the lease to expire remains the fallback on every failure below
+		// (an unwired plane, a plane older than the field, a refused write), and
+		// it is the ONLY behaviour for the `res.Untrusted` path above, which does
+		// not reach here by design.
 		stallReason, stalled := outputCapStallReasoning(res)
+		ended := d.expireHeldClaim(ctx, t, res)
 		if countUndeclared {
 			d.undeclared++
-			if stalled {
-				log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d)",
-					labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
-				return false
-			}
+		}
+		switch {
+		case ended && stalled && countUndeclared:
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover) (undeclared hand-offs this run: %d)",
+				labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
+		case ended && stalled:
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover)",
+				labelOf(t), stallReason, claimLabel(res.Claim))
+		case ended && countUndeclared:
+			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease on %s (pushed work kept for takeover) (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
+				labelOf(t), res.Claim.TaskID, claimLabel(res.Claim), d.undeclared)
+		case ended:
+			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease on %s (pushed work kept for takeover)",
+				labelOf(t), res.Claim.TaskID, claimLabel(res.Claim))
+		case stalled && countUndeclared:
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d)",
+				labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
+		case countUndeclared:
 			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
 				labelOf(t), res.Claim.TaskID, d.undeclared)
-			return false
-		}
-		if stalled {
+		case stalled:
 			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives",
 				labelOf(t), stallReason, claimLabel(res.Claim))
-			return false
+		default:
+			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
+				labelOf(t), res.Claim.TaskID)
 		}
-		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
-			labelOf(t), res.Claim.TaskID)
 		return false
 	}
 	if t.Releaser == nil {
@@ -5879,6 +5917,7 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		}
 		return false
 	}
+	d.clearCurrentClaim()
 	if stalled {
 		log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s; handed it back to the queue for another clanker",
 			labelOf(t), stallReason, claimLabel(res.Claim))
@@ -5886,6 +5925,41 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
 	return true
+}
+
+// expireHeldClaim ends a dead session's lease on a task whose pushed work must
+// survive (CLA-708). It reports whether the plane accepted the handback; every
+// refusal falls back to the pre-CLA-708 behaviour — leave the lease to expire —
+// and says which refusal it got.
+//
+// The call is detached from ctx and bounded exactly like the Release call: a
+// cancelled run (Ctrl-C, SIGTERM, RESTART_NOW) is precisely when a claim would
+// otherwise be abandoned, so the handback has to outlive the signal that
+// prompted it without letting a wedged plane hold up shutdown.
+func (d *Driver) expireHeldClaim(ctx context.Context, t Target, res harness.Result) bool {
+	if t.Releaser == nil {
+		return false
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	err := t.Releaser.ExpireLease(rctx, res.Claim.TaskID, res.Claim.RunID)
+	switch {
+	case err == nil:
+		d.clearCurrentClaim()
+		return true
+	case errors.Is(err, plane.ErrNotWired):
+		// Nothing to call. The old line is the honest one, and it is what the
+		// caller logs when this returns false.
+		return false
+	case errors.Is(err, plane.ErrFieldUnsupported):
+		d.expireUnsupportedOnce.Do(func() {
+			log.Printf("%sthe backlog plane predates expireLease — dead runs' leases will expire on their own as before; upgrade the plane to hand a dead session's claim back immediately", labelOf(t))
+		})
+		return false
+	default:
+		log.Printf("%scould not end the lease on %s: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
+		return false
+	}
 }
 
 // verifyDeliveries checks, against local git, what the session told the plane it

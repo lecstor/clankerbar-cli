@@ -260,6 +260,7 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 		name         string
 		claim        harness.Claim
 		wantReleases int
+		wantExpires  int
 	}{
 		{
 			// Since CLA-457 a clean-exit no-branch phase 1 is the EMPTY shape, not
@@ -272,11 +273,13 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 			wantReleases: 1,
 		},
 		{
-			name: "work pushed (what phase 1 actually leaves): lease left to expire",
+			name: "work pushed (what phase 1 actually leaves): the lease is ended now, work kept",
 			// update_task(branch:) sets HasWIP; CLA-314 keeps such a claim
 			// non-releasable so the task returns as a takeover with its branch.
-			claim:        harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
-			wantReleases: 0,
+			// Since CLA-708 the handback is expireLease, which produces exactly
+			// that takeover immediately instead of half an hour from now.
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
+			wantExpires: 1,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -292,6 +295,9 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 			}
 			if len(rel.calls) != tc.wantReleases {
 				t.Errorf("handed the task back %d times, want %d: %+v", len(rel.calls), tc.wantReleases, rel.calls)
+			}
+			if len(rel.expireCalls) != tc.wantExpires {
+				t.Errorf("ended the lease %d time(s), want %d: %+v", len(rel.expireCalls), tc.wantExpires, rel.expireCalls)
 			}
 		})
 	}

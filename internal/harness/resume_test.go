@@ -38,6 +38,9 @@ func TestSeededResumeClaimArmsTheUpdateTaskArm(t *testing.T) {
 	if !res.Claim.HasWIP {
 		t.Error("update_task(branch:) did not set HasWIP on the seeded claim — the claim would look releasable, so the driver would post a task with pushed work back to the queue instead of leaving the takeover hand-off")
 	}
+	if res.Claim.Branch != "clanker/task-abc-work" {
+		t.Errorf("Claim.Branch = %q, want clanker/task-abc-work — CURRENT_CLAIM needs the NAME, not only the fact, to choose expireLease over release", res.Claim.Branch)
+	}
 	if !res.Claim.Settled {
 		t.Error("update_task(status: in_review) did not settle the seeded claim — the driver would then hand back a task already in review, which is the one outcome CLA-262 calls worse than a lease expiring")
 	}

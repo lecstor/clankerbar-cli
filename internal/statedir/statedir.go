@@ -481,6 +481,45 @@ func (d *Dir) WriteFile(name string, data []byte) error {
 	return f.Close()
 }
 
+// WriteFileAtomic replaces name with data via a same-directory rename, so a
+// reader never sees a half-written file and a rewrite never follows a symlink
+// planted at name. The temporary name is ours by construction (fixed suffix,
+// O_EXCL, removed first). It exists for CURRENT_CLAIM, whose branch field is
+// updated while the daemon runs.
+//
+// WriteFile cannot be used for that: its O_EXCL refusal is the point (a marker
+// that already exists is somebody else's decision), while a claim record is
+// ours and must be replaced.
+func (d *Dir) WriteFileAtomic(name string, data []byte) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	tmp := name + ".tmp"
+	// A stale temp is possible only after a crash between the write and the
+	// rename; Remove drops a planted symlink rather than following it.
+	if err := d.root.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := d.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		_ = d.root.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = d.root.Remove(tmp)
+		return err
+	}
+	if err := d.root.Rename(tmp, name); err != nil {
+		_ = d.root.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // ReadFile reads a file from the directory, refusing to follow a symlink and
 // reading at most maxMarkerBytes.
 func (d *Dir) ReadFile(name string) ([]byte, error) {
@@ -582,7 +621,12 @@ func (d *Dir) isOurArtifact(name string) bool {
 		// The supervisor's generated effective config (phase 2b). The daemon
 		// that opens this directory next was started with `run -c` pointing at
 		// it, and doctor opens the same directory — both must adopt it.
-		name == MaterializedConfigName:
+		name == MaterializedConfigName,
+		// The daemon's record of the claim its current child holds, written for
+		// the supervisor to hand back if the child dies without letting go
+		// (CLA-708). Its `.tmp` sibling is the in-flight half of an atomic
+		// replace; a crash can leave one behind.
+		name == "CURRENT_CLAIM", name == "CURRENT_CLAIM.tmp":
 		return true
 	case name == ".DS_Store", name == "Thumbs.db":
 		// Not ours, but not the operator's either: the file manager writes these
