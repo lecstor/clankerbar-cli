@@ -298,3 +298,59 @@ func TestWaitOrStopHonoursTheControlMarkers(t *testing.T) {
 		markerAbsent(t, d.state.Path(), MarkerReload)
 	})
 }
+
+// TestWaitOrStop_ConcurrentReloadAppliesOnce is review finding 1.review-1.2's
+// fix. A parallel review panel puts N members inside waitOrStop's loop at once
+// (CLA-697), and reading a marker then removing it is not atomic: two members
+// could both find one RELOAD before either removed it and both would run
+// applyReload — swapping d.cfg and invalidating the run-config overlays from two
+// goroutines. The lock makes one marker mean exactly one reload, whatever else
+// is parked on the same wait.
+func TestWaitOrStop_ConcurrentReloadAppliesOnce(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	openTestStateDir(t, d)
+
+	var (
+		mu      sync.Mutex
+		reloads int
+	)
+	d.SetReloader(func() (*config.Config, error) {
+		mu.Lock()
+		reloads++
+		mu.Unlock()
+		return fastCfg(), nil
+	})
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return reloads
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	const (
+		waiters = 8
+		dur     = 30 * time.Millisecond
+		rounds  = 25
+	)
+	for round := 0; round < rounds; round++ {
+		writeMarker(t, d.state.Path(), MarkerReload, "")
+		before := count()
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for w := 0; w < waiters; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				d.waitOrStop(ctx, dur)
+			}()
+		}
+		close(start)
+		wg.Wait()
+		if got := count() - before; got != 1 {
+			t.Fatalf("round %d: the one RELOAD marker was applied %d times, want exactly 1 — concurrent waiters both consumed it", round, got)
+		}
+		markerAbsent(t, d.state.Path(), MarkerReload)
+	}
+}

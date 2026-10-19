@@ -81,8 +81,15 @@ func (d *Driver) noteCurrentClaim(c harness.Claim, project string) {
 	if d.state == nil {
 		return
 	}
+	// Serialised because a review panel's members run CONCURRENTLY (CLA-697) and
+	// each starts its own lease renewer on the same run; without this, their
+	// identical snapshots race on WriteFileAtomic's fixed `.tmp` name and one
+	// writer's error can leave the record missing. The content is the same claim,
+	// so serialising costs nothing but removes the race.
+	d.claimFileMu.Lock()
+	defer d.claimFileMu.Unlock()
 	if !c.Held() || c.TaskID == "" || c.RunID == "" {
-		d.clearCurrentClaim()
+		d.clearCurrentClaimLocked()
 		return
 	}
 	claimedAt := time.Now().UTC()
@@ -112,6 +119,14 @@ func (d *Driver) noteCurrentClaim(c harness.Claim, project string) {
 // clearCurrentClaim removes the record, if any. Safe on a nil state dir and on
 // a file that is already gone.
 func (d *Driver) clearCurrentClaim() {
+	d.claimFileMu.Lock()
+	defer d.claimFileMu.Unlock()
+	d.clearCurrentClaimLocked()
+}
+
+// clearCurrentClaimLocked is clearCurrentClaim for a caller already holding
+// claimFileMu.
+func (d *Driver) clearCurrentClaimLocked() {
 	if d.state == nil {
 		return
 	}

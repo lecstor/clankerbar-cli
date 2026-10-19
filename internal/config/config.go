@@ -115,9 +115,10 @@ const ReviewRoundCap = 3
 
 // The review panel (CLA-639, design §5.4 / A4 / B10). When a config SETS
 // `review_panel`, each built-in review phase expands into ONE review phase PER
-// MEMBER, run sequentially against the same reviewed tip, each writing its own
-// sealed durable record under its own reviewer role (`review-1`..`review-N`, by
-// member position). The round closes only once every member has recorded or been
+// MEMBER, run against the same reviewed tip, each writing its own sealed durable
+// record under its own reviewer role (`review-1`..`review-N`, by member
+// position). The members run concurrently by default, in private detached
+// worktrees; see ReviewPanelConcurrency. The round closes only once every member has recorded or been
 // recorded as failed — a sealed round is what keeps a later member from reading
 // an earlier member's findings, and a usage-limited or dead member therefore does
 // not stop the round.
@@ -131,9 +132,10 @@ const ReviewRoundCap = 3
 //
 // INTERIM, deliberately (B10): task-state-machine build phase 4 removes phase
 // logic from the CLI and routes findings as an `agent_review -> implementing`
-// plane transition, and parallel reviewers on one task need panel membership as
-// PLANE phase state (that is the CLA-454 reshape). Until then the panel is local
-// config and the members run one after another.
+// plane transition, and panel membership becomes PLANE phase state (that is the
+// CLA-454 reshape). Until then the panel is local config and the members run
+// CONCURRENTLY by default (CLA-697), each in its own detached worktree at the
+// reviewed tip; `review_panel_concurrency: 1` restores the sequential sequence
 
 // PanelMemberLabel is the LOG LABEL of the member at position i: the name the
 // operator gave it, or the deterministic `review-<i+1>` derived from its
@@ -2045,6 +2047,25 @@ type Config struct {
 	// the plane's (CLA-636); this is only which reviewers run.
 	ReviewPanel []ReviewPanelMember `json:"review_panel,omitempty"`
 
+	// ReviewPanelConcurrency caps how many of a review panel's members run AT
+	// ONCE (CLA-697). The members are independent by design, so the default is
+	// all of them: 0 (or an absent key) means "the whole panel", and a value
+	// larger than the panel means the same. 1 is the historical behaviour — the
+	// members run one after another in the task's own worktree — and is the
+	// fallback for an operator who wants the old sequence, or whose machine or
+	// provider cannot take N sessions at once.
+	//
+	// Each concurrent member gets its own DETACHED worktree at the reviewed tip
+	// (created and removed by the driver), because members may run builds or
+	// probes: one shared checkout would let two reviewers write the same file.
+	// A member's detached worktree is discarded when it ends — there is nothing
+	// to salvage from a review-only session, and the fix phase owns the real
+	// worktree.
+	//
+	// Read through Config.EffectivePanelConcurrency. It only applies when
+	// `review_panel` expands; a single reviewer never fans out.
+	ReviewPanelConcurrency int `json:"review_panel_concurrency,omitempty"`
+
 	// reviewPanelSet records that the config FILE named `review_panel`, so
 	// Validate can tell two shapes apart that the slice alone cannot: an operator
 	// who wrote `"review_panel": []` (a panel of none — refused, because it is
@@ -2939,6 +2960,27 @@ func (c *Config) reviewPhaseHarness() string {
 // by Validate rather than silently meaning either thing (reviewPanelSet).
 func (c *Config) EffectivePanel() []ReviewPanelMember {
 	return c.ReviewPanel
+}
+
+// EffectivePanelConcurrency is how many members of a panel of n review AT ONCE
+// (CLA-697): the operator's `review_panel_concurrency` cap, or the whole panel
+// when the cap is absent, zero or larger than the panel. It never returns less
+// than 1, and a panel of fewer than two members always reports 1 — there is
+// nothing to fan out, and callers can use `1` as "the historical sequential
+// path" without a second check.
+//
+// A negative cap is a config error refused by Validate; this method is the
+// read path and stays total so a hand-built Config cannot make the driver
+// spawn a negative number of sessions.
+func (c *Config) EffectivePanelConcurrency(n int) int {
+	if n < 2 {
+		return 1
+	}
+	v := c.ReviewPanelConcurrency
+	if v <= 0 || v > n {
+		return n
+	}
+	return v
 }
 
 // panelMember is the review phase one panel member runs as: the configured
@@ -3908,6 +3950,13 @@ func (c *Config) Validate() error {
 	if c.reviewPanelSet && len(c.EffectivePanel()) == 0 && c.expandsReviewPanel() {
 		return errors.New("review_panel is empty: a panel is one or more reviewers, each run as its own review phase " +
 			"(remove the key for a single reviewer, or list the members)")
+	}
+	// CLA-697: the concurrency cap is a count of sessions, so a negative one is
+	// meaningless rather than a way to say "unbounded" — that is 0 (or the
+	// absent key). Refused at the door like every other count.
+	if c.ReviewPanelConcurrency < 0 {
+		return fmt.Errorf("review_panel_concurrency is %d: it is the number of panel members that may run at once, "+
+			"so it must be 0 (the whole panel, the default) or a positive count (1 = sequential)", c.ReviewPanelConcurrency)
 	}
 	// A panel expands exactly ONE built-in review phase. A sequence with more
 	// than one is refused rather than resolved: the panel would multiply one and

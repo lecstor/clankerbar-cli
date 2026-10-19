@@ -63,6 +63,8 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 	if res.Claim.TaskID == "" {
 		return false
 	}
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if d.deadTally == nil {
 		d.deadTally = map[tallyKey]*phaseTally{}
 	}
@@ -91,6 +93,8 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 // checkpoint), and only the seam has that context. The run was already counted
 // by tallyDead; this adds its dead.
 func (d *Driver) tallyEmpty(phase, harness string) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if d.deadTally == nil {
 		d.deadTally = map[tallyKey]*phaseTally{}
 	}
@@ -125,6 +129,8 @@ const panelMemberFailBound = 3
 // tasks because the panel is positional; the Driver holds it so the streak
 // spans drains, and each drain runs the panel at most once per task.
 func (d *Driver) panelMemberFailed(member string) int {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if d.panelFailStreak == nil {
 		d.panelFailStreak = map[string]int{}
 	}
@@ -135,6 +141,8 @@ func (d *Driver) panelMemberFailed(member string) int {
 // panelMemberRecorded clears a member's failure streak: the member recorded
 // this task, so its next failure is not consecutive with the last.
 func (d *Driver) panelMemberRecorded(member string) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	delete(d.panelFailStreak, member)
 }
 
@@ -143,6 +151,8 @@ func (d *Driver) panelMemberRecorded(member string) {
 // every drain, so the operator watching the daemon log sees the rate grow —
 // and the last line before the run ends IS the run total.
 func (d *Driver) logDeadTally() {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if len(d.deadTally) == 0 {
 		return
 	}
