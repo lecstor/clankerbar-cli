@@ -47,6 +47,12 @@
 // state and the version of the child serving it — so version skew between
 // children (and between a child and the supervisor) is observable on the
 // machine, not only on the fleet page.
+//
+// CLA-677 adds the plane-facing half of that surface (status.go): every poll,
+// and every child state change, POSTs the same view —
+// `<backlog_url>/api/daemon-roster/status` — so the console can tell a HALTed
+// instance from a crashed one without reading this machine's log. Reporting is
+// fail-soft telemetry and never control flow.
 package supervisor
 
 import (
