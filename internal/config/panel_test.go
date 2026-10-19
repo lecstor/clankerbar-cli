@@ -265,6 +265,42 @@ func TestReviewPanel_UnphasedConfigWithAPanelStaysInert(t *testing.T) {
 	}
 }
 
+// TestReviewPanel_ConcurrencyCap: the fan-out cap is 0/absent = the whole
+// panel, 1 = the historical sequential path, and any larger value is clamped to
+// the panel's own size. A single reviewer never reports more than 1, and a
+// negative cap is refused rather than read as "unbounded".
+func TestReviewPanel_ConcurrencyCap(t *testing.T) {
+	cfg := &Config{
+		Harness: "claude",
+		Phases:  []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}},
+		ReviewPanel: []ReviewPanelMember{
+			{}, {}, {},
+		},
+	}
+	if got := cfg.EffectivePanelConcurrency(3); got != 3 {
+		t.Errorf("an absent cap resolved to %d, want the whole panel (3)", got)
+	}
+	cfg.ReviewPanelConcurrency = 1
+	if got := cfg.EffectivePanelConcurrency(3); got != 1 {
+		t.Errorf("cap 1 resolved to %d, want the sequential path", got)
+	}
+	cfg.ReviewPanelConcurrency = 2
+	if got := cfg.EffectivePanelConcurrency(3); got != 2 {
+		t.Errorf("cap 2 over a panel of 3 resolved to %d, want 2", got)
+	}
+	cfg.ReviewPanelConcurrency = 9
+	if got := cfg.EffectivePanelConcurrency(3); got != 3 {
+		t.Errorf("a cap larger than the panel resolved to %d, want the panel (3)", got)
+	}
+	if got := cfg.EffectivePanelConcurrency(1); got != 1 {
+		t.Errorf("a single reviewer resolved to %d, want 1", got)
+	}
+	cfg.ReviewPanelConcurrency = -1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a negative review_panel_concurrency validated")
+	}
+}
+
 // TestReviewPanel_ModelPinnedDirectly: a member's model is an alias, not a tier
 // bucket, and it wins over the review phase's tier without being looked up in
 // the tier map.
