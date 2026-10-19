@@ -294,6 +294,13 @@ func checkConfig(cfg *config.Config) check {
 		workdir = "(current directory)"
 	}
 	c.info = append(c.info, "harness: "+cfg.Harness, "workdir: "+workdir)
+	// The one setting that changes what the terminal SHOWS rather than what the
+	// daemon does (CLA-701): with it on, a session's whole stream is mirrored to
+	// the terminal again, which is worth knowing before an operator wonders why
+	// their overnight pane is unreadable.
+	if cfg.EchoSessions {
+		c.info = append(c.info, "echo_sessions: true - session streams are echoed to the terminal as well as their iteration logs")
+	}
 	// Which phase runs where, but only when that is not the same answer twice: a
 	// mixed sequence is the one config where "harness: <x>" above is true and
 	// incomplete, and the pairing is what an operator wants to eyeball before an
