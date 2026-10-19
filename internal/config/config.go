@@ -1280,6 +1280,47 @@ const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of "
 // still absorb - it re-reads the branch - which is why the prohibition is worded
 // as the default rather than as an impossible act.
 //
+// reviewGateScope defines what "run the adversarial review gate" means for a
+// review-only phase, and what it does NOT mean (CLA-696).
+//
+// On the first review-panel run (MAK-266, 2026-10-19) the implement phase had
+// already run typecheck, build, the full web suite (2935 tests), the
+// layout-engine suite and veraPDF at its tip, and the brief was silent on
+// whether the gate included running them again - so each of the four members
+// decided for itself: one re-ran all of it on effectively the same tree, two
+// ran focused subsets, and one read code. That is up to N redundant full-gate
+// runs per round (wall time, machine load, a context full of test output), and
+// it makes the members incomparable for the analytics (CLA-640) because some
+// spent the session reading and some watching builds.
+//
+// The gates belong to the phases that own them: implement self-verifies at its
+// tip, and the fix and verify phases run the gates again over what they change.
+// A reviewer's value is the reading, so a command is scoped to a PROBE of a
+// defect it already suspects - evidence for a finding, never a second gate.
+//
+// The last sentence is the panel's: members share one worktree, so a probe that
+// writes a report, coverage file or snapshot hands the next member (and the fix
+// phase) a dirty tree it must not commit.
+//
+// It names no evidence kind of its own. The MUST bar's seven kinds are what the
+// record is read and analysed with, so a probe's output is cited under the kind
+// that fits it - `gate` for a command that fails, `failure` for behaviour
+// reproduced by hand - not under a new one this brief alone would know.
+const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase self-verified at this tip and the fix " +
+	"and verify phases run the gates again over what they change, so do NOT run the repo's full test suite, " +
+	"typecheck, build or long checks (a PDF validator, a whole-browser e2e sweep - anything that takes minutes) " +
+	"as a matter of course: each reviewer re-running them is another identical run of the same tree, bought with " +
+	"wall time, machine load and a context full of test output. Spend the session READING instead - the diff " +
+	"against the base, and the code it touches that the diff does not show; that is where a defect the " +
+	"implementer's own gates missed is found. Run a command only as a TARGETED probe of a specific defect you " +
+	"suspect: one test file, one package, one short repro script, never the repo's gate list. Name the suspected " +
+	"defect the probe is for, and when it confirms one, the probe's output IS that finding's evidence - " +
+	"`(gate): <the command and its failing output>` for a command that fails, `(failure): <the input and the " +
+	"wrong output>` for behaviour you reproduced by hand. A probe must leave the worktree as it found it: if it " +
+	"writes a report, coverage file or snapshot, restore or delete it (`git checkout -- <path>` for a tracked " +
+	"one) before you record. The panel shares this one worktree, so an artifact left behind is the next member's " +
+	"- and the fix phase's - dirty tree. "
+
 // The brief is composed of a CORE plus a record shape and an ending, so the
 // panel member's variant (CLA-639 M5) can reuse the core verbatim and swap only
 // the two halves that differ: the panel member writes the durable record and
@@ -1297,7 +1338,7 @@ var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + P
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
 	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
 	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
-	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate. " +
+	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate. " + reviewGateScope +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
@@ -1347,7 +1388,8 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 	"repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout " +
 	"sitting on that branch is not a decision to commit where you are, it is this failure mode. Read the diff " +
 	"against the PR base (git diff " + PhasePRBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
-	"the adversarial review gate. REVIEW ONLY: do not edit, create or delete a source " +
+	"the adversarial review gate. " + reviewGateScope +
+	"REVIEW ONLY: do not edit, create or delete a source " +
 	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. Do NOT fix what you " +
 	"find: the phase after you is responsible for applying it, and a fix you apply here is a fix it cannot " +
 	"attribute." + unverifiedReviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep +
