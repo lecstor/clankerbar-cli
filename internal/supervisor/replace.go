@@ -289,8 +289,10 @@ func (d *Supervisor) drainForReplace() string {
 			ev.inst.mu.Lock()
 			ev.inst.exited = true
 			ev.inst.exitErr = ev.err
+			ev.inst.exitAt = ev.at
 			ev.inst.mu.Unlock()
 			done[ev.inst] = true
+			d.reportStatus()
 		case <-d.ctx.Done():
 			return "the fleet stop landed mid-drain - the children keep draining and the supervisor exits instead of replacing itself"
 		case <-tick.C:

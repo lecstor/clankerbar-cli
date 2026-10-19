@@ -249,6 +249,49 @@ func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 	}
 }
 
+// CLA-677: each iteration carries the drain's dollar spend as `costUsd`. It is
+// always present — the same optionality as `tokens` — because a zero here is a
+// figure (the harnesses reported no cost), not an unknown the plane should
+// distinguish from an older CLI's missing key.
+func TestMarshalReport_CarriesIterationCost(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		Iterations: []Iteration{{
+			Outcome: OutcomeReleased, DurationSeconds: 12.5, Tokens: 4321, CostUSD: 1.25,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		Iterations []struct {
+			CostUSD *float64 `json:"costUsd"`
+		} `json:"iterations"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Iterations) != 1 || got.Iterations[0].CostUSD == nil {
+		t.Fatalf("iteration did not carry costUsd: %s", b)
+	}
+	if *got.Iterations[0].CostUSD != 1.25 {
+		t.Errorf("costUsd = %v, want 1.25", *got.Iterations[0].CostUSD)
+	}
+
+	// A zero-cost iteration still carries the key: absent would read as "an
+	// older CLI", which is a different fact.
+	b, err = marshalReport(Report{
+		Identity:   Identity{Instance: "x"},
+		Iterations: []Iteration{{Outcome: OutcomeReleased}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if !strings.Contains(string(b), `"costUsd":0`) {
+		t.Errorf("a zero-cost iteration dropped costUsd: %s", b)
+	}
+}
+
 // CLA-630: the exact wire shape the plane's parsePhaseSessions reads —
 // sessions:[{phase,harness,model}] in spawn order, the model present even when
 // empty (the plane stores "" as null, "not resolved"), and no key at all on an

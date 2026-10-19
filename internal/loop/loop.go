@@ -1299,6 +1299,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			Outcome:         outcome,
 			DurationSeconds: time.Since(drainStart).Seconds(),
 			Tokens:          tokens,
+			// CLA-677: the drain's dollar spend, from the same accumulator the
+			// budget breaker reads. It rides the iteration record so the plane
+			// can show what each drain cost.
+			CostUSD: cost,
 		})
 	}()
 

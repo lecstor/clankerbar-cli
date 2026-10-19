@@ -511,6 +511,11 @@ func TestDrainPhases_RecordOutcomeReleasedWhenTheClaimGoesBack(t *testing.T) {
 	if r.Tokens != 7 {
 		t.Errorf("tokens = %d, want 7", r.Tokens)
 	}
+	// CLA-677: the drain's dollar spend rides the iteration record, from the
+	// same accumulator the budget breaker reads.
+	if r.CostUSD != 0.5 {
+		t.Errorf("costUsd = %v, want 0.5", r.CostUSD)
+	}
 	if r.DurationSeconds <= 0 {
 		t.Errorf("duration = %v, want > 0", r.DurationSeconds)
 	}
