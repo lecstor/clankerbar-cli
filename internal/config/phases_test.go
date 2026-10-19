@@ -964,8 +964,10 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 // block ALONE — pinned both ways below.
 func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	for name, brief := range map[string]string{
-		"review-only brief":            reviewOnlyBrief,
-		"unverified review-only brief": unverifiedReviewOnlyBrief,
+		"review-only brief":             reviewOnlyBrief,
+		"unverified review-only brief":  unverifiedReviewOnlyBrief,
+		"panel member brief":            panelMemberReviewOnlyBrief,
+		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
 	} {
 		for _, want := range []string{
 			"update_task(taskId, runId, review: {...})",
@@ -974,17 +976,38 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 			"raisedByModel",
 			`scope: {kind: "full-diff", base: "` + PhasePRBasePlaceholder,
 			"duplicate_reviewer",
-			// The plane seals the round on append and then refuses this run's
-			// outcome writes, so the legacy block must land first.
-			"only after that outcome write has SUCCEEDED",
 		} {
 			if !strings.Contains(brief, want) {
 				t.Errorf("the %s does not prescribe %q, so the durable record the seam gates on is not what the session writes:\n%s", name, want, brief)
 			}
 		}
 	}
-	// Both halves are prescribed, in that order: the legacy block first, the
-	// durable record below it.
+	// A PANEL MEMBER writes the durable record and NOTHING ELSE on the task
+	// (CLA-639 M5): member 1's outcome block would be readable by member 2
+	// through its own get_task, and the plane refuses the write anyway once the
+	// record is sealed. The legacy block, the outcome call and the ordering
+	// sentence that explains it must all be ABSENT.
+	for name, brief := range map[string]string{
+		"panel member brief":            panelMemberReviewOnlyBrief,
+		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
+	} {
+		for _, banned := range []string{
+			"update_task(taskId, runId, outcome: ...)",
+			"Record the LEGACY block",
+			"only after that outcome write has SUCCEEDED",
+			ReviewRecordHeading,
+			"`- reviewed by:`",
+		} {
+			if strings.Contains(brief, banned) {
+				t.Errorf("the %s prescribes %q, but a panel member must not write the task's outcome at all:\n%s", name, banned, brief)
+			}
+		}
+		if !strings.Contains(brief, panelMemberTerminalStep) {
+			t.Errorf("the %s does not carry the panel member's record-only ending:\n%s", name, brief)
+		}
+	}
+	// The two halves the SINGLE reviewer's shape prescribes, in that order: the
+	// legacy block first, the durable record below it.
 	block := strings.Index(reviewOnlyRecordShape, "Record the LEGACY block")
 	durable := strings.Index(reviewOnlyRecordShape, "append THIS run's durable")
 	if block < 0 || durable < 0 || block > durable {
@@ -1007,6 +1030,55 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	}
 }
 
+// CLA-639 M5: a panel member's brief must not write the task's outcome at all
+// — member 1's block would land in the task, member 2 would read it through its
+// own get_task, and member 2's own outcome write would be refused once member
+// 1's record sealed the round. The member records the durable record alone; the
+// fix phase is what carries the panel's findings into the outcome.
+func TestPanelMemberBriefWritesOnlyItsSealedRecord(t *testing.T) {
+	for name, brief := range map[string]string{
+		"panel member brief":            panelMemberReviewOnlyBrief,
+		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
+	} {
+		if !ReviewShaped(brief) {
+			t.Errorf("the %s is not review-shaped, so the driver would not gate it on its durable record", name)
+		}
+		if !strings.Contains(brief, panelMemberTerminalStep) {
+			t.Errorf("the %s does not end on the record-only terminal step:\n%s", name, brief)
+		}
+		if !strings.Contains(brief, "update_task(taskId, runId, review: {...})") {
+			t.Errorf("the %s does not prescribe the sealed durable record:\n%s", name, brief)
+		}
+		// The member is told what its outcome write would do to the next member,
+		// so a session that is tempted to write one knows why it must not.
+		if !strings.Contains(brief, "the member after you reads the task") {
+			t.Errorf("the %s does not say why the outcome write is forbidden:\n%s", name, brief)
+		}
+		// The panel context: a member knows it is one of several reviewers and
+		// that its own findings are what it records.
+		if !strings.Contains(brief, "ONE MEMBER of a review PANEL") {
+			t.Errorf("the %s does not tell the session it is a panel member:\n%s", name, brief)
+		}
+		// Everything that makes it a review-only brief still holds.
+		lower := strings.ToLower(brief)
+		for _, want := range []string{"review-only gate", "review only", "do not commit", "do not push", "do not open a pr"} {
+			if !strings.Contains(lower, want) {
+				t.Errorf("the %s no longer states %q:\n%s", name, want, brief)
+			}
+		}
+	}
+
+	// The SINGLE reviewer's brief is unchanged: both halves, in the order the
+	// plane's seal forces (this is the "single-reviewer configs keep today's
+	// brief exactly" half of M5, pinned where the text lives).
+	if !strings.Contains(reviewOnlyBrief, reviewOnlyRecordShape) || !strings.Contains(reviewOnlyBrief, reviewOnlyTerminalStep) {
+		t.Errorf("the single reviewer's brief lost its two-half record or its ending:\n%s", reviewOnlyBrief)
+	}
+	if strings.Contains(reviewOnlyBrief, panelMemberRecordShape) || strings.Contains(reviewOnlyBrief, panelMemberTerminalStep) {
+		t.Errorf("the single reviewer's brief picked up the panel member's record-only contract:\n%s", reviewOnlyBrief)
+	}
+}
+
 // ReviewShaped is the driver's single "this phase owes a durable review
 // record" predicate (CLA-637): true for every review-ONLY variant the briefs
 // ship — the seam gate and the round close apply to all of them, not only the
@@ -1022,6 +1094,8 @@ func TestReviewShaped(t *testing.T) {
 	}{
 		{"the review-only brief", reviewOnlyBrief, true},
 		{"the unverified review-only brief", unverifiedReviewOnlyBrief, true},
+		{"the panel member brief", panelMemberReviewOnlyBrief, true},
+		{"the unverified panel member brief", panelMemberUnverifiedReviewOnlyBrief, true},
 		{"the no-code review-only brief", noCodeReviewOnlyBrief, true},
 		{"the verification brief", verifyBrief, true},
 		{"the no-code verification brief", noCodeVerifyBrief, true},
@@ -1335,11 +1409,13 @@ func TestBuiltinReviewOnlyBriefStatesItsScopeAndRecord(t *testing.T) {
 // precedence over a repo hard rule about style, prose or doc wording is B6.
 func TestReviewOnlyVariantsCarryTheMUSTBar(t *testing.T) {
 	variants := map[string]string{
-		"review-only brief":            reviewOnlyBrief,
-		"no-code review-only brief":    noCodeReviewOnlyBrief,
-		"unverified review-only brief": unverifiedReviewOnlyBrief,
-		"review-only handoff":          HandoffContinuationFor(ReviewPhaseName, true),
-		"no-code review-only handoff":  NoCodeReviewOnlyHandoffContinuation(),
+		"review-only brief":             reviewOnlyBrief,
+		"no-code review-only brief":     noCodeReviewOnlyBrief,
+		"unverified review-only brief":  unverifiedReviewOnlyBrief,
+		"panel member brief":            panelMemberReviewOnlyBrief,
+		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
+		"review-only handoff":           HandoffContinuationFor(ReviewPhaseName, true),
+		"no-code review-only handoff":   NoCodeReviewOnlyHandoffContinuation(),
 	}
 	for name, brief := range variants {
 		lower := strings.ToLower(brief)
