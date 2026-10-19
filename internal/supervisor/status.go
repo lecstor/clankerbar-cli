@@ -19,9 +19,11 @@ package supervisor
 // POSTs. Nothing here retries: the next poll corrects the row, and the plane
 // treats each report as last-writer-wins.
 //
-// The endpoint lands with CLA-676. Until then a 404 on every POST is expected —
-// it is a failure like any other (one log line per outage, then silence), never
-// a reason to change supervision.
+// The endpoint lands with CLA-676. Until then a 404 on every POST is expected
+// and SILENT: the route simply does not exist yet, which is not an outage and
+// must not spend the one log line an outage gets. Every other failure (5xx, a
+// timeout, an unreadable body) is still a failure like any other — one log line
+// per outage, then silence — and never a reason to change supervision.
 
 import (
 	"bytes"
@@ -203,18 +205,21 @@ drain:
 		}
 	}
 	flushStart := time.Now()
-	delivered, lost := 0, 0
+	delivered, lost, absent := 0, 0, 0
 	for i := len(queued) - 1; i >= 0; i-- {
 		if time.Since(flushStart) > statusCloseBudget {
 			break
 		}
-		if err := r.sendOnce(queued[i]); err != nil {
-			lost++
-		} else {
+		switch err := r.sendOnce(queued[i]); {
+		case err == nil:
 			delivered++
+		case statusRouteAbsent(err):
+			absent++ // expected until CLA-676 lands: not a lost delivery
+		default:
+			lost++
 		}
 	}
-	if undelivered := len(queued) - delivered; undelivered > 0 {
+	if undelivered := len(queued) - delivered - absent; undelivered > 0 {
 		log.Printf("supervisor status: shutdown: %d queued report(s) not delivered (%d failed, %d dropped by budget)", undelivered, lost, undelivered-lost)
 	}
 	r.deliver(rep)
@@ -240,9 +245,15 @@ func (r *httpStatusReporter) pump() {
 // deliver performs one authenticated POST and applies the fail-soft logging
 // rule: the FIRST failure of a streak is logged, further consecutive failures
 // stay silent (an overnight outage must not write a line per poll), and recovery
-// is logged once with how many reports were lost.
+// is logged once with how many reports were lost. A 404 is the one exception:
+// until CLA-676 lands the route does not exist, so it is expected — silent, and
+// outside the streak entirely (counting it would swallow the first real outage
+// after the route ships).
 func (r *httpStatusReporter) deliver(rep StatusReport) {
 	if err := r.sendOnce(rep); err != nil {
+		if statusRouteAbsent(err) {
+			return
+		}
 		if r.failStreak.Add(1) == 1 {
 			log.Printf("supervisor status report failed and was dropped (further consecutive failures stay silent until it recovers): %v", err)
 		}
@@ -277,9 +288,29 @@ func (r *httpStatusReporter) sendOnce(rep StatusReport) error {
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("POST %s: HTTP %d: %s", r.endpoint, resp.StatusCode, statusFirstLine(string(respBody)))
+		return &statusHTTPError{endpoint: r.endpoint, code: resp.StatusCode, body: string(respBody)}
 	}
 	return nil
+}
+
+// statusHTTPError is a non-200 answer, typed so the expected 404 can be told
+// apart from a real outage without parsing the message.
+type statusHTTPError struct {
+	endpoint string
+	code     int
+	body     string
+}
+
+func (e *statusHTTPError) Error() string {
+	return fmt.Sprintf("POST %s: HTTP %d: %s", e.endpoint, e.code, statusFirstLine(e.body))
+}
+
+// statusRouteAbsent reports the one expected non-200: a 404, which until
+// CLA-676 lands means the status route does not exist yet. It is not an outage
+// and must not touch the failure/recovery accounting.
+func statusRouteAbsent(err error) bool {
+	var he *statusHTTPError
+	return errors.As(err, &he) && he.code == http.StatusNotFound
 }
 
 // ── Wire shape ────────────────────────────────────────────────────────────────
@@ -392,9 +423,14 @@ func (d *Supervisor) statusReport() StatusReport {
 
 // statusInstance maps one instance's existing bookkeeping onto the five-state
 // vocabulary. Order matters where two facts can be true at once: a live child is
-// running whatever its desired state says; a fleet stop outranks a scheduled
-// restart (the restart will never fire); and the reason names the first
-// classification that explains why the instance is not simply running.
+// running whatever its desired state says; the fleet stop outranks everything,
+// and a REPLACE drain comes next (both are the supervisor taking the child down
+// itself, so the row is "stopped", never "exited"); a stopped/removed/refused
+// entry outranks a pending retry, because that retry will never fire; and only
+// then does a scheduled restart outrank a policy refusal (the DECIDED
+// precedence: backing_off is what the supervisor is actually doing). The reason
+// names the first classification that explains why the instance is not simply
+// running.
 func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 	inst.mu.Lock()
 	alive := inst.cmd != nil && !inst.exited
@@ -409,7 +445,6 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 	out := StatusInstance{
 		Name:         inst.name,
 		ChildVersion: childVersion,
-		NextRetryAt:  restartAt,
 	}
 	if !exitAt.IsZero() {
 		out.LastExit = &StatusExit{Code: statusExitCode(exitErr), At: exitAt}
@@ -422,6 +457,8 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 		switch {
 		case d.stopping:
 			out.Reason = "supervisor stopping - draining at its iteration boundary"
+		case d.replacing:
+			out.Reason = "replacing myself - draining at the iteration boundary"
 		case inst.stopRequested:
 			out.Reason = "stop requested - draining at its iteration boundary"
 		}
@@ -429,16 +466,16 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 		out.State = StatusStopped
 		out.Reason = "supervisor stopping"
 		out.Since = exitAt
+	case d.replacing:
+		out.State = StatusStopped
+		out.Reason = "replacing myself - drained at the iteration boundary"
+		out.Since = exitAt
 	case inst.halted:
 		out.State = StatusHalted
 		out.Reason = "HALT marker present"
 		if dir != "" {
 			out.Reason = "HALT marker present in " + dir
 		}
-		out.Since = exitAt
-	case !restartAt.IsZero():
-		out.State = StatusBackingOff
-		out.Reason = fmt.Sprintf("restart scheduled in %s", inst.lastBackoff)
 		out.Since = exitAt
 	case inst.removed:
 		out.State = StatusStopped
@@ -448,13 +485,23 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 		out.State = StatusStopped
 		out.Reason = "entry refused by the supervisor"
 		out.Since = exitAt
+	case inst.desired != RosterDesiredRunning:
+		// A stopped entry outranks a retry that was scheduled before the flip:
+		// respawnDue refuses to spawn against a non-running desired state, so
+		// reporting backing_off here would promise a retry that never happens.
+		out.State = StatusStopped
+		out.Reason = "desired state is stopped"
+		out.Since = exitAt
+	case !restartAt.IsZero():
+		// The only state that carries a nextRetryAt: this is the only one where
+		// the supervisor will actually respawn.
+		out.State = StatusBackingOff
+		out.Reason = fmt.Sprintf("restart scheduled in %s", inst.lastBackoff)
+		out.Since = exitAt
+		out.NextRetryAt = restartAt
 	case inst.policyRefused:
 		out.State = StatusStopped
 		out.Reason = "refused: permission policy"
-		out.Since = exitAt
-	case inst.desired != RosterDesiredRunning:
-		out.State = StatusStopped
-		out.Reason = "desired state is stopped"
 		out.Since = exitAt
 	default:
 		out.State = StatusExited

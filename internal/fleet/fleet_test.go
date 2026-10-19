@@ -250,9 +250,9 @@ func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 }
 
 // CLA-677: each iteration carries the drain's dollar spend as `costUsd`. It is
-// always present — the same optionality as `tokens` — because a zero here is a
-// figure (the harnesses reported no cost), not an unknown the plane should
-// distinguish from an older CLI's missing key.
+// always present — deliberately UNLIKE `tokens`, which is omitempty — because a
+// zero here is a figure (the harnesses reported no cost), not an unknown the
+// plane should distinguish from an older CLI's missing key.
 func TestMarshalReport_CarriesIterationCost(t *testing.T) {
 	b, err := marshalReport(Report{
 		Identity: Identity{Instance: "x"},

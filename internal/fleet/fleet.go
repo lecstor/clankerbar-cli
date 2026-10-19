@@ -449,9 +449,9 @@ type wireIteration struct {
 	Outcome         string        `json:"outcome"`
 	DurationSeconds float64       `json:"durationSeconds,omitempty"`
 	Tokens          int           `json:"tokens,omitempty"`
-	// CostUSD is the iteration's dollar spend; always present, like tokens, so
-	// the plane can tell a zero (nothing reported) from a missing key (an older
-	// CLI). CLA-677.
+	// CostUSD is the iteration's dollar spend; always present — UNLIKE Tokens
+	// (omitempty) — so a zero (nothing reported) stays distinguishable from a
+	// missing key (an older CLI). CLA-677.
 	CostUSD float64 `json:"costUsd"`
 }
 

@@ -336,6 +336,13 @@ type Supervisor struct {
 	// down is reported "stopped" (the supervisor is taking it down), not
 	// "exited" (which would imply a crash left it down).
 	stopping bool
+
+	// replacing is true only for the duration of drainForReplace: a child the
+	// supervisor itself drained for a REPLACE is reported "stopped" (a
+	// planned upgrade), not "exited" (a crash). It must NOT be d.stopping:
+	// a timed-out drain resumes the loop and respawns the fleet, so the flag
+	// cannot mean "this supervisor is exiting".
+	replacing bool
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
@@ -792,6 +799,12 @@ func (d *Supervisor) ensureRunning(inst *Instance) {
 // child drains at its iteration boundary. Idempotent: a STOP already written
 // writes nothing more.
 func (d *Supervisor) ensureStopped(inst *Instance) {
+	// A retry scheduled before the stop will never fire: respawnDue refuses to
+	// spawn against a desired state that is no longer running. Drop the
+	// timestamp here so the report cannot carry a `nextRetryAt` that passes
+	// with no spawn — a phantom `backing_off` for up to the whole backoff
+	// window.
+	inst.restartAt = time.Time{}
 	inst.mu.Lock()
 	alive := inst.cmd != nil && !inst.exited
 	since := time.Since(inst.aliveSince)
@@ -1225,6 +1238,12 @@ func (d *Supervisor) armRestart() {
 func (d *Supervisor) stopAll() error {
 	log.Print("stop requested - writing STOP to every instance")
 	d.stopping = true
+	// Report the transition NOW, not on the first exit: a drain can run for
+	// minutes (an in-flight session finishes at its boundary), and until the
+	// first child exits the plane would otherwise keep the pre-stop report
+	// and show ordinary `running`. Every row this queues says the supervisor
+	// is stopping, which is true from this line on.
+	d.reportStatus()
 	done := map[*Instance]bool{}    // child exited (event consumed) or never spawned
 	stopped := map[*Instance]bool{} // STOP marker written; awaiting the child's exit
 	waitStart := time.Now()

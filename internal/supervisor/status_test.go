@@ -18,6 +18,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -88,9 +89,11 @@ func TestStatusReportBodyPerState(t *testing.T) {
 	crash := exitErrorWithCode(t, 3)
 
 	cases := []struct {
-		name string
-		inst *Instance
-		want statusBodyInstance
+		name      string
+		inst      *Instance
+		stopping  bool
+		replacing bool
+		want      statusBodyInstance
 	}{
 		{
 			name: "running",
@@ -111,6 +114,34 @@ func TestStatusReportBodyPerState(t *testing.T) {
 			want: statusBodyInstance{
 				Name: "clanker1", State: StatusRunning, Reason: "stop requested - draining at its iteration boundary",
 				Since: statusTime(aliveSince), ChildVersion: "0.16.0",
+			},
+		},
+		{
+			// A REPLACE drain is a stop the supervisor ordered: the children it
+			// has already drained say stopped, and the ones still alive name the
+			// replacement — never `exited`, which is the crash vocabulary.
+			name:      "running while replacing",
+			replacing: true,
+			inst: &Instance{
+				name: "clanker1", desired: RosterDesiredRunning,
+				cmd: &exec.Cmd{}, aliveSince: aliveSince, childVersion: "0.16.0",
+			},
+			want: statusBodyInstance{
+				Name: "clanker1", State: StatusRunning, Reason: "replacing myself - draining at the iteration boundary",
+				Since: statusTime(aliveSince), ChildVersion: "0.16.0",
+			},
+		},
+		{
+			name:      "drained for a replace",
+			replacing: true,
+			inst: &Instance{
+				name: "clanker1", desired: RosterDesiredRunning,
+				exited: true, childVersion: "0.16.0", exitErr: crash, exitAt: exitAt,
+			},
+			want: statusBodyInstance{
+				Name: "clanker1", State: StatusStopped, Reason: "replacing myself - drained at the iteration boundary",
+				Since: statusTime(exitAt), ChildVersion: "0.16.0",
+				LastExit: &statusBodyExit{Code: 3, At: statusTime(exitAt)},
 			},
 		},
 		{
@@ -164,6 +195,40 @@ func TestStatusReportBodyPerState(t *testing.T) {
 			},
 		},
 		{
+			// A crash scheduled a retry, then the operator flipped the entry to
+			// stopped before the retry fired: the retry will never run
+			// (respawnDue refuses against the current desired state), so the row
+			// is stopped with a null nextRetryAt, not a phantom backing_off.
+			name: "stopped while a retry is pending",
+			inst: &Instance{
+				name: "clanker5", desired: RosterDesiredStopped,
+				exited: true, childVersion: "0.16.0", exitErr: crash, exitAt: exitAt,
+				restartAt: retryAt, lastBackoff: 2 * time.Second,
+			},
+			want: statusBodyInstance{
+				Name: "clanker5", State: StatusStopped, Reason: "desired state is stopped",
+				Since: statusTime(exitAt), ChildVersion: "0.16.0",
+				LastExit: &statusBodyExit{Code: 3, At: statusTime(exitAt)},
+			},
+		},
+		{
+			// While the supervisor stops, a retry scheduled before the stop is
+			// moot (the select loop is not running, so it can never spawn), so
+			// the row must not carry a nextRetryAt either.
+			name:     "supervisor stopping while a retry is pending",
+			stopping: true,
+			inst: &Instance{
+				name: "clanker5", desired: RosterDesiredRunning,
+				exited: true, childVersion: "0.16.0", exitErr: crash, exitAt: exitAt,
+				restartAt: retryAt, lastBackoff: 2 * time.Second,
+			},
+			want: statusBodyInstance{
+				Name: "clanker5", State: StatusStopped, Reason: "supervisor stopping",
+				Since: statusTime(exitAt), ChildVersion: "0.16.0",
+				LastExit: &statusBodyExit{Code: 3, At: statusTime(exitAt)},
+			},
+		},
+		{
 			name: "stopped entry that never spawned",
 			inst: &Instance{name: "clanker6", desired: RosterDesiredStopped},
 			want: statusBodyInstance{Name: "clanker6", State: StatusStopped, Reason: "desired state is stopped"},
@@ -172,7 +237,7 @@ func TestStatusReportBodyPerState(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			d := &Supervisor{hostname: "Jasons-MBP.localdomain", startedAt: startedAt}
+			d := &Supervisor{hostname: "Jasons-MBP.localdomain", startedAt: startedAt, stopping: tc.stopping, replacing: tc.replacing}
 			d.instances = []*Instance{tc.inst}
 
 			body, err := marshalStatus(d.statusReport())
@@ -264,7 +329,7 @@ func TestStatusReporterLogsOneLinePerOutage(t *testing.T) {
 		authMu.Lock()
 		auths = append(auths, r.Header.Get("Authorization"))
 		authMu.Unlock()
-		http.Error(w, "not deployed yet", http.StatusNotFound)
+		http.Error(w, "plane incident", http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(srv.Close)
 
@@ -285,6 +350,36 @@ func TestStatusReporterLogsOneLinePerOutage(t *testing.T) {
 		if a != "Bearer acct-key" {
 			t.Errorf("Authorization = %q, want the account bearer key", a)
 		}
+	}
+}
+
+// A 404 is the pre-CLA-676 shape, not an outage: the route does not exist yet,
+// so the reporter attempts the POST and stays silent — no failure line, no
+// recovery line. Keeping it out of the failure streak matters: counting it
+// would swallow the first real 5xx after the route ships.
+func TestStatusReporterExpected404IsSilent(t *testing.T) {
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		http.Error(w, "route not deployed yet", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+
+	rep := newStatusReporter(srv.URL, "k")
+	for i := 0; i < 3; i++ {
+		rep.Send(StatusReport{Host: "h"})
+	}
+	rep.Close(StatusReport{Host: "h"})
+
+	if got := hits.Load(); got != 4 {
+		t.Fatalf("POSTs = %d, want 4 (three queued + the Close report)", got)
+	}
+	if got := buf.String(); strings.Contains(got, "supervisor status") {
+		t.Fatalf("a 404 before CLA-676 must be silent, got:\n%s", got)
 	}
 }
 
@@ -485,11 +580,20 @@ func TestStatusReportCrashBackoffState(t *testing.T) {
 }
 
 // A 404 (CLA-676 has not landed) or a 5xx (plane incident) is telemetry, not
-// control flow: children still spawn, still stop, and the supervisor logs the
-// outage once.
+// control flow: children still spawn and stop either way. Only the 5xx is an
+// outage — the 404 is the expected shape until the route lands, so it stays
+// silent while the 5xx logs once.
 func TestStatusReportFailureNeverAffectsSupervision(t *testing.T) {
-	for _, code := range []int{http.StatusNotFound, http.StatusInternalServerError} {
-		t.Run(fmt.Sprintf("HTTP_%d", code), func(t *testing.T) {
+	cases := []struct {
+		name       string
+		code       int
+		wantOutage int
+	}{
+		{"HTTP_404_is_silent", http.StatusNotFound, 0},
+		{"HTTP_500_logs_once", http.StatusInternalServerError, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			var buf lockedBuffer
 			log.SetOutput(&buf)
 			defer log.SetOutput(os.Stderr)
@@ -498,7 +602,7 @@ func TestStatusReportFailureNeverAffectsSupervision(t *testing.T) {
 			setHelperMode(t, "sleep")
 			plane := &fakePlane{}
 			plane.set([]RosterEntry{runEntry("daemon-one", "")})
-			plane.setStatusCode(code)
+			plane.setStatusCode(tc.code)
 			srv := plane.serve(t)
 
 			ctx, cancel := context.WithCancel(context.Background())
@@ -509,8 +613,11 @@ func TestStatusReportFailureNeverAffectsSupervision(t *testing.T) {
 			waitFor(t, 5*time.Second, "the child to come up despite the failing status endpoint", func() bool {
 				return countRuns(t, state) == 1
 			})
-			waitFor(t, 5*time.Second, "the status outage to be logged", func() bool {
-				return strings.Contains(buf.String(), "supervisor status report failed")
+			// The plane records a body before answering with the failure code,
+			// so this proves the POST path ran (and was judged) rather than
+			// never reaching the endpoint.
+			waitFor(t, 5*time.Second, "a status report to reach the endpoint", func() bool {
+				return len(plane.statusReports(t)) >= 1
 			})
 
 			cancel()
@@ -525,9 +632,138 @@ func TestStatusReportFailureNeverAffectsSupervision(t *testing.T) {
 			if got := countRuns(t, state); got != 1 {
 				t.Fatalf("spawns = %d, want exactly 1 - a failed status POST must not cause a respawn", got)
 			}
-			if got := strings.Count(buf.String(), "supervisor status report failed"); got != 1 {
-				t.Fatalf("failure lines = %d, want 1 for the outage:\n%s", got, buf.String())
+			if got := strings.Count(buf.String(), "supervisor status report failed"); got != tc.wantOutage {
+				t.Fatalf("failure lines = %d, want %d (404 is the expected pre-CLA-676 shape; 5xx is an outage):\n%s",
+					got, tc.wantOutage, buf.String())
 			}
 		})
+	}
+}
+
+// A fleet stop can drain for minutes (an in-flight session finishes at its
+// boundary); the plane must learn the supervisor is stopping NOW, not when the
+// first child's exit arrives. The child here ignores STOP forever, so no exit
+// ever happens and the only report that can carry the stopping reason is the
+// one stopAll queues on entering the draining state.
+func TestStatusReportShutdownTransitionBeforeTheDrainEnds(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "stubborn")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("stuck", "")})
+	srv := plane.serve(t)
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	o := testOptions(t, cacheDir, srv)
+	o.StopLogEvery = 100 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	done := runSupervise(ctx, o)
+
+	waitFor(t, 5*time.Second, "the stubborn child to come up", func() bool {
+		return strings.Contains(buf.String(), "spawned (pid")
+	})
+	cancel()
+
+	waitFor(t, 5*time.Second, "a report naming the supervisor's stopping drain before any exit", func() bool {
+		for _, rep := range plane.statusReports(t) {
+			if inst := runningInstance(rep, "stuck"); inst != nil &&
+				inst.State == StatusRunning && strings.Contains(inst.Reason, "supervisor stopping") {
+				return true
+			}
+		}
+		return false
+	})
+
+	// The stop is stuck by construction; kill the child so the test leaves no
+	// orphan, and verify the supervisor then finishes.
+	if pid := spawnPid(t, buf.String()); pid > 0 {
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
+	waitFor(t, 5*time.Second, "the supervisor to return once the child is gone", func() bool {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("Supervise returned %v, want nil", err)
+			}
+			return true
+		default:
+			return false
+		}
+	})
+}
+
+// A REPLACE drain is a stop the supervisor ordered, so the children it drained
+// must read as `stopped` (a planned upgrade), never `exited` (a fleet crash).
+// The exec hook keeps the supervisor alive, so the drained report stays in the
+// plane's history while the fleet respawns afterwards.
+func TestStatusReportReplaceDrainReportsStopped(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "sleep")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("daemon-one", "")})
+	srv := plane.serve(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	o := testOptions(t, cacheDir, srv)
+	o.LaunchVersion = func() (string, error) { return version.Current, nil }
+	o.VerifyTimeout = 5 * time.Second
+	rec := &execRecorder{}
+	o.ExecInPlace = rec.hook()
+	done := runSupervise(ctx, o)
+
+	state := entryStateDir(cacheDir, "daemon-one")
+	waitFor(t, 5*time.Second, "the child to come up", func() bool { return countRuns(t, state) == 1 })
+
+	if err := Replace(context.Background(), o); err != nil {
+		t.Fatalf("Replace returned %v, want nil", err)
+	}
+	waitFor(t, 5*time.Second, "the exec to be invoked after the drain", func() bool {
+		return rec.len() == 1
+	})
+
+	var drained *statusBodyInstance
+	waitFor(t, 5*time.Second, "the replace drain reported as stopped", func() bool {
+		for _, rep := range plane.statusReports(t) {
+			if inst := runningInstance(rep, "daemon-one"); inst != nil &&
+				inst.State == StatusStopped && strings.Contains(inst.Reason, "replacing myself") {
+				drained = inst
+				return true
+			}
+		}
+		return false
+	})
+	if drained.NextRetryAt != nil {
+		t.Errorf("drained row carries nextRetryAt = %v; a replace never schedules a retry", *drained.NextRetryAt)
+	}
+	if drained.LastExit == nil {
+		t.Error("drained row carries no lastExit")
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Supervise returned %v, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Supervise did not return after the stop")
+	}
+}
+
+// A desired-state flip to stopped drops the retry the instance was waiting on:
+// respawnDue refuses to spawn against a non-running desired state, so keeping
+// the timestamp would let the report promise a retry that cannot fire.
+func TestEnsureStoppedClearsAPendingRetry(t *testing.T) {
+	d := &Supervisor{}
+	inst := &Instance{
+		name: "a", desired: RosterDesiredStopped,
+		exited: true, restartAt: time.Now().Add(time.Minute),
+	}
+	d.ensureStopped(inst)
+	if !inst.restartAt.IsZero() {
+		t.Fatalf("restartAt = %v, want zero once the entry is stopped", inst.restartAt)
 	}
 }
