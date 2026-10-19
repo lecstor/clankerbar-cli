@@ -109,13 +109,14 @@ type Options struct {
 	Binary string
 
 	// WorkdirRoot is the machine-stated root each child's workdir derives
-	// from (phase 2a of the daemon-supervisor proposal): <root>/<repo name>
-	// for the repo the instance's project names, taken from the roster entry
-	// (the plane's `project.primary_repo`). Empty = derivation is OFF and
+	// from (phase 2a of the daemon-supervisor proposal): the per-project layout
+	// <root>/<project slug>/<repo name> with the project's worktrees under
+	// <root>/<project slug>/worktrees (CLA-678). Empty = derivation is OFF and
 	// children run on the base config's own workdirs. When set, EVERY
-	// instance is derived at reconcile, and a failed derivation — the derived
-	// directory missing, or not a checkout of the expected repo — refuses
-	// that daemon: it is never spawned, the path tried is reported, and the
+	// instance is derived at reconcile: each repo the project names is cloned
+	// if it is not there yet, a directory that exists but is not a checkout of
+	// the expected repo refuses that daemon, and a failed derivation — the path
+	// tried is reported — refuses the daemon too: it is never spawned, and the
 	// supervisor's own working directory is never used as a fallback (the
 	// CLA-441 failure).
 	WorkdirRoot string
@@ -791,6 +792,13 @@ func (d *Supervisor) ensureStopped(inst *Instance) {
 	inst.stopRequested = true
 }
 
+func (d *Supervisor) baseCtx() context.Context {
+	if d.ctx != nil {
+		return d.ctx
+	}
+	return context.Background()
+}
+
 // resolveInstance resolves the machine conventions one instance runs under,
 // in the order the materialized config is built from them: the phase-2a
 // workdir derivation (when a machine root is stated) FIRST, so validation
@@ -809,11 +817,13 @@ func (d *Supervisor) ensureStopped(inst *Instance) {
 // exactly as `run` would validate it.
 func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string, error) {
 	if d.o.WorkdirRoot != "" {
-		derived, err := deriveInstanceWorkdirs(cfg, d.o.WorkdirRoot)
+		derived, err := deriveInstanceWorkdirs(d.baseCtx(), cfg, d.o.WorkdirRoot)
 		if err != nil {
 			return nil, "", err
 		}
-		applyDerivedWorkdirs(cfg, derived)
+		if err := applyDerivedWorkdirs(cfg, derived); err != nil {
+			return nil, "", err
+		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, "", err

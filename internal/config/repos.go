@@ -149,6 +149,12 @@ func lookupCheckout(repos map[string]string, workdir, identity string) (string, 
 	return "", false
 }
 
+// WorktreesDirName is the directory every worktree the fleet creates for a
+// project lives under: <root>/<project slug>/worktrees (CLA-678). It is a fixed
+// name rather than a config knob, because the permission scope (the project
+// root) and the briefs that name it have to agree on one spelling.
+const WorktreesDirName = "worktrees"
+
 // basenameOf strips the owner segment of a repo identity: "owner/name" ->
 // "name". A bare name passes through unchanged.
 func basenameOf(repo string) string {

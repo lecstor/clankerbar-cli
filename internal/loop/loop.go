@@ -158,6 +158,14 @@ type Target struct {
 	// the plane returns repos for everything). See Repos above.
 	PrimaryRepo string
 
+	// ProjectRoot says this target's workdir is a FLEET PROJECT ROOT (CLA-678):
+	// a directory holding this project's clones and its worktrees directory,
+	// with each session's checkout inside it. It is the config's own
+	// `project_root` flag, carried here because the session, not the config, is
+	// what the permission policy is built for. See extraDirsFor for what it
+	// widens.
+	ProjectRoot bool
+
 	// Releaser hands back a claim a session left holding (CLA-242). Nil disables
 	// the handback for this target, which costs only the reclaim an expiring lease
 	// would have cost anyway — so a target without one degrades, it does not break.
@@ -6793,7 +6801,21 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 		workdir = d.cfg.WorkDir
 	}
 	dir, err := config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
-	return dir, briefed, repo, err
+	if err != nil {
+		return dir, briefed, repo, err
+	}
+	// With the per-project layout declared, the session must START inside the
+	// project root its permission scope is bounded to. ResolveCheckout prefers
+	// an explicit `repos` path, so a stale override pointing at a developer
+	// checkout would otherwise run the session outside the project and hand
+	// that path to the policy (CLA-678 review round 2, finding 3). The
+	// materialized config already rewrites the overrides; this is the
+	// driver-side refusal that holds even for a config that adopted the layout
+	// by hand.
+	if t.ProjectRoot && dir != "" && !insideProjectRoot(workdir, dir) {
+		return dir, briefed, repo, fmt.Errorf("repo checkout %s resolves outside the project root %s - refusing to start the session outside its declared scope", dir, workdir)
+	}
+	return dir, briefed, repo, nil
 }
 
 // prBaseProbeTimeout bounds the one network round-trip prBaseFor runs. It is a
@@ -6979,6 +7001,17 @@ func (d *Driver) extraDirsFor(t Target, spawnDir string) []string {
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
+	// With the per-project layout declared, every grant must stay INSIDE the
+	// project root. The scope below is additive: declared checkouts are added
+	// before it, so a stale `repos` override pointing at a developer checkout
+	// would be granted outright even though the session is scoped to the
+	// project — the escape the layout exists to close (CLA-678 review round 2,
+	// finding 3). sessionDir refuses such a checkout as a spawn dir; this also
+	// keeps it out of the reach list, alongside the conventional worktree area.
+	root := ""
+	if t.ProjectRoot && workdir != "" {
+		root = workdir
+	}
 	declared := config.DeclaredCheckouts(t.Repos, t.PrimaryRepo, workdir)
 	var out []string
 	seen := map[string]bool{}
@@ -6990,15 +7023,128 @@ func (d *Driver) extraDirsFor(t Target, spawnDir string) []string {
 		out = append(out, dir)
 	}
 	for _, dir := range declared {
+		if root != "" && !insideProjectRoot(root, dir) {
+			log.Printf("%sdeclared checkout %s is outside the project root %s - not adding it to the session's permissions", labelOf(t), dir, workdir)
+			continue
+		}
 		add(dir)
 	}
 	if spawnDir != "" {
 		wt := filepath.Join(filepath.Dir(spawnDir), filepath.Base(spawnDir)+"-wt")
 		if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
-			add(wt)
+			if root == "" || insideProjectRoot(root, wt) {
+				add(wt)
+			}
+		}
+	}
+	// The PROJECT ROOT and its children (CLA-678), when the config declares the
+	// per-project layout (`project_root`): a session starts in
+	// <project root>/<repo name>, and the rest of its project — the other repos,
+	// and the worktrees directory every task worktree lives in — sits beside it
+	// under the same root. Granting the children is what makes cross-repo work
+	// inside a project possible at all, and the project root itself is granted
+	// so `external_directory` — the gate that decides a path-taking tool's reach
+	// — is carved out for the same subtree rather than for one checkout.
+	//
+	// The flag is what keeps this off a developer's multi-repo parent: without
+	// it a session starting in one of `~/dev`'s ~150 trees would be handed every
+	// sibling it happens to have there. Nothing is granted on a guess.
+	if t.ProjectRoot {
+		if scope := projectScope(workdir, spawnDir); scope != "" {
+			add(scope)
+			for _, child := range childDirs(scope) {
+				add(child)
+			}
 		}
 	}
 	return out
+}
+
+// projectScope reports the PROJECT ROOT a session's reach is bounded to: the
+// workdir, when the session starts strictly INSIDE it — the per-project layout,
+// where the session runs in <project root>/<repo name> and the project's other
+// repos and its worktrees sit beside that checkout. "" means there is no scope
+// to widen, which is every legacy shape (the workdir is the checkout itself, or
+// the session starts nowhere near it).
+func projectScope(workdir, spawnDir string) string {
+	if workdir == "" || spawnDir == "" {
+		return ""
+	}
+	wd, sd := absOrSelfPath(workdir), absOrSelfPath(spawnDir)
+	if wd == sd {
+		return ""
+	}
+	rel, err := filepath.Rel(wd, sd)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(filepath.ToSlash(rel), "../") {
+		return ""
+	}
+	return wd
+}
+
+// insideProjectRoot reports whether path is the project root itself or lies
+// inside it. Both sides are compared on canonical paths, so a symlinked
+// checkout cannot masquerade as inside the root — the supervisor's derivation
+// refuses symlinks at the derived checkout, and this is the driver-side
+// containment the additive permission list needs.
+func insideProjectRoot(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	r, p := canonicalPath(root), canonicalPath(path)
+	if r == p {
+		return true
+	}
+	rel, err := filepath.Rel(r, p)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// canonicalPath resolves a path for containment comparison: absolute, cleaned,
+// and with symlinks resolved when the path exists. A path that exists only
+// lexically (a missing entry) is returned absolute-but-unresolved — the
+// comparison then treats it by name, never as some other directory.
+func canonicalPath(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	abs = filepath.Clean(abs)
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real
+	}
+	return abs
+}
+
+// childDirs lists the immediate subdirectories of dir that exist, sorted. It is
+// how a project root's repos and its worktrees directory are found without a
+// declaration: the layout is the declaration.
+func childDirs(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		out = append(out, filepath.Join(dir, e.Name()))
+	}
+	sort.Strings(out)
+	return out
+}
+
+// absOrSelfPath resolves a path against the process cwd, returning it unchanged
+// when it cannot be resolved (the same posture as the harness package's
+// absOrSelf: an unresolvable path must not become a different path).
+func absOrSelfPath(dir string) string {
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
 }
 
 // orRef was folded into sessionDir's log line; kept out to avoid a helper with
