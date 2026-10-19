@@ -46,6 +46,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
+	"github.com/lecstor/clankerbar-cli/internal/supervisor"
 )
 
 // status is a check's verdict. The ordering matters only for reporting.
@@ -1302,6 +1303,16 @@ func checkStateDir(cfg *config.Config) check {
 
 	c.status = pass
 	c.detail = stateDir + " writable, no stop markers"
+	// Where the two logs live, so `doctor` answers "where do I look?" without an
+	// operator reading the source (CLA-701). The daemon's own lines go to
+	// daemon.log beside the iteration logs; the supervisor keeps its own under
+	// its state dir, and is only named when one has run on this machine.
+	c.info = append(c.info, "daemon log: "+filepath.Join(stateDir, statedir.DaemonLogName)+" (size-rotated; iteration logs in the same directory)")
+	if sup, err := supervisor.CacheDir(); err == nil {
+		if _, statErr := os.Stat(sup); statErr == nil {
+			c.info = append(c.info, "supervisor log: "+filepath.Join(sup, supervisor.SuperviseLogName))
+		}
+	}
 	// The state dir's name is a hash of the workdir, so when the workdir itself
 	// came from the cwd, this line is about a directory that MOVES with where the
 	// operator happened to be standing: doctor from ~ and `run` from the checkout

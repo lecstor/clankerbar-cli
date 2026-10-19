@@ -149,6 +149,15 @@ type Options struct {
 	// Empty = the default under the loop state root.
 	RosterCacheDir string
 
+	// LogToFile writes the supervisor's own lines to supervise.log in that
+	// state dir, beside them and rotated at a size bound (CLA-701), as well as
+	// to stderr. Default FALSE, deliberately: this redirects the PROCESS-WIDE
+	// standard logger, and a library caller (every test) that never asked for
+	// a file should not have its log capture taken over. The CLI sets it; the
+	// supervisor is a long-lived process, so its lines need the same durable
+	// home the daemons' got.
+	LogToFile bool
+
 	// PollInterval is how often the roster is polled. 0 = defaultPollInterval.
 	PollInterval time.Duration
 
@@ -389,11 +398,22 @@ func Supervise(ctx context.Context, o Options) error {
 	if o.RosterCacheDir != "" {
 		d.cacheDir = o.RosterCacheDir
 	} else {
-		dir, err := rosterCacheDir()
+		dir, err := CacheDir()
 		if err != nil {
 			return fmt.Errorf("supervise: %w", err)
 		}
 		d.cacheDir = dir
+	}
+	// The supervisor's own lines get the same durable home the daemons' have
+	// (CLA-701): a supervisor is the process an operator asks "why did that
+	// child not come back?" about, and its answer was only ever in a terminal.
+	// Best-effort by the same contract — observability never gates the fleet.
+	if o.LogToFile {
+		if restore, err := installLog(d.cacheDir); err != nil {
+			log.Printf("supervise: cannot write its log into %s (%v) - its own lines go to stderr only", d.cacheDir, err)
+		} else {
+			defer restore()
+		}
 	}
 
 	// The exit channel must exist BEFORE the first reconcile spawns children:

@@ -570,6 +570,11 @@ func TestOpenAdoptsAPreSentinelStateDir(t *testing.T) {
 		// atomic rewrite must not make an otherwise-ours directory unadoptable.
 		"CURRENT_CLAIM":     `{"taskId":"t-1","runId":"r-1"}`,
 		"CURRENT_CLAIM.tmp": `{"taskId":"t-1"}`,
+		// CLA-701: the daemon's own log and the rotated siblings it keeps
+		// beside it. A log file must not make an otherwise-ours dir foreign.
+		"daemon.log":   "iteration 1 done\n",
+		"daemon.log.1": "iteration 0 done\n",
+		"daemon.log.2": "iteration -1 done\n",
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(path, name), []byte(body), 0o600); err != nil {

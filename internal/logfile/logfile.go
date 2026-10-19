@@ -26,6 +26,8 @@ package logfile
 import (
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,6 +93,23 @@ func Open(dir, name string, maxBytes int64, keep int) (*File, error) {
 
 // Path is the absolute path of the current file.
 func (l *File) Path() string { return l.path }
+
+// Install opens NAME in dir and points the standard logger at stderr plus that
+// file, returning a func that restores the previous output and closes it. It is
+// the whole wiring a long-lived process needs: its own lines keep reaching the
+// terminal they always did, and gain a durable, size-bounded home.
+func Install(dir, name string) (restore func(), err error) {
+	f, err := Open(dir, name, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+	prev := log.Writer()
+	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	return func() {
+		log.SetOutput(prev)
+		_ = f.Close()
+	}, nil
+}
 
 // Write appends p, rotating first when the record would take the file past its
 // bound. A rotation that fails is reported (once) and the bytes are appended to

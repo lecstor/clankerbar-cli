@@ -204,6 +204,12 @@ type Driver struct {
 	state   *statedir.Dir
 	blind   bool // no cheap backlog read available — drain then idle-poll
 
+	// echoOut is where an ENABLED session echo writes (cfg.EchoSessions true).
+	// Nil = os.Stderr, the real terminal. The field exists so a test can watch
+	// what the terminal would have received without capturing the process's
+	// own stderr; with EchoSessions false nothing is echoed regardless.
+	echoOut io.Writer
+
 	// undeclared counts the sessions this run that ended still holding a task
 	// whose work they had already pushed — the phase did its job and then did not
 	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a
@@ -4269,11 +4275,45 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
 		f, ferr := d.state.Create(logName)
 		logPath := filepath.Join(d.state.Path(), logName)
-		if ferr == nil {
-			inv.Console = io.MultiWriter(os.Stderr, f)
-		} else {
-			inv.Console = os.Stderr
+		// The console is where the adapter streams the session: the file, and
+		// NOT the terminal unless the operator asked for the echo (CLA-701).
+		//
+		// The stream is the whole harness transcript — prompts, tool arguments,
+		// tool output — and once it also went to the daemon's stderr it left only
+		// the last few minutes of one session in the operator's scrollback, with
+		// none of the daemon's own lines beside it. Those lines (spawn, exit,
+		// classification, why the run ended) are the record of what the driver
+		// DECIDED, and nothing re-reads a terminal; the file keeps the stream in
+		// full, so echoing it only duplicates it over the top of the useful part.
+		//
+		// `echo_sessions: true` restores the old live echo for an operator
+		// watching one session. What stays live either way is the daemon's own
+		// logging (which also lands in daemon.log). Nothing harness-side is
+		// echoed separately: claude's stderr is part of its stream and lands in
+		// the iteration log with the rest of it, and a session worth watching
+		// live is why the opt-in exists.
+		var echo io.Writer
+		if d.cfg.EchoSessions {
+			echo = d.echoOut
+			if echo == nil {
+				echo = os.Stderr
+			}
+		}
+		switch {
+		case ferr == nil && echo != nil:
+			inv.Console = io.MultiWriter(echo, f)
+		case ferr == nil:
+			inv.Console = f
+		case echo != nil:
+			// No log file: keep the live view rather than swallow the session.
+			inv.Console = echo
 			log.Printf("could not open iteration log %s: %v", logPath, ferr)
+		default:
+			// No file and no echo: the stream has nowhere to go. Say so once —
+			// the daemon's own lines still land in daemon.log — rather than
+			// failing a paid session over its transcript.
+			inv.Console = io.Discard
+			log.Printf("could not open iteration log %s: %v - the session's stream is discarded (the daemon log still records its own lines)", logPath, ferr)
 		}
 		// The spawn line stamps what the session was actually spawned WITH:
 		// phase and the resolved model id inv.Model carries (ModelForPhase's
@@ -4943,8 +4983,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// they've topped up.
 		if lim := a.DetectLimit(res); lim.Limited {
 			if lim.Stop {
-				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved)",
-					drainNum, limitReason(lim))
+				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
+					drainNum, limitReason(lim), logPath)
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
@@ -5032,10 +5072,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// invisible. The adapter's own marker is the only thing that can
 			// tell them apart.
 			if zeroUsage {
-				log.Printf("iteration %d: the session ended with the zero-usage-unknown signature (final step reason %q, all-zero usage) — a quiet death, not a clean run",
-					drainNum, harness.FinishReasonUnknown)
+				log.Printf("iteration %d: the session ended with the zero-usage-unknown signature (final step reason %q, all-zero usage) — a quiet death, not a clean run (log: %s)",
+					drainNum, harness.FinishReasonUnknown, logPath)
 			} else {
-				log.Printf("iteration %d done (tokens=%d cost=$%.4f)", drainNum, tokens, cost)
+				log.Printf("iteration %d done (tokens=%d cost=$%.4f) (log: %s)", drainNum, tokens, cost, logPath)
 			}
 			return tokens, cost, false, end, nil
 		}
@@ -5070,8 +5110,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// stop the daemon — the backstop killing what it was added to protect.
 		// Not retried either: the cap would fire again at the same place.
 		if capped {
-			log.Printf("iteration %d: the session hit its turn cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
-				drainNum, tokens, cost)
+			log.Printf("iteration %d: the session hit its turn cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above (log: %s)",
+				drainNum, tokens, cost, logPath)
 			return tokens, cost, false, end, nil
 		}
 
@@ -5086,8 +5126,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// killed stream, so res.CostUSD is 0 and printing it would under-report
 		// the drain's spend as exactly nothing. The tokens are the honest figure.
 		if ceiling {
-			log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d; cost not captured — killed mid-stream) — ending this phase; anything uncommitted was salvaged above",
-				drainNum, tokens)
+			log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d; cost not captured — killed mid-stream) — ending this phase; anything uncommitted was salvaged above (log: %s)",
+				drainNum, tokens, logPath)
 			return tokens, cost, false, end, nil
 		}
 
@@ -5109,11 +5149,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// wording was earned by CLA-365, not reserved for a future adapter.
 		if wallclock {
 			if res.Claim.Held() {
-				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above",
-					drainNum, tokens, cost)
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above (log: %s)",
+					drainNum, tokens, cost, logPath)
 			} else {
-				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase. NOTHING was salvaged: this harness does not observe the session's task claim, so whatever the session left uncommitted is still in the worktree",
-					drainNum, tokens, cost)
+				log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase. NOTHING was salvaged: this harness does not observe the session's task claim, so whatever the session left uncommitted is still in the worktree (log: %s)",
+					drainNum, tokens, cost, logPath)
 			}
 			return tokens, cost, false, end, nil
 		}
