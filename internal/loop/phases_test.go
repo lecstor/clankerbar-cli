@@ -2717,9 +2717,43 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 	}, nil
 }
 
-func (r *reviewReleaser) CloseReviewRound(_ context.Context, _, _ string, round int) error {
+// CloseReviewRound is the driver's update_task(review: {closeRound: n}), and it
+// refuses exactly what the real plane refuses (CLA-639 S4):
+//
+//   - only the LIVE HOLDER may close a round, so a close attempted after a
+//     handback (or by a run a takeover displaced) fails;
+//   - a round with no SEALED record is not an open round — a takeover voids the
+//     records it found, and a second close of the same round has nothing to
+//     release (the plane's no_open_round).
+//
+// The panel's failure arm is why this matters: it must close the round BEFORE
+// anything hands the claim back, or its close is refused and the earlier
+// members' findings stay sealed behind a lease that is already gone.
+func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID string, round int) error {
 	if r.closeErr != nil {
 		return r.closeErr
+	}
+	sealed := false
+	voided := false
+	for i := range r.records {
+		if r.records[i].Round != round {
+			continue
+		}
+		switch r.records[i].State {
+		case "sealed":
+			sealed = true
+		case "void":
+			voided = true
+		}
+	}
+	if voided {
+		return fmt.Errorf("close round %d refused: round_voided (a takeover voided this round's records)", round)
+	}
+	if runUUID(runID) != runUUID(r.holder) {
+		return fmt.Errorf("close round %d refused: run %s is not the live holder (%s)", round, runUUID(runID), runUUID(r.holder))
+	}
+	if !sealed {
+		return fmt.Errorf("close round %d refused: no_open_round (no sealed record in it)", round)
 	}
 	// The real plane releases the round's findings on close (state sealed -> open,
 	// CLA-636); the fake must too, or a later digest/resolved read would see the
@@ -2731,6 +2765,66 @@ func (r *reviewReleaser) CloseReviewRound(_ context.Context, _, _ string, round 
 	}
 	r.closes = append(r.closes, round)
 	return nil
+}
+
+// writeReviewRecord is a session's update_task(review: {...}), modelled on the
+// plane's rules (CLA-639 S4): the record lands SEALED — that is how the plane
+// stores it while the round is open — and a role that already has a record in an
+// open round is refused as a DUPLICATE, the plane's idempotency signal
+// (`{duplicate: true}`), never an error. A panel member writes its own role, so
+// two members never collide; a retry of the same member does.
+func (r *reviewReleaser) writeReviewRecord(rec plane.ReviewRecordState) error {
+	for _, have := range r.records {
+		if have.Round == rec.Round && have.ReviewerRole == rec.ReviewerRole && have.State != "void" {
+			return fmt.Errorf("update_task(review:) refused: duplicate_reviewer — %s already has a record in round %d", rec.ReviewerRole, rec.Round)
+		}
+	}
+	if rec.State == "" {
+		rec.State = "sealed"
+	}
+	r.records = append(r.records, rec)
+	return nil
+}
+
+// writeOutcome is a session's update_task(outcome: ...), refused exactly where
+// the real plane refuses it (CLA-639 S4): while THIS run has a record sealed in
+// an open round the plane refuses the run's outcome, body and decision writes
+// ("review_sealed"), and a run a takeover displaced may not write at all
+// (round_voided / not the live holder). This is the rule M5 exists for: a panel
+// member's legacy outcome block would have to land BEFORE its record, and
+// member 2's own outcome write is refused once member 1's record is sealed.
+//
+// The statusless outcome REPLACES the whole field on the plane, so that is what
+// this does — it does not append.
+func (r *reviewReleaser) writeOutcome(runID, outcome string) error {
+	for _, rec := range r.records {
+		if runUUID(rec.RunID) != runUUID(runID) {
+			continue
+		}
+		switch rec.State {
+		case "sealed":
+			return fmt.Errorf("update_task(outcome:) refused: review_sealed — run %s has a sealed record in open round %d", runUUID(runID), rec.Round)
+		case "void":
+			return fmt.Errorf("update_task(outcome:) refused: round_voided — a takeover voided round %d", rec.Round)
+		}
+	}
+	if runUUID(runID) != runUUID(r.holder) {
+		return fmt.Errorf("update_task(outcome:) refused: run %s no longer holds the task (%s)", runUUID(runID), runUUID(r.holder))
+	}
+	r.outcome = outcome
+	return nil
+}
+
+// takeover models the plane's recovery of a lapsed lease: another run becomes
+// the live holder and every OPEN round's records are VOIDED, so the previous run
+// can neither close them nor write to the task again (CLA-639 S4).
+func (r *reviewReleaser) takeover(runID string) {
+	r.holder = runID
+	for i := range r.records {
+		if r.records[i].State == "sealed" {
+			r.records[i].State = "void"
+		}
+	}
 }
 
 func (r *reviewReleaser) Park(_ context.Context, taskID, runID, outcome string) error {
