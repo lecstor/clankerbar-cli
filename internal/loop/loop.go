@@ -1665,10 +1665,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// seam evaluates the record gate. Ask the plane the same question the
 			// seam asks, so the member is counted as recorded instead of unnamed
 			// INCOMPLETE and charged a failure for writing exactly what it owed
-			// (CLA-639 fix pass 4). Only the branch-carrying forms reach the
-			// seam's matcher: a branchless checkpoint keeps the legacy outcome
-			// block gate, which is not this one.
-			if !recorded && seqEnd != nil && carried != nil && (carried.Claim.Branch != "" || carried.CheckpointUnverified) {
+			// (CLA-639 fix pass 4). Only the seam's own matcher inputs qualify: a
+			// verified tip (match it exactly) or the unverified mark (demand a
+			// tip). A carried claim with neither — a branch with no tip and no
+			// unverified mark, the shape the checkpoint-fact copy cannot fill
+			// when the claim is not held — would make the matcher accept any
+			// record by run and role, looser than the seam ever is, so it is left
+			// to the failure arm (CLA-639 fix pass 5).
+			if !recorded && seqEnd != nil && carried != nil && (carried.CheckpointTip != "" || carried.CheckpointUnverified) {
 				if rec, matched := d.panelMemberRecordMatch(ctx, t, *carried, role); matched {
 					recorded = true
 					if rec.Round > 0 {

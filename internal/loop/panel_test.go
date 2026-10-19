@@ -1593,3 +1593,50 @@ func TestDrainPhases_ReviewPanelLastMemberEndsSequenceAfterRecording(t *testing.
 		})
 	}
 }
+
+// TestDrainPhases_ReviewPanelUnheldClaimDoesNotMatchALooseTip (CLA-639 fix pass
+// 5): when the member's own claim is not Held, the checkpoint-fact copy cannot
+// fill `CheckpointTip`, so the carried claim carries a branch and no tip. The
+// seam's matcher only ever runs with a verified tip or the unverified mark; with
+// neither, matching by run and role alone would accept ANY tip, looser than the
+// seam. The panel must leave such a member to the failure arm.
+func TestDrainPhases_ReviewPanelUnheldClaimDoesNotMatchALooseTip(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	// The member's claim is held-looking except that it is SETTLED (not Held),
+	// and it names a branch: exactly the shape the checkpoint-fact copy skips.
+	unheld := harness.Claim{TaskID: "t-1", RunID: "r-1", Settled: true, Branch: "clanker/x"}
+	h := &fakeAdapter{
+		steps: []invokeStep{
+			{res: checkpointed(10, 0.10)},      // implement
+			{res: held(limitResult(), unheld)}, // review-1 records, then is turned away
+			{res: okResult(1, 0)},              // must never run
+			{res: okResult(1, 0)},              // must never run
+		},
+		limitResetAt: time.Now().Add(-time.Hour),
+	}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+	}
+	d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 (implement, review-1) — the drain must end with the failed member", h.invokeCalls)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1", len(recs))
+	}
+	for _, want := range []string{"review panel INCOMPLETE", "review-1", "hit a usage limit before recording"} {
+		if !strings.Contains(recs[0].Outcome, want) {
+			t.Errorf("the iteration outcome does not carry %q: %q", want, recs[0].Outcome)
+		}
+	}
+	if n := d.panelFailStreak["review-1"]; n != 1 {
+		t.Errorf("panelFailStreak[review-1] = %d, want 1 — without a verified tip the record is not this member's exit evidence", n)
+	}
+}
