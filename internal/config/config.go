@@ -1300,7 +1300,7 @@ const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase
 	"defect the probe is for, and when it confirms one, the probe's output IS that finding's evidence - " +
 	"`(gate): <the command and its failing output>` for a command that fails, `(failure): <the input and the " +
 	"wrong output>` for behaviour you reproduced by hand. A probe must leave the worktree as it found it: if it " +
-	"writes a report, coverage file or snapshot, restore or delete it (`git checkout -- <path>` for a tracked " +
+	"writes a report, coverage file or snapshot, restore or delete the artifact (`git checkout -- <path>` for a tracked " +
 	"one) before you record. The panel shares this one worktree, so an artifact left behind is the next member's " +
 	"- and the fix phase's - dirty tree. "
 
