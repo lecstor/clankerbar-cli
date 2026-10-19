@@ -216,6 +216,17 @@ func opencodeResumeArgs(in Invocation, sid, prompt string) []string {
 //     OutputCapReasoningKey (CLA-584) is recomputed the same way: it is the
 //     stalled STEP's own count, so a second stall must replace the first's
 //     figure rather than add to it.
+//     RecoveredErrorsKey (CLA-700) is recomputed with them, for the same
+//     shape of reason and a sharper one: it answers "did the run that ENDED
+//     this session ride out a provider error", and that answer decides whether
+//     a non-zero exit is judged on delivery rather than by its status. Summing
+//     it inherited the dead run's count into a continuation that ended on a
+//     REAL terminal error — the parser withholds the key in exactly that
+//     shape — so the merged session read "recovered" over a stream that ended
+//     on its error, the one classification the recovery arm must never make.
+//     Recovery is a property of how the session ended, not a quantity that
+//     accumulates; the continuation's own count stands, and its absence clears
+//     the dead run's.
 func mergeResume(base *Result, add Result) {
 	base.ExitCode = add.ExitCode
 	base.ExitSignal = add.ExitSignal
@@ -247,8 +258,8 @@ func mergeResume(base *Result, add Result) {
 		base.Raw = map[string]any{}
 	}
 	for k, v := range add.Raw {
-		if k == TerminalReasonKey || k == FinishReasonKey || k == OutputCapReasoningKey {
-			continue // all three recomputed below, never inherited blind
+		if k == TerminalReasonKey || k == FinishReasonKey || k == OutputCapReasoningKey || k == RecoveredErrorsKey {
+			continue // all four recomputed below, never inherited blind
 		}
 		if nv, ok := v.(int); ok {
 			if bv, ok := base.Raw[k].(int); ok {
@@ -286,6 +297,18 @@ func mergeResume(base *Result, add Result) {
 		base.Raw[OutputCapReasoningKey] = n
 	} else {
 		delete(base.Raw, OutputCapReasoningKey)
+	}
+	// The recovered-error marker is recomputed from the continuation for the
+	// reason spelled out in the field list above: the parser writes it only when
+	// the stream did NOT end on an error, so its presence is the continuation's
+	// own verdict that this session recovered, and its absence — a terminal
+	// error, or nothing to recover from — must clear the dead run's. A positive
+	// count is carried as-is rather than added: the merged session needs to know
+	// THAT it recovered, not how many runs' blips to add up.
+	if n, ok := add.Raw[RecoveredErrorsKey].(int); ok && n > 0 {
+		base.Raw[RecoveredErrorsKey] = n
+	} else {
+		delete(base.Raw, RecoveredErrorsKey)
 	}
 }
 

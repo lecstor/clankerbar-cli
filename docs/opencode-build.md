@@ -121,8 +121,8 @@ finishes the turn — but the process still exits **1** (probed 2026-10-19; pinn
 conformance suite's `_recoveredProviderError`, CLA-700). So `opencode run`'s exit status is
 not a verdict on the session: the driver judges a phase whose stream shows recovered errors on
 its DELIVERY (a verified branch, or an appended review record), and only a stream that ENDS on
-an error event classifies the session as failed or transient. Reported upstream by the operator
-from CLA-700's outcome draft.
+an error event classifies the session as failed or transient. Drafted for the operator to post
+upstream (see CLA-700's outcome under `### Upstream report draft`).
 
 ## See also
 

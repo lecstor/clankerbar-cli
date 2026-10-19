@@ -427,6 +427,11 @@ const RecoveredErrorsKey = "recovered_error_events"
 // stream ended on its error": the difference that matters to a classifier is
 // whether there is an unexplained exit status to judge, and only the second
 // shape has one.
+//
+// A RESURRECTED session (mergeResume) reports the count of the run that ENDED
+// it, not the sum of its runs: the marker answers "did this session recover",
+// and a continuation that ended on a real terminal error must read as not
+// recovered however many blips the dead run rode out first.
 func RecoveredErrors(res Result) int {
 	if res.Raw == nil {
 		return 0

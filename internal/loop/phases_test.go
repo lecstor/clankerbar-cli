@@ -5348,3 +5348,35 @@ func TestDrainPhases_A_TerminalFailureIsNotRescuedByARecordedBranch(t *testing.T
 		t.Fatalf("spawned %d sessions, want 1 — no review phase may be spawned over a session that failed", h.invokeCalls)
 	}
 }
+
+// The same boundary across a RESURRECTION, which is the shape review round 1
+// found unpinned. mergeResume folds the continuation into the dead run's Result,
+// and the merged session's marker must describe the run that ENDED it: a base
+// that recovered a provider blip and then died quietly, continued into a run
+// that ended on a terminal error, is ONE Result with the continuation's exit
+// status and error type and NO recovered marker. The merge itself is pinned
+// where it happens — TestMergeResumeRecomputesTheRecoveredMarker and the real
+// Invoke path's TestResurrectionInvokeTerminalErrorContinuationIsNotRecovered,
+// both of which fail on the pre-fix merge — and this pins the DRIVER half of
+// that chain: the exact Result those two produce must classify as a terminal
+// failure. A branch recorded before the failure does not turn it into a
+// delivery, and the phase must not advance.
+func TestDrainPhases_AResurrectedSessionThatEndsOnATerminalErrorIsNotRecovered(t *testing.T) {
+	merged := harness.Result{ExitCode: 1, Tokens: 5, CostUSD: 0.05, Raw: map[string]any{
+		"kind":                       "fail",
+		harness.OpencodeErrorTypeKey: "provider.auth",
+	}}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(reported(merged, branchReport()), openClaim())},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	captureLogs(t)
+
+	if _, _, _, err := drainPhasesOnce(t, d); err == nil {
+		t.Fatal("a resurrected session whose continuation ended on a terminal error must still stop the run; the dead run's recovered marker may not survive the merge")
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — the merged session ended on its error, so no review phase may be spawned over it", h.invokeCalls)
+	}
+}
