@@ -1448,3 +1448,74 @@ func TestDrainPhases_ReviewPanelVerifyRewindUsesTheVerifiersGrading(t *testing.T
 		}
 	}
 }
+
+// TestDrainPhases_ReviewPanelMemberLimitedAfterRecordingIsRecorded (CLA-639 fix
+// pass 4): a member that appends its durable record and is THEN turned away by a
+// usage limit is not a failure. The seam never judged the record (the resumed
+// phase's limit path returns before the gate), so the panel handler asks the
+// plane the same question the seam asks and counts the member as recorded: no
+// INCOMPLETE, no failure streak, no dead booking — and the panel continues, so
+// its findings reach the fix.
+func TestDrainPhases_ReviewPanelMemberLimitedAfterRecordingIsRecorded(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{
+		steps: []invokeStep{
+			{res: checkpointed(10, 0.10)},           // implement
+			{res: held(limitResult(), openClaim())}, // review-1 records, THEN is turned away
+			{res: checkpointed(5, 0.50)},            // review-2 records
+			{res: checkpointed(5, 0.50)},            // review-3 records (last, closes)
+			{res: checkpointed(5, 0.05)},            // fix
+		},
+		// The record means the panel continues and the wait is not owed here;
+		// a reset already past keeps the fixture deterministic if one is taken.
+		limitResetAt: time.Now().Add(-time.Hour),
+	}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "review-1's MUST")},
+			})
+		case 2:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+			})
+		case 3:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-3", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+			})
+		case 4:
+			rel.status = "in_review"
+			rel.outcome += "\n### Fixes\n- 1.review-1.1 fixed\n"
+		}
+	}
+	d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 5 {
+		t.Fatalf("spawned %d sessions, want 5 (implement, three members, fix) — a member that recorded must not stop the panel", h.invokeCalls)
+	}
+	fix := h.invocations[4].Prompt
+	if strings.Contains(fix, "INCOMPLETE") {
+		t.Errorf("a member that recorded before the limit was reported incomplete:\n%s", fix)
+	}
+	if !strings.Contains(fix, "1.review-1.1") {
+		t.Errorf("review-1's findings are not in the fix brief:\n%s", fix)
+	}
+	if n := d.panelFailStreak["review-1"]; n != 0 {
+		t.Errorf("panelFailStreak[review-1] = %d, want 0 — the member recorded", n)
+	}
+	if cell := d.deadTally[tallyKey{phase: "review-1", harness: "opencode"}]; cell != nil && cell.dead != 0 {
+		t.Errorf("the member that recorded was booked dead: %+v", cell)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1", len(recs))
+	}
+	if strings.Contains(recs[0].Outcome, "review-1:") {
+		t.Errorf("the iteration outcome names review-1 as a failed member: %q", recs[0].Outcome)
+	}
+}

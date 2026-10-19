@@ -1660,6 +1660,22 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// failure streak for the plane's failure to release the round.
 			recorded := end.reviewRecorded || end.reviewCloseFailed
 			seqEnd := end.sequenceEnd
+			// A member that writes its durable record and only THEN ends the
+			// sequence (a usage limit or a transient failure) returns before the
+			// seam evaluates the record gate. Ask the plane the same question the
+			// seam asks, so the member is counted as recorded instead of unnamed
+			// INCOMPLETE and charged a failure for writing exactly what it owed
+			// (CLA-639 fix pass 4). Only the branch-carrying forms reach the
+			// seam's matcher: a branchless checkpoint keeps the legacy outcome
+			// block gate, which is not this one.
+			if !recorded && seqEnd != nil && carried != nil && (carried.Claim.Branch != "" || carried.CheckpointUnverified) {
+				if rec, matched := d.panelMemberRecordMatch(ctx, t, *carried, role); matched {
+					recorded = true
+					if rec.Round > 0 {
+						panelRound = rec.Round
+					}
+				}
+			}
 			// endSequenceEnd is the shared tail of the panel's run-level endings:
 			// a usage limit or transient failure owes the run its wait after the
 			// sequence's handback, exactly as the single-review seam does.
@@ -1770,10 +1786,18 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				break
 			}
 			panelRecorded = true
-			// This member recorded; a sequence-end still ends the run's attempt at
-			// the panel (the round is closed by the run-level path below), and any
-			// other recorded member advances to the next one.
+			// This member recorded. A sequence-end STILL ends the run's attempt
+			// when nothing follows this member (the last member), but a recorded
+			// mid-panel member whose session was then turned away by a run-level
+			// limit or transient failure continues the panel exactly as a failed
+			// one does: its deliverable is in the round, and the wait belongs to
+			// the end that actually stops the sequence. (A failed member's arm
+			// above has always made the same choice for a mid-panel member.)
 			if seqEnd != nil {
+				if live && !end.panelLast && i+1 < len(phases) {
+					i++
+					continue
+				}
 				endSequenceEnd()
 				break
 			}
@@ -2516,6 +2540,28 @@ func matchingReviewRecord(records []plane.ReviewRecordState, role, runID, tip st
 		}
 	}
 	return best, found
+}
+
+// panelMemberRecordMatch asks the plane whether a panel member's durable record
+// is already in the round, using the SAME evidence the review seam uses:
+// matchingReviewRecord keyed by this run and the member's positional role, at
+// the checkpoint's reviewed tip.
+//
+// The seam asks that question after a session ends. A member that writes its
+// record and only THEN ends the sequence — a usage limit or a transient failure
+// — returns from drainPhase before the seam runs, so the panel handler must ask
+// it here or the member is recorded as a failure while its record sits in the
+// round (CLA-639 fix pass 4). Best-effort: an unreadable task or an unwired
+// reader leaves the member classified as failed, exactly as before this check.
+func (d *Driver) panelMemberRecordMatch(ctx context.Context, t Target, res harness.Result, role string) (plane.ReviewRecordState, bool) {
+	if role == "" || res.Claim.TaskID == "" {
+		return plane.ReviewRecordState{}, false
+	}
+	st, ok := d.readTaskState(ctx, t, res.Claim.TaskID)
+	if !ok {
+		return plane.ReviewRecordState{}, false
+	}
+	return matchingReviewRecord(st.Reviews, role, res.Claim.RunID, res.CheckpointTip, res.CheckpointUnverified)
 }
 
 // runUUID is a run id's identity: the part before the first dot. Since CLA-509
