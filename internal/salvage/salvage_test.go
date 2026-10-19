@@ -539,6 +539,11 @@ func TestUnmergedPaths(t *testing.T) {
 	if len(got) > 0 && got[0] != "a.txt" {
 		t.Errorf("path = %q, want the path with its status code stripped", got[0])
 	}
+	// The path bytes are handed on as porcelain printed them: a name that begins
+	// or ends in whitespace is a different file from the trimmed name.
+	if got := unmergedPaths("UU  leading.txt "); len(got) != 1 || got[0] != " leading.txt " {
+		t.Errorf("unmergedPaths(%q) = %q, want the path bytes kept verbatim", "UU  leading.txt ", got)
+	}
 }
 
 // untrackedOnly is asked of a porcelain that is known to be non-empty (the caller
@@ -559,6 +564,12 @@ func TestUntrackedOnly(t *testing.T) {
 		{"a trailing newline", "?? a.go\n", []string{"a.go"}, true},
 		{"CRLF", "?? a.go\r\n", []string{"a.go"}, true},
 		{"a quoted path", "?? \"a file with spaces.go\"", []string{"\"a file with spaces.go\""}, true},
+		// The path is bytes, not a token: a name whose first or last byte is a
+		// space is a different file from the trimmed name, and reporting the
+		// trimmed one hands a reader a path that matches nothing on disk.
+		{"a path whose last byte is a space", "?? trailing.go ", []string{"trailing.go "}, true},
+		{"a path whose first byte is a space", "??  leading.go", []string{" leading.go"}, true},
+		{"a quoted path ending in a space", "?? \"trailing.go \"", []string{"\"trailing.go \""}, true},
 		{"an unstaged edit", " M tracked.txt", nil, false},
 		{"a staged edit", "M  tracked.txt", nil, false},
 		{"a rename", "R  m.go -> n.go", nil, false},
@@ -717,6 +728,113 @@ func TestSalvage_TrackedEditsOnADeliveredTipAreStillSaved(t *testing.T) {
 	}
 	if got := lsRemote(t, e.repo, e.branch); got != out.Commit {
 		t.Errorf("origin/%s is at %q, want the salvage commit %q", e.branch, got, out.Commit)
+	}
+}
+
+// The paths a reader is handed are the bytes git reported, so a name whose first
+// or last byte is a space stays matchable to the file on disk: trimming it would
+// name a DIFFERENT file, and the reader cannot tell that from the log.
+//
+// Git quotes such a name (git 2.44 spells `?? "trailing.go "`), and the quoted
+// form already carries the whitespace - which is exactly the point: the spelling
+// git chose is passed through untouched rather than re-trimmed into something
+// nobody has on disk.
+func TestSalvage_WhitespacePathsAreReportedUntrimmed(t *testing.T) {
+	e := newEnv(t)
+	write(t, filepath.Join(e.wt, "the-work.go"), "package work")
+	git(t, e.wt, "add", ".")
+	git(t, e.wt, "commit", "-m", "the work")
+	git(t, e.wt, "push", "origin", "HEAD:refs/heads/"+e.branch)
+	delivered := git(t, e.wt, "rev-parse", "HEAD")
+	names := []string{" leading.go", "trailing.go "}
+	for _, name := range names {
+		write(t, filepath.Join(e.wt, name), "untracked")
+	}
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-695", e.branch)
+
+	if out.Status != Untracked {
+		t.Fatalf("status = %q (%s), want %q", out.Status, out.Detail, Untracked)
+	}
+	if len(out.Paths) != len(names) {
+		t.Fatalf("paths = %q, want the %d whitespace-named files", out.Paths, len(names))
+	}
+	for _, name := range names {
+		found := false
+		for _, p := range out.Paths {
+			if strings.Contains(p, name) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no reported path carries %q exactly - a trimmed path names a file that does not exist: %q", name, out.Paths)
+		}
+	}
+	// The tree is still left exactly as it is: reported, never committed.
+	if got := git(t, e.wt, "rev-parse", "HEAD"); got != delivered {
+		t.Errorf("HEAD moved to %s, want the delivered tip %s untouched", got, delivered)
+	}
+	if got := lsRemote(t, e.repo, e.branch); got != delivered {
+		t.Errorf("origin/%s is at %s, want the delivered tip %s", e.branch, got, delivered)
+	}
+}
+
+// The status read is the one whose bytes ARE the paths, so it keeps the last
+// line's trailing whitespace: run's own trimming would have turned a path that
+// ends in a space into a different path, and nothing follows the last line to
+// protect it. Driven through a stand-in git because the case has to be the LAST
+// line of the output to exercise it.
+func TestStatusKeepsATrailingWhitespacePath(t *testing.T) {
+	standin := filepath.Join(t.TempDir(), "git-standin.sh")
+	write(t, standin, `#!/bin/sh
+printf '?? leading.go\n?? trailing.go \n'
+`)
+	if err := os.Chmod(standin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	s := New(t.TempDir(), "")
+	s.gitBin = standin
+
+	got, err := s.status(context.Background(), t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "?? leading.go\n?? trailing.go " {
+		t.Errorf("status = %q, want the trailing whitespace kept: %q", got, "?? leading.go\n?? trailing.go ")
+	}
+	paths, only := untrackedOnly(got)
+	if !only || len(paths) != 2 || paths[0] != "leading.go" || paths[1] != "trailing.go " {
+		t.Errorf("untrackedOnly(%q) = %q, %v, want the trailing space intact", got, paths, only)
+	}
+}
+
+// The detail a reader is handed must not label the leftovers: nothing on this
+// branch can tell a build artifact from real source work the session never added,
+// and a consumer who takes the path list as disposable would drop the latter. It
+// says what is actually known - the files are untracked and their contents are
+// not known here.
+func TestSalvage_UntrackedDetailDoesNotLabelTheLeftoverFiles(t *testing.T) {
+	e := newEnv(t)
+	write(t, filepath.Join(e.wt, "the-work.go"), "package work")
+	git(t, e.wt, "add", ".")
+	git(t, e.wt, "commit", "-m", "the work")
+	git(t, e.wt, "push", "origin", "HEAD:refs/heads/"+e.branch)
+	write(t, filepath.Join(e.wt, "worker-configuration.d.ts"), "generated")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-695", e.branch)
+
+	if out.Status != Untracked {
+		t.Fatalf("status = %q (%s), want %q", out.Status, out.Detail, Untracked)
+	}
+	for _, banned := range []string{"generated", "scratch"} {
+		if strings.Contains(out.Detail, banned) {
+			t.Errorf("the detail asserts the leftovers are %q, which this branch cannot know: %s", banned, out.Detail)
+		}
+	}
+	for _, want := range []string{"left uncommitted", "not known here"} {
+		if !strings.Contains(out.Detail, want) {
+			t.Errorf("the detail must say the files are untracked-and-uncommitted with unknown contents (%q missing): %s", want, out.Detail)
+		}
 	}
 }
 

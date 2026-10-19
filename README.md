@@ -1364,13 +1364,14 @@ operation. Either way it is logged as `STRANDED WORK LEFT AS IS` with the path.
 **Untracked files alone, at a tip the session already delivered, are left alone.**
 The driver asks the origin rather than the session: when the branch the session
 recorded is on the remote at **exactly** the worktree's HEAD, the work is pushed
-and an untracked file beside it is generated or scratch output — a `wrangler
-types` dump, a report, a build artifact. Committing it would push a **new** tip at
-the phase boundary, and every reader downstream — each review-panel member, the
-fix phase, the PR — would then review the salvage commit instead of the tip the
-session handed over, which is precisely what one implement phase cost before this
-rule existed. The paths are logged instead, because an untracked file can still be
-real work (a source file written after the last commit) and only a reader can tell.
+and there is nothing left to rescue, so the untracked files are left uncommitted
+and logged. What is in them is not known here — a `wrangler types` dump and a
+source file written after the last commit are the same shape in a status line —
+and only a reader can tell which of them is disposable. Committing them would push
+a **new** tip at the phase boundary, and every reader downstream — each
+review-panel member, the fix phase, the PR — would then review the salvage commit
+instead of the tip the session handed over, which is precisely what one implement
+phase cost before this rule existed.
 
 Delivery is the whole discriminator, and it is checked, not assumed: an edit to a
 **tracked** file is salvaged on top of a delivered tip like any other uncommitted

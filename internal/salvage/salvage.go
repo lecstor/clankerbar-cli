@@ -38,9 +38,9 @@
 //     can fetch is worse than none at all.
 //   - Untracked files alone, at a tip the session already DELIVERED, are left
 //     alone and named in the outcome (CLA-695). There is nothing to rescue - the
-//     work is pushed - and committing generated output at a phase boundary moves
-//     the branch every later reader reviews onto a tip nobody chose. Delivery is
-//     the discriminator and it is checked, not assumed: an undelivered session's
+//     work is pushed - and committing them at a phase boundary moves the branch
+//     every later reader reviews onto a tip nobody chose. Delivery is the
+//     discriminator and it is checked, not assumed: an undelivered session's
 //     untracked source file is exactly the work CLA-314 exists to save.
 package salvage
 
@@ -78,12 +78,12 @@ const (
 	// Untracked: the session DELIVERED, and the only dirt left is untracked
 	// files. The branch the session recorded for this task is on the remote at
 	// exactly the worktree's HEAD, so there is nothing to rescue - and the files
-	// are deliberately left uncommitted, because at a phase boundary a generated
-	// file (a type dump, a report, a build artifact) committed here would put the
-	// branch headed for review on a tip nobody chose, and every later reader -
-	// reviewer, fix phase, PR - would review THAT instead of what was delivered
-	// (CLA-695). Outcome.Paths names them, because an untracked file can still be
-	// real work and only a human can tell which it is.
+	// are deliberately left uncommitted, because at a phase boundary committing
+	// them would put the branch headed for review on a tip nobody chose, and
+	// every later reader - reviewer, fix phase, PR - would review THAT instead of
+	// what was delivered (CLA-695). Outcome.Paths names them, and what they hold
+	// is not known here: a build artifact and a source file the session never
+	// added look the same in a status line, so only a human can tell which it is.
 	Untracked Status = "untracked"
 
 	// Failed: it was attempted and did not finish - git missing, a commit that
@@ -195,7 +195,7 @@ func (s *Salvager) Salvage(ctx context.Context, taskID, label string, recorded .
 			wt.path, op)}
 	}
 
-	dirty, err := s.run(ctx, wt.path, "status", "--porcelain")
+	dirty, err := s.status(ctx, wt.path)
 	if err != nil {
 		return Outcome{Status: Failed, Worktree: wt.path, Detail: fmt.Sprintf(
 			"could not read the state of %s: %v", wt.path, err)}
@@ -244,7 +244,7 @@ func (s *Salvager) Salvage(ctx context.Context, taskID, label string, recorded .
 				Worktree: wt.path,
 				Paths:    untracked,
 				Detail: fmt.Sprintf(
-					"%s holds %d untracked path(s) (%s) and %s is already on %s at exactly that tip, so the session delivered and they are left uncommitted: they are generated or scratch output, and committing them would push a tip nobody chose for every later reader - reviewer, fix phase and PR - to review in place of the delivered one",
+					"%s holds %d untracked path(s) (%s), left uncommitted. %s is already on %s at exactly that tip, so the session delivered and there is nothing to rescue. What those paths hold is not known here - a build artifact and a source file the session never added look the same in a status line - and committing them would push a tip nobody chose for every later reader (reviewer, fix phase and PR) to review in place of the delivered one, so a human decides what they are before anything builds on them",
 					wt.path, len(untracked), strings.Join(untracked, ", "), branch, remote),
 			}
 		}
@@ -260,6 +260,11 @@ func (s *Salvager) Salvage(ctx context.Context, taskID, label string, recorded .
 // The rule is the porcelain's own: a `U` on either side is unmerged, and AA/DD
 // are the two both-sides cases that spell no `U`. Anything else - modified,
 // added, deleted, renamed, untracked - is ordinary work and is salvaged.
+//
+// The path is what follows the fixed three-byte prefix (`XY` and the separator
+// space), handed on verbatim: those bytes are a filename, not a token to trim,
+// and a name that begins or ends in whitespace is a different file from the
+// trimmed one.
 func unmergedPaths(porcelain string) []string {
 	var out []string
 	for _, line := range strings.Split(porcelain, "\n") {
@@ -269,7 +274,7 @@ func unmergedPaths(porcelain string) []string {
 		}
 		x, y := line[0], line[1]
 		if x == 'U' || y == 'U' || (x == 'A' && y == 'A') || (x == 'D' && y == 'D') {
-			out = append(out, strings.TrimSpace(line[2:]))
+			out = append(out, line[3:])
 		}
 	}
 	return out
@@ -287,9 +292,10 @@ func unmergedPaths(porcelain string) []string {
 // An empty porcelain is false as well: "untracked-only" is a statement about a
 // tree with something in it, and the caller has already handled the clean case.
 //
-// The paths are returned as git spells them, which for an exotic path is its
-// quoted form - they are logged for a human, not fed back to git, so quoting is
-// the honest thing to show.
+// The paths are returned as git spells them, VERBATIM: for an exotic path that
+// is its quoted form, and the whitespace a name carries is preserved either way
+// - they are logged for a human, not fed back to git, so quoting is the honest
+// thing to show and trimming would report a DIFFERENT file (CLA-695 review).
 func untrackedOnly(porcelain string) ([]string, bool) {
 	var paths []string
 	only := true
@@ -304,7 +310,11 @@ func untrackedOnly(porcelain string) ([]string, bool) {
 			only = false
 			continue
 		}
-		paths = append(paths, strings.TrimSpace(line[3:]))
+		// Everything after the fixed three-byte prefix is the path, byte for
+		// byte. A name whose first or last byte is a space is a different file
+		// from the trimmed name, so the reader has to be handed the bytes git
+		// printed.
+		paths = append(paths, line[3:])
 	}
 	return paths, only && any
 }
@@ -604,6 +614,24 @@ func (s *Salvager) inProgressOp(ctx context.Context, dir string) string {
 	return ""
 }
 
+// status reads `git status --porcelain` and hands back the bytes git printed,
+// with only the final line terminator removed.
+//
+// It deliberately does not go through run: run trims its stdout, and in a
+// porcelain line the last byte class is a PATH. A name whose leading or trailing
+// bytes are whitespace is a different file from the trimmed name, and the last
+// line of the output has nothing after it to protect that whitespace - so the one
+// read whose whole job is to name files a human must be able to match keeps them
+// exactly (CLA-695 review). Git's own quoting of such a name is git's spelling of
+// it; stripping anything here would be ours.
+func (s *Salvager) status(ctx context.Context, dir string) (string, error) {
+	stdout, stderr, err := s.execGit(ctx, dir, "status", "--porcelain")
+	if err != nil {
+		return "", runError("status", err, stderr)
+	}
+	return strings.TrimRight(stdout, "\r\n"), nil
+}
+
 // run executes one git command in dir and returns its trimmed stdout.
 //
 // The environment is deliberately hostile to interaction, and the WaitDelay is
@@ -612,21 +640,35 @@ func (s *Salvager) inProgressOp(ctx context.Context, dir string) string {
 // inheritor closes its write end - so a killed git can still leave the call
 // sitting there. Same reasoning, and the same numbers, as internal/delivery.
 func (s *Salvager) run(ctx context.Context, dir string, args ...string) (string, error) {
-	stdout, stderr, err := s.runFull(ctx, dir, args...)
+	stdout, stderr, err := s.execGit(ctx, dir, args...)
 	if err != nil {
-		if msg := strings.TrimSpace(stderr); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
-		}
-		return "", fmt.Errorf("git %s: %w", args[0], err)
+		return "", runError(args[0], err, stderr)
 	}
-	return stdout, nil
+	return strings.TrimSpace(stdout), nil
 }
 
-// runFull is run's engine, handing back the FULL stderr as well. run keeps only
-// its first line, and git writes its progress to stderr - so on a failed push
-// the first line is usually "Enumerating objects" rather than the error, and the
-// HTTP/2 signature (CLA-354) sits further down where run would drop it.
+// runFull is run's engine for the one caller that needs the FULL stderr as well
+// as the trimmed stdout. run keeps only a failed command's first stderr line, and
+// git writes its progress to stderr - so on a failed push the first line is
+// usually "Enumerating objects" rather than the error, and the HTTP/2 signature
+// (CLA-354) sits further down where run would drop it.
 func (s *Salvager) runFull(ctx context.Context, dir string, args ...string) (stdout, stderr string, err error) {
+	stdout, stderr, err = s.execGit(ctx, dir, args...)
+	return strings.TrimSpace(stdout), strings.TrimSpace(stderr), err
+}
+
+// runError is the one error shape a failed git command produces, so every runner
+// reports the same way.
+func runError(arg string, err error, stderr string) error {
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		return fmt.Errorf("git %s: %w: %s", arg, err, firstLine(msg))
+	}
+	return fmt.Errorf("git %s: %w", arg, err)
+}
+
+// execGit runs one git command and hands back its RAW stdout and stderr, for the
+// runners above to trim as their caller needs.
+func (s *Salvager) execGit(ctx context.Context, dir string, args ...string) (stdout, stderr string, err error) {
 	cmd := exec.CommandContext(ctx, s.gitBin, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -641,7 +683,7 @@ func (s *Salvager) runFull(ctx context.Context, dir string, args ...string) (std
 	cmd.Stdout = &outBuf
 	cmd.Stderr = &errBuf
 	err = cmd.Run()
-	return strings.TrimSpace(outBuf.String()), strings.TrimSpace(errBuf.String()), err
+	return outBuf.String(), errBuf.String(), err
 }
 
 func realPath(p string) string {
