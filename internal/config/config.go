@@ -1338,7 +1338,7 @@ var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + P
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
 	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
 	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
-	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate. " + reviewGateScope +
+	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate." + reviewGateScope +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
@@ -1388,7 +1388,7 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 	"repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout " +
 	"sitting on that branch is not a decision to commit where you are, it is this failure mode. Read the diff " +
 	"against the PR base (git diff " + PhasePRBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
-	"the adversarial review gate. " + reviewGateScope +
+	"the adversarial review gate." + reviewGateScope +
 	"REVIEW ONLY: do not edit, create or delete a source " +
 	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. Do NOT fix what you " +
 	"find: the phase after you is responsible for applying it, and a fix you apply here is a fix it cannot " +
