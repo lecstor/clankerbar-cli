@@ -304,13 +304,15 @@ func checkConfig(cfg *config.Config) check {
 		}
 		c.info = append(c.info, "phase harnesses: "+strings.Join(pairs, ", "))
 	}
-	// CLA-639: the review panel, by member and model, whenever a review phase
-	// will actually expand one. The trial panel runs on EVERY task by default, so
-	// an operator who never wrote `review_panel` still needs to see where four
-	// review sessions will spend. Empty when the sequence has no built-in review
-	// phase, because then no panel runs at all.
+	// CLA-639: the review panel, by member and model, whenever the config sets
+	// one, or the single reviewer when it does not. The panel is OPT-IN, so an
+	// operator who never wrote `review_panel` has to be able to see which single
+	// reviewer their phases will run. Empty when the sequence has no built-in,
+	// non-final review phase, because then no review gate runs at all.
 	if panel := panelLabels(cfg); len(panel) > 0 {
 		c.info = append(c.info, "review panel: "+strings.Join(panel, ", "))
+	} else if r := singleReviewerLabel(cfg); r != "" {
+		c.info = append(c.info, "review: single reviewer ("+r+")")
 	}
 	// The one destination the account-scoped key is allowed to reach (CLA-257).
 	// Named here so the preflight answers "where does my credential go" without the
@@ -340,30 +342,55 @@ func checkConfig(cfg *config.Config) check {
 
 // panelLabels renders the review panel as `role -> harness/model` entries, in
 // the order the driver spawns them. It reads the EFFECTIVE sequence, so a
-// `review_panel` entry's own model (CLA-639) and a trial default are both shown
-// as they will actually run — an operator's preflight should not have to
-// re-derive the panel from a default they never wrote.
+// `review_panel` entry's own model (CLA-639) is shown as it will actually run —
+// an operator's preflight should not have to re-derive the panel from config.
 //
-// Empty when no built-in review phase expands: a config whose review carries its
-// own prompt, or an unphased run, has no panel to report rather than an empty
-// one to apologise for.
+// Empty when no panel is configured or none expands: a config whose review
+// carries its own prompt, an unphased run, or the absent key (the single
+// reviewer) has no panel to report rather than an empty one to apologise for.
 func panelLabels(cfg *config.Config) []string {
 	var out []string
 	for i, ph := range cfg.EffectivePhases() {
 		if !ph.IsPanelMember() {
 			continue
 		}
-		model, _ := cfg.ModelForPhase(ph)
-		if model == "" {
-			model = "harness default"
-		}
-		// HarnessFor, not ph.Harness: the effective sequence resolves the field
-		// today, but a member that INHERITS its harness carries an empty one until
-		// something resolves it, and a report that prints "review-2 -> /gpt-6"
-		// names the wrong thing (or nothing) about where the session will run.
-		out = append(out, ph.Label(i)+" -> "+cfg.HarnessFor(ph)+"/"+model)
+		out = append(out, ph.Label(i)+" -> "+reviewerHarnessModel(cfg, ph))
 	}
 	return out
+}
+
+// singleReviewerLabel renders the single reviewer a config runs when it sets no
+// panel (CLA-639): the built-in, non-final review phase at the harness/model it
+// will spawn on. Empty when no such phase exists, so an unphased config or one
+// whose review runs the final combined brief reports nothing extra — matching
+// how doctor reports a phase detail only when the phase is there to report.
+func singleReviewerLabel(cfg *config.Config) string {
+	out := cfg.EffectivePhases()
+	for i, ph := range out {
+		if ph.IsPanelMember() || ph.Name != config.ReviewPhaseName || i == len(out)-1 {
+			continue
+		}
+		if ph.Prompt != config.ReviewOnlyBrief() {
+			// A custom prompt owns its own contract; it is not the shipped
+			// review gate doctor talks about.
+			continue
+		}
+		return reviewerHarnessModel(cfg, ph)
+	}
+	return ""
+}
+
+// reviewerHarnessModel is the `<harness>/<model>` a review phase spawns on:
+// HarnessFor, not ph.Harness, because a member that INHERITS its harness carries
+// an empty one until something resolves it, and a report that prints
+// "review-2 -> /gpt-6" names the wrong thing (or nothing) about where the
+// session will run. An unresolvable model reads as the harness's own default.
+func reviewerHarnessModel(cfg *config.Config, ph config.Phase) string {
+	model, _ := cfg.ModelForPhase(ph)
+	if model == "" {
+		model = "harness default"
+	}
+	return cfg.HarnessFor(ph) + "/" + model
 }
 
 // rangeEnvNames renders the config's declared session env as one line per

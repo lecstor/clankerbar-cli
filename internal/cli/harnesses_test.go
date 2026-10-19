@@ -13,7 +13,10 @@ import (
 // run-wide `harness` never names, so a preflight that reports only that one
 // certifies half the run and stays green about the other half.
 
-// mixedDoctorCfg is implement-on-opencode / review-on-claude, validated.
+// mixedDoctorCfg is implement-on-opencode / review-on-claude, validated: the
+// legacy two-phase shape, one review session on the run's claude harness, which
+// is what the per-harness budget/ceiling reasoning here is about (a
+// `review_panel` would add harnesses this test is not about).
 func mixedDoctorCfg(t *testing.T) *config.Config {
 	t.Helper()
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
@@ -27,11 +30,6 @@ func mixedDoctorCfg(t *testing.T) *config.Config {
 		Harnesses: map[string]config.HarnessConfig{
 			"opencode": {ConfigDir: t.TempDir()},
 		},
-		// CLA-639: this fixture pins the per-harness budget/ceiling reasoning for
-		// the LEGACY two-phase shape, so its panel is one member on the review
-		// phase's own claude harness. A nil panel would resolve to the trial panel
-		// and add harnesses this test is not about.
-		ReviewPanel: []config.ReviewPanelMember{{Harness: "claude"}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture config does not validate: %v", err)
@@ -111,9 +109,6 @@ func TestDoctorFanOut_ClaudeAsAPhaseStillGetsItsAllowlistAudited(t *testing.T) {
 		Harnesses: map[string]config.HarnessConfig{
 			"claude": {ConfigDir: t.TempDir()},
 		},
-		// CLA-639: one reviewer on the review phase's own claude harness — the
-		// single-review shape this test audits, spelled as a valid panel.
-		ReviewPanel: []config.ReviewPanelMember{{Harness: "claude"}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture config does not validate: %v", err)

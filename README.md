@@ -313,6 +313,13 @@ and each found four issues the other did not. The panel is the answer — N
 independent review phases on the **same reviewed tip**, each writing its own
 sealed record, merged by the driver before the fix phase runs.
 
+**The panel is opt-in, and clankerbar ships no panel, no preset and no model
+names.** The CLI cannot know which harnesses, providers or models an operator
+has, so it never picks one. With no `review_panel`, a config's `review` phase
+runs exactly as it did before the panel existed: one reviewer, on the
+harness/model the config already gives it, with the historical brief and the
+legacy fix path. Setting the key is what fans the review phase out:
+
 ```json
 "review_panel": [
   { "harness": "opencode", "model": "opencode-go/gpt-6-luna" },
@@ -322,16 +329,19 @@ sealed record, merged by the driver before the fix phase runs.
 ]
 ```
 
-Each entry is one reviewer and one review phase; the same model appearing more
-than once is deliberate, because each run is independent. **Unset, the trial
-panel above is the default on every task** (the operator chose it from a
-measured evaluation); a config with no built-in `review` phase has nothing to
-expand and runs exactly as it did before. `name` defaults to `review-1` ..
-`review-N` by position — that is the reviewer role the durable record is keyed
-on — and a member may set `tier` instead of `model` to resolve through a
-harness's tier map. A built-in review phase must have a phase after it (the fix
-phase) for the panel to apply; an unset panel on a config whose review is final
-keeps the historical combined brief.
+That is **one operator's fleet as an example, not a default** — the members are
+whatever your own harnesses and models are. Each entry is one reviewer and one
+review phase; the same model appearing more than once is deliberate, because
+each run is independent. The panel applies to a **built-in** `review` phase (no
+prompt of its own) that is **not the last phase** — the read-only gate. A final
+review runs the historical combined brief, and a review phase with its own
+prompt owns its own contract; `review_panel` alongside either is refused rather
+than silently ignored. An empty array (`"review_panel": []`) is refused too:
+removing the key is how you ask for a single reviewer.
+
+`name` defaults to `review-1` .. `review-N` by position — that is the reviewer
+role the durable record is keyed on — and a member may set `tier` instead of
+`model` to resolve through a harness's tier map.
 
 **Independence is a seal, not a promise.** The plane holds a round's records
 sealed: written, but with their findings withheld from every `get_task` until
@@ -507,10 +517,12 @@ Nothing in the seam resists it: each phase is already a fresh session seeded fro
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
 
-**The review can be a panel.** Setting `review_panel` fans the one review phase
-out into one review phase per member; see [the review panel](#the-review-panel-several-reviewers-one-revision-one-merge)
-for the default (the trial panel, on every task), independence and the merge.
-Members name their own `harness`/`model`, so a panel can span harnesses too.
+**The review can be a panel.** Setting `review_panel` fans the one built-in,
+non-final review phase out into one review phase per member; see [the review
+panel](#the-review-panel-several-reviewers-one-revision-one-merge) for the
+config, independence and the merge. It is opt-in — with no `review_panel` the
+review phase runs once, as before — and members name their own `harness`/`model`,
+so a panel can span harnesses too.
 
 **Do not run `fix` on the review's Claude account.** A fix session that starts
 right after an Opus review can hit the same rolling usage limit the review just

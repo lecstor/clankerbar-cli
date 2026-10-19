@@ -25,11 +25,6 @@ func ctlCfg(t *testing.T) (*config.Config, string) {
 		Harness: "claude",
 		Prompt:  "Work the backlog.",
 		WorkDir: t.TempDir(),
-		// CLA-639: unset (nil) means the trial panel, and because this fixture is
-		// serialised to a file, nil is the shape that round-trips to "the key is
-		// absent" — an empty slice would be written as `"review_panel": []` and
-		// refused by Validate.
-		ReviewPanel: nil,
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture config does not validate: %v", err)
