@@ -339,22 +339,95 @@ func sessionRunID(res harness.Result, prev *harness.Result) string {
 	return ""
 }
 
-// reportedSessionCost is the harness-reported dollar figure the fleet record
-// carries for one session, or nil when there is no figure to carry.
+// sessionCost is the harness-reported dollar figure for one session's Result, or
+// nil when there is no figure to carry.
 //
-// Two ways that happens, and they are different questions. An adapter that never
-// populates CostUSD at all — Capabilities.ReportsCost false, codex today — has
-// no figure by construction; a session that reported no usage leaves the field
-// at zero, and a zero from a session nobody measured would read on the console
-// as "$0 spent". Both are "unknown", which is what nil means, and it is why the
-// wire field is nullable rather than a zero.
+// Two questions have to be answered yes, and they are different ones. The
+// adapter has to be one that reports money at all — Capabilities.ReportsCost,
+// false for codex today — or there is no figure by construction. And THIS
+// session has to have actually reported one: Result.CostReported, because a
+// session whose stream ended before its harness's accounting reported tokens and
+// no dollars, and a zero taken from that silence would read on the console as
+// "$0 spent" for a session that cost real money. Absence is "unknown", which is
+// what nil means, and it is why the wire field is nullable rather than a zero.
 //
-// A harness that DID report (a real zero — a cached-only turn, a free local
-// model) keeps its zero: the pointer survives marshalling.
-func reportedSessionCost(a harness.Adapter, res *harness.Result) *float64 {
-	if res == nil || !res.UsageReported || !a.Capabilities().ReportsCost {
+// A harness that DID report a zero (a free local model, a cached-only turn)
+// keeps its zero: the pointer survives marshalling.
+func sessionCost(a harness.Adapter, res *harness.Result) *float64 {
+	if res == nil || !res.CostReported || !a.Capabilities().ReportsCost {
 		return nil
 	}
 	cost := res.CostUSD
 	return &cost
+}
+
+// sessionSpend is what one PHASE PASS spent, summed across the attempt ladder's
+// sessions (CLA-691).
+//
+// The fleet record publishes one session entry per pass, and a pass that
+// retried is several paid processes: the loop counts every attempt toward the
+// iteration's total (its own comment: "each attempt is a distinct session")
+// while the entry keeps the LAST attempt's identity. Summing the money here is
+// what keeps the per-session figures adding up to the iteration figure — the
+// property the operator's cost analysis reads them for — instead of dropping
+// every retried attempt's spend on the floor.
+//
+// Cost is summed only while EVERY attempt that ran produced a figure; one
+// attempt whose dollars were never reported leaves the pass's cost UNKNOWN
+// rather than partial, because a partial figure presented as the session's cost
+// understates it. The token buckets have no such problem: they sum exactly.
+type sessionSpend struct {
+	usage         harness.TokenUsage
+	usageReported bool
+	costUSD       float64
+	costKnown     bool
+	attempted     bool
+}
+
+// add folds one attempt's Result in. Called from recordPassSpend, which the loop
+// runs at each place it counts an attempt's spend — exactly once per counted
+// attempt.
+func (s *sessionSpend) add(a harness.Adapter, res harness.Result) {
+	// sessionCost answers both questions this needs: whether the adapter reports
+	// money at all, and whether THIS attempt actually reported some.
+	known := sessionCost(a, &res)
+	if !s.attempted {
+		// The first attempt seeds whether the pass has a dollar figure at all.
+		s.costKnown = known != nil
+	} else if known == nil {
+		s.costKnown = false
+	}
+	s.attempted = true
+	s.usage.Add(res.Usage)
+	s.usageReported = s.usageReported || res.UsageReported
+	if known != nil {
+		s.costUSD += *known
+	}
+}
+
+// cost returns the pass's dollar figure as a pointer, or nil when it is unknown.
+func (s *sessionSpend) cost() *float64 {
+	if !s.costKnown {
+		return nil
+	}
+	cost := s.costUSD
+	return &cost
+}
+
+// recordPassSpend folds one attempt's Result into the phase pass's running spend
+// and publishes it on the pass's session entry (CLA-691).
+//
+// It is called from the SAME places the loop adds this attempt's Tokens/CostUSD
+// to the iteration's accumulators, and ONLY from there: the loop skips counting an
+// unreadable stream and (on teardown) a cancelled run, and the per-session figures
+// have to skip those too, or the sessions would add up to more than the iteration
+// they belong to. One call site, one rule.
+func recordPassSpend(s *fleet.Session, a harness.Adapter, pass *sessionSpend, res *harness.Result) {
+	if s == nil || res == nil {
+		return
+	}
+	pass.add(a, *res)
+	s.Usage = fleet.TokenUsage(pass.usage)
+	s.UsageReported = pass.usageReported
+	s.CostUSD = pass.cost()
 }

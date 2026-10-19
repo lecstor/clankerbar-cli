@@ -310,10 +310,13 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			// (CLA-288).
 			Usage *usage `json:"usage"`
 		} `json:"message"`
-		Result         string  `json:"result"`
-		TerminalReason string  `json:"terminal_reason"`
-		TotalCostUSD   float64 `json:"total_cost_usd"`
-		Usage          usage   `json:"usage"`
+		Result         string `json:"result"`
+		TerminalReason string `json:"terminal_reason"`
+		// A POINTER, so a result event that carries no cost at all is
+		// distinguishable from one that reports 0 (CLA-691): only the latter is a
+		// figure the durable record may carry.
+		TotalCostUSD *float64 `json:"total_cost_usd"`
+		Usage        usage    `json:"usage"`
 	}
 	if json.Unmarshal(line, &ev) != nil {
 		return
@@ -358,7 +361,14 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 		}
 	case "result":
 		res.FinalMessage = ev.Result
-		res.CostUSD = ev.TotalCostUSD
+		// The session's DOLLARS arrive here and nowhere else, so the flag that says
+		// "a cost figure was seen" (CLA-691) is set here too: a session killed
+		// before this event reported tokens but no money, and the durable record
+		// must carry the absence rather than a zero nobody measured.
+		if ev.TotalCostUSD != nil {
+			res.CostUSD = *ev.TotalCostUSD
+			res.CostReported = true
+		}
 		// The result event's usage is the session's CUMULATIVE total, so it
 		// overwrites the running sum rather than adding to it. On a stream that
 		// reached its end this is the number the budget sees; on a stream we
@@ -900,6 +910,7 @@ func (claude) parse(res *Result) {
 	res.FinalMessage = p.Result
 	if p.TotalCostUSD != nil {
 		res.CostUSD = *p.TotalCostUSD
+		res.CostReported = true
 	}
 	if p.Usage != nil {
 		res.Tokens = p.Usage.total()

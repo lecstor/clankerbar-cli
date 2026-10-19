@@ -165,3 +165,118 @@ func TestMergeResumeSumsTheContinuationsUsage(t *testing.T) {
 		t.Errorf("Usage.Total() = %d, Tokens = %d — the buckets and the budget figure describe the same two runs", base.Usage.Total(), base.Tokens)
 	}
 }
+
+// A session's TOKENS and its DOLLARS are reported by different events on claude:
+// per-turn assistant usage arrives on the stream, the session's own accounting
+// (total_cost_usd) only on the terminal result event. CostReported is what tells
+// those apart, and it is what lets the durable record carry "unknown" instead of
+// a $0 nobody measured (CLA-691).
+func TestClaudeReportsWhetherItSawACostFigure(t *testing.T) {
+	t.Run("a stream killed before its result event reported tokens and no cost", func(t *testing.T) {
+		stream := `{"type":"assistant","message":{"content":[{"type":"text","text":"a"}],` +
+			`"usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":900000}}}`
+
+		var res Result
+		(claude{}).consume(strings.NewReader(stream), &bytes.Buffer{}, newTail(), &res, 0, func() {})
+
+		if !res.UsageReported {
+			t.Error("UsageReported = false; the per-turn usage event is a report")
+		}
+		if res.CostReported {
+			t.Error("CostReported = true, but no event carried a cost figure — a 0 from this session would claim a spend nobody measured")
+		}
+	})
+
+	t.Run("a result event carrying zero cost IS a figure", func(t *testing.T) {
+		line := `{"type":"result","subtype":"success","total_cost_usd":0,"usage":` +
+			`{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}`
+
+		var res Result
+		(claude{}).renderAndParse([]byte(line), &bytes.Buffer{}, &res)
+
+		if !res.CostReported || res.CostUSD != 0 {
+			t.Errorf("CostReported = %v (cost %v), want a reported zero — a free session is a figure, not silence", res.CostReported, res.CostUSD)
+		}
+	})
+
+	t.Run("the probe path agrees", func(t *testing.T) {
+		var withCost Result
+		withCost.Stdout = `{"result":"done","total_cost_usd":0.5,"usage":` +
+			`{"input_tokens":10,"output_tokens":2,"cache_creation_input_tokens":1000,"cache_read_input_tokens":20000}}`
+		(claude{}).parse(&withCost)
+		if !withCost.CostReported {
+			t.Error("the non-streaming envelope carries a cost figure; CostReported must be true")
+		}
+		if want := (TokenUsage{Input: 10, Output: 2, CacheRead: 20000, CacheWrite: 1000}); withCost.Usage != want {
+			t.Errorf("Usage = %+v, want %+v — the probe path must normalise like the stream path", withCost.Usage, want)
+		}
+
+		var noCost Result
+		noCost.Stdout = `{"is_error":true,"result":"claude: command failed"}`
+		(claude{}).parse(&noCost)
+		if noCost.CostReported || noCost.Usage != (TokenUsage{}) {
+			t.Errorf("an envelope with no accounting must report neither usage nor cost: %v / %+v", noCost.CostReported, noCost.Usage)
+		}
+	})
+}
+
+func TestOpencodeReportsWhetherItSawACostFigure(t *testing.T) {
+	// opencode reports a step's tokens and its cost as independent siblings, so a
+	// stream can account for tokens and never for money.
+	const noCost = `{"type":"step_finish","part":{"type":"step-finish","reason":"stop","tokens":{"total":100,"input":40,"output":10,"reasoning":0,"cache":{"write":50,"read":0}}}}`
+	res := opencodeParsed(noCost)
+	if !res.UsageReported || res.CostReported {
+		t.Errorf("usageReported=%v costReported=%v, want tokens reported and no cost figure", res.UsageReported, res.CostReported)
+	}
+
+	const withCost = `{"type":"step_finish","part":{"type":"step-finish","reason":"stop","tokens":{"total":100,"input":40,"output":10,"reasoning":0,"cache":{"write":50,"read":0}},"cost":0.02}}`
+	res = opencodeParsed(withCost)
+	if !res.CostReported || res.CostUSD != 0.02 {
+		t.Errorf("costReported=%v cost=%v, want the reported figure", res.CostReported, res.CostUSD)
+	}
+}
+
+// A codex session that reports cached > input or reasoning > output violates the
+// inclusive-counting premise the subtraction rests on. The clamp keeps a nonsense
+// NEGATIVE out of the durable record; this pins that it does, so a future change
+// to the mapping is a deliberate one.
+func TestCodexClampsASubsetLargerThanItsTotal(t *testing.T) {
+	const stream = `{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":800,"output_tokens":50,"reasoning_output_tokens":90}}`
+	p := &codexParse{}
+	p.line([]byte(stream))
+	var res Result
+	p.finish(&res)
+
+	if res.Usage.Input != 0 || res.Usage.Output != 0 {
+		t.Errorf("Usage = %+v, want the impossible buckets clamped at 0 rather than going negative", res.Usage)
+	}
+	if res.Usage.CacheRead != 800 || res.Usage.Reasoning != 90 {
+		t.Errorf("Usage = %+v, want the reported cached and reasoning counts intact", res.Usage)
+	}
+}
+
+// codex's BUDGET figure still adds reasoning to output, which double counts it
+// (reasoning_output_tokens is a subset of output_tokens). The normalised buckets
+// do NOT — they are the disjoint breakdown — so the two figures legitimately
+// differ for codex alone, and CLA-692 carries the budget-side fix. Pinned here so
+// the divergence is visible and deliberate rather than an unnoticed drift.
+func TestCodexBudgetFigureAndBucketsDifferUntilCLA692(t *testing.T) {
+	const stream = `{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":800,"output_tokens":300,"reasoning_output_tokens":50}}`
+	p := &codexParse{}
+	p.line([]byte(stream))
+	var res Result
+	p.finish(&res)
+
+	if want := 1200 + 300; res.Usage.Total() != want {
+		t.Errorf("Usage.Total() = %d, want %d (codex's own total_tokens = input + output)", res.Usage.Total(), want)
+	}
+	if want := 1200 + 300 + 50; res.Tokens != want {
+		t.Errorf("Tokens = %d, want %d — the budget figure's historical composition", res.Tokens, want)
+	}
+	if res.Tokens-res.Usage.Total() != 50 {
+		t.Errorf("the gap between the two figures is %d, want exactly reasoning_output_tokens (50)", res.Tokens-res.Usage.Total())
+	}
+	if !res.UsageReported || res.CostReported {
+		t.Errorf("usageReported=%v costReported=%v, want tokens reported and no cost (codex reports no money)", res.UsageReported, res.CostReported)
+	}
+}

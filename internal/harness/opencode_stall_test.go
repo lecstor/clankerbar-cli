@@ -273,12 +273,18 @@ func (w *failWriter) Write(p []byte) (int, error) {
 // An errored resume still folds the turn's claim observation: the resumed turn
 // may have recorded a branch before the failure, and a driver acting on the
 // stale pre-resume claim would hand the task back over work it just pushed.
+//
+// CLA-691 rides the same arm: a resumed turn re-sends the whole transcript, so it
+// is real money even when it fails, and its tokens/cost must be summed into the
+// session's normalised usage exactly as Tokens and CostUSD are — the durable
+// record reads this Result.
 func TestOutputCapStall_ErroredResumeKeepsTheClaimObservation(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "log")
 	opencodeStub(t, `#!/bin/sh
 echo "$*" >> "`+logPath+`"
 echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+echo '{"type":"step_finish","sessionID":"ses_stall","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
 `)
 
 	rec := &failWriter{}
@@ -302,6 +308,13 @@ echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"c
 	}
 	if !(opencode{}).OutputCapNoOutput(res) {
 		t.Error("the stall marker must survive an errored resume — the stall still stands")
+	}
+	want := TokenUsage{Input: 5280 + 800, Output: 100, Reasoning: 32000, CacheRead: 269312}
+	if res.Usage != want {
+		t.Errorf("Usage = %+v, want %+v — the errored resume's spend is this session's spend", res.Usage, want)
+	}
+	if res.Usage.Total() != res.Tokens {
+		t.Errorf("Usage.Total() = %d, Tokens = %d — both must carry the stalled step plus the errored resume", res.Usage.Total(), res.Tokens)
 	}
 }
 

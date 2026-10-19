@@ -469,9 +469,16 @@ func (u *TokenUsage) Add(o TokenUsage) {
 	u.CacheWrite += o.CacheWrite
 }
 
-// Total is the sum of the buckets: the token figure the harness itself reported,
-// recomputed here so a consumer repricing bucket by bucket can check it against
-// Tokens.
+// Total is the sum of the buckets: the token figure the harness itself
+// reported, recomputed here so a consumer repricing bucket by bucket can add up
+// what it was given.
+//
+// For claude and opencode it equals Result.Tokens exactly. codex is the one
+// exception TODAY, and the divergence is a known defect of the BUDGET figure
+// rather than of these buckets: codex's `reasoning_output_tokens` is a subset of
+// its `output_tokens`, while Result.Tokens still adds the reasoning count a
+// second time (CLA-692 tracks the fix). These buckets sum to codex's own
+// total_tokens, which is the correct figure.
 func (u TokenUsage) Total() int {
 	return u.Input + u.Output + u.Reasoning + u.CacheRead + u.CacheWrite
 }
@@ -500,6 +507,18 @@ type Result struct {
 	// Zero when the harness reported no usage, which UsageReported distinguishes
 	// from a reported zero.
 	Usage TokenUsage
+
+	// CostReported says the adapter actually SAW a cost figure for this session,
+	// as distinct from CostUSD merely being zero — the same question UsageReported
+	// answers for tokens, and NOT the same event.
+	//
+	// claude is why this is its own field: it reports per-turn TOKENS on the
+	// stream but the session's DOLLARS only on its terminal result event, so a
+	// claude session killed mid-stream (the token ceiling, the turn cap) has
+	// UsageReported true with CostUSD still 0 — a zero nobody measured. The fleet
+	// record's costUsd is nullable for exactly this reason, and this flag is what
+	// lets it stay absent instead of claiming "$0 spent".
+	CostReported bool
 
 	// UsageReported says the adapter actually SAW a usage-bearing event on this
 	// session's stream, as distinct from Tokens/CostUSD merely being zero.
