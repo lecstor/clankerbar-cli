@@ -318,7 +318,17 @@ func checkConfig(cfg *config.Config) check {
 	// reviewer their phases will run. Empty when the sequence has no built-in,
 	// non-final review phase, because then no review gate runs at all.
 	if panel := panelLabels(cfg); len(panel) > 0 {
-		c.info = append(c.info, "review panel: "+strings.Join(panel, ", "))
+		// CLA-697: the members run concurrently by default; say when the cap
+		// makes that not the whole panel, because a sequential (cap 1) or
+		// throttled panel is a choice that changes the round's wall time.
+		line := "review panel: " + strings.Join(panel, ", ")
+		switch n := cfg.EffectivePanelConcurrency(len(panel)); {
+		case n == 1:
+			line += " (sequential)"
+		case n < len(panel):
+			line += fmt.Sprintf(" (at most %d at once)", n)
+		}
+		c.info = append(c.info, line)
 	} else if r := singleReviewerLabel(cfg); r != "" {
 		c.info = append(c.info, "review: single reviewer ("+r+")")
 	}

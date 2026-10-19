@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -2656,6 +2657,10 @@ func TestPRBaseResolution_ReachesHandoffRespawnPrompts(t *testing.T) {
 // closes record what the driver actually sent.
 type reviewReleaser struct {
 	fakeReleaser
+	// mu guards the fields a CONCURRENT review panel touches: the driver reads
+	// TaskState from several member goroutines at once while each member appends
+	// its record (CLA-697). The sequential fixtures never needed it.
+	mu      sync.Mutex
 	status  string
 	outcome string
 	holder  string
@@ -2691,6 +2696,8 @@ type reviewReleaser struct {
 }
 
 func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.reads++
 	if r.readErr != nil {
 		if err := r.readErr(); err != nil {
@@ -2732,6 +2739,8 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 // anything hands the claim back, or its close is refused and the earlier
 // members' findings stay sealed behind a lease that is already gone.
 func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID string, round int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closeErr != nil {
 		return r.closeErr
 	}
@@ -2776,6 +2785,8 @@ func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID str
 // (`{duplicate: true}`), never an error. A panel member writes its own role, so
 // two members never collide; a retry of the same member does.
 func (r *reviewReleaser) writeReviewRecord(rec plane.ReviewRecordState) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, have := range r.records {
 		if have.Round == rec.Round && have.ReviewerRole == rec.ReviewerRole && have.State != "void" {
 			return fmt.Errorf("update_task(review:) refused: duplicate_reviewer — %s already has a record in round %d", rec.ReviewerRole, rec.Round)

@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,6 +23,35 @@ import (
 )
 
 // --- the record itself -------------------------------------------------------
+
+// CLA-697 x CLA-708: a review panel's members run concurrently and each starts
+// its own lease renewer on the SAME run, so every member's observation reaches
+// noteCurrentClaim at once. WriteFileAtomic uses a fixed `.tmp` name, so the
+// writes have to be serialised or they race on it; the surviving record must
+// still be one valid claim, not a torn one.
+func TestCurrentClaim_ConcurrentMembersWriteOneValidRecord(t *testing.T) {
+	d := &Driver{}
+	openTestStateDir(t, d)
+	claim := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.noteCurrentClaim(claim, "proj")
+		}()
+	}
+	wg.Wait()
+
+	got, err := ReadCurrentClaim(d.state)
+	if err != nil {
+		t.Fatalf("ReadCurrentClaim after concurrent member writes: %v", err)
+	}
+	if got.TaskID != "t-1" || got.RunID != "r-1" || got.Branch != "clanker/x" || got.Project != "proj" {
+		t.Errorf("record = %+v, want the one held claim", got)
+	}
+}
 
 func TestCurrentClaim_WrittenUpdatedAndRemoved(t *testing.T) {
 	d := &Driver{}
