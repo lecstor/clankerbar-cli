@@ -1519,3 +1519,77 @@ func TestDrainPhases_ReviewPanelMemberLimitedAfterRecordingIsRecorded(t *testing
 		t.Errorf("the iteration outcome names review-1 as a failed member: %q", recs[0].Outcome)
 	}
 }
+
+// TestDrainPhases_ReviewPanelLastMemberEndsSequenceAfterRecording (CLA-639 fix
+// pass 5): the LAST member appends its record and is then turned away by a
+// usage limit or a transient failure. The seam never ran, so the round is still
+// sealed; the panel handler must release it while the holder is live and hand
+// over to the fix exactly as the failed last member's arm does. Otherwise the
+// fix never runs and a takeover voids every member's record.
+func TestDrainPhases_ReviewPanelLastMemberEndsSequenceAfterRecording(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		res  harness.Result
+	}{
+		{name: "a usage limit", res: held(limitResult(), openClaim())},
+		{name: "a transient failure", res: held(transientResult(), openClaim())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+			h := &fakeAdapter{
+				steps: []invokeStep{
+					{res: checkpointed(10, 0.10)}, // implement
+					{res: checkpointed(5, 0.50)},  // review-1 records
+					{res: tc.res},                 // review-2 records, THEN the sequence ends
+					{res: checkpointed(5, 0.05)},  // fix: must spawn on the released round
+				},
+				limitResetAt: time.Now().Add(-time.Hour),
+			}
+			h.onInvoke = func(i int) {
+				switch i {
+				case 1:
+					rel.records = append(rel.records, plane.ReviewRecordState{
+						Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+						Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "review-1's MUST")},
+					})
+				case 2:
+					rel.records = append(rel.records, plane.ReviewRecordState{
+						Round: 1, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+						Findings: []plane.ReviewFindingState{mustFinding("1.review-2.1", "open", "review-2's MUST")},
+					})
+				case 3:
+					rel.status = "in_review"
+					rel.outcome += "\n### Fixes\n- 1.review-1.1 fixed\n- 1.review-2.1 fixed\n"
+				}
+			}
+			d := panelDriver(t, h, rel, panelMembers()[:2], panelPhases())
+
+			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+				t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+			}
+			if h.invokeCalls != 4 {
+				t.Fatalf("spawned %d sessions, want 4 (implement, two members, fix) — the last member's record must hand over", h.invokeCalls)
+			}
+			if len(rel.closes) != 1 || rel.closes[0] != 1 {
+				t.Fatalf("closed rounds = %v, want [1] — the last member's round must be released before the fix", rel.closes)
+			}
+			fix := h.invocations[3].Prompt
+			for _, want := range []string{"1.review-1.1", "1.review-2.1"} {
+				if !strings.Contains(fix, want) {
+					t.Errorf("the fix brief does not carry %q:\n%s", want, fix)
+				}
+			}
+			if strings.Contains(fix, "INCOMPLETE") {
+				t.Errorf("a member that recorded was reported incomplete:\n%s", fix)
+			}
+			for _, r := range rel.records {
+				if r.State != "open" {
+					t.Errorf("the record of %s is %q after the panel closed, want open — a sealed round would be voided on takeover", r.ReviewerRole, r.State)
+				}
+			}
+			if n := d.panelFailStreak["review-2"]; n != 0 {
+				t.Errorf("panelFailStreak[review-2] = %d, want 0 — the member recorded", n)
+			}
+		})
+	}
+}

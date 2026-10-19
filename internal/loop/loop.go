@@ -1786,15 +1786,33 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				break
 			}
 			panelRecorded = true
-			// This member recorded. A sequence-end STILL ends the run's attempt
-			// when nothing follows this member (the last member), but a recorded
-			// mid-panel member whose session was then turned away by a run-level
-			// limit or transient failure continues the panel exactly as a failed
-			// one does: its deliverable is in the round, and the wait belongs to
-			// the end that actually stops the sequence. (A failed member's arm
-			// above has always made the same choice for a mid-panel member.)
+			// This member recorded. A recorded mid-panel member whose session was
+			// then turned away by a run-level limit or transient failure continues
+			// the panel exactly as a failed one does: its deliverable is in the
+			// round, and the wait belongs to the end that actually stops the
+			// sequence.
+			//
+			// The LAST member is the panel's close, so its sequence-end must do
+			// what the failed last member's arm does: release the round while the
+			// holder is still live (a sealed round would be voided by the
+			// takeover, losing every member's record), then hand over to the fix
+			// that applies the merged list. A close that fails is fail-closed —
+			// the drain ends with the wait and no fix runs against a sealed
+			// round.
 			if seqEnd != nil {
 				if live && !end.panelLast && i+1 < len(phases) {
+					i++
+					continue
+				}
+				if live && panelRound > 0 {
+					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
+						log.Printf("%siteration %d: the panel's round %d could not be closed after %s recorded but ended the sequence (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
+							labelOf(t), drainNum, panelRound, member, cerr)
+						endSequenceEnd()
+						break
+					}
+				}
+				if live && panelRecorded && i+1 < len(phases) {
 					i++
 					continue
 				}
