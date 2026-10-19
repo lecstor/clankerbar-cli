@@ -291,10 +291,15 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	}
 	defer cancel()
 
-	cmd := exec.CommandContext(sctx, "opencode", args...)
-	setupProcessGroup(cmd)
-	if in.WorkDir != "" {
-		cmd.Dir = in.WorkDir
+	// One canonical directory for the permission policy, the server process,
+	// the status query and the run: the server keys its MCP state by the
+	// resolved path, so a raw `/var/...` query would poll a location no session
+	// uses (see opencodeWorkDir). The policy's absolute paths must agree with
+	// the directory the session actually runs in, or an in-tree write can look
+	// external on a symlinked temp dir.
+	workDir := opencodeWorkDir(in.WorkDir)
+	if workDir != "" {
+		in.WorkDir = workDir
 	}
 	env, err := o.env(in)
 	if err != nil {
@@ -303,7 +308,57 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// caller reports. See env's fail-closed note.
 		return Result{}, err
 	}
-	cmd.Env = env
+
+	// CLA-703: a working (non-probe) session gets a private server of the
+	// adapter's own, and does not run its first model turn until that server
+	// reports the clankerbar MCP connection established. The OLD shape —
+	// `run --standalone`, which spawns its own private server and submits the
+	// prompt immediately — is exactly the race: opencode 2.x connects MCP in the
+	// background, so a fast model could take its first turn with no clankerbar
+	// tools at all.
+	//
+	// A PROBE keeps `--standalone`: it is a one-word liveness check of an
+	// already-created session and does not use the backlog, so waiting for MCP
+	// would only eat its time box.
+	runArgs := args
+	runEnv := env
+	var srv *opencodeServer
+	if !in.Probe {
+		// Only a session with a clankerbar server gets the preflight. That
+		// server is resolved across the config layers opencode actually loads:
+		// the named file when there is one, otherwise the global config dir and
+		// the project-level files discovered from the instance directory. A
+		// layer that exists but cannot be read fails CLOSED — an unknown
+		// effective config is not evidence that no backlog server is declared —
+		// and a session that does declare one never gets its first turn until
+		// that server reports connected (CLA-703 review, findings 1.1 and 3.1).
+		names, err := opencodeEffectiveMCPServers(in, env)
+		if err != nil {
+			return mcpPreflightFailure(sctx, ctx, err)
+		}
+		if len(names) > 0 {
+			srv, err = startOpencodeServer(sctx, env, workDir)
+			if err != nil {
+				return mcpPreflightFailure(sctx, ctx, err)
+			}
+			defer srv.stop()
+			if err := srv.waitForMCP(sctx, names, workDir); err != nil {
+				return mcpPreflightFailure(sctx, ctx, err)
+			}
+			runArgs = withOpencodeServer(args, srv.url)
+			// The run must authenticate to the server the adapter started,
+			// whatever an inherited or configured OPENCODE_PASSWORD says.
+			// Appended last so it wins over env's own tail (in.Env).
+			runEnv = append(append([]string{}, env...), "OPENCODE_PASSWORD="+srv.password)
+		}
+	}
+
+	cmd := exec.CommandContext(sctx, "opencode", runArgs...)
+	setupProcessGroup(cmd)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	cmd.Env = runEnv
 	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
 	// io.MultiWriter values, so os/exec makes its own pipes and cmd.Run waits for
 	// every WRITER of them to close — and CommandContext kills the direct child
@@ -454,29 +509,22 @@ func opencodeArgs(in Invocation) []string {
 	return append(args, "--", prompt)
 }
 
-// opencodeMCPWarmupNote is prepended to every prompt that does work. 2.x
-// connects MCP servers asynchronously: verified against 2.0.32 with a fake MCP
-// server, the clankerbar tools were absent from the session's first LLM request
-// and arrived on the second, so a first-turn `claim_task` comes back as the
-// tool error "No tool named ... is currently available". The model sees that
-// error and decides what to do next; without being told, it can read it as a
-// missing integration and give up on the backlog. A retry inside the adapter
-// was the alternative and was not chosen: the failed call is an ordinary turn
-// the model already gets to react to, and re-spawning the session would pay for
-// the whole prompt again to fix something one sentence of brief fixes.
-const opencodeMCPWarmupNote = "Note: this session's MCP servers connect in the background. " +
-	"If an MCP tool (for example clankerbar_claim_task) reports that no tool by that name is currently available, " +
-	"it is still connecting: call it again on your next step rather than concluding it is missing. "
-
-// opencodePrompt is the message a working (non-probe) run sends. It carries the
-// MCP warm-up note ahead of the caller's prompt; see opencodeMCPWarmupNote. The
-// note is one line and ends in a space, so the prompt keeps its own first line.
-// An empty prompt stays empty so the CLI's own handling of it is unchanged.
+// opencodePrompt is the message a working (non-probe) run sends. It is the
+// caller's prompt unchanged.
+//
+// It USED to prepend an MCP warm-up note ("MCP servers connect in the
+// background; call the tool again if it is missing"). CLA-703 removed the race
+// that note described: the adapter now starts its own server, waits until the
+// clankerbar server reports connected, and only then attaches the run, so the
+// first model turn already has the tools. Keeping the note would tell every
+// session to expect a failure that no longer happens, and would spend prompt
+// bytes on a workaround the code no longer needs.
+//
+// The function is kept (rather than inlined at its two call sites) because the
+// prompt shape is a contract this adapter owns, and the tests assert the
+// absence of the note through it.
 func opencodePrompt(prompt string) string {
-	if prompt == "" {
-		return prompt
-	}
-	return opencodeMCPWarmupNote + prompt
+	return prompt
 }
 
 // opencodeMCPResourcePattern is the pattern shape opencode's MCP resource tools
@@ -1491,6 +1539,10 @@ func (p *opencodeParse) finish(res *Result) {
 	// `observed` field.
 	res.Claim = p.observed.Claim
 	res.Reports = p.observed.Reports
+	// CLA-703: how many clankerbar calls got a successful result, copied for the
+	// same reason as the claim — the parser's observation is stream-side state
+	// until the process ends.
+	res.ClankerbarCalls = p.observed.ClankerbarCalls
 	// Recorded whatever the figures come to: the driver bounds attempts that
 	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
 	res.UsageReported = p.sawUsage

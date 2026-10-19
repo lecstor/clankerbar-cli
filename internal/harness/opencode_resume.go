@@ -156,8 +156,10 @@ func probeCoherent(reply, ref string) bool {
 
 // opencodeResumeArgs builds the args for a continuation run into an existing
 // session: the same dialect as opencodeArgs, plus `-s <id>` and WITHOUT the
-// phase prompt — a continuation carries its own short message, behind the same
-// MCP warm-up note (each `run` process connects its MCP servers afresh).
+// phase prompt — a continuation carries its own short message. The adapter's
+// server preflight (CLA-703) applies to a continuation exactly as it does to a
+// first run: every non-probe session waits for the clankerbar MCP server before
+// its first turn.
 //
 // sid must be an id this adapter SAW on a session's stream (resumeTargets reads
 // it off Result.Raw, which only the stream parser writes). 2.x does not refuse
@@ -241,6 +243,11 @@ func mergeResume(base *Result, add Result) {
 	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
+	// A resurrection is part of the SAME session, so a clankerbar call the
+	// continuation made counts toward whether the session reached the backlog
+	// (CLA-703). Without this a session that died before its first claim and
+	// then recovered and worked would be classified no_mcp by the driver.
+	base.ClankerbarCalls += add.ClankerbarCalls
 	// The normalised breakdown sums on the same terms as Tokens/CostUSD above:
 	// the continuation is PART of this session's spend, not a second session
 	// (CLA-691).

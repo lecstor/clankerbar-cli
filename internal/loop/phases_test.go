@@ -1340,11 +1340,11 @@ func TestDrainPhases_AReloadMidDrainDoesNotReshapeTheInFlightSequence(t *testing
 	t.Run("3 to 2: the in-flight review-only keeps its gate and its skip-salvage", func(t *testing.T) {
 		outcome := "implemented: pushed the branch\n"
 		h := &fakeAdapter{steps: []invokeStep{
-			{res: transientResult()},  // implement attempt 1 blips; the backoff wait applies the RELOAD
-			{res: checkpointed(1, 0)}, // implement attempt 2: checkpoint
-			{res: checkpointed(1, 0)}, // in-flight review-only: records NOTHING — the gate must refuse it
-			{res: checkpointed(1, 0)}, // next drain, new 2-phase shape: implement
-			{res: checkpointed(1, 0)}, // next drain: FINAL review
+			{res: transientResult()},              // implement attempt 1 blips; the backoff wait applies the RELOAD
+			{res: checkpointed(1, 0)},             // implement attempt 2: checkpoint
+			{res: mcpReached(checkpointed(1, 0))}, // in-flight review-only: reached the backlog, records NOTHING — the gate must refuse it
+			{res: checkpointed(1, 0)},             // next drain, new 2-phase shape: implement
+			{res: checkpointed(1, 0)},             // next drain: FINAL review
 		}}
 		rel := &wiredReleaser{state: func() plane.TaskState {
 			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
@@ -3155,9 +3155,15 @@ func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 // lease to lapse into a takeover instead of handing the task back to the queue
 // over pushed work (Claim.Releasable).
 func resumedCheckpointed(tokens int, cost float64) harness.Result {
-	return reported(held(okResult(tokens, cost), harness.Claim{
+	r := reported(held(okResult(tokens, cost), harness.Claim{
 		TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x",
 	}), branchReport())
+	// A resumed phase's brief starts by reaching the backlog (heartbeat/get_task),
+	// so a fixture that models an ordinary resumed session has reached it. This
+	// keeps CLA-703's no-MCP backstop from mistaking a test's silence for a
+	// missing MCP server; the tests that DO want that shape set the count back to 0.
+	r.ClankerbarCalls = 1
+	return r
 }
 
 // The review-shaped seam must not advance to fix on the implementer's branch
@@ -3472,8 +3478,8 @@ func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 	t.Run("an unchanged outcome is refused", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: held(okResult(1, 0), openClaim())},
-			{res: held(okResult(1, 0), openClaim())}, // review records nothing
-			{res: okResult(1, 0)},                    // must NEVER run
+			{res: mcpReached(held(okResult(1, 0), openClaim()))}, // review reached the backlog, records nothing
+			{res: okResult(1, 0)},                                // must NEVER run
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 		d := phaseDriverWithReleaser(t, h, phases, rel)
@@ -3491,8 +3497,8 @@ func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 			"\n- verdict: findings\n### Findings\n- R1 [must] a.go:1 - old. Required fix: none.\n"
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: held(okResult(1, 0), openClaim())},
-			{res: held(okResult(1, 0), openClaim())}, // review edits the outcome without adding a block
-			{res: okResult(1, 0)},                    // must NEVER run
+			{res: mcpReached(held(okResult(1, 0), openClaim()))}, // review reached the backlog, edits the outcome without adding a block
+			{res: okResult(1, 0)},                                // must NEVER run
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": {Status: "in_review", Outcome: oldBlock}}}
 		h.onInvoke = func(i int) {

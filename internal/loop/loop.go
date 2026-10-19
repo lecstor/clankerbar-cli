@@ -1875,6 +1875,11 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			if !recorded {
 				reason := end.emptyWhy
 				switch {
+				case end.noMCP:
+					// CLA-703: an infrastructure miss, not a reviewer's verdict.
+					// The `no_mcp` token is stable so the fixer's INCOMPLETE list
+					// and the analytics can exclude it without parsing prose.
+					reason = "no_mcp: no successful clankerbar MCP call and no review record"
 				case end.dead:
 					reason = "died producing nothing"
 				case seqEnd != nil && seqEnd.limitWait != nil:
@@ -1901,13 +1906,24 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// loudly once it reaches panelMemberFailBound. Deliberately NOT a
 				// park: one reviewer of several failing is not a reason to strand
 				// the panel's real findings.
-				if !end.deadBooked {
-					d.tallyEmpty(member, tc.HarnessFor(ph))
-				}
-				if n := d.panelMemberFailed(member); n >= panelMemberFailBound {
-					model, _ := tc.ModelForPhase(ph)
-					log.Printf("%siteration %d: WARNING — the %s review-panel member has recorded nothing on %d consecutive tasks (harness %s, model %s); the panel runs on and the fix applies what the other members found, but this member's harness, model or brief is not producing reviews — check its iteration logs",
-						labelOf(t), drainNum, member, n, tc.HarnessFor(ph), attributionOr(model, "harness default"))
+				//
+				// CLA-703: a no_mcp miss belongs to NEITHER counter. It is not a
+				// dead phase (no work was attempted), and it is not the member's
+				// fault — charging its streak would make an MCP outage look like a
+				// broken reviewer. It gets its own tally cell and its own log line.
+				if end.noMCP {
+					d.tallyNoMCP(member, tc.HarnessFor(ph))
+					log.Printf("%siteration %d: the %s panel member's failure is no_mcp (infrastructure), not a review failure — not counted against the member's streak or the dead rate",
+						labelOf(t), drainNum, member)
+				} else {
+					if !end.deadBooked {
+						d.tallyEmpty(member, tc.HarnessFor(ph))
+					}
+					if n := d.panelMemberFailed(member); n >= panelMemberFailBound {
+						model, _ := tc.ModelForPhase(ph)
+						log.Printf("%siteration %d: WARNING — the %s review-panel member has recorded nothing on %d consecutive tasks (harness %s, model %s); the panel runs on and the fix applies what the other members found, but this member's harness, model or brief is not producing reviews — check its iteration logs",
+							labelOf(t), drainNum, member, n, tc.HarnessFor(ph), attributionOr(model, "harness default"))
+					}
 				}
 				if live && !end.panelLast {
 					// The next member resumes this claim: keep the panel going, and
@@ -1993,6 +2009,24 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				endSequenceEnd()
 				break
 			}
+		}
+
+		// CLA-703: a LONE review-only phase (no panel) that never reached the
+		// backlog is an infrastructure miss, not a dead phase and not a review
+		// verdict. It gets its own drained ending: the claim was handed back (or
+		// left to lapse) by drainPhase, the tally books the miss separately, and
+		// the iteration outcome names it so the operator does not read a review
+		// as having been attempted when the tools were absent.
+		if end.noMCP && !end.panelMember {
+			d.tallyNoMCP(ph.Label(i), tc.HarnessFor(ph))
+			note := fmt.Sprintf("no_mcp: the %s session made no successful clankerbar MCP call and recorded no review record", ph.Label(i))
+			log.Printf("%siteration %d: %s — ending the drain; this is an infrastructure miss, not a review result", labelOf(t), drainNum, note)
+			if finalDisp == "" {
+				finalDisp = note
+			} else {
+				finalDisp += " — " + note
+			}
+			break
 		}
 
 		// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
@@ -2496,6 +2530,15 @@ type phaseEnd struct {
 	// member left a durable record behind. It is what the panel handler's
 	// "recorded or been recorded as failed" decision reads.
 	reviewRecorded bool
+
+	// noMCP reports that this pass ended with NO review record and NO successful
+	// clankerbar MCP call at all (CLA-703). That is an infrastructure miss, not
+	// a reviewer's verdict: the tools the brief tells it to use were not there.
+	// The panel handler names it distinctly and keeps it off the member's
+	// failure streak; drainPhases books it apart from dead/capped so analytics
+	// can exclude it. It is set only on the FINAL attempt — the one bounded
+	// retry the same pass already took is not reported as the member's outcome.
+	noMCP bool
 
 	// reviewCloseFailed reports that this pass's review seam gate passed far
 	// enough to find a SEALED round, but the driver's own close of that round
@@ -4164,6 +4207,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	}
 	requireReviewRecord := config.ReviewShaped(captured.Prompt)
 	isVerify := config.VerifyShaped(captured.Prompt)
+	// CLA-703: the no-MCP backstop is for a REVIEW-ONLY session — one whose
+	// deliverable is the durable record and whose brief tells it to reach the
+	// backlog. A verification round is review-shaped but adjudicates prior
+	// findings and has its own fail-closed seam; it is deliberately out of
+	// scope here.
+	reviewOnly := requireReviewRecord && !isVerify
 	// CLA-639: whether this pass is one reviewer of a review panel, and whether
 	// it is the LAST one. The last member is the panel's seam: it runs the same
 	// record gate as the shipped single review, and it must run it even when the
@@ -4372,6 +4421,15 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		}
 	}
 	retries := 0
+	// CLA-703: the ONE retry a phase gets for an infrastructure miss. TWO arms
+	// spend this single budget, deliberately: an adapter preflight failure
+	// (ErrMCPNotConnected, any phase) and a review-only session that made no
+	// successful clankerbar MCP call and wrote no review record (the no_mcp
+	// backstop). They are not independent one-retry lanes — a preflight failure
+	// followed by a no-record end closes the round INCOMPLETE with no second
+	// backstop. Deliberately a separate counter from `retries`: this is not the
+	// transient/limit ladder, and its bound is one regardless of max_retries.
+	mcpRetried := false
 	// Consecutive attempts that ended without the harness reporting any usage -
 	// the spend the budget breaker above can never see (CLA-288).
 	//
@@ -4685,6 +4743,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// live in drainPhases; if they refuse, the deferred handback there
 		// releases what this held.
 		handoff := detectHandoff(drainNum, t, res)
+		// A handoff the session emitted is evidence it worked, even where the
+		// driver then REFUSES to chain it (a panel member, a verification round).
+		// CLA-703's no-MCP backstop must not fire on such a session: it reached a
+		// conclusion and wrote a successor prompt, which a session with no tools
+		// does not do.
+		emittedHandoff := handoff != ""
 		// CLA-638: a verification round does not chain via a handoff. Its record
 		// is the deliverable, and the DRIVER decides what follows (another fix, a
 		// park, or nothing) from the open MUSTs the record releases; a successor
@@ -4850,6 +4914,37 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// member handler. It is the seam gate's verdict, not the round number: a
 		// member whose envelope was sealed and closed still recorded.
 		end.reviewRecorded = reviewable && review.required && evidenceOK
+		// CLA-703: did this review-only session ever reach the backlog? A clean
+		// end with no successful clankerbar call and no review record is the
+		// missing-MCP shape — the tools the brief tells it to use were not
+		// offered, so "recorded nothing" is not a reviewer's verdict.
+		//
+		// The dead signature is EXCLUDED: a silent death is already classified
+		// as dead and retried by the dead-phase ladder, and relabelling it no_mcp
+		// here would hide a real death behind an infrastructure excuse. A
+		// non-zero exit is excluded for the same reason — the transient/
+		// non-retryable classification owns it. Caps and untrusted streams are
+		// excluded because neither can be read as "the tools were missing".
+		noMCPNow := reviewOnly && !end.reviewRecorded && !end.reviewCloseFailed && res.ClankerbarCalls == 0 &&
+			!res.Claim.Settled && !emittedHandoff &&
+			res.Untrusted == "" && res.ExitCode == 0 && !capped && !ceiling && !wallclock &&
+			!producedNothing && a.Capabilities().TracksClaims
+		retryNoMCP := noMCPNow && !mcpRetried
+		if noMCPNow && mcpRetried {
+			// The retry ended the same way: this is the final classification.
+			end.noMCP = true
+			// The generic dead booking (if the retry happened to look like a
+			// death) and the held-but-empty booking below both belong to dead/
+			// empty, not to an infrastructure miss. Unbook the first and stop the
+			// second from firing; the handler books the no-MCP cell instead.
+			if bookedDead {
+				d.unbookDead(ph.Label(phaseIdx), tc.HarnessFor(ph))
+			}
+			end.deadBooked = true
+			if end.session != nil {
+				end.session.Cause = fleet.CauseNoMCP
+			}
+		}
 		// A handoff holds the seam OPEN even without evidence: its successor
 		// continues THIS phase's job, so it is not the false-premise advance the
 		// gate exists to stop. The evidence gate governs only the bare seam
@@ -4964,11 +5059,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// false, so there is nothing to release either way. The handler owns the
 			// handback for this shape, and takes it AFTER the close (see
 			// drainPhases).
-			if !panelMember {
+			// CLA-703: a retrying no-MCP attempt is not an ending — keep the claim
+			// (the retry resumes the same run) and book nothing yet. The final
+			// attempt goes through the normal handback.
+			if !panelMember && !retryNoMCP {
 				end.released = res.Claim.Held()
 			}
 			end.dead = dead
-			if end.empty {
+			if end.empty && !end.noMCP && !retryNoMCP {
 				log.Printf("%siteration %d: the %s phase ended holding %s with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns",
 					labelOf(t), drainNum, ph.Label(phaseIdx), claimLabel(res.Claim), evidenceWhy)
 				// Book it into the dead-phase tally (CLA-457): this is the
@@ -5009,7 +5107,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// — the thing a bounded retry can re-claim. A release the plane refused
 			// (or that never ran) leaves the lease live, so a retry session would
 			// only be refused and burned.
-			if !panelMember {
+			if !panelMember && !retryNoMCP {
 				end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
 			}
 
@@ -5102,6 +5200,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				}
 			}
 		}
+		// CLA-703: a no-MCP end is an infrastructure miss, not a dead or empty
+		// phase. It must not reach the dead-phase ladder (which would retry/park
+		// a task whose reviewer never got its tools) or the empty-retry arm.
+		// The class is carried on end.noMCP for the panel handler and the
+		// drain-level booking.
+		if end.noMCP {
+			end.dead = false
+			end.producedNothing = false
+			end.empty = false
+		}
 		// Then check what it said it delivered. After the handback, because a dead
 		// lease is time-sensitive and a git check is not; on every exit, because a
 		// session that pushed nothing and died is exactly as likely to have recorded
@@ -5128,6 +5236,21 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				publishSpend()
 				recordPassSpend(end.session, a, &pass, &res)
 				d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
+			}
+			// CLA-703: an MCP preflight failure is infrastructure, not a verdict
+			// on the phase. The session never reached its first turn, so the
+			// claim it was seeded with is untouched and the same run can be
+			// retried. One retry — the same bound the no-record backstop uses —
+			// then the run fails loudly with the reason rather than producing a
+			// silent empty phase.
+			if errors.Is(ierr, harness.ErrMCPNotConnected) {
+				if !mcpRetried {
+					mcpRetried = true
+					log.Printf("%siteration %d: %s could not start its first turn: %v — retrying the %s phase once (MCP preflight failure, not a phase verdict)",
+						labelOf(t), drainNum, a.Name(), ierr, ph.Label(phaseIdx))
+					continue
+				}
+				return tokens, cost, false, end, fmt.Errorf("iteration %d: %w", drainNum, ierr)
 			}
 			// A run failure that was not an exit status — a launch failure, or one
 			// of the deaths in Wait above — ends the attempt without any retry
@@ -5165,6 +5288,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// to the pass, and none it refuses is.
 		recordPassSpend(end.session, a, &pass, &res)
 		d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
+
+		// CLA-703 backstop: the primary fix is the adapter's MCP preflight, but
+		// a session can still end with no clankerbar call and no record (an
+		// older build, a session that acted before its tools were offered, a
+		// harness whose preflight does not exist). Re-run it ONCE with the same
+		// brief before the panel records the member as failed. The claim was
+		// deliberately kept above, so a resumed phase retries the same run; the
+		// spend is already counted, so the retry is visible to the budget.
+		if retryNoMCP {
+			mcpRetried = true
+			log.Printf("%siteration %d: the %s phase made no successful clankerbar MCP call and recorded no review record — retrying it once (no_mcp: the backlog tools were not available to the session)",
+				labelOf(t), drainNum, ph.Label(phaseIdx))
+			continue
+		}
 
 		// A usage limit. A rolling-window subscription cap is waited out and the
 		// session re-run; a hard budget/credit exhaustion (Stop) has no reset to

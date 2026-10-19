@@ -329,6 +329,42 @@ func TestMarshalReport_SessionsWireShape(t *testing.T) {
 	}
 }
 
+// CLA-703: a session's infrastructure cause rides the wire only when there is
+// one. The pre-CLA-703 shape is byte-for-byte unchanged (pinned above); a
+// no_mcp session adds `cause` so the durable phase_session record can carry the
+// classification once the plane's parser stores it.
+func TestMarshalReport_SessionCauseIsOptional(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		Iterations: []Iteration{{
+			Outcome: OutcomeReleased,
+			Sessions: []Session{
+				{Phase: "review", Harness: "opencode", Cause: CauseNoMCP},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if !strings.Contains(string(b), `"cause":"no_mcp"`) {
+		t.Errorf("a no_mcp session did not carry its cause: %s", b)
+	}
+	// An ordinary session must not grow the key.
+	b, err = marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		Iterations: []Iteration{{
+			Outcome:  OutcomeReleased,
+			Sessions: []Session{{Phase: "implement", Harness: "opencode"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), `"cause"`) {
+		t.Errorf("an ordinary session grew a cause key: %s", b)
+	}
+}
+
 // CLA-630: the plane refuses the WHOLE report (all-or-nothing, presence
 // included) when one iteration carries more than its per-iteration session cap,
 // so the reporter clamps at the same bound. The first entries in spawn order are

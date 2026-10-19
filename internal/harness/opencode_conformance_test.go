@@ -640,15 +640,20 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 }
 
 // MCP tools reach the session top-level (out of Code Mode), the claim is
-// observed off the stream, and the first-turn race is survived. Both config
-// dialects: the adapter rewrites 1.x `mcp.<name>` into `mcp.servers.<name>`.
+// observed off the stream, and the first-turn race is GONE: the adapter's
+// private-server preflight means the first tool-bearing request already offers
+// clankerbar_claim_task (CLA-703). Both config dialects: the adapter rewrites
+// 1.x `mcp.<name>` into `mcp.servers.<name>`.
 func TestOpencodeConformance_mcpClaim(t *testing.T) {
 	requireOpencodeConformance(t)
 	for _, dialect := range []string{"v1", "v2"} {
 		t.Run(dialect, func(t *testing.T) {
 			claim := []fakeCall{{"clankerbar_claim_task", map[string]any{"taskId": "T-9"}}}
-			// Two claim rounds: the first may land before the MCP server has
-			// connected; the model then calls again, as the warm-up note asks.
+			// Two claim rounds are kept so a regression is VISIBLE rather than
+			// fatal: if the preflight stops working, the first claim gets the
+			// "No tool named" error and the model retries, and the assertions
+			// below fail with the race named. On a healthy build the first
+			// request already has the tools and the second round answers it.
 			fake := &fakeOpenAI{rounds: [][]fakeCall{claim, claim}, delay: 300 * time.Millisecond}
 			srv := httptest.NewServer(fake)
 			defer srv.Close()
@@ -685,19 +690,41 @@ func TestOpencodeConformance_mcpClaim(t *testing.T) {
 			if !res.Claim.Held() || res.Claim.TaskID != "T-9" || res.Claim.RunID != "run-1" {
 				t.Errorf("Claim = %+v, want held T-9 / run-1", res.Claim)
 			}
+			// The successful call is also the fact the driver's no-MCP backstop
+			// reads; it must be visible on the real stream, not only in a fixture.
+			if res.ClankerbarCalls < 1 {
+				t.Errorf("ClankerbarCalls = %d, want at least 1 for the completed claim_task", res.ClankerbarCalls)
+			}
 			if data, err := os.ReadFile(filepath.Join(mcpDir, "calls.jsonl")); err != nil || !strings.Contains(string(data), "claim_task") {
 				t.Errorf("the fake MCP server saw no claim_task call (%v)", err)
 			}
-			sawNote := false
+			// CLA-703: the race is removed, not described. The first request
+			// that carries tools must already offer the clankerbar tool, and
+			// the old warm-up note must be gone from every user message.
+			sawToolOnFirstToolRequest := false
 			for _, r := range fake.requests() {
 				for _, u := range r.User {
 					if strings.Contains(u, "connect in the background") {
-						sawNote = true
+						t.Error("the removed MCP warm-up note still reached the model")
 					}
 				}
+				if len(r.Tools) == 0 || sawToolOnFirstToolRequest {
+					continue
+				}
+				sawToolOnFirstToolRequest = true
+				found := false
+				for _, name := range r.Tools {
+					if strings.Contains(name, "clankerbar_claim_task") {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("the first tool-bearing request did not offer clankerbar_claim_task (tools: %v)", r.Tools)
+				}
 			}
-			if !sawNote {
-				t.Error("the MCP warm-up note did not reach the model")
+			if !sawToolOnFirstToolRequest {
+				t.Error("no tool-bearing request reached the fake provider")
 			}
 			if want := int(fake.hit.Load()) * fakeRequestTokens; res.Tokens != want {
 				t.Errorf("Tokens = %d, want %d", res.Tokens, want)

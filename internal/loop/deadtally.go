@@ -38,10 +38,15 @@ type tallyKey struct {
 	harness string
 }
 
-// phaseTally counts phase sessions run and dead for one (phase, harness) cell.
+// phaseTally counts phase sessions run and dead for one (phase, harness) cell,
+// plus the infrastructure misses kept OUT of the dead rate (CLA-703): a review
+// session that never reached the backlog because the clankerbar MCP server was
+// not available is not a reviewer that died, and counting it as dead is how a
+// harness/infra problem becomes a false review-quality signal.
 type phaseTally struct {
-	run  int
-	dead int
+	run   int
+	dead  int
+	noMCP int
 }
 
 // tallyDead books one finished phase session into the run's dead-phase tally,
@@ -80,6 +85,39 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 		return true
 	}
 	return false
+}
+
+// unbookDead removes a dead booking tallyDead made for an exit that is later
+// classified as an infrastructure miss (CLA-703) rather than a death. It is the
+// counterpart of the booking and exists because the booking has to happen when
+// the exit arrives, before the review seam has decided whether the session ever
+// reached the backlog. The run count is deliberately NOT decremented: the
+// session did run; only its dead classification was wrong.
+func (d *Driver) unbookDead(phase, harness string) {
+	if d.deadTally == nil {
+		return
+	}
+	t := d.deadTally[tallyKey{phase: phase, harness: harness}]
+	if t != nil && t.dead > 0 {
+		t.dead--
+	}
+}
+
+// tallyNoMCP books an infrastructure miss: a review-only session that ended with
+// no successful clankerbar MCP call and no review record. It is counted
+// SEPARATELY from dead so the operator can see that the member's harness or the
+// MCP wiring was at fault, not the reviewer.
+func (d *Driver) tallyNoMCP(phase, harness string) {
+	if d.deadTally == nil {
+		d.deadTally = map[tallyKey]*phaseTally{}
+	}
+	k := tallyKey{phase: phase, harness: harness}
+	t := d.deadTally[k]
+	if t == nil {
+		t = &phaseTally{}
+		d.deadTally[k] = t
+	}
+	t.noMCP++
 }
 
 // tallyEmpty books one held-but-empty implement exit into the run's dead-phase
@@ -173,7 +211,11 @@ func (d *Driver) logDeadTally() {
 		if t.run > 0 {
 			rate = 100 * float64(t.dead) / float64(t.run)
 		}
-		parts = append(parts, fmt.Sprintf("%s/%s: %d dead of %d (%.1f%%)", k.phase, k.harness, t.dead, t.run, rate))
+		line := fmt.Sprintf("%s/%s: %d dead of %d (%.1f%%)", k.phase, k.harness, t.dead, t.run, rate)
+		if t.noMCP > 0 {
+			line += fmt.Sprintf(", %d no-mcp", t.noMCP)
+		}
+		parts = append(parts, line)
 	}
 	log.Printf("dead-phase tally: %s", strings.Join(parts, "; "))
 }

@@ -619,13 +619,19 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 }
 
 // A real drain fails closed on exfil but must still allow edits and shell to do
-// the work; the prompt is carried through, behind the MCP warm-up note.
+// the work; the prompt is carried through unchanged. The raw argv still says
+// --standalone because that is the dialect's shape for a probe; a working run
+// has it swapped for `--server` once the adapter's own server has waited for
+// MCP (CLA-703), and the warm-up note it used to carry is gone with the race.
 func TestOpencodeDrainInvocation(t *testing.T) {
 	args := opencodeArgs(Invocation{Prompt: "Work the backlog.", Model: "opencode/claude-sonnet-4-5"})
 	joined := strings.Join(args, " ")
 	if !strings.HasPrefix(joined, "run --standalone --format json") || args[len(args)-2] != "--" ||
-		args[len(args)-1] != opencodeMCPWarmupNote+"Work the backlog." {
+		args[len(args)-1] != "Work the backlog." {
 		t.Errorf("drain args = %q, want the prompt carried into `opencode run --standalone` behind a `--` terminator", joined)
+	}
+	if strings.Contains(joined, "connect in the background") {
+		t.Errorf("drain args still carry the removed MCP warm-up note: %q", joined)
 	}
 	if !strings.Contains(joined, "--model opencode/claude-sonnet-4-5") {
 		t.Errorf("drain args = %q, want the model passed through", joined)
