@@ -228,10 +228,11 @@ func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
 // included — so an offline start honours "stopped" exactly as a warm one does.
 const rosterCacheName = "roster.json"
 
-// rosterCacheDir is where the supervisor's own state lives: the cached roster
-// and one per-instance state dir (see rosterStateDir). It sits under the loop
-// state root beside the daemons' own per-workdir state dirs.
-func rosterCacheDir() (string, error) {
+// CacheDir is where the supervisor's own state lives: the cached roster, one
+// per-instance state dir (see rosterStateDir), and its own log
+// (supervise.log). It sits under the loop state root beside the daemons' own
+// per-workdir state dirs.
+func CacheDir() (string, error) {
 	root, err := config.StateRoot()
 	if err != nil {
 		return "", err

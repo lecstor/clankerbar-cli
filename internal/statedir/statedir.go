@@ -79,9 +79,9 @@ const gitignoreBody = "*\n"
 // `state_dir` happened to name.
 const sentinelName = ".clankerbar-statedir"
 
-const sentinelBody = "clankerbar loop state dir: iteration transcripts and control markers\n" +
-	"(STOP/HALT/RESTART/RESTART_NOW/RELOAD), plus the supervisor's generated\n" +
-	"instance config (materialized.json).\n" +
+const sentinelBody = "clankerbar loop state dir: iteration transcripts, the daemon's own\n" +
+	"log (daemon.log), and control markers (STOP/HALT/RESTART/RESTART_NOW/RELOAD),\n" +
+	"plus the supervisor's generated instance config (materialized.json).\n" +
 	"Created and owned by clankerbar; safe to delete while no loop is running.\n"
 
 // MaterializedConfigName is the generated effective config the fleet
@@ -91,6 +91,13 @@ const sentinelBody = "clankerbar loop state dir: iteration transcripts and contr
 // which is why the adoption check below must count it as ours: a state dir
 // holding it must stay adoptable by the daemon and by doctor.
 const MaterializedConfigName = "materialized.json"
+
+// DaemonLogName is the daemon's own log file in its state dir (CLA-701): the
+// process's `log.Printf` lines, rotated at a size bound by internal/logfile.
+// It is named here because this package's adoption check has to recognise it —
+// a state dir holding one is still ours — and because it sits beside the
+// iteration logs it can be joined to.
+const DaemonLogName = "daemon.log"
 
 // maxMarkerBytes caps a control-marker read. A marker holds a one-line reason;
 // the cap stops a large or endless file (a fifo, /dev/zero, a log someone
@@ -626,7 +633,11 @@ func (d *Dir) isOurArtifact(name string) bool {
 		// the supervisor to hand back if the child dies without letting go
 		// (CLA-708). Its `.tmp` sibling is the in-flight half of an atomic
 		// replace; a crash can leave one behind.
-		name == "CURRENT_CLAIM", name == "CURRENT_CLAIM.tmp":
+		name == "CURRENT_CLAIM", name == "CURRENT_CLAIM.tmp",
+		// The daemon's own log and its rotated siblings (CLA-701). A pre-sentinel
+		// state dir holding one is still ours, and `doctor` opens the same
+		// directory a daemon writes it into.
+		name == DaemonLogName, strings.HasPrefix(name, DaemonLogName+"."):
 		return true
 	case name == ".DS_Store", name == "Thumbs.db":
 		// Not ours, but not the operator's either: the file manager writes these

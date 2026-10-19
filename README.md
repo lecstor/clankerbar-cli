@@ -923,7 +923,9 @@ allowlist, which `doctor` already warns about.
 lists the version it itself runs and, per instance, the state and the version
 of the child serving it — so version skew between children (and between a
 child and the supervisor) is observable on the machine, not only on the fleet
-page. `clankerbar supervise roll` rolls the children onto a newly installed
+page. Those lines, and its refuse/spawn/exit decisions, are also written to
+`<supervisor state dir>/supervise.log` (see [Visibility](#visibility)).
+`clankerbar supervise roll` rolls the children onto a newly installed
 binary one at a time, verifying each one's next beacon reports it before the
 next is touched; `clankerbar supervise replace` drains the fleet and execs the
 running supervisor into a newly installed build. Neither fetches or installs
@@ -1290,9 +1292,36 @@ project_required` from the legacy slug-less route) — give the loop a slug via
 
 The driver logs milestones to your terminal as it goes (timestamped): spawning,
 queue state each poll, done + tokens/cost, usage-limit pauses, transient retries.
-The Claude harness runs with `--output-format stream-json`, so the agent's own
-progress — assistant text and `→ Tool` markers — streams live too, and each
-attempt is captured to its own `<state-dir>/iteration-<ts>.log`.
+
+Those lines — the daemon's own record of what it *decided* — are also written to
+**`<state-dir>/daemon.log`**, rotated at 8 MiB and keeping 3 files
+(`daemon.log`, `daemon.log.1`, `daemon.log.2`), so a daemon that runs for weeks
+does not leave one unbounded file and a monitoring agent does not need your
+terminal. The state dir is the one `doctor`'s `state_dir` line prints
+(`~/.local/state/clankerbar/loop/<workdir-slug>` by default); `doctor` also names
+the log paths.
+
+A session's own stream is **not** echoed there by default. It is the whole
+harness transcript — prompts, tool arguments, tool output — and once it also
+went to the daemon's stderr it buried the daemon's lines under thousands of rows
+of scrollback, which is exactly the record that says why a run ended. Each
+attempt is kept in full in its own `<state-dir>/iteration-<ts>.log`, and the
+daemon's spawn and end lines name that file, so the two can be joined. The
+Claude harness still renders the agent's progress — assistant text and `→ Tool`
+markers — into that file.
+
+To watch one session live again, set **`"echo_sessions": true`**: the stream is
+mirrored to the daemon's terminal *as well as* written to the iteration log.
+No harness gets a separate live channel of its own: claude's stderr is part of
+its stream and lands in the log with the rest of it.
+
+The fleet supervisor keeps its own lines the same way, in
+**`<supervisor state dir>/supervise.log`** (`~/.local/state/clankerbar/loop/roster/supervise.log`
+by default, size-rotated on the same terms) — refuse-to-start reasons, spawn
+failures, exits and backoff, and the per-change fleet status listing. That is the
+long-lived `clankerbar supervise` process; the one-shot `supervise roll` and
+`supervise replace` write their own lines to stderr only, and exit. Children's
+stderr still streams to the supervisor's own terminal, as before.
 
 ### Fleet visibility
 
@@ -1554,6 +1583,7 @@ instance the supervisor reads.
   "max_retries": 0,
   "retry_cap": "5m",
   "max_zero_spend_attempts": 3,
+  "echo_sessions": false,
   "budget": {
     "max_tokens": 0,
     "max_cost_usd": 0,
@@ -1563,6 +1593,11 @@ instance the supervisor reads.
   }
 }
 ```
+
+`echo_sessions` (default **false**) restores the old live echo of a session's
+stream to the daemon's terminal. Off, the stream goes only to its iteration log,
+which is what keeps the daemon's own lines readable — [Visibility](#visibility)
+has the reasoning and where both logs live.
 
 `max_turns` bounds every session's turns when its phase sets none of its own:
 the phase's `max_turns` wins, then this, then a built-in default of 400

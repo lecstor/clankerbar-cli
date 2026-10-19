@@ -2193,6 +2193,20 @@ type Config struct {
 	// nothing.
 	MaxZeroSpendAttempts int `json:"max_zero_spend_attempts"`
 
+	// EchoSessions mirrors each session's output stream to the daemon's own
+	// stderr while it runs, as well as to its iteration log. Default FALSE
+	// (CLA-701): the stream is the whole harness transcript — opencode emits
+	// one JSON event per line, many carrying tool output inline — so echoing it
+	// buries the daemon's own lines (spawn, exit, classification, why the run
+	// ended) under thousands of rows of scrollback, and the iteration log keeps
+	// it in full anyway. Turn it on when watching one session live is worth
+	// more than the terminal being readable: `"echo_sessions": true`.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: the
+	// config's marshalled form is its identity, and the default must not change
+	// a daemon's identity merely because this field now exists.
+	EchoSessions bool `json:"echo_sessions,omitempty"`
+
 	// Budget is the circuit breaker / headroom knob. See Budget.
 	Budget Budget `json:"budget"`
 

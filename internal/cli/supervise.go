@@ -98,6 +98,10 @@ func Supervise(ctx context.Context, args []string) error {
 		RosterURL: strings.TrimRight(base.BacklogURL, "/") + "/api/daemon-roster",
 		APIKey:    key,
 		BaseCfg:   base,
+		// The supervisor is a long-lived process whose own lines are the fleet's
+		// diagnosis; they go to its state dir's supervise.log as well as stderr
+		// (CLA-701).
+		LogToFile: true,
 	}
 	if root := os.Getenv(WorkdirRootEnv); root != "" {
 		o.WorkdirRoot = root

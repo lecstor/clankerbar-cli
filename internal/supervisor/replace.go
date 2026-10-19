@@ -87,7 +87,7 @@ func Replace(ctx context.Context, o Options) error {
 
 	cacheDir := o.RosterCacheDir
 	if cacheDir == "" {
-		dir, err := rosterCacheDir()
+		dir, err := CacheDir()
 		if err != nil {
 			return fmt.Errorf("supervise replace: %w", err)
 		}
