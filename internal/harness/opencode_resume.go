@@ -243,6 +243,11 @@ func mergeResume(base *Result, add Result) {
 	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
+	// A resurrection is part of the SAME session, so a clankerbar call the
+	// continuation made counts toward whether the session reached the backlog
+	// (CLA-703). Without this a session that died before its first claim and
+	// then recovered and worked would be classified no_mcp by the driver.
+	base.ClankerbarCalls += add.ClankerbarCalls
 	// The normalised breakdown sums on the same terms as Tokens/CostUSD above:
 	// the continuation is PART of this session's spend, not a second session
 	// (CLA-691).

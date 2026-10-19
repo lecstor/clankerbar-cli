@@ -173,6 +173,27 @@ func TestOpencodeMCPWaitTimeoutIsAnInfrastructureError(t *testing.T) {
 	}
 }
 
+// The server keys its MCP state by the canonical path, so the status query has
+// to use the same one. On macOS this is the /var -> /private/var symlink; a raw
+// path polled a location no session used and the first turn still raced.
+func TestOpencodeWorkDirResolvesSymlinks(t *testing.T) {
+	dir := t.TempDir()
+	want, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if got := opencodeWorkDir(link); got != want {
+		t.Errorf("opencodeWorkDir(%q) = %q, want the resolved %q", link, got, want)
+	}
+	if got := opencodeWorkDir(""); got != "" {
+		t.Errorf("opencodeWorkDir(\"\") = %q, want empty", got)
+	}
+}
+
 // The wait targets the clankerbar server(s) the config names, and not some
 // unrelated MCP server in the same file or an ambient layer.
 func TestOpencodeMCPServers(t *testing.T) {

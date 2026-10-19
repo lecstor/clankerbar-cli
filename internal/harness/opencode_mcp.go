@@ -38,16 +38,17 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 )
 
-// opencodeMCPStartupTimeout bounds the whole preflight — the server announcing
-// itself AND the clankerbar server reporting connected — and is a var so tests
-// can shrink it. Thirty seconds is six times opencode's own default MCP startup
-// timeout (5s), which leaves room for a remote server's handshake and one
-// opencode-side retry without making a broken MCP config look like a hang.
+// opencodeMCPStartupTimeout bounds each preflight stage — the server announcing
+// itself, and then the clankerbar server reporting connected — and is a var so
+// tests can shrink it. Thirty seconds is six times opencode's own default MCP
+// startup timeout (5s), which leaves room for a remote server's handshake and
+// one opencode-side retry without making a broken MCP config look like a hang.
 var opencodeMCPStartupTimeout = 30 * time.Second
 
 // opencodeMCPPollInterval is how often the status endpoint is polled. A var for
@@ -66,6 +67,34 @@ type opencodeServer struct {
 	// stop() never double-waits; it kills the group and waits for this channel.
 	exited chan struct{}
 	stderr *tail
+}
+
+// opencodeWorkDir canonicalises a session's directory the way the SERVER will
+// key its location: absolute, with symlinks resolved.
+//
+// This is load-bearing, not tidiness. On macOS a temp dir is `/var/...`, a
+// symlink to `/private/var/...`; the run's session is recorded at the resolved
+// path, while an `/api/mcp?location[directory]=/var/...` query makes the server
+// create a SECOND location keyed by the raw path. Polling that one reports
+// `connected` for a location no session will ever use, the real location's MCP
+// state finishes connecting later, and the first model turn still races — the
+// exact failure this file exists to remove (verified against 2.0.32).
+//
+// EvalSymlinks needs the path to exist; a path it cannot resolve falls back to
+// the absolute form, which is the best key available and still matches what the
+// CLI records for an ordinary directory.
+func opencodeWorkDir(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
+	}
+	return abs
 }
 
 // startOpencodeServer launches `opencode serve` on a free loopback port and
@@ -193,9 +222,14 @@ func (s *opencodeServer) waitForMCP(ctx context.Context, names []string, dir str
 				switch {
 				case !found || state == "pending" || state == "":
 					pending = true
-				case state == "connected" || state == "disabled":
-					// An answer. disabled is the operator's choice, not a race.
-				case state == "failed" || state == "needs_auth":
+				case state == "connected":
+					// The only status that means the tools are there.
+				case state == "disabled" || state == "failed" || state == "needs_auth":
+					// An answer, not a race: waiting the full timeout on a state
+					// that will not change only delays the retry the driver owes.
+					// `disabled` is included because a clankerbar entry that is
+					// switched off leaves the session with no backlog tools at
+					// all — the same outcome as a failed connection.
 					return fmt.Errorf("%w: MCP server %q reports %q%s", ErrMCPNotConnected, name, state, serverDiagnostic(s.stderr))
 				default:
 					// An unrecognised status is not evidence of connection.
@@ -248,6 +282,9 @@ func (s *opencodeServer) mcpStates(ctx context.Context, dir string) (map[string]
 		return nil, fmt.Errorf("GET /api/mcp: %s: %s", resp.Status, strings.TrimSpace(string(body)))
 	}
 	var doc struct {
+		Location struct {
+			Directory string `json:"directory"`
+		} `json:"location"`
 		Data []struct {
 			Name   string `json:"name"`
 			Status struct {
@@ -257,6 +294,13 @@ func (s *opencodeServer) mcpStates(ctx context.Context, dir string) (map[string]
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&doc); err != nil {
 		return nil, fmt.Errorf("decoding /api/mcp: %w", err)
+	}
+	// The server keys its MCP state by location. An answer for ANY OTHER
+	// location is not about the session that is about to run, so treating it as
+	// this one's status is how a `/var` vs `/private/var` query reported
+	// connected while the real session still had no tools (see opencodeWorkDir).
+	if dir != "" && doc.Location.Directory != "" && opencodeWorkDir(doc.Location.Directory) != dir {
+		return nil, fmt.Errorf("the server answered for location %q, not the requested %q", doc.Location.Directory, dir)
 	}
 	states := make(map[string]string, len(doc.Data))
 	for _, entry := range doc.Data {

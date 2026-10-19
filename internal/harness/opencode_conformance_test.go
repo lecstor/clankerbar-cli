@@ -640,15 +640,20 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 }
 
 // MCP tools reach the session top-level (out of Code Mode), the claim is
-// observed off the stream, and the first-turn race is survived. Both config
-// dialects: the adapter rewrites 1.x `mcp.<name>` into `mcp.servers.<name>`.
+// observed off the stream, and the first-turn race is GONE: the adapter's
+// private-server preflight means the first tool-bearing request already offers
+// clankerbar_claim_task (CLA-703). Both config dialects: the adapter rewrites
+// 1.x `mcp.<name>` into `mcp.servers.<name>`.
 func TestOpencodeConformance_mcpClaim(t *testing.T) {
 	requireOpencodeConformance(t)
 	for _, dialect := range []string{"v1", "v2"} {
 		t.Run(dialect, func(t *testing.T) {
 			claim := []fakeCall{{"clankerbar_claim_task", map[string]any{"taskId": "T-9"}}}
-			// Two claim rounds: the first may land before the MCP server has
-			// connected; the model then calls again, as the warm-up note asks.
+			// Two claim rounds are kept so a regression is VISIBLE rather than
+			// fatal: if the preflight stops working, the first claim gets the
+			// "No tool named" error and the model retries, and the assertions
+			// below fail with the race named. On a healthy build the first
+			// request already has the tools and the second round answers it.
 			fake := &fakeOpenAI{rounds: [][]fakeCall{claim, claim}, delay: 300 * time.Millisecond}
 			srv := httptest.NewServer(fake)
 			defer srv.Close()

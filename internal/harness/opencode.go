@@ -291,6 +291,16 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	}
 	defer cancel()
 
+	// One canonical directory for the permission policy, the server process,
+	// the status query and the run: the server keys its MCP state by the
+	// resolved path, so a raw `/var/...` query would poll a location no session
+	// uses (see opencodeWorkDir). The policy's absolute paths must agree with
+	// the directory the session actually runs in, or an in-tree write can look
+	// external on a symlinked temp dir.
+	workDir := opencodeWorkDir(in.WorkDir)
+	if workDir != "" {
+		in.WorkDir = workDir
+	}
 	env, err := o.env(in)
 	if err != nil {
 		// Nothing has been spawned yet, so this is a clean refusal to start
@@ -319,12 +329,12 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// `run --standalone` shape is left alone (a single-phase run with no
 		// backlog, a probe-style connectivity smoke, a test stub).
 		if names := opencodeMCPServers(in.MCPConfigPath); len(names) > 0 {
-			srv, err = startOpencodeServer(sctx, env, in.WorkDir)
+			srv, err = startOpencodeServer(sctx, env, workDir)
 			if err != nil {
 				return mcpPreflightFailure(sctx, ctx, err)
 			}
 			defer srv.stop()
-			if err := srv.waitForMCP(sctx, names, in.WorkDir); err != nil {
+			if err := srv.waitForMCP(sctx, names, workDir); err != nil {
 				return mcpPreflightFailure(sctx, ctx, err)
 			}
 			runArgs = withOpencodeServer(args, srv.url)
@@ -337,8 +347,8 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 
 	cmd := exec.CommandContext(sctx, "opencode", runArgs...)
 	setupProcessGroup(cmd)
-	if in.WorkDir != "" {
-		cmd.Dir = in.WorkDir
+	if workDir != "" {
+		cmd.Dir = workDir
 	}
 	cmd.Env = runEnv
 	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
