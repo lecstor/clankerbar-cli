@@ -391,12 +391,13 @@ type Driver struct {
 	deadTally map[tallyKey]*phaseTally
 
 	// panelFailStreak is how many consecutive TASKS each review-panel member has
-	// recorded nothing on (CLA-639 M4), keyed by the member's role/label. Like
-	// deadTally it is the run's account: one flaky member is a blip, but the same
-	// member failing task after task is a fault in that member's harness, model
-	// or brief, and the warning it earns must not depend on the drain boundary.
-	// Cleared for a member the moment that member records. See
-	// panelMemberFailed / panelMemberRecorded.
+	// recorded nothing on (CLA-639 M4), keyed by the member's log label (the
+	// positional `review-N` when unnamed). Like deadTally it is the run's
+	// account: one flaky member is a blip, but the same member failing task
+	// after task is a fault in that member's harness, model or brief, and the
+	// warning it earns must not depend on the drain boundary. Cleared for a
+	// member the moment that member records. See panelMemberFailed /
+	// panelMemberRecorded.
 	panelFailStreak map[string]int
 
 	// restartRequested (CLA-461) flips when a RESTART / RESTART_NOW marker has
@@ -1632,6 +1633,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			if round := end.reviewRound; round > 0 {
 				panelRound = round
 			}
+			// The member's reviewer ROLE is positional (CLA-639): the durable
+			// record and the seam gate are keyed on it, and the operator's `name`
+			// is only the log label. The incomplete list and the fix brief must
+			// therefore speak roles, or a named member would be reported missing
+			// while its role-keyed record is sitting right there.
+			role := reviewerRoleFor(phases, i)
+			member := ph.Label(i)
 			// CLA-639 M4: whether the NEXT member, or the fix phase after the
 			// panel, could still resume this run. The member's own claim is the
 			// live one when it observed any; a member that observed NOTHING (a
@@ -1645,12 +1653,41 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// claim the failed member took with it, or a harness sequence-end.
 			// Only a failed member with a live claim and a member after it is
 			// skipped past.
-			recorded := end.reviewRecorded
+			//
+			// A member whose own round close failed DID record: the seam matched
+			// a record and the close is a later, separate step. Counting that as
+			// "recorded nothing" would name a reviewer INCOMPLETE and charge its
+			// failure streak for the plane's failure to release the round.
+			recorded := end.reviewRecorded || end.reviewCloseFailed
 			seqEnd := end.sequenceEnd
+			// endSequenceEnd is the shared tail of the panel's run-level endings:
+			// a usage limit or transient failure owes the run its wait after the
+			// sequence's handback, exactly as the single-review seam does.
+			endSequenceEnd := func() {
+				if seqEnd == nil {
+					return
+				}
+				limitWait = seqEnd.limitWait
+				if limitWait == nil {
+					transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
+					transientRung = d.noteResumedTransient(transientKey)
+				}
+			}
 			if recorded {
 				// The member recorded, so its failure streak is over (CLA-639
 				// M4): the next failure, if any, is not consecutive with the last.
-				d.panelMemberRecorded(ph.Label(i))
+				d.panelMemberRecorded(member)
+			}
+			// A round that could not be closed is the single-review seam's
+			// fail-closed shape, for the panel: the member recorded, but the fix
+			// must not spawn against findings the plane still holds sealed. End
+			// the drain here (the deferred handback releases the claim exactly as
+			// the single-review close-failure path does) and say why.
+			if end.reviewCloseFailed {
+				log.Printf("%siteration %d: the %s panel member recorded, but the panel's round %d could not be closed (%s) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
+					labelOf(t), drainNum, member, panelRound, end.emptyWhy)
+				endSequenceEnd()
+				break
 			}
 			if !recorded {
 				reason := end.emptyWhy
@@ -1668,9 +1705,9 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				case reason == "":
 					reason = "recorded no durable review record"
 				}
-				panelIncomplete = append(panelIncomplete, ph.Label(i)+": "+reason)
-				panelFailed[ph.Label(i)] = reason
-				log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed", labelOf(t), drainNum, ph.Label(i), reason)
+				panelIncomplete = append(panelIncomplete, role+": "+reason)
+				panelFailed[role] = reason
+				log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed", labelOf(t), drainNum, member, reason)
 				// CLA-639 M4: the member is a failure the operator has to be able
 				// to see, so it is counted in the run's per-harness dead-phase
 				// tally (CLA-402) — the rate that exists for exactly this shape —
@@ -1682,12 +1719,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// park: one reviewer of several failing is not a reason to strand
 				// the panel's real findings.
 				if !end.deadBooked {
-					d.tallyEmpty(ph.Label(i), tc.HarnessFor(ph))
+					d.tallyEmpty(member, tc.HarnessFor(ph))
 				}
-				if n := d.panelMemberFailed(ph.Label(i)); n >= panelMemberFailBound {
+				if n := d.panelMemberFailed(member); n >= panelMemberFailBound {
 					model, _ := tc.ModelForPhase(ph)
 					log.Printf("%siteration %d: WARNING — the %s review-panel member has recorded nothing on %d consecutive tasks (harness %s, model %s); the panel runs on and the fix applies what the other members found, but this member's harness, model or brief is not producing reviews — check its iteration logs",
-						labelOf(t), drainNum, ph.Label(i), n, tc.HarnessFor(ph), attributionOr(model, "harness default"))
+						labelOf(t), drainNum, member, n, tc.HarnessFor(ph), attributionOr(model, "harness default"))
 				}
 				if live && !end.panelLast {
 					// The next member resumes this claim: keep the panel going, and
@@ -1705,8 +1742,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// because the close is legal only while we are still the holder.
 				if panelRound > 0 && live {
 					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
-						log.Printf("%siteration %d: the panel's round %d could not be closed after %s failed (%v) — its findings stay sealed for the takeover to re-run the panel",
-							labelOf(t), drainNum, panelRound, ph.Label(i), cerr)
+						log.Printf("%siteration %d: the panel's round %d could not be closed after %s failed (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
+							labelOf(t), drainNum, panelRound, member, cerr)
+						endSequenceEnd()
+						break
 					}
 				}
 				switch {
@@ -1726,11 +1765,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// The run-level sequence-end break above was deferred for this
 					// member so the round could be released first; end the attempt
 					// here, with the run's wait machinery to follow.
-					limitWait = seqEnd.limitWait
-					if limitWait == nil {
-						transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
-						transientRung = d.noteResumedTransient(transientKey)
-					}
+					endSequenceEnd()
 				}
 				break
 			}
@@ -1739,11 +1774,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// the panel (the round is closed by the run-level path below), and any
 			// other recorded member advances to the next one.
 			if seqEnd != nil {
-				limitWait = seqEnd.limitWait
-				if limitWait == nil {
-					transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
-					transientRung = d.noteResumedTransient(transientKey)
-				}
+				endSequenceEnd()
 				break
 			}
 		}
@@ -1992,6 +2023,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				log.Printf("iteration %d: the %s phase closed round %d (%d non-void round(s) this cycle) with open MUST(s) [%s] — spawning another %s round against them",
 					drainNum, ph.Label(i), end.verifyRound, end.verifyCounted,
 					strings.Join(end.verifyOpenMusts, ", "), phases[fixIdx].Label(fixIdx))
+				// CLA-639: the merged panel list belongs to the FIRST fix after
+				// the panel, before any verification round has run. A verify
+				// rewind is a later fix round: its grading is the verifier's own
+				// record (plus the plane's open-MUST list), and reprinting the
+				// panel's list would replace the verifier's findings with a
+				// stale round. Clear the panel round so drainPhase falls back to
+				// the shipped single-review path unchanged.
+				panelRound = 0
 				i = fixIdx
 				continue
 			}
@@ -2233,6 +2272,16 @@ type phaseEnd struct {
 	// member left a durable record behind. It is what the panel handler's
 	// "recorded or been recorded as failed" decision reads.
 	reviewRecorded bool
+
+	// reviewCloseFailed reports that this pass's review seam gate passed far
+	// enough to find a SEALED round, but the driver's own close of that round
+	// failed. The record exists (the reviewer did record), so the panel must not
+	// name the member INCOMPLETE or charge its failure streak; the drain must
+	// end without spawning the fix, because the fix would run against findings
+	// the plane still holds sealed. It is the close-failure half of
+	// reviewRecorded, kept separate because the evidence gate sets both to the
+	// same value everywhere else.
+	reviewCloseFailed bool
 
 	// reviewRound is the review round the seam gate MATCHED this pass (CLA-637),
 	// zero when the phase is not review-shaped or no record matched. The round is
@@ -3394,10 +3443,16 @@ func mergedFindingLine(f plane.ReviewFindingState, r plane.ReviewRecordState) st
 // panel: the member phases immediately before it in the CAPTURED sequence.
 // Empty when the phase does not follow a panel, which is the shipped
 // single-review shape.
+//
+// The role is POSITIONAL (`reviewerRoleFor`), never the member's log label. The
+// durable record and the seam gate are keyed on the positional role, so a named
+// member (`alpha`) writes `review-1`; returning the label here would make the
+// merged list look for an `alpha` record and report a member that recorded as
+// INCOMPLETE (CLA-639).
 func panelRoles(phases []config.Phase, fixIdx int) []string {
 	var roles []string
 	for i := fixIdx - 1; i >= 0 && phases[i].IsPanelMember(); i-- {
-		roles = append([]string{phases[i].Label(i)}, roles...)
+		roles = append([]string{reviewerRoleFor(phases, i)}, roles...)
 	}
 	return roles
 }
@@ -3810,7 +3865,15 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// is the sequence's only record and keeps the shipped fail-closed path.
 	panelMember := captured.IsPanelMember()
 	panelLast := false
-	if panelMember && !nextReviewShaped {
+	// A BRANCHLESS checkpoint runs exactly ONE reviewer: the record this shape
+	// can write is the legacy `## Review` block, not a durable one, so
+	// drainPhases skips the members after the first. That first member is the
+	// panel's last member in every sense the seam cares about — its record is
+	// the panel's only record and the "no member recorded → no fix" rule must
+	// apply to it — so the position test alone (`no review-shaped phase follows`)
+	// is not enough here.
+	branchlessPanel := panelMember && prev != nil && prev.Claim.Branch == ""
+	if panelMember && (!nextReviewShaped || branchlessPanel) {
 		panelLast = true
 	}
 	// The review seam's freshness baseline, read ONCE before the attempt ladder:
@@ -4214,6 +4277,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// live in drainPhases; if they refuse, the deferred handback there
 		// releases what this held.
 		handoff := detectHandoff(drainNum, t, res)
+		// CLA-638: a verification round does not chain via a handoff. Its record
+		// is the deliverable, and the DRIVER decides what follows (another fix, a
+		// park, or nothing) from the open MUSTs the record releases; a successor
+		// prompt here would have nothing to continue that this round has not
+		// already written, and honoring it would defer the close/evaluation the
+		// driver owes the round.
 		if isVerify && handoff != "" {
 			log.Printf("%siteration %d: the verification round emitted a handoff block; verification rounds do not chain — the driver judges the round's record and decides whether another fix runs", labelOf(t), drainNum)
 			handoff = ""
@@ -4344,6 +4413,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && handoff == "" && !nextReviewShaped {
 				if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
 					evidenceOK = false
+					end.reviewCloseFailed = true
 					evidenceWhy = fmt.Sprintf("review round %d could not be closed (%v) — refusing the checkpoint, because the fix phase would be spawned against findings the plane still has sealed", review.round, cerr)
 				}
 			}
@@ -4465,7 +4535,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// one session may not read as two dead ones out of one run —
 				// CLA-639 M4 needs this booking to be exactly one per failed
 				// panel member, and the operator's rate needs it to be honest.
-				if !bookedDead {
+				//
+				// And unless this is a review-close failure (CLA-639 fix pass
+				// 3): a member that WROTE its record and whose round the plane
+				// then refused to release produced a review — the empty shape
+				// here would report it as a session that died producing
+				// nothing, which is the opposite of what happened.
+				if !bookedDead && !end.reviewCloseFailed {
 					d.tallyEmpty(ph.Label(phaseIdx), tc.HarnessFor(ph))
 					// CLA-639 M4: this exit is booked, so the panel's member
 					// handler must not book it again when it records the member

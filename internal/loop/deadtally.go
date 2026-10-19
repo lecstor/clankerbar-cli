@@ -121,9 +121,9 @@ const panelMemberFailBound = 3
 
 // panelMemberFailed counts one task on which the member recorded nothing and
 // returns the member's streak of consecutive such tasks. Keyed by the member's
-// role/label (`review-2`), which is stable across tasks because the panel is
-// positional; the Driver holds it so the streak spans drains, and each drain
-// runs the panel at most once per task.
+// log label (the positional `review-N` when unnamed), which is stable across
+// tasks because the panel is positional; the Driver holds it so the streak
+// spans drains, and each drain runs the panel at most once per task.
 func (d *Driver) panelMemberFailed(member string) int {
 	if d.panelFailStreak == nil {
 		d.panelFailStreak = map[string]int{}

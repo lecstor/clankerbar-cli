@@ -2,9 +2,11 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
@@ -1125,5 +1127,324 @@ func TestDrainPhases_NoPanelIsTheLegacySingleReviewer(t *testing.T) {
 	}
 	if len(rel.closes) != 1 || rel.closes[0] != 1 {
 		t.Errorf("closed rounds = %v, want exactly [1] — the single reviewer's round is closed before the fix", rel.closes)
+	}
+}
+
+// TestDrainPhases_ReviewPanelCloseFailureEndsWithoutAFix (CLA-639 fix pass 3):
+// a round the driver cannot close must end the drain, not spawn the fix against
+// findings the plane still holds sealed. The single-review seam has always
+// failed closed here; the panel's last member must too.
+//
+// Two shapes: the last member RECORDED and the seam's own close failed (the
+// member is not INCOMPLETE — it recorded; the plane failed to release), and the
+// last member was usage-limited so the panel's failure arm attempted the close
+// and it failed. Neither may spawn the fix.
+func TestDrainPhases_ReviewPanelCloseFailureEndsWithoutAFix(t *testing.T) {
+	closeErr := errors.New("the plane is unreachable")
+
+	t.Run("the last member recorded", func(t *testing.T) {
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n", closeErr: closeErr}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: checkpointed(10, 0.10)}, // implement
+			{res: checkpointed(5, 0.50)},  // review-1 records
+			{res: checkpointed(5, 0.50)},  // review-2 records (last member; the seam's close fails)
+		}}
+		h.onInvoke = func(i int) {
+			if i == 1 || i == 2 {
+				role := "review-" + strconv.Itoa(i)
+				rel.records = append(rel.records, plane.ReviewRecordState{
+					Round: 1, ReviewerRole: role, RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+					Findings: []plane.ReviewFindingState{mustFinding("1."+role+".1", "open", "a "+role+" MUST")},
+				})
+			}
+		}
+		d, ff := panelDriverWithFleet(t, h, rel, panelMembers()[:2], panelPhases())
+		logs := captureLogs(t)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v — a close failure must end the drain, not fail the run", err, stop)
+		}
+		if h.invokeCalls != 3 {
+			t.Fatalf("spawned %d sessions, want 3 (implement, two members, NO fix) — the fix must not run against a sealed round", h.invokeCalls)
+		}
+		if len(rel.closes) != 0 {
+			t.Errorf("a close was recorded despite the injected failure: %v", rel.closes)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "could not be closed") || !strings.Contains(out, "without spawning the fix") {
+			t.Errorf("the driver did not say why the fix was skipped:\n%s", out)
+		}
+		// The member that RECORDED is not named incomplete and is not charged a
+		// failure streak: the record exists; the plane failed to release it.
+		recs := ff.records()
+		if len(recs) != 1 {
+			t.Fatalf("iteration records = %d, want 1", len(recs))
+		}
+		if strings.Contains(recs[0].Outcome, "INCOMPLETE") {
+			t.Errorf("a member that recorded was reported incomplete: %q", recs[0].Outcome)
+		}
+		for _, role := range []string{"review-1", "review-2"} {
+			if n := d.panelFailStreak[role]; n != 0 {
+				t.Errorf("panelFailStreak[%s] = %d, want 0 — the member recorded", role, n)
+			}
+			if cell := d.deadTally[tallyKey{phase: role, harness: "opencode"}]; cell != nil && cell.dead != 0 {
+				t.Errorf("the recorded member %s was booked dead: %+v — it produced a record; the close is the plane's failure", role, cell)
+			}
+		}
+		// Nothing reports success: the drain ended on a released claim, and no
+		// round was released for a reader.
+		if recs[0].Outcome == fleet.OutcomeCheckpoint {
+			t.Errorf("the drain reported a checkpoint after the panel's round could not be closed: %q", recs[0].Outcome)
+		}
+		for _, r := range rel.records {
+			if r.State != "sealed" {
+				t.Errorf("a record was released despite the failed close: %+v", r)
+			}
+		}
+	})
+
+	t.Run("the last member is usage-limited", func(t *testing.T) {
+		rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n", closeErr: closeErr}
+		h := &fakeAdapter{
+			steps: []invokeStep{
+				{res: checkpointed(10, 0.10)},           // implement
+				{res: checkpointed(5, 0.50)},            // review-1 records
+				{res: checkpointed(5, 0.50)},            // review-2 records
+				{res: held(limitResult(), openClaim())}, // review-3 is turned away, last member
+			},
+			// A reset already past, so the run-level wait resumes at once and
+			// this test stays about the panel's close.
+			limitResetAt: time.Now().Add(-time.Hour),
+		}
+		h.onInvoke = func(i int) {
+			if i == 1 || i == 2 {
+				role := "review-" + strconv.Itoa(i)
+				rel.records = append(rel.records, plane.ReviewRecordState{
+					Round: 1, ReviewerRole: role, RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+					Findings: []plane.ReviewFindingState{mustFinding("1."+role+".1", "open", "a "+role+" MUST")},
+				})
+			}
+		}
+		d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+		logs := captureLogs(t)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if h.invokeCalls != 4 {
+			t.Fatalf("spawned %d sessions, want 4 (implement, three members, NO fix) — the close failed and the fix must not run", h.invokeCalls)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "could not be closed") || !strings.Contains(out, "without spawning the fix") {
+			t.Errorf("the driver did not say why the fix was skipped:\n%s", out)
+		}
+		recs := ff.records()
+		if len(recs) != 1 {
+			t.Fatalf("iteration records = %d, want 1", len(recs))
+		}
+		// The usage-limited member is the one named incomplete; the members that
+		// recorded are not.
+		for _, want := range []string{"review panel INCOMPLETE", "review-3", "hit a usage limit before recording"} {
+			if !strings.Contains(recs[0].Outcome, want) {
+				t.Errorf("the iteration outcome does not carry %q: %q", want, recs[0].Outcome)
+			}
+		}
+		for _, role := range []string{"review-1:", "review-2:"} {
+			if strings.Contains(recs[0].Outcome, role) {
+				t.Errorf("a member that recorded was named incomplete: %q", recs[0].Outcome)
+			}
+			short := strings.TrimSuffix(role, ":")
+			if n := d.panelFailStreak[short]; n != 0 {
+				t.Errorf("panelFailStreak[%s] = %d, want 0 — the member recorded", short, n)
+			}
+		}
+		if n := d.panelFailStreak["review-3"]; n != 1 {
+			t.Errorf("panelFailStreak[review-3] = %d, want 1 — it recorded nothing", n)
+		}
+	})
+}
+
+// TestDrainPhases_BranchlessPanelWithNoRecordEndsWithoutAFix (CLA-639 fix pass
+// 3): a branchless task runs the panel as ONE reviewer, so that reviewer is the
+// panel's last member. When it records nothing, no fix may run — the same end a
+// config with no panel reaches. Before the fix, the lone member was "not last"
+// (another member followed in the effective sequence) and the panel handed over
+// to the fix anyway.
+func TestDrainPhases_BranchlessPanelWithNoRecordEndsWithoutAFix(t *testing.T) {
+	settled := plane.TaskState{Status: "in_review", Outcome: "no-code delivery: the task body was updated\n"}
+	run := func(t *testing.T, members []config.ReviewPanelMember) (*fakeAdapter, bool, error) {
+		t.Helper()
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: held(okResult(1, 0), openClaim())}, // implement: no branch (the plane's record is the evidence)
+			{res: held(okResult(1, 0), openClaim())}, // the only reviewer: records NOTHING and holds
+			{res: okResult(1, 0)},                    // would be the fix
+			{res: okResult(1, 0)},
+		}}
+		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+		d := panelDriver(t, h, rel, members, panelPhases())
+		_, _, stop, err := drainPhasesOnce(t, d)
+		return h, stop, err
+	}
+
+	panel, panelStop, panelErr := run(t, panelMembers())
+	legacy, legacyStop, legacyErr := run(t, nil)
+
+	if panelErr != nil || panelStop {
+		t.Fatalf("the panel drain: err=%v stop=%v, want a clean end", panelErr, panelStop)
+	}
+	if legacyErr != nil || legacyStop {
+		t.Fatalf("the no-panel drain: err=%v stop=%v, want a clean end", legacyErr, legacyStop)
+	}
+	if panel.invokeCalls != 2 {
+		t.Fatalf("the branchless panel spawned %d sessions, want 2 (implement + ONE reviewer, no fix)", panel.invokeCalls)
+	}
+	if legacy.invokeCalls != 2 {
+		t.Fatalf("the no-panel drain spawned %d sessions, want 2 (implement + review)", legacy.invokeCalls)
+	}
+}
+
+// TestDrainPhases_ReviewPanelNamedMembersKeepPositionalRoles (CLA-639 fix pass
+// 3): a member's `name` is a log label; its reviewer role is positional
+// (review-1..review-N). A named panel must record and merge by role exactly as
+// an unnamed one does. Before the fix, panelRoles matched records by label, so
+// alpha/beta were reported INCOMPLETE while review-1/review-2 sat in the round.
+func TestDrainPhases_ReviewPanelNamedMembersKeepPositionalRoles(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // alpha (role review-1) records
+		{res: checkpointed(5, 0.50)},  // beta (role review-2) records
+		{res: checkpointed(5, 0.05)},  // fix
+	}}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "alpha's MUST")},
+			})
+		case 2:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{{ID: "1.review-2.1", Severity: "should", Status: "open", Summary: "beta's SHOULD"}},
+			})
+		case 3:
+			rel.status = "in_review"
+			rel.outcome += "\n### Fixes\n- 1.review-1.1 fixed\n"
+		}
+	}
+	members := []config.ReviewPanelMember{
+		{Name: "alpha", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},
+		{Name: "beta", Harness: "opencode", Model: "opencode-go/glm-5.3-flash"},
+	}
+	d := panelDriver(t, h, rel, members, panelPhases())
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 (implement, alpha, beta, fix)", h.invokeCalls)
+	}
+	// The briefs name the POSITIONAL role, never the label.
+	for i, want := range []string{`reviewerRole: "review-1"`, `reviewerRole: "review-2"`} {
+		if p := h.invocations[i+1].Prompt; !strings.Contains(p, want) {
+			t.Errorf("member %d's brief does not name %s:\n%s", i+1, want, p)
+		}
+	}
+	// Both records reach the fix under their roles, and no member is incomplete.
+	fix := h.invocations[3].Prompt
+	for _, want := range []string{"1.review-1.1", "1.review-2.1", "raised by review-2"} {
+		if !strings.Contains(fix, want) {
+			t.Errorf("the fix brief does not carry %q — the roles are not positional:\n%s", want, fix)
+		}
+	}
+	if strings.Contains(fix, "INCOMPLETE") {
+		t.Errorf("a member that recorded under its positional role was reported incomplete:\n%s", fix)
+	}
+}
+
+// TestDrainPhases_ReviewPanelVerifyRewindUsesTheVerifiersGrading (CLA-639 fix
+// pass 3): the merged panel list belongs to the FIRST fix after the panel. A
+// fix spawned by a verify rewind is a later round: its grading must be the
+// verifier's own record (the legacy block plus the plane's open-MUST list), not
+// the panel's stale merged list again.
+func TestDrainPhases_ReviewPanelVerifyRewindUsesTheVerifiersGrading(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review-1 records a MUST and a SHOULD
+		{res: checkpointed(5, 0.50)},  // review-2 records (last member, closes round 1)
+		{res: checkpointed(5, 0.05)},  // fix 1 (the panel's merged list)
+		{res: checkpointed(5, 0.05)},  // verify 1: an open MUST -> rewind
+		{res: checkpointed(5, 0.05)},  // fix 2 (the brief under test)
+		{res: checkpointed(5, 0.05)},  // verify 2: clean
+	}}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{
+					mustFinding("1.review-1.1", "open", "panel-only must finding"),
+					{ID: "1.review-1.2", Severity: "should", Status: "open", Summary: "panel-only should finding"},
+				},
+			})
+		case 2:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-2", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+			})
+			rel.openMusts = []string{"1.review-1.1"}
+			rel.counted = 1
+		case 3: // fix 1 applies the merged list
+			rel.records[0].Findings[0].Status = "fixed"
+			rel.openMusts = nil
+			rel.outcome += "\n### Fixes\n- 1.review-1.1 fixed\n"
+			rel.status = "in_review"
+		case 4: // verify 1: its own block and record, with a NEW open MUST
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip +
+				"\n- verdict: findings\n\n### Findings\n- R1 [should] (gate): verifier-should-text internal/x.go:1 - fix it. Required fix: do it.\n" +
+				"- R2 [nit] verifier-nit-text internal/x.go:2 - tidy it. Required fix: tidy.\n"
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 2, ReviewerRole: "review-3", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("2.review-3.1", "open", "verifier's new MUST")},
+			})
+			rel.openMusts = []string{"2.review-3.1"}
+			rel.counted = 2
+		case 5: // fix 2 answers the verifier's MUST
+			for n := range rel.records {
+				if rel.records[n].Round == 2 {
+					rel.records[n].Findings[0].Status = "fixed"
+				}
+			}
+			rel.openMusts = nil
+			rel.outcome += "\n### Fixes\n- 2.review-3.1 fixed\n"
+		case 6: // verify 2: clean, carries the terminal step
+			rel.records = append(rel.records, recordFor(3, "review-4", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 3
+			rel.openMusts = nil
+			rel.status = "in_review"
+		}
+	}
+	d := panelDriver(t, h, rel, panelMembers()[:2], append(panelPhases(), config.Phase{Name: config.VerifyPhaseName}))
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 7 {
+		t.Fatalf("spawned %d sessions, want 7 (implement, 2 members, fix, verify, fix, verify)", h.invokeCalls)
+	}
+	if first := h.invocations[3].Prompt; !strings.Contains(first, "This is the MERGED list from every member that recorded") {
+		t.Fatalf("the first fix did not receive the panel's merged list:\n%s", first)
+	}
+	second := h.invocations[5].Prompt
+	for _, want := range []string{"verifier-should-text", "verifier-nit-text", "R1 [SHOULD]", "R2 [NIT]"} {
+		if !strings.Contains(second, want) {
+			t.Errorf("the second fix brief does not carry the verifier's finding %q:\n%s", want, second)
+		}
+	}
+	for _, banned := range []string{"This is the MERGED list from every member that recorded", "panel-only should finding", "panel-only must finding"} {
+		if strings.Contains(second, banned) {
+			t.Errorf("the second fix brief repeats the panel's stale merged list (%q):\n%s", banned, second)
+		}
 	}
 }
