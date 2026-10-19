@@ -1533,6 +1533,14 @@ func TestDrainPhases_ReviewPanelLastMemberEndsSequenceAfterRecording(t *testing.
 	}{
 		{name: "a usage limit", res: held(limitResult(), openClaim())},
 		{name: "a transient failure", res: held(transientResult(), openClaim())},
+		{
+			// A session the adapter also classifies as limited can still exit
+			// cleanly: the seam runs first, matches the record and closes the
+			// round itself, and the sequence-end is read afterwards. The arm must
+			// not close a second time (CLA-639 fix pass 6).
+			name: "a usage limit on a clean exit the seam already closed",
+			res:  reported(held(harness.Result{ExitCode: 0, Tokens: 5, CostUSD: 0.05, Raw: map[string]any{"kind": "limit"}}, openClaim()), branchReport()),
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}

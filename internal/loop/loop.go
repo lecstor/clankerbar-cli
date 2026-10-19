@@ -1808,7 +1808,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					i++
 					continue
 				}
-				if live && panelRound > 0 {
+				// Close only when the seam did not already close the round for
+				// this member. A session the adapter ALSO classifies as a limit
+				// or transient can exit cleanly (or be capped with WIP), so the
+				// seam runs first, matches the record and closes the round; the
+				// sequence-end is then read by the arm below. A second close is
+				// the plane's no_open_round, and failing closed on it would skip
+				// the fix against a round that is already released.
+				if live && panelRound > 0 && !end.reviewRecorded {
 					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
 						log.Printf("%siteration %d: the panel's round %d could not be closed after %s recorded but ended the sequence (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
 							labelOf(t), drainNum, panelRound, member, cerr)
