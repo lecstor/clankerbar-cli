@@ -223,6 +223,84 @@ func TestMergeResumeReasonlessContinuationClearsFinishReason(t *testing.T) {
 	}
 }
 
+// CLA-700 review round 1 (1.review-1.1 / 1.review-3.1 / 1.review-4.1): the
+// recovered-error marker is a verdict on how the session ENDED, not a quantity
+// that accumulates, so a merge may not SUM it. The base run here really did
+// ride out a provider error — parsed from a stream, not hand-set — and then
+// died the quiet death, which is the only shape a resurrection can follow. A
+// continuation whose stream ENDS on a terminal error carries no marker (the
+// parser withholds it precisely there); inheriting the dead run's count left
+// the merged session reading "recovered", so drainPhase judged a genuine
+// terminal failure on its delivery and could advance the phase.
+func TestMergeResumeRecomputesTheRecoveredMarker(t *testing.T) {
+	// A FRESH base per subtest: mergeResume writes through the Raw map, which a
+	// struct copy shares, so one subtest's merge would otherwise seed the next.
+	newBase := func(t *testing.T) Result {
+		t.Helper()
+		// One recovered provider error, a claim observation, then the zero-usage
+		// quiet death. Both markers come from the parser.
+		return opencodeParsed(`{"type":"error","sessionID":"ses_dead","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}
+{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
+	}
+
+	t.Run("a terminal-error continuation clears the dead run's count", func(t *testing.T) {
+		base := newBase(t)
+		if got := RecoveredErrors(base); got != 1 {
+			t.Fatalf("test precondition: the base run recovered %d event(s), want 1 (Raw: %v)", got, base.Raw)
+		}
+		if !(opencode{}).ZeroUsageUnknown(base) {
+			t.Fatalf("test precondition: the base run must be the quiet death a resurrection runs on (Raw: %v)", base.Raw)
+		}
+
+		cont := opencodeParsed(`{"type":"step_start","sessionID":"ses_dead","part":{"type":"step-start","messageID":"msg_2"}}
+{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"pushing the branch"}}
+{"type":"error","sessionID":"ses_dead","error":{"type":"provider.auth","message":"invalid api key"}}`)
+		cont.ExitCode = 1
+		if got := RecoveredErrors(cont); got != 0 {
+			t.Fatalf("test precondition: a stream that ENDS on its error carries no marker, got %d", got)
+		}
+
+		mergeResume(&base, cont)
+
+		if got := RecoveredErrors(base); got != 0 {
+			t.Fatalf("RecoveredErrors = %d after merging a continuation that ended on a terminal error (Raw: %v) — the dead run's recovered marker survived the merge, so the driver would judge a genuine failure on its delivery", got, base.Raw)
+		}
+		if _, ok := base.Raw[RecoveredErrorsKey]; ok {
+			t.Errorf("Raw still carries %s = %v; the key is absent when the stream ended on its error", RecoveredErrorsKey, base.Raw[RecoveredErrorsKey])
+		}
+	})
+
+	t.Run("a clean continuation does not inherit the dead run's count", func(t *testing.T) {
+		base := newBase(t)
+		cont := opencodeParsed(`{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"all done"}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`)
+
+		mergeResume(&base, cont)
+
+		if got := RecoveredErrors(base); got != 0 {
+			t.Errorf("RecoveredErrors = %d for a merged session whose final run recovered from nothing, want 0 (Raw: %v)", got, base.Raw)
+		}
+	})
+
+	t.Run("a continuation that recovered reports its own count, not the sum", func(t *testing.T) {
+		base := newBase(t)
+		cont := opencodeParsed(`{"type":"error","sessionID":"ses_dead","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}
+{"type":"error","sessionID":"ses_dead","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}
+{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"all done"}}
+{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`)
+		if got := RecoveredErrors(cont); got != 2 {
+			t.Fatalf("test precondition: the continuation recovered %d event(s), want 2", got)
+		}
+
+		mergeResume(&base, cont)
+
+		if got := RecoveredErrors(base); got != 2 {
+			t.Errorf("RecoveredErrors = %d, want 2 — the continuation's own count stands; summing would report 3 blips across two runs that saw 2", got)
+		}
+	})
+}
+
 // ---- Invoke-level tests (CLA-406 review WARN 6) ----
 //
 // These exec a stub `opencode` through the REAL Invoke, so the loop's
@@ -307,6 +385,57 @@ esac
 	}
 	if !strings.Contains(console.String(), "resurrection 1 succeeded") {
 		t.Errorf("console missing success line; got:\n%s", console.String())
+	}
+}
+
+// CLA-700 review round 1 (1.review-3.1): the same hazard through the REAL
+// Invoke path. The base run recovered a provider blip and then died the quiet
+// death (the only shape a resurrection follows); the continuation ends on a
+// terminal error and exits 1. The merged Result is the one drainPhase reads, and
+// it must carry NO recovered marker — otherwise the terminal failure is judged
+// on its delivery and can advance the phase.
+func TestResurrectionInvokeTerminalErrorContinuationIsNotRecovered(t *testing.T) {
+	old := opencodeResumeBackoff
+	opencodeResumeBackoff = time.Millisecond
+	defer func() { opencodeResumeBackoff = old }()
+
+	opencodeStub(t, `#!/bin/sh
+case "$*" in
+  *"Confirm you are intact"*)
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-196 - last action: ran go test."}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
+    ;;
+  *"Continue exactly where you left off"*)
+    echo '{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"pushing the branch"}}'
+    echo '{"type":"error","sessionID":"ses_dead","error":{"type":"provider.auth","message":"invalid api key"}}'
+    exit 1
+    ;;
+  *)
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_claim_task","id":"c0","state":{"status":"completed","input":{"taskId":"uuid-1"},"output":"{\"task\":{\"id\":\"uuid-1\",\"ref\":\"EZY-196\"},\"run\":{\"id\":\"run-1\"}}"}}}'
+    echo '{"type":"error","sessionID":"ses_dead","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}'
+    echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}'
+    ;;
+esac
+`)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{Prompt: "Work."})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if n := res.Raw[opencodeResurrectionsKey]; n != 1 {
+		t.Fatalf("resurrections = %v, want 1 — the fixture did not take the merge path this test exists to pin", n)
+	}
+	if res.ExitCode != 1 {
+		t.Fatalf("ExitCode = %d, want the continuation's 1", res.ExitCode)
+	}
+	if got := res.Raw[OpencodeErrorTypeKey]; got != "provider.auth" {
+		t.Errorf("opencode_error_type = %v, want the CONTINUATION's provider.auth — the type is how the merged session ended", got)
+	}
+	if got := RecoveredErrors(res); got != 0 {
+		t.Fatalf("RecoveredErrors = %d for a merged session whose last run ended on a terminal error, want 0 (Raw: %v) — the dead run's recovered marker survived mergeResume, so drainPhase would judge the failure on delivery and could advance the phase", got, res.Raw)
+	}
+	if _, ok := res.Raw[RecoveredErrorsKey]; ok {
+		t.Errorf("Raw still carries %s = %v after the merge; a stream that ended on its error carries no marker", RecoveredErrorsKey, res.Raw[RecoveredErrorsKey])
 	}
 }
 

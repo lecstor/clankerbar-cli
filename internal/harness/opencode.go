@@ -1165,6 +1165,16 @@ type opencodeParse struct {
 	// ("provider.auth", ...), recorded on Result.Raw for diagnostics and the
 	// conformance suite. Classification itself reads the event text.
 	errorType string
+
+	// recoveredErrors counts the typed error events the stream did NOT end on:
+	// an event that is followed by any later typed event is one the session
+	// recovered from, because 2.x retries a provider failure itself and carries
+	// on (CLA-700). lastEventWasError is whether the most recent typed event was
+	// itself an error — exactly the question buildOpencodeErrorText asks of the
+	// finished stream, tracked here as the stream arrives so the two cannot
+	// disagree about how the session ended.
+	recoveredErrors   int
+	lastEventWasError bool
 }
 
 // newOpencodeParse builds the parser a session streams into. It exists so the
@@ -1205,6 +1215,18 @@ func (p *opencodeParse) line(line []byte) {
 	}
 	if ev.Type == "error" && ev.Error != nil && ev.Error.Type != "" {
 		p.errorType = ev.Error.Type
+	}
+	// CLA-700: an error event the stream moves past is one the session
+	// recovered from. Counted here for every typed event, before the Part check,
+	// because an error event carries no part and can be the last thing a failed
+	// run emits.
+	if ev.Type != "" {
+		if p.lastEventWasError {
+			// The PREVIOUS error event was followed by this one, so it was
+			// recovered from (whether or not this event is also an error).
+			p.recoveredErrors++
+		}
+		p.lastEventWasError = ev.Type == "error"
 	}
 	if ev.Part == nil {
 		return
@@ -1547,6 +1569,17 @@ func (p *opencodeParse) finish(res *Result) {
 		}
 		res.Raw[OpencodeErrorTypeKey] = p.errorType
 	}
+	// CLA-700: the events this session RECOVERED from, with no error event ending
+	// the stream. Recorded as a positive count so the driver can tell "nothing
+	// happened" from "provider blips were ridden out" — the difference between an
+	// exit status that means the session failed and one that is upstream's own
+	// bug (2.x exits non-zero after recovering, pinned by the conformance suite).
+	if p.recoveredErrors > 0 && !p.lastEventWasError {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[RecoveredErrorsKey] = p.recoveredErrors
+	}
 }
 
 // opencodeBudgetRe recognizes a HARD budget/credit-exhaustion stop from the
@@ -1575,15 +1608,35 @@ func (opencode) DetectLimit(res Result) Limit {
 }
 
 // opencodeErrorText collects the harness-level diagnostic text — all of stderr,
-// plus the stdout lines that decode to a {"type":"error"} event — so a limit scan
-// sees provider/transport errors but never the agent's own assistant text.
+// plus a TERMINAL {"type":"error"} event on stdout — so a limit scan sees
+// provider/transport errors but never the agent's own assistant text.
 func opencodeErrorText(res Result) string {
 	return res.scan(scanErrorText, func() string { return buildOpencodeErrorText(res) })
 }
 
+// buildOpencodeErrorText appends the stream's error event ONLY when it is how
+// the session ENDED — the last typed event on stdout (CLA-700).
+//
+// 2.x emits a provider error mid-session, retries the request itself and carries
+// on: a stream whose error event is followed by a step_start / tool_use / text
+// part is a session that RECOVERED, and calling that session failed or
+// retryable is how a delivered phase got classified as a failed attempt (both
+// 2026-10-19 incidents). So an error event with any typed event after it is
+// recovery and contributes nothing here; only a stream that stops on the error
+// is a failure. The distinction is pinned by the conformance suite's
+// recovered-provider-error case, which execs the real binary.
+//
+// stderr is scanned unconditionally: it is the harness's own diagnostic channel,
+// written as the process winds down, and the fallback for the untyped failures
+// the typed-event scan cannot see.
+//
+// Note this is deliberately stricter than opencodeErrorType (the Raw
+// diagnostic key), which records the LAST error event whatever followed it —
+// that key is testimony about the stream, not a classification.
 func buildOpencodeErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
+	last := ""
 	for _, line := range strings.Split(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "{") {
@@ -1592,9 +1645,18 @@ func buildOpencodeErrorText(res Result) string {
 		var ev struct {
 			Type string `json:"type"`
 		}
-		if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "error" {
+		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type == "" {
+			continue
+		}
+		last = line
+	}
+	if last != "" {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(last), &ev) == nil && ev.Type == "error" {
 			b.WriteByte('\n')
-			b.WriteString(line)
+			b.WriteString(last)
 		}
 	}
 	return b.String()
@@ -1802,6 +1864,17 @@ func (o opencode) IsTransient(res Result) bool {
 	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
 		return false
 	}
+	// CLA-700: a session that RECOVERED from its provider errors is not retryable,
+	// however its exit status reads. 2.x emits the error, retries the request
+	// itself and finishes the work, then exits 1 anyway (pinned by the conformance
+	// suite), so there is no failure here for a retry to ride out — the question
+	// this exit raises is whether the session DELIVERED, and that is the driver's
+	// to answer, not a classifier's. Both the pattern scan below and the
+	// usage-gated heuristic are skipped: the heuristic exists to catch failures no
+	// pattern names, and this one is named (and it is not a failure).
+	if RecoveredErrors(res) > 0 {
+		return false
+	}
 	if opencodeTransientRe.MatchString(text) {
 		return true
 	}
@@ -1834,6 +1907,12 @@ func (opencode) IsUnclassifiedTransient(res Result) bool {
 	}
 	text := opencodeErrorText(res)
 	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	// CLA-700: the same rule as IsTransient's — a session that recovered from its
+	// error events has no unrecognised failure to guess at, so the heuristic must
+	// not launder its exit status into a retry.
+	if RecoveredErrors(res) > 0 {
 		return false
 	}
 	return !opencodeTransientRe.MatchString(text)
