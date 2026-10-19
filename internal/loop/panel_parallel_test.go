@@ -441,3 +441,139 @@ func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
 		t.Errorf("fix sessions = %d, want 1", fixCalls)
 	}
 }
+
+// --- CLA-697, review round 1: the fix delta --------------------------------
+
+// TestPanelSpendLedgerAggregatesPeers pins the ledger's arithmetic: a member's
+// published total is what its SIBLINGS see, never itself (its own accumulator
+// already carries that), and a republish REPLACES the total rather than adding
+// to it — the member publishes its running accumulator, not a delta.
+func TestPanelSpendLedgerAggregatesPeers(t *testing.T) {
+	ledger := newPanelSpend()
+	one := &panelSpendHandle{ledger: ledger, self: ledger.join()}
+	two := &panelSpendHandle{ledger: ledger, self: ledger.join()}
+
+	if tokens, cost := one.peers(); tokens != 0 || cost != 0 {
+		t.Fatalf("a ledger with nothing published reports (%d, %v), want zero", tokens, cost)
+	}
+	one.publish(120, 0.60)
+	if tokens, cost := two.peers(); tokens != 120 || cost != 0.60 {
+		t.Errorf("the sibling's published spend reads (%d, %v), want (120, 0.6)", tokens, cost)
+	}
+	if tokens, cost := one.peers(); tokens != 0 || cost != 0 {
+		t.Errorf("a member must not count its own spend as a peer's: (%d, %v)", tokens, cost)
+	}
+	one.publish(200, 0.90)
+	two.publish(50, 0.25)
+	if tokens, cost := one.peers(); tokens != 50 || cost != 0.25 {
+		t.Errorf("the other member's republished total reads (%d, %v), want (50, 0.25)", tokens, cost)
+	}
+}
+
+// TestPanelSpendLedgerIsConcurrencySafe hammers the ledger from many goroutines:
+// the members really do publish from separate goroutines at once (CLA-697), and
+// the ledger's whole job is to make that safe. Run under -race it is the check
+// that matters; without it, it still pins that nothing panics or deadlocks.
+func TestPanelSpendLedgerIsConcurrencySafe(t *testing.T) {
+	ledger := newPanelSpend()
+	var wg sync.WaitGroup
+	for k := 0; k < 8; k++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			h := &panelSpendHandle{ledger: ledger, self: ledger.join()}
+			for i := 1; i <= 50; i++ {
+				h.publish(k*i, float64(k)*0.1)
+				h.peers()
+			}
+		}(k)
+	}
+	wg.Wait()
+}
+
+// TestDrainPhases_ParallelPanelStopsAMemberWhenTheAggregateReachesTheCeiling is
+// review finding 1.review-1.1's fix, end to end. With cap 2 over three members,
+// the third member waits on the concurrency slot until a sibling has ENDED; by
+// then that sibling's $0.50 is published, and the run-wide check reads
+// $0.10 (implement) + $0.50 (the sibling) ≥ the $0.50 ceiling, so the member
+// refuses to spawn. Before the fix its check measured only the prior run totals
+// plus its own (still zero) local spend and it spawned, taking the panel's spend
+// past the ceiling the aggregate had already reached.
+func TestDrainPhases_ParallelPanelStopsAMemberWhenTheAggregateReachesTheCeiling(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers()
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	// Only the concurrent pair runs to the barrier; the third member is parked on
+	// the cap until one of them ends, which is what staggers the starts.
+	a.expectConcurrent = 2
+	d := panelParallelDriver(t, a, rel, members, repo, tip, 2)
+	// The implement attempt spends $0.10; each review costs $0.50.
+	d.cfg.Budget = config.Budget{MaxCostUSD: 0.50}
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if !stop {
+		t.Error("a member tripping the run-wide ceiling must stop the run")
+	}
+	a.mu.Lock()
+	reviews := a.reviewCalls
+	fixCalls := a.fixCalls
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if reviews != 2 {
+		t.Errorf("review sessions = %d, want 2 — a member spawned against a ceiling the panel's aggregate had already reached", reviews)
+	}
+	if fixCalls != 0 {
+		t.Errorf("fix sessions = %d, want 0 — the run stopped on the ceiling instead", fixCalls)
+	}
+}
+
+// TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin is
+// review finding 1.review-3.1's fix: one member's pre-spawn baseline-read
+// failure must not expire the ONE claim its siblings are still recording under.
+// The claim here carries pushed work, so the handback is an expireLease — and
+// the property is that it happens EXACTLY ONCE (the panel's join), not once per
+// member. Before the fix each of the three members called releaseHeldClaim on
+// its way out, ending the shared lease three times over.
+func TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{
+		status:  "in_progress",
+		holder:  "r-1",
+		outcome: "implemented\n",
+		readErr: func() error { return errors.New("plane down") },
+	}
+	members := panelMembers()
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	a.mu.Lock()
+	reviews := a.reviewCalls
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if reviews != 0 {
+		t.Fatalf("review sessions = %d, want 0 — every member's baseline read failed", reviews)
+	}
+	rel.mu.Lock()
+	expires := append([]releaseCall(nil), rel.expireCalls...)
+	releases := append([]releaseCall(nil), rel.calls...)
+	rel.mu.Unlock()
+	if len(releases) != 0 {
+		t.Errorf("the claim carries pushed work and must never be Release()d: %v", releases)
+	}
+	if len(expires) != 1 {
+		t.Errorf("expireLease calls = %d, want exactly 1 (the join's single handback, not one per member): %v", len(expires), expires)
+	}
+}

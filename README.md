@@ -416,11 +416,15 @@ the one round the plane derives (`max(existing round) + 1` when nothing is
 sealed — deterministic for simultaneous first writers). Membership therefore
 needs no per-(task, phase) leases; what it needs is what ships here: a private
 checkout per member and a join that closes the round before the fix. The cap is
-also the budget breaker's granularity: members are spawned together, so their
-spend reaches the breaker as each one ends, and the cap bounds that overshoot to
-at most `cap - 1` sessions. `clankerbar doctor` prints the resolved panel, with
-each member's harness and model, so an overnight run's review spend is visible
-before it happens.
+also the budget breaker's granularity: the members share one run-wide ceiling,
+so each member publishes the spend it has counted to a shared panel ledger the
+moment its attempt ladder counts it, and every member's pre-spawn budget check
+measures the panel's **aggregate** — a member that starts after a sibling has
+already paid (the cap staggers them) sees that money against the ceiling. What
+no check can see is spend still in flight, so the residual overshoot stays
+bounded by the sessions running alongside it, at most `cap - 1`. `clankerbar
+doctor` prints the resolved panel, with each member's harness and model, so an
+overnight run's review spend is visible before it happens.
 
 ### Session-initiated handoff: a boundary the session chooses
 

@@ -405,6 +405,16 @@ type Driver struct {
 	// would race there rather than merely duplicate work.
 	claimFileMu sync.Mutex
 
+	// controlMu serialises control-marker CONSUMPTION and the RELOAD action
+	// (CLA-697 review finding 1.review-1.2). A parallel panel puts N members
+	// inside waitOrStop's loop at once, and reading a marker then removing it is
+	// not atomic: two members could both find RELOAD before either removed it
+	// and both would run applyReload, swapping d.cfg and invalidating the
+	// run-config overlays from two goroutines. Holding it across
+	// consume-then-act means the second consumer finds the marker already gone —
+	// exactly what a single-threaded loop would see.
+	controlMu sync.Mutex
+
 	// deadTally is this run's dead-phase tally, keyed by phase label and harness
 	// name (CLA-402): how many phase sessions ran and how many of those died
 	// producing nothing. Like spentBy it is the RUN's account — the rate is
@@ -731,11 +741,17 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			d.restartRequested.Store(true)
 			return nil
 		}
+		// Locked against a panel member's wait-side RELOAD (CLA-697 review finding
+		// 1.review-1.2): both consume the same marker, and the read-then-remove is
+		// not atomic — the lock is what makes the reload happen once, on one
+		// goroutine, whatever else is parked in waitOrStop.
+		d.controlMu.Lock()
 		if present, _ := d.readMarker(MarkerReload); present {
 			_ = d.state.Remove(MarkerReload)
 			log.Print("RELOAD requested — re-reading the config file at the iteration boundary")
 			d.applyReload()
 		}
+		d.controlMu.Unlock()
 		idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 		if d.cfg.MaxIterations > 0 && drains >= d.cfg.MaxIterations {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
@@ -4062,6 +4078,15 @@ type phaseRunOpts struct {
 	// round's close. A member must not close it itself: its siblings may still be
 	// recording, and the close is what releases the findings they must not see.
 	panelParallel bool
+
+	// panelSpend, when non-nil, is this member's handle on its panel's shared
+	// spend ledger (CLA-697 review finding 1.review-1.1). Every attempt's counted
+	// spend is published to it the moment the ladder counts it, and the ladder's
+	// pre-spawn budget check measures the run's totals PLUS the siblings' counted
+	// spend. Without it each member compared the same prior snapshot plus its own
+	// local spend against a run-wide ceiling none of them could see the others
+	// approaching. Nil for every caller that is not a parallel panel member.
+	panelSpend *panelSpendHandle
 }
 
 // panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).
@@ -4187,14 +4212,29 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		review.role = reviewerRoleFor(phases, phaseIdx)
 		review.baseline, review.read = d.readReviewBaseline(ctx, t, prev)
 		if !review.read {
-			log.Printf("%siteration %d: refusing to spawn the %s phase: the task could not be read before it spawned, so this phase's record cannot be judged against the task it found — the sequence ends here without the review; the claim is released when it is releasable, else left to lapse into a takeover",
-				labelOf(t), drainNum, ph.Label(phaseIdx))
 			end.empty = true
 			end.emptyWhy = "the task's outcome could not be read before the review phase spawned"
+			if opts.panelParallel {
+				// CLA-697 review finding 1.review-3.1: this claim is the ONE the
+				// whole panel is working under. Releasing it here would expire a
+				// lease the other members' in-flight sessions are still appending
+				// their records under — their durable writes would be
+				// unauthorized and the panel would lose findings it had already
+				// earned. Only the JOIN may dispose of it, and it does: the
+				// panel's deferred handback runs once, in drainPhases, after every
+				// member has ended.
+				log.Printf("%siteration %d: refusing to spawn the %s phase: the task could not be read before it spawned, so this phase's record cannot be judged against the task it found — the sequence ends here without the review; this member leaves the SHARED claim to the panel's join, because a release here would expire the lease its siblings are still recording under",
+					labelOf(t), drainNum, ph.Label(phaseIdx))
+			} else {
+				log.Printf("%siteration %d: refusing to spawn the %s phase: the task could not be read before it spawned, so this phase's record cannot be judged against the task it found — the sequence ends here without the review; the claim is released when it is releasable, else left to lapse into a takeover",
+					labelOf(t), drainNum, ph.Label(phaseIdx))
+			}
 			if prev != nil {
 				end.claim = prev
-				end.released = prev.Claim.Held()
-				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
+				if !opts.panelParallel {
+					end.released = prev.Claim.Held()
+					end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
+				}
 			}
 			return 0, 0, false, end, nil
 		}
@@ -4359,6 +4399,29 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// retried is several paid sessions, so every attempt the ladder spawned is
 	// folded in here where the entry is built.
 	pass := sessionSpend{}
+	// The budget breaker's view of this decision, beside the run's own totals
+	// (CLA-697 review finding 1.review-1.1). For a PARALLEL panel member the
+	// siblings' published spend is part of it: the members share the run's
+	// ceilings, and a check that measured only the shared `prior` plus this
+	// member's own local spend could spawn an attempt the panel's AGGREGATE had
+	// already made unaffordable. Nil handle — every other caller — returns
+	// exactly the arithmetic the ladder has always done.
+	sofar := func() (int, float64) {
+		tokensSoFar, costSoFar := prior.tokens+tokens, prior.cost+cost
+		if opts.panelSpend != nil {
+			peersTokens, peersCost := opts.panelSpend.peers()
+			tokensSoFar += peersTokens
+			costSoFar += peersCost
+		}
+		return tokensSoFar, costSoFar
+	}
+	// Every attempt's spend reaches the ledger the moment the ladder counts it,
+	// so a sibling's next pre-spawn check sees a member that has already paid.
+	publishSpend := func() {
+		if opts.panelSpend != nil {
+			opts.panelSpend.publish(tokens, cost)
+		}
+	}
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
 		// just waited — a supervised wait on a usage limit, an exponential backoff
@@ -4367,9 +4430,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// an operator is least likely to have set. A drain that re-spawns a paid
 		// session on a loop is the expensive failure this stops, whatever put it
 		// there (CLA-258).
-		if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+		spentTokens, spentCost := sofar()
+		if dim := d.budgetTrip(spentTokens, spentCost, time.Since(prior.start)); dim != "" {
 			log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-				drainNum, dim, prior.tokens+tokens, prior.cost+cost, time.Since(prior.start).Round(time.Second))
+				drainNum, dim, spentTokens, spentCost, time.Since(prior.start).Round(time.Second))
 			return tokens, cost, true, end, nil
 		}
 
@@ -5061,6 +5125,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			if res.Untrusted == "" {
 				tokens += res.Tokens
 				cost += res.CostUSD
+				publishSpend()
 				recordPassSpend(end.session, a, &pass, &res)
 				d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 			}
@@ -5094,6 +5159,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
+		publishSpend()
 		// The pass's own session entry takes the same figures, in the same breath
 		// (CLA-691): every attempt the loop counts is money the record attributes
 		// to the pass, and none it refuses is.
@@ -5150,14 +5216,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// Probed on the harness that hit the limit, in that harness's own
 			// session shape: a usage limit is a property of one provider's account,
 			// so probing the run's default harness would answer a question nobody
-			// asked, and spend on it.
+			// asked, and spend on it. The panel AGGREGATE rides `sofar` too (see
+			// above): a sibling's counted spend counts against the same ceiling
+			// this wait's probes are about to spend under.
+			waitTokens, waitCost := sofar()
 			ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, t, spend{
 				start:  prior.start,
-				tokens: prior.tokens + tokens,
-				cost:   prior.cost + cost,
+				tokens: waitTokens,
+				cost:   waitCost,
 			})
 			tokens += ptokens
 			cost += pcost
+			publishSpend()
 			if pstop {
 				return tokens, cost, true, end, nil
 			}
@@ -7472,35 +7542,15 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 	wallStart := time.Now().Round(0)
 	end := time.Now().Add(dur)
 	for {
-		if present, _ := d.readMarker("STOP"); present {
-			_ = d.state.Remove("STOP")
-			log.Print("STOP requested during wait — stopping")
+		// The marker pass is serialised against every other consumer in this
+		// process (CLA-697 review finding 1.review-1.2): a parallel panel's
+		// members all reach this loop, and two of them reading one RELOAD before
+		// either removed it would apply the reload twice, from two goroutines.
+		d.controlMu.Lock()
+		stop := d.consumeWaitControls()
+		d.controlMu.Unlock()
+		if stop {
 			return true
-		}
-		if present, msg := d.readMarker(MarkerRestart); present {
-			_ = d.state.Remove(MarkerRestart)
-			if msg != "" {
-				log.Printf("RESTART requested during wait: %s", msg)
-			} else {
-				log.Print("RESTART requested during wait")
-			}
-			d.restartRequested.Store(true)
-			return true
-		}
-		if present, msg := d.readMarker(MarkerRestartNow); present {
-			_ = d.state.Remove(MarkerRestartNow)
-			if msg != "" {
-				log.Printf("RESTART_NOW requested during wait: %s", msg)
-			} else {
-				log.Print("RESTART_NOW requested during wait")
-			}
-			d.restartRequested.Store(true)
-			return true
-		}
-		if present, _ := d.readMarker(MarkerReload); present {
-			_ = d.state.Remove(MarkerReload)
-			log.Print("RELOAD requested during wait — reloading config; this wait keeps its schedule")
-			d.applyReload()
 		}
 		remaining := time.Until(end)
 		if remaining <= 0 {
@@ -7520,6 +7570,49 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 		case <-time.After(w):
 		}
 	}
+}
+
+// consumeWaitControls reads and consumes the control markers waitOrStop honours:
+// STOP, the restart family, and RELOAD (which is APPLIED here, in place, as
+// control.go describes). It reports whether the wait must stop, which is true
+// for STOP and either restart marker.
+//
+// The caller MUST hold d.controlMu: the read-then-remove of a marker is not
+// atomic, and a parallel panel's members can be in this wait at the same time
+// (CLA-697 review finding 1.review-1.2). The lock is what makes a marker a
+// single-consumer switch no matter how many waiters are parked on it.
+func (d *Driver) consumeWaitControls() bool {
+	if present, _ := d.readMarker("STOP"); present {
+		_ = d.state.Remove("STOP")
+		log.Print("STOP requested during wait — stopping")
+		return true
+	}
+	if present, msg := d.readMarker(MarkerRestart); present {
+		_ = d.state.Remove(MarkerRestart)
+		if msg != "" {
+			log.Printf("RESTART requested during wait: %s", msg)
+		} else {
+			log.Print("RESTART requested during wait")
+		}
+		d.restartRequested.Store(true)
+		return true
+	}
+	if present, msg := d.readMarker(MarkerRestartNow); present {
+		_ = d.state.Remove(MarkerRestartNow)
+		if msg != "" {
+			log.Printf("RESTART_NOW requested during wait: %s", msg)
+		} else {
+			log.Print("RESTART_NOW requested during wait")
+		}
+		d.restartRequested.Store(true)
+		return true
+	}
+	if present, _ := d.readMarker(MarkerReload); present {
+		_ = d.state.Remove(MarkerReload)
+		log.Print("RELOAD requested during wait — reloading config; this wait keeps its schedule")
+		d.applyReload()
+	}
+	return false
 }
 
 // readMarker reports whether a control marker file exists, and its first line.
