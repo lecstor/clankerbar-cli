@@ -6767,7 +6767,21 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 		workdir = d.cfg.WorkDir
 	}
 	dir, err := config.ResolveCheckout(t.Repos, t.PrimaryRepo, workdir, repo)
-	return dir, briefed, repo, err
+	if err != nil {
+		return dir, briefed, repo, err
+	}
+	// With the per-project layout declared, the session must START inside the
+	// project root its permission scope is bounded to. ResolveCheckout prefers
+	// an explicit `repos` path, so a stale override pointing at a developer
+	// checkout would otherwise run the session outside the project and hand
+	// that path to the policy (CLA-678 review round 2, finding 3). The
+	// materialized config already rewrites the overrides; this is the
+	// driver-side refusal that holds even for a config that adopted the layout
+	// by hand.
+	if t.ProjectRoot && dir != "" && !insideProjectRoot(workdir, dir) {
+		return dir, briefed, repo, fmt.Errorf("repo checkout %s resolves outside the project root %s - refusing to start the session outside its declared scope", dir, workdir)
+	}
+	return dir, briefed, repo, nil
 }
 
 // prBaseProbeTimeout bounds the one network round-trip prBaseFor runs. It is a
@@ -6953,6 +6967,17 @@ func (d *Driver) extraDirsFor(t Target, spawnDir string) []string {
 	if workdir == "" {
 		workdir = d.cfg.WorkDir
 	}
+	// With the per-project layout declared, every grant must stay INSIDE the
+	// project root. The scope below is additive: declared checkouts are added
+	// before it, so a stale `repos` override pointing at a developer checkout
+	// would be granted outright even though the session is scoped to the
+	// project — the escape the layout exists to close (CLA-678 review round 2,
+	// finding 3). sessionDir refuses such a checkout as a spawn dir; this also
+	// keeps it out of the reach list, alongside the conventional worktree area.
+	root := ""
+	if t.ProjectRoot && workdir != "" {
+		root = workdir
+	}
 	declared := config.DeclaredCheckouts(t.Repos, t.PrimaryRepo, workdir)
 	var out []string
 	seen := map[string]bool{}
@@ -6964,12 +6989,18 @@ func (d *Driver) extraDirsFor(t Target, spawnDir string) []string {
 		out = append(out, dir)
 	}
 	for _, dir := range declared {
+		if root != "" && !insideProjectRoot(root, dir) {
+			log.Printf("%sdeclared checkout %s is outside the project root %s - not adding it to the session's permissions", labelOf(t), dir, workdir)
+			continue
+		}
 		add(dir)
 	}
 	if spawnDir != "" {
 		wt := filepath.Join(filepath.Dir(spawnDir), filepath.Base(spawnDir)+"-wt")
 		if fi, err := os.Stat(wt); err == nil && fi.IsDir() {
-			add(wt)
+			if root == "" || insideProjectRoot(root, wt) {
+				add(wt)
+			}
 		}
 	}
 	// The PROJECT ROOT and its children (CLA-678), when the config declares the
@@ -7014,6 +7045,43 @@ func projectScope(workdir, spawnDir string) string {
 		return ""
 	}
 	return wd
+}
+
+// insideProjectRoot reports whether path is the project root itself or lies
+// inside it. Both sides are compared on canonical paths, so a symlinked
+// checkout cannot masquerade as inside the root — the supervisor's derivation
+// refuses symlinks at the derived checkout, and this is the driver-side
+// containment the additive permission list needs.
+func insideProjectRoot(root, path string) bool {
+	if root == "" || path == "" {
+		return false
+	}
+	r, p := canonicalPath(root), canonicalPath(path)
+	if r == p {
+		return true
+	}
+	rel, err := filepath.Rel(r, p)
+	if err != nil {
+		return false
+	}
+	rel = filepath.ToSlash(rel)
+	return rel != ".." && !strings.HasPrefix(rel, "../")
+}
+
+// canonicalPath resolves a path for containment comparison: absolute, cleaned,
+// and with symlinks resolved when the path exists. A path that exists only
+// lexically (a missing entry) is returned absolute-but-unresolved — the
+// comparison then treats it by name, never as some other directory.
+func canonicalPath(dir string) string {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		abs = dir
+	}
+	abs = filepath.Clean(abs)
+	if real, err := filepath.EvalSymlinks(abs); err == nil {
+		return real
+	}
+	return abs
 }
 
 // childDirs lists the immediate subdirectories of dir that exist, sorted. It is

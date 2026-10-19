@@ -359,11 +359,137 @@ func TestResolveInstanceAppliesTheDerivedRootToAZeroProjectsConfig(t *testing.T)
 		PrimaryRepo: "acme/widgets",
 		WorkDir:     t.TempDir(),
 	}
-	applyDerivedWorkdirs(cfg, map[string]string{"acme": filepath.Join(root, "acme")})
+	if err := applyDerivedWorkdirs(cfg, map[string]string{"acme": filepath.Join(root, "acme")}); err != nil {
+		t.Fatalf("applyDerivedWorkdirs: %v", err)
+	}
 	if cfg.ProjectRoot {
 		t.Error("project_root = true although no derived root was applied")
 	}
 	if cfg.WorkDir == filepath.Join(root, "acme") {
 		t.Error("applyDerivedWorkdirs wrote another project's root into this config")
+	}
+}
+
+// CLA-678 review round 2 (findings 1 and 2): with WorkdirRoot active and a
+// `repos` override pointing at an existing developer checkout OUTSIDE the
+// project root, the derivation clones <root>/<slug>/<name> but the old code
+// left the override in place. config.ResolveCheckout prefers an explicit
+// entry, so the session started in — and was granted — the developer's
+// checkout while the fleet clone sat unused. The materialized config must
+// resolve every declared identity to the managed clone instead.
+func TestResolveInstanceRewritesRepoOverridesToTheFleetClone(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "widgets")
+	makeCheckout(t, outside, "acme/widgets") // a REAL checkout of the same repo, outside
+	pointClonesAt(t, makeBareRemote(t, "acme/widgets"))
+
+	cacheDir := t.TempDir()
+	o := materializeOptions(t, cacheDir, root)
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
+
+	cfg := &config.Config{
+		Harness:     "claude",
+		Prompt:      "Work the next backlog item.",
+		BacklogURL:  "https://clankerbar.com/mcp/acme",
+		PrimaryRepo: "acme/widgets",
+		Repos:       map[string]string{"acme/widgets": outside},
+		WorkDir:     t.TempDir(),
+	}
+	got, stateDir, err := d.resolveInstance(cfg)
+	if err != nil {
+		t.Fatalf("resolveInstance: %v", err)
+	}
+	managed := filepath.Join(root, "acme", "widgets")
+
+	if got.Repos["acme/widgets"] != managed {
+		t.Fatalf("repos override = %q, want the managed clone %q", got.Repos["acme/widgets"], managed)
+	}
+	dir, err := config.ResolveCheckout(got.ReposFor(""), got.PrimaryRepoFor(""), got.WorkDir, "acme/widgets")
+	if err != nil {
+		t.Fatalf("ResolveCheckout against the resolved config: %v", err)
+	}
+	if dir != managed {
+		t.Errorf("session checkout = %q, want the managed clone %q (never the developer checkout %q)", dir, managed, outside)
+	}
+	for _, granted := range config.DeclaredCheckouts(got.ReposFor(""), got.PrimaryRepoFor(""), got.WorkDir) {
+		if granted == outside {
+			t.Errorf("declared checkouts = %v; the outside checkout %q must not be granted", config.DeclaredCheckouts(got.ReposFor(""), got.PrimaryRepoFor(""), got.WorkDir), outside)
+		}
+	}
+
+	// The rewrite must survive materialization — that file is what the child
+	// daemon loads, so a value changed only in memory never reaches a session.
+	inst := &Instance{name: "daemon-one", cfg: got, stateDir: stateDir}
+	path, err := d.materializeConfig(inst)
+	if err != nil {
+		t.Fatalf("materializeConfig: %v", err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("the materialized config does not load: %v", err)
+	}
+	if loaded.ReposFor("")["acme/widgets"] != managed {
+		t.Errorf("materialized repos override = %q, want the managed clone %q", loaded.ReposFor("")["acme/widgets"], managed)
+	}
+	if dir, err := config.ResolveCheckout(loaded.ReposFor(""), loaded.PrimaryRepoFor(""), loaded.WorkDir, "acme/widgets"); err != nil || dir != managed {
+		t.Errorf("materialized session checkout = %q (%v), want the managed clone %q", dir, err, managed)
+	}
+}
+
+// The same rewrite for a multi-project config: each project's own map is
+// rewritten against ITS root, and a project that inherits the top-level map
+// gets a rewritten copy of it rather than one global rewrite that could only
+// be right for one project.
+func TestApplyDerivedWorkdirsRewritesEveryProjectToItsOwnClone(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	acmeManaged := filepath.Join(root, "acme", "widgets")
+	otherManaged := filepath.Join(root, "other", "thing")
+	outsideWidgets := filepath.Join(outside, "widgets")
+	outsideThing := filepath.Join(outside, "thing")
+	for _, dir := range []string{acmeManaged, otherManaged, outsideWidgets, outsideThing} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := &config.Config{
+		WorkDir: outside, // the multi-repo parent; not derived
+		Repos:   map[string]string{"other/thing": outsideThing},
+		Projects: []config.Project{
+			{Slug: "acme", PrimaryRepo: "acme/widgets", Repos: map[string]string{"acme/widgets": outsideWidgets}},
+			{Slug: "other", PrimaryRepo: "other/thing"},
+		},
+	}
+	derived := map[string]string{
+		"acme":  filepath.Join(root, "acme"),
+		"other": filepath.Join(root, "other"),
+	}
+	if err := applyDerivedWorkdirs(cfg, derived); err != nil {
+		t.Fatalf("applyDerivedWorkdirs: %v", err)
+	}
+	if !cfg.ProjectRoot {
+		t.Error("project_root = false, want true once the roots were applied")
+	}
+	if got := cfg.Projects[0].Repos["acme/widgets"]; got != acmeManaged {
+		t.Errorf("acme repos override = %q, want %q", got, acmeManaged)
+	}
+	if got := cfg.Projects[1].Repos["other/thing"]; got != otherManaged {
+		t.Errorf("other repos override = %q, want a copy pointing at %q", got, otherManaged)
+	}
+	// The shared top-level map is not rewritten: it belongs to more than one
+	// project, and each project now carries its own rewritten copy.
+	if got := cfg.Repos["other/thing"]; got != outsideThing {
+		t.Errorf("top-level repos override = %q; it must stay as declared and not be rewritten for one project", got)
+	}
+	for i, want := range []string{acmeManaged, otherManaged} {
+		p := cfg.Projects[i]
+		dir, err := config.ResolveCheckout(p.Repos, p.PrimaryRepo, p.WorkDir, "")
+		if err != nil {
+			t.Fatalf("project %s: ResolveCheckout: %v", p.Slug, err)
+		}
+		if dir != want {
+			t.Errorf("project %s session checkout = %q, want %q", p.Slug, dir, want)
+		}
 	}
 }

@@ -58,6 +58,14 @@ import (
 // to; the session itself still starts in the task's checkout INSIDE it, which
 // the config's own repo resolution finds at <project root>/<repo name>.
 //
+// Applying a project root also REWRITES that project's `repos` path overrides
+// to the fleet's own clones under it (managedCheckouts). The derivation
+// just cloned them; leaving the operator's path in place would make
+// config.ResolveCheckout prefer the developer's checkout over the clone the
+// fleet created, and DeclaredCheckouts would hand that outside path to the
+// session's permission policy — the managed clone would sit unused while the
+// session ran (and could edit) outside its project root.
+//
 // The top-level workdir of a MULTI-project config stays as declared — it is
 // the multi-repo parent, which the derivation does not derive (sessions run in
 // the per-project workdirs).
@@ -70,7 +78,7 @@ import (
 // top-level conventions resolved against it (mcp_config_path discovery,
 // relative settings_path, Config.Identity) would vary with wherever the
 // supervisor happened to start rather than the project root the entry names.
-func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
+func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) error {
 	if len(cfg.Projects) == 0 {
 		// The single-project config's derived root is keyed by the slug its MCP
 		// endpoint names (deriveInstanceWorkdirs), not by "". Only a root that
@@ -79,13 +87,34 @@ func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 		if dir, ok := derived[cfg.Slug()]; ok {
 			cfg.WorkDir = dir
 			cfg.ProjectRoot = true
+			repos, err := managedCheckouts(cfg.Repos, dir)
+			if err != nil {
+				return fmt.Errorf("project %s: %w", cfg.Slug(), err)
+			}
+			cfg.Repos = repos
 		}
-		return
+		return nil
 	}
 	for i := range cfg.Projects {
-		if dir, ok := derived[cfg.Projects[i].Slug]; ok {
-			cfg.Projects[i].WorkDir = dir
-			cfg.ProjectRoot = true
+		dir, ok := derived[cfg.Projects[i].Slug]
+		if !ok {
+			continue
+		}
+		cfg.Projects[i].WorkDir = dir
+		cfg.ProjectRoot = true
+		// Rewrite this project's EFFECTIVE map — its own when it declares one,
+		// else the top-level fallback — into a FRESH map carrying the same
+		// identity keys and this project's managed clones. A fresh map (rather
+		// than an in-place rewrite) is load-bearing twice over: the effective
+		// map may be the top-level one shared by every project (whose roots
+		// differ), and Config.Clone shares these maps with the base config
+		// that the supervisor re-reads on every build.
+		repos, err := managedCheckouts(cfg.ReposFor(cfg.Projects[i].Slug), dir)
+		if err != nil {
+			return fmt.Errorf("project %s: %w", cfg.Projects[i].Slug, err)
+		}
+		if repos != nil {
+			cfg.Projects[i].Repos = repos
 		}
 	}
 	if len(cfg.Projects) == 1 {
@@ -99,6 +128,41 @@ func applyDerivedWorkdirs(cfg *config.Config, derived map[string]string) {
 	// would be guessing where a generated file can simply state the fact. Set
 	// only when a derived root was actually applied — the flag asserts the
 	// layout, so it must not claim one that was never written.
+	return nil
+}
+
+// managedCheckouts returns a COPY of a project's `repos` map whose path
+// OVERRIDES all resolve to the fleet's own clones under the derived project
+// root: <project root>/<repo name>. The identity KEYS are kept — they are what
+// the project declares, what a task's `repo` field names, and what the
+// derivation cloned — and only the local path value is replaced. An empty map
+// yields nil, so a config that declares no path overrides keeps its shape.
+//
+// This is the materialization half of the project-root containment (CLA-678
+// review round 2). config.ResolveCheckout prefers an explicit `repos` entry
+// over every convention, and DeclaredCheckouts hands every explicit entry to
+// the session's permission policy. Without the rewrite, a config carrying
+// `repos: {"acme/widgets": "/Users/me/dev/widgets"}` would start the session in
+// that developer checkout and grant it, while the fleet clone the derivation
+// just made sat unused — the session would read and edit outside the project
+// root the layout promises.
+//
+// An identity whose last segment is empty, "." or ".." names no manageable
+// checkout and is refused rather than joined, because ".." would escape the
+// project root.
+func managedCheckouts(repos map[string]string, projectRoot string) (map[string]string, error) {
+	if len(repos) == 0 {
+		return nil, nil
+	}
+	out := make(map[string]string, len(repos))
+	for identity := range repos {
+		name := basenameOfRepo(identity)
+		if name == "" || name == "." || name == ".." {
+			return nil, fmt.Errorf("repo identity %q does not name a checkout directory", identity)
+		}
+		out[identity] = filepath.Join(projectRoot, name)
+	}
+	return out, nil
 }
 
 // materializeConfig builds the instance's effective config and writes it into

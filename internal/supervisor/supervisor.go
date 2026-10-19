@@ -821,7 +821,9 @@ func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string
 		if err != nil {
 			return nil, "", err
 		}
-		applyDerivedWorkdirs(cfg, derived)
+		if err := applyDerivedWorkdirs(cfg, derived); err != nil {
+			return nil, "", err
+		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, "", err

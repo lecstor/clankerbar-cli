@@ -146,10 +146,14 @@ func TestBuildConfigRosterWithoutPrimaryRepoKeepsBaseWiring(t *testing.T) {
 	}
 }
 
-// With CLANKERBAR_WORKDIR_ROOT stated, derivation overrides WORKDIR ONLY: the
-// base entry's repos, mcp_config_path(s), pr_base and the rest survive the
-// derived checkout.
-func TestBuildConfigWorkdirDerivationOverridesOnlyWorkdir(t *testing.T) {
+// With CLANKERBAR_WORKDIR_ROOT stated, derivation overrides the WORKDIR and the
+// repo PATH overrides (each declared identity resolves to its managed clone
+// under the derived root, keeping its identity key). Everything else — the base
+// entry's mcp_config_path, pr_base and the rest — survives the derived
+// checkout. The path rewrite is CLA-678 review round 2: an override left
+// pointing at a developer checkout would be preferred by ResolveCheckout and
+// handed to the session's permission policy, outside the project root.
+func TestBuildConfigWorkdirDerivationRewritesRepoPaths(t *testing.T) {
 	root := t.TempDir()
 	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
 
@@ -186,13 +190,13 @@ func TestBuildConfigWorkdirDerivationOverridesOnlyWorkdir(t *testing.T) {
 		t.Errorf("the project's repo was not materialized under its root: %v", err)
 	}
 	if p.MCPConfigPath != mcp {
-		t.Errorf("mcp_config_path = %q, want the base entry's %q (derivation overrides workdir only)", p.MCPConfigPath, mcp)
+		t.Errorf("mcp_config_path = %q, want the base entry's %q (derivation rewrites only the workdir and repo paths)", p.MCPConfigPath, mcp)
 	}
-	if p.Repos["acme/widgets"] != checkout {
-		t.Errorf("repos = %v, want the base entry's map (derivation overrides workdir only)", p.Repos)
+	if want := filepath.Join(root, "acme", "widgets"); p.Repos["acme/widgets"] != want {
+		t.Errorf("repos = %v, want acme/widgets -> the managed clone %q, not the base override %q", p.Repos, want, checkout)
 	}
 	if p.PRBase["acme/widgets"] != "develop" {
-		t.Errorf("pr_base = %v, want the base entry's map (derivation overrides workdir only)", p.PRBase)
+		t.Errorf("pr_base = %v, want the base entry's map (derivation rewrites only the workdir and repo paths)", p.PRBase)
 	}
 }
 
