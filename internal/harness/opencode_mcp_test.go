@@ -194,6 +194,17 @@ func TestOpencodeWorkDirResolvesSymlinks(t *testing.T) {
 	}
 }
 
+// The run must attach to the adapter's server, never spawn a second private one:
+// --standalone is removed and --server is inserted after the subcommand.
+func TestWithOpencodeServer(t *testing.T) {
+	args := []string{"run", "--standalone", "--format", "json", "--agent", "build", "--", "hi"}
+	got := strings.Join(withOpencodeServer(args, "http://127.0.0.1:1234"), " ")
+	want := "run --server http://127.0.0.1:1234 --format json --agent build -- hi"
+	if got != want {
+		t.Errorf("withOpencodeServer = %q, want %q", got, want)
+	}
+}
+
 // The wait targets the clankerbar server(s) the config names, and not some
 // unrelated MCP server in the same file or an ambient layer.
 func TestOpencodeMCPServers(t *testing.T) {
