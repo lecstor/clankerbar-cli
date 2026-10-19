@@ -34,11 +34,12 @@ limit for ~82s before it exits).
 | `_permissions/readonly` | A probe-shaped run is offered no `edit`, `write` or `shell`, and writes nothing. |
 | `_permissions/ambient *` | A project opencode.json in the session's checkout carrying `agent.build.permission`, `agents.build.permissions`, `default_agent` or a top-level `permission` that allows everything leaves out-of-tree reads/writes refused, webfetch/subagent unoffered, and in-tree writes working. |
 | `_permissions/pattern` | Last-match-wins: `shell: {"*":"allow","git push*":"deny"}` denies the push and runs the other command. The policy's ordering depends on this. |
-| `_mcpClaim/v1`, `/v2` | With an MCP config in either dialect, `clankerbar_claim_task` runs top-level (never through `execute`), the claim is observed (task, run id), the fake MCP server saw the call, and the warm-up note reached the model. Logs when the first-turn race fired. |
+| `_mcpClaim/v1`, `/v2` | With an MCP config in either dialect, `clankerbar_claim_task` runs top-level (never through `execute`), the claim is observed (task, run id), the fake MCP server saw the call, and the FIRST tool-bearing request already offered the clankerbar tool — the adapter waits for its private server to report the MCP connection before it submits the prompt (CLA-703). The old warm-up note is asserted absent. |
 | `_largeClaim` | A 120 KB claim_task result, which 2.x truncates to a pointer at a saved file, is still observed as a held claim. |
 | `_mcpDisable` | A full MCP entry with the off switch stops a server the global config declares; a partial one (no `type`) is logged as leaving it running. |
 | `_resume` | `-s <sid>` continues the same session headlessly, the resumed run is charged only its own requests, and the session holds both turns. |
 | `_errors` | 401 -> `provider.auth`, not transient; unknown model -> `provider.no-route`, no request sent, not transient; 429 -> `provider.rate-limit`, transient. None reports usage. |
+| `_recoveredProviderError` | The #43622 stream shape (every `finish_reason` null, then `[DONE]`): 2.0.32 emits `provider.invalid-output`, RETRIES the request itself, finishes the turn — and exits **1** anyway. The adapter records the recovered events and classifies the session as neither transient nor failed (CLA-700). |
 | `_contentPin` | `OPENCODE_CONFIG_CONTENT` wins over `OPENCODE_CONFIG`. The permission policy and the Code Mode rewrite live in that layer. |
 
 ## How the hermetic harness works
@@ -75,10 +76,11 @@ tools (re-checked on 2.0.32 on 2026-10-18). doctor still FAILs that combination,
 the right verdict for a different reason than the one it gives.
 
 ## Related
-
 - [`docs/opencode-build.md`](./opencode-build.md) - which build the fleet runs and how the
   adapter drives it.
 - [`docs/opencode-tool-schema-limits.md`](./opencode-tool-schema-limits.md) - the gateway
   tool-schema rejection family.
+- anomalyco/opencode#43622 - the 1.x stream-without-`finish_reason` report; its 2.x successor
+  is what `_recoveredProviderError` pins (CLA-700).
 - CLA-675 (the 2.x move and this suite), CLA-441 (the content-layer pin), CLA-406
   (resurrection), CLA-381 (transient classification), CLA-263 (the mcpServers refusal).

@@ -46,6 +46,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
+	"github.com/lecstor/clankerbar-cli/internal/supervisor"
 )
 
 // status is a check's verdict. The ordering matters only for reporting.
@@ -293,6 +294,13 @@ func checkConfig(cfg *config.Config) check {
 		workdir = "(current directory)"
 	}
 	c.info = append(c.info, "harness: "+cfg.Harness, "workdir: "+workdir)
+	// The one setting that changes what the terminal SHOWS rather than what the
+	// daemon does (CLA-701): with it on, a session's whole stream is mirrored to
+	// the terminal again, which is worth knowing before an operator wonders why
+	// their overnight pane is unreadable.
+	if cfg.EchoSessions {
+		c.info = append(c.info, "echo_sessions: true - session streams are echoed to the terminal as well as their iteration logs")
+	}
 	// Which phase runs where, but only when that is not the same answer twice: a
 	// mixed sequence is the one config where "harness: <x>" above is true and
 	// incomplete, and the pairing is what an operator wants to eyeball before an
@@ -310,7 +318,17 @@ func checkConfig(cfg *config.Config) check {
 	// reviewer their phases will run. Empty when the sequence has no built-in,
 	// non-final review phase, because then no review gate runs at all.
 	if panel := panelLabels(cfg); len(panel) > 0 {
-		c.info = append(c.info, "review panel: "+strings.Join(panel, ", "))
+		// CLA-697: the members run concurrently by default; say when the cap
+		// makes that not the whole panel, because a sequential (cap 1) or
+		// throttled panel is a choice that changes the round's wall time.
+		line := "review panel: " + strings.Join(panel, ", ")
+		switch n := cfg.EffectivePanelConcurrency(len(panel)); {
+		case n == 1:
+			line += " (sequential)"
+		case n < len(panel):
+			line += fmt.Sprintf(" (at most %d at once)", n)
+		}
+		c.info = append(c.info, line)
 	} else if r := singleReviewerLabel(cfg); r != "" {
 		c.info = append(c.info, "review: single reviewer ("+r+")")
 	}
@@ -482,13 +500,195 @@ func checkRepos(cfg *config.Config) []check {
 	}
 
 	if len(cfg.Projects) == 0 {
-		return []check{report("repos", cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)}
+		return append([]check{report("repos", cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)},
+			checkProjectRoot("project root", cfg, cfg.ReposFor(""), cfg.PrimaryRepoFor(""), cfg.WorkDir)...)
 	}
-	out := make([]check, 0, len(cfg.Projects))
+	out := make([]check, 0, 2*len(cfg.Projects))
 	for _, p := range cfg.Projects {
-		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), projectWorkDir(cfg, p)))
+		workdir := projectWorkDir(cfg, p)
+		out = append(out, report("repos["+p.Slug+"]", cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), workdir))
+		out = append(out, checkProjectRoot("project root["+p.Slug+"]", cfg, cfg.ReposFor(p.Slug), cfg.PrimaryRepoFor(p.Slug), workdir)...)
 	}
 	return out
+}
+
+// checkProjectRoot reports on the per-project layout (CLA-678): with
+// `project_root` declared, every workdir in the config is a fleet project root
+// — <root>/<project slug>, holding that project's clones under
+// <project root>/<repo name> and its worktrees under
+// <project root>/worktrees — and this check FAILS when the layout does not
+// hold, because every one of those facts is load-bearing at run time:
+//
+//   - a configured repo resolving OUTSIDE the project root is a session
+//     reading a tree its permission scope does not cover, or one the fleet
+//     will try to clone over;
+//   - a clone whose origin names a different repo than the identity it sits
+//     under is the wrong-repo read the layout exists to prevent (the same
+//     attribution rule the supervisor's derivation enforces, checked here
+//     before a daemon is refused at spawn time);
+//   - a missing or outside-the-root worktrees directory is where a task
+//     worktree fails to be created, which costs an iteration its whole session.
+//
+// A config that does not declare `project_root` gets no check: there the
+// workdir is whatever the operator pointed it at, and its repos are wherever
+// the `repos` map says, by design.
+func checkProjectRoot(label string, cfg *config.Config, repos map[string]string, primary, workdir string) []check {
+	if !cfg.ProjectRoot {
+		return nil
+	}
+	c := check{name: label}
+	if strings.TrimSpace(workdir) == "" {
+		c.status = fail
+		c.detail = "project_root is declared but no workdir names the project root"
+		c.remedy = "set workdir to <root>/<project slug>, or drop project_root"
+		return []check{c}
+	}
+	rootAbs, err := filepath.Abs(workdir)
+	if err != nil {
+		c.status = fail
+		c.detail = fmt.Sprintf("workdir %s cannot be resolved: %v", workdir, err)
+		return []check{c}
+	}
+	rootAbs = filepath.Clean(rootAbs)
+
+	var problems []string
+	// The project root and everything the layout puts under it are checked on
+	// CANONICAL paths: a lexical comparison says <root>/worktrees is inside
+	// <root> even when that name is a symlink to a directory on another disk.
+	// The supervisor refuses a symlink at any of these paths (see
+	// supervisor.DeriveWorkdir), so doctor must fail for the same layout rather
+	// than pass a config the derivation will refuse at reconcile time.
+	if fi, lerr := os.Lstat(rootAbs); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		problems = append(problems, "the project root "+rootAbs+" is a symlink to "+resolvePath(rootAbs)+" - it must be a real directory, never a link to a tree outside it")
+	}
+	if fi, statErr := os.Stat(rootAbs); statErr != nil || !fi.IsDir() {
+		problems = append(problems, "the project root "+rootAbs+" does not exist")
+	}
+	canonRoot := resolvePath(rootAbs)
+	// The worktree directory is the fleet's own, so it must be the fixed
+	// <project root>/worktrees - anything else means the layout is not what
+	// the sessions' scope (and their briefs) assume.
+	wt := filepath.Join(rootAbs, config.WorktreesDirName)
+	if fi, lerr := os.Lstat(wt); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+		problems = append(problems, "the worktree directory "+wt+" is a symlink to "+resolvePath(wt)+" - it must be a real directory inside the project root")
+	} else if fi, statErr := os.Stat(wt); statErr != nil || !fi.IsDir() {
+		problems = append(problems, "the worktree directory "+wt+" is missing (the fleet creates it at reconcile; `clankerbar supervise` makes it on its first derivation)")
+	} else if !insideDir(canonRoot, resolvePath(wt)) {
+		problems = append(problems, "the worktree directory "+wt+" is outside the project root")
+	}
+
+	idents := make([]string, 0, len(repos)+1)
+	for k := range repos {
+		idents = append(idents, k)
+	}
+	sort.Strings(idents)
+	if p := strings.TrimSpace(primary); p != "" && !slices.Contains(idents, p) {
+		idents = append(idents, p)
+	}
+	// Two FULL identities that end in the same name derive the SAME directory
+	// (<project root>/<name>), so only one of them can ever be the clone there
+	// and the other reads as a wrong-origin checkout. Name the conflict here,
+	// where the operator can fix the config, rather than letting the layout
+	// report the symptom. A bare key beside a full identity of the same name is
+	// NOT a conflict: it is that repo spelled short, and the derivation
+	// materializes the full identity (the only spelling with a clone URL).
+	byBase := make(map[string]string, len(idents))
+	for _, id := range idents {
+		base := filepath.Base(id)
+		prev, ok := byBase[base]
+		if ok && prev != id && strings.Contains(prev, "/") && strings.Contains(id, "/") {
+			problems = append(problems, fmt.Sprintf("%s and %s both derive the directory %s - two repos cannot share one clone path; drop one from the project", prev, id, filepath.Join(rootAbs, base)))
+			continue
+		}
+		if !ok {
+			byBase[base] = id
+		}
+	}
+	for _, id := range idents {
+		dir, err := config.ResolveCheckout(repos, primary, rootAbs, id)
+		if err != nil {
+			// The repos check above already reports an unresolvable identity;
+			// this one is about the layout, so it stays quiet here.
+			continue
+		}
+		if fi, lerr := os.Lstat(dir); lerr == nil && fi.Mode()&os.ModeSymlink != 0 {
+			problems = append(problems, fmt.Sprintf("%s (%s) is a symlink to %s - the fleet's clone is a real directory inside the project root, never a link to a checkout outside it", id, dir, resolvePath(dir)))
+			continue
+		}
+		if !insideDir(canonRoot, resolvePath(dir)) {
+			problems = append(problems, fmt.Sprintf("%s resolves to %s, which is OUTSIDE the project root - a session's scope covers the project root, so it could not read it, and the fleet's own clone belongs at %s", id, dir, filepath.Join(rootAbs, filepath.Base(dir))))
+			continue
+		}
+		remote, remoteErr := gitRemoteURL(dir)
+		if remoteErr != nil {
+			problems = append(problems, fmt.Sprintf("%s (%s) has no attributable origin remote: %v", id, dir, remoteErr))
+			continue
+		}
+		if !delivery.MatchesRepoSlug(remote, id) {
+			problems = append(problems, fmt.Sprintf("%s is a checkout of a different repo - its origin names %q", id, remote))
+		}
+	}
+	if len(problems) > 0 {
+		c.status = fail
+		c.detail = strings.Join(problems, "; ")
+		c.remedy = "fix the layout, or drop project_root to run the legacy shape (one checkout per workdir)"
+		return []check{c}
+	}
+	c.status = pass
+	c.detail = fmt.Sprintf("%s holds every configured repo and its worktree directory", rootAbs)
+	return []check{c}
+}
+
+// insideDir reports whether path is dir itself or sits below it, comparing
+// CLEANED absolute paths so a symlink-free path and its ".."-normalized
+// spelling never read as different trees.
+func insideDir(dir, path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(abs))
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+}
+
+// gitRemoteURL reads a checkout's attributable origin remote ("origin" when it
+// has one, else its only remote), the same rule the supervisor's derivation
+// applies - a checkout with several remotes and no origin cannot be attributed
+// to one repo.
+func gitRemoteURL(dir string) (string, error) {
+	out, err := exec.Command("git", "-C", dir, "remote").Output()
+	if err != nil {
+		return "", fmt.Errorf("not a git checkout")
+	}
+	names := strings.Fields(string(out))
+	if len(names) == 0 {
+		return "", fmt.Errorf("a git repository with no remotes")
+	}
+	remote := ""
+	for _, n := range names {
+		if n == "origin" {
+			remote = n
+			break
+		}
+	}
+	if remote == "" {
+		if len(names) != 1 {
+			return "", fmt.Errorf("%d remotes and no origin", len(names))
+		}
+		remote = names[0]
+	}
+	urlBytes, err := exec.Command("git", "-C", dir, "remote", "get-url", remote).Output()
+	if err != nil {
+		return "", fmt.Errorf("cannot read remote %s", remote)
+	}
+	url := strings.TrimSpace(string(urlBytes))
+	if url == "" {
+		return "", fmt.Errorf("remote %s has an empty URL", remote)
+	}
+	return url, nil
 }
 
 // --- 1c. session env ---------------------------------------------------------
@@ -1120,6 +1320,16 @@ func checkStateDir(cfg *config.Config) check {
 
 	c.status = pass
 	c.detail = stateDir + " writable, no stop markers"
+	// Where the two logs live, so `doctor` answers "where do I look?" without an
+	// operator reading the source (CLA-701). The daemon's own lines go to
+	// daemon.log beside the iteration logs; the supervisor keeps its own under
+	// its state dir, and is only named when one has run on this machine.
+	c.info = append(c.info, "daemon log: "+filepath.Join(stateDir, statedir.DaemonLogName)+" (size-rotated; iteration logs in the same directory)")
+	if sup, err := supervisor.CacheDir(); err == nil {
+		if _, statErr := os.Stat(sup); statErr == nil {
+			c.info = append(c.info, "supervisor log: "+filepath.Join(sup, supervisor.SuperviseLogName))
+		}
+	}
 	// The state dir's name is a hash of the workdir, so when the workdir itself
 	// came from the cwd, this line is about a directory that MOVES with where the
 	// operator happened to be standing: doctor from ~ and `run` from the checkout

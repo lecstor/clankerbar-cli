@@ -26,6 +26,14 @@ func TestMain(m *testing.M) {
 		runFakeMCP(dir)
 		os.Exit(0)
 	}
+	// The suite must not inherit the opencode environment of the session that
+	// happens to be running it: OPENCODE_CONFIG / OPENCODE_CONFIG_DIR then name
+	// a real config whose clankerbar server the ambient-layer preflight would
+	// correctly wait for, but which no test's fake `opencode` script serves.
+	// Conformance tests hand their own values in Invocation.Env, which wins.
+	for _, k := range []string{"OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION"} {
+		os.Unsetenv(k)
+	}
 	// The conformance suite execs the opencode 2.x binary through the real
 	// adapter, which runs whatever `opencode` PATH resolves. PATH is set here,
 	// once, rather than per test with t.Setenv, so the slow error cases can run
@@ -35,7 +43,21 @@ func TestMain(m *testing.M) {
 			os.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
 		}
 	}
-	os.Exit(m.Run())
+	// The MCP preflight resolves opencode's ambient config layers when an
+	// invocation names no MCP config (CLA-703 review). Without isolation this
+	// suite would read the DEVELOPER's own ~/.config/opencode and behave
+	// differently depending on whether that file declares a clankerbar server.
+	// Point the default global config dir at an empty temp dir; a test that
+	// wants an ambient layer sets its own XDG_CONFIG_HOME or ConfigDir.
+	iso, err := os.MkdirTemp("", "clankerbar-harness-config-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "harness tests: cannot isolate XDG_CONFIG_HOME:", err)
+		os.Exit(1)
+	}
+	os.Setenv("XDG_CONFIG_HOME", iso)
+	code := m.Run()
+	os.RemoveAll(iso)
+	os.Exit(code)
 }
 
 // runFakeMCP serves newline-delimited JSON-RPC on stdin/stdout: initialize,

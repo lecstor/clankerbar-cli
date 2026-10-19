@@ -41,12 +41,13 @@ func materializeOptions(t *testing.T, cacheDir, workdirRoot string) Options {
 // CLANKERBAR_API_KEY, which never lands in a file).
 func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	root := t.TempDir()
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
 	// A discovered <workdir>/.mcp.json must land in the materialized file via
 	// the documented mcp_config_path default, resolved against the DERIVED
-	// workdir.
+	// workdir — which is the PROJECT ROOT, the directory a session's reach is
+	// scoped to (CLA-678).
 	mcp := `{"mcpServers": {"clankerbar": {"type": "http", "url": "https://clankerbar.com/mcp/acme", "headers": {"Authorization": "Bearer ${CLANKERBAR_API_KEY}"}}}}`
-	if err := os.WriteFile(filepath.Join(root, "widgets", ".mcp.json"), []byte(mcp), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "acme", ".mcp.json"), []byte(mcp), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -80,14 +81,21 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	}
 
 	// The machine conventions are IN the file.
-	if loaded.WorkDir != filepath.Join(root, "widgets") {
-		t.Errorf("workdir = %q, want the derived %q", loaded.WorkDir, filepath.Join(root, "widgets"))
+	if loaded.WorkDir != filepath.Join(root, "acme") {
+		t.Errorf("workdir = %q, want the derived project root %q", loaded.WorkDir, filepath.Join(root, "acme"))
 	}
 	if len(loaded.Projects) != 1 {
 		t.Fatalf("projects = %d, want 1", len(loaded.Projects))
 	}
-	if loaded.Projects[0].WorkDir != filepath.Join(root, "widgets") {
-		t.Errorf("projects[0].workdir = %q, want the derived %q", loaded.Projects[0].WorkDir, filepath.Join(root, "widgets"))
+	if loaded.Projects[0].WorkDir != filepath.Join(root, "acme") {
+		t.Errorf("projects[0].workdir = %q, want the derived project root %q", loaded.Projects[0].WorkDir, filepath.Join(root, "acme"))
+	}
+	if !loaded.ProjectRoot {
+		// The scope flag has to survive the round trip: it is what the DRIVER
+		// reads to widen a session's reach to the whole project (CLA-678), and
+		// it is written here precisely so the child never has to infer the
+		// layout from the filesystem.
+		t.Error("project_root = false, want true — the derivation's layout must be stated in the generated config")
 	}
 	if loaded.InstanceName != "daemon-one" {
 		t.Errorf("instance_name = %q, want the roster entry's name (daemon-one)", loaded.InstanceName)
@@ -98,7 +106,7 @@ func TestMaterializedConfigRoundTripsThroughTheLoader(t *testing.T) {
 	if loaded.BacklogURL != "https://clankerbar.com" {
 		t.Errorf("backlog_url = %q, want the default plane origin", loaded.BacklogURL)
 	}
-	if loaded.MCPConfigPath != filepath.Join(root, "widgets", ".mcp.json") {
+	if loaded.MCPConfigPath != filepath.Join(root, "acme", ".mcp.json") {
 		t.Errorf("mcp_config_path = %q, want the discovered default resolved against the derived workdir", loaded.MCPConfigPath)
 	}
 }
@@ -158,8 +166,8 @@ func TestMaterializedConfigWithoutAPanelRoundTrips(t *testing.T) {
 // at materialization time. The projects come from the roster entry.
 func TestMaterializedConfigConsumesPerProjectDerivedWorkdirs(t *testing.T) {
 	root := t.TempDir()
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
-	makeCheckout(t, filepath.Join(root, "gadgets"), "acme/gadgets")
+	makeCheckout(t, filepath.Join(root, "one", "widgets"), "acme/widgets")
+	makeCheckout(t, filepath.Join(root, "two", "gadgets"), "acme/gadgets")
 
 	cacheDir := t.TempDir()
 	entry := RosterEntry{
@@ -196,8 +204,8 @@ func TestMaterializedConfigConsumesPerProjectDerivedWorkdirs(t *testing.T) {
 	for _, p := range loaded.Projects {
 		got[p.Slug] = p.WorkDir
 	}
-	if got["one"] != filepath.Join(root, "widgets") || got["two"] != filepath.Join(root, "gadgets") {
-		t.Fatalf("project workdirs = %v, want one -> %q, two -> %q", got, filepath.Join(root, "widgets"), filepath.Join(root, "gadgets"))
+	if got["one"] != filepath.Join(root, "one") || got["two"] != filepath.Join(root, "two") {
+		t.Fatalf("project workdirs = %v, want one -> %q, two -> %q", got, filepath.Join(root, "one"), filepath.Join(root, "two"))
 	}
 }
 
@@ -306,4 +314,182 @@ func TestMaterializedConfigIsACache(t *testing.T) {
 			return false
 		}
 	})
+}
+
+// applyDerivedWorkdirs' zero-projects branch must key on the slug the
+// derivation used (cfg.Slug(), from the MCP endpoint), not on "" — and it must
+// set the scope flag only when a derived root was actually applied (CLA-678
+// review SHOULD 4.1). Driven through resolveInstance, the documented
+// single-config shape.
+func TestResolveInstanceAppliesTheDerivedRootToAZeroProjectsConfig(t *testing.T) {
+	root := t.TempDir()
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
+	if err := os.MkdirAll(filepath.Join(root, "acme", config.WorktreesDirName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cacheDir := t.TempDir()
+	o := materializeOptions(t, cacheDir, root)
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
+
+	cfg := &config.Config{
+		Harness:     "claude",
+		Prompt:      "Work the next backlog item.",
+		BacklogURL:  "https://clankerbar.com/mcp/acme",
+		PrimaryRepo: "acme/widgets",
+		WorkDir:     t.TempDir(), // NOT the derived root: the pin must replace it
+	}
+	got, _, err := d.resolveInstance(cfg)
+	if err != nil {
+		t.Fatalf("resolveInstance: %v", err)
+	}
+	if want := filepath.Join(root, "acme"); got.WorkDir != want {
+		t.Fatalf("workdir = %q, want the derived project root %q", got.WorkDir, want)
+	}
+	if !got.ProjectRoot {
+		t.Error("project_root = false, want true once a derived root was applied")
+	}
+
+	// A config whose derived map has no entry for its slug applies NOTHING and
+	// must not claim the layout either.
+	cfg = &config.Config{
+		Harness:     "claude",
+		Prompt:      "Work the next backlog item.",
+		BacklogURL:  "https://clankerbar.com/mcp/other",
+		PrimaryRepo: "acme/widgets",
+		WorkDir:     t.TempDir(),
+	}
+	if err := applyDerivedWorkdirs(cfg, map[string]string{"acme": filepath.Join(root, "acme")}); err != nil {
+		t.Fatalf("applyDerivedWorkdirs: %v", err)
+	}
+	if cfg.ProjectRoot {
+		t.Error("project_root = true although no derived root was applied")
+	}
+	if cfg.WorkDir == filepath.Join(root, "acme") {
+		t.Error("applyDerivedWorkdirs wrote another project's root into this config")
+	}
+}
+
+// CLA-678 review round 2 (findings 1 and 2): with WorkdirRoot active and a
+// `repos` override pointing at an existing developer checkout OUTSIDE the
+// project root, the derivation clones <root>/<slug>/<name> but the old code
+// left the override in place. config.ResolveCheckout prefers an explicit
+// entry, so the session started in — and was granted — the developer's
+// checkout while the fleet clone sat unused. The materialized config must
+// resolve every declared identity to the managed clone instead.
+func TestResolveInstanceRewritesRepoOverridesToTheFleetClone(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "widgets")
+	makeCheckout(t, outside, "acme/widgets") // a REAL checkout of the same repo, outside
+	pointClonesAt(t, makeBareRemote(t, "acme/widgets"))
+
+	cacheDir := t.TempDir()
+	o := materializeOptions(t, cacheDir, root)
+	d := &Supervisor{o: o, hostname: "testhost", cacheDir: cacheDir}
+
+	cfg := &config.Config{
+		Harness:     "claude",
+		Prompt:      "Work the next backlog item.",
+		BacklogURL:  "https://clankerbar.com/mcp/acme",
+		PrimaryRepo: "acme/widgets",
+		Repos:       map[string]string{"acme/widgets": outside},
+		WorkDir:     t.TempDir(),
+	}
+	got, stateDir, err := d.resolveInstance(cfg)
+	if err != nil {
+		t.Fatalf("resolveInstance: %v", err)
+	}
+	managed := filepath.Join(root, "acme", "widgets")
+
+	if got.Repos["acme/widgets"] != managed {
+		t.Fatalf("repos override = %q, want the managed clone %q", got.Repos["acme/widgets"], managed)
+	}
+	dir, err := config.ResolveCheckout(got.ReposFor(""), got.PrimaryRepoFor(""), got.WorkDir, "acme/widgets")
+	if err != nil {
+		t.Fatalf("ResolveCheckout against the resolved config: %v", err)
+	}
+	if dir != managed {
+		t.Errorf("session checkout = %q, want the managed clone %q (never the developer checkout %q)", dir, managed, outside)
+	}
+	for _, granted := range config.DeclaredCheckouts(got.ReposFor(""), got.PrimaryRepoFor(""), got.WorkDir) {
+		if granted == outside {
+			t.Errorf("declared checkouts = %v; the outside checkout %q must not be granted", config.DeclaredCheckouts(got.ReposFor(""), got.PrimaryRepoFor(""), got.WorkDir), outside)
+		}
+	}
+
+	// The rewrite must survive materialization — that file is what the child
+	// daemon loads, so a value changed only in memory never reaches a session.
+	inst := &Instance{name: "daemon-one", cfg: got, stateDir: stateDir}
+	path, err := d.materializeConfig(inst)
+	if err != nil {
+		t.Fatalf("materializeConfig: %v", err)
+	}
+	loaded, err := config.Load(path)
+	if err != nil {
+		t.Fatalf("the materialized config does not load: %v", err)
+	}
+	if loaded.ReposFor("")["acme/widgets"] != managed {
+		t.Errorf("materialized repos override = %q, want the managed clone %q", loaded.ReposFor("")["acme/widgets"], managed)
+	}
+	if dir, err := config.ResolveCheckout(loaded.ReposFor(""), loaded.PrimaryRepoFor(""), loaded.WorkDir, "acme/widgets"); err != nil || dir != managed {
+		t.Errorf("materialized session checkout = %q (%v), want the managed clone %q", dir, err, managed)
+	}
+}
+
+// The same rewrite for a multi-project config: each project's own map is
+// rewritten against ITS root, and a project that inherits the top-level map
+// gets a rewritten copy of it rather than one global rewrite that could only
+// be right for one project.
+func TestApplyDerivedWorkdirsRewritesEveryProjectToItsOwnClone(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	acmeManaged := filepath.Join(root, "acme", "widgets")
+	otherManaged := filepath.Join(root, "other", "thing")
+	outsideWidgets := filepath.Join(outside, "widgets")
+	outsideThing := filepath.Join(outside, "thing")
+	for _, dir := range []string{acmeManaged, otherManaged, outsideWidgets, outsideThing} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cfg := &config.Config{
+		WorkDir: outside, // the multi-repo parent; not derived
+		Repos:   map[string]string{"other/thing": outsideThing},
+		Projects: []config.Project{
+			{Slug: "acme", PrimaryRepo: "acme/widgets", Repos: map[string]string{"acme/widgets": outsideWidgets}},
+			{Slug: "other", PrimaryRepo: "other/thing"},
+		},
+	}
+	derived := map[string]string{
+		"acme":  filepath.Join(root, "acme"),
+		"other": filepath.Join(root, "other"),
+	}
+	if err := applyDerivedWorkdirs(cfg, derived); err != nil {
+		t.Fatalf("applyDerivedWorkdirs: %v", err)
+	}
+	if !cfg.ProjectRoot {
+		t.Error("project_root = false, want true once the roots were applied")
+	}
+	if got := cfg.Projects[0].Repos["acme/widgets"]; got != acmeManaged {
+		t.Errorf("acme repos override = %q, want %q", got, acmeManaged)
+	}
+	if got := cfg.Projects[1].Repos["other/thing"]; got != otherManaged {
+		t.Errorf("other repos override = %q, want a copy pointing at %q", got, otherManaged)
+	}
+	// The shared top-level map is not rewritten: it belongs to more than one
+	// project, and each project now carries its own rewritten copy.
+	if got := cfg.Repos["other/thing"]; got != outsideThing {
+		t.Errorf("top-level repos override = %q; it must stay as declared and not be rewritten for one project", got)
+	}
+	for i, want := range []string{acmeManaged, otherManaged} {
+		p := cfg.Projects[i]
+		dir, err := config.ResolveCheckout(p.Repos, p.PrimaryRepo, p.WorkDir, "")
+		if err != nil {
+			t.Fatalf("project %s: ResolveCheckout: %v", p.Slug, err)
+		}
+		if dir != want {
+			t.Errorf("project %s session checkout = %q, want %q", p.Slug, dir, want)
+		}
+	}
 }

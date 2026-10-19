@@ -115,9 +115,10 @@ const ReviewRoundCap = 3
 
 // The review panel (CLA-639, design §5.4 / A4 / B10). When a config SETS
 // `review_panel`, each built-in review phase expands into ONE review phase PER
-// MEMBER, run sequentially against the same reviewed tip, each writing its own
-// sealed durable record under its own reviewer role (`review-1`..`review-N`, by
-// member position). The round closes only once every member has recorded or been
+// MEMBER, run against the same reviewed tip, each writing its own sealed durable
+// record under its own reviewer role (`review-1`..`review-N`, by member
+// position). The members run concurrently by default, in private detached
+// worktrees; see ReviewPanelConcurrency. The round closes only once every member has recorded or been
 // recorded as failed — a sealed round is what keeps a later member from reading
 // an earlier member's findings, and a usage-limited or dead member therefore does
 // not stop the round.
@@ -131,9 +132,10 @@ const ReviewRoundCap = 3
 //
 // INTERIM, deliberately (B10): task-state-machine build phase 4 removes phase
 // logic from the CLI and routes findings as an `agent_review -> implementing`
-// plane transition, and parallel reviewers on one task need panel membership as
-// PLANE phase state (that is the CLA-454 reshape). Until then the panel is local
-// config and the members run one after another.
+// plane transition, and panel membership becomes PLANE phase state (that is the
+// CLA-454 reshape). Until then the panel is local config and the members run
+// CONCURRENTLY by default (CLA-697), each in its own detached worktree at the
+// reviewed tip; `review_panel_concurrency: 1` restores the sequential sequence
 
 // PanelMemberLabel is the LOG LABEL of the member at position i: the name the
 // operator gave it, or the deterministic `review-<i+1>` derived from its
@@ -2045,6 +2047,25 @@ type Config struct {
 	// the plane's (CLA-636); this is only which reviewers run.
 	ReviewPanel []ReviewPanelMember `json:"review_panel,omitempty"`
 
+	// ReviewPanelConcurrency caps how many of a review panel's members run AT
+	// ONCE (CLA-697). The members are independent by design, so the default is
+	// all of them: 0 (or an absent key) means "the whole panel", and a value
+	// larger than the panel means the same. 1 is the historical behaviour — the
+	// members run one after another in the task's own worktree — and is the
+	// fallback for an operator who wants the old sequence, or whose machine or
+	// provider cannot take N sessions at once.
+	//
+	// Each concurrent member gets its own DETACHED worktree at the reviewed tip
+	// (created and removed by the driver), because members may run builds or
+	// probes: one shared checkout would let two reviewers write the same file.
+	// A member's detached worktree is discarded when it ends — there is nothing
+	// to salvage from a review-only session, and the fix phase owns the real
+	// worktree.
+	//
+	// Read through Config.EffectivePanelConcurrency. It only applies when
+	// `review_panel` expands; a single reviewer never fans out.
+	ReviewPanelConcurrency int `json:"review_panel_concurrency,omitempty"`
+
 	// reviewPanelSet records that the config FILE named `review_panel`, so
 	// Validate can tell two shapes apart that the slice alone cannot: an operator
 	// who wrote `"review_panel": []` (a panel of none — refused, because it is
@@ -2054,6 +2075,30 @@ type Config struct {
 
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
 	WorkDir string `json:"workdir"`
+
+	// ProjectRoot marks every workdir in this file as a FLEET PROJECT ROOT
+	// (CLA-678): `<machine root>/<project slug>`, holding that project's clones
+	// (<project root>/<repo name>) and its worktrees directory
+	// (<project root>/worktrees). The supervisor's workdir derivation sets it
+	// on the config it materializes; set it by hand to adopt the layout without
+	// the supervisor.
+	//
+	// It is what decides a session's permission SCOPE. With it, a session
+	// starting in one of the project's checkouts reaches its whole project —
+	// every repo under the project root and every worktree in it — and nothing
+	// outside; without it, the scope stays the session's own checkout, exactly
+	// as before. So a config whose workdir is a developer's multi-repo parent
+	// (`~/dev`, say) must NOT set it: the flag is an assertion about the
+	// layout, and granting a whole directory tree on a guess is the wrong
+	// direction to be wrong in.
+	//
+	// `omitempty` is load-bearing: Config.Identity() hashes the marshalled
+	// form (see ReviewPanel for the same care), so the field must NOT alter the
+	// identity of a config that does not adopt the layout — an unset flag is
+	// the legacy shape, and a daemon's beacon must not report a config change
+	// just because this field exists. Set it, and the identity does change,
+	// correctly: the config now means something different.
+	ProjectRoot bool `json:"project_root,omitempty"`
 
 	// ConfigDir pins the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
 	// headless session loads the same skills, plugins, and auth as the interactive
@@ -2147,6 +2192,20 @@ type Config struct {
 	// honestly reports zero, so this never counts a session that merely did
 	// nothing.
 	MaxZeroSpendAttempts int `json:"max_zero_spend_attempts"`
+
+	// EchoSessions mirrors each session's output stream to the daemon's own
+	// stderr while it runs, as well as to its iteration log. Default FALSE
+	// (CLA-701): the stream is the whole harness transcript — opencode emits
+	// one JSON event per line, many carrying tool output inline — so echoing it
+	// buries the daemon's own lines (spawn, exit, classification, why the run
+	// ended) under thousands of rows of scrollback, and the iteration log keeps
+	// it in full anyway. Turn it on when watching one session live is worth
+	// more than the terminal being readable: `"echo_sessions": true`.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: the
+	// config's marshalled form is its identity, and the default must not change
+	// a daemon's identity merely because this field now exists.
+	EchoSessions bool `json:"echo_sessions,omitempty"`
 
 	// Budget is the circuit breaker / headroom knob. See Budget.
 	Budget Budget `json:"budget"`
@@ -2915,6 +2974,27 @@ func (c *Config) reviewPhaseHarness() string {
 // by Validate rather than silently meaning either thing (reviewPanelSet).
 func (c *Config) EffectivePanel() []ReviewPanelMember {
 	return c.ReviewPanel
+}
+
+// EffectivePanelConcurrency is how many members of a panel of n review AT ONCE
+// (CLA-697): the operator's `review_panel_concurrency` cap, or the whole panel
+// when the cap is absent, zero or larger than the panel. It never returns less
+// than 1, and a panel of fewer than two members always reports 1 — there is
+// nothing to fan out, and callers can use `1` as "the historical sequential
+// path" without a second check.
+//
+// A negative cap is a config error refused by Validate; this method is the
+// read path and stays total so a hand-built Config cannot make the driver
+// spawn a negative number of sessions.
+func (c *Config) EffectivePanelConcurrency(n int) int {
+	if n < 2 {
+		return 1
+	}
+	v := c.ReviewPanelConcurrency
+	if v <= 0 || v > n {
+		return n
+	}
+	return v
 }
 
 // panelMember is the review phase one panel member runs as: the configured
@@ -3884,6 +3964,13 @@ func (c *Config) Validate() error {
 	if c.reviewPanelSet && len(c.EffectivePanel()) == 0 && c.expandsReviewPanel() {
 		return errors.New("review_panel is empty: a panel is one or more reviewers, each run as its own review phase " +
 			"(remove the key for a single reviewer, or list the members)")
+	}
+	// CLA-697: the concurrency cap is a count of sessions, so a negative one is
+	// meaningless rather than a way to say "unbounded" — that is 0 (or the
+	// absent key). Refused at the door like every other count.
+	if c.ReviewPanelConcurrency < 0 {
+		return fmt.Errorf("review_panel_concurrency is %d: it is the number of panel members that may run at once, "+
+			"so it must be 0 (the whole panel, the default) or a positive count (1 = sequential)", c.ReviewPanelConcurrency)
 	}
 	// A panel expands exactly ONE built-in review phase. A sequence with more
 	// than one is refused rather than resolved: the panel would multiply one and

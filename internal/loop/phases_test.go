@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -259,6 +260,7 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 		name         string
 		claim        harness.Claim
 		wantReleases int
+		wantExpires  int
 	}{
 		{
 			// Since CLA-457 a clean-exit no-branch phase 1 is the EMPTY shape, not
@@ -271,11 +273,13 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 			wantReleases: 1,
 		},
 		{
-			name: "work pushed (what phase 1 actually leaves): lease left to expire",
+			name: "work pushed (what phase 1 actually leaves): the lease is ended now, work kept",
 			// update_task(branch:) sets HasWIP; CLA-314 keeps such a claim
 			// non-releasable so the task returns as a takeover with its branch.
-			claim:        harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
-			wantReleases: 0,
+			// Since CLA-708 the handback is expireLease, which produces exactly
+			// that takeover immediately instead of half an hour from now.
+			claim:       harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"},
+			wantExpires: 1,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -291,6 +295,9 @@ func TestDrainPhases_WhatTheSeamOwesDependsOnWhetherWorkWasPushed(t *testing.T) 
 			}
 			if len(rel.calls) != tc.wantReleases {
 				t.Errorf("handed the task back %d times, want %d: %+v", len(rel.calls), tc.wantReleases, rel.calls)
+			}
+			if len(rel.expireCalls) != tc.wantExpires {
+				t.Errorf("ended the lease %d time(s), want %d: %+v", len(rel.expireCalls), tc.wantExpires, rel.expireCalls)
 			}
 		})
 	}
@@ -1333,11 +1340,11 @@ func TestDrainPhases_AReloadMidDrainDoesNotReshapeTheInFlightSequence(t *testing
 	t.Run("3 to 2: the in-flight review-only keeps its gate and its skip-salvage", func(t *testing.T) {
 		outcome := "implemented: pushed the branch\n"
 		h := &fakeAdapter{steps: []invokeStep{
-			{res: transientResult()},  // implement attempt 1 blips; the backoff wait applies the RELOAD
-			{res: checkpointed(1, 0)}, // implement attempt 2: checkpoint
-			{res: checkpointed(1, 0)}, // in-flight review-only: records NOTHING — the gate must refuse it
-			{res: checkpointed(1, 0)}, // next drain, new 2-phase shape: implement
-			{res: checkpointed(1, 0)}, // next drain: FINAL review
+			{res: transientResult()},              // implement attempt 1 blips; the backoff wait applies the RELOAD
+			{res: checkpointed(1, 0)},             // implement attempt 2: checkpoint
+			{res: mcpReached(checkpointed(1, 0))}, // in-flight review-only: reached the backlog, records NOTHING — the gate must refuse it
+			{res: checkpointed(1, 0)},             // next drain, new 2-phase shape: implement
+			{res: checkpointed(1, 0)},             // next drain: FINAL review
 		}}
 		rel := &wiredReleaser{state: func() plane.TaskState {
 			return plane.TaskState{Status: "in_progress", ClaimedByRun: "r-1", Outcome: outcome}
@@ -2650,6 +2657,10 @@ func TestPRBaseResolution_ReachesHandoffRespawnPrompts(t *testing.T) {
 // closes record what the driver actually sent.
 type reviewReleaser struct {
 	fakeReleaser
+	// mu guards the fields a CONCURRENT review panel touches: the driver reads
+	// TaskState from several member goroutines at once while each member appends
+	// its record (CLA-697). The sequential fixtures never needed it.
+	mu      sync.Mutex
 	status  string
 	outcome string
 	holder  string
@@ -2685,6 +2696,8 @@ type reviewReleaser struct {
 }
 
 func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.reads++
 	if r.readErr != nil {
 		if err := r.readErr(); err != nil {
@@ -2726,6 +2739,8 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 // anything hands the claim back, or its close is refused and the earlier
 // members' findings stay sealed behind a lease that is already gone.
 func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID string, round int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closeErr != nil {
 		return r.closeErr
 	}
@@ -2770,6 +2785,8 @@ func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID str
 // (`{duplicate: true}`), never an error. A panel member writes its own role, so
 // two members never collide; a retry of the same member does.
 func (r *reviewReleaser) writeReviewRecord(rec plane.ReviewRecordState) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, have := range r.records {
 		if have.Round == rec.Round && have.ReviewerRole == rec.ReviewerRole && have.State != "void" {
 			return fmt.Errorf("update_task(review:) refused: duplicate_reviewer — %s already has a record in round %d", rec.ReviewerRole, rec.Round)
@@ -3138,9 +3155,15 @@ func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 // lease to lapse into a takeover instead of handing the task back to the queue
 // over pushed work (Claim.Releasable).
 func resumedCheckpointed(tokens int, cost float64) harness.Result {
-	return reported(held(okResult(tokens, cost), harness.Claim{
+	r := reported(held(okResult(tokens, cost), harness.Claim{
 		TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x",
 	}), branchReport())
+	// A resumed phase's brief starts by reaching the backlog (heartbeat/get_task),
+	// so a fixture that models an ordinary resumed session has reached it. This
+	// keeps CLA-703's no-MCP backstop from mistaking a test's silence for a
+	// missing MCP server; the tests that DO want that shape set the count back to 0.
+	r.ClankerbarCalls = 1
+	return r
 }
 
 // The review-shaped seam must not advance to fix on the implementer's branch
@@ -3455,8 +3478,8 @@ func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 	t.Run("an unchanged outcome is refused", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: held(okResult(1, 0), openClaim())},
-			{res: held(okResult(1, 0), openClaim())}, // review records nothing
-			{res: okResult(1, 0)},                    // must NEVER run
+			{res: mcpReached(held(okResult(1, 0), openClaim()))}, // review reached the backlog, records nothing
+			{res: okResult(1, 0)},                                // must NEVER run
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
 		d := phaseDriverWithReleaser(t, h, phases, rel)
@@ -3474,8 +3497,8 @@ func TestDrainPhases_NoCodeReviewSeamGatesOnTheLegacyBlock(t *testing.T) {
 			"\n- verdict: findings\n### Findings\n- R1 [must] a.go:1 - old. Required fix: none.\n"
 		h := &fakeAdapter{steps: []invokeStep{
 			{res: held(okResult(1, 0), openClaim())},
-			{res: held(okResult(1, 0), openClaim())}, // review edits the outcome without adding a block
-			{res: okResult(1, 0)},                    // must NEVER run
+			{res: mcpReached(held(okResult(1, 0), openClaim()))}, // review reached the backlog, edits the outcome without adding a block
+			{res: okResult(1, 0)},                                // must NEVER run
 		}}
 		rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": {Status: "in_review", Outcome: oldBlock}}}
 		h.onInvoke = func(i int) {
@@ -5191,5 +5214,192 @@ func TestInvocationForSelectsTheVerifyVariants(t *testing.T) {
 	}
 	if strings.Contains(inv.Prompt, "COMMIT and PUSH") {
 		t.Errorf("the no-code verification brief tells the verifier to commit and push:\n%s", inv.Prompt)
+	}
+}
+
+// --- CLA-700: a session that recovered from provider errors ------------------
+//
+// Both 2026-10-19 incidents have the same shape: opencode emitted typed
+// provider errors mid-session (provider.invalid-output / "OpenAI Chat stream
+// ended without finish_reason"), retried, finished the work — and then exited
+// 1. The conformance suite pins that exit status by exec'ing the real binary
+// against a fake provider that serves exactly that stream; these tests pin what
+// the DRIVER must do with it, replaying each incident.
+
+// recoveredResult is a session that took a provider error and recovered: the
+// adapter's Raw marker records the events it rode out, and the exit status is
+// non-zero, exactly as opencode 2.0.32 really ends (probed, and pinned by
+// TestOpencodeConformance_recoveredProviderError).
+//
+// kind is "fail" on purpose: the fake adapter's IsTransient decodes it, so if a
+// future change lets a recovered exit reach the classifiers this test sees the
+// shipped non-retryable path (a run-stopping error) rather than a silent retry
+// that would look like a green phase.
+func recoveredResult(tokens int, cost float64) harness.Result {
+	return harness.Result{ExitCode: 1, Tokens: tokens, CostUSD: cost, Raw: map[string]any{
+		"kind":                     "fail",
+		harness.RecoveredErrorsKey: 1,
+	}}
+}
+
+// Incident 2 (CLA-695, iteration-...-d3-pimplement-a0): the IMPLEMENT phase
+// recovered, pushed 73ef9e4, recorded the branch — and the driver spent a
+// second implement session (a1) that claimed the NEXT task off the queue
+// instead of running review-1 on the delivered work.
+func TestDrainPhases_A_RecoveredImplementExitThatDeliveredAdvancesToReview(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(reported(recoveredResult(10, 0.10), branchReport()), openClaim())},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	logged := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — a recovered exit that delivered must neither fail nor stop the run", err, stop)
+	}
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 (implement, review) — the a1 attempt in the 2026-10-19 log was a RETRY that claimed another task", h.invokeCalls)
+	}
+	if got := h.invocations[1].Prompt; !strings.Contains(got, "PHASE 2") {
+		t.Errorf("the second session is not the review phase; the recovered implement phase did not advance:\n%s", got)
+	}
+	if out := logged.String(); !strings.Contains(out, "recovered") {
+		t.Errorf("the driver did not say why it judged the exit on delivery rather than status:\n%s", out)
+	}
+}
+
+// Incident 1 (CLA-678, iteration-...-d2-pfix-a0): the FIX phase recovered, pushed
+// 2a4a32f and recorded its finding updates, and the drain ended without running
+// verify — the task was left held mid-sequence for a lease expiry to recover.
+func TestDrainPhases_A_RecoveredFixExitThatDeliveredRunsTheVerificationRound(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review
+		{res: held(reported(recoveredResult(5, 0.05), branchReport()), openClaim())}, // fix, recovered
+		{res: checkpointed(5, 0.05)}, // verify
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		}
+		if i == 3 { // the verification round records and hands over
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.status = "in_review"
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+	logged := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — a recovered fix exit that delivered must reach the verification round", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 (implement, review, fix, verify) — the 2026-10-19 fix phase ended the drain without verify", h.invokeCalls)
+	}
+	if got := h.invocations[3].Prompt; !strings.Contains(got, "PHASE 4") {
+		t.Errorf("the fourth session is not the verification round:\n%s", got)
+	}
+	if out := logged.String(); !strings.Contains(out, "recovered") {
+		t.Errorf("the driver did not say why the recovered fix exit was judged on delivery:\n%s", out)
+	}
+}
+
+// The narrow half of the same rule: a recovered exit that delivered NOTHING is
+// not a checkpoint. It ends the sequence as the held-but-empty shape (the claim
+// goes back to the queue for a takeover), the run is not stopped over an exit
+// status, and — the point of the 2026-10-19 fix — no retry session is spawned
+// to claim the next task off the queue off the back of a delivery that does not
+// exist.
+func TestDrainPhases_A_RecoveredExitWithNoDeliveryDoesNotAdvanceOrRetry(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(recoveredResult(10, 0.10), openClaim())},
+		{res: okResult(5, 0.05)},
+	}}
+	d, rel := phaseDriver(t, h, twoPhases())
+	// No branch anywhere: the verifier fails every claim, so the evidence gate
+	// refuses the checkpoint exactly as it would for a session that crashed.
+	d.newVerifier = func(string, bool) deliveryVerifier {
+		return &fakeVerifier{report: delivery.Report{Checks: []delivery.Check{{
+			Kind: delivery.BranchPushed, Status: delivery.Fail, Detail: "no such branch on the origin remote",
+		}}}}
+	}
+	logged := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — a recovered exit with nothing delivered is an empty phase, not a run-ending failure", err, stop)
+	}
+	// ONE bounded retry, and it is the SHIPPED empty-phase retry (the claim went
+	// back to the queue, so a fresh session re-claims the same task) — not a
+	// re-run of a delivered phase, and never a session sent to the queue for
+	// someone else's work: the second brief is phase 1 again, not the review.
+	if h.invokeCalls != 2 {
+		t.Fatalf("spawned %d sessions, want 2 (the empty phase's one bounded retry)", h.invokeCalls)
+	}
+	if got := h.invocations[1].Prompt; !strings.Contains(got, "PHASE 1") || strings.Contains(got, "REVIEW-ONLY") {
+		t.Errorf("the retry was not a fresh implement session; a recovered exit with no delivery must not advance to review (its brief would claim work that is not there):\n%s", got)
+	}
+	if len(rel.calls) != 1 || rel.calls[0].taskID != "t-1" {
+		t.Fatalf("handbacks = %+v, want the empty task handed back to the queue for a takeover", rel.calls)
+	}
+	if out := logged.String(); !strings.Contains(out, "no recorded branch on the origin remote") {
+		t.Errorf("the driver did not name the missing evidence:\n%s", out)
+	}
+}
+
+// The widening's boundary: a session whose stream ENDS on its error is not a
+// recovery, and the adapter withholds the marker for exactly that shape. A
+// non-zero exit with no marker keeps every shipped classification — a verified
+// branch on the origin remote does not make a genuine failure into a checkpoint,
+// because the branch may be earlier work and the session's own end says it did
+// not finish. Here the exit is non-retryable, so the run stops rather than
+// spawning the review phase on work the session did not deliver.
+func TestDrainPhases_A_TerminalFailureIsNotRescuedByARecordedBranch(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		// No RecoveredErrorsKey on Raw: the stream ended on the error.
+		{res: held(reported(nonRetryableResult(), branchReport()), openClaim())},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	captureLogs(t)
+
+	if _, _, _, err := drainPhasesOnce(t, d); err == nil {
+		t.Fatal("a non-zero exit that names a failure must still stop the run; a recorded branch alone is not delivery")
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — no review phase may be spawned over a session that failed", h.invokeCalls)
+	}
+}
+
+// The same boundary across a RESURRECTION, which is the shape review round 1
+// found unpinned. mergeResume folds the continuation into the dead run's Result,
+// and the merged session's marker must describe the run that ENDED it: a base
+// that recovered a provider blip and then died quietly, continued into a run
+// that ended on a terminal error, is ONE Result with the continuation's exit
+// status and error type and NO recovered marker. The merge itself is pinned
+// where it happens — TestMergeResumeRecomputesTheRecoveredMarker and the real
+// Invoke path's TestResurrectionInvokeTerminalErrorContinuationIsNotRecovered,
+// both of which fail on the pre-fix merge — and this pins the DRIVER half of
+// that chain: the exact Result those two produce must classify as a terminal
+// failure. A branch recorded before the failure does not turn it into a
+// delivery, and the phase must not advance.
+func TestDrainPhases_AResurrectedSessionThatEndsOnATerminalErrorIsNotRecovered(t *testing.T) {
+	merged := harness.Result{ExitCode: 1, Tokens: 5, CostUSD: 0.05, Raw: map[string]any{
+		"kind":                       "fail",
+		harness.OpencodeErrorTypeKey: "provider.auth",
+	}}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(reported(merged, branchReport()), openClaim())},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	captureLogs(t)
+
+	if _, _, _, err := drainPhasesOnce(t, d); err == nil {
+		t.Fatal("a resurrected session whose continuation ended on a terminal error must still stop the run; the dead run's recovered marker may not survive the merge")
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — the merged session ended on its error, so no review phase may be spawned over it", h.invokeCalls)
 	}
 }

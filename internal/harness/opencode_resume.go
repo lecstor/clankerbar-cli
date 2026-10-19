@@ -156,8 +156,10 @@ func probeCoherent(reply, ref string) bool {
 
 // opencodeResumeArgs builds the args for a continuation run into an existing
 // session: the same dialect as opencodeArgs, plus `-s <id>` and WITHOUT the
-// phase prompt — a continuation carries its own short message, behind the same
-// MCP warm-up note (each `run` process connects its MCP servers afresh).
+// phase prompt — a continuation carries its own short message. The adapter's
+// server preflight (CLA-703) applies to a continuation exactly as it does to a
+// first run: every non-probe session waits for the clankerbar MCP server before
+// its first turn.
 //
 // sid must be an id this adapter SAW on a session's stream (resumeTargets reads
 // it off Result.Raw, which only the stream parser writes). 2.x does not refuse
@@ -216,6 +218,17 @@ func opencodeResumeArgs(in Invocation, sid, prompt string) []string {
 //     OutputCapReasoningKey (CLA-584) is recomputed the same way: it is the
 //     stalled STEP's own count, so a second stall must replace the first's
 //     figure rather than add to it.
+//     RecoveredErrorsKey (CLA-700) is recomputed with them, for the same
+//     shape of reason and a sharper one: it answers "did the run that ENDED
+//     this session ride out a provider error", and that answer decides whether
+//     a non-zero exit is judged on delivery rather than by its status. Summing
+//     it inherited the dead run's count into a continuation that ended on a
+//     REAL terminal error — the parser withholds the key in exactly that
+//     shape — so the merged session read "recovered" over a stream that ended
+//     on its error, the one classification the recovery arm must never make.
+//     Recovery is a property of how the session ended, not a quantity that
+//     accumulates; the continuation's own count stands, and its absence clears
+//     the dead run's.
 func mergeResume(base *Result, add Result) {
 	base.ExitCode = add.ExitCode
 	base.ExitSignal = add.ExitSignal
@@ -230,6 +243,11 @@ func mergeResume(base *Result, add Result) {
 	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
+	// A resurrection is part of the SAME session, so a clankerbar call the
+	// continuation made counts toward whether the session reached the backlog
+	// (CLA-703). Without this a session that died before its first claim and
+	// then recovered and worked would be classified no_mcp by the driver.
+	base.ClankerbarCalls += add.ClankerbarCalls
 	// The normalised breakdown sums on the same terms as Tokens/CostUSD above:
 	// the continuation is PART of this session's spend, not a second session
 	// (CLA-691).
@@ -247,8 +265,8 @@ func mergeResume(base *Result, add Result) {
 		base.Raw = map[string]any{}
 	}
 	for k, v := range add.Raw {
-		if k == TerminalReasonKey || k == FinishReasonKey || k == OutputCapReasoningKey {
-			continue // all three recomputed below, never inherited blind
+		if k == TerminalReasonKey || k == FinishReasonKey || k == OutputCapReasoningKey || k == RecoveredErrorsKey {
+			continue // all four recomputed below, never inherited blind
 		}
 		if nv, ok := v.(int); ok {
 			if bv, ok := base.Raw[k].(int); ok {
@@ -286,6 +304,18 @@ func mergeResume(base *Result, add Result) {
 		base.Raw[OutputCapReasoningKey] = n
 	} else {
 		delete(base.Raw, OutputCapReasoningKey)
+	}
+	// The recovered-error marker is recomputed from the continuation for the
+	// reason spelled out in the field list above: the parser writes it only when
+	// the stream did NOT end on an error, so its presence is the continuation's
+	// own verdict that this session recovered, and its absence — a terminal
+	// error, or nothing to recover from — must clear the dead run's. A positive
+	// count is carried as-is rather than added: the merged session needs to know
+	// THAT it recovered, not how many runs' blips to add up.
+	if n, ok := add.Raw[RecoveredErrorsKey].(int); ok && n > 0 {
+		base.Raw[RecoveredErrorsKey] = n
+	} else {
+		delete(base.Raw, RecoveredErrorsKey)
 	}
 }
 

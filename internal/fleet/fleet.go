@@ -69,6 +69,16 @@ const (
 	OutcomeDead       = "dead"
 )
 
+// Per-session causes that are not an outcome of the phase's own work. They ride
+// the session entry so the durable phase_session record can say WHY a session
+// that ran produced nothing, and analytics can exclude an infrastructure miss
+// from review-quality numbers (CLA-703).
+const (
+	// CauseNoMCP: the session made no successful clankerbar MCP call and wrote
+	// no review record — the backlog tools were not available to it.
+	CauseNoMCP = "no_mcp"
+)
+
 // State is the presence half of a report: what the daemon is doing right now.
 type State struct {
 	Kind    string // one of the State* constants
@@ -119,6 +129,13 @@ type Session struct {
 	Usage         TokenUsage
 	UsageReported bool
 
+	// Cause names a non-work reason this session produced nothing, using the
+	// Cause* vocabulary above. Empty for an ordinary session. It is carried on
+	// the session (not the iteration) because one reviewer can be an
+	// infrastructure miss while the rest of the panel and the fix run normally
+	// (CLA-703).
+	Cause string `json:"cause,omitempty"`
+
 	// RunID is the run's UUID the session worked the task under, when there is
 	// one — empty for a session that never held a claim. It is deliberately NOT
 	// the run credential the session holds: that string is `<uuid>.<secret>` and
@@ -160,6 +177,12 @@ type Iteration struct {
 	Outcome         string    // one of the Outcome* constants
 	DurationSeconds float64   // wall clock for the whole drain
 	Tokens          int       // the drain's total reported token spend
+	// CostUSD is the drain's total harness-reported dollar spend (CLA-677),
+	// from the same accumulator the budget breaker reads. It is always a
+	// figure for an iteration that ran: zero means the harnesses reported no
+	// cost, and the plane stores the number rather than reading absence as
+	// unknown.
+	CostUSD float64
 }
 
 // Identity is what every beacon carries about THIS daemon: who and where it is,
@@ -433,6 +456,11 @@ type wireSession struct {
 	CostUSD *float64 `json:"costUsd,omitempty"`
 	// RunID omits itself when the session held no claim, like the rest.
 	RunID string `json:"runId,omitempty"`
+	// Cause is omitted for an ordinary session, so an older plane sees the same
+	// bytes it always did. The current plane ignores unknown session keys; the
+	// classification is carried for the durable phase_session record to read
+	// once its parser stores it (CLA-703 follow-up).
+	Cause string `json:"cause,omitempty"`
 }
 
 type wireIteration struct {
@@ -443,6 +471,10 @@ type wireIteration struct {
 	Outcome         string        `json:"outcome"`
 	DurationSeconds float64       `json:"durationSeconds,omitempty"`
 	Tokens          int           `json:"tokens,omitempty"`
+	// CostUSD is the iteration's dollar spend; always present — UNLIKE Tokens
+	// (omitempty) — so a zero (nothing reported) stays distinguishable from a
+	// missing key (an older CLI). CLA-677.
+	CostUSD float64 `json:"costUsd"`
 }
 
 type wireReport struct {
@@ -488,6 +520,7 @@ func marshalReport(rep Report) ([]byte, error) {
 			Outcome:         it.Outcome,
 			DurationSeconds: it.DurationSeconds,
 			Tokens:          it.Tokens,
+			CostUSD:         it.CostUSD,
 		})
 	}
 	return json.Marshal(w)
@@ -521,7 +554,7 @@ func wireSessions(sessions []Session) []wireSession {
 	}
 	out := make([]wireSession, 0, len(sessions))
 	for _, s := range sessions {
-		w := wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model, RunID: s.RunID}
+		w := wireSession{Phase: s.Phase, Harness: s.Harness, Model: s.Model, RunID: s.RunID, Cause: s.Cause}
 		if s.UsageReported {
 			w.UsageReported = true
 			w.Usage = &wireUsage{

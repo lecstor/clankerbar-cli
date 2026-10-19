@@ -37,9 +37,8 @@ var terminatorAdapters = []struct {
 	// silently not applied at all - the sandbox pin would be absent rather than
 	// overridden, and codex's own default would decide the session's write access.
 	wantFlags []string
-	// message is the positional the adapter sends for a prompt: the prompt
-	// itself, or (opencode) the prompt behind the MCP warm-up note. Either way
-	// it is ONE argument after the terminator.
+	// message is the positional the adapter sends for a prompt. Either way it
+	// is ONE argument after the terminator.
 	message func(string) string
 }{
 	{"codex", codexArgs, []string{

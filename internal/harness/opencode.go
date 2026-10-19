@@ -291,10 +291,15 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	}
 	defer cancel()
 
-	cmd := exec.CommandContext(sctx, "opencode", args...)
-	setupProcessGroup(cmd)
-	if in.WorkDir != "" {
-		cmd.Dir = in.WorkDir
+	// One canonical directory for the permission policy, the server process,
+	// the status query and the run: the server keys its MCP state by the
+	// resolved path, so a raw `/var/...` query would poll a location no session
+	// uses (see opencodeWorkDir). The policy's absolute paths must agree with
+	// the directory the session actually runs in, or an in-tree write can look
+	// external on a symlinked temp dir.
+	workDir := opencodeWorkDir(in.WorkDir)
+	if workDir != "" {
+		in.WorkDir = workDir
 	}
 	env, err := o.env(in)
 	if err != nil {
@@ -303,7 +308,57 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// caller reports. See env's fail-closed note.
 		return Result{}, err
 	}
-	cmd.Env = env
+
+	// CLA-703: a working (non-probe) session gets a private server of the
+	// adapter's own, and does not run its first model turn until that server
+	// reports the clankerbar MCP connection established. The OLD shape —
+	// `run --standalone`, which spawns its own private server and submits the
+	// prompt immediately — is exactly the race: opencode 2.x connects MCP in the
+	// background, so a fast model could take its first turn with no clankerbar
+	// tools at all.
+	//
+	// A PROBE keeps `--standalone`: it is a one-word liveness check of an
+	// already-created session and does not use the backlog, so waiting for MCP
+	// would only eat its time box.
+	runArgs := args
+	runEnv := env
+	var srv *opencodeServer
+	if !in.Probe {
+		// Only a session with a clankerbar server gets the preflight. That
+		// server is resolved across the config layers opencode actually loads:
+		// the named file when there is one, otherwise the global config dir and
+		// the project-level files discovered from the instance directory. A
+		// layer that exists but cannot be read fails CLOSED — an unknown
+		// effective config is not evidence that no backlog server is declared —
+		// and a session that does declare one never gets its first turn until
+		// that server reports connected (CLA-703 review, findings 1.1 and 3.1).
+		names, err := opencodeEffectiveMCPServers(in, env)
+		if err != nil {
+			return mcpPreflightFailure(sctx, ctx, err)
+		}
+		if len(names) > 0 {
+			srv, err = startOpencodeServer(sctx, env, workDir)
+			if err != nil {
+				return mcpPreflightFailure(sctx, ctx, err)
+			}
+			defer srv.stop()
+			if err := srv.waitForMCP(sctx, names, workDir); err != nil {
+				return mcpPreflightFailure(sctx, ctx, err)
+			}
+			runArgs = withOpencodeServer(args, srv.url)
+			// The run must authenticate to the server the adapter started,
+			// whatever an inherited or configured OPENCODE_PASSWORD says.
+			// Appended last so it wins over env's own tail (in.Env).
+			runEnv = append(append([]string{}, env...), "OPENCODE_PASSWORD="+srv.password)
+		}
+	}
+
+	cmd := exec.CommandContext(sctx, "opencode", runArgs...)
+	setupProcessGroup(cmd)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	cmd.Env = runEnv
 	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
 	// io.MultiWriter values, so os/exec makes its own pipes and cmd.Run waits for
 	// every WRITER of them to close — and CommandContext kills the direct child
@@ -454,29 +509,22 @@ func opencodeArgs(in Invocation) []string {
 	return append(args, "--", prompt)
 }
 
-// opencodeMCPWarmupNote is prepended to every prompt that does work. 2.x
-// connects MCP servers asynchronously: verified against 2.0.32 with a fake MCP
-// server, the clankerbar tools were absent from the session's first LLM request
-// and arrived on the second, so a first-turn `claim_task` comes back as the
-// tool error "No tool named ... is currently available". The model sees that
-// error and decides what to do next; without being told, it can read it as a
-// missing integration and give up on the backlog. A retry inside the adapter
-// was the alternative and was not chosen: the failed call is an ordinary turn
-// the model already gets to react to, and re-spawning the session would pay for
-// the whole prompt again to fix something one sentence of brief fixes.
-const opencodeMCPWarmupNote = "Note: this session's MCP servers connect in the background. " +
-	"If an MCP tool (for example clankerbar_claim_task) reports that no tool by that name is currently available, " +
-	"it is still connecting: call it again on your next step rather than concluding it is missing. "
-
-// opencodePrompt is the message a working (non-probe) run sends. It carries the
-// MCP warm-up note ahead of the caller's prompt; see opencodeMCPWarmupNote. The
-// note is one line and ends in a space, so the prompt keeps its own first line.
-// An empty prompt stays empty so the CLI's own handling of it is unchanged.
+// opencodePrompt is the message a working (non-probe) run sends. It is the
+// caller's prompt unchanged.
+//
+// It USED to prepend an MCP warm-up note ("MCP servers connect in the
+// background; call the tool again if it is missing"). CLA-703 removed the race
+// that note described: the adapter now starts its own server, waits until the
+// clankerbar server reports connected, and only then attaches the run, so the
+// first model turn already has the tools. Keeping the note would tell every
+// session to expect a failure that no longer happens, and would spend prompt
+// bytes on a workaround the code no longer needs.
+//
+// The function is kept (rather than inlined at its two call sites) because the
+// prompt shape is a contract this adapter owns, and the tests assert the
+// absence of the note through it.
 func opencodePrompt(prompt string) string {
-	if prompt == "" {
-		return prompt
-	}
-	return opencodeMCPWarmupNote + prompt
+	return prompt
 }
 
 // opencodeMCPResourcePattern is the pattern shape opencode's MCP resource tools
@@ -1165,6 +1213,16 @@ type opencodeParse struct {
 	// ("provider.auth", ...), recorded on Result.Raw for diagnostics and the
 	// conformance suite. Classification itself reads the event text.
 	errorType string
+
+	// recoveredErrors counts the typed error events the stream did NOT end on:
+	// an event that is followed by any later typed event is one the session
+	// recovered from, because 2.x retries a provider failure itself and carries
+	// on (CLA-700). lastEventWasError is whether the most recent typed event was
+	// itself an error — exactly the question buildOpencodeErrorText asks of the
+	// finished stream, tracked here as the stream arrives so the two cannot
+	// disagree about how the session ended.
+	recoveredErrors   int
+	lastEventWasError bool
 }
 
 // newOpencodeParse builds the parser a session streams into. It exists so the
@@ -1205,6 +1263,18 @@ func (p *opencodeParse) line(line []byte) {
 	}
 	if ev.Type == "error" && ev.Error != nil && ev.Error.Type != "" {
 		p.errorType = ev.Error.Type
+	}
+	// CLA-700: an error event the stream moves past is one the session
+	// recovered from. Counted here for every typed event, before the Part check,
+	// because an error event carries no part and can be the last thing a failed
+	// run emits.
+	if ev.Type != "" {
+		if p.lastEventWasError {
+			// The PREVIOUS error event was followed by this one, so it was
+			// recovered from (whether or not this event is also an error).
+			p.recoveredErrors++
+		}
+		p.lastEventWasError = ev.Type == "error"
 	}
 	if ev.Part == nil {
 		return
@@ -1469,6 +1539,10 @@ func (p *opencodeParse) finish(res *Result) {
 	// `observed` field.
 	res.Claim = p.observed.Claim
 	res.Reports = p.observed.Reports
+	// CLA-703: how many clankerbar calls got a successful result, copied for the
+	// same reason as the claim — the parser's observation is stream-side state
+	// until the process ends.
+	res.ClankerbarCalls = p.observed.ClankerbarCalls
 	// Recorded whatever the figures come to: the driver bounds attempts that
 	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
 	res.UsageReported = p.sawUsage
@@ -1547,6 +1621,17 @@ func (p *opencodeParse) finish(res *Result) {
 		}
 		res.Raw[OpencodeErrorTypeKey] = p.errorType
 	}
+	// CLA-700: the events this session RECOVERED from, with no error event ending
+	// the stream. Recorded as a positive count so the driver can tell "nothing
+	// happened" from "provider blips were ridden out" — the difference between an
+	// exit status that means the session failed and one that is upstream's own
+	// bug (2.x exits non-zero after recovering, pinned by the conformance suite).
+	if p.recoveredErrors > 0 && !p.lastEventWasError {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[RecoveredErrorsKey] = p.recoveredErrors
+	}
 }
 
 // opencodeBudgetRe recognizes a HARD budget/credit-exhaustion stop from the
@@ -1575,15 +1660,35 @@ func (opencode) DetectLimit(res Result) Limit {
 }
 
 // opencodeErrorText collects the harness-level diagnostic text — all of stderr,
-// plus the stdout lines that decode to a {"type":"error"} event — so a limit scan
-// sees provider/transport errors but never the agent's own assistant text.
+// plus a TERMINAL {"type":"error"} event on stdout — so a limit scan sees
+// provider/transport errors but never the agent's own assistant text.
 func opencodeErrorText(res Result) string {
 	return res.scan(scanErrorText, func() string { return buildOpencodeErrorText(res) })
 }
 
+// buildOpencodeErrorText appends the stream's error event ONLY when it is how
+// the session ENDED — the last typed event on stdout (CLA-700).
+//
+// 2.x emits a provider error mid-session, retries the request itself and carries
+// on: a stream whose error event is followed by a step_start / tool_use / text
+// part is a session that RECOVERED, and calling that session failed or
+// retryable is how a delivered phase got classified as a failed attempt (both
+// 2026-10-19 incidents). So an error event with any typed event after it is
+// recovery and contributes nothing here; only a stream that stops on the error
+// is a failure. The distinction is pinned by the conformance suite's
+// recovered-provider-error case, which execs the real binary.
+//
+// stderr is scanned unconditionally: it is the harness's own diagnostic channel,
+// written as the process winds down, and the fallback for the untyped failures
+// the typed-event scan cannot see.
+//
+// Note this is deliberately stricter than opencodeErrorType (the Raw
+// diagnostic key), which records the LAST error event whatever followed it —
+// that key is testimony about the stream, not a classification.
 func buildOpencodeErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
+	last := ""
 	for _, line := range strings.Split(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "{") {
@@ -1592,9 +1697,18 @@ func buildOpencodeErrorText(res Result) string {
 		var ev struct {
 			Type string `json:"type"`
 		}
-		if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "error" {
+		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type == "" {
+			continue
+		}
+		last = line
+	}
+	if last != "" {
+		var ev struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal([]byte(last), &ev) == nil && ev.Type == "error" {
 			b.WriteByte('\n')
-			b.WriteString(line)
+			b.WriteString(last)
 		}
 	}
 	return b.String()
@@ -1802,6 +1916,17 @@ func (o opencode) IsTransient(res Result) bool {
 	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
 		return false
 	}
+	// CLA-700: a session that RECOVERED from its provider errors is not retryable,
+	// however its exit status reads. 2.x emits the error, retries the request
+	// itself and finishes the work, then exits 1 anyway (pinned by the conformance
+	// suite), so there is no failure here for a retry to ride out — the question
+	// this exit raises is whether the session DELIVERED, and that is the driver's
+	// to answer, not a classifier's. Both the pattern scan below and the
+	// usage-gated heuristic are skipped: the heuristic exists to catch failures no
+	// pattern names, and this one is named (and it is not a failure).
+	if RecoveredErrors(res) > 0 {
+		return false
+	}
 	if opencodeTransientRe.MatchString(text) {
 		return true
 	}
@@ -1834,6 +1959,12 @@ func (opencode) IsUnclassifiedTransient(res Result) bool {
 	}
 	text := opencodeErrorText(res)
 	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	// CLA-700: the same rule as IsTransient's — a session that recovered from its
+	// error events has no unrecognised failure to guess at, so the heuristic must
+	// not launder its exit status into a retry.
+	if RecoveredErrors(res) > 0 {
 		return false
 	}
 	return !opencodeTransientRe.MatchString(text)

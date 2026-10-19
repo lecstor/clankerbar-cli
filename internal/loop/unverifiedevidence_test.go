@@ -372,7 +372,7 @@ func TestDrainPhases_AnUnverifiedReviewHandoffKeepsTheUnverifiedContinuation(t *
 		{res: reported(held(okResult(1, 0),
 			harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}), branchReport())},
 		{res: reviewHandoff},
-		{res: checkpointed(5, 0.50)}, // the successor, continuing the review
+		{res: mcpReached(checkpointed(5, 0.50))}, // the successor reached the backlog, continuing the review
 	}}
 	// The task carries no durable review record, so the review seam's gate
 	// refuses the checkpoint: the handoff is the only reason it is one.
@@ -422,7 +422,7 @@ func TestDrainPhases_AHandoffAfterAVerifiedCheckpointKeepsTheOpeningTip(t *testi
 		{res: reported(held(okResult(1, 0),
 			harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}), branchReport())},
 		{res: reviewHandoff},
-		{res: checkpointed(5, 0.50)},
+		{res: mcpReached(checkpointed(5, 0.50))},
 	}}
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
 	d := phaseDriverWithReleaser(t, h, []config.Phase{

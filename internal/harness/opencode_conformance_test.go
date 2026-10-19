@@ -114,19 +114,26 @@ type fakeRequest struct {
 // fakeOpenAI is a minimal OpenAI-compatible streaming chat server.
 //
 //   - status != 0: every chat request fails with that HTTP status.
+//   - malformedTurns > 0: the first N requests that CARRY TOOLS stream the
+//     anomalyco/opencode#43622 shape instead of an answer — content deltas with
+//     no non-null finish_reason, then `[DONE]` — which 2.0.32 reads as
+//     provider.invalid-output and retries itself. The retry is a fresh request,
+//     so it gets the ordinary answer below.
 //   - rounds set: a request that offers tools gets round k's tool calls, where
 //     k is the number of assistant tool-call turns already in the conversation;
 //     past the last round it answers "DONE". A request offering no tools (title
 //     generation) gets a plain answer.
 //   - otherwise: a plain "OK" answer with a usage block.
 type fakeOpenAI struct {
-	status int
-	rounds [][]fakeCall
-	delay  time.Duration
+	status         int
+	rounds         [][]fakeCall
+	delay          time.Duration
+	malformedTurns int
 
-	hit  atomic.Int64
-	mu   sync.Mutex
-	reqs []fakeRequest
+	hit       atomic.Int64
+	toolTurns atomic.Int64
+	mu        sync.Mutex
+	reqs      []fakeRequest
 }
 
 func (f *fakeOpenAI) requests() []fakeRequest {
@@ -209,6 +216,20 @@ func (f *fakeOpenAI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	usage := map[string]any{"prompt_tokens": fakePromptTokens, "completion_tokens": fakeCompletionTokens, "total_tokens": fakeRequestTokens}
 	chunk(map[string]any{"role": "assistant", "content": ""}, nil, nil)
+	if f.malformedTurns > 0 && len(rec.Tools) > 0 && int(f.toolTurns.Add(1)) <= f.malformedTurns {
+		// The #43622 shape, byte-for-byte what drained on 2026-10-19: a complete
+		// answer with every finish_reason null, then [DONE]. The AI SDK raises
+		// "OpenAI Chat stream ended without finish_reason"; 2.x surfaces it as a
+		// typed provider.invalid-output error event and retries the request
+		// itself.
+		chunk(map[string]any{"content": "O"}, nil, nil)
+		chunk(map[string]any{"content": "K"}, nil, nil)
+		fmt.Fprint(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return
+	}
 	if len(f.rounds) > 0 && len(rec.Tools) > 0 && turns < len(f.rounds) {
 		for i, c := range f.rounds[turns] {
 			args, _ := json.Marshal(c.Args)
@@ -619,15 +640,20 @@ func TestOpencodeConformance_permissions(t *testing.T) {
 }
 
 // MCP tools reach the session top-level (out of Code Mode), the claim is
-// observed off the stream, and the first-turn race is survived. Both config
-// dialects: the adapter rewrites 1.x `mcp.<name>` into `mcp.servers.<name>`.
+// observed off the stream, and the first-turn race is GONE: the adapter's
+// private-server preflight means the first tool-bearing request already offers
+// clankerbar_claim_task (CLA-703). Both config dialects: the adapter rewrites
+// 1.x `mcp.<name>` into `mcp.servers.<name>`.
 func TestOpencodeConformance_mcpClaim(t *testing.T) {
 	requireOpencodeConformance(t)
 	for _, dialect := range []string{"v1", "v2"} {
 		t.Run(dialect, func(t *testing.T) {
 			claim := []fakeCall{{"clankerbar_claim_task", map[string]any{"taskId": "T-9"}}}
-			// Two claim rounds: the first may land before the MCP server has
-			// connected; the model then calls again, as the warm-up note asks.
+			// Two claim rounds are kept so a regression is VISIBLE rather than
+			// fatal: if the preflight stops working, the first claim gets the
+			// "No tool named" error and the model retries, and the assertions
+			// below fail with the race named. On a healthy build the first
+			// request already has the tools and the second round answers it.
 			fake := &fakeOpenAI{rounds: [][]fakeCall{claim, claim}, delay: 300 * time.Millisecond}
 			srv := httptest.NewServer(fake)
 			defer srv.Close()
@@ -664,19 +690,41 @@ func TestOpencodeConformance_mcpClaim(t *testing.T) {
 			if !res.Claim.Held() || res.Claim.TaskID != "T-9" || res.Claim.RunID != "run-1" {
 				t.Errorf("Claim = %+v, want held T-9 / run-1", res.Claim)
 			}
+			// The successful call is also the fact the driver's no-MCP backstop
+			// reads; it must be visible on the real stream, not only in a fixture.
+			if res.ClankerbarCalls < 1 {
+				t.Errorf("ClankerbarCalls = %d, want at least 1 for the completed claim_task", res.ClankerbarCalls)
+			}
 			if data, err := os.ReadFile(filepath.Join(mcpDir, "calls.jsonl")); err != nil || !strings.Contains(string(data), "claim_task") {
 				t.Errorf("the fake MCP server saw no claim_task call (%v)", err)
 			}
-			sawNote := false
+			// CLA-703: the race is removed, not described. The first request
+			// that carries tools must already offer the clankerbar tool, and
+			// the old warm-up note must be gone from every user message.
+			sawToolOnFirstToolRequest := false
 			for _, r := range fake.requests() {
 				for _, u := range r.User {
 					if strings.Contains(u, "connect in the background") {
-						sawNote = true
+						t.Error("the removed MCP warm-up note still reached the model")
 					}
 				}
+				if len(r.Tools) == 0 || sawToolOnFirstToolRequest {
+					continue
+				}
+				sawToolOnFirstToolRequest = true
+				found := false
+				for _, name := range r.Tools {
+					if strings.Contains(name, "clankerbar_claim_task") {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("the first tool-bearing request did not offer clankerbar_claim_task (tools: %v)", r.Tools)
+				}
 			}
-			if !sawNote {
-				t.Error("the MCP warm-up note did not reach the model")
+			if !sawToolOnFirstToolRequest {
+				t.Error("no tool-bearing request reached the fake provider")
 			}
 			if want := int(fake.hit.Load()) * fakeRequestTokens; res.Tokens != want {
 				t.Errorf("Tokens = %d, want %d", res.Tokens, want)
@@ -873,6 +921,83 @@ func TestOpencodeConformance_errors(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestOpencodeConformance_recoveredProviderError is the CLA-700 probe, run
+// against the REAL binary: what does opencode 2.x do with a chat stream that
+// drains with every finish_reason null (#43622)?
+//
+// The recorded answer, and the reason the driver may not judge a phase by its
+// exit status:
+//
+//   - the session RETRIES the request itself and finishes the work — the stream
+//     carries the typed provider.invalid-output error event and then the retry's
+//     own steps and final answer, which is what makes this a RECOVERED error
+//     rather than a failed session;
+//   - and it exits NON-ZERO anyway (1 on 2.0.32). That exit status is
+//     indistinguishable from a genuine failure at the process level, which is
+//     exactly how two delivered phases were stranded on 2026-10-19.
+//
+// The assertions below pin all three facts, so an upstream fix (or a new
+// regression) fails here loudly instead of silently changing how the driver
+// reads a session.
+func TestOpencodeConformance_recoveredProviderError(t *testing.T) {
+	requireOpencodeConformance(t)
+	fake := &fakeOpenAI{malformedTurns: 1}
+	srv := httptest.NewServer(fake)
+	defer srv.Close()
+	iso := isolate(t)
+	res := invokeConformance(t, iso.invocation(conformancePrompt, t.TempDir(), writeJSON(t, fakeConfigDoc(srv.URL))))
+	requireHit(t, fake)
+	requireV2Record(t, iso, res)
+
+	// The retry really happened: the fake served the malformed shape once, and a
+	// later tool-bearing request got the ordinary answer.
+	if got := fake.toolTurns.Load(); got < 2 {
+		t.Fatalf("the session sent %d tool-bearing request(s), want at least 2 — opencode did not retry the malformed stream, so this fixture is not exercising the recovery", got)
+	}
+
+	// The exit status (CLA-700's open question, now answered): non-zero.
+	if res.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1 — opencode 2.x exits NON-ZERO after recovering from a provider error (stderr %.300s); if upstream changed this, the driver's recovery handling can be revisited", res.ExitCode, res.Stderr)
+	}
+
+	// The event sequence: the typed error event, and typed events AFTER it.
+	lines := strings.Split(strings.TrimSpace(res.Stdout), "\n")
+	errAt := -1
+	for i, line := range lines {
+		var ev opencodeEvent
+		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type == "" {
+			continue
+		}
+		if ev.Type == "error" {
+			errAt = i
+			if ev.Error == nil || ev.Error.Type != "provider.invalid-output" {
+				t.Errorf("line %d: error event = %+v, want type provider.invalid-output (the #43622 shape)", i, ev.Error)
+			}
+		}
+	}
+	if errAt < 0 {
+		t.Fatalf("the stream carries no error event; the fixture did not reproduce #43622:\n%s", res.Stdout)
+	}
+	if errAt == len(lines)-1 {
+		t.Fatalf("the error event is the LAST event on the stream — the session did not recover, so this fixture is not #43622:\n%s", res.Stdout)
+	}
+	if got := RecoveredErrors(res); got == 0 {
+		t.Errorf("the adapter recorded no recovered error events for a stream whose error is followed by %d event(s)", len(lines)-errAt-1)
+	}
+	if res.FinalMessage != "OK" {
+		t.Errorf("FinalMessage = %q, want OK — the retried turn's answer is the session's final message", res.FinalMessage)
+	}
+	// And the classification the driver actually reads: a recovered session is
+	// neither transient nor a failure, whatever the exit status says.
+	if (opencode{}).IsTransient(res) {
+		t.Errorf("IsTransient = true for a recovered session (exit %d); diagnostic = %.300q", res.ExitCode, (opencode{}).Diagnostic(res))
+	}
+	if (opencode{}).DetectLimit(res).Limited {
+		t.Error("DetectLimit fired on a recovered provider.invalid-output event")
+	}
+	t.Logf("exit=%d recovered=%d final=%q usage_reported=%v tokens=%d", res.ExitCode, RecoveredErrors(res), res.FinalMessage, res.UsageReported, res.Tokens)
 }
 
 // The content layer is merged after OPENCODE_CONFIG. The adapter's permission

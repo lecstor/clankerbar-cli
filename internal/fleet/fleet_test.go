@@ -249,6 +249,49 @@ func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 	}
 }
 
+// CLA-677: each iteration carries the drain's dollar spend as `costUsd`. It is
+// always present — deliberately UNLIKE `tokens`, which is omitempty — because a
+// zero here is a figure (the harnesses reported no cost), not an unknown the
+// plane should distinguish from an older CLI's missing key.
+func TestMarshalReport_CarriesIterationCost(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		Iterations: []Iteration{{
+			Outcome: OutcomeReleased, DurationSeconds: 12.5, Tokens: 4321, CostUSD: 1.25,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	var got struct {
+		Iterations []struct {
+			CostUSD *float64 `json:"costUsd"`
+		} `json:"iterations"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Iterations) != 1 || got.Iterations[0].CostUSD == nil {
+		t.Fatalf("iteration did not carry costUsd: %s", b)
+	}
+	if *got.Iterations[0].CostUSD != 1.25 {
+		t.Errorf("costUsd = %v, want 1.25", *got.Iterations[0].CostUSD)
+	}
+
+	// A zero-cost iteration still carries the key: absent would read as "an
+	// older CLI", which is a different fact.
+	b, err = marshalReport(Report{
+		Identity:   Identity{Instance: "x"},
+		Iterations: []Iteration{{Outcome: OutcomeReleased}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if !strings.Contains(string(b), `"costUsd":0`) {
+		t.Errorf("a zero-cost iteration dropped costUsd: %s", b)
+	}
+}
+
 // CLA-630: the exact wire shape the plane's parsePhaseSessions reads —
 // sessions:[{phase,harness,model}] in spawn order, the model present even when
 // empty (the plane stores "" as null, "not resolved"), and no key at all on an
@@ -283,6 +326,42 @@ func TestMarshalReport_SessionsWireShape(t *testing.T) {
 	}
 	if strings.Contains(string(b), "sessions") {
 		t.Errorf("an iteration that spawned no sessions grew a sessions key: %s", b)
+	}
+}
+
+// CLA-703: a session's infrastructure cause rides the wire only when there is
+// one. The pre-CLA-703 shape is byte-for-byte unchanged (pinned above); a
+// no_mcp session adds `cause` so the durable phase_session record can carry the
+// classification once the plane's parser stores it.
+func TestMarshalReport_SessionCauseIsOptional(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		Iterations: []Iteration{{
+			Outcome: OutcomeReleased,
+			Sessions: []Session{
+				{Phase: "review", Harness: "opencode", Cause: CauseNoMCP},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if !strings.Contains(string(b), `"cause":"no_mcp"`) {
+		t.Errorf("a no_mcp session did not carry its cause: %s", b)
+	}
+	// An ordinary session must not grow the key.
+	b, err = marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		Iterations: []Iteration{{
+			Outcome:  OutcomeReleased,
+			Sessions: []Session{{Phase: "implement", Harness: "opencode"}},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), `"cause"`) {
+		t.Errorf("an ordinary session grew a cause key: %s", b)
 	}
 }
 

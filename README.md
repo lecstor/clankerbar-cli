@@ -343,6 +343,18 @@ prompt owns its own contract; `review_panel` alongside either is refused rather
 than silently ignored. An empty array (`"review_panel": []`) is refused too:
 removing the key is how you ask for a single reviewer.
 
+Members run **in parallel by default**: the whole panel at once, each in its own
+**detached worktree at the reviewed tip**. The driver creates that checkout (a
+`git worktree add --detach <tip>`), starts the member in it, and removes it when
+the member ends; a dirty member tree is logged and discarded, never salvaged,
+because a review-only session's deliverable is its record and committing its
+probe artifacts would move the tip past the revision every member recorded.
+`review_panel_concurrency` caps how many run at once: `1` is the historical
+sequential behaviour (members then share the task's own worktree), `N` runs at
+most `N`, and an absent key or `0` means the whole panel. The fix phase starts
+only after the join has every member's record — or its INCOMPLETE outcome — and
+then works in the task's own worktree as before.
+
 Each member's reviewer role is **positional** — `review-1` .. `review-N`, counted
 over the review-shaped phases — and that is the role the durable record is keyed
 on. `name` is only the member's log label (it defaults to the same positional
@@ -395,11 +407,24 @@ with evidence, never by dropping a finding another reviewer would have kept.
 The panel is **interim** and local config, like the phase sequencing it
 multiplies (B10). The state-machine reshape moves review sequencing and the
 `agent_review -> implementing` transition onto the plane, where panel membership
-becomes plane phase state; until then the members run sequentially in the CLI
-because parallel reviewers on one task need per-(task, phase) leases the plane
-does not yet model. `clankerbar doctor` prints the resolved panel, with each
-member's harness and model, so an overnight run's review spend is visible before
-it happens.
+becomes plane phase state; until then the CLI owns the fan-out. Members resume
+the **same run** and all heartbeat its one run id: that is safe because a
+heartbeat is an idempotent lease renewal (one `last_heartbeat_at` /
+`heartbeat_count` UPDATE, no version check), and each member's durable record is
+keyed by its **positional role**, so concurrent appends land as distinct rows in
+the one round the plane derives (`max(existing round) + 1` when nothing is
+sealed — deterministic for simultaneous first writers). Membership therefore
+needs no per-(task, phase) leases; what it needs is what ships here: a private
+checkout per member and a join that closes the round before the fix. The cap is
+also the budget breaker's granularity: the members share one run-wide ceiling,
+so each member publishes the spend it has counted to a shared panel ledger the
+moment its attempt ladder counts it, and every member's pre-spawn budget check
+measures the panel's **aggregate** — a member that starts after a sibling has
+already paid (the cap staggers them) sees that money against the ceiling. What
+no check can see is spend still in flight, so the residual overshoot stays
+bounded by the sessions running alongside it, at most `cap - 1`. `clankerbar
+doctor` prints the resolved panel, with each member's harness and model, so an
+overnight run's review spend is visible before it happens.
 
 ### Session-initiated handoff: a boundary the session chooses
 
@@ -539,7 +564,9 @@ non-final review phase out into one review phase per member; see [the review
 panel](#the-review-panel-several-reviewers-one-revision-one-merge) for the
 config, independence and the merge. It is opt-in — with no `review_panel` the
 review phase runs once, as before — and members name their own `harness`/`model`,
-so a panel can span harnesses too.
+so a panel can span harnesses too. The members run concurrently by default, each
+in its own detached worktree; `review_panel_concurrency: 1` restores the
+sequential sequence.
 
 **Do not run `fix` on the review's Claude account.** A fix session that starts
 right after an Opus review can hit the same rolling usage limit the review just
@@ -710,6 +737,16 @@ roster** on the plane, polled every 15 seconds from
 `<backlog_url>/api/daemon-roster`. The account key (`CLANKERBAR_API_KEY`) is
 required — a supervisor spans projects, so a project key will not do.
 
+Every poll — and immediately after any child state change — the supervisor also
+reports its own view back to `<backlog_url>/api/daemon-roster/status`, so the
+console can tell a HALTed instance from a crashed one and a stopped machine from
+a sleeping one. The body carries the host, the supervisor's version and start
+time, and one row per instance: its state (`running`, `halted`, `backing_off`,
+`exited`, `stopped`), the reason, since when, the child's version, its last exit
+(code and time) and any scheduled retry. Like the daemon's fleet beacons this is
+fail-soft telemetry — a failed POST is logged once per outage and never changes
+what the supervisor does.
+
 Each roster entry declares one instance:
 
 - **`desiredState: running`** — a supervised child is kept up, spawned as
@@ -738,6 +775,19 @@ contrast, is consumed by the daemon when it honours it, so the supervisor
 cannot see it and reads the exit as unexpected: **to stop ONE instance while
 the supervisor runs, touch `HALT` in its state dir, not `STOP`.**
 
+**A dead child's claim is handed back immediately.** A session that dies with
+the daemon process — a crash, a `kill`, the machine sleeping — would otherwise
+leave its lease ticking for the full 30 minutes with nobody working the task.
+While a daemon holds a claim it keeps `CURRENT_CLAIM` in its state dir (task id,
+run id, project, branch once one is recorded, and when the claim was taken) and
+removes it on every path where it lets go. When a child exits with the file
+still there, the supervisor makes the call the dead daemon could not, before any
+respawn: `release` when no branch was recorded, `expireLease` when one was, so
+pushed work comes back as an immediate takeover with its branch instead of
+waiting out the lease. The same happens inside the daemon when a phase is
+abandoned holding pushed work. A plane that refuses because the run already
+ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
+
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
 (loaded exactly as `clankerbar run` loads it, or bare defaults when no file
@@ -765,17 +815,79 @@ nothing else: a machine-layer key (`env`, `settings_path`, `workdir`,
 in the log, never silently dropped — a silent drop is how a daemon ends up
 looking configured and not being.
 
-**Workdir derivation (phase 2a).** Set `CLANKERBAR_WORKDIR_ROOT` to the
-machine's one checkout root and the supervisor derives each child's workdir as
-`<root>/<repo name>` for the repo its project's roster entry names
-(`primary_repo`, per project when the entry drives several). Derivation fails
-closed, both conditions learned from the CLA-441 wrong-workdir failure: if the
-derived directory does not exist, or is not a checkout of the expected repo
-(its origin remote names something else), that daemon is **refused** — never
-spawned, the path tried is reported, nothing is created, and the supervisor's
-own working directory is never used as a fallback. With the variable unset,
-derivation is off and children run on the base config's own workdirs, exactly
-as before.
+**Workdir derivation (phase 2a) — the fleet's own clones.** Set
+`CLANKERBAR_WORKDIR_ROOT` to the machine's one root and the supervisor lays out
+one directory per project, and clones into it:
+
+```
+<root>/
+  <project slug>/                     the project root — a session's scope
+    <repo name>/                      one clone per repo the project names
+    worktrees/                        every worktree the fleet creates here
+```
+
+Each repo the project names — the keys of its `repos` map (whose VALUES are
+optional local-path overrides, not identities) plus its `primary_repo` — is
+derived as `<root>/<project slug>/<repo name>`. A bare `repos` key that names
+the same checkout as one of the project's full `owner/name` identities is that
+identity spelled short and is materialized under the full name, which is the
+only spelling a clone URL can come from; two DIFFERENT full identities that
+share a name (`acme/api` and `other/api`) cannot both live at
+`<project root>/api`, and the derivation refuses the instance naming both rather
+than cloning one over the other. A repo that is **not there yet
+is cloned** from the plane's repo identity, so nobody has to check anything out
+for the fleet first; the clone reads the run's git credential (the same
+`gh auth token --user <owner>` scoping the delivery verifier uses, and the token
+travels in the child's environment, never on a command line). The project's
+`worktrees/` directory is created too: it is the fleet's own area, not the
+operator's.
+
+Derivation fails closed, on the conditions learned from the CLA-441
+wrong-workdir failure. A directory that **exists** is never replaced, adopted or
+cloned over: if it is not a checkout of the expected repo — a plain directory, a
+file, a symlink, a checkout of a different repo, a repo whose origin cannot be
+attributed — that daemon is **refused**, the path tried is reported, and the
+supervisor's own working directory is never used as a fallback. A **symlink** at
+the project root, a repo clone or the `worktrees/` directory is refused too: it
+would put the project's clones, its worktrees and the sessions' scope outside the
+project root the layout promises, so those are always real directories. A failed
+clone leaves nothing behind (it lands in a temporary sibling and is renamed into
+place, and only onto a path nothing else created in the meantime). With the
+variable unset, derivation is off and children run on the base config's own
+workdirs, exactly as before.
+
+**These clones are the fleet's.** The fleet fetches in them, resets its own
+default checkout, creates and deletes branches and worktrees in them, and
+clones one in when it is missing. They are not a place to keep work that is not
+pushed. The derivation writes `project_root: true` into the generated config,
+which is what widens each session's permission scope to the whole project root
+(see "What each harness receives" below) and what `doctor`'s `project root`
+check verifies: every configured repo resolves INSIDE the project root, no path
+in the layout is a symlink out of it, the clone's origin names the repo it sits
+under, and the worktree directory exists and is inside the root.
+
+**Working in the fleet's clones, or not.** The choice is yours:
+
+- **Work in them** and let the fleet manage them (the default the layout is
+  built for). Nothing to keep in sync: your checkout IS the fleet's.
+- **Keep your own clones** elsewhere (`~/dev/...`, wherever you like) and pull
+  the branches the fleet pushes. Costs disk for a second copy of every repo,
+  and you must not expect the fleet to touch your tree — it never reads or
+  writes outside `<root>`.
+- **Middle path: a worktree of a fleet clone.** `git worktree add` from
+  `<root>/<project slug>/<repo name>` gives you your own working tree sharing
+  the fleet clone's objects, with these caveats:
+  - git refuses to check out a branch that is checked out in another worktree,
+    in **either** direction: you cannot check out a branch a fleet worktree
+    holds, and the fleet cannot create a worktree for a branch you hold. Use
+    your own branch names, or `--detach`.
+  - refs and objects are shared, so a commit of yours is visible to the fleet
+    clone immediately, and a fleet `git worktree prune` / `gc` runs over your
+    worktree's metadata (safe while your worktree directory exists).
+  - if the fleet ever re-clones the repo, worktrees hanging off the old clone
+    break.
+  - the fleet's own default checkout (the repo directory itself) must be left
+    alone — that is where it reads, fetches and branches.
 
 **Materialized configs (phase 2b).** Every child runs on a config the
 supervisor *generates*, not a hand-maintained file: the child's effective
@@ -811,7 +923,9 @@ allowlist, which `doctor` already warns about.
 lists the version it itself runs and, per instance, the state and the version
 of the child serving it — so version skew between children (and between a
 child and the supervisor) is observable on the machine, not only on the fleet
-page. `clankerbar supervise roll` rolls the children onto a newly installed
+page. Those lines, and its refuse/spawn/exit decisions, are also written to
+`<supervisor state dir>/supervise.log` (see [Visibility](#visibility)).
+`clankerbar supervise roll` rolls the children onto a newly installed
 binary one at a time, verifying each one's next beacon reports it before the
 next is touched; `clankerbar supervise replace` drains the fleet and execs the
 running supervisor into a newly installed build. Neither fetches or installs
@@ -1178,9 +1292,36 @@ project_required` from the legacy slug-less route) — give the loop a slug via
 
 The driver logs milestones to your terminal as it goes (timestamped): spawning,
 queue state each poll, done + tokens/cost, usage-limit pauses, transient retries.
-The Claude harness runs with `--output-format stream-json`, so the agent's own
-progress — assistant text and `→ Tool` markers — streams live too, and each
-attempt is captured to its own `<state-dir>/iteration-<ts>.log`.
+
+Those lines — the daemon's own record of what it *decided* — are also written to
+**`<state-dir>/daemon.log`**, rotated at 8 MiB and keeping 3 files
+(`daemon.log`, `daemon.log.1`, `daemon.log.2`), so a daemon that runs for weeks
+does not leave one unbounded file and a monitoring agent does not need your
+terminal. The state dir is the one `doctor`'s `state_dir` line prints
+(`~/.local/state/clankerbar/loop/<workdir-slug>` by default); `doctor` also names
+the log paths.
+
+A session's own stream is **not** echoed there by default. It is the whole
+harness transcript — prompts, tool arguments, tool output — and once it also
+went to the daemon's stderr it buried the daemon's lines under thousands of rows
+of scrollback, which is exactly the record that says why a run ended. Each
+attempt is kept in full in its own `<state-dir>/iteration-<ts>.log`, and the
+daemon's spawn and end lines name that file, so the two can be joined. The
+Claude harness still renders the agent's progress — assistant text and `→ Tool`
+markers — into that file.
+
+To watch one session live again, set **`"echo_sessions": true`**: the stream is
+mirrored to the daemon's terminal *as well as* written to the iteration log.
+No harness gets a separate live channel of its own: claude's stderr is part of
+its stream and lands in the log with the rest of it.
+
+The fleet supervisor keeps its own lines the same way, in
+**`<supervisor state dir>/supervise.log`** (`~/.local/state/clankerbar/loop/roster/supervise.log`
+by default, size-rotated on the same terms) — refuse-to-start reasons, spawn
+failures, exits and backoff, and the per-change fleet status listing. That is the
+long-lived `clankerbar supervise` process; the one-shot `supervise roll` and
+`supervise replace` write their own lines to stderr only, and exit. Children's
+stderr still streams to the supervisor's own terminal, as before.
 
 ### Fleet visibility
 
@@ -1203,7 +1344,9 @@ cadences the loop already runs (no new timers):
 - **Iteration history**: exactly one record per drain, posted at the boundary it
   just crossed — the task, the phases attempted, how it ended (`checkpoint`
   work left for a takeover / `released` back to the queue or settled /
-  `parked` for the operator / `dead`), duration, and tokens. The record also
+  `parked` for the operator / `dead`), duration, tokens, and the drain's
+  harness-reported dollar spend (`costUsd`; zero means no harness reported a
+  cost). The record also
   names every session the drain spawned, in spawn order, with the label of the
   phase it ran, the harness that ran it, the model it was spawned with (empty
   when the harness default applied), and what that session spent: the token
@@ -1327,7 +1470,8 @@ of a day's spend, for work that was done twice.
 
 So when a session ends still holding a task, the driver looks for the worktree it
 was working in and, if anything is uncommitted, **commits it, pushes it, and
-records the branch on the task** — turning a redo into a takeover:
+records the branch on the task** — turning a redo into a takeover (with the one
+exception below, for a tip the session already delivered):
 
 ```
 salvaged CLA-314: committed the uncommitted work in /Users/you/dev/acme-wt/cc561415
@@ -1359,6 +1503,25 @@ merge, rebase, cherry-pick or revert) and a conflict nothing is holding open: a
 `git stash pop`, `git apply --3way` or `git checkout -m` leaves unmerged entries
 with no state file at all, so the unmerged index is checked as well as the
 operation. Either way it is logged as `STRANDED WORK LEFT AS IS` with the path.
+
+**Untracked files alone, at a tip the session already delivered, are left alone.**
+The driver asks the origin rather than the session: when the branch the session
+recorded is on the remote at **exactly** the worktree's HEAD, the work is pushed
+and there is nothing left to rescue, so the untracked files are left uncommitted
+and logged. What is in them is not known here — a `wrangler types` dump and a
+source file written after the last commit are the same shape in a status line —
+and only a reader can tell which of them is disposable. Committing them would push
+a **new** tip at the phase boundary, and every reader downstream — each
+review-panel member, the fix phase, the PR — would then review the salvage commit
+instead of the tip the session handed over, which is precisely what one implement
+phase cost before this rule existed.
+
+Delivery is the whole discriminator, and it is checked, not assumed: an edit to a
+**tracked** file is salvaged on top of a delivered tip like any other uncommitted
+work, and an undelivered session's untracked files — the new module it never
+staged — are salvaged in full, which is what the rescue above is for. If the origin
+cannot be read the answer is "not delivered" and the work is saved exactly as
+before: the failure mode of this check is the old behaviour, never a quiet loss.
 
 **It cannot touch a tree that is not this task's.** The worktree is identified by
 its checked-out branch carrying `clanker/<first 8 characters of the task id>` —
@@ -1420,6 +1583,7 @@ instance the supervisor reads.
   "max_retries": 0,
   "retry_cap": "5m",
   "max_zero_spend_attempts": 3,
+  "echo_sessions": false,
   "budget": {
     "max_tokens": 0,
     "max_cost_usd": 0,
@@ -1429,6 +1593,11 @@ instance the supervisor reads.
   }
 }
 ```
+
+`echo_sessions` (default **false**) restores the old live echo of a session's
+stream to the daemon's terminal. Off, the stream goes only to its iteration log,
+which is what keeps the daemon's own lines readable — [Visibility](#visibility)
+has the reasoning and where both logs live.
 
 `max_turns` bounds every session's turns when its phase sets none of its own:
 the phase's `max_turns` wins, then this, then a built-in default of 400
@@ -1701,6 +1870,17 @@ repo B:
 The conventional task-worktree area beside a checkout (`<checkout>-wt` as its
 sibling) joins the grant list automatically whenever that directory exists, so
 a session can create and edit the worktree it is told to work in.
+
+Under the per-project layout (`project_root`, see "Workdir derivation" above)
+the reach is the whole PROJECT instead: the project root and every directory
+inside it — each repo of the project, and `worktrees/` — are granted, whether
+or not they are declared, and a repo the fleet clones in later is in scope with
+no config edit. Everything outside the project root stays closed: a session in
+`<root>/<project slug>/<repo name>` cannot read a sibling project under the
+same root, nor anything above it. Because the grant is the project root rather
+than a declaration, it is asserted by the config flag and never inferred from
+the directory layout — a developer's multi-repo parent (`~/dev` and its ~150
+trees) is never widened just because a session runs inside it.
 
 ### PR bases: `pr_base`
 

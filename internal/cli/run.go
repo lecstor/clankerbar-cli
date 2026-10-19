@@ -85,6 +85,15 @@ func Run(ctx context.Context, args []string) error {
 	if err := cfg.Validate(); err != nil {
 		return err
 	}
+	// The daemon's own lines go to its state dir as well as stderr (CLA-701):
+	// the terminal is not a log store, and once the session stream stopped
+	// being echoed there these became the only live output. A failure here is
+	// a warning, never a refusal — observability must not gate the run.
+	if restore, err := installDaemonLog(cfg); err != nil {
+		warnNoDaemonLog(cfg, err)
+	} else {
+		defer restore()
+	}
 	// Validation's one WARNING, said out loud at startup rather than only in
 	// `doctor` (CLA-441): an opencode config the driver never named that a
 	// session will merge anyway. Neither kind is a refusal - but an overnight
@@ -155,6 +164,10 @@ func Run(ctx context.Context, args []string) error {
 				// permission policy covers every declared checkout.
 				Repos:       cfg.ReposFor(p.Slug),
 				PrimaryRepo: cfg.PrimaryRepoFor(p.Slug),
+				// Whether this workdir is a fleet project root (CLA-678), whose
+				// whole subtree a session's permission scope must cover — see
+				// loop.Target.ProjectRoot.
+				ProjectRoot: cfg.ProjectRoot,
 				// Fleet activity reporting for this project (CLA-466): presence
 				// on every poll, iteration records at drain boundaries. Not
 				// wired (a no-op reporter) when no slug-ful report URL can be
@@ -177,6 +190,8 @@ func Run(ctx context.Context, args []string) error {
 		Fleet:       fleet.New(cfg.FleetReportURL(), apiKey),
 		Repos:       cfg.ReposFor(""),
 		PrimaryRepo: cfg.PrimaryRepoFor(""),
+		// See the multi-project branch above.
+		ProjectRoot: cfg.ProjectRoot,
 	}}), f.cfgPath, overrides)
 }
 

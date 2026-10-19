@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -53,6 +54,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/teststate"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
@@ -75,6 +77,13 @@ func TestMain(m *testing.M) {
 		helperMain()
 		os.Exit(0) // unreachable — helperMain exits
 	}
+	// No test here may reach the network by accident: the workdir derivation
+	// CLONES a missing repo, so the default clone remote is an unreachable local
+	// path and gh is a binary that cannot resolve a token. A test that wants a
+	// real clone points cloneRemoteBase at a local bare repository
+	// (pointClonesAt).
+	cloneRemoteBase = "file:///nonexistent-clankerbar-test-remote/"
+	cloneGHBin = "false"
 	os.Exit(teststate.Isolate(m))
 }
 
@@ -159,6 +168,12 @@ func helperMain() {
 
 	stopPath := filepath.Join(spec.StateDir, "STOP")
 	switch mode {
+	case "crash-claim", "crash-claim-branch":
+		// A daemon that died while holding a claim, leaving the record the
+		// supervisor reads (CLA-708). Branch empty vs set is the whole
+		// release/expireLease split.
+		writeHelperClaim(spec.StateDir, mode == "crash-claim-branch")
+		os.Exit(1)
 	case "crash":
 		os.Exit(1)
 	case "halt":
@@ -166,10 +181,16 @@ func helperMain() {
 			os.Exit(9)
 		}
 		os.Exit(1)
-	case "sleep", "sleep-seen":
+	case "sleep", "sleep-seen", "sleep-claim", "sleep-claim-branch":
+		// A daemon that is alive and holding a claim when the fleet stop lands:
+		// the STOP takes effect at its iteration boundary, and the record is
+		// still present for the supervisor's shutdown-path handback.
+		if strings.HasPrefix(mode, "sleep-claim") {
+			writeHelperClaim(spec.StateDir, mode == "sleep-claim-branch")
+		}
 		for {
 			if _, err := os.Lstat(stopPath); err == nil {
-				if mode == "sleep" {
+				if mode != "sleep-seen" {
 					_ = os.Remove(stopPath)
 				} else {
 					_ = os.WriteFile(filepath.Join(spec.StateDir, "STOP-SEEN"), []byte("marker landed\n"), 0o600)
@@ -206,21 +227,117 @@ func helperMain() {
 	}
 }
 
+// writeHelperClaim leaves the CURRENT_CLAIM record the supervisor hands back
+// (CLA-708). Branch empty vs set is the whole release/expireLease split.
+func writeHelperClaim(stateDir string, branch bool) {
+	claim := loop.CurrentClaim{
+		TaskID:    "t-claim",
+		RunID:     "r-claim",
+		Project:   "acme",
+		ClaimedAt: time.Now().UTC(),
+	}
+	if branch {
+		claim.Branch = "clanker/claim-wip"
+	}
+	body, err := json.Marshal(claim)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
+		os.Exit(9)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, loop.CurrentClaimName), body, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
+		os.Exit(9)
+	}
+}
+
 // --- test scaffolding -------------------------------------------------------
 
 // fakePlane serves the account-scoped roster over httptest. The served
 // entries are mutable (set) so a test can flip desired state between polls —
 // the console flip — and the plane can be put down (setDown) to exercise the
-// offline paths.
+// offline paths. Status reports (CLA-677) land on the roster's `/status` child
+// path and are recorded raw so a test can assert their body; statusCode lets a
+// test make that endpoint fail (404 before CLA-676 lands, or 5xx).
 type fakePlane struct {
-	mu      sync.Mutex
-	entries []RosterEntry
-	down    bool
+	mu         sync.Mutex
+	entries    []RosterEntry
+	down       bool
+	statusCode int // 0 = 200
+	statuses   []json.RawMessage
+	// calls records the write calls the supervisor made against the MCP
+	// endpoints, so a handback test can assert the tool, the ids and the
+	// driver marker on the wire.
+	calls []planeCall
+	// planeRefusal, when set, is returned as an MCP tool-level refusal
+	// (`isError`, the shape the plane uses for not_holding/run_superseded).
+	planeRefusal string
+}
+
+type planeCall struct {
+	path string
+	tool string
+	args map[string]any
 }
 
 func (p *fakePlane) serve(t *testing.T) *httptest.Server {
 	t.Helper()
+	const okBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/mcp/") {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			var rpc struct {
+				Params struct {
+					Name      string         `json:"name"`
+					Arguments map[string]any `json:"arguments"`
+				} `json:"params"`
+			}
+			_ = json.Unmarshal(body, &rpc)
+			p.mu.Lock()
+			down := p.down
+			if !down {
+				p.calls = append(p.calls, planeCall{path: r.URL.Path, tool: rpc.Params.Name, args: rpc.Params.Arguments})
+			}
+			refusal := p.planeRefusal
+			p.mu.Unlock()
+			if down {
+				http.Error(w, "plane unreachable", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if refusal != "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0", "id": 1,
+					"result": map[string]any{
+						"isError": true,
+						"content": []map[string]any{{"type": "text", "text": refusal}},
+					},
+				})
+				return
+			}
+			_, _ = io.WriteString(w, okBody)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			p.mu.Lock()
+			code := p.statusCode
+			down := p.down
+			if !down {
+				p.statuses = append(p.statuses, json.RawMessage(body))
+			}
+			p.mu.Unlock()
+			if down {
+				http.Error(w, "plane unreachable", http.StatusServiceUnavailable)
+				return
+			}
+			if code != 0 && code != http.StatusOK {
+				http.Error(w, "status endpoint refused", code)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
 		p.mu.Lock()
 		down := p.down
 		entries := p.entries
@@ -248,6 +365,42 @@ func (p *fakePlane) setDown(down bool) {
 	p.mu.Unlock()
 }
 
+func (p *fakePlane) setStatusCode(code int) {
+	p.mu.Lock()
+	p.statusCode = code
+	p.mu.Unlock()
+}
+
+// planeCalls returns the MCP write calls the plane received.
+func (p *fakePlane) planeCalls() []planeCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]planeCall(nil), p.calls...)
+}
+
+func (p *fakePlane) setPlaneRefusal(text string) {
+	p.mu.Lock()
+	p.planeRefusal = text
+	p.mu.Unlock()
+}
+
+// statusReports decodes every status POST the plane received, in arrival order.
+func (p *fakePlane) statusReports(t *testing.T) []statusBody {
+	t.Helper()
+	p.mu.Lock()
+	raw := append([]json.RawMessage(nil), p.statuses...)
+	p.mu.Unlock()
+	out := make([]statusBody, 0, len(raw))
+	for _, b := range raw {
+		var rep statusBody
+		if err := json.Unmarshal(b, &rep); err != nil {
+			t.Fatalf("status report is not the documented JSON: %v\nbody: %s", err, b)
+		}
+		out = append(out, rep)
+	}
+	return out
+}
+
 // testOptions returns supervisor options pointed at the test binary as the
 // child and the fake plane as the roster, with fast intervals so the tests do
 // not wait on production defaults. HOME is isolated so the machine-layer
@@ -266,6 +419,12 @@ func testOptions(t *testing.T, cacheDir string, srv *httptest.Server) Options {
 		BackoffCap:        200 * time.Millisecond,
 		BackoffResetAfter: time.Second,
 		SettleBeforeStop:  10 * time.Millisecond,
+		// The handback (CLA-708) targets a production MCP endpoint the child's
+		// config resolves; point it at this test's fake plane so the call is
+		// observed for real rather than leaving for clankerbar.com.
+		PlaneFor: func(_, key string) plane.Releaser {
+			return plane.New(srv.URL+"/mcp/acme", key)
+		},
 	}
 }
 
@@ -768,8 +927,8 @@ func TestWorkdirDerivationFailureSpawnsNothing(t *testing.T) {
 	root := t.TempDir()
 	// The good instance's derived workdir must be a real checkout of the repo
 	// its project names; the ghost instance's derived path will simply not
-	// exist.
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
+	// exist (and, with the clone remote unreachable in tests, cannot be cloned).
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
 
 	cacheDir := t.TempDir()
 	setHelperMode(t, "sleep")
@@ -799,8 +958,8 @@ func TestWorkdirDerivationFailureSpawnsNothing(t *testing.T) {
 		t.Fatalf("spawns for the refused instance = %d, want 0 — a failed derivation must spawn nothing", got)
 	}
 	// The refusal is loud and names the path that was tried.
-	if logText := buf.String(); !strings.Contains(logText, filepath.Join(root, "ghost")) {
-		t.Fatalf("the refusal log does not name the path tried %q:\n%s", filepath.Join(root, "ghost"), logText)
+	if logText := buf.String(); !strings.Contains(logText, filepath.Join(root, "acme", "ghost")) {
+		t.Fatalf("the refusal log does not name the path tried %q:\n%s", filepath.Join(root, "acme", "ghost"), logText)
 	}
 
 	cancel()

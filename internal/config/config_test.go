@@ -834,3 +834,43 @@ func TestSessionTokenCeilingFollowsAPerHarnessTokenCeiling(t *testing.T) {
 		t.Errorf("SessionTokenCeiling = %d, want 2x max_tokens as before", got)
 	}
 }
+
+// echo_sessions is opt-in and must default off (CLA-701): the session stream is
+// the whole harness transcript, and echoing it buries the daemon's own lines. It
+// is also part of the config's identity only when SET, so a config that never
+// names it keeps the identity it had before the field existed.
+func TestLoadEchoSessions(t *testing.T) {
+	write := func(t *testing.T, body string) *Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "clankerbar.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return c
+	}
+
+	t.Run("absent means off", func(t *testing.T) {
+		c := write(t, `{"harness":"claude"}`)
+		if c.EchoSessions {
+			t.Error("echo_sessions must default to false")
+		}
+	})
+	t.Run("true restores the echo", func(t *testing.T) {
+		c := write(t, `{"harness":"claude","echo_sessions":true}`)
+		if !c.EchoSessions {
+			t.Error("echo_sessions: true must be read")
+		}
+	})
+	t.Run("unset does not change the config identity", func(t *testing.T) {
+		without := write(t, `{"harness":"claude"}`)
+		other := write(t, `{"harness":"claude","prompt":"x"}`)
+		other.Prompt = without.Prompt
+		if without.Identity() != other.Identity() {
+			t.Errorf("an unset echo_sessions changed the config identity:\n%q\n%q", without.Identity(), other.Identity())
+		}
+	})
+}

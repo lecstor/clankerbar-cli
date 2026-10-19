@@ -275,11 +275,64 @@ func TestExtraDirsForIncludesConventionalWorktreeArea(t *testing.T) {
 	}
 }
 
+// extraDirsFor with a project-rooted config (CLA-678): the session's reach is
+// the whole project — the project root itself, every repo under it, and the
+// worktrees directory — found from the layout rather than from a declaration,
+// and NOTHING beside it.
+func TestExtraDirsForProjectRootCoversTheProject(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "acme")
+	repoA := gitCheckout(t, filepath.Join(project, "repo-a"))
+	repoB := gitCheckout(t, filepath.Join(project, "repo-b"))
+	worktrees := filepath.Join(project, config.WorktreesDirName)
+	if err := os.MkdirAll(worktrees, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A sibling PROJECT under the same root: in scope for nobody here.
+	otherProject := filepath.Join(root, "other")
+	if err := os.MkdirAll(otherProject, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	target := Target{
+		Poller:      busyPoller(),
+		WorkDir:     project,
+		Repos:       map[string]string{"acme/repo-a": repoA, "acme/repo-b": repoB},
+		PrimaryRepo: "acme/repo-a",
+		ProjectRoot: true,
+	}
+	got := d0(target).extraDirsFor(target, repoA)
+	if !containsPath(got, project) {
+		t.Errorf("extra dirs = %v, want the project root %q (the external_directory carve-out)", got, project)
+	}
+	if !containsPath(got, repoB) {
+		t.Errorf("extra dirs = %v, want the sibling repo %q", got, repoB)
+	}
+	if !containsPath(got, worktrees) {
+		t.Errorf("extra dirs = %v, want the worktrees directory %q", got, worktrees)
+	}
+	if containsPath(got, repoA) {
+		t.Errorf("extra dirs = %v; the spawn dir itself must be excluded", got)
+	}
+	if containsPath(got, otherProject) {
+		t.Errorf("extra dirs = %v; a sibling PROJECT must not be granted", got)
+	}
+
+	// The same tree WITHOUT the flag grants nothing beyond the declared
+	// checkouts: the scope is an assertion about the layout, never an
+	// inference from it.
+	target.ProjectRoot = false
+	got = d0(target).extraDirsFor(target, repoA)
+	if containsPath(got, project) || containsPath(got, worktrees) {
+		t.Errorf("extra dirs = %v; without project_root the layout must not be inferred", got)
+	}
+}
+
 // --- helpers -----------------------------------------------------------------
 
 type noopSalvager struct{}
 
-func (noopSalvager) Salvage(context.Context, string, string) salvage.Outcome {
+func (noopSalvager) Salvage(context.Context, string, string, ...string) salvage.Outcome {
 	return salvage.Outcome{Status: salvage.Nothing}
 }
 
@@ -296,4 +349,115 @@ func containsPath(paths []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// projectScope requires the session to start STRICTLY INSIDE the workdir. A
+// spawn dir exactly at the workdir's immediate parent has rel == "..", which is
+// neither "." nor "../"-prefixed, so it used to be reported as inside — the one
+// boundary value the documented contract excludes (CLA-678 review NIT 4.2).
+func TestProjectScopeRefusesTheImmediateParent(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "acme")
+	if err := os.MkdirAll(filepath.Join(project, "widgets"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := projectScope(project, filepath.Join(project, "widgets")); got != project {
+		t.Fatalf("projectScope for a child = %q, want %q", got, project)
+	}
+	if got := projectScope(project, root); got != "" {
+		t.Fatalf("projectScope for the immediate parent = %q, want no scope", got)
+	}
+	if got := projectScope(project, project); got != "" {
+		t.Fatalf("projectScope for the workdir itself = %q, want no scope", got)
+	}
+	if got := projectScope(project, filepath.Join(root, "other", "x")); got != "" {
+		t.Fatalf("projectScope for a tree outside the workdir = %q, want no scope", got)
+	}
+}
+
+// CLA-678 review round 2 (finding 3): with the per-project layout declared, a
+// stale `repos` override pointing at a checkout OUTSIDE the project root must
+// not start the session there. ResolveCheckout prefers the explicit path, so
+// without this refusal the session would run outside — and be granted — the
+// project root its scope is bounded to. The flag is what gates it: the same
+// override on a config that has not adopted the layout keeps working.
+func TestSessionDirRefusesACheckoutOutsideTheProjectRoot(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "acme")
+	inside := gitCheckout(t, filepath.Join(project, "repo-a"))
+	outside := gitCheckout(t, filepath.Join(t.TempDir(), "repo-a"))
+
+	target := Target{
+		Poller:      busyPoller(),
+		WorkDir:     project,
+		Repos:       map[string]string{"acme/repo-a": outside},
+		PrimaryRepo: "acme/repo-a",
+		ProjectRoot: true,
+		Releaser:    &repoReleaser{},
+	}
+	dir, _, _, err := d0(target).sessionDir(context.Background(), target, nil)
+	if err == nil {
+		t.Fatalf("sessionDir = %q; want a refusal for a checkout outside the project root %q", dir, project)
+	}
+	if !strings.Contains(err.Error(), outside) || !strings.Contains(err.Error(), project) {
+		t.Errorf("error = %v; want it to name both the outside checkout and the project root", err)
+	}
+
+	// The managed checkout inside the root still resolves.
+	target.Repos = map[string]string{"acme/repo-a": inside}
+	dir, _, _, err = d0(target).sessionDir(context.Background(), target, nil)
+	if err != nil || dir != inside {
+		t.Errorf("sessionDir = %q (%v), want the in-root checkout %q", dir, err, inside)
+	}
+
+	// Without the layout flag the declared checkout is the operator's choice,
+	// exactly as before CLA-678: no containment is inferred.
+	target.Repos = map[string]string{"acme/repo-a": outside}
+	target.ProjectRoot = false
+	dir, _, _, err = d0(target).sessionDir(context.Background(), target, nil)
+	if err != nil || dir != outside {
+		t.Errorf("sessionDir = %q (%v), want the declared checkout %q when project_root is off", dir, err, outside)
+	}
+}
+
+// The permission list must not hand the policy an outside checkout either: the
+// project-root scope is additive, so a declared override used to be granted
+// before the scope branch ran. Nor may the conventional <checkout>-wt sibling
+// be granted when it sits outside the root.
+func TestExtraDirsForProjectRootDropsOutsideCheckouts(t *testing.T) {
+	root := t.TempDir()
+	project := filepath.Join(root, "acme")
+	repoA := gitCheckout(t, filepath.Join(project, "repo-a"))
+	repoB := gitCheckout(t, filepath.Join(project, "repo-b"))
+	outsideParent := t.TempDir()
+	outside := gitCheckout(t, filepath.Join(outsideParent, "repo-c"))
+	outsideWT := gitCheckout(t, filepath.Join(outsideParent, "repo-c-wt"))
+
+	target := Target{
+		Poller:      busyPoller(),
+		WorkDir:     project,
+		Repos:       map[string]string{"acme/repo-a": repoA, "acme/repo-c": outside},
+		PrimaryRepo: "acme/repo-a",
+		ProjectRoot: true,
+	}
+	got := d0(target).extraDirsFor(target, repoA)
+	if containsPath(got, outside) {
+		t.Errorf("extra dirs = %v; the outside checkout %q must never be granted", got, outside)
+	}
+	if !containsPath(got, project) || !containsPath(got, repoB) {
+		t.Errorf("extra dirs = %v, want the project root %q and its child %q", got, project, repoB)
+	}
+	if containsPath(got, outsideWT) {
+		t.Errorf("extra dirs = %v; an outside worktree area must not be granted", got)
+	}
+
+	// Defence in depth: even a spawn dir that escaped resolution (an outside
+	// checkout) must not bring its -wt sibling into the grants.
+	got = d0(target).extraDirsFor(target, outside)
+	if containsPath(got, outsideWT) {
+		t.Errorf("extra dirs = %v; the outside %q worktree area must not be granted", got, outsideWT)
+	}
+	if containsPath(got, outside) {
+		t.Errorf("extra dirs = %v; the outside spawn dir must not be granted", got)
+	}
 }

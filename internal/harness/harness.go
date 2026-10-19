@@ -408,6 +408,38 @@ const FinishReasonLength = "length"
 // which is the adapter-to-driver channel the loop already reads.
 const ZeroUsageReason = "zero_usage_unknown"
 
+// RecoveredErrorsKey is the Result.Raw key an adapter uses to record that its
+// session's stream carried a typed error event the session then RECOVERED from —
+// it retried and carried on — with no error event ending the stream (CLA-700).
+// The loop reads it off Raw rather than growing Adapter, the same way it reads
+// FinishReasonKey: it is the adapter-to-driver channel, and only opencode emits
+// this signal today.
+//
+// Its value is the COUNT of recovered events (an int), so a diagnostic can say
+// how many provider blips the session rode out. Absent — rather than zero —
+// when the session recovered from nothing, which is both the common case and
+// the one a missing key already means.
+const RecoveredErrorsKey = "recovered_error_events"
+
+// RecoveredErrors reports how many typed error events the session's stream
+// RECOVERED from — events with further transcript after them, and no error event
+// ending the stream (CLA-700). Zero covers both "nothing went wrong" and "the
+// stream ended on its error": the difference that matters to a classifier is
+// whether there is an unexplained exit status to judge, and only the second
+// shape has one.
+//
+// A RESURRECTED session (mergeResume) reports the count of the run that ENDED
+// it, not the sum of its runs: the marker answers "did this session recover",
+// and a continuation that ended on a real terminal error must read as not
+// recovered however many blips the dead run rode out first.
+func RecoveredErrors(res Result) int {
+	if res.Raw == nil {
+		return 0
+	}
+	n, _ := res.Raw[RecoveredErrorsKey].(int)
+	return n
+}
+
 // OutputCapReason is the terminal_reason the opencode adapter writes into a
 // Result when the session's final step_finish carried reason "length" with
 // ZERO output tokens — the CLA-584 output-cap stall, read back through
@@ -564,6 +596,17 @@ type Result struct {
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
 
+	// ClankerbarCalls is how many clankerbar MCP tool calls this session got a
+	// SUCCESSFUL result for. A refused call (the tool was not connected yet, the
+	// plane rejected it) does not count: it says nothing about whether the
+	// backlog was reachable, and the driver's no-MCP classification is exactly
+	// the question "was the backlog reachable at all?".
+	//
+	// Only adapters that observe a session's clankerbar traffic populate it
+	// (Capabilities.TracksClaims); on any other adapter it stays zero and the
+	// driver must not read a zero as "the MCP server was missing".
+	ClankerbarCalls int
+
 	// CheckpointUnverified marks this Result as the hand-off for a phase that
 	// reached its checkpoint on an UNVERIFIED branch (CLA-576): the phase
 	// recorded Claim.Branch on the plane, but the driver's read of the origin
@@ -600,6 +643,13 @@ type Result struct {
 	// output: every clankerbar call that matters is judged on the plane's ANSWER,
 	// never on the request, because a refused call changes nothing.
 	pending map[string]pendingKind
+
+	// clankerbarCalls names the tool_use ids that are clankerbar calls, so the
+	// RESULT can decide ClankerbarCalls. It is separate from `pending` because
+	// most clankerbar calls (get_task, heartbeat, list_tasks) arm no claim or
+	// delivery state, yet a successful one still proves the MCP server was
+	// usable — which is the fact CLA-703's no-MCP classification needs.
+	clankerbarCalls map[string]bool
 
 	// pendingReports is the same discipline for delivery claims: an `update_task`
 	// REFUSED by the plane (a missing Tests header, a superseded run) recorded
@@ -994,6 +1044,18 @@ var ErrUsageUnsupported = errors.New("usage introspection not supported by this 
 // the harness's output is unreadable, and a wait that keeps polling on it is
 // spending money no ceiling can see. loop.supervisedWait tells them apart.
 var ErrUntrusted = errors.New("untrusted harness output")
+
+// ErrMCPNotConnected marks a session that never reached its first model turn
+// because the clankerbar MCP server did not report connected in time. It is an
+// INFRASTRUCTURE failure, not a verdict on the phase: the session did no work
+// and recorded no review, and the driver must retry it as such rather than read
+// an empty result as "the session reviewed nothing" (CLA-703).
+//
+// It is an error rather than a zero Result on purpose. A zero Result is
+// indistinguishable from a session that ran and produced nothing — exactly the
+// silent "no record" shape the task exists to kill — while the error carries the
+// reason to the driver's log and to whatever retry decision it makes.
+var ErrMCPNotConnected = errors.New("the clankerbar MCP server did not connect")
 
 // probeVerdict turns a finished probe session into what the caller may act on.
 //

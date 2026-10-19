@@ -38,10 +38,15 @@ type tallyKey struct {
 	harness string
 }
 
-// phaseTally counts phase sessions run and dead for one (phase, harness) cell.
+// phaseTally counts phase sessions run and dead for one (phase, harness) cell,
+// plus the infrastructure misses kept OUT of the dead rate (CLA-703): a review
+// session that never reached the backlog because the clankerbar MCP server was
+// not available is not a reviewer that died, and counting it as dead is how a
+// harness/infra problem becomes a false review-quality signal.
 type phaseTally struct {
-	run  int
-	dead int
+	run   int
+	dead  int
+	noMCP int
 }
 
 // tallyDead books one finished phase session into the run's dead-phase tally,
@@ -63,6 +68,8 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 	if res.Claim.TaskID == "" {
 		return false
 	}
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if d.deadTally == nil {
 		d.deadTally = map[tallyKey]*phaseTally{}
 	}
@@ -80,6 +87,39 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 	return false
 }
 
+// unbookDead removes a dead booking tallyDead made for an exit that is later
+// classified as an infrastructure miss (CLA-703) rather than a death. It is the
+// counterpart of the booking and exists because the booking has to happen when
+// the exit arrives, before the review seam has decided whether the session ever
+// reached the backlog. The run count is deliberately NOT decremented: the
+// session did run; only its dead classification was wrong.
+func (d *Driver) unbookDead(phase, harness string) {
+	if d.deadTally == nil {
+		return
+	}
+	t := d.deadTally[tallyKey{phase: phase, harness: harness}]
+	if t != nil && t.dead > 0 {
+		t.dead--
+	}
+}
+
+// tallyNoMCP books an infrastructure miss: a review-only session that ended with
+// no successful clankerbar MCP call and no review record. It is counted
+// SEPARATELY from dead so the operator can see that the member's harness or the
+// MCP wiring was at fault, not the reviewer.
+func (d *Driver) tallyNoMCP(phase, harness string) {
+	if d.deadTally == nil {
+		d.deadTally = map[tallyKey]*phaseTally{}
+	}
+	k := tallyKey{phase: phase, harness: harness}
+	t := d.deadTally[k]
+	if t == nil {
+		t = &phaseTally{}
+		d.deadTally[k] = t
+	}
+	t.noMCP++
+}
+
 // tallyEmpty books one held-but-empty implement exit into the run's dead-phase
 // tally as a dead phase (CLA-457). It is called ONLY at the seam, where the
 // driver has just classified the exit as empty — the 2026-08-24 fleet-incident
@@ -91,6 +131,8 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 // checkpoint), and only the seam has that context. The run was already counted
 // by tallyDead; this adds its dead.
 func (d *Driver) tallyEmpty(phase, harness string) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if d.deadTally == nil {
 		d.deadTally = map[tallyKey]*phaseTally{}
 	}
@@ -125,6 +167,8 @@ const panelMemberFailBound = 3
 // tasks because the panel is positional; the Driver holds it so the streak
 // spans drains, and each drain runs the panel at most once per task.
 func (d *Driver) panelMemberFailed(member string) int {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if d.panelFailStreak == nil {
 		d.panelFailStreak = map[string]int{}
 	}
@@ -135,6 +179,8 @@ func (d *Driver) panelMemberFailed(member string) int {
 // panelMemberRecorded clears a member's failure streak: the member recorded
 // this task, so its next failure is not consecutive with the last.
 func (d *Driver) panelMemberRecorded(member string) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	delete(d.panelFailStreak, member)
 }
 
@@ -143,6 +189,8 @@ func (d *Driver) panelMemberRecorded(member string) {
 // every drain, so the operator watching the daemon log sees the rate grow —
 // and the last line before the run ends IS the run total.
 func (d *Driver) logDeadTally() {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if len(d.deadTally) == 0 {
 		return
 	}
@@ -163,7 +211,11 @@ func (d *Driver) logDeadTally() {
 		if t.run > 0 {
 			rate = 100 * float64(t.dead) / float64(t.run)
 		}
-		parts = append(parts, fmt.Sprintf("%s/%s: %d dead of %d (%.1f%%)", k.phase, k.harness, t.dead, t.run, rate))
+		line := fmt.Sprintf("%s/%s: %d dead of %d (%.1f%%)", k.phase, k.harness, t.dead, t.run, rate)
+		if t.noMCP > 0 {
+			line += fmt.Sprintf(", %d no-mcp", t.noMCP)
+		}
+		parts = append(parts, line)
 	}
 	log.Printf("dead-phase tally: %s", strings.Join(parts, "; "))
 }

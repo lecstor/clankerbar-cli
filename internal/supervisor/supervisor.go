@@ -47,6 +47,12 @@
 // state and the version of the child serving it — so version skew between
 // children (and between a child and the supervisor) is observable on the
 // machine, not only on the fleet page.
+//
+// CLA-677 adds the plane-facing half of that surface (status.go): every poll,
+// and every child state change, POSTs the same view —
+// `<backlog_url>/api/daemon-roster/status` — so the console can tell a HALTed
+// instance from a crashed one without reading this machine's log. Reporting is
+// fail-soft telemetry and never control flow.
 package supervisor
 
 import (
@@ -64,6 +70,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
@@ -109,13 +116,14 @@ type Options struct {
 	Binary string
 
 	// WorkdirRoot is the machine-stated root each child's workdir derives
-	// from (phase 2a of the daemon-supervisor proposal): <root>/<repo name>
-	// for the repo the instance's project names, taken from the roster entry
-	// (the plane's `project.primary_repo`). Empty = derivation is OFF and
+	// from (phase 2a of the daemon-supervisor proposal): the per-project layout
+	// <root>/<project slug>/<repo name> with the project's worktrees under
+	// <root>/<project slug>/worktrees (CLA-678). Empty = derivation is OFF and
 	// children run on the base config's own workdirs. When set, EVERY
-	// instance is derived at reconcile, and a failed derivation — the derived
-	// directory missing, or not a checkout of the expected repo — refuses
-	// that daemon: it is never spawned, the path tried is reported, and the
+	// instance is derived at reconcile: each repo the project names is cloned
+	// if it is not there yet, a directory that exists but is not a checkout of
+	// the expected repo refuses that daemon, and a failed derivation — the path
+	// tried is reported — refuses the daemon too: it is never spawned, and the
 	// supervisor's own working directory is never used as a fallback (the
 	// CLA-441 failure).
 	WorkdirRoot string
@@ -140,6 +148,15 @@ type Options struct {
 	// and the per-instance state dirs (with their materialized configs).
 	// Empty = the default under the loop state root.
 	RosterCacheDir string
+
+	// LogToFile writes the supervisor's own lines to supervise.log in that
+	// state dir, beside them and rotated at a size bound (CLA-701), as well as
+	// to stderr. Default FALSE, deliberately: this redirects the PROCESS-WIDE
+	// standard logger, and a library caller (every test) that never asked for
+	// a file should not have its log capture taken over. The CLI sets it; the
+	// supervisor is a long-lived process, so its lines need the same durable
+	// home the daemons' got.
+	LogToFile bool
 
 	// PollInterval is how often the roster is polled. 0 = defaultPollInterval.
 	PollInterval time.Duration
@@ -189,6 +206,13 @@ type Options struct {
 	// the drain happens before it, and a returned error resumes the loop with
 	// the marker already consumed.
 	ExecInPlace func(bin string, argv []string, env []string) error
+
+	// PlaneFor builds the write client the supervisor uses to hand a dead
+	// child's claim back (CLA-708). Nil = plane.New. The hook exists because the
+	// endpoint the supervisor resolves is the CHILD's production endpoint, which
+	// a test's fake plane is not; a test supplies a client pointed at its own
+	// server so the wire shape is exercised for real.
+	PlaneFor func(endpoint, apiKey string) plane.Releaser
 }
 
 // childVersionEnv is the environment variable the supervisor sets on every
@@ -266,12 +290,18 @@ type Instance struct {
 	restartAt   time.Time // zero = not scheduled for a restart
 	lastBackoff time.Duration
 	halted      bool // HALT marker seen: never respawn
+	// exitAt is when the last child's Wait goroutine saw it end (CLA-677). It
+	// is what the status report's `lastExit.at` and `since` carry: the
+	// supervisor stored the exit ERROR for its own logging, but a time has to be
+	// captured at the exit itself, because the status row needs to say WHEN.
+	exitAt time.Time
 }
 
 // exitEvent is posted by a child's Wait goroutine when its process ends.
 type exitEvent struct {
 	inst *Instance
 	err  error
+	at   time.Time // when the Wait goroutine saw the process end
 }
 
 // Supervisor holds the fleet state. Everything except the per-child Wait
@@ -313,6 +343,23 @@ type Supervisor struct {
 	// prints once per CHANGE: idempotent polls print nothing, exactly as
 	// reconcile itself writes nothing.
 	lastStatus string
+
+	// status is the plane-facing status reporter (CLA-677). It is fail-soft by
+	// construction: a failed POST is logged once per outage and dropped, and
+	// never changes what the supervisor does.
+	status StatusReporter
+
+	// stopping is set at the top of stopAll: from then on an instance that is
+	// down is reported "stopped" (the supervisor is taking it down), not
+	// "exited" (which would imply a crash left it down).
+	stopping bool
+
+	// replacing is true only for the duration of drainForReplace: a child the
+	// supervisor itself drained for a REPLACE is reported "stopped" (a
+	// planned upgrade), not "exited" (a crash). It must NOT be d.stopping:
+	// a timed-out drain resumes the loop and respawns the fleet, so the flag
+	// cannot mean "this supervisor is exiting".
+	replacing bool
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
@@ -334,7 +381,9 @@ func Supervise(ctx context.Context, o Options) error {
 		startedAt:    time.Now(),
 		roster:       NewRosterClient(o.RosterURL, o.APIKey),
 		loggedRemote: map[string]bool{},
+		status:       newStatusReporter(statusEndpoint(o.RosterURL), o.APIKey),
 	}
+	defer func() { d.status.Close(d.statusReport()) }()
 
 	if ctx.Err() != nil {
 		// Cancelled before any child was spawned: nothing is running, so
@@ -349,11 +398,22 @@ func Supervise(ctx context.Context, o Options) error {
 	if o.RosterCacheDir != "" {
 		d.cacheDir = o.RosterCacheDir
 	} else {
-		dir, err := rosterCacheDir()
+		dir, err := CacheDir()
 		if err != nil {
 			return fmt.Errorf("supervise: %w", err)
 		}
 		d.cacheDir = dir
+	}
+	// The supervisor's own lines get the same durable home the daemons' have
+	// (CLA-701): a supervisor is the process an operator asks "why did that
+	// child not come back?" about, and its answer was only ever in a terminal.
+	// Best-effort by the same contract — observability never gates the fleet.
+	if o.LogToFile {
+		if restore, err := installLog(d.cacheDir); err != nil {
+			log.Printf("supervise: cannot write its log into %s (%v) - its own lines go to stderr only", d.cacheDir, err)
+		} else {
+			defer restore()
+		}
 	}
 
 	// The exit channel must exist BEFORE the first reconcile spawns children:
@@ -384,7 +444,7 @@ func Supervise(ctx context.Context, o Options) error {
 		case <-ctx.Done():
 			return d.stopAll()
 		case ev := <-d.exits:
-			d.onExit(ev.inst, ev.err)
+			d.onExit(ev.inst, ev.err, ev.at)
 		case <-d.timerCh:
 			d.respawnDue()
 			d.armRestart()
@@ -531,7 +591,7 @@ func (d *Supervisor) reconcile() error {
 	// The fleet changed (or not): the status surface follows reconcile, so a
 	// spawn, a stop, a flip or a removal is reflected within the same poll —
 	// and an unchanged pass prints nothing.
-	d.logFleetStatus()
+	d.publishStatus()
 
 	d.armRestart()
 	return nil
@@ -767,6 +827,12 @@ func (d *Supervisor) ensureRunning(inst *Instance) {
 // child drains at its iteration boundary. Idempotent: a STOP already written
 // writes nothing more.
 func (d *Supervisor) ensureStopped(inst *Instance) {
+	// A retry scheduled before the stop will never fire: respawnDue refuses to
+	// spawn against a desired state that is no longer running. Drop the
+	// timestamp here so the report cannot carry a `nextRetryAt` that passes
+	// with no spawn — a phantom `backing_off` for up to the whole backoff
+	// window.
+	inst.restartAt = time.Time{}
 	inst.mu.Lock()
 	alive := inst.cmd != nil && !inst.exited
 	since := time.Since(inst.aliveSince)
@@ -791,6 +857,13 @@ func (d *Supervisor) ensureStopped(inst *Instance) {
 	inst.stopRequested = true
 }
 
+func (d *Supervisor) baseCtx() context.Context {
+	if d.ctx != nil {
+		return d.ctx
+	}
+	return context.Background()
+}
+
 // resolveInstance resolves the machine conventions one instance runs under,
 // in the order the materialized config is built from them: the phase-2a
 // workdir derivation (when a machine root is stated) FIRST, so validation
@@ -809,11 +882,13 @@ func (d *Supervisor) ensureStopped(inst *Instance) {
 // exactly as `run` would validate it.
 func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string, error) {
 	if d.o.WorkdirRoot != "" {
-		derived, err := deriveInstanceWorkdirs(cfg, d.o.WorkdirRoot)
+		derived, err := deriveInstanceWorkdirs(d.baseCtx(), cfg, d.o.WorkdirRoot)
 		if err != nil {
 			return nil, "", err
 		}
-		applyDerivedWorkdirs(cfg, derived)
+		if err := applyDerivedWorkdirs(cfg, derived); err != nil {
+			return nil, "", err
+		}
 	}
 	if err := cfg.Validate(); err != nil {
 		return nil, "", err
@@ -910,23 +985,32 @@ func (d *Supervisor) spawn(inst *Instance) {
 	inst.cmd = cmd
 	inst.aliveSince = time.Now()
 	inst.exited = false
-	inst.exitErr = nil
 	inst.childVersion = v
 	inst.mu.Unlock()
 	// A fresh child starts clean: the next stopped flip must write its STOP
 	// again, it must not inherit the previous child's marker state.
 	inst.stopRequested = false
 	log.Printf("%s: spawned (pid %d, %s, version %s)", inst.name, cmd.Process.Pid, cfgPath, inst.childVersion)
-	d.logFleetStatus()
+	d.publishStatus()
 	go func() {
-		d.exits <- exitEvent{inst, cmd.Wait()}
+		err := cmd.Wait()
+		d.exits <- exitEvent{inst: inst, err: err, at: time.Now()}
 	}()
 }
 
 // onExit classifies one child exit: a stop the supervisor ordered (desired
 // state, roster removal, refusal), a HALT the operator planted, or an
-// unexpected exit. Only the last respawns.
-func (d *Supervisor) onExit(inst *Instance, err error) {
+// unexpected exit. Only the last respawns. at is when the Wait goroutine saw
+// the process end, carried onto the status row as `lastExit.at`.
+func (d *Supervisor) onExit(inst *Instance, err error, at time.Time) {
+	// A child that exited without letting go may have left its claim behind
+	// (CLA-708). Read it BEFORE deciding whether to respawn — the hand-back is
+	// what turns a dead session into an immediate takeover instead of a
+	// 30-minute lease. It applies to EVERY exit, including one the supervisor
+	// ordered: a drained child normally holds nothing (the record is removed on
+	// every let-go path), and a record found anyway means the drain did not let
+	// go, which is still the dead-session case.
+	d.handBackDeadClaim(inst)
 	// The exited flag is set BEFORE the ctx check, not after: the select loop
 	// may have picked this event in the same instant the fleet stop landed
 	// (ctx.Done), and stopAll counts live children from this flag. If the
@@ -935,6 +1019,7 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 	inst.mu.Lock()
 	inst.exited = true
 	inst.exitErr = err
+	inst.exitAt = at
 	uptime := time.Since(inst.aliveSince)
 	inst.mu.Unlock()
 
@@ -951,7 +1036,7 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 		// The fleet changed: the listing flips this line now — "stopped",
 		// or "removed"/"refused" for an entry that is about to leave the
 		// fleet — rather than on the next poll.
-		d.logFleetStatus()
+		d.publishStatus()
 		return
 	}
 
@@ -967,7 +1052,7 @@ func (d *Supervisor) onExit(inst *Instance, err error) {
 	if d.haltPresent(inst) {
 		inst.halted = true
 		log.Printf("%s: HALT marker present in %s - leaving it stopped; delete the marker and restart the supervisor to resume it", inst.name, inst.stateDir)
-		d.logFleetStatus()
+		d.publishStatus()
 		return
 	}
 
@@ -986,7 +1071,7 @@ func (inst *Instance) scheduleRestart(d *Supervisor, err error, uptime time.Dura
 	// The fleet changed: the status listing now shows the child down and its
 	// restart scheduled. Called from every restart-scheduling path (an exit,
 	// a refused or failed spawn), so no transition goes unlisted.
-	d.logFleetStatus()
+	d.publishStatus()
 }
 
 // backoffDelay is the pure restart schedule: the previous delay doubles
@@ -1188,6 +1273,13 @@ func (d *Supervisor) armRestart() {
 // state dir, so the dir-never-appears condition never clears either).
 func (d *Supervisor) stopAll() error {
 	log.Print("stop requested - writing STOP to every instance")
+	d.stopping = true
+	// Report the transition NOW, not on the first exit: a drain can run for
+	// minutes (an in-flight session finishes at its boundary), and until the
+	// first child exits the plane would otherwise keep the pre-stop report
+	// and show ordinary `running`. Every row this queues says the supervisor
+	// is stopping, which is true from this line on.
+	d.reportStatus()
 	done := map[*Instance]bool{}    // child exited (event consumed) or never spawned
 	stopped := map[*Instance]bool{} // STOP marker written; awaiting the child's exit
 	waitStart := time.Now()
@@ -1198,8 +1290,26 @@ func (d *Supervisor) stopAll() error {
 	for len(done) < len(d.instances) {
 		select {
 		case ev := <-d.exits:
+			// A child that exits during the drain may still hold its claim: the
+			// STOP marker only takes effect at an iteration boundary, and a
+			// daemon killed (or still settling) in the meantime leaves its
+			// CURRENT_CLAIM behind. onExit would have handed it back, but this
+			// loop is what consumes an exit once the fleet stop has begun, so
+			// the handback must happen here too or the claim waits out its
+			// 30-minute lease while the supervisor exits. A no-op when the
+			// record is absent.
+			d.handBackDeadClaim(ev.inst)
+			// The flags onExit would have set are set here too: this loop is
+			// what consumes an exit once the fleet stop has begun, and the
+			// status report (and its final `stopped` rows) reads them.
+			ev.inst.mu.Lock()
+			ev.inst.exited = true
+			ev.inst.exitErr = ev.err
+			ev.inst.exitAt = ev.at
+			ev.inst.mu.Unlock()
 			done[ev.inst] = true
 			lastExit = time.Now()
+			d.reportStatus()
 		case <-readyTick.C:
 			// A drain can legitimately take minutes (an in-flight session
 			// finishes), so the wait is never bounded — but a stop making no
