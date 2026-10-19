@@ -390,3 +390,212 @@ func TestSalvage_TheEmptyWorktreeLineNamesWhichCase(t *testing.T) {
 		})
 	}
 }
+
+// --- what the salvage is told, and what a delivered tip does (CLA-695) ------
+
+// The salvage decides "did this session deliver?" from the branches the session
+// recorded for the task, so the driver has to hand them over. Both spellings
+// count: an update_task(branch: …) the stream reported, and the branch the claim
+// carried in (a resumed predecessor's WIP, or the task's branch at claim time).
+func TestSalvage_HandsTheSessionsRecordedBranchesToTheSalvager(t *testing.T) {
+	captureLogs(t)
+	s := &fakeSalvager{out: salvage.Outcome{Status: salvage.Nothing}}
+	res := held(okResult(0, 0), heldClaim())
+	res.Claim.HasWIP = true
+	res.Claim.Branch = "clanker/cc561415-carried-in-on-the-claim"
+	res.Reports = []harness.Report{{
+		TaskID: heldClaim().TaskID, Ref: "CLA-314", RunID: "r-1",
+		Branch: "clanker/cc561415-recorded-by-the-session",
+	}}
+
+	drainWithSalvager(t, &fakeAdapter{steps: []invokeStep{{res: res}}}, &recordingReleaser{}, s)
+
+	if len(s.calls) != 1 {
+		t.Fatalf("salvaged %d times, want exactly 1", len(s.calls))
+	}
+	got, want := s.calls[0].recorded, []string{
+		"clanker/cc561415-recorded-by-the-session",
+		"clanker/cc561415-carried-in-on-the-claim",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("the salvager was handed %v, want %v — the delivery check is only as good as the branches it is given", got, want)
+	}
+}
+
+// The incident's ending (CLA-695): the session delivered and left a generated
+// file. Nothing may be committed, pushed or re-recorded, and the log has to name
+// the paths — only a reader can tell generated output from a source file the
+// session wrote after its last commit.
+func TestSalvage_AnUntrackedOnlyOutcomeRecordsNothingAndNamesThePaths(t *testing.T) {
+	logs := captureLogs(t)
+	rel := &recordingReleaser{}
+	out := salvage.Outcome{
+		Status:   salvage.Untracked,
+		Worktree: "/w",
+		Paths:    []string{"apps/web/worker-configuration.d.ts"},
+		Detail:   "the delivered tip is already on the origin",
+	}
+
+	drainWithSalvager(t, &fakeAdapter{steps: []invokeStep{{res: held(limitResult(), heldClaim())}}}, rel, &fakeSalvager{out: out})
+
+	if len(rel.records) != 0 {
+		t.Errorf("recorded a branch for a delivered tip: %+v", rel.records)
+	}
+	// Nothing was recorded, so the ordinary handback rules apply unchanged.
+	if len(rel.calls) != 1 {
+		t.Errorf("handed the claim back %d times, want 1: %+v", len(rel.calls), rel.calls)
+	}
+	if got := logs.String(); !strings.Contains(got, "worker-configuration.d.ts") {
+		t.Errorf("the operator's log does not name the untracked path it left alone:\n%s", got)
+	}
+}
+
+// --- real repositories, the incident's own shape ----------------------------
+
+// newDriverGitEnv lays out what the per-task worktree convention produces — a bare
+// remote, a checkout on main, and the session's worktree on the task's derived
+// branch — and returns the paths the assertions need.
+func newDriverGitEnv(t *testing.T) (root, remote, wt, branch string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not on PATH")
+	}
+	root = t.TempDir()
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	remote = filepath.Join(root, "remote.git")
+	repo := filepath.Join(root, "repo")
+	branch = "clanker/cc561415-a-session-killed-mid-task"
+	wt = filepath.Join(root, "repo-wt", "cc561415")
+
+	gitRun(t, root, "init", "--bare", "-b", "main", remote)
+	gitRun(t, root, "init", "-b", "main", repo)
+	gitRun(t, repo, "config", "user.email", "driver@example.test")
+	gitRun(t, repo, "config", "user.name", "Driver Test")
+	gitRun(t, repo, "config", "commit.gpgsign", "false")
+	gitRun(t, repo, "remote", "add", "origin", remote)
+	writeTestFile(t, filepath.Join(repo, "a.txt"), "a")
+	gitRun(t, repo, "add", ".")
+	gitRun(t, repo, "commit", "-m", "base")
+	gitRun(t, repo, "push", "origin", "main")
+	gitRun(t, repo, "worktree", "add", "-b", branch, wt)
+	return root, remote, wt, branch
+}
+
+// runOneRealDrain drives one iteration with a substituted session result over a
+// real repository, and returns the releaser so callers can assert what was
+// recorded.
+func runOneRealDrain(t *testing.T, root string, res harness.Result) *recordingReleaser {
+	t.Helper()
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.WorkDir = root
+	cfg.MaxIterations = 1
+	rel := &recordingReleaser{}
+	h := &fakeAdapter{steps: []invokeStep{{res: res}}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}}).Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	return rel
+}
+
+// deliveredBranchResult is the session result the incident produced: the work
+// committed, pushed and recorded, the session then killed by a usage limit.
+func deliveredBranchResult(claim harness.Claim, branch string) harness.Result {
+	res := held(limitResult(), claim)
+	res.Reports = []harness.Report{{TaskID: claim.TaskID, Ref: claim.Ref, RunID: claim.RunID, Branch: branch}}
+	return res
+}
+
+// The observed incident (CLA-695, the first review-panel run): the implement phase
+// ended NORMALLY — committed, pushed and recorded its branch at its final tip — and
+// left one untracked generated file in its worktree. The driver committed it,
+// pushed a new tip, and every review-panel member then reviewed the salvage commit
+// instead of the implementer's tip, with the generated file on the branch headed
+// for a PR.
+func TestRun_RealGitRepo_ADeliveredTipWithOnlyUntrackedFilesIsNotSalvaged(t *testing.T) {
+	logs := captureLogs(t)
+	root, remote, wt, branch := newDriverGitEnv(t)
+	claim := heldClaim()
+
+	// What the session delivered: its work, committed and pushed.
+	writeTestFile(t, filepath.Join(wt, "the-work.go"), "package work")
+	gitRun(t, wt, "add", ".")
+	gitRun(t, wt, "commit", "-m", "the work")
+	gitRun(t, wt, "push", "origin", branch)
+	delivered := gitOut(t, wt, "rev-parse", "HEAD")
+	// And what it left behind: the typecheck's exhaust, untracked.
+	writeTestFile(t, filepath.Join(wt, "worker-configuration.d.ts"), "generated")
+
+	rel := runOneRealDrain(t, root, deliveredBranchResult(claim, branch))
+
+	if head := gitOut(t, wt, "rev-parse", "HEAD"); head != delivered {
+		t.Errorf("HEAD is %q, want the delivered tip %q — a salvage commit was made", head, delivered)
+	}
+	if bare := gitOut(t, remote, "rev-parse", "refs/heads/"+branch); bare != delivered {
+		t.Errorf("origin/%s is at %q, want the delivered tip %q — the salvage pushed", branch, bare, delivered)
+	}
+	if len(rel.records) != 0 {
+		t.Errorf("recorded a branch for an already-delivered tip: %+v", rel.records)
+	}
+	if out := logs.String(); !strings.Contains(out, "worker-configuration.d.ts") {
+		t.Errorf("the operator's log does not name the untracked path it left alone:\n%s", out)
+	}
+}
+
+// The other half of the rule: an edit to a TRACKED file on top of a delivered tip is
+// work the session left uncommitted, and it is salvaged exactly as it always was.
+func TestRun_RealGitRepo_ADeliveredTipWithTrackedEditsIsStillSalvaged(t *testing.T) {
+	captureLogs(t)
+	root, remote, wt, branch := newDriverGitEnv(t)
+	claim := heldClaim()
+
+	writeTestFile(t, filepath.Join(wt, "the-work.go"), "package work")
+	gitRun(t, wt, "add", ".")
+	gitRun(t, wt, "commit", "-m", "the work")
+	gitRun(t, wt, "push", "origin", branch)
+	writeTestFile(t, filepath.Join(wt, "a.txt"), "an edit the session left uncommitted")
+
+	rel := runOneRealDrain(t, root, deliveredBranchResult(claim, branch))
+
+	head := gitOut(t, wt, "rev-parse", "HEAD")
+	if subject := gitOut(t, wt, "log", "-1", "--pretty=format:%s"); !strings.Contains(subject, "WIP salvage") {
+		t.Fatalf("the worktree's tip is not a salvage commit: %q", subject)
+	}
+	if bare := gitOut(t, remote, "rev-parse", "refs/heads/"+branch); bare != head {
+		t.Errorf("origin/%s is at %q, want the salvage commit %q", branch, bare, head)
+	}
+	want := recordCall{claim.TaskID, claim.RunID, branch}
+	if len(rel.records) != 1 || rel.records[0] != want {
+		t.Fatalf("recorded %+v, want exactly one %+v", rel.records, want)
+	}
+}
+
+// The CLA-314 guarantee, against the case the delivery check could get wrong: the
+// session RECORDED a branch and never pushed it, so there is no delivered tip and
+// its untracked file is the work the rescue exists to save.
+func TestRun_RealGitRepo_AnUnpushedRecordedBranchIsStillSalvaged(t *testing.T) {
+	captureLogs(t)
+	root, remote, wt, branch := newDriverGitEnv(t)
+	claim := heldClaim()
+
+	writeTestFile(t, filepath.Join(wt, "brand-new.go"), "package new")
+
+	rel := runOneRealDrain(t, root, deliveredBranchResult(claim, branch))
+
+	head := gitOut(t, wt, "rev-parse", "HEAD")
+	if subject := gitOut(t, wt, "log", "-1", "--pretty=format:%s"); !strings.Contains(subject, "WIP salvage") {
+		t.Fatalf("the worktree's tip is not a salvage commit: %q", subject)
+	}
+	if bare := gitOut(t, remote, "rev-parse", "refs/heads/"+branch); bare != head {
+		t.Errorf("origin/%s is at %q, want the salvage commit %q", branch, bare, head)
+	}
+	want := recordCall{claim.TaskID, claim.RunID, branch}
+	if len(rel.records) != 1 || rel.records[0] != want {
+		t.Fatalf("recorded %+v, want exactly one %+v", rel.records, want)
+	}
+}

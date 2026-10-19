@@ -5254,8 +5254,14 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 		// reader can tell that from the generated output this rule exists for. The
 		// claim is left exactly as the Refused and Failed cases leave it — no
 		// branch recorded, so the ordinary handback rules apply unchanged.
+		left := strings.Join(out.Paths, ", ")
+		if left == "" {
+			// A salvager that names the paths only in its prose still gets them in
+			// front of the operator: a log line ending in a colon says nothing.
+			left = out.Detail
+		}
 		log.Printf("%sdelivered %s with only untracked files left in %s — committing them would move the branch later readers review, so they are left alone: %s",
-			labelOf(t), label, out.Worktree, strings.Join(out.Paths, ", "))
+			labelOf(t), label, out.Worktree, left)
 		return
 	case salvage.Refused:
 		log.Printf("%sSTRANDED WORK LEFT AS IS — %s: %s", labelOf(t), label, out.Detail)

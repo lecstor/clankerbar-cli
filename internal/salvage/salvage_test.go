@@ -541,6 +541,185 @@ func TestUnmergedPaths(t *testing.T) {
 	}
 }
 
+// untrackedOnly is asked of a porcelain that is known to be non-empty (the caller
+// has already handled the clean tree), and its answer decides whether anything at
+// all happens to a delivered worktree (CLA-695).
+func TestUntrackedOnly(t *testing.T) {
+	// Only a tree whose EVERY entry is untracked is the shape the delivered rule
+	// can leave alone. Anything tracked on either side is a change to work that
+	// exists, and is salvaged.
+	for _, tc := range []struct {
+		name      string
+		porcelain string
+		paths     []string
+		only      bool
+	}{
+		{"one untracked file", "?? worker-configuration.d.ts", []string{"worker-configuration.d.ts"}, true},
+		{"two untracked files", "?? a.go\n?? b.go", []string{"a.go", "b.go"}, true},
+		{"a trailing newline", "?? a.go\n", []string{"a.go"}, true},
+		{"CRLF", "?? a.go\r\n", []string{"a.go"}, true},
+		{"a quoted path", "?? \"a file with spaces.go\"", []string{"\"a file with spaces.go\""}, true},
+		{"an unstaged edit", " M tracked.txt", nil, false},
+		{"a staged edit", "M  tracked.txt", nil, false},
+		{"a rename", "R  m.go -> n.go", nil, false},
+		{"an unmerged entry", "UU tracked.txt", nil, false},
+		{"an untracked file beside an edit", "?? a.go\n M tracked.txt", []string{"a.go"}, false},
+		{"a clean tree", "", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			paths, only := untrackedOnly(tc.porcelain)
+			if only != tc.only {
+				t.Errorf("untrackedOnly(%q) only = %v, want %v", tc.porcelain, only, tc.only)
+			}
+			if strings.Join(paths, ",") != strings.Join(tc.paths, ",") {
+				t.Errorf("untrackedOnly(%q) paths = %v, want %v", tc.porcelain, paths, tc.paths)
+			}
+		})
+	}
+}
+
+// --- the delivered tip, and the one dirt it does not save (CLA-695) ----------
+
+// The incident this rule exists for: the session DELIVERED — committed, pushed and
+// recorded its branch — and left one untracked generated file in its worktree.
+// Committing that file pushed a NEW tip, so every reader downstream (the review
+// panel, the fix phase, the PR) rode the salvage commit instead of the tip the
+// session had handed over, and the generated file sat on the branch headed for a PR.
+func TestSalvage_ADeliveredTipWithOnlyUntrackedFilesIsLeftAlone(t *testing.T) {
+	e := newEnv(t)
+	// The session's work, committed and pushed: the worktree's tip IS the origin's.
+	write(t, filepath.Join(e.wt, "the-work.go"), "package work")
+	git(t, e.wt, "add", ".")
+	git(t, e.wt, "commit", "-m", "the work")
+	git(t, e.wt, "push", "origin", "HEAD:refs/heads/"+e.branch)
+	delivered := git(t, e.wt, "rev-parse", "HEAD")
+	// The typecheck's exhaust: generated, untracked, not the work.
+	write(t, filepath.Join(e.wt, "worker-configuration.d.ts"), "generated")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-695", e.branch)
+
+	if out.Status != Untracked {
+		t.Fatalf("status = %q (%s), want %q — an untracked file at a delivered tip is not stranded work", out.Status, out.Detail, Untracked)
+	}
+	if got := git(t, e.wt, "rev-parse", "HEAD"); got != delivered {
+		t.Errorf("HEAD moved to %s, want the delivered tip %s untouched", got, delivered)
+	}
+	if got := lsRemote(t, e.repo, e.branch); got != delivered {
+		t.Errorf("origin/%s is at %s, want the delivered tip %s — a salvage commit was pushed", e.branch, got, delivered)
+	}
+	if out.Branch != "" || out.Commit != "" {
+		t.Errorf("outcome names branch %q / commit %q, want neither: nothing was saved", out.Branch, out.Commit)
+	}
+	if len(out.Paths) != 1 || out.Paths[0] != "worker-configuration.d.ts" {
+		t.Errorf("paths = %v, want the untracked file named", out.Paths)
+	}
+	if !strings.Contains(out.Detail, "worker-configuration.d.ts") {
+		t.Errorf("the detail a reader is handed does not name the path: %s", out.Detail)
+	}
+	// Left exactly as it is, like every other thing this package declines to touch.
+	if dirty := git(t, e.wt, "status", "--porcelain"); !strings.Contains(dirty, "worker-configuration.d.ts") {
+		t.Errorf("the untracked file was staged or altered: %q", dirty)
+	}
+}
+
+// The discriminator is DELIVERY, so every shape that is not one keeps the CLA-314
+// rescue in full: an undelivered session's untracked file is the new module it
+// never staged, which is the exact work that rescue exists for.
+func TestSalvage_UntrackedFilesAtAnUndeliveredTipAreStillSaved(t *testing.T) {
+	e := newEnv(t)
+	write(t, filepath.Join(e.wt, "brand-new.go"), "package new")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-314", e.branch)
+
+	if !out.Saved() {
+		t.Fatalf("status = %q (%s), want the work saved", out.Status, out.Detail)
+	}
+	if got := lsRemote(t, e.repo, e.branch); got != out.Commit {
+		t.Errorf("origin/%s is at %q, want the salvage commit %q", e.branch, got, out.Commit)
+	}
+	if files := git(t, e.wt, "show", "--pretty=format:", "--name-only", "HEAD"); !strings.Contains(files, "brand-new.go") {
+		t.Errorf("the new file is not in the salvage commit: %q", files)
+	}
+}
+
+// Exact equality, not ancestry: a worktree whose HEAD is AHEAD of the recorded
+// branch is the unpushed work CLA-134 is about, so the file beside it is saved
+// rather than skipped on a technicality.
+func TestSalvage_UntrackedOnlyIsStillSavedWhenHEADIsAheadOfTheRecordedBranch(t *testing.T) {
+	e := newEnv(t)
+	write(t, filepath.Join(e.wt, "the-work.go"), "package work")
+	git(t, e.wt, "add", ".")
+	git(t, e.wt, "commit", "-m", "the work")
+	git(t, e.wt, "push", "origin", "HEAD:refs/heads/"+e.branch)
+	// A second commit the session never pushed, with an untracked file beside it.
+	write(t, filepath.Join(e.wt, "tracked.txt"), "more work")
+	git(t, e.wt, "commit", "-am", "more work")
+	write(t, filepath.Join(e.wt, "brand-new.go"), "package new")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-695", e.branch)
+
+	if !out.Saved() {
+		t.Fatalf("status = %q (%s), want the work saved — this tip is not on the origin", out.Status, out.Detail)
+	}
+	if got := lsRemote(t, e.repo, e.branch); got != out.Commit {
+		t.Errorf("origin/%s is at %q, want the salvage commit %q", e.branch, got, out.Commit)
+	}
+}
+
+// Nothing recorded, nothing to judge delivery against — and an unreadable origin
+// answers the same way. Neither may turn into a quiet loss: the failure mode is the
+// status quo, which is to save the work.
+func TestSalvage_UntrackedFilesAreSavedWhenNoBranchWasRecorded(t *testing.T) {
+	e := newEnv(t)
+	write(t, filepath.Join(e.wt, "the-work.go"), "package work")
+	git(t, e.wt, "add", ".")
+	git(t, e.wt, "commit", "-m", "the work")
+	git(t, e.wt, "push", "origin", "HEAD:refs/heads/"+e.branch)
+	write(t, filepath.Join(e.wt, "brand-new.go"), "package new")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-314")
+
+	if !out.Saved() {
+		t.Fatalf("status = %q (%s), want the work saved", out.Status, out.Detail)
+	}
+}
+
+// A recorded branch the origin does not have is not a delivery either: the session
+// named a branch it never pushed.
+func TestSalvage_UntrackedFilesAreSavedWhenTheRecordedBranchIsNotOnTheOrigin(t *testing.T) {
+	e := newEnv(t)
+	write(t, filepath.Join(e.wt, "the-work.go"), "package work")
+	git(t, e.wt, "add", ".")
+	git(t, e.wt, "commit", "-m", "the work")
+	write(t, filepath.Join(e.wt, "brand-new.go"), "package new")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-314", prefix+"-a-branch-that-never-was-pushed")
+
+	if !out.Saved() {
+		t.Fatalf("status = %q (%s), want the work saved", out.Status, out.Detail)
+	}
+}
+
+// Tracked edits on top of a delivered tip are changes to work that EXISTS, which is
+// what the rescue is for: only the untracked-only shape is left alone.
+func TestSalvage_TrackedEditsOnADeliveredTipAreStillSaved(t *testing.T) {
+	e := newEnv(t)
+	write(t, filepath.Join(e.wt, "the-work.go"), "package work")
+	git(t, e.wt, "add", ".")
+	git(t, e.wt, "commit", "-m", "the work")
+	git(t, e.wt, "push", "origin", "HEAD:refs/heads/"+e.branch)
+	write(t, filepath.Join(e.wt, "tracked.txt"), "an edit left uncommitted")
+
+	out := New(e.root, "").Salvage(context.Background(), taskID, "CLA-695", e.branch)
+
+	if !out.Saved() {
+		t.Fatalf("status = %q (%s), want the edit saved on top of the delivered tip", out.Status, out.Detail)
+	}
+	if got := lsRemote(t, e.repo, e.branch); got != out.Commit {
+		t.Errorf("origin/%s is at %q, want the salvage commit %q", e.branch, got, out.Commit)
+	}
+}
+
 // --- fixtures ---------------------------------------------------------------
 
 type env struct {
