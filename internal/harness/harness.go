@@ -408,6 +408,33 @@ const FinishReasonLength = "length"
 // which is the adapter-to-driver channel the loop already reads.
 const ZeroUsageReason = "zero_usage_unknown"
 
+// RecoveredErrorsKey is the Result.Raw key an adapter uses to record that its
+// session's stream carried a typed error event the session then RECOVERED from —
+// it retried and carried on — with no error event ending the stream (CLA-700).
+// The loop reads it off Raw rather than growing Adapter, the same way it reads
+// FinishReasonKey: it is the adapter-to-driver channel, and only opencode emits
+// this signal today.
+//
+// Its value is the COUNT of recovered events (an int), so a diagnostic can say
+// how many provider blips the session rode out. Absent — rather than zero —
+// when the session recovered from nothing, which is both the common case and
+// the one a missing key already means.
+const RecoveredErrorsKey = "recovered_error_events"
+
+// RecoveredErrors reports how many typed error events the session's stream
+// RECOVERED from — events with further transcript after them, and no error event
+// ending the stream (CLA-700). Zero covers both "nothing went wrong" and "the
+// stream ended on its error": the difference that matters to a classifier is
+// whether there is an unexplained exit status to judge, and only the second
+// shape has one.
+func RecoveredErrors(res Result) int {
+	if res.Raw == nil {
+		return 0
+	}
+	n, _ := res.Raw[RecoveredErrorsKey].(int)
+	return n
+}
+
 // OutputCapReason is the terminal_reason the opencode adapter writes into a
 // Result when the session's final step_finish carried reason "length" with
 // ZERO output tokens — the CLA-584 output-cap stall, read back through
