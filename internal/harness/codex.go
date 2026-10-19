@@ -243,6 +243,17 @@ func (p *codexParse) finish(res *Result) {
 	if p.sawUsage {
 		// Exclude cached input (discounted reads); reasoning counts as output spend.
 		res.Tokens = p.in + p.out + p.reason
+		// The normalised breakdown (CLA-691). codex's counters are INCLUSIVE —
+		// cached_input_tokens is a subset of input_tokens, reasoning_output_tokens
+		// a subset of output_tokens — so the subsets are subtracted out to leave
+		// buckets that are disjoint (see Usage's own comment). Copying them
+		// field-for-field would double count both.
+		res.Usage = TokenUsage{
+			Input:     max(0, p.in-p.cached),
+			Output:    max(0, p.out-p.reason),
+			Reasoning: p.reason,
+			CacheRead: p.cached,
+		}
 		res.Raw = map[string]any{
 			"input_tokens": p.in, "cached_input_tokens": p.cached,
 			"output_tokens": p.out, "reasoning_output_tokens": p.reason,

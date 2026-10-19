@@ -3327,8 +3327,8 @@ func TestDrainPhases_AnUnreadableBaselineRefusesBeforeTheReviewSpawns(t *testing
 		if h.invokeCalls != 1 {
 			t.Fatalf("spawned %d sessions, want 1 — the review must not spawn with an unreadable baseline, and the fix has nothing to apply", h.invokeCalls)
 		}
-		if rel.reads != reviewBaselineReadAttempts {
-			t.Errorf("the baseline read was attempted %d times, want the bound (%d) before refusing", rel.reads, reviewBaselineReadAttempts)
+		if rel.reads != planeSeamReadAttempts {
+			t.Errorf("the baseline read was attempted %d times, want the bound (%d) before refusing", rel.reads, planeSeamReadAttempts)
 		}
 		if len(rel.calls) != 0 {
 			t.Errorf("the refusal released the task (%+v); a HasWIP claim must be left to lapse into a takeover, exactly as a seam refusal leaves it", rel.calls)
@@ -4793,6 +4793,13 @@ func TestOpenMustFixDigestListsEveryOpenMustAcrossRounds(t *testing.T) {
 // count at all (an older plane, a degraded read), the driver's own count of
 // closed verification rounds still terminates the fix→verify pair at the cap.
 // The loop must never be unbounded because a read came back zero.
+//
+// The fallback counts the same ROUNDS the plane does (CLA-686 D2): a cycle is
+// ONE review round plus the verification rounds after it, so three rounds is
+// review + two verifications — the same two fix/verify pairs the plane-counted
+// path allows before it parks (TestDrainPhases_VerificationCapParksWithTheRecords).
+// Counting verification rounds alone against the cap let the degraded path run
+// a fourth round and then park on "Round 4 of the 3-round cap".
 func TestDrainPhases_VerificationLocalRoundBound(t *testing.T) {
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
 	steps := []invokeStep{
@@ -4803,7 +4810,7 @@ func TestDrainPhases_VerificationLocalRoundBound(t *testing.T) {
 		steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // fix
 		steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // verify
 	}
-	steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // would be a fourth fix
+	steps = append(steps, invokeStep{res: checkpointed(5, 0.05)}) // would be a THIRD verify round, i.e. the forbidden fourth round
 	h := &fakeAdapter{steps: steps}
 	h.onInvoke = func(i int) {
 		switch i {
@@ -4823,13 +4830,170 @@ func TestDrainPhases_VerificationLocalRoundBound(t *testing.T) {
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
-	// implement + review + three fix/verify pairs = 8; a 9th would be the
+	// implement + review + two fix/verify pairs = 6; a 7th would be the
 	// forbidden "one more round".
-	if h.invokeCalls != 8 {
-		t.Fatalf("spawned %d sessions, want 8 — the local round bound must stop the pair", h.invokeCalls)
+	if h.invokeCalls != 6 {
+		t.Fatalf("spawned %d sessions, want 6 — the local round bound must stop the pair at the same round the plane-counted path does", h.invokeCalls)
 	}
 	if len(rel.parks) != 1 || !strings.Contains(rel.parks[0], "cap") {
 		t.Fatalf("the local round bound did not park at the cap: parks=%v", rel.parks)
+	}
+	// The park's own text must not name a round past the cap: the degraded path
+	// used to report "Round 4 of the 3-round cap".
+	if strings.Contains(rel.parks[0], "Round 4 of the 3-round cap") {
+		t.Errorf("the degraded path parked on a round past the cap:\n%s", rel.parks[0])
+	}
+}
+
+// CLA-686 D3: the verification round's spawn read is fail-closed — a round that
+// cannot be told what it must adjudicate is refused before it is paid for — so a
+// SINGLE plane blip there ended the sequence, discarding the fix round that had
+// just run and handing the claim back to the queue. The brief's own comment
+// claimed the same disposition as the CLA-663 review baseline, which retries a
+// transient failure three times; this read took one attempt. It now shares that
+// bound.
+func TestDrainPhases_AFailedVerifySpawnReadIsRetried(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review
+		{res: checkpointed(5, 0.05)},  // fix
+		{res: checkpointed(5, 0.05)},  // verify
+	}}
+	blips := 0
+	verifySpawnReads := 0
+	h.onInvoke = func(i int) {
+		if i == 3 { // the verify phase is about to run: its spawn reads are all done
+			verifySpawnReads = rel.reads
+		}
+		switch i {
+		case 1: // the review gate seals round 1 and raises the MUST the verifier adjudicates
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+			rel.openMusts = []string{"1.review-1.1"}
+		case 2:
+			// Arm the blip as the fix phase starts. The TaskState reads that
+			// follow are the verification round's spawn sequence, in order: the
+			// record gate's baseline read (the verify phase is review-shaped, so
+			// it pays readReviewBaseline), then the round's own digest read —
+			// the one under test, and the last read before the round spawns.
+			// Skipping the baseline and failing the NEXT TWO calls blips the
+			// digest's first attempts whatever the baseline costs, so only a
+			// retry gets the round spawned.
+			calls := 0
+			rel.readErr = func() error {
+				calls++
+				if calls == 2 || calls == 3 {
+					blips++
+					return errors.New("plane blip: read timeout")
+				}
+				return nil
+			}
+		case 3: // the verifier closes round 2 with the MUST resolved
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.openMusts = nil
+			rel.status = "in_review"
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	// Both injected failures must have been CONSUMED, and the reads the verify
+	// phase was spawned with must be exactly the spawn sequence: four reads
+	// before the fix phase ran (the review baseline, the review's exit
+	// evidence, the fix phase's grading and open-MUST digests), then the verify
+	// baseline's single attempt and the digest's three. Pinning that count is
+	// what stops the blip silently drifting onto some earlier tolerated read,
+	// which would leave the spawn read succeeding on its first attempt and this
+	// test proving nothing.
+	if blips != 2 {
+		t.Errorf("the injected failures were not both consumed (%d) — the fault injection, not the driver, is what is being tested", blips)
+	}
+	if verifySpawnReads != 8 {
+		t.Errorf("the verify phase was spawned after %d plane reads, want 8 (review baseline, review exit evidence, fix grading, fix open-MUST digest, verify baseline, then the digest's failed, failed, succeeded attempts) — the blip no longer lands on the spawn read", verifySpawnReads)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — one blip on the verification round's spawn read must not discard the fix round and end the sequence", h.invokeCalls)
+	}
+	if out := logs.String(); strings.Contains(out, "refusing to spawn the verify") {
+		t.Errorf("the spawn read was refused on its first attempt instead of retried:\n%s", out)
+	}
+	// The retried read must be the one that FEEDS the round: its digest carries
+	// the MUST the review raised, so the round knows what to adjudicate.
+	if p := h.invocations[3].Prompt; !strings.Contains(p, "1.review-1.1") {
+		t.Errorf("the verification round's brief does not carry the open MUST the retried read served:\n%s", p)
+	}
+	if len(rel.parks) != 0 || len(rel.questions) != 0 {
+		t.Fatalf("the retried spawn parked the task: parks=%v questions=%v", rel.parks, rel.questions)
+	}
+	if len(rel.closes) != 2 {
+		t.Errorf("closed rounds = %v, want the review's and the verifier's", rel.closes)
+	}
+}
+
+// CLA-686 D3, the other end of the same seam: the read the driver makes AFTER
+// the verification round closed is fail-closed too — it is what the open-MUST
+// set is judged from — so one blip there also threw away a round that had
+// already been paid for. It shares the spawn read's retry bound.
+func TestDrainPhases_AFailedPostRoundVerifyReadIsRetried(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review
+		{res: checkpointed(5, 0.05)},  // fix
+		{res: checkpointed(5, 0.05)},  // verify
+		{res: checkpointed(5, 0.05)},  // a second verify round, if the first failed to be judged
+	}}
+	blips := 0
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1: // the review gate seals round 1 with a non-gating SHOULD
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		case 3:
+			// Arm the blip as the verify round starts. Two reads follow it: the
+			// round's own exit evidence (the verify phase is review-shaped, so
+			// checkpointEvidence pays planeExitRecord), then the post-round read
+			// under test. Skipping the first and failing the next two blips that
+			// read's own attempts.
+			rel.records = append(rel.records, recordFor(2, "review-2", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.openMusts = nil
+			rel.status = "in_review"
+			calls := 0
+			rel.readErr = func() error {
+				calls++
+				if calls == 2 || calls == 3 {
+					blips++
+					return errors.New("plane blip: read timeout")
+				}
+				return nil
+			}
+		}
+	}
+	d := phaseDriverWithReleaser(t, h, verifyPhases(), rel)
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if blips != 2 {
+		t.Errorf("the injected failures were not both consumed (%d) — the fault injection, not the driver, is what is being tested", blips)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — the round was judged from the retried read, not thrown away", h.invokeCalls)
+	}
+	out := logs.String()
+	if strings.Contains(out, "the task could not be read after the verification round closed") {
+		t.Errorf("the post-round read was refused on its first attempt instead of retried:\n%s", out)
+	}
+	if len(rel.parks) != 0 || len(rel.questions) != 0 {
+		t.Fatalf("the retried read parked the task: parks=%v questions=%v", rel.parks, rel.questions)
 	}
 }
 

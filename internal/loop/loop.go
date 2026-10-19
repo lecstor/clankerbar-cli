@@ -2068,7 +2068,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			}
 			verifyRoundsRun++
 			reason := nonConvergenceReason(end.verifyOpenMusts, end.verifyRound, verifyResolved)
-			capHit := end.verifyCounted >= config.ReviewRoundCap || verifyRoundsRun >= config.ReviewRoundCap
+			// The local fallback counts the same ROUNDS the plane does (CLA-686
+			// D2). A review cycle is one review round plus the verification
+			// rounds that follow it, and the plane's `counted` includes the
+			// review round — so comparing verification rounds ALONE against the
+			// cap allowed a cycle one round longer than the counted path, and
+			// the park then read "Round 4 of the 3-round cap". `+1` is the
+			// review round that opened this cycle.
+			localRounds := verifyRoundsRun + 1
+			capHit := end.verifyCounted >= config.ReviewRoundCap || localRounds >= config.ReviewRoundCap
 			if reason == "" && !capHit && fixIdx >= 0 && end.checkpoint && carried != nil {
 				for _, id := range end.verifyResolvedIDs {
 					verifyResolved[id] = true
@@ -3090,14 +3098,61 @@ func (d *Driver) readTaskOutcome(ctx context.Context, t Target, prev *harness.Re
 	return st.Outcome, true
 }
 
-// reviewBaselineReadAttempts bounds the baseline read's retries at review spawn
-// (CLA-663): the initial attempt plus two more. The failure this recovers from
-// is a plane blip — a dropped response, a read that timed out — and one retry
-// pair around a 20-second read is enough for that without turning an outage
-// into a long stall. Deliberately no sleep between attempts: the read's own
-// timeout is the pacing, and the whole point of a bounded retry here is to
-// avoid paying for a session, not to wait for a sick plane.
-const reviewBaselineReadAttempts = 3
+// planeSeamReadAttempts bounds the retries of a plane read whose failure fails
+// the sequence CLOSED (CLA-663 for the review baseline, CLA-686 D3 for the
+// verification round's spawn read): the initial attempt plus two more. The
+// failure this recovers from is a plane blip — a dropped response, a read that
+// timed out — and one retry pair around a 20-second read is enough for that
+// without turning an outage into a long stall. Deliberately no sleep between
+// attempts: the read's own timeout is the pacing, and the whole point of a
+// bounded retry here is to avoid paying for a session (or discarding one
+// already paid for), not to wait for a sick plane.
+const planeSeamReadAttempts = 3
+
+// planeTaskState reads the plane's record of one task, retrying a transient
+// failure up to `attempts` times. It is the single implementation behind every
+// seam read of the task — the review baseline and the verification round's
+// fail-closed reads share it precisely so their retry behaviour cannot drift
+// apart (CLA-686 D3: the verify spawn's read claimed to mirror the baseline's
+// and did not, one attempt against three).
+//
+// ok is false when there is no task id, no wired reader, or every attempt
+// failed; ErrNotWired is never retried, because asking an unwired client again
+// cannot wire it. `purpose` names the read in the log line only; the caller
+// decides what an unreadable task MEANS.
+func (d *Driver) planeTaskState(ctx context.Context, t Target, taskID string, attempts int, purpose string) (plane.TaskState, bool) {
+	if taskID == "" {
+		return plane.TaskState{}, false
+	}
+	src, wired := t.Releaser.(plane.TaskStateSource)
+	if !wired {
+		return plane.TaskState{}, false
+	}
+	lastErr := ""
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if ctx.Err() != nil {
+			return plane.TaskState{}, false
+		}
+		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		st, err := src.TaskState(sctx, taskID)
+		cancel()
+		switch {
+		case err == nil:
+			return st, true
+		case errors.Is(err, plane.ErrNotWired):
+			// No wiring to retry against; the caller refuses at its own guard.
+			return plane.TaskState{}, false
+		default:
+			lastErr = err.Error()
+		}
+	}
+	if attempts > 1 {
+		log.Printf("%scould not read the plane's record of %s %s, after %d attempts (%s)", labelOf(t), taskID, purpose, attempts, lastErr)
+	} else {
+		log.Printf("%scould not read the plane's record of %s %s (%s)", labelOf(t), taskID, purpose, lastErr)
+	}
+	return plane.TaskState{}, false
+}
 
 // readReviewBaseline reads the task's outcome as it stands BEFORE the review
 // phase spawns, so the seam can require the record to have changed. The task id
@@ -3106,41 +3161,20 @@ const reviewBaselineReadAttempts = 3
 // in hand.
 //
 // Best-effort like every other plane read, with one difference CLA-663 added:
-// the read is RETRIED up to reviewBaselineReadAttempts times, because a blip
-// here does not degrade to "judge on other evidence" — it fails the whole
-// sequence closed. A failure still returns read=false, and the caller refuses
-// to spawn the review rather than letting it run a session whose checkpoint the
-// seam would reject. No retries are spent on a target with no plane wiring or
-// no task id to ask about: those cannot be fixed by asking again.
+// the read is RETRIED up to planeSeamReadAttempts times, because a blip here
+// does not degrade to "judge on other evidence" — it fails the whole sequence
+// closed. A failure still returns read=false, and the caller refuses to spawn
+// the review rather than letting it run a session whose checkpoint the seam
+// would reject.
 func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness.Result) (string, bool) {
-	if prev == nil || prev.Claim.TaskID == "" {
+	if prev == nil {
 		return "", false
 	}
-	src, wired := t.Releaser.(plane.TaskStateSource)
-	if !wired {
+	st, ok := d.planeTaskState(ctx, t, prev.Claim.TaskID, planeSeamReadAttempts, "before the review phase spawned")
+	if !ok {
 		return "", false
 	}
-	lastErr := ""
-	for attempt := 1; attempt <= reviewBaselineReadAttempts; attempt++ {
-		if ctx.Err() != nil {
-			return "", false
-		}
-		sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-		st, err := src.TaskState(sctx, prev.Claim.TaskID)
-		cancel()
-		switch {
-		case err == nil:
-			return st.Outcome, true
-		case errors.Is(err, plane.ErrNotWired):
-			// No wiring to retry against; the gate refuses at the spawn guard.
-			return "", false
-		default:
-			lastErr = err.Error()
-		}
-	}
-	log.Printf("%scould not read the plane's record of %s before the review phase spawned, after %d attempts (%s) — the review→fix gate cannot judge its record against the task it found",
-		labelOf(t), prev.Claim.TaskID, reviewBaselineReadAttempts, lastErr)
-	return "", false
+	return st.Outcome, true
 }
 
 // closeReviewRound releases a review round's sealed findings (CLA-637) by
@@ -3165,29 +3199,28 @@ func (d *Driver) closeReviewRound(ctx context.Context, t Target, res harness.Res
 }
 
 // readTaskState reads the plane's record of one task, for the verification
-// round's reads (CLA-638). Best-effort like every other plane read: ok is false
-// when there is no task id, no wired reader, or the read fails. The caller
-// decides what an unreadable task means; for the verification seam it is a
-// failed round, because open MUSTs cannot be judged from a record that cannot
-// be read.
+// round's BEST-EFFORT reads (CLA-638): the fix phase's panel digest and its
+// open-MUST digest, where a failure degrades to "judge on other evidence" — the
+// fix brief's own instruction to read `reviews.openMustIds` itself. Best-effort
+// like every other plane read: ok is false when there is no task id, no wired
+// reader, or the read fails. The reads that fail the sequence CLOSED instead use
+// readTaskStateRetry, which shares this implementation with a retry bound.
 func (d *Driver) readTaskState(ctx context.Context, t Target, taskID string) (plane.TaskState, bool) {
-	if taskID == "" {
-		return plane.TaskState{}, false
-	}
-	src, wired := t.Releaser.(plane.TaskStateSource)
-	if !wired {
-		return plane.TaskState{}, false
-	}
-	sctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	st, err := src.TaskState(sctx, taskID)
-	if err != nil {
-		if !errors.Is(err, plane.ErrNotWired) {
-			log.Printf("%scould not read the plane's record of %s for the verification round (%v)", labelOf(t), taskID, err)
-		}
-		return plane.TaskState{}, false
-	}
-	return st, true
+	return d.planeTaskState(ctx, t, taskID, 1, "for the verification round")
+}
+
+// readTaskStateRetry is readTaskState for the verification round's FAIL-CLOSED
+// reads (CLA-686 D3): the round's spawn read, and the read the driver makes
+// after a closed round to judge its open-MUST set. A failure on any of them
+// fail-closes the sequence — the round cannot be told what to adjudicate, or
+// cannot be judged — so one plane blip there discards work that has already
+// been paid for: at the spawn, the fix round that just ran (the sequence ends,
+// the claim is released and the next claim re-runs the phases); after a closed
+// round, the verification round itself. That is exactly why the review baseline
+// read these claim parity with retries, and they now share its bound
+// (planeSeamReadAttempts) rather than taking a single attempt.
+func (d *Driver) readTaskStateRetry(ctx context.Context, t Target, taskID, purpose string) (plane.TaskState, bool) {
+	return d.planeTaskState(ctx, t, taskID, planeSeamReadAttempts, purpose)
 }
 
 // findingIDRound parses the round prefix out of a plane finding id
@@ -4078,15 +4111,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// their findings, read from the plane's released records before the session
 	// spawns. Fail-closed: a round that cannot be told what it must adjudicate is
 	// refused before it is paid for, the same disposition CLA-663 gives the
-	// review baseline. The task id comes from the carried claim; the phase is
-	// resumed, so it is exact.
+	// review baseline — which includes its RETRY (CLA-686 D3): one plane blip
+	// here would otherwise discard the fix round that just ran and hand the
+	// sequence back to the queue, so this read shares the baseline's bound
+	// instead of taking a single attempt. The task id comes from the carried
+	// claim; the phase is resumed, so it is exact.
 	verifyDigest := ""
 	if isVerify {
 		taskID := ""
 		if prev != nil {
 			taskID = prev.Claim.TaskID
 		}
-		st, read := d.readTaskState(ctx, t, taskID)
+		st, read := d.readTaskStateRetry(ctx, t, taskID, "before the verification round spawned")
 		if !read {
 			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's record could not be read, so the round would not know what to adjudicate — the sequence ends here; the claim is released when it is releasable, else left to lapse into a takeover",
 				labelOf(t), drainNum, ph.Label(phaseIdx))
@@ -4131,6 +4167,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// shape of a provider degrading: real 5xx blips interleaved with stream drops
 	// nothing has a pattern for.
 	unclassified := 0
+	// The spend of THIS phase pass, summed across the ladder's attempts
+	// (CLA-691). One fleet-record entry is published per pass, and a pass that
+	// retried is several paid sessions, so every attempt the ladder spawned is
+	// folded in here where the entry is built.
+	pass := sessionSpend{}
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
 		// just waited — a supervised wait on a usage limit, an exponential backoff
@@ -4339,10 +4380,22 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// the spawn line above used — the phase's label, the phase's resolved
 		// harness, and the resolved model (empty when the harness default
 		// applied; never guessed). Set on every attempt, so the LAST attempt's
-		// values are the ones that ride: a retry within the ladder is the same
-		// session re-run, and the only way its values can differ between
-		// attempts is a reload landing mid-ladder.
-		end.session = &fleet.Session{Phase: ph.Label(phaseIdx), Harness: a.Name(), Model: inv.Model}
+		// values are the ones that ride: the entry describes the PASS, and a
+		// retry within the ladder cannot change what the pass ran — only a
+		// reload landing mid-ladder can.
+		//
+		// CLA-691: its spend is filled in later, at the point the loop counts the
+		// attempt's spend toward the iteration (recordPassSpend), so the two can
+		// never disagree about which attempts were counted. The pass sums every
+		// counted attempt, because the loop counts each one as its own paid
+		// session: an entry reporting only the surviving attempt's money would
+		// not add up to the iteration total.
+		end.session = &fleet.Session{
+			Phase:   ph.Label(phaseIdx),
+			Harness: a.Name(),
+			Model:   inv.Model,
+			RunID:   sessionRunID(res, prev),
+		}
 		// The wider classification rides the end for the fleet record only — see
 		// phaseEnd.producedNothing.
 		end.producedNothing = producedNothing
@@ -4416,7 +4469,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					// nothing downstream may try to close it again.
 					end.reviewRound = 0
 					end.verifyRound = review.round
-					if st, read := d.readTaskState(ctx, t, res.Claim.TaskID); !read {
+					// Fail-closed, so retried like the spawn read (CLA-686 D3):
+					// one blip here ends a sequence the verification round has
+					// already been paid for.
+					if st, read := d.readTaskStateRetry(ctx, t, res.Claim.TaskID, "after the verification round closed"); !read {
 						evidenceOK = false
 						evidenceWhy = "the task could not be read after the verification round closed, so its open MUSTs cannot be judged"
 					} else {
@@ -4435,9 +4491,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// the hand-over log needs: a branchless verifier that recorded its
 				// pass but left the task in_progress must be named loudly, exactly
 				// as the id-based shape names it. A failed read ends the sequence
-				// fail-closed, like every other unreadable seam.
+				// fail-closed, like every other unreadable seam — so it retries
+				// like them too (CLA-686 D3).
 				end.verifyRound = 0
-				if st, read := d.readTaskState(ctx, t, res.Claim.TaskID); !read {
+				if st, read := d.readTaskStateRetry(ctx, t, res.Claim.TaskID, "after the branchless verification round"); !read {
 					evidenceOK = false
 					evidenceWhy = "the task could not be read after the branchless verification round, so its hand-over cannot be judged"
 				} else {
@@ -4556,6 +4613,40 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// read (branchless or unverified), which is when no tip can be
 				// demanded of the reviewer either.
 				end.claim.CheckpointTip = evidenceTip
+				// CLA-685: a HANDOFF is the one checkpoint this session's own
+				// exit did not earn — it holds only because the successor
+				// continues THIS phase, which the claim carried in as `prev`
+				// opened. So when the exit evidenced NOTHING (evidenceOK false)
+				// the verdict just folded above is its REFUSAL's, not a
+				// checkpoint's: the record gate zeroes the unverified mark even
+				// though the branch leg had established it. The successor then
+				// reads carried.CheckpointUnverified as false, is handed the
+				// VERIFIED continuation - "The driver verified the origin
+				// remote's tip ... as {{reviewedTip}}" - for a tip this driver
+				// never read, and the placeholder stays literal, since it is
+				// filled only when the tip is non-empty.
+				//
+				// The exit's verdict about the checkpoint is empty exactly when
+				// it read no tip of its own: an evidenced branch leg always
+				// brings a tip (the verified form), and a non-empty tip implies
+				// unverified=false — the verified continuation, whose
+				// {{reviewedTip}} that tip then fills. So the opening
+				// checkpoint's mark is the only true one there, and it rides
+				// forward, as the panel-member block in drainPhases rides a
+				// claim's resumption facts onto the claim it hands on.
+				//
+				// The tip is carried only for the branch it was read for — it
+				// is `prev`'s, and a claim that now names another one must not
+				// be handed a tip that never belonged to it. The BRANCH stays as
+				// folded: it is the live truth about where the work is. An exit
+				// that WAS evidenced keeps its own verdict untouched, so the
+				// verified path is unaffected.
+				if handoff != "" && !evidenceOK && prev != nil && end.claim.CheckpointTip == "" {
+					end.claim.CheckpointUnverified = prev.CheckpointUnverified
+					if end.claim.Claim.Branch == prev.Claim.Branch {
+						end.claim.CheckpointTip = prev.CheckpointTip
+					}
+				}
 			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
@@ -4754,6 +4845,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			if res.Untrusted == "" {
 				tokens += res.Tokens
 				cost += res.CostUSD
+				recordPassSpend(end.session, a, &pass, &res)
 				d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 			}
 			// A run failure that was not an exit status — a launch failure, or one
@@ -4769,6 +4861,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		if res.Untrusted != "" {
 			// held is nil here by construction — an untrusted stream never holds a
 			// phase open — so the sequence ends and nothing is carried forward.
+			//
+			// CLA-691: no spend figures were recorded on this pass's session entry
+			// either (recordPassSpend runs only where the loop counts an attempt),
+			// so the record says "unknown" instead of publishing a FLOOR from a
+			// stream with a hole in it as if it were a report.
 			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
@@ -4781,6 +4878,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
+		// The pass's own session entry takes the same figures, in the same breath
+		// (CLA-691): every attempt the loop counts is money the record attributes
+		// to the pass, and none it refuses is.
+		recordPassSpend(end.session, a, &pass, &res)
 		d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the

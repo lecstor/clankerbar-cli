@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -88,10 +89,35 @@ func sqliteOpencodeCredentials(ctx context.Context, dbPath string) (map[string]i
 	return counts, nil
 }
 
+// modelProvider is the provider a model id names: opencode ids are
+// `<provider>/<model>` ("opencode-go/deepseek-v4-flash"). ok is false for an id
+// with no provider half - a bare alias names nothing this can look up in the
+// credential store, and guessing a provider from it would invent a finding.
+func modelProvider(id string) (provider string, ok bool) {
+	p, _, found := strings.Cut(id, "/")
+	p = strings.TrimSpace(p)
+	if !found || p == "" {
+		return "", false
+	}
+	return p, true
+}
+
 // checkOpencodeAuth reports on 2.x's credential store when the run spawns
 // opencode. A missing store or an empty one is a WARN, not a FAIL: a provider
 // key can also come from the provider config (`{env:...}`), which this cannot
 // see.
+//
+// A NON-EMPTY store is not by itself a green (CLA-687). Credentials are stored
+// per provider (the `integration_id` column) and a session only works on the
+// provider its model names, so a store holding `google` says nothing about a
+// config whose models run on `opencode-go`: every session dies with
+// `provider.auth` (401) on its first call, and the check used to report PASS
+// because it counted rows rather than matching them. The providers are therefore
+// taken from the models the run will ACTUALLY use - Config.ModelIDsFor, which
+// resolves the phase/tier/panel chain - and compared with the ids the store
+// holds. A named provider with no stored credential is a WARN rather than a
+// FAIL, for the same reason an empty store is: the key may be declared in the
+// opencode config instead, which this cannot read.
 func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	if !slices.Contains(cfg.SpawnedHarnesses(), "opencode") {
 		return nil
@@ -127,8 +153,45 @@ func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []c
 		names = append(names, n)
 	}
 	sort.Strings(names)
+	// Which providers the configured models name, and which models put them
+	// there (so the detail can point at the model, not just the provider).
+	needed := map[string][]string{}
+	var unattributed []string
+	for _, id := range cfg.ModelIDsFor("opencode") {
+		p, ok := modelProvider(id)
+		if !ok {
+			unattributed = append(unattributed, id)
+			continue
+		}
+		needed[p] = append(needed[p], id)
+	}
+	var missing []string
+	for _, p := range slices.Sorted(maps.Keys(needed)) {
+		if counts[p] == 0 {
+			missing = append(missing, p)
+		}
+	}
+	if len(unattributed) > 0 {
+		// Said, not warned: an id with no provider half cannot be matched against
+		// the store either way, and inventing a provider for it would report a
+		// gap nobody can act on.
+		c.info = append(c.info, "model ids naming no provider, so not checked against the store: "+strings.Join(unattributed, ", "))
+	}
+	if len(missing) > 0 {
+		gaps := make([]string, 0, len(missing))
+		for _, p := range missing {
+			gaps = append(gaps, fmt.Sprintf("%s (used by %s)", p, strings.Join(needed[p], ", ")))
+		}
+		c.status = warn
+		c.detail = fmt.Sprintf("%s holds active credentials for: %s - but the configured models run on %s, which the store holds no credential for; a session on such a model ends at its first call with provider.auth", db, strings.Join(names, ", "), strings.Join(gaps, "; "))
+		c.remedy = "run `opencode auth login` for " + strings.Join(missing, ", ") + ", or give that provider its key in the opencode config"
+		return []check{c}
+	}
 	c.status = pass
 	c.detail = fmt.Sprintf("%s holds active credentials for: %s (values not read; presence is not validity - the store records no expiry, so a revoked or expired key still counts)", db, strings.Join(names, ", "))
+	if providers := slices.Sorted(maps.Keys(needed)); len(providers) > 0 {
+		c.detail += "; the configured models run on " + strings.Join(providers, ", ")
+	}
 	return []check{c}
 }
 

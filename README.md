@@ -523,6 +523,13 @@ Nothing in the seam resists it: each phase is already a fresh session seeded fro
 the observed claim, so what crosses the boundary is a task id and a run id, and
 both live on the plane rather than in a session.
 
+**Every key in `harnesses` must name a registered harness** — `claude`, `codex`,
+`opencode`. A block keyed by anything else is refused at startup rather than kept
+as dead config: nothing ever looks that key up, so its `model`, `models` and
+paths would silently stop applying. What that catches is the leftover of a
+rename — a `harnesses.opencode2` block from the retired 2.x preview harness
+(CLA-675) — and the refusal names the rename to make.
+
 **The review can be a panel.** Setting `review_panel` fans the one built-in,
 non-final review phase out into one review phase per member; see [the review
 panel](#the-review-panel-several-reviewers-one-revision-one-merge) for the
@@ -1192,7 +1199,22 @@ cadences the loop already runs (no new timers):
 - **Iteration history**: exactly one record per drain, posted at the boundary it
   just crossed — the task, the phases attempted, how it ended (`checkpoint`
   work left for a takeover / `released` back to the queue or settled /
-  `parked` for the operator / `dead`), duration, and tokens.
+  `parked` for the operator / `dead`), duration, and tokens. The record also
+  names every session the drain spawned, in spawn order, with the label of the
+  phase it ran, the harness that ran it, the model it was spawned with (empty
+  when the harness default applied), and what that session spent: the token
+  usage as a normalised breakdown — `input`, `output`, `reasoning`,
+  `cacheRead`, `cacheWrite`, five disjoint buckets summed across the session's
+  own steps, so the figure can be repriced later — plus the harness-reported
+  dollar figure, when there is one. The breakdown is what the operator's cost
+  analysis reads; the dollar figure is labelled as harness-reported because on a
+  subscription it is the API-rate equivalent, not what was paid, and it is
+  omitted for a harness that reports no cost at all (codex today).
+  The plane keeps a session's usage on the task, as a durable `phase_session`
+  record (`list_phase_sessions` reads it back), alongside the run that session
+  worked under — the run's UUID, never the credential the session holds, which
+  carries a bearer secret and is stripped off on the way out — so the cost of a
+  round of review can be attributed to the round it belongs to.
 
 Everything is strictly fail-soft telemetry: a failed report is logged once and
 dropped, never retried (v1), and can never block, delay, or fail the loop, a

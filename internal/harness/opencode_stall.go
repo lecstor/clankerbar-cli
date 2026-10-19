@@ -149,7 +149,9 @@ func (o opencode) resumeOutputCapStall(ctx context.Context, in Invocation, res *
 		// would count the resume twice.)
 		res.Tokens += contRes.Tokens
 		res.CostUSD += contRes.CostUSD
+		res.Usage.Add(contRes.Usage)
 		res.UsageReported = res.UsageReported || contRes.UsageReported
+		res.CostReported = res.CostReported || contRes.CostReported
 		// The claim observation folds even here, under the probe's guard: an
 		// errored resume still ran a real turn, and one that recorded a branch
 		// (or settled the task) before the failure is describing STATE THIS

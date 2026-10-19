@@ -289,7 +289,11 @@ bound:
 - **Round cap 3 per review cycle.** The plane counts non-void rounds; a human
   verdict starts a new cycle, a takeover or reclaim does not, and a void round
   does not count. At the cap an open MUST parks the task with a question
-  carrying the records — never one more round.
+  carrying the records — never one more round. The driver also counts, itself,
+  the rounds it closed, for the case where a plane serves no count at all (an
+  older plane, a degraded read): the count is the opening review round plus
+  every verification round this drain ran, so it never exceeds the plane's
+  count, and a degraded read cannot buy the cycle a fourth round (CLA-686 D2).
 - **Non-convergence breaker.** A MUST still open after two fix attempts, or one
   a verifier marked resolved that a later verifier reopens, parks the task with
   a question rather than spending another round on the disagreement.
