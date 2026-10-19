@@ -178,6 +178,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// observation folds separately, just as unconditionally.
 		res.Tokens += probeRes.Tokens
 		res.CostUSD += probeRes.CostUSD
+		res.Usage.Add(probeRes.Usage)
 		res.UsageReported = res.UsageReported || probeRes.UsageReported
 		// The claim observation folds ONLY when it is still about THIS task
 		// and arrived on a capture we may read: noteClaimed replaces a parser's
@@ -239,6 +240,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			// Spend first, even on the error path.
 			res.Tokens += contRes.Tokens
 			res.CostUSD += contRes.CostUSD
+			res.Usage.Add(contRes.Usage)
 			res.UsageReported = res.UsageReported || contRes.UsageReported
 			if console != nil {
 				fmt.Fprintf(console, "!! resurrection continuation errored (%v) — counting the death\n", contErr)
@@ -1466,6 +1468,16 @@ func (p *opencodeParse) finish(res *Result) {
 		// is the honest spend figure for the budget.
 		res.Tokens = p.total
 		res.CostUSD = p.cost
+		// The normalised breakdown (CLA-691): opencode's step tokens are already
+		// disjoint across exactly these five buckets, so this is the report
+		// itself, summed over the session's steps.
+		res.Usage = TokenUsage{
+			Input:      p.in,
+			Output:     p.out,
+			Reasoning:  p.reason,
+			CacheRead:  p.cRead,
+			CacheWrite: p.cWrite,
+		}
 		res.Raw = map[string]any{
 			"input_tokens": p.in, "output_tokens": p.out, "reasoning_tokens": p.reason,
 			"cache_write_tokens": p.cWrite, "cache_read_tokens": p.cRead,

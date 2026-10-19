@@ -230,6 +230,10 @@ func mergeResume(base *Result, add Result) {
 	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
+	// The normalised breakdown sums on the same terms as Tokens/CostUSD above:
+	// the continuation is PART of this session's spend, not a second session
+	// (CLA-691).
+	base.Usage.Add(add.Usage)
 	base.UsageReported = base.UsageReported || add.UsageReported
 	if add.FinalMessage != "" {
 		base.FinalMessage = add.FinalMessage

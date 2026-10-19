@@ -318,3 +318,43 @@ func claimDisposition(res *harness.Result) string {
 	}
 	return fleet.OutcomeReleased
 }
+
+// sessionRunID is the run the session worked the task under, or "" when it never
+// held one (CLA-691).
+//
+// A session that CLAIMED the task observed its own run id, and that is the
+// value to record. A later phase's session never calls claim_task — the driver
+// resumes the run the predecessor left held — so it has no observation of its
+// own, and the id comes from the claim carried INTO the phase. That is the same
+// claim the driver substitutes into the session's brief as {{runId}}, so the
+// record and the session's own writes agree by construction rather than by two
+// lookups that could drift.
+func sessionRunID(res harness.Result, prev *harness.Result) string {
+	if res.Claim.RunID != "" {
+		return res.Claim.RunID
+	}
+	if prev != nil {
+		return prev.Claim.RunID
+	}
+	return ""
+}
+
+// reportedSessionCost is the harness-reported dollar figure the fleet record
+// carries for one session, or nil when there is no figure to carry.
+//
+// Two ways that happens, and they are different questions. An adapter that never
+// populates CostUSD at all — Capabilities.ReportsCost false, codex today — has
+// no figure by construction; a session that reported no usage leaves the field
+// at zero, and a zero from a session nobody measured would read on the console
+// as "$0 spent". Both are "unknown", which is what nil means, and it is why the
+// wire field is nullable rather than a zero.
+//
+// A harness that DID report (a real zero — a cached-only turn, a free local
+// model) keeps its zero: the pointer survives marshalling.
+func reportedSessionCost(a harness.Adapter, res *harness.Result) *float64 {
+	if res == nil || !res.UsageReported || !a.Capabilities().ReportsCost {
+		return nil
+	}
+	cost := res.CostUSD
+	return &cost
+}

@@ -4342,7 +4342,19 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// values are the ones that ride: a retry within the ladder is the same
 		// session re-run, and the only way its values can differ between
 		// attempts is a reload landing mid-ladder.
-		end.session = &fleet.Session{Phase: ph.Label(phaseIdx), Harness: a.Name(), Model: inv.Model}
+		//
+		// CLA-691: its spend rides too — the normalised token breakdown, whether
+		// the harness reported usage at all, and the harness-reported dollar
+		// figure when there is one.
+		end.session = &fleet.Session{
+			Phase:         ph.Label(phaseIdx),
+			Harness:       a.Name(),
+			Model:         inv.Model,
+			Usage:         fleet.TokenUsage(res.Usage),
+			UsageReported: res.UsageReported,
+			CostUSD:       reportedSessionCost(a, &res),
+			RunID:         sessionRunID(res, prev),
+		}
 		// The wider classification rides the end for the fleet record only — see
 		// phaseEnd.producedNothing.
 		end.producedNothing = producedNothing
