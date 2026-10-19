@@ -129,6 +129,107 @@ func TestSendPostsThePlaneShape(t *testing.T) {
 	}
 }
 
+// CLA-691: each session entry carries its normalised token breakdown and the
+// harness-reported cost, and each of those fields is OMITTED when there is
+// nothing to say — an older CLI's entry, and a session that died before its
+// harness reported anything, must stay the pre-CLA-691 shape exactly, which is
+// how the plane tells "no usage" from "a reported zero".
+func TestMarshalReportCarriesPerSessionUsage(t *testing.T) {
+	cost := 0.18
+	zero := 0.0
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "box-1"},
+		State:    State{Kind: StateIteration},
+		Iterations: []Iteration{{
+			Outcome: OutcomeReleased,
+			Sessions: []Session{
+				{
+					Phase: "review-1", Harness: "opencode", Model: "opencode-go/gpt-6-luna",
+					Usage:         TokenUsage{Input: 120, Output: 30, Reasoning: 5, CacheRead: 4000, CacheWrite: 100},
+					UsageReported: true, CostUSD: &cost, RunID: "run-1",
+				},
+				{
+					// A harness that reported usage but genuinely spent nothing:
+					// the report rides, every bucket is zero, and a cost of 0 is a
+					// FIGURE (a pointer) rather than unknown.
+					Phase: "verify", Harness: "opencode", Model: "opencode-go/gpt-6-luna",
+					UsageReported: true, CostUSD: &zero,
+				},
+				{
+					// Nothing reported at all — the pre-CLA-691 entry, untouched.
+					Phase: "implement", Harness: "codex", Model: "gpt-5",
+				},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+
+	var got struct {
+		Iterations []struct {
+			Sessions []struct {
+				Phase         string          `json:"phase"`
+				UsageReported *bool           `json:"usageReported"`
+				Usage         *map[string]int `json:"usage"`
+				CostUSD       *float64        `json:"costUsd"`
+				RunID         string          `json:"runId"`
+			} `json:"sessions"`
+		} `json:"iterations"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Iterations) != 1 || len(got.Iterations[0].Sessions) != 3 {
+		t.Fatalf("wire shape lost a session: %s", b)
+	}
+	sessions := got.Iterations[0].Sessions
+
+	if sessions[0].UsageReported == nil || !*sessions[0].UsageReported {
+		t.Errorf("session[0].usageReported = %v, want true — the harness reported usage", sessions[0].UsageReported)
+	}
+	wantUsage := map[string]int{"input": 120, "output": 30, "reasoning": 5, "cacheRead": 4000, "cacheWrite": 100}
+	if sessions[0].Usage == nil || !mapsEqual(*sessions[0].Usage, wantUsage) {
+		t.Errorf("session[0].usage = %v, want %v", sessions[0].Usage, wantUsage)
+	}
+	if sessions[0].CostUSD == nil || *sessions[0].CostUSD != cost {
+		t.Errorf("session[0].costUsd = %v, want %v", sessions[0].CostUSD, cost)
+	}
+
+	if sessions[1].CostUSD == nil || *sessions[1].CostUSD != 0 {
+		t.Errorf("session[1].costUsd = %v, want a present 0 — a reported zero is a figure, not unknown", sessions[1].CostUSD)
+	}
+	if sessions[1].Usage == nil || len(*sessions[1].Usage) != 0 {
+		t.Errorf("session[1].usage = %v, want an empty object: every bucket is zero and each key is omitted", sessions[1].Usage)
+	}
+
+	if sessions[2].UsageReported != nil || sessions[2].Usage != nil || sessions[2].CostUSD != nil {
+		t.Errorf("session[2] = %+v, want the pre-CLA-691 shape with all three fields absent", sessions[2])
+	}
+
+	// The run id is what joins a session to the plane's per-run records (the
+	// durable review record carries the run that wrote it), so it must survive —
+	// and be absent, like the rest, for a session that held no claim.
+	if sessions[0].RunID != "run-1" {
+		t.Errorf("session[0].runId = %q, want run-1", sessions[0].RunID)
+	}
+	if sessions[2].RunID != "" {
+		t.Errorf("session[2].runId = %q, want absent for a session that held no claim", sessions[2].RunID)
+	}
+}
+
+func mapsEqual(a, b map[string]int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
+
 func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 	b, err := marshalReport(Report{Identity: Identity{Instance: "x"}})
 	if err != nil {

@@ -649,8 +649,12 @@ func TestDrainPhases_IterationRecordNamesEachSessionsHarnessAndModel(t *testing.
 		t.Fatalf("exactly one record must post, got %d", len(recs))
 	}
 	want := []fleet.Session{
-		{Phase: "implement", Harness: "opencode", Model: "opencode-go/deepseek-v4-flash"},
-		{Phase: "review", Harness: "claude", Model: "claude-opus-5"},
+		{Phase: "implement", Harness: "opencode", Model: "opencode-go/deepseek-v4-flash", RunID: "r-1"},
+		// The review session never claimed the task — the driver resumed the run
+		// the implement phase left held — so its run id comes from the claim
+		// CARRIED into the phase (CLA-691), which is also the id the driver wrote
+		// into its brief.
+		{Phase: "review", Harness: "claude", Model: "claude-opus-5", RunID: "r-1"},
 	}
 	if !slices.Equal(recs[0].Sessions, want) {
 		t.Errorf("sessions = %+v, want %+v — one entry per phase, in order, with the phase's own resolved harness and model", recs[0].Sessions, want)
@@ -682,9 +686,9 @@ func TestDrainPhases_IterationRecordCountsAHandoffRespawnInOrder(t *testing.T) {
 		t.Fatalf("exactly one record must post, got %d", len(recs))
 	}
 	want := []fleet.Session{
-		{Phase: "implement", Harness: "fake"},
-		{Phase: "implement", Harness: "fake"}, // the handoff successor: same phase, its own session
-		{Phase: "review", Harness: "fake"},
+		{Phase: "implement", Harness: "fake", RunID: "r-1"},
+		{Phase: "implement", Harness: "fake", RunID: "r-1"}, // the handoff successor: same phase, its own session, the same run
+		{Phase: "review", Harness: "fake", RunID: "r-1"},
 	}
 	if !slices.Equal(recs[0].Sessions, want) {
 		t.Errorf("sessions = %+v, want %+v — the handoff respawn is a spawned session and must appear in spawn order", recs[0].Sessions, want)
@@ -714,8 +718,8 @@ func TestDrainPhases_IterationRecordSendsAnUnresolvedModelAsTheEmptyString(t *te
 		t.Fatalf("exactly one record must post, got %d", len(recs))
 	}
 	want := []fleet.Session{
-		{Phase: "implement", Harness: "opencode"}, // Model stays "" on purpose
-		{Phase: "review", Harness: "claude", Model: "claude-opus-5"},
+		{Phase: "implement", Harness: "opencode", RunID: "r-1"}, // Model stays "" on purpose
+		{Phase: "review", Harness: "claude", Model: "claude-opus-5", RunID: "r-1"},
 	}
 	if !slices.Equal(recs[0].Sessions, want) {
 		t.Errorf("sessions = %+v, want %+v — an unresolved model must be the empty string, never a guess", recs[0].Sessions, want)
@@ -758,7 +762,7 @@ func TestDrainPhases_ALimitStoppedPassStillNamesItsSession(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("exactly one record must post, got %d", len(recs))
 	}
-	want := []fleet.Session{{Phase: "implement", Harness: "fake"}} // Model stays "": no model configured
+	want := []fleet.Session{{Phase: "implement", Harness: "fake", RunID: "r-1"}} // Model stays "": no model configured
 	if !slices.Equal(recs[0].Sessions, want) {
 		t.Errorf("sessions = %+v, want %+v — the limited pass still spawned a session, and the record must name it", recs[0].Sessions, want)
 	}
@@ -1028,5 +1032,286 @@ func TestRun_LocalBeaconAccompaniesEachBeacon(t *testing.T) {
 	// stopping beacon — the same final word the plane POST carries.
 	if b.State != fleet.StateStopping {
 		t.Errorf("local beacon state after the run = %q, want %q (the final stopping beacon must land locally too)", b.State, fleet.StateStopping)
+	}
+}
+
+// --- CLA-691: what each session spent, durably per session ---------------------
+
+// The iteration record's per-session entry carries the session's normalised token
+// breakdown, whether the harness reported usage at all, and the harness-reported
+// cost — the figures a per-phase/per-reviewer cost analysis reads back out of the
+// durable phase_session record.
+func TestDrainPhases_IterationRecordCarriesEachSessionsUsage(t *testing.T) {
+	impl := checkpointed(10, 0.10)
+	impl.Usage = harness.TokenUsage{Input: 1000, Output: 200, CacheRead: 4000, CacheWrite: 50}
+	impl.UsageReported = true
+	impl.CostReported = true
+	review := okResult(5, 0.05)
+	review.Usage = harness.TokenUsage{Input: 900, Output: 30, Reasoning: 12, CacheRead: 100}
+	review.UsageReported = true
+	review.CostReported = true
+
+	reporting := &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true}
+	implAdapter := &fakeAdapter{steps: []invokeStep{{res: impl}}, caps: reporting}
+	reviewAdapter := &fakeAdapter{name: "claude", steps: []invokeStep{{res: review}}, caps: reporting}
+	d := mixedDriver(t, implAdapter, reviewAdapter)
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 || len(recs[0].Sessions) != 2 {
+		t.Fatalf("one record with two sessions must post, got %+v", recs)
+	}
+
+	implement, reviewSession := recs[0].Sessions[0], recs[0].Sessions[1]
+	wantImpl := fleet.TokenUsage{Input: 1000, Output: 200, CacheRead: 4000, CacheWrite: 50}
+	if implement.Usage != wantImpl || !implement.UsageReported {
+		t.Errorf("implement session = %+v, want usage %+v reported", implement, wantImpl)
+	}
+	wantReview := fleet.TokenUsage{Input: 900, Output: 30, Reasoning: 12, CacheRead: 100}
+	if reviewSession.Usage != wantReview || !reviewSession.UsageReported {
+		t.Errorf("review session = %+v, want usage %+v reported", reviewSession, wantReview)
+	}
+	if implement.CostUSD == nil || *implement.CostUSD != 0.10 {
+		t.Errorf("implement cost = %v, want 0.10 — a harness that reports cost must have its figure recorded per session", implement.CostUSD)
+	}
+	if reviewSession.CostUSD == nil || *reviewSession.CostUSD != 0.05 {
+		t.Errorf("review cost = %v, want 0.05", reviewSession.CostUSD)
+	}
+	// The run id joins each entry to the plane's per-run records; the review
+	// session never claimed, so it inherits the run the implement phase held.
+	if implement.RunID != "r-1" || reviewSession.RunID != "r-1" {
+		t.Errorf("run ids = %q/%q, want r-1/r-1 — a resumed phase's session works the same run", implement.RunID, reviewSession.RunID)
+	}
+}
+
+// A session that never held a claim — a phase whose predecessor claimed nothing,
+// or a launch that died before the stream carried one — records an empty run id
+// rather than inventing one.
+func TestSessionRunIDNeedsAClaimToNameARun(t *testing.T) {
+	if got := sessionRunID(harness.Result{}, nil); got != "" {
+		t.Errorf("sessionRunID = %q, want empty with no claim anywhere", got)
+	}
+	prev := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-9"}}
+	if got := sessionRunID(harness.Result{}, &prev); got != "r-9" {
+		t.Errorf("sessionRunID = %q, want the carried claim's run r-9", got)
+	}
+	own := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-own"}}
+	if got := sessionRunID(own, &prev); got != "r-own" {
+		t.Errorf("sessionRunID = %q, want the session's OWN claim (r-own) ahead of the carried one", got)
+	}
+}
+
+// The claim's run id is the compound CREDENTIAL `<uuid>.<secret>` — the secret
+// half is what authorises a write as that run, and the plane keeps the plaintext
+// out of every durable record (CLA-509). The record gets the uuid, which is also
+// the only form that joins to the plane's per-run records.
+func TestSessionRunIDSendsTheUUIDNotTheCredential(t *testing.T) {
+	const (
+		uuid   = "4f0a2c11-8d3e-4a6b-9c7d-1e2f3a4b5c6d"
+		secret = "9yppJMvwZstZlDtUw4VIjNj-7QIT0iJ1CPwKiFz7jMM"
+	)
+	res := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: uuid + "." + secret}}
+
+	if got := sessionRunID(res, nil); got != uuid {
+		t.Errorf("sessionRunID = %q, want just the uuid — the secret half is a bearer token and must not ride telemetry the plane stores and serves", got)
+	}
+	if got := runUUID(uuid); got != uuid {
+		t.Errorf("runUUID(%q) = %q, want a dot-less id taken whole (a grandfathered claim carries no secret)", uuid, got)
+	}
+	if got := runUUID(""); got != "" {
+		t.Errorf("runUUID(\"\") = %q, want empty", got)
+	}
+	// The FIRST dot is the seam, exactly as the plane parses it.
+	if got := runUUID(uuid + ".a.b"); got != uuid {
+		t.Errorf("runUUID = %q, want the first-dot split the plane uses", got)
+	}
+}
+
+// The dollar figure is recorded only when there IS one: an adapter that never
+// reports cost (Capabilities.ReportsCost false — codex today) and a session that
+// reported nothing at all both leave it nil, because a zero would read as "$0
+// spent" for a session nobody measured. A harness that really reported zero keeps
+// its zero.
+func TestSessionCost(t *testing.T) {
+	reporting := &fakeAdapter{caps: &harness.Capabilities{ReportsCost: true}}
+	noCost := &fakeAdapter{} // ReportsCost false, the codex shape
+	cost := 1.25
+
+	cases := []struct {
+		name    string
+		adapter harness.Adapter
+		res     *harness.Result
+		want    *float64
+	}{
+		{"a reported figure rides", reporting, &harness.Result{UsageReported: true, CostReported: true, CostUSD: cost}, &cost},
+		{"a reported zero is a figure", reporting, &harness.Result{UsageReported: true, CostReported: true}, new(float64)},
+		{"a session that reported nothing has no figure", reporting, &harness.Result{}, nil},
+		{
+			// The claude mid-stream kill: per-turn tokens were reported, the
+			// session's own accounting event never arrived, so there is no dollar
+			// figure and a 0 would claim a spend nobody measured.
+			"tokens reported without a cost figure", reporting,
+			&harness.Result{UsageReported: true, Tokens: 4200}, nil,
+		},
+		{"an adapter that never reports cost has no figure", noCost, &harness.Result{UsageReported: true, CostReported: true, CostUSD: cost}, nil},
+		{"no result at all", reporting, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sessionCost(tc.adapter, tc.res)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("sessionCost = %v, want nil", *got)
+			case tc.want != nil && got == nil:
+				t.Errorf("sessionCost = nil, want %v", *tc.want)
+			case tc.want != nil && got != nil && *got != *tc.want:
+				t.Errorf("sessionCost = %v, want %v", *got, *tc.want)
+			}
+		})
+	}
+}
+
+// A pass that RETRIED is several paid sessions: the loop counts every attempt
+// toward the iteration's total ("each attempt is a distinct session"), so the one
+// entry the record publishes for the pass must carry every attempt's money — or
+// the sessions would sum to less than the iteration they belong to, which is
+// exactly what a per-phase cost analysis reads them for.
+func TestDrainPhases_ASessionsEntrySumsARetriedPass(t *testing.T) {
+	// A usage-limit attempt is waited out and re-run: 1000 tokens and $0.40 burned
+	// on the attempt that was retried away, then a clean checkpoint.
+	limited := limitResult()
+	limited.Tokens = 1000
+	limited.CostUSD = 0.40
+	limited.Usage = harness.TokenUsage{Input: 900, Output: 100}
+	limited.UsageReported = true
+	limited.CostReported = true
+	second := checkpointed(10, 0.10)
+	second.Usage = harness.TokenUsage{Input: 8, Output: 2}
+	second.UsageReported = true
+	second.CostReported = true
+
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limited}, {res: second}},
+		limitResetAt: time.Now().Add(-time.Minute), // already lifted: the wait is a no-op
+		caps:         &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true},
+	}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	sessions := recs[0].Sessions
+	if len(sessions) != 2 {
+		t.Fatalf("sessions = %+v, want one entry per pass (the retry is not a new pass)", sessions)
+	}
+	// The retried pass is the implement phase's entry: both attempts' tokens, and
+	// both attempts' dollars.
+	pass := sessions[0]
+	if pass.Phase != "implement" {
+		t.Fatalf("sessions[0] = %+v, want the implement pass", pass)
+	}
+	wantUsage := harness.TokenUsage{Input: 908, Output: 102}
+	if pass.Usage != fleet.TokenUsage(wantUsage) {
+		t.Errorf("usage = %+v, want %+v — a retried attempt's tokens are part of the pass", pass.Usage, wantUsage)
+	}
+	if pass.CostUSD == nil || *pass.CostUSD != 0.50 {
+		t.Errorf("cost = %v, want 0.50 — every attempt the ladder paid for counts toward the pass", pass.CostUSD)
+	}
+
+	// And the property the whole thing exists for: the per-session figures add up
+	// to the iteration's own total.
+	var summed int
+	for _, s := range sessions {
+		summed += int(s.Usage.Input + s.Usage.Output + s.Usage.Reasoning + s.Usage.CacheRead + s.Usage.CacheWrite)
+	}
+	if summed != recs[0].Tokens {
+		t.Errorf("session usage sums to %d, iteration Tokens = %d — the record's per-session figures must add up to the iteration total", summed, recs[0].Tokens)
+	}
+}
+
+// An attempt whose dollars were never reported makes the whole pass's cost
+// UNKNOWN rather than partial: the tokens are exact and still ride, but a partial
+// dollar figure presented as the session's cost would understate it.
+func TestDrainPhases_APassWithAnUnreportedCostCarriesNoFigure(t *testing.T) {
+	// The retried attempt reported tokens and no money (the claude mid-stream
+	// kill), the survivor reported both.
+	killed := limitResult()
+	killed.Tokens = 900
+	killed.Usage = harness.TokenUsage{Input: 900}
+	killed.UsageReported = true
+	survivor := checkpointed(10, 0.10)
+	survivor.Usage = harness.TokenUsage{Input: 8, Output: 2}
+	survivor.UsageReported = true
+	survivor.CostReported = true
+
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: killed}, {res: survivor}},
+		limitResetAt: time.Now().Add(-time.Minute),
+		caps:         &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true},
+	}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	pass := recs[0].Sessions[0]
+	if pass.CostUSD != nil {
+		t.Errorf("cost = %v, want nil — one attempt's dollars were never reported, so the pass's total is unknown, not partial", *pass.CostUSD)
+	}
+	if !pass.UsageReported || pass.Usage != (fleet.TokenUsage{Input: 908, Output: 2}) {
+		t.Errorf("usage = %+v (reported=%v), want both attempts' exact token buckets", pass.Usage, pass.UsageReported)
+	}
+}
+
+// An unreadable stream's figures are a floor, not a report: the iteration total
+// leaves them out, so the session entry must too, or the sessions would sum to
+// more than the iteration they belong to.
+func TestDrainPhases_AnUntrustedSessionReportsNoSpend(t *testing.T) {
+	res := untrustedResult(4321, 1.25)
+	res.Usage = harness.TokenUsage{Input: 4000, Output: 321}
+	res.UsageReported = true
+	res.CostReported = true
+	h := &fakeAdapter{steps: []invokeStep{{res: res}}}
+	// A second step is scripted but must never be reached: the phase ends on the
+	// unreadable stream.
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions; an unreadable stream is not a checkpoint to build on", h.invokeCalls)
+	}
+	recs := ff.records()
+	if len(recs) != 1 || len(recs[0].Sessions) != 1 {
+		t.Fatalf("want one record with the pass's session entry, got %+v", recs)
+	}
+	s := recs[0].Sessions[0]
+	if s.UsageReported || s.Usage != (fleet.TokenUsage{}) || s.CostUSD != nil {
+		t.Errorf("session = %+v, want no spend figures at all — an unreadable stream proves nothing about what was spent", s)
+	}
+	if s.Phase != "implement" || s.Harness != "fake" {
+		t.Errorf("session = %+v, want the identity kept even when the spend is dropped", s)
+	}
+	if recs[0].Tokens != 0 {
+		t.Errorf("iteration Tokens = %d, want 0 — the floor is not counted", recs[0].Tokens)
 	}
 }

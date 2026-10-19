@@ -4167,6 +4167,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// shape of a provider degrading: real 5xx blips interleaved with stream drops
 	// nothing has a pattern for.
 	unclassified := 0
+	// The spend of THIS phase pass, summed across the ladder's attempts
+	// (CLA-691). One fleet-record entry is published per pass, and a pass that
+	// retried is several paid sessions, so every attempt the ladder spawned is
+	// folded in here where the entry is built.
+	pass := sessionSpend{}
 	for {
 		// The breaker, from inside the drain. Every path that loops back here has
 		// just waited — a supervised wait on a usage limit, an exponential backoff
@@ -4375,10 +4380,22 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// the spawn line above used — the phase's label, the phase's resolved
 		// harness, and the resolved model (empty when the harness default
 		// applied; never guessed). Set on every attempt, so the LAST attempt's
-		// values are the ones that ride: a retry within the ladder is the same
-		// session re-run, and the only way its values can differ between
-		// attempts is a reload landing mid-ladder.
-		end.session = &fleet.Session{Phase: ph.Label(phaseIdx), Harness: a.Name(), Model: inv.Model}
+		// values are the ones that ride: the entry describes the PASS, and a
+		// retry within the ladder cannot change what the pass ran — only a
+		// reload landing mid-ladder can.
+		//
+		// CLA-691: its spend is filled in later, at the point the loop counts the
+		// attempt's spend toward the iteration (recordPassSpend), so the two can
+		// never disagree about which attempts were counted. The pass sums every
+		// counted attempt, because the loop counts each one as its own paid
+		// session: an entry reporting only the surviving attempt's money would
+		// not add up to the iteration total.
+		end.session = &fleet.Session{
+			Phase:   ph.Label(phaseIdx),
+			Harness: a.Name(),
+			Model:   inv.Model,
+			RunID:   sessionRunID(res, prev),
+		}
 		// The wider classification rides the end for the fleet record only — see
 		// phaseEnd.producedNothing.
 		end.producedNothing = producedNothing
@@ -4828,6 +4845,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			if res.Untrusted == "" {
 				tokens += res.Tokens
 				cost += res.CostUSD
+				recordPassSpend(end.session, a, &pass, &res)
 				d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 			}
 			// A run failure that was not an exit status — a launch failure, or one
@@ -4843,6 +4861,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		if res.Untrusted != "" {
 			// held is nil here by construction — an untrusted stream never holds a
 			// phase open — so the sequence ends and nothing is carried forward.
+			//
+			// CLA-691: no spend figures were recorded on this pass's session entry
+			// either (recordPassSpend runs only where the loop counts an attempt),
+			// so the record says "unknown" instead of publishing a FLOOR from a
+			// stream with a hole in it as if it were a report.
 			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
@@ -4855,6 +4878,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// counts every session exactly once.
 		tokens += res.Tokens
 		cost += res.CostUSD
+		// The pass's own session entry takes the same figures, in the same breath
+		// (CLA-691): every attempt the loop counts is money the record attributes
+		// to the pass, and none it refuses is.
+		recordPassSpend(end.session, a, &pass, &res)
 		d.charge(tc.HarnessFor(ph), res.Tokens, res.CostUSD)
 
 		// A usage limit. A rolling-window subscription cap is waited out and the

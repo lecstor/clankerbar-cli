@@ -223,6 +223,20 @@ func applyOpencodeExport(res *Result, doc opencodeExport, started time.Time, res
 	res.UsageReported = res.UsageReported || runMsgs > 0 || run.total() > 0 || runCost > 0
 	res.Tokens = run.total()
 	res.CostUSD = runCost
+	// The export IS the cost figure — parseOpencodeExport refuses a document
+	// without info.cost — so this run's dollars are known, even when they are 0
+	// (CLA-691).
+	res.CostReported = true
+	// The normalised breakdown (CLA-691), from the same export figures the
+	// budget figures above are computed from — including the session's own
+	// overhead (title generation) when this run is not a resume.
+	res.Usage = TokenUsage{
+		Input:      run.Input,
+		Output:     run.Output,
+		Reasoning:  run.Reasoning,
+		CacheRead:  run.Cache.Read,
+		CacheWrite: run.Cache.Write,
+	}
 	res.Raw["input_tokens"] = run.Input
 	res.Raw["output_tokens"] = run.Output
 	res.Raw["reasoning_tokens"] = run.Reasoning
