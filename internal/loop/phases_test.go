@@ -5324,3 +5324,27 @@ func TestDrainPhases_A_RecoveredExitWithNoDeliveryDoesNotAdvanceOrRetry(t *testi
 		t.Errorf("the driver did not name the missing evidence:\n%s", out)
 	}
 }
+
+// The widening's boundary: a session whose stream ENDS on its error is not a
+// recovery, and the adapter withholds the marker for exactly that shape. A
+// non-zero exit with no marker keeps every shipped classification — a verified
+// branch on the origin remote does not make a genuine failure into a checkpoint,
+// because the branch may be earlier work and the session's own end says it did
+// not finish. Here the exit is non-retryable, so the run stops rather than
+// spawning the review phase on work the session did not deliver.
+func TestDrainPhases_A_TerminalFailureIsNotRescuedByARecordedBranch(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		// No RecoveredErrorsKey on Raw: the stream ended on the error.
+		{res: held(reported(nonRetryableResult(), branchReport()), openClaim())},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	captureLogs(t)
+
+	if _, _, _, err := drainPhasesOnce(t, d); err == nil {
+		t.Fatal("a non-zero exit that names a failure must still stop the run; a recorded branch alone is not delivery")
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions, want 1 — no review phase may be spawned over a session that failed", h.invokeCalls)
+	}
+}

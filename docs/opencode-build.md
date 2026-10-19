@@ -114,6 +114,16 @@ its headless default declining every tool call. 2.0.32 changed both, which is wh
 adapter was moved to 2.x rather than the preview adapter promoted. CLA-381 (the transport
 drop that made opencode exit-1 classification retry transient failures) still applies.
 
+**2.x still exits non-zero after a recovered provider error.** The #43622 stream shape
+(a chat completion that drains with every `finish_reason` null) is now surfaced as a typed
+`provider.invalid-output` error event which 2.0.32 RETRIES itself — the session carries on and
+finishes the turn — but the process still exits **1** (probed 2026-10-19; pinned by the
+conformance suite's `_recoveredProviderError`, CLA-700). So `opencode run`'s exit status is
+not a verdict on the session: the driver judges a phase whose stream shows recovered errors on
+its DELIVERY (a verified branch, or an appended review record), and only a stream that ENDS on
+an error event classifies the session as failed or transient. Reported upstream by the operator
+from CLA-700's outcome draft.
+
 ## See also
 
 - [`docs/opencode-tool-schema-limits.md`](./opencode-tool-schema-limits.md) - the Console Go

@@ -5022,11 +5022,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// pushed, and the non-retryable stop ends the run over an exit status that
 		// names no failure.
 		//
-		// Deliberately AFTER the cap branches above and after exit 0: a cap is an
-		// orderly end with its own handling, and a usage limit or budget stop is
-		// still honoured by DetectLimit before this point (its scan reads stderr
-		// and a TERMINAL error event, so a recovered blip cannot trip it, and a
-		// genuine account stop still can).
+		// Deliberately HERE, after the untrusted and spend-accounting arms and
+		// after DetectLimit: a usage limit or budget stop is still honoured (its
+		// scan reads stderr and a TERMINAL error event, so a recovered blip cannot
+		// trip it while a genuine account stop still can), and the cap branches
+		// below are unreachable from here by construction — a capped exit is
+		// `orderlyExit`, so it never sets recoveredExit.
 		if recoveredExit {
 			log.Printf("iteration %d: the session's stream shows %d provider error event(s) it recovered from and no terminal one (exit %s) — judging this phase on its delivery, not on the exit status",
 				drainNum, harness.RecoveredErrors(res), res.ExitString())
