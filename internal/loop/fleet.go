@@ -320,7 +320,20 @@ func claimDisposition(res *harness.Result) string {
 }
 
 // sessionRunID is the run the session worked the task under, or "" when it never
-// held one (CLA-691).
+// held one (CLA-691). The value is the run's UUID, never the credential the
+// session holds.
+//
+// The split is load-bearing, not cosmetic: the id `claim_task` returns — and
+// seeds into a resumed phase's brief — is the COMPOUND credential
+// `<run uuid>.<secret>`, and the secret half is what AUTHORISES a write as that
+// run (the plane refuses a bare uuid for a credential-bound run). Telemetry must
+// not carry a bearer token: this report is stored on the plane and served back to
+// every key in the project, while the plane keeps the plaintext secret out of
+// every durable record (CLA-509). The uuid is also the only form the per-round
+// join can use, since the plane's own records hold bare uuids. `runUUID` is the
+// existing CLA-509 helper for exactly this split, so both sides parse the
+// credential the same way; the plane splits again on arrival, because a reporter
+// is never trusted.
 //
 // A session that CLAIMED the task observed its own run id, and that is the
 // value to record. A later phase's session never calls claim_task — the driver
@@ -331,10 +344,10 @@ func claimDisposition(res *harness.Result) string {
 // lookups that could drift.
 func sessionRunID(res harness.Result, prev *harness.Result) string {
 	if res.Claim.RunID != "" {
-		return res.Claim.RunID
+		return runUUID(res.Claim.RunID)
 	}
 	if prev != nil {
-		return prev.Claim.RunID
+		return runUUID(prev.Claim.RunID)
 	}
 	return ""
 }

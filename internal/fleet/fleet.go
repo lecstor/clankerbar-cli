@@ -119,15 +119,18 @@ type Session struct {
 	Usage         TokenUsage
 	UsageReported bool
 
-	// RunID is the run this session worked the task under, when there is one —
-	// empty for a session that never held a claim.
+	// RunID is the run's UUID the session worked the task under, when there is
+	// one — empty for a session that never held a claim. It is deliberately NOT
+	// the run credential the session holds: that string is `<uuid>.<secret>` and
+	// the secret half authorises a write as that run, so telemetry the plane
+	// stores and serves back must not carry it (the loop's runUUID splits it off).
 	//
 	// It is what makes a durable per-session record join EXACTLY to the per-run
 	// records already on the plane: a review record carries the run that wrote it
-	// (task_review.run_id), so "which model raised these findings, on what did it
-	// spend" is answerable per ROUND rather than only per task and phase label —
-	// a re-review runs the same phase labels again, so the label alone cannot
-	// tell two rounds apart.
+	// (task_review.run_id, itself a bare UUID), so "which model raised these
+	// findings, on what did it spend" is answerable per ROUND rather than only per
+	// task and phase label — a re-review runs the same phase labels again, so the
+	// label alone cannot tell two rounds apart.
 	//
 	// A session's own claim carries its run id. A later phase's session never
 	// calls claim_task (it heartbeats the run the predecessor left held), so the

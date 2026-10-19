@@ -1205,7 +1205,8 @@ cadences the loop already runs (no new timers):
   omitted for a harness that reports no cost at all (codex today).
   The plane keeps a session's usage on the task, as a durable `phase_session`
   record (`list_phase_sessions` reads it back), alongside the run that session
-  worked under — the join key to the plane's per-run records, so the cost of a
+  worked under — the run's UUID, never the credential the session holds, which
+  carries a bearer secret and is stripped off on the way out — so the cost of a
   round of review can be attributed to the round it belongs to.
 
 Everything is strictly fail-soft telemetry: a failed report is logged once and

@@ -1105,6 +1105,32 @@ func TestSessionRunIDNeedsAClaimToNameARun(t *testing.T) {
 	}
 }
 
+// The claim's run id is the compound CREDENTIAL `<uuid>.<secret>` — the secret
+// half is what authorises a write as that run, and the plane keeps the plaintext
+// out of every durable record (CLA-509). The record gets the uuid, which is also
+// the only form that joins to the plane's per-run records.
+func TestSessionRunIDSendsTheUUIDNotTheCredential(t *testing.T) {
+	const (
+		uuid   = "4f0a2c11-8d3e-4a6b-9c7d-1e2f3a4b5c6d"
+		secret = "9yppJMvwZstZlDtUw4VIjNj-7QIT0iJ1CPwKiFz7jMM"
+	)
+	res := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: uuid + "." + secret}}
+
+	if got := sessionRunID(res, nil); got != uuid {
+		t.Errorf("sessionRunID = %q, want just the uuid — the secret half is a bearer token and must not ride telemetry the plane stores and serves", got)
+	}
+	if got := runUUID(uuid); got != uuid {
+		t.Errorf("runUUID(%q) = %q, want a dot-less id taken whole (a grandfathered claim carries no secret)", uuid, got)
+	}
+	if got := runUUID(""); got != "" {
+		t.Errorf("runUUID(\"\") = %q, want empty", got)
+	}
+	// The FIRST dot is the seam, exactly as the plane parses it.
+	if got := runUUID(uuid + ".a.b"); got != uuid {
+		t.Errorf("runUUID = %q, want the first-dot split the plane uses", got)
+	}
+}
+
 // The dollar figure is recorded only when there IS one: an adapter that never
 // reports cost (Capabilities.ReportsCost false — codex today) and a session that
 // reported nothing at all both leave it nil, because a zero would read as "$0
