@@ -75,6 +75,13 @@ func TestMain(m *testing.M) {
 		helperMain()
 		os.Exit(0) // unreachable — helperMain exits
 	}
+	// No test here may reach the network by accident: the workdir derivation
+	// CLONES a missing repo, so the default clone remote is an unreachable local
+	// path and gh is a binary that cannot resolve a token. A test that wants a
+	// real clone points cloneRemoteBase at a local bare repository
+	// (pointClonesAt).
+	cloneRemoteBase = "file:///nonexistent-clankerbar-test-remote/"
+	cloneGHBin = "false"
 	os.Exit(teststate.Isolate(m))
 }
 
@@ -768,8 +775,8 @@ func TestWorkdirDerivationFailureSpawnsNothing(t *testing.T) {
 	root := t.TempDir()
 	// The good instance's derived workdir must be a real checkout of the repo
 	// its project names; the ghost instance's derived path will simply not
-	// exist.
-	makeCheckout(t, filepath.Join(root, "widgets"), "acme/widgets")
+	// exist (and, with the clone remote unreachable in tests, cannot be cloned).
+	makeCheckout(t, filepath.Join(root, "acme", "widgets"), "acme/widgets")
 
 	cacheDir := t.TempDir()
 	setHelperMode(t, "sleep")
@@ -799,8 +806,8 @@ func TestWorkdirDerivationFailureSpawnsNothing(t *testing.T) {
 		t.Fatalf("spawns for the refused instance = %d, want 0 — a failed derivation must spawn nothing", got)
 	}
 	// The refusal is loud and names the path that was tried.
-	if logText := buf.String(); !strings.Contains(logText, filepath.Join(root, "ghost")) {
-		t.Fatalf("the refusal log does not name the path tried %q:\n%s", filepath.Join(root, "ghost"), logText)
+	if logText := buf.String(); !strings.Contains(logText, filepath.Join(root, "acme", "ghost")) {
+		t.Fatalf("the refusal log does not name the path tried %q:\n%s", filepath.Join(root, "acme", "ghost"), logText)
 	}
 
 	cancel()
