@@ -461,6 +461,29 @@ func TestReviewPanel_MemberNamesAreLogLabels(t *testing.T) {
 			t.Fatalf("Validate() = %v, want the derived/explicit collision refused", err)
 		}
 	})
+	t.Run("a member named after a built-in phase is refused", func(t *testing.T) {
+		cfg := writePanelConfig(t, base(`[{"name": "review"}]`))
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "built-in phase name") {
+			t.Fatalf("Validate() = %v, want the built-in-phase name refused", err)
+		}
+	})
+	t.Run("a member named after a configured phase is refused", func(t *testing.T) {
+		cfg := writePanelConfig(t, `{
+			"harness": "claude",
+			"phases": [
+				{"name": "implement"},
+				{"name": "audit", "prompt": "my own gate"},
+				{"name": "review"},
+				{"name": "fix"}
+			],
+			"review_panel": [{"name": "audit"}]
+		}`)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "already the name of phases[1]") {
+			t.Fatalf("Validate() = %v, want a configured phase name refused", err)
+		}
+	})
 	t.Run("alpha and beta are accepted and keep their labels", func(t *testing.T) {
 		cfg := writePanelConfig(t, base(`[{"name": "alpha"}, {"name": "beta"}]`))
 		if err := cfg.Validate(); err != nil {

@@ -3791,6 +3791,20 @@ func (c *Config) Validate() error {
 		if name := strings.TrimSpace(m.Name); name != "" && !phaseNameRe.MatchString(name) {
 			return fmt.Errorf("review_panel[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, name)
 		}
+		// The label is also the iteration-log tag, the phasesRun entry and the
+		// dead-phase tally cell, so it must not shadow a phase. A member named
+		// `review` would merge with the real review phase in every log and tally
+		// (and ReviewShaped/escalation still key on the phase's prompt, so only
+		// the reporting would be a lie — which is enough). Refused instead of
+		// renamed: the operator wrote the name deliberately.
+		if slices.Contains(BuiltinPhaseNames(), label) {
+			return fmt.Errorf("review_panel[%d]: name %q is a built-in phase name; a member's name is its log label and iteration-log tag, so it must not shadow the %q phase — give the member a name of its own", i, label, label)
+		}
+		for j, ph := range c.Phases {
+			if ph.Name == label {
+				return fmt.Errorf("review_panel[%d]: name %q is already the name of phases[%d]; a member's name labels its logs and dead-phase tally, so it must not merge with a configured phase", i, label, j)
+			}
+		}
 		h := strings.TrimSpace(m.Harness)
 		if h == "" {
 			h = c.reviewPhaseHarness()
