@@ -492,6 +492,22 @@ const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the pha
 	"this same run from it. Ending this session after recording the review is this phase " +
 	"FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
 
+// panelMemberTerminalStep ends a PANEL MEMBER's phase (CLA-639 M5). It is
+// reviewOnlyTerminalStep with the legacy outcome write REMOVED, not moved: the
+// member's only task write is the durable record, and the member after it must
+// not be able to read this member's findings through the task's outcome. A
+// session told to write both would have its outcome write refused by the plane
+// (the round is sealed the moment the record lands, CLA-636 B3) and could
+// easily read that refusal as the phase failing.
+const panelMemberTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
+	"TASK in the ONE form the shape above prescribes - the sealed durable record with update_task(taskId, runId, " +
+	"review: {...}) - and write NOTHING ELSE on the task: do NOT call update_task with an outcome, do not write " +
+	"an outcome of your own, and do not touch the task's status or body. That is a CHECKPOINT, not a hand-off: " +
+	"keep holding the task - do NOT release it, do NOT move it to in_review, and do NOT COMMIT, PUSH or open a " +
+	"PR. The driver checkpoints on the branch the implement phase recorded, and the phase after you (the next " +
+	"panel member, or the fix phase) resumes this same run from it. Ending this session after recording the " +
+	"review is this phase FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
+
 // reviewRecordOutcomeShape is the LEGACY half of the review record: the
 // `## Review` block appended to the task's outcome. It is kept for one release
 // (CLA-637), so older planes and readers still find a review where they expect
@@ -611,11 +627,89 @@ const unverifiedReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordT
 // its own line, and a last block the baseline did not carry).
 const noCodeReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipNone + reviewMUSTBar
 
-// reviewMUSTBar is the accepted bar for a MUST (task CLA-635; the review-panel
-// design's section 14 A2 as amended by B5/B6, decisions 3a57db6a and 60ed0748
-// superseding it): the evidence a MUST must cite, the seventh kind the operator
-// added after the second review, and the things that are never a MUST however
-// confident the reviewer is.
+// panelMemberRecordIntro and panelMemberRecordBody are the two halves of a
+// PANEL MEMBER's record contract (CLA-639 M5): the tip paragraph sits between
+// them, so the verified and unverified variants share everything else.
+//
+// A panel member writes the DURABLE record and NOTHING ELSE on the task. The
+// legacy outcome block reviewOnlyRecordShape prescribes is not merely deferred
+// here, it is forbidden: member 1's block would be readable by member 2 through
+// its own get_task — the exact cross-member leak the seal exists to prevent —
+// and the plane refuses a run's outcome writes while its record sits sealed in
+// the open round the panel writes into (CLA-636 B3), so the write would be
+// refused anyway. The panel's findings reach the task's outcome through the FIX
+// phase, from the merged list the driver releases to it (mergedFindingsDigest).
+//
+// The field list below is deliberately a second copy of the durable record's
+// rather than a shared constant: the two differ wherever the legacy block is
+// named ("one object per finding in the block", "write `- none` under
+// Findings"), and one string cannot say both. Both copies are pinned by
+// TestReviewOnlyBriefsPrescribeTheDurableRecord, so they cannot drift silently.
+//
+// No branchless variant exists: a branchless task writes no durable record (a
+// settled task has no live holder to accept one), so a panel cannot run that
+// way at all — the driver skips every member after the first, whose brief is
+// the shipped no-code one.
+const panelMemberRecordIntro = " You are ONE MEMBER of a review PANEL: several reviewers, possibly on " +
+	"different models, review the SAME revision independently, and the driver merges every member's findings " +
+	"into the fix phase's work list afterwards. Do not look for, wait for or defer to another member's " +
+	"findings - review the revision yourself and record your own."
+
+const panelMemberRecordBody = " THE RECORD IS YOUR DELIVERABLE, and it is the ONLY thing you write on the " +
+	"task: record it with update_task(taskId, runId, review: {...}). Do NOT write the task's outcome - do not " +
+	"call update_task with an outcome or a status, and do not hand the task over: the fix phase carries the " +
+	"panel's findings into the task's outcome, and the member after you reads the task, so an outcome write here " +
+	"would leak this review to a reviewer that must not see it. Send exactly: reviewerRole: \"" +
+	ReviewerRolePlaceholder + "\" (this member's role; the plane assigns the round and cycle from it), verdict: " +
+	"\"pass\" or \"findings\", harness: \"" + PhaseHarnessPlaceholder + "\", model: \"" + PhaseModelPlaceholder +
+	"\", branch: \"" + PhaseBranchPlaceholder + "\", reviewedTip as above, scope: {kind: \"full-diff\", base: \"" +
+	PhasePRBasePlaceholder + "\", range: \"" + PhasePRBasePlaceholder + "..<reviewedTip>\"} (the plane caps range at 100 " +
+	"characters, so never put the branch name there), and findings: one object per finding in YOUR review, in " +
+	"the same order you report them, at most 20 (the plane refuses a record with more: keep every MUST, then the " +
+	"most important of the rest, and say in your final message how many you left out): {severity: \"must\" | " +
+	"\"should\" | \"nit\", evidenceKind: <the MUST's kind token>, evidence: <its payload>, file: <path>, line: " +
+	"<number>, kind: <short category>, summary: <what is wrong>, requiredFix: <the smallest fix>, raisedByModel: \"" +
+	PhaseModelPlaceholder + "\"}. The plane assigns each finding's id (`<round>.<reviewer role>.<n>`); do NOT " +
+	"invent one - the fix phase updates by that id. A RETRY proves itself here: get_task before writing, and if " +
+	"a record for your reviewer role and THIS run is already there (records show the run id WITHOUT its secret: " +
+	"compare only the part of " + PhaseRunPlaceholder + " before its first dot) in an open round, the record is " +
+	"already written - skip the write and end. If instead the plane refuses the append with duplicate_reviewer, " +
+	"the same follows: a record for this role and round is already written, that refusal is the idempotency " +
+	"signal, and retrying it changes nothing. If there are no findings, send no findings (or an empty array), " +
+	"and verdict: pass."
+
+// panelMemberRecordTipVerified is the panel member's counterpart of
+// reviewRecordTipVerified: the same driver-verified tip, recorded in the
+// durable record alone.
+const panelMemberRecordTipVerified = " The driver verified the origin remote's tip for branch " +
+	PhaseBranchPlaceholder + " as `" + ReviewedTipPlaceholder + "`. Fetch and confirm the worktree is at that " +
+	"commit (`git rev-parse HEAD`) before you review, and record that SHA as `reviewedTip` in your durable " +
+	"record."
+
+// panelMemberRecordTipUnverified is the panel member's counterpart of
+// reviewRecordTipUnverified (CLA-576): the member establishes the tip itself.
+const panelMemberRecordTipUnverified = " The driver could NOT verify the origin remote's tip, so there is no " +
+	"driver-verified tip to record: establish it yourself. Read the branch from the origin remote " +
+	"(`git ls-remote origin " + PhaseBranchPlaceholder + "`, or fetch it), check out the commit it names, review " +
+	"that revision, and record that SHA as `reviewedTip` in your durable record. If the branch is absent or the " +
+	"remote cannot be read, record the failed hand-off and end holding the task - do not invent a tip and do not " +
+	"review a phantom diff."
+
+// panelMemberRecordShape is the verified panel member's record contract: the
+// panel context, the verified tip, and the durable record alone.
+var panelMemberRecordShape = panelMemberRecordIntro + panelMemberRecordTipVerified +
+	panelMemberRecordBody + panelMemberMUSTBar
+
+// panelMemberUnverifiedRecordShape is panelMemberRecordShape for a checkpoint
+// the driver could not verify on the origin remote (CLA-576).
+var panelMemberUnverifiedRecordShape = panelMemberRecordIntro + panelMemberRecordTipUnverified +
+	panelMemberRecordBody + panelMemberMUSTBar
+
+// reviewMUSTBarGrades is the accepted bar for a MUST (task CLA-635; the
+// review-panel design's section 14 A2 as amended by B5/B6, decisions 3a57db6a
+// and 60ed0748 superseding it): the evidence a MUST must cite, the seventh kind
+// the operator added after the second review, and the things that are never a
+// MUST however confident the reviewer is.
 //
 // Only PRESENCE is checked structurally - here as the reviewer's own
 // obligation, and by the driver when it parses the block back
@@ -624,7 +718,11 @@ const noCodeReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipNo
 // MUST refutes it with evidence, it does not downgrade it. Where a repo hard
 // rule concerns style, prose or documentation wording, the not-a-MUST list wins
 // over it (B6); missing tests stay not-a-MUST except the untested-guard case.
-const reviewMUSTBar = " GRADE EVERY FINDING. A severity in brackets is `[must]`, `[should]` or `[nit]`; " +
+//
+// The GRADING rules are one constant because they are the same for every
+// reviewer; the attribution sentence that closes the bar is not, so it is
+// separate (CLA-639) — see reviewMUSTBar and panelMemberMUSTBar.
+const reviewMUSTBarGrades = " GRADE EVERY FINDING. A severity in brackets is `[must]`, `[should]` or `[nit]`; " +
 	"MUST is the only gating grade and the only one that must carry evidence. A MUST must be followed by " +
 	"`(<kind>): <evidence>`, where <kind> is one of: doneWhen - quote the clause of the task's doneWhen the change " +
 	"violates; gate - name a repo gate (a test, typecheck, lint, build, CI check, or a check the repo's agent " +
@@ -638,9 +736,31 @@ const reviewMUSTBar = " GRADE EVERY FINDING. A severity in brackets is `[must]`,
 	"and the missing test). NEVER a MUST, however confident you are: style, naming, a design you would prefer, a " +
 	"performance concern without a measurement, missing tests the doneWhen does not require (except untested), or " +
 	"documentation wording - and where a repo hard rule concerns style, prose or documentation wording, this " +
-	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. Every finding in the block is " +
+	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. "
+
+// reviewMUSTBarAttribution closes the bar for the SINGLE reviewer, whose record
+// has two halves: the legacy outcome block and the durable record. Both carry
+// the attribution, and the block's own line is what a human reading the task
+// sees.
+const reviewMUSTBarAttribution = "Every finding in the block is " +
 	"attributed by the block's own `- reviewed by:` line, and the durable record carries `raisedByModel` on every " +
 	"finding so the review is attributable per finding, not only per block."
+
+// reviewMUSTBar is the bar as the single reviewer's record shape carries it:
+// the grading rules, then the attribution sentence. Split into two constants
+// (CLA-639) so a PANEL MEMBER — whose record is the durable one alone — gets
+// the same grading rules with an attribution sentence that names no block.
+const reviewMUSTBar = reviewMUSTBarGrades + reviewMUSTBarAttribution
+
+// panelMemberMUSTBarAttribution is reviewMUSTBarAttribution for a panel member:
+// there is no block, so the record's own `raisedByModel` is the whole
+// attribution.
+const panelMemberMUSTBarAttribution = "Every finding is attributed in your durable " +
+	"record by its `raisedByModel` field, so the review is attributable per finding."
+
+// panelMemberMUSTBar is the panel member's bar: the same grading rules, the
+// record-only attribution.
+const panelMemberMUSTBar = reviewMUSTBarGrades + panelMemberMUSTBarAttribution
 
 // fixOutcomeRecord is the fix phase's outcome requirement, shared by both fix
 // variants. It carries the review forward: the final outcome is the only
@@ -1139,7 +1259,12 @@ const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of "
 // its own job by ID. A session that edits anyway is a failure the fix phase can
 // still absorb - it re-reads the branch - which is why the prohibition is worded
 // as the default rather than as an impossible act.
-var reviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+//
+// The brief is composed of a CORE plus a record shape and an ending, so the
+// panel member's variant (CLA-639 M5) can reuse the core verbatim and swap only
+// the two halves that differ: the panel member writes the durable record and
+// nothing else.
+var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: you find issues " +
 	"and specify fixes; the phase after you applies them. The implement phase (harness " +
 	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") recorded branch " +
@@ -1155,8 +1280,27 @@ var reviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + Phase
 	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate. " +
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
-	"and a fix applied here is a fix it cannot attribute." +
+	"and a fix applied here is a fix it cannot attribute."
+
+// reviewOnlyBrief is the single reviewer's brief: the core above, the two-half
+// record shape, and the two-half ending.
+var reviewOnlyBrief = reviewOnlyBriefCore +
 	reviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep + handoffGuidance
+
+// panelMemberReviewOnlyBrief is a PANEL MEMBER's brief (CLA-639 M5): the same
+// core, with the durable-record-only shape and an ending that forbids the
+// outcome write. It is selected by the driver at spawn time — the member's
+// captured prompt is the review-only brief, exactly as for the single reviewer
+// — and only for a checkpoint that carries a branch: a branchless checkpoint
+// cannot run a panel at all (no live holder accepts a durable record), so its
+// single reviewer keeps the shipped no-code brief.
+var panelMemberReviewOnlyBrief = reviewOnlyBriefCore +
+	panelMemberRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
+
+// panelMemberUnverifiedReviewOnlyBrief is panelMemberReviewOnlyBrief for a
+// checkpoint the driver could not verify against the origin remote (CLA-576).
+var panelMemberUnverifiedReviewOnlyBrief = reviewOnlyBriefCore +
+	panelMemberUnverifiedRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
 
 // unverifiedReviewOnlyBrief is reviewOnlyBrief for a checkpoint the driver could
 // NOT verify against the origin remote (CLA-576). The verified claim above is
@@ -1545,6 +1689,7 @@ func BuiltinReviewBrief() string { return builtinPhasePrompts[ReviewPhaseName] }
 func ReviewShaped(prompt string) bool {
 	switch prompt {
 	case reviewOnlyBrief, unverifiedReviewOnlyBrief, noCodeReviewOnlyBrief,
+		panelMemberReviewOnlyBrief, panelMemberUnverifiedReviewOnlyBrief,
 		verifyBrief, noCodeVerifyBrief:
 		return true
 	}
@@ -1574,6 +1719,16 @@ func NoCodeReviewOnlyBrief() string { return noCodeReviewOnlyBrief }
 // UnverifiedReviewOnlyBrief returns the review-only brief for a checkpoint the
 // driver could not verify against the origin remote.
 func UnverifiedReviewOnlyBrief() string { return unverifiedReviewOnlyBrief }
+
+// PanelMemberReviewOnlyBrief returns the review-only brief a PANEL MEMBER
+// writes: the durable record alone, with no outcome write (CLA-639 M5). The
+// driver selects it at spawn time for a panel member whose checkpoint carries a
+// branch.
+func PanelMemberReviewOnlyBrief() string { return panelMemberReviewOnlyBrief }
+
+// PanelMemberUnverifiedReviewOnlyBrief returns the panel member's brief for a
+// checkpoint the driver could not verify against the origin remote.
+func PanelMemberUnverifiedReviewOnlyBrief() string { return panelMemberUnverifiedReviewOnlyBrief }
 
 // FixBrief returns the fix phase's shipped brief.
 func FixBrief() string { return fixBrief }
