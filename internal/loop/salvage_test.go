@@ -21,15 +21,18 @@ import (
 
 // --- doubles ---------------------------------------------------------------
 
-type salvageCall struct{ taskID, label string }
+type salvageCall struct {
+	taskID, label string
+	recorded      []string
+}
 
 type fakeSalvager struct {
 	calls []salvageCall
 	out   salvage.Outcome
 }
 
-func (f *fakeSalvager) Salvage(_ context.Context, taskID, label string) salvage.Outcome {
-	f.calls = append(f.calls, salvageCall{taskID, label})
+func (f *fakeSalvager) Salvage(_ context.Context, taskID, label string, recorded ...string) salvage.Outcome {
+	f.calls = append(f.calls, salvageCall{taskID, label, recorded})
 	return f.out
 }
 
@@ -105,7 +108,7 @@ func TestSalvage_RunsOnEveryEndingThatLeavesAClaimHeld(t *testing.T) {
 			if len(s.calls) != 1 {
 				t.Fatalf("salvaged %d times, want exactly 1: %+v", len(s.calls), s.calls)
 			}
-			if s.calls[0] != (salvageCall{heldClaim().TaskID, "CLA-314"}) {
+			if s.calls[0].taskID != heldClaim().TaskID || s.calls[0].label != "CLA-314" {
 				t.Errorf("salvaged %+v, want the held task and its ref", s.calls[0])
 			}
 		})

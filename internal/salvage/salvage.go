@@ -36,6 +36,12 @@
 //     creation, no worktree removal. A push the remote refuses is reported as a
 //     failure and leaves the branch UNRECORDED, because a recorded branch nobody
 //     can fetch is worse than none at all.
+//   - Untracked files alone, at a tip the session already DELIVERED, are left
+//     alone and named in the outcome (CLA-695). There is nothing to rescue - the
+//     work is pushed - and committing generated output at a phase boundary moves
+//     the branch every later reader reviews onto a tip nobody chose. Delivery is
+//     the discriminator and it is checked, not assumed: an undelivered session's
+//     untracked source file is exactly the work CLA-314 exists to save.
 package salvage
 
 import (
@@ -69,6 +75,17 @@ const (
 	// where to look; a human or the next clanker decides.
 	Refused Status = "refused"
 
+	// Untracked: the session DELIVERED, and the only dirt left is untracked
+	// files. The branch the session recorded for this task is on the remote at
+	// exactly the worktree's HEAD, so there is nothing to rescue - and the files
+	// are deliberately left uncommitted, because at a phase boundary a generated
+	// file (a type dump, a report, a build artifact) committed here would put the
+	// branch headed for review on a tip nobody chose, and every later reader -
+	// reviewer, fix phase, PR - would review THAT instead of what was delivered
+	// (CLA-695). Outcome.Paths names them, because an untracked file can still be
+	// real work and only a human can tell which it is.
+	Untracked Status = "untracked"
+
 	// Failed: it was attempted and did not finish - git missing, a commit that
 	// would not run, a push the remote rejected. The work may still be committed
 	// locally; the detail says what happened.
@@ -90,6 +107,10 @@ type Outcome struct {
 
 	// Worktree is the tree acted on (or declined), when one was identified.
 	Worktree string
+
+	// Paths are the untracked paths left alone by the Untracked status, as git
+	// reported them. Empty on every other status.
+	Paths []string
 
 	// Detail is the human-readable account. Always set except on the empty
 	// Nothing.
@@ -127,10 +148,16 @@ func New(workdir, remote string) *Salvager {
 // uncommitted work, commits and pushes it. label is the task's human-readable
 // ref, used in the commit message and the detail; it is cosmetic.
 //
+// recorded are the branches this session reported to the plane for this task
+// (`update_task(branch: …)`), in the order the driver read them, plus the branch
+// the claim carried. They are what "delivered" is judged against, and they are
+// consulted only when nothing but untracked files is left: every other dirty tree
+// is salvaged exactly as it always was (CLA-695).
+//
 // It never returns an error: every way this can go wrong is an Outcome the caller
 // logs and carries on from. The caller must not treat a non-Saved outcome as a
 // reason to stop the run - the session is already over, and this is a rescue.
-func (s *Salvager) Salvage(ctx context.Context, taskID, label string) Outcome {
+func (s *Salvager) Salvage(ctx context.Context, taskID, label string, recorded ...string) Outcome {
 	prefix, ok := branchPrefix(taskID)
 	if !ok {
 		return Outcome{Status: Nothing, Detail: fmt.Sprintf(
@@ -196,6 +223,33 @@ func (s *Salvager) Salvage(ctx context.Context, taskID, label string) Outcome {
 			wt.path, len(conflicted), strings.Join(conflicted, ", "))}
 	}
 
+	// The one dirt this package deliberately does not save: untracked files
+	// alone, left by a session that DELIVERED. "Delivered" is a fact about the
+	// remote, not about the session's word - the branch it recorded must be on
+	// the origin at exactly the worktree's HEAD - and it is asked for only here,
+	// where it decides something (CLA-695).
+	//
+	// The observed cost of getting this wrong: an implement phase ended normally,
+	// committed, pushed and recorded its branch, and left one untracked generated
+	// file (`wrangler types` output, 13k lines) in its worktree. This package
+	// committed that file, pushed a new tip, and recorded the branch again - so
+	// every review-panel member reviewed the salvage commit rather than the
+	// implementer's tip, and the generated file sat on the branch headed for the
+	// PR. The path was not the work; it was the typecheck's exhaust.
+	if untracked, only := untrackedOnly(dirty); only {
+		remote := delivery.Remote(ctx, wt.path, s.remote)
+		if branch, ok := s.delivered(ctx, wt, remote, recorded); ok {
+			return Outcome{
+				Status:   Untracked,
+				Worktree: wt.path,
+				Paths:    untracked,
+				Detail: fmt.Sprintf(
+					"%s holds %d untracked path(s) (%s) and %s is already on %s at exactly that tip, so the session delivered and they are left uncommitted: they are generated or scratch output, and committing them would push a tip nobody chose for every later reader - reviewer, fix phase and PR - to review in place of the delivered one",
+					wt.path, len(untracked), strings.Join(untracked, ", "), branch, remote),
+			}
+		}
+	}
+
 	return s.commitAndPush(ctx, wt, taskID, label)
 }
 
@@ -219,6 +273,98 @@ func unmergedPaths(porcelain string) []string {
 		}
 	}
 	return out
+}
+
+// untrackedOnly reads `git status --porcelain` (v1) and reports the paths git
+// calls untracked (`??`), together with whether EVERY entry is one of those -
+// which is the only shape whose fate the delivered rule can change.
+//
+// Anything tracked on either side of the porcelain makes the answer false: a
+// modification, a staged addition, a deletion, a rename, an unmerged entry. Those
+// are edits to work that already exists, and an edit on top of a delivered tip is
+// exactly what the salvage is for, so they are never skipped.
+//
+// An empty porcelain is false as well: "untracked-only" is a statement about a
+// tree with something in it, and the caller has already handled the clean case.
+//
+// The paths are returned as git spells them, which for an exotic path is its
+// quoted form - they are logged for a human, not fed back to git, so quoting is
+// the honest thing to show.
+func untrackedOnly(porcelain string) ([]string, bool) {
+	var paths []string
+	only := true
+	any := false
+	for _, line := range strings.Split(porcelain, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		any = true
+		if !strings.HasPrefix(line, "?? ") {
+			only = false
+			continue
+		}
+		paths = append(paths, strings.TrimSpace(line[3:]))
+	}
+	return paths, only && any
+}
+
+// delivered reports whether one of the branches the session recorded for this
+// task is on the remote at EXACTLY the worktree's HEAD - the session pushed the
+// work it committed and left nothing behind but untracked files.
+//
+// Exact equality, deliberately, where the delivery verifier settles for ancestry:
+// a local tip AHEAD of the remote is the CLA-134 failure (the work exists on one
+// laptop), and a local tip BEHIND it means the remote moved under us - another
+// run's push or a rebase - where a salvage commit plus a push would be refused
+// non-fast-forward and the work would sit unrecorded. Neither is a delivered tip.
+//
+// Asked only when the dirt is untracked-only, so the network call it makes is
+// paid on a rare path. It rides the same transport as the push it decides about
+// (same env, same remote resolution), so a remote this cannot read is one the
+// push could not have reached either: the answer is "not delivered" and the
+// salvage proceeds unchanged. The failure mode is the status quo, never silence.
+func (s *Salvager) delivered(ctx context.Context, wt worktree, remote string, recorded []string) (string, bool) {
+	if len(recorded) == 0 {
+		return "", false
+	}
+	head, err := s.run(ctx, wt.path, "rev-parse", "HEAD")
+	if err != nil || head == "" {
+		return "", false
+	}
+	seen := map[string]bool{}
+	for _, branch := range recorded {
+		if branch == "" || seen[branch] {
+			continue
+		}
+		seen[branch] = true
+		sha, err := s.lsRemote(ctx, wt.path, remote, branch)
+		if err != nil || sha == "" {
+			continue
+		}
+		if sha == head {
+			return branch, true
+		}
+	}
+	return "", false
+}
+
+// lsRemote reads the remote's tip for a branch without touching anything local.
+// Empty with a nil error means the remote does not have the branch; an error means
+// it could not be read, which the caller treats the same way - both are "not
+// delivered", and the difference is not one this rescue needs.
+func (s *Salvager) lsRemote(ctx context.Context, dir, remote, branch string) (string, error) {
+	out, err := s.run(ctx, dir, "ls-remote", "--heads", "--", remote, "refs/heads/"+branch)
+	if err != nil {
+		return "", err
+	}
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[1] == "refs/heads/"+branch {
+			return fields[0], nil
+		}
+	}
+	return "", nil
 }
 
 // commitAndPush is the only mutating path in this package. Everything above it is
@@ -323,10 +469,11 @@ func commitMessage(label, taskID string, wt worktree) (subject, body string) {
 	}
 	subject = fmt.Sprintf("WIP salvage: %s (unreviewed, may not build)", name)
 	body = strings.Join([]string{
-		"The session working this task ended without committing - killed by a usage",
-		"limit, a crash, or a stream that could not be read. The driver committed its",
-		"worktree verbatim so the work is recoverable from another machine instead of",
-		"being redone from nothing.",
+		"The session working this task ended with uncommitted work in its worktree -",
+		"killed by a usage limit, a crash, a stream that could not be read, or simply",
+		"stopped with the work unfinished. The driver committed the tree verbatim so",
+		"the work is recoverable from another machine instead of being redone from",
+		"nothing.",
 		"",
 		"Nothing here has been reviewed, built or tested, and no human or agent chose",
 		"this as a stopping point. Read it before building on it, and discard it if it",

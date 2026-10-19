@@ -481,7 +481,10 @@ type deliveryVerifier interface {
 
 // workSalvager is the driver's view of internal/salvage, narrowed the same way.
 type workSalvager interface {
-	Salvage(ctx context.Context, taskID, label string) salvage.Outcome
+	// Salvage rescues the work a dead session left in a worktree. recorded are
+	// the branches the session reported for the task, which is what "the session
+	// delivered" is judged against (CLA-695).
+	Salvage(ctx context.Context, taskID, label string, recorded ...string) salvage.Outcome
 }
 
 // New builds a single-project Driver — the original mode, driven entirely by the
@@ -5175,6 +5178,19 @@ func (d *Driver) endUntrustedDrain(t Target, drainNum int, harnessName string, r
 // it was not needed costs nothing — a clean worktree commits nothing, pushes
 // nothing and records nothing.
 //
+// # What it will not save (CLA-695)
+//
+// Untracked files alone, when the session DELIVERED — the branch it recorded for
+// the task is on the origin at exactly the worktree's HEAD. There is nothing to
+// rescue, and committing a generated file (a `wrangler types` dump, a report, a
+// build artifact) pushes a NEW tip at the phase boundary: every review-panel
+// member, the fix phase and the PR then ride a commit nobody chose, which is
+// exactly what happened on the first review-panel run. Tracked edits are still
+// salvaged on top of a delivered tip, and an undelivered session's untracked files
+// are still salvaged in full — new source files it never added are the work
+// CLA-314 exists to save. Delivery is the discriminator, and internal/salvage
+// checks it against the origin rather than taking the session's word for it.
+//
 // # Why it is safe on the untrusted path
 //
 // CLA-262 forbids acting on a truncated stream's CLAIM-STATE: a settle we never
@@ -5205,7 +5221,7 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), salvageTimeout)
 	defer cancel()
 
-	out := d.newSalvager(workdir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref)
+	out := d.newSalvager(workdir).Salvage(sctx, res.Claim.TaskID, res.Claim.Ref, recordedBranches(*res)...)
 	label := claimLabel(res.Claim)
 	switch out.Status {
 	case salvage.Nothing:
@@ -5228,6 +5244,18 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 				log.Printf("%snothing to salvage for %s: %s", labelOf(t), label, out.Detail)
 			}
 		}
+		return
+	case salvage.Untracked:
+		// CLA-695: the session DELIVERED — the branch it recorded is on the origin
+		// at exactly the worktree's HEAD — and left nothing but untracked files.
+		// There is nothing to rescue and nothing to record, so this is a report
+		// rather than an alarm: the paths are named because an untracked file can
+		// still be work (a source file written after the last commit), and only a
+		// reader can tell that from the generated output this rule exists for. The
+		// claim is left exactly as the Refused and Failed cases leave it — no
+		// branch recorded, so the ordinary handback rules apply unchanged.
+		log.Printf("%sdelivered %s with only untracked files left in %s — committing them would move the branch later readers review, so they are left alone: %s",
+			labelOf(t), label, out.Worktree, strings.Join(out.Paths, ", "))
 		return
 	case salvage.Refused:
 		log.Printf("%sSTRANDED WORK LEFT AS IS — %s: %s", labelOf(t), label, out.Detail)
