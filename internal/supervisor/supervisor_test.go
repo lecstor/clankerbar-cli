@@ -172,24 +172,7 @@ func helperMain() {
 		// A daemon that died while holding a claim, leaving the record the
 		// supervisor reads (CLA-708). Branch empty vs set is the whole
 		// release/expireLease split.
-		claim := loop.CurrentClaim{
-			TaskID:    "t-claim",
-			RunID:     "r-claim",
-			Project:   "acme",
-			ClaimedAt: time.Now().UTC(),
-		}
-		if mode == "crash-claim-branch" {
-			claim.Branch = "clanker/claim-wip"
-		}
-		body, err := json.Marshal(claim)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
-			os.Exit(9)
-		}
-		if err := os.WriteFile(filepath.Join(spec.StateDir, loop.CurrentClaimName), body, 0o600); err != nil {
-			fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
-			os.Exit(9)
-		}
+		writeHelperClaim(spec.StateDir, mode == "crash-claim-branch")
 		os.Exit(1)
 	case "crash":
 		os.Exit(1)
@@ -198,10 +181,16 @@ func helperMain() {
 			os.Exit(9)
 		}
 		os.Exit(1)
-	case "sleep", "sleep-seen":
+	case "sleep", "sleep-seen", "sleep-claim", "sleep-claim-branch":
+		// A daemon that is alive and holding a claim when the fleet stop lands:
+		// the STOP takes effect at its iteration boundary, and the record is
+		// still present for the supervisor's shutdown-path handback.
+		if strings.HasPrefix(mode, "sleep-claim") {
+			writeHelperClaim(spec.StateDir, mode == "sleep-claim-branch")
+		}
 		for {
 			if _, err := os.Lstat(stopPath); err == nil {
-				if mode == "sleep" {
+				if mode != "sleep-seen" {
 					_ = os.Remove(stopPath)
 				} else {
 					_ = os.WriteFile(filepath.Join(spec.StateDir, "STOP-SEEN"), []byte("marker landed\n"), 0o600)
@@ -234,6 +223,29 @@ func helperMain() {
 		}
 	default:
 		fmt.Fprintln(os.Stderr, "fake daemon: unknown mode", mode)
+		os.Exit(9)
+	}
+}
+
+// writeHelperClaim leaves the CURRENT_CLAIM record the supervisor hands back
+// (CLA-708). Branch empty vs set is the whole release/expireLease split.
+func writeHelperClaim(stateDir string, branch bool) {
+	claim := loop.CurrentClaim{
+		TaskID:    "t-claim",
+		RunID:     "r-claim",
+		Project:   "acme",
+		ClaimedAt: time.Now().UTC(),
+	}
+	if branch {
+		claim.Branch = "clanker/claim-wip"
+	}
+	body, err := json.Marshal(claim)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
+		os.Exit(9)
+	}
+	if err := os.WriteFile(filepath.Join(stateDir, loop.CurrentClaimName), body, 0o600); err != nil {
+		fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
 		os.Exit(9)
 	}
 }

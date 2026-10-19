@@ -26,7 +26,6 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"path"
 	"strings"
 	"time"
 
@@ -177,8 +176,21 @@ func mcpEndpointFromRoster(rosterURL, project string) string {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return ""
 	}
-	u.Path = path.Join("/mcp", project)
-	u.RawPath, u.RawQuery, u.Fragment = "", "", ""
+	// The project is ONE path segment, so escape it rather than letting a
+	// value carrying "/" (or any other URL-special character) select a
+	// different same-origin endpoint. Path holds the decoded form and RawPath
+	// the exact spelling: assigning an already-escaped string to Path alone
+	// would make String() escape the "%" again (`a%2Fb` -> `a%252Fb`).
+	// Reachable only from a corrupted or stale CURRENT_CLAIM, and a wrong
+	// endpoint is a refused call, never a write somewhere new - but the
+	// segment boundary should not be the project's to redraw.
+	if project == "" {
+		u.Path, u.RawPath = "/mcp", ""
+	} else {
+		u.Path = "/mcp/" + project
+		u.RawPath = "/mcp/" + url.PathEscape(project)
+	}
+	u.RawQuery, u.Fragment = "", ""
 	return u.String()
 }
 

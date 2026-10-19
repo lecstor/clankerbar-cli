@@ -15,6 +15,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
@@ -270,5 +271,63 @@ func TestCurrentClaim_ParkClearsTheRecord(t *testing.T) {
 	}
 	if _, err := ReadCurrentClaim(d.state); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("record survived a park (err=%v)", err)
+	}
+}
+
+// The branch must be on disk before the observation callback returns, not when
+// the renewer goroutine next reaches the snapshot (review 1.review-1.1). The
+// renewer is parked INSIDE a Heartbeat here: before the fix the branch stayed
+// queued in r.claims, and a daemon dying in that window left the old
+// no-branch record for the supervisor to `release` over pushed work.
+func TestCurrentClaim_BranchIsPersistedBeforeTheObservationReturns(t *testing.T) {
+	hb := &recordingHeartbeat{stall: make(chan struct{}), entered: make(chan struct{})}
+	ticks := make(chan time.Time, 1)
+	d := &Driver{}
+	openTestStateDir(t, d)
+	r := &leaseRenewer{
+		hb:        hb,
+		interval:  time.Minute, // cadence is hand-driven via r.tick
+		prefix:    "test: ",
+		claims:    make(chan harness.Claim, 4),
+		done:      make(chan struct{}),
+		stopped:   make(chan struct{}),
+		tick:      ticks,
+		claimFile: func(c harness.Claim) { d.noteCurrentClaim(c, "proj") },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer func() {
+		close(hb.stall)
+		r.stop()
+	}()
+	go r.run(ctx, harness.Claim{TaskID: "t-1", RunID: "r-1"})
+
+	ticks <- time.Now()
+	heartbeatWaitFor(t, "the renewer to park inside the stalled heartbeat", func() bool {
+		select {
+		case <-hb.entered:
+			return true
+		default:
+			return false
+		}
+	})
+
+	// The record starts with no branch, as it would before update_task.
+	r.observe(harness.Claim{TaskID: "t-1", RunID: "r-1"})
+	c, err := ReadCurrentClaim(d.state)
+	if err != nil || c.Branch != "" {
+		t.Fatalf("precondition: record = %+v, err = %v; want a no-branch record", c, err)
+	}
+
+	// The branch observation arrives while the renewer is still parked. Read
+	// the file WITHOUT releasing the heartbeat: the write must not wait for
+	// the renewer goroutine to drain its queue.
+	r.observe(harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/t-1-work"})
+	c, err = ReadCurrentClaim(d.state)
+	if err != nil {
+		t.Fatalf("branch observation was not persisted while the renewer was parked: %v", err)
+	}
+	if c.Branch != "clanker/t-1-work" {
+		t.Fatalf("branch on disk = %q, want clanker/t-1-work — a supervisor would choose release and post ready over the work", c.Branch)
 	}
 }

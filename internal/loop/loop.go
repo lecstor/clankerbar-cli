@@ -4948,19 +4948,18 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit", drainNum)
-			// A RESUMED phase must not wait one out (CLA-631). It is working a
-			// live lease — 30 minutes, and nothing driver-side heartbeats it — so
-			// a supervised wait of hours would re-spawn the phase against a run
-			// the plane has long since swept or handed to another clanker, with a
-			// runId in its prompt that no longer means anything. End the sequence
-			// instead: the branch is pushed, the lease lapses, and the task comes
-			// back as a takeover, which is the designed recovery for exactly
-			// this. The RUN, though, must not end with it — exiting the daemon
-			// left a whole fleet idle until an operator noticed — so the wait is
-			// handed to drainPhases, which owes it only once the sequence's
+			// A RESUMED phase must not wait one out (CLA-631). The seam's handback
+			// has already ended the claim: `release` puts a no-work claim straight
+			// back in the queue, and `expireLease` ends a pushed-work claim's lease
+			// immediately, leaving the task an immediate takeover — so a supervised
+			// wait of hours would only run against a task this sequence no longer
+			// holds, with a runId in its prompt that no longer means anything. End
+			// the sequence instead. The RUN, though, must not end with it — exiting
+			// the daemon left a whole fleet idle until an operator noticed — so the
+			// wait is handed to drainPhases, which owes it only once the sequence's
 			// handback has run and no lease is held.
 			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a 30-minute lease; the task returns as a takeover with its branch recorded, and the run stays up to wait for the reset instead of exiting",
+				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting",
 					drainNum)
 				end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
 				return tokens, cost, false, end, nil
@@ -5126,23 +5125,23 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// out a usage limit — and this path is the more dangerous of the two,
 			// because MaxRetries defaults to 0, meaning never give up. Seeding the
 			// resumed claim made the seam's handback live for phase 2, so a blip
-			// here hands the task back mid-sequence while the retry is handed the
-			// very same heartbeat(runId) brief; and where the handback is declined
-			// (HasWIP), the backoff ladder walks past the 30-minute lease in about
-			// six steps and then re-spawns, indefinitely, against a run the plane
-			// has swept. End the sequence: the branch is pushed, the lease lapses,
-			// and the task comes back as a takeover. The RUN, though, must not end
-			// with it (CLA-651) — exiting the daemon on one provider blip left the
-			// fleet idle until an operator noticed, the same failure CLA-631 fixed
-			// for limits — so the sequence-end signal goes to drainPhases, which
-			// owes it a wait (CLA-662): there is no reset for a blip, so the run
-			// waits the target's growing backoff rung after the handback and then
-			// polls again. The rung matters precisely when this phase's harness is
-			// NOT the one the queue drains on: an opencode implement start can
-			// never see the claude blip, so without the run-level wait the same
-			// implement-and-lose loop would repeat with nothing bounding it.
+			// here hands the task back mid-sequence at once: `release` for a claim
+			// with nothing pushed, `expireLease` for pushed work, which ends that
+			// claim's lease immediately and leaves the task an immediate takeover.
+			// A retry would then be handed the very same heartbeat(runId) brief
+			// against a run that no longer holds anything. End the sequence. The
+			// RUN, though, must not end with it (CLA-651) — exiting the daemon on
+			// one provider blip left the fleet idle until an operator noticed, the
+			// same failure CLA-631 fixed for limits — so the sequence-end signal
+			// goes to drainPhases, which owes it a wait (CLA-662): there is no
+			// reset for a blip, so the run waits the target's growing backoff rung
+			// after the handback and then polls again. The rung matters precisely
+			// when this phase's harness is NOT the one the queue drains on: an
+			// opencode implement start can never see the claude blip, so without
+			// the run-level wait the same implement-and-lose loop would repeat with
+			// nothing bounding it.
 			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying on a 30-minute lease nothing renews; the task returns as a takeover with its branch recorded, and the run stays up to poll again instead of exiting",
+				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting",
 					drainNum, res.ExitString())
 				end.sequenceEnd = &phaseSequenceEnd{}
 				return tokens, cost, false, end, nil

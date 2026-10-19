@@ -1270,6 +1270,15 @@ func (d *Supervisor) stopAll() error {
 	for len(done) < len(d.instances) {
 		select {
 		case ev := <-d.exits:
+			// A child that exits during the drain may still hold its claim: the
+			// STOP marker only takes effect at an iteration boundary, and a
+			// daemon killed (or still settling) in the meantime leaves its
+			// CURRENT_CLAIM behind. onExit would have handed it back, but this
+			// loop is what consumes an exit once the fleet stop has begun, so
+			// the handback must happen here too or the claim waits out its
+			// 30-minute lease while the supervisor exits. A no-op when the
+			// record is absent.
+			d.handBackDeadClaim(ev.inst)
 			// The flags onExit would have set are set here too: this loop is
 			// what consumes an exit once the fleet stop has begun, and the
 			// status report (and its final `stopped` rows) reads them.

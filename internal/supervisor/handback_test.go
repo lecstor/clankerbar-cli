@@ -194,11 +194,103 @@ func TestCleanChildExitMakesNoHandbackCall(t *testing.T) {
 	})
 }
 
+// A child that is alive and holding a claim when the fleet stop lands exits
+// during stopAll, not through the main select loop — so stopAll's own exit
+// branch is the one that must hand the claim back (review 1.review-2.1 /
+// 1.review-3.1). The helper writes CURRENT_CLAIM and only exits after seeing
+// the STOP marker, which is written by stopAll, so the exit event is
+// deterministically consumed there.
+func TestShutdownHandsBackAClaimStillPresent(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mode   string
+		branch string
+	}{
+		{name: "no branch: released", mode: "sleep-claim"},
+		{name: "branch recorded: expireLease", mode: "sleep-claim-branch", branch: "clanker/claim-wip"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cacheDir := t.TempDir()
+			setHelperMode(t, tc.mode)
+			plane := &fakePlane{}
+			plane.set([]RosterEntry{runEntry("acme-1", "")})
+			srv := plane.serve(t)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+			state := entryStateDir(cacheDir, "acme-1")
+			waitFor(t, 5*time.Second, "the live child's CURRENT_CLAIM", func() bool {
+				_, err := os.Lstat(filepath.Join(state, loop.CurrentClaimName))
+				return err == nil
+			})
+			// Nothing may have been handed back yet: the child is alive and
+			// holding it.
+			if calls := plane.planeCalls(); len(calls) != 0 {
+				t.Fatalf("a live child's claim was handed back early: %+v", calls)
+			}
+
+			cancel() // the fleet stop: stopAll writes STOP, the child exits here
+
+			waitFor(t, 5*time.Second, "the shutdown-path handback", func() bool {
+				return len(plane.planeCalls()) > 0
+			})
+			calls := plane.planeCalls()
+			if len(calls) != 1 {
+				t.Fatalf("%d handback call(s), want exactly 1: %+v", len(calls), calls)
+			}
+			call := calls[0]
+			for key, want := range map[string]any{
+				"taskId":         "t-claim",
+				"runId":          "r-claim",
+				"driverReleased": true,
+			} {
+				if got := call.args[key]; got != want {
+					t.Errorf("arguments[%q] = %v, want %v (args: %+v)", key, got, want, call.args)
+				}
+			}
+			if tc.branch == "" {
+				if call.args["release"] != true {
+					t.Errorf("a claim with no branch must be released (args: %+v)", call.args)
+				}
+				if _, present := call.args["expireLease"]; present {
+					t.Errorf("release and expireLease are mutually exclusive; got both: %+v", call.args)
+				}
+			} else {
+				if call.args["expireLease"] != true {
+					t.Errorf("a claim with a recorded branch must use expireLease (args: %+v)", call.args)
+				}
+				if _, present := call.args["release"]; present {
+					t.Errorf("expireLease must not be paired with release; got both: %+v", call.args)
+				}
+			}
+
+			waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatalf("Supervise returned %v, want nil", err)
+					}
+					return true
+				default:
+					return false
+				}
+			})
+			if _, err := os.Lstat(filepath.Join(state, loop.CurrentClaimName)); !os.IsNotExist(err) {
+				t.Fatalf("%s still present after the shutdown handback (err=%v)", loop.CurrentClaimName, err)
+			}
+		})
+	}
+}
+
 func TestMCPEndpointFromRoster(t *testing.T) {
 	for _, tc := range []struct{ name, roster, project, want string }{
 		{"project path", "https://clankerbar.com/api/daemon-roster", "acme", "https://clankerbar.com/mcp/acme"},
 		{"no project keeps the legacy slug-less path", "https://clankerbar.com/api/daemon-roster", "", "https://clankerbar.com/mcp"},
 		{"unparseable roster URL", "not a url", "acme", ""},
+		{"a slash stays inside the project segment", "https://clankerbar.com/api/daemon-roster", "a/b", "https://clankerbar.com/mcp/a%2Fb"},
+		{"URL-special characters are escaped", "https://clankerbar.com/api/daemon-roster", "a b?c#d", "https://clankerbar.com/mcp/a%20b%3Fc%23d"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := mcpEndpointFromRoster(tc.roster, tc.project); got != tc.want {
