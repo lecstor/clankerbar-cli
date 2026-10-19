@@ -4556,6 +4556,40 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// read (branchless or unverified), which is when no tip can be
 				// demanded of the reviewer either.
 				end.claim.CheckpointTip = evidenceTip
+				// CLA-685: a HANDOFF is the one checkpoint this session's own
+				// exit did not earn — it holds only because the successor
+				// continues THIS phase, which the claim carried in as `prev`
+				// opened. So when the exit evidenced NOTHING (evidenceOK false)
+				// the verdict just folded above is its REFUSAL's, not a
+				// checkpoint's: the record gate zeroes the unverified mark even
+				// though the branch leg had established it. The successor then
+				// reads carried.CheckpointUnverified as false, is handed the
+				// VERIFIED continuation - "The driver verified the origin
+				// remote's tip ... as {{reviewedTip}}" - for a tip this driver
+				// never read, and the placeholder stays literal, since it is
+				// filled only when the tip is non-empty.
+				//
+				// The exit's verdict about the checkpoint is empty exactly when
+				// it read no tip of its own: an evidenced branch leg always
+				// brings a tip (the verified form), and a non-empty tip implies
+				// unverified=false — the verified continuation, whose
+				// {{reviewedTip}} that tip then fills. So the opening
+				// checkpoint's mark is the only true one there, and it rides
+				// forward, as the panel-member block in drainPhases rides a
+				// claim's resumption facts onto the claim it hands on.
+				//
+				// The tip is carried only for the branch it was read for — it
+				// is `prev`'s, and a claim that now names another one must not
+				// be handed a tip that never belonged to it. The BRANCH stays as
+				// folded: it is the live truth about where the work is. An exit
+				// that WAS evidenced keeps its own verdict untouched, so the
+				// verified path is unaffected.
+				if handoff != "" && !evidenceOK && prev != nil && end.claim.CheckpointTip == "" {
+					end.claim.CheckpointUnverified = prev.CheckpointUnverified
+					if end.claim.Claim.Branch == prev.Claim.Branch {
+						end.claim.CheckpointTip = prev.CheckpointTip
+					}
+				}
 			}
 			if handoff != "" {
 				log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
