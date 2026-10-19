@@ -83,6 +83,11 @@ type leaseRenewer struct {
 	// with no fleet reporter, and nil in the heartbeat unit tests, which
 	// construct the renewer directly.
 	reflect func(harness.Claim)
+	// claimFile, when non-nil, is called on the renewer goroutine with every
+	// observed claim snapshot to maintain CURRENT_CLAIM (CLA-708) — the record
+	// a supervisor uses to hand a dead child's claim back. Nil in the heartbeat
+	// unit tests, which construct the renewer directly.
+	claimFile func(harness.Claim)
 }
 
 // startLeaseRenewal begins renewing the spawned session's claim lease and
@@ -112,6 +117,10 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 		claims:   make(chan harness.Claim, 4),
 		done:     make(chan struct{}),
 		stopped:  make(chan struct{}),
+		// CURRENT_CLAIM (CLA-708): the same observation seam, a third consumer.
+		// The project rides along because a claim file outlives this process and
+		// the supervisor needs the endpoint the claim belongs to.
+		claimFile: func(c harness.Claim) { d.noteCurrentClaim(c, t.Name) },
 	}
 	if t.Fleet != nil {
 		// CLA-510: the fleet card's task ref rides the same observation seam
@@ -183,6 +192,13 @@ func (r *leaseRenewer) apply(c, current harness.Claim) harness.Claim {
 	}
 	if r.reflect != nil {
 		r.reflect(c)
+	}
+	// One more consumer of the same snapshot (CLA-708): CURRENT_CLAIM. Kept
+	// after reflect for no ordering reason — both are observations, neither can
+	// fail the renewal — but in the same guarded section so no snapshot reaches
+	// one and not the other.
+	if r.claimFile != nil {
+		r.claimFile(c)
 	}
 	switch {
 	case c.Settled && !current.Settled:

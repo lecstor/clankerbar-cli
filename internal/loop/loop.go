@@ -414,6 +414,12 @@ type Driver struct {
 	// Run returns.
 	restartRequested atomic.Bool
 
+	// expireUnsupportedOnce says once, not once per abandoned phase, that the
+	// plane predates expireLease (CLA-707/708). Every such handback falls back
+	// to leaving the lease to expire, which is the old behaviour, so repeating
+	// the line adds nothing.
+	expireUnsupportedOnce sync.Once
+
 	// beaconWriteFailed is the streak latch for the LOCAL beacon write
 	// (loop/fleet.go): the first consecutive failure is logged, further ones
 	// stay silent, and recovery is logged once. Atomic because the claim
@@ -606,6 +612,12 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// cannot forget it. (The closure, not `defer d.sweepPendingStop(runErr)`:
 	// arguments evaluate at registration, and runErr is not assigned yet.)
 	defer func() { d.sweepPendingStop(runErr) }()
+	// A run that ends in an orderly way holds nothing, so nothing is left for a
+	// supervisor to hand back (CLA-708). Every let-go path removes this file as
+	// it happens; this is the backstop for a path that forgets. A process that is
+	// KILLED never reaches it, and that is exactly the case the supervisor's exit
+	// check exists for.
+	defer d.clearCurrentClaim()
 	if src := d.cfg.Source(); src != "" {
 		log.Printf("config: %s", src)
 	}
@@ -5349,6 +5361,12 @@ func (d *Driver) salvageStrandedWork(ctx context.Context, t Target, res *harness
 	// Only now. HasWIP is a statement about the TASK, not about the disk: it means
 	// the next clanker will be told there is work to fetch.
 	res.Claim.HasWIP = true
+	res.Claim.Branch = out.Branch
+	// The session is over, so no OnClaim snapshot will carry this branch to
+	// CURRENT_CLAIM; update the record directly, or a supervisor handing this
+	// claim back after the daemon dies would choose `release` (no branch) and
+	// post `ready` over the work just rescued.
+	d.noteCurrentClaim(res.Claim, t.Name)
 	log.Printf("%srecorded %s as the hand-off branch for %s — the next clanker takes it over instead of starting again",
 		labelOf(t), out.Branch, label)
 }
@@ -5670,33 +5688,47 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		return false
 	}
 	if !res.Claim.Releasable() {
-		// Leaving the lease alone is right — see Releasable. Whether it is also a
-		// FAILURE depends entirely on which call site got here; only that caller
-		// knows, so only that caller says so.
+		// CLA-708: the claim has pushed work, so Release is forbidden — it would
+		// post `ready` over the branch and throw away the takeover hand-off. The
+		// plane's expireLease ends the dead run's lease NOW and leaves the task an
+		// immediate takeover with its branch, which is the same disposition the
+		// lease's own expiry sweep produces, half an hour sooner.
 		//
-		// CLA-584: a session the adapter marked as an output-cap stall is named
-		// by its cause, in place of the generic line — the operator reading
-		// daemon.log after MAK-123 could only see "the phase finished but never
-		// moved the task on", which says nothing about what stopped it.
+		// Leaving the lease to expire remains the fallback on every failure below
+		// (an unwired plane, a plane older than the field, a refused write), and
+		// it is the ONLY behaviour for the `res.Untrusted` path above, which does
+		// not reach here by design.
 		stallReason, stalled := outputCapStallReasoning(res)
+		ended := d.expireHeldClaim(ctx, t, res)
 		if countUndeclared {
 			d.undeclared++
-			if stalled {
-				log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d)",
-					labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
-				return false
-			}
+		}
+		switch {
+		case ended && stalled && countUndeclared:
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover) (undeclared hand-offs this run: %d)",
+				labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
+		case ended && stalled:
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover)",
+				labelOf(t), stallReason, claimLabel(res.Claim))
+		case ended && countUndeclared:
+			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease so it is an immediate takeover (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
+				labelOf(t), res.Claim.TaskID, d.undeclared)
+		case ended:
+			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease so it is an immediate takeover",
+				labelOf(t), res.Claim.TaskID)
+		case stalled && countUndeclared:
+			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d)",
+				labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)
+		case countUndeclared:
 			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
 				labelOf(t), res.Claim.TaskID, d.undeclared)
-			return false
-		}
-		if stalled {
+		case stalled:
 			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives",
 				labelOf(t), stallReason, claimLabel(res.Claim))
-			return false
+		default:
+			log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
+				labelOf(t), res.Claim.TaskID)
 		}
-		log.Printf("%ssession ended holding %s, which has pushed work — leaving the lease to expire so the takeover hand-off survives",
-			labelOf(t), res.Claim.TaskID)
 		return false
 	}
 	if t.Releaser == nil {
@@ -5722,6 +5754,7 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 		}
 		return false
 	}
+	d.clearCurrentClaim()
 	if stalled {
 		log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s; handed it back to the queue for another clanker",
 			labelOf(t), stallReason, claimLabel(res.Claim))
@@ -5729,6 +5762,41 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 	}
 	log.Printf("%shanded %s back to the queue (the session ended still holding it)", labelOf(t), res.Claim.TaskID)
 	return true
+}
+
+// expireHeldClaim ends a dead session's lease on a task whose pushed work must
+// survive (CLA-708). It reports whether the plane accepted the handback; every
+// refusal falls back to the pre-CLA-708 behaviour — leave the lease to expire —
+// and says which refusal it got.
+//
+// The call is detached from ctx and bounded exactly like the Release call: a
+// cancelled run (Ctrl-C, SIGTERM, RESTART_NOW) is precisely when a claim would
+// otherwise be abandoned, so the handback has to outlive the signal that
+// prompted it without letting a wedged plane hold up shutdown.
+func (d *Driver) expireHeldClaim(ctx context.Context, t Target, res harness.Result) bool {
+	if t.Releaser == nil {
+		return false
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer cancel()
+	err := t.Releaser.ExpireLease(rctx, res.Claim.TaskID, res.Claim.RunID)
+	switch {
+	case err == nil:
+		d.clearCurrentClaim()
+		return true
+	case errors.Is(err, plane.ErrNotWired):
+		// Nothing to call. The old line is the honest one, and it is what the
+		// caller logs when this returns false.
+		return false
+	case errors.Is(err, plane.ErrFieldUnsupported):
+		d.expireUnsupportedOnce.Do(func() {
+			log.Printf("%sthe backlog plane predates expireLease — dead runs' leases will expire on their own as before; upgrade the plane to hand a dead session's claim back immediately", labelOf(t))
+		})
+		return false
+	default:
+		log.Printf("%scould not end the lease on %s: %v — its lease will expire instead", labelOf(t), res.Claim.TaskID, err)
+		return false
+	}
 }
 
 // verifyDeliveries checks, against local git, what the session told the plane it

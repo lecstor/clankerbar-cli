@@ -975,6 +975,14 @@ func (d *Supervisor) spawn(inst *Instance) {
 // unexpected exit. Only the last respawns. at is when the Wait goroutine saw
 // the process end, carried onto the status row as `lastExit.at`.
 func (d *Supervisor) onExit(inst *Instance, err error, at time.Time) {
+	// A child that exited without letting go may have left its claim behind
+	// (CLA-708). Read it BEFORE deciding whether to respawn — the hand-back is
+	// what turns a dead session into an immediate takeover instead of a
+	// 30-minute lease. It applies to EVERY exit, including one the supervisor
+	// ordered: a drained child normally holds nothing (the record is removed on
+	// every let-go path), and a record found anyway means the drain did not let
+	// go, which is still the dead-session case.
+	d.handBackDeadClaim(inst)
 	// The exited flag is set BEFORE the ctx check, not after: the select loop
 	// may have picked this event in the same instant the fleet stop landed
 	// (ctx.Done), and stopAll counts live children from this flag. If the

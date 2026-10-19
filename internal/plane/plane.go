@@ -57,10 +57,33 @@ type Releaser interface {
 	// lease, so moving the task to `ready` discards the very hint that warns the
 	// next clanker there is pushed work to pick up. That trap is on the record —
 	// it is what standing decision 15 (CLA-191) was written about. The WIP case
-	// wants a plane-side primitive that preserves the handoff; until that exists,
-	// the driver leaves those tasks to expire.
+	// wants ExpireLease below.
 	Release(ctx context.Context, taskID, runID string) error
+
+	// ReleaseDriver is Release carrying `driverReleased: true` — the same
+	// handback, recorded as one a driver made on a session's behalf rather than
+	// one the session chose. The supervisor uses it when a child it did not
+	// start a drain for has exited holding a task with no branch.
+	ReleaseDriver(ctx context.Context, taskID, runID string) error
+
+	// ExpireLease ends the holding run NOW instead of waiting out its 30-minute
+	// lease, and leaves the task an immediate takeover when a branch is recorded
+	// (or `ready` when there is none). It sends `expireLease: true` plus
+	// `driverReleased: true` — the plane's CLA-707 primitive, written for a dead
+	// session whose work IS pushed. Unlike Release it keeps the WIP hand-off, so
+	// it is the correct handback for a claim with a branch recorded.
+	//
+	// A plane older than CLA-707 refuses the field; that refusal is wrapped in
+	// ErrFieldUnsupported so the caller can fall back to leaving the lease to
+	// expire, which is exactly the behaviour this replaces.
+	ExpireLease(ctx context.Context, taskID, runID string) error
 }
+
+// ErrFieldUnsupported means the plane refused a field this build sends because
+// it does not know the field — a plane older than the build. Callers fall back
+// to the behaviour that predates the field rather than treating it as a failed
+// handback: the lease will expire on its own, as it always did.
+var ErrFieldUnsupported = errors.New("the plane does not support a field this build sends")
 
 // Attester records the driver's own verdict on a delivery a session declared.
 //
@@ -180,10 +203,12 @@ type ParkAPI interface {
 
 type notWired struct{}
 
-func (notWired) Release(context.Context, string, string) error    { return ErrNotWired }
-func (notWired) Heartbeat(context.Context, string) error          { return ErrNotWired }
-func (notWired) PeekNextTask(context.Context) (NextTask, error)   { return NextTask{}, ErrNotWired }
-func (notWired) TaskRepo(context.Context, string) (string, error) { return "", ErrNotWired }
+func (notWired) Release(context.Context, string, string) error       { return ErrNotWired }
+func (notWired) ReleaseDriver(context.Context, string, string) error { return ErrNotWired }
+func (notWired) ExpireLease(context.Context, string, string) error   { return ErrNotWired }
+func (notWired) Heartbeat(context.Context, string) error             { return ErrNotWired }
+func (notWired) PeekNextTask(context.Context) (NextTask, error)      { return NextTask{}, ErrNotWired }
+func (notWired) TaskRepo(context.Context, string) (string, error)    { return "", ErrNotWired }
 func (notWired) TaskState(context.Context, string) (TaskState, error) {
 	return TaskState{}, ErrNotWired
 }
@@ -261,6 +286,86 @@ func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
 		"runId":   runID,
 		"release": true,
 	})
+}
+
+// ReleaseDriver is Release with `driverReleased: true`, the marker the plane
+// records for a handback a driver made on a dead session's behalf (CLA-707
+// extended the existing driver-marker guard to accept `release` as well as
+// `expireLease`).
+//
+// It is separate from Release rather than a flag on it so the daemon's own
+// long-standing handback keeps the exact wire shape it has always had: a plane
+// older than the marker must not start refusing a call that used to work.
+func (r *mcpReleaser) ReleaseDriver(ctx context.Context, taskID, runID string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("release driver: taskId and runId are both required")
+	}
+	err := r.call(ctx, "update_task", map[string]any{
+		"taskId":         taskID,
+		"runId":          runID,
+		"release":        true,
+		"driverReleased": true,
+	})
+	if err != nil && refusedField(err, "driverReleased") {
+		return fmt.Errorf("%w: %v", ErrFieldUnsupported, err)
+	}
+	return err
+}
+
+// ExpireLease ends the run holding taskID now and leaves the task to the same
+// paths a natural expiry would: an immediate takeover when a branch is
+// recorded, `ready` when there is none (CLA-707). It is the handback for a
+// session that died holding PUSHED work, where Release is forbidden because it
+// would discard the takeover hand-off.
+//
+// `driverReleased` marks it as a driver's call for a dead session, which is
+// what both the loop (on an abandoned phase) and the supervisor (on a child
+// exit) are making.
+func (r *mcpReleaser) ExpireLease(ctx context.Context, taskID, runID string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("expire lease: taskId and runId are both required")
+	}
+	err := r.call(ctx, "update_task", map[string]any{
+		"taskId":         taskID,
+		"runId":          runID,
+		"expireLease":    true,
+		"driverReleased": true,
+	})
+	if err != nil && refusedField(err, "expireLease") {
+		return fmt.Errorf("%w: %v", ErrFieldUnsupported, err)
+	}
+	return err
+}
+
+// refusedField reports whether a plane refusal is about not knowing a field,
+// rather than about the task, the run, or the connection. A plane built before
+// CLA-707 validates `update_task` arguments and says so by naming the field
+// (`unrecognized key`, `unknown argument`, `unexpected property`); the shapes
+// differ between validators, so the test is "the refusal names the field AND
+// calls it unknown", never a guess at one validator's wording.
+func refusedField(err error, field string) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if !strings.Contains(msg, strings.ToLower(field)) {
+		return false
+	}
+	for _, unknown := range []string{
+		"unknown",
+		"unrecognized",
+		"unrecognised",
+		"unexpected",
+		"not supported",
+		"unsupported",
+		"additional propert",
+		"invalid key",
+	} {
+		if strings.Contains(msg, unknown) {
+			return true
+		}
+	}
+	return false
 }
 
 // RecordBranch writes a work-in-progress branch onto a task, so a session that
