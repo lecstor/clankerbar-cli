@@ -391,6 +391,14 @@ type Driver struct {
 	// a block is added mid-file.
 	spentBy map[string]harnessSpend
 
+	// stateMu serialises the run-scoped maps below. They are written by whatever
+	// goroutine a session's result is processed on: with a review panel's members
+	// running concurrently (CLA-697) that is more than one at a time, and a Go map
+	// written from two goroutines is a data race, not a lost update. Every
+	// read-modify-write of spentBy, deadTally and panelFailStreak holds it;
+	// nothing that calls out to the plane or a harness may hold it.
+	stateMu sync.Mutex
+
 	// deadTally is this run's dead-phase tally, keyed by phase label and harness
 	// name (CLA-402): how many phase sessions ran and how many of those died
 	// producing nothing. Like spentBy it is the RUN's account — the rate is
@@ -1088,6 +1096,8 @@ type harnessSpend struct {
 // running on some other harness would bill opencode's tokens to claude's breaker,
 // which is precisely the mis-accounting the per-harness ceilings exist to prevent.
 func (d *Driver) charge(harnessName string, tokens int, cost float64) {
+	d.stateMu.Lock()
+	defer d.stateMu.Unlock()
 	if d.spentBy == nil {
 		d.spentBy = make(map[string]harnessSpend)
 	}
@@ -1110,8 +1120,11 @@ func (d *Driver) budgetTrip(tokens int, cost float64, elapsed time.Duration) str
 	if dim := d.cfg.Budget.ExceededBy(tokens, cost, elapsed); dim != "" {
 		return dim
 	}
-	for _, name := range slices.Sorted(maps.Keys(d.spentBy)) {
-		s := d.spentBy[name]
+	d.stateMu.Lock()
+	spent := maps.Clone(d.spentBy)
+	d.stateMu.Unlock()
+	for _, name := range slices.Sorted(maps.Keys(spent)) {
+		s := spent[name]
 		if dim := d.cfg.Budget.ExceededByHarness(name, s.tokens, s.cost); dim != "" {
 			// That harness's OWN totals ride along, because every caller prints
 			// the RUN's figures after the reason: in a mixed-harness run two
@@ -1200,6 +1213,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// CLA-639 M5: the branchless-panel skip says its piece once, not once per
 	// skipped member — N-1 identical lines would read as N problems.
 	branchlessPanelNoted := false
+	// CLA-697: a panel run whose fan-out could not be set up (no repo, no
+	// resolvable tip) falls back to the sequential members for THIS panel; the
+	// flag stops every later member re-running the same failing probes.
+	panelFanOutOff := false
 	// The claim a phase deliberately left held for its successor, and the source
 	// of the task/run ids that successor's prompt needs.
 	var carried *harness.Result
@@ -1347,6 +1364,100 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			terminal = true
 		}
 		isHandoff := nextPrompt != ""
+		// CLA-697: fan the panel's contiguous members out concurrently, each in
+		// its own detached worktree. A handoff respawn continues ONE phase (never
+		// a panel run), and a branchless checkpoint runs one reviewer by design —
+		// both take the shipped sequential path below.
+		//
+		// The join owns everything the sequential member handler would have done
+		// one member at a time: the incomplete list, the round close, the run-level
+		// wait a limited member owes, and the decision not to spawn a fix when
+		// nobody recorded. With cap = 1 (or a single member) this block does
+		// nothing at all and the old path runs byte for byte.
+		if !panelMember {
+			panelFanOutOff = false
+		}
+		if panelMember && !isHandoff && !branchlessCheckpoint && !panelFanOutOff {
+			runEnd := i + 1
+			for runEnd < len(phases) && phases[runEnd].IsPanelMember() {
+				runEnd++
+			}
+			if n := runEnd - i; n > 1 && tc.EffectivePanelConcurrency(n) > 1 {
+				// The breaker at the boundary BEFORE the fan-out, exactly as the
+				// sequential path's per-spawn check would have stopped before the
+				// first member it could not afford.
+				if spawned > 0 {
+					if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+						log.Printf("iteration %d: budget reached at the %s phase boundary: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
+							drainNum, ph.Label(i), dim, prior.tokens+tokens, prior.cost+cost,
+							time.Since(prior.start).Round(time.Second))
+						stop = true
+						break
+					}
+				}
+				if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, i, runEnd, tc.EffectivePanelConcurrency(n), carried, spend{
+					start:  prior.start,
+					tokens: prior.tokens + tokens,
+					cost:   prior.cost + cost,
+				}); ok {
+					tokens += out.tokens
+					cost += out.cost
+					spawned += n
+					for k, m := range out.members {
+						if m.end.session != nil {
+							sessionsRun = append(sessionsRun, *m.end.session)
+						}
+						label := phases[i+k].Label(i + k)
+						if len(phasesRun) == 0 || phasesRun[len(phasesRun)-1] != label {
+							phasesRun = append(phasesRun, label)
+						}
+					}
+					if out.claim != nil && (carried == nil || out.claim.Claim.TaskID == carried.Claim.TaskID) {
+						seen = out.claim.Claim
+						finalDisp = out.disposition
+						if carried != nil && out.claim.Claim.Held() {
+							carried = out.claim
+						}
+					}
+					finalDead = out.finalDead
+					lastProducedNothing = out.lastProducedNothing
+					panelRecorded = panelRecorded || out.recorded
+					panelRound = max(panelRound, out.round)
+					panelIncomplete = append(panelIncomplete, out.incomplete...)
+					for role, why := range out.failed {
+						panelFailed[role] = why
+					}
+					// The run-level endings, in the order the sequential handler
+					// checks them: a close that failed is fail-closed and stops the
+					// drain; a member's budget stop ends the run; a limit or
+					// transient end hands the drain its wait (the claim is left to
+					// lapse into a takeover, never released); no record at all means
+					// no fix.
+					switch {
+					case out.closeFailed:
+						if limitWait == nil && out.sequenceEnded && out.limitWait == nil {
+							transientKey = out.transientKey
+							transientRung = d.noteResumedTransient(transientKey)
+						}
+					case out.stop:
+						stop = true
+					case out.err != nil:
+						err = out.err
+					case out.sequenceEnded:
+						limitWait = out.limitWait
+						if limitWait == nil {
+							transientKey = out.transientKey
+							transientRung = d.noteResumedTransient(transientKey)
+						}
+					}
+					if stop || err != nil || out.closeFailed || out.sequenceEnded || !out.recorded || runEnd >= len(phases) {
+						break
+					}
+					i = runEnd
+					continue
+				}
+			}
+		}
 		promptBytes := 0
 		if isHandoff {
 			// The respawn continues this phase's job under its knobs — turn cap
@@ -1493,7 +1604,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
-		}, phases, panelState{round: panelRound, failed: panelFailed})
+		}, phases, panelState{round: panelRound, failed: panelFailed}, phaseRunOpts{})
 		tokens += ptokens
 		cost += pcost
 		// CLA-630: one entry per session this pass spawned, in spawn order. nil
@@ -3907,7 +4018,7 @@ func (d *Driver) peekCheckpointClaim(ctx context.Context, t Target, drainNum int
 func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, prior spend) (tokens int, cost float64, stop bool, err error) {
 	phases := d.targetCfg(t).EffectivePhases()
 	ph := phases[0]
-	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior, phases, panelState{})
+	tokens, cost, stop, _, err = d.drainPhase(ctx, drainNum, 0, 0, "", ph, true, nil, t, prior, phases, panelState{}, phaseRunOpts{})
 	return tokens, cost, stop, err
 }
 
@@ -3950,7 +4061,35 @@ func (d *Driver) drainWithRetries(ctx context.Context, drainNum int, t Target, p
 // recorded. It is the fix phase's grading input (mergedFindingsDigest reads
 // that round and no other); the unphased drain and a phase that does not follow
 // a panel pass the zero value.
-func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend, phases []config.Phase, panel panelState) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
+// phaseRunOpts are the per-spawn facts a panel's parallel fan-out adds to
+// drainPhase (CLA-697). The zero value is every other caller: the phase runs in
+// the checkout sessionDir resolved, and drainPhase itself closes the review
+// round when the review stage is over.
+type phaseRunOpts struct {
+	// worktree, when non-empty, is the session's start directory instead of the
+	// one sessionDir resolved: the member's own DETACHED checkout at the reviewed
+	// tip. The brief tells the session it is there, so a member cannot wander
+	// into the shared task worktree.
+	worktree string
+
+	// panelParallel says the JOIN that spawned this member owns the review
+	// round's close. A member must not close it itself: its siblings may still be
+	// recording, and the close is what releases the findings they must not see.
+	panelParallel bool
+}
+
+// panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).
+// The shipped brief says to work in "the worktree for branch X", which is the
+// task's shared one; giving each member its own detached checkout would be
+// contradicted by that sentence, so the driver states the fact first.
+const panelWorktreeNote = "YOUR CHECKOUT: you are one member of a review PANEL running in PARALLEL " +
+	"with its siblings. The driver created a DETACHED worktree of the task's repository at the reviewed tip " +
+	"and started this session IN it; work here for the whole session. Do NOT switch to, edit, or leave " +
+	"artifacts in the task's shared worktree — another member and the fix phase use that one. This checkout " +
+	"is discarded when you end and is never salvaged, so put nothing you need in it. Nothing you do here can " +
+	"affect a sibling's checkout, so a probe is yours alone. "
+
+func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx int, tag string, ph config.Phase, last bool, prev *harness.Result, t Target, prior spend, phases []config.Phase, panel panelState, opts phaseRunOpts) (tokens int, cost float64, stop bool, end phaseEnd, err error) {
 	tc := d.targetCfg(t)
 	// captured is this phase as the sequence was captured at drain start, before
 	// a handoff respawn replaced ph.Prompt with the successor's continuation: the
@@ -4058,6 +4197,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	spawnDir, briefedTask, briefedRepo, serr := d.sessionDir(ctx, t, prev)
 	if serr != nil {
 		return 0, 0, false, end, fmt.Errorf("iteration %d: phase %q: %w", drainNum, ph.Label(phaseIdx), serr)
+	}
+	// CLA-697: a parallel panel member starts in its OWN detached checkout at
+	// the reviewed tip. The repo's resolution above still ran, so the briefed
+	// task/repo and the PR-base probe are the ones it would have had anyway; only
+	// the directory the session runs in (and therefore the tree it can dirty)
+	// differs.
+	if opts.worktree != "" {
+		spawnDir = opts.worktree
 	}
 	// The branch this task's repo PRs target, resolved ONCE per phase like the
 	// spawn directory above, and for the same reason: it does not change between
@@ -4248,6 +4395,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// (CLA-638): plane-read ids and findings, prepended verbatim.
 		if verifyDigest != "" {
 			inv.Prompt = verifyDigest + inv.Prompt
+		}
+		// CLA-697: a parallel member's own checkout is a fact only the driver
+		// knows — the panel brief still says "work in the worktree for branch X",
+		// which is the shared one. State it first, so the session's cwd and its
+		// brief agree.
+		if opts.worktree != "" {
+			inv.Prompt = panelWorktreeNote + inv.Prompt
 		}
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, retries, randomTail())
@@ -4579,7 +4733,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// is what releases them all to the fix phase, and it happens in the
 			// SAME condition below because nextReviewShaped is false only for
 			// the last member (the panel's last phase, when no fix follows).
-			if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && handoff == "" && !nextReviewShaped {
+			if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && handoff == "" && !nextReviewShaped && !opts.panelParallel {
 				if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
 					evidenceOK = false
 					end.reviewCloseFailed = true
@@ -4825,7 +4979,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					// handoff is possible here (detectHandoff refuses an
 					// unobserved claim), so the only skip is a following
 					// review-shaped phase.
-					if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && !nextReviewShaped {
+					if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && !nextReviewShaped && !opts.panelParallel {
 						if cerr := d.closeReviewRound(ctx, t, *claim, review.round); cerr != nil {
 							evidenceOK = false
 							evidenceWhy = fmt.Sprintf("review round %d could not be closed (%v) — refusing the checkpoint, because the fix phase would be spawned against findings the plane still has sealed", review.round, cerr)

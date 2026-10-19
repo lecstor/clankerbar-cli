@@ -115,9 +115,10 @@ const ReviewRoundCap = 3
 
 // The review panel (CLA-639, design §5.4 / A4 / B10). When a config SETS
 // `review_panel`, each built-in review phase expands into ONE review phase PER
-// MEMBER, run sequentially against the same reviewed tip, each writing its own
-// sealed durable record under its own reviewer role (`review-1`..`review-N`, by
-// member position). The round closes only once every member has recorded or been
+// MEMBER, run against the same reviewed tip, each writing its own sealed durable
+// record under its own reviewer role (`review-1`..`review-N`, by member
+// position). The members run concurrently by default, in private detached
+// worktrees; see ReviewPanelConcurrency. The round closes only once every member has recorded or been
 // recorded as failed — a sealed round is what keeps a later member from reading
 // an earlier member's findings, and a usage-limited or dead member therefore does
 // not stop the round.
@@ -131,9 +132,10 @@ const ReviewRoundCap = 3
 //
 // INTERIM, deliberately (B10): task-state-machine build phase 4 removes phase
 // logic from the CLI and routes findings as an `agent_review -> implementing`
-// plane transition, and parallel reviewers on one task need panel membership as
-// PLANE phase state (that is the CLA-454 reshape). Until then the panel is local
-// config and the members run one after another.
+// plane transition, and panel membership becomes PLANE phase state (that is the
+// CLA-454 reshape). Until then the panel is local config and the members run
+// CONCURRENTLY by default (CLA-697), each in its own detached worktree at the
+// reviewed tip; `review_panel_concurrency: 1` restores the sequential sequence
 
 // PanelMemberLabel is the LOG LABEL of the member at position i: the name the
 // operator gave it, or the deterministic `review-<i+1>` derived from its

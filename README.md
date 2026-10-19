@@ -343,6 +343,18 @@ prompt owns its own contract; `review_panel` alongside either is refused rather
 than silently ignored. An empty array (`"review_panel": []`) is refused too:
 removing the key is how you ask for a single reviewer.
 
+Members run **in parallel by default**: the whole panel at once, each in its own
+**detached worktree at the reviewed tip**. The driver creates that checkout (a
+`git worktree add --detach <tip>`), starts the member in it, and removes it when
+the member ends; a dirty member tree is logged and discarded, never salvaged,
+because a review-only session's deliverable is its record and committing its
+probe artifacts would move the tip past the revision every member recorded.
+`review_panel_concurrency` caps how many run at once: `1` is the historical
+sequential behaviour (members then share the task's own worktree), `N` runs at
+most `N`, and an absent key or `0` means the whole panel. The fix phase starts
+only after the join has every member's record — or its INCOMPLETE outcome — and
+then works in the task's own worktree as before.
+
 Each member's reviewer role is **positional** — `review-1` .. `review-N`, counted
 over the review-shaped phases — and that is the role the durable record is keyed
 on. `name` is only the member's log label (it defaults to the same positional
@@ -395,11 +407,20 @@ with evidence, never by dropping a finding another reviewer would have kept.
 The panel is **interim** and local config, like the phase sequencing it
 multiplies (B10). The state-machine reshape moves review sequencing and the
 `agent_review -> implementing` transition onto the plane, where panel membership
-becomes plane phase state; until then the members run sequentially in the CLI
-because parallel reviewers on one task need per-(task, phase) leases the plane
-does not yet model. `clankerbar doctor` prints the resolved panel, with each
-member's harness and model, so an overnight run's review spend is visible before
-it happens.
+becomes plane phase state; until then the CLI owns the fan-out. Members resume
+the **same run** and all heartbeat its one run id: that is safe because a
+heartbeat is an idempotent lease renewal (one `last_heartbeat_at` /
+`heartbeat_count` UPDATE, no version check), and each member's durable record is
+keyed by its **positional role**, so concurrent appends land as distinct rows in
+the one round the plane derives (`max(existing round) + 1` when nothing is
+sealed — deterministic for simultaneous first writers). Membership therefore
+needs no per-(task, phase) leases; what it needs is what ships here: a private
+checkout per member and a join that closes the round before the fix. The cap is
+also the budget breaker's granularity: members are spawned together, so their
+spend reaches the breaker as each one ends, and the cap bounds that overshoot to
+at most `cap - 1` sessions. `clankerbar doctor` prints the resolved panel, with
+each member's harness and model, so an overnight run's review spend is visible
+before it happens.
 
 ### Session-initiated handoff: a boundary the session chooses
 
@@ -539,7 +560,9 @@ non-final review phase out into one review phase per member; see [the review
 panel](#the-review-panel-several-reviewers-one-revision-one-merge) for the
 config, independence and the merge. It is opt-in — with no `review_panel` the
 review phase runs once, as before — and members name their own `harness`/`model`,
-so a panel can span harnesses too.
+so a panel can span harnesses too. The members run concurrently by default, each
+in its own detached worktree; `review_panel_concurrency: 1` restores the
+sequential sequence.
 
 **Do not run `fix` on the review's Claude account.** A fix session that starts
 right after an Opus review can hit the same rolling usage limit the review just
