@@ -1263,23 +1263,6 @@ const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of "
 	"that had to reach outside its own area), never the default." + rerunGuidance + reviewTerminalStep +
 	handoffGuidance
 
-// reviewOnlyBrief is the review phase's brief when a LATER phase will apply its
-// findings (the shipped [implement, review, fix] sequence). It is the split's
-// whole point: the expensive model reads and judges, and changes nothing.
-//
-// A final `review` phase keeps the historical review-AND-fix brief
-// (builtinPhasePrompts[ReviewPhaseName]) so a two-phase config written before
-// this split keeps reaching in_review instead of silently stopping at a
-// checkpoint with no successor. The position, not a second name, selects the
-// mode; EffectivePhases resolves it, and the driver's variant selection matches
-// on the resolved prompt text.
-//
-// "Review only" is enforced as a scope, not a capability: the phase is told what
-// it may not do, and the fix phase is told to treat any fix it did not make as
-// its own job by ID. A session that edits anyway is a failure the fix phase can
-// still absorb - it re-reads the branch - which is why the prohibition is worded
-// as the default rather than as an impossible act.
-//
 // reviewGateScope defines what "run the adversarial review gate" means for a
 // review-only phase, and what it does NOT mean (CLA-696).
 //
@@ -1321,6 +1304,23 @@ const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase
 	"one) before you record. The panel shares this one worktree, so an artifact left behind is the next member's " +
 	"- and the fix phase's - dirty tree. "
 
+// reviewOnlyBrief is the review phase's brief when a LATER phase will apply its
+// findings (the shipped [implement, review, fix] sequence). It is the split's
+// whole point: the expensive model reads and judges, and changes nothing.
+//
+// A final `review` phase keeps the historical review-AND-fix brief
+// (builtinPhasePrompts[ReviewPhaseName]) so a two-phase config written before
+// this split keeps reaching in_review instead of silently stopping at a
+// checkpoint with no successor. The position, not a second name, selects the
+// mode; EffectivePhases resolves it, and the driver's variant selection matches
+// on the resolved prompt text.
+//
+// "Review only" is enforced as a scope, not a capability: the phase is told what
+// it may not do, and the fix phase is told to treat any fix it did not make as
+// its own job by ID. A session that edits anyway is a failure the fix phase can
+// still absorb - it re-reads the branch - which is why the prohibition is worded
+// as the default rather than as an impossible act.
+//
 // The brief is composed of a CORE plus a record shape and an ending, so the
 // panel member's variant (CLA-639 M5) can reuse the core verbatim and swap only
 // the two halves that differ: the panel member writes the durable record and
