@@ -113,47 +113,27 @@ const (
 // be a sequence with no bound at all.
 const ReviewRoundCap = 3
 
-// The review panel (CLA-639, design §5.4 / A4 / B10). Every configured review
-// phase expands into ONE review phase PER MEMBER, run sequentially against the
-// same reviewed tip, each writing its own sealed durable record under its own
-// reviewer role (`review-1`..`review-N`, by member position). The round closes
-// only once every member has recorded or been recorded as failed — a sealed
-// round is what keeps a later member from reading an earlier member's findings,
-// and a usage-limited or dead member therefore does not stop the round.
+// The review panel (CLA-639, design §5.4 / A4 / B10). When a config SETS
+// `review_panel`, each built-in review phase expands into ONE review phase PER
+// MEMBER, run sequentially against the same reviewed tip, each writing its own
+// sealed durable record under its own reviewer role (`review-1`..`review-N`, by
+// member position). The round closes only once every member has recorded or been
+// recorded as failed — a sealed round is what keeps a later member from reading
+// an earlier member's findings, and a usage-limited or dead member therefore does
+// not stop the round.
+//
+// OPT-IN, and shipped with NO model-naming default and NO preset: the CLI cannot
+// know which harnesses, providers or models an operator has, so it never names
+// one (decision a0b1373b, superseding the trial panel of c8e7509a). A config
+// that sets no panel runs its one review phase as it always has — the historical
+// brief, the historical `review-1` role, the legacy fix path, byte for byte. See
+// Config.ReviewPanel.
 //
 // INTERIM, deliberately (B10): task-state-machine build phase 4 removes phase
 // logic from the CLI and routes findings as an `agent_review -> implementing`
 // plane transition, and parallel reviewers on one task need panel membership as
 // PLANE phase state (that is the CLA-454 reshape). Until then the panel is local
 // config and the members run one after another.
-const (
-	// TrialReviewPanelName is the trial panel the operator chose from a measured
-	// evaluation (decision c8e7509a), applied when a config names no panel of its
-	// own: opencode-go/gpt-6-luna three times plus opencode-go/glm-5.3-flash
-	// once, on EVERY task. The duplicates are independent runs, not redundancy to
-	// be pruned (see ReviewPanelMember).
-	TrialReviewPanelName = "trial"
-)
-
-// trialReviewPanel is TrialReviewPanelName as the members themselves. The
-// harness/model pairs are copied verbatim from the operator's decision
-// (`opencode-go/...` is the provider prefix inside the MODEL id the opencode
-// harness takes, not a harness name — the registry has one opencode adapter).
-// The names make each member's role, log line and durable record legible
-// (`review-2` is the second gpt-6-luna run, not "a review").
-var trialReviewPanel = []ReviewPanelMember{
-	{Name: "review-1", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},
-	{Name: "review-2", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},
-	{Name: "review-3", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},
-	{Name: "review-4", Harness: "opencode", Model: "opencode-go/glm-5.3-flash"},
-}
-
-// TrialReviewPanel returns the trial panel by value, for a caller (the docs
-// tests, an operator's generated config) that wants to spell out what an unset
-// review_panel resolves to.
-func TrialReviewPanel() []ReviewPanelMember {
-	return append([]ReviewPanelMember(nil), trialReviewPanel...)
-}
 
 // PanelMemberName is the reviewer role of the member at position i: the name the
 // operator gave it, or the deterministic `review-<i+1>` derived from its
@@ -313,9 +293,8 @@ func (p Phase) ConfiguredIndex() int { return p.sourceIdx }
 // A member is NOT a session: the driver still runs one review phase per member,
 // sequentially, and each writes its own sealed durable record under its own
 // reviewer role (see Config.ReviewPanel). Two entries naming the same
-// harness/model are two INDEPENDENT REVIEWS of the same revision — that is the
-// point of the duplicates in the trial panel — never a mistake to be
-// deduplicated.
+// harness/model are two INDEPENDENT REVIEWS of the same revision — never a
+// mistake to be deduplicated.
 type ReviewPanelMember struct {
 	// Name is the member's log label AND its reviewer role. Empty = the driver
 	// derives it from the member's position: `review-1` .. `review-N`. The
@@ -1941,17 +1920,31 @@ type Config struct {
 	// two prompts their sessions are actually being handed.
 	Phases []Phase `json:"phases"`
 
-	// ReviewPanel is the ordered list of independent reviewers every review
-	// phase expands into (CLA-639). Empty/absent = the TRIAL panel
-	// (trialReviewPanel): the operator chose it from a measured evaluation and
-	// put it on every task (decision c8e7509a). An explicitly EMPTY array
-	// (`"review_panel": []`) is the opt-out that keeps a config's single
-	// `review` phase a single review, byte for byte as before this feature.
+	// ReviewPanel is the ordered list of independent reviewers a built-in review
+	// phase expands into (CLA-639). There is NO default and NO preset: the CLI
+	// cannot know which harnesses, providers or models an operator has, so it
+	// never names one (decision a0b1373b).
+	//
+	// ABSENT = one reviewer, exactly as before this feature: the config's own
+	// review phase runs once, on the harness/model the config already gives it,
+	// with the historical brief, the historical `review-1` role and the legacy
+	// single-review fix path — byte for byte.
+	//
+	// SET = those members, and only those: any number, the same model allowed
+	// more than once (each entry is an independent run). The panel applies to a
+	// BUILT-IN review phase (no prompt of its own) that is not the last phase —
+	// the read-only gate. A final review phase (the historical review-and-fix
+	// brief) never expands, and a review phase with its own prompt owns its own
+	// contract; Validate refuses the combination rather than letting the panel
+	// silently not apply.
+	//
+	// An explicitly EMPTY array (`"review_panel": []`) is a half-edited config
+	// rather than an opt-out, and Validate refuses it — the opt-out is to remove
+	// the key. Read through Config.EffectivePanel.
 	//
 	// The panel hangs off the review PHASE, not the sequence, because that is
 	// what it multiplies: `phases` still reads [implement, review, fix], the
-	// config still has one review, and the driver is what fans it out. Read
-	// through Config.EffectivePanel, which applies the trial default.
+	// config still has one review, and the driver is what fans it out.
 	//
 	// INTERIM placement (B10, A7): the panel is local config because phases are,
 	// until CLA-598 moves the sequence onto the plane and the state-machine
@@ -1963,8 +1956,8 @@ type Config struct {
 	// reviewPanelSet records that the config FILE named `review_panel`, so
 	// Validate can tell two shapes apart that the slice alone cannot: an operator
 	// who wrote `"review_panel": []` (a panel of none — refused, because it is
-	// almost certainly a half-edited config) and a program-built Config whose
-	// nil panel means "the default". Load is the only writer.
+	// almost certainly a half-edited config) and a config that never mentioned
+	// the key (nil, the single reviewer). Load is the only writer.
 	reviewPanelSet bool
 
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
@@ -2807,16 +2800,28 @@ func (c *Config) expandsReviewPanel() bool {
 	return false
 }
 
-// EffectivePanel is the review panel this config actually runs: the operator's
-// own list when they wrote one, the TRIAL panel when the key is absent. A config
-// built in Go (a test, the supervisor's base config) cannot say "absent but
-// default me" other than by leaving the field nil, so nil means the trial panel
-// at both entry points; a FILE that writes `"review_panel": []` is refused by
-// Validate instead of silently meaning either thing.
-func (c *Config) EffectivePanel() []ReviewPanelMember {
-	if c.ReviewPanel == nil {
-		return trialReviewPanel
+// reviewPhaseHarness is the harness a panel member with none of its own
+// inherits: the REVIEW phase's, which is itself the run-wide harness when that
+// phase names none — exactly the chain EffectivePhases' panelMember copies into
+// each member. The FIRST built-in review phase is the one that expands, so it is
+// the one whose harness a member inherits; nothing here assumes a review phase
+// exists (the caller checks).
+func (c *Config) reviewPhaseHarness() string {
+	for _, ph := range c.Phases {
+		if ph.Prompt == "" && ph.Name == ReviewPhaseName {
+			return c.HarnessFor(ph)
+		}
 	}
+	return c.Harness
+}
+
+// EffectivePanel is the review panel this config actually runs: the operator's
+// own list, and nothing else — an absent key (nil) means the historical single
+// review, not a panel of one (decision a0b1373b). There is no trial panel and no
+// preset: the CLI cannot know which harnesses, providers or models an operator
+// has, so it never names one. A FILE that writes `"review_panel": []` is refused
+// by Validate rather than silently meaning either thing (reviewPanelSet).
+func (c *Config) EffectivePanel() []ReviewPanelMember {
 	return c.ReviewPanel
 }
 
@@ -2903,9 +2908,12 @@ func (c *Config) EffectivePhases() []Phase {
 		// PANEL MEMBER, so every consumer of the effective sequence — the
 		// driver's spawn loop, its seam, doctor — sees the reviewers that
 		// actually run rather than a single review the driver would have to
-		// remember to multiply. A phase carrying its own prompt is not expanded:
-		// a custom review prompt owns its own contract, and Validate refuses the
-		// combination rather than letting a panel silently not apply.
+		// remember to multiply. The panel is what the operator SET: an absent
+		// `review_panel` expands nothing (the single reviewer, as before), a
+		// phase carrying its own prompt is not expanded either (a custom review
+		// prompt owns its own contract), and a FINAL review keeps the historical
+		// combined brief — Validate refuses a configured panel in either of
+		// those two shapes rather than letting it silently not apply.
 		if len(panel) > 0 && srcIdx < len(c.Phases) && c.Phases[srcIdx].Prompt == "" && ph.Name == ReviewPhaseName {
 			for i := range panel {
 				member := ph.panelMember(panel, i)
@@ -3266,9 +3274,10 @@ func Load(path string) (*Config, error) {
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", p, err)
 	}
-	// CLA-639: whether the file named `review_panel` at all. Nil after unmarshal
-	// means "absent" and resolves to the trial panel; a present-but-empty array
-	// is the operator's own panel of none, which Validate refuses.
+	// CLA-639: whether the file named `review_panel` at all. A present-but-empty
+	// array is the operator's own panel of none, which Validate refuses; absent
+	// (nil after unmarshal) is the single reviewer, exactly as before the panel
+	// existed.
 	var probe map[string]json.RawMessage
 	if err := json.Unmarshal(data, &probe); err == nil {
 		_, cfg.reviewPanelSet = probe["review_panel"]
@@ -3672,24 +3681,27 @@ func (c *Config) Validate() error {
 	// here for the same reason: the alternative is a paid review session with
 	// none of its harness's fields, or one that dies on a name nothing answers
 	// to, discovered at 3am rather than at startup.
-	// An empty panel is refused when it would MEAN something — a phased config
-	// with a built-in review phase to expand. With no such phase the panel is
-	// inert (a config with its own review prompt owns its contract, an unphased
-	// config has no phase sequence at all), and refusing it would break the
-	// marshalled round trip of a config that never mentioned a panel.
-	if c.reviewPanelSet && len(c.ReviewPanel) == 0 && c.expandsReviewPanel() {
+	//
+	// Validation runs on the EFFECTIVE panel: a member with no harness of its own
+	// inherits the REVIEW phase's, so that inherited harness is checked here too
+	// (the phase rules above resolve it to the run-wide harness when the phase
+	// names none, so there is exactly one answer).
+	//
+	// An empty panel is refused when it is the key the FILE wrote and it would
+	// MEAN something — a phased config with a built-in review phase to expand.
+	// With no such phase the panel is inert (a config with its own review prompt
+	// owns its contract, an unphased config has no phase sequence at all) and
+	// refusing it would break the marshalled round trip of a config that never
+	// mentioned a panel.
+	if c.reviewPanelSet && len(c.EffectivePanel()) == 0 && c.expandsReviewPanel() {
 		return errors.New("review_panel is empty: a panel is one or more reviewers, each run as its own review phase " +
-			"(remove the key for the trial panel, or drop `review_panel`)")
+			"(remove the key for a single reviewer, or list the members)")
 	}
-	// A member with no harness inherits the REVIEW phase's — which the phase
-	// rules above already validated — so every harness a panel runs on is either
-	// named and checked here or inherited and checked there. Nothing is inferred
-	// silently: the spawn line stamps the resolved name.
-	for i, m := range c.ReviewPanel {
-		role := PanelMemberName(c.ReviewPanel, i)
+	for i, m := range c.EffectivePanel() {
+		role := PanelMemberName(c.EffectivePanel(), i)
 		h := strings.TrimSpace(m.Harness)
 		if h == "" {
-			continue
+			h = c.reviewPhaseHarness()
 		}
 		if !harness.Known(h) {
 			return fmt.Errorf("review_panel[%d] (%q): unknown harness %q (want: %s)%s",
@@ -3706,17 +3718,19 @@ func (c *Config) Validate() error {
 				i, role, h, h, h)
 		}
 	}
-	// A panel multiplies the review phase, so a config that names one but writes
-	// its own review prompt is two contracts for one phase. Refused rather than
-	// resolved: silently running the operator's prompt once would make the panel
-	// a no-op they could only discover from the log, and silently replacing it
-	// would throw away the brief they did write.
-	for i, ph := range c.Phases {
-		if len(c.EffectivePanel()) > 0 && ph.Prompt != "" && ph.Name == ReviewPhaseName {
-			return fmt.Errorf("phases[%d]: the %q phase carries its own prompt, so it is not expanded into a review "+
-				"panel — a panel reviews under the shipped review briefs. Remove `review_panel` to keep this brief, "+
-				"or drop the phase's `prompt` to use the panel", i, ReviewPhaseName)
-		}
+	// A panel multiplies the review phase, so a config that names one but has a
+	// review phase it cannot multiply is two contracts for one sequence. Refused
+	// rather than resolved: a FINAL review runs the historical combined brief and
+	// a review phase with its own prompt owns its own contract, so in either
+	// shape the panel would be a no-op the operator could only discover from the
+	// log. An UNPHASED config has no phase sequence at all — the key is inert
+	// there, not a no-op a run could have honoured.
+	if len(c.EffectivePanel()) > 0 && len(c.Phases) > 0 && !c.expandsReviewPanel() {
+		return fmt.Errorf("review_panel is set, but the sequence has no built-in, non-final %q phase to expand: "+
+			"a panel needs a built-in %q phase with a phase after it (the fix), because a FINAL review runs the "+
+			"historical combined brief and a review phase with its own prompt owns its own contract. Remove "+
+			"`review_panel` for a single reviewer, or make the review built-in and give it a phase after it",
+			ReviewPhaseName, ReviewPhaseName)
 	}
 	// Phases rest on EVERY phase's adapter observing the session's claim, not only
 	// the claiming one's.

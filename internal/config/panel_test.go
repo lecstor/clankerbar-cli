@@ -3,23 +3,10 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
-
-// The single-review opt-out (CLA-639) as a fixture helper.
-//
-// A review PANEL expands each built-in review phase into one review phase per
-// member, and an unset `review_panel` resolves to the trial panel (the operator
-// chose it for every task: decision c8e7509a). The other fixtures pin the
-// sequence BEFORE that expansion — one review, one record, one seam — so they
-// say so out loud here rather than leaning on the field's zero value (nil means
-// TRIAL, not "none"). Go-built configs may spell the opt-out directly; a FILE
-// that writes `"review_panel": []` is refused instead (reviewPanelSet).
-func noPanel(c *Config) *Config {
-	c.ReviewPanel = []ReviewPanelMember{}
-	return c
-}
 
 // writePanelConfig writes a config file through Load's own path so the JSON
 // round trip — including how "absent" differs from "empty" — is the real one.
@@ -36,10 +23,11 @@ func writePanelConfig(t *testing.T, body string) *Config {
 	return cfg
 }
 
-// TestReviewPanel_TrialDefault: a config that never mentions a panel runs the
-// operator's trial panel on every task (decision c8e7509a) — three runs of
-// gpt-6-luna and one of glm-5.3-flash, each an independent review phase.
-func TestReviewPanel_TrialDefault(t *testing.T) {
+// TestReviewPanel_AbsentIsTheSingleReviewer (CLA-639, decision a0b1373b): a
+// config that never mentions a panel is the shape that existed before this
+// feature — ONE review phase, with no expansion, no panel members and no roles
+// beyond `review-1`. The panel is opt-in; there is no default and no preset.
+func TestReviewPanel_AbsentIsTheSingleReviewer(t *testing.T) {
 	cfg := writePanelConfig(t, `{
 		"harness": "opencode",
 		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
@@ -47,42 +35,24 @@ func TestReviewPanel_TrialDefault(t *testing.T) {
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("a config that never mentions a panel must validate: %v", err)
 	}
-	panel := cfg.EffectivePanel()
-	if len(panel) != 4 {
-		t.Fatalf("the trial panel has %d members, want 4", len(panel))
+	if panel := cfg.EffectivePanel(); len(panel) != 0 {
+		t.Fatalf("an absent review_panel resolved to %d members, want none — the CLI ships no panel of its own", len(panel))
 	}
-	var luna, glm int
-	for _, m := range panel {
-		if m.Harness != "opencode" {
-			t.Errorf("member %q runs on harness %q, want opencode", PanelMemberName(panel, 0), m.Harness)
-		}
-		switch m.Model {
-		case "opencode-go/gpt-6-luna":
-			luna++
-		case "opencode-go/glm-5.3-flash":
-			glm++
-		}
-	}
-	if luna != 3 || glm != 1 {
-		t.Errorf("trial panel models = %d x gpt-6-luna + %d x glm-5.3-flash, want 3 + 1", luna, glm)
-	}
-	// And the effective sequence is what the driver iterates: implement + four
-	// reviewers + fix, each reviewer under its own role.
 	got := cfg.EffectivePhases()
-	if len(got) != 6 {
-		t.Fatalf("effective phases = %d, want 6 (implement, four reviewers, fix)", len(got))
+	if len(got) != 3 {
+		t.Fatalf("effective phases = %d, want 3 (implement, review, fix) — the review must not be multiplied", len(got))
 	}
-	wantRoles := []string{"review-1", "review-2", "review-3", "review-4"}
-	for i, role := range wantRoles {
-		if got[i+1].Name != role || !got[i+1].IsPanelMember() {
-			t.Errorf("phase %d = %q (panel=%v), want panel member %q", i+1, got[i+1].Name, got[i+1].IsPanelMember(), role)
-		}
-		if got[i+1].Prompt == "" {
-			t.Errorf("%s resolved to no prompt — the member inherits the review phase's brief", role)
-		}
+	if got[1].Name != ReviewPhaseName || got[1].IsPanelMember() {
+		t.Errorf("phase 1 = %q (panel=%v), want the operator's own %q phase", got[1].Name, got[1].IsPanelMember(), ReviewPhaseName)
 	}
-	if got[5].Name != FixPhaseName || got[5].IsPanelMember() {
-		t.Errorf("the fix phase was swallowed by the expansion: %q (panel=%v)", got[5].Name, got[5].IsPanelMember())
+	if got[1].Prompt != reviewOnlyBrief {
+		t.Errorf("the single review did not resolve to the historical review-only brief")
+	}
+	if got[1].Name != "review" {
+		t.Errorf("the single review phase = %q, want the configured name %q — the historical reviewer role derives from it", got[1].Name, ReviewPhaseName)
+	}
+	if got[2].Prompt != fixBrief {
+		t.Errorf("the fix after the single review did not resolve to the legacy fix brief — the legacy fix path is what an absent panel must keep")
 	}
 }
 
@@ -124,8 +94,58 @@ func TestReviewPanel_ExplicitMembers(t *testing.T) {
 	}
 }
 
-// TestReviewPanel_ValidationRefusals pins the two refusals the task names: an
-// empty panel, and a member whose harness is not configured.
+// TestReviewPanel_FourMembersExpand expands the operator's own four-member
+// shape: the same model three times plus another once (decision c8e7509a's
+// fleet, spelled out — an EXAMPLE, not a default), each an independent review
+// phase on the same configured review.
+func TestReviewPanel_FourMembersExpand(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [
+			{"harness": "opencode", "model": "opencode-go/gpt-6-luna"},
+			{"harness": "opencode", "model": "opencode-go/gpt-6-luna"},
+			{"harness": "opencode", "model": "opencode-go/gpt-6-luna"},
+			{"harness": "opencode", "model": "opencode-go/glm-5.3-flash"}
+		]
+	}`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	if panel := cfg.EffectivePanel(); len(panel) != 4 {
+		t.Fatalf("the configured panel has %d members, want 4", len(panel))
+	}
+	got := cfg.EffectivePhases()
+	if len(got) != 6 {
+		t.Fatalf("effective phases = %d, want 6 (implement, four reviewers, fix)", len(got))
+	}
+	var luna, glm int
+	for i := 1; i <= 4; i++ {
+		ph := got[i]
+		if !ph.IsPanelMember() || ph.Name != "review-"+strconv.Itoa(i) {
+			t.Errorf("phase %d = %q (panel=%v), want panel member review-%d", i, ph.Name, ph.IsPanelMember(), i)
+		}
+		if ph.Prompt != reviewOnlyBrief {
+			t.Errorf("%s did not inherit the review phase's resolved brief (the panel-member variant is swapped in at spawn, by invocationFor)", ph.Name)
+		}
+		switch ph.Model {
+		case "opencode-go/gpt-6-luna":
+			luna++
+		case "opencode-go/glm-5.3-flash":
+			glm++
+		}
+	}
+	if luna != 3 || glm != 1 {
+		t.Errorf("panel members = %d x gpt-6-luna + %d x glm-5.3-flash, want 3 + 1", luna, glm)
+	}
+	if got[5].Name != FixPhaseName || got[5].IsPanelMember() {
+		t.Errorf("the fix phase was swallowed by the expansion: %q (panel=%v)", got[5].Name, got[5].IsPanelMember())
+	}
+}
+
+// TestReviewPanel_ValidationRefusals pins the refusals the operator's decision
+// names: an empty panel, a member whose harness (own or inherited) is not
+// configured, and a panel beside a review phase it cannot multiply.
 func TestReviewPanel_ValidationRefusals(t *testing.T) {
 	base := func(panel string) string {
 		return `{
@@ -139,6 +159,9 @@ func TestReviewPanel_ValidationRefusals(t *testing.T) {
 		err := cfg.Validate()
 		if err == nil || !strings.Contains(err.Error(), "review_panel is empty") {
 			t.Fatalf("Validate() = %v, want a review_panel-is-empty refusal", err)
+		}
+		if !strings.Contains(err.Error(), "remove the key for a single reviewer") {
+			t.Errorf("the empty-panel refusal does not say how to ask for a single reviewer: %v", err)
 		}
 	})
 	t.Run("a member on an unknown harness is refused", func(t *testing.T) {
@@ -155,15 +178,20 @@ func TestReviewPanel_ValidationRefusals(t *testing.T) {
 			t.Fatalf("Validate() = %v, want a missing-harnesses-block refusal", err)
 		}
 	})
-	t.Run("a panelled custom review prompt is refused", func(t *testing.T) {
+	t.Run("a member INHERITING an unconfigured harness is refused", func(t *testing.T) {
+		// The member names no harness, so it reviews on the review phase's —
+		// which the member inherits in turn. Validation runs on the EFFECTIVE
+		// panel, so the inherited harness is held to the same rule as a harness a
+		// member names itself: a harness other than the run-wide one needs a
+		// block of its own, whether the phase names it or inherits it.
 		cfg := writePanelConfig(t, `{
 			"harness": "claude",
-			"phases": [{"name": "implement"}, {"name": "review", "prompt": "my own gate"}, {"name": "fix"}],
-			"review_panel": [{"model": "opus"}]
+			"phases": [{"name": "implement"}, {"name": "review", "harness": "opencode"}, {"name": "fix"}],
+			"review_panel": [{"model": "opencode-go/gpt-6-luna"}]
 		}`)
 		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "its own prompt") {
-			t.Fatalf("Validate() = %v, want the custom-prompt refusal", err)
+		if err == nil || !strings.Contains(err.Error(), "harnesses.opencode") {
+			t.Fatalf("Validate() = %v, want the inherited harness held to the missing-block rule", err)
 		}
 	})
 	t.Run("a configured member harness is accepted", func(t *testing.T) {
@@ -177,6 +205,31 @@ func TestReviewPanel_ValidationRefusals(t *testing.T) {
 			t.Fatalf("Validate() = %v, want a configured opencode member accepted", err)
 		}
 	})
+	t.Run("a panelled custom review prompt is refused", func(t *testing.T) {
+		cfg := writePanelConfig(t, `{
+			"harness": "claude",
+			"phases": [{"name": "implement"}, {"name": "review", "prompt": "my own gate"}, {"name": "fix"}],
+			"review_panel": [{"model": "opus"}]
+		}`)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "built-in") {
+			t.Fatalf("Validate() = %v, want the panel-needs-a-built-in-review refusal", err)
+		}
+	})
+	t.Run("a panelled FINAL review is refused", func(t *testing.T) {
+		// The review is final, so it runs the historical review-and-fix brief and
+		// never expands; a panel beside it is a no-op the operator could only
+		// discover from the log.
+		cfg := writePanelConfig(t, `{
+			"harness": "claude",
+			"phases": [{"name": "implement"}, {"name": "review"}],
+			"review_panel": [{"model": "opus"}]
+		}`)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "built-in, non-final") {
+			t.Fatalf("Validate() = %v, want the final-review refusal", err)
+		}
+	})
 }
 
 // TestReviewPanel_NoPanelWithoutAReviewPhase: a config with no phased review has
@@ -186,6 +239,24 @@ func TestReviewPanel_NoPanelWithoutAReviewPhase(t *testing.T) {
 	cfg := &Config{Harness: "claude", Prompt: "Work the backlog."}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("an unphased config must validate: %v", err)
+	}
+	if got := cfg.EffectivePhases(); len(got) != 1 {
+		t.Fatalf("an unphased run resolved to %d phases, want 1", len(got))
+	}
+}
+
+// TestReviewPanel_UnphasedConfigWithAPanelStaysInert: an unphased run has no
+// phase sequence at all, so there is nothing for a panel to multiply; the key
+// is inert rather than refused (the marshalled round trip of a config that
+// never mentioned one must survive).
+func TestReviewPanel_UnphasedConfigWithAPanelStaysInert(t *testing.T) {
+	cfg := &Config{
+		Harness:     "claude",
+		Prompt:      "Work the backlog.",
+		ReviewPanel: []ReviewPanelMember{{Model: "opus"}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("an unphased config with an inert panel must validate: %v", err)
 	}
 	if got := cfg.EffectivePhases(); len(got) != 1 {
 		t.Fatalf("an unphased run resolved to %d phases, want 1", len(got))
