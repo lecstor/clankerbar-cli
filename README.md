@@ -1291,7 +1291,9 @@ its stream and lands in the log with the rest of it.
 The fleet supervisor keeps its own lines the same way, in
 **`<supervisor state dir>/supervise.log`** (`~/.local/state/clankerbar/loop/roster/supervise.log`
 by default, size-rotated on the same terms) — refuse-to-start reasons, spawn
-failures, exits and backoff, and the per-change fleet status listing. Children's
+failures, exits and backoff, and the per-change fleet status listing. That is the
+long-lived `clankerbar supervise` process; the one-shot `supervise roll` and
+`supervise replace` write their own lines to stderr only, and exit. Children's
 stderr still streams to the supervisor's own terminal, as before.
 
 ### Fleet visibility

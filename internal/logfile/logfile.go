@@ -102,17 +102,55 @@ func Install(dir, name string) (restore func(), err error) {
 		return nil, err
 	}
 	prev := log.Writer()
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	log.SetOutput(Tee(os.Stderr, f))
 	return func() {
 		log.SetOutput(prev)
 		_ = f.Close()
 	}, nil
 }
 
+// Tee sends every write to BOTH sinks, independently: neither sink's failure
+// keeps the bytes out of the other, and both are attempted before either error
+// is reported.
+//
+// It is deliberately not io.MultiWriter, which stops at the first failing sink
+// and drops the rest of that write. Wired the MultiWriter way, a terminal whose
+// reader has gone (the daemon's parent closed its inherited stderr: EPIPE, and
+// the standard logger ignores the error it gets back) would silently cost the
+// DURABLE copy of every line after it — the exact loss this package exists to
+// prevent. The file is the sink that must survive, so the terminal is written
+// first and its failure reported only once the file has had its bytes.
+func Tee(a, b io.Writer) io.Writer { return tee{a: a, b: b} }
+
+type tee struct {
+	a, b io.Writer
+}
+
+func (t tee) Write(p []byte) (int, error) {
+	_, errA := t.a.Write(p)
+	n, errB := t.b.Write(p)
+	switch {
+	case errA != nil && errB != nil:
+		// Neither sink took the line: report both, so a diagnostic naming one
+		// failure does not hide the other.
+		return n, errors.Join(errA, errB)
+	case errA != nil:
+		return n, errA
+	default:
+		return n, errB
+	}
+}
+
 // Write appends p, rotating first when the record would take the file past its
-// bound. A rotation that fails is reported (once) and the bytes are appended to
-// the file that is still open, so a full or read-only directory loses the
-// bound, never the line.
+// bound. A rotation that fails is reported (once per failure streak) and the
+// bytes are appended through the handle that is still open, so a full or
+// read-only directory loses the bound, never the line.
+//
+// When a rotation leaves NO usable handle — the rename landed and the reopen
+// could not create the replacement, or the truncating `keep: 1` mode could not
+// start its file again — the write is refused with an error instead of being
+// attempted on a nil file. A logging failure must degrade the log, never take
+// the daemon down with a panic.
 func (l *File) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -120,7 +158,9 @@ func (l *File) Write(p []byte) (int, error) {
 		return 0, errors.New("log: file is closed")
 	}
 	if l.size > 0 && l.size+int64(len(p)) > l.max {
-		l.rotate()
+		if err := l.rotate(); err != nil {
+			return 0, err
+		}
 	}
 	n, err := l.f.Write(p)
 	l.size += int64(n)
@@ -141,42 +181,77 @@ func (l *File) Close() error {
 
 // rotate shifts NAME -> NAME.1 -> NAME.2 ... and starts a fresh NAME, keeping
 // at most keep files in total (so keep = 1 means the file is truncated).
-// Errors are reported through warnf rather than failing the write: the open
-// handle is left usable, appending, and the next rotation attempt tries again.
-func (l *File) rotate() {
-	if l.f != nil {
-		_ = l.f.Close()
-		l.f = nil
-	}
+// Errors are reported through warnf rather than failing the write, and the
+// rotate returns an error only when NO file is left to write to — the single
+// case Write must not follow with a write through a nil handle.
+//
+// A rotation that fails after the rename leaves the previously open file (now
+// NAME.1) as the handle: appending there loses the bound, never the line, and
+// the next rotation attempt tries again. Only the truncating mode cannot do
+// that — it has already removed the file the handle pointed at — so there a
+// failed reopen is returned and the caller degrades to reporting it.
+func (l *File) rotate() error {
+	old := l.f
+	l.f = nil
 	if l.keep <= 1 {
-		if err := os.Remove(l.path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			l.warnf("cannot truncate %s (%v)", l.path, err)
+		rmErr := os.Remove(l.path)
+		unlinked := rmErr == nil
+		if rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			l.warnf("cannot truncate %s (%v)", l.path, rmErr)
 		}
 		if err := l.reopen(false); err != nil {
 			l.warnf("cannot reopen %s (%v)", l.path, err)
+			if unlinked {
+				// We unlinked the file ourselves and could not create its
+				// replacement. The handle still names an inode no reader can
+				// reach, so writing there would lose the line invisibly — and
+				// l.f is nil, which Write must never follow with a write. Refuse
+				// the write instead, and leave the daemon running.
+				if old != nil {
+					_ = old.Close()
+				}
+				return fmt.Errorf("log %s: cannot reopen after rotation: %w", l.path, err)
+			}
+			// Nothing was removed — the removal failed, or the name was already
+			// absent (the file has moved with its directory) — so the handle is
+			// still the best place for the line: keep it rather than the bound.
+			l.f = old
+			return nil
 		}
-		return
-	}
-	ok := true
-	// Oldest first, so a failure part-way does not shred the newest files.
-	_ = os.Remove(l.rotated(l.keep - 1))
-	for i := l.keep - 2; i >= 1; i-- {
-		if err := os.Rename(l.rotated(i), l.rotated(i+1)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			ok = false
-			l.warnf("cannot rotate %s (%v)", l.rotated(i), err)
-			break
+	} else {
+		ok := true
+		// Oldest first, so a failure part-way does not shred the newest files.
+		_ = os.Remove(l.rotated(l.keep - 1))
+		for i := l.keep - 2; i >= 1; i-- {
+			if err := os.Rename(l.rotated(i), l.rotated(i+1)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				ok = false
+				l.warnf("cannot rotate %s (%v)", l.rotated(i), err)
+				break
+			}
+		}
+		if ok {
+			if err := os.Rename(l.path, l.rotated(1)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				l.warnf("cannot rotate %s (%v)", l.path, err)
+			}
+		}
+		// Reopen for appending whatever happened: if the rename failed, the old file
+		// is still there and the write continues in it.
+		if err := l.reopen(false); err != nil {
+			l.warnf("cannot reopen %s (%v)", l.path, err)
+			// Keep writing through the handle we already had (the rotated file)
+			// rather than leaving the file nil: a rotation failure must not cost
+			// the line, and it must never become a nil dereference.
+			l.f = old
+			return nil
 		}
 	}
-	if ok {
-		if err := os.Rename(l.path, l.rotated(1)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			l.warnf("cannot rotate %s (%v)", l.path, err)
-		}
+	if old != nil {
+		_ = old.Close()
 	}
-	// Reopen for appending whatever happened: if the rename failed, the old file
-	// is still there and the write continues in it.
-	if err := l.reopen(false); err != nil {
-		l.warnf("cannot reopen %s (%v)", l.path, err)
-	}
+	// The rotation succeeded, so the streak is over: a file that breaks again
+	// later is a NEW failure and gets its own warning.
+	l.warned = false
+	return nil
 }
 
 // reopen opens the current file for appending, recording its size. When
@@ -220,7 +295,10 @@ func (l *File) rotated(i int) string {
 // warnf reports a rotation problem to a side channel without recursing into
 // the logger that owns this writer (a log failure must not log through the
 // logger that just failed). Stderr is the same channel the daemon's earlier
-// output went to, and it is only reached once per failure streak.
+// output went to, and it is reached at most once per failure STREAK: warned is
+// cleared by the next successful rotation, so a directory that breaks, is fixed
+// and breaks again is reported again, while a directory that stays broken is
+// reported once rather than on every line.
 func (l *File) warnf(format string, args ...any) {
 	if l.warned {
 		return

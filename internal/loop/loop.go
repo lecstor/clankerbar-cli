@@ -35,6 +35,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/logfile"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/salvage"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
@@ -4299,21 +4300,31 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				echo = os.Stderr
 			}
 		}
+		// sink names where the stream actually LANDS, on the spawn line the
+		// operator joins the daemon log and the transcript by: whenever the
+		// iteration log could not be opened (ferr != nil) there is no such file
+		// to send a reader to, so the sink says so and names the fallback
+		// instead of a path that was never created.
+		sink := "log: " + logPath
 		switch {
 		case ferr == nil && echo != nil:
-			inv.Console = io.MultiWriter(echo, f)
+			// Both sinks get the stream, INDEPENDENTLY: a terminal that has gone
+			// away must not cost the iteration log the chunk it would have
+			// received — io.MultiWriter stops at the first failing writer, which
+			// is the order that fails worst here (echo first, file second).
+			inv.Console = logfile.Tee(echo, f)
 		case ferr == nil:
 			inv.Console = f
 		case echo != nil:
 			// No log file: keep the live view rather than swallow the session.
 			inv.Console = echo
-			log.Printf("could not open iteration log %s: %v", logPath, ferr)
+			sink = fmt.Sprintf("log: none (could not open %s: %v - the session's stream goes to the terminal)", logPath, ferr)
 		default:
 			// No file and no echo: the stream has nowhere to go. Say so once —
 			// the daemon's own lines still land in daemon.log — rather than
 			// failing a paid session over its transcript.
 			inv.Console = io.Discard
-			log.Printf("could not open iteration log %s: %v - the session's stream is discarded (the daemon log still records its own lines)", logPath, ferr)
+			sink = fmt.Sprintf("log: none (could not open %s: %v - the session's stream is discarded; the daemon log still records its own lines)", logPath, ferr)
 		}
 		// The spawn line stamps what the session was actually spawned WITH:
 		// phase and the resolved model id inv.Model carries (ModelForPhase's
@@ -4323,9 +4334,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// evidence: no explicit model was configured at spawn time, and the
 		// harness ran its own default.
 		if retries == 0 {
-			log.Printf("iteration %d %s- spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
+			log.Printf("iteration %d %s- spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), inv.Model, sink)
 		} else {
-			log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s log: %s)", drainNum, labelOf(t), retries, a.Name(), ph.Label(phaseIdx), inv.Model, logPath)
+			log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), retries, a.Name(), ph.Label(phaseIdx), inv.Model, sink)
 		}
 
 		// CLA-358: while THIS child runs, renew whatever task-lease it holds.
@@ -4944,7 +4955,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// A run failure that was not an exit status — a launch failure, or one
 			// of the deaths in Wait above — ends the attempt without any retry
 			// classification. Not a blip.
-			return tokens, cost, false, end, fmt.Errorf("invoke %s: %w", a.Name(), ierr)
+			return tokens, cost, false, end, fmt.Errorf("invoke %s: %w (log: %s)", a.Name(), ierr, logPath)
 		}
 
 		// A session whose stream could not be read whole (CLA-262). Everything below
@@ -4959,7 +4970,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// either (recordPassSpend runs only where the loop counts an attempt),
 			// so the record says "unknown" instead of publishing a FLOOR from a
 			// stream with a hole in it as if it were a report.
-			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), res, tokens, cost)
+			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), logPath, res, tokens, cost)
 			return utokens, ucost, ustop, end, uerr
 		}
 
@@ -4999,8 +5010,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// wait is handed to drainPhases, which owes it only once the sequence's
 			// handback has run and no lease is held.
 			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting",
-					drainNum)
+				log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting (log: %s)",
+					drainNum, logPath)
 				end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
 				return tokens, cost, false, end, nil
 			}
@@ -5016,8 +5027,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// returns, so the operator can start a fresh run against it.
 			remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
 			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
-				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
-					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
+				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset (log: %s)",
+					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute), logPath)
 				return tokens, cost, true, end, nil
 			}
 			// The wait's own probe spend lands in the SAME accumulator as the
@@ -5099,8 +5110,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// below are unreachable from here by construction — a capped exit is
 		// `orderlyExit`, so it never sets recoveredExit.
 		if recoveredExit {
-			log.Printf("iteration %d: the session's stream shows %d provider error event(s) it recovered from and no terminal one (exit %s) — judging this phase on its delivery, not on the exit status",
-				drainNum, harness.RecoveredErrors(res), res.ExitString())
+			log.Printf("iteration %d: the session's stream shows %d provider error event(s) it recovered from and no terminal one (exit %s) — judging this phase on its delivery, not on the exit status (log: %s)",
+				drainNum, harness.RecoveredErrors(res), res.ExitString(), logPath)
 			return tokens, cost, false, end, nil
 		}
 
@@ -5181,8 +5192,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// the run-level wait the same implement-and-lose loop would repeat with
 			// nothing bounding it.
 			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting",
-					drainNum, res.ExitString())
+				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting (log: %s)",
+					drainNum, res.ExitString(), logPath)
 				end.sequenceEnd = &phaseSequenceEnd{}
 				return tokens, cost, false, end, nil
 			}
@@ -5196,8 +5207,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				unclassified++
 				if unclassified > unclassifiedRetryBound {
 					return tokens, cost, false, end, fmt.Errorf(
-						"iteration %d: %w: %d retries on %s failures that matched no known-transient pattern - retried because the session had reported usage, but the same unrecognised failure keeps happening, so this is a real fault rather than a blip%s",
-						drainNum, errUnclassifiedRetryLoop, unclassified-1, a.Name(), failureDetail(a.Diagnostic(res)))
+						"iteration %d: %w: %d retries on %s failures that matched no known-transient pattern - retried because the session had reported usage, but the same unrecognised failure keeps happening, so this is a real fault rather than a blip%s (log: %s)",
+						drainNum, errUnclassifiedRetryLoop, unclassified-1, a.Name(), failureDetail(a.Diagnostic(res)), logPath)
 				}
 			}
 			// As in the limit branch: the retry is a fresh session that re-claims,
@@ -5206,12 +5217,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			retries++
 			if d.cfg.MaxRetries > 0 && retries > d.cfg.MaxRetries {
 				return tokens, cost, false, end, fmt.Errorf(
-					"iteration %d: transient failures persisted after %d retries (check https://status.claude.com; rerun to resume)",
-					drainNum, d.cfg.MaxRetries)
+					"iteration %d: transient failures persisted after %d retries (check https://status.claude.com; rerun to resume) (log: %s)",
+					drainNum, d.cfg.MaxRetries, logPath)
 			}
 			wait := d.backoff(retries)
-			log.Printf("iteration %d transient failure (%s) — %s in %s (a fresh session reclaims any half-done task)",
-				drainNum, res.ExitString(), retryLabel(retries, d.cfg.MaxRetries), wait)
+			log.Printf("iteration %d transient failure (%s) — %s in %s (a fresh session reclaims any half-done task) (log: %s)",
+				drainNum, res.ExitString(), retryLabel(retries, d.cfg.MaxRetries), wait, logPath)
 			if d.waitOrStop(ctx, wait) {
 				return tokens, cost, true, end, nil
 			}
@@ -5224,8 +5235,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// yet — which is the one thing they need in order to report the gap. The
 		// text is the harness's own diagnostic scope, never the raw stream, so
 		// the agent's narration is not quoted back at them (CLA-258).
-		return tokens, cost, false, end, fmt.Errorf("iteration %d: %s %s (non-retryable) — stopping%s%s",
-			drainNum, a.Name(), res.ExitString(), failureDetail(a.Diagnostic(res)), droppedNote(res.OutputDropped))
+		return tokens, cost, false, end, fmt.Errorf("iteration %d: %s %s (non-retryable) — stopping%s%s (log: %s)",
+			drainNum, a.Name(), res.ExitString(), failureDetail(a.Diagnostic(res)), droppedNote(res.OutputDropped), logPath)
 	}
 }
 
@@ -5260,14 +5271,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 // (CLA-366) the session that went unreadable is not necessarily on d.h. Asking
 // d.h would let an unreadable opencode session be waved through on the grounds
 // that CLAUDE has no ceiling set.
-func (d *Driver) endUntrustedDrain(t Target, drainNum int, harnessName string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
-	log.Printf("iteration %d UNTRUSTED — %s", drainNum, res.Untrusted)
+func (d *Driver) endUntrustedDrain(t Target, drainNum int, harnessName, logPath string, res harness.Result, tokens int, cost float64) (int, float64, bool, error) {
+	log.Printf("iteration %d UNTRUSTED — %s (log: %s)", drainNum, res.Untrusted, logPath)
 	log.Printf("iteration %d: not counting this session's parsed spend (tokens=%d cost=$%.4f — a floor, not a total), not classifying its exit (%s), and not handing back any claim it appeared to hold",
 		drainNum, res.Tokens, res.CostUSD, res.ExitString())
 	if !d.targetCfg(t).Budget.CountsSpendFor(harnessName) {
 		return tokens, cost, false, nil
 	}
-	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured. Check the iteration log, then rerun to resume.", drainNum)
+	log.Printf("iteration %d: stopping — a token/cost ceiling is set and this session's real spend cannot be known, so the ceiling can no longer be honoured — check the iteration log, then rerun to resume (log: %s)", drainNum, logPath)
 	return tokens, cost, true, nil
 }
 
