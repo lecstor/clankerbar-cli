@@ -533,6 +533,12 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		// strands the branch.
 		if args.Branch != "" {
 			res.Claim.HasWIP = true
+			// Carry the NAME too, not just the fact (CLA-708): CURRENT_CLAIM's
+			// branch field is what tells a supervisor to expireLease rather than
+			// release — release would post `ready` over the branch. Notifying is
+			// what gets the new name to the lease renewer's record mid-session.
+			res.Claim.Branch = args.Branch
+			res.notifyClaim()
 		}
 
 	case askQuestionTool:

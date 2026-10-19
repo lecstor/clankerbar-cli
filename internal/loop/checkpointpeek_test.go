@@ -122,6 +122,9 @@ func TestDrainPhases_ABlindSpotClaimIsRecoveredFromThePlaneAtTheSeam(t *testing.
 	if len(rel.calls) != 0 {
 		t.Errorf("released the recovered claim %d time(s): %+v — a held claim with a branch must never be handed back", len(rel.calls), rel.calls)
 	}
+	if len(rel.expireCalls) != 1 {
+		t.Errorf("ended the lease %d time(s), want once: %+v", len(rel.expireCalls), rel.expireCalls)
+	}
 	if strings.Join(rel.asked, ",") != "t-1" {
 		t.Errorf("the plane was asked about %v, want exactly the briefed task t-1", rel.asked)
 	}
@@ -362,7 +365,10 @@ func TestDrainPhases_ARecoveredClaimStillFacesTheEvidenceGate(t *testing.T) {
 		t.Errorf("an unverifiable branch was taken as a checkpoint:\n%s", out)
 	}
 	if len(rel.calls) != 0 {
-		t.Errorf("released the recovered hold %d time(s): %+v — a live lease with a recorded branch expires, keeping the takeover hand-off", len(rel.calls), rel.calls)
+		t.Errorf("released the recovered hold %d time(s): %+v — a live lease with a recorded branch is ended with expireLease, keeping the takeover hand-off", len(rel.calls), rel.calls)
+	}
+	if len(rel.expireCalls) != 1 {
+		t.Errorf("ended the lease %d time(s), want once: %+v", len(rel.expireCalls), rel.expireCalls)
 	}
 }
 

@@ -189,3 +189,49 @@ func TestDoctor_PanelMemberLabelsAreNotRoles(t *testing.T) {
 		t.Errorf("a named member is not reported as role (label): %s", line)
 	}
 }
+
+// CLA-697: the concurrency cap is part of what an operator is choosing. The
+// default (the whole panel) needs no suffix; a throttled or sequential panel
+// does, because it changes the round's wall time.
+func TestDoctor_ReportsThePanelConcurrency(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	members := []config.ReviewPanelMember{
+		{Model: "opencode-go/gpt-6-luna"},
+		{Model: "opencode-go/gpt-6-luna"},
+		{Model: "opencode-go/glm-5.3-flash"},
+	}
+	lineFor := func(t *testing.T, concurrency int) string {
+		t.Helper()
+		cfg := &config.Config{
+			Harness: "opencode",
+			WorkDir: t.TempDir(),
+			Phases: []config.Phase{
+				{Name: "implement"},
+				{Name: "review"},
+				{Name: "fix"},
+			},
+			ReviewPanel:            append([]config.ReviewPanelMember(nil), members...),
+			ReviewPanelConcurrency: concurrency,
+		}
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("fixture does not validate: %v", err)
+		}
+		for _, l := range checkConfig(cfg).info {
+			if strings.HasPrefix(l, "review panel: ") {
+				return l
+			}
+		}
+		t.Fatalf("doctor does not report the review panel")
+		return ""
+	}
+
+	if got := lineFor(t, 0); strings.Contains(got, "sequential") || strings.Contains(got, "at once") {
+		t.Errorf("the whole-panel default was reported as a throttle: %s", got)
+	}
+	if got := lineFor(t, 1); !strings.Contains(got, "(sequential)") {
+		t.Errorf("cap 1 is not reported as sequential: %s", got)
+	}
+	if got := lineFor(t, 2); !strings.Contains(got, "(at most 2 at once)") {
+		t.Errorf("a cap under the panel size is not reported: %s", got)
+	}
+}
