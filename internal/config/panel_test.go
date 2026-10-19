@@ -1,6 +1,8 @@
 package config
 
 import (
+	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -278,4 +280,321 @@ func TestReviewPanel_ModelPinnedDirectly(t *testing.T) {
 	if got, ok := cfg.ModelForPhase(member); got != "opencode-go/gpt-6-luna" || !ok {
 		t.Errorf("ModelForPhase(member) = (%q, %v), want the pinned alias", got, ok)
 	}
+}
+
+// TestReviewPanel_NullIsAbsent (CLA-639 fix pass 3): a supervised daemon's child
+// config is a MARSHALLED config, and before this fix the marshalled form of a
+// config with no panel wrote `"review_panel": null`. Load treated the key's
+// mere presence as "the operator set a panel", so the child refused to start
+// with "review_panel is empty" on the standard [implement, review, fix] shape.
+// Only a JSON ARRAY counts as set now; `null` reads exactly like an absent key.
+func TestReviewPanel_NullIsAbsent(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "claude",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": null
+	}`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("an explicit null panel must read as absent and validate: %v", err)
+	}
+	if got := cfg.EffectivePanel(); len(got) != 0 {
+		t.Fatalf("null panel resolved to %d members, want none", len(got))
+	}
+	if got := cfg.EffectivePhases(); len(got) != 3 {
+		t.Fatalf("effective phases = %d, want 3 — null must not expand anything", len(got))
+	}
+}
+
+// TestReviewPanel_MarshalledConfigRoundTrips is the supervised-daemon shape
+// (CLA-639 fix pass 3): materializeConfig marshals the validated config into the
+// child's own file, and the child Loads and Validates it again. A config with no
+// panel must round-trip cleanly (no `review_panel` key at all), and a config
+// with a panel must keep its members byte-for-byte through the same trip.
+func TestReviewPanel_MarshalledConfigRoundTrips(t *testing.T) {
+	writeMarshalled := func(t *testing.T, data []byte) *Config {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "materialized.json")
+		if err := os.WriteFile(p, data, 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+		cfg, err := Load(p)
+		if err != nil {
+			t.Fatalf("Load(materialized): %v", err)
+		}
+		return cfg
+	}
+
+	t.Run("no panel", func(t *testing.T) {
+		cfg := writePanelConfig(t, `{
+			"harness": "claude",
+			"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
+		}`)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("source config does not validate: %v", err)
+		}
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		if bytes.Contains(data, []byte(`"review_panel"`)) {
+			t.Errorf("the marshalled config of a panel-less run names review_panel: %s", data)
+		}
+		loaded := writeMarshalled(t, data)
+		if err := loaded.Validate(); err != nil {
+			t.Fatalf("a materialized config with no panel must validate: %v", err)
+		}
+		if got := loaded.EffectivePhases(); len(got) != 3 {
+			t.Fatalf("materialized effective phases = %d, want 3", len(got))
+		}
+	})
+
+	t.Run("a panel keeps its members", func(t *testing.T) {
+		cfg := writePanelConfig(t, `{
+			"harness": "claude",
+			"harnesses": {"opencode": {"model": "opencode-go/gpt-6-luna"}},
+			"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+			"review_panel": [
+				{"name": "alpha", "harness": "opencode"},
+				{"name": "beta", "harness": "opencode", "model": "opencode-go/glm-5.3-flash"}
+			]
+		}`)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("source config does not validate: %v", err)
+		}
+		data, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		loaded := writeMarshalled(t, data)
+		if err := loaded.Validate(); err != nil {
+			t.Fatalf("a materialized panel config must validate: %v", err)
+		}
+		panel := loaded.EffectivePanel()
+		if len(panel) != 2 {
+			t.Fatalf("materialized panel = %d members, want 2", len(panel))
+		}
+		if panel[0].Name != "alpha" || panel[0].Harness != "opencode" {
+			t.Errorf("member 0 = %+v, want alpha on opencode", panel[0])
+		}
+		if panel[1].Name != "beta" || panel[1].Model != "opencode-go/glm-5.3-flash" {
+			t.Errorf("member 1 = %+v, want beta with its pinned model", panel[1])
+		}
+		got := loaded.EffectivePhases()
+		if len(got) != 4 || got[1].Name != "alpha" || got[2].Name != "beta" {
+			t.Fatalf("materialized effective phases = %v, want implement, alpha, beta, fix", phaseNames(got))
+		}
+	})
+}
+
+// TestReviewPanel_FinalReviewNeverExpands (CLA-639 fix pass 3): the position
+// check lives in the expansion itself, so EffectivePhases can never multiply a
+// FINAL review even when a caller skips Validate. Validate still refuses a
+// sequence with more than one built-in review phase beside a panel: a panel
+// expands exactly one, and which one it picked would be trivia.
+func TestReviewPanel_FinalReviewNeverExpands(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "claude",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix", "prompt": "custom fix"}, {"name": "review"}],
+		"review_panel": [{"model": "a"}, {"model": "b"}]
+	}`)
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "ONE built-in") {
+		t.Fatalf("Validate() = %v, want a refusal naming the single expandable built-in review", err)
+	}
+	// Called WITHOUT Validate: the expansion itself must not multiply the final
+	// review even though the first one still expands.
+	got := cfg.EffectivePhases()
+	if len(got) != 5 {
+		t.Fatalf("effective phases = %v, want 5 (implement, 2 members, fix, the final review)", phaseNames(got))
+	}
+	last := got[len(got)-1]
+	if last.IsPanelMember() {
+		t.Fatalf("the FINAL review expanded into a panel member: %+v", last)
+	}
+	if last.Name != ReviewPhaseName || last.Prompt != builtinPhasePrompts[ReviewPhaseName] {
+		t.Errorf("the final review = %q with prompt %.60q, want the historical combined brief", last.Name, last.Prompt)
+	}
+	members := 0
+	for i, ph := range got {
+		if ph.IsPanelMember() {
+			members++
+			if i == len(got)-1 {
+				t.Errorf("a panel member sits at the last position")
+			}
+		}
+	}
+	if members != 2 {
+		t.Errorf("panel members = %d, want 2 (only the non-final review expands)", members)
+	}
+}
+
+// TestReviewPanel_MemberNamesAreLogLabels (CLA-639 fix pass 3): names are
+// validated like phase names (they become iteration-log filenames) and are
+// unique; the reviewer ROLE stays positional, so naming a member never changes
+// which durable record it writes.
+func TestReviewPanel_MemberNamesAreLogLabels(t *testing.T) {
+	base := func(panel string) string {
+		return `{
+			"harness": "claude",
+			"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+			"review_panel": ` + panel + `
+		}`
+	}
+	t.Run("a bad name is refused", func(t *testing.T) {
+		cfg := writePanelConfig(t, base(`[{"name": "Alpha"}]`))
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "lowercase letters, digits and hyphens") {
+			t.Fatalf("Validate() = %v, want the phase-name format refusal", err)
+		}
+	})
+	t.Run("a duplicate name is refused", func(t *testing.T) {
+		cfg := writePanelConfig(t, base(`[{"name": "alpha"}, {"name": "alpha"}]`))
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "duplicate member name") {
+			t.Fatalf("Validate() = %v, want the duplicate-name refusal", err)
+		}
+	})
+	t.Run("a derived label that collides with an explicit one is refused", func(t *testing.T) {
+		cfg := writePanelConfig(t, base(`[{"name": "review-2"}, {}]`))
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "duplicate member name") {
+			t.Fatalf("Validate() = %v, want the derived/explicit collision refused", err)
+		}
+	})
+	t.Run("alpha and beta are accepted and keep their labels", func(t *testing.T) {
+		cfg := writePanelConfig(t, base(`[{"name": "alpha"}, {"name": "beta"}]`))
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() = %v, want named members accepted", err)
+		}
+		got := cfg.EffectivePhases()
+		if got[1].Name != "alpha" || got[2].Name != "beta" {
+			t.Fatalf("member labels = %q, %q, want alpha, beta", got[1].Name, got[2].Name)
+		}
+	})
+}
+
+// TestReviewPanel_CodexMemberIsRefused: a member runs one review phase of the
+// sequence, so it is held to the same claim-tracking rule a phase is. Codex
+// does not observe the session's task claim, so a codex member is refused at
+// validation rather than discovered as an ended sequence at 3am.
+func TestReviewPanel_CodexMemberIsRefused(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "claude",
+		"harnesses": {"codex": {"model": "gpt-5.1"}},
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"harness": "codex"}]
+	}`)
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "does not observe the session's task claim") {
+		t.Fatalf("Validate() = %v, want the claim-tracking refusal for a codex member", err)
+	}
+}
+
+// TestReviewPanel_HarnessesMatchTheLegacyAnswer (CLA-639 fix pass 3): with no
+// panel, SpawnedHarnesses and PhaseHarnesses answer exactly as they did before
+// this feature — the raw `phases`, so a verify phase that names no harness
+// resolves to the run-wide one, not to the fix phase's. With a panel, the
+// members' resolved harnesses are added, because those are sessions the run
+// really starts.
+func TestReviewPanel_HarnessesMatchTheLegacyAnswer(t *testing.T) {
+	t.Run("no panel: the pre-CLA-639 answer", func(t *testing.T) {
+		cfg := writePanelConfig(t, `{
+			"harness": "claude",
+			"harnesses": {"opencode": {"model": "opencode-go/gpt-6-luna"}},
+			"phases": [
+				{"name": "implement", "harness": "opencode"},
+				{"name": "review", "harness": "opencode"},
+				{"name": "fix", "harness": "opencode"},
+				{"name": "verify"}
+			]
+		}`)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() = %v", err)
+		}
+		if got := strings.Join(cfg.SpawnedHarnesses(), ","); got != "opencode,claude" {
+			t.Errorf("SpawnedHarnesses() = %q, want the pre-panel answer opencode,claude (the verify phase is on the run-wide harness)", got)
+		}
+		if got := strings.Join(cfg.PhaseHarnesses(), ","); got != "claude,opencode" {
+			t.Errorf("PhaseHarnesses() = %q, want claude,opencode (run-wide first)", got)
+		}
+	})
+	t.Run("a panel adds its members", func(t *testing.T) {
+		cfg := writePanelConfig(t, `{
+			"harness": "opencode",
+			"harnesses": {"claude": {"model": "claude-opus-5"}},
+			"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+			"review_panel": [{"harness": "claude"}]
+		}`)
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("Validate() = %v", err)
+		}
+		if got := strings.Join(cfg.SpawnedHarnesses(), ","); got != "opencode,claude" {
+			t.Errorf("SpawnedHarnesses() = %q, want opencode,claude — the member runs on claude", got)
+		}
+		if got := strings.Join(cfg.PhaseHarnesses(), ","); got != "opencode,claude" {
+			t.Errorf("PhaseHarnesses() = %q, want opencode,claude", got)
+		}
+	})
+}
+
+// TestReviewPanel_PhaseModelIsNotAConfigKey (CLA-639 fix pass 3): Phase.Model
+// is internal plumbing for member expansion, never a `phases[].model` key. A
+// stray `model` on a phase is ignored on load, and marshalling a config never
+// emits one — only a MEMBER's model is user-facing JSON.
+func TestReviewPanel_PhaseModelIsNotAConfigKey(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "claude",
+		"phases": [{"name": "implement", "model": "stray"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"model": "opencode-go/gpt-6-luna"}]
+	}`)
+	if got := cfg.Phases[0].Model; got != "" {
+		t.Fatalf("a stray phase model loaded into Phase.Model = %q; it must stay ignored", got)
+	}
+	// Give every phase an internal model, so the assertion is about the key and
+	// not about the value being empty.
+	for i := range cfg.Phases {
+		cfg.Phases[i].Model = "internal-only"
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var doc struct {
+		Phases      []map[string]json.RawMessage `json:"phases"`
+		ReviewPanel []map[string]json.RawMessage `json:"review_panel"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	for i, ph := range doc.Phases {
+		if _, ok := ph["model"]; ok {
+			t.Errorf("phases[%d] marshalled a `model` key: %s", i, data)
+		}
+	}
+	if len(doc.ReviewPanel) != 1 || len(doc.ReviewPanel[0]["model"]) == 0 {
+		t.Errorf("the member's model did not survive marshalling: %s", data)
+	}
+}
+
+// TestReviewPanel_AbsentKeepsTheConfigIdentity (CLA-639 fix pass 3): with no
+// panel, Identity() must hash exactly what it hashed before this branch. The
+// golden below was computed at 5805722 with this exact literal config; it is the
+// proof that neither `review_panel` nor the phase `model` leaked into the
+// marshalled form.
+func TestReviewPanel_AbsentKeepsTheConfigIdentity(t *testing.T) {
+	cfg := &Config{Harness: "claude", Phases: []Phase{
+		{Name: "implement"}, {Name: "review"}, {Name: "fix"},
+	}}
+	const prePanelIdentity = "e83c686b2bfc9c8c60e23d1946116ca7ca5c71da23c7fa50be60a16452cdd7f8"
+	if got := cfg.Identity(); got != prePanelIdentity {
+		t.Errorf("Identity() = %s, want the pre-panel identity %s", got, prePanelIdentity)
+	}
+}
+
+func phaseNames(phases []Phase) []string {
+	out := make([]string, len(phases))
+	for i, ph := range phases {
+		out[i] = ph.Label(i)
+	}
+	return out
 }
