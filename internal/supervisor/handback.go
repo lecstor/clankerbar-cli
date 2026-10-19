@@ -59,7 +59,11 @@ func (d *Supervisor) handBackDeadClaim(inst *Instance) {
 	if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
 		return
 	}
-	st, err := statedir.Open(dir)
+	var roots []string
+	if cfg != nil {
+		roots = cfg.SessionWorkDirs()
+	}
+	st, err := statedir.Open(dir, roots...)
 	if err != nil {
 		log.Printf("%s: cannot read %s (%v) - its lease will expire instead", inst.name, loop.CurrentClaimName, err)
 		return
@@ -86,18 +90,16 @@ func (d *Supervisor) handBackDeadClaim(inst *Instance) {
 	defer cancel()
 
 	branch := strings.TrimSpace(claim.Branch)
-	var action string
-	switch {
-	case branch == "":
+	action := "ended the lease on"
+	if branch == "" {
 		action = "released"
+		// A no-branch task needs only the old `release` primitive; the driver
+		// marker is the one new thing, and a plane without it still has release.
 		err = rel.ReleaseDriver(ctx, claim.TaskID, claim.RunID)
 		if errors.Is(err, plane.ErrFieldUnsupported) {
-			// A plane older than the driver marker still has `release`: the
-			// handback itself needs nothing newer.
 			err = rel.Release(ctx, claim.TaskID, claim.RunID)
 		}
-	case branch != "":
-		action = "ended the lease on"
+	} else {
 		err = rel.ExpireLease(ctx, claim.TaskID, claim.RunID)
 	}
 
@@ -160,6 +162,9 @@ func (d *Supervisor) planeFor(cfg *config.Config, project string) plane.Releaser
 	}
 	if endpoint == "" || d.o.APIKey == "" {
 		return nil
+	}
+	if d.o.PlaneFor != nil {
+		return d.o.PlaneFor(endpoint, d.o.APIKey)
 	}
 	return plane.New(endpoint, d.o.APIKey)
 }

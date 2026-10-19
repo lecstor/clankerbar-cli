@@ -350,6 +350,9 @@ func TestDrainPhases_AHandoffCountsAgainstMaxIterations(t *testing.T) {
 		if len(rel.calls) != 0 {
 			t.Errorf("the driver released a claim holding pushed work %+v — the takeover hand-off would be lost: %+v", res.Claim, rel.calls)
 		}
+		if len(rel.expireCalls) != 1 {
+			t.Errorf("the driver ended the lease %d time(s), want once — CLA-708 turns the wait into an immediate takeover: %+v", len(rel.expireCalls), rel.expireCalls)
+		}
 	})
 	t.Run("one iteration of headroom buys exactly one respawn", func(t *testing.T) {
 		h := &fakeAdapter{steps: []invokeStep{

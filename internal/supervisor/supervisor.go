@@ -70,6 +70,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
@@ -196,6 +197,13 @@ type Options struct {
 	// the drain happens before it, and a returned error resumes the loop with
 	// the marker already consumed.
 	ExecInPlace func(bin string, argv []string, env []string) error
+
+	// PlaneFor builds the write client the supervisor uses to hand a dead
+	// child's claim back (CLA-708). Nil = plane.New. The hook exists because the
+	// endpoint the supervisor resolves is the CHILD's production endpoint, which
+	// a test's fake plane is not; a test supplies a client pointed at its own
+	// server so the wire shape is exercised for real.
+	PlaneFor func(endpoint, apiKey string) plane.Releaser
 }
 
 // childVersionEnv is the environment variable the supervisor sets on every

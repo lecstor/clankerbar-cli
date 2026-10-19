@@ -3808,6 +3808,10 @@ func (d *Driver) parkVerification(ctx context.Context, t Target, res harness.Res
 			labelOf(t), ref, err)
 		return
 	}
+	// The park moved the task out of the holding run: nothing is left for a
+	// supervisor to hand back (CLA-708), exactly as a settle observed from the
+	// stream would have said.
+	d.clearCurrentClaim()
 	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
 		log.Printf("%sparked %s — %s, but the question for the operator could not be filed: %v",
 			labelOf(t), ref, reason, err)
@@ -5588,6 +5592,9 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 			labelOf(t), claimLabel(res.Claim), err)
 		return
 	}
+	// Parked is a let-go: the record describes a run that no longer holds the
+	// task, and a supervisor must not try to hand it back (CLA-708).
+	d.clearCurrentClaim()
 	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
 		// The task IS parked — it will not be retried — so saying it was "left
 		// for the next claim" would be the opposite of what happened. The park
@@ -5711,11 +5718,11 @@ func (d *Driver) releaseHeldClaim(ctx context.Context, t Target, res harness.Res
 			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — ended the lease on %s (pushed work kept for takeover)",
 				labelOf(t), stallReason, claimLabel(res.Claim))
 		case ended && countUndeclared:
-			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease so it is an immediate takeover (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
-				labelOf(t), res.Claim.TaskID, d.undeclared)
+			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease on %s (pushed work kept for takeover) (undeclared hand-offs this run: %d — the phase finished but never moved the task on, so the next clanker pays to rediscover it)",
+				labelOf(t), res.Claim.TaskID, claimLabel(res.Claim), d.undeclared)
 		case ended:
-			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease so it is an immediate takeover",
-				labelOf(t), res.Claim.TaskID)
+			log.Printf("%ssession ended holding %s, which has pushed work — ended the lease on %s (pushed work kept for takeover)",
+				labelOf(t), res.Claim.TaskID, claimLabel(res.Claim))
 		case stalled && countUndeclared:
 			log.Printf("%sstalled: output cap hit with no output (reasoning=%d) — session ended holding %s with pushed work; leaving the lease to expire so the takeover hand-off survives (undeclared hand-offs this run: %d)",
 				labelOf(t), stallReason, claimLabel(res.Claim), d.undeclared)

@@ -54,6 +54,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/teststate"
 	"github.com/lecstor/clankerbar-cli/internal/version"
 )
@@ -167,6 +168,29 @@ func helperMain() {
 
 	stopPath := filepath.Join(spec.StateDir, "STOP")
 	switch mode {
+	case "crash-claim", "crash-claim-branch":
+		// A daemon that died while holding a claim, leaving the record the
+		// supervisor reads (CLA-708). Branch empty vs set is the whole
+		// release/expireLease split.
+		claim := loop.CurrentClaim{
+			TaskID:    "t-claim",
+			RunID:     "r-claim",
+			Project:   "acme",
+			ClaimedAt: time.Now().UTC(),
+		}
+		if mode == "crash-claim-branch" {
+			claim.Branch = "clanker/claim-wip"
+		}
+		body, err := json.Marshal(claim)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
+			os.Exit(9)
+		}
+		if err := os.WriteFile(filepath.Join(spec.StateDir, loop.CurrentClaimName), body, 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, "fake daemon: claim:", err)
+			os.Exit(9)
+		}
+		os.Exit(1)
 	case "crash":
 		os.Exit(1)
 	case "halt":
@@ -228,11 +252,59 @@ type fakePlane struct {
 	down       bool
 	statusCode int // 0 = 200
 	statuses   []json.RawMessage
+	// calls records the write calls the supervisor made against the MCP
+	// endpoints, so a handback test can assert the tool, the ids and the
+	// driver marker on the wire.
+	calls []planeCall
+	// planeRefusal, when set, is returned as an MCP tool-level refusal
+	// (`isError`, the shape the plane uses for not_holding/run_superseded).
+	planeRefusal string
+}
+
+type planeCall struct {
+	path string
+	tool string
+	args map[string]any
 }
 
 func (p *fakePlane) serve(t *testing.T) *httptest.Server {
 	t.Helper()
+	const okBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/mcp/") {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			var rpc struct {
+				Params struct {
+					Name      string         `json:"name"`
+					Arguments map[string]any `json:"arguments"`
+				} `json:"params"`
+			}
+			_ = json.Unmarshal(body, &rpc)
+			p.mu.Lock()
+			down := p.down
+			if !down {
+				p.calls = append(p.calls, planeCall{path: r.URL.Path, tool: rpc.Params.Name, args: rpc.Params.Arguments})
+			}
+			refusal := p.planeRefusal
+			p.mu.Unlock()
+			if down {
+				http.Error(w, "plane unreachable", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if refusal != "" {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0", "id": 1,
+					"result": map[string]any{
+						"isError": true,
+						"content": []map[string]any{{"type": "text", "text": refusal}},
+					},
+				})
+				return
+			}
+			_, _ = io.WriteString(w, okBody)
+			return
+		}
 		if strings.HasSuffix(r.URL.Path, "/status") {
 			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 			p.mu.Lock()
@@ -287,6 +359,19 @@ func (p *fakePlane) setStatusCode(code int) {
 	p.mu.Unlock()
 }
 
+// planeCalls returns the MCP write calls the plane received.
+func (p *fakePlane) planeCalls() []planeCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]planeCall(nil), p.calls...)
+}
+
+func (p *fakePlane) setPlaneRefusal(text string) {
+	p.mu.Lock()
+	p.planeRefusal = text
+	p.mu.Unlock()
+}
+
 // statusReports decodes every status POST the plane received, in arrival order.
 func (p *fakePlane) statusReports(t *testing.T) []statusBody {
 	t.Helper()
@@ -322,6 +407,12 @@ func testOptions(t *testing.T, cacheDir string, srv *httptest.Server) Options {
 		BackoffCap:        200 * time.Millisecond,
 		BackoffResetAfter: time.Second,
 		SettleBeforeStop:  10 * time.Millisecond,
+		// The handback (CLA-708) targets a production MCP endpoint the child's
+		// config resolves; point it at this test's fake plane so the call is
+		// observed for real rather than leaving for clankerbar.com.
+		PlaneFor: func(_, key string) plane.Releaser {
+			return plane.New(srv.URL+"/mcp/acme", key)
+		},
 	}
 }
 
