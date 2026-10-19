@@ -399,6 +399,12 @@ type Driver struct {
 	// nothing that calls out to the plane or a harness may hold it.
 	stateMu sync.Mutex
 
+	// claimFileMu serialises CURRENT_CLAIM writes (CLA-708). A review panel's
+	// members run concurrently (CLA-697) and each renewer persists the same
+	// claim; WriteFileAtomic uses a fixed `.tmp` name, so unsynchronised writers
+	// would race there rather than merely duplicate work.
+	claimFileMu sync.Mutex
+
 	// deadTally is this run's dead-phase tally, keyed by phase label and harness
 	// name (CLA-402): how many phase sessions ran and how many of those died
 	// producing nothing. Like spentBy it is the RUN's account — the rate is
