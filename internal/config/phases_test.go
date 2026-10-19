@@ -2004,6 +2004,79 @@ func TestNoCodeFixVerifyBriefStopsBeforeTheHandover(t *testing.T) {
 	}
 }
 
+// CLA-686 D1: a fix phase whose terminal step belongs to the VERIFICATION round
+// must not also be told to hand the task over. All four of those variants ended
+// with fixOnlyTerminalStep — "Do NOT open a PR and do NOT move the task to
+// in_review", because the verifier carries that move — while still embedding
+// fixTerminalRecord, which says "THEN hand the task over" and names the call
+// that moves the task to in_review. The same brief told the fixer both to hand
+// the task over and not to, and a fixer that obeyed the first half shipped
+// fixes no verification round had seen. The final-phase fix briefs, which DO own
+// the hand-over, must keep it: the property is one-sided, and a test that only
+// banned the phrase would be satisfied by a brief that says nothing at all.
+func TestFixVerifyVariantsDoNotHandTheTaskOver(t *testing.T) {
+	// The imperative hand-over forms only a fix phase that OWNS the sequence's
+	// terminal step may carry. Spelled out rather than referencing
+	// fixTerminalRecord: this test has to fail — and still COMPILE — against the
+	// briefs as they were before the split.
+	handOver := []string{
+		"THEN hand the task over",
+		"the call that moves the task to in_review",
+	}
+	verifyOnly := []struct {
+		name string
+		// brief is the whole prompt or continuation the phase spawns with.
+		brief string
+		// terminal is the step that ends the phase still holding the task.
+		terminal string
+		// record is the record requirement it must carry instead of
+		// fixTerminalRecord.
+		record string
+		// durable is whether the durable findingUpdates call belongs in this
+		// variant: only the BRANCH-shaped ones have a durable record to update,
+		// because the branchless round writes none (question 03a12578, option 1).
+		durable bool
+	}{
+		{"the fix-with-verification brief", fixVerifyBrief, fixOnlyTerminalStep, fixVerifyRecord, true},
+		{"the no-code fix-with-verification brief", noCodeFixVerifyBrief, noCodeFixOnlyTerminalStep, noCodeFixVerifyRecord, false},
+		{"the fix-verify handoff", FixVerifyHandoffContinuation(), fixOnlyTerminalStep, fixVerifyRecord, true},
+		{"the branchless fix-verify handoff", NoCodeFixVerifyHandoffContinuation(), noCodeFixOnlyTerminalStep, noCodeFixVerifyRecord, false},
+	}
+	for _, tc := range verifyOnly {
+		for _, banned := range handOver {
+			if strings.Contains(tc.brief, banned) {
+				t.Errorf("%s says %q, but its terminal step leaves the hand-over to the verification round:\n%s", tc.name, banned, tc.brief)
+			}
+		}
+		// Dropping the hand-over must not drop the rest of the contract: the
+		// terminal step that ends the phase, and the record requirement the
+		// successor's own outcome depends on.
+		if !strings.Contains(tc.brief, tc.terminal) {
+			t.Errorf("%s lost the terminal step that stops it before the hand-over:\n%s", tc.name, tc.brief)
+		}
+		if !strings.Contains(tc.brief, tc.record) {
+			t.Errorf("%s lost its record requirement:\n%s", tc.name, tc.brief)
+		}
+		// The durable finding updates are the seam's evidence; a variant that
+		// cannot make the call must not be told to (the same exemption
+		// noCodeFixTerminalRecord carries for the branchless final fix).
+		if tc.durable && !strings.Contains(tc.brief, "findingUpdates") {
+			t.Errorf("%s lost the durable finding updates the fix phase owes:\n%s", tc.name, tc.brief)
+		}
+		if !tc.durable && strings.Contains(tc.brief, "findingUpdates") {
+			t.Errorf("%s demands the durable findingUpdates call a branchless round cannot make:\n%s", tc.name, tc.brief)
+		}
+	}
+	// The other side of the property: the fix phase that IS the sequence's last
+	// still hands the task over.
+	if !strings.Contains(fixBrief, "THEN hand the task over") {
+		t.Errorf("the final fix brief lost the hand-over it owns:\n%s", fixBrief)
+	}
+	if !strings.Contains(noCodeFixBrief, "When you hand the task over") {
+		t.Errorf("the branchless final fix brief lost the hand-over it owns:\n%s", noCodeFixBrief)
+	}
+}
+
 // VerifyShaped is deliberately narrower than ReviewShaped: every verifier is a
 // review-shaped record writer, but an ordinary review must not be mistaken for
 // the stopping-rule gate.
