@@ -1648,3 +1648,60 @@ func TestDrainPhases_ReviewPanelUnheldClaimDoesNotMatchALooseTip(t *testing.T) {
 		t.Errorf("panelFailStreak[review-1] = %d, want 1 — without a verified tip the record is not this member's exit evidence", n)
 	}
 }
+
+// TestDrainPhases_ReviewPanelLastMemberCloseFailureEndsWithoutAFix (CLA-639 fix
+// pass 6): the close the recorded + sequence-end arm performs is fail-closed. A
+// close error must end the drain with no fix and no success report, exactly as
+// the failed last member's arm does. This pins the `break`; replacing it with a
+// fall-through spawns the fix and fails this test.
+func TestDrainPhases_ReviewPanelLastMemberCloseFailureEndsWithoutAFix(t *testing.T) {
+	rel := &reviewReleaser{
+		status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n",
+		closeErr: errors.New("the plane is unreachable"),
+	}
+	h := &fakeAdapter{
+		steps: []invokeStep{
+			{res: checkpointed(10, 0.10)},           // implement
+			{res: checkpointed(5, 0.50)},            // review-1 records
+			{res: held(limitResult(), openClaim())}, // review-2 records, then is turned away
+			{res: checkpointed(5, 0.05)},            // the fix: must NEVER run
+		},
+		limitResetAt: time.Now().Add(-time.Hour),
+	}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1, 2:
+			role := "review-" + strconv.Itoa(i)
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: role, RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1."+role+".1", "open", "a "+role+" MUST")},
+			})
+		}
+	}
+	d, ff := panelDriverWithFleet(t, h, rel, panelMembers()[:2], panelPhases())
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 (implement, two members, NO fix) — a failed close must not hand over", h.invokeCalls)
+	}
+	if len(rel.closes) != 0 {
+		t.Errorf("a close was recorded despite the injected failure: %v", rel.closes)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "could not be closed") || !strings.Contains(out, "without spawning the fix") {
+		t.Errorf("the driver did not say why the fix was skipped:\n%s", out)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1", len(recs))
+	}
+	if recs[0].Outcome == fleet.OutcomeCheckpoint {
+		t.Errorf("the drain reported a checkpoint after the close failed: %q", recs[0].Outcome)
+	}
+	if strings.Contains(recs[0].Outcome, "INCOMPLETE") {
+		t.Errorf("a member that recorded was reported incomplete: %q", recs[0].Outcome)
+	}
+}
