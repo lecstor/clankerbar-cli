@@ -2691,20 +2691,65 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 			return plane.TaskState{}, err
 		}
 	}
+	// The plane withholds a SEALED record's findings: the driver (and a later
+	// panel member reading get_task, CLA-639) sees its metadata and counts, never
+	// the text. The fake has to do the same, or an independence test could pass by
+	// reading state the real plane would never serve.
+	served := make([]plane.ReviewRecordState, 0, len(r.records))
+	for _, rec := range r.records {
+		if rec.State == "sealed" {
+			rec.Findings = nil
+		}
+		served = append(served, rec)
+	}
 	return plane.TaskState{
 		Status:            r.status,
 		ClaimedByRun:      r.holder,
 		Outcome:           r.outcome,
 		DeliveryNoCode:    r.noCode,
-		Reviews:           r.records,
+		Reviews:           served,
 		ReviewCounted:     r.counted,
 		ReviewOpenMustIDs: r.openMusts,
 	}, nil
 }
 
-func (r *reviewReleaser) CloseReviewRound(_ context.Context, _, _ string, round int) error {
+// CloseReviewRound is the driver's update_task(review: {closeRound: n}), and it
+// refuses exactly what the real plane refuses (CLA-639 S4):
+//
+//   - only the LIVE HOLDER may close a round, so a close attempted after a
+//     handback (or by a run a takeover displaced) fails;
+//   - a round with no SEALED record is not an open round — a takeover voids the
+//     records it found, and a second close of the same round has nothing to
+//     release (the plane's no_open_round).
+//
+// The panel's failure arm is why this matters: it must close the round BEFORE
+// anything hands the claim back, or its close is refused and the earlier
+// members' findings stay sealed behind a lease that is already gone.
+func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID string, round int) error {
 	if r.closeErr != nil {
 		return r.closeErr
+	}
+	sealed := false
+	voided := false
+	for i := range r.records {
+		if r.records[i].Round != round {
+			continue
+		}
+		switch r.records[i].State {
+		case "sealed":
+			sealed = true
+		case "void":
+			voided = true
+		}
+	}
+	if voided {
+		return fmt.Errorf("close round %d refused: round_voided (a takeover voided this round's records)", round)
+	}
+	if runUUID(runID) != runUUID(r.holder) {
+		return fmt.Errorf("close round %d refused: run %s is not the live holder (%s)", round, runUUID(runID), runUUID(r.holder))
+	}
+	if !sealed {
+		return fmt.Errorf("close round %d refused: no_open_round (no sealed record in it)", round)
 	}
 	// The real plane releases the round's findings on close (state sealed -> open,
 	// CLA-636); the fake must too, or a later digest/resolved read would see the
@@ -2716,6 +2761,66 @@ func (r *reviewReleaser) CloseReviewRound(_ context.Context, _, _ string, round 
 	}
 	r.closes = append(r.closes, round)
 	return nil
+}
+
+// writeReviewRecord is a session's update_task(review: {...}), modelled on the
+// plane's rules (CLA-639 S4): the record lands SEALED — that is how the plane
+// stores it while the round is open — and a role that already has a record in an
+// open round is refused as a DUPLICATE, the plane's idempotency signal
+// (`{duplicate: true}`), never an error. A panel member writes its own role, so
+// two members never collide; a retry of the same member does.
+func (r *reviewReleaser) writeReviewRecord(rec plane.ReviewRecordState) error {
+	for _, have := range r.records {
+		if have.Round == rec.Round && have.ReviewerRole == rec.ReviewerRole && have.State != "void" {
+			return fmt.Errorf("update_task(review:) refused: duplicate_reviewer — %s already has a record in round %d", rec.ReviewerRole, rec.Round)
+		}
+	}
+	if rec.State == "" {
+		rec.State = "sealed"
+	}
+	r.records = append(r.records, rec)
+	return nil
+}
+
+// writeOutcome is a session's update_task(outcome: ...), refused exactly where
+// the real plane refuses it (CLA-639 S4): while THIS run has a record sealed in
+// an open round the plane refuses the run's outcome, body and decision writes
+// ("review_sealed"), and a run a takeover displaced may not write at all
+// (round_voided / not the live holder). This is the rule M5 exists for: a panel
+// member's legacy outcome block would have to land BEFORE its record, and
+// member 2's own outcome write is refused once member 1's record is sealed.
+//
+// The statusless outcome REPLACES the whole field on the plane, so that is what
+// this does — it does not append.
+func (r *reviewReleaser) writeOutcome(runID, outcome string) error {
+	for _, rec := range r.records {
+		if runUUID(rec.RunID) != runUUID(runID) {
+			continue
+		}
+		switch rec.State {
+		case "sealed":
+			return fmt.Errorf("update_task(outcome:) refused: review_sealed — run %s has a sealed record in open round %d", runUUID(runID), rec.Round)
+		case "void":
+			return fmt.Errorf("update_task(outcome:) refused: round_voided — a takeover voided round %d", rec.Round)
+		}
+	}
+	if runUUID(runID) != runUUID(r.holder) {
+		return fmt.Errorf("update_task(outcome:) refused: run %s no longer holds the task (%s)", runUUID(runID), runUUID(r.holder))
+	}
+	r.outcome = outcome
+	return nil
+}
+
+// takeover models the plane's recovery of a lapsed lease: another run becomes
+// the live holder and every OPEN round's records are VOIDED, so the previous run
+// can neither close them nor write to the task again (CLA-639 S4).
+func (r *reviewReleaser) takeover(runID string) {
+	r.holder = runID
+	for i := range r.records {
+		if r.records[i].State == "sealed" {
+			r.records[i].State = "void"
+		}
+	}
 }
 
 func (r *reviewReleaser) Park(_ context.Context, taskID, runID, outcome string) error {
@@ -3639,6 +3744,9 @@ func TestReviewerRoleFor(t *testing.T) {
 		t.Errorf("the fix phase's role = %q, want none", got)
 	}
 
+	// The legacy hand-expanded shape: two review phases the OPERATOR wrote. A
+	// panel expands into the same shape from one review, and takes the same
+	// roles.
 	panel := (&config.Config{Phases: []config.Phase{
 		{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
 	}}).EffectivePhases()
@@ -3647,6 +3755,28 @@ func TestReviewerRoleFor(t *testing.T) {
 	}
 	if got := reviewerRoleFor(panel, 2); got != "review-2" {
 		t.Errorf("the second panel member's role = %q, want review-2", got)
+	}
+
+	// The expanded panel: one configured review, four members, roles by position
+	// (CLA-639). This is what the driver actually iterates. The panel is SET
+	// explicitly — an absent `review_panel` expands nothing (there is no
+	// default), so the roles below are the operator's own members.
+	expanded := (&config.Config{
+		Phases: []config.Phase{
+			{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}, {Name: config.FixPhaseName},
+		},
+		ReviewPanel: []config.ReviewPanelMember{{}, {}, {}, {}},
+	}).EffectivePhases()
+	if len(expanded) != 6 {
+		t.Fatalf("a four-member panel sequence has %d phases, want 6 (implement + 4 reviewers + fix)", len(expanded))
+	}
+	for i, want := range map[int]string{1: "review-1", 2: "review-2", 3: "review-3", 4: "review-4"} {
+		if got := reviewerRoleFor(expanded, i); got != want {
+			t.Errorf("panel position %d role = %q, want %q", i, got, want)
+		}
+	}
+	if got := reviewerRoleFor(expanded, 5); got != "" {
+		t.Errorf("the fix phase after a panel has role %q, want none", got)
 	}
 }
 
@@ -3684,6 +3814,13 @@ func TestDrainPhases_ReviewSeamRefusesWhenTheRoundCannotClose(t *testing.T) {
 	}
 	if len(rel.closes) != 0 {
 		t.Fatalf("closes = %v, want none — the injected close error must not be recorded as a close", rel.closes)
+	}
+	// The no-panel close failure keeps the CLA-457 empty booking it had before
+	// CLA-639 (CLA-639 fix pass 4): the skip is for PANEL members only, so the
+	// operator's dead-phase rate reads exactly as it did at the base commit.
+	cell := d.deadTally[tallyKey{phase: "review", harness: "claude"}]
+	if cell == nil || cell.run != 1 || cell.dead != 1 {
+		t.Errorf("dead-phase tally for review/claude = %+v, want 1 dead of 1 — a plain review whose round cannot close is the empty shape", cell)
 	}
 }
 
