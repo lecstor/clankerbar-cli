@@ -47,7 +47,9 @@ func panelMembers() []config.ReviewPanelMember {
 }
 
 // panelDriver wires a phased driver over the given members, on one fake adapter
-// for every harness (so the invocation list is the spawn order).
+// for every harness (so the invocation list is the spawn order). A nil member
+// list leaves the config's panel absent, which is the single-reviewer shape the
+// driver must run exactly as it did before CLA-639.
 func panelDriver(t *testing.T, h *fakeAdapter, rel plane.Releaser, members []config.ReviewPanelMember, phases []config.Phase) *Driver {
 	t.Helper()
 	d, _ := panelDriverWithFleet(t, h, rel, members, phases)
@@ -1055,5 +1057,73 @@ func TestDrainPhases_ReviewPanelBeforeAVerificationRound(t *testing.T) {
 	}
 	if !strings.Contains(h.invocations[4].Prompt, "1.review-1.1") {
 		t.Errorf("the verifier was not handed the panel's MUST to adjudicate:\n%s", h.invocations[4].Prompt)
+	}
+}
+
+// TestDrainPhases_NoPanelIsTheLegacySingleReviewer (CLA-639, decision
+// a0b1373b): a config that sets NO review_panel — the default, and the shape
+// every config had before this feature — runs exactly one review phase, on the
+// harness/model the config gives it, with the historical brief and the
+// historical `review-1` role, and the fix gets the legacy block grading, not
+// the panel's merged list. This is the fixture-level proof the driver reads
+// nothing panel-shaped when the key is absent.
+func TestDrainPhases_NoPanelIsTheLegacySingleReviewer(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review: ONE reviewer, the legacy record
+		{res: okResult(5, 0.05)},      // fix
+	}}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1:
+			// The single reviewer writes the legacy `## Review` block the shipped
+			// brief prescribes (its durable record alongside it is the CLA-637
+			// half; the fix's grading below reads the block).
+			rel.outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: " + testCheckpointTip +
+				"\n- verdict: findings\n\n### Findings\n- R1 [must] (test): it is untested. internal/x.go:1 - the seam. Required fix: add a test.\n"
+			rel.records = append(rel.records, recordFor(1, "review-1", "r-1", testCheckpointTip, "sealed"))
+		case 2:
+			if len(rel.closes) != 1 {
+				t.Errorf("the fix spawned with the review round not yet closed (closes=%v)", rel.closes)
+			}
+			rel.status = "in_review"
+		}
+	}
+	// panelDriver's member list is nil: the config's ReviewPanel keeps its zero
+	// value, which is exactly what "the key is absent" unmarshals to.
+	d := panelDriver(t, h, rel, nil, panelPhases())
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — one review phase, not a panel (implement, review, fix)", h.invokeCalls)
+	}
+	// The single reviewer: the historical review-only brief, its own role, its
+	// own harness/model — and no panel context anywhere.
+	p := h.invocations[1].Prompt
+	for _, want := range []string{"REVIEW-ONLY gate", `reviewerRole: "review-1"`, `harness: "claude"`} {
+		if !strings.Contains(p, want) {
+			t.Errorf("the single reviewer's brief does not carry %q:\n%s", want, p)
+		}
+	}
+	if strings.Contains(p, "ONE MEMBER of a review PANEL") {
+		t.Errorf("a config with no review_panel got the panel member's brief:\n%s", p)
+	}
+	// The fix gets the LEGACY grading: reviewFindingsDigest's own preamble, and
+	// none of the merged list's panel-shaped prose.
+	fix := h.invocations[2].Prompt
+	if !strings.Contains(fix, "The driver read the review record and graded its findings structurally") ||
+		!strings.Contains(fix, "R1 [MUST]") {
+		t.Errorf("the fix did not receive the legacy review-record grading:\n%s", fix)
+	}
+	for _, banned := range []string{"This is the MERGED list from every member that recorded", "No panel member wrote a `## Review` block"} {
+		if strings.Contains(fix, banned) {
+			t.Errorf("the fix of a single-review config carries panel prose %q:\n%s", banned, fix)
+		}
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Errorf("closed rounds = %v, want exactly [1] — the single reviewer's round is closed before the fix", rel.closes)
 	}
 }
