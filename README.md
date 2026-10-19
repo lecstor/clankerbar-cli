@@ -1285,8 +1285,8 @@ markers — into that file.
 
 To watch one session live again, set **`"echo_sessions": true`**: the stream is
 mirrored to the daemon's terminal *as well as* written to the iteration log.
-Nothing is surfaced separately by harness; claude's stderr is part of its stream
-and lands in the log with the rest of it.
+No harness gets a separate live channel of its own: claude's stderr is part of
+its stream and lands in the log with the rest of it.
 
 The fleet supervisor keeps its own lines the same way, in
 **`<supervisor state dir>/supervise.log`** (`~/.local/state/clankerbar/loop/roster/supervise.log`

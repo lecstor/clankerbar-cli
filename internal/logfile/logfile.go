@@ -48,8 +48,6 @@ const (
 // Open. It is safe for concurrent use — the standard logger serialises its own
 // writes, but a process may also write here from more than one goroutine.
 type File struct {
-	dir  string
-	name string
 	max  int64
 	keep int
 
@@ -84,7 +82,7 @@ func Open(dir, name string, maxBytes int64, keep int) (*File, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("log %s: %w", filepath.Join(dir, name), err)
 	}
-	l := &File{dir: dir, name: name, max: maxBytes, keep: keep, path: filepath.Join(dir, name)}
+	l := &File{max: maxBytes, keep: keep, path: filepath.Join(dir, name)}
 	if err := l.reopen(true); err != nil {
 		return nil, err
 	}
