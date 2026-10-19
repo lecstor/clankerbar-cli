@@ -237,7 +237,15 @@ func (d *Supervisor) checkReplace() {
 
 	log.Print("replace: REPLACE honoured - writing STOP to every child; each drains at its iteration boundary")
 	d.removeReplaceMarker()
-	if stuck := d.drainForReplace(); stuck != "" {
+	// The drain is a stop the supervisor itself ordered, so for its duration
+	// every row it reports says stopped (not exited, the crash vocabulary) —
+	// this flag, deliberately not d.stopping, whose meaning ("the supervisor
+	// is exiting") must not stick when a timed-out drain resumes the loop.
+	d.replacing = true
+	d.reportStatus()
+	stuck := d.drainForReplace()
+	d.replacing = false
+	if stuck != "" {
 		if d.ctx.Err() != nil {
 			// The fleet stop landed mid-drain: the supervisor exits instead
 			// of replacing itself, and the stop owns the children now — the
@@ -289,8 +297,10 @@ func (d *Supervisor) drainForReplace() string {
 			ev.inst.mu.Lock()
 			ev.inst.exited = true
 			ev.inst.exitErr = ev.err
+			ev.inst.exitAt = ev.at
 			ev.inst.mu.Unlock()
 			done[ev.inst] = true
+			d.reportStatus()
 		case <-d.ctx.Done():
 			return "the fleet stop landed mid-drain - the children keep draining and the supervisor exits instead of replacing itself"
 		case <-tick.C:

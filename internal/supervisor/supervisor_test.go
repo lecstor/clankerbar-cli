@@ -39,6 +39,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -218,16 +219,41 @@ func helperMain() {
 // fakePlane serves the account-scoped roster over httptest. The served
 // entries are mutable (set) so a test can flip desired state between polls —
 // the console flip — and the plane can be put down (setDown) to exercise the
-// offline paths.
+// offline paths. Status reports (CLA-677) land on the roster's `/status` child
+// path and are recorded raw so a test can assert their body; statusCode lets a
+// test make that endpoint fail (404 before CLA-676 lands, or 5xx).
 type fakePlane struct {
-	mu      sync.Mutex
-	entries []RosterEntry
-	down    bool
+	mu         sync.Mutex
+	entries    []RosterEntry
+	down       bool
+	statusCode int // 0 = 200
+	statuses   []json.RawMessage
 }
 
 func (p *fakePlane) serve(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+			p.mu.Lock()
+			code := p.statusCode
+			down := p.down
+			if !down {
+				p.statuses = append(p.statuses, json.RawMessage(body))
+			}
+			p.mu.Unlock()
+			if down {
+				http.Error(w, "plane unreachable", http.StatusServiceUnavailable)
+				return
+			}
+			if code != 0 && code != http.StatusOK {
+				http.Error(w, "status endpoint refused", code)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+			return
+		}
 		p.mu.Lock()
 		down := p.down
 		entries := p.entries
@@ -253,6 +279,29 @@ func (p *fakePlane) setDown(down bool) {
 	p.mu.Lock()
 	p.down = down
 	p.mu.Unlock()
+}
+
+func (p *fakePlane) setStatusCode(code int) {
+	p.mu.Lock()
+	p.statusCode = code
+	p.mu.Unlock()
+}
+
+// statusReports decodes every status POST the plane received, in arrival order.
+func (p *fakePlane) statusReports(t *testing.T) []statusBody {
+	t.Helper()
+	p.mu.Lock()
+	raw := append([]json.RawMessage(nil), p.statuses...)
+	p.mu.Unlock()
+	out := make([]statusBody, 0, len(raw))
+	for _, b := range raw {
+		var rep statusBody
+		if err := json.Unmarshal(b, &rep); err != nil {
+			t.Fatalf("status report is not the documented JSON: %v\nbody: %s", err, b)
+		}
+		out = append(out, rep)
+	}
+	return out
 }
 
 // testOptions returns supervisor options pointed at the test binary as the

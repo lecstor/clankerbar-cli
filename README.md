@@ -710,6 +710,16 @@ roster** on the plane, polled every 15 seconds from
 `<backlog_url>/api/daemon-roster`. The account key (`CLANKERBAR_API_KEY`) is
 required — a supervisor spans projects, so a project key will not do.
 
+Every poll — and immediately after any child state change — the supervisor also
+reports its own view back to `<backlog_url>/api/daemon-roster/status`, so the
+console can tell a HALTed instance from a crashed one and a stopped machine from
+a sleeping one. The body carries the host, the supervisor's version and start
+time, and one row per instance: its state (`running`, `halted`, `backing_off`,
+`exited`, `stopped`), the reason, since when, the child's version, its last exit
+(code and time) and any scheduled retry. Like the daemon's fleet beacons this is
+fail-soft telemetry — a failed POST is logged once per outage and never changes
+what the supervisor does.
+
 Each roster entry declares one instance:
 
 - **`desiredState: running`** — a supervised child is kept up, spawned as
@@ -1265,7 +1275,9 @@ cadences the loop already runs (no new timers):
 - **Iteration history**: exactly one record per drain, posted at the boundary it
   just crossed — the task, the phases attempted, how it ended (`checkpoint`
   work left for a takeover / `released` back to the queue or settled /
-  `parked` for the operator / `dead`), duration, and tokens. The record also
+  `parked` for the operator / `dead`), duration, tokens, and the drain's
+  harness-reported dollar spend (`costUsd`; zero means no harness reported a
+  cost). The record also
   names every session the drain spawned, in spawn order, with the label of the
   phase it ran, the harness that ran it, the model it was spawned with (empty
   when the harness default applied), and what that session spent: the token

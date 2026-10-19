@@ -160,6 +160,12 @@ type Iteration struct {
 	Outcome         string    // one of the Outcome* constants
 	DurationSeconds float64   // wall clock for the whole drain
 	Tokens          int       // the drain's total reported token spend
+	// CostUSD is the drain's total harness-reported dollar spend (CLA-677),
+	// from the same accumulator the budget breaker reads. It is always a
+	// figure for an iteration that ran: zero means the harnesses reported no
+	// cost, and the plane stores the number rather than reading absence as
+	// unknown.
+	CostUSD float64
 }
 
 // Identity is what every beacon carries about THIS daemon: who and where it is,
@@ -443,6 +449,10 @@ type wireIteration struct {
 	Outcome         string        `json:"outcome"`
 	DurationSeconds float64       `json:"durationSeconds,omitempty"`
 	Tokens          int           `json:"tokens,omitempty"`
+	// CostUSD is the iteration's dollar spend; always present — UNLIKE Tokens
+	// (omitempty) — so a zero (nothing reported) stays distinguishable from a
+	// missing key (an older CLI). CLA-677.
+	CostUSD float64 `json:"costUsd"`
 }
 
 type wireReport struct {
@@ -488,6 +498,7 @@ func marshalReport(rep Report) ([]byte, error) {
 			Outcome:         it.Outcome,
 			DurationSeconds: it.DurationSeconds,
 			Tokens:          it.Tokens,
+			CostUSD:         it.CostUSD,
 		})
 	}
 	return json.Marshal(w)
