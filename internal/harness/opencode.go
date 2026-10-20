@@ -105,6 +105,13 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// Never resurrect a probe: a probe IS the liveness check.
 		return res, nil
 	}
+	if res.ToolLoop != "" {
+		// CLA-739: killed for repeating a failing tool call. Neither recovery
+		// below applies - a stall resume or a resurrection continues the same
+		// transcript, which is the one that was looping, at the price of
+		// re-sending all of it.
+		return res, nil
+	}
 	console := in.Console
 	// CLA-584: the output-cap stall. A final step that hit the output token
 	// limit with zero output is NOT the quiet death the loop below resumes —
@@ -123,7 +130,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// enlarge the accounting blind spot endUntrustedDrain exists to bound.
 	// The conjunct mirrors the driver's own gate (!capped && !ceiling &&
 	// !wallclock && untrusted) so adapter and tallyDead agree on what is dead.
-	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res) && res.Untrusted == ""; attempt++ {
+	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res) && res.Untrusted == "" && res.ToolLoop == ""; attempt++ {
 		sid, ref := resumeTargets(res)
 		if sid == "" || ref == "" {
 			// No session to resume into (died before its first event) or no
@@ -353,7 +360,13 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		}
 	}
 
-	cmd := exec.CommandContext(sctx, "opencode", runArgs...)
+	// CLA-739: the repeated-failing-tool-call kill cancels THIS context, a child
+	// of sctx, so the kill reaches the run alone - never the server above, which
+	// the deferred stop tears down, and never the caller. Created even when the
+	// guard is off, so there is one shape of exec context below.
+	lctx, loopKill := context.WithCancel(sctx)
+	defer loopKill()
+	cmd := exec.CommandContext(lctx, "opencode", runArgs...)
 	setupProcessGroup(cmd)
 	if workDir != "" {
 		cmd.Dir = workDir
@@ -377,7 +390,15 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// exactly that case): an fd holder would otherwise keep the pipe open past
 	// the kill and hang Run past its own box. An ordinary uncapped session's
 	// I/O is never cut short by it.
-	if _, hasDeadline := sctx.Deadline(); hasDeadline {
+	//
+	// CLA-739 arms it too whenever the repeated-failure guard is armed, because
+	// that guard is a cancellation with no deadline, and a kill that can hang is
+	// not a kill either. What that changes for a session the guard never fires
+	// on: a grandchild still holding the pipes after opencode exits on its own
+	// now has Run return exec.ErrWaitDelay 5s later instead of blocking until the
+	// grandchild lets go - the CLA-414 branch below already reads that as the
+	// clean end it is.
+	if _, hasDeadline := sctx.Deadline(); hasDeadline || (in.MaxRepeatedToolFailures > 0 && !in.Probe) {
 		cmd.WaitDelay = 5 * time.Second
 	}
 
@@ -420,6 +441,7 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// claim seed, and the tests build the parser the same way so that dropping it
 	// here turns them red.
 	p := newOpencodeParse(in, console)
+	p.kill = loopKill
 	captured := newCapture(p.line)
 	captured.attach(cmd, console)
 	// Taken before the spawn, so every message this process adds to the session
@@ -449,11 +471,17 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 			fmt.Fprintf(console, "\n!! session outlived its wall-clock cap (%s) — ending it here; whatever it wrote is still in the worktree, uncommitted\n", in.MaxSessionWallClock)
 		}
 	}
+	// CLA-739: the guard's verdict rides the Result whether or not the kill
+	// landed before the process ended on its own - the session WAS looping, and
+	// that is what the driver classifies. loopKilled is the narrower fact the
+	// exit handling below needs: Run's error is the kill's, not the session's.
+	res.ToolLoop = p.observed.toolLoop.tripped()
+	loopKilled := runErr != nil && res.ToolLoop != ""
 
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
-	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut {
+	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut && !loopKilled {
 		// The process exited cleanly on its own — ExitCode 0 — but a grandchild
 		// (a backgrounded build, a test run) inherited the output pipes and held
 		// them open past cmd.WaitDelay, so os/exec force-closed them and Run
@@ -475,13 +503,14 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// later — so the noise is left standing rather than guarded against.
 		o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
 		return res, nil
-	} else if runErr != nil && !timedOut {
+	} else if runErr != nil && !timedOut && !loopKilled {
 		// A launch failure (bad PATH, unreadable config): nothing was emitted,
 		// so res is an honest zero, and the failure is real.
 		return res, runErr
 	} else if runErr != nil {
-		// Our own kill: the child died on the cancel, so its error is the kill's
-		// and not a verdict. The marker above is the verdict.
+		// Our own kill (the wall-clock cap, or CLA-739's repeated failing tool
+		// call): the child died on the cancel, so its error is the kill's and
+		// not a verdict. The marker above is the verdict.
 		res.ExitCode = -1
 	}
 	o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
@@ -1223,6 +1252,12 @@ type opencodeParse struct {
 	// disagree about how the session ended.
 	recoveredErrors   int
 	lastEventWasError bool
+
+	// kill ends the session's process, for the CLA-739 repeated-failure guard
+	// (armed on observed.toolLoop by newSessionResult). Set by runSession to the
+	// cancel of the run's own exec context; nil in the parser tests, where the
+	// guard still records its verdict and nothing is killed.
+	kill func()
 }
 
 // newOpencodeParse builds the parser a session streams into. It exists so the
@@ -1390,13 +1425,11 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	if st.Status != "completed" && st.Status != "error" {
 		return
 	}
-	name := opencodeClankerbarTool(part.Tool)
-	if name == "" {
-		return
-	}
 	// Replays are recognised by the part id, not the call id: the call id is
 	// the provider's and repeats across steps (see opencodePart), so keying on
-	// it would drop a later, genuine call.
+	// it would drop a later, genuine call. Taken for EVERY tool, ahead of the
+	// clankerbar filter, because the CLA-739 guard below counts every tool and
+	// a replayed failure must not count as a second one.
 	key := part.PartID
 	if key == "" {
 		key = part.ID
@@ -1408,6 +1441,16 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 		p.settledCalls = map[string]bool{}
 	}
 	p.settledCalls[key] = true
+	// CLA-739: the STATUS is the failure flag (see opencodeToolState), and the
+	// error text rides where the output would have been.
+	if p.observed.toolLoop.observe(part.Tool, st.Status == "error", st.Error) && p.kill != nil {
+		fmt.Fprintf(p.diag(), "\n!! %s - killing the session here instead of letting it retry the same failing call\n", p.observed.toolLoop.tripped())
+		p.kill()
+	}
+	name := opencodeClankerbarTool(part.Tool)
+	if name == "" {
+		return
+	}
 
 	noteToolUse(name, part.ID, st.Input, &p.observed)
 	// The result text is handed over as JSON so it reaches noteClaimed by the same

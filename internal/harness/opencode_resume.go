@@ -241,6 +241,11 @@ func mergeResume(base *Result, add Result) {
 	if add.Untrusted != "" {
 		base.markUntrusted(add.Untrusted)
 	}
+	// CLA-739: a continuation killed for repeating a failing tool call is how
+	// the merged session ended, and the resurrection loop reads it to stop.
+	if add.ToolLoop != "" && base.ToolLoop == "" {
+		base.ToolLoop = add.ToolLoop
+	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
 	// A resurrection is part of the SAME session, so a clankerbar call the

@@ -80,7 +80,9 @@ func (d *Driver) tallyDead(phase, harness string, res harness.Result, capped, ce
 		d.deadTally[k] = t
 	}
 	t.run++
-	if res.Untrusted == "" && res.Claim.Held() && !capped && !ceiling && !wallclock && deadPhase(res) {
+	// CLA-739: a tool-loop kill is a death in the rate too, so the panel's
+	// failed-member path finds it already booked.
+	if res.Untrusted == "" && res.Claim.Held() && !capped && !ceiling && !wallclock && (deadPhase(res) || res.ToolLoop != "") {
 		t.dead++
 		return true
 	}

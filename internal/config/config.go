@@ -81,6 +81,19 @@ const DefaultMaxTurns = 400
 // if a harness of yours legitimately dies silently more often than that.
 const DefaultMaxZeroSpendAttempts = 3
 
+// DefaultMaxRepeatedToolFailures is how many CONSECUTIVE calls of one tool may
+// return the same error before the harness kills the session (see
+// Config.MaxRepeatedToolFailures, CLA-739).
+//
+// 5 because the measured loop is nothing like the ordinary shape. The incident
+// sessions made 65 to 316 identical refused calls each; a working session that
+// trips over the same refusal retries it once or twice and moves on. And the
+// largest legitimate run of identical failures in that incident's own logs was
+// 4: a session refused `external_directory` on four shell calls in a row, which
+// then recovered and carried on. So 5 sits just above what a session that is
+// still working does, and every call past it re-sends the whole context.
+const DefaultMaxRepeatedToolFailures = 5
+
 // MaxInstanceNameLen is the plane's cap on a daemon instance name (CLA-465's
 // report bounds): longer names are refused by Validate rather than beached as
 // silently-dropped beacons.
@@ -2238,6 +2251,22 @@ type Config struct {
 	// nothing.
 	MaxZeroSpendAttempts int `json:"max_zero_spend_attempts"`
 
+	// MaxRepeatedToolFailures ends a session whose SAME tool returns the SAME
+	// error on this many consecutive tool calls (CLA-739). The harness kills the
+	// session mid-stream, and the driver classifies it as dead with a cause
+	// naming the tool, the count and the error. Unset = the built-in default
+	// (DefaultMaxRepeatedToolFailures); 0 turns the check off; negative is
+	// refused.
+	//
+	// A POINTER, unlike max_zero_spend_attempts, because 0 here is a real
+	// setting (off) and not "use the default", so unset has to be a third state.
+	// And `omitempty`, because the config's marshalled form is its identity (see
+	// EchoSessions): adding the knob must not change an existing daemon's.
+	//
+	// Enforced by the harnesses that observe tool results as they stream -
+	// claude and opencode. Inert under codex.
+	MaxRepeatedToolFailures *int `json:"max_repeated_tool_failures,omitempty"`
+
 	// EchoSessions mirrors each session's output stream to the daemon's own
 	// stderr while it runs, as well as to its iteration log. Default FALSE
 	// (CLA-701): the stream is the whole harness transcript — opencode emits
@@ -3259,6 +3288,17 @@ func (c *Config) ZeroSpendAttemptBound() int {
 	return DefaultMaxZeroSpendAttempts
 }
 
+// RepeatedToolFailureBound is the effective repeated-failing-tool-call
+// threshold: the operator's own, else the built-in default. Unlike
+// ZeroSpendAttemptBound this one resolves to zero when the operator set zero,
+// which is how the check is turned off.
+func (c *Config) RepeatedToolFailureBound() int {
+	if c.MaxRepeatedToolFailures != nil {
+		return *c.MaxRepeatedToolFailures
+	}
+	return DefaultMaxRepeatedToolFailures
+}
+
 // BuiltinPhaseNames lists the shipped phase briefs, sorted so the error naming
 // them is stable.
 func BuiltinPhaseNames() []string {
@@ -4043,6 +4083,11 @@ func (c *Config) Validate() error {
 	// doctor's negative-budget check exists to stop.
 	if c.MaxZeroSpendAttempts < 0 {
 		return errors.New("max_zero_spend_attempts is negative")
+	}
+	// Refused rather than read as "off": 0 is how the check is turned off, and a
+	// negative is a typo that would otherwise disable it silently.
+	if c.MaxRepeatedToolFailures != nil && *c.MaxRepeatedToolFailures < 0 {
+		return errors.New("max_repeated_tool_failures is negative")
 	}
 	// The plane refuses an instance name over 100 characters (CLA-465's report
 	// bounds), so a beacon carrying one would be dropped on EVERY poll — reporting

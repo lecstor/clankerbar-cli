@@ -1887,6 +1887,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// The `no_mcp` token is stable so the fixer's INCOMPLETE list
 					// and the analytics can exclude it without parsing prose.
 					reason = "no_mcp: no successful clankerbar MCP call and no review record"
+				case end.toolLoop != "":
+					reason = end.toolLoop
 				case end.dead:
 					reason = "died producing nothing"
 				case seqEnd != nil && seqEnd.limitWait != nil:
@@ -2089,8 +2091,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			}
 
 			if !last && i == 0 && taskID != "" && taskID == deadTask && deadRetries >= perTaskDeadBound-1 {
-				log.Printf("%siteration %d: the %s phase died producing nothing for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
-					labelOf(t), drainNum, ph.Label(i), deadRetries+1, perTaskDeadBound)
+				how := "died producing nothing"
+				if end.toolLoop != "" {
+					how = "was killed (" + end.toolLoop + "), dead"
+				}
+				log.Printf("%siteration %d: the %s phase %s for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
+					labelOf(t), drainNum, ph.Label(i), how, deadRetries+1, perTaskDeadBound)
 				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
 				parkFired = true // CLA-466: the record says parked, not dead
 				// The task is parked for the operator and this drain is over; the
@@ -2120,8 +2126,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				} else {
 					deadRetries++
 				}
-				log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
-					labelOf(t), drainNum, ph.Label(i), deadReason(end.claim), deadRetries, perTaskDeadBound)
+				if end.toolLoop != "" {
+					log.Printf("%siteration %d: the %s phase was killed (%s) — retrying it (%d of %d) before any review brief sees the task",
+						labelOf(t), drainNum, ph.Label(i), end.toolLoop, deadRetries, perTaskDeadBound)
+				} else {
+					log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
+						labelOf(t), drainNum, ph.Label(i), deadReason(end.claim), deadRetries, perTaskDeadBound)
+				}
 				continue
 			}
 		}
@@ -2546,6 +2557,13 @@ type phaseEnd struct {
 	// can exclude it. It is set only on the FINAL attempt — the one bounded
 	// retry the same pass already took is not reported as the member's outcome.
 	noMCP bool
+
+	// toolLoop is the cause when the adapter killed this pass's session for
+	// repeating a failing tool call (CLA-739), "" otherwise. The pass is also
+	// dead (when !last and held); this carries the NAME of the death, so the
+	// panel handler records the member as failed with the cause rather than
+	// with "died producing nothing".
+	toolLoop string
 
 	// reviewCloseFailed reports that this pass's review seam gate passed far
 	// enough to find a SEALED round, but the driver's own close of that round
@@ -4647,7 +4665,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		ceiling := a.TokenCeilingHit(res)
 		wallclock := a.WallClockCapped(res)
 		zeroUsage := a.ZeroUsageUnknown(res)
-		producedNothing := res.Untrusted == "" && !capped && !ceiling && !wallclock && deadPhase(res)
+		// CLA-739: the adapter killed this session for making the same failing
+		// tool call over and over. That is a DEAD session - no delivery, whatever
+		// it pushed before it started looping - and it joins the dead signature
+		// everywhere below: the seam veto, the dead-phase ladder, the tally, the
+		// panel's failed-member path and the fleet record. Not a cap: a cap is an
+		// orderly end of a session doing its job, and this one had stopped.
+		toolLoop := res.ToolLoop
+		producedNothing := res.Untrusted == "" && !capped && !ceiling && !wallclock && (deadPhase(res) || toolLoop != "")
 		// Rescue whatever the session left uncommitted, FIRST — before the handback,
 		// because a successful salvage changes what the handback should do: a task
 		// with a branch recorded on it is no longer safe to release (CLA-314).
@@ -4661,8 +4686,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// it would park a healthy task for a mismatch the DRIVER created. A
 		// review that genuinely dies leaving source edits loses them, which is
 		// exactly what "review only, change nothing" means.
+		//
+		// A tool-loop kill is salvaged like any other end, but not with the
+		// emphatic "produced nothing" line: a clean tree there may well be work
+		// the session committed and pushed before it started looping.
 		if !requireReviewRecord {
-			d.salvageStrandedWork(ctx, t, &res, producedNothing, inv.WorkDir)
+			d.salvageStrandedWork(ctx, t, &res, producedNothing && toolLoop == "", inv.WorkDir)
 		}
 		// Hand back anything the session was still holding, BEFORE deciding what to
 		// do next — every branch below either waits, retries or returns, and all of
@@ -4729,9 +4758,15 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// says it delivered nothing, it is the existing held-but-empty shape
 		// (retry once, then hand the task back), never a run-ending stop over an
 		// exit status the harness itself explains.
-		orderlyExit := res.ExitCode == 0 || capped || ceiling || wallclock
-		recoveredExit := !orderlyExit && res.Untrusted == "" && harness.RecoveredErrors(res) > 0
-		checkpointable := res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP) || recoveredExit
+		//
+		// CLA-739: a tool-loop kill is none of these. The process usually reads
+		// exit -1 from the kill, but the session can exit on its own in the
+		// instant before the kill lands, and a zero exit must not turn a looping
+		// session into a checkpoint - nor can its stream's recovered provider
+		// errors (the incident's own log carries one).
+		orderlyExit := toolLoop == "" && (res.ExitCode == 0 || capped || ceiling || wallclock)
+		recoveredExit := !orderlyExit && toolLoop == "" && res.Untrusted == "" && harness.RecoveredErrors(res) > 0
+		checkpointable := toolLoop == "" && (res.ExitCode == 0 || ((capped || ceiling || wallclock) && res.Claim.HasWIP) || recoveredExit)
 		// CLA-386: a session whose final step finished with reason "unknown" and
 		// left no branch recorded produced NOTHING — a dead phase, not a completed
 		// one. It must not earn a checkpoint even on a zero exit, because a
@@ -4744,7 +4779,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// wall-clock kill can land mid-turn, but a cap is an orderly end with its
 		// own marker — retrying it would re-spend against the same cap and parking
 		// it would read a doing-its-job backstop as a silent death.
-		dead := !last && res.Untrusted == "" && res.Claim.Held() && !capped && !ceiling && !wallclock && deadPhase(res)
+		dead := !last && res.Untrusted == "" && res.Claim.Held() && !capped && !ceiling && !wallclock && (deadPhase(res) || toolLoop != "")
 		// CLA-402: book this session into the run's dead-phase tally, per phase
 		// label and harness, whatever the seam decided about retrying it. The
 		// tally's dead classification deliberately drops the `!last` conjunct
@@ -4785,6 +4820,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			Model:   inv.Model,
 			RunID:   sessionRunID(res, prev),
 		}
+		// CLA-739: the tool-loop kill's cause rides the session entry on the
+		// fleet report, as CLA-703's no_mcp does - it is why this session
+		// produced nothing.
+		if toolLoop != "" {
+			end.session.Cause = toolLoop
+		}
+		end.toolLoop = toolLoop
 		// The wider classification rides the end for the fleet record only — see
 		// phaseEnd.producedNothing.
 		end.producedNothing = producedNothing
@@ -5159,7 +5201,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// (or that never ran) leaves the lease live, so a retry session would
 			// only be refused and burned.
 			if !panelMember && !retryNoMCP {
-				end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+				// A tool-loop kill is never the undeclared hand-off CLA-384
+				// counts, even when the process exited 0 an instant before the
+				// kill landed: it was killed failing to move the task on.
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0 && toolLoop == "")
 			}
 
 			// CLA-451: the blind-spot convergence. Everything above learns about
@@ -5442,6 +5487,27 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			noUsage = 0
 		} else {
 			noUsage++
+		}
+
+		// CLA-739: killed for repeating a failing tool call. Ahead of the exit
+		// status, because the session can exit 0 in the instant before the kill
+		// lands. Never retried here as a transient (a fresh session would loop
+		// the same way, and each call re-sends the whole context), and never a
+		// run failure (the kill did its job). The dead classification above has
+		// already decided what follows: drainPhases' dead-phase ladder, or the
+		// panel's failed-member path.
+		if toolLoop != "" {
+			// claude reports dollars only on its terminal result event, which a
+			// killed stream never reaches - so say the cost was not captured
+			// rather than print $0 as if it were measured (the CLA-343 ceiling
+			// branch's rule). opencode sums each step's cost up to the kill.
+			spent := fmt.Sprintf("tokens=%d cost=$%.4f", tokens, cost)
+			if !res.CostReported {
+				spent = fmt.Sprintf("tokens=%d; cost not captured - killed mid-stream", tokens)
+			}
+			log.Printf("%siteration %d: the %s phase was killed by the driver: %s — classified dead, no delivery (%s) (log: %s)",
+				labelOf(t), drainNum, ph.Label(phaseIdx), toolLoop, spent, logPath)
+			return tokens, cost, false, end, nil
 		}
 
 		if res.ExitCode == 0 {
@@ -5983,21 +6049,28 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 		log.Printf("%sdead-phase park: no claim observed, so there is no task to park", labelOf(t))
 		return
 	}
+	// How the sessions died. A CLA-739 tool-loop kill is dead whatever it
+	// pushed, so "no branch recorded" may be false for it and the finish reason
+	// says nothing: the cause names what happened instead. The cause is the
+	// LAST attempt's, which is the one the operator is being asked about.
+	death := fmt.Sprintf("died producing nothing (final step reason %q, no branch recorded)", deadReason(res))
+	if res.ToolLoop != "" {
+		death = fmt.Sprintf("was killed by the driver (%s)", res.ToolLoop)
+	}
 	pk, ok := t.Releaser.(plane.ParkAPI)
 	if !ok {
-		log.Printf("%sCANNOT PARK %s — four consecutive dead phases (final step reason %q, no branch recorded), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
-			labelOf(t), claimLabel(res.Claim), deadReason(res))
+		log.Printf("%sCANNOT PARK %s — four consecutive dead phases (the last %s), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
+			labelOf(t), claimLabel(res.Claim), death)
 		return
 	}
-	sig := deadReason(res)
 	ref := claimLabel(res.Claim)
 	outcome := fmt.Sprintf(
-		"Parked after four consecutive dead phases: the %s session died producing nothing (final step reason %q, no branch recorded) on each attempt. Per the 2026-08-20 operator decision, a task that can kill four full sessions reaches the operator rather than a fifth; the retry budget is per task. Iteration logs are in %s.",
-		phaseLabel, sig, d.state.Path())
+		"Parked after four consecutive dead phases: the %s session %s on the last attempt, after dying on each of the three before it. Per the 2026-08-20 operator decision, a task that can kill four full sessions reaches the operator rather than a fifth; the retry budget is per task. Iteration logs are in %s.",
+		phaseLabel, death, d.state.Path())
 	body := fmt.Sprintf(
-		"**%s has defeated four sessions and is now parked.** The %s phase died producing nothing (final step reason %q, no branch recorded) on four consecutive attempts, so the driver stopped rather than spending a fifth session on it.\n\n"+
+		"**%s has defeated four sessions and is now parked.** The %s phase died on four consecutive attempts; the last one %s, so the driver stopped rather than spending a fifth session on it.\n\n"+
 			"The task is `parked` — nothing will pick it up until an operator decides what to do with it. The iteration logs are in %s.",
-		ref, phaseLabel, sig, d.state.Path())
+		ref, phaseLabel, death, d.state.Path())
 	options := []string{
 		"Set it back to `ready` — the blocker is gone, let the fleet try again",
 		"Leave it parked — I will work it myself",
@@ -7018,6 +7091,8 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// shipped default (CLA-368). Unlike the token ceiling this one HAS a disabled
 	// state, because no default number is honest across models and providers.
 	inv.MaxSessionWallClock = ph.MaxWallClock.Duration()
+	// CLA-739: the repeated-failing-tool-call kill. Default on (5), 0 off.
+	inv.MaxRepeatedToolFailures = tc.RepeatedToolFailureBound()
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the

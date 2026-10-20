@@ -1610,6 +1610,7 @@ instance the supervisor reads.
   "max_retries": 0,
   "retry_cap": "5m",
   "max_zero_spend_attempts": 3,
+  "max_repeated_tool_failures": 5,
   "echo_sessions": false,
   "budget": {
     "max_tokens": 0,
@@ -2111,6 +2112,24 @@ is counted neither way**: a session the cap turned away often reports nothing at
 all, and waiting out a quota overnight must not read as sessions failing to start.
 The ladder is per phase, so a phased config allows the bound in each. Raise it if a
 harness of yours dies silently more often than that.
+
+**A session that keeps making the same failing tool call is killed.** When the
+same tool returns the same error on `max_repeated_tool_failures` (default **5**)
+**consecutive** tool calls, the harness kills the session mid-stream (CLA-739).
+On 2026-10-20 nine review-panel sessions each called one clankerbar tool with an
+argument the plane refuses, 65 to 316 times per session, and every retry re-sent
+the whole context: ~273M tokens in ~45 minutes, until the provider's 5-hour window
+ran out. The inputs are not compared (the incident varied an argument while the
+error stayed identical); any other tool call in between, or a success, breaks the
+streak. A killed session is classified **dead, no delivery**: the daemon log
+names the tool, the count and the error (`repeated failing tool call:
+clankerbar_update_task x5: invalid_release: ...`), the same text rides the
+session's `cause` on the fleet report, an implement phase goes down the
+dead-phase retry ladder, and a review-panel member is recorded as a failed member
+with that cause. It is never retried as a transient failure and never stops the
+run. `0` turns the check off; unset is the default; a negative is refused.
+Enforced by the `claude` and `opencode` adapters, which see tool results as they
+stream; inert under `codex`.
 
 **And one more thing is bounded: retries taken on a failure the harness could not
 name.** `opencode`'s error surface changes between versions, so beyond the anchored
