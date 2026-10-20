@@ -234,6 +234,110 @@ func (c *Config) SessionEnv(harnessName, slug string) ([]string, error) {
 	return out, nil
 }
 
+// SessionEnvAllowlist returns the inherited-environment allowlist in force for
+// one session (CLA-714): nil/empty means "inherit the daemon's whole
+// environment", which is the unchanged default.
+//
+// The four levels compose as a WHOLE LIST, not per key: top level, harness
+// block, project block, project's per-harness block, each REPLACING the
+// previous answer when it declares one. That is deliberately unlike the `env`
+// maps, whose per-key overlay merges: an allowlist is a complete answer to
+// "what may this session see", and unioning levels would make a narrower level
+// unable to remove a variable a broader one admitted. An unmatched slug (the
+// single-project case, which reaches here with "") gets the top-level and
+// harness layers only, exactly as envOverlay does.
+func (c *Config) SessionEnvAllowlist(harnessName, slug string) []string {
+	list := c.EnvAllowlist
+	if hc, ok := c.Harnesses[harnessName]; ok && len(hc.EnvAllowlist) > 0 {
+		list = hc.EnvAllowlist
+	}
+	for i := range c.Projects {
+		if c.Projects[i].Slug != slug {
+			continue
+		}
+		if len(c.Projects[i].EnvAllowlist) > 0 {
+			list = c.Projects[i].EnvAllowlist
+		}
+		if ph := c.Projects[i].EnvAllowlistPerHarness[harnessName]; len(ph) > 0 {
+			list = ph
+		}
+		break
+	}
+	if len(list) == 0 {
+		return nil
+	}
+	return list
+}
+
+// EnvAllowlistDeclared reports whether ANY level declares an inherited-env
+// allowlist. `doctor` uses it for the one-line "sessions inherit everything /
+// only the allowlist" summary, which is about the CONFIG rather than one
+// session's resolved answer.
+func (c *Config) EnvAllowlistDeclared() bool {
+	if len(c.EnvAllowlist) > 0 {
+		return true
+	}
+	for _, name := range sortedKeys(c.Harnesses) {
+		if len(c.Harnesses[name].EnvAllowlist) > 0 {
+			return true
+		}
+	}
+	for i := range c.Projects {
+		if len(c.Projects[i].EnvAllowlist) > 0 {
+			return true
+		}
+		for _, h := range sortedKeys(c.Projects[i].EnvAllowlistPerHarness) {
+			if len(c.Projects[i].EnvAllowlistPerHarness[h]) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// validateEnvAllowlist checks one declared allowlist. A list that is present
+// but EMPTY is refused rather than read as "inherit everything": `[]` is the
+// shape of a half-edited config, and silently giving it the most permissive
+// meaning is the wrong direction to be wrong in. Omit the key for full
+// inheritance. Duplicates are refused too — a set with one member spelled twice
+// tells the operator something about the list that is not true of its effect.
+func validateEnvAllowlist(list []string, label string) error {
+	if list == nil {
+		return nil
+	}
+	if len(list) == 0 {
+		return fmt.Errorf("%s is empty - omit the key to inherit the daemon's whole environment, or name at least the required minimum (HOME, PATH, CLANKERBAR_API_KEY)", label)
+	}
+	seen := make(map[string]struct{}, len(list))
+	for i, name := range list {
+		if name != strings.TrimSpace(name) {
+			return fmt.Errorf("%s[%d] = %q has surrounding whitespace - name the variable exactly", label, i, name)
+		}
+		if !validEnvName(name) {
+			return fmt.Errorf("%s[%d] = %q is not a valid environment variable name", label, i, list[i])
+		}
+		if _, ok := seen[name]; ok {
+			return fmt.Errorf("%s names %s twice", label, name)
+		}
+		seen[name] = struct{}{}
+	}
+	return nil
+}
+
+// SessionEnvNames lists the variable NAMES the four-level env overlay declares
+// for one session, without resolving any value — `doctor` prints these beside
+// the inherited-env allowlist (CLA-714) so an operator can see the whole set a
+// session will receive and never a credential. Sorted, so two runs agree.
+func (c *Config) SessionEnvNames(harnessName, slug string) []string {
+	overlaid := make(EnvMap)
+	for _, layer := range c.envOverlay(harnessName, slug) {
+		for k, v := range layer {
+			overlaid[k] = v
+		}
+	}
+	return sortedKeys(overlaid)
+}
+
 // envOverlay returns the four layers for one session, least specific first:
 // top level, harness block, project block, project's per-harness block. The
 // project layers apply only when slug matches a declared projects[] entry —

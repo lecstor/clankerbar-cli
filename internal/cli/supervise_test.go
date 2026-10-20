@@ -94,9 +94,10 @@ func TestSuperviseReadsWorkdirRootFromEnv(t *testing.T) {
 	t.Setenv("CLANKERBAR_API_KEY", "test-key")
 	t.Setenv("HOME", t.TempDir())
 	// The "unset" half of this test must not inherit the ambient value: a
-	// session running under the fleet supervisor HAS this variable set, and
-	// then the first assertion would fail on the supervisor's own environment
-	// rather than on anything this test changed.
+	// session running under the fleet supervisor HAS this variable set (CLA-714's
+	// sibling failure: a test that assumes an ambient variable is absent passes
+	// only on the machine where it happens to be), and the first assertion would
+	// otherwise fail on the supervisor's own environment.
 	t.Setenv(WorkdirRootEnv, "")
 	writeSuperviseConfig(t, srv.URL)
 
