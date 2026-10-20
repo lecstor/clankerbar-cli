@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -1718,22 +1719,28 @@ var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
 // session once the window lifts, so this must be reported as Limited with Stop
 // UNSET rather than falling through to the transient ladder.
 //
-// Two arms, both read from opencodeErrorText (stderr + a TERMINAL error event),
+// Three arms, all read from opencodeErrorText (stderr + a TERMINAL error event),
 // never the agent's narration:
 //   - 2.x types it: error.type == "provider.quota". This alone is enough — the
 //     type is the provider's own statement that the cap is a quota it will lift,
 //     so a message carrying no duration/window wording at all is still waitable.
-//   - the message names a rolling window by duration or scope: "5-hour usage
-//     limit", "Your 5-hour limit has been reached", "30-minute usage limit",
-//     "session usage limit", "daily usage limit". The word "usage" is not
-//     required — an untyped provider that calls it a "5-hour limit" is the same
-//     window.
+//   - the message names the window BEFORE the limit word: "5-hour usage limit",
+//     "Your 5-hour limit has been reached", "30-minute usage limit", "session
+//     usage limit", "daily usage limit". The word "usage" is not required — an
+//     untyped provider that calls it a "5-hour limit" is the same window.
+//   - the message names the window AFTER the limit word: "Your usage limit has
+//     been reached (5-hour window)". Same statement with the clause order
+//     swapped; without this arm it matches neither the window-first arm (the
+//     limit must follow the window) nor the generic quota arm ("usage limit
+//     reached" wants those words adjacent), so a waitable window rode the
+//     transient ladder instead of a supervised wait (review 1.review-2.2).
 //
 // Deliberately narrow. A bare 429 "rate limit" names no window and stays
 // transient, and the hard budget arms above are checked FIRST — so a monthly cap
 // typed as provider.quota is still a Stop.
 var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"` +
 	`|\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b[^.\n"]{0,40}\blimit\b` +
+	`|\b(?:limit|quota)\b[^.\n"]{0,40}\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b` +
 	`|\b(session|daily)\s+usage\s+limit`)
 
 // opencodeResetRe captures the reset instant a rolling quota STATES as RFC3339,
@@ -1743,16 +1750,41 @@ var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"`
 var opencodeResetRe = regexp.MustCompile(`(?i)resets?\s+at\s+` +
 	`(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))`)
 
-func parseOpencodeReset(s string) time.Time {
-	m := opencodeResetRe.FindStringSubmatch(s)
+// opencodeResetInRe captures a RELATIVE reset a rolling quota states by duration,
+// e.g. "Usage limit reached. Resets in 4 hours." or "reset in 45m". The same
+// provider family emits either form, and a relative window is the same statement
+// of when the limit lifts — the classifier's own rule is that "a message that
+// says when it lifts is a wait" (review 1.review-2.2), and reading only the
+// absolute form turned the wait into an engineer-visible stop.
+var opencodeResetInRe = regexp.MustCompile(`(?i)resets?\s+in\s+(\d+)\s*(hours?|hrs?|minutes?|mins?|h|m)\b`)
+
+func parseOpencodeReset(s string) time.Time { return parseOpencodeResetAt(s, time.Now()) }
+
+// parseOpencodeResetAt is parseOpencodeReset with an injectable "now" for
+// testing — the same split parseClaudeResetAt uses. "now" is the drain's now: a
+// relative window is resolved at the moment the session's diagnostics are
+// classified.
+func parseOpencodeResetAt(s string, now time.Time) time.Time {
+	if m := opencodeResetRe.FindStringSubmatch(s); m != nil {
+		if t, err := time.Parse(time.RFC3339Nano, m[1]); err == nil {
+			return t
+		}
+	}
+	m := opencodeResetInRe.FindStringSubmatch(s)
 	if m == nil {
 		return time.Time{}
 	}
-	t, err := time.Parse(time.RFC3339Nano, m[1])
-	if err != nil {
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
 		return time.Time{}
 	}
-	return t
+	switch strings.ToLower(m[2])[0] {
+	case 'h':
+		return now.Add(time.Duration(n) * time.Hour)
+	case 'm':
+		return now.Add(time.Duration(n) * time.Minute)
+	}
+	return time.Time{}
 }
 
 func (opencode) DetectLimit(res Result) Limit {
@@ -1774,9 +1806,11 @@ func (opencode) DetectLimit(res Result) Limit {
 	}
 	// The generic exhausted-quota phrasings are a Stop only when nothing makes
 	// the limit waitable. A provider.quota type or a rolling window is the case
-	// above; here the one remaining signal is a STATED reset — a message that
-	// says when it lifts is a wait, not a top-up — so it must not be turned into
-	// a hard stop by wording that names no hard condition (CLA-736 review).
+	// above; here the one remaining signal is a STATED reset — absolute
+	// ("resets at <RFC3339>") or relative ("resets in 4 hours") — a message that
+	// says when it lifts is a wait, not a top-up, so it must not be turned into a
+	// hard stop by wording that names no hard condition (CLA-736 review,
+	// 1.review-2.2).
 	if opencodeGenericLimitRe.MatchString(text) {
 		if reset := parseOpencodeReset(text); !reset.IsZero() {
 			return Limit{Limited: true, ResetAt: reset, Reason: "usage_limit"}

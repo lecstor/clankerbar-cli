@@ -218,6 +218,79 @@ func TestMarshalReportCarriesPerSessionUsage(t *testing.T) {
 	}
 }
 
+// CLA-737: the wire never carries costUsd on a session without
+// usageReported: true. The plane refuses the WHOLE report otherwise —
+// {"code":"invalid_request","message":"session.costUsd requires session.usageReported"}
+// — so every other iteration in the batch and the presence refresh are lost
+// with a single such session. Session is constructible by any caller, so the
+// guarantee lives at the wire rather than only in the aggregation that usually
+// builds it.
+func TestMarshalReportOmitsCostWithoutUsageReported(t *testing.T) {
+	zero := 0.0
+	logs := captureLog(t)
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "box-1"},
+		State:    State{Kind: StateIteration},
+		Iterations: []Iteration{{
+			Outcome: OutcomeReleased,
+			Sessions: []Session{
+				// The refused shape: a cost figure and no usage report (opencode's
+				// export path after a session died before its first answered
+				// request).
+				{Phase: "implement", Harness: "opencode", Model: "m", CostUSD: &zero},
+				// A reported zero WITH a usage report is still a figure, and the
+				// fix must not turn that into silence.
+				{Phase: "review", Harness: "opencode", Model: "m", UsageReported: true, CostUSD: &zero},
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+
+	var got struct {
+		Iterations []struct {
+			Sessions []map[string]any `json:"sessions"`
+		} `json:"iterations"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(got.Iterations) != 1 || len(got.Iterations[0].Sessions) != 2 {
+		t.Fatalf("wire shape lost a session: %s", b)
+	}
+	silent, reported := got.Iterations[0].Sessions[0], got.Iterations[0].Sessions[1]
+
+	// Key presence, not a decoded value: the plane's refusal is about the key.
+	if v, ok := silent["costUsd"]; ok {
+		t.Errorf("session[0].costUsd = %v, want absent — the plane refuses the whole report when costUsd rides without usageReported: true: %s", v, b)
+	}
+	if v, ok := silent["usageReported"]; ok {
+		t.Errorf("session[0].usageReported = %v, want absent with no usage report", v)
+	}
+
+	if v, ok := reported["costUsd"]; !ok || v != 0.0 {
+		t.Errorf("session[1].costUsd = %v (present=%v), want a present 0 — a reported zero beside a usage report is a figure", v, ok)
+	}
+	if v, ok := reported["usageReported"]; !ok || v != true {
+		t.Errorf("session[1].usageReported = %v (present=%v), want true", v, ok)
+	}
+
+	// Review 1.review-2.3: deleting a figure the CALLER reported is a producer
+	// bug, so it is logged — one line naming the session — rather than swallowed.
+	// The guard protects the batch; it must not hide the case it detects.
+	line := logs.String()
+	if !strings.Contains(line, `dropping the figure`) {
+		t.Errorf("no log line for the dropped costUsd: %q", line)
+	}
+	if !strings.Contains(line, `"implement"`) || !strings.Contains(line, "opencode") {
+		t.Errorf("log line does not name the session's phase and harness: %q", line)
+	}
+	if strings.Contains(line, `"review"`) {
+		t.Errorf("log line names the session whose cost was KEPT — only the silent one was dropped: %q", line)
+	}
+}
+
 func mapsEqual(a, b map[string]int) bool {
 	if len(a) != len(b) {
 		return false

@@ -199,6 +199,71 @@ func TestMergeResumeUnobservedContinuationKeepsClaim(t *testing.T) {
 	}
 }
 
+// CLA-739 / review 1.review-2.1: the ToolLoop verdict is CARRIED by mergeResume,
+// and the carry is load-bearing in both directions: opencode Invoke returns
+// early on a merged cause (`if res.ToolLoop != ""` — no stall resume, no
+// resurrection) and the resurrection loop's own condition requires
+// `res.ToolLoop == ""`. A regression that dropped the carry would resurrect a
+// session that was killed for repeating a failing tool call, re-sending its
+// whole transcript per attempt — the incident CLA-739 bounds. The continuation
+// here is built through the REAL parser and guard (the cause is set on the
+// Result after the stream is parsed, exactly as Invoke does), not hand-set, so
+// the test fails if that seam stops producing one too.
+func TestMergeResumeCarriesTheToolLoopCause(t *testing.T) {
+	// The continuation's stream: one refused clankerbar call, then nothing —
+	// opencode exiting after the adapter's own kill. Threshold 1 trips the guard.
+	continuation := func(t *testing.T) Result {
+		t.Helper()
+		p := newOpencodeParse(Invocation{MaxRepeatedToolFailures: 1}, nil)
+		p.line([]byte(`{"type":"tool_use","sessionID":"ses_dead","part":{"partID":"prt_9","type":"tool","id":"call_9","tool":"clankerbar_update_task","state":{"status":"error","input":{"release":true},"error":"{\"error\":{\"code\":\"invalid_release\"}}"}}}`))
+		var res Result
+		p.finish(&res)
+		res.ToolLoop = p.observed.toolLoop.tripped()
+		return res
+	}
+
+	t.Run("a killed continuation's cause becomes the merged session's", func(t *testing.T) {
+		base := quietDeathResult("ses_dead")
+		cont := continuation(t)
+		if cont.ToolLoop == "" {
+			t.Fatalf("test precondition: the parser/guard produced no cause (Raw: %v)", cont.Raw)
+		}
+
+		mergeResume(&base, cont)
+
+		if base.ToolLoop != cont.ToolLoop {
+			t.Errorf("ToolLoop = %q after merging a continuation killed for looping (%q) — the merged session would read as resurrectable and re-send its whole transcript", base.ToolLoop, cont.ToolLoop)
+		}
+		if !strings.HasPrefix(base.ToolLoop, ToolLoopCausePrefix) {
+			t.Errorf("ToolLoop = %q, want the %q cause", base.ToolLoop, ToolLoopCausePrefix)
+		}
+	})
+
+	t.Run("a base that already carries a cause keeps it", func(t *testing.T) {
+		const dead = "repeated failing tool call: clankerbar_update_task x5: invalid_release"
+		base := quietDeathResult("ses_dead")
+		base.ToolLoop = dead
+
+		// A DIFFERENT cause: threshold 2 names x2, so an overwrite cannot pass
+		// by looking like a no-op.
+		p := newOpencodeParse(Invocation{MaxRepeatedToolFailures: 2}, nil)
+		p.line([]byte(`{"type":"tool_use","sessionID":"ses_dead","part":{"partID":"prt_1","type":"tool","id":"call_1","tool":"shell","state":{"status":"error","input":{},"error":"Permission denied: external_directory"}}}`))
+		p.line([]byte(`{"type":"tool_use","sessionID":"ses_dead","part":{"partID":"prt_2","type":"tool","id":"call_2","tool":"shell","state":{"status":"error","input":{},"error":"Permission denied: external_directory"}}}`))
+		var cont Result
+		p.finish(&cont)
+		cont.ToolLoop = p.observed.toolLoop.tripped()
+		if cont.ToolLoop == "" || cont.ToolLoop == dead {
+			t.Fatalf("test precondition: continuation cause = %q, want a cause distinct from the base's", cont.ToolLoop)
+		}
+
+		mergeResume(&base, cont)
+
+		if base.ToolLoop != dead {
+			t.Errorf("ToolLoop = %q, want the dead run's own cause %q kept — the first cause is the loop the session was killed for and a later one must not rewrite that history", base.ToolLoop, dead)
+		}
+	})
+}
+
 // Review WARN (finish_reason asymmetry): a continuation that names NO finish
 // reason must clear the corpse's, symmetrically with terminal_reason. The
 // parser writes finish_reason only when the stream carried a step_finish

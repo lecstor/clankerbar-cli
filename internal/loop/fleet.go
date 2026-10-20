@@ -464,7 +464,9 @@ func sessionCost(a harness.Adapter, res *harness.Result) *float64 {
 // Cost is summed only while EVERY attempt that ran produced a figure; one
 // attempt whose dollars were never reported leaves the pass's cost UNKNOWN
 // rather than partial, because a partial figure presented as the session's cost
-// understates it. The token buckets have no such problem: they sum exactly.
+// understates it. A pass that reported no usage at all has no figure either,
+// however many attempts carried one — see cost(). The token buckets have no such
+// problem: they sum exactly.
 type sessionSpend struct {
 	usage         harness.TokenUsage
 	usageReported bool
@@ -495,8 +497,19 @@ func (s *sessionSpend) add(a harness.Adapter, res harness.Result) {
 }
 
 // cost returns the pass's dollar figure as a pointer, or nil when it is unknown.
+//
+// A figure only counts as one when the pass actually REPORTED usage (CLA-737).
+// `CostReported` and `UsageReported` answer different questions, and an adapter
+// that reports money can still set the first with no usage report at all:
+// opencode's export path does exactly that for a session killed before its first
+// answered request (a provider.quota error is the common one), where the run's
+// export is all zeroes but still a document with a cost. Its zero is silence,
+// not "$0 spent", so the pass has no figure to publish — and the wire must not
+// carry one, because the plane refuses the WHOLE report with
+// "session.costUsd requires session.usageReported" and every other iteration in
+// that batch, presence refresh included, is lost with it.
 func (s *sessionSpend) cost() *float64 {
-	if !s.costKnown {
+	if !s.costKnown || !s.usageReported {
 		return nil
 	}
 	cost := s.costUSD
