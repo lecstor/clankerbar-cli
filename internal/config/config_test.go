@@ -619,6 +619,45 @@ func TestZeroSpendAttemptBound(t *testing.T) {
 	})
 }
 
+// TestRepeatedToolFailureBound pins the CLA-739 knob: unset is the default 5,
+// an explicit 0 is OFF (unlike max_zero_spend_attempts, where 0 defers to the
+// default), a negative is refused, and an unset knob is absent from the
+// marshalled config so adding it changes no existing daemon's identity.
+func TestRepeatedToolFailureBound(t *testing.T) {
+	load := func(t *testing.T, doc string) *Config {
+		t.Helper()
+		var c Config
+		if err := json.Unmarshal([]byte(doc), &c); err != nil {
+			t.Fatalf("unmarshal %s: %v", doc, err)
+		}
+		return &c
+	}
+	if got := load(t, `{}`).RepeatedToolFailureBound(); got != 5 {
+		t.Errorf("unset = %d, want the default 5", got)
+	}
+	if got := load(t, `{"max_repeated_tool_failures": 0}`).RepeatedToolFailureBound(); got != 0 {
+		t.Errorf("explicit 0 = %d, want 0 (off)", got)
+	}
+	if got := load(t, `{"max_repeated_tool_failures": 9}`).RepeatedToolFailureBound(); got != 9 {
+		t.Errorf("explicit 9 = %d, want 9", got)
+	}
+	c := load(t, `{"harness": "claude", "prompt": "work", "max_repeated_tool_failures": -1}`)
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_repeated_tool_failures") {
+		t.Errorf("Validate() = %v, want an error naming max_repeated_tool_failures", err)
+	}
+	c = load(t, `{"harness": "claude", "prompt": "work", "max_repeated_tool_failures": 0}`)
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() with 0 (off) = %v, want nil", err)
+	}
+	out, err := json.Marshal(load(t, `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "max_repeated_tool_failures") {
+		t.Errorf("an unset knob is marshalled: %s", out)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Per-harness breakers (CLA-367).
 //

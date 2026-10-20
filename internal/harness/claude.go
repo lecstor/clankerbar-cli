@@ -52,7 +52,14 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // first cut of this shipped with the seed untested and a mutation of it surviving
 // the whole suite.
 func newSessionResult(in Invocation) Result {
-	return Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
+	res := Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
+	// CLA-739: never on a probe. A probe is a one-word liveness check with its
+	// tools denied, so it has no tool calls to repeat, and a probe killed for a
+	// "loop" would report a session-shaped verdict for something no phase ran.
+	if !in.Probe {
+		res.toolLoop = newToolLoopGuard(in.MaxRepeatedToolFailures)
+	}
+	return res
 }
 
 // claudeArgs builds the session's argv. Extracted from Invoke so it can be
@@ -192,11 +199,12 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
-	} else if waitErr != nil && !c.TokenCeilingHit(res) {
+	} else if waitErr != nil && !c.TokenCeilingHit(res) && res.ToolLoop == "" {
 		return res, waitErr // couldn't run claude at all
 	} else if waitErr != nil {
-		// Our own ceiling kill: the child died on the cancel, and its exit code
-		// is the kill's, not a verdict. The marker below is the verdict.
+		// Our own kill (the ceiling, or CLA-739's repeated failing tool call):
+		// the child died on the cancel, and its exit code is the kill's, not a
+		// verdict. The marker is the verdict.
 		res.ExitCode = -1
 	}
 	return res, nil
@@ -258,6 +266,17 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result,
 			// result event is the only carrier of total_cost_usd, and we deliberately
 			// never see it. The driver says so on the ceiling branch rather than
 			// printing $0.0000 as if it were real (CLA-343 review).
+			break
+		}
+		// CLA-739: the same tool returned the same error on enough consecutive
+		// calls that the session is looping, and every further retry re-sends
+		// the whole context. Killed here for the ceiling's reasons, and the
+		// stream ends here for the same one: what is still in the pipe arrived
+		// after the verdict.
+		if cause := res.toolLoop.tripped(); cause != "" && res.ToolLoop == "" {
+			res.ToolLoop = cause
+			fmt.Fprintf(console, "\n!! %s - killing the session here instead of letting it retry the same failing call\n", cause)
+			kill()
 			break
 		}
 	}
@@ -332,6 +351,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
 				noteToolUse(b.Name, b.ID, b.Input, res)
+				res.noteToolName(b.ID, b.Name)
 			}
 		}
 		// The API's per-turn usage rides on the assistant event's message, and it
@@ -358,6 +378,16 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				continue
 			}
 			noteToolResult(res, b.ToolUseID, b.IsError, b.Content, console)
+			// CLA-739: every tool, not only clankerbar's - a loop on any tool
+			// re-sends the context just the same. The error text is only read
+			// for a failed call; a success resets the streak whatever it says.
+			if res.toolLoop != nil {
+				var text string
+				if b.IsError {
+					text = toolResultText(b.Content)
+				}
+				res.toolLoop.observe(res.takeToolName(b.ToolUseID), b.IsError, text)
+			}
 		}
 	case "result":
 		res.FinalMessage = ev.Result

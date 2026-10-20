@@ -87,6 +87,10 @@ type panelParallelAdapter struct {
 	wantRecords int
 	// failLabel is the member that records nothing, when set.
 	failLabel string
+	// failToolLoop, when set, is the cause the failing member's adapter
+	// reports for killing it on a repeated failing tool call (CLA-739),
+	// still holding the claim it resumed.
+	failToolLoop string
 
 	mu          sync.Mutex
 	calls       int
@@ -217,6 +221,13 @@ func (a *panelParallelAdapter) review(in harness.Invocation) (harness.Result, er
 		a.mu.Lock()
 		a.inFlight--
 		a.mu.Unlock()
+		if a.failToolLoop != "" {
+			res := okResult(1, 0.01)
+			res.ExitCode = -1
+			res.ToolLoop = a.failToolLoop
+			res.Claim = in.ResumeClaim
+			return res, nil
+		}
 		return okResult(1, 0.01), nil
 	}
 
