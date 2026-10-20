@@ -4563,6 +4563,21 @@ func (c *Config) Validate() error {
 			return err
 		}
 		for _, h := range sortedKeys(c.Projects[i].EnvAllowlistPerHarness) {
+			// The KEY is checked against the harness registry too, and here that
+			// matters more than in the sibling env maps: an inert
+			// `env_per_harness` entry merely fails to add a variable, whereas an
+			// allowlist keyed by a name no adapter answers to is never consulted.
+			// SessionEnvAllowlist looks up the harness actually spawned, finds no
+			// per-project list for it, and can then fall back to nil — which
+			// inheritEnv reads as FULL INHERITANCE. A typo or a retired name would
+			// therefore switch the filter OFF instead of narrowing it, the one
+			// direction this feature exists to prevent. Refused here, against the
+			// same registry as `harnesses` and `budget.per_harness`, with the same
+			// rename hint.
+			if !harness.Known(h) {
+				return fmt.Errorf("projects[%d].env_allowlist_per_harness[%q]: unknown harness (want: %s)%s",
+					i, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
+			}
 			if err := validateEnvAllowlist(c.Projects[i].EnvAllowlistPerHarness[h], fmt.Sprintf("projects[%d].env_allowlist_per_harness.%s", i, h)); err != nil {
 				return err
 			}

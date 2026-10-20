@@ -1772,16 +1772,24 @@ is dropped from the harness process.
 - **The daemon keeps its own environment.** The filter is applied at the last
   hop, where the harness process is spawned. The daemon needs its environment to
   resolve `fromCommand` values and to read git remotes; the session — the
-  model-driven process — is what the list governs.
+  model-driven process — is what the list governs. This bounds what is HANDED
+  OVER, not what a determined same-user session can reach: on a platform where
+  one same-user process can read another's environment (Linux
+  `/proc/<pid>/environ`), a session that goes looking by PID can still recover
+  the dropped variables from the daemon's own environment.
 - **Four levels, whole-list replacement.** Like `env` it is declared at the top
   level, per harness, per project, and per project-per-harness
   (`env_allowlist_per_harness.<name>`), but the most specific level that
   declares one WINS ENTIRELY rather than merging. An allowlist is a complete
   answer to "what may this session see"; unioning levels would make a narrower
-  level unable to remove a variable a broader one admitted.
-- **Omit the key for today's behaviour.** An absent key (or an empty `[]`, which
-  is refused as a half-edit) means full inheritance. A config that says nothing
-  about it is byte-identical to before.
+  level unable to remove a variable a broader one admitted. A
+  `env_allowlist_per_harness` key must name a registered harness: an unknown one
+  is refused at load rather than left inert, because a key nothing consults
+  would silently leave that harness on full inheritance.
+- **Omit the key for today's behaviour.** An absent key means full inheritance,
+  and a config that says nothing about it is byte-identical to before. An empty
+  `[]` is refused by validation and `clankerbar doctor` as a half-edit — the
+  only way to say "everything" is to omit the key.
 
 `doctor` reports which shape is in force, prints the variable names that will
 reach a session (never values), and **FAILs** when the list omits one of the

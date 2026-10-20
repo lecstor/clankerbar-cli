@@ -765,14 +765,27 @@ func requiredSessionEnv(cfg *config.Config) []string {
 // session - names only, never values - and FAILs when the list omits one of
 // requiredSessionEnv, because that failure otherwise appears later as an
 // unexplained repo_not_found or an unauthenticated plane call inside a session.
+//
+// It asks SpawnedHarnesses, not PhaseHarnesses, for the reason the two exist:
+// PhaseHarnesses seeds the run-wide `harness` unconditionally, which is right
+// for "is every declared harness registered and usable" but wrong for "what is
+// true of the sessions this run actually runs". A config whose every phase
+// names its own harness never spawns the run-wide one, and this check is about
+// what a session INHERITS - so reporting (and FAILing) that harness's scope
+// would send the operator to fix a harness no session ever runs on, and a false
+// FAIL blocks a run that works. Same doctrine as runsHarness and
+// costBlindHarnesses in the budget check.
 func checkSessionEnvAllowlist(cfg *config.Config) []check {
-	harnesses := cfg.PhaseHarnesses()
+	harnesses := cfg.SpawnedHarnesses()
 	name := func(slug, h string) string {
 		label := "session env allowlist"
 		qualifier := slug
 		if len(harnesses) > 1 {
-			// Match checkSessions' naming: the harness is named only when the run
-			// spawns more than one, so a single-harness report stays unqualified.
+			// Same SHAPE as checkSessions' naming: the harness is part of the
+			// name only when more than one is in play, so a single-harness report
+			// stays unqualified. The count itself comes from SpawnedHarnesses, so
+			// it can be smaller than checkSessions' - that check asks what is
+			// configured, this one what a session inherits.
 			if qualifier != "" {
 				qualifier += ":"
 			}

@@ -8,6 +8,8 @@ package config
 import (
 	"strings"
 	"testing"
+
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
 func TestEnvAllowlistDefaultIsFullInheritance(t *testing.T) {
@@ -109,6 +111,13 @@ func TestValidateEnvAllowlistWalksEveryLevel(t *testing.T) {
 			c.Projects = []Project{{Slug: "p", WorkDir: t.TempDir(),
 				EnvAllowlistPerHarness: map[string][]string{"claude": {"HOME", "HOME"}}}}
 		}, `projects[0].env_allowlist_per_harness.claude names HOME twice`},
+		// The KEY has to be a registered harness. A key nothing looks up is never
+		// consulted, so the harness actually spawned falls back to full
+		// inheritance — the filter silently switches OFF (CLA-714 review).
+		{"project per harness unknown key", func(c *Config) {
+			c.Projects = []Project{{Slug: "p", WorkDir: t.TempDir(),
+				EnvAllowlistPerHarness: map[string][]string{"opencode2": {"HOME"}}}}
+		}, `projects[0].env_allowlist_per_harness["opencode2"]: unknown harness`},
 		{"explicitly empty", func(c *Config) {
 			c.EnvAllowlist = []string{}
 		}, `env_allowlist is empty`},
@@ -133,11 +142,27 @@ func TestValidateEnvAllowlistAcceptsAValidList(t *testing.T) {
 	c.WorkDir = t.TempDir()
 	c.EnvAllowlist = []string{"HOME", "PATH", "CLANKERBAR_API_KEY"}
 	c.Harnesses = map[string]HarnessConfig{"opencode": {EnvAllowlist: []string{"HOME", "PATH"}}}
+	c.Projects = []Project{{Slug: "p", WorkDir: t.TempDir(),
+		EnvAllowlistPerHarness: map[string][]string{"opencode": {"HOME", "PATH"}}}}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
 	if (HarnessConfig{EnvAllowlist: []string{"HOME"}}).Empty() {
 		t.Fatal("a harness block declaring only an allowlist reads as empty")
+	}
+}
+
+// The per-harness key is validated against the harness REGISTRY, not a hand-kept
+// list: a name an adapter answers to is accepted without config.go learning it.
+func TestValidateEnvAllowlistPerHarnessKeyFollowsTheRegistry(t *testing.T) {
+	for _, name := range harness.Names() {
+		c := defaults()
+		c.WorkDir = t.TempDir()
+		c.Projects = []Project{{Slug: "p", WorkDir: t.TempDir(),
+			EnvAllowlistPerHarness: map[string][]string{name: {"HOME"}}}}
+		if err := c.Validate(); err != nil {
+			t.Errorf("registered harness %q refused as an allowlist key: %v", name, err)
+		}
 	}
 }
 

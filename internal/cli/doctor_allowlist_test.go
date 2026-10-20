@@ -165,6 +165,72 @@ func TestDoctorSessionEnvAllowlistPerProject(t *testing.T) {
 	}
 }
 
+// A run-wide `harness` every phase overrides is DECLARED but never spawned, so
+// its allowlist gets no check at all — the same doctrine runsHarness and
+// costBlindHarnesses follow in the budget check. Reporting (and FAILing) its
+// scope would send the operator to fix a harness no session ever runs on, and a
+// false FAIL blocks a run that works.
+func TestDoctorSessionEnvAllowlistSkipsANeverSpawnedRunWideHarness(t *testing.T) {
+	clearWorkdirRoot(t)
+	cfg := &config.Config{
+		Harness:    "claude",
+		Prompt:     "work",
+		BacklogURL: "https://clankerbar.com",
+		Phases: []config.Phase{
+			{Name: "implement", Harness: "opencode"},
+			{Name: "verify", Harness: "opencode"},
+		},
+		EnvAllowlist: []string{"HOME", "PATH", "CLANKERBAR_API_KEY"},
+		Harnesses: map[string]config.HarnessConfig{
+			"claude":   {EnvAllowlist: []string{"HOME"}},
+			"opencode": {EnvAllowlist: []string{"HOME", "PATH", "CLANKERBAR_API_KEY"}},
+		},
+	}
+
+	got := checkSessionEnvAllowlist(cfg)
+	if len(got) != 1 {
+		t.Fatalf("checks = %v, want exactly one for the only spawned harness (opencode)", got)
+	}
+	c := got[0]
+	if c.name != "session env allowlist" {
+		t.Errorf("name = %q, want it unqualified - only one harness spawns, so no harness qualifier is needed", c.name)
+	}
+	if c.status != pass {
+		t.Errorf("status = %v (%s), want pass: claude's deficient list is never used", c.status, c.detail)
+	}
+	for _, wrong := range []string{"[claude]", "claude:"} {
+		if strings.Contains(c.name, wrong) {
+			t.Errorf("name = %q, want no check for the never-spawned run-wide harness", c.name)
+		}
+	}
+}
+
+// The multi-harness naming still qualifies by harness for the ones that DO
+// spawn, so the skip above cannot be had by simply dropping the qualifier.
+func TestDoctorSessionEnvAllowlistQualifiesWhenTwoHarnessesSpawn(t *testing.T) {
+	clearWorkdirRoot(t)
+	cfg := &config.Config{
+		Harness:      "claude",
+		Prompt:       "work",
+		BacklogURL:   "https://clankerbar.com",
+		EnvAllowlist: []string{"HOME", "PATH", "CLANKERBAR_API_KEY"},
+		Phases: []config.Phase{
+			{Name: "implement", Harness: "claude"},
+			{Name: "verify", Harness: "opencode"},
+		},
+	}
+
+	got := checkSessionEnvAllowlist(cfg)
+	if len(got) != 2 {
+		t.Fatalf("checks = %v, want one per spawned harness", got)
+	}
+	for _, want := range []string{"session env allowlist[claude]", "session env allowlist[opencode]"} {
+		if _, ok := statusOf(got, want); !ok {
+			t.Errorf("checks = %v, want %q", got, want)
+		}
+	}
+}
+
 // The config summary says which shape is in force, beside the declared names.
 func TestDoctorConfigReportsTheInheritanceShape(t *testing.T) {
 	clearWorkdirRoot(t)
