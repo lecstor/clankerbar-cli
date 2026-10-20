@@ -267,6 +267,7 @@ func TestDrainPhases_ReviewPanelMemberFailureDoesNotStopTheRound(t *testing.T) {
 			}
 		}
 		d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+		logs := captureLogs(t)
 
 		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 			t.Fatalf("drainPhases: err=%v stop=%v — a dead member must not fail the run", err, stop)
@@ -296,15 +297,18 @@ func TestDrainPhases_ReviewPanelMemberFailureDoesNotStopTheRound(t *testing.T) {
 				t.Errorf("the fix brief does not carry %q — the merged list must name the incomplete member:\n%s", want, fix)
 			}
 		}
-		// The operator sees it too: the iteration record's outcome names the panel
-		// as incomplete, by member and reason.
+		// The operator sees it too, but in the LOG — never in the iteration
+		// outcome, which stays one of the four words the plane accepts (CLA-738:
+		// free text there made the plane refuse the whole report).
 		recs := ff.records()
 		if len(recs) != 1 {
 			t.Fatalf("iteration records = %d, want 1", len(recs))
 		}
+		requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeReleased)
+		out := logs.String()
 		for _, want := range []string{"review panel INCOMPLETE", "review-2", "died producing nothing"} {
-			if !strings.Contains(recs[0].Outcome, want) {
-				t.Errorf("the iteration outcome does not carry %q: %q", want, recs[0].Outcome)
+			if !strings.Contains(out, want) {
+				t.Errorf("the daemon log does not carry %q:\n%s", want, out)
 			}
 		}
 		// And the run's dead-phase tally books the member that produced nothing,
@@ -346,6 +350,7 @@ func TestDrainPhases_ReviewPanelMemberFailureDoesNotStopTheRound(t *testing.T) {
 			}
 		}
 		d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+		logs := captureLogs(t)
 
 		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 			t.Fatalf("drainPhases: err=%v stop=%v — a usage-limited last member must not fail the run", err, stop)
@@ -370,8 +375,14 @@ func TestDrainPhases_ReviewPanelMemberFailureDoesNotStopTheRound(t *testing.T) {
 			}
 		}
 		recs := ff.records()
-		if len(recs) != 1 || !strings.Contains(recs[0].Outcome, "review-3") {
-			t.Errorf("the iteration outcome does not name the failed member: %+v", recs)
+		if len(recs) != 1 {
+			t.Fatalf("iteration records = %d, want 1", len(recs))
+		}
+		// The record keeps the four-word enum (CLA-738); the log names the
+		// failed member.
+		requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeReleased)
+		if out := logs.String(); !strings.Contains(out, "review-3") || !strings.Contains(out, "review panel INCOMPLETE") {
+			t.Errorf("the daemon log does not name the failed member:\n%s", out)
 		}
 	})
 
@@ -444,6 +455,60 @@ func TestDrainPhases_ReviewPanelAllFailuresEndWithoutAFix(t *testing.T) {
 		cell := d.deadTally[tallyKey{phase: member, harness: "opencode"}]
 		if cell == nil || cell.dead != 1 {
 			t.Errorf("dead-phase tally for %s/opencode = %+v, want 1 dead", member, cell)
+		}
+	}
+}
+
+// TestDrainPhases_IncompletePanelCheckpointKeepsTheFleetOutcome is CLA-738: an
+// incomplete review panel is a LOG fact, never the iteration outcome. Before the
+// fix the driver appended "review panel INCOMPLETE: ..." to the claim's
+// disposition, so a drain that otherwise reached a checkpoint recorded
+// `checkpoint — review panel INCOMPLETE: ...`; marshalReport then refused the
+// WHOLE report, dropping the iteration record and the presence refresh for
+// exactly the drains the operator most needs to see. The dead-final-phase
+// sibling is TestDrainPhases_ReviewPanelAllFailuresEndWithoutAFix.
+func TestDrainPhases_IncompletePanelCheckpointKeepsTheFleetOutcome(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	// wip is the claim a session ends holding when its work is pushed but not
+	// delivered: the plane reads it as a takeover, so the drain's disposition at
+	// the boundary is a checkpoint.
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},                       // implement
+		{res: checkpointed(5, 0.50)},                        // review-1 records
+		{res: held(mcpReached(deadResult()), openClaim())},  // review-2 dies producing nothing
+		{res: held(mcpReached(limitResult()), openClaim())}, // review-3 is turned away: the last member
+		{res: held(mcpReached(okResult(5, 0.05)), wip)},     // fix ends still holding pushed work
+	}}
+	h.onInvoke = func(i int) {
+		if i == 1 {
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+		}
+	}
+	d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — a limited last member must not fail the run", err, stop)
+	}
+	if h.invokeCalls != 5 {
+		t.Fatalf("spawned %d sessions, want 5 (implement, three members, fix) — a failed LAST member hands over to the fix; log:\n%s", h.invokeCalls, logs.String())
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1", len(recs))
+	}
+	// The record's one word survives the note: checkpoint, so the plane accepts
+	// the report and keeps the hand-off visible.
+	requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeCheckpoint)
+	// The operator still sees the panel's incompleteness, by member, in the log.
+	out := logs.String()
+	for _, want := range []string{"review panel INCOMPLETE", "review-2", "review-3", "died producing nothing", "hit a usage limit before recording"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the daemon log does not carry %q:\n%s", want, out)
 		}
 	}
 }
@@ -1180,8 +1245,9 @@ func TestDrainPhases_ReviewPanelCloseFailureEndsWithoutAFix(t *testing.T) {
 		if len(recs) != 1 {
 			t.Fatalf("iteration records = %d, want 1", len(recs))
 		}
-		if strings.Contains(recs[0].Outcome, "INCOMPLETE") {
-			t.Errorf("a member that recorded was reported incomplete: %q", recs[0].Outcome)
+		requireFleetOutcome(t, recs[0].Outcome, "")
+		if strings.Contains(out, "INCOMPLETE") {
+			t.Errorf("a member that recorded was reported incomplete:\n%s", out)
 		}
 		for _, role := range []string{"review-1", "review-2"} {
 			if n := d.panelFailStreak[role]; n != 0 {
@@ -1242,16 +1308,18 @@ func TestDrainPhases_ReviewPanelCloseFailureEndsWithoutAFix(t *testing.T) {
 		if len(recs) != 1 {
 			t.Fatalf("iteration records = %d, want 1", len(recs))
 		}
-		// The usage-limited member is the one named incomplete; the members that
-		// recorded are not.
+		// The usage-limited member is the one named incomplete in the LOG; the
+		// iteration record itself keeps the four-word enum (CLA-738) — free text
+		// there made the plane refuse the whole report.
+		requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeReleased)
 		for _, want := range []string{"review panel INCOMPLETE", "review-3", "hit a usage limit before recording"} {
-			if !strings.Contains(recs[0].Outcome, want) {
-				t.Errorf("the iteration outcome does not carry %q: %q", want, recs[0].Outcome)
+			if !strings.Contains(out, want) {
+				t.Errorf("the daemon log does not carry %q:\n%s", want, out)
 			}
 		}
 		for _, role := range []string{"review-1:", "review-2:"} {
-			if strings.Contains(recs[0].Outcome, role) {
-				t.Errorf("a member that recorded was named incomplete: %q", recs[0].Outcome)
+			if strings.Contains(out, role) {
+				t.Errorf("a member that recorded was named incomplete:\n%s", out)
 			}
 			short := strings.TrimSuffix(role, ":")
 			if n := d.panelFailStreak[short]; n != 0 {
@@ -1628,6 +1696,7 @@ func TestDrainPhases_ReviewPanelUnheldClaimDoesNotMatchALooseTip(t *testing.T) {
 		}
 	}
 	d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+	logs := captureLogs(t)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -1639,9 +1708,12 @@ func TestDrainPhases_ReviewPanelUnheldClaimDoesNotMatchALooseTip(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("iteration records = %d, want 1", len(recs))
 	}
+	// The record keeps the enum (CLA-738); the log names the failed member.
+	requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeReleased)
+	out := logs.String()
 	for _, want := range []string{"review panel INCOMPLETE", "review-1", "hit a usage limit before recording"} {
-		if !strings.Contains(recs[0].Outcome, want) {
-			t.Errorf("the iteration outcome does not carry %q: %q", want, recs[0].Outcome)
+		if !strings.Contains(out, want) {
+			t.Errorf("the daemon log does not carry %q:\n%s", want, out)
 		}
 	}
 	if n := d.panelFailStreak["review-1"]; n != 1 {
@@ -1701,7 +1773,25 @@ func TestDrainPhases_ReviewPanelLastMemberCloseFailureEndsWithoutAFix(t *testing
 	if recs[0].Outcome == fleet.OutcomeCheckpoint {
 		t.Errorf("the drain reported a checkpoint after the close failed: %q", recs[0].Outcome)
 	}
-	if strings.Contains(recs[0].Outcome, "INCOMPLETE") {
-		t.Errorf("a member that recorded was reported incomplete: %q", recs[0].Outcome)
+	requireFleetOutcome(t, recs[0].Outcome, "")
+	if strings.Contains(out, "INCOMPLETE") {
+		t.Errorf("a member that recorded was reported incomplete:\n%s", out)
+	}
+}
+
+// requireFleetOutcome asserts an iteration record's Outcome is one of the four
+// words the plane knows (CLA-738), and — when want is non-empty — exactly that
+// word. Free text here makes marshalReport refuse the WHOLE report, dropping
+// the iteration record and the presence refresh riding it; prose about a panel
+// belongs in the daemon log.
+func requireFleetOutcome(t *testing.T, outcome, want string) {
+	t.Helper()
+	switch outcome {
+	case fleet.OutcomeCheckpoint, fleet.OutcomeReleased, fleet.OutcomeParked, fleet.OutcomeDead:
+	default:
+		t.Fatalf("iteration outcome = %q, want one of the four fleet.Outcome* constants", outcome)
+	}
+	if want != "" && outcome != want {
+		t.Errorf("iteration outcome = %q, want %q", outcome, want)
 	}
 }

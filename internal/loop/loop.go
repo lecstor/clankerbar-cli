@@ -1306,7 +1306,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		seen        harness.Claim
 		parkFired   bool // the per-task dead budget parked the task
 		tripFired   bool // the fleet dead counter tripped and paused this target
-		finalDisp   string
+		// finalOutcome is the CLAIM's disposition at the drain boundary, and it
+		// is ALWAYS one of the fleet.Outcome* constants (CLA-738). Never append
+		// prose to it: marshalReport refuses the WHOLE report on a word it does
+		// not know, so free text here loses the iteration record AND the
+		// presence refresh riding the same report. Free-text notes belong in
+		// the log.
+		finalOutcome string
 		// CLA-631/CLA-651/CLA-662: the wait a RESUMED phase's sequence-end
 		// signal asks the run for. A rolling limit (CLA-631) hands its reset
 		// down here; the transient arm (CLA-662) hands its backoff rung down as
@@ -1326,21 +1332,23 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		lastProducedNothing bool
 	)
 	defer func() {
-		// CLA-639: the iteration record says the panel was incomplete, by member,
-		// whether the drain then reached the fix phase or stopped before it. The
-		// reviewers that DID record are what the fix phase receives; this names the
-		// ones that did not, so "the panel" never reads as the full panel when it
-		// was not.
+		// CLA-639: the LOG says the panel was incomplete, by member, whether the
+		// drain then reached the fix phase or stopped before it. The reviewers
+		// that DID record are what the fix phase receives; this names the ones
+		// that did not, so "the panel" never reads as the full panel when it was
+		// not.
+		//
+		// CLA-738: the note is a log line and NOTHING more. It must never be
+		// folded into the iteration Outcome, which is one of the four
+		// fleet.Outcome* words: the pre-CLA-738 code appended it to the
+		// disposition, and marshalReport then refused the whole report on the
+		// free text — dropping the iteration record and the presence refresh for
+		// exactly the drains the operator most needs to see. The per-member
+		// failures already ride each session's `cause`.
 		if len(panelIncomplete) > 0 {
-			note := fmt.Sprintf("review panel INCOMPLETE: %s", strings.Join(panelIncomplete, "; "))
-			log.Printf("%siteration %d: %s", labelOf(t), drainNum, note)
-			if finalDisp == "" {
-				finalDisp = note
-			} else {
-				finalDisp += " — " + note
-			}
+			log.Printf("%siteration %d: review panel INCOMPLETE: %s", labelOf(t), drainNum, strings.Join(panelIncomplete, "; "))
 		}
-		outcome := finalDisp
+		outcome := finalOutcome
 		switch {
 		case parkFired:
 			outcome = fleet.OutcomeParked
@@ -1461,7 +1469,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// phase an unverified-looking checkpoint.
 					if out.claim != nil && (carried == nil || out.claim.Claim.TaskID == carried.Claim.TaskID) {
 						seen = out.claim.Claim
-						finalDisp = out.disposition
+						finalOutcome = out.disposition
 					}
 					finalDead = out.finalDead
 					lastProducedNothing = out.lastProducedNothing
@@ -1666,7 +1674,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// arm: a claim on a DIFFERENT task does not re-attribute the iteration.
 		if end.claim != nil && !(carried != nil && carried.Claim.TaskID != end.claim.Claim.TaskID) {
 			seen = end.claim.Claim
-			finalDisp = claimDisposition(end.claim)
+			finalOutcome = claimDisposition(end.claim)
 		}
 		// What, if anything, is still owed a handback. Three cases, and getting any
 		// of them wrong is a task either stranded on a dead lease or posted back to
@@ -2024,17 +2032,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// backlog is an infrastructure miss, not a dead phase and not a review
 		// verdict. It gets its own drained ending: the claim was handed back (or
 		// left to lapse) by drainPhase, the tally books the miss separately, and
-		// the iteration outcome names it so the operator does not read a review
-		// as having been attempted when the tools were absent.
+		// the LOG names it so the operator does not read a review as having been
+		// attempted when the tools were absent.
+		//
+		// CLA-738: the name is a log line only. The iteration Outcome stays the
+		// four-word enum the plane accepts — prose there makes marshalReport
+		// refuse the whole report, presence refresh included.
 		if end.noMCP && !end.panelMember {
 			d.tallyNoMCP(ph.Label(i), tc.HarnessFor(ph))
 			note := fmt.Sprintf("no_mcp: the %s session made no successful clankerbar MCP call and recorded no review record", ph.Label(i))
 			log.Printf("%siteration %d: %s — ending the drain; this is an infrastructure miss, not a review result", labelOf(t), drainNum, note)
-			if finalDisp == "" {
-				finalDisp = note
-			} else {
-				finalDisp += " — " + note
-			}
 			break
 		}
 

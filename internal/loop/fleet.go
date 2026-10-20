@@ -296,6 +296,11 @@ func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase strin
 //     settled by the session itself) -> released
 //   - nothing observed at all -> released, best-effort (the iteration ran;
 //     exactly one record posts per iteration, always)
+//
+// Free text is NEVER an outcome (CLA-738): marshalReport refuses the whole
+// report on a word it does not know, so a note about the drain belongs in the
+// log. A caller that appends prose to the disposition loses the record AND the
+// presence refresh riding the same report.
 func (d *Driver) endIteration(ti int, t Target, rec fleet.Iteration) {
 	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
