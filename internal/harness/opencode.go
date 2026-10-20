@@ -43,12 +43,14 @@ func init() { Register(opencode{}) }
 //     network with webfetch denied. The adapter sets `codemode: false` on every
 //     server it hands over and denies `execute`.
 //   - Billing depends on the configured backend, not opencode: metered pay-per-token
-//     (OpenRouter / Zen) or a monthly-limit subscription (opencode Go). NONE impose a
-//     short rolling-window cap, so there is no supervised-wait/early-reset case here.
-//     DetectLimit instead recognizes a HARD budget/credit-exhaustion stop (402 /
-//     "out of credits" / "monthly limit reached") and flags Limit.Stop so the loop
-//     stops cleanly rather than waiting for a reset that never comes. The
-//     self-accounted budget breaker is the primary control; ReadUsage is unsupported.
+//     (OpenRouter / Zen), a monthly-limit subscription (opencode Go), or the Command
+//     Code plan's rolling 5-hour usage window. The first two are hard caps; a
+//     rolling window states its reset, so DetectLimit reports it as a WAITABLE
+//     limit (Limit.Stop unset, ResetAt parsed when stated) and the loop supervises
+//     the wait. The hard cases (402 / "out of credits" / "monthly limit reached")
+//     still set Limit.Stop so the loop stops cleanly rather than waiting for a
+//     reset that never comes. The self-accounted budget breaker is the primary
+//     control; ReadUsage is unsupported.
 //   - Usage: 2.x emits step_finish only for tool-call steps, never for the final
 //     answer, so the stream under-counts. After each process exits the adapter
 //     reads `opencode session export --standalone <sid>` for the authoritative
