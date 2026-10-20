@@ -33,7 +33,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
@@ -86,25 +85,46 @@ func (d *Supervisor) refreshMaterialized(inst *Instance) {
 	}
 
 	path := filepath.Join(dir, statedir.MaterializedConfigName)
-	if err := writeMaterialized(dir, cfg, want); err != nil {
+	st, err := statedir.Open(dir, cfg.SessionWorkDirs()...)
+	if err != nil {
+		log.Printf("%s: its effective config changed but its state dir could not be opened (%v) - it keeps running on its current file", inst.name, err)
+		return
+	}
+	defer st.Close() //nolint:errcheck // read-side handle on the way out
+
+	// The rewrite is a same-directory rename, NOT the spawn path's
+	// remove-then-create (materializeConfig): a live child may read this file
+	// at the instant of the rewrite — a RESTART already pending means its
+	// re-exec can land at any boundary — and a reader that found the file
+	// missing would die and need a backoff respawn. A rename leaves a reader
+	// the old file or the new one, never an absent one, and replaces a symlink
+	// planted at the name rather than following it.
+	if err := st.WriteFileAtomic(statedir.MaterializedConfigName, want); err != nil {
 		log.Printf("%s: its effective config changed but %s could not be rewritten (%v) - it keeps running on its current file", inst.name, path, err)
 		return
 	}
 	// A restart may already be queued (a roll, a ctl, an earlier edit): it will
 	// re-exec onto the file just written, so one marker is enough. Checked
 	// AFTER the rewrite on purpose — a pending marker can be consumed while the
-	// file is being replaced, and a marker consumed then re-execs onto the new
-	// file; if it is gone by now, the write below re-queues the restart the
-	// switch consumed, so the change is never lost.
-	if markerPresent(dir, loop.MarkerRestart) || markerPresent(dir, loop.MarkerRestartNow) {
+	// file is being replaced, and if it is gone by now the write below re-queues
+	// the restart the operator's switch consumed, so the change is never lost.
+	if st.Exists(loop.MarkerRestart) || st.Exists(loop.MarkerRestartNow) {
 		log.Printf("%s: effective config changed - rewrote %s; its restart is already queued and lands at its iteration boundary", inst.name, path)
 		return
 	}
-	if err := writeConfigRestart(inst, cfg, dir); err != nil {
+	// Never RESTART_NOW: an edit applies at the iteration boundary, never
+	// mid-session.
+	body := []byte(fmt.Sprintf("supervisor: effective config changed at %s\n", time.Now().UTC().Format(time.RFC3339)))
+	switch err := st.WriteFile(loop.MarkerRestart, body); {
+	case err == nil:
+		log.Printf("%s: effective config changed - rewrote %s and queued a restart at its iteration boundary", inst.name, path)
+	case errors.Is(err, statedir.ErrExists):
+		// A marker landed between the check and this write (ctl, a roll): one
+		// pending request is enough, and the rewrite above still rides it.
+		log.Printf("%s: effective config changed - rewrote %s; its restart is already queued and lands at its iteration boundary", inst.name, path)
+	default:
 		log.Printf("%s: effective config changed and %s was rewritten, but the restart marker could not be written (%v) - restart it with `clankerbar ctl restart -c %s`", inst.name, path, err, path)
-		return
 	}
-	log.Printf("%s: effective config changed - rewrote %s and queued a restart at its iteration boundary", inst.name, path)
 }
 
 // readMaterialized reads one child's generated config IN FULL, for the
@@ -127,45 +147,6 @@ func readMaterialized(dir string) ([]byte, error) {
 		return nil, fmt.Errorf("%s is not a regular file", path)
 	}
 	return os.ReadFile(path)
-}
-
-// writeMaterialized replaces a RUNNING child's generated config. Unlike
-// materializeConfig's remove-then-create (a spawn has no reader), a live child
-// may be reading this file at the instant of the rewrite: a RESTART already
-// pending means its re-exec can land at any boundary, and a reader that found
-// the file missing would die and need a backoff respawn. The same-directory
-// rename means a reader sees the old file or the new one, never an absent one;
-// a symlink planted at the name is replaced by the rename, never followed.
-func writeMaterialized(dir string, cfg *config.Config, data []byte) error {
-	st, err := statedir.Open(dir, cfg.SessionWorkDirs()...)
-	if err != nil {
-		return err
-	}
-	defer st.Close() //nolint:errcheck // read-side handle on the way out
-	if err := st.WriteFileAtomic(statedir.MaterializedConfigName, data); err != nil {
-		return fmt.Errorf("replace %s: %w", statedir.MaterializedConfigName, err)
-	}
-	return nil
-}
-
-// writeConfigRestart queues the ONE graceful restart a rewritten config needs.
-// It writes the same RESTART marker `ctl restart` and `supervise roll` write —
-// never RESTART_NOW, because an edit applies at the iteration boundary — and
-// the dir must already exist (the live child created it, exactly as with
-// writeStop). A marker that appeared between the caller's check and this write
-// is one pending request too many; the caller treats that as success.
-func writeConfigRestart(inst *Instance, cfg *config.Config, dir string) error {
-	st, err := statedir.Open(dir, cfg.SessionWorkDirs()...)
-	if err != nil {
-		return err
-	}
-	defer st.Close() //nolint:errcheck // read-side handle on the way out
-	body := []byte(fmt.Sprintf("supervisor: effective config changed at %s\n", time.Now().UTC().Format(time.RFC3339)))
-	err = st.WriteFile(loop.MarkerRestart, body)
-	if errors.Is(err, statedir.ErrExists) {
-		return nil
-	}
-	return err
 }
 
 // markerPresent reports whether one control marker sits in dir. An absent dir

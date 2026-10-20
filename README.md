@@ -795,10 +795,16 @@ ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
 (loaded exactly as `clankerbar run` loads it, or bare defaults when no file
-exists). When the file exists it is re-read on every reconcile, so an edit
-lands without a supervisor restart. Everything the plane may not set — `env`
-and `@file` secrets, `settings_path`, `config_dir`, `mcp_config_path`,
-`backlog_url` and the rest — comes from this file.
+exists). When the file exists it is re-read on every reconcile. An edit that
+changes a running child's effective config is written into that child's
+generated config and queued as a graceful `RESTART`, so it reaches the child at
+its next iteration boundary — no supervisor restart and no hand-written `STOP`.
+An edit that changes nothing writes nothing (an unchanged config serializes to
+the same bytes, so there is no restart loop), and an edit the permission-policy
+check refuses is logged and never written: the running child stays on its
+current file. Everything the plane may not set — `env` and `@file` secrets,
+`settings_path`, `config_dir`, `mcp_config_path`, `backlog_url` and the rest —
+comes from this file.
 
 **The roster names the projects; the base config wires them.** A roster entry
 carries the project(s) the instance drives. For each one the supervisor starts
@@ -1272,6 +1278,11 @@ path - so restarting after installing a new build runs the new build. **Reload**
 re-reads the config file at the next iteration boundary without replacing
 anything: budget, ceiling, prompt and poll-interval edits apply to the next
 iteration; harness, env and binary changes need a restart.
+
+On a **supervised** child there is nothing to reach for: the file its `-c`
+names is the supervisor's generated `materialized.json`, not the base config
+you edit, and the supervisor itself rewrites that file and queues the `RESTART`
+when your base-config edit lands (see "The base config is the machine layer").
 
 One limit worth knowing before you reach for restart: **re-exec preserves the
 daemon's CURRENT environment.** It cannot conjure env the daemon was never
