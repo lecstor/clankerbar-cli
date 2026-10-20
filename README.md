@@ -33,7 +33,7 @@ long run, and a session killed mid-task is fine: the driver hands the task strai
 queue (see [Resilience](#resilience)) and the next iteration picks it up. The
 backlog is the durable state; the loop is thin.
 
-### Phases: splitting one task across two sessions
+### Phases: splitting one task across several sessions
 
 A session's context grows monotonically and is re-read on every turn, so a long
 task gets expensive at the *end*: one measured task spent 66.2M tokens over 370
@@ -351,9 +351,13 @@ because a review-only session's deliverable is its record and committing its
 probe artifacts would move the tip past the revision every member recorded.
 `review_panel_concurrency` caps how many run at once: `1` is the historical
 sequential behaviour (members then share the task's own worktree), `N` runs at
-most `N`, and an absent key or `0` means the whole panel. The fix phase starts
-only after the join has every member's record — or its INCOMPLETE outcome — and
-then works in the task's own worktree as before.
+most `N`, and an absent key or `0` means the whole panel. Members start in
+`review_panel` order: with a cap smaller than the panel, the first `N` entries
+run first and each freed slot goes to the next entry, so put the slowest
+reviewer at the top of the list — its long session then overlaps the others
+instead of extending the round's tail. The fix phase starts only after the join
+has every member's record — or its INCOMPLETE outcome — and then works in the
+task's own worktree as before.
 
 Each member's reviewer role is **positional** — `review-1` .. `review-N`, counted
 over the review-shaped phases — and that is the role the durable record is keyed
@@ -841,6 +845,17 @@ for the fleet first; the clone reads the run's git credential (the same
 travels in the child's environment, never on a command line). The project's
 `worktrees/` directory is created too: it is the fleet's own area, not the
 operator's.
+
+The clone's transport comes from `clone_url_base` (default
+`https://github.com/`). With the default, `origin` is
+`https://github.com/<owner>/<name>.git` and the one clone invocation resolves the
+owner's token through `gh auth token`. With an ssh prefix such as
+`git@github-personal:`, `origin` is
+`git@github-personal:<owner>/<name>.git`, the clone uses that host alias and the
+key, and **no `gh auth token` is spawned** — so a session's fetch and push do not
+depend on a token riding in its environment. The key is a prefix, so it ends
+where the owner begins (`/` for a URL or path, `:` for an scp-style ssh alias);
+[Config](#config) has the full shape and the refusal for anything else.
 
 Derivation fails closed, on the conditions learned from the CLA-441
 wrong-workdir failure. A directory that **exists** is never replaced, adopted or
@@ -1599,6 +1614,21 @@ stream to the daemon's terminal. Off, the stream goes only to its iteration log,
 which is what keeps the daemon's own lines readable — [Visibility](#visibility)
 has the reasoning and where both logs live.
 
+`clone_url_base` (default `https://github.com/`) is the URL **prefix** the
+supervisor's workdir derivation clones a missing repo from:
+`<clone_url_base><owner>/<name>.git`. Set it to an ssh host alias such as
+`git@github-personal:` to give derived fleet clones an ssh `origin`, so a
+session's fetch and push use the key rather than a GitHub token in its
+environment; any other mirror prefix — `https://git.example.com/mirror/`,
+`file:///srv/mirrors/` — works too. It is read only by the supervisor: a plain
+`run` has no clone to make. The value has to end where the owner begins, so a
+URL or path prefix ends with `/` and an scp-style ssh alias ends with `:`.
+Anything else is refused (`doctor` and `supervise` both name the key) rather than
+concatenated into a URL nobody can clone. An ssh base spawns no
+`gh auth token` at all while cloning; the HTTPS github.com default keeps
+resolving the owner's token exactly as before. Existing clones are never
+re-cloned, so a change affects only repos cloned after it is set.
+
 `max_turns` bounds every session's turns when its phase sets none of its own:
 the phase's `max_turns` wins, then this, then a built-in default of 400
 (CLA-343 — an unphased run used to have no cap anywhere in the chain, and one
@@ -1748,6 +1778,65 @@ be non-empty; both are refused at load. `doctor` runs every declared command and
 re-checks every `@path` file, so a source that has stopped working is a FAIL in
 the preflight instead of a refusal at 3am, and it WARNs when a project declares
 repos but no `GH_TOKEN` source anywhere.
+
+#### `env_allowlist`: what a session may inherit
+
+By default a spawned session inherits the daemon's **whole environment** — every
+variable in the shell (or launchd unit) that started the supervisor, including
+tokens for services the session has no business with. `env_allowlist` makes that
+inheritance a whitelist: with it set, every inherited variable NOT named there
+is dropped from the harness process.
+
+```json
+{
+  "env_allowlist": ["HOME", "PATH", "CLANKERBAR_API_KEY", "SSH_AUTH_SOCK"],
+  "env": { "GH_TOKEN": { "fromCommand": "gh auth token -u your-account" } }
+}
+```
+
+- **The `env` block still applies on top.** The allowlist filters INHERITANCE
+  only; a value declared in `env` (or `@path`, or `fromCommand`) is an
+  instruction for the session and is always present. That is how `GH_TOKEN`
+  and `CLAUDE_CODE_OAUTH_TOKEN` arrive, and a `fromCommand` may read a variable
+  that is not on the allowlist because it runs in the daemon, before the filter.
+- **The daemon keeps its own environment.** The filter is applied at the last
+  hop, where the harness process is spawned. The daemon needs its environment to
+  resolve `fromCommand` values and to read git remotes; the session — the
+  model-driven process — is what the list governs. This bounds what is HANDED
+  OVER, not what a determined same-user session can reach: on a platform where
+  one same-user process can read another's environment (Linux
+  `/proc/<pid>/environ`), a session that goes looking by PID can still recover
+  the dropped variables from the daemon's own environment.
+- **Four levels, whole-list replacement.** Like `env` it is declared at the top
+  level, per harness, per project, and per project-per-harness
+  (`env_allowlist_per_harness.<name>`), but the most specific level that
+  declares one WINS ENTIRELY rather than merging. An allowlist is a complete
+  answer to "what may this session see"; unioning levels would make a narrower
+  level unable to remove a variable a broader one admitted. A
+  `env_allowlist_per_harness` key must name a registered harness: an unknown one
+  is refused at load rather than left inert, because a key nothing consults
+  would silently leave that harness on full inheritance.
+- **Omit the key for today's behaviour.** An absent key means full inheritance,
+  and a config that says nothing about it is byte-identical to before. An empty
+  `[]` is refused by validation and `clankerbar doctor` as a half-edit — the
+  only way to say "everything" is to omit the key.
+
+`doctor` reports which shape is in force, prints the variable names that will
+reach a session (never values), and **FAILs** when the list omits one of the
+variables the fleet needs:
+
+- `HOME` — git and ssh read their configuration from it;
+- `PATH` — the harness and every command a session runs;
+- `CLANKERBAR_API_KEY` — the MCP config carries it as
+  `Bearer {env:CLANKERBAR_API_KEY}`; without it the session cannot reach the
+  plane;
+- `CLANKERBAR_WORKDIR_ROOT` — required while the workdir derivation is on
+  (`project_root` on a generated config, or the variable in a base config's
+  environment), because it names the fleet layout every brief works in.
+
+Missing one of those does not fail the spawn; it fails later and elsewhere
+(`repo_not_found`, an unauthenticated plane), which is exactly the failure
+`doctor` exists to move forward.
 
 ### Where the account-scoped key is allowed to go
 

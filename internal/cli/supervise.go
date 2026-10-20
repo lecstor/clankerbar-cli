@@ -82,6 +82,12 @@ func Supervise(ctx context.Context, args []string) error {
 	if err != nil {
 		return fmt.Errorf("supervise: %w", err)
 	}
+	// The clone transport is a machine-layer fact in the same base config. A
+	// malformed prefix fails the whole supervisor at startup, where the operator
+	// is watching, rather than surfacing later as an uncloneable repo (CLA-713).
+	if err := config.ValidateCloneURLBase(base.CloneURLBase); err != nil {
+		return fmt.Errorf("supervise: clone_url_base: %w", err)
+	}
 
 	// The account key is the whole credential: the roster is account-scoped
 	// (Decision 3) and the children inherit the same key for their own plane
@@ -102,6 +108,12 @@ func Supervise(ctx context.Context, args []string) error {
 		// diagnosis; they go to its state dir's supervise.log as well as stderr
 		// (CLA-701).
 		LogToFile: true,
+		// Empty keeps the built-in https://github.com/ base; a set key changes
+		// the transport of every clone the derivation makes (CLA-713).
+		CloneURLBase: strings.TrimSpace(base.CloneURLBase),
+	}
+	if o.CloneURLBase != "" {
+		log.Printf("deriving clones from %s (set by clone_url_base) - an ssh base uses the key and spawns no gh auth token", config.RedactURLCredentials(o.CloneURLBase))
 	}
 	if root := os.Getenv(WorkdirRootEnv); root != "" {
 		o.WorkdirRoot = root

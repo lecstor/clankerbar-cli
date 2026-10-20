@@ -32,6 +32,12 @@ import (
 // another one in their own config file.
 const defaultBacklogURL = "https://clankerbar.com"
 
+// DefaultCloneURLBase is the URL prefix the fleet's derived clones are made
+// from when the operator sets no clone_url_base: <base><owner>/<name>.git.
+// Keeping the default HTTPS is deliberate — a config that says nothing about
+// the clone transport keeps the behaviour it had before the key existed.
+const DefaultCloneURLBase = "https://github.com/"
+
 // defaultPrompt asks each session for exactly ONE task.
 //
 // The wording is not casual: the served protocol
@@ -296,10 +302,10 @@ func (p Phase) ConfiguredIndex() int { return p.sourceIdx }
 // against the same reviewed tip as its siblings.
 //
 // A member is NOT a session: the driver still runs one review phase per member,
-// sequentially, and each writes its own sealed durable record under its own
-// reviewer role (see Config.ReviewPanel). Two entries naming the same
-// harness/model are two INDEPENDENT REVIEWS of the same revision — never a
-// mistake to be deduplicated.
+// concurrently up to Config.ReviewPanelConcurrency, and each writes its own
+// sealed durable record under its own reviewer role (see Config.ReviewPanel).
+// Two entries naming the same harness/model are two INDEPENDENT REVIEWS of the
+// same revision — never a mistake to be deduplicated.
 type ReviewPanelMember struct {
 	// Name is the member's LOG LABEL only. Empty = the driver derives it from
 	// the member's position: `review-1` .. `review-N`. It names the member in
@@ -372,6 +378,11 @@ type HarnessConfig struct {
 	// overlay applies to every harness, with SessionEnv stacking them in
 	// most-specific-wins order.
 	Env EnvMap `json:"env"`
+
+	// EnvAllowlist is this harness's inherited-env allowlist, replacing the
+	// top-level one wholly for sessions on THIS harness — see Config.EnvAllowlist
+	// for the semantics, the composition rule and the minimum `doctor` enforces.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
 }
 
 // Empty reports whether this block declares nothing at all — the shape that is
@@ -379,7 +390,7 @@ type HarnessConfig struct {
 // same reason. Written out rather than compared against the zero value because
 // the Models map makes the struct incomparable.
 func (h HarnessConfig) Empty() bool {
-	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0
+	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0 && len(h.EnvAllowlist) == 0
 }
 
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
@@ -2100,6 +2111,28 @@ type Config struct {
 	// correctly: the config now means something different.
 	ProjectRoot bool `json:"project_root,omitempty"`
 
+	// CloneURLBase is the URL PREFIX the supervisor clones a project's missing
+	// repos from: <base><owner>/<name>.git. Empty means the built-in
+	// DefaultCloneURLBase (`https://github.com/`), so a config that never
+	// mentions the key clones exactly as it always did.
+	//
+	// It exists because a derived fleet clone's origin is otherwise always
+	// HTTPS, which makes a session's branch pushes depend on a GitHub token
+	// riding in its environment (the `gh auth token` scoping on the clone).
+	// An SSH prefix — `git@github-personal:` for an ssh host alias, or
+	// `git@github.com:` — makes the clone authenticate with the key alone and
+	// skips the token scoping entirely. Any other mirror prefix works too;
+	// it is a prefix, not a GitHub-specific setting.
+	//
+	// The value is a PREFIX, so it has to end where the owner begins: a URL
+	// base ends with `/` (`https://github.com/`, `file:///srv/mirrors/`) and
+	// an scp-style ssh base ends with `:` (`git@github-personal:`). Anything
+	// else is refused by Validate rather than concatenated into a broken URL.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: an unset
+	// key must not change a daemon's identity, and a set one correctly does.
+	CloneURLBase string `json:"clone_url_base,omitempty"`
+
 	// ConfigDir pins the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
 	// headless session loads the same skills, plugins, and auth as the interactive
 	// one. Empty inherits the ambient environment — declare it for an unattended
@@ -2384,6 +2417,33 @@ type Config struct {
 	// before a run starts.
 	Env EnvMap `json:"env"`
 
+	// EnvAllowlist, when non-empty, is the COMPLETE set of inherited environment
+	// variable NAMES a spawned session receives (CLA-714). Variables not named
+	// here are dropped from the harness process, so the session cannot read the
+	// tokens that happen to sit in the shell that started the supervisor.
+	//
+	// Unset is the default and keeps today's behaviour exactly: the harness
+	// inherits the daemon's whole environment. An explicitly EMPTY list is
+	// refused by Validate as a half-edit, so the only way to say "everything" is
+	// to omit the key. The list is about INHERITANCE only — the `env` maps above
+	// are still added on top of it at every level, which is how GH_TOKEN and
+	// CLAUDE_CODE_OAUTH_TOKEN arrive. A var may therefore be in the allowlist,
+	// in an `env` block, or in both; a `fromCommand` may read a variable that is
+	// NOT in the allowlist, because it runs in the daemon, before the filter.
+	//
+	// It composes at the same four levels as `env` (top level, harness, project,
+	// project-per-harness) but as a WHOLE LIST, not per key: the most specific
+	// level that declares one wins entirely. Restate a broader list where you
+	// narrow it; an intersection would make a level's own entry silently
+	// ineffective. `doctor` FAILS when the list in force omits a variable the
+	// fleet needs (HOME, PATH, CLANKERBAR_API_KEY, and CLANKERBAR_WORKDIR_ROOT
+	// when the workdir derivation is on), because a session missing one of those
+	// fails later and elsewhere.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: an unset
+	// key must not change a daemon's identity, and a set one correctly does.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
+
 	source string // path the config was loaded from, for diagnostics
 
 	// harnessFromFlag / modelFromFlag record that --harness / --model overrode
@@ -2449,6 +2509,17 @@ type Project struct {
 	// projects[].env, which wins over `harnesses.<name>.env`, which wins over
 	// the top level. Empty on every config that needs no per-pair override.
 	EnvPerHarness map[string]EnvMap `json:"env_per_harness"`
+
+	// EnvAllowlist is this project's inherited-env allowlist, replacing the
+	// top-level (and any harness-level) one wholly for this project's sessions —
+	// see Config.EnvAllowlist. It is how one daemon driving several backlogs
+	// keeps a credential one project needs out of another project's sessions.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
+
+	// EnvAllowlistPerHarness is this project's allowlist PER HARNESS, the most
+	// specific level of the four: it wins over EnvAllowlist for sessions on that
+	// harness only. Empty on every config that needs no per-pair override.
+	EnvAllowlistPerHarness map[string][]string `json:"env_allowlist_per_harness,omitempty"`
 
 	// AllowUncheckedPR is this project's CLA-310 opt-out, overriding the
 	// top-level field of the same name for this project only. See
@@ -3763,6 +3834,79 @@ func underWorkDir(p, workdir string) string {
 	return filepath.Join(workdir, p)
 }
 
+// RedactURLCredentials removes any URL userinfo - the `user:password@` part of
+// `scheme://user:password@host/...` - from raw, so a clone URL base carrying
+// embedded mirror credentials can be logged or quoted in an error without
+// writing the credential down. The host and path are kept: they are what makes
+// a log line or a failure diagnosable.
+//
+// An scp-style ssh prefix (`git@github-personal:`) is not a URL and its user is
+// a plain login name, not a credential, so it is returned unchanged. A value
+// with no userinfo is returned byte for byte.
+func RedactURLCredentials(raw string) string {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return raw
+	}
+	rest := raw[i+3:]
+	authority := rest
+	if end := strings.IndexByte(rest, '/'); end >= 0 {
+		authority = rest[:end]
+	}
+	at := strings.LastIndexByte(authority, '@')
+	if at < 0 {
+		return raw
+	}
+	return raw[:i+3] + "redacted@" + rest[at+1:]
+}
+
+// ValidateCloneURLBase checks that base can be concatenated with an
+// `owner/name.git` identity to make ONE clone URL. The value is a prefix, so
+// the only structural mistake that is both common and silent is a missing
+// separator - `https://github.com` would otherwise produce
+// `https://github.comowner/name.git` - and that is refused here.
+//
+// Accepted shapes:
+//
+//	https://github.com/        (any URL-style base, ending in /)
+//	file:///srv/mirrors/       (a local mirror)
+//	/srv/mirrors/              (a bare path prefix)
+//	git@github-personal:       (an scp-style ssh host alias)
+//
+// An empty value is the default and therefore valid. Errors are recorded
+// with the key name by the caller, so they describe only what is wrong with
+// the value.
+func ValidateCloneURLBase(base string) error {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return nil
+	}
+	if strings.ContainsAny(base, " \t\r\n") {
+		return errors.New("must not contain whitespace")
+	}
+	if strings.Contains(base, "://") {
+		if !strings.HasSuffix(base, "/") {
+			return fmt.Errorf("%q must end with / - it is a URL prefix (https://github.com/)", RedactURLCredentials(base))
+		}
+		return nil
+	}
+	if strings.HasSuffix(base, ":") {
+		host := strings.TrimSuffix(base, ":")
+		at := strings.LastIndexByte(host, '@')
+		// HasSuffix(host, ":") is the doubled separator - `git@host::` leaves a
+		// host that still ends in ':' after one is trimmed, and the concatenated
+		// URL is uncloneable (git reads the second ':' as the start of a path).
+		if at <= 0 || at == len(host)-1 || strings.HasSuffix(host, ":") || strings.Contains(host, "/") {
+			return fmt.Errorf("%q is not an ssh host alias - write it as user@host: (git@github-personal:)", RedactURLCredentials(base))
+		}
+		return nil
+	}
+	if strings.HasSuffix(base, "/") {
+		return nil
+	}
+	return fmt.Errorf("%q must end with / (https://github.com/, file:///srv/mirrors/) or be an ssh host alias ending in : (git@github-personal:)", RedactURLCredentials(base))
+}
+
 // Validate normalizes path fields and checks the resolved config is runnable.
 func (c *Config) Validate() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
@@ -4313,6 +4457,14 @@ func (c *Config) Validate() error {
 	if err := validatePRBase(c.PRBase, "pr_base"); err != nil {
 		return err
 	}
+	// clone_url_base is concatenated with a repo identity to make the supervisor's
+	// clone URL (CLA-713), so a value with no trailing separator would silently
+	// build a URL nobody can clone. Refuse it here so doctor reports it once,
+	// before a reconcile ever tries to use it.
+	c.CloneURLBase = strings.TrimSpace(c.CloneURLBase)
+	if err := ValidateCloneURLBase(c.CloneURLBase); err != nil {
+		return fmt.Errorf("clone_url_base: %w", err)
+	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
@@ -4499,6 +4651,43 @@ func (c *Config) Validate() error {
 		}
 		for _, h := range sortedKeys(c.Projects[i].EnvPerHarness) {
 			if err := validateEnvDecls(c.Projects[i].EnvPerHarness[h], fmt.Sprintf("projects[%d].env_per_harness.%s", i, h)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// The inherited-env allowlists (CLA-714) are validated at all four levels
+	// too: a name that can never match, a duplicate, or an explicit empty list
+	// is a config error, not a spawn-time surprise.
+	if err := validateEnvAllowlist(c.EnvAllowlist, "env_allowlist"); err != nil {
+		return err
+	}
+	for _, name := range sortedKeys(c.Harnesses) {
+		if err := validateEnvAllowlist(c.Harnesses[name].EnvAllowlist, "harnesses."+name+".env_allowlist"); err != nil {
+			return err
+		}
+	}
+	for i := range c.Projects {
+		if err := validateEnvAllowlist(c.Projects[i].EnvAllowlist, fmt.Sprintf("projects[%d].env_allowlist", i)); err != nil {
+			return err
+		}
+		for _, h := range sortedKeys(c.Projects[i].EnvAllowlistPerHarness) {
+			// The KEY is checked against the harness registry too, and here that
+			// matters more than in the sibling env maps: an inert
+			// `env_per_harness` entry merely fails to add a variable, whereas an
+			// allowlist keyed by a name no adapter answers to is never consulted.
+			// SessionEnvAllowlist looks up the harness actually spawned, finds no
+			// per-project list for it, and can then fall back to nil — which
+			// inheritEnv reads as FULL INHERITANCE. A typo or a retired name would
+			// therefore switch the filter OFF instead of narrowing it, the one
+			// direction this feature exists to prevent. Refused here, against the
+			// same registry as `harnesses` and `budget.per_harness`, with the same
+			// rename hint.
+			if !harness.Known(h) {
+				return fmt.Errorf("projects[%d].env_allowlist_per_harness[%q]: unknown harness (want: %s)%s",
+					i, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
+			}
+			if err := validateEnvAllowlist(c.Projects[i].EnvAllowlistPerHarness[h], fmt.Sprintf("projects[%d].env_allowlist_per_harness.%s", i, h)); err != nil {
 				return err
 			}
 		}

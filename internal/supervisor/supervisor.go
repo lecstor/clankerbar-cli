@@ -128,6 +128,13 @@ type Options struct {
 	// CLA-441 failure).
 	WorkdirRoot string
 
+	// CloneURLBase is the URL prefix a derived clone is made from:
+	// <base><owner>/<name>.git. Empty = config.DefaultCloneURLBase
+	// (`https://github.com/`), which is what every config that does not set
+	// clone_url_base keeps using. Set it through the base config's
+	// clone_url_base; the CLI passes that value here.
+	CloneURLBase string
+
 	// RosterURL is the account-scoped roster endpoint the supervisor polls
 	// (`<origin>/api/daemon-roster`). Empty = not wired: Supervise refuses to
 	// run, because a supervisor without the roster is a supervisor with no
@@ -882,7 +889,7 @@ func (d *Supervisor) baseCtx() context.Context {
 // exactly as `run` would validate it.
 func (d *Supervisor) resolveInstance(cfg *config.Config) (*config.Config, string, error) {
 	if d.o.WorkdirRoot != "" {
-		derived, err := deriveInstanceWorkdirs(d.baseCtx(), cfg, d.o.WorkdirRoot)
+		derived, err := deriveInstanceWorkdirs(d.baseCtx(), cfg, d.o.WorkdirRoot, d.o.CloneURLBase)
 		if err != nil {
 			return nil, "", err
 		}

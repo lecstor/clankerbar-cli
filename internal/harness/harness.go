@@ -294,6 +294,12 @@ type Invocation struct {
 	// terminal and/or a per-iteration logfile). Nil → os.Stderr.
 	Console io.Writer
 	Env     []string // extra env, appended to the process environment
+	// EnvAllowlist names the INHERITED variables this session may keep
+	// (CLA-714). Nil/empty = inherit the daemon's whole environment, the
+	// unchanged default. When set, every other inherited variable is dropped
+	// before exec; Env is still appended in full, because a declared value is
+	// an instruction for the session rather than inherited state.
+	EnvAllowlist []string
 	// Probe marks this as a cheap liveness check, not real work — adapters run
 	// the smallest possible request instead of the drain prompt.
 	Probe bool
