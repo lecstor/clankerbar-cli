@@ -1024,7 +1024,8 @@ type Limit struct {
 	// exhaustion (out of credits, spend-cap or monthly-limit reached) with no
 	// rolling-window reset to poll for. The loop stops the run cleanly instead of
 	// entering the supervised wait. Zero value (false) keeps the wait-and-poll
-	// behaviour for the rolling-window subscription caps that claude/codex hit.
+	// behaviour for the rolling-window subscription caps that claude, codex and
+	// opencode hit.
 	Stop    bool
 	ResetAt time.Time // zero = unknown
 	Reason  string

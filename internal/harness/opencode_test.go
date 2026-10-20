@@ -187,8 +187,9 @@ func TestOpencodeDetectLimit(t *testing.T) {
 // an unknown exit 1 AFTER reported usage is retryable, because a session that
 // already reported usage evidently authenticated and started doing paid work,
 // while one that reported nothing is the config/auth signature and stays a stop.
-// A NAMED stop (opencodeBudgetRe, opencodeFatalRe) beats both scans, so the
-// heuristic cannot launder an exhausted account or a revoked key into a retry.
+// A NAMED stop (opencodeBudgetRe, opencodeRollingQuotaRe, opencodeFatalRe) beats
+// both scans, so the heuristic cannot launder an exhausted account, a rolling
+// quota window, or a revoked key into a retry.
 // Cases mark where the signal lives (stdout error event vs. stderr) to match how
 // opencode actually emits it.
 func TestOpencodeIsTransient(t *testing.T) {
