@@ -110,7 +110,7 @@ func Supervise(ctx context.Context, args []string) error {
 		LogToFile: true,
 		// Empty keeps the built-in https://github.com/ base; a set key changes
 		// the transport of every clone the derivation makes (CLA-713).
-		CloneURLBase: base.CloneURLBase,
+		CloneURLBase: strings.TrimSpace(base.CloneURLBase),
 	}
 	if o.CloneURLBase != "" {
 		log.Printf("deriving clones from %s (set by clone_url_base) - an ssh base uses the key and spawns no gh auth token", o.CloneURLBase)

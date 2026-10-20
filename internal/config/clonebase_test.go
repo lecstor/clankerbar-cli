@@ -52,6 +52,7 @@ func TestValidateCloneURLBase(t *testing.T) {
 		"git@github-personal:",
 		"git@github.com:",
 		"deploy@git.internal:",
+		"  git@github-personal:  ", // surrounding whitespace is trimmed
 	}
 	for _, base := range valid {
 		if err := ValidateCloneURLBase(base); err != nil {
@@ -66,7 +67,6 @@ func TestValidateCloneURLBase(t *testing.T) {
 		{"https://github.com", "must end with /"},
 		{"git@github-personal", "must end with /"},
 		{"/srv/mirrors", "must end with /"},
-		{"git@github-personal: ", ""}, // trimmed to a valid value
 		{"https://github.com/ has a space/", "whitespace"},
 		{"git@:", "ssh host alias"},
 		{"@github-personal:", "ssh host alias"},
@@ -74,12 +74,6 @@ func TestValidateCloneURLBase(t *testing.T) {
 	}
 	for _, c := range invalid {
 		err := ValidateCloneURLBase(c.base)
-		if c.want == "" { // the trimmed-valid case
-			if err != nil {
-				t.Errorf("ValidateCloneURLBase(%q) = %v, want nil after trimming", c.base, err)
-			}
-			continue
-		}
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("ValidateCloneURLBase(%q) = %v, want an error containing %q", c.base, err, c.want)
 		}
