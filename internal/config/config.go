@@ -2394,13 +2394,14 @@ type Config struct {
 	// here are dropped from the harness process, so the session cannot read the
 	// tokens that happen to sit in the shell that started the supervisor.
 	//
-	// Unset (or an empty list) is the default and keeps today's behaviour
-	// exactly: the harness inherits the daemon's whole environment. The list is
-	// about INHERITANCE only — the `env` maps above are still added on top of it
-	// at every level, which is how GH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN arrive.
-	// A var may therefore be in the allowlist, in an `env` block, or in both; a
-	// `fromCommand` may read a variable that is NOT in the allowlist, because it
-	// runs in the daemon, before the filter.
+	// Unset is the default and keeps today's behaviour exactly: the harness
+	// inherits the daemon's whole environment. An explicitly EMPTY list is
+	// refused by Validate as a half-edit, so the only way to say "everything" is
+	// to omit the key. The list is about INHERITANCE only — the `env` maps above
+	// are still added on top of it at every level, which is how GH_TOKEN and
+	// CLAUDE_CODE_OAUTH_TOKEN arrive. A var may therefore be in the allowlist,
+	// in an `env` block, or in both; a `fromCommand` may read a variable that is
+	// NOT in the allowlist, because it runs in the daemon, before the filter.
 	//
 	// It composes at the same four levels as `env` (top level, harness, project,
 	// project-per-harness) but as a WHOLE LIST, not per key: the most specific

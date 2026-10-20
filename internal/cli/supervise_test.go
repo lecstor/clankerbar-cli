@@ -93,6 +93,11 @@ func TestSuperviseReadsWorkdirRootFromEnv(t *testing.T) {
 
 	t.Setenv("CLANKERBAR_API_KEY", "test-key")
 	t.Setenv("HOME", t.TempDir())
+	// The test is about the UNSET branch, and this binary may be running inside a
+	// supervised session that exports the root (CLA-714's sibling failure: a test
+	// that assumes an ambient variable is absent passes only on the machine where
+	// it happens to be).
+	t.Setenv(WorkdirRootEnv, "")
 	writeSuperviseConfig(t, srv.URL)
 
 	if err := Supervise(context.Background(), nil); err != nil {
