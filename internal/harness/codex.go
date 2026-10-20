@@ -95,7 +95,7 @@ func (c codex) env(in Invocation) []string {
 	// Pin the child's PWD to the directory Invoke sets as cmd.Dir, dropping the
 	// daemon's inherited value - see pinPWD. Applied to the INHERITED
 	// environment, before in.Env, so an explicit caller value still wins.
-	env := append(pinPWD(os.Environ(), in.WorkDir), in.Env...)
+	env := append(pinPWD(inheritEnv(os.Environ(), in.EnvAllowlist), in.WorkDir), in.Env...)
 	if in.ConfigDir != "" {
 		env = append(env, "CODEX_HOME="+in.ConfigDir)
 	}

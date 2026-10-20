@@ -1749,6 +1749,57 @@ re-checks every `@path` file, so a source that has stopped working is a FAIL in
 the preflight instead of a refusal at 3am, and it WARNs when a project declares
 repos but no `GH_TOKEN` source anywhere.
 
+#### `env_allowlist`: what a session may inherit
+
+By default a spawned session inherits the daemon's **whole environment** — every
+variable in the shell (or launchd unit) that started the supervisor, including
+tokens for services the session has no business with. `env_allowlist` makes that
+inheritance a whitelist: with it set, every inherited variable NOT named there
+is dropped from the harness process.
+
+```json
+{
+  "env_allowlist": ["HOME", "PATH", "CLANKERBAR_API_KEY", "SSH_AUTH_SOCK"],
+  "env": { "GH_TOKEN": { "fromCommand": "gh auth token -u your-account" } }
+}
+```
+
+- **The `env` block still applies on top.** The allowlist filters INHERITANCE
+  only; a value declared in `env` (or `@path`, or `fromCommand`) is an
+  instruction for the session and is always present. That is how `GH_TOKEN`
+  and `CLAUDE_CODE_OAUTH_TOKEN` arrive, and a `fromCommand` may read a variable
+  that is not on the allowlist because it runs in the daemon, before the filter.
+- **The daemon keeps its own environment.** The filter is applied at the last
+  hop, where the harness process is spawned. The daemon needs its environment to
+  resolve `fromCommand` values and to read git remotes; the session — the
+  model-driven process — is what the list governs.
+- **Four levels, whole-list replacement.** Like `env` it is declared at the top
+  level, per harness, per project, and per project-per-harness
+  (`env_allowlist_per_harness.<name>`), but the most specific level that
+  declares one WINS ENTIRELY rather than merging. An allowlist is a complete
+  answer to "what may this session see"; unioning levels would make a narrower
+  level unable to remove a variable a broader one admitted.
+- **Omit the key for today's behaviour.** An absent key (or an empty `[]`, which
+  is refused as a half-edit) means full inheritance. A config that says nothing
+  about it is byte-identical to before.
+
+`doctor` reports which shape is in force, prints the variable names that will
+reach a session (never values), and **FAILs** when the list omits one of the
+variables the fleet needs:
+
+- `HOME` — git and ssh read their configuration from it;
+- `PATH` — the harness and every command a session runs;
+- `CLANKERBAR_API_KEY` — the MCP config carries it as
+  `Bearer {env:CLANKERBAR_API_KEY}`; without it the session cannot reach the
+  plane;
+- `CLANKERBAR_WORKDIR_ROOT` — required while the workdir derivation is on
+  (`project_root` on a generated config, or the variable in a base config's
+  environment), because it names the fleet layout every brief works in.
+
+Missing one of those does not fail the spawn; it fails later and elsewhere
+(`repo_not_found`, an unauthenticated plane), which is exactly the failure
+`doctor` exists to move forward.
+
 ### Where the account-scoped key is allowed to go
 
 `CLANKERBAR_API_KEY` is an **account-scoped bearer token** — one key covers every

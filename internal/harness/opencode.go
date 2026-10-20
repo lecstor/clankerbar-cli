@@ -818,7 +818,7 @@ func (opencode) env(in Invocation) ([]string, error) {
 	// The session's INSTANCE directory. opencode reads $PWD, not just the real
 	// cwd, so this is what decides which project-level opencode.json it merges
 	// and which git worktree its read/edit asks are relative to - see pinPWD.
-	env := pinPWD(os.Environ(), in.WorkDir)
+	env := pinPWD(inheritEnv(os.Environ(), in.EnvAllowlist), in.WorkDir)
 	// Pin the config dir so a headless session loads the SAME providers, model
 	// and plugins as the interactive one (the claude/CODEX parity). On 2.x
 	// OPENCODE_CONFIG_DIR REPLACES the global config dir (~/.config/opencode)

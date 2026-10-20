@@ -251,6 +251,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkConfigDirs(cfg)...)
 	checks = append(checks, checkRepos(cfg)...)
 	checks = append(checks, checkSessionEnv(ctx, cfg, e)...)
+	checks = append(checks, checkSessionEnvAllowlist(cfg)...)
 	checks = append(checks, checkTokenSources(cfg)...)
 	checks = append(checks, checkBacklog(ctx, cfg, e)...)
 	checks = append(checks, checkFleets(ctx, cfg, e)...)
@@ -345,6 +346,17 @@ func checkConfig(cfg *config.Config) check {
 		for _, line := range rangeEnvNames(decls) {
 			c.info = append(c.info, line)
 		}
+	}
+	// ...and what the session may INHERIT, which since CLA-714 is a config
+	// decision rather than the daemon's whole environment. Same rule as above:
+	// names only, never values.
+	if cfg.EnvAllowlistDeclared() {
+		for _, line := range rangeEnvAllowlist(cfg) {
+			c.info = append(c.info, line)
+		}
+		c.info = append(c.info, "sessions inherit: only the env_allowlist above, plus the env block")
+	} else {
+		c.info = append(c.info, "sessions inherit: the daemon's whole environment (no env_allowlist declared)")
 	}
 	if len(cfg.Projects) > 0 {
 		for _, p := range cfg.Projects {
@@ -444,6 +456,42 @@ func rangeEnvNames(decls []config.DeclaredEnv) []string {
 		names := byLabel[l]
 		sort.Strings(names)
 		out = append(out, "env["+l+"]: "+strings.Join(names, ", "))
+	}
+	return out
+}
+
+// rangeEnvAllowlist renders the config's inherited-env allowlist as one line
+// per LEVEL that declares anything, mirroring rangeEnvNames: names only, never
+// values, because the list decides which inherited credentials reach a session.
+func rangeEnvAllowlist(cfg *config.Config) []string {
+	byLabel := map[string][]string{}
+	add := func(label string, list []string) {
+		if len(list) == 0 {
+			return
+		}
+		names := append([]string(nil), list...)
+		sort.Strings(names)
+		byLabel[label] = names
+	}
+	add("env_allowlist", cfg.EnvAllowlist)
+	for _, name := range slices.Sorted(maps.Keys(cfg.Harnesses)) {
+		add("harnesses."+name+".env_allowlist", cfg.Harnesses[name].EnvAllowlist)
+	}
+	for i := range cfg.Projects {
+		p := &cfg.Projects[i]
+		add(fmt.Sprintf("projects[%d].env_allowlist", i), p.EnvAllowlist)
+		for _, h := range slices.Sorted(maps.Keys(p.EnvAllowlistPerHarness)) {
+			add(fmt.Sprintf("projects[%d].env_allowlist_per_harness.%s", i, h), p.EnvAllowlistPerHarness[h])
+		}
+	}
+	labels := make([]string, 0, len(byLabel))
+	for l := range byLabel {
+		labels = append(labels, l)
+	}
+	sort.Strings(labels)
+	out := make([]string, 0, len(labels))
+	for _, l := range labels {
+		out = append(out, l+": "+strings.Join(byLabel[l], ", "))
 	}
 	return out
 }
@@ -692,6 +740,104 @@ func gitRemoteURL(dir string) (string, error) {
 }
 
 // --- 1c. session env ---------------------------------------------------------
+
+// requiredSessionEnv is the minimum a triggered allowlist must keep (CLA-714).
+// A session without PATH cannot run a command, without HOME cannot read git's
+// or ssh's configuration, and without CLANKERBAR_API_KEY cannot reach the
+// plane (the MCP config carries it as `Bearer {env:CLANKERBAR_API_KEY}`).
+// CLANKERBAR_WORKDIR_ROOT joins them while the workdir derivation is on: the
+// fleet's layout is what every brief names, and `doctor` has no way to tell an
+// operator's shell from a supervisor's without the one signal both carry
+// (`project_root` on a materialized config, the variable in a base config's
+// environment).
+func requiredSessionEnv(cfg *config.Config) []string {
+	req := []string{"HOME", "PATH", "CLANKERBAR_API_KEY"}
+	if cfg.ProjectRoot || os.Getenv(WorkdirRootEnv) != "" {
+		req = append(req, WorkdirRootEnv)
+	}
+	return req
+}
+
+// checkSessionEnvAllowlist reports the shape in force for every (project,
+// harness) pair the run will spawn (CLA-714). With no allowlist declared it
+// PASSes and says so: full inheritance is the documented default, not a
+// warning. With one declared it names the variables that will reach the
+// session - names only, never values - and FAILs when the list omits one of
+// requiredSessionEnv, because that failure otherwise appears later as an
+// unexplained repo_not_found or an unauthenticated plane call inside a session.
+func checkSessionEnvAllowlist(cfg *config.Config) []check {
+	harnesses := cfg.PhaseHarnesses()
+	name := func(slug, h string) string {
+		label := "session env allowlist"
+		qualifier := slug
+		if len(harnesses) > 1 {
+			// Match checkSessions' naming: the harness is named only when the run
+			// spawns more than one, so a single-harness report stays unqualified.
+			if qualifier != "" {
+				qualifier += ":"
+			}
+			qualifier += h
+		}
+		return label + bracket(qualifier)
+	}
+	// The env a session receives on top of the allowlist, by name. doctor never
+	// reads a value: one of these is routinely a credential.
+	declaredNames := func(h, slug string) []string { return cfg.SessionEnvNames(h, slug) }
+	report := func(slug, h string) check {
+		c := check{name: name(slug, h)}
+		allow := cfg.SessionEnvAllowlist(h, slug)
+		if len(allow) == 0 {
+			c.status = pass
+			c.detail = "no env_allowlist - sessions inherit the daemon's whole environment (the unchanged default)"
+			return c
+		}
+		passes := append([]string(nil), allow...)
+		sort.Strings(passes)
+		c.detail = "sessions inherit only: " + strings.Join(passes, ", ")
+		if extra := declaredNames(h, slug); len(extra) > 0 {
+			c.detail += "; the env block adds: " + strings.Join(extra, ", ")
+		}
+		var missing []string
+		for _, want := range requiredSessionEnv(cfg) {
+			if !contains(allow, want) {
+				missing = append(missing, want)
+			}
+		}
+		if len(missing) > 0 {
+			c.status = fail
+			c.detail += " - missing " + strings.Join(missing, ", ") + " (a session without it fails later, elsewhere)"
+			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), or drop env_allowlist to inherit everything"
+			return c
+		}
+		c.status = pass
+		return c
+	}
+	if len(cfg.Projects) == 0 {
+		out := make([]check, 0, len(harnesses))
+		for _, h := range harnesses {
+			out = append(out, report("", h))
+		}
+		return out
+	}
+	out := make([]check, 0, len(cfg.Projects)*len(harnesses))
+	for _, p := range cfg.Projects {
+		for _, h := range harnesses {
+			out = append(out, report(p.Slug, h))
+		}
+	}
+	return out
+}
+
+// contains reports whether names holds want. Small and local: the minimum is
+// four entries, and a set would cost more lines than it saves.
+func contains(names []string, want string) bool {
+	for _, n := range names {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
 
 // checkSessionEnv verifies every DECLARED env entry that needs resolving can be
 // resolved right now (CLA-462): each fromCommand is executed and each "@path"

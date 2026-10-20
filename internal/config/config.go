@@ -372,6 +372,11 @@ type HarnessConfig struct {
 	// overlay applies to every harness, with SessionEnv stacking them in
 	// most-specific-wins order.
 	Env EnvMap `json:"env"`
+
+	// EnvAllowlist is this harness's inherited-env allowlist, replacing the
+	// top-level one wholly for sessions on THIS harness — see Config.EnvAllowlist
+	// for the semantics, the composition rule and the minimum `doctor` enforces.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
 }
 
 // Empty reports whether this block declares nothing at all — the shape that is
@@ -379,7 +384,7 @@ type HarnessConfig struct {
 // same reason. Written out rather than compared against the zero value because
 // the Models map makes the struct incomparable.
 func (h HarnessConfig) Empty() bool {
-	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0
+	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0 && len(h.EnvAllowlist) == 0
 }
 
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
@@ -2384,6 +2389,32 @@ type Config struct {
 	// before a run starts.
 	Env EnvMap `json:"env"`
 
+	// EnvAllowlist, when non-empty, is the COMPLETE set of inherited environment
+	// variable NAMES a spawned session receives (CLA-714). Variables not named
+	// here are dropped from the harness process, so the session cannot read the
+	// tokens that happen to sit in the shell that started the supervisor.
+	//
+	// Unset (or an empty list) is the default and keeps today's behaviour
+	// exactly: the harness inherits the daemon's whole environment. The list is
+	// about INHERITANCE only — the `env` maps above are still added on top of it
+	// at every level, which is how GH_TOKEN and CLAUDE_CODE_OAUTH_TOKEN arrive.
+	// A var may therefore be in the allowlist, in an `env` block, or in both; a
+	// `fromCommand` may read a variable that is NOT in the allowlist, because it
+	// runs in the daemon, before the filter.
+	//
+	// It composes at the same four levels as `env` (top level, harness, project,
+	// project-per-harness) but as a WHOLE LIST, not per key: the most specific
+	// level that declares one wins entirely. Restate a broader list where you
+	// narrow it; an intersection would make a level's own entry silently
+	// ineffective. `doctor` FAILS when the list in force omits a variable the
+	// fleet needs (HOME, PATH, CLANKERBAR_API_KEY, and CLANKERBAR_WORKDIR_ROOT
+	// when the workdir derivation is on), because a session missing one of those
+	// fails later and elsewhere.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: an unset
+	// key must not change a daemon's identity, and a set one correctly does.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
+
 	source string // path the config was loaded from, for diagnostics
 
 	// harnessFromFlag / modelFromFlag record that --harness / --model overrode
@@ -2449,6 +2480,17 @@ type Project struct {
 	// projects[].env, which wins over `harnesses.<name>.env`, which wins over
 	// the top level. Empty on every config that needs no per-pair override.
 	EnvPerHarness map[string]EnvMap `json:"env_per_harness"`
+
+	// EnvAllowlist is this project's inherited-env allowlist, replacing the
+	// top-level (and any harness-level) one wholly for this project's sessions —
+	// see Config.EnvAllowlist. It is how one daemon driving several backlogs
+	// keeps a credential one project needs out of another project's sessions.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
+
+	// EnvAllowlistPerHarness is this project's allowlist PER HARNESS, the most
+	// specific level of the four: it wins over EnvAllowlist for sessions on that
+	// harness only. Empty on every config that needs no per-pair override.
+	EnvAllowlistPerHarness map[string][]string `json:"env_allowlist_per_harness,omitempty"`
 
 	// AllowUncheckedPR is this project's CLA-310 opt-out, overriding the
 	// top-level field of the same name for this project only. See
@@ -4499,6 +4541,28 @@ func (c *Config) Validate() error {
 		}
 		for _, h := range sortedKeys(c.Projects[i].EnvPerHarness) {
 			if err := validateEnvDecls(c.Projects[i].EnvPerHarness[h], fmt.Sprintf("projects[%d].env_per_harness.%s", i, h)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// The inherited-env allowlists (CLA-714) are validated at all four levels
+	// too: a name that can never match, a duplicate, or an explicit empty list
+	// is a config error, not a spawn-time surprise.
+	if err := validateEnvAllowlist(c.EnvAllowlist, "env_allowlist"); err != nil {
+		return err
+	}
+	for _, name := range sortedKeys(c.Harnesses) {
+		if err := validateEnvAllowlist(c.Harnesses[name].EnvAllowlist, "harnesses."+name+".env_allowlist"); err != nil {
+			return err
+		}
+	}
+	for i := range c.Projects {
+		if err := validateEnvAllowlist(c.Projects[i].EnvAllowlist, fmt.Sprintf("projects[%d].env_allowlist", i)); err != nil {
+			return err
+		}
+		for _, h := range sortedKeys(c.Projects[i].EnvAllowlistPerHarness) {
+			if err := validateEnvAllowlist(c.Projects[i].EnvAllowlistPerHarness[h], fmt.Sprintf("projects[%d].env_allowlist_per_harness.%s", i, h)); err != nil {
 				return err
 			}
 		}

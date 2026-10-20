@@ -7273,6 +7273,7 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 		ConfigDir:     hc.ConfigDir,
 		SettingsPath:  hc.SettingsPath,
 		Env:           env,
+		EnvAllowlist:  d.cfg.SessionEnvAllowlist(harnessName, t.Name),
 		Probe:         probe,
 	}, nil
 }
