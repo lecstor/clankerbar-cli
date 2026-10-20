@@ -93,10 +93,11 @@ func TestSuperviseReadsWorkdirRootFromEnv(t *testing.T) {
 
 	t.Setenv("CLANKERBAR_API_KEY", "test-key")
 	t.Setenv("HOME", t.TempDir())
-	// The test is about the UNSET branch, and this binary may be running inside a
-	// supervised session that exports the root (CLA-714's sibling failure: a test
-	// that assumes an ambient variable is absent passes only on the machine where
-	// it happens to be).
+	// The "unset" half of this test must not inherit the ambient value: a
+	// session running under the fleet supervisor HAS this variable set (CLA-714's
+	// sibling failure: a test that assumes an ambient variable is absent passes
+	// only on the machine where it happens to be), and the first assertion would
+	// otherwise fail on the supervisor's own environment.
 	t.Setenv(WorkdirRootEnv, "")
 	writeSuperviseConfig(t, srv.URL)
 
@@ -117,16 +118,54 @@ func TestSuperviseReadsWorkdirRootFromEnv(t *testing.T) {
 	}
 }
 
+// A clone_url_base can carry URL userinfo (a mirror's credentials), and the
+// supervisor's line is logged to its state dir as well as stderr. The log must
+// name the host and never the credential (CLA-713 review).
+func TestSuperviseRedactsCloneURLCredentialsInItsLog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"entries": []}`))
+	}))
+	defer srv.Close()
+
+	var buf lockedLog
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	t.Setenv("CLANKERBAR_API_KEY", "test-key")
+	t.Setenv("HOME", t.TempDir())
+	writeSuperviseConfigMap(t, map[string]string{
+		"backlog_url":    srv.URL,
+		"clone_url_base": "https://user:token@git.example.com/mirror/",
+	})
+
+	if err := Supervise(context.Background(), nil); err != nil {
+		t.Fatalf("Supervise with a userinfo clone_url_base returned %v, want nil", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "user:token") {
+		t.Fatalf("the supervisor log carries the clone URL's userinfo:\n%s", out)
+	}
+	if !strings.Contains(out, "redacted@git.example.com") {
+		t.Fatalf("the supervisor log lost the clone host it is naming:\n%s", out)
+	}
+}
+
 // writeSuperviseConfig drops the supervisor's local config into the isolated
 // HOME, pointing the roster at the fake plane (backlog_url is where the
 // roster endpoint is derived from — the account key never lands in a file).
 func writeSuperviseConfig(t *testing.T, backlogURL string) {
 	t.Helper()
+	writeSuperviseConfigMap(t, map[string]string{"backlog_url": backlogURL})
+}
+
+func writeSuperviseConfigMap(t *testing.T, cfg map[string]string) {
+	t.Helper()
 	dir := filepath.Join(os.Getenv("HOME"), ".config", "clankerbar")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(map[string]string{"backlog_url": backlogURL})
+	body, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,5 +245,32 @@ func TestSuperviseReplaceRejectsPositionalArgs(t *testing.T) {
 	err := Supervise(context.Background(), []string{"replace", "bogus"})
 	if err == nil || !strings.Contains(err.Error(), "unexpected argument") {
 		t.Fatalf("supervise replace bogus returned %v, want an unexpected-argument error", err)
+	}
+}
+
+// CLA-713: the clone transport is read from the machine-layer config and a
+// malformed prefix refuses the supervisor at startup, naming the key - before
+// any reconcile could try to use it.
+func TestSuperviseRefusesAMalformedCloneURLBase(t *testing.T) {
+	t.Setenv("CLANKERBAR_API_KEY", "test-key")
+	t.Setenv("HOME", t.TempDir())
+	dir := filepath.Join(os.Getenv("HOME"), ".config", "clankerbar")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]string{
+		"backlog_url":    "https://clankerbar.example",
+		"clone_url_base": "https://github.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = Supervise(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "clone_url_base") || !strings.Contains(err.Error(), "must end with /") {
+		t.Fatalf("Supervise with a malformed clone_url_base returned %v, want a refusal naming the key and the missing separator", err)
 	}
 }
