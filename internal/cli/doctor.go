@@ -354,7 +354,7 @@ func checkConfig(cfg *config.Config) check {
 		for _, line := range rangeEnvAllowlist(cfg) {
 			c.info = append(c.info, line)
 		}
-		c.info = append(c.info, "sessions inherit: only the env_allowlist above, plus the env block")
+		c.info = append(c.info, "sessions inherit: the env_allowlist above where one applies, plus the env block")
 	} else {
 		c.info = append(c.info, "sessions inherit: the daemon's whole environment (no env_allowlist declared)")
 	}

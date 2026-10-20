@@ -179,7 +179,7 @@ func TestDoctorConfigReportsTheInheritanceShape(t *testing.T) {
 	base.EnvAllowlist = []string{"HOME", "PATH", "CLANKERBAR_API_KEY"}
 	c = checkConfig(base)
 	joined = strings.Join(c.info, "\n")
-	if !strings.Contains(joined, "only the env_allowlist") || !strings.Contains(joined, "CLANKERBAR_API_KEY") {
+	if !strings.Contains(joined, "env_allowlist above") || !strings.Contains(joined, "CLANKERBAR_API_KEY") {
 		t.Errorf("info = %q, want the allowlist shape AND the variable names", joined)
 	}
 }
