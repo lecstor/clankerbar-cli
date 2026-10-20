@@ -3791,14 +3791,30 @@ func underWorkDir(p, workdir string) string {
 	return filepath.Join(workdir, p)
 }
 
-// EffectiveCloneURLBase is the clone URL prefix the supervisor derives a
-// repo's clone URL from: the operator's clone_url_base, trimmed, or the
-// built-in DefaultCloneURLBase when the key is unset.
-func (c *Config) EffectiveCloneURLBase() string {
-	if base := strings.TrimSpace(c.CloneURLBase); base != "" {
-		return base
+// RedactURLCredentials removes any URL userinfo - the `user:password@` part of
+// `scheme://user:password@host/...` - from raw, so a clone URL base carrying
+// embedded mirror credentials can be logged or quoted in an error without
+// writing the credential down. The host and path are kept: they are what makes
+// a log line or a failure diagnosable.
+//
+// An scp-style ssh prefix (`git@github-personal:`) is not a URL and its user is
+// a plain login name, not a credential, so it is returned unchanged. A value
+// with no userinfo is returned byte for byte.
+func RedactURLCredentials(raw string) string {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return raw
 	}
-	return DefaultCloneURLBase
+	rest := raw[i+3:]
+	authority := rest
+	if end := strings.IndexByte(rest, '/'); end >= 0 {
+		authority = rest[:end]
+	}
+	at := strings.LastIndexByte(authority, '@')
+	if at < 0 {
+		return raw
+	}
+	return raw[:i+3] + "redacted@" + rest[at+1:]
 }
 
 // ValidateCloneURLBase checks that base can be concatenated with an
@@ -3827,22 +3843,25 @@ func ValidateCloneURLBase(base string) error {
 	}
 	if strings.Contains(base, "://") {
 		if !strings.HasSuffix(base, "/") {
-			return fmt.Errorf("%q must end with / - it is a URL prefix (https://github.com/)", base)
+			return fmt.Errorf("%q must end with / - it is a URL prefix (https://github.com/)", RedactURLCredentials(base))
 		}
 		return nil
 	}
 	if strings.HasSuffix(base, ":") {
 		host := strings.TrimSuffix(base, ":")
 		at := strings.LastIndexByte(host, '@')
-		if at <= 0 || at == len(host)-1 || strings.Contains(host, "/") {
-			return fmt.Errorf("%q is not an ssh host alias - write it as user@host: (git@github-personal:)", base)
+		// HasSuffix(host, ":") is the doubled separator - `git@host::` leaves a
+		// host that still ends in ':' after one is trimmed, and the concatenated
+		// URL is uncloneable (git reads the second ':' as the start of a path).
+		if at <= 0 || at == len(host)-1 || strings.HasSuffix(host, ":") || strings.Contains(host, "/") {
+			return fmt.Errorf("%q is not an ssh host alias - write it as user@host: (git@github-personal:)", RedactURLCredentials(base))
 		}
 		return nil
 	}
 	if strings.HasSuffix(base, "/") {
 		return nil
 	}
-	return fmt.Errorf("%q must end with / (https://github.com/, file:///srv/mirrors/) or be an ssh host alias ending in : (git@github-personal:)", base)
+	return fmt.Errorf("%q must end with / (https://github.com/, file:///srv/mirrors/) or be an ssh host alias ending in : (git@github-personal:)", RedactURLCredentials(base))
 }
 
 // Validate normalizes path fields and checks the resolved config is runnable.

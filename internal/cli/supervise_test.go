@@ -117,16 +117,54 @@ func TestSuperviseReadsWorkdirRootFromEnv(t *testing.T) {
 	}
 }
 
+// A clone_url_base can carry URL userinfo (a mirror's credentials), and the
+// supervisor's line is logged to its state dir as well as stderr. The log must
+// name the host and never the credential (CLA-713 review).
+func TestSuperviseRedactsCloneURLCredentialsInItsLog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"entries": []}`))
+	}))
+	defer srv.Close()
+
+	var buf lockedLog
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	t.Setenv("CLANKERBAR_API_KEY", "test-key")
+	t.Setenv("HOME", t.TempDir())
+	writeSuperviseConfigMap(t, map[string]string{
+		"backlog_url":    srv.URL,
+		"clone_url_base": "https://user:token@git.example.com/mirror/",
+	})
+
+	if err := Supervise(context.Background(), nil); err != nil {
+		t.Fatalf("Supervise with a userinfo clone_url_base returned %v, want nil", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "user:token") {
+		t.Fatalf("the supervisor log carries the clone URL's userinfo:\n%s", out)
+	}
+	if !strings.Contains(out, "redacted@git.example.com") {
+		t.Fatalf("the supervisor log lost the clone host it is naming:\n%s", out)
+	}
+}
+
 // writeSuperviseConfig drops the supervisor's local config into the isolated
 // HOME, pointing the roster at the fake plane (backlog_url is where the
 // roster endpoint is derived from — the account key never lands in a file).
 func writeSuperviseConfig(t *testing.T, backlogURL string) {
 	t.Helper()
+	writeSuperviseConfigMap(t, map[string]string{"backlog_url": backlogURL})
+}
+
+func writeSuperviseConfigMap(t *testing.T, cfg map[string]string) {
+	t.Helper()
 	dir := filepath.Join(os.Getenv("HOME"), ".config", "clankerbar")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(map[string]string{"backlog_url": backlogURL})
+	body, err := json.Marshal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

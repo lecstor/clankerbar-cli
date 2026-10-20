@@ -18,27 +18,6 @@ func TestDefaultCloneURLBaseIsTheHistoricalHTTPSBase(t *testing.T) {
 	}
 }
 
-func TestEffectiveCloneURLBase(t *testing.T) {
-	cases := []struct {
-		name string
-		set  string
-		want string
-	}{
-		{"unset keeps the default", "", DefaultCloneURLBase},
-		{"an ssh host alias is used verbatim", "git@github-personal:", "git@github-personal:"},
-		{"a mirror prefix is used verbatim", "https://git.example.com/mirror/", "https://git.example.com/mirror/"},
-		{"surrounding whitespace is trimmed", "  git@github-personal: \n", "git@github-personal:"},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			cfg := &Config{CloneURLBase: c.set}
-			if got := cfg.EffectiveCloneURLBase(); got != c.want {
-				t.Errorf("EffectiveCloneURLBase() = %q, want %q", got, c.want)
-			}
-		})
-	}
-}
-
 // The accepted shapes, and the common mistakes refused with a message that
 // names what a prefix has to end with.
 func TestValidateCloneURLBase(t *testing.T) {
@@ -70,6 +49,7 @@ func TestValidateCloneURLBase(t *testing.T) {
 		{"https://github.com/ has a space/", "whitespace"},
 		{"git@:", "ssh host alias"},
 		{"@github-personal:", "ssh host alias"},
+		{"git@github-personal::", "ssh host alias"},
 		{"https://github.com/:", "must end with /"},
 	}
 	for _, c := range invalid {
@@ -77,6 +57,44 @@ func TestValidateCloneURLBase(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("ValidateCloneURLBase(%q) = %v, want an error containing %q", c.base, err, c.want)
 		}
+	}
+}
+
+// A userinfo-bearing prefix is a legitimate shape, so it validates; what must
+// never happen is the credential reaching a log line or an error, so the
+// redaction helper keeps the host (and the diagnosis) and drops the userinfo.
+func TestRedactURLCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"no userinfo is unchanged", "https://git.example.com/mirror/", "https://git.example.com/mirror/"},
+		{"user and password are redacted", "https://user:token@git.example.com/mirror/", "https://redacted@git.example.com/mirror/"},
+		{"a bare token user is redacted", "http://ghp_secret@mirror.internal/git/", "http://redacted@mirror.internal/git/"},
+		{"an ssh scp-style prefix keeps its login user", "git@github-personal:", "git@github-personal:"},
+		{"a local file URL is unchanged", "file:///srv/mirrors/", "file:///srv/mirrors/"},
+		{"the whole URL is still named after redaction", "https://user:token@git.example.com/mirror/acme/widgets.git", "https://redacted@git.example.com/mirror/acme/widgets.git"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := RedactURLCredentials(c.in); got != c.want {
+				t.Errorf("RedactURLCredentials(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// The refusal message for a malformed userinfo-bearing prefix must not echo
+	// the credential either.
+	err := ValidateCloneURLBase("https://user:token@git.example.com/mirror")
+	if err == nil {
+		t.Fatal("a URL prefix without its trailing / must be refused")
+	}
+	if strings.Contains(err.Error(), "user:token") {
+		t.Errorf("the refusal echoes the userinfo: %v", err)
+	}
+	if !strings.Contains(err.Error(), "redacted@git.example.com") {
+		t.Errorf("the refusal lost the host it is diagnosing: %v", err)
 	}
 }
 

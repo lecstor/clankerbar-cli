@@ -113,7 +113,7 @@ func Supervise(ctx context.Context, args []string) error {
 		CloneURLBase: strings.TrimSpace(base.CloneURLBase),
 	}
 	if o.CloneURLBase != "" {
-		log.Printf("deriving clones from %s (set by clone_url_base) - an ssh base uses the key and spawns no gh auth token", o.CloneURLBase)
+		log.Printf("deriving clones from %s (set by clone_url_base) - an ssh base uses the key and spawns no gh auth token", config.RedactURLCredentials(o.CloneURLBase))
 	}
 	if root := os.Getenv(WorkdirRootEnv); root != "" {
 		o.WorkdirRoot = root

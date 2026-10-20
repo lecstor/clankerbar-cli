@@ -128,7 +128,13 @@ func cloneRepo(ctx context.Context, dir, repo, cloneBase string) error {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		_ = os.RemoveAll(tmp)
-		return fmt.Errorf("git clone %s: %v: %s", url, err, firstLine(stderr.String()))
+		// Never carry the credential-bearing URL into the error text, and
+		// redact it out of git's own stderr too: a mirror base can embed
+		// userinfo, and a failed clone's message is logged and shown to the
+		// operator (CLA-713 review).
+		safeURL := config.RedactURLCredentials(url)
+		detail := firstLine(strings.ReplaceAll(stderr.String(), url, safeURL))
+		return fmt.Errorf("git clone %s: %v: %s", safeURL, err, detail)
 	}
 	if err := installClone(tmp, dir, repo); err != nil {
 		_ = os.RemoveAll(tmp)

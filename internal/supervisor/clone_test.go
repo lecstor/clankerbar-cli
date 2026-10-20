@@ -197,6 +197,41 @@ func TestCloneURL(t *testing.T) {
 	}
 }
 
+// A failed clone must not write the credential-bearing URL into the error the
+// supervisor logs: a mirror base can embed userinfo, and the error text is
+// shown to the operator. The host stays, so the failure is still diagnosable.
+func TestCloneFailureRedactsURLCredentials(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Skipf("git not on PATH: %v", err)
+	}
+	dir := t.TempDir()
+	// Echo the URL git was given, the way git does in some remote errors, and
+	// fail the clone.
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = clone ]; then\n" +
+		"  printf \"fatal: repository '%s' not found\\n\" \"$3\" >&2\n" +
+		"  exit 128\n" +
+		"fi\n" +
+		"exec " + shellQuote(realGit) + " \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	cloneErr := cloneRepo(context.Background(), filepath.Join(t.TempDir(), "widgets"), "acme/widgets", "https://user:token@git.example.com/mirror/")
+	if cloneErr == nil {
+		t.Fatal("cloneRepo succeeded against a failing git shim")
+	}
+	msg := cloneErr.Error()
+	if strings.Contains(msg, "user:token") {
+		t.Fatalf("the clone error carries the userinfo: %s", msg)
+	}
+	if !strings.Contains(msg, "redacted@git.example.com") {
+		t.Fatalf("the clone error lost the host it is diagnosing: %s", msg)
+	}
+}
+
 // An ssh base is cloned as git@<alias>:owner/name.git, and no gh token is
 // resolved for it: the key is the credential, so the session's environment does
 // not need one (CLA-713).
