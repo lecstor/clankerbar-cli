@@ -136,6 +136,34 @@ func TestOpencodeDetectLimit(t *testing.T) {
 		// The hard-stop arm keeps winning when the event is typed as a quota: a
 		// monthly cap is not a window to wait out (settled 2).
 		{"provider.quota typed monthly cap is still a Stop", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You have reached your monthly usage limit","status":429}}`}, true, true, ""},
+		// Review 1.review-1.1 / 1.review-3.1: the GENERIC budget phrasings
+		// ("usage limit reached", "insufficient ... quota") must not win over the
+		// rolling classification. A provider.quota event carrying those words and
+		// a stated reset is a WAIT with the reset parsed, not a hard stop that
+		// discards it.
+		{"provider.quota 'Usage limit reached' with a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Usage limit reached. Your limit resets at 2026-10-20T15:56:48.251Z. Please wait for the window to reset.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z"},
+		{"provider.quota 'Insufficient quota remaining' with a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Insufficient quota remaining. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z"},
+		// Review 1.review-3.1's exact probe: the legacy phrase alone, typed as a
+		// quota, with no stated reset — still waitable (interval probing).
+		{"provider.quota '5-hour usage limit reached'", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"5-hour usage limit reached","status":429}}`}, true, false, ""},
+		// Review 1.review-1.1's UNTYPED probe: a rolling window plus the legacy
+		// phrase, with no error.type — the window arm must win before the generic
+		// stop arm, or the loop never waits out the quota.
+		{"untyped 5-hour window with 'usage limit reached'", Result{Stdout: `{"type":"error","error":{"message":"You've reached your 5-hour usage limit. Usage limit reached for your plan.","status":429}}`}, true, false, ""},
+		// Review 1.review-5.1: the provider.quota TYPE alone classifies, with no
+		// duration/window wording anywhere in the message. Removing that
+		// alternative must fail this case.
+		{"provider.quota type alone (no window wording)", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Provider quota exhausted for this account.","status":429}}`}, true, false, ""},
+		// Review 1.review-1.2: the window arm must not require the word "usage" —
+		// an untyped "5-hour limit" is the same window.
+		{"untyped '5-hour limit has been reached'", Result{Stdout: `{"type":"error","error":{"message":"Your 5-hour limit has been reached","status":429}}`}, true, false, ""},
+		// The generic phrasings on their own are still a Stop: nothing says the
+		// window lifts, so there is no reset to wait for.
+		{"generic 'usage limit reached' alone is still a Stop", Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Upgrade your plan to continue.","status":429}}`}, true, true, ""},
+		{"generic 'insufficient quota' alone is still a Stop", Result{Stdout: `{"type":"error","error":{"message":"Insufficient quota to run this request.","status":429}}`}, true, true, ""},
+		// A generic phrasing that STATES the reset is a wait even untyped: the
+		// provider named when it lifts.
+		{"untyped 'usage limit reached' with a stated reset", Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z"},
 		// The wording arm, for a provider that does not type the error: an
 		// N-hour/N-minute/session/daily usage limit is a rolling window whichever
 		// type carries it.

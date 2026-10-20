@@ -1680,19 +1680,36 @@ func (p *opencodeParse) finish(res *Result) {
 }
 
 // opencodeBudgetRe recognizes a HARD budget/credit-exhaustion stop from the
-// configured provider: out of credits, spend-cap or monthly-limit reached, or an
-// HTTP 402 Payment Required. This is a STOP (Limit.Stop) — there is no window to
-// wait out. A rolling subscription quota (an N-hour/N-minute/session/daily usage
-// limit, or error.type "provider.quota") is the separate, WAITABLE case, matched
-// by opencodeRollingQuotaRe; a plain 429 "rate limit" with no quota wording is a
+// configured provider: out of credits, spend-cap or monthly/billing-limit
+// reached, or an HTTP 402 Payment Required. This is a STOP (Limit.Stop) — there
+// is no window to wait out.
+//
+// It carries only phrasings that NAME a hard condition. The generic wordings
+// that name an exhausted quota without saying which window it is — "usage limit
+// reached", "insufficient quota" — live in opencodeGenericLimitRe, because the
+// SAME words arrive on a rolling subscription window that a wait can outlast: a
+// provider.quota event whose text is "Usage limit reached ... resets at ..." was
+// a Stop here and threw the stated reset away (CLA-736 review). A rolling
+// subscription quota (an N-hour/N-minute/session/daily usage limit, or
+// error.type "provider.quota") is the separate, WAITABLE case, matched by
+// opencodeRollingQuotaRe; a plain 429 "rate limit" with no quota wording is a
 // transient blip (IsTransient), not this.
 var opencodeBudgetRe = regexp.MustCompile(`(?i)"status(code)?": ?402` +
 	`|payment required` +
 	`|out of (credit|credits|balance)` +
-	`|insufficient (credit|credits|fund|funds|balance|quota)` +
+	`|insufficient (credit|credits|fund|funds|balance)` +
 	`|(credit|token) balance (is )?(too low|depleted)` +
 	`|spend[ -]?(cap|limit)|spending limit` +
-	`|monthly (usage )?limit|billing (hard )?limit|usage limit reached`)
+	`|monthly (usage )?limit|billing (hard )?limit`)
+
+// opencodeGenericLimitRe names an exhausted quota WITHOUT naming a window or a
+// hard condition: the legacy "usage limit reached", and "insufficient
+// [provider] quota". On its own that is still a Stop — nothing in it says the
+// window lifts — but DetectLimit lets the rolling classification win when the
+// same event is typed provider.quota or states a reset instant, which is the
+// whole difference between a top-up and a wait (CLA-736 review).
+var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
+	`|insufficient (?:[\w-]+ )?quota`)
 
 // opencodeRollingQuotaRe recognizes the OTHER kind of provider limit: a rolling
 // subscription window that a wait can outlast (CLA-736). The Command Code plan's
@@ -1703,16 +1720,20 @@ var opencodeBudgetRe = regexp.MustCompile(`(?i)"status(code)?": ?402` +
 //
 // Two arms, both read from opencodeErrorText (stderr + a TERMINAL error event),
 // never the agent's narration:
-//   - 2.x types it: error.type == "provider.quota".
-//   - the message names a rolling window: "5-hour usage limit", "30-minute usage
-//     limit", "session usage limit", "daily usage limit".
+//   - 2.x types it: error.type == "provider.quota". This alone is enough — the
+//     type is the provider's own statement that the cap is a quota it will lift,
+//     so a message carrying no duration/window wording at all is still waitable.
+//   - the message names a rolling window by duration or scope: "5-hour usage
+//     limit", "Your 5-hour limit has been reached", "30-minute usage limit",
+//     "session usage limit", "daily usage limit". The word "usage" is not
+//     required — an untyped provider that calls it a "5-hour limit" is the same
+//     window.
 //
 // Deliberately narrow. A bare 429 "rate limit" names no window and stays
 // transient, and the hard budget arms above are checked FIRST — so a monthly cap
 // typed as provider.quota is still a Stop.
 var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"` +
-	`|\b\d+\s*[- ]?\s*(hour|hr)s?\b[^.\n"]{0,80}\busage limit` +
-	`|\b\d+\s*[- ]?\s*(minute|min)s?\b[^.\n"]{0,80}\busage limit` +
+	`|\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b[^.\n"]{0,40}\blimit\b` +
 	`|\b(session|daily)\s+usage\s+limit`)
 
 // opencodeResetRe captures the reset instant a rolling quota STATES as RFC3339,
@@ -1750,6 +1771,17 @@ func (opencode) DetectLimit(res Result) Limit {
 	// false. ResetAt is the provider's own stated instant when present.
 	if opencodeRollingQuotaRe.MatchString(text) {
 		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit"}
+	}
+	// The generic exhausted-quota phrasings are a Stop only when nothing makes
+	// the limit waitable. A provider.quota type or a rolling window is the case
+	// above; here the one remaining signal is a STATED reset — a message that
+	// says when it lifts is a wait, not a top-up — so it must not be turned into
+	// a hard stop by wording that names no hard condition (CLA-736 review).
+	if opencodeGenericLimitRe.MatchString(text) {
+		if reset := parseOpencodeReset(text); !reset.IsZero() {
+			return Limit{Limited: true, ResetAt: reset, Reason: "usage_limit"}
+		}
+		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
 	}
 	return Limit{}
 }
@@ -2006,11 +2038,15 @@ func (o opencode) IsTransient(res Result) bool {
 	// loop already runs DetectLimit before IsTransient, so the budget arm is
 	// belt-and-braces there — but this function must not answer "retryable" about
 	// an exhausted account just because it happens to be asked out of that order,
-	// and a rolling quota is the same shape: it is WAITED, not retried. The braces
-	// are why the loop's ordering has no test of its own: with both classifiers
-	// agreeing, no order produces a retry, so there is nothing left for a test to
-	// distinguish (CLA-381).
-	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+	// and a rolling quota is the same shape: it is WAITED, not retried. The
+	// generic quota phrasings belong here even though DetectLimit may make them
+	// waitable on a stated reset: either way there is nothing to RETRY, and a 429
+	// saying "usage limit reached" must never ride the transient ladder. The
+	// braces are why the loop's ordering has no test of its own: with both
+	// classifiers agreeing, no order produces a retry, so there is nothing left
+	// for a test to distinguish (CLA-381).
+	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
+		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
 		return false
 	}
 	// CLA-700: a session that RECOVERED from its provider errors is not retryable,
@@ -2055,7 +2091,8 @@ func (opencode) IsUnclassifiedTransient(res Result) bool {
 		return false
 	}
 	text := opencodeErrorText(res)
-	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
+		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
 		return false
 	}
 	// CLA-700: the same rule as IsTransient's — a session that recovered from its
