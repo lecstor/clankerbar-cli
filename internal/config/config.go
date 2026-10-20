@@ -3791,7 +3791,6 @@ func underWorkDir(p, workdir string) string {
 	return filepath.Join(workdir, p)
 }
 
-// Validate normalizes path fields and checks the resolved config is runnable.
 // EffectiveCloneURLBase is the clone URL prefix the supervisor derives a
 // repo's clone URL from: the operator's clone_url_base, trimmed, or the
 // built-in DefaultCloneURLBase when the key is unset.
@@ -3846,6 +3845,7 @@ func ValidateCloneURLBase(base string) error {
 	return fmt.Errorf("%q must end with / (https://github.com/, file:///srv/mirrors/) or be an ssh host alias ending in : (git@github-personal:)", base)
 }
 
+// Validate normalizes path fields and checks the resolved config is runnable.
 func (c *Config) Validate() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
 	c.WorkDir = expandHome(c.WorkDir)
