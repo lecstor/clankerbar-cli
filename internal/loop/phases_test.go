@@ -913,9 +913,10 @@ func TestRun_ResumedPhaseLimitKeepsTheDaemonDraining(t *testing.T) {
 
 // The wait is the first-phase path's own waitOrStop, so the control markers
 // that path honours land here too — STOP is pinned above; RESTART is tested
-// because it sets the re-exec flag, and HALT because it is deliberately NOT
-// read during a wait: it must survive the wait and land at the boundary after
-// it, exactly as on the first-phase path.
+// because it sets the re-exec flag, and HALT because CLA-728's doneWhen says the
+// limit wait ends promptly on STOP *and* HALT: HALT is READ by this wait without
+// being consumed, so the operator's note is still there for the next run to
+// report, and the run stops now rather than a probe lap later.
 func TestRun_ResumedPhaseLimitWaitHonoursMarkers(t *testing.T) {
 	t.Run("RESTART lands in the wait and asks for the re-exec", func(t *testing.T) {
 		h := &fakeAdapter{
@@ -953,7 +954,7 @@ func TestRun_ResumedPhaseLimitWaitHonoursMarkers(t *testing.T) {
 		}
 	})
 
-	t.Run("HALT survives the wait and lands at the boundary after it", func(t *testing.T) {
+	t.Run("HALT ends the wait promptly and is left in place", func(t *testing.T) {
 		h := &fakeAdapter{
 			steps: []invokeStep{
 				{res: checkpointed(1, 0)},
@@ -970,17 +971,17 @@ func TestRun_ResumedPhaseLimitWaitHonoursMarkers(t *testing.T) {
 		}
 
 		logs := captureLogs(t)
+		start := time.Now()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := d.Run(ctx); err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
-		// The limit was waited out (the run stayed up and probed) and only then
-		// did the boundary read find the HALT. If the wait had swallowed it, the
-		// daemon would have spawned another sequence; if the run had exited at
-		// the limit instead, no probe would have run at all.
-		if h.probeCalls == 0 {
-			t.Error("the run exited at the limit instead of waiting it out")
+		// CLA-728 review 1.review-5.1: the doneWhen says STOP/HALT end the wait
+		// promptly, so a HALT already present when the limit lands ends it BEFORE
+		// the first paid probe rather than surviving a whole probe lap.
+		if h.probeCalls != 0 {
+			t.Errorf("the wait probed %d times past a HALT it should have ended on", h.probeCalls)
 		}
 		if h.invokeCalls != 2 {
 			t.Errorf("spawned %d sessions; the HALT must land before the next sequence", h.invokeCalls)
@@ -988,9 +989,18 @@ func TestRun_ResumedPhaseLimitWaitHonoursMarkers(t *testing.T) {
 		if !markerPresent(t, d.state.Path(), "HALT") {
 			t.Error("HALT must be left in place for the operator")
 		}
+		if elapsed := time.Since(start); elapsed > 3*time.Second {
+			t.Errorf("the wait took %s to end on HALT - the switch must be prompt", elapsed.Round(time.Millisecond))
+		}
 		out := logs.String()
-		if !strings.Contains(out, "waiting for the reset") || !strings.Contains(out, "HALT present") {
-			t.Errorf("the wait and the HALT must both appear in the log; log was:\n%s", out)
+		if !strings.Contains(out, "HALT present during wait") {
+			t.Errorf("the wait must say the HALT ended it; log was:\n%s", out)
+		}
+		// And it must say how to clear it: this exit path does not reach the
+		// boundary read that normally prints that, and the marker is left for the
+		// operator either way.
+		if !strings.Contains(out, "resolve and delete") {
+			t.Errorf("the wait must name how to clear the HALT; log was:\n%s", out)
 		}
 	})
 }

@@ -357,6 +357,14 @@ type Driver struct {
 	// minute, and no test should sleep a minute to watch a boundary land.
 	waitGrace time.Duration
 
+	// limitBeaconInterval is how often a paused wait re-beacons `limited`
+	// (CLA-728). The plane calls an instance dead once its last beacon is
+	// INSTANCE_STALE_AFTER_MS (15 minutes) old, and a limit wait can be hours,
+	// so the wait speaks at half that window — 5 minutes, since half is 7.5 and
+	// the task takes the shorter of the two. A field for the same reason as
+	// waitGrace: no test should sleep five minutes to watch a beacon repeat.
+	limitBeaconInterval time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
 	// second argument is CLA-310's empty-check-rollup opt-out for the target
@@ -544,31 +552,32 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
 	d := &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:        make([]bool, n),
-		quietTokens:   make([]int, n),
-		spent:         make([]int, n),
-		baseline:      make([]int, n),
-		openQs:        make([]int, n),
-		pending:       make([]bool, n),
-		skipUntil:     make([]time.Time, n),
-		harnessFails:  make([]int, n),
-		harnessErrs:   make([]error, n),
-		fleetDead:     make([]int, n),
-		fleetPaused:   make([]bool, n),
-		fleetRaised:   make([]bool, n),
-		fleetOpenQ:    make([]int, n),
-		startupFails:  make([]int, n),
-		startupPaused: make([]bool, n),
-		startupRaised: make([]bool, n),
-		startupOpenQ:  make([]int, n),
-		iter:          make([]iterState, n),
-		rcVersions:    make([]int, n),
-		rcAttempt:     make([]time.Time, n),
-		rcAttemptVer:  make([]int, n),
-		rcFails:       make([]int, n),
-		tgtTokens:     make([]int, n),
-		tgtCost:       make([]float64, n),
-		waitGrace:     time.Minute,
+		paused:              make([]bool, n),
+		quietTokens:         make([]int, n),
+		spent:               make([]int, n),
+		baseline:            make([]int, n),
+		openQs:              make([]int, n),
+		pending:             make([]bool, n),
+		skipUntil:           make([]time.Time, n),
+		harnessFails:        make([]int, n),
+		harnessErrs:         make([]error, n),
+		fleetDead:           make([]int, n),
+		fleetPaused:         make([]bool, n),
+		fleetRaised:         make([]bool, n),
+		fleetOpenQ:          make([]int, n),
+		startupFails:        make([]int, n),
+		startupPaused:       make([]bool, n),
+		startupRaised:       make([]bool, n),
+		startupOpenQ:        make([]int, n),
+		iter:                make([]iterState, n),
+		rcVersions:          make([]int, n),
+		rcAttempt:           make([]time.Time, n),
+		rcAttemptVer:        make([]int, n),
+		rcFails:             make([]int, n),
+		tgtTokens:           make([]int, n),
+		tgtCost:             make([]float64, n),
+		waitGrace:           time.Minute,
+		limitBeaconInterval: 5 * time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -6802,24 +6811,6 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 	return resetAt, time.Until(resetAt) > remaining
 }
 
-// supervisedWait pauses on a usage limit, then polls for an early reset rather
-// than sleeping blindly to the stated reset. Returns the probe spend it incurred,
-// and stop=true if the loop should stop (STOP marker, context cancel, or a budget
-// ceiling reached during the wait).
-//
-// sofar is everything the run has spent, including this drain's attempts. The
-// breaker is consulted HERE and not only by the caller, because this loop does not
-// return to the caller while the limit persists: it waits, probes, and waits again
-// for as long as it takes. Without this, the one shape the task names — a drain
-// stuck in a supervised wait — was the one shape no ceiling could end, and it is
-// the shape codex always produces, since it states no reset for waitPastBudget to
-// measure (CLA-258).
-//
-// The probes are themselves paid sessions, so their spend is added to `sofar` as it
-// accrues and returned to the caller for the run's accumulator. A breaker that can
-// only be tripped by spend it can SEE was blind to exactly the spend this loop
-// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
-// and this is the one loop with no other way out (CLA-287).
 // probeWait returns how long the paused loop sleeps before its next probe.
 //
 // A known reset still ahead of us is worth waiting for precisely: sleep until
@@ -6844,6 +6835,33 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 	return interval
 }
 
+// supervisedWait pauses on a usage limit, then polls for an early reset rather
+// than sleeping blindly to the stated reset. Returns the probe spend it incurred,
+// and stop=true if the loop should stop (STOP marker, context cancel, or a budget
+// ceiling reached during the wait).
+//
+// sofar is everything the run has spent, including this drain's attempts. The
+// breaker is consulted HERE and not only by the caller, because this loop does not
+// return to the caller while the limit persists: it waits, probes, and waits again
+// for as long as it takes. Without this, the one shape the task names — a drain
+// stuck in a supervised wait — was the one shape no ceiling could end, and it is
+// the shape codex always produces, since it states no reset for waitPastBudget to
+// measure (CLA-258).
+//
+// The probes are themselves paid sessions, so their spend is added to `sofar` as it
+// accrues and returned to the caller for the run's accumulator. A breaker that can
+// only be tripped by spend it can SEE was blind to exactly the spend this loop
+// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
+// and this is the one loop with no other way out (CLA-287).
+//
+// While it waits it speaks: a `limited` presence beacon on entry and again at
+// limitBeaconInterval while the pause lasts (CLA-728). A wait can be hours, and
+// the plane calls an instance dead once its last beacon is stale, so silence
+// here is what made a healthy daemon look crashed. Beacons cost nothing, and
+// they ride their own ticker rather than the probe loop, so the two cadences are
+// independent in both directions: a beacon never spends (probes are paid
+// sessions, CLA-287), and a probe in flight — a harness session with no ceiling
+// of its own — never silences the beacon.
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	tc := d.targetCfg(t)
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
@@ -6861,16 +6879,88 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 	}
 
+	// CLA-728: the wait can outlast the plane's liveness window many times over,
+	// and a healthy daemon that stops talking reads on the console as dead -
+	// which is what sent the operator looking for a crash on 2026-10-20. Say
+	// `limited` on entry and keep saying it at limitBeaconInterval; the next
+	// ordinary beacon (`iteration` or `idle`) is what replaces it on resume, so
+	// there is no exit call.
+	beaconInterval := d.limitBeaconInterval
+	if beaconInterval <= 0 {
+		// A Driver built by hand in a test carries the zero value; the default
+		// is the production window, never "beacon in a tight loop".
+		beaconInterval = 5 * time.Minute
+	}
+
+	// What the beacon carries is the harness's stated reset only while the wait
+	// still believes it. The fallback below measures a stated reset false, and
+	// from that moment the console must read "probing for a reset" rather than a
+	// countdown to an instant this loop already knows did not lift the limit.
+	// Mutex-guarded because the re-beacon goroutine reads it while this loop
+	// writes it.
+	var resetMu sync.Mutex
+	beaconReset := lim.ResetAt
+	currentReset := func() time.Time {
+		resetMu.Lock()
+		defer resetMu.Unlock()
+		return beaconReset
+	}
+	dropBeaconReset := func() {
+		resetMu.Lock()
+		beaconReset = time.Time{}
+		resetMu.Unlock()
+	}
+
+	d.beaconLimited(currentReset())
+
+	// The re-beacon runs on its OWN goroutine, not as another wake in the probe
+	// loop below. A probe is a harness session with no ceiling of its own — the
+	// session wall-clock cap exempts probes (CLA-368) — so a cadence driven by
+	// the same loop goes silent for the whole probe, and a probe longer than the
+	// plane's liveness window puts the instance back to `dead`: the exact
+	// failure this state exists to fix. The goroutine is joined before the wait
+	// returns, so the boundary's next ordinary beacon is still the last word.
+	beaconStop := make(chan struct{})
+	beaconDone := make(chan struct{})
+	go func() {
+		defer close(beaconDone)
+		tk := time.NewTicker(beaconInterval)
+		defer tk.Stop()
+		for {
+			select {
+			case <-beaconStop:
+				return
+			case <-tk.C:
+				d.beaconLimited(currentReset())
+			}
+		}
+	}()
+	defer func() {
+		close(beaconStop)
+		<-beaconDone
+	}()
+
+	// The FIRST probe's deadline is the only one measured from the wake: it is
+	// the wait's entry, and probeWait is what aims it at a stated reset. Every
+	// later deadline is measured from the END of the attempt that preceded it
+	// (see the probe branches below).
+	nextProbe := time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
+
 	for {
 		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
 			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
 		}
-		waitDur := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
-		if d.waitOrStop(ctx, waitDur) {
-			return tokens, cost, true
+		// waitOrStopHalt stays the sleep, so STOP / RESTART / RELOAD - and, in
+		// this wait, HALT - keep ending it promptly however long the limit lasts.
+		if waitDur := time.Until(nextProbe); waitDur > 0 {
+			if d.waitOrStopHalt(ctx, waitDur) {
+				return tokens, cost, true
+			}
 		}
+		// Probe time.
+		//
 		// A stated reset is the provider's claim, not a guarantee, so crossing it
 		// mid-wait does NOT resume the run the way a blind-grid wake used to: it
 		// falls back to interval polling, and the very next probe is what confirms
@@ -6882,6 +6972,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		if !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) && waitingForReset {
 			log.Print("stated reset passed - falling back to interval polling (a stated reset is a claim, not a guarantee)")
 			waitingForReset = false
+			// The loop has just measured the claim false: stop repeating it to
+			// the console.
+			dropBeaconReset()
 		} else if !waitedOnReset && !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) {
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
@@ -6893,9 +6986,22 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			// named variable (the error carries it) and poll again next
 			// interval. The wait stays bounded by its own dials.
 			log.Printf("probe error: %v — will retry next interval", ierr)
+			// A refusal is still a probe ATTEMPT: the next one is a full
+			// probeWait from the end of this one, never sooner.
+			nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 			continue
 		}
 		got, err := a.Probe(ctx, inv)
+		// The successor deadline is measured from HERE, the end of the attempt,
+		// and only here. Anchoring it at the wake instead would let a probe that
+		// outlives the poll interval consume the whole wait: the next paid
+		// session would start the instant this one returned, which is more
+		// probes than the pre-CLA-728 loop ever spawned (it slept the interval
+		// AFTER each probe) and, for a harness whose probe reports no spend, a
+		// cadence the CLA-287 breaker cannot see. The attempt counts as finished
+		// before its verdict is read, so an error path that retries is spaced
+		// exactly like a successful one.
+		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 		// Count the probe BEFORE reading its verdict, and before the error branch: a
 		// probe that failed still spawned the harness and still spent. Every path out
 		// of here — resume, stop, or another lap — carries it.
@@ -7823,6 +7929,27 @@ func labelOf(t Target) string {
 // very limit being waited out. A changed poll_interval applies from the NEXT
 // pause, which recomputes it.
 func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
+	return d.waitResponsive(ctx, dur, false)
+}
+
+// waitOrStopHalt is waitOrStop with one addition: a HALT marker ends the wait
+// too (CLA-728).
+//
+// HALT is deliberately NOT consumed here — it is the operator's note, and the
+// next run's start-up read reports it again without clearing it either. Ending
+// the wait early therefore does not change where the run ends, only WHEN: the
+// same halt, at most a poll interval sooner, which is what "STOP/HALT still end
+// the wait promptly" asks for a pause that can last hours.
+//
+// It is a separate entry point rather than a widening of waitOrStop because the
+// idle polls are not this wait: widening those is a change to every wait in the
+// loop, and this task is about the limit pause.
+func (d *Driver) waitOrStopHalt(ctx context.Context, dur time.Duration) bool {
+	return d.waitResponsive(ctx, dur, true)
+}
+
+// waitResponsive is the shared body of waitOrStop and waitOrStopHalt.
+func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEndsWait bool) bool {
 	const chunk = 3 * time.Second
 	// Round(0) strips the monotonic reading, so wallStart measures REAL elapsed
 	// time. Everything else here runs on the monotonic clock, which does not
@@ -7838,7 +7965,7 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 		// members all reach this loop, and two of them reading one RELOAD before
 		// either removed it would apply the reload twice, from two goroutines.
 		d.controlMu.Lock()
-		stop := d.consumeWaitControls()
+		stop := d.consumeWaitControls(haltEndsWait)
 		d.controlMu.Unlock()
 		if stop {
 			return true
@@ -7868,15 +7995,29 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 // control.go describes). It reports whether the wait must stop, which is true
 // for STOP and either restart marker.
 //
+// haltEndsWait asks for HALT to end the wait as well (waitOrStopHalt, the
+// supervised limit pause). HALT is READ but never consumed: it is the operator's
+// note, so it is still there for the next run's start-up read.
+//
 // The caller MUST hold d.controlMu: the read-then-remove of a marker is not
 // atomic, and a parallel panel's members can be in this wait at the same time
 // (CLA-697 review finding 1.review-1.2). The lock is what makes a marker a
 // single-consumer switch no matter how many waiters are parked on it.
-func (d *Driver) consumeWaitControls() bool {
+func (d *Driver) consumeWaitControls(haltEndsWait bool) bool {
 	if present, _ := d.readMarker("STOP"); present {
 		_ = d.state.Remove("STOP")
 		log.Print("STOP requested during wait — stopping")
 		return true
+	}
+	if haltEndsWait {
+		if present, msg := d.readMarker("HALT"); present {
+			// Left in place on purpose: it is the operator's note, and the next
+			// run's start-up read is what reports it again. The path is named
+			// here because this exit does not reach the boundary read that
+			// normally prints it.
+			log.Printf("HALT present during wait: %s — ending the wait; resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
+			return true
+		}
 	}
 	if present, msg := d.readMarker(MarkerRestart); present {
 		_ = d.state.Remove(MarkerRestart)

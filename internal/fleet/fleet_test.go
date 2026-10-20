@@ -685,3 +685,81 @@ func TestReporter_OutageLogsOnceThenRecoveryNamesTheLosses(t *testing.T) {
 		t.Errorf("recovery line does not name all %d silently-dropped failures:\n%s", outageReports, buf.String())
 	}
 }
+
+// CLA-728: a daemon waiting out a usage limit says so — `limited`, with the
+// reset instant in RFC 3339 UTC when the harness stated one. The instant is
+// asserted by PARSING it back to the same moment, not by matching a spelling,
+// because the plane's parser is what has to accept these bytes (an explicit
+// zone is mandatory there, and a local-time rendering would store whatever zone
+// the reading machine happened to be in).
+func TestMarshalReport_LimitedStateCarriesResetAt(t *testing.T) {
+	reset := time.Date(2026, 10, 21, 12, 30, 0, 0, time.FixedZone("AWST", 8*60*60))
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateLimited, ResetAt: reset},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+
+	var got struct {
+		State struct {
+			Kind    string `json:"kind"`
+			ResetAt string `json:"resetAt"`
+		} `json:"state"`
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatalf("unmarshal: %v\n%s", err, b)
+	}
+	if got.State.Kind != StateLimited {
+		t.Errorf("state.kind = %q, want %q", got.State.Kind, StateLimited)
+	}
+	parsed, err := time.Parse(time.RFC3339, got.State.ResetAt)
+	if err != nil {
+		t.Fatalf("state.resetAt %q is not RFC 3339: %v\n%s", got.State.ResetAt, err, b)
+	}
+	if !parsed.Equal(reset) {
+		t.Errorf("state.resetAt = %s (parsed %s), want the stated instant %s",
+			got.State.ResetAt, parsed.UTC(), reset.UTC())
+	}
+	if !strings.Contains(got.State.ResetAt, "Z") {
+		t.Errorf("resetAt %q carries no explicit UTC designator; the plane refuses a zoneless instant", got.State.ResetAt)
+	}
+}
+
+// The other half of the contract: a harness that stated no reset (codex always,
+// claude whenever no typed source carries one) sends the bare state — absence is
+// "probing for a reset", and a zero time.Time must not leak as "0001-01-01".
+func TestMarshalReport_LimitedStateOmitsAnUnstatedReset(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State:    State{Kind: StateLimited},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), "resetAt") {
+		t.Errorf("a limited state with no stated reset grew a resetAt key: %s", b)
+	}
+	if !strings.Contains(string(b), `"state":{"kind":"limited"}`) {
+		t.Errorf("want the bare limited state shape, got: %s", b)
+	}
+}
+
+// resetAt belongs to `limited` alone: the plane reads it only there, so a value
+// left on another state is dropped rather than shipped as a key the plane
+// ignores. Pinned because a later refactor that formats unconditionally would
+// silently start sending `"resetAt":"0001-01-01T00:00:00Z"` on every beacon.
+func TestMarshalReport_ResetAtOnlyOnTheLimitedState(t *testing.T) {
+	b, err := marshalReport(Report{
+		Identity: Identity{Instance: "x"},
+		State: State{Kind: StateIteration,
+			ResetAt: time.Date(2026, 10, 21, 12, 30, 0, 0, time.UTC)},
+	})
+	if err != nil {
+		t.Fatalf("marshalReport: %v", err)
+	}
+	if strings.Contains(string(b), "resetAt") {
+		t.Errorf("an iteration state carried resetAt: %s", b)
+	}
+}
