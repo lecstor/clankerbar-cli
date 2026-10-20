@@ -138,6 +138,24 @@ func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.It
 	})
 }
 
+// beaconLimited tells the plane this daemon is parked on a usage limit
+// (CLA-728), for EVERY target it serves. The wait blocks the whole loop, so no
+// other project's queue is being serviced either — beaconing only the target
+// whose harness hit the limit would leave the other projects' presence rows
+// silent, and each of those reads as a dead instance for exactly the reason
+// this state exists to correct.
+//
+// It rides the ordinary beacon path, so the local BEACON file in the state dir
+// carries the same state: `supervise` status and the console agree by
+// construction rather than by two writers that could drift. resetAt is the
+// harness's stated instant, or the zero time when it stated none.
+func (d *Driver) beaconLimited(resetAt time.Time) {
+	st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
+	for i := range d.targets {
+		d.beacon(i, d.targets[i], st)
+	}
+}
+
 // LocalBeaconName is the local presence file the daemon keeps beside its plane
 // beacons: the same identity+state the next POST carries, written into the
 // state dir so the supervisor's roll (phase 5b) can verify a restarted child

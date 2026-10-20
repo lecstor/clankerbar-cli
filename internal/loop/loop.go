@@ -357,6 +357,14 @@ type Driver struct {
 	// minute, and no test should sleep a minute to watch a boundary land.
 	waitGrace time.Duration
 
+	// limitBeaconInterval is how often a paused wait re-beacons `limited`
+	// (CLA-728). The plane calls an instance dead once its last beacon is
+	// INSTANCE_STALE_AFTER_MS (15 minutes) old, and a limit wait can be hours,
+	// so the wait speaks at half that window — 5 minutes, since half is 7.5 and
+	// the task takes the shorter of the two. A field for the same reason as
+	// waitGrace: no test should sleep five minutes to watch a beacon repeat.
+	limitBeaconInterval time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
 	// second argument is CLA-310's empty-check-rollup opt-out for the target
@@ -544,31 +552,32 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
 	d := &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:        make([]bool, n),
-		quietTokens:   make([]int, n),
-		spent:         make([]int, n),
-		baseline:      make([]int, n),
-		openQs:        make([]int, n),
-		pending:       make([]bool, n),
-		skipUntil:     make([]time.Time, n),
-		harnessFails:  make([]int, n),
-		harnessErrs:   make([]error, n),
-		fleetDead:     make([]int, n),
-		fleetPaused:   make([]bool, n),
-		fleetRaised:   make([]bool, n),
-		fleetOpenQ:    make([]int, n),
-		startupFails:  make([]int, n),
-		startupPaused: make([]bool, n),
-		startupRaised: make([]bool, n),
-		startupOpenQ:  make([]int, n),
-		iter:          make([]iterState, n),
-		rcVersions:    make([]int, n),
-		rcAttempt:     make([]time.Time, n),
-		rcAttemptVer:  make([]int, n),
-		rcFails:       make([]int, n),
-		tgtTokens:     make([]int, n),
-		tgtCost:       make([]float64, n),
-		waitGrace:     time.Minute,
+		paused:              make([]bool, n),
+		quietTokens:         make([]int, n),
+		spent:               make([]int, n),
+		baseline:            make([]int, n),
+		openQs:              make([]int, n),
+		pending:             make([]bool, n),
+		skipUntil:           make([]time.Time, n),
+		harnessFails:        make([]int, n),
+		harnessErrs:         make([]error, n),
+		fleetDead:           make([]int, n),
+		fleetPaused:         make([]bool, n),
+		fleetRaised:         make([]bool, n),
+		fleetOpenQ:          make([]int, n),
+		startupFails:        make([]int, n),
+		startupPaused:       make([]bool, n),
+		startupRaised:       make([]bool, n),
+		startupOpenQ:        make([]int, n),
+		iter:                make([]iterState, n),
+		rcVersions:          make([]int, n),
+		rcAttempt:           make([]time.Time, n),
+		rcAttemptVer:        make([]int, n),
+		rcFails:             make([]int, n),
+		tgtTokens:           make([]int, n),
+		tgtCost:             make([]float64, n),
+		waitGrace:           time.Minute,
+		limitBeaconInterval: 5 * time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -6775,24 +6784,6 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 	return resetAt, time.Until(resetAt) > remaining
 }
 
-// supervisedWait pauses on a usage limit, then polls for an early reset rather
-// than sleeping blindly to the stated reset. Returns the probe spend it incurred,
-// and stop=true if the loop should stop (STOP marker, context cancel, or a budget
-// ceiling reached during the wait).
-//
-// sofar is everything the run has spent, including this drain's attempts. The
-// breaker is consulted HERE and not only by the caller, because this loop does not
-// return to the caller while the limit persists: it waits, probes, and waits again
-// for as long as it takes. Without this, the one shape the task names — a drain
-// stuck in a supervised wait — was the one shape no ceiling could end, and it is
-// the shape codex always produces, since it states no reset for waitPastBudget to
-// measure (CLA-258).
-//
-// The probes are themselves paid sessions, so their spend is added to `sofar` as it
-// accrues and returned to the caller for the run's accumulator. A breaker that can
-// only be tripped by spend it can SEE was blind to exactly the spend this loop
-// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
-// and this is the one loop with no other way out (CLA-287).
 // probeWait returns how long the paused loop sleeps before its next probe.
 //
 // A known reset still ahead of us is worth waiting for precisely: sleep until
@@ -6817,6 +6808,30 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 	return interval
 }
 
+// supervisedWait pauses on a usage limit, then polls for an early reset rather
+// than sleeping blindly to the stated reset. Returns the probe spend it incurred,
+// and stop=true if the loop should stop (STOP marker, context cancel, or a budget
+// ceiling reached during the wait).
+//
+// sofar is everything the run has spent, including this drain's attempts. The
+// breaker is consulted HERE and not only by the caller, because this loop does not
+// return to the caller while the limit persists: it waits, probes, and waits again
+// for as long as it takes. Without this, the one shape the task names — a drain
+// stuck in a supervised wait — was the one shape no ceiling could end, and it is
+// the shape codex always produces, since it states no reset for waitPastBudget to
+// measure (CLA-258).
+//
+// The probes are themselves paid sessions, so their spend is added to `sofar` as it
+// accrues and returned to the caller for the run's accumulator. A breaker that can
+// only be tripped by spend it can SEE was blind to exactly the spend this loop
+// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
+// and this is the one loop with no other way out (CLA-287).
+//
+// While it waits it speaks: a `limited` presence beacon on entry and again at
+// limitBeaconInterval, carrying the stated reset when there is one (CLA-728). A
+// wait can be hours, and the plane calls an instance dead once its last beacon is
+// stale, so silence here is what made a healthy daemon look crashed. Beacons cost
+// nothing; the probe cadence is untouched, so a beacon-only wake never spends.
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	tc := d.targetCfg(t)
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
@@ -6834,16 +6849,62 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
 	}
 
+	// CLA-728: the wait can outlast the plane's liveness window many times over,
+	// and a healthy daemon that stops talking reads on the console as dead -
+	// which is what sent the operator looking for a crash on 2026-10-20. Say
+	// `limited` on entry and keep saying it at limitBeaconInterval; the next
+	// ordinary beacon (`iteration` or `idle`) is what replaces it on resume, so
+	// there is no exit call.
+	beaconInterval := d.limitBeaconInterval
+	if beaconInterval <= 0 {
+		// A Driver built by hand in a test carries the zero value; the default
+		// is the production window, never "beacon in a tight loop".
+		beaconInterval = 5 * time.Minute
+	}
+	nextBeacon := time.Now()
+	// The probe deadline is a DEADLINE, not a per-lap duration: the sleep is
+	// split between probe wakes and beacon wakes, so recomputing "interval from
+	// now" on every lap would push the probe out forever whenever the beacon
+	// interval is shorter than the poll interval.
+	nextProbe := time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
+
 	for {
 		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
 			log.Printf("budget reached while paused: %s — stopping rather than waiting out the limit (tokens=%d cost=$%.2f elapsed=%s)",
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
 		}
-		waitDur := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
+		if !time.Now().Before(nextBeacon) {
+			d.beaconLimited(lim.ResetAt)
+			nextBeacon = time.Now().Add(beaconInterval)
+		}
+		// Wake on whichever comes first: the next probe, or the next beacon. A
+		// beacon-only wake must NOT spawn a probe - probes are paid sessions
+		// (CLA-287), and this exists precisely so a long wait costs nothing but
+		// the beacons.
+		waitDur := time.Until(nextProbe)
+		beaconDue := false
+		if until := time.Until(nextBeacon); until < waitDur {
+			waitDur, beaconDue = until, true
+		}
+		if waitDur < 0 {
+			// The deadline passed while the budget check/probe ran: wake at once
+			// and let the branch below do the work.
+			waitDur = 0
+		}
+		// waitOrStop stays the sleep, so STOP / RESTART / RELOAD keep ending
+		// the wait promptly however long the limit lasts.
 		if d.waitOrStop(ctx, waitDur) {
 			return tokens, cost, true
 		}
+		if beaconDue {
+			d.beaconLimited(lim.ResetAt)
+			nextBeacon = time.Now().Add(beaconInterval)
+			continue
+		}
+		// Probe time. Its successor deadline is computed HERE and only here, so
+		// a beacon wake in between never moves it.
+		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 		// A stated reset is the provider's claim, not a guarantee, so crossing it
 		// mid-wait does NOT resume the run the way a blind-grid wake used to: it
 		// falls back to interval polling, and the very next probe is what confirms

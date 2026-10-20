@@ -1352,10 +1352,14 @@ cadences the loop already runs (no new timers):
   the host and binary version, a
   fingerprint of the config in force, and the state — `idle`,
   `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
-  holds spawns, `stopping` as the final beacon when the run ends. State changes
+  holds spawns, `limited` {resetAt} while the run is parked on a harness usage
+  limit (with the stated reset instant when the harness stated one), `stopping`
+  as the final beacon when the run ends. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
-  to learn which phase is running. The plane stores exactly what you report; it
-  infers nothing.
+  to learn which phase is running, and a limit wait re-beacons `limited` every
+  five minutes — well inside the plane's liveness window — so hours spent
+  waiting out a cap do not read on the console as a dead instance. The plane
+  stores exactly what you report; it infers nothing.
 - **Iteration history**: exactly one record per drain, posted at the boundary it
   just crossed — the task, the phases attempted, how it ended (`checkpoint`
   work left for a takeover / `released` back to the queue or settled /
