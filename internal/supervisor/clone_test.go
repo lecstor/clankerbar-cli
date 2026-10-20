@@ -298,4 +298,15 @@ func TestDeriveInstanceWorkdirsUsesTheConfiguredCloneBase(t *testing.T) {
 			t.Errorf("clones = %q, want it to contain %q", got, want)
 		}
 	}
+	// And the installed checkouts carry that ssh URL as their origin, which is
+	// what a session's fetch and push actually resolve.
+	for _, name := range []string{"widgets", "gadgets"} {
+		remote, err := checkoutOriginRemote(filepath.Join(root, "acme", name))
+		if err != nil {
+			t.Fatalf("the %s clone is not an attributable checkout: %v", name, err)
+		}
+		if want := "git@github-personal:acme/" + name + ".git"; remote != want {
+			t.Errorf("the %s clone's origin is %q, want %q", name, remote, want)
+		}
+	}
 }
