@@ -128,6 +128,14 @@ func (d *Driver) startupPausedAt(ti int) bool {
 // tests and not-wired targets need no branching at the call sites.
 func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.Iteration) {
 	d.writeLocalBeacon(st)
+	d.sendBeacon(ti, t, st, iterations...)
+}
+
+// sendBeacon is beacon without the local file: the plane half alone. Split out
+// for the callers that report one daemon-wide state to several targets, so the
+// local BEACON file (which takes no target) is written ONCE per lap instead of
+// once per target.
+func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...fleet.Iteration) {
 	if t.Fleet == nil {
 		return
 	}
@@ -148,11 +156,16 @@ func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.It
 // It rides the ordinary beacon path, so the local BEACON file in the state dir
 // carries the same state: `supervise` status and the console agree by
 // construction rather than by two writers that could drift. resetAt is the
-// harness's stated instant, or the zero time when it stated none.
+// harness's stated instant, or the zero time when it stated none (or when the
+// wait has already measured that instant false).
 func (d *Driver) beaconLimited(resetAt time.Time) {
 	st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
+	// One daemon-wide state, one daemon-wide file: writeLocalBeacon takes no
+	// target, so writing it inside the per-target loop below would
+	// remove-then-create the identical bytes once per target on every lap.
+	d.writeLocalBeacon(st)
 	for i := range d.targets {
-		d.beacon(i, d.targets[i], st)
+		d.sendBeacon(i, d.targets[i], st)
 	}
 }
 
@@ -166,10 +179,29 @@ const LocalBeaconName = "BEACON"
 // localBeacon is the JSON shape of LocalBeaconName. The supervisor's roll
 // mirrors it for reading (the same roster-style lockstep: two packages, one
 // contract), so a new field here must land in internal/supervisor/roll.go too.
+//
+// ResetAt is the `limited` state's payload (CLA-728): the instant the harness
+// stated, present only while the wait still believes it — exactly the field the
+// plane POST carries, so the local file keeps mirroring the next report rather
+// than saying `limited` with no moment while the console shows a countdown. A
+// pointer rather than a time.Time so `omitempty` can actually omit it (the
+// encoder never treats a time.Time's zero value as empty).
 type localBeacon struct {
-	Version string    `json:"version"`
-	State   string    `json:"state"`
-	At      time.Time `json:"at"`
+	Version string     `json:"version"`
+	State   string     `json:"state"`
+	At      time.Time  `json:"at"`
+	ResetAt *time.Time `json:"resetAt,omitempty"`
+}
+
+// localBeaconResetAt is the reset instant the local file carries: the stated
+// one on a `limited` state, and nothing on any other kind (the plane drops it
+// there too), so one representation of "no reset" rather than two.
+func localBeaconResetAt(st fleet.State) *time.Time {
+	if st.Kind != fleet.StateLimited || st.ResetAt.IsZero() {
+		return nil
+	}
+	at := st.ResetAt.UTC()
+	return &at
 }
 
 // writeLocalBeacon refreshes the local beacon file. Fail-soft exactly like the
@@ -186,6 +218,7 @@ func (d *Driver) writeLocalBeacon(st fleet.State) {
 		Version: version.Current,
 		State:   st.Kind,
 		At:      time.Now().UTC(),
+		ResetAt: localBeaconResetAt(st),
 	})
 	if err != nil {
 		return // the four state kinds and a version string cannot fail to marshal

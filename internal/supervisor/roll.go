@@ -290,11 +290,14 @@ func waitForNextBeacon(ctx context.Context, dir, name, target string, timeout ti
 }
 
 // localBeacon mirrors internal/loop's LocalBeaconName JSON shape (the same
-// roster-style lockstep: two packages, one contract).
+// roster-style lockstep: two packages, one contract). ResetAt is carried, not
+// read: it is the `limited` state's stated instant (CLA-728), and the roll
+// verifies a version, not a pause.
 type localBeacon struct {
-	Version string    `json:"version"`
-	State   string    `json:"state"`
-	At      time.Time `json:"at"`
+	Version string     `json:"version"`
+	State   string     `json:"state"`
+	At      time.Time  `json:"at"`
+	ResetAt *time.Time `json:"resetAt,omitempty"`
 }
 
 // readLocalBeacon reads one child's local beacon. Absent, corrupt, or

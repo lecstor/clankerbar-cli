@@ -11,6 +11,7 @@ package loop
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -274,6 +275,19 @@ func TestSupervisedWait_BeaconsLimitedOnEntryWithTheStatedReset(t *testing.T) {
 	if !strings.Contains(string(data), `"state":"`+fleet.StateLimited+`"`) {
 		t.Errorf("local beacon does not carry the limited state, so `supervise` status disagrees with the console: %s", data)
 	}
+	// 1.review-1.4: the local file mirrors the next POST, and the POST carries
+	// the moment now — a file saying `limited` with no instant while the console
+	// shows a countdown is two answers to one question.
+	var lb struct {
+		State   string    `json:"state"`
+		ResetAt time.Time `json:"resetAt"`
+	}
+	if err := json.Unmarshal(data, &lb); err != nil {
+		t.Fatalf("local beacon is not the mirrored JSON shape: %v (%s)", err, data)
+	}
+	if !lb.ResetAt.Equal(reset) {
+		t.Errorf("local beacon resetAt = %s, want the stated reset %s", lb.ResetAt.Format(time.RFC3339), reset.Format(time.RFC3339))
+	}
 }
 
 // A real limit is hours long, so one entry beacon is not enough: the plane's
@@ -397,5 +411,210 @@ func TestSupervisedWait_ResumingLeavesTheNextBeaconNonLimited(t *testing.T) {
 	}
 	if last != fleet.StateIdle {
 		t.Errorf("the newest beacon after resuming = %q, want %q", last, fleet.StateIdle)
+	}
+}
+
+// CLA-728 review 1.review-1.1 / 1.review-3.1: the successor probe deadline is
+// measured from the END of the attempt, never from the wake that started it. A
+// probe that outlives the poll interval therefore still owes a full interval
+// before the next paid session, which is the pre-CLA-728 cadence (it slept the
+// interval AFTER each probe) and the one the doneWhen pins: "It spawns no more
+// probes than today for the same wait".
+func TestSupervisedWait_SlowProbeStillWaitsThePollIntervalBeforeTheNext(t *testing.T) {
+	const interval = 40 * time.Millisecond
+	const probeDur = 120 * time.Millisecond
+	cfg := fastCfg()
+	cfg.PollInterval = config.Duration(interval)
+	h := &fakeAdapter{
+		probeResults: []harness.Limit{{Limited: true}, {Limited: true}, {Limited: true}, {Limited: false}},
+		probeDelay:   probeDur,
+	}
+	d := New(cfg, h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	logs := captureLogs(t)
+	start := time.Now()
+	_, _, stop := d.supervisedWait(context.Background(),
+		harness.Limit{Limited: true},
+		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+	if stop {
+		t.Fatalf("the script ends with a lift; the wait must not stop\n%s", logs.String())
+	}
+	if len(h.probeStarts) != 4 {
+		t.Fatalf("got %d probes, want the four scripted laps (a slow probe must not change the script)", len(h.probeStarts))
+	}
+	for i := 1; i < len(h.probeStarts); i++ {
+		gap := h.probeStarts[i].Sub(h.probeStarts[i-1])
+		if gap < probeDur+interval {
+			t.Errorf("probe %d started %s after probe %d began, want at least %s (the %s probe plus the %s poll interval): the probe's own duration ate the wait, so a probe slower than the interval spawns the next paid session immediately\n%s",
+				i, gap.Round(time.Millisecond), i-1, (probeDur + interval).Round(time.Millisecond), probeDur, interval, logs.String())
+		}
+	}
+}
+
+// CLA-728 review 1.review-4.1 / 1.review-1.2: a probe is a real harness session
+// with no ceiling of its own (probes are exempt from the session wall-clock
+// cap), so a re-beacon driven by the same loop goes silent for the whole probe.
+// A probe longer than the plane's liveness window would put the still-waiting
+// daemon back to `dead` — the exact incident this task fixes. The beacon must
+// therefore fire while a probe is in flight.
+func TestSupervisedWait_BeaconsWhileTheProbeIsInFlight(t *testing.T) {
+	cfg := fastCfg()
+	// Short first wait, long enough that the blocking probe is what holds the
+	// wait open rather than the poll grid.
+	cfg.PollInterval = config.Duration(30 * time.Millisecond)
+	reset := time.Now().Add(4 * time.Hour)
+	h := &fakeAdapter{probeResults: []harness.Limit{{Limited: false}}, limitResetAt: reset}
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Fleet: ff}})
+	openTestStateDir(t, d)
+	d.limitBeaconInterval = 10 * time.Millisecond
+
+	// The FIRST probe blocks until a second beacon has landed — the entry one
+	// plus at least one sent while the probe is in flight — then reports the
+	// lift. A cadence that only ran between probes could never release it, so a
+	// regression fails the test's own deadline instead of hanging the suite.
+	release := make(chan struct{})
+	reached := make(chan int, 1)
+	h.onProbe = func(call int) {
+		if call == 0 {
+			<-release
+		}
+	}
+	go func() {
+		deadline := time.After(5 * time.Second)
+		for {
+			if sent, _ := ff.reports(); len(sent) >= 2 {
+				reached <- len(sent)
+				close(release)
+				return
+			}
+			select {
+			case <-deadline:
+				close(release)
+				return
+			case <-time.After(2 * time.Millisecond):
+			}
+		}
+	}()
+
+	logs := captureLogs(t)
+	start := time.Now()
+	_, _, stop := d.supervisedWait(context.Background(),
+		harness.Limit{Limited: true, ResetAt: reset},
+		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+	if stop {
+		t.Fatalf("the probe lifted the limit; the wait should resume, not stop\n%s", logs.String())
+	}
+	select {
+	case n := <-reached:
+		if n < 2 {
+			t.Fatalf("only %d beacon(s) landed while the probe was in flight", n)
+		}
+	default:
+		t.Fatalf("the probe returned before a second `limited` beacon landed: the re-beacon is still driven by the probe loop, so a probe longer than the plane's liveness window leaves the instance dead\n%s", logs.String())
+	}
+	if h.probeCalls != 1 {
+		t.Errorf("got %d probes, want the single scripted one", h.probeCalls)
+	}
+	for _, r := range func() []fleet.Report { s, _ := ff.reports(); return s }() {
+		if r.State.Kind != fleet.StateLimited {
+			t.Fatalf("every beacon while the wait holds must be limited, got %q", r.State.Kind)
+		}
+	}
+}
+
+// CLA-728 review 1.review-2.1: the fallback is the loop's own pin that a stated
+// reset did not lift the limit. Repeating that instant to the console draws a
+// countdown to a moment the daemon has already measured false, so the re-beacons
+// after the flip must carry no reset at all.
+func TestSupervisedWait_ReBeaconsDropAResetTheWaitMeasuredFalse(t *testing.T) {
+	const interval = 50 * time.Millisecond
+	cfg := fastCfg()
+	cfg.PollInterval = config.Duration(interval)
+	reset := time.Now().Add(130 * time.Millisecond)
+	// The same timeline as the fallback test above: laps at ~50ms and ~100ms
+	// probe before the reset, the ~145ms lap flips to interval polling, and the
+	// last lap lifts.
+	h := &fakeAdapter{
+		probeResults: []harness.Limit{{Limited: true}, {Limited: true}, {Limited: true}, {Limited: false}},
+		limitResetAt: reset,
+	}
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Fleet: ff}})
+	openTestStateDir(t, d)
+	d.waitGrace = 15 * time.Millisecond
+	d.limitBeaconInterval = 10 * time.Millisecond
+
+	logs := captureLogs(t)
+	start := time.Now()
+	_, _, stop := d.supervisedWait(context.Background(),
+		harness.Limit{Limited: true, ResetAt: reset},
+		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+	if stop {
+		t.Fatalf("a failed reset claim falls back to polling; it must not stop the run\n%s", logs.String())
+	}
+	if !strings.Contains(logs.String(), "falling back to interval polling") {
+		t.Fatalf("the fixture did not cross the stated reset mid-wait, so it cannot say anything about the fallback:\n%s", logs.String())
+	}
+
+	sent, _ := ff.reports()
+	if len(sent) < 2 {
+		t.Fatalf("got %d beacons; the entry one plus at least one re-beacon after the fallback are expected", len(sent))
+	}
+	if !sent[0].State.ResetAt.Equal(reset) {
+		t.Errorf("the entry beacon resetAt = %s, want the stated reset %s", sent[0].State.ResetAt.Format(time.RFC3339), reset.Format(time.RFC3339))
+	}
+	if last := sent[len(sent)-1].State.ResetAt; !last.IsZero() {
+		t.Errorf("the newest beacon still carries resetAt = %s after the wait measured that instant false; the console would show a countdown to a moment already known not to lift the limit", last.Format(time.RFC3339))
+	}
+}
+
+// CLA-728 review 1.review-5.1: the doneWhen says "STOP/HALT still end the wait
+// promptly". STOP is pinned above; HALT is the half that used to be read only
+// after the wait ran out. It now ends the wait as promptly as STOP does — while
+// still being READ, never consumed, so the operator's note outlives the run.
+func TestSupervisedWait_HaltEndsTheWaitPromptly(t *testing.T) {
+	cfg := fastCfg()
+	// A wait long enough that only a control marker can end it promptly.
+	cfg.PollInterval = config.Duration(10 * time.Minute)
+	h := &fakeAdapter{} // never probed: the HALT lands first
+	d := New(cfg, h, &fakePoller{})
+	openTestStateDir(t, d)
+	d.waitGrace = time.Second
+
+	haltPath := filepath.Join(d.state.Path(), "HALT")
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		if err := os.WriteFile(haltPath, []byte("wedged — needs a human"), 0o644); err != nil {
+			t.Errorf("planting HALT: %v", err)
+		}
+	}()
+
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	logs := captureLogs(t)
+	_, _, stop := d.supervisedWait(ctx,
+		harness.Limit{Limited: true, ResetAt: start.Add(8 * time.Second)},
+		h, d.cfg.EffectivePhases()[0], d.targets[0], spend{start: start})
+	elapsed := time.Since(start)
+
+	if !stop {
+		t.Errorf("a planted HALT must end the paused wait")
+	}
+	if h.probeCalls != 0 {
+		t.Errorf("HALT should end the wait before another paid probe; got %d", h.probeCalls)
+	}
+	// ~three control-read chunks of the plant, with headroom for a loaded -race
+	// machine: the point is that it is nowhere near the wait's own duration.
+	if elapsed > 5*time.Second {
+		t.Errorf("HALT took %s to end a wait aimed %s out - the switch went dead", elapsed.Round(time.Millisecond), 8*time.Second)
+	}
+	if _, err := os.Stat(haltPath); err != nil {
+		t.Errorf("HALT must be left in place for the operator; stat err = %v", err)
+	}
+	if out := logs.String(); !strings.Contains(out, "HALT present during wait") {
+		t.Errorf("the wait must say the HALT ended it; log was:\n%s", out)
 	}
 }

@@ -1343,7 +1343,17 @@ stderr still streams to the supervisor's own terminal, as before.
 The daemon also reports what it is doing to the plane, so the console's Fleet
 page shows every instance — working *and* idle, where the run-based panel only
 sees a daemon that currently holds a task. Two things are reported, both riding
-cadences the loop already runs (no new timers):
+cadences the loop already runs — presence on each backlog poll, iteration
+history at each drain boundary — with one exception: a run parked on a usage
+limit re-beacons on a ticker of its own, because the pause is the one time the
+poll cadence stops:
+
+> **Release order**: a plane older than CLA-727 refuses an unknown
+> `state.kind` for the WHOLE report (400), so `limited` has to be promoted on
+> the plane — accepting `state.kind: "limited"` and `state.resetAt` — before a
+> CLI that sends it reaches the fleet. Against an older plane every beacon is
+> rejected, not just the `limited` ones, and the instance goes dark in every
+> state.
 
 - **Presence** rides each backlog poll: who the instance is (`instance_name`;
   when unset it resolves to the machine's hostname plus the config file's
