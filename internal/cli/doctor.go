@@ -765,9 +765,6 @@ func requiredSessionEnv(cfg *config.Config) []string {
 // session - names only, never values - and FAILs when the list omits one of
 // requiredSessionEnv, because that failure otherwise appears later as an
 // unexplained repo_not_found or an unauthenticated plane call inside a session.
-// A required name the `env` overlay declares is NOT missing: that overlay is
-// appended after the inherited filter, so it reaches the child regardless of
-// the allowlist (CLA-738 review 3.1).
 //
 // It asks SpawnedHarnesses, not PhaseHarnesses, for the reason the two exist:
 // PhaseHarnesses seeds the run-wide `harness` unconditionally, which is right
@@ -814,23 +811,30 @@ func checkSessionEnvAllowlist(cfg *config.Config) []check {
 		if len(declared) > 0 {
 			c.detail += "; the env block adds: " + strings.Join(declared, ", ")
 		}
+		// The env overlay is appended AFTER the inheritEnv filter and WINS (every
+		// adapter's env() puts in.Env last), so a required variable the env block
+		// declares reaches the session even when the allowlist omits it. Computing
+		// the miss from the allowlist alone FAILed that working shape, and a false
+		// FAIL blocks a run that works (CLA-736 review 1.review-2.1).
+		present := append(append([]string(nil), allow...), declared...)
 		var missing []string
 		for _, want := range requiredSessionEnv(cfg) {
-			// A required name the env OVERLAY declares is satisfied even when the
-			// allowlist omits it: the overlay is appended AFTER the inherited
-			// filter (harness.inheritEnv's contract — "the config's env entries
-			// ... are therefore always present"), so the child receives it either
-			// way. Reading only the allowlist made doctor FAIL a config whose
-			// session reaches the plane perfectly well (CLA-738 review 3.1).
-			if !contains(allow, want) && !contains(declared, want) {
+			if !contains(present, want) {
 				missing = append(missing, want)
 			}
 		}
 		if len(missing) > 0 {
 			c.status = fail
 			c.detail += " - missing " + strings.Join(missing, ", ") + " (a session without it fails later, elsewhere)"
-			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), declare it in the env block, or drop env_allowlist to inherit everything"
+			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), or declare it in the session env block, or drop env_allowlist to inherit everything"
 			return c
+		}
+		// ADVICE, not a verdict (CLA-736 review 1.review-2.2): an ssh clone_url_base
+		// works from an on-disk key without the agent, so this is only a footgun
+		// when the key is agent-held - not something to FAIL, or even WARN, a
+		// working run over.
+		if !contains(present, "SSH_AUTH_SOCK") {
+			c.info = append(c.info, "SSH_AUTH_SOCK is not in the session env: a session pushing over an ssh origin needs it only when the key is agent-held (an on-disk key does not)")
 		}
 		c.status = pass
 		return c

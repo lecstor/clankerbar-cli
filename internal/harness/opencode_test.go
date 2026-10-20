@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // opencodeParsed runs a stdout stream through exactly the machinery Invoke uses —
@@ -100,35 +101,107 @@ func TestOpencodeParse_empty(t *testing.T) {
 	}
 }
 
+// opencodeQuotaEvent is the verbatim terminal stream event CLA-736 captured from
+// the Command Code plan's rolling 5-hour window (2026-10-20T22:00 AEST). It is
+// the shape that was misread as a transient failure: a 429 whose error.type is
+// provider.quota and whose message STATES the reset instant.
+const opencodeQuotaEvent = `{"type":"error","sessionID":"ses_quota","error":{"type":"provider.quota","message":"You've reached your 5-hour usage limit for your plan. Your limit resets at 2026-10-20T15:56:48.251Z. Please wait for the window to reset or upgrade your plan to continue.","status":429,"response":{"body":"{\"error\":{\"type\":\"rate_limit_error\",\"code\":\"RATE_LIMITED\"}}"}}}`
+
 func TestOpencodeDetectLimit(t *testing.T) {
-	// DetectLimit is the HARD budget/credit-exhaustion STOP only, and only from the
+	// DetectLimit recognizes two shapes, and Stop is what separates them: a HARD
+	// budget/credit exhaustion (Stop — no reset to wait for) and a ROLLING
+	// subscription quota that states a window (wait-and-poll). Both scan only the
 	// harness's own diagnostics (an error event, or stderr) — never the agent's
-	// narration. An API 429 rate limit is transient (below), not this.
+	// narration.
 	cases := []struct {
-		name string
-		res  Result
-		want bool
+		name      string
+		res       Result
+		want      bool
+		wantStop  bool
+		wantReset string // RFC3339; empty means the zero time
 	}{
-		{"402 payment required (opencode error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Payment Required","statusCode":402,"isRetryable":false}}}`}, true},
-		{"out of credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your account is out of credits"}}}`}, true},
-		{"insufficient credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Insufficient credits to run this request"}}}`}, true},
-		{"openrouter credit balance too low (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your credit balance is too low to access this model"}}}`}, true},
-		{"monthly limit reached (stderr diagnostic)", Result{Stderr: "opencode: you have reached your monthly limit"}, true},
-		{"spend cap (stderr diagnostic)", Result{Stderr: "spend cap exceeded for this workspace"}, true},
-		{"429 is transient not the cap", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`}, false},
-		{"agent narration about credits is NOT a stop", Result{Stdout: `{"type":"text","part":{"type":"text","text":"The billing note says the account is out of credits and hit its monthly limit."}}`}, false},
-		{"clean run", Result{Stdout: opencodeStream}, false},
+		{"402 payment required (opencode error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Payment Required","statusCode":402,"isRetryable":false}}}`}, true, true, ""},
+		{"out of credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your account is out of credits"}}}`}, true, true, ""},
+		{"insufficient credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Insufficient credits to run this request"}}}`}, true, true, ""},
+		{"openrouter credit balance too low (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your credit balance is too low to access this model"}}}`}, true, true, ""},
+		{"monthly limit reached (stderr diagnostic)", Result{Stderr: "opencode: you have reached your monthly limit"}, true, true, ""},
+		{"spend cap (stderr diagnostic)", Result{Stderr: "spend cap exceeded for this workspace"}, true, true, ""},
+		// CLA-736: the rolling 5-hour quota. Limited, NOT Stop, with the provider's
+		// own stated reset parsed out of the message.
+		{"provider.quota 5-hour window (verbatim CLA-736 event)", Result{Stdout: opencodeQuotaEvent}, true, false, "2026-10-20T15:56:48.251Z"},
+		// The same message with the reset sentence absent is still a rolling limit
+		// — the wait falls back to interval probing, which is why a missing reset
+		// must not demote it to "no limit".
+		{"provider.quota 5-hour window without a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You've reached your 5-hour usage limit for your plan.","status":429}}`}, true, false, ""},
+		// The hard-stop arm keeps winning when the event is typed as a quota: a
+		// monthly cap is not a window to wait out (settled 2).
+		{"provider.quota typed monthly cap is still a Stop", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You have reached your monthly usage limit","status":429}}`}, true, true, ""},
+		// Review 1.review-1.1 / 1.review-3.1: the GENERIC budget phrasings
+		// ("usage limit reached", "insufficient ... quota") must not win over the
+		// rolling classification. A provider.quota event carrying those words and
+		// a stated reset is a WAIT with the reset parsed, not a hard stop that
+		// discards it.
+		{"provider.quota 'Usage limit reached' with a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Usage limit reached. Your limit resets at 2026-10-20T15:56:48.251Z. Please wait for the window to reset.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z"},
+		{"provider.quota 'Insufficient quota remaining' with a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Insufficient quota remaining. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z"},
+		// Review 1.review-3.1's exact probe: the legacy phrase alone, typed as a
+		// quota, with no stated reset — still waitable (interval probing).
+		{"provider.quota '5-hour usage limit reached'", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"5-hour usage limit reached","status":429}}`}, true, false, ""},
+		// Review 1.review-1.1's UNTYPED probe: a rolling window plus the legacy
+		// phrase, with no error.type — the window arm must win before the generic
+		// stop arm, or the loop never waits out the quota.
+		{"untyped 5-hour window with 'usage limit reached'", Result{Stdout: `{"type":"error","error":{"message":"You've reached your 5-hour usage limit. Usage limit reached for your plan.","status":429}}`}, true, false, ""},
+		// Review 1.review-5.1: the provider.quota TYPE alone classifies, with no
+		// duration/window wording anywhere in the message. Removing that
+		// alternative must fail this case.
+		{"provider.quota type alone (no window wording)", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Provider quota exhausted for this account.","status":429}}`}, true, false, ""},
+		// Review 1.review-1.2: the window arm must not require the word "usage" —
+		// an untyped "5-hour limit" is the same window.
+		{"untyped '5-hour limit has been reached'", Result{Stdout: `{"type":"error","error":{"message":"Your 5-hour limit has been reached","status":429}}`}, true, false, ""},
+		// The generic phrasings on their own are still a Stop: nothing says the
+		// window lifts, so there is no reset to wait for.
+		{"generic 'usage limit reached' alone is still a Stop", Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Upgrade your plan to continue.","status":429}}`}, true, true, ""},
+		{"generic 'insufficient quota' alone is still a Stop", Result{Stdout: `{"type":"error","error":{"message":"Insufficient quota to run this request.","status":429}}`}, true, true, ""},
+		// A generic phrasing that STATES the reset is a wait even untyped: the
+		// provider named when it lifts.
+		{"untyped 'usage limit reached' with a stated reset", Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z"},
+		// The wording arm, for a provider that does not type the error: an
+		// N-hour/N-minute/session/daily usage limit is a rolling window whichever
+		// type carries it.
+		{"untyped 5-hour usage limit on stderr", Result{Stderr: "You've reached your 5-hour usage limit for your plan"}, true, false, ""},
+		{"untyped 30-minute usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your 30-minute usage limit"}}`}, true, false, ""},
+		{"untyped session usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your session usage limit"}}`}, true, false, ""},
+		{"untyped daily usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your daily usage limit"}}`}, true, false, ""},
+		// A plain 429 rate limit names no window: still transient, not a limit.
+		{"429 is transient not the cap", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`}, false, false, ""},
+		{"agent narration about credits is NOT a stop", Result{Stdout: `{"type":"text","part":{"type":"text","text":"The billing note says the account is out of credits and hit its monthly limit."}}`}, false, false, ""},
+		// CLA-258 scoping: the quota sentence in assistant TEXT is narration, not a
+		// provider diagnostic.
+		{"quota sentence in assistant text is NOT a limit", Result{Stdout: `{"type":"text","part":{"type":"text","text":"You've reached your 5-hour usage limit for your plan. Your limit resets at 2026-10-20T15:56:48.251Z."}}`}, false, false, ""},
+		// CLA-700: an error event the session RECOVERED from classifies nothing.
+		// The same event followed by a further typed event is a session that
+		// carried on, so there is no limit to wait out.
+		{"quota event recovered by a later step is NOT a limit", Result{Stdout: opencodeQuotaEvent + "\n" + `{"type":"step_start","part":{"type":"step-start"}}`}, false, false, ""},
+		{"clean run", Result{Stdout: opencodeStream}, false, false, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := (opencode{}).DetectLimit(tc.res)
 			if got.Limited != tc.want {
-				t.Errorf("DetectLimit.Limited = %v, want %v", got.Limited, tc.want)
+				t.Fatalf("DetectLimit.Limited = %v, want %v (reason %q)", got.Limited, tc.want, got.Reason)
 			}
-			// A recognized budget stop must flag Stop so the loop stops rather than
-			// waiting for a reset that never comes.
-			if tc.want && !got.Stop {
-				t.Errorf("DetectLimit recognized a budget limit but did not set Stop")
+			if got.Stop != tc.wantStop {
+				t.Errorf("DetectLimit.Stop = %v, want %v — a hard budget stop must stop, a rolling quota must wait", got.Stop, tc.wantStop)
+			}
+			want := time.Time{}
+			if tc.wantReset != "" {
+				ts, err := time.Parse(time.RFC3339Nano, tc.wantReset)
+				if err != nil {
+					t.Fatalf("bad wantReset %q: %v", tc.wantReset, err)
+				}
+				want = ts
+			}
+			if !got.ResetAt.Equal(want) {
+				t.Errorf("DetectLimit.ResetAt = %v, want %v", got.ResetAt, want)
 			}
 		})
 	}
@@ -142,8 +215,9 @@ func TestOpencodeDetectLimit(t *testing.T) {
 // an unknown exit 1 AFTER reported usage is retryable, because a session that
 // already reported usage evidently authenticated and started doing paid work,
 // while one that reported nothing is the config/auth signature and stays a stop.
-// A NAMED stop (opencodeBudgetRe, opencodeFatalRe) beats both scans, so the
-// heuristic cannot launder an exhausted account or a revoked key into a retry.
+// A NAMED stop (opencodeBudgetRe, opencodeRollingQuotaRe, opencodeFatalRe) beats
+// both scans, so the heuristic cannot launder an exhausted account, a rolling
+// quota window, or a revoked key into a retry.
 // Cases mark where the signal lives (stdout error event vs. stderr) to match how
 // opencode actually emits it.
 func TestOpencodeIsTransient(t *testing.T) {
@@ -224,6 +298,11 @@ func TestOpencodeIsTransient(t *testing.T) {
 		// Regression for finding #2: an assistant text part mentioning a rate limit
 		// must NOT be read as a transient error — only opencodeErrorText is scanned.
 		{"assistant narration mentioning a rate limit does NOT trip", Result{Stdout: `{"type":"text","text":"Earlier I hit a rate limit and connection error, so I paused before retrying."}`}, false},
+		// CLA-736: a rolling 5-hour quota is NOT a blip to retry at 30s/1m/2m. It
+		// carries a 429, so the status arm below would call it transient; the
+		// rolling-quota arm vetoes that, and the loop's DetectLimit branch is what
+		// actually waits the window out.
+		{"rolling 5-hour quota is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: opencodeQuotaEvent}, false},
 		{"clean run", Result{Stdout: opencodeStream}, false},
 		// CLA-700, the 2026-10-19 incidents: an error event the session RECOVERED
 		// from classifies nothing. 2.x emits provider.invalid-output, retries the
