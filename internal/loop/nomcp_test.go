@@ -92,8 +92,11 @@ func TestDrainPhases_ReviewPanelMemberNoMCPIsRetriedOnce(t *testing.T) {
 		t.Errorf("review-1 streak = %d, want 0 after a successful retry", n)
 	}
 	recs := ff.records()
-	if len(recs) != 1 || strings.Contains(recs[0].Outcome, "INCOMPLETE") {
-		t.Errorf("a recovered member left the panel incomplete: %+v", recs)
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1", len(recs))
+	}
+	if strings.Contains(logs.String(), "INCOMPLETE") {
+		t.Errorf("a recovered member left the panel incomplete:\n%s", logs.String())
 	}
 }
 

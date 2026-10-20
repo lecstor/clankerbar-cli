@@ -1559,6 +1559,7 @@ func TestDrainPhases_ReviewPanelMemberLimitedAfterRecordingIsRecorded(t *testing
 		}
 	}
 	d, ff := panelDriverWithFleet(t, h, rel, panelMembers(), panelPhases())
+	logs := captureLogs(t)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -1583,8 +1584,8 @@ func TestDrainPhases_ReviewPanelMemberLimitedAfterRecordingIsRecorded(t *testing
 	if len(recs) != 1 {
 		t.Fatalf("iteration records = %d, want 1", len(recs))
 	}
-	if strings.Contains(recs[0].Outcome, "review-1:") {
-		t.Errorf("the iteration outcome names review-1 as a failed member: %q", recs[0].Outcome)
+	if strings.Contains(logs.String(), "review-1:") {
+		t.Errorf("the daemon log names review-1 as a failed member:\n%s", logs.String())
 	}
 }
 
