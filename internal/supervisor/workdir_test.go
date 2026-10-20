@@ -361,7 +361,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 			BacklogURL:  "https://clankerbar.com/mcp/acme",
 			PrimaryRepo: "acme/widgets",
 		}
-		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
+		got, err := deriveInstanceWorkdirs(ctx, cfg, root, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -381,7 +381,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 			BacklogURL: "https://clankerbar.com/mcp/acme",
 			Repos:      map[string]string{"acme/widgets": "widgets"},
 		}
-		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
+		got, err := deriveInstanceWorkdirs(ctx, cfg, root, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -395,7 +395,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 			{Slug: "one", PrimaryRepo: "acme/widgets", Repos: map[string]string{"acme/gadgets": "gadgets"}},
 			{Slug: "two", PrimaryRepo: "acme/gadgets"},
 		}}
-		got, err := deriveInstanceWorkdirs(ctx, cfg, root)
+		got, err := deriveInstanceWorkdirs(ctx, cfg, root, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -415,7 +415,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 			{Slug: "one", PrimaryRepo: "acme/widgets"},
 			{Slug: "two", PrimaryRepo: "acme/ghost"},
 		}}
-		_, err := deriveInstanceWorkdirs(ctx, cfg, root)
+		_, err := deriveInstanceWorkdirs(ctx, cfg, root, "")
 		if err == nil {
 			t.Fatal("deriveInstanceWorkdirs succeeded with a project whose repo cannot be cloned")
 		}
@@ -426,7 +426,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 
 	t.Run("a project naming no repo is a refusal, not a skip", func(t *testing.T) {
 		cfg := &config.Config{BacklogURL: "https://clankerbar.com/mcp/acme", PrimaryRepo: ""}
-		_, err := deriveInstanceWorkdirs(ctx, cfg, root)
+		_, err := deriveInstanceWorkdirs(ctx, cfg, root, "")
 		if err == nil {
 			t.Fatal("deriveInstanceWorkdirs succeeded with no repo declared")
 		}
@@ -437,7 +437,7 @@ func TestDeriveInstanceWorkdirsPerProject(t *testing.T) {
 
 	t.Run("a config naming no project slug is a refusal", func(t *testing.T) {
 		cfg := &config.Config{PrimaryRepo: "acme/widgets"}
-		if _, err := deriveInstanceWorkdirs(ctx, cfg, root); err == nil {
+		if _, err := deriveInstanceWorkdirs(ctx, cfg, root, ""); err == nil {
 			t.Fatal("deriveInstanceWorkdirs succeeded with no project slug to root the layout on")
 		}
 	})
@@ -566,7 +566,7 @@ func TestDeriveInstanceWorkdirsBareKeyAliasesThePrimary(t *testing.T) {
 		Repos:       map[string]string{"widgets": "/some/local/path"},
 		PrimaryRepo: "acme/widgets",
 	}
-	got, err := deriveInstanceWorkdirs(context.Background(), cfg, root)
+	got, err := deriveInstanceWorkdirs(context.Background(), cfg, root, "")
 	if err != nil {
 		t.Fatalf("deriveInstanceWorkdirs refused a bare key aliasing the primary: %v", err)
 	}
@@ -594,7 +594,7 @@ func TestDeriveInstanceWorkdirsRefusesDuplicateCheckoutNames(t *testing.T) {
 		Repos:       map[string]string{"other/api": "/some/local/path"},
 		PrimaryRepo: "acme/api",
 	}
-	_, err := deriveInstanceWorkdirs(context.Background(), cfg, root)
+	_, err := deriveInstanceWorkdirs(context.Background(), cfg, root, "")
 	if err == nil {
 		t.Fatal("deriveInstanceWorkdirs accepted two repos deriving the same checkout name")
 	}

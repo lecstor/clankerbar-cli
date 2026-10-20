@@ -139,7 +139,8 @@ func DeriveWorktreesDir(root, project string) (string, error) {
 // the fleet works in its own clones, so the operator's layout is neither
 // required nor read. The clone reads the plane's repo identity and the run's
 // git credential (see cloneRepo); a clone that cannot run refuses with the
-// path tried.
+// path tried. This form uses the built-in clone base; the supervisor's own path
+// goes through deriveWorkdir with the operator's clone_url_base.
 //
 // Fail-closed after the clone, in order: the derived directory must EXIST and
 // be a checkout of the expected repo — its attributable origin remote must name
@@ -148,6 +149,13 @@ func DeriveWorktreesDir(root, project string) (string, error) {
 // or no checkout at all, is a REFUSAL naming the path: the developer's own
 // tree is never adopted, mutated, or re-cloned over.
 func DeriveWorkdir(ctx context.Context, root, project, repo string) (string, error) {
+	return deriveWorkdir(ctx, root, project, repo, "")
+}
+
+// deriveWorkdir is DeriveWorkdir with an explicit clone base: empty means the
+// package default (cloneRemoteBase), anything else is the operator's
+// clone_url_base, validated by cloneRepo before it is used.
+func deriveWorkdir(ctx context.Context, root, project, repo, cloneBase string) (string, error) {
 	pr, err := ProjectRoot(root, project)
 	if err != nil {
 		return "", err
@@ -180,7 +188,7 @@ func DeriveWorkdir(ctx context.Context, root, project, repo string) (string, err
 			return "", fmt.Errorf("%w: %s exists and is not a directory - refusing to replace it", ErrWorkdirRefused, dir)
 		}
 	case os.IsNotExist(statErr):
-		if err := cloneRepo(ctx, dir, repo); err != nil {
+		if err := cloneRepo(ctx, dir, repo, cloneBase); err != nil {
 			return "", fmt.Errorf("%w: %s does not exist and could not be cloned from %s: %v", ErrWorkdirRefused, dir, repo, err)
 		}
 	default:
@@ -330,7 +338,16 @@ func checkoutOriginRemote(dir string) (string, error) {
 // This is the one place the fleet reaches the network outside a session: a repo
 // the project declares but has not cloned is cloned here, once, at reconcile.
 // Everything already present is only verified (and never touched).
-func deriveInstanceWorkdirs(ctx context.Context, cfg *config.Config, root string) (map[string]string, error) {
+//
+// cloneBase is the operator's clone_url_base (empty = the built-in default). It
+// is validated ONCE here, before any project is derived, so a malformed
+// transport refuses the whole instance even when every repo is already cloned
+// and no clone would be attempted this reconcile: a typo must not sit dormant
+// until the day a clone is needed.
+func deriveInstanceWorkdirs(ctx context.Context, cfg *config.Config, root, cloneBase string) (map[string]string, error) {
+	if err := config.ValidateCloneURLBase(cloneBase); err != nil {
+		return nil, fmt.Errorf("clone_url_base: %w", err)
+	}
 	slugs := make([]string, 0, len(cfg.Projects)+1)
 	if len(cfg.Projects) == 0 {
 		slugs = append(slugs, cfg.Slug())
@@ -360,7 +377,7 @@ func deriveInstanceWorkdirs(ctx context.Context, cfg *config.Config, root string
 			return nil, fmt.Errorf("project %s: %w: names no repo (set primary_repo) to materialize", label, ErrWorkdirRefused)
 		}
 		for _, repo := range repos {
-			if _, err := DeriveWorkdir(ctx, root, slug, repo); err != nil {
+			if _, err := deriveWorkdir(ctx, root, slug, repo, cloneBase); err != nil {
 				return nil, fmt.Errorf("project %s: %w", label, err)
 			}
 		}
