@@ -6,11 +6,21 @@ package supervisor
 // (see workdir.go). A clone is made from the plane's repo identity — which is
 // why the identity has to be `owner/name` and not a bare name: an identity with
 // no owner names no clone URL, and guessing one would clone somebody else's
-// repo or nobody's. The credential comes from the run's own git credential
-// (delivery.TokenForOwner), the same `gh auth token --user <owner>` resolution
-// the delivery verifier and doctor's deploy-lag check already read remotes
-// with, scoped to this one git invocation through the route in delivery.ScopeEnv
-// — the token rides the child's ENVIRONMENT, never its argv.
+// repo or nobody's.
+//
+// The URL is `<clone_url_base><owner>/<name>.git`. The base defaults to
+// `https://github.com/` and an operator may name another prefix — an ssh host
+// alias (`git@github-personal:`), a mirror, a local path — through the
+// `clone_url_base` config key (CLA-713). That exists because an HTTPS origin
+// makes a session's pushes depend on a GitHub token in its environment, while
+// an ssh origin depends on the key alone.
+//
+// For a github.com HTTPS clone the credential comes from the run's own git
+// credential (delivery.TokenForOwner via ScopeRemoteEnv), scoped to this one git
+// invocation through the route in delivery.ScopeEnv — the token rides the
+// child's ENVIRONMENT, never its argv. Any other transport runs unscoped
+// (ScopeRemoteEnv's documented fallback), and in particular an ssh base spawns
+// no `gh auth token` at all.
 //
 // What is deliberately NOT here: fetching, resetting, pulling. A clone is made
 // once; after that the repo directory is the fleet's working checkout and its
@@ -28,6 +38,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 )
 
@@ -37,13 +48,16 @@ import (
 // a private one). A var so tests can point it at a stub.
 var cloneGHBin = "gh"
 
-// cloneRemoteBase is the URL prefix a repo identity is cloned from:
-// <base><owner>/<name>.git. github.com is also what the credential scoping
-// understands (delivery.GithubOwner); an ssh/other-host remote in the
-// operator's own clones has no bearing here, because those clones are not read.
-// A var so a test can point the fleet at a local bare repository instead of the
-// network — the clone is otherwise the only thing here that cannot be faked.
-var cloneRemoteBase = "https://github.com/"
+// cloneRemoteBase is the DEFAULT URL prefix a repo identity is cloned from:
+// <base><owner>/<name>.git. It is the built-in
+// config.DefaultCloneURLBase unless a test overrides it; the operator's
+// clone_url_base (config.Config.CloneURLBase) overrides it per clone when set.
+// github.com HTTPS is also what the credential scoping understands
+// (delivery.GithubOwner); an ssh or other-host base runs unscoped, on the key
+// or ambient credential git finds. A var so a test can point the fleet at a
+// local bare repository instead of the network — the clone is otherwise the
+// only thing here that cannot be faked.
+var cloneRemoteBase = config.DefaultCloneURLBase
 
 // cloneTimeout bounds one clone. A clone is a full history fetch: it is the
 // longest thing the supervisor does, and the only one that cannot be allowed to
@@ -54,6 +68,11 @@ var cloneTimeout = 5 * time.Minute
 // cloneRepo materializes repo ("owner/name") at dir, creating the project root
 // above it if needed. It refuses when the identity names no owner, because a
 // bare name cannot be resolved to a clone URL.
+//
+// cloneBase is the URL prefix the identity is appended to (the operator's
+// clone_url_base, or empty for the built-in default). It is validated here as
+// well as in config so a caller that bypassed Validate still fails with the
+// transport named rather than building a URL git cannot use.
 //
 // The clone lands in a temporary sibling and is RENAMED into place only once it
 // has succeeded, so a failed or interrupted clone can never leave a
@@ -66,15 +85,18 @@ var cloneTimeout = 5 * time.Minute
 // it does replace a file or a symlink, so the destination is Lstat-ed
 // immediately before the rename and every shape is refused. A raced-in path is
 // left exactly as it was and the clone is discarded.
-func cloneRepo(ctx context.Context, dir, repo string) error {
+func cloneRepo(ctx context.Context, dir, repo, cloneBase string) error {
 	owner, name, err := splitRepoIdentity(repo)
+	if err != nil {
+		return err
+	}
+	url, err := cloneURL(cloneBase, owner, name)
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(dir), 0o755); err != nil {
 		return fmt.Errorf("create %s: %v", filepath.Dir(dir), err)
 	}
-	url := cloneRemoteBase + owner + "/" + name + ".git"
 	tmp := fmt.Sprintf("%s.clone-%d", dir, os.Getpid())
 
 	env := []string{
@@ -88,9 +110,14 @@ func cloneRepo(ctx context.Context, dir, repo string) error {
 		"GIT_SSH_COMMAND=ssh -oBatchMode=yes -oConnectTimeout=10",
 		"GCM_INTERACTIVE=never",
 	}
-	if token := delivery.TokenForOwner(ctx, filepath.Dir(dir), cloneGHBin, owner); token != "" {
-		env = append(env, delivery.ScopeEnv(token)...)
-	}
+	// Scope the credential by the URL we are actually cloning FROM, not by the
+	// owner alone: ScopeRemoteEnv degrades to "run unscoped" for anything its
+	// github.com HTTPS resolution does not understand, which is exactly what an
+	// ssh (git@host:owner/name.git) or other-host base needs. An ssh base must
+	// not spawn `gh auth token` at all - the key is the credential there, and
+	// CLA-713 exists to stop branch pushes depending on a token in the session's
+	// environment.
+	env = append(env, delivery.ScopeRemoteEnv(ctx, filepath.Dir(dir), cloneGHBin, url)...)
 
 	ctx, cancel := context.WithTimeout(ctx, cloneTimeout)
 	defer cancel()
@@ -108,6 +135,23 @@ func cloneRepo(ctx context.Context, dir, repo string) error {
 		return err
 	}
 	return nil
+}
+
+// cloneURL concatenates a clone base with a repo identity. The base is a
+// PREFIX, so its trailing separator is the whole contract: '/' for a URL or
+// path base (https://github.com/, file:///srv/mirrors/) and ':' for an
+// scp-style ssh base (git@github-personal:). An empty base means the built-in
+// default. config.ValidateCloneURLBase is the one rule for that shape, shared
+// with Config.Validate so a config is refused before a reconcile ever uses it.
+func cloneURL(base, owner, name string) (string, error) {
+	if strings.TrimSpace(base) == "" {
+		base = cloneRemoteBase
+	}
+	base = strings.TrimSpace(base)
+	if err := config.ValidateCloneURLBase(base); err != nil {
+		return "", fmt.Errorf("clone_url_base: %w", err)
+	}
+	return base + owner + "/" + name + ".git", nil
 }
 
 // installClone moves a completed clone from tmp into dir with NO-REPLACE

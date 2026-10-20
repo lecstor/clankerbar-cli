@@ -203,3 +203,30 @@ func TestSuperviseReplaceRejectsPositionalArgs(t *testing.T) {
 		t.Fatalf("supervise replace bogus returned %v, want an unexpected-argument error", err)
 	}
 }
+
+// CLA-713: the clone transport is read from the machine-layer config and a
+// malformed prefix refuses the supervisor at startup, naming the key - before
+// any reconcile could try to use it.
+func TestSuperviseRefusesAMalformedCloneURLBase(t *testing.T) {
+	t.Setenv("CLANKERBAR_API_KEY", "test-key")
+	t.Setenv("HOME", t.TempDir())
+	dir := filepath.Join(os.Getenv("HOME"), ".config", "clankerbar")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(map[string]string{
+		"backlog_url":    "https://clankerbar.example",
+		"clone_url_base": "https://github.com",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	err = Supervise(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "clone_url_base") || !strings.Contains(err.Error(), "must end with /") {
+		t.Fatalf("Supervise with a malformed clone_url_base returned %v, want a refusal naming the key and the missing separator", err)
+	}
+}

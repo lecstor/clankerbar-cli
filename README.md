@@ -842,6 +842,17 @@ travels in the child's environment, never on a command line). The project's
 `worktrees/` directory is created too: it is the fleet's own area, not the
 operator's.
 
+The clone's transport comes from `clone_url_base` (default
+`https://github.com/`). With the default, `origin` is
+`https://github.com/<owner>/<name>.git` and the one clone invocation resolves the
+owner's token through `gh auth token`. With an ssh prefix such as
+`git@github-personal:`, `origin` is
+`git@github-personal:<owner>/<name>.git`, the clone uses that host alias and the
+key, and **no `gh auth token` is spawned** — so a session's fetch and push do not
+depend on a token riding in its environment. The key is a prefix, so it ends
+where the owner begins (`/` for a URL or path, `:` for an scp-style ssh alias);
+[Config](#config) has the full shape and the refusal for anything else.
+
 Derivation fails closed, on the conditions learned from the CLA-441
 wrong-workdir failure. A directory that **exists** is never replaced, adopted or
 cloned over: if it is not a checkout of the expected repo — a plain directory, a
@@ -1598,6 +1609,21 @@ instance the supervisor reads.
 stream to the daemon's terminal. Off, the stream goes only to its iteration log,
 which is what keeps the daemon's own lines readable — [Visibility](#visibility)
 has the reasoning and where both logs live.
+
+`clone_url_base` (default `https://github.com/`) is the URL **prefix** the
+supervisor's workdir derivation clones a missing repo from:
+`<clone_url_base><owner>/<name>.git`. Set it to an ssh host alias such as
+`git@github-personal:` to give derived fleet clones an ssh `origin`, so a
+session's fetch and push use the key rather than a GitHub token in its
+environment; any other mirror prefix — `https://git.example.com/mirror/`,
+`file:///srv/mirrors/` — works too. It is read only by the supervisor: a plain
+`run` has no clone to make. The value has to end where the owner begins, so a
+URL or path prefix ends with `/` and an scp-style ssh alias ends with `:`.
+Anything else is refused (`doctor` and `supervise` both name the key) rather than
+concatenated into a URL nobody can clone. An ssh base spawns no
+`gh auth token` at all while cloning; the HTTPS github.com default keeps
+resolving the owner's token exactly as before. Existing clones are never
+re-cloned, so a change affects only repos cloned after it is set.
 
 `max_turns` bounds every session's turns when its phase sets none of its own:
 the phase's `max_turns` wins, then this, then a built-in default of 400

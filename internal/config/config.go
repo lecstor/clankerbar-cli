@@ -32,6 +32,12 @@ import (
 // another one in their own config file.
 const defaultBacklogURL = "https://clankerbar.com"
 
+// DefaultCloneURLBase is the URL prefix the fleet's derived clones are made
+// from when the operator sets no clone_url_base: <base><owner>/<name>.git.
+// Keeping the default HTTPS is deliberate — a config that says nothing about
+// the clone transport keeps the behaviour it had before the key existed.
+const DefaultCloneURLBase = "https://github.com/"
+
 // defaultPrompt asks each session for exactly ONE task.
 //
 // The wording is not casual: the served protocol
@@ -2100,6 +2106,28 @@ type Config struct {
 	// correctly: the config now means something different.
 	ProjectRoot bool `json:"project_root,omitempty"`
 
+	// CloneURLBase is the URL PREFIX the supervisor clones a project's missing
+	// repos from: <base><owner>/<name>.git. Empty means the built-in
+	// DefaultCloneURLBase (`https://github.com/`), so a config that never
+	// mentions the key clones exactly as it always did.
+	//
+	// It exists because a derived fleet clone's origin is otherwise always
+	// HTTPS, which makes a session's branch pushes depend on a GitHub token
+	// riding in its environment (the `gh auth token` scoping on the clone).
+	// An SSH prefix — `git@github-personal:` for an ssh host alias, or
+	// `git@github.com:` — makes the clone authenticate with the key alone and
+	// skips the token scoping entirely. Any other mirror prefix works too;
+	// it is a prefix, not a GitHub-specific setting.
+	//
+	// The value is a PREFIX, so it has to end where the owner begins: a URL
+	// base ends with `/` (`https://github.com/`, `file:///srv/mirrors/`) and
+	// an scp-style ssh base ends with `:` (`git@github-personal:`). Anything
+	// else is refused by Validate rather than concatenated into a broken URL.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: an unset
+	// key must not change a daemon's identity, and a set one correctly does.
+	CloneURLBase string `json:"clone_url_base,omitempty"`
+
 	// ConfigDir pins the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
 	// headless session loads the same skills, plugins, and auth as the interactive
 	// one. Empty inherits the ambient environment — declare it for an unattended
@@ -3764,6 +3792,60 @@ func underWorkDir(p, workdir string) string {
 }
 
 // Validate normalizes path fields and checks the resolved config is runnable.
+// EffectiveCloneURLBase is the clone URL prefix the supervisor derives a
+// repo's clone URL from: the operator's clone_url_base, trimmed, or the
+// built-in DefaultCloneURLBase when the key is unset.
+func (c *Config) EffectiveCloneURLBase() string {
+	if base := strings.TrimSpace(c.CloneURLBase); base != "" {
+		return base
+	}
+	return DefaultCloneURLBase
+}
+
+// ValidateCloneURLBase checks that base can be concatenated with an
+// `owner/name.git` identity to make ONE clone URL. The value is a prefix, so
+// the only structural mistake that is both common and silent is a missing
+// separator - `https://github.com` would otherwise produce
+// `https://github.comowner/name.git` - and that is refused here.
+//
+// Accepted shapes:
+//
+//	https://github.com/        (any URL-style base, ending in /)
+//	file:///srv/mirrors/       (a local mirror)
+//	/srv/mirrors/              (a bare path prefix)
+//	git@github-personal:       (an scp-style ssh host alias)
+//
+// An empty value is the default and therefore valid. Errors are recorded
+// with the key name by the caller, so they describe only what is wrong with
+// the value.
+func ValidateCloneURLBase(base string) error {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return nil
+	}
+	if strings.ContainsAny(base, " \t\r\n") {
+		return errors.New("must not contain whitespace")
+	}
+	if strings.Contains(base, "://") {
+		if !strings.HasSuffix(base, "/") {
+			return fmt.Errorf("%q must end with / - it is a URL prefix (https://github.com/)", base)
+		}
+		return nil
+	}
+	if strings.HasSuffix(base, ":") {
+		host := strings.TrimSuffix(base, ":")
+		at := strings.LastIndexByte(host, '@')
+		if at <= 0 || at == len(host)-1 || strings.Contains(host, "/") {
+			return fmt.Errorf("%q is not an ssh host alias - write it as user@host: (git@github-personal:)", base)
+		}
+		return nil
+	}
+	if strings.HasSuffix(base, "/") {
+		return nil
+	}
+	return fmt.Errorf("%q must end with / (https://github.com/, file:///srv/mirrors/) or be an ssh host alias ending in : (git@github-personal:)", base)
+}
+
 func (c *Config) Validate() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
 	c.WorkDir = expandHome(c.WorkDir)
@@ -4312,6 +4394,14 @@ func (c *Config) Validate() error {
 	// so they are held to the same ref-name shape (CLA-608).
 	if err := validatePRBase(c.PRBase, "pr_base"); err != nil {
 		return err
+	}
+	// clone_url_base is concatenated with a repo identity to make the supervisor's
+	// clone URL (CLA-713), so a value with no trailing separator would silently
+	// build a URL nobody can clone. Refuse it here so doctor reports it once,
+	// before a reconcile ever tries to use it.
+	c.CloneURLBase = strings.TrimSpace(c.CloneURLBase)
+	if err := ValidateCloneURLBase(c.CloneURLBase); err != nil {
+		return fmt.Errorf("clone_url_base: %w", err)
 	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
