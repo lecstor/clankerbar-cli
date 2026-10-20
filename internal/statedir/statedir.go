@@ -627,8 +627,11 @@ func (d *Dir) isOurArtifact(name string) bool {
 		name == "RESTART", name == "RESTART_NOW", name == "RELOAD",
 		// The supervisor's generated effective config (phase 2b). The daemon
 		// that opens this directory next was started with `run -c` pointing at
-		// it, and doctor opens the same directory — both must adopt it.
-		name == MaterializedConfigName,
+		// it, and doctor opens the same directory — both must adopt it. The
+		// `.tmp` sibling is the in-flight half of the atomic replace a
+		// reconcile-time config edit performs (CLA-724); a crash can leave one
+		// behind, exactly as with CURRENT_CLAIM.tmp.
+		name == MaterializedConfigName, name == MaterializedConfigName+".tmp",
 		// The daemon's record of the claim its current child holds, written for
 		// the supervisor to hand back if the child dies without letting go
 		// (CLA-708). Its `.tmp` sibling is the in-flight half of an atomic

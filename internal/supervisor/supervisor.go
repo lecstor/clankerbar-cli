@@ -581,6 +581,15 @@ func (d *Supervisor) reconcile() error {
 		}
 	}
 
+	// Reach the children that are already up with an edit (CLA-724). This runs
+	// AFTER the act loop on purpose: a child stopped in this pass already
+	// carries its STOP (so the refresh leaves it alone), and a child spawned in
+	// it is compared against the very file its spawn just wrote (so an
+	// unchanged fleet writes nothing).
+	for _, inst := range d.instances {
+		d.refreshMaterialized(inst)
+	}
+
 	// Drop instances that are gone and have already exited; the ones still
 	// draining stay until their child's exit event arrives.
 	kept := d.instances[:0]
@@ -1216,11 +1225,7 @@ func (d *Supervisor) haltPresent(inst *Instance) bool {
 	inst.mu.Lock()
 	dir := inst.stateDir
 	inst.mu.Unlock()
-	if dir == "" {
-		return false
-	}
-	_, err := os.Lstat(filepath.Join(dir, "HALT"))
-	return err == nil
+	return markerPresent(dir, "HALT")
 }
 
 // respawnDue starts every instance whose restart time has arrived.
