@@ -565,7 +565,14 @@ func wireSessions(sessions []Session) []wireSession {
 				CacheWrite: s.Usage.CacheWrite,
 			}
 		}
-		if s.CostUSD != nil {
+		// CLA-737: the plane refuses a session carrying costUsd without
+		// usageReported: true ("session.costUsd requires session.usageReported"),
+		// and it refuses the WHOLE report with it. sessionSpend already withholds
+		// the figure at the aggregated source, but Session is constructible by any
+		// caller and the wire is where the contract lives — so the guarantee is
+		// made here too, rather than trusting every future producer to remember a
+		// rule whose violation costs unrelated iterations and presence as well.
+		if s.UsageReported && s.CostUSD != nil {
 			w.CostUSD = s.CostUSD
 		}
 		out = append(out, w)

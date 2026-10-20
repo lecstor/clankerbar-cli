@@ -1180,6 +1180,55 @@ func TestSessionCost(t *testing.T) {
 	}
 }
 
+// CLA-737: a pass whose attempts never reported usage has an UNKNOWN cost, even
+// when the adapter reports money and the attempts carry a CostReported figure.
+// opencode's export path is the shape that made this matter: a session killed
+// before its first answered request (a provider.quota error was the one seen)
+// exports an all-zero run, so CostReported is true and UsageReported is false.
+// Publishing the 0 made the plane refuse the whole fleet report with
+// "session.costUsd requires session.usageReported".
+func TestSessionSpendCostNeedsAUsageReport(t *testing.T) {
+	reporting := &fakeAdapter{caps: &harness.Capabilities{ReportsCost: true}}
+
+	t.Run("no attempt reported usage, so there is no figure", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{CostReported: true})                // the export's all-zero run
+		pass.add(reporting, harness.Result{CostReported: true, CostUSD: 0.25}) // money, but still no usage report
+		if got := pass.cost(); got != nil {
+			t.Errorf("cost = %v, want nil — a zero from a session that reported no usage is silence, not a spend", *got)
+		}
+		if pass.usageReported {
+			t.Error("usageReported = true, want false — no attempt reported usage")
+		}
+	})
+
+	// A pass that DID report usage keeps today's arithmetic. The task pins this
+	// rather than changing it: the figure is the sum of what the attempts
+	// reported, and the silent attempt contributes its reported zero (or the
+	// pass is unknown when it reported no cost at all).
+	t.Run("one attempt with usage keeps the reported figure", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{CostReported: true})
+		pass.add(reporting, harness.Result{UsageReported: true, CostReported: true, CostUSD: 0.40})
+		got := pass.cost()
+		if got == nil || *got != 0.40 {
+			t.Errorf("cost = %v, want 0.40 — the pass reported usage, so its figure is a figure", got)
+		}
+		if !pass.usageReported {
+			t.Error("usageReported = false, want the pass's report ORed across attempts")
+		}
+	})
+
+	t.Run("an attempt that reported no dollars still leaves the pass unknown", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{UsageReported: true, CostReported: true, CostUSD: 0.40})
+		pass.add(reporting, harness.Result{UsageReported: true}) // tokens reported, no dollars (the claude mid-stream kill)
+		if got := pass.cost(); got != nil {
+			t.Errorf("cost = %v, want nil — one attempt's dollars were never reported, so the total is unknown, not partial", *got)
+		}
+	})
+}
+
 // A pass that RETRIED is several paid sessions: the loop counts every attempt
 // toward the iteration's total ("each attempt is a distinct session"), so the one
 // entry the record publishes for the pass must carry every attempt's money — or
@@ -1281,6 +1330,40 @@ func TestDrainPhases_APassWithAnUnreportedCostCarriesNoFigure(t *testing.T) {
 	}
 	if !pass.UsageReported || pass.Usage != (fleet.TokenUsage{Input: 908, Output: 2}) {
 		t.Errorf("usage = %+v (reported=%v), want both attempts' exact token buckets", pass.Usage, pass.UsageReported)
+	}
+}
+
+// CLA-737 end to end: a session that died before its harness reported usage —
+// opencode's export leaves CostReported true and a zero behind for a run the
+// provider never answered — reaches the iteration record with no spend figures
+// at all, so the wire carries no costUsd and the plane accepts the report.
+func TestDrainPhases_ASessionWithNoUsageReportCarriesNoCost(t *testing.T) {
+	res := checkpointed(0, 0)
+	res.Usage = harness.TokenUsage{}
+	res.UsageReported = false
+	res.CostReported = true
+
+	h := &fakeAdapter{
+		steps: []invokeStep{{res: res}},
+		caps:  &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true},
+	}
+	d, _ := phaseDriver(t, h, []config.Phase{{Name: "implement"}})
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 || len(recs[0].Sessions) != 1 {
+		t.Fatalf("want one record with the pass's session entry, got %+v", recs)
+	}
+	s := recs[0].Sessions[0]
+	if s.UsageReported {
+		t.Error("usageReported = true, want false — no attempt reported usage")
+	}
+	if s.CostUSD != nil {
+		t.Errorf("cost = %v, want nil — the plane refuses the whole report when costUsd rides without usageReported", *s.CostUSD)
 	}
 }
 
