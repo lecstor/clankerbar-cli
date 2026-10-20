@@ -187,9 +187,10 @@ type Target struct {
 	// Cfg is this target's EFFECTIVE config — the driver's base config with the
 	// project's stored run-config document overlaid — or nil when no document is
 	// in force, in which case every read falls through to d.cfg unchanged. It
-	// carries only policy the plane may say (harness/model/tiers/budget/
-	// escalation/backstops); phases, wiring, env and machine paths stay local,
-	// so the overlay can never repoint a session at somebody else's dialect.
+	// carries only policy the plane may say (the pipeline — prompt, phases,
+	// review_panel — plus harness/model/tiers/budget/escalation/backstops);
+	// wiring, env and machine paths stay local, so the overlay can never
+	// repoint a session at somebody else's dialect.
 	// Rebuilt between iterations when the poll's runConfigVersion moves — never
 	// mid-session.
 	Cfg *config.Config
