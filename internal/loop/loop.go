@@ -6049,13 +6049,6 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 		log.Printf("%sdead-phase park: no claim observed, so there is no task to park", labelOf(t))
 		return
 	}
-	pk, ok := t.Releaser.(plane.ParkAPI)
-	if !ok {
-		log.Printf("%sCANNOT PARK %s — four consecutive dead phases (final step reason %q, no branch recorded), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
-			labelOf(t), claimLabel(res.Claim), deadReason(res))
-		return
-	}
-	ref := claimLabel(res.Claim)
 	// How the sessions died. A CLA-739 tool-loop kill is dead whatever it
 	// pushed, so "no branch recorded" may be false for it and the finish reason
 	// says nothing: the cause names what happened instead. The cause is the
@@ -6064,6 +6057,13 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 	if res.ToolLoop != "" {
 		death = fmt.Sprintf("was killed by the driver (%s)", res.ToolLoop)
 	}
+	pk, ok := t.Releaser.(plane.ParkAPI)
+	if !ok {
+		log.Printf("%sCANNOT PARK %s — four consecutive dead phases (the last %s), but the releaser cannot park or raise a question; the task stays in the queue and the next claim will retry it again",
+			labelOf(t), claimLabel(res.Claim), death)
+		return
+	}
+	ref := claimLabel(res.Claim)
 	outcome := fmt.Sprintf(
 		"Parked after four consecutive dead phases: the %s session %s on the last attempt, after dying on each of the three before it. Per the 2026-08-20 operator decision, a task that can kill four full sessions reaches the operator rather than a fifth; the retry budget is per task. Iteration logs are in %s.",
 		phaseLabel, death, d.state.Path())
