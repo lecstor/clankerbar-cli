@@ -5,6 +5,10 @@ Status: implemented in the CLI (`[implement, review, fix]`, plus an optional
 tracked as CLA-629 (per-phase harness/model, done) and the durable review record
 (CLA-636 plane, CLA-637 CLI — both landed), so this change files no duplicate
 task. CLA-210 (the parked structured-record task) was archived by CLA-636.
+The `review` phase can now fan out to several independent reviewers (CLA-639,
+parallel since CLA-697); see the README's
+[review panel](../README.md#the-review-panel-several-reviewers-one-revision-one-merge)
+section.
 
 ## Why
 

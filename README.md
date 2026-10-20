@@ -33,7 +33,7 @@ long run, and a session killed mid-task is fine: the driver hands the task strai
 queue (see [Resilience](#resilience)) and the next iteration picks it up. The
 backlog is the durable state; the loop is thin.
 
-### Phases: splitting one task across two sessions
+### Phases: splitting one task across several sessions
 
 A session's context grows monotonically and is re-read on every turn, so a long
 task gets expensive at the *end*: one measured task spent 66.2M tokens over 370

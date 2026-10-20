@@ -296,7 +296,7 @@ func (p Phase) ConfiguredIndex() int { return p.sourceIdx }
 // against the same reviewed tip as its siblings.
 //
 // A member is NOT a session: the driver still runs one review phase per member,
-// sequentially, and each writes its own sealed durable record under its own
+// concurrently up to Config.ReviewPanelConcurrency, and each writes its own sealed durable record under its own
 // reviewer role (see Config.ReviewPanel). Two entries naming the same
 // harness/model are two INDEPENDENT REVIEWS of the same revision — never a
 // mistake to be deduplicated.
