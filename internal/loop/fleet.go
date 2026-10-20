@@ -301,7 +301,27 @@ func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase strin
 // report on a word it does not know, so a note about the drain belongs in the
 // log. A caller that appends prose to the disposition loses the record AND the
 // presence refresh riding the same report.
+//
+// That invariant is enforced here as a last line of defence, not left to
+// convention: an outcome outside the four is posted as released with one loud
+// line naming the caller's mistake. The alternative is what CLA-738's incident
+// did — the reporter refuses the WHOLE report (every iteration plus the presence
+// refresh) and then logs only the first failure of the streak, so one prose
+// outcome would silently starve the plane for the rest of the session. One
+// degraded iteration is the cheaper failure, and the loud line is what gets the
+// convention fixed.
 func (d *Driver) endIteration(ti int, t Target, rec fleet.Iteration) {
+	switch rec.Outcome {
+	case fleet.OutcomeCheckpoint, fleet.OutcomeReleased, fleet.OutcomeParked, fleet.OutcomeDead:
+	default:
+		task := ""
+		if rec.TaskRef != "" {
+			task = " (task " + rec.TaskRef + ")"
+		}
+		log.Printf("%sBUG: iteration outcome %q%s is not one of the four the plane knows (checkpoint/released/parked/dead) - reporting it as %q so the fleet report and its presence refresh are not dropped; the caller must put prose in the log, never the outcome",
+			labelOf(t), rec.Outcome, task, fleet.OutcomeReleased)
+		rec.Outcome = fleet.OutcomeReleased
+	}
 	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
 		d.iter[ti] = iterState{}

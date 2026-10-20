@@ -765,6 +765,9 @@ func requiredSessionEnv(cfg *config.Config) []string {
 // session - names only, never values - and FAILs when the list omits one of
 // requiredSessionEnv, because that failure otherwise appears later as an
 // unexplained repo_not_found or an unauthenticated plane call inside a session.
+// A required name the `env` overlay declares is NOT missing: that overlay is
+// appended after the inherited filter, so it reaches the child regardless of
+// the allowlist (CLA-738 review 3.1).
 //
 // It asks SpawnedHarnesses, not PhaseHarnesses, for the reason the two exist:
 // PhaseHarnesses seeds the run-wide `harness` unconditionally, which is right
@@ -807,19 +810,26 @@ func checkSessionEnvAllowlist(cfg *config.Config) []check {
 		passes := append([]string(nil), allow...)
 		sort.Strings(passes)
 		c.detail = "sessions inherit only: " + strings.Join(passes, ", ")
-		if extra := declaredNames(h, slug); len(extra) > 0 {
-			c.detail += "; the env block adds: " + strings.Join(extra, ", ")
+		declared := declaredNames(h, slug)
+		if len(declared) > 0 {
+			c.detail += "; the env block adds: " + strings.Join(declared, ", ")
 		}
 		var missing []string
 		for _, want := range requiredSessionEnv(cfg) {
-			if !contains(allow, want) {
+			// A required name the env OVERLAY declares is satisfied even when the
+			// allowlist omits it: the overlay is appended AFTER the inherited
+			// filter (harness.inheritEnv's contract — "the config's env entries
+			// ... are therefore always present"), so the child receives it either
+			// way. Reading only the allowlist made doctor FAIL a config whose
+			// session reaches the plane perfectly well (CLA-738 review 3.1).
+			if !contains(allow, want) && !contains(declared, want) {
 				missing = append(missing, want)
 			}
 		}
 		if len(missing) > 0 {
 			c.status = fail
 			c.detail += " - missing " + strings.Join(missing, ", ") + " (a session without it fails later, elsewhere)"
-			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), or drop env_allowlist to inherit everything"
+			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), declare it in the env block, or drop env_allowlist to inherit everything"
 			return c
 		}
 		c.status = pass

@@ -1320,3 +1320,52 @@ func TestDrainPhases_AnUntrustedSessionReportsNoSpend(t *testing.T) {
 		t.Errorf("iteration Tokens = %d, want 0 — the floor is not counted", recs[0].Tokens)
 	}
 }
+
+// TestEndIterationDegradesAFreeTextOutcome is CLA-738 review 1.review-1.3: the
+// four-word invariant is a GUARD, not a convention. A future caller that appends
+// prose to the outcome must cost ONE degraded iteration (reported as released)
+// instead of the whole fleet report — which is what marshalReport's refusal does,
+// and the reporter logs only the first failure of a streak, so one bad word would
+// silence the plane for the rest of the session.
+func TestEndIterationDegradesAFreeTextOutcome(t *testing.T) {
+	logs := captureLogs(t)
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+
+	prose := "checkpoint — review panel INCOMPLETE: review-2: died producing nothing"
+	d.endIteration(0, d.targets[0], fleet.Iteration{TaskRef: "CLA-738", Outcome: prose})
+
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1 — the record must still reach the reporter", len(recs))
+	}
+	if recs[0].Outcome != fleet.OutcomeReleased {
+		t.Errorf("outcome = %q, want %q — a word outside the four must be degraded, not posted", recs[0].Outcome, fleet.OutcomeReleased)
+	}
+	out := logs.String()
+	for _, want := range []string{"BUG", prose, "not one of the four", fleet.OutcomeReleased} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the guard's log line does not carry %q:\n%s", want, out)
+		}
+	}
+}
+
+// And a known outcome passes through untouched, with no BUG line: the guard
+// degrades only what the plane would refuse.
+func TestEndIterationPassesAKnownOutcomeThrough(t *testing.T) {
+	logs := captureLogs(t)
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+
+	d.endIteration(0, d.targets[0], fleet.Iteration{TaskRef: "CLA-738", Outcome: fleet.OutcomeCheckpoint})
+
+	recs := ff.records()
+	if len(recs) != 1 || recs[0].Outcome != fleet.OutcomeCheckpoint {
+		t.Fatalf("records = %+v, want one checkpoint", recs)
+	}
+	if out := logs.String(); strings.Contains(out, "BUG") {
+		t.Errorf("a known outcome tripped the guard:\n%s", out)
+	}
+}

@@ -112,7 +112,7 @@ func TestDrainPhases_ParallelPanelToolLoopKilledMemberIsAFailedMember(t *testing
 	a.failLabel = "review-2"
 	a.failToolLoop = loopCause
 	a.wantRecords = len(members) - 1
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -128,6 +128,18 @@ func TestDrainPhases_ParallelPanelToolLoopKilledMemberIsAFailedMember(t *testing
 	}
 	if !strings.Contains(fix, "INCOMPLETE") || !strings.Contains(fix, "repeated failing tool call: clankerbar_update_task x5") {
 		t.Errorf("the fix brief does not name the killed member by its cause:\n%s", fix)
+	}
+	// The killed member's cause rides its SESSION entry, never the iteration
+	// outcome, which stays one of the four the plane accepts (CLA-738).
+	rec := requireOneFleetRecord(t, ff)
+	found := false
+	for _, s := range rec.Sessions {
+		if s.Cause == loopCause {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no session on the iteration record carries the kill cause %q: %+v", loopCause, rec.Sessions)
 	}
 }
 

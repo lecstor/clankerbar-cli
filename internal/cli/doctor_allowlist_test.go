@@ -249,3 +249,43 @@ func TestDoctorConfigReportsTheInheritanceShape(t *testing.T) {
 		t.Errorf("info = %q, want the allowlist shape AND the variable names", joined)
 	}
 }
+
+// A required variable the env OVERLAY supplies is not missing (CLA-738 review
+// 3.1): the overlay is appended AFTER the inherited-environment filter, so the
+// child receives it even when the allowlist omits the name. Reading only the
+// allowlist FAILed a config whose session reaches the plane perfectly well.
+func TestDoctorSessionEnvAllowlistAcceptsARequiredVariableFromTheEnvOverlay(t *testing.T) {
+	clearWorkdirRoot(t)
+	cfg := &config.Config{
+		Harness:      "claude",
+		Prompt:       "work",
+		BacklogURL:   "https://clankerbar.com",
+		EnvAllowlist: []string{"HOME", "PATH"},
+		Env:          config.EnvMap{"CLANKERBAR_API_KEY": {Literal: "from-the-overlay"}},
+	}
+	c, ok := statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist")
+	if !ok {
+		t.Fatal("want a session env allowlist check")
+	}
+	if c.status != pass {
+		t.Fatalf("status = %v (%s), want pass: the env overlay supplies CLANKERBAR_API_KEY", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "missing") {
+		t.Errorf("detail = %q, want no missing list", c.detail)
+	}
+
+	// The same rule for the conditionally-required workdir root.
+	cfg.ProjectRoot = true
+	cfg.Env[WorkdirRootEnv] = config.EnvValue{Literal: "/machine/root"}
+	if c, _ := statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist"); c.status != pass {
+		t.Fatalf("status = %v (%s), want pass with the workdir root declared in the overlay", c.status, c.detail)
+	}
+
+	// A required name NEITHER the allowlist nor the overlay supplies is still
+	// the failure it was: the fix narrows the false FAIL, it does not remove it.
+	delete(cfg.Env, "CLANKERBAR_API_KEY")
+	c, _ = statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist")
+	if c.status != fail || !strings.Contains(c.detail, "CLANKERBAR_API_KEY") {
+		t.Fatalf("status/detail = %v/%q, want fail naming CLANKERBAR_API_KEY", c.status, c.detail)
+	}
+}

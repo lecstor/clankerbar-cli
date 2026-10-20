@@ -1306,12 +1306,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		seen        harness.Claim
 		parkFired   bool // the per-task dead budget parked the task
 		tripFired   bool // the fleet dead counter tripped and paused this target
-		// finalOutcome is the CLAIM's disposition at the drain boundary, and it
-		// is ALWAYS one of the fleet.Outcome* constants (CLA-738). Never append
-		// prose to it: marshalReport refuses the WHOLE report on a word it does
-		// not know, so free text here loses the iteration record AND the
-		// presence refresh riding the same report. Free-text notes belong in
-		// the log.
+		// finalOutcome is the CLAIM's disposition at the drain boundary: one of
+		// the fleet.Outcome* constants, or "" when nothing was observed (no
+		// claim state at all, or claimDisposition's nil return). The deferred
+		// switch below is what makes the RECORDED outcome one of the four — it
+		// maps "" to released and the drain's own verdicts (parked/dead) over
+		// the disposition — so the variable itself is not always safe to hand
+		// on (CLA-738). Never append prose to it: marshalReport refuses the
+		// WHOLE report on a word it does not know, so free text here loses the
+		// iteration record AND the presence refresh riding the same report.
+		// Free-text notes belong in the log.
 		finalOutcome string
 		// CLA-631/CLA-651/CLA-662: the wait a RESUMED phase's sequence-end
 		// signal asks the run for. A rolling limit (CLA-631) hands its reset
@@ -4162,6 +4166,16 @@ type phaseRunOpts struct {
 	// local spend against a run-wide ceiling none of them could see the others
 	// approaching. Nil for every caller that is not a parallel panel member.
 	panelSpend *panelSpendHandle
+
+	// onSessionLaunch, when non-nil, is called immediately before the adapter is
+	// invoked — the first moment this phase's session launch has actually BEGUN —
+	// on every attempt the ladder makes. A parallel panel member uses it to
+	// release the NEXT member's start: signalling when its worktree was ready let
+	// a later member's own setup and launch overtake an earlier member's, so the
+	// scheduler's list-order guarantee (CLA-697) did not extend to the adapters
+	// (CLA-738 review 3.2). Idempotent on the panel side, so a retry's repeat
+	// call is harmless. Nil for every other caller.
+	onSessionLaunch func()
 }
 
 // panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).
@@ -4657,6 +4671,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// run its own resurrection machinery (opencode CLA-406): those processes
 		// continue the SAME session on the SAME claim, so renewal spans them.
 		renewer := d.startLeaseRenewal(ctx, ti, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
+		// The launch boundary itself (CLA-738 review 3.2): a panel member releases
+		// its successor here, so nothing this member did before its adapter call
+		// (worktree, brief, budget check) can be overtaken by a later member's.
+		if opts.onSessionLaunch != nil {
+			opts.onSessionLaunch()
+		}
 		res, ierr := a.Invoke(ctx, inv)
 		renewer.stop()
 		if f != nil {
