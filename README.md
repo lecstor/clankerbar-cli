@@ -351,9 +351,13 @@ because a review-only session's deliverable is its record and committing its
 probe artifacts would move the tip past the revision every member recorded.
 `review_panel_concurrency` caps how many run at once: `1` is the historical
 sequential behaviour (members then share the task's own worktree), `N` runs at
-most `N`, and an absent key or `0` means the whole panel. The fix phase starts
-only after the join has every member's record — or its INCOMPLETE outcome — and
-then works in the task's own worktree as before.
+most `N`, and an absent key or `0` means the whole panel. Members start in
+`review_panel` order: with a cap smaller than the panel, the first `N` entries
+run first and each freed slot goes to the next entry, so put the slowest
+reviewer at the top of the list — its long session then overlaps the others
+instead of extending the round's tail. The fix phase starts only after the join
+has every member's record — or its INCOMPLETE outcome — and then works in the
+task's own worktree as before.
 
 Each member's reviewer role is **positional** — `review-1` .. `review-N`, counted
 over the review-shaped phases — and that is the role the durable record is keyed

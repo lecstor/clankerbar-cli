@@ -185,6 +185,43 @@ type panelRunOutcome struct {
 	lastProducedNothing bool
 }
 
+// runPanelMembers runs n work functions with at most `concurrency` in flight.
+// A slot is acquired BEFORE the member's goroutine is spawned, and the loop
+// waits for that member to call started() before spawning the next, so no
+// member is spawned until its predecessor's checkout exists and it is about to
+// drain: the panel's sessions begin in the config's list order. A finished
+// member frees its slot and the next member in list order starts immediately —
+// a backfill queue, not a wave barrier, so a short reviewer never waits for a
+// long one in its batch.
+//
+// run MUST call started exactly once, as soon as its work has begun. The member
+// shape calls it after creating its worktree and before draining its session;
+// the test calls it at the top of its callback.
+func runPanelMembers(n, concurrency int, run func(k int, started func())) {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for k := 0; k < n; k++ {
+		sem <- struct{}{}
+		started := make(chan struct{})
+		var once sync.Once
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			// The defer is a safety net: a path that forgets to call started
+			// still unblocks the loop when the member ends, instead of deadlocking
+			// the panel.
+			defer once.Do(func() { close(started) })
+			run(k, func() { once.Do(func() { close(started) }) })
+		}(k)
+		<-started
+	}
+	wg.Wait()
+}
+
 // runPanelInParallel runs phases[start:end] concurrently, each in its own
 // detached worktree at the reviewed tip. ok=false means the fan-out could not be
 // set up at all (no live claim, no repo, no resolvable tip) and the caller must
@@ -241,41 +278,37 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	// checks must see each other's counted spend, not only the same `prior`.
 	ledger := newPanelSpend()
 
-	sem := make(chan struct{}, concurrency)
-	var wg sync.WaitGroup
-	for k := 0; k < n; k++ {
+	runPanelMembers(n, concurrency, func(k int, started func()) {
 		idx := start + k
 		ph := phases[idx]
 		label := ph.Label(idx)
 		role := reviewerRoleFor(phases, idx)
 		last := idx == len(phases)-1
-		wg.Add(1)
-		go func(k, idx int, ph config.Phase, label, role string, last bool) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
 
-			m := panelMemberOutcome{label: label, role: role}
-			dir, werr := d.createPanelWorktree(ctx, repoRoot, tip, label)
-			if werr != nil {
-				m.setupErr = "could not create its own detached worktree: " + werr.Error()
-				out.members[k] = m
-				return
-			}
-			defer d.removePanelWorktree(repoRoot, dir)
-
-			tag := "-p" + label
-			m.tokens, m.cost, m.stop, m.end, m.perr = d.drainPhase(
-				ctx, drainNum, ti, idx, tag, ph, last, carried, t, prior, phases,
-				panelState{}, phaseRunOpts{
-					worktree:      dir,
-					panelParallel: true,
-					panelSpend:    &panelSpendHandle{ledger: ledger, self: ledger.join()},
-				})
+		m := panelMemberOutcome{label: label, role: role}
+		dir, werr := d.createPanelWorktree(ctx, repoRoot, tip, label)
+		if werr != nil {
+			m.setupErr = "could not create its own detached worktree: " + werr.Error()
 			out.members[k] = m
-		}(k, idx, ph, label, role, last)
-	}
-	wg.Wait()
+			started()
+			return
+		}
+		defer d.removePanelWorktree(repoRoot, dir)
+
+		// The member is ready to drain its session. Release the next member's
+		// start only now, so the panel's start order is the config's list order.
+		started()
+
+		tag := "-p" + label
+		m.tokens, m.cost, m.stop, m.end, m.perr = d.drainPhase(
+			ctx, drainNum, ti, idx, tag, ph, last, carried, t, prior, phases,
+			panelState{}, phaseRunOpts{
+				worktree:      dir,
+				panelParallel: true,
+				panelSpend:    &panelSpendHandle{ledger: ledger, self: ledger.join()},
+			})
+		out.members[k] = m
+	})
 
 	for k, m := range out.members {
 		out.tokens += m.tokens
