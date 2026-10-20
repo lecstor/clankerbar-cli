@@ -575,6 +575,16 @@ func wireSessions(sessions []Session) []wireSession {
 		if s.UsageReported && s.CostUSD != nil {
 			w.CostUSD = s.CostUSD
 		}
+		// Dropping a figure the caller DID report is a producer bug, and a silent
+		// one would let the session sums stop tying up to the iteration-level
+		// costUsd with nothing to explain the gap. Every other contract stumble on
+		// this wire is logged (the clamp above, endIteration's BUG line,
+		// marshalReport's refusal); the guard's job is protecting the batch, not
+		// hiding the case it was written to catch (review 1.review-2.3).
+		if s.CostUSD != nil && !s.UsageReported {
+			log.Printf("fleet: session %q (%s/%s) reported costUsd %v with no usage report — dropping the figure (BUG: the producer bypassed sessionSpend, whose contract is that a cost is known only when the attempt reported usage)",
+				s.Phase, s.Harness, s.Model, *s.CostUSD)
+		}
 		out = append(out, w)
 	}
 	return out

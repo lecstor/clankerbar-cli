@@ -227,6 +227,7 @@ func TestMarshalReportCarriesPerSessionUsage(t *testing.T) {
 // builds it.
 func TestMarshalReportOmitsCostWithoutUsageReported(t *testing.T) {
 	zero := 0.0
+	logs := captureLog(t)
 	b, err := marshalReport(Report{
 		Identity: Identity{Instance: "box-1"},
 		State:    State{Kind: StateIteration},
@@ -273,6 +274,20 @@ func TestMarshalReportOmitsCostWithoutUsageReported(t *testing.T) {
 	}
 	if v, ok := reported["usageReported"]; !ok || v != true {
 		t.Errorf("session[1].usageReported = %v (present=%v), want true", v, ok)
+	}
+
+	// Review 1.review-2.3: deleting a figure the CALLER reported is a producer
+	// bug, so it is logged — one line naming the session — rather than swallowed.
+	// The guard protects the batch; it must not hide the case it detects.
+	line := logs.String()
+	if !strings.Contains(line, `dropping the figure`) {
+		t.Errorf("no log line for the dropped costUsd: %q", line)
+	}
+	if !strings.Contains(line, `"implement"`) || !strings.Contains(line, "opencode") {
+		t.Errorf("log line does not name the session's phase and harness: %q", line)
+	}
+	if strings.Contains(line, `"review"`) {
+		t.Errorf("log line names the session whose cost was KEPT — only the silent one was dropped: %q", line)
 	}
 }
 
