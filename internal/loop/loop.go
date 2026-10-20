@@ -2091,8 +2091,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			}
 
 			if !last && i == 0 && taskID != "" && taskID == deadTask && deadRetries >= perTaskDeadBound-1 {
-				log.Printf("%siteration %d: the %s phase died producing nothing for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
-					labelOf(t), drainNum, ph.Label(i), deadRetries+1, perTaskDeadBound)
+				how := "died producing nothing"
+				if end.toolLoop != "" {
+					how = "was killed (" + end.toolLoop + "), dead"
+				}
+				log.Printf("%siteration %d: the %s phase %s for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
+					labelOf(t), drainNum, ph.Label(i), how, deadRetries+1, perTaskDeadBound)
 				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
 				parkFired = true // CLA-466: the record says parked, not dead
 				// The task is parked for the operator and this drain is over; the
@@ -5197,7 +5201,10 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// (or that never ran) leaves the lease live, so a retry session would
 			// only be refused and burned.
 			if !panelMember && !retryNoMCP {
-				end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0)
+				// A tool-loop kill is never the undeclared hand-off CLA-384
+				// counts, even when the process exited 0 an instant before the
+				// kill landed: it was killed failing to move the task on.
+				end.releasedToQueue = d.releaseHeldClaim(ctx, t, res, last && res.ExitCode == 0 && toolLoop == "")
 			}
 
 			// CLA-451: the blind-spot convergence. Everything above learns about
@@ -5490,8 +5497,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// already decided what follows: drainPhases' dead-phase ladder, or the
 		// panel's failed-member path.
 		if toolLoop != "" {
-			log.Printf("%siteration %d: the %s phase was killed by the driver: %s — classified dead, no delivery (tokens=%d cost=$%.4f) (log: %s)",
-				labelOf(t), drainNum, ph.Label(phaseIdx), toolLoop, tokens, cost, logPath)
+			// claude reports dollars only on its terminal result event, which a
+			// killed stream never reaches - so say the cost was not captured
+			// rather than print $0 as if it were measured (the CLA-343 ceiling
+			// branch's rule). opencode sums each step's cost up to the kill.
+			spent := fmt.Sprintf("tokens=%d cost=$%.4f", tokens, cost)
+			if !res.CostReported {
+				spent = fmt.Sprintf("tokens=%d; cost not captured - killed mid-stream", tokens)
+			}
+			log.Printf("%siteration %d: the %s phase was killed by the driver: %s — classified dead, no delivery (%s) (log: %s)",
+				labelOf(t), drainNum, ph.Label(phaseIdx), toolLoop, spent, logPath)
 			return tokens, cost, false, end, nil
 		}
 
@@ -6040,15 +6055,22 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 			labelOf(t), claimLabel(res.Claim), deadReason(res))
 		return
 	}
-	sig := deadReason(res)
 	ref := claimLabel(res.Claim)
+	// How the sessions died. A CLA-739 tool-loop kill is dead whatever it
+	// pushed, so "no branch recorded" may be false for it and the finish reason
+	// says nothing: the cause names what happened instead. The cause is the
+	// LAST attempt's, which is the one the operator is being asked about.
+	death := fmt.Sprintf("died producing nothing (final step reason %q, no branch recorded)", deadReason(res))
+	if res.ToolLoop != "" {
+		death = fmt.Sprintf("was killed by the driver (%s)", res.ToolLoop)
+	}
 	outcome := fmt.Sprintf(
-		"Parked after four consecutive dead phases: the %s session died producing nothing (final step reason %q, no branch recorded) on each attempt. Per the 2026-08-20 operator decision, a task that can kill four full sessions reaches the operator rather than a fifth; the retry budget is per task. Iteration logs are in %s.",
-		phaseLabel, sig, d.state.Path())
+		"Parked after four consecutive dead phases: the %s session %s on the last attempt, after dying on each of the three before it. Per the 2026-08-20 operator decision, a task that can kill four full sessions reaches the operator rather than a fifth; the retry budget is per task. Iteration logs are in %s.",
+		phaseLabel, death, d.state.Path())
 	body := fmt.Sprintf(
-		"**%s has defeated four sessions and is now parked.** The %s phase died producing nothing (final step reason %q, no branch recorded) on four consecutive attempts, so the driver stopped rather than spending a fifth session on it.\n\n"+
+		"**%s has defeated four sessions and is now parked.** The %s phase died on four consecutive attempts; the last one %s, so the driver stopped rather than spending a fifth session on it.\n\n"+
 			"The task is `parked` — nothing will pick it up until an operator decides what to do with it. The iteration logs are in %s.",
-		ref, phaseLabel, sig, d.state.Path())
+		ref, phaseLabel, death, d.state.Path())
 	options := []string{
 		"Set it back to `ready` — the blocker is gone, let the fleet try again",
 		"Leave it parked — I will work it myself",

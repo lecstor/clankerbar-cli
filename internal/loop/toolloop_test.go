@@ -173,3 +173,45 @@ func TestInvocationCarriesTheRepeatedToolFailureBound(t *testing.T) {
 }
 
 func intPtr(n int) *int { return &n }
+
+// Four tool-loop kills on one task park it, and the park names the cause rather
+// than the dead signature's "final step reason ... no branch recorded", which a
+// tool-loop kill need not match (review finding, CLA-739).
+func TestDrainPhases_FourToolLoopKillsParkWithTheCause(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(toolLoopResult(-1), openClaim())},
+		{res: held(toolLoopResult(-1), openClaim())},
+		{res: held(toolLoopResult(-1), openClaim())},
+		{res: held(toolLoopResult(-1), openClaim())},
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	openTestStateDir(t, d)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(rel.parks) != 1 || len(rel.questions) != 1 {
+		t.Fatalf("parks=%d questions=%d, want 1 and 1", len(rel.parks), len(rel.questions))
+	}
+	for name, text := range map[string]string{"outcome": rel.parks[0].outcome, "question": rel.questions[0].body} {
+		if !strings.Contains(text, loopCause) {
+			t.Errorf("the park %s does not name the cause: %q", name, text)
+		}
+		if strings.Contains(text, "no branch recorded") {
+			t.Errorf("the park %s claims no branch was recorded, which a tool-loop kill does not establish: %q", name, text)
+		}
+	}
+	if out := logs.String(); !strings.Contains(out, "was killed ("+loopCause+"), dead for the 4th consecutive time") {
+		t.Errorf("the park log line does not name the cause:\n%s", out)
+	}
+	// The fake reports no cost, as a killed claude stream does: the log must
+	// say so rather than print $0.
+	if out := logs.String(); !strings.Contains(out, "cost not captured") {
+		t.Errorf("the kill line printed a cost nobody measured:\n%s", out)
+	}
+}
