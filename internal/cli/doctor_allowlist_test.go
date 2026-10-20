@@ -249,3 +249,78 @@ func TestDoctorConfigReportsTheInheritanceShape(t *testing.T) {
 		t.Errorf("info = %q, want the allowlist shape AND the variable names", joined)
 	}
 }
+
+// The env overlay is appended AFTER the inheritEnv filter and wins (every
+// adapter's env() puts in.Env last), so a required variable the env block
+// declares reaches the session even when the allowlist omits it. FAILing that
+// shape sent the operator to fix a run that works (CLA-736 review 1.review-2.1).
+func TestDoctorSessionEnvAllowlistCountsTheEnvBlockAsPresent(t *testing.T) {
+	clearWorkdirRoot(t)
+	cfg := &config.Config{
+		Harness:      "opencode",
+		Prompt:       "work",
+		BacklogURL:   "https://clankerbar.com",
+		EnvAllowlist: []string{"HOME", "PATH"},
+		Env:          config.EnvMap{"CLANKERBAR_API_KEY": {Literal: "sk-not-a-real-key"}},
+	}
+
+	c, ok := statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist")
+	if !ok {
+		t.Fatal("no session env allowlist check")
+	}
+	if c.status != pass {
+		t.Fatalf("status = %v (%s), want pass: the env block injects the key and wins over the allowlist", c.status, c.detail)
+	}
+	if strings.Contains(c.detail, "missing") {
+		t.Errorf("detail = %q, want no missing-variable claim for a variable the env block declares", c.detail)
+	}
+
+	// Genuinely nowhere is still a FAIL: the union is what changed, not the check.
+	cfg.Env = nil
+	c, _ = statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist")
+	if c.status != fail {
+		t.Fatalf("status = %v (%s), want fail when CLANKERBAR_API_KEY is in neither the allowlist nor the env block", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "CLANKERBAR_API_KEY") || !strings.Contains(c.remedy, "CLANKERBAR_API_KEY") {
+		t.Errorf("detail/remedy = %q / %q, want both to name the genuinely missing variable", c.detail, c.remedy)
+	}
+}
+
+// SSH_AUTH_SOCK is ADVICE, never a verdict: an ssh clone_url_base works from an
+// on-disk key, so only an agent-held key needs the socket (CLA-736 review
+// 1.review-2.2).
+func TestDoctorSessionEnvAllowlistNotesSSHAuthSock(t *testing.T) {
+	clearWorkdirRoot(t)
+	cfg := &config.Config{
+		Harness:      "opencode",
+		Prompt:       "work",
+		BacklogURL:   "https://clankerbar.com",
+		EnvAllowlist: []string{"HOME", "PATH", "CLANKERBAR_API_KEY"},
+	}
+
+	c, ok := statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist")
+	if !ok {
+		t.Fatal("no session env allowlist check")
+	}
+	if c.status != pass {
+		t.Fatalf("status = %v (%s), want pass - the socket is advice, not a requirement", c.status, c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "SSH_AUTH_SOCK") {
+		t.Errorf("info = %q, want a note that an agent-held ssh key needs SSH_AUTH_SOCK", c.info)
+	}
+
+	// Once the name reaches the session - through the allowlist OR the env block
+	// - the advice is noise and must go.
+	cfg.EnvAllowlist = append(cfg.EnvAllowlist, "SSH_AUTH_SOCK")
+	c, _ = statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist")
+	if strings.Contains(strings.Join(c.info, "\n"), "SSH_AUTH_SOCK") {
+		t.Errorf("info = %q, want no note when the allowlist carries SSH_AUTH_SOCK", c.info)
+	}
+
+	cfg.EnvAllowlist = []string{"HOME", "PATH", "CLANKERBAR_API_KEY"}
+	cfg.Env = config.EnvMap{"SSH_AUTH_SOCK": {Literal: "/tmp/agent.sock"}}
+	c, _ = statusOf(checkSessionEnvAllowlist(cfg), "session env allowlist")
+	if strings.Contains(strings.Join(c.info, "\n"), "SSH_AUTH_SOCK") {
+		t.Errorf("info = %q, want no note when the env block declares SSH_AUTH_SOCK", c.info)
+	}
+}

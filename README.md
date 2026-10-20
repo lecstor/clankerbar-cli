@@ -1343,7 +1343,17 @@ stderr still streams to the supervisor's own terminal, as before.
 The daemon also reports what it is doing to the plane, so the console's Fleet
 page shows every instance — working *and* idle, where the run-based panel only
 sees a daemon that currently holds a task. Two things are reported, both riding
-cadences the loop already runs (no new timers):
+cadences the loop already runs — presence on each backlog poll, iteration
+history at each drain boundary — with one exception: a run parked on a usage
+limit re-beacons on a ticker of its own, because the pause is the one time the
+poll cadence stops:
+
+> **Release order**: a plane older than CLA-727 refuses an unknown
+> `state.kind` for the WHOLE report (400), so `limited` has to be promoted on
+> the plane — accepting `state.kind: "limited"` and `state.resetAt` — before a
+> CLI that sends it reaches the fleet. Against an older plane every beacon is
+> rejected, not just the `limited` ones, and the instance goes dark in every
+> state.
 
 - **Presence** rides each backlog poll: who the instance is (`instance_name`;
   when unset it resolves to the machine's hostname plus the config file's
@@ -1352,10 +1362,14 @@ cadences the loop already runs (no new timers):
   the host and binary version, a
   fingerprint of the config in force, and the state — `idle`,
   `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
-  holds spawns, `stopping` as the final beacon when the run ends. State changes
+  holds spawns, `limited` {resetAt} while the run is parked on a harness usage
+  limit (with the stated reset instant when the harness stated one), `stopping`
+  as the final beacon when the run ends. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
-  to learn which phase is running. The plane stores exactly what you report; it
-  infers nothing.
+  to learn which phase is running, and a limit wait re-beacons `limited` every
+  five minutes — well inside the plane's liveness window — so hours spent
+  waiting out a cap do not read on the console as a dead instance. The plane
+  stores exactly what you report; it infers nothing.
 - **Iteration history**: exactly one record per drain, posted at the boundary it
   just crossed — the task, the phases attempted, how it ended (`checkpoint`
   work left for a takeover / `released` back to the queue or settled /
@@ -1371,7 +1385,10 @@ cadences the loop already runs (no new timers):
   dollar figure, when there is one. The breakdown is what the operator's cost
   analysis reads; the dollar figure is labelled as harness-reported because on a
   subscription it is the API-rate equivalent, not what was paid, and it is
-  omitted for a harness that reports no cost at all (codex today).
+  omitted for a harness that reports no cost at all (codex today), and for a
+  session that reported no usage at all — the plane refuses a report carrying a
+  session's cost without its usage report, so the figure rides only when the
+  usage report does.
   The plane keeps a session's usage on the task, as a durable `phase_session`
   record (`list_phase_sessions` reads it back), alongside the run that session
   worked under — the run's UUID, never the credential the session holds, which

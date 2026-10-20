@@ -29,6 +29,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -104,7 +105,10 @@ type panelParallelAdapter struct {
 	// per member label: the directory it ran in and that directory's HEAD.
 	workdirs map[string]string
 	heads    map[string]string
-	errs     []string
+	// order is the reviewer role of every adapter invocation, in the order the
+	// adapters were actually entered: the launch order the panel promises.
+	order []string
+	errs  []string
 }
 
 func newPanelParallelAdapter(rel *reviewReleaser, branch, tip string, members int) *panelParallelAdapter {
@@ -202,6 +206,7 @@ func (a *panelParallelAdapter) review(in harness.Invocation) (harness.Result, er
 
 	a.mu.Lock()
 	a.reviewCalls++
+	a.order = append(a.order, label)
 	a.workdirs[label] = in.WorkDir
 	a.heads[label] = head
 	a.inFlight++
@@ -281,8 +286,10 @@ func panelGitOutput(dir string, args ...string) (string, error) {
 }
 
 // panelParallelDriver wires a panel over a real checkout. concurrency 0 means
-// the config's default (the whole panel).
-func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, members []config.ReviewPanelMember, workdir, tip string, concurrency int) *Driver {
+// the config's default (the whole panel). The fakeFleet is on the target so the
+// iteration RECORD is observable: free text in its Outcome is what the plane
+// refused in CLA-738, and the parallel path is the shipped default.
+func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, members []config.ReviewPanelMember, workdir, tip string, concurrency int) (*Driver, *fakeFleet) {
 	t.Helper()
 	cfg := fastCfg()
 	cfg.Prompt = ""
@@ -291,12 +298,37 @@ func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, m
 	cfg.ReviewPanelConcurrency = concurrency
 	cfg.WorkDir = workdir
 	cfg.MaxIterations = 1
-	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel, Fleet: ff}})
 	d.newAdapter = func(string) (harness.Adapter, error) { return h, nil }
 	openTestStateDir(t, d)
 	d.newVerifier = func(string, bool) deliveryVerifier { return &panelVerifier{tip: tip} }
 	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
-	return d
+	return d, ff
+}
+
+// memberNames is the panel's configured order, for the launch-order assertion.
+func memberNames(members []config.ReviewPanelMember) []string {
+	out := make([]string, len(members))
+	for i, m := range members {
+		out[i] = m.Name
+	}
+	return out
+}
+
+// requireOneFleetRecord is CLA-738's invariant on the PARALLEL path — the
+// shipped default, and the shape the CLA-598/CLA-717/CLA-727 incident ran. The
+// panel must post exactly one iteration record and its Outcome must be one of
+// the four words the plane knows: free text there made marshalReport refuse the
+// WHOLE report, dropping the record and the presence refresh riding it.
+func requireOneFleetRecord(t *testing.T, ff *fakeFleet) fleet.Iteration {
+	t.Helper()
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1 — the panel's report was dropped or duplicated", len(recs))
+	}
+	requireFleetOutcome(t, recs[0].Outcome, "")
+	return recs[0]
 }
 
 func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testing.T) {
@@ -304,7 +336,7 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
 	members := panelMembers()
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -322,6 +354,7 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	for k, v := range a.heads {
 		heads[k] = v
 	}
+	order := append([]string(nil), a.order...)
 	a.mu.Unlock()
 	if maxInFlight != len(members) {
 		t.Errorf("max reviews in flight = %d, want %d — the members did not run concurrently", maxInFlight, len(members))
@@ -329,6 +362,16 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	if len(workdirs) != len(members) {
 		t.Fatalf("reviews ran in %d distinct worktrees, want %d: %v", len(workdirs), len(members), workdirs)
 	}
+	// The adapters were ENTERED in the config's list order, not merely created
+	// in it (CLA-738 review 3.2): the next member is released from this one's
+	// launch boundary, not from its checkout being ready.
+	for k, m := range members {
+		if k >= len(order) || order[k] != m.Name {
+			t.Fatalf("adapter invocation order = %v, want the panel's list order %v", order, memberNames(members))
+		}
+	}
+	// And the iteration record the plane receives keeps the four-word enum.
+	requireOneFleetRecord(t, ff)
 	seen := map[string]bool{}
 	for label, dir := range workdirs {
 		if dir == repo {
@@ -379,7 +422,7 @@ func TestDrainPhases_ParallelPanelOneMemberFailingStillRunsTheFix(t *testing.T) 
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	a.failLabel = "review-2"
 	a.wantRecords = len(members) - 1
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -410,6 +453,9 @@ func TestDrainPhases_ParallelPanelOneMemberFailingStillRunsTheFix(t *testing.T) 
 	if !strings.Contains(fix, "1.review-1.1") || !strings.Contains(fix, "1.review-3.1") {
 		t.Errorf("the fix brief does not carry the healthy members' findings:\n%s", fix)
 	}
+	// CLA-738: the INCOMPLETE panel is a log fact, never free text in the
+	// iteration outcome — a prose outcome makes the plane refuse the whole report.
+	requireOneFleetRecord(t, ff)
 }
 
 func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
@@ -418,7 +464,7 @@ func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
 	members := panelMembers()
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	a.expectConcurrent = 1
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 1)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 1)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -451,6 +497,7 @@ func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
 	if fixCalls != 1 {
 		t.Errorf("fix sessions = %d, want 1", fixCalls)
 	}
+	requireOneFleetRecord(t, ff)
 }
 
 // --- CLA-697, review round 1: the fix delta --------------------------------
@@ -518,7 +565,7 @@ func TestDrainPhases_ParallelPanelStopsAMemberWhenTheAggregateReachesTheCeiling(
 	// Only the concurrent pair runs to the barrier; the third member is parked on
 	// the cap until one of them ends, which is what staggers the starts.
 	a.expectConcurrent = 2
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 2)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 2)
 	// The implement attempt spends $0.10; each review costs $0.50.
 	d.cfg.Budget = config.Budget{MaxCostUSD: 0.50}
 
@@ -543,6 +590,7 @@ func TestDrainPhases_ParallelPanelStopsAMemberWhenTheAggregateReachesTheCeiling(
 	if fixCalls != 0 {
 		t.Errorf("fix sessions = %d, want 0 — the run stopped on the ceiling instead", fixCalls)
 	}
+	requireOneFleetRecord(t, ff)
 }
 
 // TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin is
@@ -562,7 +610,7 @@ func TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin(t
 	}
 	members := panelMembers()
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -574,6 +622,7 @@ func TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin(t
 	for _, e := range errs {
 		t.Error(e)
 	}
+	requireOneFleetRecord(t, ff)
 	if reviews != 0 {
 		t.Fatalf("review sessions = %d, want 0 — every member's baseline read failed", reviews)
 	}

@@ -1180,6 +1180,55 @@ func TestSessionCost(t *testing.T) {
 	}
 }
 
+// CLA-737: a pass whose attempts never reported usage has an UNKNOWN cost, even
+// when the adapter reports money and the attempts carry a CostReported figure.
+// opencode's export path is the shape that made this matter: a session killed
+// before its first answered request (a provider.quota error was the one seen)
+// exports an all-zero run, so CostReported is true and UsageReported is false.
+// Publishing the 0 made the plane refuse the whole fleet report with
+// "session.costUsd requires session.usageReported".
+func TestSessionSpendCostNeedsAUsageReport(t *testing.T) {
+	reporting := &fakeAdapter{caps: &harness.Capabilities{ReportsCost: true}}
+
+	t.Run("no attempt reported usage, so there is no figure", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{CostReported: true})                // the export's all-zero run
+		pass.add(reporting, harness.Result{CostReported: true, CostUSD: 0.25}) // money, but still no usage report
+		if got := pass.cost(); got != nil {
+			t.Errorf("cost = %v, want nil — a zero from a session that reported no usage is silence, not a spend", *got)
+		}
+		if pass.usageReported {
+			t.Error("usageReported = true, want false — no attempt reported usage")
+		}
+	})
+
+	// A pass that DID report usage keeps today's arithmetic. The task pins this
+	// rather than changing it: the figure is the sum of what the attempts
+	// reported, and the silent attempt contributes its reported zero (or the
+	// pass is unknown when it reported no cost at all).
+	t.Run("one attempt with usage keeps the reported figure", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{CostReported: true})
+		pass.add(reporting, harness.Result{UsageReported: true, CostReported: true, CostUSD: 0.40})
+		got := pass.cost()
+		if got == nil || *got != 0.40 {
+			t.Errorf("cost = %v, want 0.40 — the pass reported usage, so its figure is a figure", got)
+		}
+		if !pass.usageReported {
+			t.Error("usageReported = false, want the pass's report ORed across attempts")
+		}
+	})
+
+	t.Run("an attempt that reported no dollars still leaves the pass unknown", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{UsageReported: true, CostReported: true, CostUSD: 0.40})
+		pass.add(reporting, harness.Result{UsageReported: true}) // tokens reported, no dollars (the claude mid-stream kill)
+		if got := pass.cost(); got != nil {
+			t.Errorf("cost = %v, want nil — one attempt's dollars were never reported, so the total is unknown, not partial", *got)
+		}
+	})
+}
+
 // A pass that RETRIED is several paid sessions: the loop counts every attempt
 // toward the iteration's total ("each attempt is a distinct session"), so the one
 // entry the record publishes for the pass must carry every attempt's money — or
@@ -1284,6 +1333,40 @@ func TestDrainPhases_APassWithAnUnreportedCostCarriesNoFigure(t *testing.T) {
 	}
 }
 
+// CLA-737 end to end: a session that died before its harness reported usage —
+// opencode's export leaves CostReported true and a zero behind for a run the
+// provider never answered — reaches the iteration record with no spend figures
+// at all, so the wire carries no costUsd and the plane accepts the report.
+func TestDrainPhases_ASessionWithNoUsageReportCarriesNoCost(t *testing.T) {
+	res := checkpointed(0, 0)
+	res.Usage = harness.TokenUsage{}
+	res.UsageReported = false
+	res.CostReported = true
+
+	h := &fakeAdapter{
+		steps: []invokeStep{{res: res}},
+		caps:  &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true},
+	}
+	d, _ := phaseDriver(t, h, []config.Phase{{Name: "implement"}})
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 || len(recs[0].Sessions) != 1 {
+		t.Fatalf("want one record with the pass's session entry, got %+v", recs)
+	}
+	s := recs[0].Sessions[0]
+	if s.UsageReported {
+		t.Error("usageReported = true, want false — no attempt reported usage")
+	}
+	if s.CostUSD != nil {
+		t.Errorf("cost = %v, want nil — the plane refuses the whole report when costUsd rides without usageReported", *s.CostUSD)
+	}
+}
+
 // An unreadable stream's figures are a floor, not a report: the iteration total
 // leaves them out, so the session entry must too, or the sessions would sum to
 // more than the iteration they belong to.
@@ -1318,5 +1401,54 @@ func TestDrainPhases_AnUntrustedSessionReportsNoSpend(t *testing.T) {
 	}
 	if recs[0].Tokens != 0 {
 		t.Errorf("iteration Tokens = %d, want 0 — the floor is not counted", recs[0].Tokens)
+	}
+}
+
+// TestEndIterationDegradesAFreeTextOutcome is CLA-738 review 1.review-1.3: the
+// four-word invariant is a GUARD, not a convention. A future caller that appends
+// prose to the outcome must cost ONE degraded iteration (reported as released)
+// instead of the whole fleet report — which is what marshalReport's refusal does,
+// and the reporter logs only the first failure of a streak, so one bad word would
+// silence the plane for the rest of the session.
+func TestEndIterationDegradesAFreeTextOutcome(t *testing.T) {
+	logs := captureLogs(t)
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+
+	prose := "checkpoint — review panel INCOMPLETE: review-2: died producing nothing"
+	d.endIteration(0, d.targets[0], fleet.Iteration{TaskRef: "CLA-738", Outcome: prose})
+
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1 — the record must still reach the reporter", len(recs))
+	}
+	if recs[0].Outcome != fleet.OutcomeReleased {
+		t.Errorf("outcome = %q, want %q — a word outside the four must be degraded, not posted", recs[0].Outcome, fleet.OutcomeReleased)
+	}
+	out := logs.String()
+	for _, want := range []string{"BUG", prose, "not one of the four", fleet.OutcomeReleased} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the guard's log line does not carry %q:\n%s", want, out)
+		}
+	}
+}
+
+// And a known outcome passes through untouched, with no BUG line: the guard
+// degrades only what the plane would refuse.
+func TestEndIterationPassesAKnownOutcomeThrough(t *testing.T) {
+	logs := captureLogs(t)
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+
+	d.endIteration(0, d.targets[0], fleet.Iteration{TaskRef: "CLA-738", Outcome: fleet.OutcomeCheckpoint})
+
+	recs := ff.records()
+	if len(recs) != 1 || recs[0].Outcome != fleet.OutcomeCheckpoint {
+		t.Fatalf("records = %+v, want one checkpoint", recs)
+	}
+	if out := logs.String(); strings.Contains(out, "BUG") {
+		t.Errorf("a known outcome tripped the guard:\n%s", out)
 	}
 }

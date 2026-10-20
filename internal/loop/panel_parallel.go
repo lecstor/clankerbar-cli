@@ -188,15 +188,17 @@ type panelRunOutcome struct {
 // runPanelMembers runs n work functions with at most `concurrency` in flight.
 // A slot is acquired BEFORE the member's goroutine is spawned, and the loop
 // waits for that member to call started() before spawning the next, so no
-// member is spawned until its predecessor's checkout exists and it is about to
-// drain: the panel's sessions begin in the config's list order. A finished
-// member frees its slot and the next member in list order starts immediately —
-// a backfill queue, not a wave barrier, so a short reviewer never waits for a
-// long one in its batch.
+// member is spawned until its predecessor's work has begun: the panel's
+// sessions begin in the config's list order. A finished member frees its slot
+// and the next member in list order starts immediately — a backfill queue, not a
+// wave barrier, so a short reviewer never waits for a long one in its batch.
 //
-// run MUST call started exactly once, as soon as its work has begun. The member
-// shape calls it after creating its worktree and before draining its session;
-// the test calls it at the top of its callback.
+// run MUST call started exactly once, as soon as its work has begun. A panel
+// member's "work" is its SESSION LAUNCH, so it passes started down to the
+// launch boundary (phaseRunOpts.onSessionLaunch) rather than calling it when its
+// checkout exists (CLA-738 review 3.2); a member that never launches — setup
+// failed, budget refused — calls it itself before returning. The test calls it
+// at the top of its callback.
 func runPanelMembers(n, concurrency int, run func(k int, started func())) {
 	if concurrency < 1 {
 		concurrency = 1
@@ -290,14 +292,13 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		if werr != nil {
 			m.setupErr = "could not create its own detached worktree: " + werr.Error()
 			out.members[k] = m
+			// This member never launches a session, so nothing will fire the
+			// launch boundary: release the next member here or the panel waits
+			// forever for a session that will not run.
 			started()
 			return
 		}
 		defer d.removePanelWorktree(repoRoot, dir)
-
-		// The member is ready to drain its session. Release the next member's
-		// start only now, so the panel's start order is the config's list order.
-		started()
 
 		tag := "-p" + label
 		m.tokens, m.cost, m.stop, m.end, m.perr = d.drainPhase(
@@ -306,6 +307,13 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 				worktree:      dir,
 				panelParallel: true,
 				panelSpend:    &panelSpendHandle{ledger: ledger, self: ledger.join()},
+				// The next member starts only once THIS member's session launch
+				// has actually begun (CLA-738 review 3.2). Signalling when the
+				// worktree was ready woke the scheduler first: a later member
+				// whose setup happened to finish sooner could reach its adapter
+				// ahead of this one, so the config list order was not the
+				// adapter/start order the panel promises.
+				onSessionLaunch: started,
 			})
 		out.members[k] = m
 	})

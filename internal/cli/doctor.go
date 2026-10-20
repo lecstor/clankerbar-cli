@@ -807,20 +807,34 @@ func checkSessionEnvAllowlist(cfg *config.Config) []check {
 		passes := append([]string(nil), allow...)
 		sort.Strings(passes)
 		c.detail = "sessions inherit only: " + strings.Join(passes, ", ")
-		if extra := declaredNames(h, slug); len(extra) > 0 {
-			c.detail += "; the env block adds: " + strings.Join(extra, ", ")
+		declared := declaredNames(h, slug)
+		if len(declared) > 0 {
+			c.detail += "; the env block adds: " + strings.Join(declared, ", ")
 		}
+		// The env overlay is appended AFTER the inheritEnv filter and WINS (every
+		// adapter's env() puts in.Env last), so a required variable the env block
+		// declares reaches the session even when the allowlist omits it. Computing
+		// the miss from the allowlist alone FAILed that working shape, and a false
+		// FAIL blocks a run that works (CLA-736 review 1.review-2.1).
+		present := append(append([]string(nil), allow...), declared...)
 		var missing []string
 		for _, want := range requiredSessionEnv(cfg) {
-			if !contains(allow, want) {
+			if !contains(present, want) {
 				missing = append(missing, want)
 			}
 		}
 		if len(missing) > 0 {
 			c.status = fail
 			c.detail += " - missing " + strings.Join(missing, ", ") + " (a session without it fails later, elsewhere)"
-			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), or drop env_allowlist to inherit everything"
+			c.remedy = "add " + strings.Join(missing, ", ") + " to the env_allowlist in force for this scope (the most specific level that declares one replaces the rest), or declare it in the session env block, or drop env_allowlist to inherit everything"
 			return c
+		}
+		// ADVICE, not a verdict (CLA-736 review 1.review-2.2): an ssh clone_url_base
+		// works from an on-disk key without the agent, so this is only a footgun
+		// when the key is agent-held - not something to FAIL, or even WARN, a
+		// working run over.
+		if !contains(present, "SSH_AUTH_SOCK") {
+			c.info = append(c.info, "SSH_AUTH_SOCK is not in the session env: a session pushing over an ssh origin needs it only when the key is agent-held (an on-disk key does not)")
 		}
 		c.status = pass
 		return c

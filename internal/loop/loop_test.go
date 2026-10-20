@@ -126,6 +126,19 @@ type fakeAdapter struct {
 	// failing it.
 	probeErrs  []error
 	probeCalls int
+	// probeStarts records each probe's start instant, so a test can measure the
+	// gap between two paid sessions — the cadence CLA-728 must not tighten
+	// (1.review-1.1). Appended on the loop goroutine, like probeCalls.
+	probeStarts []time.Time
+	// probeDelay is how long each probe BLOCKS before answering, which is what a
+	// real probe does: it spawns a harness session. Zero keeps every pre-existing
+	// test's timing exactly as it was.
+	probeDelay time.Duration
+	// onProbe, when set, fires at the start of each probe with the call number
+	// (0-based), before any probeDelay. The seam for driving something onto the
+	// daemon DURING a probe — a blocking probe that waits for a beacon is exactly
+	// what 1.review-4.1 needs.
+	onProbe func(call int)
 	// probeTokens/probeCost are what EACH probe reports spending. A probe is a real
 	// paid session (CLA-287), so the fake has to be able to charge for one; zero
 	// keeps every pre-existing test's arithmetic exactly as it was.
@@ -232,6 +245,13 @@ func (f *fakeAdapter) Diagnostic(r harness.Result) string { return r.Stderr }
 func (f *fakeAdapter) Probe(ctx context.Context, in harness.Invocation) (harness.ProbeResult, error) {
 	i := f.probeCalls
 	f.probeCalls++
+	f.probeStarts = append(f.probeStarts, time.Now())
+	if f.onProbe != nil {
+		f.onProbe(i)
+	}
+	if f.probeDelay > 0 {
+		time.Sleep(f.probeDelay)
+	}
 	// Charged on every path, including the error one. That is the loop's contract
 	// with an adapter — whatever a ProbeResult carries is counted — not a claim
 	// about what the real adapters manage to parse from a failed run (CLA-299).
