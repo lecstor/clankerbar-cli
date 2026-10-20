@@ -221,7 +221,7 @@ func (d *Driver) applyRunConfig(i int, t *Target, st *plane.RunConfigState) {
 	} else if d.rcVersions[i] == 0 {
 		was = " (was: local)"
 	}
-	log.Printf("%srun-config v%d applied%s - harness/model/tiers/budget/escalation now follow the plane", d.prefix(i), st.Version, was)
+	log.Printf("%srun-config v%d applied%s - pipeline/harness/model/tiers/budget/escalation now follow the plane", d.prefix(i), st.Version, was)
 	t.Cfg = eff
 	d.rcVersions[i] = st.Version
 }

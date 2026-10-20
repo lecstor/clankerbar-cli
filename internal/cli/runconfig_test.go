@@ -264,3 +264,39 @@ func TestProposeConfig_MinimalConfigImportsExactlyItsMovableHalf(t *testing.T) {
 		t.Errorf("document = %+v, want exactly the resolved harness dial", gotDoc)
 	}
 }
+
+// CLA-598: a stored STEP whose harness this machine cannot run is a FAILED
+// check naming the project, the step and the harness — not the WARN every
+// other stored-document refusal gets. The loop keeps its previous config
+// either way, but a ratified pipeline that silently cannot run here is exactly
+// the kind of degradation doctor exists to surface before an unattended drain.
+func TestCheckRunConfigs_StoredStepOnAnUnrunnableHarnessFails(t *testing.T) {
+	cfg := &config.Config{
+		Harness:    "opencode",
+		Prompt:     "work the backlog",
+		BacklogURL: "https://clankerbar.com",
+		Projects:   []config.Project{{Slug: "demo"}},
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"phases": []map[string]any{
+			{"name": "implement"},
+			{"name": "review", "harness": "codex"},
+			{"name": "fix"},
+		},
+	})
+	checks := checkRunConfigs(context.Background(), cfg, rcPlaneEnv(func() (*plane.RunConfigState, error) {
+		return &plane.RunConfigState{Version: 4, Config: raw}, nil
+	}))
+	c := findRunConfigCheck(t, checks)
+	if c.status != fail {
+		t.Fatalf("status=%v detail=%q, want FAIL for a stored step this machine cannot run", c.status, c.detail)
+	}
+	for _, want := range []string{"demo", `phases[1] ("review")`, "codex"} {
+		if !strings.Contains(c.detail, want) {
+			t.Errorf("detail=%q, want it to name %q", c.detail, want)
+		}
+	}
+	if !strings.Contains(c.remedy, "harnesses.codex") {
+		t.Errorf("remedy=%q, want it to name the block to declare", c.remedy)
+	}
+}

@@ -9,10 +9,15 @@
 // What is consumed is exactly what CLA-410's bar names plus the two numeric
 // backstops stored in this config's native units: harness, model, tier buckets
 // (`models`, and the per-harness blocks' model/models half), budget,
-// escalation rules, max_turns, max_session_wall_clock. Deliberately NOT
-// consumed yet: prompt and phases (order and briefs stay CLI-side until the
-// state-machine reshape moves sequencing onto the plane), transitions (the
-// workflow document is data for that same reshape), backlog_url and
+// escalation rules, max_turns, max_session_wall_clock — and, since CLA-598,
+// the PIPELINE: `prompt`, `phases`, `review_panel` and
+// `review_panel_concurrency` (operator decision 30d69869 decoupled that from
+// the CLA-454 state-machine reshape; the CLI still sequences sessions itself,
+// it now reads the sequence from the plane). Those four are ONE section:
+// carrying any of them replaces all four, so a stored `phases` clears a local
+// `prompt` and panel, and a stored `prompt` clears a local sequence (decision
+// 6bf1fa15's per-section rule). Deliberately NOT consumed yet: transitions
+// (the workflow document is data for the same reshape), backlog_url and
 // allow_local_mcp_servers (part of the local bootstrap core), notes
 // (console-facing reasoning).
 package config
@@ -61,6 +66,31 @@ type RunConfigEscalation struct {
 	CategoryRules map[string]string `json:"category_rules"`
 }
 
+// RunConfigPhase is the plane's stored phase shape (RunConfigPhase in the
+// plane's shared schema), mapped onto Phase by RunConfigDoc.phases. The plane
+// names `max_wall_clock` in integer seconds, which Duration accepts; `model`
+// mirrors the now operator-facing Phase.Model (CLA-722).
+type RunConfigPhase struct {
+	Name         string   `json:"name"`
+	Prompt       string   `json:"prompt"`
+	MaxTurns     int      `json:"max_turns"`
+	MaxWallClock Duration `json:"max_wall_clock"`
+	Tier         string   `json:"tier"`
+	Model        string   `json:"model"`
+	Harness      string   `json:"harness"`
+}
+
+// RunConfigPanelMember is one stored review-panel member, mapped onto
+// ReviewPanelMember. A member may set both `model` and `tier` (the alias wins
+// on expansion), exactly as in the local file — the one-model rule applies to a
+// configured PHASE, not to a member.
+type RunConfigPanelMember struct {
+	Name    string `json:"name"`
+	Harness string `json:"harness"`
+	Model   string `json:"model"`
+	Tier    string `json:"tier"`
+}
+
 // RunConfigDoc mirrors the plane's stored execution-config document — only the
 // keys this build consumes. JSON decoding ignores everything else, so a newer
 // plane's added keys degrade to "unconsumed" rather than unmarshal errors;
@@ -68,16 +98,25 @@ type RunConfigEscalation struct {
 // A newer `$schema_version` is NOT covered by that rule — it means the known
 // keys themselves may have changed meaning — so the consume points refuse it
 // outright; see RunConfigSchemaVersion and SchemaNewer.
+//
+// Prompt, Phases, ReviewPanel and ReviewPanelConcurrency are the PIPELINE
+// section. Its presence is judged by KEY, not by value: a nil Phases/ReviewPanel
+// is an absent key, while an empty non-nil slice is a key that clears the local
+// value; a non-empty Prompt or a non-zero concurrency marks the section too.
 type RunConfigDoc struct {
-	SchemaVersion       int                              `json:"$schema_version"`
-	Harness             string                           `json:"harness"`
-	Model               string                           `json:"model"`
-	Models              map[string]string                `json:"models"`
-	Harnesses           map[string]RunConfigHarnessBlock `json:"harnesses"`
-	MaxTurns            int                              `json:"max_turns"`
-	MaxSessionWallClock Duration                         `json:"max_session_wall_clock"`
-	Budget              *RunConfigBudget                 `json:"budget"`
-	Escalation          *RunConfigEscalation             `json:"escalation"`
+	SchemaVersion          int                              `json:"$schema_version"`
+	Harness                string                           `json:"harness"`
+	Model                  string                           `json:"model"`
+	Models                 map[string]string                `json:"models"`
+	Harnesses              map[string]RunConfigHarnessBlock `json:"harnesses"`
+	Prompt                 string                           `json:"prompt"`
+	Phases                 []RunConfigPhase                 `json:"phases"`
+	ReviewPanel            []RunConfigPanelMember           `json:"review_panel"`
+	ReviewPanelConcurrency int                              `json:"review_panel_concurrency"`
+	MaxTurns               int                              `json:"max_turns"`
+	MaxSessionWallClock    Duration                         `json:"max_session_wall_clock"`
+	Budget                 *RunConfigBudget                 `json:"budget"`
+	Escalation             *RunConfigEscalation             `json:"escalation"`
 }
 
 // SchemaNewer reports whether the document carries a `$schema_version` newer
@@ -92,6 +131,19 @@ func (d *RunConfigDoc) SchemaNewer() bool {
 	return d.SchemaVersion > RunConfigSchemaVersion
 }
 
+// pipelineSet reports whether the stored document carries ANY key of the
+// pipeline section (prompt, phases, review_panel, review_panel_concurrency),
+// which is what makes the overlay replace all four: the section is one unit,
+// exactly as the plane stores it (decision 6bf1fa15). Presence is judged the
+// way JSON can express it — a nil slice is an absent key, an empty one is a key
+// that clears — so `"phases": []` still counts.
+func (d *RunConfigDoc) pipelineSet() bool {
+	if d == nil {
+		return false
+	}
+	return d.Prompt != "" || d.Phases != nil || d.ReviewPanel != nil || d.ReviewPanelConcurrency != 0
+}
+
 // Empty reports whether the document consumes to nothing: every field a stored
 // document may set is absent. The plane's default document is exactly this —
 // `{}` with a schema version — and it means "the local file rules".
@@ -100,6 +152,7 @@ func (d *RunConfigDoc) Empty() bool {
 		return true
 	}
 	return d.Harness == "" && d.Model == "" && d.Models == nil && d.Harnesses == nil &&
+		!d.pipelineSet() &&
 		d.MaxTurns == 0 && d.MaxSessionWallClock == 0 &&
 		d.Budget == nil && d.Escalation == nil
 }
@@ -135,6 +188,12 @@ func (c *Config) Clone() *Config {
 	// slice gets its own backing array even though the overlay itself never
 	// touches projects.
 	cp.Projects = append([]Project(nil), c.Projects...)
+	// The pipeline is replaced wholesale by an overlay, so both slices get their
+	// own backing arrays: appending to (or writing into) the clone's phases or
+	// panel must never reach the base config the driver shares across targets,
+	// and an overlay on a clone must never alias the base (CLA-598).
+	cp.Phases = append([]Phase(nil), c.Phases...)
+	cp.ReviewPanel = append([]ReviewPanelMember(nil), c.ReviewPanel...)
 	return &cp
 }
 
@@ -186,6 +245,49 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	}
 	if err := c.CheckHarnessSwap(doc); err != nil {
 		return err
+	}
+	// The PIPELINE is one section (decision 6bf1fa15): a document carrying any
+	// of prompt/phases/review_panel/review_panel_concurrency replaces all four,
+	// and a key it omits is cleared to its zero value rather than kept from the
+	// local file. That is what keeps prompt and phases mutually exclusive ACROSS
+	// the overlay boundary — a stored phases clears a local prompt, and the
+	// reverse — and what stops a stored phases running with a local panel it
+	// never named. A document carrying none of the four leaves the local
+	// pipeline untouched, as before (handled by pipelineSet, not by this branch).
+	if doc.pipelineSet() {
+		c.Prompt = doc.Prompt
+		if doc.Phases == nil {
+			c.Phases = nil
+		} else {
+			phases := make([]Phase, len(doc.Phases))
+			for i, p := range doc.Phases {
+				phases[i] = Phase{
+					Name:         p.Name,
+					Prompt:       p.Prompt,
+					MaxTurns:     p.MaxTurns,
+					MaxWallClock: p.MaxWallClock,
+					Tier:         p.Tier,
+					Model:        p.Model,
+					Harness:      p.Harness,
+				}
+			}
+			c.Phases = phases
+		}
+		if doc.ReviewPanel == nil {
+			c.ReviewPanel = nil
+		} else {
+			panel := make([]ReviewPanelMember, len(doc.ReviewPanel))
+			for i, m := range doc.ReviewPanel {
+				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: m.Model, Tier: m.Tier}
+			}
+			c.ReviewPanel = panel
+		}
+		c.ReviewPanelConcurrency = doc.ReviewPanelConcurrency
+		// reviewPanelSet records whether the panel KEY is in force, which is now
+		// the document's answer rather than the file's: a section replace that
+		// omits the key means "no panel", while an explicit empty array is still
+		// the half-edited shape Validate refuses.
+		c.reviewPanelSet = doc.ReviewPanel != nil
 	}
 	if h := strings.TrimSpace(doc.Harness); h != "" {
 		c.Harness = h
@@ -366,6 +468,69 @@ func (c *Config) RunConfigDocument() map[string]any {
 		if len(blocks) > 0 {
 			doc["harnesses"] = blocks
 		}
+	}
+	// The pipeline section (CLA-598), in the plane's own vocabulary. `prompt` is
+	// exported only when it is the OPERATOR's: defaults() fills in the built-in
+	// prompt, and exporting that would have propose-config replace the plane's
+	// pipeline with prose the operator never wrote.
+	pipeline := map[string]any{}
+	if c.Prompt != "" && c.Prompt != defaultPrompt {
+		pipeline["prompt"] = c.Prompt
+	}
+	if len(c.Phases) > 0 {
+		phases := make([]map[string]any, len(c.Phases))
+		for i, ph := range c.Phases {
+			entry := map[string]any{}
+			if ph.Name != "" {
+				entry["name"] = ph.Name
+			}
+			if ph.Prompt != "" {
+				entry["prompt"] = ph.Prompt
+			}
+			if ph.MaxTurns > 0 {
+				entry["max_turns"] = ph.MaxTurns
+			}
+			if ph.MaxWallClock > 0 {
+				entry["max_wall_clock"] = int(ph.MaxWallClock.Duration().Seconds())
+			}
+			if ph.Tier != "" {
+				entry["tier"] = ph.Tier
+			}
+			if ph.Model != "" {
+				entry["model"] = ph.Model
+			}
+			if ph.Harness != "" {
+				entry["harness"] = ph.Harness
+			}
+			phases[i] = entry
+		}
+		pipeline["phases"] = phases
+	}
+	if len(c.ReviewPanel) > 0 {
+		panel := make([]map[string]any, len(c.ReviewPanel))
+		for i, m := range c.ReviewPanel {
+			entry := map[string]any{}
+			if m.Name != "" {
+				entry["name"] = m.Name
+			}
+			if m.Harness != "" {
+				entry["harness"] = m.Harness
+			}
+			if m.Model != "" {
+				entry["model"] = m.Model
+			}
+			if m.Tier != "" {
+				entry["tier"] = m.Tier
+			}
+			panel[i] = entry
+		}
+		pipeline["review_panel"] = panel
+	}
+	if c.ReviewPanelConcurrency > 0 {
+		pipeline["review_panel_concurrency"] = c.ReviewPanelConcurrency
+	}
+	for k, v := range pipeline {
+		doc[k] = v
 	}
 	if c.MaxTurns > 0 {
 		doc["max_turns"] = c.MaxTurns

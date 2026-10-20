@@ -483,16 +483,25 @@ land. Before the split, a death there destroyed the findings and the half-applie
 fixes together; now the findings are on the task before the expensive session
 ends, and a death costs the fix session, not the review.
 
-### Per-phase models: a tier map you own
+### Per-phase models: a tier map you own, or a model you name
 
-`model` pins one model alias for the whole run. `models` and a phase's `tier` let
-different phases run on different models:
+`model` pins one model alias for the whole run. A phase can name its model one
+of two ways, and the stored run-config document carries both:
+
+- `tier` names a bucket in `models`, so one policy word can resolve to a
+  different alias on each harness;
+- `model` names an alias directly, for a step whose model you do not want to
+  express through a bucket.
+
+A phase sets **one or the other, never both**, and `Validate` refuses both so it
+is never ambiguous which one wins (a review-panel member may set both, and the
+alias wins there). Resolution is `model`, then `tier`, then the harness default.
 
 ```json
 "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
 "phases": [
   { "name": "implement", "tier": "standard" },
-  { "name": "review",    "tier": "strong" },
+  { "name": "review",    "model": "opencode-go/gpt-6-luna" },
   { "name": "fix",       "tier": "cheap" }
 ]
 ```
@@ -505,17 +514,20 @@ task lapses into a takeover that pays `implement` again, plus the wait. Keep the
 three-phase shape, but run `fix` on a different provider — see
 [Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
 
-**The buckets are yours, and the indirection is the point.** clankerbar drives
-three harnesses and cannot know which models you have, nor which of them is
-cheaper — that needs a price table, which goes stale silently and in the direction
-that costs money. So it never learns what models exist; it learns only that you
-bucketed them, and a phase names a **bucket**, never an alias. (`"tier": "opus"`
-does not pin opus. It looks for a bucket called `opus`.)
+**The buckets are yours, and the indirection is the point — when you want it.**
+clankerbar drives three harnesses and cannot know which models you have, nor
+which of them is cheaper — that needs a price table, which goes stale silently and
+in the direction that costs money. So it never learns what models exist; with
+`tier` it learns only that you bucketed them, and the phase names a **bucket**,
+never an alias. (`"tier": "opus"` does not pin opus. It looks for a bucket called
+`opus`.) `model` is the way to name an alias directly when you do not want that
+indirection — it is a plain alias, so a typo is a model the provider refuses
+rather than a bucket that silently resolves to the harness default.
 
-**Everything falls back, and nothing here can stop a run.** A phase with no
-`tier` runs on `model`; a `tier` naming a bucket you never defined runs on `model`
-and says so in the iteration log; `model` itself empty means the harness picks, as
-it always has. A config written before any of this existed behaves exactly as it
+**Everything falls back, and nothing here can stop a run.** A phase with neither
+`model` nor `tier` runs on the run-wide `model`; a `tier` naming a bucket you never
+defined runs on that model and says so in the iteration log; the run-wide `model`
+itself empty means the harness picks, as it always has. A config written before any of this existed behaves exactly as it
 did. A mistyped bucket costs a log line at 3am, not a stopped drain.
 
 **Which way to tier is a question of blast radius, not difficulty.** A phase that
@@ -2007,14 +2019,22 @@ two knobs are separate.
 
 ### Execution config from the plane
 
-A project's execution dials - harness, model, tier buckets, budget, review-tier
-escalation rules, and the two backstops (`max_turns`, `max_session_wall_clock`,
-as integer seconds) - can live **on the plane** instead of in this file. The
-daemon reads each project's stored document (per project, so two queues can run
-two postures) and overlays it over this file; until a project has one, this
-file rules byte for byte. `doctor` reports which is in force per project, and
-warns when a stored dial cannot fire on your machine (a turn cap under opencode,
-say) - shape-validates on the plane, machine-fit is doctor's.
+A project's execution dials - the **pipeline** (`prompt`, `phases`,
+`review_panel`, `review_panel_concurrency`), harness, model, tier buckets,
+budget, review-tier escalation rules, and the two backstops (`max_turns`,
+`max_session_wall_clock`, as integer seconds) - can live **on the plane**
+instead of in this file. The daemon reads each project's stored document (per
+project, so two queues can run two postures) and overlays it over this file;
+until a project has one, this file rules byte for byte. `doctor` reports which
+is in force per project, warns when a stored dial cannot fire on your machine (a
+turn cap under opencode, say), and **fails** when a stored step names a harness
+this machine cannot spawn (no `harnesses.<h>` block) - shape-validates on the
+plane, machine-fit is doctor's.
+
+The pipeline is **one section**: a stored document carrying any of the four
+pipeline keys replaces all four, so a stored `phases` clears a local `prompt`
+and `review_panel` rather than running beside them. A document that carries
+none of them leaves the local pipeline alone.
 
 Edits apply at the **next iteration boundary**, never mid-session: the daemon
 watches the version on the backlog-summary poll it already makes, and on a bump
@@ -2029,8 +2049,10 @@ clankerbar propose-config            # --slug <project> when projects[] names se
 ```
 
 That records a PENDING proposal; nothing changes until you ratify it in the
-console (Settings -> Run configuration). Phases, prompts, wiring, env and paths
-stay local: the plane custodies policy, never machine fit or credentials.
+console (Settings -> Run configuration). The pipeline travels with it — `prompt`,
+`phases`, `review_panel`, `review_panel_concurrency`, and a phase's `model` —
+along with the model/tier/budget/escalation dials. Wiring, env and paths stay
+local: the plane custodies policy, never machine fit or credentials.
 
 ### Multi-project: one instance, many queues
 

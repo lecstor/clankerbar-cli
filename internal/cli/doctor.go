@@ -3736,6 +3736,25 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 			continue
 		}
 		if err := eff.Validate(); err != nil {
+			// A stored STEP this machine cannot spawn is the one refusal that
+			// earns FAIL: the document is ratified policy that silently will not
+			// run here, and the operator has to know before an unattended drain
+			// quietly falls back to local rules instead (CLA-598). Every other
+			// refusal stays WARN — plane trouble must not make `doctor && run`
+			// unusable (applyRunConfig's own posture).
+			var she *config.StepHarnessError
+			if errors.As(err, &she) {
+				where := ""
+				if name != "" {
+					where = fmt.Sprintf("project %q: ", name)
+				}
+				c.status = fail
+				c.detail = fmt.Sprintf("%sstored v%d step %s runs on harness %q, which this machine cannot run (%s) - local rules (%s) stay in force",
+					where, st.Version, she.Step, she.Harness, she.Problem, src)
+				c.remedy = fmt.Sprintf("declare `harnesses.%s` locally (or change the stored step's harness) and ratify again; until then the loop ignores the document", she.Harness)
+				checks = append(checks, c)
+				continue
+			}
 			c.status = warn
 			c.detail = fmt.Sprintf("stored v%d REFUSED locally (%v) - local rules (%s) stay in force", st.Version, err, src)
 			c.remedy = "fix the stored document and ratify again; until then the loop ignores it"

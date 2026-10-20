@@ -393,6 +393,41 @@ func TestRun_AnOverlaidConfigValidateRefusesStaysPut(t *testing.T) {
 	}
 }
 
+// CLA-598: a stored PIPELINE whose step this machine cannot spawn - a phase on
+// a harness with no local block - is refused by Validate, so the loop keeps the
+// previous config and says which step and harness in the log. This is the case
+// that matters when the plane starts carrying the sequence: the local file may
+// never have run codex at all, so there is nothing to inherit.
+func TestRun_AStoredStepOnAnUnconfiguredHarnessKeepsThePreviousConfig(t *testing.T) {
+	var events []string
+	h := &recordingAdapter{fakeAdapter: &fakeAdapter{}, events: &events}
+	rc := &fakeRCfg{docs: map[int]string{1: `{"phases":[
+		{"name":"implement"},
+		{"name":"review","harness":"codex"},
+		{"name":"fix"}
+	]}`}, events: &events}
+	cfg := fastCfg()
+	cfg.Model = "local-model"
+	buf := captureLogs(t)
+
+	rcRunDriver(t, cfg, []backlog.Summary{
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+		{Ready: 1, Claimable: 1, RunConfigVersion: 1},
+	}, rc, h)
+
+	logs := buf.String()
+	for _, want := range []string{"REFUSED locally", "phases[1]", "review", "codex"} {
+		if !strings.Contains(logs, want) {
+			t.Errorf("the refusal log does not name %q; log had: %s", want, logs)
+		}
+	}
+	for i, inv := range h.invocations {
+		if inv.Model != "local-model" {
+			t.Errorf("drain %d ran on %q despite a refused stored pipeline", i+1, inv.Model)
+		}
+	}
+}
+
 // A stored document with a NEWER $schema_version is refused like any other
 // unusable document: the familiar-looking keys may have changed meaning, so
 // the previous config stays, the refusal is loud, and the version is marked
