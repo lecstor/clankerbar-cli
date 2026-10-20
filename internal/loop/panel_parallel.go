@@ -396,6 +396,8 @@ func panelMemberFailureReason(m panelMemberOutcome) string {
 	switch {
 	case m.setupErr != "":
 		return m.setupErr
+	case m.end.toolLoop != "":
+		return m.end.toolLoop
 	case m.end.dead:
 		return "died producing nothing"
 	case m.end.sequenceEnd != nil && m.end.sequenceEnd.limitWait != nil:

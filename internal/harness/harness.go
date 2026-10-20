@@ -336,6 +336,16 @@ type Invocation struct {
 	// it; opencode is that adapter today.
 	MaxSessionWallClock time.Duration
 
+	// MaxRepeatedToolFailures ends this session when the same tool returns the
+	// same error on this many CONSECUTIVE tool calls (CLA-739): the adapter kills
+	// the process mid-stream and records the cause on Result.ToolLoop, and the
+	// driver classifies the session as dead. The driver resolves it from
+	// Config.MaxRepeatedToolFailures. 0 = no check, which is also every probe.
+	//
+	// Enforced by the adapters that observe tool results as they stream: claude
+	// and opencode. codex does not, and the field is inert there.
+	MaxRepeatedToolFailures int
+
 	// ResumeClaim is the claim a PREVIOUS phase left held, seeded into this
 	// session's Result before its stream is parsed.
 	//
@@ -588,6 +598,13 @@ type Result struct {
 	// not release the claim, do not classify the exit. See CLA-262.
 	Untrusted string
 
+	// ToolLoop is the cause, when the ADAPTER killed this session for making the
+	// same failing tool call MaxRepeatedToolFailures times in a row (CLA-739):
+	// "repeated failing tool call: <tool> x<n>: <error, cut short>". Empty for
+	// every other end. It is a verdict about the session, not a figure parsed out
+	// of its stream, so it is set after the stream is parsed and survives it.
+	ToolLoop string
+
 	// OutputDropped is how many bytes of this session's output were NOT retained,
 	// across both streams — the ordinary cost of the rolling window, not a fault.
 	//
@@ -673,6 +690,14 @@ type Result struct {
 	// left to stop, and classifying a session that merely REPORTED a high total
 	// as killed would lie about what happened.
 	gotResult bool
+
+	// toolLoop is claude's repeated-failure guard (CLA-739), armed by
+	// newSessionResult from the Invocation; nil when the check is off. toolNames
+	// maps a pending tool_use id to its tool name, because claude reports a
+	// call's RESULT on a later event that carries only the id. Parser state, not
+	// output, like pending above. opencode keeps its own guard on its parser.
+	toolLoop  *toolLoopGuard
+	toolNames map[string]string
 
 	// scans memoizes the harness-authored text a classifier reads. See scan.
 	scans *scanCache
