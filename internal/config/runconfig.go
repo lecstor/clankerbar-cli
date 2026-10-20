@@ -433,12 +433,13 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 }
 
 // RunConfigDocument renders the config's MOVABLE half as the plane-side
-// proposal document `propose-config` imports: the consumed families plus the
-// two backstops, in the plane's own snake_case vocabulary with wall clock as
-// integer seconds. Nothing machine-local (workdir, wiring, env, state dirs)
-// is included — importing those would ask the plane to custody what it must
-// not, and the origin rule depends on the trusted statement staying where the
-// operator wrote it until ratified.
+// proposal document `propose-config` imports: the pipeline (prompt, phases,
+// review_panel, review_panel_concurrency, and each phase's model), the consumed
+// families and the two backstops, in the plane's own snake_case vocabulary with
+// wall clock as integer seconds. Nothing machine-local (workdir, wiring, env,
+// state dirs) is included — importing those would ask the plane to custody what
+// it must not, and the origin rule depends on the trusted statement staying
+// where the operator wrote it until ratified.
 func (c *Config) RunConfigDocument() map[string]any {
 	doc := map[string]any{}
 	if c.Harness != "" {

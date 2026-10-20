@@ -2086,11 +2086,14 @@ type Config struct {
 	// `review_panel` expands; a single reviewer never fans out.
 	ReviewPanelConcurrency int `json:"review_panel_concurrency,omitempty"`
 
-	// reviewPanelSet records that the config FILE named `review_panel`, so
-	// Validate can tell two shapes apart that the slice alone cannot: an operator
-	// who wrote `"review_panel": []` (a panel of none — refused, because it is
-	// almost certainly a half-edited config) and a config that never mentioned
-	// the key (nil, the single reviewer). Load is the only writer.
+	// reviewPanelSet records that `review_panel` was an EXPLICIT key — written
+	// by the config file at Load, or carried by a stored run-config document at
+	// ApplyRunConfig — so Validate can tell two shapes apart that the slice
+	// alone cannot: an operator who wrote `"review_panel": []` (a panel of none
+	// — refused, because it is almost certainly a half-edited config) and a
+	// config that never mentioned the key (nil, the single reviewer). An overlay
+	// REPLACES the pipeline section, so it rewrites this flag from the
+	// document's own key presence rather than inheriting the file's.
 	reviewPanelSet bool
 
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
