@@ -256,16 +256,25 @@ type Phase struct {
 	Tier string `json:"tier"`
 
 	// Model pins this phase's session to a model alias directly, skipping the
-	// tier map (which is what lets a REVIEW PANEL read as the harness/model pairs
-	// the operator wrote — see ReviewPanelMember). Empty = fall through to Tier,
-	// then the harness's default: an untouched config's resolution is unchanged.
+	// tier map. It is an operator-facing key (operator decision 3eddb7a5) on
+	// both the local file and the plane's stored document (CLA-598, mirrored by
+	// the plane in CLA-722), and it is what lets a REVIEW PANEL read as the
+	// harness/model pairs the operator wrote — see ReviewPanelMember, whose
+	// expansion sets it too. Empty = fall through to Tier, then the harness's
+	// default: an untouched config's resolution is unchanged.
 	//
 	// Unlike Tier it is an ALIAS, never a bucket name — the panel entries and the
 	// documented config examples name `opencode-go/gpt-6-luna` and friends, not a
 	// policy word. The two are deliberately not merged: keeping them apart is
 	// what makes a typo visible as a model the provider refuses, rather than a
-	// bucket that silently resolves to the harness default.
-	Model string `json:"-"`
+	// bucket that silently resolves to the harness default. A CONFIGURED phase
+	// sets one of them, not both (Validate refuses both, so which one wins is
+	// never ambiguous); a panel MEMBER may set both, and expansion lets the
+	// alias win, exactly as before.
+	//
+	// `omitempty` is load-bearing: Config.Identity() hashes the marshalled
+	// config, so an unset model must not add a key and move every identity.
+	Model string `json:"model,omitempty"`
 
 	// Harness selects which coding-agent CLI runs this phase. Empty = the
 	// run-wide Config.Harness, so an untouched config runs every phase on one
@@ -1857,8 +1866,12 @@ func NoCodeHandoffContinuation() string {
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
-// iteration log's filename.
-var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
+// iteration log's filename. It is the PLANE's own pattern verbatim
+// (/^[a-z0-9]+(-[a-z0-9]+)*$/, RUN_CONFIG built-ins aside): a proposal is
+// ratified by that validator, so a name this file accepts but the plane refuses
+// (a double hyphen, a leading or trailing one) would be a config `propose-config`
+// could never lift.
+var phaseNameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // panelMemberPositionRe matches the DERIVED member-label family (`review-N`),
 // which is owned by member position (CLA-639). An explicit name from this family
@@ -2111,11 +2124,14 @@ type Config struct {
 	// `review_panel` expands; a single reviewer never fans out.
 	ReviewPanelConcurrency int `json:"review_panel_concurrency,omitempty"`
 
-	// reviewPanelSet records that the config FILE named `review_panel`, so
-	// Validate can tell two shapes apart that the slice alone cannot: an operator
-	// who wrote `"review_panel": []` (a panel of none — refused, because it is
-	// almost certainly a half-edited config) and a config that never mentioned
-	// the key (nil, the single reviewer). Load is the only writer.
+	// reviewPanelSet records that `review_panel` was an EXPLICIT key — written
+	// by the config file at Load, or carried by a stored run-config document at
+	// ApplyRunConfig — so Validate can tell two shapes apart that the slice
+	// alone cannot: an operator who wrote `"review_panel": []` (a panel of none
+	// — refused, because it is almost certainly a half-edited config) and a
+	// config that never mentioned the key (nil, the single reviewer). An overlay
+	// REPLACES the pipeline section, so it rewrites this flag from the
+	// document's own key presence rather than inheriting the file's.
 	reviewPanelSet bool
 
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
@@ -3134,15 +3150,21 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 		ph.Harness = h
 	}
 	// Model and Tier are the same choice at two levels of indirection, and a
-	// member states one of them: an alias is the more specific statement, so it
-	// clears the tier it overrides. An empty member field leaves the review
-	// phase's own value in place (itself empty on a config that resolved
-	// neither), which is the fall-through to the harness default.
+	// member states one of them: either is the more specific statement than
+	// whatever the review phase carries, so setting one clears the other. An
+	// empty member field leaves the review phase's own value in place (itself
+	// empty on a config that resolved neither), which is the fall-through to
+	// the harness default.
 	if v := strings.TrimSpace(m.Model); v != "" {
 		ph.Model = v
 		ph.Tier = ""
 	} else if t := strings.TrimSpace(m.Tier); t != "" {
 		ph.Tier = t
+		// The inherited model would otherwise WIN: ModelForPhase resolves Model
+		// before Tier, so a member that asked for a bucket would silently run on
+		// the review phase's pinned alias. The member's own tier is the more
+		// specific statement, so it clears the inherited model too.
+		ph.Model = ""
 	}
 	return ph
 }
@@ -3220,14 +3242,15 @@ func (c *Config) EffectivePhases() []Phase {
 		}
 		out = append(out, ph)
 	}
-	// A verify phase that names neither a harness nor a tier would otherwise run
-	// on the REVIEWER'S model — the one that raised the findings — which A5
-	// (throughput, not only dollars) says is the wrong default: verification
-	// rounds are scoped and cheap, and a Claude subscription limit is shared with
-	// the operator's interactive use. So it inherits the FIX phase's harness and
-	// tier instead (the shipped shape has fix on a cheap non-Claude harness), and
-	// an explicit harness/tier on the verify phase always wins. Configurable,
-	// never silent magic: the resolved values are what the spawn line stamps.
+	// A verify phase that names neither a harness nor a tier nor a model would
+	// otherwise run on the REVIEWER'S model — the one that raised the findings —
+	// which A5 (throughput, not only dollars) says is the wrong default:
+	// verification rounds are scoped and cheap, and a Claude subscription limit is
+	// shared with the operator's interactive use. So it inherits the FIX phase's
+	// harness and its model/tier pair instead (the shipped shape has fix on a
+	// cheap non-Claude harness), and an explicit harness/model/tier on the verify
+	// phase always wins. Configurable, never silent magic: the resolved values
+	// are what the spawn line stamps.
 	//
 	// Keyed on the RESOLVED built-in brief, not the name: an operator's own
 	// prompt under the name "verify" owns its own contract (the same convention
@@ -3246,7 +3269,13 @@ func (c *Config) EffectivePhases() []Phase {
 			if out[i].Harness == "" {
 				out[i].Harness = out[lastFix].Harness
 			}
-			if out[i].Tier == "" {
+			// Model and tier are one choice, and the verify phase's own statement
+			// wins: inherit the fix phase's pair only when the verifier named
+			// neither. Inheriting the MODEL beside a tier the verifier named
+			// would make that tier inert, because ModelForPhase resolves Model
+			// first — the same trap a panel member's tier has.
+			if out[i].Model == "" && out[i].Tier == "" {
+				out[i].Model = out[lastFix].Model
 				out[i].Tier = out[lastFix].Tier
 			}
 		}
@@ -3990,6 +4019,31 @@ func ValidateCloneURLBase(base string) error {
 	return fmt.Errorf("%q must end with / (https://github.com/, file:///srv/mirrors/) or be an ssh host alias ending in : (git@github-personal:)", RedactURLCredentials(base))
 }
 
+// StepHarnessError is Validate's refusal for a configured STEP whose harness
+// this machine cannot run: a phase, or a review-panel member, that names a
+// harness nothing registered, or one other than the run's top-level harness
+// with no local `harnesses.<h>` block to give it its machine wiring (CLA-598,
+// extending the rule CLA-366 set).
+//
+// The prose stays in Error(); the step label and harness are carried apart so a
+// caller can report them without matching on the message — `doctor` turns this
+// one into a FAILED check naming the project, step and harness, because a
+// stored document whose step this machine cannot spawn is a ratified policy
+// that silently will not run here, not the ordinary "keep the local rules"
+// trouble.
+type StepHarnessError struct {
+	// Step is the operator-facing label, e.g. `phases[1] ("review")` or
+	// `review_panel[2] ("review-3")`.
+	Step string
+	// Harness is the resolved harness name the step asked for.
+	Harness string
+	// Problem is the short reason: "unknown harness" or "no local harness block".
+	Problem string
+	msg     string
+}
+
+func (e *StepHarnessError) Error() string { return e.msg }
+
 // Validate normalizes path fields and checks the resolved config is runnable.
 func (c *Config) Validate() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
@@ -4151,8 +4205,12 @@ func (c *Config) Validate() error {
 	for i, ph := range c.Phases {
 		h := c.HarnessFor(ph)
 		if !harness.Known(h) {
-			return fmt.Errorf("phases[%d] (%q): unknown harness %q (want: %s)%s",
-				i, ph.Label(i), h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
+			step := fmt.Sprintf("phases[%d] (%q)", i, ph.Label(i))
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "unknown harness",
+				msg: fmt.Sprintf("%s: unknown harness %q (want: %s)%s",
+					step, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h)),
+			}
 		}
 		// A phase on some OTHER harness inherits none of the run-wide
 		// harness-shaped fields, by design (see HarnessConfig), so with no block
@@ -4169,10 +4227,14 @@ func (c *Config) Validate() error {
 			// said that way: the promise this rule makes is that no session spawns
 			// with none of its harness's fields, and `"harnesses": {"opencode": {}}`
 			// spawns exactly that while satisfying a presence-of-key check.
-			return fmt.Errorf("phases[%d] (%q) runs on harness %q, but `harnesses.%s` is missing or empty: "+
-				"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
-				"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
-				i, ph.Label(i), h, h, h)
+			step := fmt.Sprintf("phases[%d] (%q)", i, ph.Label(i))
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "no local harness block",
+				msg: fmt.Sprintf("%s runs on harness %q, but `harnesses.%s` is missing or empty: "+
+					"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
+					"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
+					step, h, h, h),
+			}
 		}
 	}
 	// The conflict-only session step (CLA-759). It names a harness the SUPERVISOR
@@ -4266,7 +4328,7 @@ func (c *Config) Validate() error {
 		}
 		labels[label] = i
 		if name := strings.TrimSpace(m.Name); name != "" && !phaseNameRe.MatchString(name) {
-			return fmt.Errorf("review_panel[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, name)
+			return fmt.Errorf("review_panel[%d]: name %q must be lowercase letters, digits and hyphens, with no leading, trailing or doubled hyphen (it becomes part of the iteration log filename)", i, name)
 		}
 		// The review-N family is owned by member POSITION: a member may write its
 		// own derived label, but not another member's, or the logs, the
@@ -4303,8 +4365,12 @@ func (c *Config) Validate() error {
 			h = c.reviewPhaseHarness()
 		}
 		if !harness.Known(h) {
-			return fmt.Errorf("review_panel[%d] (%q): unknown harness %q (want: %s)%s",
-				i, label, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
+			step := fmt.Sprintf("review_panel[%d] (%q)", i, label)
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "unknown harness",
+				msg: fmt.Sprintf("%s: unknown harness %q (want: %s)%s",
+					step, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h)),
+			}
 		}
 		// A member runs one review phase of the sequence, so it is held to the
 		// same claim-tracking rule a configured phase is (the rule above): a
@@ -4327,10 +4393,14 @@ func (c *Config) Validate() error {
 		}
 		hc, ok := c.Harnesses[h]
 		if !ok || hc.Empty() {
-			return fmt.Errorf("review_panel[%d] (%q) reviews on harness %q, but `harnesses.%s` is missing or empty: "+
-				"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
-				"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
-				i, label, h, h, h)
+			step := fmt.Sprintf("review_panel[%d] (%q)", i, label)
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "no local harness block",
+				msg: fmt.Sprintf("%s reviews on harness %q, but `harnesses.%s` is missing or empty: "+
+					"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
+					"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
+					step, h, h, h),
+			}
 		}
 	}
 	// A panel multiplies the review phase, so a config that names one but has a
@@ -4386,13 +4456,25 @@ func (c *Config) Validate() error {
 		// like — which would cost the phase its iteration log entirely, the one
 		// artifact an operator has to debug the sequence with.
 		if ph.Name != "" && !phaseNameRe.MatchString(ph.Name) {
-			return fmt.Errorf("phases[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, ph.Name)
+			return fmt.Errorf("phases[%d]: name %q must be lowercase letters, digits and hyphens, with no leading, trailing or doubled hyphen (it becomes part of the iteration log filename)", i, ph.Name)
 		}
 		if ph.MaxTurns < 0 {
 			return fmt.Errorf("phases[%d]: max_turns is negative", i)
 		}
 		if ph.MaxWallClock < 0 {
 			return fmt.Errorf("phases[%d]: max_wall_clock is negative", i)
+		}
+		// A configured phase names its model ONE way (operator decision
+		// 3eddb7a5): a direct alias or a tier bucket, never both. ModelForPhase
+		// would silently let the alias win, which would leave an operator reading
+		// a tier that is stored but inert — the same ambiguity the plane refuses
+		// (CLA-722). Checked on c.Phases, which is the configured sequence: a
+		// phase SYNTHESIZED from a review-panel member is not here, and a member
+		// may still set both (its expansion clears the tier, so the alias wins by
+		// construction — see Phase.panelMember).
+		if strings.TrimSpace(ph.Model) != "" && strings.TrimSpace(ph.Tier) != "" {
+			return fmt.Errorf("phases[%d] (%q) sets both `model` (%q) and `tier` (%q): a phase names its model one way — remove one of them (`model` is the alias it runs on, `tier` a bucket in `models`)",
+				i, ph.Label(i), ph.Model, ph.Tier)
 		}
 		// The resume placeholders are filled from the claim the PREVIOUS phase left
 		// held, so the first phase has nothing to fill them from. The driver leaves

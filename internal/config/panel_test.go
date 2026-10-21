@@ -650,23 +650,23 @@ func TestReviewPanel_HarnessesMatchTheLegacyAnswer(t *testing.T) {
 	})
 }
 
-// TestReviewPanel_PhaseModelIsNotAConfigKey (CLA-639 fix pass 3): Phase.Model
-// is internal plumbing for member expansion, never a `phases[].model` key. A
-// stray `model` on a phase is ignored on load, and marshalling a config never
-// emits one — only a MEMBER's model is user-facing JSON.
-func TestReviewPanel_PhaseModelIsNotAConfigKey(t *testing.T) {
+// TestReviewPanel_PhaseModelIsAConfigKey (CLA-598, superseding the CLA-639
+// rule): Phase.Model used to be internal plumbing for member expansion, never a
+// `phases[].model` key. Operator decision 3eddb7a5 made it user-settable, on
+// both the local file and the stored document, so a `model` on a phase now
+// loads, resolves, and marshals back out — alongside a MEMBER's model, which
+// was always user-facing JSON.
+func TestReviewPanel_PhaseModelIsAConfigKey(t *testing.T) {
 	cfg := writePanelConfig(t, `{
 		"harness": "claude",
-		"phases": [{"name": "implement", "model": "stray"}, {"name": "review"}, {"name": "fix"}],
+		"phases": [{"name": "implement", "model": "opencode-go/gpt-6-luna"}, {"name": "review"}, {"name": "fix"}],
 		"review_panel": [{"model": "opencode-go/gpt-6-luna"}]
 	}`)
-	if got := cfg.Phases[0].Model; got != "" {
-		t.Fatalf("a stray phase model loaded into Phase.Model = %q; it must stay ignored", got)
+	if got := cfg.Phases[0].Model; got != "opencode-go/gpt-6-luna" {
+		t.Fatalf("phases[0].model loaded as %q, want the configured alias", got)
 	}
-	// Give every phase an internal model, so the assertion is about the key and
-	// not about the value being empty.
-	for i := range cfg.Phases {
-		cfg.Phases[i].Model = "internal-only"
+	if got, ok := cfg.ModelForPhase(cfg.Phases[0]); got != "opencode-go/gpt-6-luna" || !ok {
+		t.Errorf("ModelForPhase(phases[0]) = %q/%v, want the configured alias", got, ok)
 	}
 	data, err := json.Marshal(cfg)
 	if err != nil {
@@ -679,21 +679,25 @@ func TestReviewPanel_PhaseModelIsNotAConfigKey(t *testing.T) {
 	if err := json.Unmarshal(data, &doc); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	for i, ph := range doc.Phases {
-		if _, ok := ph["model"]; ok {
-			t.Errorf("phases[%d] marshalled a `model` key: %s", i, data)
-		}
+	if len(doc.Phases) != 3 || len(doc.Phases[0]["model"]) == 0 {
+		t.Errorf("the phase's model did not survive marshalling: %s", data)
+	}
+	// An unset model stays absent (`omitempty`), so a config that never named
+	// one keeps the marshalled form — and therefore Identity() — it always had.
+	if _, ok := doc.Phases[1]["model"]; ok {
+		t.Errorf("phases[1] marshalled an empty `model` key, moving every identity: %s", data)
 	}
 	if len(doc.ReviewPanel) != 1 || len(doc.ReviewPanel[0]["model"]) == 0 {
 		t.Errorf("the member's model did not survive marshalling: %s", data)
 	}
 }
 
-// TestReviewPanel_AbsentKeepsTheConfigIdentity (CLA-639 fix pass 3): with no
-// panel, Identity() must hash exactly what it hashed before this branch. The
-// golden below was computed at 5805722 with this exact literal config; it is the
-// proof that neither `review_panel` nor the phase `model` leaked into the
-// marshalled form.
+// TestReviewPanel_AbsentKeepsTheConfigIdentity (CLA-639 fix pass 3, still held
+// by CLA-598): with no panel and no phase model, Identity() must hash exactly
+// what it hashed before either key existed. The golden below was computed at
+// 5805722 with this exact literal config; the phase `model` still stays out of
+// the marshalled form when unset, because it is tagged `omitempty` — which is
+// what keeps an operator who names no models off a config-identity change.
 func TestReviewPanel_AbsentKeepsTheConfigIdentity(t *testing.T) {
 	cfg := &Config{Harness: "claude", Phases: []Phase{
 		{Name: "implement"}, {Name: "review"}, {Name: "fix"},
@@ -710,4 +714,42 @@ func phaseNames(phases []Phase) []string {
 		out[i] = ph.Label(i)
 	}
 	return out
+}
+
+// TestReviewPanel_MemberTierBeatsTheReviewPhasesModel: a member that names a
+// TIER must run on that tier, not on the model inherited from the configured
+// review phase. ModelForPhase resolves Model before Tier, so the tier branch of
+// panelMember has to clear the inherited model — otherwise the member's explicit
+// choice is silently inert (CLA-598 fix round 2, 2.review-1.2/3.1/2.1/4.1/5.1).
+func TestReviewPanel_MemberTierBeatsTheReviewPhasesModel(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "opencode",
+		"models": {"strong": "opencode-go/glm-5.3-flash"},
+		"phases": [
+			{"name": "implement"},
+			{"name": "review", "model": "opencode-go/gpt-6-luna"},
+			{"name": "fix"}
+		],
+		"review_panel": [
+			{"tier": "strong"},
+			{"model": "opencode-go/gpt-6-luna"}
+		]
+	}`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	got := cfg.EffectivePhases()
+	if len(got) != 4 {
+		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(got))
+	}
+	tiered, modeld := got[1], got[2]
+	if tiered.Tier != "strong" || tiered.Model != "" {
+		t.Errorf("the tier member expanded to model=%q tier=%q, want tier strong with NO inherited model", tiered.Model, tiered.Tier)
+	}
+	if model, ok := cfg.ModelForPhase(tiered); !ok || model != "opencode-go/glm-5.3-flash" {
+		t.Errorf("the tier member resolves to %q/%v, want opencode-go/glm-5.3-flash — the tier it named", model, ok)
+	}
+	if modeld.Model != "opencode-go/gpt-6-luna" || modeld.Tier != "" {
+		t.Errorf("the model member expanded to model=%q tier=%q, want its own alias and no tier", modeld.Model, modeld.Tier)
+	}
 }

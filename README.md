@@ -204,12 +204,12 @@ Two bounds make the loop terminate:
   one a verifier marked resolved that a later verifier reopens, parks the task
   with a question instead of spending another round on the disagreement.
 
-The verifier is configurable like any phase (`harness`, `tier`). Left unset, it
-inherits the **fix** phase's harness and tier — the cheap, non-reviewer side of
-the split — because verification rounds are scoped and cheap and a reviewer's
-Claude subscription limit is shared with the operator's interactive use. In the
-shipped example above that means the verifier runs on opencode, not on the
-expensive review model.
+The verifier is configurable like any phase (`harness`, `tier`, `model`). Left
+unset, it inherits the **fix** phase's harness and its model/tier pair — the
+cheap, non-reviewer side of the split — because verification rounds are scoped
+and cheap and a reviewer's Claude subscription limit is shared with the
+operator's interactive use. In the shipped example above that means the verifier
+runs on opencode, not on the expensive review model.
 
 This loop is **interim**. It lives in the CLI's `drainPhases` because it ships
 before the state-machine reshape, which moves phase sequencing and the
@@ -353,7 +353,10 @@ because a review-only session's deliverable is its record and committing its
 probe artifacts would move the tip past the revision every member recorded.
 `review_panel_concurrency` caps how many run at once: `1` is the historical
 sequential behaviour (members then share the task's own worktree), `N` runs at
-most `N`, and an absent key or `0` means the whole panel. Members start in
+most `N`, and an absent key or `0` means the whole panel. It is **machine-owned**
+(local `config.json` only, never taken from the plane's stored document): how
+many seats run at once changes how fast a machine reaches the result, not what
+the result is. Members start in
 `review_panel` order: with a cap smaller than the panel, the first `N` entries
 run first and each freed slot goes to the next entry, so put the slowest
 reviewer at the top of the list — its long session then overlaps the others
@@ -365,8 +368,8 @@ Each member's reviewer role is **positional** — `review-1` .. `review-N`, coun
 over the review-shaped phases — and that is the role the durable record is keyed
 on. `name` is only the member's log label (it defaults to the same positional
 string); naming a member `alpha` changes what the logs call it, never which
-record it writes. A member may set `tier` instead of `model` to resolve through a
-harness's tier map.
+record it writes. A member may set a `tier`, a `model`, or both — the model
+alias wins on expansion — so a tier resolves through a harness's tier map.
 
 **Independence is a seal, not a promise.** The plane holds a round's records
 sealed: written, but with their findings withheld from every `get_task` until
@@ -485,16 +488,25 @@ land. Before the split, a death there destroyed the findings and the half-applie
 fixes together; now the findings are on the task before the expensive session
 ends, and a death costs the fix session, not the review.
 
-### Per-phase models: a tier map you own
+### Per-phase models: a tier map you own, or a model you name
 
-`model` pins one model alias for the whole run. `models` and a phase's `tier` let
-different phases run on different models:
+`model` pins one model alias for the whole run. A phase can name its model one
+of two ways, and the stored run-config document carries both:
+
+- `tier` names a bucket in `models`, so one policy word can resolve to a
+  different alias on each harness;
+- `model` names an alias directly, for a step whose model you do not want to
+  express through a bucket.
+
+A phase sets **one or the other, never both**, and `Validate` refuses both so it
+is never ambiguous which one wins (a review-panel member may set both, and the
+alias wins there). Resolution is `model`, then `tier`, then the harness default.
 
 ```json
 "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
 "phases": [
   { "name": "implement", "tier": "standard" },
-  { "name": "review",    "tier": "strong" },
+  { "name": "review",    "model": "opencode-go/gpt-6-luna" },
   { "name": "fix",       "tier": "cheap" }
 ]
 ```
@@ -507,17 +519,20 @@ task lapses into a takeover that pays `implement` again, plus the wait. Keep the
 three-phase shape, but run `fix` on a different provider — see
 [Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
 
-**The buckets are yours, and the indirection is the point.** clankerbar drives
-three harnesses and cannot know which models you have, nor which of them is
-cheaper — that needs a price table, which goes stale silently and in the direction
-that costs money. So it never learns what models exist; it learns only that you
-bucketed them, and a phase names a **bucket**, never an alias. (`"tier": "opus"`
-does not pin opus. It looks for a bucket called `opus`.)
+**The buckets are yours, and the indirection is the point — when you want it.**
+clankerbar drives three harnesses and cannot know which models you have, nor
+which of them is cheaper — that needs a price table, which goes stale silently and
+in the direction that costs money. So it never learns what models exist; with
+`tier` it learns only that you bucketed them, and the phase names a **bucket**,
+never an alias. (`"tier": "opus"` does not pin opus. It looks for a bucket called
+`opus`.) `model` is the way to name an alias directly when you do not want that
+indirection — it is a plain alias, so a typo is a model the provider refuses
+rather than a bucket that silently resolves to the harness default.
 
-**Everything falls back, and nothing here can stop a run.** A phase with no
-`tier` runs on `model`; a `tier` naming a bucket you never defined runs on `model`
-and says so in the iteration log; `model` itself empty means the harness picks, as
-it always has. A config written before any of this existed behaves exactly as it
+**Everything falls back, and nothing here can stop a run.** A phase with neither
+`model` nor `tier` runs on the run-wide `model`; a `tier` naming a bucket you never
+defined runs on that model and says so in the iteration log; the run-wide `model`
+itself empty means the harness picks, as it always has. A config written before any of this existed behaves exactly as it
 did. A mistyped bucket costs a log line at 3am, not a stopped drain.
 
 **Which way to tier is a question of blast radius, not difficulty.** A phase that
@@ -2143,14 +2158,30 @@ two knobs are separate.
 
 ### Execution config from the plane
 
-A project's execution dials - harness, model, tier buckets, budget, review-tier
-escalation rules, and the two backstops (`max_turns`, `max_session_wall_clock`,
-as integer seconds) - can live **on the plane** instead of in this file. The
-daemon reads each project's stored document (per project, so two queues can run
-two postures) and overlays it over this file; until a project has one, this
-file rules byte for byte. `doctor` reports which is in force per project, and
-warns when a stored dial cannot fire on your machine (a turn cap under opencode,
-say) - shape-validates on the plane, machine-fit is doctor's.
+A project's execution dials - the **pipeline** (`prompt`, `phases`,
+`review_panel`), harness, model, tier buckets, budget, review-tier escalation
+rules, and the two backstops (`max_turns`, `max_session_wall_clock`, as integer
+seconds) - can live **on the plane** instead of in this file. The daemon reads
+each project's stored document (per project, so two queues can run two postures)
+and overlays it over this file; until a project has one, this file rules byte
+for byte. `doctor` reports which is in force per project, warns when a stored
+dial cannot fire on your machine (a turn cap under opencode, say), and **fails**
+when a stored step names a harness this machine cannot spawn (no
+`harnesses.<h>` block) - shape-validates on the plane, machine-fit is doctor's.
+
+The pipeline is **one section**: a stored document carrying any of the three
+pipeline keys replaces all three, so a stored `phases` clears a local `prompt`
+and `review_panel` rather than running beside them. A document that carries none
+of them leaves the local pipeline alone. A phase may name a `model` directly,
+exactly as in the local file (a configured phase sets `model` or `tier`, not
+both).
+
+`review_panel_concurrency` is **machine-owned**, not part of the section and
+never taken from the stored document: the phase sequence, every phase's harness
+and model, and the panel's composition are policy, so the run's result is the
+same on every machine, while how many panel seats run at once is how fast that
+machine gets there. The local file's value stays in force whatever the document
+carries.
 
 Edits apply at the **next iteration boundary**, never mid-session: the daemon
 watches the version on the backlog-summary poll it already makes, and on a bump
@@ -2165,8 +2196,12 @@ clankerbar propose-config            # --slug <project> when projects[] names se
 ```
 
 That records a PENDING proposal; nothing changes until you ratify it in the
-console (Settings -> Run configuration). Phases, prompts, wiring, env and paths
-stay local: the plane custodies policy, never machine fit or credentials.
+console (Settings -> Run configuration). The pipeline travels with it — `prompt`,
+`phases`, `review_panel`, and a phase's `model` — along with the
+model/tier/budget/escalation dials. `review_panel_concurrency` deliberately does
+not travel: it names this machine's parallelism, not the pipeline's result.
+Wiring, env and paths stay local too: the plane custodies policy, never machine
+fit or credentials.
 
 ### Multi-project: one instance, many queues
 
