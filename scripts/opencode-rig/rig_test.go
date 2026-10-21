@@ -192,6 +192,29 @@ func TestDispatchAcceptsTheDocumentedFlagOnlyInvocation(t *testing.T) {
 	}
 }
 
+// TestThePaddingScenarioRefusesAPreCutoverCatalog pins the loud failure: the
+// residual lives on edit_task, so a catalog still serving the deleted
+// update_task (a plane before the CLA-746/CLA-748 cutover is promoted) would
+// leave the model with every tool except the one the scenario studies.
+func TestThePaddingScenarioRefusesAPreCutoverCatalog(t *testing.T) {
+	dir := t.TempDir()
+	cat := filepath.Join(dir, "pre-cutover.json")
+	if err := os.WriteFile(cat, []byte(`{"tools":[{"name":"update_task","inputSchema":{"type":"object"}}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code := dispatch([]string{
+		"--model", "commandcode/gpt-6-luna",
+		"--scenario", "padding",
+		"--schemas", cat,
+		"--upstream", "https://api.commandcode.invalid/provider/v1",
+		"--out", filepath.Join(dir, "run"),
+		"--dry-run",
+	})
+	if code != 1 {
+		t.Fatalf("dispatch = %d, want 1 (a catalog with no edit_task exercises nothing)", code)
+	}
+}
+
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
 // printed.
 func captureStdout(t *testing.T, fn func() int) string {

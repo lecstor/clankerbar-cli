@@ -34,19 +34,23 @@ func (s scenarioDef) promptFor(schemaTool string) string {
 	return s.Prompt
 }
 
+// schemaToolID is the catalog's (unprefixed) name for the schema scenario's
+// selected tool: --schema-tool when it is set, otherwise the tool the
+// protocol-41 plane serves for the residual.
+func schemaToolID(tool string) string {
+	tool = strings.TrimSpace(tool)
+	if tool == "" {
+		return "edit_task"
+	}
+	return strings.TrimPrefix(tool, "clankerbar_")
+}
+
 // schemaToolName is the tool name the session sees. The catalog's tools are
 // served by the clankerbar MCP server, so opencode exposes `edit_task` as
 // `clankerbar_edit_task`; --schema-tool names the catalog's (unprefixed) tool
 // and this is the prefixed form the prompt must ask for.
 func schemaToolName(tool string) string {
-	tool = strings.TrimSpace(tool)
-	if tool == "" {
-		tool = "edit_task"
-	}
-	if strings.HasPrefix(tool, "clankerbar_") {
-		return tool
-	}
-	return "clankerbar_" + tool
+	return "clankerbar_" + schemaToolID(tool)
 }
 
 // toolResult is what the stub puts on the wire for one tools/call.
@@ -158,6 +162,22 @@ Call the tool %s exactly once. Pass taskId "CLA-753" if its schema declares one,
 			},
 		},
 	}
+}
+
+// catalogTool returns the tool a scenario's stub answers and its prompt asks
+// for, when the scenario is pointless without that tool in the catalog the
+// session is offered. "" means the scenario does not depend on a catalog tool.
+func catalogTool(scenario, schemaTool string) string {
+	switch scenario {
+	case "schema":
+		return schemaToolID(schemaTool)
+	case "padding":
+		// The residual lives on edit_task. A catalog that still serves the
+		// deleted update_task is a pre-cutover plane, and the model would be
+		// offered everything except the surface this scenario studies.
+		return "edit_task"
+	}
+	return ""
 }
 
 // editTaskState is the canned task row the padding scenario edits, reduced to
