@@ -54,6 +54,13 @@
 // `<backlog_url>/api/daemon-roster/status` — so the console can tell a HALTed
 // instance from a crashed one without reading this machine's log. Reporting is
 // fail-soft telemetry and never control flow.
+//
+// CLA-758 adds the deterministic half of INTEGRATION: an approved-awaiting-merge
+// task whose pull request is mergeable, green and based on the project's
+// integration branch is claimed, merged as a merge commit and closed done by this
+// process, with no harness session at all. Everything it cannot do without
+// judgement — a conflict above all — is left exactly where the agent close-out
+// already picks it up. See closeout.go.
 package supervisor
 
 import (
@@ -68,9 +75,11 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
@@ -222,6 +231,12 @@ type Options struct {
 	// server so the wire shape is exercised for real.
 	PlaneFor func(endpoint, apiKey string) plane.Releaser
 
+	// CloseOutVerifier builds the local verifier a close-out judges one repo with.
+	// Nil = delivery.New(repo, "") with production defaults. The hook exists
+	// because the PR judgement polls within a 30-second window and shells out to
+	// `gh`: a test cannot wait that window out, and must substitute its own gh.
+	CloseOutVerifier func(repo string) *delivery.Verifier
+
 	// AfterConfigRewrite is called after a reconcile-time rewrite of a child's
 	// generated config and before the RESTART that applies it is queued
 	// (CLA-724). It is the deterministic seam for the rewrite-to-marker window,
@@ -330,9 +345,11 @@ type exitEvent struct {
 }
 
 // Supervisor holds the fleet state. Everything except the per-child Wait
-// goroutines runs on the single Supervise goroutine, so no locks guard the
-// scheduling fields — the mutex on Instance exists only for the hand-off
-// between a Wait goroutine (exited/exitErr) and the main goroutine.
+// goroutines and the close-out pass (CLA-758) runs on the single Supervise
+// goroutine, so no locks guard the scheduling fields — the mutex on Instance
+// exists only for the hand-off between a Wait goroutine (exited/exitErr) and the
+// main goroutine, and for the config pointer the pass snapshots before it leaves
+// that goroutine.
 type Supervisor struct {
 	o Options
 
@@ -385,6 +402,21 @@ type Supervisor struct {
 	// a timed-out drain resumes the loop and respawns the fleet, so the flag
 	// cannot mean "this supervisor is exiting".
 	replacing bool
+
+	// closeOutSaid remembers the last close-out line logged per key, so an
+	// unchanged stand-down is said once rather than on every poll (CLA-758). It
+	// is written only by the close-out pass goroutine.
+	closeOutSaid map[string]string
+	// closeOutConflicts remembers the head@base pair already reported as
+	// conflicting per task, so the conflicting-path evidence is logged once per
+	// pair rather than on every reconcile. Also pass-goroutine only.
+	closeOutConflicts map[string]string
+	// closeOutBusy is set while a close-out pass runs on its own goroutine, so the
+	// next poll skips instead of starting a second pass over the same queue.
+	closeOutBusy atomic.Bool
+	// closeOutWG tracks that pass, so a fleet stop can wait (bounded) for it to
+	// hand back a claim it had already taken.
+	closeOutWG sync.WaitGroup
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
@@ -467,7 +499,12 @@ func Supervise(ctx context.Context, o Options) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return d.stopAll()
+			err := d.stopAll()
+			// The close-out pass runs off this loop; its context is cancelled
+			// already, and this bounded wait is what lets it hand back a claim it
+			// had taken before the process exits.
+			d.waitCloseOut()
+			return err
 		case ev := <-d.exits:
 			d.onExit(ev.inst, ev.err, ev.at)
 		case <-d.timerCh:
@@ -626,6 +663,15 @@ func (d *Supervisor) reconcile() error {
 	// spawn, a stop, a flip or a removal is reflected within the same poll —
 	// and an unchanged pass prints nothing.
 	d.publishStatus()
+
+	// The deterministic close-out (CLA-758) starts last, on configs this pass just
+	// refreshed, and on its OWN goroutine: an approved task whose PR is clean is
+	// merged and closed with no agent session, and everything it cannot finish
+	// deterministically is left exactly where the agent close-out expects it. The
+	// goroutine matters because a judgement can poll a `gh` read for 90 seconds and
+	// the loop below reaps children, respawns and restarts — it must never wait
+	// behind a close-out.
+	d.startCloseOutPass()
 
 	d.armRestart()
 	return nil

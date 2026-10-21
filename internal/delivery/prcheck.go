@@ -84,6 +84,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -185,11 +186,20 @@ func (c ghCheck) neutral() bool {
 }
 
 // ghPR is the slice of `gh pr view --json ...` the gate reads.
+//
+// The three ref fields are not part of the delivery gate's two conditions; they
+// are read because the close-out (prclose.go) needs to know which branch the PR
+// would merge INTO and which revision it would merge, and taking them from the
+// same read the judgement is made on is what keeps the two from describing
+// different revisions.
 type ghPR struct {
 	Mergeable         string    `json:"mergeable"`         // MERGEABLE | CONFLICTING | UNKNOWN
 	MergeStateStatus  string    `json:"mergeStateStatus"`  // CLEAN | DIRTY | BLOCKED | ...
 	StatusCheckRollup []ghCheck `json:"statusCheckRollup"` // null when none
 	URL               string    `json:"url"`
+	BaseRefName       string    `json:"baseRefName"`
+	HeadRefName       string    `json:"headRefName"`
+	HeadRefOid        string    `json:"headRefOid"`
 }
 
 // prVerdict is the classified outcome of one read of the PR. prConflict,
@@ -441,33 +451,54 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 		}
 	}
 
+	_, chk := v.pollPR(ctx, repo, slug, atoiPR(prNum), ghScope)
+	return chk
+}
+
+// atoiPR converts an already-validated PR number. prCheck's normalizePR has
+// rejected everything but digits before this point.
+func atoiPR(prNum string) int {
+	n, _ := strconv.Atoi(prNum)
+	return n
+}
+
+// pollPR reads one pull request until it can be decided, or until the poll budget
+// closes. It returns the LAST view it read alongside the settled check, because the
+// delivery gate reads only the check while the close-out (prclose.go) also needs to
+// know which base the PR targets and which revision it would merge.
+//
+// The waiting verdicts (prMergeableUnknown, prNoChecks, prChecksPending) mean "true
+// so far as it went, but not yet decidable" — they are polled here and only become
+// their refusal when the window closes, never an assumption.
+func (v *Verifier) pollPR(ctx context.Context, repo, slug string, prNum int, ghScope []string) (ghPR, Check) {
+	pr := strconv.Itoa(prNum)
 	start := time.Now()
 	deadline := start.Add(v.prBudget)
 	for {
-		j, err := v.readPR(ctx, repo, slug, prNum, ghScope)
+		view, j, err := v.readPR(ctx, repo, slug, pr, ghScope)
 		if err != nil {
 			var nf *ghNotFoundError
 			if errors.As(err, &nf) {
-				return Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
-					"PR %s was not found in %s — the delivery names a pull request that does not exist; correct the number and declare again", prNum, slug)}
+				return ghPR{}, Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+					"PR %s was not found in %s — the delivery names a pull request that does not exist; correct the number and declare again", pr, slug)}
 			}
-			return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
-				"PR %s could not be verified: %v", prNum, err)}
+			return ghPR{}, Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+				"PR %s could not be verified: %v", pr, err)}
 		}
 		switch j.verdict {
 		case prPass, prConflict, prChecksFailed:
 			// Decidable now: settle on what this read said.
-			return settlePR(j, prNum, slug, time.Since(start), v.allowUncheckedPR)
+			return view, settlePR(j, pr, slug, time.Since(start), v.allowUncheckedPR)
 		}
 		// A waiting verdict. Once the window closes it becomes the refusal it
 		// now names — never an assumption.
 		if !time.Now().Before(deadline) || ctx.Err() != nil {
-			return settlePR(j, prNum, slug, time.Since(start), v.allowUncheckedPR)
+			return view, settlePR(j, pr, slug, time.Since(start), v.allowUncheckedPR)
 		}
 		select {
 		case <-ctx.Done():
-			return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
-				"PR %s verification was interrupted: %v", prNum, ctx.Err())}
+			return ghPR{}, Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+				"PR %s verification was interrupted: %v", pr, ctx.Err())}
 		case <-time.After(v.prInterval):
 		}
 	}
@@ -477,19 +508,20 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 // waiting verdicts (prMergeableUnknown, prNoChecks, prChecksPending) mean
 // "true so far as it went, but not yet decidable" — the caller polls within
 // its budget. scope carries the caller's credential scoping, nil to run
-// unscoped.
-func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string, scope []string) (prJudgement, error) {
+// unscoped. The view is returned alongside the judgement because the close-out
+// reads the PR's refs from the SAME read the judgement was made on.
+func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string, scope []string) (ghPR, prJudgement, error) {
 	out, err := v.runGHScoped(ctx, dir, scope, "pr", "view", prNum,
 		"--repo", slug,
-		"--json", "mergeable,mergeStateStatus,statusCheckRollup,url")
+		"--json", "mergeable,mergeStateStatus,statusCheckRollup,url,baseRefName,headRefName,headRefOid")
 	if err != nil {
-		return prJudgement{verdict: prMergeableUnknown}, err
+		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, err
 	}
 	var view ghPR
 	if jerr := json.Unmarshal([]byte(out), &view); jerr != nil {
-		return prJudgement{verdict: prMergeableUnknown}, fmt.Errorf("could not parse gh pr view output: %v", jerr)
+		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, fmt.Errorf("could not parse gh pr view output: %v", jerr)
 	}
-	return judgePR(view), nil
+	return view, judgePR(view), nil
 }
 
 // runGH executes one gh command in dir and returns its trimmed stdout, with

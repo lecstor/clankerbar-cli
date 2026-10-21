@@ -797,6 +797,31 @@ waiting out the lease. The same happens inside the daemon when a phase is
 abandoned holding pushed work. A plane that refuses because the run already
 ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
 
+**A clean approved task is integrated without a session.** An
+approved-awaiting-merge task used to wait for a fresh agent session to merge its
+PR — which waits for some clanker to finish the task it is on, and a task with a
+review panel runs 30-60 minutes. Every step except resolving a conflict is
+mechanical, so the supervisor does them: for each supervised project whose
+policy says a clanker integrates (`authorityIntegrate: clanker`), it finds the
+open PR for the task's recorded branch, judges it with the same delivery check
+the driver applies to an agent's claim (mergeable, and a check rollup that ran
+and passed), **claims the task first** so an agent close-out and this path can
+never both merge it, merges the PR as a merge commit, verifies that merge commit
+is an ancestor of the base on origin, and closes the task done with that
+delivery. It does nothing under `authorityIntegrate: human`, for a PR based on
+`main` (the promotion is yours), for a conflicting, failing, unchecked or
+unresolvable PR, or when the claim is refused. A conflict is the one stand-down
+that carries evidence: the conflicting paths are logged once per head/base pair,
+for deciding whether a conflict needs an agent at all. Anything after a
+successful claim that cannot be finished releases it, so the task goes back to
+`approved` rather than being left held — with one exception: a merge that LANDED
+but whose ancestry could not be verified is closed `done` with `mergeVerified:
+false`, because the PR is no longer open and a release would strand the task.
+The merge itself names the configured base and the judged head revision, so a
+PR retargeted after the judgement cannot be merged into `main`; its verification
+and conflict reads run in a throwaway clone, never in the checkout the fleet's
+sessions share.
+
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
 (loaded exactly as `clankerbar run` loads it, or bare defaults when no file
