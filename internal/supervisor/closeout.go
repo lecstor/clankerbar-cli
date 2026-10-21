@@ -69,9 +69,9 @@ const (
 
 	// closeOutPassBudget bounds a whole reconcile's close-out work, so a queue of
 	// stuck merges cannot hold the reconcile loop (which also spawns, stops and
-	// reports) for longer than the fleet can tolerate. Work it does not reach is
-	// left for the next poll.
-	closeOutPassBudget = 4 * time.Minute
+	// reports) for longer than the fleet can tolerate: two minutes is well over a
+	// dozen clean close-outs, and everything past it waits for the next poll.
+	closeOutPassBudget = 2 * time.Minute
 )
 
 // reconcileCloseOuts is the pass, called from reconcile once the fleet's configs are
@@ -82,6 +82,10 @@ func (d *Supervisor) reconcileCloseOuts() {
 	budget := time.Now().Add(closeOutPassBudget)
 	seen := map[string]bool{}
 	for _, inst := range d.instances {
+		// A stopped, removed or refused instance is not driving its project: the
+		// operator's stop is about that project's autonomous work, integration
+		// included, so its approved queue waits for the agent path (or for the next
+		// instance that does run it).
 		if inst.removed || inst.refused || inst.desired != RosterDesiredRunning {
 			continue
 		}
@@ -202,7 +206,7 @@ func (d *Supervisor) reconcileCloseOutTask(cfg *config.Config, slug string, clie
 		return
 	case 1:
 	default:
-		d.closeOutSay(key, "close-out: %s has %d open pull requests whose head is %s (%s) - refusing to guess which one carries the delivery", label, len(prs), task.Branch, prNumbers(prs))
+		d.closeOutSay(key, "close-out: %s has %d open pull requests whose head is %s (%s) - refusing to guess which one carries the delivery", label, len(prs), task.Branch, prBases(prs))
 		return
 	}
 	pr := prs[0]
@@ -481,11 +485,17 @@ func isPromotionBranch(branch string) bool {
 	return false
 }
 
-// prNumbers renders the open PRs one branch has, for the "refusing to guess" line.
-func prNumbers(prs []delivery.PRRef) string {
+// prBases renders the open PRs one branch has, with the base each one targets, for
+// the "refusing to guess" line — the base is what tells the operator whether the
+// duplicates are two deliveries or one retargeted PR.
+func prBases(prs []delivery.PRRef) string {
 	parts := make([]string, 0, len(prs))
 	for _, pr := range prs {
-		parts = append(parts, fmt.Sprintf("#%d", pr.Number))
+		base := pr.Base
+		if base == "" {
+			base = "no base"
+		}
+		parts = append(parts, fmt.Sprintf("#%d -> %s", pr.Number, base))
 	}
 	return strings.Join(parts, ", ")
 }

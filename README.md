@@ -792,6 +792,25 @@ waiting out the lease. The same happens inside the daemon when a phase is
 abandoned holding pushed work. A plane that refuses because the run already
 ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
 
+**A clean approved task is integrated without a session.** An
+approved-awaiting-merge task used to wait for a fresh agent session to merge its
+PR — which waits for some clanker to finish the task it is on, and a task with a
+review panel runs 30-60 minutes. Every step except resolving a conflict is
+mechanical, so the supervisor does them: for each supervised project whose
+policy says a clanker integrates (`authority.integrate: clanker`), it finds the
+open PR for the task's recorded branch, judges it with the same delivery check
+the driver applies to an agent's claim (mergeable, and a check rollup that ran
+and passed), **claims the task first** so an agent close-out and this path can
+never both merge it, merges the PR as a merge commit, verifies that merge commit
+is an ancestor of the base on origin, and closes the task done with that
+delivery. It does nothing under `authority.integrate: human`, for a PR based on
+`main` (the promotion is yours), for a conflicting, failing, unchecked or
+unresolvable PR, or when the claim is refused. A conflict is the one stand-down
+that carries evidence: the conflicting paths are logged once per head/base pair,
+for deciding whether a conflict needs an agent at all. Anything after a
+successful claim that cannot be finished releases it, so the task goes back to
+`approved` rather than being left held.
+
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
 (loaded exactly as `clankerbar run` loads it, or bare defaults when no file

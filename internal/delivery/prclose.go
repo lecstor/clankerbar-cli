@@ -14,9 +14,10 @@ package delivery
 // The judgement is REUSED rather than reimplemented: JudgePR drives prCheck's own
 // polling loop and settles with settlePR, so this surface can never call a PR
 // greener than the gate that judges an agent's delivery. The one deliberate
-// difference is that `allow_unchecked_pr` does not reach this judgement: an empty
-// check rollup is a refusal here whatever the project's delivery opt-out says,
-// because a deterministic merge has nobody reading it afterwards.
+// difference is that `allow_unchecked_pr` cannot make an empty check rollup
+// mergeable here: it only words the refusal as a warning, and PRReady still
+// requires the gate's `prPass`, because a deterministic merge has nobody reading
+// the log afterwards.
 //
 // Nothing here touches a worktree. The merge happens through the GitHub API, and
 // the conflicting paths come from `git merge-tree` against refs this file fetches
@@ -51,10 +52,10 @@ const (
 	PRRefused PRVerdict = "refused"
 )
 
-// PRRef is one open pull request as `gh pr list` serves it.
+// PRRef is one open pull request as `gh pr list` serves it: the number the merge
+// names, the base it targets, and the head revision a merge must be pinned to.
 type PRRef struct {
 	Number  int
-	URL     string
 	Base    string
 	Head    string
 	HeadOID string
@@ -95,7 +96,6 @@ func (v *Verifier) OpenPRs(ctx context.Context, repo, slug, head string) ([]PRRe
 	}
 	var listed []struct {
 		Number      int    `json:"number"`
-		URL         string `json:"url"`
 		BaseRefName string `json:"baseRefName"`
 		HeadRefName string `json:"headRefName"`
 		HeadRefOid  string `json:"headRefOid"`
@@ -107,7 +107,6 @@ func (v *Verifier) OpenPRs(ctx context.Context, repo, slug, head string) ([]PRRe
 	for _, pr := range listed {
 		refs = append(refs, PRRef{
 			Number:  pr.Number,
-			URL:     pr.URL,
 			Base:    pr.BaseRefName,
 			Head:    pr.HeadRefName,
 			HeadOID: pr.HeadRefOid,
@@ -121,6 +120,12 @@ func (v *Verifier) OpenPRs(ctx context.Context, repo, slug, head string) ([]PRRe
 // running — and classifies it for the close-out. It never returns an error: an
 // unreadable PR is PRRefused with the reason in Check.Detail, which is the honest
 // answer for a caller whose only correct response is "do not merge".
+//
+// Only PRReady is mergeable, and only the gate's `prPass` produces it — so the
+// project's `allow_unchecked_pr` opt-out cannot make an empty rollup mergeable
+// here. It reaches settlePR, and all it can do there is word the refusal as a
+// warning; the verdict stays PRRefused either way. That is deliberate: a
+// deterministic merge has nobody reading the log afterwards.
 func (v *Verifier) JudgePR(ctx context.Context, repo, slug string, num int) PRState {
 	state := PRState{PRRef: PRRef{Number: num}}
 	if num <= 0 {
@@ -139,7 +144,6 @@ func (v *Verifier) JudgePR(ctx context.Context, repo, slug string, num int) PRSt
 	j := judgePR(view)
 	state.PRRef = PRRef{
 		Number:  num,
-		URL:     view.URL,
 		Base:    view.BaseRefName,
 		Head:    view.HeadRefName,
 		HeadOID: view.HeadRefOid,
@@ -210,18 +214,15 @@ func (v *Verifier) MergePR(ctx context.Context, repo, slug string, num int, expe
 func (v *Verifier) ConflictPaths(ctx context.Context, repo, baseRef, headRef string) ([]string, error) {
 	out, runErr := v.gitRunOut(ctx, repo, nil, "merge-tree", "--write-tree", "--name-only", baseRef, headRef)
 	paths, parseErr := parseMergeTreeConflicts(out)
-	switch {
-	case parseErr == nil && len(paths) > 0:
+	if parseErr == nil {
+		// Either the conflicts git named, or none at all (the trees merged
+		// cleanly, which a caller that expected a conflict still needs to know).
 		return paths, nil
-	case runErr == nil:
-		// The trees merged cleanly. A caller that expected a conflict has the
-		// answer it needs: there is nothing to name.
-		return nil, nil
-	case parseErr != nil:
-		return nil, fmt.Errorf("merge-tree %s..%s: %v (output: %s)", baseRef, headRef, runErr, firstLine(out))
-	default:
-		return nil, fmt.Errorf("merge-tree %s..%s: %v (output: %s)", baseRef, headRef, runErr, firstLine(out))
 	}
+	if runErr == nil {
+		return nil, fmt.Errorf("merge-tree %s..%s: %w", baseRef, headRef, parseErr)
+	}
+	return nil, fmt.Errorf("merge-tree %s..%s: %v (output: %s)", baseRef, headRef, runErr, firstLine(out))
 }
 
 // parseMergeTreeConflicts reads the path section of `git merge-tree --write-tree

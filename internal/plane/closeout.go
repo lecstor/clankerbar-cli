@@ -57,7 +57,6 @@ type ProjectPolicy struct {
 type CloseOutTask struct {
 	ID     string
 	Ref    string
-	Title  string
 	Branch string
 	Repo   string
 }
@@ -152,7 +151,6 @@ func (r *mcpReleaser) ApprovedForCloseOut(ctx context.Context) (CloseOutQueue, e
 		Tasks []struct {
 			ID     string `json:"id"`
 			Ref    string `json:"ref"`
-			Title  string `json:"title"`
 			Branch string `json:"branch"`
 			Repo   string `json:"repo"`
 		} `json:"tasks"`
@@ -166,7 +164,6 @@ func (r *mcpReleaser) ApprovedForCloseOut(ctx context.Context) (CloseOutQueue, e
 		queue.Tasks = append(queue.Tasks, CloseOutTask{
 			ID:     strings.TrimSpace(t.ID),
 			Ref:    strings.TrimSpace(t.Ref),
-			Title:  strings.TrimSpace(t.Title),
 			Branch: strings.TrimSpace(t.Branch),
 			Repo:   strings.TrimSpace(t.Repo),
 		})
