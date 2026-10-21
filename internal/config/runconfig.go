@@ -10,16 +10,23 @@
 // backstops stored in this config's native units: harness, model, tier buckets
 // (`models`, and the per-harness blocks' model/models half), budget,
 // escalation rules, max_turns, max_session_wall_clock — and, since CLA-598,
-// the PIPELINE: `prompt`, `phases`, `review_panel` and
-// `review_panel_concurrency` (operator decision 30d69869 decoupled that from
-// the CLA-454 state-machine reshape; the CLI still sequences sessions itself,
-// it now reads the sequence from the plane). Those four are ONE section:
-// carrying any of them replaces all four, so a stored `phases` clears a local
-// `prompt` and panel, and a stored `prompt` clears a local sequence (decision
-// 6bf1fa15's per-section rule). Deliberately NOT consumed yet: transitions
-// (the workflow document is data for the same reshape), backlog_url and
-// allow_local_mcp_servers (part of the local bootstrap core), notes
-// (console-facing reasoning).
+// the PIPELINE: `prompt`, `phases` and `review_panel` (operator decision
+// 30d69869 decoupled that from the CLA-454 state-machine reshape; the CLI still
+// sequences sessions itself, it now reads the sequence from the plane). Those
+// three are ONE section: carrying any of them replaces all three, so a stored
+// `phases` clears a local `prompt` and panel, and a stored `prompt` clears a
+// local sequence (decision 6bf1fa15's per-section rule).
+//
+// `review_panel_concurrency` is NOT part of that section: it is MACHINE-OWNED
+// (operator decision e1365721). The run's RESULT must be the same on every
+// machine; a machine may change only how fast it gets there, so the local
+// file's cap stays in force whatever a stored document carries, and the overlay
+// neither replaces nor clears it. A stored document that names it has the value
+// accepted and ignored, never applied.
+//
+// Deliberately NOT consumed yet: transitions (the workflow document is data for
+// the same reshape), backlog_url and allow_local_mcp_servers (part of the local
+// bootstrap core), notes (console-facing reasoning).
 package config
 
 import (
@@ -99,10 +106,16 @@ type RunConfigPanelMember struct {
 // keys themselves may have changed meaning — so the consume points refuse it
 // outright; see RunConfigSchemaVersion and SchemaNewer.
 //
-// Prompt, Phases, ReviewPanel and ReviewPanelConcurrency are the PIPELINE
-// section. Its presence is judged by KEY, not by value: a nil Phases/ReviewPanel
-// is an absent key, while an empty non-nil slice is a key that clears the local
-// value; a non-empty Prompt or a non-zero concurrency marks the section too.
+// Prompt, Phases and ReviewPanel are the PIPELINE section (CLA-598). Its
+// presence is judged by KEY, not by value: a nil Phases/ReviewPanel is an
+// absent key, while an empty non-nil slice is a key that clears the local
+// value; a non-empty Prompt marks the section too.
+//
+// ReviewPanelConcurrency is deliberately NOT part of that section: it is
+// machine-owned (decision e1365721), so the overlay never applies it. The field
+// stays here only because the plane stores the key and a client must be able to
+// decode the whole document; it is accepted and ignored, never copied onto the
+// config.
 type RunConfigDoc struct {
 	SchemaVersion          int                              `json:"$schema_version"`
 	Harness                string                           `json:"harness"`
@@ -132,16 +145,20 @@ func (d *RunConfigDoc) SchemaNewer() bool {
 }
 
 // pipelineSet reports whether the stored document carries ANY key of the
-// pipeline section (prompt, phases, review_panel, review_panel_concurrency),
-// which is what makes the overlay replace all four: the section is one unit,
-// exactly as the plane stores it (decision 6bf1fa15). Presence is judged the
-// way JSON can express it — a nil slice is an absent key, an empty one is a key
-// that clears — so `"phases": []` still counts.
+// pipeline section (prompt, phases, review_panel), which is what makes the
+// overlay replace all three: the section is one unit, exactly as the plane
+// stores it (decision 6bf1fa15). Presence is judged the way JSON can express it
+// — a nil slice is an absent key, an empty one is a key that clears — so
+// `"phases": []` still counts.
+//
+// `review_panel_concurrency` is NOT a section key (decision e1365721): a
+// document carrying only that is not a pipeline statement at all, so the local
+// pipeline stays untouched.
 func (d *RunConfigDoc) pipelineSet() bool {
 	if d == nil {
 		return false
 	}
-	return d.Prompt != "" || d.Phases != nil || d.ReviewPanel != nil || d.ReviewPanelConcurrency != 0
+	return d.Prompt != "" || d.Phases != nil || d.ReviewPanel != nil
 }
 
 // Empty reports whether the document consumes to nothing: every field a stored
@@ -247,13 +264,18 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		return err
 	}
 	// The PIPELINE is one section (decision 6bf1fa15): a document carrying any
-	// of prompt/phases/review_panel/review_panel_concurrency replaces all four,
-	// and a key it omits is cleared to its zero value rather than kept from the
-	// local file. That is what keeps prompt and phases mutually exclusive ACROSS
-	// the overlay boundary — a stored phases clears a local prompt, and the
-	// reverse — and what stops a stored phases running with a local panel it
-	// never named. A document carrying none of the four leaves the local
-	// pipeline untouched, as before (handled by pipelineSet, not by this branch).
+	// of prompt/phases/review_panel replaces all three, and a key it omits is
+	// cleared to its zero value rather than kept from the local file. That is
+	// what keeps prompt and phases mutually exclusive ACROSS the overlay
+	// boundary — a stored phases clears a local prompt, and the reverse — and
+	// what stops a stored phases running with a local panel it never named. A
+	// document carrying none of the three leaves the local pipeline untouched,
+	// as before (handled by pipelineSet, not by this branch).
+	//
+	// `review_panel_concurrency` is deliberately absent from this block: it is
+	// machine-owned (decision e1365721), so the local file's value survives a
+	// section replace whatever the document carries, and a document that sets
+	// only that key is not a pipeline statement at all.
 	if doc.pipelineSet() {
 		c.Prompt = doc.Prompt
 		if doc.Phases == nil {
@@ -282,13 +304,15 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 			}
 			c.ReviewPanel = panel
 		}
-		c.ReviewPanelConcurrency = doc.ReviewPanelConcurrency
 		// reviewPanelSet records whether the panel KEY is in force, which is now
 		// the document's answer rather than the file's: a section replace that
 		// omits the key means "no panel", while an explicit empty array is still
 		// the half-edited shape Validate refuses.
 		c.reviewPanelSet = doc.ReviewPanel != nil
 	}
+	// c.ReviewPanelConcurrency is NOT updated here: how many panel seats run at
+	// once is the machine's dial (decision e1365721), so the local value is kept
+	// even when the document carries one.
 	if h := strings.TrimSpace(doc.Harness); h != "" {
 		c.Harness = h
 	}
@@ -434,12 +458,17 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 
 // RunConfigDocument renders the config's MOVABLE half as the plane-side
 // proposal document `propose-config` imports: the pipeline (prompt, phases,
-// review_panel, review_panel_concurrency, and each phase's model), the consumed
-// families and the two backstops, in the plane's own snake_case vocabulary with
-// wall clock as integer seconds. Nothing machine-local (workdir, wiring, env,
-// state dirs) is included — importing those would ask the plane to custody what
-// it must not, and the origin rule depends on the trusted statement staying
-// where the operator wrote it until ratified.
+// review_panel, and each phase's model), the consumed families and the two
+// backstops, in the plane's own snake_case vocabulary with wall clock as
+// integer seconds. Nothing machine-local (workdir, wiring, env, state dirs) is
+// included — importing those would ask the plane to custody what it must not,
+// and the origin rule depends on the trusted statement staying where the
+// operator wrote it until ratified.
+//
+// `review_panel_concurrency` is deliberately NOT exported (decision e1365721):
+// it is how many panel seats run at once on THIS machine, not part of the
+// run's result, so it stays machine-owned. A ratifying round-trip therefore
+// cannot move one machine's cap onto every other.
 func (c *Config) RunConfigDocument() map[string]any {
 	doc := map[string]any{}
 	if c.Harness != "" {
@@ -526,9 +555,6 @@ func (c *Config) RunConfigDocument() map[string]any {
 			panel[i] = entry
 		}
 		pipeline["review_panel"] = panel
-	}
-	if c.ReviewPanelConcurrency > 0 {
-		pipeline["review_panel_concurrency"] = c.ReviewPanelConcurrency
 	}
 	for k, v := range pipeline {
 		doc[k] = v

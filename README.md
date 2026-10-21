@@ -353,7 +353,10 @@ because a review-only session's deliverable is its record and committing its
 probe artifacts would move the tip past the revision every member recorded.
 `review_panel_concurrency` caps how many run at once: `1` is the historical
 sequential behaviour (members then share the task's own worktree), `N` runs at
-most `N`, and an absent key or `0` means the whole panel. Members start in
+most `N`, and an absent key or `0` means the whole panel. It is **machine-owned**
+(local `config.json` only, never taken from the plane's stored document): how
+many seats run at once changes how fast a machine reaches the result, not what
+the result is. Members start in
 `review_panel` order: with a cap smaller than the panel, the first `N` entries
 run first and each freed slot goes to the next entry, so put the slowest
 reviewer at the top of the list — its long session then overlaps the others
@@ -2156,21 +2159,29 @@ two knobs are separate.
 ### Execution config from the plane
 
 A project's execution dials - the **pipeline** (`prompt`, `phases`,
-`review_panel`, `review_panel_concurrency`), harness, model, tier buckets,
-budget, review-tier escalation rules, and the two backstops (`max_turns`,
-`max_session_wall_clock`, as integer seconds) - can live **on the plane**
-instead of in this file. The daemon reads each project's stored document (per
-project, so two queues can run two postures) and overlays it over this file;
-until a project has one, this file rules byte for byte. `doctor` reports which
-is in force per project, warns when a stored dial cannot fire on your machine (a
-turn cap under opencode, say), and **fails** when a stored step names a harness
-this machine cannot spawn (no `harnesses.<h>` block) - shape-validates on the
-plane, machine-fit is doctor's.
+`review_panel`), harness, model, tier buckets, budget, review-tier escalation
+rules, and the two backstops (`max_turns`, `max_session_wall_clock`, as integer
+seconds) - can live **on the plane** instead of in this file. The daemon reads
+each project's stored document (per project, so two queues can run two postures)
+and overlays it over this file; until a project has one, this file rules byte
+for byte. `doctor` reports which is in force per project, warns when a stored
+dial cannot fire on your machine (a turn cap under opencode, say), and **fails**
+when a stored step names a harness this machine cannot spawn (no
+`harnesses.<h>` block) - shape-validates on the plane, machine-fit is doctor's.
 
-The pipeline is **one section**: a stored document carrying any of the four
-pipeline keys replaces all four, so a stored `phases` clears a local `prompt`
-and `review_panel` rather than running beside them. A document that carries
-none of them leaves the local pipeline alone.
+The pipeline is **one section**: a stored document carrying any of the three
+pipeline keys replaces all three, so a stored `phases` clears a local `prompt`
+and `review_panel` rather than running beside them. A document that carries none
+of them leaves the local pipeline alone. A phase may name a `model` directly,
+exactly as in the local file (a configured phase sets `model` or `tier`, not
+both).
+
+`review_panel_concurrency` is **machine-owned**, not part of the section and
+never taken from the stored document: the phase sequence, every phase's harness
+and model, and the panel's composition are policy, so the run's result is the
+same on every machine, while how many panel seats run at once is how fast that
+machine gets there. The local file's value stays in force whatever the document
+carries.
 
 Edits apply at the **next iteration boundary**, never mid-session: the daemon
 watches the version on the backlog-summary poll it already makes, and on a bump
@@ -2186,9 +2197,11 @@ clankerbar propose-config            # --slug <project> when projects[] names se
 
 That records a PENDING proposal; nothing changes until you ratify it in the
 console (Settings -> Run configuration). The pipeline travels with it — `prompt`,
-`phases`, `review_panel`, `review_panel_concurrency`, and a phase's `model` —
-along with the model/tier/budget/escalation dials. Wiring, env and paths stay
-local: the plane custodies policy, never machine fit or credentials.
+`phases`, `review_panel`, and a phase's `model` — along with the
+model/tier/budget/escalation dials. `review_panel_concurrency` deliberately does
+not travel: it names this machine's parallelism, not the pipeline's result.
+Wiring, env and paths stay local too: the plane custodies policy, never machine
+fit or credentials.
 
 ### Multi-project: one instance, many queues
 

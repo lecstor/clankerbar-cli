@@ -397,13 +397,18 @@ func pipelineBase() *Config {
 		{Name: "fix", Tier: "local"},
 	}
 	c.ReviewPanel = []ReviewPanelMember{{Name: "local", Model: "local/one"}}
-	c.ReviewPanelConcurrency = 1
+	// The cap is the MACHINE's dial (decision e1365721). A distinct local value
+	// is what every overlay assertion uses to prove the stored document never
+	// moved it.
+	c.ReviewPanelConcurrency = 3
 	return c
 }
 
 // operatorPipeline is the document the task's doneWhen describes: implement /
 // review / fix / verify on opencode, implement pinned to a model directly, a
-// five-member panel, concurrency 3.
+// five-member panel. It deliberately carries NO review_panel_concurrency: that
+// is the machine's dial and propose-config does not export it (decision
+// e1365721).
 func operatorPipeline() *RunConfigDoc {
 	return &RunConfigDoc{
 		SchemaVersion: 1,
@@ -420,7 +425,6 @@ func operatorPipeline() *RunConfigDoc {
 			{Model: "opencode-go/glm-5.3-flash"},
 			{Name: "tiebreak", Model: "opencode-go/gpt-6-luna"},
 		},
-		ReviewPanelConcurrency: 3,
 	}
 }
 
@@ -448,7 +452,7 @@ func TestApplyRunConfig_PipelineSectionReplacesTheLocalPipeline(t *testing.T) {
 		t.Errorf("review panel = %+v, want the stored 5 members", base.ReviewPanel)
 	}
 	if base.ReviewPanelConcurrency != 3 {
-		t.Errorf("review_panel_concurrency = %d, want the stored 3", base.ReviewPanelConcurrency)
+		t.Errorf("review_panel_concurrency = %d, want the LOCAL 3 kept: the stored document does not own the machine's cap (decision e1365721)", base.ReviewPanelConcurrency)
 	}
 	if base.Prompt != "" {
 		t.Errorf("prompt = %q, want the local one cleared by the stored phases", base.Prompt)
@@ -458,8 +462,10 @@ func TestApplyRunConfig_PipelineSectionReplacesTheLocalPipeline(t *testing.T) {
 	}
 }
 
-// The pipeline is ONE section (decision 6bf1fa15): carrying any key replaces all
-// four, in both directions, so prompt and phases cannot both survive an overlay.
+// The pipeline is ONE section (decision 6bf1fa15): carrying any of prompt,
+// phases or review_panel replaces all three, in both directions, so prompt and
+// phases cannot both survive an overlay. `review_panel_concurrency` is outside
+// the section (decision e1365721) and survives whichever way it goes.
 func TestApplyRunConfig_PipelineSectionClearsTheKeysItOmits(t *testing.T) {
 	t.Run("stored phases clear a local panel and prompt", func(t *testing.T) {
 		base := defaults()
@@ -482,8 +488,8 @@ func TestApplyRunConfig_PipelineSectionClearsTheKeysItOmits(t *testing.T) {
 		if base.ReviewPanel != nil {
 			t.Errorf("review panel = %+v, want it cleared: the stored section omitted it", base.ReviewPanel)
 		}
-		if base.ReviewPanelConcurrency != 0 {
-			t.Errorf("review_panel_concurrency = %d, want it cleared with the panel", base.ReviewPanelConcurrency)
+		if base.ReviewPanelConcurrency != 2 {
+			t.Errorf("review_panel_concurrency = %d, want the local 2 kept: the cap is machine-owned, not part of the replaced section", base.ReviewPanelConcurrency)
 		}
 	})
 	t.Run("a stored prompt clears a local sequence and panel", func(t *testing.T) {
@@ -497,8 +503,11 @@ func TestApplyRunConfig_PipelineSectionClearsTheKeysItOmits(t *testing.T) {
 		if base.Phases != nil {
 			t.Errorf("phases = %+v, want them cleared: the stored section omitted them", base.Phases)
 		}
-		if base.ReviewPanel != nil || base.ReviewPanelConcurrency != 0 {
-			t.Errorf("panel = %+v/%d, want the whole section cleared", base.ReviewPanel, base.ReviewPanelConcurrency)
+		if base.ReviewPanel != nil {
+			t.Errorf("panel = %+v, want it cleared: the stored section omitted it", base.ReviewPanel)
+		}
+		if base.ReviewPanelConcurrency != 3 {
+			t.Errorf("review_panel_concurrency = %d, want the local 3 kept with the panel gone", base.ReviewPanelConcurrency)
 		}
 	})
 }
@@ -513,12 +522,47 @@ func TestApplyRunConfig_DocumentWithoutPipelineKeepsTheLocalPipeline(t *testing.
 	if len(base.Phases) != 3 || base.Phases[0].Tier != "local" {
 		t.Errorf("phases = %+v, want the local sequence untouched", base.Phases)
 	}
-	if len(base.ReviewPanel) != 1 || base.ReviewPanel[0].Model != "local/one" || base.ReviewPanelConcurrency != 1 {
+	if len(base.ReviewPanel) != 1 || base.ReviewPanel[0].Model != "local/one" || base.ReviewPanelConcurrency != 3 {
 		t.Errorf("panel = %+v/%d, want the local panel untouched", base.ReviewPanel, base.ReviewPanelConcurrency)
 	}
 	if base.MaxTurns != 9 {
 		t.Errorf("max_turns = %d, want the stored 9 (the non-pipeline family still overlays)", base.MaxTurns)
 	}
+}
+
+// review_panel_concurrency is machine-owned (decision e1365721). A stored value
+// must never override the local file's, and the key alone is not a pipeline
+// statement: it cannot drag in a stored panel or clear a local one.
+func TestApplyRunConfig_StoredPanelConcurrencyIsIgnored(t *testing.T) {
+	t.Run("a stored cap never overrides the local one", func(t *testing.T) {
+		base := pipelineBase()
+		doc := operatorPipeline()
+		doc.ReviewPanelConcurrency = 5
+		if err := base.ApplyRunConfig(doc); err != nil {
+			t.Fatalf("ApplyRunConfig: %v", err)
+		}
+		if base.ReviewPanelConcurrency != 3 {
+			t.Errorf("review_panel_concurrency = %d, want the local 3, not the stored 5", base.ReviewPanelConcurrency)
+		}
+		if len(base.ReviewPanel) != 5 {
+			t.Errorf("review panel = %d members, want the stored 5: the rest of the section still applies", len(base.ReviewPanel))
+		}
+	})
+	t.Run("the key alone is not a pipeline statement", func(t *testing.T) {
+		base := pipelineBase()
+		if err := base.ApplyRunConfig(&RunConfigDoc{SchemaVersion: 1, ReviewPanelConcurrency: 5}); err != nil {
+			t.Fatalf("ApplyRunConfig: %v", err)
+		}
+		if len(base.Phases) != 3 || base.Phases[0].Tier != "local" {
+			t.Errorf("phases = %+v, want the local sequence untouched", base.Phases)
+		}
+		if len(base.ReviewPanel) != 1 || base.ReviewPanel[0].Model != "local/one" {
+			t.Errorf("panel = %+v, want the local panel untouched", base.ReviewPanel)
+		}
+		if base.ReviewPanelConcurrency != 3 {
+			t.Errorf("review_panel_concurrency = %d, want the local 3", base.ReviewPanelConcurrency)
+		}
+	})
 }
 
 // An overlay on a CLONE must never reach the base config's pipeline: the driver
@@ -535,7 +579,7 @@ func TestClone_PipelineSlicesAreIndependent(t *testing.T) {
 	if base.Phases[0].Model != "" || base.Phases[0].Tier != "local" {
 		t.Errorf("base phases mutated through the clone: %+v", base.Phases[0])
 	}
-	if base.ReviewPanel[0].Model != "local/one" || base.ReviewPanelConcurrency != 1 {
+	if base.ReviewPanel[0].Model != "local/one" || base.ReviewPanelConcurrency != 3 {
 		t.Errorf("base panel mutated through the clone: %+v/%d", base.ReviewPanel[0], base.ReviewPanelConcurrency)
 	}
 	// An overlay REPLACES the slices, so the clone must not end up aliasing the
@@ -555,18 +599,25 @@ func TestClone_PipelineSlicesAreIndependent(t *testing.T) {
 
 // propose-config lifts the live pipeline onto the plane, so the rendered
 // document must carry the section in the plane's vocabulary — integer seconds,
-// `model` beside `tier`, empty fields omitted.
+// `model` beside `tier`, empty fields omitted — while `review_panel_concurrency`
+// stays behind: it is the machine's, not the run's (decision e1365721).
 func TestRunConfigDocument_RoundTripsThePipelineAndPhaseModel(t *testing.T) {
 	c := pipelineBase()
 	c.Phases[0].Model = "opencode-go/gpt-6-luna"
 	c.Phases[0].Tier = ""
 	c.Phases[0].MaxWallClock = Duration(45 * time.Minute)
 	c.Phases[1].Tier = "strong"
-	c.ReviewPanelConcurrency = 3
 
 	data, err := json.Marshal(c.RunConfigDocument())
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v (%s)", err, data)
+	}
+	if _, ok := raw["review_panel_concurrency"]; ok {
+		t.Errorf("the rendered document carries review_panel_concurrency, which is machine-owned and must not travel (%s)", data)
 	}
 	var doc RunConfigDoc
 	if err := json.Unmarshal(data, &doc); err != nil {
@@ -588,16 +639,16 @@ func TestRunConfigDocument_RoundTripsThePipelineAndPhaseModel(t *testing.T) {
 		t.Errorf("phases[1] = model %q tier %q, want the tier kept and no model (%s)", doc.Phases[1].Model, doc.Phases[1].Tier, data)
 	}
 	// Integer seconds, not a duration string: the stored shape is the plane's.
-	var raw struct {
+	var rawPhases struct {
 		Phases []map[string]json.RawMessage `json:"phases"`
 	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("unmarshal raw: %v", err)
+	if err := json.Unmarshal(data, &rawPhases); err != nil {
+		t.Fatalf("unmarshal raw phases: %v", err)
 	}
-	if got := string(raw.Phases[0]["max_wall_clock"]); got != "2700" {
+	if got := string(rawPhases.Phases[0]["max_wall_clock"]); got != "2700" {
 		t.Errorf("max_wall_clock on the wire = %s, want the integer 2700", got)
 	}
-	if len(doc.ReviewPanel) != 1 || doc.ReviewPanel[0].Model != "local/one" || doc.ReviewPanelConcurrency != 3 {
+	if len(doc.ReviewPanel) != 1 || doc.ReviewPanel[0].Model != "local/one" || doc.ReviewPanelConcurrency != 0 {
 		t.Errorf("panel did not round-trip: %+v/%d (%s)", doc.ReviewPanel, doc.ReviewPanelConcurrency, data)
 	}
 }
