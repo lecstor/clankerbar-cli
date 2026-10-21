@@ -201,6 +201,9 @@ func TestOpencodeDetectLimit(t *testing.T) {
 		// window, so only the structured path can classify these.
 		{"structured weekly window at the body's top level", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Your plan limit has been reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"message\":\"Weekly usage limit reached\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, true, false, "", "weekly"},
 		{"structured weekly window nested under the body's error object", Result{Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"response":{"body":"{\"error\":{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}}"}}}`}, true, false, "", "weekly"},
+		// The window may also sit on the error object itself, not in a body —
+		// opencode's own ProviderError carries a rateLimit there.
+		{"structured weekly window on the error object", Result{Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"code":"RATE_LIMITED","rateLimit":{"window":"weekly"}}}`}, true, false, "", "weekly"},
 		{"structured daily window", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Your plan limit has been reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"daily\"}}"}}}`}, true, false, "", "daily"},
 		{"structured fiveHour window with a stated reset", Result{Stdout: `{"type":"error","error":{"message":"Your plan limit has been reached. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"fiveHour\"}}"}}}`}, true, false, "2026-10-20T15:56:48.251Z", "5-hour"},
 		// The older APIError shape puts the same provider body under
