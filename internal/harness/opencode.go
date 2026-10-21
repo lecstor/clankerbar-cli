@@ -45,10 +45,13 @@ func init() { Register(opencode{}) }
 //     server it hands over and denies `execute`.
 //   - Billing depends on the configured backend, not opencode: metered pay-per-token
 //     (OpenRouter / Zen), a monthly-limit subscription (opencode Go), or the Command
-//     Code plan's rolling 5-hour usage window. The first two are hard caps; a
-//     rolling window states its reset, so DetectLimit reports it as a WAITABLE
-//     limit (Limit.Stop unset, ResetAt parsed when stated) and the loop supervises
-//     the wait. The hard cases (402 / "out of credits" / "monthly limit reached")
+//     Code plan's rolling usage windows — 5-hour, daily and weekly. The first two
+//     are hard caps; a rolling window names the cap and usually states its reset,
+//     so DetectLimit reports it as a WAITABLE limit (Limit.Stop unset, ResetAt
+//     parsed when stated, Limit.Window labelled) and the loop supervises the wait.
+//     The window is read from the provider's structured `rateLimit.window` in the
+//     response body opencode passes through verbatim, falling back to the message
+//     wording. The hard cases (402 / "out of credits" / "monthly limit reached")
 //     still set Limit.Stop so the loop stops cleanly rather than waiting for a
 //     reset that never comes. The self-accounted budget breaker is the primary
 //     control; ReadUsage is unsupported.
