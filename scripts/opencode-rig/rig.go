@@ -231,8 +231,13 @@ func runRig(o runOptions) (int, error) {
 			return 1, err
 		}
 	}
-	if o.Scenario == "schema" && !contains(cat.toolNames(), o.SchemaTool) {
-		return 1, fmt.Errorf("schema scenario: tool %q is not in the catalog (have %s)", o.SchemaTool, strings.Join(cat.toolNames(), ", "))
+	// A scenario whose stub answers one tool and whose prompt asks for it is
+	// pointless against a catalog that does not serve that tool: the model is
+	// offered the old surface (or nothing), the stub logs no call for it, and
+	// the report says nothing about what the scenario claims to test.
+	if want := catalogTool(o.Scenario, o.SchemaTool); want != "" && !contains(cat.toolNames(), want) {
+		return 1, fmt.Errorf("%s scenario: tool %q is not in the catalog (have %s). Serve a catalog from a plane that serves it (or a file with --schemas)",
+			o.Scenario, want, strings.Join(cat.toolNames(), ", "))
 	}
 
 	// Base config: the fleet's own file when present.

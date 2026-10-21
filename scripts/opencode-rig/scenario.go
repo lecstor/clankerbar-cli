@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 )
 
@@ -39,21 +38,27 @@ func (s scenarioDef) promptFor(schemaTool string) string {
 // is not given. It must be a tool this release's plane serves (CLA-748): the
 // cutover deletes update_task, so a probe defaulting to it would exercise a
 // name the plane answers as unknown and prove nothing about a real schema.
-const defaultSchemaTool = "record_progress"
+// edit_task is also the surface the padding scenario studies.
+const defaultSchemaTool = "edit_task"
 
-// schemaToolName is the tool name the session sees. The catalog's tools are
-// served by the clankerbar MCP server, so opencode exposes `record_progress` as
-// `clankerbar_record_progress`; --schema-tool names the catalog's (unprefixed)
-// tool and this is the prefixed form the prompt must ask for.
-func schemaToolName(tool string) string {
+// schemaToolID is the catalog's (unprefixed) name for the schema scenario's
+// selected tool: --schema-tool when it is set, otherwise the default. The
+// catalog serves unprefixed names, so an already-prefixed --schema-tool is
+// unwrapped rather than prefixed twice.
+func schemaToolID(tool string) string {
 	tool = strings.TrimSpace(tool)
 	if tool == "" {
-		tool = defaultSchemaTool
+		return defaultSchemaTool
 	}
-	if strings.HasPrefix(tool, "clankerbar_") {
-		return tool
-	}
-	return "clankerbar_" + tool
+	return strings.TrimPrefix(tool, "clankerbar_")
+}
+
+// schemaToolName is the tool name the session sees. The catalog's tools are
+// served by the clankerbar MCP server, so opencode exposes `edit_task` as
+// `clankerbar_edit_task`; --schema-tool names the catalog's (unprefixed) tool
+// and this is the prefixed form the prompt must ask for.
+func schemaToolName(tool string) string {
+	return "clankerbar_" + schemaToolID(tool)
 }
 
 // toolResult is what the stub puts on the wire for one tools/call.
@@ -65,34 +70,49 @@ type toolResult struct {
 // scenarios is the shipped set. Each one is small on purpose: one question, one
 // run, one report.
 func scenarios() map[string]scenarioDef {
+	// The padding scenario's canned task row starts with both flags SET,
+	// because that is the state the residual is about: a padded `false` CLEARS
+	// a SET flag, and a `false` on an already-false one is a no-op.
+	edit := newEditTaskState()
 	return map[string]scenarioDef{
-		// padding reproduces the provider padding a review-shaped update_task
-		// with every nullable property set to null, which the plane refuses as
-		// invalid_review. The refusal names the offenders the arguments actually
-		// carried, exactly as the plane's reviewCallRefusal does, and the report
-		// lists the keys sent per call.
+		// padding reproduces strict-mode provider padding against the one
+		// strict-mode surface edit_task still has (proposal R4, decision
+		// c06cdfc7): a client that fills EVERY optional property with its
+		// type's empty value sends `null` on the nullable enums and `false` on
+		// the two flags. The prompt therefore asks only for the arguments that
+		// DIFFER between the three calls; whether the rest arrives padded is
+		// the provider behaviour this scenario exists to observe, not something
+		// the prompt should dictate. What the scenario shows:
+		//
+		//   - `null` on a nullable enum is absence, so a padded call is not
+		//     refused for sending one;
+		//   - `container` / `humanOnly` take `false` as their CLEAR spelling, so
+		//     a padded `false` CLEARS a flag the task had SET - the one place
+		//     padding is not safe;
+		//   - `repo: ""` clears routing back to the primary repo, while a padded
+		//     `repo: null` is absence and leaves it alone;
+		//   - a call carrying nothing real is refused `nothing_to_do`, and two
+		//     long fields in one call are refused `one_long_field`.
+		//
+		// The stub answers like the plane does, including the `changed` receipt,
+		// and the report lists the keys sent per call plus the residual signals
+		// each call actually carried.
 		"padding": {
 			Name: "padding",
 			Prompt: strings.TrimSpace(`
-Call the tool clankerbar_update_task once to record this review:
-- taskId: CLA-753
-- runId: rig-run-1
-- review: reviewerRole "review-1", verdict "pass"
-Then answer with one sentence summarizing what the tool returned and stop.`),
+Call the tool clankerbar_edit_task three times, one call at a time, and pass
+taskId "CLA-753" every time. The calls differ only in these arguments:
+
+1. detail: "the new body"
+2. repo: ""
+3. repo: null
+
+Then answer with one sentence saying what each call reported changed, and stop.`),
 			Respond: func(tool string, args map[string]any) toolResult {
-				if tool != "update_task" {
+				if tool != "edit_task" {
 					return defaultToolResult(tool)
 				}
-				offenders := reviewPadding(args)
-				if len(offenders) == 0 {
-					// The plane would write the record; the stub never writes.
-					return toolResult{Text: `{"ok":true,"note":"rig stub: review accepted, nothing written"}`}
-				}
-				msg := "a review call carries only taskId, runId and review - resend it without: " +
-					strings.Join(offenders, ", ") +
-					". Those fields would change the task, and a reviewer records its review and " +
-					"nothing else. Nothing was written."
-				return toolError("invalid_review", msg)
+				return editTaskReceipt(edit, args)
 			},
 		},
 
@@ -131,15 +151,15 @@ clankerbar_get_task once for CLA-754. Then say DONE and stop.`),
 		// schema serves whatever catalog --schemas names, so a proposed tool
 		// shape (nullable enums, a new tool) can be tested before the plane
 		// ships it. The prompt names the tool --schema-tool selects, so the
-		// selected tool is the one actually exercised: it asks for null on every
-		// optional argument the schema allows, the padding a strict-mode client
-		// is easy to get wrong on.
+		// selected tool is the one actually exercised, and it asks for exactly
+		// the shape a nullable enum is easy to get wrong on: a null everywhere
+		// the schema allows one.
 		"schema": {
 			Name: "schema",
 			PromptFor: func(schemaTool string) string {
 				name := schemaToolName(schemaTool)
 				return strings.TrimSpace(fmt.Sprintf(`
-Call the tool %s exactly once, sending null for every optional argument its schema allows to be null, and the arguments its schema requires. Then say DONE and stop.`, name))
+Call the tool %s exactly once. Pass taskId "CLA-753" if its schema declares one, send null for every optional argument its schema allows to be null, and supply the arguments its schema requires. Then say DONE and stop.`, name))
 			},
 			Respond: func(tool string, args map[string]any) toolResult {
 				return jsonResult(map[string]any{
@@ -152,19 +172,145 @@ Call the tool %s exactly once, sending null for every optional argument its sche
 	}
 }
 
-// reviewPadding returns the review call's own top-level arguments that the
-// plane's review rule refuses, sorted. It mirrors the plane: a review call may
-// carry taskId, runId and review and nothing else, and a padded nullable
-// property sent as null is still an argument that was passed.
-func reviewPadding(args map[string]any) []string {
-	allowed := map[string]bool{"taskId": true, "runId": true, "review": true}
+// catalogTool returns the tool a scenario's stub answers and its prompt asks
+// for, when the scenario is pointless without that tool in the catalog the
+// session is offered. "" means the scenario does not depend on a catalog tool.
+func catalogTool(scenario, schemaTool string) string {
+	switch scenario {
+	case "schema":
+		return schemaToolID(schemaTool)
+	case "padding":
+		// The residual lives on edit_task. A catalog that predates the tool
+		// cutover does not serve it, and the model would be offered everything
+		// except the surface this scenario studies.
+		return "edit_task"
+	case "reasoning-replay":
+		// Both tool turns ask for get_task and the stub answers it; a catalog
+		// without it produces the same pointless run as the padding scenario
+		// against a pre-cutover catalog.
+		return "get_task"
+	}
+	return ""
+}
+
+// editTaskState is the canned task row the padding scenario edits, reduced to
+// the two flags whose CURRENT value decides whether a padded `false` is a CLEAR
+// or a no-op. Both start SET, so the residual is observable on the first call.
+type editTaskState struct {
+	container bool
+	humanOnly bool
+}
+
+func newEditTaskState() *editTaskState {
+	return &editTaskState{container: true, humanOnly: true}
+}
+
+// editTaskFields is the order the plane's edit_task builds its revision in, so
+// the receipt's `changed` reads the same here as it does from the plane.
+var editTaskFields = []string{
+	"title", "detail", "doneWhen", "category", "repo",
+	"priority", "schedule", "container", "humanOnly",
+}
+
+// editTaskReceipt answers one edit_task call the way the protocol-41 plane
+// does, reduced to what this scenario exercises. The order is the plane's:
+// empty arguments are dropped first (an empty value is an absent one), then
+// edit_task's own guards run (taskId required, at most one long field), then a
+// `false` on an already-false flag is dropped so the receipt never claims a
+// change the call did not make.
+func editTaskReceipt(st *editTaskState, args map[string]any) toolResult {
+	sent := dropEmptyArgs(args)
+	if taskID, _ := sent["taskId"].(string); taskID == "" {
+		return toolError("missing_argument",
+			"Required argument(s) absent or empty: taskId. `edit_task` needs the task to "+
+				"revise. Nothing was written.")
+	}
+	if longs := longFieldsCarried(sent); len(longs) > 1 {
+		return toolError("one_long_field",
+			"`edit_task` takes at most ONE long field per call, and this call carries "+
+				strings.Join(longs, " and ")+
+				". The emission defect that swallows a parameter merges ADJACENT long ones, "+
+				"so two in one call can silently absorb each other - send them as separate "+
+				"calls. Nothing was written.")
+	}
+
+	changed := make([]string, 0, len(editTaskFields))
+	for _, field := range editTaskFields {
+		v, ok := sent[field]
+		if !ok {
+			continue
+		}
+		if field == "container" || field == "humanOnly" {
+			set, _ := v.(bool)
+			current := st.container
+			if field == "humanOnly" {
+				current = st.humanOnly
+			}
+			// A padded `false` on an already-false flag is a no-op (CLA-745),
+			// and a receipt listing it would claim a change nobody made. On a
+			// SET flag the `false` IS the clear - the ruled residual.
+			if !set && !current {
+				continue
+			}
+			if field == "container" {
+				st.container = set
+			} else {
+				st.humanOnly = set
+			}
+		}
+		changed = append(changed, field)
+	}
+	if len(changed) == 0 {
+		return toolError("nothing_to_do",
+			"`edit_task` needs at least one field to revise. Nothing was written.")
+	}
+	return jsonResult(map[string]any{
+		"task": map[string]any{
+			"id":     "00000000-0000-4000-8000-000000000753",
+			"ref":    "CLA-753",
+			"status": "backlog",
+		},
+		"changed": changed,
+		"note":    "rig stub: accepted, nothing written",
+	})
+}
+
+// dropEmptyArgs mirrors the plane's rule that an EMPTY VALUE IS AN ABSENT ONE
+// (tool-args.ts): `null` is absence on every property, `""` is absence on the
+// text fields EXCEPT `repo` whose `""` is the documented CLEAR, and an empty
+// list is absence. It deliberately KEEPS a `false` on container/humanOnly,
+// which is their CLEAR spelling - the ruled residual this scenario exists to
+// show.
+func dropEmptyArgs(args map[string]any) map[string]any {
+	textFields := map[string]bool{
+		"title": true, "detail": true, "doneWhen": true, "category": true,
+	}
+	out := make(map[string]any, len(args))
+	for k, v := range args {
+		if v == nil {
+			continue
+		}
+		if s, ok := v.(string); ok && s == "" && textFields[k] {
+			continue
+		}
+		if xs, ok := v.([]any); ok && len(xs) == 0 {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
+// longFieldsCarried returns the long (prose) fields a call actually carries.
+// edit_task refuses more than one per call: the emission defect merges ADJACENT
+// long parameters, so the loss is schema-valid and nothing else catches it.
+func longFieldsCarried(sent map[string]any) []string {
 	var out []string
-	for k := range args {
-		if !allowed[k] {
-			out = append(out, k)
+	for _, field := range []string{"title", "detail", "doneWhen"} {
+		if s, ok := sent[field].(string); ok && s != "" {
+			out = append(out, field)
 		}
 	}
-	sort.Strings(out)
 	return out
 }
 

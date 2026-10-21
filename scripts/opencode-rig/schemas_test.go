@@ -47,7 +47,7 @@ func TestLoadCatalogAcceptsEveryShape(t *testing.T) {
 
 func TestSaveCatalogPreservesRawToolBytes(t *testing.T) {
 	dir := t.TempDir()
-	raw := `{"name":"update_task","inputSchema":{"type":"object","properties":{"status":{"anyOf":[{"type":"string","enum":["ready"]},{"type":"null"}]}}}}`
+	raw := `{"name":"edit_task","inputSchema":{"type":"object","properties":{"priority":{"anyOf":[{"type":"string","enum":["h"]},{"type":"null"}]}}}}`
 	cat := catalog{Source: "test", Tools: []json.RawMessage{json.RawMessage(raw)}}
 	path := filepath.Join(dir, "schemas.json")
 	if err := saveCatalog(path, cat); err != nil {
@@ -112,7 +112,7 @@ func TestFetchCatalogTalksReadOnlyMCP(t *testing.T) {
 		case "notifications/initialized":
 			w.WriteHeader(http.StatusAccepted)
 		case "tools/list":
-			fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"next_task\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"update_task\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n")
+			fmt.Fprint(w, "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"next_task\",\"inputSchema\":{\"type\":\"object\"}},{\"name\":\"edit_task\",\"inputSchema\":{\"type\":\"object\"}}]}}\n\n")
 		default:
 			http.Error(w, "the rig must never call a tool", http.StatusForbidden)
 		}
@@ -123,7 +123,7 @@ func TestFetchCatalogTalksReadOnlyMCP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(cat.toolNames(), ","); got != "next_task,update_task" {
+	if got := strings.Join(cat.toolNames(), ","); got != "next_task,edit_task" {
 		t.Errorf("tools = %s", got)
 	}
 	if cat.Source != srv.URL {
@@ -140,23 +140,26 @@ func TestShippedProposedSchemaLoads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(cat.toolNames(), ","); got != "update_task,frobnicate" {
+	if got := strings.Join(cat.toolNames(), ","); got != "edit_task,frobnicate" {
 		t.Fatalf("tools = %s", got)
 	}
 	// The example must keep the nullable-enum rendering the schema scenario
 	// exists to exercise.
-	var update struct {
+	var edit struct {
 		InputSchema struct {
 			Properties map[string]struct {
 				AnyOf []json.RawMessage `json:"anyOf"`
 			} `json:"properties"`
 		} `json:"inputSchema"`
 	}
-	if err := json.Unmarshal(cat.Tools[0], &update); err != nil {
+	if err := json.Unmarshal(cat.Tools[0], &edit); err != nil {
 		t.Fatal(err)
 	}
-	if len(update.InputSchema.Properties["status"].AnyOf) != 2 {
-		t.Errorf("status is no longer a nullable enum: %s", cat.Tools[0])
+	if len(edit.InputSchema.Properties["priority"].AnyOf) != 2 {
+		t.Errorf("priority is no longer a nullable enum: %s", cat.Tools[0])
+	}
+	if len(edit.InputSchema.Properties["container"].AnyOf) != 2 {
+		t.Errorf("container is no longer a nullable boolean: %s", cat.Tools[0])
 	}
 }
 

@@ -93,7 +93,7 @@ Run flags (run):
                                                tools/list, or load a file
   --plane-url URL                              plane MCP URL for the live fetch
   --schema-tool name                           tool the schema scenario calls, as the
-                                               catalog names it (default record_progress)
+                                               catalog names it (default edit_task)
   --plane-key-file file                        read CLANKERBAR_API_KEY from this file
   --provider-key-file file                     read the provider key from this file
   --provider-key-env VAR                       environment variable the provider key is

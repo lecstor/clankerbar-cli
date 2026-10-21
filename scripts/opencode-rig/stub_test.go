@@ -13,7 +13,7 @@ import (
 func testCatalog(t *testing.T) catalog {
 	t.Helper()
 	return catalog{Tools: []json.RawMessage{
-		json.RawMessage(`{"name":"update_task","description":"Update a task","inputSchema":{"type":"object","properties":{"taskId":{"type":"string"}}}}`),
+		json.RawMessage(`{"name":"edit_task","description":"Revise a task","inputSchema":{"type":"object","properties":{"taskId":{"type":"string"}}}}`),
 		json.RawMessage(`{"name":"get_task","description":"Get a task","inputSchema":{"type":"object","properties":{"taskId":{"type":"string"}}}}`),
 	}}
 }
@@ -24,7 +24,7 @@ func TestStubServesInitializeListAndCannedCall(t *testing.T) {
 		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}`,
 		`{"jsonrpc":"2.0","method":"notifications/initialized"}`,
 		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`,
-		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"update_task","arguments":{"taskId":"CLA-753","runId":"rig-run-1","review":{"reviewerRole":"review-1","verdict":"pass"},"status":null}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"edit_task","arguments":{"taskId":"CLA-753","runId":null,"title":"","detail":"the new body","category":"","repo":null,"priority":null,"schedule":null,"container":false,"humanOnly":false}}}`,
 	}, "\n"))
 	var out bytes.Buffer
 	if err := serveStub(context.Background(), stdin, &out, stubOptions{
@@ -49,19 +49,20 @@ func TestStubServesInitializeListAndCannedCall(t *testing.T) {
 		t.Errorf("tools/list = %v, want the catalog's 2 tools", list)
 	}
 
-	// The third response is a tools/call: a review-shaped update_task with a
-	// padded nullable property must be refused like the plane refuses it.
+	// The third response is a tools/call: a fully padded edit_task must be
+	// answered the way the plane answers it. The `null`s are absence, the text
+	// `""`s say nothing, and the two padded `false` flags CLEAR a SET flag.
 	call := responses[3].(map[string]any)
-	if call["isError"] != true {
-		t.Fatalf("padded review call isError = %v, want true", call["isError"])
+	if call["isError"] == true {
+		t.Fatalf("padded edit_task was refused: %v", call)
 	}
 	text := call["content"].([]any)[0].(map[string]any)["text"].(string)
-	if !strings.Contains(text, `"code":"invalid_review"`) || !strings.Contains(text, "status") {
-		t.Errorf("refusal = %s, want invalid_review naming status", text)
+	if !strings.Contains(text, `"changed":["detail","container","humanOnly"]`) {
+		t.Errorf("receipt = %s, want changed detail, container and humanOnly", text)
 	}
 
 	// The call log is the report's source of truth: the keys actually sent must
-	// be there, null included.
+	// be there, empty values included.
 	calls, err := readStubCalls(dir + "/stub-calls.jsonl")
 	if err != nil {
 		t.Fatal(err)
@@ -69,11 +70,11 @@ func TestStubServesInitializeListAndCannedCall(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("logged %d calls, want 1", len(calls))
 	}
-	if got := strings.Join(calls[0].Keys, ","); got != "review,runId,status,taskId" {
+	if got := strings.Join(calls[0].Keys, ","); got != "category,container,detail,humanOnly,priority,repo,runId,schedule,taskId,title" {
 		t.Errorf("argumentKeys = %s", got)
 	}
-	if !calls[0].IsError {
-		t.Error("logged call isError = false, want true")
+	if calls[0].IsError {
+		t.Error("logged call isError = true, want the padded call accepted")
 	}
 	if !fileExists(dir + "/stub-started") {
 		t.Error("stub-started marker missing")
@@ -135,17 +136,116 @@ func TestStubCapIsOffAtZero(t *testing.T) {
 	}
 }
 
-func TestReviewPadding(t *testing.T) {
-	got := reviewPadding(map[string]any{
-		"taskId": "x", "runId": "r", "review": map[string]any{},
-		"status": nil, "priority": nil, "schedule": nil,
-	})
-	want := []string{"priority", "schedule", "status"}
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Fatalf("reviewPadding = %v, want %v", got, want)
+// paddedEditCall is the shape a strict-mode client sends: every property the
+// edit_task schema declares, each at its type's empty value. `over` sets the
+// members a call really carries.
+func paddedEditCall(over map[string]any) map[string]any {
+	args := map[string]any{
+		"taskId":    "CLA-753",
+		"runId":     nil,
+		"title":     "",
+		"detail":    "",
+		"doneWhen":  "",
+		"category":  "",
+		"repo":      nil,
+		"priority":  nil,
+		"schedule":  nil,
+		"container": false,
+		"humanOnly": false,
 	}
-	if got := reviewPadding(map[string]any{"taskId": "x", "runId": "r", "review": map[string]any{}}); len(got) != 0 {
-		t.Fatalf("clean review call got offenders %v", got)
+	for k, v := range over {
+		args[k] = v
+	}
+	return args
+}
+
+func changedOf(t *testing.T, res toolResult) []string {
+	t.Helper()
+	if res.IsError {
+		t.Fatalf("call refused: %s", res.Text)
+	}
+	var payload struct {
+		Changed []string `json:"changed"`
+	}
+	if err := json.Unmarshal([]byte(res.Text), &payload); err != nil {
+		t.Fatalf("receipt %q: %v", res.Text, err)
+	}
+	return payload.Changed
+}
+
+// TestEditTaskPaddingClearsTheSetFlags is the ruled residual: `false` is the
+// CLEAR spelling on these two flags, so a client that pads every boolean clears
+// a flag the task had SET. The receipt names it, and nothing else moves.
+func TestEditTaskPaddingClearsTheSetFlags(t *testing.T) {
+	st := newEditTaskState()
+	got := changedOf(t, editTaskReceipt(st, paddedEditCall(map[string]any{"detail": "the new body"})))
+	if want := "detail,container,humanOnly"; strings.Join(got, ",") != want {
+		t.Fatalf("changed = %v, want %s", got, want)
+	}
+	if st.container || st.humanOnly {
+		t.Errorf("flags = container %v, humanOnly %v; a padded false must clear both", st.container, st.humanOnly)
+	}
+}
+
+// TestEditTaskPaddingNullLeavesTheFlags pins the other half: null is the
+// leave-it-alone spelling, so the same padded call with null on the flags moves
+// only the real field.
+func TestEditTaskPaddingNullLeavesTheFlags(t *testing.T) {
+	st := newEditTaskState()
+	got := changedOf(t, editTaskReceipt(st, paddedEditCall(map[string]any{
+		"detail": "the new body", "container": nil, "humanOnly": nil,
+	})))
+	if want := "detail"; strings.Join(got, ",") != want {
+		t.Fatalf("changed = %v, want %s", got, want)
+	}
+	if !st.container || !st.humanOnly {
+		t.Errorf("flags = container %v, humanOnly %v; null must leave both", st.container, st.humanOnly)
+	}
+}
+
+// TestEditTaskPaddingRepoClearVersusAbsent pins `repo`: "" is the CLEAR and null
+// is absence, so the padded spelling leaves routing alone while an explicit ""
+// corrects a wrong route.
+func TestEditTaskPaddingRepoClearVersusAbsent(t *testing.T) {
+	// The flags stay null here so the call isolates the repo spelling: this is
+	// about `""` (the CLEAR) versus `null` (absence), where the padded call's
+	// `""` on a text field is absence.
+	st := newEditTaskState()
+	clear := paddedEditCall(map[string]any{"repo": "", "container": nil, "humanOnly": nil})
+	if got := changedOf(t, editTaskReceipt(st, clear)); strings.Join(got, ",") != "repo" {
+		t.Fatalf("repo \"\" changed = %v, want [repo]", got)
+	}
+
+	absent := paddedEditCall(map[string]any{"container": nil, "humanOnly": nil})
+	res := editTaskReceipt(newEditTaskState(), absent)
+	if !res.IsError || !strings.Contains(res.Text, `"code":"nothing_to_do"`) {
+		t.Fatalf("padded call with repo null = %s, want nothing_to_do", res.Text)
+	}
+}
+
+// TestEditTaskPaddingDropsAFalseOnAnAlreadyFalseFlag covers CLA-745's half: the
+// same padded false that CLEARED the flags is a no-op once they are clear, and a
+// receipt must not claim it.
+func TestEditTaskPaddingDropsAFalseOnAnAlreadyFalseFlag(t *testing.T) {
+	st := newEditTaskState()
+	_ = changedOf(t, editTaskReceipt(st, paddedEditCall(map[string]any{"detail": "one"})))
+	got := changedOf(t, editTaskReceipt(st, paddedEditCall(map[string]any{"priority": "m"})))
+	if want := "priority"; strings.Join(got, ",") != want {
+		t.Fatalf("changed = %v, want %s", got, want)
+	}
+}
+
+func TestEditTaskRefusesTwoLongFields(t *testing.T) {
+	res := editTaskReceipt(newEditTaskState(), paddedEditCall(map[string]any{"title": "a title", "detail": "a body"}))
+	if !res.IsError || !strings.Contains(res.Text, "one_long_field") || !strings.Contains(res.Text, "title and detail") {
+		t.Fatalf("two long fields = %s, want one_long_field naming both", res.Text)
+	}
+}
+
+func TestEditTaskNeedsATaskID(t *testing.T) {
+	res := editTaskReceipt(newEditTaskState(), map[string]any{"detail": "a body"})
+	if !res.IsError || !strings.Contains(res.Text, "missing_argument") || !strings.Contains(res.Text, "taskId") {
+		t.Fatalf("call without taskId = %s, want missing_argument naming taskId", res.Text)
 	}
 }
 
@@ -173,15 +273,15 @@ func TestSchemaScenarioPromptFollowsTheSelectedTool(t *testing.T) {
 	if !strings.Contains(got, "clankerbar_frobnicate") {
 		t.Errorf("--schema-tool frobnicate prompt = %q, want it to ask for clankerbar_frobnicate", got)
 	}
-	if strings.Contains(got, "clankerbar_update_task") {
-		t.Errorf("--schema-tool frobnicate prompt still asks for update_task: %q", got)
+	if strings.Contains(got, "clankerbar_edit_task") {
+		t.Errorf("--schema-tool frobnicate prompt still asks for edit_task: %q", got)
 	}
 
 	// The default selection names a tool this release's plane still serves: the
 	// cutover deletes update_task, so a probe that defaulted to it would exercise
 	// a name the plane answers as unknown.
 	defaulted := schema.promptFor(defaultSchemaTool)
-	if !strings.Contains(defaulted, "clankerbar_"+defaultSchemaTool) || !strings.Contains(defaulted, "null") {
+	if !strings.Contains(defaulted, "clankerbar_"+defaultSchemaTool) || !strings.Contains(defaulted, "send null") {
 		t.Errorf("default schema prompt = %q", defaulted)
 	}
 	if defaultSchemaTool == "update_task" {
