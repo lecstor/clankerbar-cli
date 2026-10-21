@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
@@ -56,6 +57,12 @@ func TestConflictStandDownStartsOneConflictSession(t *testing.T) {
 	}
 	if call.req.RunID != "run-1" {
 		t.Errorf("the session was briefed with run %q, want the claim's run-1", call.req.RunID)
+	}
+	if !strings.Contains(call.req.Worktree, "conflict-"+closeOutTestTask) {
+		t.Errorf("the worktree path %q does not name the task", call.req.Worktree)
+	}
+	if !strings.Contains(call.req.Prompt, call.req.Worktree) {
+		t.Errorf("the brief does not name the worktree %q:\n%s", call.req.Worktree, call.req.Prompt)
 	}
 	for _, want := range []string{closeOutTestTask, closeOutTestRef, "run-1", closeOutTestHead, closeOutTestBase, "#12", "a.txt", "b.txt"} {
 		if !strings.Contains(call.req.Prompt, want) {
@@ -127,6 +134,23 @@ func TestConflictSessionRunsOneAtATime(t *testing.T) {
 	}
 	if got := f.callsFor("claim_task"); len(got) != 1 {
 		t.Errorf("claim_task calls = %d, want one (the second task waits): %v", len(got), got)
+	}
+
+	// Once the first session has ended, the second task is no longer held back:
+	// the next poll reaches it. (task-1 leaves the approved queue because its
+	// claim moved it to in_progress — the fake plane does not model that, so the
+	// listing is updated to what the plane would serve.)
+	f.plane.serveTool("list_tasks", fmt.Sprintf(
+		`{"tasks":[{"id":%q,"ref":%q,"branch":%q,"repo":%q}],"count":1,"total":1,"view":"full"}`,
+		conflictTestTask2, conflictTestRef2, closeOutTestHead, closeOutTestRepo))
+	f.run(d)
+
+	calls := f.conflictCalls()
+	if len(calls) != 2 {
+		t.Fatalf("conflict sessions after the first ended = %d, want 2", len(calls))
+	}
+	if calls[1].req.TaskID != conflictTestTask2 {
+		t.Errorf("the second session was for %q, want the waiting task %q", calls[1].req.TaskID, conflictTestTask2)
 	}
 }
 
@@ -240,6 +264,70 @@ func TestConflictSessionReleasesWhenThePlaneCannotBeRead(t *testing.T) {
 	}
 	if !strings.Contains(lines, "outcome: failed") || !strings.Contains(lines, "claim was released") {
 		t.Errorf("the failure line does not say what happened:\n%s", lines)
+	}
+}
+
+func TestConflictSessionIsBounded(t *testing.T) {
+	f := conflictingFixture(t)
+	d := f.supervisor(0)
+
+	f.run(d)
+	f.run(d)
+	lines := f.run(d)
+
+	if got := len(f.conflictCalls()); got != maxConflictAttempts {
+		t.Errorf("conflict sessions = %d, want the bound %d at one unchanged head", got, maxConflictAttempts)
+	}
+	if !strings.Contains(lines, "leaving it to the agent close-out") {
+		t.Errorf("the exhausted bound does not say it falls back to the agent close-out:\n%s", lines)
+	}
+}
+
+func TestConflictInvocationComposesTheSession(t *testing.T) {
+	cfg := &config.Config{
+		Harness:             "opencode",
+		Model:               "run-model",
+		MaxTurns:            150,
+		MaxSessionWallClock: config.Duration(20 * time.Minute),
+		Projects:            []config.Project{{Slug: "acme", MCPConfigPath: "/fleet/acme/.mcp.json"}},
+	}
+	step := config.ConflictStep{Harness: "opencode", Model: "conflict-model", MaxTurns: 40}
+	req := ConflictRunRequest{
+		Harness:  "opencode",
+		Model:    "conflict-model",
+		WorkDir:  "/fleet/acme/widgets",
+		Worktree: "/fleet/acme/worktrees/conflict-t1",
+		Prompt:   "the brief",
+	}
+
+	inv, err := conflictInvocation(cfg, "acme", req, step)
+	if err != nil {
+		t.Fatalf("conflictInvocation: %v", err)
+	}
+	if inv.Prompt != "the brief" || inv.Model != "conflict-model" || inv.WorkDir != "/fleet/acme/widgets" {
+		t.Errorf("invocation = %+v, want the request's prompt/model/workdir", inv)
+	}
+	if inv.MCPConfigPath != "/fleet/acme/.mcp.json" {
+		t.Errorf("MCP config = %q, want the project's own file", inv.MCPConfigPath)
+	}
+	if len(inv.ExtraDirs) != 1 || inv.ExtraDirs[0] != "/fleet/acme/worktrees" {
+		t.Errorf("ExtraDirs = %v, want the worktree area granted", inv.ExtraDirs)
+	}
+	if inv.MaxTurns != 40 {
+		t.Errorf("MaxTurns = %d, want the conflict step's 40", inv.MaxTurns)
+	}
+	if inv.MaxSessionWallClock != 20*time.Minute {
+		t.Errorf("MaxSessionWallClock = %s, want the config's 20m", inv.MaxSessionWallClock)
+	}
+}
+
+func TestConflictWorktreeFollowsTheProjectLayout(t *testing.T) {
+	const dir = "/fleet/acme/widgets"
+	if got, want := conflictWorktree(&config.Config{ProjectRoot: true}, dir, "t1"), "/fleet/acme/worktrees/conflict-t1"; got != want {
+		t.Errorf("project-root worktree = %q, want %q", got, want)
+	}
+	if got, want := conflictWorktree(&config.Config{}, dir, "t1"), "/fleet/acme/widgets-wt/conflict-t1"; got != want {
+		t.Errorf("operator-checkout worktree = %q, want %q", got, want)
 	}
 }
 

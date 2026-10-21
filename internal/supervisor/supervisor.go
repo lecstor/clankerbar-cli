@@ -445,6 +445,11 @@ type Supervisor struct {
 	// goroutine and the session goroutine both write it.
 	conflictMu   sync.Mutex
 	conflictSaid map[string]string
+	// conflictTried bounds the paid retries per task (CLA-759): a failed session
+	// leaves the task approved, so without it the next poll would start another
+	// session forever instead of falling back to the agent close-out. Also under
+	// conflictMu.
+	conflictTried map[string]conflictAttempt
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the

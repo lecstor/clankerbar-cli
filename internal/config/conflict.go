@@ -84,6 +84,13 @@ func (c *Config) ConflictStep() ConflictStep {
 	if step.MaxTurns <= 0 {
 		step.MaxTurns = c.MaxTurns
 	}
+	// The config's turn-cap chain has no "uncapped" value (see Config.MaxTurns):
+	// an unphased run, which this session is not part of, still resolves through
+	// DefaultMaxTurns. A daemon-started session must never be the one uncapped
+	// session on the machine.
+	if step.MaxTurns <= 0 {
+		step.MaxTurns = DefaultMaxTurns
+	}
 	return step
 }
 
@@ -193,7 +200,12 @@ type ConflictBriefInput struct {
 	PR      string // "#12"
 	Repo    string
 	WorkDir string
-	Paths   []string
+	// Worktree is the exact path the session must create its branch worktree at.
+	// It is named rather than left to the session because the supervisor grants
+	// the session's permission scope on that path: a worktree in a directory the
+	// session may not write would fail at the first `git worktree add`.
+	Worktree string
+	Paths    []string
 	// Gate is the repo-wide check command, or "" when it could not be derived
 	// from the checkout; the brief then points at the repo's own documented
 	// gate instead of inventing a command.
@@ -242,22 +254,23 @@ func ConflictBrief(in ConflictBriefInput) string {
 		"states in step 7. No other work.\n\n" +
 		"1. KEEP THE LEASE. Call heartbeat(runId: \"" + in.RunID + "\") now, and again every ~10 minutes while you work. Every " +
 		"plane call you make signs with taskId \"" + in.TaskID + "\" and runId \"" + in.RunID + "\".\n\n" +
-		"2. WORKTREE. Your checkout is " + in.WorkDir + ". Create a worktree of the PR's HEAD BRANCH - never resolve the merge in " +
-		"the shared checkout:\n" +
+		"2. WORKTREE. Your checkout is " + in.WorkDir + ". Create a worktree of the PR's HEAD BRANCH at exactly " + in.Worktree +
+		" - never resolve the merge in the shared checkout:\n" +
 		"   git -C " + in.WorkDir + " fetch origin " + in.Base + " " + in.Branch + "\n" +
-		"   git -C " + in.WorkDir + " worktree add <path> " + in.Branch + "\n" +
-		"Put <path> under the project's worktrees/ directory when one exists (`" + in.WorkDir + "/../worktrees/`), else beside the " +
-		"checkout. Do all remaining work in that worktree.\n\n" +
-		"3. MERGE, NEVER REBASE. In the worktree run `git merge --no-ff origin/" + in.Base + "`. The branch is already PUSHED: a rebase " +
+		"   git -C " + in.WorkDir + " worktree add --detach " + in.Worktree + " origin/" + in.Branch + "\n" +
+		"If that path already exists from an earlier attempt, remove it first (`git -C " + in.WorkDir + " worktree remove --force " +
+		in.Worktree + "`). Do all remaining work in that worktree. The worktree is detached on purpose - it does not own or move " +
+		"the local branch, and the push below names the remote branch explicitly.\n\n" +
+		"3. MERGE, NEVER REBASE. In that worktree run `git -C " + in.Worktree + " merge --no-ff origin/" + in.Base + "`. The branch is already PUSHED: a rebase " +
 		"or a force-push rewrites published history and invalidates the fleet's tip check, so never do either, and never merge the PR " +
 		"yourself.\n\n" +
 		"4. RESOLVE ONLY THE CONFLICTING HUNKS. The conflicting paths are: " + paths + ". Resolve ONLY the hunks git reports as " +
 		"conflicting in those files, and nothing else: no reformatting, no renames, no dependency bumps, no deleting a side just to " +
 		"make the merge quiet. If the merge reports a conflicting path outside that list, stop and report FAILED (the base moved or " +
 		"the checkout is stale); do not invent a resolution for it. Never commit conflict markers.\n\n" +
-		"5. GATE. Run " + gateCommand + " in the worktree. It must pass before you push.\n\n" +
-		"6. PUSH. Commit the merge (a merge commit, not a squash) and push the branch: `git push origin HEAD:" + in.Branch + "`. Never " +
-		"force-push, and never push to " + in.Base + ".\n\n" +
+		"5. GATE. In the worktree (`cd " + in.Worktree + "` first) run " + gateCommand + ". It must pass before you push.\n\n" +
+		"6. PUSH. The merge commit is the commit `git merge` made - do not squash or amend it - and push the branch: " +
+		"`git -C " + in.Worktree + " push origin HEAD:" + in.Branch + "`. Never force-push, and never push to " + in.Base + ".\n\n" +
 		"7. HAND THE TASK BACK - exactly one of these, and nothing else:\n" +
 		"   - MECHANICAL - every resolution is renumbering, keeping both sides of a list, or regenerating a pinned figure, with NO " +
 		"change to what the code does. That code does not need a new review, so leave the task approved for the supervisor to merge " +
@@ -275,6 +288,7 @@ func ConflictBrief(in ConflictBriefInput) string {
 		"     update_task(taskId: \"" + in.TaskID + "\", runId: \"" + in.RunID + "\", outcome: \"RESOLUTION: failed\\n\\n- <why>\")\n" +
 		"     update_task(taskId: \"" + in.TaskID + "\", runId: \"" + in.RunID + "\", release: true, checkGreen: true)\n\n" +
 		"8. STOP. Do not review, do not open or merge the PR, do not file tasks, and do not move the task except exactly as step 7 " +
-		"says. Remove the worktree you created once the push succeeded (`git -C " + in.WorkDir + " worktree remove --force <path>`). " +
+		"says. Remove the worktree before you finish, whatever the outcome (`git -C " + in.WorkDir + " worktree remove --force " + in.Worktree + "`), " +
+		"so a retry starts clean. " +
 		"Your FINAL message is one line: `conflict " + ref + ": <mechanical|behavioural|failed>`."
 }

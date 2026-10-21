@@ -10,16 +10,17 @@ import (
 // thing that could explain a difference.
 func conflictBriefInput() ConflictBriefInput {
 	return ConflictBriefInput{
-		TaskID:  "task-1",
-		TaskRef: "CLA-1",
-		RunID:   "run-1.secret",
-		Branch:  "clanker/task-1",
-		Base:    "staging",
-		PR:      "#12",
-		Repo:    "acme/widgets",
-		WorkDir: "/fleet/acme/widgets",
-		Paths:   []string{"a.txt", "b.txt"},
-		Gate:    "go test ./...",
+		TaskID:   "task-1",
+		TaskRef:  "CLA-1",
+		RunID:    "run-1.secret",
+		Branch:   "clanker/task-1",
+		Base:     "staging",
+		PR:       "#12",
+		Repo:     "acme/widgets",
+		WorkDir:  "/fleet/acme/widgets",
+		Worktree: "/fleet/acme/worktrees/conflict-task-1",
+		Paths:    []string{"a.txt", "b.txt"},
+		Gate:     "go test ./...",
 	}
 }
 
@@ -30,8 +31,8 @@ func TestConflictBriefCarriesTheConflictOnlyContract(t *testing.T) {
 	exact := []string{
 		// the task, the claim and the branch it must merge into
 		"CLA-1", "task-1", "run-1.secret", "clanker/task-1", "staging", "#12", "acme/widgets",
-		// the conflicting paths, the gate and the push
-		"a.txt, b.txt", "go test ./...", "git push origin HEAD:clanker/task-1",
+		// the conflicting paths, the gate, the worktree and the push
+		"a.txt, b.txt", "go test ./...", "/fleet/acme/worktrees/conflict-task-1", "push origin HEAD:clanker/task-1",
 		// the hand-back markers the supervisor classifies on
 		"RESOLUTION: mechanical", "RESOLUTION: behavioural", "RESOLUTION: failed",
 	}

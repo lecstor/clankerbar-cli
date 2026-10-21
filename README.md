@@ -809,10 +809,11 @@ and passed), **claims the task first** so an agent close-out and this path can
 never both merge it, merges the PR as a merge commit, verifies that merge commit
 is an ancestor of the base on origin, and closes the task done with that
 delivery. It does nothing under `authorityIntegrate: human`, for a PR based on
-`main` (the promotion is yours), for a conflicting, failing, unchecked or
-unresolvable PR, or when the claim is refused. A conflict is the one stand-down
-that carries evidence: the conflicting paths are logged once per head/base pair,
-for deciding whether a conflict needs an agent at all. Anything after a
+`main` (the promotion is yours), for a failing, unchecked or unresolvable PR, or
+when the claim is refused. A conflict is the one stand-down that hands work
+somewhere instead of just leaving the task alone: the conflicting paths are
+logged once per head/base pair, and a conflict-only session is started for it.
+Anything after a
 successful claim that cannot be finished releases it, so the task goes back to
 `approved` rather than being left held — with one exception: a merge that LANDED
 but whose ancestry could not be verified is closed `done` with `mergeVerified:
@@ -821,6 +822,37 @@ The merge itself names the configured base and the judged head revision, so a
 PR retargeted after the judgement cannot be merged into `main`; its verification
 and conflict reads run in a throwaway clone, never in the checkout the fleet's
 sessions share.
+
+**A conflict gets a short dedicated session, not the next clanker's full one.**
+A CONFLICTING PR used to wait for whichever clanker finished its current task — a
+full implement-phase session, with the whole drain brief, to resolve a merge
+conflict. The supervisor now handles it: it takes the claim itself (so an agent
+close-out and this path cannot both work the task — a refused claim means no
+session), then starts **one** short session on the fleet's implement harness and
+model, configurable as the `conflict` step:
+
+```json
+"conflict": { "harness": "opencode", "model": "commandcode/deepseek/deepseek-v4.1-flash", "max_turns": 80 }
+```
+
+Every field is optional and defaults to the implement step's own, so an untouched
+config runs the conflict session on the model that implemented the branch. The
+brief is narrow: create a worktree of the branch, merge the PR's base into it (a
+merge, **never** a rebase — the branch is already pushed), resolve **only** the
+conflicting hunks, run the repo-wide gate (`go test ./...` when the checkout has
+a `go.mod`, `pnpm test` when it has a `package.json`, else the repo's own
+documented gate), and push. It then hands the task back by the nature of the
+resolution: **mechanical** (renumbering, keeping both sides of a list,
+regenerating a pinned figure — no change to what the code does) releases the
+claim and leaves the task `approved` for the close-out above to merge once CI is
+green; **behavioural** or uncertain moves it back to `in_review` with a note
+naming what changed, because that code has not been reviewed; a **failure** (a
+gate that will not go green, a hunk that cannot be resolved without guessing)
+releases the claim, leaves the task `approved` and is logged with its reason. At
+most one conflict session runs at a time per supervisor, so a second conflicting
+task waits for the next poll. Daemon-started sessions never run on Claude: a
+`conflict` step resolving to `claude` stands down with a log line and leaves the
+task to the agent close-out.
 
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`

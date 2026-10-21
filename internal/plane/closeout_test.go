@@ -227,6 +227,9 @@ func TestNewCloseOutAPINotWiredRefusesAndStaysNarrow(t *testing.T) {
 	if err := api.CompleteCloseOut(ctx, "t-1", "r-1", CloseOutDelivery{Commit: "a", IntegrationBranch: "b"}); !errors.Is(err, ErrNotWired) {
 		t.Errorf("CompleteCloseOut err = %v, want ErrNotWired", err)
 	}
+	if _, err := api.TaskState(ctx, "t-1"); !errors.Is(err, ErrNotWired) {
+		t.Errorf("TaskState err = %v, want ErrNotWired", err)
+	}
 
 	// Narrow on purpose: a close-out client must not be assertable into another
 	// capability it never asked for.

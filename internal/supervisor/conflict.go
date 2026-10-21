@@ -62,7 +62,21 @@ const (
 	// the session (the claim, the state read, the safety-net release). It is the
 	// same budget the close-out gives a non-judgement call.
 	conflictCallTimeout = closeOutCallTimeout
+
+	// maxConflictAttempts bounds how many paid sessions one task may burn in this
+	// supervisor's lifetime. A failed session leaves the task approved, so
+	// without a bound the next poll would start another, and another: the exact
+	// opposite of "the agent close-out remains the fallback". A task that keeps
+	// failing falls back to the agent close-out, which is the designed
+	// fallback — not a third paid experiment.
+	maxConflictAttempts = 2
 )
+
+// conflictAttempt is how many conflict sessions one task has spent in this
+// supervisor's lifetime.
+type conflictAttempt struct {
+	n int
+}
 
 // ConflictRunRequest is everything one conflict-only session is handed. The
 // prompt is the rendered config.ConflictBrief; the rest is passed so the session
@@ -81,7 +95,11 @@ type ConflictRunRequest struct {
 	Harness string
 	Model   string
 	WorkDir string
-	Prompt  string
+	// Worktree is the exact path the session creates its branch worktree at. The
+	// supervisor names it (rather than letting the session choose) so it can
+	// grant that directory into the session's permission scope.
+	Worktree string
+	Prompt   string
 }
 
 // startConflictSession takes the claim for one CONFLICTING approved task and
@@ -99,6 +117,8 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	// One at a time. A second conflicting task is not dropped: it stays approved,
 	// and the pass reaches it again on the next poll once this session ends.
 	if !d.conflictBusy.CompareAndSwap(false, true) {
+		d.conflictSay("busy:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but a conflict session is already running - "+
+			"this task waits for the next poll", label, pr)
 		return
 	}
 	started := false
@@ -119,6 +139,27 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 			"verified (%v) - no session was started", label, pr, err)
 		return
 	}
+	// Everything that can fail WITHOUT a plane write happens before the claim:
+	// a failure after the claim must either release it or is a bug, and the
+	// worktree area is the last precondition.
+	gate := conflictGate(dir)
+	worktree := conflictWorktree(cfg, dir, task.ID)
+	if err := os.MkdirAll(filepath.Dir(worktree), 0o755); err != nil {
+		d.conflictSay("worktree:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but the worktree area %s could not be prepared (%v) - "+
+			"no session was started", label, pr, filepath.Dir(worktree), err)
+		return
+	}
+
+	// Refuse a further session once the bound is spent: a failure leaves the task
+	// approved, so an unbounded retry would spend a paid session every poll
+	// forever. The check runs BEFORE the claim so an exhausted task costs no
+	// plane writes.
+	if !d.conflictAttemptAllowed(task.ID) {
+		d.conflictSay("exhausted:"+task.ID, "conflict: %s PR #%d is CONFLICTING but %d conflict sessions have already "+
+			"failed at it - leaving it to the agent close-out instead of spending another",
+			label, pr, maxConflictAttempts)
+		return
+	}
 
 	// The claim is the lock. Taking it BEFORE spending a session is what makes
 	// "a task already claimed is skipped" true rather than hopeful: an agent
@@ -130,33 +171,35 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 			"no conflict session; the task stays with whoever holds it", label, pr, err)
 		return
 	}
+	d.noteConflictAttempt(task.ID)
 
-	gate := conflictGate(dir)
 	req := ConflictRunRequest{
-		TaskID:  task.ID,
-		TaskRef: task.Ref,
-		RunID:   runID,
-		Branch:  task.Branch,
-		Base:    base,
-		PR:      fmt.Sprintf("#%d", pr),
-		Repo:    task.Repo,
-		Paths:   paths,
-		Gate:    gate,
-		Harness: step.Harness,
-		Model:   step.Model,
-		WorkDir: dir,
+		TaskID:   task.ID,
+		TaskRef:  task.Ref,
+		RunID:    runID,
+		Branch:   task.Branch,
+		Base:     base,
+		PR:       fmt.Sprintf("#%d", pr),
+		Repo:     task.Repo,
+		Paths:    paths,
+		Gate:     gate,
+		Harness:  step.Harness,
+		Model:    step.Model,
+		WorkDir:  dir,
+		Worktree: worktree,
 	}
 	req.Prompt = config.ConflictBrief(config.ConflictBriefInput{
-		TaskID:  req.TaskID,
-		TaskRef: req.TaskRef,
-		RunID:   req.RunID,
-		Branch:  req.Branch,
-		Base:    req.Base,
-		PR:      req.PR,
-		Repo:    req.Repo,
-		WorkDir: req.WorkDir,
-		Paths:   req.Paths,
-		Gate:    req.Gate,
+		TaskID:   req.TaskID,
+		TaskRef:  req.TaskRef,
+		RunID:    req.RunID,
+		Branch:   req.Branch,
+		Base:     req.Base,
+		PR:       req.PR,
+		Repo:     req.Repo,
+		WorkDir:  req.WorkDir,
+		Worktree: req.Worktree,
+		Paths:    req.Paths,
+		Gate:     req.Gate,
 	})
 
 	started = true
@@ -184,7 +227,13 @@ func (d *Supervisor) runConflictSession(cfg *config.Config, slug string, client 
 
 	ctx, cancel := context.WithTimeout(d.baseCtx(), conflictSessionBudget)
 	defer cancel()
-	res, runErr := d.o.ConflictRun(ctx, cfg, slug, req, step)
+	run := d.o.ConflictRun
+	if run == nil {
+		// A Supervisor built by hand in a test may not have gone through
+		// withDefaults; the production runner is still the safe default.
+		run = defaultConflictRun
+	}
+	res, runErr := run(ctx, cfg, slug, req, step)
 	d.finishConflictSession(client, req, label, res, runErr)
 }
 
@@ -281,23 +330,34 @@ func conflictFailureReason(res harness.Result, runErr error, detail string) stri
 	return "the session produced no resolution"
 }
 
-// behaviouralDetail prefers the marker's note, falling back to the plain fact.
-func behaviouralDetail(kind, detail string) string {
-	if strings.TrimSpace(detail) != "" {
-		return detail
-	}
-	if kind != config.ConflictResolutionBehavioural {
-		return "the resolution changed behaviour and needs review"
-	}
-	return "the resolution changed behaviour and needs review"
-}
-
 // conflictPaths renders the conflicting paths for a log line.
 func conflictPaths(paths []string) string {
 	if len(paths) == 0 {
 		return "(the fleet could not name them)"
 	}
 	return strings.Join(paths, ", ")
+}
+
+// conflictWorktree names the worktree the session must create. Two layouts, in
+// the same order the fleet derives them:
+//
+//   - the per-project layout (`project_root`): <project root>/worktrees/, which
+//     the workdir derivation already creates and which sits beside the repo
+//     clones — the same area every fleet worktree lives in;
+//   - an operator's own checkout: the conventional <checkout>-wt area beside it,
+//     which is the shape the driver's own ExtraDirs grants (see extraDirsFor).
+//
+// Naming it here, rather than letting the session choose, is what lets the
+// supervisor grant exactly that directory into the session's permission scope
+// (defaultConflictRun's ExtraDirs): a worktree in a directory the session may not
+// write fails at the first `git worktree add`.
+func conflictWorktree(cfg *config.Config, dir, taskID string) string {
+	dir = filepath.Clean(dir)
+	name := "conflict-" + taskID
+	if cfg != nil && cfg.ProjectRoot {
+		return filepath.Join(filepath.Dir(dir), "worktrees", name)
+	}
+	return filepath.Join(dir+"-wt", name)
 }
 
 // conflictGate resolves the repo-wide check the conflict session must run,
@@ -341,6 +401,26 @@ func (d *Supervisor) waitConflict() {
 	}
 }
 
+// conflictAttemptAllowed reports whether another paid session may be spent on
+// this task. Called only from the close-out pass goroutine.
+func (d *Supervisor) conflictAttemptAllowed(taskID string) bool {
+	d.conflictMu.Lock()
+	defer d.conflictMu.Unlock()
+	return d.conflictTried[taskID].n < maxConflictAttempts
+}
+
+// noteConflictAttempt records that a session is about to be spent on this task.
+func (d *Supervisor) noteConflictAttempt(taskID string) {
+	d.conflictMu.Lock()
+	defer d.conflictMu.Unlock()
+	if d.conflictTried == nil {
+		d.conflictTried = map[string]conflictAttempt{}
+	}
+	prev := d.conflictTried[taskID]
+	prev.n++
+	d.conflictTried[taskID] = prev
+}
+
 // conflictSay logs one conflict-path line unless the line for that key is
 // unchanged, the "say it once per change" discipline the close-out keeps. It has
 // its own map and mutex because the start path runs on the close-out pass
@@ -369,26 +449,37 @@ func defaultConflictRun(ctx context.Context, cfg *config.Config, slug string, re
 	if err != nil {
 		return harness.Result{}, err
 	}
+	inv, err := conflictInvocation(cfg, slug, req, step)
+	if err != nil {
+		return harness.Result{}, err
+	}
+	return adapter.Invoke(ctx, inv)
+}
+
+// conflictInvocation composes the invocation a conflict session runs. Split from
+// the launcher so the composition — the one part that needs no paid process — is
+// testable: the prompt, the model, the reach (ExtraDirs) and the ceilings.
+func conflictInvocation(cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Invocation, error) {
 	env, err := cfg.SessionEnv(req.Harness, slug)
 	if err != nil {
-		return harness.Result{}, fmt.Errorf("conflict session env: %w", err)
+		return harness.Invocation{}, fmt.Errorf("conflict session env: %w", err)
 	}
 	hc := cfg.SessionFor(req.Harness)
 	project := conflictProject(cfg, slug)
-	inv := harness.Invocation{
+	return harness.Invocation{
 		Prompt:              req.Prompt,
 		Model:               req.Model,
 		WorkDir:             req.WorkDir,
 		MCPConfigPath:       cfg.ResolveMCPConfig(req.Harness, project.MCPConfigPath, project.MCPConfigPaths),
 		ConfigDir:           hc.ConfigDir,
 		SettingsPath:        hc.SettingsPath,
+		ExtraDirs:           []string{filepath.Dir(req.Worktree)},
 		Env:                 env,
 		EnvAllowlist:        cfg.SessionEnvAllowlist(req.Harness, slug),
 		MaxTurns:            step.MaxTurns,
 		MaxSessionTokens:    cfg.Budget.SessionTokenCeilingFor(req.Harness),
 		MaxSessionWallClock: cfg.MaxSessionWallClock.Duration(),
-	}
-	return adapter.Invoke(ctx, inv)
+	}, nil
 }
 
 // conflictProject finds the project block the supervisor built one instance

@@ -539,7 +539,7 @@ func (d *Supervisor) logCloseOutConflict(ctx context.Context, verifier *delivery
 	if named == "" {
 		named = "(none reported - the fetched tips merged cleanly, so the PR's state is stale)"
 	}
-	d.closeOutSay(key, "close-out: %s PR #%d is CONFLICTING with %s (head %s@%s, base %s@%s) - conflicting paths: %s - the conflict-only session handles it",
+	d.closeOutSay(key, "close-out: %s PR #%d is CONFLICTING with %s (head %s@%s, base %s@%s) - conflicting paths: %s",
 		label, state.Number, base, head, shortSHA(state.HeadOID), base, shortSHA(baseTip), named)
 	return paths
 }

@@ -3693,10 +3693,8 @@ func (c *Config) SpawnedHarnesses() []string {
 		}
 	}
 	// The conflict-only session's own harness (CLA-759), when the block names one
-	// that is not already listed. It is a harness this config can spawn a session
-	// on, so both questions below have to see it: doctor checks a DECLARED
-	// harness's binary, config dir and permission policy, and the spawn question
-	// must know the supervisor will really start one there.
+	// that is not already listed: the supervisor really starts a session there on
+	// a conflicted approved task, so this list must know about it.
 	if h := c.conflictHarness(); h != "" && !seen[h] {
 		seen[h] = true
 		out = append(out, h)
