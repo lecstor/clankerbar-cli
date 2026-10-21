@@ -145,6 +145,11 @@ type fakeAdapter struct {
 	probeTokens  int
 	probeCost    float64
 	limitResetAt time.Time
+	// limitWindow is the usage window the fake's "limit" kind reports, so a test
+	// can pin what the loop's wait logs say about WHICH cap it is waiting out
+	// (CLA-752 review). Empty keeps every pre-existing test's limit exactly as it
+	// was.
+	limitWindow string
 	// caps overrides the fake's default capabilities, for the tests that drive an
 	// adapter which cannot observe a claim.
 	caps *harness.Capabilities
@@ -202,7 +207,7 @@ func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harnes
 func (f *fakeAdapter) DetectLimit(r harness.Result) harness.Limit {
 	switch kindOf(r) {
 	case "limit":
-		return harness.Limit{Limited: true, ResetAt: f.limitResetAt}
+		return harness.Limit{Limited: true, ResetAt: f.limitResetAt, Window: f.limitWindow}
 	case "limitStop":
 		return harness.Limit{Limited: true, Stop: true, Reason: "out of credits"}
 	}
@@ -551,6 +556,35 @@ func TestDrainWithRetries_ResetInsideBudgetStillWaits(t *testing.T) {
 	}
 	if tokens != 7 {
 		t.Errorf("the session should have been re-run after the wait; got %d tokens", tokens)
+	}
+}
+
+// CLA-752 review 1.review-1.3 / 1.review-2.1 / 1.review-3.1 / 1.review-5.1: the
+// wait an operator actually sits through must say WHICH cap it is waiting out.
+// Both the wait-entry line and the paused line carry the window the adapter
+// reported, so a multi-day weekly pause is not logged identically to a 5-hour
+// one — which is the whole reason the adapter labels the window.
+func TestDrainWithRetries_WaitLogsNameTheWindow(t *testing.T) {
+	cfg := fastCfg()
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
+		limitResetAt: time.Now().Add(time.Minute),
+		limitWindow:  "weekly",
+	}
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(4 * time.Hour)}
+	d := New(cfg, h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	logs := captureLogs(t)
+	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); err != nil || stop {
+		t.Fatalf("a reset inside the ceiling must be waited out: stop=%v err=%v", stop, err)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "hit a usage limit: usage limit (weekly window)") {
+		t.Errorf("the wait-entry log must name the window it is waiting out:\n%s", out)
+	}
+	if !strings.Contains(out, "paused (weekly window)") {
+		t.Errorf("the paused log must name the window it is waiting out:\n%s", out)
 	}
 }
 
@@ -2929,6 +2963,43 @@ func TestDrainExitLine_NamesTheSignalNotJustTheCode(t *testing.T) {
 			}
 			if tc.notWant != "" && strings.Contains(err.Error(), tc.notWant) {
 				t.Errorf("error = %q, must not say %q", err, tc.notWant)
+			}
+		})
+	}
+}
+
+// TestLimitWindowSuffix pins the wait's own label: the supervised-wait lines
+// already say what they are doing, so they only need the window appended — and a
+// window-less limit's line must stay byte-for-byte what it was.
+func TestLimitWindowSuffix(t *testing.T) {
+	if got := limitWindowSuffix(harness.Limit{Window: "weekly"}); got != " (weekly window)" {
+		t.Errorf("limitWindowSuffix(weekly) = %q, want %q", got, " (weekly window)")
+	}
+	if got := limitWindowSuffix(harness.Limit{}); got != "" {
+		t.Errorf("limitWindowSuffix(no window) = %q, want empty", got)
+	}
+}
+
+// TestLimitReasonNamesTheWindow pins what a paused log line says about WHICH cap
+// it is waiting out (CLA-752). The window is diagnostic only — Stop already
+// decided whether the loop may wait — but a multi-day weekly wait that logs a
+// bare "usage_limit" hides the one thing the operator needs to tell a plan cap
+// from a burst.
+func TestLimitReasonNamesTheWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		lim  harness.Limit
+		want string
+	}{
+		{"the adapter's own reason", harness.Limit{Reason: "budget_exhausted"}, "budget_exhausted"},
+		{"a named window rides along", harness.Limit{Reason: "usage_limit", Window: "weekly"}, "usage_limit (weekly window)"},
+		{"an unnamed window leaves the reason alone", harness.Limit{Reason: "usage_limit"}, "usage_limit"},
+		{"a blank reason still defaults", harness.Limit{}, "usage limit"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := limitReason(tc.lim); got != tc.want {
+				t.Errorf("limitReason(%+v) = %q, want %q", tc.lim, got, tc.want)
 			}
 		})
 	}
