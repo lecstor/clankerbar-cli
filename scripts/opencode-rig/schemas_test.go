@@ -135,6 +135,31 @@ func TestFetchCatalogTalksReadOnlyMCP(t *testing.T) {
 	}
 }
 
+func TestShippedProposedSchemaLoads(t *testing.T) {
+	cat, err := loadCatalog("testdata/schema-proposed.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(cat.toolNames(), ","); got != "update_task,frobnicate" {
+		t.Fatalf("tools = %s", got)
+	}
+	// The example must keep the nullable-enum rendering the schema scenario
+	// exists to exercise.
+	var update struct {
+		InputSchema struct {
+			Properties map[string]struct {
+				AnyOf []json.RawMessage `json:"anyOf"`
+			} `json:"properties"`
+		} `json:"inputSchema"`
+	}
+	if err := json.Unmarshal(cat.Tools[0], &update); err != nil {
+		t.Fatal(err)
+	}
+	if len(update.InputSchema.Properties["status"].AnyOf) != 2 {
+		t.Errorf("status is no longer a nullable enum: %s", cat.Tools[0])
+	}
+}
+
 func TestResponseJSONRejectsAnEmptyBody(t *testing.T) {
 	if got, err := responseJSON(nil); err != nil || got != nil {
 		t.Errorf("empty body = %s, %v", got, err)

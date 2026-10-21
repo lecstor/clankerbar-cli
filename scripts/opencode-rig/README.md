@@ -98,8 +98,10 @@ message's extra fields per request:
 ```
 
 and a one-line observation (`reasoning replay: 1 of 1 assistant message(s) …`).
-For DeepSeek via Command Code on 2026-10-21, it was replayed (131 chars on a
-padding run; the length varies with the step).
+For DeepSeek via Command Code on 2026-10-21 it was replayed — 127 characters on
+one padding run — and replayed as an empty string on steps where the model
+produced no reasoning. The report prints the string's length, so `string(0)`
+means "replayed, but empty".
 
 ```bash
 scripts/opencode-rig/run.sh --model commandcode/deepseek/deepseek-v4.1-flash \
@@ -249,11 +251,12 @@ provider key the caller supplies.
 Measured on 2026-10-21 with `commandcode/deepseek/deepseek-v4.1-flash`, 29
 clankerbar tools plus six built-ins:
 
-- one `padding` run with one tool call: **~90 KB per request**, one 13.8 K-token
-  step, **~$0.002**;
+- one `padding` run with one tool call: **~60–90 KB per request** (the prompt and
+  catalog decide), one 13.8 K-token step, **~$0.002**;
 - opencode also issues a small title-generation request (no tools, ~3 KB);
-- the `reasoning-replay` scenario makes two tool turns, so expect roughly twice
-  the tool-call step cost.
+- the `reasoning-replay` scenario makes two tool turns and measured **~$0.002**
+  in total, with the second request mostly served from the prompt cache;
+- the `schema` scenario with a two-tool catalog measured **~$0.0007**.
 
 The caps are the spend bound: the session stops at `--max-tool-calls` calls or
 `--deadline`, whichever comes first. Start with `--max-tool-calls 2` and a

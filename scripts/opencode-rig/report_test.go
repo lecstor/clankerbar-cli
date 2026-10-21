@@ -102,9 +102,18 @@ func TestMessageMetaOfKeepsUnknownFields(t *testing.T) {
 	names := []string{}
 	for _, e := range m.Extras {
 		names = append(names, e.Name)
+		if e.Kind == "string" && e.Len != 3 {
+			t.Errorf("%s: string length = %d, want 3 (the content, not the JSON encoding)", e.Name, e.Len)
+		}
 	}
 	if strings.Join(names, ",") != "reasoning_content,signature" {
 		t.Fatalf("extras = %v", names)
+	}
+	// An empty reasoning_content is replayed-but-empty: it must read as 0, not
+	// as the two bytes of its JSON quotes.
+	empty := messageMetaOf(0, json.RawMessage(`{"role":"assistant","content":null,"reasoning_content":""}`))
+	if len(empty.Extras) != 1 || empty.Extras[0].Len != 0 {
+		t.Fatalf("empty reasoning_content = %+v, want string(0)", empty.Extras)
 	}
 }
 

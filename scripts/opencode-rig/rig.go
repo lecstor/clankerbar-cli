@@ -74,7 +74,6 @@ type runRecord struct {
 	Capped         bool     `json:"capped"`
 	StubStarted    bool     `json:"stubStarted"`
 	ProviderReqs   int      `json:"providerRequests"`
-	SessionErr     string   `json:"sessionError,omitempty"`
 	Prompt         string   `json:"prompt"`
 	OpencodeBin    string   `json:"opencodeBin"`
 	IsolationDirs  []string `json:"isolationDirs"`
@@ -224,13 +223,13 @@ func runRig(o runOptions) (int, error) {
 		if err != nil {
 			return 1, err
 		}
+		if cat.Source == "" {
+			cat.Source = o.Schemas
+		}
 		// Keep the exact catalog the run served, beside the rest of the evidence.
 		if err := saveCatalog(schemasPath, cat); err != nil {
 			return 1, err
 		}
-	}
-	if o.Schemas == "live" {
-		cat.Source = o.PlaneURL
 	}
 	if o.Scenario == "schema" && !contains(cat.toolNames(), o.SchemaTool) {
 		return 1, fmt.Errorf("schema scenario: tool %q is not in the catalog (have %s)", o.SchemaTool, strings.Join(cat.toolNames(), ", "))
@@ -361,7 +360,10 @@ func runRig(o runOptions) (int, error) {
 	if o.DryRun {
 		rec.FinishedAt = time.Now().UTC().Format(time.RFC3339)
 		_ = writeJSON(filepath.Join(o.Out, "run.json"), rec)
-		fmt.Printf("  dry run: would run\n  %s %s\n", o.OpencodeBin, strings.Join(opencodeArgs(o), " "))
+		display := o
+		display.ServerURL = "<url>"
+		fmt.Printf("  dry run: would start opencode serve, wait for MCP server %q, then attach with:\n  %s %s\n",
+			"clankerbar", o.OpencodeBin, strings.Join(opencodeArgs(display), " "))
 		fmt.Printf("  session config content: %s\n", contentPath)
 		return 0, nil
 	}
@@ -666,13 +668,6 @@ func readKeyFile(path string) (string, error) {
 		return "", fmt.Errorf("%s is empty", path)
 	}
 	return key, nil
-}
-
-func schemaSourceLabel(s string) string {
-	if s == "live" {
-		return "the live plane"
-	}
-	return s
 }
 
 func contains(xs []string, want string) bool {

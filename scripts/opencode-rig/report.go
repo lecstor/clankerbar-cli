@@ -199,7 +199,7 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 	line("- run: `%s`", rec.RunID)
 	line("- model: `%s` (provider `%s`)", rec.Model, rec.Provider)
 	line("- provider upstream: `%s` via `%s`", rec.Upstream, rec.ProxyURL)
-	line("- tools: %d from `%s`", len(rec.Tools), schemaSourceLabel2(rec.SchemaSource))
+	line("- tools: %d from `%s`", len(rec.Tools), schemaSourceLabel(rec.SchemaSource))
 	line("- sandbox: `%s`", rec.Workdir)
 	line("- deadline: %s; stub call cap: %d", rec.Deadline, rec.MaxToolCalls)
 	line("- session: exit %d after %s (timed out: %v, capped: %v, stub started: %v)",
@@ -375,9 +375,12 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 	return b.String()
 }
 
-func schemaSourceLabel2(source string) string {
+func schemaSourceLabel(source string) string {
 	if source == "" {
 		return "(unknown)"
+	}
+	if source == "live" {
+		return "the live plane"
 	}
 	return source
 }
@@ -468,7 +471,17 @@ func messageMetaOf(i int, raw json.RawMessage) messageMeta {
 		if known[k] {
 			continue
 		}
-		meta.Extras = append(meta.Extras, extraField{Name: k, Kind: jsonKind(v), Len: len(v)})
+		kind := jsonKind(v)
+		length := len(v)
+		if kind == "string" {
+			// Report the STRING's length, not its JSON encoding: an empty
+			// reasoning_content is `""` (2 bytes) on the wire and must read as 0.
+			var s string
+			if json.Unmarshal(v, &s) == nil {
+				length = len(s)
+			}
+		}
+		meta.Extras = append(meta.Extras, extraField{Name: k, Kind: kind, Len: length})
 	}
 	sort.Slice(meta.Extras, func(a, b int) bool { return meta.Extras[a].Name < meta.Extras[b].Name })
 	return meta
