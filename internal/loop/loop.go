@@ -193,6 +193,14 @@ type Target struct {
 	// Rebuilt between iterations when the poll's runConfigVersion moves — never
 	// mid-session.
 	Cfg *config.Config
+
+	// PlaneProtocol is the protocol version the plane reported on this target's
+	// last cheap poll (CLA-743). The phase briefs use it to name the review door
+	// the plane actually serves: record_review from protocol 40, update_task
+	// (review: ...) below it. 0 means unknown — blind mode never polls, and an
+	// older plane's summary may omit the field — and every reader treats unknown
+	// as older, because the legacy wording works on every plane.
+	PlaneProtocol int
 }
 
 // Driver runs the loop for one harness against one or more backlogs.
@@ -838,6 +846,12 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 				case err != nil:
 					log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
 				default:
+					// The protocol version the briefs must speak (CLA-743): the
+					// plane's review door is record_review from protocol 40, and
+					// an older plane only understands update_task(review: ...).
+					// Captured on every successful poll so it travels with the
+					// target copy the spawn path reads.
+					d.targets[i].PlaneProtocol = sum.ProtocolVersion
 					// The stored execution-config boundary (CLA-410): a moved
 					// runConfigVersion — including the first poll, which is
 					// "start of run" — refetches and re-overlays BEFORE the
@@ -3442,8 +3456,9 @@ func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness
 	return st.Outcome, true
 }
 
-// closeReviewRound releases a review round's sealed findings (CLA-637) by
-// calling update_task(review: {closeRound: n}) as the holding run. The round is
+// closeReviewRound releases a review round's sealed findings (CLA-637) as the
+// holding run: record_review({closeRound: n}) on a plane that serves it, and
+// update_task(review: {closeRound: n}) below protocol 40 (CLA-743). The round is
 // the one the seam gate MATCHED, never a number predicted at spawn time: the
 // plane assigns rounds, and the driver reads them back off the record — which
 // is also what keeps this correct across void rounds and panel members.
@@ -3460,7 +3475,11 @@ func (d *Driver) closeReviewRound(ctx context.Context, t Target, res harness.Res
 	if res.Claim.TaskID == "" || res.Claim.RunID == "" {
 		return fmt.Errorf("no held claim to close review round %d with", round)
 	}
-	return closer.CloseReviewRound(ctx, res.Claim.TaskID, res.Claim.RunID, round)
+	// CLA-743: a plane serving record_review gets the review door; an older (or
+	// unknown-version) one keeps update_task(review: ...), which it has always
+	// accepted. The driver is not a strict-mode client, but the write belongs on
+	// the same door the briefs now prescribe.
+	return closer.CloseReviewRound(ctx, res.Claim.TaskID, res.Claim.RunID, round, config.ReviewToolServed(t.PlaneProtocol))
 }
 
 // readTaskState reads the plane's record of one task, for the verification
@@ -3516,7 +3535,7 @@ func findingIDRound(id string) (int, bool) {
 // open list is not an empty digest — the session is still told the delta base
 // and that the gate currently reads as clear, so a verifier that sees a problem
 // states it rather than silently passing a hand-over it cannot explain.
-func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string, recordsTotal int) string {
+func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string, recordsTotal int, protocolVersion int) string {
 	byID := map[string]plane.ReviewFindingState{}
 	newestRound, newestTip, newestCycle := 0, "", 0
 	for _, r := range records {
@@ -3622,7 +3641,7 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 		}
 	}
 	if len(settledIDs) > 0 {
-		b.WriteString("The following MUST(s) of this review cycle are already MARKED settled on the plane — by the fix phase, or by an earlier verification round. A fixer's own marking is its claim, not a verdict, and a refutation changes no code, so the fix delta will not show it: check each one against HEAD and its stated evidence. CONFIRM it by leaving its status as it is. REJECT it by setting its status back to \"open\" through update_task(review: {findingUpdates: [...]}) and recording why in this round's record; a rejected MUST is open, so the gate does not pass and the driver spawns another fix:\n")
+		b.WriteString("The following MUST(s) of this review cycle are already MARKED settled on the plane — by the fix phase, or by an earlier verification round. A fixer's own marking is its claim, not a verdict, and a refutation changes no code, so the fix delta will not show it: check each one against HEAD and its stated evidence. CONFIRM it by leaving its status as it is. REJECT it by setting its status back to \"open\" through " + config.ReviewFindingsCall(protocolVersion) + " and recording why in this round's record; a rejected MUST is open, so the gate does not pass and the driver spawns another fix:\n")
 		for _, id := range settledIDs {
 			b.WriteString(digestFindingLine(id, byID))
 		}
@@ -3679,7 +3698,7 @@ const planeUnparkOption = "Set it back to `ready` — the blocker is gone, let t
 // failed carries, per reviewer role, the reason that member recorded nothing
 // (CLA-639 M4): naming the missing member is not enough for the fixer to judge
 // whether the short list is bad luck or a member that never ran.
-func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, round int, failed map[string]string) string {
+func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, round int, failed map[string]string, protocolVersion int) string {
 	type merged struct {
 		finding plane.ReviewFindingState
 		record  plane.ReviewRecordState
@@ -3744,7 +3763,7 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 		fmt.Fprintf(&b, "The list is round %d's records only — an earlier round's findings, and anything already marked fixed, refuted or filed on the plane, are not relisted here.\n", round)
 	}
 	if settled > 0 {
-		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through update_task(review: {findingUpdates: [...]}), not by re-fixing it blind.\n", settled)
+		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through "+config.ReviewFindingsCall(protocolVersion)+", not by re-fixing it blind.\n", settled)
 	}
 	// CLA-639 M5: a panel member writes no `## Review` block — its record is the
 	// durable one — so the fixer must not wait for a block to preserve, and its
@@ -4435,7 +4454,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// a member that recorded in an earlier round as having recorded this one.
 		if roles := panelRoles(phases, phaseIdx); len(roles) > 0 && panel.round > 0 && prev != nil && prev.Claim.TaskID != "" {
 			if st, read := d.readTaskState(ctx, t, prev.Claim.TaskID); read {
-				if merged := mergedFindingsDigest(st.Reviews, roles, panel.round, panel.failed); merged != "" {
+				if merged := mergedFindingsDigest(st.Reviews, roles, panel.round, panel.failed, t.PlaneProtocol); merged != "" {
 					fixGrading = merged
 				}
 			}
@@ -4486,7 +4505,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// record), so the digest hands it the LAST legacy block instead.
 			verifyDigest = branchlessVerificationDigest(st.Outcome)
 		} else {
-			verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs, st.ReviewsTotal)
+			verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs, st.ReviewsTotal, t.PlaneProtocol)
 		}
 	}
 	retries := 0
@@ -7419,6 +7438,15 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		config.PhasePrevModelPlaceholder, attributionOr(prevModel, "harness default"),
 		config.PhaseNumberPlaceholder, strconv.Itoa(phaseIdx + 1),
 		config.PhaseTotalPlaceholder, strconv.Itoa(phaseTotal),
+		// CLA-743: the review write's SHAPE is a fact about the plane, not the
+		// phase. A plane serving record_review (protocol >= 40) gets the
+		// strict-client-safe tool; an older one - or an unknown version, which
+		// blind mode and a pre-field summary both produce - keeps
+		// update_task(review: ...), the call every plane understands.
+		config.ReviewRecordCallPlaceholder, config.ReviewRecordCall(t.PlaneProtocol),
+		config.ReviewCloseCallPlaceholder, config.ReviewCloseCall(t.PlaneProtocol),
+		config.ReviewFindingsCallPlaceholder, config.ReviewFindingsCall(t.PlaneProtocol),
+		config.VerifyHandoverStepPlaceholder, config.VerifyHandoverStep(t.PlaneProtocol, prBase),
 	}
 	if prBase != "" {
 		repl = append(repl, config.PhasePRBasePlaceholder, prBase)

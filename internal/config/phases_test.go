@@ -8,6 +8,19 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
+// resolveReviewCalls substitutes the protocol-dependent review-write
+// placeholders, the way the driver does at spawn time (CLA-743). Tests that pin
+// the review shape read the RESOLVED brief, so a protocol choice that made a
+// brief unexecutable fails here rather than in a session.
+func resolveReviewCalls(brief string, protocolVersion int) string {
+	return strings.NewReplacer(
+		ReviewRecordCallPlaceholder, ReviewRecordCall(protocolVersion),
+		ReviewCloseCallPlaceholder, ReviewCloseCall(protocolVersion),
+		ReviewFindingsCallPlaceholder, ReviewFindingsCall(protocolVersion),
+		VerifyHandoverStepPlaceholder, VerifyHandoverStep(protocolVersion, "staging"),
+	).Replace(brief)
+}
+
 // A config with no phases must behave exactly as it always has. This is the
 // back-compat guarantee that lets phases be opt-in rather than a migration.
 func TestEffectivePhases_UnphasedIsOnePhaseCarryingThePrompt(t *testing.T) {
@@ -970,7 +983,7 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
 	} {
 		for _, want := range []string{
-			"update_task(taskId, runId, review: {...})",
+			ReviewRecordCallPlaceholder,
 			`reviewerRole: "` + ReviewerRolePlaceholder + `"`,
 			"reviewedTip",
 			"raisedByModel",
@@ -1020,13 +1033,113 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	if !strings.Contains(noCodeReviewOnlyBrief, "update_task(taskId, runId, outcome: ...)") {
 		t.Errorf("the no-code review-only brief does not prescribe the legacy block write:\n%s", noCodeReviewOnlyBrief)
 	}
-	for _, banned := range []string{"update_task(taskId, runId, review: {...})", "THEN append THIS run's durable"} {
+	for _, banned := range []string{ReviewRecordCallPlaceholder, "update_task(taskId, runId, review: {...})", "THEN append THIS run's durable"} {
 		if strings.Contains(noCodeReviewOnlyBrief, banned) {
 			t.Errorf("the no-code review-only brief prescribes %q, but the plane refuses every review write on a settled task (question 03a12578, option 1):\n%s", banned, noCodeReviewOnlyBrief)
 		}
 	}
-	if !strings.Contains(noCodeReviewOnlyTerminalStep, "Do NOT attempt update_task(review: ...) here") {
+	if !strings.Contains(noCodeReviewOnlyTerminalStep, "Do NOT attempt a durable review record write here") {
 		t.Errorf("the no-code terminal step does not tell the session the durable write is not attempted:\n%s", noCodeReviewOnlyTerminalStep)
+	}
+}
+
+// CLA-743: the review write's door follows the plane's protocol version.
+// record_review is served from protocol 40; below it (and for an unknown
+// version) the brief must prescribe update_task(review: ...), which every
+// plane accepts. A brief that names a tool the plane does not serve sends every
+// review session into an unknown-tool refusal, so both resolutions are pinned.
+func TestReviewWriteToolFollowsPlaneProtocol(t *testing.T) {
+	for _, tc := range []struct {
+		version int
+		served  bool
+	}{
+		{0, false},  // unknown: blind mode, or a summary without the field
+		{39, false}, // the last protocol before record_review
+		{40, true},  // the first protocol serving it
+		{41, true},
+	} {
+		if got := ReviewToolServed(tc.version); got != tc.served {
+			t.Errorf("ReviewToolServed(%d) = %t, want %t", tc.version, got, tc.served)
+		}
+	}
+
+	durable := map[string]string{
+		"review-only brief":             reviewOnlyBrief,
+		"unverified review-only brief":  unverifiedReviewOnlyBrief,
+		"panel member brief":            panelMemberReviewOnlyBrief,
+		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
+		"fix brief":                     fixBrief,
+		"fix-verify brief":              fixVerifyBrief,
+		"verify brief":                  verifyBrief,
+		"review-only terminal step":     reviewOnlyTerminalStep,
+		"panel member terminal step":    panelMemberTerminalStep,
+	}
+	for name, brief := range durable {
+		if !strings.Contains(brief, ReviewRecordCallPlaceholder) && !strings.Contains(brief, ReviewFindingsCallPlaceholder) {
+			continue
+		}
+		current := resolveReviewCalls(brief, ReviewToolProtocol)
+		if !strings.Contains(current, "record_review(") {
+			t.Errorf("the %s does not resolve to record_review on protocol %d:\n%s", name, ReviewToolProtocol, current)
+		}
+		if strings.Contains(current, "update_task(taskId, runId, review:") || strings.Contains(current, "update_task(review:") {
+			t.Errorf("the %s still prescribes update_task(review:) on protocol %d:\n%s", name, ReviewToolProtocol, current)
+		}
+		old := resolveReviewCalls(brief, ReviewToolProtocol-1)
+		if !strings.Contains(old, "update_task(taskId, runId, review:") && !strings.Contains(old, "update_task(review:") {
+			t.Errorf("the %s does not fall back to update_task(review:) on protocol %d:\n%s", name, ReviewToolProtocol-1, old)
+		}
+		if strings.Contains(old, "record_review(") {
+			t.Errorf("the %s prescribes record_review on protocol %d, which does not serve it:\n%s", name, ReviewToolProtocol-1, old)
+		}
+	}
+
+	// The verify hand-over: on a plane serving record_review it is TWO calls,
+	// and the close comes FIRST. The order is load-bearing — the plane accepts a
+	// close only from the run that still holds the task, so a close sent after
+	// the in_review move is refused.
+	current := resolveReviewCalls(verifyBrief, ReviewToolProtocol)
+	closeAt := strings.Index(current, "record_review(taskId, runId, { closeRound:")
+	moveAt := strings.Index(current, `status: "in_review"`)
+	if closeAt < 0 || moveAt < 0 || closeAt > moveAt {
+		t.Errorf("the verify hand-over does not close the round with record_review BEFORE the in_review move (close at %d, move at %d):\n%s", closeAt, moveAt, current)
+	}
+	if !strings.Contains(current, "TWO calls, IN THIS ORDER") || !strings.Contains(current, "still HOLDS the task") {
+		t.Errorf("the verify hand-over does not state the two-call order and why it is load-bearing:\n%s", current)
+	}
+
+	// Below protocol 40 the one-call shape is the only legal one: the plane
+	// refuses a close once the task has left in_progress, so the status move and
+	// closeRound must travel in the SAME call.
+	old := resolveReviewCalls(verifyBrief, ReviewToolProtocol-1)
+	if !strings.Contains(old, `status: "in_review", review: { closeRound:`) {
+		t.Errorf("the verify hand-over does not carry the legacy one-call status+closeRound shape below protocol %d:\n%s", ReviewToolProtocol, old)
+	}
+	if strings.Contains(old, "TWO calls") {
+		t.Errorf("the legacy verify hand-over claims a two-call order it cannot use:\n%s", old)
+	}
+
+	// A branchless round writes no durable record at all, at either protocol: a
+	// placeholder that reached these briefs would be a call the plane refuses.
+	for name, brief := range map[string]string{
+		"no-code review-only brief": noCodeReviewOnlyBrief,
+		"no-code fix brief":         noCodeFixBrief,
+		"no-code fix-verify brief":  noCodeFixVerifyBrief,
+		"no-code verify brief":      noCodeVerifyBrief,
+	} {
+		for _, banned := range []string{
+			ReviewRecordCallPlaceholder,
+			ReviewCloseCallPlaceholder,
+			ReviewFindingsCallPlaceholder,
+			// The verify hand-over is the fourth member of the family: the
+			// branch-shaped one tells the session to open a PR and then move
+			// the task to in_review, which a branchless round must never do.
+			VerifyHandoverStepPlaceholder,
+		} {
+			if strings.Contains(brief, banned) {
+				t.Errorf("the %s carries %s, but a branchless round writes no durable record:\n%s", name, banned, brief)
+			}
+		}
 	}
 }
 
@@ -1046,7 +1159,7 @@ func TestPanelMemberBriefWritesOnlyItsSealedRecord(t *testing.T) {
 		if !strings.Contains(brief, panelMemberTerminalStep) {
 			t.Errorf("the %s does not end on the record-only terminal step:\n%s", name, brief)
 		}
-		if !strings.Contains(brief, "update_task(taskId, runId, review: {...})") {
+		if !strings.Contains(brief, ReviewRecordCallPlaceholder) {
 			t.Errorf("the %s does not prescribe the sealed durable record:\n%s", name, brief)
 		}
 		// The member is told what its outcome write would do to the next member,
@@ -2022,7 +2135,9 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 		}
 	}
 	// The ID-based machinery is the CODE shape's: plane ids to adjudicate by,
-	// the driver's round cap, and the non-convergence breaker.
+	// the driver's round cap, and the non-convergence breaker. Read the
+	// protocol-40 resolution: that is the shape a current plane's session runs.
+	verify := resolveReviewCalls(verifyBrief, ReviewToolProtocol)
 	for _, want := range []string{
 		"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
 		"RESOLVED",
@@ -2039,7 +2154,7 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 		"do NOT open a PR",
 		"{{reviewerRole}}",
 	} {
-		if !strings.Contains(verifyBrief, want) {
+		if !strings.Contains(verify, want) {
 			t.Errorf("the code verify brief does not carry %q", want)
 		}
 	}
@@ -2139,6 +2254,7 @@ func TestFixVerifyVariantsDoNotHandTheTaskOver(t *testing.T) {
 		// Dropping the hand-over must not drop the rest of the contract: the
 		// terminal step that ends the phase, and the record requirement the
 		// successor's own outcome depends on.
+		resolved := resolveReviewCalls(tc.brief, ReviewToolProtocol)
 		if !strings.Contains(tc.brief, tc.terminal) {
 			t.Errorf("%s lost the terminal step that stops it before the hand-over:\n%s", tc.name, tc.brief)
 		}
@@ -2148,11 +2264,11 @@ func TestFixVerifyVariantsDoNotHandTheTaskOver(t *testing.T) {
 		// The durable finding updates are the seam's evidence; a variant that
 		// cannot make the call must not be told to (the same exemption
 		// noCodeFixTerminalRecord carries for the branchless final fix).
-		if tc.durable && !strings.Contains(tc.brief, "findingUpdates") {
-			t.Errorf("%s lost the durable finding updates the fix phase owes:\n%s", tc.name, tc.brief)
+		if tc.durable && !strings.Contains(resolved, "findingUpdates") {
+			t.Errorf("%s lost the durable finding updates the fix phase owes:\n%s", tc.name, resolved)
 		}
-		if !tc.durable && strings.Contains(tc.brief, "findingUpdates") {
-			t.Errorf("%s demands the durable findingUpdates call a branchless round cannot make:\n%s", tc.name, tc.brief)
+		if !tc.durable && strings.Contains(resolved, "findingUpdates") {
+			t.Errorf("%s demands the durable findingUpdates call a branchless round cannot make:\n%s", tc.name, resolved)
 		}
 	}
 	// The other side of the property: the fix phase that IS the sequence's last

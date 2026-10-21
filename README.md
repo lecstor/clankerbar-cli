@@ -86,7 +86,8 @@ targeted probe of a suspected defect, and the worktree is left clean. It is
 **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task: a sealed per-reviewer durable record written through
-`update_task(review: ...)` — round, reviewer role, the phase's resolved
+`record_review` (or `update_task(review: ...)` against a plane older than protocol
+40) — round, reviewer role, the phase's resolved
 harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
 severity grade and `raisedByModel` — plus, for one release, the legacy block
 in the outcome (`update_task(outcome: ...)`, no status move) carrying the
@@ -182,10 +183,14 @@ only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, and a `status: "in_review"` move. It releases its own round in that same
-`update_task` call (`review: {closeRound: …}`), because the plane refuses a
-sealed holder's outcome write and refuses a close after the task has left
-`in_progress`; the fix phase has already written the outcome with the
+PR, and a `status: "in_review"` move. On a plane that serves `record_review`
+(protocol 40+) that is TWO calls in a load-bearing order: close the round with
+`record_review(…, { closeRound: … })` while the task is still held, then move it
+with `update_task(…, status: "in_review")`. The plane refuses a sealed holder's
+outcome write and refuses a close after the task has left `in_progress`, so the
+close must land first; an older plane takes the one call that bundles both
+(`update_task(…, status: "in_review", review: { closeRound: … })`) for the same
+reason. The fix phase has already written the outcome with the
 `**Tests**` section the `in_review` guard reads. A round with any open MUST
 releases its round the same way but ends **without** the PR and without moving
 the task; the driver spawns another `fix`, then verifies again. SHOULD and NIT
@@ -791,6 +796,31 @@ pushed work comes back as an immediate takeover with its branch instead of
 waiting out the lease. The same happens inside the daemon when a phase is
 abandoned holding pushed work. A plane that refuses because the run already
 ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
+
+**A clean approved task is integrated without a session.** An
+approved-awaiting-merge task used to wait for a fresh agent session to merge its
+PR — which waits for some clanker to finish the task it is on, and a task with a
+review panel runs 30-60 minutes. Every step except resolving a conflict is
+mechanical, so the supervisor does them: for each supervised project whose
+policy says a clanker integrates (`authorityIntegrate: clanker`), it finds the
+open PR for the task's recorded branch, judges it with the same delivery check
+the driver applies to an agent's claim (mergeable, and a check rollup that ran
+and passed), **claims the task first** so an agent close-out and this path can
+never both merge it, merges the PR as a merge commit, verifies that merge commit
+is an ancestor of the base on origin, and closes the task done with that
+delivery. It does nothing under `authorityIntegrate: human`, for a PR based on
+`main` (the promotion is yours), for a conflicting, failing, unchecked or
+unresolvable PR, or when the claim is refused. A conflict is the one stand-down
+that carries evidence: the conflicting paths are logged once per head/base pair,
+for deciding whether a conflict needs an agent at all. Anything after a
+successful claim that cannot be finished releases it, so the task goes back to
+`approved` rather than being left held — with one exception: a merge that LANDED
+but whose ancestry could not be verified is closed `done` with `mergeVerified:
+false`, because the PR is no longer open and a release would strand the task.
+The merge itself names the configured base and the judged head revision, so a
+PR retargeted after the judgement cannot be merged into `main`; its verification
+and conflict reads run in a throwaway clone, never in the checkout the fleet's
+sessions share.
 
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
