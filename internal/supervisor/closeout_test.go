@@ -450,6 +450,38 @@ func TestCloseOutNeverMergesAMainBasedPR(t *testing.T) {
 	})
 }
 
+func TestCloseOutStandsDownWithoutOneIdentifiedPR(t *testing.T) {
+	cases := []struct {
+		name   string
+		prs    []int
+		says   string
+		hasRef bool
+	}{
+		{"no open PR", nil, "no OPEN pull request", false},
+		{"two open PRs", []int{12, 13}, "refusing to guess", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newCloseOutFixture(t, false)
+			f.servePlane(t, "clanker")
+			f.writePRList(tc.prs...)
+			d := f.supervisor(0)
+
+			lines := f.run(d)
+
+			if got := f.callsFor("claim_task"); len(got) != 0 {
+				t.Errorf("a task was claimed with no single PR to merge: %v", got)
+			}
+			if !strings.Contains(lines, tc.says) {
+				t.Errorf("the stand-down does not say %q:\n%s", tc.says, lines)
+			}
+			if tc.hasRef && !strings.Contains(lines, "#13") {
+				t.Errorf("the stand-down does not name both PRs:\n%s", lines)
+			}
+		})
+	}
+}
+
 func TestCloseOutUsesTheConfiguredCheckoutWithoutAMachineRoot(t *testing.T) {
 	f := newCloseOutFixture(t, false)
 	f.servePlane(t, "clanker")
