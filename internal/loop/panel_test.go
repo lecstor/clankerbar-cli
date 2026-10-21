@@ -1038,10 +1038,10 @@ func TestReviewReleaser_EnforcesThePlanesWriteRules(t *testing.T) {
 		t.Errorf("an outcome write that should have been refused landed: %q", rel.outcome)
 	}
 	// Only the live holder may close the round.
-	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-2", 1); err == nil || !strings.Contains(err.Error(), "not the live holder") {
+	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-2", 1, false); err == nil || !strings.Contains(err.Error(), "not the live holder") {
 		t.Errorf("a non-holder closed the round: %v", err)
 	}
-	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1); err != nil {
+	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1, false); err != nil {
 		t.Fatalf("the live holder could not close the round: %v", err)
 	}
 	// Which is what releases the findings to a reader.
@@ -1049,7 +1049,7 @@ func TestReviewReleaser_EnforcesThePlanesWriteRules(t *testing.T) {
 		t.Errorf("the close did not release the round's findings: %+v", st.Reviews)
 	}
 	// ... and a second close has nothing to release.
-	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1); err == nil || !strings.Contains(err.Error(), "no_open_round") {
+	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1, false); err == nil || !strings.Contains(err.Error(), "no_open_round") {
 		t.Errorf("a second close of the same round was accepted: %v", err)
 	}
 
@@ -1066,7 +1066,7 @@ func TestReviewReleaser_EnforcesThePlanesWriteRules(t *testing.T) {
 	if err := rel2.writeOutcome("r-1", "a displaced run's outcome\n"); err == nil || !strings.Contains(err.Error(), "round_voided") {
 		t.Errorf("a displaced run wrote to the task: %v", err)
 	}
-	if err := rel2.CloseReviewRound(context.Background(), "t-1", "r-1", 1); err == nil || !strings.Contains(err.Error(), "void") {
+	if err := rel2.CloseReviewRound(context.Background(), "t-1", "r-1", 1, false); err == nil || !strings.Contains(err.Error(), "void") {
 		t.Errorf("a displaced run closed the round: %v", err)
 	}
 }

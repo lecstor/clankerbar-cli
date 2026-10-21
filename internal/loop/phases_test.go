@@ -2748,7 +2748,7 @@ func (r *reviewReleaser) TaskState(_ context.Context, _ string) (plane.TaskState
 // The panel's failure arm is why this matters: it must close the round BEFORE
 // anything hands the claim back, or its close is refused and the earlier
 // members' findings stay sealed behind a lease that is already gone.
-func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID string, round int) error {
+func (r *reviewReleaser) CloseReviewRound(_ context.Context, _ string, runID string, round int, _ bool) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closeErr != nil {

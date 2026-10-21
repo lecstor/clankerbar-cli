@@ -193,6 +193,14 @@ type Target struct {
 	// Rebuilt between iterations when the poll's runConfigVersion moves — never
 	// mid-session.
 	Cfg *config.Config
+
+	// PlaneProtocol is the protocol version the plane reported on this target's
+	// last cheap poll (CLA-743). The phase briefs use it to name the review door
+	// the plane actually serves: record_review from protocol 40, update_task
+	// (review: ...) below it. 0 means unknown — blind mode never polls, and an
+	// older plane's summary may omit the field — and every reader treats unknown
+	// as older, because the legacy wording works on every plane.
+	PlaneProtocol int
 }
 
 // Driver runs the loop for one harness against one or more backlogs.
@@ -824,6 +832,12 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 				case err != nil:
 					log.Printf("%sbacklog poll error: %v — retry in %s", d.prefix(i), err, idle)
 				default:
+					// The protocol version the briefs must speak (CLA-743): the
+					// plane's review door is record_review from protocol 40, and
+					// an older plane only understands update_task(review: ...).
+					// Captured on every successful poll so it travels with the
+					// target copy the spawn path reads.
+					d.targets[i].PlaneProtocol = sum.ProtocolVersion
 					// The stored execution-config boundary (CLA-410): a moved
 					// runConfigVersion — including the first poll, which is
 					// "start of run" — refetches and re-overlays BEFORE the
@@ -3446,7 +3460,11 @@ func (d *Driver) closeReviewRound(ctx context.Context, t Target, res harness.Res
 	if res.Claim.TaskID == "" || res.Claim.RunID == "" {
 		return fmt.Errorf("no held claim to close review round %d with", round)
 	}
-	return closer.CloseReviewRound(ctx, res.Claim.TaskID, res.Claim.RunID, round)
+	// CLA-743: a plane serving record_review gets the review door; an older (or
+	// unknown-version) one keeps update_task(review: ...), which it has always
+	// accepted. The driver is not a strict-mode client, but the write belongs on
+	// the same door the briefs now prescribe.
+	return closer.CloseReviewRound(ctx, res.Claim.TaskID, res.Claim.RunID, round, config.ReviewToolServed(t.PlaneProtocol))
 }
 
 // readTaskState reads the plane's record of one task, for the verification
@@ -7405,6 +7423,15 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		config.PhasePrevModelPlaceholder, attributionOr(prevModel, "harness default"),
 		config.PhaseNumberPlaceholder, strconv.Itoa(phaseIdx + 1),
 		config.PhaseTotalPlaceholder, strconv.Itoa(phaseTotal),
+		// CLA-743: the review write's SHAPE is a fact about the plane, not the
+		// phase. A plane serving record_review (protocol >= 40) gets the
+		// strict-client-safe tool; an older one - or an unknown version, which
+		// blind mode and a pre-field summary both produce - keeps
+		// update_task(review: ...), the call every plane understands.
+		config.ReviewRecordCallPlaceholder, config.ReviewRecordCall(t.PlaneProtocol),
+		config.ReviewCloseCallPlaceholder, config.ReviewCloseCall(t.PlaneProtocol),
+		config.ReviewFindingsCallPlaceholder, config.ReviewFindingsCall(t.PlaneProtocol),
+		config.VerifyHandoverStepPlaceholder, config.VerifyHandoverStep(t.PlaneProtocol),
 	}
 	if prBase != "" {
 		repl = append(repl, config.PhasePRBasePlaceholder, prBase)
