@@ -70,23 +70,44 @@ that it also loads whatever servers that global layer declares (e.g. `github`).
 
 ## Scenarios
 
-### `padding` — what keys does the model send on a review-shaped `update_task`?
+### `padding` — what does a strict-mode client send to `edit_task`, and what does it clear?
 
-The plane's `update_task` takes a nullable `review` block and many nullable
-top-level fields. Some models pad a review call with every nullable property set
-to `null`, and the plane refuses that as `invalid_review` ("a review call
-carries only taskId, runId and review — resend it without: …").
+Some model/provider pairs force strict structured tool calls on: every property
+of whatever schema they are handed is present on every call, a nullable one as
+`null`, a string as `""`, a boolean as `false`. Ordinary calls are harmless — the
+plane drops the empty spellings, so `null` and `""` are absence. The exception is
+the surface `edit_task` still has (proposal R4, decision `c06cdfc7`):
 
-The stub serves `update_task` and refuses it **exactly like the plane** (the
-real refusal text, naming the extra arguments the call actually carried). The
-report prints the top-level keys sent per call, marking explicit nulls:
+- `container` and `humanOnly` take `false` as their **CLEAR** spelling, so a
+  client that pads every boolean clears a flag the task had SET;
+- `repo: ""` clears routing back to the primary repo, while a padded
+  `repo: null` is absence and leaves it alone;
+- the nullable enums (`priority`, `schedule`) accept the padded `null` as
+  absence, and a call that carries nothing real is refused `nothing_to_do`.
+
+The prompt asks for three fully padded calls — one carrying a real `detail`, one
+with `repo: ""`, one with `repo: null` — so all three behaviours are visible in
+one run. The stub serves `edit_task` and answers **exactly like the plane**: the
+same empty-value drop, the same `one_long_field` refusal, the same clear
+spellings, and a receipt carrying `changed`. The report prints the arguments sent
+per call, with the empty value the model actually sent, and then lists the
+residual signal per call:
 
 ```
-| # | tool          | keys sent                                        | result                 |
-| 1 | `update_task` | `priority=null`, `review`, `runId`, `status=null`, `taskId` | error `invalid_review` |
+| # | tool        | keys sent (abridged)                                             | result                                    |
+| 1 | `edit_task` | `category=""`, `container=false`, `detail`, `humanOnly=false`, …  | ok; changed: detail, container, humanOnly |
+| 2 | `edit_task` | `repo=""`, `taskId`                                              | ok; changed: repo                         |
+| 3 | `edit_task` | `repo=null`, `taskId`                                            | error `nothing_to_do`                     |
+
+- `edit_task` padding by call — a padded `false` on `container`/`humanOnly` is their CLEAR spelling, `repo=""` clears routing and `null` is absence:
+  - call 1: `container=false` (CLEARS a set flag), `humanOnly=false` (CLEARS a set flag), `priority=null` (absent), `repo=null` (absent), `schedule=null` (absent)
+  - call 2: `repo=""` (CLEARS to primary)
+  - call 3: `repo=null` (absent)
 ```
 
-That is the Command Code Luna padding, visible without a fleet run:
+Call 1's padded `false` is the clear, and its receipt says so; call 3 carried
+nothing real, which is why the plane answers `nothing_to_do` instead of writing.
+This makes the residual visible without a fleet run:
 
 ```bash
 scripts/opencode-rig/run.sh --model commandcode/gpt-6-luna --scenario padding
@@ -116,7 +137,7 @@ scripts/opencode-rig/run.sh --model commandcode/deepseek/deepseek-v4.1-flash \
 
 ### `schema` — test a proposed tool shape before the plane ships it
 
-`--schemas live` (the default) serves the plane's current 29 tools, byte for
+`--schemas live` (the default) serves the plane's live tool catalog, byte for
 byte as fetched. To test a proposal, fetch the catalog once, edit a copy, and
 serve it:
 
@@ -134,10 +155,11 @@ scripts/opencode-rig/run.sh \
 The scenario asks for `clankerbar_<--schema-tool>` (default `edit_task`) with
 a null on every optional field the schema allows one on; the prompt is built
 from the selected name, so `--schema-tool frobnicate` asks the model to call
-`clankerbar_frobnicate` rather than the default tool. The report shows the tool catalog that went on the wire
-(count, names, one sha256 per request) and whether the model's call arrived at
-the stub. A provider or model that rejects the schema fails the run before any
-backlog write is possible — there is no backlog connection at all.
+`clankerbar_frobnicate` rather than the default tool. The report shows the tool
+catalog that went on the wire (count, names, one sha256 per request) and whether
+the model's call arrived at the stub. A provider or model that rejects the
+schema fails the run before any backlog write is possible — there is no backlog
+connection at all.
 
 `scripts/opencode-rig/testdata/schema-proposed.json` is a small example of an
 alternative catalog. It is *not* the live catalog; use `fetch-schemas` for that.
@@ -265,8 +287,8 @@ can be used by the real run straight afterwards.
 provider: the proxy forwards to the URL the fleet config declares, with the
 provider key the caller supplies.
 
-Measured on 2026-10-21 with `commandcode/deepseek/deepseek-v4.1-flash`, 29
-clankerbar tools plus six built-ins:
+Measured on 2026-10-21 against the 29-tool catalog the plane served then (six
+built-ins beside it), with `commandcode/deepseek/deepseek-v4.1-flash`:
 
 - one `padding` run with one tool call: **~60–90 KB per request** (the prompt and
   catalog decide), one 13.8 K-token step, **~$0.002**;

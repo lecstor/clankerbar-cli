@@ -232,7 +232,7 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 			line("| %d | `%s` | %s | %s |", c.Seq, c.Name, renderKeys(c.Arguments), resultLabel(c))
 		}
 		line("")
-		line("`key=null` means the model explicitly sent that property as null; a bare `key` means it was sent with a non-null value. That distinction is the padding signal.")
+		line("An empty value is printed as the model sent it: `key=null`, `key=false` or `key=\"\"`. A bare `key` means a non-empty value. That distinction is the padding signal.")
 	}
 	line("")
 
@@ -336,8 +336,11 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 	line("## Observations")
 	line("")
 	line("- %d tool call(s): %d refused (isError), %d ok.", len(calls), countErrors(calls), len(calls)-countErrors(calls))
-	if extra := paddingExtras(calls); len(extra) > 0 {
-		line("- review padding: extra top-level keys beyond taskId/runId/review were sent — %s.", strings.Join(extra, "; "))
+	if lines := editTaskResidual(calls); len(lines) > 0 {
+		line("- `edit_task` padding by call — a padded `false` on `container`/`humanOnly` is their CLEAR spelling, `repo=\"\"` clears routing and `null` is absence:")
+		for _, l := range lines {
+			line("  - %s", l)
+		}
 	}
 	if len(requests) > 1 {
 		replayed, assistantMsgs := replayStats(requests)
@@ -413,6 +416,11 @@ func boolLabel(b *bool) string {
 
 func resultLabel(c stubCall) string {
 	if !c.IsError {
+		if changed := changedLabel(c.Result); changed != "" {
+			// The receipt's `changed` is the half of the residual the arguments
+			// alone cannot answer: what the call actually DID.
+			return "ok; changed: " + changed
+		}
 		return "ok"
 	}
 	var payload struct {
@@ -427,7 +435,22 @@ func resultLabel(c stubCall) string {
 	return "error"
 }
 
-// renderKeys prints a call's top-level argument keys, marking explicit nulls.
+// changedLabel renders a task-write receipt's `changed` list, when the result
+// carries one.
+func changedLabel(result string) string {
+	var payload struct {
+		Changed []string `json:"changed"`
+	}
+	if json.Unmarshal([]byte(result), &payload) != nil || len(payload.Changed) == 0 {
+		return ""
+	}
+	return strings.Join(payload.Changed, ", ")
+}
+
+// renderKeys prints a call's top-level arguments, marking the empty value the
+// model actually sent. A padded `false` and a padded `""` are as much a signal
+// as a null - they are the CLEAR spellings on container/humanOnly and repo - so
+// each is printed as sent rather than collapsed to a bare key.
 func renderKeys(raw json.RawMessage) string {
 	var m map[string]any
 	if err := json.Unmarshal(raw, &m); err != nil || len(m) == 0 {
@@ -440,9 +463,18 @@ func renderKeys(raw json.RawMessage) string {
 	sort.Strings(keys)
 	parts := make([]string, 0, len(keys))
 	for _, k := range keys {
-		if m[k] == nil {
+		switch v := m[k].(type) {
+		case nil:
 			parts = append(parts, "`"+k+"=null`")
-		} else {
+		case bool:
+			parts = append(parts, fmt.Sprintf("`%s=%t`", k, v))
+		case string:
+			if v == "" {
+				parts = append(parts, "`"+k+`=""`+"`")
+				continue
+			}
+			parts = append(parts, "`"+k+"`")
+		default:
 			parts = append(parts, "`"+k+"`")
 		}
 	}
@@ -594,33 +626,51 @@ func countErrors(calls []stubCall) int {
 	return n
 }
 
-// paddingExtras lists, per call, the review call's extra top-level keys. It is
-// what the padding scenario exists to show.
-func paddingExtras(calls []stubCall) []string {
+// editTaskResidual lists, per edit_task call, the padding signals the ruled
+// residual is about, read from the arguments the model actually sent: a
+// nullable enum sent as null (absence), `repo: ""` (the CLEAR) beside `repo:
+// null` (absence), and the two flags whose padded `false` is their CLEAR
+// spelling. What the call then CHANGED is the table's result column.
+func editTaskResidual(calls []stubCall) []string {
 	var out []string
 	for _, c := range calls {
+		if c.Name != "edit_task" {
+			continue
+		}
 		var args map[string]any
 		if json.Unmarshal(c.Arguments, &args) != nil {
 			continue
 		}
-		if _, isReview := args["review"]; !isReview {
-			continue
-		}
-		var extra []string
-		for _, k := range sortedKeys(args) {
-			switch k {
-			case "taskId", "runId", "review":
-			default:
-				if args[k] == nil {
-					extra = append(extra, k+"=null")
-				} else {
-					extra = append(extra, k)
-				}
+		var signals []string
+		if v, ok := args["repo"]; ok {
+			switch {
+			case v == nil:
+				signals = append(signals, "`repo=null` (absent)")
+			case v == "":
+				signals = append(signals, "`repo=\"\"` (CLEARS to primary)")
 			}
 		}
-		if len(extra) > 0 {
-			out = append(out, fmt.Sprintf("call %d: %s", c.Seq, strings.Join(extra, ", ")))
+		for _, field := range []string{"container", "humanOnly"} {
+			v, ok := args[field]
+			if !ok {
+				continue
+			}
+			switch {
+			case v == nil:
+				signals = append(signals, "`"+field+"=null` (leaves the flag)")
+			case v == false:
+				signals = append(signals, "`"+field+"=false` (CLEARS a set flag)")
+			}
 		}
+		for _, field := range []string{"priority", "schedule"} {
+			if v, ok := args[field]; ok && v == nil {
+				signals = append(signals, "`"+field+"=null` (absent)")
+			}
+		}
+		if len(signals) == 0 {
+			continue
+		}
+		out = append(out, fmt.Sprintf("call %d: %s", c.Seq, strings.Join(signals, ", ")))
 	}
 	return out
 }

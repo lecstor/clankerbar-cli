@@ -14,18 +14,35 @@ func reportFixture() (runRecord, []rigEvent, []stubCall, []capturedRequest) {
 		RunID: "padding-test", Scenario: "padding", Model: "commandcode/deepseek/deepseek-v4.1-flash",
 		Provider: "commandcode", Upstream: "https://api.commandcode.ai/provider/v1",
 		ProxyURL: "http://127.0.0.1:1", SchemaSource: "https://clankerbar.com/mcp/clankerbar",
-		Tools: []string{"update_task", "get_task"}, Workdir: "/runs/x/sandbox",
+		Tools: []string{"edit_task", "get_task"}, Workdir: "/runs/x/sandbox",
 		Deadline: "5m0s", MaxToolCalls: 6, ExitCode: 0, DurationMS: 1234,
 		StubStarted: true, IsolationDirs: []string{"XDG_DATA_HOME=/runs/x/xdg/data"},
-		Prompt: "Call clankerbar_update_task.",
+		Prompt: "Call clankerbar_edit_task three times.",
 	}
-	calls := []stubCall{{
-		Seq: 1, Name: "update_task",
-		Arguments: json.RawMessage(`{"taskId":"CLA-753","runId":"rig-run-1","review":{"reviewerRole":"review-1","verdict":"pass"},"status":null,"priority":null}`),
-		Keys:      []string{"priority", "review", "runId", "status", "taskId"},
-		IsError:   true,
-		Result:    `{"error":{"code":"invalid_review","message":"a review call carries only taskId, runId and review."}}`,
-	}}
+	calls := []stubCall{
+		{
+			Seq:       1,
+			Name:      "edit_task",
+			Arguments: json.RawMessage(`{"taskId":"CLA-753","runId":null,"title":"","detail":"the new body","category":"","repo":null,"priority":null,"schedule":null,"container":false,"humanOnly":false}`),
+			Keys:      []string{"category", "container", "detail", "humanOnly", "priority", "repo", "runId", "schedule", "taskId", "title"},
+			Result:    `{"task":{"ref":"CLA-753"},"changed":["detail","container","humanOnly"],"note":"rig stub: accepted, nothing written"}`,
+		},
+		{
+			Seq:       2,
+			Name:      "edit_task",
+			Arguments: json.RawMessage(`{"taskId":"CLA-753","repo":""}`),
+			Keys:      []string{"repo", "taskId"},
+			Result:    `{"task":{"ref":"CLA-753"},"changed":["repo"]}`,
+		},
+		{
+			Seq:       3,
+			Name:      "edit_task",
+			Arguments: json.RawMessage(`{"taskId":"CLA-753","repo":null}`),
+			Keys:      []string{"repo", "taskId"},
+			IsError:   true,
+			Result:    `{"error":{"code":"nothing_to_do","message":"edit_task needs at least one field to revise. Nothing was written."}}`,
+		},
+	}
 	events := []rigEvent{{Part: &rigPart{
 		Type: "step-finish", Reason: "tool-calls", Cost: &cost,
 		Tokens: &rigTokens{Input: 13836, Output: 96, Reasoning: 28, Cache: &rigCache{Read: 2048}},
@@ -33,11 +50,11 @@ func reportFixture() (runRecord, []rigEvent, []stubCall, []capturedRequest) {
 	requests := []capturedRequest{
 		{
 			Seq: 1, Method: "POST", Path: "/chat/completions", AuthOmit: true,
-			Body: json.RawMessage(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"system","content":"s"},{"role":"user","content":"Call clankerbar_update_task."}],"tools":[{"type":"function","function":{"name":"clankerbar_update_task"}}],"stream":true,"reasoning_effort":"max"}`),
+			Body: json.RawMessage(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"system","content":"s"},{"role":"user","content":"Call clankerbar_edit_task three times."}],"tools":[{"type":"function","function":{"name":"clankerbar_edit_task"}}],"stream":true,"reasoning_effort":"max"}`),
 		},
 		{
 			Seq: 2, Method: "POST", Path: "/chat/completions", AuthOmit: true,
-			Body: json.RawMessage(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"system","content":"s"},{"role":"user","content":"Call clankerbar_update_task."},{"role":"assistant","content":null,"tool_calls":[{"id":"call_0"}],"reasoning_content":"thinking about the schema"},{"role":"tool","content":"{\"ok\":true}","tool_call_id":"call_0"}],"tools":[{"type":"function","function":{"name":"clankerbar_update_task"}}],"stream":true}`),
+			Body: json.RawMessage(`{"model":"deepseek/deepseek-v4.1-flash","messages":[{"role":"system","content":"s"},{"role":"user","content":"Call clankerbar_edit_task three times."},{"role":"assistant","content":null,"tool_calls":[{"id":"call_0"}],"reasoning_content":"thinking about the residual"},{"role":"tool","content":"{\"ok\":true}","tool_call_id":"call_0"}],"tools":[{"type":"function","function":{"name":"clankerbar_edit_task"}}],"stream":true}`),
 		},
 	}
 	return rec, events, calls, requests
@@ -50,15 +67,22 @@ func TestRenderReportShowsKeysReasoningAndReplayedFields(t *testing.T) {
 	for _, want := range []string{
 		"# opencode rig: padding",
 		"`commandcode/deepseek/deepseek-v4.1-flash`",
-		"| 1 | `update_task` |",
-		"`priority=null`", // the padding signal
-		"`status=null`",
-		"error `invalid_review`",
+		"| 1 | `edit_task` |",
+		"`container=false`", // the CLEAR spelling, shown as sent
+		"`repo=\"\"`",       // repo's clear
+		"`repo=null`",       // repo's absence
+		"`priority=null`",   // a nullable enum padded null
+		"ok; changed: detail, container, humanOnly",
+		"ok; changed: repo",
+		"error `nothing_to_do`",
 		"| 1 | tool-calls | 13836 | 96 | 28 | 2048 | 0.002000 |",
 		"`reasoning_content`=string(", // the replay field
 		"reasoning replay: 1 of 1",
 		"reasoning tokens reported on the event stream: 28",
-		"review padding:",
+		"`edit_task` padding by call",
+		"`container=false` (CLEARS a set flag)",
+		"`repo=\"\"` (CLEARS to primary)",
+		"`repo=null` (absent)",
 		"`opencode-config-content.json`",
 	} {
 		if !strings.Contains(report, want) {
@@ -86,9 +110,9 @@ func TestRenderReportExplainsAZeroRequestRun(t *testing.T) {
 	}
 }
 
-func TestRenderKeysMarksNulls(t *testing.T) {
-	got := renderKeys(json.RawMessage(`{"b":null,"a":"x","c":0,"d":false}`))
-	want := "`a`, `b=null`, `c`, `d`"
+func TestRenderKeysMarksTheEmptyValues(t *testing.T) {
+	got := renderKeys(json.RawMessage(`{"b":null,"a":"x","c":0,"d":false,"e":"","f":true}`))
+	want := "`a`, `b=null`, `c`, `d=false`, `e=\"\"`, `f=true`"
 	if got != want {
 		t.Fatalf("renderKeys = %s, want %s", got, want)
 	}
