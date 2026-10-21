@@ -82,6 +82,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -339,26 +340,155 @@ func settlePR(j prJudgement, prNum, slug string, waited time.Duration, allowUnch
 // remote is not a github.com one. The known prefix forms are matched
 // explicitly rather than searching for "github.com" anywhere in the string —
 // a host like "mygithub.example.com" contains the needle and must not match.
+//
+// This is the DIRECT grammar only. A remote whose host is an SSH config alias
+// (git@github-personal:lecstor/clankerbar-cli.git) is not a github.com remote
+// to this function; githubSlugResolving resolves the alias through ssh, which
+// is what the PR check uses. Kept pure so the grammar is pinned without a
+// process spawn.
 func githubSlug(remoteURL string) (string, bool) {
-	u := strings.TrimSpace(remoteURL)
-	u = strings.TrimSuffix(u, ".git")
-	for _, p := range []string{
-		"https://github.com/",
-		"http://github.com/",
-		"ssh://git@github.com/",
-		"git@github.com:",
-		"github.com:",
-	} {
-		if i := strings.Index(u, p); i >= 0 {
-			rest := strings.TrimLeft(u[i+len(p):], "/")
-			parts := strings.Split(rest, "/")
-			if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
-				return parts[0] + "/" + parts[1], true
-			}
+	return githubSlugResolving(remoteURL, nil)
+}
+
+// githubSlugResolving is githubSlug plus SSH host alias resolution. When the
+// URL is an ssh form whose host is not github.com, resolve is asked for the
+// hostname that alias selects (production: `ssh -G`, the effective config);
+// the remote is accepted when that comes back as github.com. resolve == nil
+// means "direct forms only".
+//
+// The alias case is not exotic: a machine with
+//
+//	Host github-personal
+//	  HostName github.com
+//
+// in ~/.ssh/config has `git@github-personal:lecstor/clankerbar-cli.git` as its
+// origin, and every remote read reported it as "not a github.com repository",
+// so the PR check was skipped rather than run (CLA-728 PR 230, 2026-10-21).
+func githubSlugResolving(remoteURL string, resolve func(host string) (string, bool)) (string, bool) {
+	host, path, sshish, ok := splitRemoteHostPath(remoteURL)
+	if !ok {
+		return "", false
+	}
+	if !isGitHubHost(host) {
+		if !sshish || resolve == nil {
+			return "", false
+		}
+		real, ok := resolve(host)
+		if !ok || !isGitHubHost(real) {
 			return "", false
 		}
 	}
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return "", false
+	}
+	return parts[0] + "/" + parts[1], true
+}
+
+// splitRemoteHostPath splits a git remote URL into the host and the owner/name
+// path below it, for the forms git actually writes: scheme URLs (https, http,
+// ssh, git+ssh) and scp-like syntax ([user@]host:path). sshish reports an ssh
+// form — the only kind a Host alias can apply to. ok is false for anything
+// else, including a local filesystem path, which is not a remote host at all.
+func splitRemoteHostPath(remoteURL string) (host, path string, sshish, ok bool) {
+	u := strings.TrimSpace(remoteURL)
+	u = strings.TrimSuffix(u, ".git")
+	if u == "" {
+		return "", "", false, false
+	}
+	if i := strings.Index(u, "://"); i > 0 {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return "", "", false, false
+		}
+		switch strings.ToLower(parsed.Scheme) {
+		case "http", "https":
+		case "ssh", "git+ssh":
+			sshish = true
+		default:
+			return "", "", false, false
+		}
+		path = strings.TrimPrefix(parsed.Path, "/")
+		host = parsed.Hostname()
+		return host, path, sshish, host != "" && path != ""
+	}
+	// scp-like: [user@]host:path. A colon after a slash is a path
+	// separator (a local path, or a Windows drive), not a host.
+	if i := strings.LastIndex(u, ":"); i > 0 && !strings.Contains(u[:i], "/") {
+		host = u[:i]
+		if j := strings.LastIndex(host, "@"); j >= 0 {
+			host = host[j+1:]
+		}
+		path = strings.TrimPrefix(u[i+1:], "/")
+		return host, path, true, host != "" && path != ""
+	}
+	return "", "", false, false
+}
+
+// isGitHubHost is an EXACT host comparison, because "mygithub.example.com"
+// contains the needle and must not match.
+func isGitHubHost(host string) bool {
+	return strings.EqualFold(strings.TrimSpace(host), "github.com")
+}
+
+// sshAliasTimeout bounds one `ssh -G` lookup. It reads configuration and never
+// opens a connection, so it is fast; the bound exists so a pathological config
+// (a Match exec block that blocks) cannot hold a delivery check open.
+const sshAliasTimeout = 5 * time.Second
+
+// sshAliasHost resolves an SSH host alias to the HostName its configuration
+// selects, using `ssh -G <alias>` — the effective configuration ssh itself
+// would use, which is exactly the question. An unknown alias resolves to
+// itself, which is why the caller still compares the ANSWER with github.com
+// rather than trusting that resolution happened.
+//
+// The host is passed AFTER `--`: it comes from a git remote URL, which can
+// spell a host beginning with '-' (the scp-like split only requires no '/'
+// before the colon), and without the marker ssh would read that string as an
+// OPTION rather than a destination.
+func sshAliasHost(ctx context.Context, host string) (string, bool) {
+	cctx, cancel := context.WithTimeout(ctx, sshAliasTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "ssh", "-G", "--", host)
+	cmd.WaitDelay = ghWaitDelay
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && strings.EqualFold(f[0], "hostname") {
+			return f[1], true
+		}
+	}
 	return "", false
+}
+
+// sshAliasLookup returns a memoized resolver for one check. A workdir of many
+// repositories routinely shares one alias, and `ssh -G` costs a process spawn:
+// without the cache, narrowing to the right repository would pay it once per
+// candidate. Failures are remembered too — an absent ssh or an unreadable
+// config does not change between candidates.
+func (v *Verifier) sshAliasLookup(ctx context.Context) func(host string) (string, bool) {
+	resolved := map[string]string{}
+	failed := map[string]bool{}
+	return func(host string) (string, bool) {
+		if h, ok := resolved[host]; ok {
+			return h, true
+		}
+		if failed[host] {
+			return "", false
+		}
+		h, ok := sshAliasHost(ctx, host)
+		if !ok {
+			failed[host] = true
+			return "", false
+		}
+		resolved[host] = h
+		return h, true
+	}
 }
 
 // ghNotFoundError marks a `gh` failure that means THE PR IS NOT THERE, rather
@@ -367,6 +497,29 @@ func githubSlug(remoteURL string) (string, bool) {
 type ghNotFoundError struct{ detail string }
 
 func (e *ghNotFoundError) Error() string { return e.detail }
+
+// ghParseError marks gh output that is not the JSON this gate asked for. It is
+// deliberately NOT an absence of evidence: gh ran and answered, and the answer
+// is unintelligible — a defect in the gate's own contract (CLA-776: an
+// inherited GH_FORCE_TTY made gh colour its JSON, and the parse error was
+// logged as "could not verify … carrying on" on every delivery for two
+// months). Callers refuse the delivery on it, loudly, rather than carrying on.
+type ghParseError struct {
+	detail string
+	err    error
+}
+
+func (e *ghParseError) Error() string { return e.detail }
+func (e *ghParseError) Unwrap() error { return e.err }
+
+// IsGHParseError reports whether err is gh output this package could not parse.
+// The doctor preflight classifies its probe's failures with it: a parse failure
+// means the delivery gate is broken NOW and is a FAIL, while auth and network
+// failures of the same probe are only a WARN.
+func IsGHParseError(err error) bool {
+	var pe *ghParseError
+	return errors.As(err, &pe)
+}
 
 // normalizePR accepts the shapes a session actually reports - "42", "#42" -
 // and rejects everything else BEFORE gh sees it. The rejection is the point:
@@ -409,11 +562,16 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 			"PR %s cannot be verified: %s is not on PATH — the delivery's pull request goes unchecked, which is not a pass. Install the GitHub CLI so this gate can run", prNum, v.ghBin)}
 	}
 
+	// One alias cache for the whole check: the candidate search below can probe
+	// several repositories, and an SSH host alias is resolved once, not per
+	// repo.
+	lookupHost := v.sshAliasLookup(ctx)
+
 	repo := rep.Repo
 	if repo == "" {
 		for _, r := range repos {
 			if url, err := v.remoteURL(ctx, r); err == nil {
-				if _, ok := githubSlug(url); ok {
+				if _, ok := githubSlugResolving(url, lookupHost); ok {
 					repo = r
 					break
 				}
@@ -422,7 +580,7 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 	}
 	if repo == "" && len(repos) > 0 {
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
-			"PR %s cannot be verified: no repository at or below %s has a github.com remote, so where the pull request lives cannot be told", prNum, v.workdir)}
+			"PR %s cannot be verified: no repository at or below %s has a github.com remote (SSH host aliases were resolved through `ssh -G`)", prNum, v.workdir)}
 	}
 	if repo == "" {
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
@@ -433,23 +591,21 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
 			"PR %s cannot be verified: could not read the remote of %s: %v", prNum, repo, err)}
 	}
-	slug, ok := githubSlug(url)
+	slug, ok := githubSlugResolving(url, lookupHost)
 	if !ok {
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
-			"PR %s cannot be verified: the remote of %s (%s) is not a github.com repository", prNum, repo, url)}
+			"PR %s cannot be verified: the remote of %s (%s) is not a github.com repository, and any SSH host alias it names did not resolve to github.com (checked with `ssh -G`)", prNum, repo, url)}
 	}
 
-	// Scope every API read below to the account that owns the remote, the way
-	// CLA-458 scoped the git ones. Resolved once here, not per poll: the polls
-	// then share one identity, and the worst case stays a couple of gh spawns
-	// per verification. Empty means "run unscoped" — the fallback the header
-	// documents.
-	var ghScope []string
-	if owner := githubOwner(url); owner != "" {
-		if token := v.ghTokenFor(ctx, repo, owner); token != "" {
-			ghScope = []string{"GH_TOKEN=" + token}
-		}
-	}
+	// Scope every API read below to the account that owns the RESOLVED slug,
+	// the way CLA-458 scoped the git ones. The slug has already been resolved
+	// through the SSH alias machinery above, so an scp-like or aliased remote
+	// is scoped like an HTTPS one — and the close-out scopes by the same slug
+	// (ghAPIScope), so gate and close-out read one PR under one identity.
+	// Resolved once here, not per poll: the polls then share one identity, and
+	// the worst case stays a couple of gh spawns per verification. Empty means
+	// "run unscoped" — the fallback the header documents.
+	ghScope := v.ghAPIScope(ctx, repo, slug)
 
 	_, chk := v.pollPR(ctx, repo, slug, atoiPR(prNum), ghScope)
 	return chk
@@ -482,6 +638,19 @@ func (v *Verifier) pollPR(ctx context.Context, repo, slug string, prNum int, ghS
 				return ghPR{}, Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
 					"PR %s was not found in %s — the delivery names a pull request that does not exist; correct the number and declare again", pr, slug)}
 			}
+			// A parse failure is a refusal, not a "could not verify" (CLA-776).
+			// gh ran and answered, and its answer is unintelligible — that is a
+			// defect in this gate's own contract, and carrying on is exactly how
+			// an inherited GH_FORCE_TTY hid the hole on every real delivery for
+			// two months. It names the preflight that catches the same fault
+			// before a run starts.
+			if IsGHParseError(err) {
+				return ghPR{}, Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+					"PR %s could not be verified: %v — the delivery is REFUSED, not carried on. "+
+						"gh ran, but its output is not the plain JSON this gate asked for, so the pull request was NOT judged. "+
+						"Run `clankerbar doctor` (its pr_gate probe parses a real `gh pr view --json`) and clear whatever is decorating gh's output",
+					pr, err)}
+			}
 			return ghPR{}, Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
 				"PR %s could not be verified: %v", pr, err)}
 		}
@@ -513,15 +682,196 @@ func (v *Verifier) pollPR(ctx context.Context, repo, slug string, prNum int, ghS
 func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string, scope []string) (ghPR, prJudgement, error) {
 	out, err := v.runGHScoped(ctx, dir, scope, "pr", "view", prNum,
 		"--repo", slug,
-		"--json", "mergeable,mergeStateStatus,statusCheckRollup,url,baseRefName,headRefName,headRefOid")
+		"--json", prViewJSONFields)
 	if err != nil {
 		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, err
 	}
-	var view ghPR
-	if jerr := json.Unmarshal([]byte(out), &view); jerr != nil {
-		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, fmt.Errorf("could not parse gh pr view output: %v", jerr)
+	view, err := parseGHPR(out)
+	if err != nil {
+		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, err
 	}
 	return view, judgePR(view), nil
+}
+
+// prViewJSONFields is the exact --json selection of the delivery gate's read.
+// The doctor probe (ProbeGHJSON) sends the SAME fields: a preflight that parsed
+// a different command would stop proving the thing the gate depends on.
+const prViewJSONFields = "mergeable,mergeStateStatus,statusCheckRollup,url,baseRefName,headRefName,headRefOid"
+
+// parseGHPR decodes one `gh pr view --json` answer. A decode failure is a
+// ghParseError — gh ran and answered, and the answer is not what this package
+// asked for (see ghParseError for why that is a refusal, not an absence).
+func parseGHPR(out string) (ghPR, error) {
+	var view ghPR
+	if err := json.Unmarshal([]byte(out), &view); err != nil {
+		return ghPR{}, &ghParseError{
+			detail: fmt.Sprintf("could not parse gh pr view output: %v", err),
+			err:    err,
+		}
+	}
+	return view, nil
+}
+
+// PRProbe names the pull request a successful doctor probe read.
+type PRProbe struct {
+	Slug   string
+	Number int
+}
+
+// ErrNoPRProbeTarget reports that the doctor probe found no pull request it
+// could read — no github.com repository under the workdir, or none of them has
+// a pull request. It is NOT a gate failure: there was simply nothing to read,
+// and the probe says so rather than pretending it exercised the parse path.
+var ErrNoPRProbeTarget = errors.New("no pull request to probe")
+
+// probeMaxRepos bounds how many github.com repositories the doctor probe tries
+// before giving up. A fleet workdir holds a dozen; the first one with a PR
+// proves the parse path, and a repo with none costs one `gh pr list` to skip.
+const probeMaxRepos = 4
+
+// prProbeTimeout bounds the whole probe. doctor is documented as a cron gate,
+// so a wedged gh or an unreachable API must not hold the preflight open.
+const prProbeTimeout = 20 * time.Second
+
+// ProbeGHJSON runs a REAL `gh pr view --json` against a pull request found in a
+// repository under workdir and reports whether the answer parsed. It exists so
+// `clankerbar doctor` can catch the CLA-776 class of fault before a run: gh on
+// PATH is necessary but not sufficient, because a gh that decorates its stdout
+// (the shipped GH_FORCE_TTY=0 did exactly that) cannot be parsed by the gate
+// and every delivery silently went unjudged for two months.
+//
+// The pull request is discovered rather than configured: the first github.com
+// repository with a PR (any state) is read through the gate's own command and
+// parser. Repositories with no PR are skipped, and an SSH host alias is
+// resolved exactly as the gate resolves it. The error the caller classifies is
+// the parse one (IsGHParseError); every other failure — gh not authenticated,
+// no network — is an unavailable prerequisite, not a broken gate.
+//
+// ProbeGHJSON is the single-workdir form. doctor uses ProbeGHJSONDirs, because
+// the delivery gate judges each project's effective workdir and its declared
+// checkouts, which need not live under the top-level cfg.WorkDir.
+func ProbeGHJSON(ctx context.Context, ghBin, workdir string) (PRProbe, error) {
+	return ProbeGHJSONDirs(ctx, ghBin, []string{workdir})
+}
+
+// ProbeGHJSONDirs is ProbeGHJSON over EVERY workdir the delivery gate judges:
+// each configured project's effective workdir plus the checkouts its repos map
+// declares (doctor assembles that list). It reads the first pull request found
+// in any of them, so a multi-project config whose projects carry their own
+// workdirs exercises the gate's parse path instead of reporting it untested.
+//
+// Repositories are deduplicated by git common directory, so a project whose
+// workdir and declared checkout name the same repository — or one workdir
+// nested inside another — is tried once.
+func ProbeGHJSONDirs(ctx context.Context, ghBin string, workdirs []string) (PRProbe, error) {
+	ctx, cancel := context.WithTimeout(ctx, prProbeTimeout)
+	defer cancel()
+
+	v := New("", "")
+	if ghBin != "" {
+		v.ghBin = ghBin
+	}
+	lookupHost := v.sshAliasLookup(ctx)
+
+	// Collect the candidate repositories across every workdir FIRST, deduped by
+	// the shared git common dir (the same identity candidateRepos uses within
+	// one workdir).
+	var repos []string
+	seenRepo := map[string]bool{}
+	for _, workdir := range workdirs {
+		if strings.TrimSpace(workdir) == "" {
+			continue
+		}
+		wv := New(workdir, "")
+		for _, repo := range wv.candidateRepos(ctx) {
+			common, root, ok := wv.repoAt(ctx, repo)
+			key := common
+			if !ok || key == "" {
+				key = root
+			}
+			if key == "" {
+				key = repo
+			}
+			if seenRepo[key] {
+				continue
+			}
+			seenRepo[key] = true
+			repos = append(repos, repo)
+		}
+	}
+
+	tried := 0
+	var lastNoTarget error
+	for _, repo := range repos {
+		if ctx.Err() != nil {
+			return PRProbe{}, ctx.Err()
+		}
+		url, err := v.remoteURL(ctx, repo)
+		if err != nil {
+			continue
+		}
+		slug, ok := githubSlugResolving(url, lookupHost)
+		if !ok {
+			continue
+		}
+		// probeMaxRepos bounds the repositories actually READ; comparing before
+		// incrementing is what makes the constant bound what it says.
+		if tried >= probeMaxRepos {
+			break
+		}
+		tried++
+		// Scope by the RESOLVED slug, not the raw remote URL: an scp-like SSH
+		// remote (or a host alias) is not parsed by githubOwner, and the
+		// close-out scopes by this same slug (ghAPIScope). One PR must not be
+		// read under two identities.
+		scope := v.ghAPIScope(ctx, repo, slug)
+		num, err := v.probePRNumber(ctx, repo, slug, scope)
+		if err != nil {
+			if errors.Is(err, ErrNoPRProbeTarget) {
+				lastNoTarget = fmt.Errorf("%w: %s has no pull request to read", ErrNoPRProbeTarget, slug)
+				continue
+			}
+			return PRProbe{}, err
+		}
+		// The read itself is the gate's own: same --json selection, same
+		// parser, so the probe cannot pass while the gate's parse is broken.
+		if _, _, err := v.readPR(ctx, repo, slug, strconv.Itoa(num), scope); err != nil {
+			return PRProbe{}, err
+		}
+		return PRProbe{Slug: slug, Number: num}, nil
+	}
+	if lastNoTarget != nil {
+		return PRProbe{}, lastNoTarget
+	}
+	where := strings.Join(workdirs, ", ")
+	if strings.TrimSpace(where) == "" {
+		where = "an empty workdir"
+	}
+	return PRProbe{}, fmt.Errorf("%w: no github.com repository at or below %s", ErrNoPRProbeTarget, where)
+}
+
+// probePRNumber asks gh for one pull request number in slug, any state: a
+// merged or closed PR proves the `--json` output just as well as an open one,
+// and an open one is not guaranteed to exist.
+func (v *Verifier) probePRNumber(ctx context.Context, dir, slug string, scope []string) (int, error) {
+	out, err := v.runGHScoped(ctx, dir, scope, "pr", "list",
+		"--repo", slug, "--state", "all", "--limit", "1", "--json", "number")
+	if err != nil {
+		return 0, err
+	}
+	var rows []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		return 0, &ghParseError{
+			detail: fmt.Sprintf("could not parse gh pr list output: %v", err),
+			err:    err,
+		}
+	}
+	if len(rows) == 0 || rows[0].Number <= 0 {
+		return 0, ErrNoPRProbeTarget
+	}
+	return rows[0].Number, nil
 }
 
 // runGH executes one gh command in dir and returns its trimmed stdout, with
@@ -550,24 +900,9 @@ func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []strin
 // "gh" here. extraEnv carries per-invocation environment additions (see
 // runGHScoped); pass nil for the plain spawn.
 func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ...string) (string, error) {
-	env := append(os.Environ(),
-		"GH_NO_UPDATE_NOTIFIER=1",
-		"GH_FORCE_TTY=0",
-		"GIT_TERMINAL_PROMPT=0",
-	)
-	if len(extraEnv) > 0 {
-		scoped := make([]string, 0, len(env)+len(extraEnv))
-		for _, e := range env {
-			if i := strings.IndexByte(e, '='); i > 0 && isGhTokenVar(e[:i]) {
-				continue
-			}
-			scoped = append(scoped, e)
-		}
-		env = append(scoped, extraEnv...)
-	}
 	cmd := exec.CommandContext(ctx, ghBin, args...)
 	cmd.Dir = dir
-	cmd.Env = env
+	cmd.Env = ghEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = ghWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -586,6 +921,78 @@ func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ..
 		return "", fmt.Errorf("gh %s: %w", args[0], err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// ghEnv builds the environment for one gh invocation: the parent environment
+// with every variable this function OWNS removed (so an ambient value cannot
+// win by accident of position — duplicate entries have no portable
+// precedence), the per-invocation additions the caller passes (held to the same
+// ownership rule), and LAST the non-interactive and no-colour settings this
+// driver requires — so neither an inherited value nor an addition can
+// reintroduce a colour switch the output parser depends on.
+//
+// # Why GH_FORCE_TTY is gone, not zeroed (CLA-776)
+//
+// gh treats ANY value of GH_FORCE_TTY as "force terminal-style output", and
+// reads a number as a column width. The CLA-310 gate shipped `GH_FORCE_TTY=0`,
+// which therefore turned colour ON: `gh pr view --json` printed
+// ANSI-coloured, pretty-printed JSON, encoding/json refused it at the first
+// `\x1b`, and every delivery's PR check degraded to a "could not verify …
+// carrying on" — unnoticed for two months because the unit tests drive a fake
+// gh that never colours anything.
+//
+// So the variable is REMOVED (from the inherited environment too: an ambient
+// value would do the same damage) and the colour-forcing family is stripped
+// alongside it. NO_COLOR and CLICOLOR=0 are set as the positive statement of
+// the same requirement, so a gh version that ignores one honours the other.
+func ghEnv(parent, extraEnv []string) []string {
+	// Colour and interaction settings this child OWNS. Setting ours by
+	// appending over an inherited value is not enough: duplicate entries have
+	// unspecified precedence, so the parent's must be gone.
+	owned := func(name string) bool {
+		switch name {
+		case "GH_FORCE_TTY", "CLICOLOR_FORCE", "FORCE_COLOR", "NO_COLOR", "CLICOLOR",
+			"GH_NO_UPDATE_NOTIFIER", "GIT_TERMINAL_PROMPT":
+			return true
+		}
+		return false
+	}
+	env := make([]string, 0, len(parent)+len(extraEnv)+4)
+	for _, e := range parent {
+		name := envName(e)
+		if owned(name) {
+			continue
+		}
+		// An ambient token only goes when a scoped one rides this invocation;
+		// with no additions the previous behaviour is kept exactly.
+		if len(extraEnv) > 0 && isGhTokenVar(name) {
+			continue
+		}
+		env = append(env, e)
+	}
+	// Additions ride the same rule: a variable this function OWNS cannot re-enter
+	// through the caller, so no extraEnv can turn colour back on behind the
+	// parser's back.
+	for _, e := range extraEnv {
+		if owned(envName(e)) {
+			continue
+		}
+		env = append(env, e)
+	}
+	return append(env,
+		"GH_NO_UPDATE_NOTIFIER=1",
+		"NO_COLOR=1",
+		"CLICOLOR=0",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+}
+
+// envName is the NAME part of a NAME=value environment entry.
+func envName(e string) string {
+	if i := strings.IndexByte(e, '='); i > 0 {
+		return e[:i]
+	}
+	return e
 }
 
 // isGhTokenVar reports whether an environment NAME is one of the variables gh

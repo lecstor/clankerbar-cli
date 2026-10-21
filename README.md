@@ -204,12 +204,12 @@ Two bounds make the loop terminate:
   one a verifier marked resolved that a later verifier reopens, parks the task
   with a question instead of spending another round on the disagreement.
 
-The verifier is configurable like any phase (`harness`, `tier`). Left unset, it
-inherits the **fix** phase's harness and tier — the cheap, non-reviewer side of
-the split — because verification rounds are scoped and cheap and a reviewer's
-Claude subscription limit is shared with the operator's interactive use. In the
-shipped example above that means the verifier runs on opencode, not on the
-expensive review model.
+The verifier is configurable like any phase (`harness`, `tier`, `model`). Left
+unset, it inherits the **fix** phase's harness and its model/tier pair — the
+cheap, non-reviewer side of the split — because verification rounds are scoped
+and cheap and a reviewer's Claude subscription limit is shared with the
+operator's interactive use. In the shipped example above that means the verifier
+runs on opencode, not on the expensive review model.
 
 This loop is **interim**. It lives in the CLI's `drainPhases` because it ships
 before the state-machine reshape, which moves phase sequencing and the
@@ -353,7 +353,10 @@ because a review-only session's deliverable is its record and committing its
 probe artifacts would move the tip past the revision every member recorded.
 `review_panel_concurrency` caps how many run at once: `1` is the historical
 sequential behaviour (members then share the task's own worktree), `N` runs at
-most `N`, and an absent key or `0` means the whole panel. Members start in
+most `N`, and an absent key or `0` means the whole panel. It is **machine-owned**
+(local `config.json` only, never taken from the plane's stored document): how
+many seats run at once changes how fast a machine reaches the result, not what
+the result is. Members start in
 `review_panel` order: with a cap smaller than the panel, the first `N` entries
 run first and each freed slot goes to the next entry, so put the slowest
 reviewer at the top of the list — its long session then overlaps the others
@@ -365,8 +368,8 @@ Each member's reviewer role is **positional** — `review-1` .. `review-N`, coun
 over the review-shaped phases — and that is the role the durable record is keyed
 on. `name` is only the member's log label (it defaults to the same positional
 string); naming a member `alpha` changes what the logs call it, never which
-record it writes. A member may set `tier` instead of `model` to resolve through a
-harness's tier map.
+record it writes. A member may set a `tier`, a `model`, or both — the model
+alias wins on expansion — so a tier resolves through a harness's tier map.
 
 **Independence is a seal, not a promise.** The plane holds a round's records
 sealed: written, but with their findings withheld from every `get_task` until
@@ -485,16 +488,25 @@ land. Before the split, a death there destroyed the findings and the half-applie
 fixes together; now the findings are on the task before the expensive session
 ends, and a death costs the fix session, not the review.
 
-### Per-phase models: a tier map you own
+### Per-phase models: a tier map you own, or a model you name
 
-`model` pins one model alias for the whole run. `models` and a phase's `tier` let
-different phases run on different models:
+`model` pins one model alias for the whole run. A phase can name its model one
+of two ways, and the stored run-config document carries both:
+
+- `tier` names a bucket in `models`, so one policy word can resolve to a
+  different alias on each harness;
+- `model` names an alias directly, for a step whose model you do not want to
+  express through a bucket.
+
+A phase sets **one or the other, never both**, and `Validate` refuses both so it
+is never ambiguous which one wins (a review-panel member may set both, and the
+alias wins there). Resolution is `model`, then `tier`, then the harness default.
 
 ```json
 "models": { "strong": "opus", "standard": "sonnet", "cheap": "haiku" },
 "phases": [
   { "name": "implement", "tier": "standard" },
-  { "name": "review",    "tier": "strong" },
+  { "name": "review",    "model": "opencode-go/gpt-6-luna" },
   { "name": "fix",       "tier": "cheap" }
 ]
 ```
@@ -507,17 +519,20 @@ task lapses into a takeover that pays `implement` again, plus the wait. Keep the
 three-phase shape, but run `fix` on a different provider — see
 [Per-phase harnesses](#per-phase-harnesses-implement-on-one-review-on-another).
 
-**The buckets are yours, and the indirection is the point.** clankerbar drives
-three harnesses and cannot know which models you have, nor which of them is
-cheaper — that needs a price table, which goes stale silently and in the direction
-that costs money. So it never learns what models exist; it learns only that you
-bucketed them, and a phase names a **bucket**, never an alias. (`"tier": "opus"`
-does not pin opus. It looks for a bucket called `opus`.)
+**The buckets are yours, and the indirection is the point — when you want it.**
+clankerbar drives three harnesses and cannot know which models you have, nor
+which of them is cheaper — that needs a price table, which goes stale silently and
+in the direction that costs money. So it never learns what models exist; with
+`tier` it learns only that you bucketed them, and the phase names a **bucket**,
+never an alias. (`"tier": "opus"` does not pin opus. It looks for a bucket called
+`opus`.) `model` is the way to name an alias directly when you do not want that
+indirection — it is a plain alias, so a typo is a model the provider refuses
+rather than a bucket that silently resolves to the harness default.
 
-**Everything falls back, and nothing here can stop a run.** A phase with no
-`tier` runs on `model`; a `tier` naming a bucket you never defined runs on `model`
-and says so in the iteration log; `model` itself empty means the harness picks, as
-it always has. A config written before any of this existed behaves exactly as it
+**Everything falls back, and nothing here can stop a run.** A phase with neither
+`model` nor `tier` runs on the run-wide `model`; a `tier` naming a bucket you never
+defined runs on that model and says so in the iteration log; the run-wide `model`
+itself empty means the harness picks, as it always has. A config written before any of this existed behaves exactly as it
 did. A mistyped bucket costs a log line at 3am, not a stopped drain.
 
 **Which way to tier is a question of blast radius, not difficulty.** A phase that
@@ -806,10 +821,11 @@ and passed), **claims the task first** so an agent close-out and this path can
 never both merge it, merges the PR as a merge commit, verifies that merge commit
 is an ancestor of the base on origin, and closes the task done with that
 delivery. It does nothing under `authorityIntegrate: human`, for a PR based on
-`main` (the promotion is yours), for a conflicting, failing, unchecked or
-unresolvable PR, or when the claim is refused. A conflict is the one stand-down
-that carries evidence: the conflicting paths are logged once per head/base pair,
-for deciding whether a conflict needs an agent at all. Anything after a
+`main` (the promotion is yours), for a failing, unchecked or unresolvable PR, or
+when the claim is refused. A conflict is the one stand-down that hands work
+somewhere instead of just leaving the task alone: the conflicting paths are
+logged once per head/base pair, and a conflict-only session is started for it.
+Anything after a
 successful claim that cannot be finished releases it, so the task goes back to
 `approved` rather than being left held — with one exception: a merge that LANDED
 but whose ancestry could not be verified is closed `done` with `mergeVerified:
@@ -818,6 +834,58 @@ The merge itself names the configured base and the judged head revision, so a
 PR retargeted after the judgement cannot be merged into `main`; its verification
 and conflict reads run in a throwaway clone, never in the checkout the fleet's
 sessions share.
+
+**A conflict gets a short dedicated session, not the next clanker's full one.**
+A CONFLICTING PR used to wait for whichever clanker finished its current task — a
+full implement-phase session, with the whole drain brief, to resolve a merge
+conflict. The supervisor now handles it: it takes the claim itself (so an agent
+close-out and this path cannot both work the task — a refused claim means no
+session), then starts **one** short session on the fleet's implement harness and
+model, configurable as the `conflict` step:
+
+```json
+"conflict": { "harness": "opencode", "model": "commandcode/deepseek/deepseek-v4.1-flash", "max_turns": 80 }
+```
+
+Every field is optional and defaults to the implement step's own, so an untouched
+config runs the conflict session on the model that implemented the branch. The
+brief is narrow: create a worktree of the branch, merge the PR's base into it (a
+merge, **never** a rebase — the branch is already pushed), resolve **only** the
+conflicting hunks, run the repo-wide gate (`go test ./...` when the checkout has
+a `go.mod`, `pnpm test` when it has a `package.json`, else the repo's own
+documented gate), and push. It then hands the task back by the nature of the
+resolution: **mechanical** (renumbering, keeping both sides of a list,
+regenerating a pinned figure — no change to what the code does) releases the
+claim and leaves the task `approved` for the close-out above to merge once CI is
+green; **behavioural** or uncertain moves it back to `in_review` with a note
+naming what changed, because that code has not been reviewed; a **failure** (a
+gate that will not go green, a hunk that cannot be resolved without guessing)
+releases the claim (attesting `checkGreen: false`, since the merge never
+happened — that is what makes the plane's CI-repair ladder bound a
+green-but-unmergeable PR), leaves the task `approved` and is logged with its
+reason.
+
+At most one conflict session runs at a time, and the bound is a **shared lease,
+not a per-process flag**: the supervisor takes an exclusive lock on
+`conflict-session.lock` under its state root for the session's lifetime, so every
+supervisor using that state root contends for one slot — two processes on a
+machine, or two instances in one process. The kernel drops the lock when the
+holder exits, so a session that crashed or was rolled never strands the slot, and
+a second conflicting task waits for the next poll. The plane claim remains the
+guard for the SAME task (a refused claim means someone else has it). Machines
+whose state roots are separate each hold their own slot, so a fleet spanning
+machines should give them a shared state root if the one-session-at-a-time bound
+has to hold across all of them; a cross-machine slot for *different* tasks needs a
+lease in the plane, which does not exist yet.
+
+A CONFLICTING read whose fetched tips merge cleanly starts no session at all:
+GitHub's mergeable state lags a push, so that is the evidence that the conflict is
+already resolved (exactly the shape a mechanical resolution leaves behind), and a
+session there would be a second paid attempt at a conflict that no longer exists.
+The task is left to the deterministic close-out, which merges it as soon as the
+stale read catches up. Daemon-started sessions never run on Claude: a
+`conflict` step resolving to `claude` stands down with a log line and leaves the
+task to the agent close-out.
 
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
@@ -1075,7 +1143,10 @@ config the driver never named that a session merges anyway: one whose
 what a session may do), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
 long enough to do the work), **deploy_lag** (how far the deployed build lags the
-project's integration branch), and **budget** (ceilings parse and are sane).
+project's integration branch), **pr_gate** (gh is on PATH *and* a real
+`gh pr view --json` parses — decorated output is a FAIL, an unreachable GitHub a
+WARN, and "no PR to read" says the probe was not exercised), and **budget**
+(ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
@@ -1382,10 +1453,10 @@ stderr still streams to the supervisor's own terminal, as before.
 The daemon also reports what it is doing to the plane, so the console's Fleet
 page shows every instance — working *and* idle, where the run-based panel only
 sees a daemon that currently holds a task. Two things are reported, both riding
-cadences the loop already runs — presence on each backlog poll, iteration
-history at each drain boundary — with one exception: a run parked on a usage
-limit re-beacons on a ticker of its own, because the pause is the one time the
-poll cadence stops:
+cadences the loop already runs — presence on each backlog poll and on each
+in-session lease-renewal tick, iteration history at each drain boundary — with
+one exception: a run parked on a usage limit re-beacons on a ticker of its own,
+because the pause is the one time that poll and session cadences both stop:
 
 > **Release order**: a plane older than CLA-727 refuses an unknown
 > `state.kind` for the WHOLE report (400), so `limited` has to be promoted on
@@ -1405,8 +1476,17 @@ poll cadence stops:
   limit (with the stated reset instant when the harness stated one), `stopping`
   as the final beacon when the run ends. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
-  to learn which phase is running, and a limit wait re-beacons `limited` every
-  five minutes — well inside the plane's liveness window — so hours spent
+  to learn which phase is running; a session in progress re-beacons the same
+  `iteration` state on every lease renewal (a third of the plane's 30-minute
+  lease, so ten minutes apart at most), because the poll does not run while a
+  session does and a session longer than the plane's 15-minute liveness window
+  would otherwise read as a dead instance — and that tick keeps firing, without
+  the lease beat, after renewal stands down on a plane that refuses it, since
+  the fleet report is a different transport and a healthy instance must not go
+  dark mid-session; every other project the daemon serves is re-beaconed its own
+  `idle`/`draining` state on the same tick, for the same reason one project over;
+  and a limit wait re-beacons `limited`
+  every five minutes — well inside the plane's liveness window — so hours spent
   waiting out a cap do not read on the console as a dead instance. The plane
   stores exactly what you report; it infers nothing.
 - **Iteration history**: exactly one record per drain, posted at the boundary it
@@ -1520,6 +1600,20 @@ a bounded window (30s) and then **refused**, never assumed. Failing or
 unfinished checks refuse by name. If `gh` is not installed the check degrades
 to an explicit could-not-verify - never a pass - and `clankerbar doctor`'s
 `pr_gate` line warns about it up front.
+
+The gate parses `gh`'s `--json` output, so it owns that child's environment:
+`GH_FORCE_TTY` is **removed** (from the inherited environment too — gh treats
+ANY value as "force terminal-style output", and the `GH_FORCE_TTY=0` this gate
+shipped itself turned colour ON) and `NO_COLOR=1` / `CLICOLOR=0` are set. When
+the output still does not parse, the delivery is **refused**: gh ran and its
+answer is unintelligible, which is a defect in the gate's own contract, not an
+absence of evidence. That is deliberately *not* the same as "could not verify":
+a missing `gh` or an unreachable GitHub stays an explicit could-not-verify,
+while a parse failure refuses. Until CLA-776 the difference was invisible —
+every real delivery logged "could not verify … carrying on" for two months.
+A remote whose host is an SSH config alias (`git@github-personal:…`) is resolved
+through `ssh -G` and checked when the alias lands on github.com, rather than
+being skipped as "not a github.com repository".
 
 **Repos with no CI at all:** refusing every delivery there would wedge the
 driver shut, so a per-project opt-out exists - set `"allow_unchecked_pr": true`
@@ -2064,14 +2158,30 @@ two knobs are separate.
 
 ### Execution config from the plane
 
-A project's execution dials - harness, model, tier buckets, budget, review-tier
-escalation rules, and the two backstops (`max_turns`, `max_session_wall_clock`,
-as integer seconds) - can live **on the plane** instead of in this file. The
-daemon reads each project's stored document (per project, so two queues can run
-two postures) and overlays it over this file; until a project has one, this
-file rules byte for byte. `doctor` reports which is in force per project, and
-warns when a stored dial cannot fire on your machine (a turn cap under opencode,
-say) - shape-validates on the plane, machine-fit is doctor's.
+A project's execution dials - the **pipeline** (`prompt`, `phases`,
+`review_panel`), harness, model, tier buckets, budget, review-tier escalation
+rules, and the two backstops (`max_turns`, `max_session_wall_clock`, as integer
+seconds) - can live **on the plane** instead of in this file. The daemon reads
+each project's stored document (per project, so two queues can run two postures)
+and overlays it over this file; until a project has one, this file rules byte
+for byte. `doctor` reports which is in force per project, warns when a stored
+dial cannot fire on your machine (a turn cap under opencode, say), and **fails**
+when a stored step names a harness this machine cannot spawn (no
+`harnesses.<h>` block) - shape-validates on the plane, machine-fit is doctor's.
+
+The pipeline is **one section**: a stored document carrying any of the three
+pipeline keys replaces all three, so a stored `phases` clears a local `prompt`
+and `review_panel` rather than running beside them. A document that carries none
+of them leaves the local pipeline alone. A phase may name a `model` directly,
+exactly as in the local file (a configured phase sets `model` or `tier`, not
+both).
+
+`review_panel_concurrency` is **machine-owned**, not part of the section and
+never taken from the stored document: the phase sequence, every phase's harness
+and model, and the panel's composition are policy, so the run's result is the
+same on every machine, while how many panel seats run at once is how fast that
+machine gets there. The local file's value stays in force whatever the document
+carries.
 
 Edits apply at the **next iteration boundary**, never mid-session: the daemon
 watches the version on the backlog-summary poll it already makes, and on a bump
@@ -2086,8 +2196,12 @@ clankerbar propose-config            # --slug <project> when projects[] names se
 ```
 
 That records a PENDING proposal; nothing changes until you ratify it in the
-console (Settings -> Run configuration). Phases, prompts, wiring, env and paths
-stay local: the plane custodies policy, never machine fit or credentials.
+console (Settings -> Run configuration). The pipeline travels with it — `prompt`,
+`phases`, `review_panel`, and a phase's `model` — along with the
+model/tier/budget/escalation dials. `review_panel_concurrency` deliberately does
+not travel: it names this machine's parallelism, not the pipeline's result.
+Wiring, env and paths stay local too: the plane custodies policy, never machine
+fit or credentials.
 
 ### Multi-project: one instance, many queues
 

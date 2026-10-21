@@ -292,7 +292,10 @@ func (d *Supervisor) drainForReplace() string {
 	lastLog := waitStart
 	tick := time.NewTicker(50 * time.Millisecond)
 	defer tick.Stop()
-	for len(done) < len(d.instances) {
+	// A conflict-only session is fleet work too (CLA-759): it is not a child
+	// process, so the exit loop cannot see it, and exec'ing over it would kill a
+	// session holding a task claim. Wait for it as well, within the same bound.
+	for len(done) < len(d.instances) || d.conflictBusy.Load() {
 		select {
 		case ev := <-d.exits:
 			ev.inst.mu.Lock()
@@ -307,12 +310,12 @@ func (d *Supervisor) drainForReplace() string {
 		case <-tick.C:
 		}
 		if now := time.Now(); !now.Before(deadline) {
-			return fmt.Sprintf("the fleet did not drain within %s - still waiting for: %s", timeout, stuckNames(d, done))
+			return fmt.Sprintf("the fleet did not drain within %s - still waiting for: %s", timeout, drainStuck(d, done))
 		}
 		if now := time.Now(); now.Sub(lastLog) >= d.o.StopLogEvery {
 			lastLog = now
-			log.Printf("replace: still waiting for %d instance(s) after %s: %s - they stop at their iteration boundary; the supervisor keeps waiting rather than killing them",
-				len(d.instances)-len(done), time.Since(waitStart).Round(time.Second), stuckNames(d, done))
+			log.Printf("replace: still waiting after %s: %s - children stop at their iteration boundary and a conflict-only session finishes on its own; the supervisor keeps waiting rather than killing them",
+				time.Since(waitStart).Round(time.Second), drainStuck(d, done))
 		}
 		for _, inst := range d.instances {
 			if done[inst] || stopped[inst] {
@@ -360,6 +363,20 @@ func stuckNames(d *Supervisor, done map[*Instance]bool) string {
 	}
 	sort.Strings(stuck)
 	return strings.Join(stuck, ", ")
+}
+
+// drainStuck is stuckNames plus the conflict-only session (CLA-759) when one is
+// running: it is fleet work the exit loop cannot see, and a drain that execs
+// over it would kill a session holding a task claim.
+func drainStuck(d *Supervisor, done map[*Instance]bool) string {
+	stuck := stuckNames(d, done)
+	if !d.conflictBusy.Load() {
+		return stuck
+	}
+	if stuck == "" {
+		return "a conflict-only session"
+	}
+	return stuck + ", a conflict-only session"
 }
 
 // execSelf replaces the supervisor's process image in place with the binary

@@ -2313,3 +2313,62 @@ func TestFixVerifyHandoffContinuationStopsBeforeThePR(t *testing.T) {
 		t.Errorf("the legacy branchless fix handoff lost its no-code hand-over:\n%s", noCodeLegacy)
 	}
 }
+
+// The CLI's phase-name rule is the PLANE's (2.review-3.5): a name like `a--b`
+// locally validates but the plane's pattern (^[a-z0-9]+(-[a-z0-9]+)*$) refuses
+// it, so a proposal carrying it could never be ratified. Refused at the door.
+func TestValidate_RejectsAPhaseNameThePlaneWouldRefuse(t *testing.T) {
+	for _, name := range []string{"a--b", "-a", "a-", "a_b", "A"} {
+		c := defaults()
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: name, Prompt: "do the thing"}}
+		if err := c.Validate(); err == nil {
+			t.Errorf("Validate accepted phase name %q, which the plane's name pattern refuses", name)
+		}
+	}
+	// The plane's own shapes still pass: built-ins and hyphen-separated words.
+	for _, name := range []string{"implement", "review", "fix", "verify", "a-b", "a1-b2"} {
+		c := defaults()
+		c.Prompt = ""
+		c.Phases = []Phase{{Name: name, Prompt: "do the thing"}}
+		if err := c.Validate(); err != nil {
+			t.Errorf("Validate refused the plane-legal phase name %q: %v", name, err)
+		}
+	}
+}
+
+// 2.review-1.5: the verify phase inherits the fix phase's model too, so a fix
+// phase that pins an alias does not silently verify on the harness default —
+// while an explicit model or tier on the verifier still wins.
+func TestEffectivePhases_VerifyInheritsTheFixModel(t *testing.T) {
+	c := defaults()
+	c.Prompt = ""
+	c.Harness = "opencode"
+	c.Phases = []Phase{
+		{Name: ImplementPhaseName},
+		{Name: ReviewPhaseName},
+		{Name: FixPhaseName, Model: "cheap/alias"},
+		{Name: VerifyPhaseName},
+	}
+	got := c.EffectivePhases()
+	if got[3].Model != "cheap/alias" || got[3].Tier != "" {
+		t.Errorf("verify inherited model=%q tier=%q, want the fix phase's model %q", got[3].Model, got[3].Tier, "cheap/alias")
+	}
+
+	// The verifier's OWN tier is the more specific statement: inheriting the fix
+	// phase's model beside it would make the tier inert (ModelForPhase resolves
+	// Model first), so no model is inherited then.
+	c.Models = map[string]string{"strong": "strong/alias"}
+	c.Phases[3] = Phase{Name: VerifyPhaseName, Tier: "strong"}
+	got = c.EffectivePhases()
+	if got[3].Model != "" || got[3].Tier != "strong" {
+		t.Errorf("an explicit verify tier resolved to model=%q tier=%q, want tier strong and no inherited model", got[3].Model, got[3].Tier)
+	}
+
+	// And an explicit model on the verifier wins outright.
+	c.Phases[3] = Phase{Name: VerifyPhaseName, Model: "verify/own"}
+	got = c.EffectivePhases()
+	if got[3].Model != "verify/own" {
+		t.Errorf("an explicit verify model was overwritten: %q", got[3].Model)
+	}
+}

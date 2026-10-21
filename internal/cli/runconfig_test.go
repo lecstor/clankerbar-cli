@@ -264,3 +264,84 @@ func TestProposeConfig_MinimalConfigImportsExactlyItsMovableHalf(t *testing.T) {
 		t.Errorf("document = %+v, want exactly the resolved harness dial", gotDoc)
 	}
 }
+
+// CLA-598: a stored STEP whose harness this machine cannot run is a FAILED
+// check naming the project, the step and the harness — not the WARN every
+// other stored-document refusal gets. The loop keeps its previous config
+// either way, but a ratified pipeline that silently cannot run here is exactly
+// the kind of degradation doctor exists to surface before an unattended drain.
+func TestCheckRunConfigs_StoredStepOnAnUnrunnableHarnessFails(t *testing.T) {
+	cfg := &config.Config{
+		Harness:    "opencode",
+		Prompt:     "work the backlog",
+		BacklogURL: "https://clankerbar.com",
+		Projects:   []config.Project{{Slug: "demo"}},
+	}
+	raw, _ := json.Marshal(map[string]any{
+		"phases": []map[string]any{
+			{"name": "implement"},
+			{"name": "review", "harness": "codex"},
+			{"name": "fix"},
+		},
+	})
+	checks := checkRunConfigs(context.Background(), cfg, rcPlaneEnv(func() (*plane.RunConfigState, error) {
+		return &plane.RunConfigState{Version: 4, Config: raw}, nil
+	}))
+	c := findRunConfigCheck(t, checks)
+	if c.status != fail {
+		t.Fatalf("status=%v detail=%q, want FAIL for a stored step this machine cannot run", c.status, c.detail)
+	}
+	for _, want := range []string{"demo", `phases[1] ("review")`, "codex"} {
+		if !strings.Contains(c.detail, want) {
+			t.Errorf("detail=%q, want it to name %q", c.detail, want)
+		}
+	}
+	if !strings.Contains(c.remedy, "harnesses.codex") {
+		t.Errorf("remedy=%q, want it to name the block to declare", c.remedy)
+	}
+}
+
+// 2.review-3.3 (CLA-598 fix round 2): a panel with no phase sequence to expand
+// passes the CLI's own Validate (the key is inert locally), but the PLANE refuses
+// it as stored policy (decision 94497792). propose-config must refuse it locally
+// with a message the operator can act on, never send it.
+func TestProposeConfig_RefusesAPanelThePlaneCannotExpand(t *testing.T) {
+	var gotDoc map[string]any
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Params struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			} `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Params.Name == "propose_project_run_config" {
+			called = true
+			gotDoc, _ = body.Params.Arguments["config"].(map[string]any)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"harness": "opencode", "prompt": "work the backlog", "backlog_url": "` + srv.URL + `/mcp/demo",` +
+		` "review_panel": [{"model": "opencode-go/gpt-6-luna"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLANKERBAR_API_KEY", "k-test")
+
+	err := ProposeConfig(context.Background(), []string{"--config", path})
+	if err == nil {
+		t.Fatalf("propose-config proposed %v; the plane refuses a panel with no expandable review phase", gotDoc)
+	}
+	if !strings.Contains(err.Error(), "review_panel") || !strings.Contains(err.Error(), "review") {
+		t.Errorf("the refusal does not name the panel and the missing review phase: %v", err)
+	}
+	if called {
+		t.Error("a proposal was sent for a document the plane cannot ratify")
+	}
+}

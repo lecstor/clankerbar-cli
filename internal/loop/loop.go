@@ -187,9 +187,10 @@ type Target struct {
 	// Cfg is this target's EFFECTIVE config — the driver's base config with the
 	// project's stored run-config document overlaid — or nil when no document is
 	// in force, in which case every read falls through to d.cfg unchanged. It
-	// carries only policy the plane may say (harness/model/tiers/budget/
-	// escalation/backstops); phases, wiring, env and machine paths stay local,
-	// so the overlay can never repoint a session at somebody else's dialect.
+	// carries only policy the plane may say (the pipeline — prompt, phases,
+	// review_panel — plus harness/model/tiers/budget/escalation/backstops);
+	// wiring, env and machine paths stay local, so the overlay can never
+	// repoint a session at somebody else's dialect.
 	// Rebuilt between iterations when the poll's runConfigVersion moves — never
 	// mid-session.
 	Cfg *config.Config
@@ -394,6 +395,13 @@ type Driver struct {
 	// the task takes the shorter of the two. A field for the same reason as
 	// waitGrace: no test should sleep five minutes to watch a beacon repeat.
 	limitBeaconInterval time.Duration
+
+	// leaseRenewalInterval overrides the in-session renewal cadence, which
+	// carries the CLA-771 presence beacon as well as the lease heartbeat.
+	// Production leaves it zero: heartbeatInterval(planeLeaseDuration), a third
+	// of the plane's 30-minute lease. A field for the same reason as
+	// limitBeaconInterval — no test should wait ten minutes to watch a tick.
+	leaseRenewalInterval time.Duration
 
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
@@ -828,6 +836,9 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 				// It fires whatever the poll answered (even an error poll proves
 				// the daemon is alive and looping), and carries the state derived
 				// below, so a console-paused target reads `draining`, not `idle`.
+				// The poll is not the only carrier: a session blocks the poll for
+				// as long as it runs, so the in-session lease-renewal tick carries
+				// the same per-target lap (CLA-771, Driver.beaconSessionTargets).
 				d.beacon(i, t, d.fleetState(i))
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):
@@ -7303,11 +7314,25 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 			}
 			tier, rule := tc.Escalation.Evaluate(changedPaths, category)
 			if tier != "" {
-				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
+				// A pinned Phase.Model would otherwise make the rule INERT:
+				// ModelForPhase resolves Model before Tier, so setting the tier
+				// alone leaves the session on the pinned alias while the log
+				// claims an escalation (CLA-379's whole point is to raise the
+				// review to the escalated tier's alias). The rule fires on a
+				// phase, not the operator's per-phase wish, so the tier wins and
+				// the pinned alias is dropped.
+				raised := model
 				ph.Tier = tier
+				ph.Model = ""
 				model, ok = tc.ModelForPhase(ph)
 				if !ok {
 					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
+				}
+				// An escalation that lands on the model the phase already ran
+				// changed nothing, and logging one would attribute spend to a
+				// rule that made no difference.
+				if model != raised {
+					log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
 				}
 			}
 		}

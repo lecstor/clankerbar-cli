@@ -264,6 +264,28 @@ func waitForBeaconRef(ff *fakeFleet, ref string, timeout time.Duration) bool {
 	return false
 }
 
+// waitForBeaconRefN polls the fake fleet until at least n reports carry an
+// iteration state naming ref. The renewal cadence is compressed to milliseconds
+// in the CLA-771 tests, so this is how a session is held open across several
+// ticks without guessing at timers.
+func waitForBeaconRefN(ff *fakeFleet, ref string, n int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		seen := 0
+		sent, _ := ff.reports()
+		for _, r := range sent {
+			if r.State.Kind == fleet.StateIteration && r.State.TaskRef == ref {
+				seen++
+			}
+		}
+		if seen >= n {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
 // iterationRefs lists the task ref of every iteration-state beacon, in order —
 // the card's history through one drain. "" means the card shows no task.
 func iterationRefs(ff *fakeFleet) []string {
@@ -406,6 +428,201 @@ func TestDrainPhases_RefusedClaimCarriesNoRef(t *testing.T) {
 	}
 	if recs[0].TaskID != "" || recs[0].TaskRef != "" {
 		t.Errorf("record task fields = {%s %s}, want empty — a refused claim is not a claim", recs[0].TaskID, recs[0].TaskRef)
+	}
+}
+
+// longSessionDriver is fleetRenewingDriver with the heartbeat supplied by the
+// caller and the in-session renewal cadence compressed to a few milliseconds
+// (the CLA-771 seam), so a test can hold a session open across several renewal
+// ticks and count what each one carries.
+func longSessionDriver(t *testing.T, cfg *config.Config, h harness.Adapter, reporter fleet.Reporter, hb *recordingHeartbeat) *Driver {
+	t.Helper()
+	d := NewMulti(cfg, h, []Target{{
+		Poller:   busyPoller(),
+		Releaser: renewingReleaser{fakeReleaser: &fakeReleaser{}, hb: hb},
+		Fleet:    reporter,
+	}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.leaseRenewalInterval = 5 * time.Millisecond
+	return d
+}
+
+// A session that outlives the renewal interval keeps the instance's presence
+// row fresh: every renewal tick beacons the state the poll would have sent
+// (iteration, with the current claim's ref and the phase), so a healthy daemon
+// in a long session never reads on the console as a dead instance (CLA-771).
+func TestDrainPhases_LongSessionBeaconsPresenceOnEveryRenewalTick(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-long"
+	cfg.Phases = []config.Phase{{Name: "implement"}}
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	ff := &fakeFleet{}
+	hb := &recordingHeartbeat{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// Hold the session open across several renewal ticks. Four ref
+			// beacons is one claim reflector (the ref changing from "" to
+			// CLA-1) plus at least three renewal ticks.
+			if !waitForBeaconRefN(ff, "CLA-1", 4, 2*time.Second) {
+				t.Error("a session longer than the renewal interval did not beacon presence on every tick")
+			}
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d := longSessionDriver(t, cfg, h, ff, hb)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	sent, _ := ff.reports()
+	refBeacons := 0
+	for _, r := range sent {
+		if r.State.Kind != fleet.StateIteration || r.State.TaskRef != "CLA-1" {
+			continue
+		}
+		refBeacons++
+		if r.State.N != 1 || r.State.Phase != "implement" {
+			t.Errorf("renewal-tick beacon = %+v, want iteration {n:1 ref:CLA-1 phase:implement}", r.State)
+		}
+	}
+	if refBeacons < 4 {
+		t.Fatalf("%d presence beacon(s) naming CLA-1, want at least 4 (one claim reflector + three renewal ticks)", refBeacons)
+	}
+	if n := hb.count(); n < 3 {
+		t.Errorf("renewed %d time(s) during the session, want at least 3 - each tick must beacon AND beat", n)
+	}
+	// Presence rides the same tick; it is not a second iteration record.
+	if recs := ff.records(); len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+}
+
+// A session on ONE target must not silence the sibling projects' presence rows:
+// each configured project has its own reporter and its own project-scoped row,
+// and the poll that covers them all does not run while a drain is in progress.
+// The renewal tick therefore carries the poll's per-target lap: the running
+// target reports its iteration, every other target its own idle (or draining)
+// state (CLA-771 review — beaconLimited is the same precedent for a
+// daemon-wide state).
+func TestDrainPhases_LongSessionBeaconsEveryTargetNotOnlyTheRunningOne(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-multi"
+	cfg.Phases = []config.Phase{{Name: "implement"}}
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	idleFF := &fakeFleet{}
+	busyFF := &fakeFleet{}
+	hb := &recordingHeartbeat{}
+	countIdle := func() int {
+		sent, _ := idleFF.reports()
+		n := 0
+		for _, r := range sent {
+			if r.State.Kind == fleet.StateIdle {
+				n++
+			}
+		}
+		return n
+	}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// Hold the session open across several renewal ticks, the way the
+			// single-target cadence test does: the sibling's row is refreshed by
+			// the tick, not by the drain boundary.
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && countIdle() < 3 {
+				time.Sleep(time.Millisecond)
+			}
+			if countIdle() < 3 {
+				t.Error("a session on another target sent no idle presence to this project")
+			}
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d := NewMulti(cfg, h, []Target{
+		{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: idleFF},
+		{Poller: busyPoller(), Releaser: renewingReleaser{fakeReleaser: &fakeReleaser{}, hb: hb}, Fleet: busyFF},
+	})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.leaseRenewalInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, _, _, err := d.drainPhases(ctx, 1, 1, d.targets[1], spend{start: time.Now()}); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+
+	if n := countIdle(); n < 3 {
+		t.Fatalf("%d idle presence beacon(s) on the sibling target, want at least 3 across the session's renewal ticks", n)
+	}
+	// The sibling's row must not borrow the running target's work.
+	sent, _ := idleFF.reports()
+	for i, r := range sent {
+		if r.State.TaskRef != "" {
+			t.Errorf("sibling beacon %d carries taskRef %q from another target's session", i, r.State.TaskRef)
+		}
+	}
+	if n := hb.count(); n < 3 {
+		t.Errorf("renewed %d time(s) during the session, want at least 3 - each tick beacons every target", n)
+	}
+}
+
+// A failing presence report is telemetry: it must neither stop nor delay the
+// lease renewal that carries it. Every beacon this session sends is refused
+// (500), and the renewal keeps beating straight through the outage.
+func TestDrainPhases_FailingPresenceBeaconNeverStopsRenewal(t *testing.T) {
+	var mu sync.Mutex
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	buf := captureLogs(t)
+
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement"}}
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	hb := &recordingHeartbeat{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// A beacon is attempted (and refused) before each beat. If the
+			// failure could stall or stop renewal, these three beats would not
+			// arrive while the session is held open here.
+			heartbeatWaitFor(t, "three renewal beats through a beacon outage", func() bool {
+				return hb.count() >= 3
+			})
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d := longSessionDriver(t, cfg, h, fleet.New(srv.URL, "k"), hb)
+
+	tokens, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if tokens != 7 {
+		t.Errorf("tokens = %d, want the session's 7 - a beacon outage must not change the drain's accounting", tokens)
+	}
+	if n := hb.count(); n < 3 {
+		t.Errorf("renewed %d time(s) through the outage, want at least 3 - a failed beacon must never stop renewal", n)
+	}
+	waitFor(t, "the refused beacons to reach the endpoint", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits >= 2
+	})
+	time.Sleep(50 * time.Millisecond) // let the last failure land in the buffer
+	if lines := countLines(buf.String(), "fleet report failed and was dropped"); lines != 1 {
+		t.Errorf("%d 'fleet report failed' lines for the outage, want exactly 1:\n%s", lines, buf.String())
 	}
 }
 

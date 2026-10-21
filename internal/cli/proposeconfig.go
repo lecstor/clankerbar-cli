@@ -20,11 +20,14 @@ import (
 // ratify click is the operator's, exactly as for a clanker's own proposal over
 // MCP. Until they click, the loop keeps running the local file byte for byte.
 //
-// What is imported is the MOVABLE half only (harness, model, tier buckets,
-// budget, escalation rules, the two backstops): workdir, wiring, env and state
-// stay machine-local, because the plane must not become a custodian of paths
-// and credentials, and the origin rule depends on the trusted statement staying
-// where the operator wrote it.
+// What is imported is the MOVABLE half only (the pipeline — prompt, phases,
+// review_panel and a phase's model — plus harness, model, tier buckets, budget,
+// escalation rules and the two backstops): workdir, wiring, env and state stay
+// machine-local, because the plane must not become a custodian of paths and
+// credentials, and the origin rule depends on the trusted statement staying
+// where the operator wrote it. `review_panel_concurrency` is machine-owned
+// (decision e1365721) and is deliberately not exported either: how many panel
+// seats run at once changes only how fast a machine reaches the result.
 
 type proposeConfigFlags struct {
 	cfgPath string
@@ -66,9 +69,12 @@ func ProposeConfig(ctx context.Context, args []string) error {
 		return err
 	}
 
-	doc := cfg.RunConfigDocument()
+	doc, err := cfg.RunConfigDocument()
+	if err != nil {
+		return err
+	}
 	if len(doc) == 0 {
-		return errors.New("nothing to import: this config sets none of the dials the plane stores (harness, model, models, budget, escalation, max_turns, max_session_wall_clock)")
+		return errors.New("nothing to import: this config sets none of the dials the plane stores (prompt, phases, review_panel, harness, model, models, budget, escalation, max_turns, max_session_wall_clock)")
 	}
 
 	endpoint := cfg.BacklogEndpoint()
