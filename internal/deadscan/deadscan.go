@@ -78,9 +78,9 @@ type Log struct {
 	// claim_task, or a completed heartbeat on a resumed phase. A refused claim
 	// leaves this false, and the session counts toward neither counter.
 	GotPastClaim bool
-	// BranchRecorded mirrors Claim.HasWIP: an update_task carrying a branch, or
-	// a claim result that already carried WIP. A session that recorded a branch
-	// before dying is not dead.
+	// BranchRecorded mirrors Claim.HasWIP: a record_progress carrying a branch,
+	// or a claim result that already carried WIP. A session that recorded a
+	// branch before dying is not dead.
 	BranchRecorded bool
 	// LastReason is the final step_finish part's reason, as the driver reads it
 	// off FinishReasonKey. Empty for harnesses that emit no step_finish (claude,
@@ -387,7 +387,7 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 //   - a COMPLETED claim_task means the session got past its claim; a refused
 //     one has status "error" and changes nothing.
 //   - a COMPLETED heartbeat means a resumed phase holding a claim.
-//   - an update_task whose INPUT carries a branch, or a claim result that
+//   - a record_progress whose INPUT carries a branch, or a claim result that
 //     already carried WIP (hasWip / task.branch), is the HasWIP mirror.
 func noteTool(part json.RawMessage, gotPastClaim, branchRecorded bool) (bool, bool) {
 	var p struct {
@@ -424,7 +424,7 @@ func noteTool(part json.RawMessage, gotPastClaim, branchRecorded bool) (bool, bo
 				}
 			}
 		}
-	case strings.Contains(p.Tool, "update_task") && completed:
+	case strings.Contains(p.Tool, "record_progress") && completed:
 		// HasWIP is set on the REQUEST in the live adapter (the branch arg),
 		// which is the state.input here.
 		var args struct {
