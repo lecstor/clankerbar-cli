@@ -261,6 +261,71 @@ func TestRecordBranch_NotWiredIsNotARecorder(t *testing.T) {
 // and raises nothing, and a blocking question would un-block to `ready` on any
 // answer, handing the task straight back to the fleet the guard just withheld it
 // from (CLA-395).
+// CLA-743: a round close takes the door the plane serves. record_review is the
+// strict-client-safe tool from protocol 40; below it the only shape is
+// update_task(review: {closeRound: n}). The caller decides from the protocol
+// version the cheap poll reported, so the client never guesses.
+func TestCloseReviewRound_RequestShape(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		useRecordReview bool
+		wantTool        string
+	}{
+		{"a plane serving record_review", true, "record_review"},
+		{"a plane older than it", false, "update_task"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := serve(t, http.StatusOK, okBody)
+			if err := New(srv.URL+"/mcp/demo", "k-1").(ReviewRoundCloser).
+				CloseReviewRound(context.Background(), "t-1", "r-1", 2, tc.useRecordReview); err != nil {
+				t.Fatalf("CloseReviewRound: %v", err)
+			}
+			params, _ := got.body["params"].(map[string]any)
+			if params["name"] != tc.wantTool {
+				t.Errorf("tool = %v, want %s", params["name"], tc.wantTool)
+			}
+			args, _ := params["arguments"].(map[string]any)
+			if args["taskId"] != "t-1" || args["runId"] != "r-1" {
+				t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
+			}
+			if tc.useRecordReview && args["closeRound"] != float64(2) {
+				t.Errorf("closeRound = %v, want 2 on the record_review door", args["closeRound"])
+			}
+			// The legacy door carries the close as its review member, and sends
+			// nothing else: a close is not a status move or an outcome write.
+			if tc.wantTool == "update_task" {
+				review, _ := args["review"].(map[string]any)
+				if review["closeRound"] != float64(2) {
+					t.Errorf("review.closeRound = %v, want 2", review["closeRound"])
+				}
+				if len(args) != 3 {
+					t.Errorf("arguments = %+v, want only taskId, runId and review", args)
+				}
+			}
+		})
+	}
+}
+
+// A close is a write like any other: an empty id or a non-positive round is a
+// caller bug, refused before anything reaches the plane (the same guard the
+// other writes carry).
+func TestCloseReviewRound_RefusesEmptyIdentity(t *testing.T) {
+	rel := New("https://plane.test/mcp/demo", "k-1").(ReviewRoundCloser)
+	for _, tc := range []struct {
+		name          string
+		taskID, runID string
+		round         int
+	}{
+		{"no task", "", "r-1", 1},
+		{"no run", "t-1", "", 1},
+		{"no round", "t-1", "r-1", 0},
+	} {
+		if err := rel.CloseReviewRound(context.Background(), tc.taskID, tc.runID, tc.round, true); err == nil {
+			t.Errorf("%s: CloseReviewRound succeeded, want a refusal", tc.name)
+		}
+	}
+}
+
 func TestPark_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 

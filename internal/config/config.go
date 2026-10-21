@@ -583,7 +583,9 @@ const reviewRecordTipNone = " There is NO branch and NO tip to review: this reco
 	"this variant's review record, and the driver gates the seam on it."
 
 // reviewRecordDurableShape is the durable half (CLA-637): one sealed
-// per-reviewer record per run, written through update_task.review. It is the
+// per-reviewer record per run, written through record_review where the plane
+// serves it and update_task.review below that (CLA-743 - the placeholder is
+// resolved at spawn from the plane's protocol version). It is the
 // driver's seam evidence — round, role, run and reviewed tip are what the gate
 // matches — and per-finding `raisedByModel` is what the analytics need.
 //
@@ -1974,11 +1976,21 @@ func ReviewFindingsCall(protocolVersion int) string {
 // plane accepts a round close only from a run that still HOLDS the task, so the
 // close must land before the in_review move), while an older plane takes the one
 // call the pre-record_review CLI always made.
-func VerifyHandoverStep(protocolVersion int) string {
+//
+// prBase is passed in rather than left as PhasePRBasePlaceholder in the text:
+// this string is itself a REPLACEMENT VALUE in the driver's single replacer
+// pass, and a placeholder inside a replacement is never rescanned (the one-pass
+// rule that keeps a claim-derived value containing "{{model}}" intact). A
+// literal placeholder here would reach the session unresolved.
+func VerifyHandoverStep(protocolVersion int, prBase string) string {
+	base := ""
+	if prBase != "" {
+		base = " (" + prBase + ")"
+	}
 	if !ReviewToolServed(protocolVersion) {
 		return "If NO MUST remains open, carry the hand-over in the SAME call that releases the round: confirm the " +
-			"branch is pushed (push any fix commit that is still local), open a PR targeting the repo's PR base (" +
-			PhasePRBasePlaceholder + ") if none exists for the branch, then call update_task(taskId, runId, status: " +
+			"branch is pushed (push any fix commit that is still local), open a PR targeting the repo's PR base" +
+			base + " if none exists for the branch, then call update_task(taskId, runId, status: " +
 			"\"in_review\", review: { closeRound: <the round the append returned> }). Do NOT send an outcome in " +
 			"that call: your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), " +
 			"and the fix phase has already written the **Tests** section the in_review guard reads. Releasing the " +
@@ -1986,8 +1998,8 @@ func VerifyHandoverStep(protocolVersion int) string {
 			"no longer accepts a close from this run. Never decide to run one more round yourself."
 	}
 	return "If NO MUST remains open: carry the hand-over in TWO calls, IN THIS ORDER. FIRST confirm the " +
-		"branch is pushed (push any fix commit that is still local) and open a PR targeting the repo's PR base (" +
-		PhasePRBasePlaceholder + ") if none exists for the branch. THEN close the round with " +
+		"branch is pushed (push any fix commit that is still local) and open a PR targeting the repo's PR base" +
+		base + " if none exists for the branch. THEN close the round with " +
 		"record_review(taskId, runId, { closeRound: <the round the append returned> }) while the task is " +
 		"still in_progress: this order is load-bearing, because the plane accepts a round close only from the run " +
 		"that still HOLDS the task, and once the task leaves in_progress this run can no longer close it. " +
@@ -2000,9 +2012,10 @@ func VerifyHandoverStep(protocolVersion int) string {
 // ReviewRecordHeading is the marker of the LEGACY block a review-only phase
 // still records in the task's outcome for one release (CLA-637), so older
 // planes and readers keep seeing a review where they expect one. The durable
-// per-reviewer record written through update_task.review is the interface the
-// driver's review→fix seam gate reads now; this block is carried for
-// compatibility, and the fix phase keeps it verbatim in its own outcome.
+// per-reviewer record (record_review on a plane that serves it, and
+// update_task.review below that) is the interface the driver's review→fix seam
+// gate reads now; this block is carried for compatibility, and the fix phase
+// keeps it verbatim in its own outcome.
 //
 // It deliberately carries no round number. The round lives in the durable
 // record, assigned by the plane; a hard-coded "round 1" would be false on any

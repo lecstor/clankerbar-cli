@@ -86,7 +86,8 @@ targeted probe of a suspected defect, and the worktree is left clean. It is
 **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task: a sealed per-reviewer durable record written through
-`update_task(review: ...)` — round, reviewer role, the phase's resolved
+`record_review` (or `update_task(review: ...)` against a plane older than protocol
+40) — round, reviewer role, the phase's resolved
 harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
 severity grade and `raisedByModel` — plus, for one release, the legacy block
 in the outcome (`update_task(outcome: ...)`, no status move) carrying the
@@ -182,10 +183,14 @@ only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, and a `status: "in_review"` move. It releases its own round in that same
-`update_task` call (`review: {closeRound: …}`), because the plane refuses a
-sealed holder's outcome write and refuses a close after the task has left
-`in_progress`; the fix phase has already written the outcome with the
+PR, and a `status: "in_review"` move. On a plane that serves `record_review`
+(protocol 40+) that is TWO calls in a load-bearing order: close the round with
+`record_review(…, { closeRound: … })` while the task is still held, then move it
+with `update_task(…, status: "in_review")`. The plane refuses a sealed holder's
+outcome write and refuses a close after the task has left `in_progress`, so the
+close must land first; an older plane takes the one call that bundles both
+(`update_task(…, status: "in_review", review: { closeRound: … })`) for the same
+reason. The fix phase has already written the outcome with the
 `**Tests**` section the `in_review` guard reads. A round with any open MUST
 releases its round the same way but ends **without** the PR and without moving
 the task; the driver spawns another `fix`, then verifies again. SHOULD and NIT

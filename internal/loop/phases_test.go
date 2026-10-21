@@ -4725,7 +4725,7 @@ func TestVerificationDigest(t *testing.T) {
 			mustFinding("2.review-2.1", "open", "sealed, must not leak"),
 		}},
 	}
-	got := verificationDigest(records, []string{"1.review-1.1"}, len(records))
+	got := verificationDigest(records, []string{"1.review-1.1"}, len(records), config.ReviewToolProtocol)
 	if !strings.Contains(got, "1.review-1.1") || !strings.Contains(got, "the seam is untested") {
 		t.Errorf("the digest omits the open MUST:\n%s", got)
 	}
@@ -4744,7 +4744,7 @@ func TestVerificationDigest(t *testing.T) {
 	}
 	clean := verificationDigest([]plane.ReviewRecordState{
 		{Round: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open"},
-	}, nil, 1)
+	}, nil, 1, config.ReviewToolProtocol)
 	if !strings.Contains(clean, "NO OPEN MUST") || !strings.Contains(clean, "aaaa") {
 		t.Errorf("a clean digest must still name the delta base and the clear gate:\n%s", clean)
 	}
@@ -4763,7 +4763,7 @@ func TestVerificationDigestListsAFixerRefutation(t *testing.T) {
 		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "old", State: "open", Findings: []plane.ReviewFindingState{earlier}},
 		{Round: 2, Cycle: 2, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", Findings: []plane.ReviewFindingState{refuted}},
 	}
-	got := verificationDigest(records, nil, len(records))
+	got := verificationDigest(records, nil, len(records), config.ReviewToolProtocol)
 	if strings.Contains(got, "carry the terminal step. Everything you find") {
 		t.Errorf("with a refuted MUST to adjudicate, the digest told the verifier the gate is clear:\n%s", got)
 	}
@@ -4786,13 +4786,13 @@ func TestVerificationDigestNamesWhatThePlaneDidNotServe(t *testing.T) {
 		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", FindingsTotal: 4,
 			Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "served")}},
 	}
-	got := verificationDigest(records, []string{"1.review-1.1"}, 2)
+	got := verificationDigest(records, []string{"1.review-1.1"}, 2, config.ReviewToolProtocol)
 	if !strings.Contains(got, "round 1: 3 of 4 finding(s) not served") || !strings.Contains(got, "export_project") {
 		t.Errorf("the digest does not name the findings the plane left out:\n%s", got)
 	}
 	trimmed := verificationDigest([]plane.ReviewRecordState{
 		{Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open", FindingsTotal: 2},
-	}, nil, 3)
+	}, nil, 3, config.ReviewToolProtocol)
 	if strings.Contains(trimmed, "carry the terminal step. Everything you find") {
 		t.Errorf("with findings and records left out, the digest told the verifier the gate is clear:\n%s", trimmed)
 	}
@@ -5155,6 +5155,117 @@ func TestBranchlessVerificationDigest(t *testing.T) {
 	empty := branchlessVerificationDigest("declared no-code delivery\n")
 	if !strings.Contains(empty, "failed hand-off") || !strings.Contains(empty, config.ReviewRecordHeading) {
 		t.Errorf("a blockless branchless digest must name the missing block as a failed hand-off:\n%s", empty)
+	}
+}
+
+// CLA-743: the driver's own digests are brief text too — they are PREPENDED to
+// the fix and verify briefs — so a tool named there must follow the same
+// protocol rule the brief constants do. A digest that says update_task(review:)
+// on a protocol-40 plane reintroduces the strict-mode padding bug the separate
+// tool exists to end.
+func TestReviewDigestsNameTheDoorThePlaneServes(t *testing.T) {
+	records := []plane.ReviewRecordState{{
+		Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open",
+		Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "fixed", "already fixed")},
+	}}
+	for _, tc := range []struct {
+		name     string
+		protocol int
+		want     string
+		banned   string
+	}{
+		{"a plane serving record_review", config.ReviewToolProtocol,
+			"record_review(taskId, runId, {findingUpdates: [...]})", "update_task(review:"},
+		{"an older plane", config.ReviewToolProtocol - 1,
+			"update_task(taskId, runId, review: {findingUpdates: [...]})", "record_review("},
+	} {
+		verify := verificationDigest(records, nil, 1, tc.protocol)
+		if !strings.Contains(verify, tc.want) {
+			t.Errorf("%s: the verification digest does not name %q:\n%s", tc.name, tc.want, verify)
+		}
+		if strings.Contains(verify, tc.banned) {
+			t.Errorf("%s: the verification digest names %q:\n%s", tc.name, tc.banned, verify)
+		}
+		merged := mergedFindingsDigest(records, []string{"review-1"}, 1, nil, tc.protocol)
+		if !strings.Contains(merged, tc.want) {
+			t.Errorf("%s: the panel fix digest does not name %q:\n%s", tc.name, tc.want, merged)
+		}
+		if strings.Contains(merged, tc.banned) {
+			t.Errorf("%s: the panel fix digest names %q:\n%s", tc.name, tc.banned, merged)
+		}
+	}
+}
+
+// CLA-743: the review-write TOOL is chosen from the plane's protocol version,
+// which the driver captures on its cheap poll and carries on the target. A
+// plane serving record_review must get it; an older one - and an unknown
+// version (blind mode, or a summary without the field) - must keep
+// update_task(review: ...), the only door it has. This pins the spawn-time
+// substitution, not just the constants: a placeholder left unresolved or a
+// replacement that swallowed {{prBase}} would reach the session as literal text.
+func TestInvocationForSelectsTheReviewDoorByPlaneProtocol(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+		{Name: config.VerifyPhaseName},
+	})
+	phases := d.cfg.EffectivePhases()
+	verified := &harness.Result{
+		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
+		CheckpointTip: testCheckpointTip,
+	}
+	invoke := func(protocol, idx int) string {
+		t.Helper()
+		d.targets[0].PlaneProtocol = protocol
+		inv, err := d.invocationFor(d.targets[0], idx, phases[idx], verified, "", "staging", phases)
+		if err != nil {
+			t.Fatalf("invocationFor phase %d at protocol %d: %v", idx+1, protocol, err)
+		}
+		if strings.Contains(inv.Prompt, "{{") {
+			t.Fatalf("phase %d at protocol %d carries an unresolved placeholder:\n%s", idx+1, protocol, inv.Prompt)
+		}
+		return inv.Prompt
+	}
+
+	// A plane serving record_review: the review records through it, and the
+	// verifier closes its round through it BEFORE the in_review move.
+	review := invoke(config.ReviewToolProtocol, 1)
+	if !strings.Contains(review, "record_review(taskId, runId, {...})") {
+		t.Errorf("the review brief does not name record_review on protocol %d:\n%s", config.ReviewToolProtocol, review)
+	}
+	if strings.Contains(review, "update_task(taskId, runId, review:") {
+		t.Errorf("the review brief still prescribes update_task(review:) on protocol %d:\n%s", config.ReviewToolProtocol, review)
+	}
+	verify := invoke(config.ReviewToolProtocol, 3)
+	closeAt := strings.Index(verify, "record_review(taskId, runId, { closeRound:")
+	moveAt := strings.Index(verify, `status: "in_review"`)
+	if closeAt < 0 || moveAt < 0 || closeAt > moveAt {
+		t.Errorf("the verify hand-over does not close the round with record_review before the in_review move (close at %d, move at %d):\n%s", closeAt, moveAt, verify)
+	}
+
+	// An older plane: only update_task(review: ...), and the verify hand-over is
+	// the ONE call the plane requires (a close after the status move is refused).
+	review = invoke(config.ReviewToolProtocol-1, 1)
+	if !strings.Contains(review, "update_task(taskId, runId, review: {...})") {
+		t.Errorf("the review brief does not fall back to update_task(review:) on protocol %d:\n%s", config.ReviewToolProtocol-1, review)
+	}
+	if strings.Contains(review, "record_review(") {
+		t.Errorf("the review brief names record_review on protocol %d, which does not serve it:\n%s", config.ReviewToolProtocol-1, review)
+	}
+	verify = invoke(config.ReviewToolProtocol-1, 3)
+	if !strings.Contains(verify, `status: "in_review", review: { closeRound:`) {
+		t.Errorf("the verify hand-over does not carry the legacy one-call status+closeRound shape on protocol %d:\n%s", config.ReviewToolProtocol-1, verify)
+	}
+	if strings.Contains(verify, "record_review(") {
+		t.Errorf("the verify brief names record_review on protocol %d, which does not serve it:\n%s", config.ReviewToolProtocol-1, verify)
+	}
+
+	// Unknown (blind mode): the legacy wording, since it works on every plane.
+	review = invoke(0, 1)
+	if !strings.Contains(review, "update_task(taskId, runId, review: {...})") || strings.Contains(review, "record_review(") {
+		t.Errorf("an unknown protocol did not degrade to the wording every plane understands:\n%s", review)
 	}
 }
 

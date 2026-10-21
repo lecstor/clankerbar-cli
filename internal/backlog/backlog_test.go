@@ -58,6 +58,28 @@ func TestParseSummary_MissingPauseIsFalse(t *testing.T) {
 	}
 }
 
+// protocolVersion is the plane fact the review briefs key their review door on
+// (CLA-743): record_review from protocol 40, update_task(review: ...) below it.
+// It rides the same cheap poll; a plane that predates the field decodes to 0,
+// which every reader treats as "older" and answers with the legacy wording.
+func TestParseSummary_ProtocolVersion(t *testing.T) {
+	got, err := parseSummary([]byte(`{"version":1,"counts":{"ready":0,"in_progress":0},"claimable":0,"openQuestions":0,"protocolVersion":40}`))
+	if err != nil {
+		t.Fatalf("parseSummary: %v", err)
+	}
+	if got.ProtocolVersion != 40 {
+		t.Errorf("ProtocolVersion = %d, want 40", got.ProtocolVersion)
+	}
+
+	old, err := parseSummary([]byte(summaryJSON))
+	if err != nil {
+		t.Fatalf("parseSummary: %v", err)
+	}
+	if old.ProtocolVersion != 0 {
+		t.Errorf("a payload without protocolVersion must decode to 0 (unknown); got %d", old.ProtocolVersion)
+	}
+}
+
 // staleClaimable is what the plane reports as offerable abandoned WIP (CLA-273),
 // and it must land in its own field rather than being folded into Claimable —
 // three readers agree on what that number means.

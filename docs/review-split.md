@@ -144,7 +144,8 @@ branch — would pass it with nothing recorded at all. Two guards close that:
 
 1. **The review→fix checkpoint requires a durable record from THIS run.** Since
    CLA-636/637 the review phase's deliverable is a sealed per-reviewer record
-   written through `update_task(review: ...)`, and the seam gate is that record:
+   written through `record_review` (or `update_task(review: ...)` on a plane
+   older than protocol 40), and the seam gate is that record:
    the driver reads the task's `reviews` block at the seam and refuses a
    checkpoint unless it carries a record this run wrote, under this phase's
    reviewer role, whose `reviewedTip` equals the branch tip the driver verified
@@ -221,7 +222,7 @@ The backlog tasks that own this, so this change does not re-file them:
   prune. **CLA-630** (`lecstor/clankerbar-cli`, ready, depends on CLA-629) sends
   it from the CLI. That is the attribution half of "which model reviewed this".
 - **CLA-636** (done, `lecstor/clankerbar`) — the durable per-reviewer
-  `task_review` store written through `update_task(review: ...)`, sealed until
+  `task_review` store written through `record_review` / `update_task(review: ...)`, sealed until
   the round closes. **CLA-637** (this work, `lecstor/clankerbar-cli`) makes the
   review phase write it, gates the seam on it and closes the round before `fix`.
   CLA-210 was archived pointing at CLA-636 and the `agent_review` state.
@@ -352,7 +353,7 @@ close-out.
 | linear `[implement, review, fix]` | **done**: 2 briefs + variants, positional selection, attribution/position placeholders, validation, tests | none for the first round; the review record is an `outcome` block | low — no new loop control | now |
 | bounded second review | one more brief + a conditional-phase predicate in `drainPhases` | none | medium — conditional spawning is new control flow | after a live run measures the split |
 | new task on the branch | no CLI change | task-linking + round counter + close-out semantics | high — two tasks per unit of work | not recommended pre-PR |
-| durable review history | **done** (CLA-637): the record is a sealed per-reviewer row written via `update_task(review: ...)`; the seam gates on it and the driver closes the round | CLA-636 (done): the append-only `task_review` store; CLA-629/630 carry the attribution | low — additive, bounded, token-budgeted | shipped alongside this doc's split |
+| durable review history | **done** (CLA-637): the record is a sealed per-reviewer row written via `record_review` (protocol 40+) or `update_task(review: ...)` on an older plane; the seam gates on it and the driver closes the round | CLA-636 (done): the append-only `task_review` store; CLA-629/630 carry the attribution | low — additive, bounded, token-budgeted | shipped alongside this doc's split |
 
 ## Answers, explicitly
 
