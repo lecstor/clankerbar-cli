@@ -326,7 +326,7 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 			return
 		}
 	case delivery.PRConflict:
-		paths := d.logCloseOutConflict(ctx, verifier, dir, label, key, task, state, base)
+		paths, known := d.logCloseOutConflict(ctx, verifier, dir, label, key, task, state, base)
 		// A conflict needs judgement, so the deterministic path cannot finish it —
 		// but the fleet can still handle it without waiting for whichever clanker
 		// finishes its current task: a short conflict-only session (CLA-759) on
@@ -336,6 +336,17 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 		// the one conflict the session cannot be briefed for: it must merge a
 		// named branch, and guessing which one is the wrong direction.
 		if state.Base == "" {
+			return
+		}
+		if known && len(paths) == 0 {
+			// The evidence came back with NO conflicting paths: the two tips merge
+			// cleanly, so GitHub's CONFLICTING read is stale (its mergeable state lags
+			// a push). Starting a session here would be a SECOND paid attempt at a
+			// conflict that no longer exists — the shape a mechanical resolution
+			// leaves behind, since it pushes a new head and the task stays approved.
+			// Leave it to the deterministic close-out, which merges it as soon as the
+			// stale read catches up.
+			d.closeOutSay(key+":conflict-stale", "close-out: %s PR #%d still reads CONFLICTING with %s, but the fetched tips merge cleanly - the conflict state is stale, so no conflict session was started; leaving it to the deterministic close-out", label, state.Number, base)
 			return
 		}
 		d.startConflictSession(ctx, cfg, slug, client, task, state.Number, base, paths, dir)
@@ -472,18 +483,24 @@ func (d *Supervisor) closeOutCleanupCtx() (context.Context, context.CancelFunc) 
 }
 
 // conflictEvidence is what one conflicting task's head/base pair is known to
-// conflict on: the pair the paths were computed against, and the paths
-// themselves. Cached so the conflict session started in the same pass is briefed
-// with them, and so a later pass for the same unchanged pair neither re-logs the
-// evidence nor has to recompute it.
+// conflict on: the pair the paths were computed against, the paths themselves, and
+// whether they were actually computed. An empty KNOWN result means the fetched tips
+// merge cleanly — a different fact from "the paths could not be read", and the one
+// that says a CONFLICTING read is stale. Cached so the conflict session started in
+// the same pass is briefed with them, and so a later pass for the same unchanged
+// pair neither re-logs the evidence nor has to recompute it.
 type conflictEvidence struct {
 	pair  string
 	paths []string
+	known bool
 }
 
 // logCloseOutConflict records the evidence for a conflicting PR — the task, the
 // PR, the base and EVERY conflicting path — and returns those paths for the
-// conflict-only session that follows.
+// conflict-only session that follows, with whether they could be computed at all
+// (FALSE when a tip, a clone, a fetch or the merge itself failed; TRUE when the
+// paths are the truth for this pair, including the empty case where the two tips
+// merge cleanly).
 //
 // One line per head/base PAIR, not one per poll. The pair is the judged head's oid
 // plus the base tip read fresh from the remote (`ls-remote`, not a fetch), so a push
@@ -492,18 +509,18 @@ type conflictEvidence struct {
 // what keeps this a greppable evidence trail as well as the session's input. The
 // paths themselves are computed in a throwaway clone, so the evidence never touches
 // the checkout the fleet's sessions are using.
-func (d *Supervisor) logCloseOutConflict(ctx context.Context, verifier *delivery.Verifier, dir, label, key string, task plane.CloseOutTask, state delivery.PRState, base string) []string {
+func (d *Supervisor) logCloseOutConflict(ctx context.Context, verifier *delivery.Verifier, dir, label, key string, task plane.CloseOutTask, state delivery.PRState, base string) ([]string, bool) {
 	baseTip, err := verifier.RemoteTip(ctx, dir, "origin", base)
 	if err != nil {
 		d.closeOutSay(key+":conflict-tip", "close-out: %s PR #%d is CONFLICTING with %s, but its base tip could not be read (%v)", label, state.Number, base, err)
-		return nil
+		return nil, false
 	}
 	pair := state.HeadOID + "@" + baseTip
 	if d.closeOutConflicts == nil {
 		d.closeOutConflicts = map[string]conflictEvidence{}
 	}
 	if prev, ok := d.closeOutConflicts[task.ID]; ok && prev.pair == pair {
-		return prev.paths // this exact head/base pair has already been reported
+		return prev.paths, prev.known // this exact head/base pair has already been read
 	}
 
 	head := strings.TrimSpace(state.Head)
@@ -517,31 +534,31 @@ func (d *Supervisor) logCloseOutConflict(ctx context.Context, verifier *delivery
 	iso, cleanup, err := verifier.IsolatedClone(ctx, dir, "origin")
 	if err != nil {
 		d.closeOutSay(key+":conflict-iso", "close-out: %s PR #%d is CONFLICTING with %s, but a throwaway checkout to name the paths could not be made (%v)", label, state.Number, base, err)
-		return nil
+		return nil, false
 	}
 	defer cleanup()
 	dir = iso
 	if err := verifier.FetchRef(ctx, dir, "origin", base); err != nil {
 		d.closeOutSay(key+":conflict-fetch", "close-out: %s PR #%d is CONFLICTING with %s, but the base could not be fetched to name the paths (%v)", label, state.Number, base, err)
-		return nil
+		return nil, false
 	}
 	if err := verifier.FetchRef(ctx, dir, "origin", head); err != nil {
 		d.closeOutSay(key+":conflict-fetch", "close-out: %s PR #%d is CONFLICTING with %s, but its head could not be fetched to name the paths (%v)", label, state.Number, base, err)
-		return nil
+		return nil, false
 	}
 	paths, err := verifier.ConflictPaths(ctx, dir, "origin/"+base, "origin/"+head)
 	if err != nil {
 		d.closeOutSay(key+":conflict-paths", "close-out: %s PR #%d is CONFLICTING with %s (head %s@%s, base %s@%s), but its conflicting paths could not be computed (%v)", label, state.Number, base, head, shortSHA(state.HeadOID), base, shortSHA(baseTip), err)
-		return nil
+		return nil, false
 	}
-	d.closeOutConflicts[task.ID] = conflictEvidence{pair: pair, paths: paths}
+	d.closeOutConflicts[task.ID] = conflictEvidence{pair: pair, paths: paths, known: true}
 	named := strings.Join(paths, ", ")
 	if named == "" {
 		named = "(none reported - the fetched tips merged cleanly, so the PR's state is stale)"
 	}
 	d.closeOutSay(key, "close-out: %s PR #%d is CONFLICTING with %s (head %s@%s, base %s@%s) - conflicting paths: %s",
 		label, state.Number, base, head, shortSHA(state.HeadOID), base, shortSHA(baseTip), named)
-	return paths
+	return paths, true
 }
 
 // closeOutSay logs one close-out line, unless the line for that key is unchanged —

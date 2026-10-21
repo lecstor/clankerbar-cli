@@ -848,9 +848,30 @@ claim and leaves the task `approved` for the close-out above to merge once CI is
 green; **behavioural** or uncertain moves it back to `in_review` with a note
 naming what changed, because that code has not been reviewed; a **failure** (a
 gate that will not go green, a hunk that cannot be resolved without guessing)
-releases the claim, leaves the task `approved` and is logged with its reason. At
-most one conflict session runs at a time per supervisor, so a second conflicting
-task waits for the next poll. Daemon-started sessions never run on Claude: a
+releases the claim (attesting `checkGreen: false`, since the merge never
+happened — that is what makes the plane's CI-repair ladder bound a
+green-but-unmergeable PR), leaves the task `approved` and is logged with its
+reason.
+
+At most one conflict session runs at a time, and the bound is a **shared lease,
+not a per-process flag**: the supervisor takes an exclusive lock on
+`conflict-session.lock` under its state root for the session's lifetime, so every
+supervisor using that state root contends for one slot — two processes on a
+machine, or two instances in one process. The kernel drops the lock when the
+holder exits, so a session that crashed or was rolled never strands the slot, and
+a second conflicting task waits for the next poll. The plane claim remains the
+guard for the SAME task (a refused claim means someone else has it). Machines
+whose state roots are separate each hold their own slot, so a fleet spanning
+machines should give them a shared state root if the one-session-at-a-time bound
+has to hold across all of them; a cross-machine slot for *different* tasks needs a
+lease in the plane, which does not exist yet.
+
+A CONFLICTING read whose fetched tips merge cleanly starts no session at all:
+GitHub's mergeable state lags a push, so that is the evidence that the conflict is
+already resolved (exactly the shape a mechanical resolution leaves behind), and a
+session there would be a second paid attempt at a conflict that no longer exists.
+The task is left to the deterministic close-out, which merges it as soon as the
+stale read catches up. Daemon-started sessions never run on Claude: a
 `conflict` step resolving to `claude` stands down with a log line and leaves the
 task to the agent close-out.
 

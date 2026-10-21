@@ -29,14 +29,19 @@ package supervisor
 //     it has not been reviewed); anything still held by this run is FAILED — the
 //     claim is released and the task left approved, with the reason logged.
 //
-// At most ONE conflict session runs at a time per supervisor: a second conflicting
-// task waits for the next poll, and the claim is what makes that safe even when
-// another machine's supervisor is racing for the same task. Daemon-started
-// sessions never run on Claude (operator rule), so a step resolving to Claude
-// stands down loudly instead of spending a session.
+// At most ONE conflict session runs at a time across the fleet: the Supervisor's
+// own atomic is only a fast in-process gate, and the bound that holds across
+// supervisors is a shared, durable SLOT taken before the claim (conflictlock.go) —
+// one file under the fleet's state root, locked exclusively while a session runs,
+// released by the kernel if the holder dies. A second conflicting task (on this
+// supervisor or any other sharing that state root) waits for the next poll, and
+// the claim is what makes "a task already claimed is skipped" safe even then.
+// Daemon-started sessions never run on Claude (operator rule), so a step resolving
+// to Claude stands down loudly instead of spending a session.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -114,16 +119,21 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		label = task.ID
 	}
 
-	// One at a time. A second conflicting task is not dropped: it stays approved,
-	// and the pass reaches it again on the next poll once this session ends.
+	// One at a time ON THIS SUPERVISOR. A second conflicting task is not dropped:
+	// it stays approved, and the pass reaches it again on the next poll once this
+	// session ends. The bound ACROSS supervisors is the shared slot below.
 	if !d.conflictBusy.CompareAndSwap(false, true) {
 		d.conflictSay("busy:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but a conflict session is already running - "+
 			"this task waits for the next poll", label, pr)
 		return
 	}
+	var slot *conflictSlot
 	started := false
 	defer func() {
 		if !started {
+			// Every early return below must hand back BOTH: the in-process gate
+			// and, once it has been taken, the fleet's slot.
+			slot.release()
 			d.conflictBusy.Store(false)
 		}
 	}()
@@ -144,6 +154,17 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	// worktree area is the last precondition.
 	gate := conflictGate(dir)
 	worktree := conflictWorktree(cfg, dir, task.ID)
+	// The brief makes the session create its worktree OUTSIDE the checkout, and the
+	// only grant that makes that writable is Invocation.ExtraDirs. A harness that
+	// drops ExtraDirs (codex by design — its sandbox's writable roots are the cwd
+	// plus operator-owned config) would fail at step 2 of the brief AFTER the
+	// session was paid for, so it is refused here, before the claim.
+	if !conflictHarnessTakesExtraDirs(step.Harness) {
+		d.conflictSay("harness:"+slug, "conflict: %s PR #%d is CONFLICTING, but the conflict step resolves to harness %q, "+
+			"which does not translate ExtraDirs - it could not create the worktree at %s, so no session was started; "+
+			"name a harness that can (opencode) or leave the conflict block unset", label, pr, step.Harness, worktree)
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(worktree), 0o755); err != nil {
 		d.conflictSay("worktree:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but the worktree area %s could not be prepared (%v) - "+
 			"no session was started", label, pr, filepath.Dir(worktree), err)
@@ -158,6 +179,30 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 		d.conflictSay("exhausted:"+task.ID, "conflict: %s PR #%d is CONFLICTING but %d conflict sessions have already "+
 			"failed at it - leaving it to the agent close-out instead of spending another",
 			label, pr, maxConflictAttempts)
+		return
+	}
+
+	// The FLEET's slot, not this process's: conflictBusy above serialises this
+	// Supervisor value, while the slot is the shared lease every supervisor on the
+	// fleet's state root takes (conflictlock.go). It is acquired BEFORE the claim,
+	// so a task that has to wait costs no plane write and no provider token.
+	slotPath := d.conflictSlotPath()
+	var serr error
+	slot, serr = d.acquireConflictSlot(fmt.Sprintf("host=%s pid=%d task=%s %s pr=#%d",
+		d.conflictHostname(), os.Getpid(), task.ID, label, pr))
+	if serr != nil {
+		slot = nil
+		if errors.Is(serr, errConflictSlotHeld) {
+			held := conflictSlotHolder(slotPath)
+			if held == "" {
+				held = "the holder left no record"
+			}
+			d.conflictSay("slot:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but another supervisor holds the fleet's "+
+				"conflict-session slot (%s) - this task waits for the next poll", label, pr, held)
+			return
+		}
+		d.conflictSay("slot:"+task.ID, "conflict: %s PR #%d is CONFLICTING, but the fleet's conflict-session slot could not "+
+			"be taken (%v) - no session was started", label, pr, serr)
 		return
 	}
 
@@ -205,6 +250,9 @@ func (d *Supervisor) startConflictSession(ctx context.Context, cfg *config.Confi
 	started = true
 	d.conflictWG.Add(1)
 	go func() {
+		// Declared first, so it runs LAST: the fleet's slot is held until every
+		// other bit of this session's bookkeeping is done.
+		defer slot.release()
 		defer d.conflictWG.Done()
 		defer d.conflictBusy.Store(false)
 		d.runConflictSession(cfg, slug, client, req, step)
@@ -268,6 +316,14 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 		if note == "" {
 			note = "the resolution changed behaviour and needs review"
 		}
+		// NOTHING TO RELEASE HERE, and a release would be refused. The plane's status
+		// write clears the claim on every transition away from `in_progress`
+		// (`updateStatus`: `via.to !== "in_progress" ? { claimedByRun: null }`) and ends
+		// the run as `done`, so the behavioural hand-back hands the task to the human
+		// reviewer with no claim left behind — pinned by the plane's own test
+		// "status in_review ends the run as done and releases the claim". A release
+		// call here would hit the `not_holding` guard (it requires `in_progress` with a
+		// claimedByRun), i.e. a guaranteed refusal for a task that is already free.
 		log.Printf("conflict: %s PR %s - outcome: behavioural - conflicting paths: %s - %s",
 			label, req.PR, conflictPaths(req.Paths), note)
 		return
@@ -277,8 +333,21 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 	// back. Release it, run or no run, and classify by the marker the session
 	// left (a mechanical resolution whose release call failed is still
 	// mechanical; a session that left no marker is a failure).
-	if strings.TrimSpace(st.ClaimedByRun) == strings.TrimSpace(req.RunID) {
-		if rerr := client.ReleaseCloseOut(ctx, req.TaskID, req.RunID, true); rerr != nil {
+	//
+	// The comparison is between run IDENTITIES, not the ids as strings: the claim
+	// hands this supervisor the run CREDENTIAL (`<uuid>.<secret>`) while the
+	// plane's `claimedByRun` holds the bare uuid, so comparing the raw strings
+	// never matched - the release never fired, and our own dead run was
+	// misreported as "another run".
+	//
+	// The release attests green ONLY for a mechanical resolution, whose merge
+	// really landed. A failed session's merge never happened, and a session that
+	// left no marker has not shown a landing either, so both attest false and the
+	// plane's CI-repair ladder counts and bounds the PR (standing decision
+	// 047d3dad rule 1) — the same rule the brief's FAILED hand-back spells out.
+	checkGreen := marked && kind == config.ConflictResolutionMechanical
+	if claimIsOurs(st.ClaimedByRun, req.RunID) {
+		if rerr := client.ReleaseCloseOut(ctx, req.TaskID, req.RunID, checkGreen); rerr != nil {
 			log.Printf("conflict: %s PR %s - outcome: failed - the claim could not be released (%v); its lease must expire - %s",
 				label, req.PR, rerr, conflictFailureReason(res, runErr, detail))
 			return
@@ -306,6 +375,66 @@ func (d *Supervisor) finishConflictSession(client plane.CloseOutAPI, req Conflic
 		log.Printf("conflict: %s PR %s - outcome: failed - the session left no resolution marker - %s",
 			label, req.PR, conflictFailureReason(res, runErr, detail))
 	}
+}
+
+// conflictRunUUID is a run id's identity: the part before the first dot. A claim
+// hands the supervisor the run CREDENTIAL (`<uuid>.<secret>`), while the plane's
+// records — `claimedByRun` above all — hold the BARE uuid, so two ids name the
+// same run exactly when their uuids match. Mirrors internal/loop's runUUID, which
+// is the same split the plane makes (parseRunCredential); a bare id is its own
+// uuid.
+func conflictRunUUID(id string) string {
+	id = strings.TrimSpace(id)
+	if i := strings.IndexByte(id, '.'); i >= 0 {
+		return id[:i]
+	}
+	return id
+}
+
+// claimIsOurs reports whether the task's recorded holder is the run this
+// supervisor claimed under. Both sides are compared as run IDENTITIES: comparing
+// the strings was a real defect (CLA-759 review 1.review-1.1), because the claim
+// returns a credential and the plane records the bare uuid, so it never matched
+// and the safety-net release never fired.
+func claimIsOurs(claimedByRun, runID string) bool {
+	mine := conflictRunUUID(runID)
+	return mine != "" && conflictRunUUID(claimedByRun) == mine
+}
+
+// conflictHarnessTakesExtraDirs reports whether a harness translates
+// Invocation.ExtraDirs into a writable-root grant for the session. It is an
+// inverted ALLOWLIST on purpose: the conflict brief makes the session create a
+// worktree OUTSIDE its checkout, so a harness whose sandbox ignores ExtraDirs can
+// never do the job — and a new harness must be added here deliberately, rather than
+// silently inheriting a session it cannot complete. Today:
+//
+//   - opencode gains read/edit/external_directory scope on every extra dir
+//     (harness/opencode.go, scopeExtraDirs);
+//   - claude maps them to --add-dir (and is refused earlier by the operator's
+//     no-Claude-for-daemon-sessions rule, listed for completeness);
+//   - codex deliberately does NOT: its workspace-write scope is the cwd plus the
+//     operator-owned `writable_roots` in CODEX_HOME (harness/codex.go).
+func conflictHarnessTakesExtraDirs(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "opencode", "claude":
+		return true
+	default:
+		return false
+	}
+}
+
+// conflictHostname is the machine identity written into the slot's holder record:
+// the name reconcile resolved, else the OS's own, so a stand-down line on another
+// supervisor names a host even when this value was never resolved (a test, or a
+// supervisor that failed before its first reconcile).
+func (d *Supervisor) conflictHostname() string {
+	if h := strings.TrimSpace(d.hostname); h != "" {
+		return h
+	}
+	if h, err := os.Hostname(); err == nil {
+		return h
+	}
+	return "unknown"
 }
 
 // conflictFailureReason composes the one-line "why" for a failed conflict

@@ -34,6 +34,15 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
+// closeOutTestRunCredential is what a real `claim_task` answers with: the run
+// CREDENTIAL `<uuid>.<secret>`, never a bare uuid. The plane's own records
+// (`claimedByRun`) hold the bare uuid, so the fixture pins BOTH shapes apart on
+// purpose — comparing the two as strings is the defect CLA-759 review 1.review-1.1
+// found, and a fixture that served a bare id hid it.
+const closeOutTestRunUUID = "run-1"
+
+const closeOutTestRunCredential = closeOutTestRunUUID + ".s3cr3t-session-credential"
+
 const (
 	closeOutTestSlug = "acme"
 	closeOutTestRepo = "acme/widgets"
@@ -58,6 +67,11 @@ type closeOutFixture struct {
 
 	plane *fakePlane
 	srv   string // roster URL base
+
+	// cacheDir is the state root the fixture's Supervisors share: it is where the
+	// fleet's conflict-session slot lives (conflictlock.go), so two Supervisors
+	// built from this fixture contend for the same slot exactly as two real ones do.
+	cacheDir string
 
 	headOID string // the task branch's tip, as the PR JSON advertises it
 
@@ -128,12 +142,13 @@ func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
 	mustGit(t, root, "clone", "-q", remote, dir)
 
 	f := &closeOutFixture{
-		t:      t,
-		root:   root,
-		dir:    dir,
-		seed:   seed,
-		remote: remote,
-		ghDir:  filepath.Join(root, "fakegh"),
+		t:        t,
+		root:     root,
+		dir:      dir,
+		seed:     seed,
+		remote:   remote,
+		ghDir:    filepath.Join(root, "fakegh"),
+		cacheDir: filepath.Join(root, "state", "roster"),
 	}
 	f.headOID = strings.TrimSpace(mustGit(t, seed, "rev-parse", closeOutTestHead))
 	if err := os.MkdirAll(f.ghDir, 0o755); err != nil {
@@ -275,11 +290,12 @@ func (f *closeOutFixture) servePlane(t *testing.T, authority string) {
 	f.plane.serveTool("list_tasks", fmt.Sprintf(
 		`{"tasks":[{"id":%q,"ref":%q,"title":"a task","branch":%q,"repo":%q}],"count":1,"total":1,"view":"full"}`,
 		closeOutTestTask, closeOutTestRef, closeOutTestHead, closeOutTestRepo))
-	f.plane.serveTool("claim_task", `{"task":{"id":"`+closeOutTestTask+`"},"run":{"id":"run-1"}}`)
+	f.plane.serveTool("claim_task", `{"task":{"id":"`+closeOutTestTask+`"},"run":{"id":"`+closeOutTestRunCredential+`"}}`)
 	// The post-session read (CLA-759): the default is the hand-back the conflict
 	// brief asks for, so a test that does not care about the classification gets
 	// the ordinary mechanical outcome. A test overrides this payload to drive
-	// the behavioural, failed and still-held cases.
+	// the behavioural, failed and still-held cases. `claimedByRun` is NULL here
+	// because the session released its claim, exactly as the brief asks.
 	f.plane.serveTool("get_task", fmt.Sprintf(
 		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":null,"branch":%q,"outcome":"RESOLUTION: mechanical\n\n**Tests**\n- `+closeOutTestBase+`: pass\n\n- a.txt: kept both sides\n- b.txt: kept both sides"}}`,
 		closeOutTestTask, closeOutTestRef, closeOutTestHead))
@@ -310,7 +326,7 @@ func (f *closeOutFixture) supervisor(pollWindow time.Duration) *Supervisor {
 			return harness.Result{}, nil
 		},
 	}.withDefaults()
-	d := &Supervisor{o: o, ctx: context.Background()}
+	d := &Supervisor{o: o, ctx: context.Background(), cacheDir: f.cacheDir}
 	cfg := &config.Config{
 		Harness: "opencode",
 		Model:   "implement-model",
@@ -429,8 +445,8 @@ func TestCloseOutMergesACleanApprovedTask(t *testing.T) {
 	if closed == nil {
 		t.Fatalf("no update_task(status: done); the task was not closed. calls: %v", f.plane.planeCalls())
 	}
-	if got := closed["runId"]; got != "run-1" {
-		t.Errorf("close runId = %v, want the claim's run (run-1)", got)
+	if got := closed["runId"]; got != closeOutTestRunCredential {
+		t.Errorf("close runId = %v, want the claim's run credential (%s)", got, closeOutTestRunCredential)
 	}
 	delivery, ok := closed["delivery"].(map[string]any)
 	if !ok {
@@ -770,8 +786,8 @@ func TestCloseOutReleasesTheClaimAfterAMergeFailure(t *testing.T) {
 	for _, c := range f.callsFor("update_task") {
 		if c.args["release"] == true {
 			releases++
-			if c.args["runId"] != "run-1" {
-				t.Errorf("release runId = %v, want run-1", c.args["runId"])
+			if c.args["runId"] != closeOutTestRunCredential {
+				t.Errorf("release runId = %v, want the claim's run credential (%s)", c.args["runId"], closeOutTestRunCredential)
 			}
 			// A failed MERGE is what the plane's repair ladder must bound: the
 			// checks are still green, so attesting green here would leave a

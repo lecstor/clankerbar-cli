@@ -271,7 +271,11 @@ func ConflictBrief(in ConflictBriefInput) string {
 		"5. GATE. In the worktree (`cd " + in.Worktree + "` first) run " + gateCommand + ". It must pass before you push.\n\n" +
 		"6. PUSH. The merge commit is the commit `git merge` made - do not squash or amend it - and push the branch: " +
 		"`git -C " + in.Worktree + " push origin HEAD:" + in.Branch + "`. Never force-push, and never push to " + in.Base + ".\n\n" +
-		"7. HAND THE TASK BACK - exactly one of these, and nothing else:\n" +
+		"7. HAND THE TASK BACK - exactly one of these, and nothing else. FIRST keep the task's record: call " +
+		"get_task(taskId: \"" + in.TaskID + "\") and copy the `outcome` it carries VERBATIM into the outcome you write, with your " +
+		"RESOLUTION block and **Tests** section APPENDED after it (write only your block if it is empty). That stored outcome is the " +
+		"review evidence that earned the approval, and the close-out records no outcome of its own - replacing it would destroy that " +
+		"evidence. Then:\n" +
 		"   - MECHANICAL - every resolution is renumbering, keeping both sides of a list, or regenerating a pinned figure, with NO " +
 		"change to what the code does. That code does not need a new review, so leave the task approved for the supervisor to merge " +
 		"once CI is green. First record the resolution, then release the claim:\n" +
@@ -284,9 +288,10 @@ func ConflictBrief(in ConflictBriefInput) string {
 		"behavioural\\n\\n**Tests**\\n- " + gateWording + ": pass\\n\\n- <each conflicting path>: <what changed and why>\")\n" +
 		"   - FAILED - the gate will not go green, or a hunk cannot be resolved without guessing. Do NOT push a broken or " +
 		"half-resolved branch: discard the merge, record why, then release the claim and leave the task approved for the agent " +
-		"close-out:\n" +
+		"close-out. The merge never happened, so the release attests checkGreen: false - that is what makes the plane's CI-repair " +
+		"ladder count and bound a green-but-unmergeable PR instead of exempting it:\n" +
 		"     update_task(taskId: \"" + in.TaskID + "\", runId: \"" + in.RunID + "\", outcome: \"RESOLUTION: failed\\n\\n- <why>\")\n" +
-		"     update_task(taskId: \"" + in.TaskID + "\", runId: \"" + in.RunID + "\", release: true, checkGreen: true)\n\n" +
+		"     update_task(taskId: \"" + in.TaskID + "\", runId: \"" + in.RunID + "\", release: true, checkGreen: false)\n\n" +
 		"8. STOP. Do not review, do not open or merge the PR, do not file tasks, and do not move the task except exactly as step 7 " +
 		"says. Remove the worktree before you finish, whatever the outcome (`git -C " + in.WorkDir + " worktree remove --force " + in.Worktree + "`), " +
 		"so a retry starts clean. " +

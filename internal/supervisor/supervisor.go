@@ -434,8 +434,10 @@ type Supervisor struct {
 	closeOutWG sync.WaitGroup
 
 	// conflictBusy is set while a conflict-only session runs (CLA-759): at most
-	// one at a time per supervisor, so a second conflicting task waits for the
-	// next poll rather than spending a second paid session.
+	// one at a time on this supervisor, so a second conflicting task waits for the
+	// next poll rather than spending a second paid session. It is only the FAST
+	// in-process gate: the bound that holds across supervisors is the shared slot
+	// in conflictlock.go, taken before the claim.
 	conflictBusy atomic.Bool
 	// conflictWG tracks the session goroutine, so a fleet stop can wait
 	// (bounded) for it to release a claim it holds.

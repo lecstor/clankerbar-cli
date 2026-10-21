@@ -55,6 +55,23 @@ func TestConflictBriefCarriesTheConflictOnlyContract(t *testing.T) {
 			t.Errorf("the brief does not say %q:\n%s", want, brief)
 		}
 	}
+	// The CI attestation is load-bearing for the plane's repair ladder, not a detail
+	// of the call: the mechanical hand-back (the merge LANDED) attests green, and the
+	// FAILED one (the merge never happened) attests false so a green-but-unmergeable
+	// PR is counted and bounded instead of silently exempted (standing decision
+	// 047d3dad rule 1).
+	if !strings.Contains(brief, "release: true, checkGreen: true") {
+		t.Errorf("the mechanical hand-back does not attest the landed merge as green:\n%s", brief)
+	}
+	if !strings.Contains(brief, "release: true, checkGreen: false") {
+		t.Errorf("the failed hand-back does not attest checkGreen: false:\n%s", brief)
+	}
+	// The stored outcome is the review evidence that earned the approval: the
+	// hand-back must APPEND to it, never replace it, or the task later closes done
+	// carrying a resolution note instead of that evidence (CLA-759 review 1.review-1.7).
+	if !strings.Contains(brief, "copy the `outcome` it carries VERBATIM") {
+		t.Errorf("the brief does not require the existing outcome to be preserved:\n%s", brief)
+	}
 }
 
 func TestConflictBriefFallsBackWhenPathsOrGateAreUnknown(t *testing.T) {
