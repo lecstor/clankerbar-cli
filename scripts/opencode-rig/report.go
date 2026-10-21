@@ -337,7 +337,7 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 	line("")
 	line("- %d tool call(s): %d refused (isError), %d ok.", len(calls), countErrors(calls), len(calls)-countErrors(calls))
 	if lines := editTaskResidual(calls); len(lines) > 0 {
-		line("- `edit_task` padding by call — a padded `false` on `container`/`humanOnly` is their CLEAR spelling, `repo=\"\"` clears routing and `null` is absence:")
+		line("- `edit_task` padding by call — a padded `false` on `container`/`humanOnly` is their CLEAR spelling, `repo=\"\"` clears routing and `null` is absence; each `false` is annotated with what the call's receipt says it did, because a `false` on an already-false flag is a no-op (CLA-745):")
 		for _, l := range lines {
 			line("  - %s", l)
 		}
@@ -630,7 +630,8 @@ func countErrors(calls []stubCall) int {
 // residual is about, read from the arguments the model actually sent: a
 // nullable enum sent as null (absence), `repo: ""` (the CLEAR) beside `repo:
 // null` (absence), and the two flags whose padded `false` is their CLEAR
-// spelling. What the call then CHANGED is the table's result column.
+// spelling. What the call then CHANGED is the table's result column - and, for
+// the flags, the difference between a clear that landed and a no-op.
 func editTaskResidual(calls []stubCall) []string {
 	var out []string
 	for _, c := range calls {
@@ -641,6 +642,7 @@ func editTaskResidual(calls []stubCall) []string {
 		if json.Unmarshal(c.Arguments, &args) != nil {
 			continue
 		}
+		facts := editTaskReceiptFactsOf(c)
 		var signals []string
 		if v, ok := args["repo"]; ok {
 			switch {
@@ -659,7 +661,11 @@ func editTaskResidual(calls []stubCall) []string {
 			case v == nil:
 				signals = append(signals, "`"+field+"=null` (leaves the flag)")
 			case v == false:
-				signals = append(signals, "`"+field+"=false` (CLEARS a set flag)")
+				// The arguments alone cannot say whether this false cleared a
+				// set flag or was a no-op on one already false: that is the
+				// receipt's answer (standing decision c06cdfc7 - the no-op drop
+				// is limited to a false on an ALREADY false flag).
+				signals = append(signals, "`"+field+"=false` ("+flagClearLabel(field, facts)+")")
 			}
 		}
 		for _, field := range []string{"priority", "schedule"} {
@@ -673,6 +679,70 @@ func editTaskResidual(calls []stubCall) []string {
 		out = append(out, fmt.Sprintf("call %d: %s", c.Seq, strings.Join(signals, ", ")))
 	}
 	return out
+}
+
+// editTaskReceiptFacts is what one call's result says about the write: the
+// fields its receipt CLAIMS it changed, or the code it refused with. The report
+// already uses that receipt as "what the call actually did" (resultLabel); the
+// flag annotation needs the same evidence, because a sent `false` means the
+// CLEAR spelling without necessarily being a clear.
+type editTaskReceiptFacts struct {
+	ok bool
+	// hasChanged is true when the result carries a `changed` list at all, so
+	// silence and "changed nothing" are not conflated.
+	hasChanged bool
+	changed    map[string]bool
+	code       string
+}
+
+func editTaskReceiptFactsOf(c stubCall) editTaskReceiptFacts {
+	facts := editTaskReceiptFacts{ok: !c.IsError, changed: map[string]bool{}}
+	var payload struct {
+		Changed *[]string `json:"changed"`
+		Error   struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if json.Unmarshal([]byte(c.Result), &payload) != nil {
+		return facts
+	}
+	if payload.Error.Code != "" {
+		facts.ok = false
+		facts.code = payload.Error.Code
+	}
+	if payload.Changed != nil {
+		facts.hasChanged = true
+		for _, field := range *payload.Changed {
+			facts.changed[field] = true
+		}
+	}
+	return facts
+}
+
+// flagClearLabel annotates a `false` sent on container/humanOnly, using the
+// call's own receipt as the evidence:
+//
+//   - the field is in `changed` - the write landed, so a SET flag was cleared;
+//   - the call returned a receipt, or was refused `nothing_to_do`, without the
+//     field - the stub dropped the false as a no-op on an already-false flag
+//     (CLA-745). A false on a SET flag would have been a change, and on its own
+//     would have kept the call from being refused `nothing_to_do`;
+//   - the call was refused for another reason - nothing was written at all;
+//   - there is no receipt to read - describe the spelling, claim no effect.
+func flagClearLabel(field string, facts editTaskReceiptFacts) string {
+	switch {
+	case facts.changed[field]:
+		return "CLEARS a set flag"
+	case facts.ok || facts.code == "nothing_to_do":
+		if !facts.hasChanged && facts.code == "" {
+			return "the CLEAR spelling (the receipt does not say what changed)"
+		}
+		return "no-op (already false)"
+	case facts.code != "":
+		return "not applied (call refused `" + facts.code + "`)"
+	default:
+		return "the CLEAR spelling (the receipt does not say what changed)"
+	}
 }
 
 // replayStats counts the assistant messages in requests after the first that

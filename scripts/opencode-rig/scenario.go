@@ -71,7 +71,10 @@ func scenarios() map[string]scenarioDef {
 		// strict-mode surface edit_task still has (proposal R4, decision
 		// c06cdfc7): a client that fills EVERY optional property with its
 		// type's empty value sends `null` on the nullable enums and `false` on
-		// the two flags. What the scenario shows:
+		// the two flags. The prompt therefore asks only for the arguments that
+		// DIFFER between the three calls; whether the rest arrives padded is
+		// the provider behaviour this scenario exists to observe, not something
+		// the prompt should dictate. What the scenario shows:
 		//
 		//   - `null` on a nullable enum is absence, so a padded call is not
 		//     refused for sending one;
@@ -89,10 +92,8 @@ func scenarios() map[string]scenarioDef {
 		"padding": {
 			Name: "padding",
 			Prompt: strings.TrimSpace(`
-Call the tool clankerbar_edit_task three times, one call at a time, and stop after the third.
-Every call is FULLY PADDED: it carries every argument the schema declares, with the
-nullable ones sent as null and container/humanOnly sent as false. The calls differ only in
-these arguments:
+Call the tool clankerbar_edit_task three times, one call at a time, and pass
+taskId "CLA-753" every time. The calls differ only in these arguments:
 
 1. detail: "the new body"
 2. repo: ""
@@ -175,6 +176,11 @@ func catalogTool(scenario, schemaTool string) string {
 		// cutover does not serve it, and the model would be offered everything
 		// except the surface this scenario studies.
 		return "edit_task"
+	case "reasoning-replay":
+		// Both tool turns ask for get_task and the stub answers it; a catalog
+		// without it produces the same pointless run as the padding scenario
+		// against a pre-cutover catalog.
+		return "get_task"
 	}
 	return ""
 }

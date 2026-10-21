@@ -15,8 +15,14 @@ answered in one small run with the evidence on disk, instead of a live fleet
 run whose transcript scrolls away.
 
 ```
-scripts/opencode-rig/run.sh --model commandcode/gpt-6-luna --scenario padding
+scripts/opencode-rig/run.sh --model commandcode/gpt-6-luna --scenario padding \
+  --schemas scripts/opencode-rig/testdata/schema-proposed.json
 ```
+
+The `--schemas` line is not optional today: the live plane
+is still protocol 39 and serves `update_task`, not `edit_task`, so the `padding`
+and `schema` scenarios refuse the live catalog up front (see [`padding`](#padding--what-does-a-strict-mode-client-send-to-edit_task-and-what-does-it-clear)).
+A catalog file needs no plane key.
 
 Each run prints a report and leaves its raw logs in the run directory. **Every
 run makes real provider requests and costs real money** (see [Cost](#cost)).
@@ -29,16 +35,18 @@ run makes real provider requests and costs real money** (see [Cost](#cost)).
 # the fleet model and its key (the key file is where the daemon keeps it)
 export COMMANDCODE_API_KEY="$(cat ~/.config/clankerbar/commandcode-key)"
 
-# the plane key: --schemas live (the default) does a READ-ONLY tools/list fetch,
-# which needs CLANKERBAR_API_KEY. Set it from the daemon's own environment, pass
-# --plane-key-file <file>, or skip the fetch entirely with --schemas <catalog>.
-export CLANKERBAR_API_KEY="..."
+# The live plane is protocol 39 and serves `update_task`, not `edit_task`, so
+# `--schemas live` (the default) makes the `padding` and `schema` scenarios
+# refuse: serve a catalog that HAS edit_task until the cutover is promoted. The
+# shipped testdata/schema-proposed.json is one, and a file needs no plane key.
+# (`--schemas live` does: it is a read-only tools/list fetch, CLANKERBAR_API_KEY.)
 
 # reproduce the Luna padding question against Command Code
 # (`run` is optional: a leading flag is taken as the run subcommand's)
 scripts/opencode-rig/run.sh \
   --model commandcode/gpt-6-luna \
   --scenario padding \
+  --schemas scripts/opencode-rig/testdata/schema-proposed.json \
   --deadline 3m --max-tool-calls 4
 ```
 
@@ -51,7 +59,7 @@ Useful flags (full list: `run.sh --help`):
 |---|---|
 | `--model provider/model` | **required**; the fleet model, e.g. `commandcode/deepseek/deepseek-v4.1-flash`. The provider part also selects which `baseURL` is redirected at the proxy |
 | `--scenario` | `padding` (default), `reasoning-replay`, `schema` |
-| `--schemas live\|file` | tool catalog: fetch the plane's real `tools/list`, or serve a file (the `schema` scenario) |
+| `--schemas live\|file` | tool catalog: fetch the plane's real `tools/list`, or serve a file. Today's live plane serves `update_task`, not `edit_task`, so `padding` and the default `schema` run need a file that carries `edit_task` |
 | `--mcp-config` | source config; defaults to `~/.config/clankerbar/opencode-mcp.json` when present, otherwise a minimal config with only the stub |
 | `--config-dir` | `OPENCODE_CONFIG_DIR` for the session; pass `~/.config/opencode` for a fleet-identical global layer |
 | `--upstream` | the real provider base URL, if the config does not declare `provider.<id>.options.baseURL` |
@@ -74,9 +82,10 @@ that it also loads whatever servers that global layer declares (e.g. `github`).
 
 Some model/provider pairs force strict structured tool calls on: every property
 of whatever schema they are handed is present on every call, a nullable one as
-`null`, a string as `""`, a boolean as `false`. Ordinary calls are harmless — the
-plane drops the empty spellings, so `null` and `""` are absence. The exception is
-the surface `edit_task` still has (proposal R4, decision `c06cdfc7`):
+`null`, a string as `""`, and a **nullable boolean as `false`** — which is the
+CLEAR spelling, not absence. Ordinary calls are harmless: the plane drops the
+empty spellings, so `null` and `""` are absence. The exception is the surface
+`edit_task` still has (proposal R4, decision `c06cdfc7`):
 
 - `container` and `humanOnly` take `false` as their **CLEAR** spelling, so a
   client that pads every boolean clears a flag the task had SET;
@@ -85,38 +94,53 @@ the surface `edit_task` still has (proposal R4, decision `c06cdfc7`):
 - the nullable enums (`priority`, `schedule`) accept the padded `null` as
   absence, and a call that carries nothing real is refused `nothing_to_do`.
 
-The prompt asks for three fully padded calls — one carrying a real `detail`, one
-with `repo: ""`, one with `repo: null` — so all three behaviours are visible in
-one run. The stub serves `edit_task` and answers **exactly like the plane**: the
+The prompt asks for three calls that differ ONLY in the arguments under test —
+one carrying a real `detail`, one with `repo: ""`, one with `repo: null` — and
+says nothing about padding, so whatever else arrives on the wire is the
+provider's own behaviour[^pad]: a provider that pads every call shows up as
+the padded keys sent, and one that sends only the named arguments shows that
+instead. The stub serves `edit_task` and answers **exactly like the plane**: the
 same empty-value drop, the same `one_long_field` refusal, the same clear
 spellings, and a receipt carrying `changed`. The report prints the arguments sent
 per call, with the empty value the model actually sent, and then lists the
-residual signal per call:
+residual signal per call. With a strict-mode provider, its call table and the
+residual observations read:
 
 ```
-| # | tool        | keys sent (abridged)                                             | result                                    |
-| 1 | `edit_task` | `category=""`, `container=false`, `detail`, `humanOnly=false`, …  | ok; changed: detail, container, humanOnly |
-| 2 | `edit_task` | `repo=""`, `taskId`                                              | ok; changed: repo                         |
-| 3 | `edit_task` | `repo=null`, `taskId`                                            | error `nothing_to_do`                     |
+| # | tool | keys sent | result |
+|---|------|-----------|--------|
+| 1 | `edit_task` | `container=false`, `detail`, `humanOnly=false`, `priority=null`, `repo=null`, `schedule=null`, `taskId` | ok; changed: detail, container, humanOnly |
+| 2 | `edit_task` | `container=false`, `detail=""`, `humanOnly=false`, `priority=null`, `repo=""`, `schedule=null`, `taskId` | ok; changed: repo |
+| 3 | `edit_task` | `container=false`, `detail=""`, `humanOnly=false`, `priority=null`, `repo=null`, `schedule=null`, `taskId` | error `nothing_to_do` |
 
-- `edit_task` padding by call — a padded `false` on `container`/`humanOnly` is their CLEAR spelling, `repo=""` clears routing and `null` is absence:
-  - call 1: `container=false` (CLEARS a set flag), `humanOnly=false` (CLEARS a set flag), `priority=null` (absent), `repo=null` (absent), `schedule=null` (absent)
-  - call 2: `repo=""` (CLEARS to primary)
-  - call 3: `repo=null` (absent)
+- `edit_task` padding by call — a padded `false` on `container`/`humanOnly` is their CLEAR spelling, `repo=""` clears routing and `null` is absence; each `false` is annotated with what the call's receipt says it did, because a `false` on an already-false flag is a no-op (CLA-745):
+  - call 1: `repo=null` (absent), `container=false` (CLEARS a set flag), `humanOnly=false` (CLEARS a set flag), `priority=null` (absent), `schedule=null` (absent)
+  - call 2: `repo=""` (CLEARS to primary), `container=false` (no-op (already false)), `humanOnly=false` (no-op (already false)), `priority=null` (absent), `schedule=null` (absent)
+  - call 3: `repo=null` (absent), `container=false` (no-op (already false)), `humanOnly=false` (no-op (already false)), `priority=null` (absent), `schedule=null` (absent)
 ```
 
-Call 1's padded `false` is the clear, and its receipt says so; call 3 carried
-nothing real, which is why the plane answers `nothing_to_do` instead of writing.
-This makes the residual visible without a fleet run:
+Call 1's padded `false` is a real clear, and its receipt says so. On calls 2 and
+3 the flags are already false, so the stub drops the same `false` as a no-op —
+and the observation says exactly that, because it follows the receipt, never the
+argument alone. Call 3 carried nothing real, which is why the plane answers
+`nothing_to_do` instead of writing. This makes the residual visible without a
+fleet run:
 
 ```bash
-scripts/opencode-rig/run.sh --model commandcode/gpt-6-luna --scenario padding
+scripts/opencode-rig/run.sh --model commandcode/gpt-6-luna --scenario padding \
+  --schemas scripts/opencode-rig/testdata/schema-proposed.json
 ```
 
-The scenario needs a catalog that serves `edit_task`. A plane predating the
-tool cutover does not, and the rig refuses that run up front rather than
-reporting a run that exercised nothing — pass `--schemas <file>` with a catalog
-from a protocol-41 plane (or a copy of one) until the cutover is promoted.
+The scenario needs a catalog that serves `edit_task`. The live plane is still
+protocol 39 and serves `update_task`, so the default `--schemas live` fetch does
+not carry it, and the rig refuses that run up front rather than reporting a run
+that exercised nothing — pass `--schemas <file>` with a catalog that serves
+`edit_task` (`scripts/opencode-rig/testdata/schema-proposed.json` ships one)
+until the cutover is promoted.
+
+[^pad]: This is why the scenario is still called `padding`: padding is what it
+    measures. It does not ask the model to pad, because a shape the prompt
+    dictates would say nothing about the provider.
 
 ### `reasoning-replay` — does the provider replay `reasoning_content`?
 
@@ -143,8 +167,12 @@ scripts/opencode-rig/run.sh --model commandcode/deepseek/deepseek-v4.1-flash \
 ### `schema` — test a proposed tool shape before the plane ships it
 
 `--schemas live` (the default) serves the plane's live tool catalog, byte for
-byte as fetched. To test a proposal, fetch the catalog once, edit a copy, and
-serve it:
+byte as fetched. **The live plane is still protocol 39 and serves
+`update_task`, not `edit_task`**, so a `schema` run against it refuses up front
+(the default `--schema-tool edit_task` is not in the catalog), as does every
+`padding` run. Serve a file that carries the tool instead; today
+`scripts/opencode-rig/testdata/schema-proposed.json` does. To test a proposal,
+fetch the catalog once, edit a copy, and serve it:
 
 ```bash
 # keep the exact current catalog
@@ -295,17 +323,26 @@ provider key the caller supplies.
 Measured on 2026-10-21 against the 29-tool catalog the plane served then (six
 built-ins beside it), with `commandcode/deepseek/deepseek-v4.1-flash`:
 
-- one `padding` run with one tool call: **~60–90 KB per request** (the prompt and
-  catalog decide), one 13.8 K-token step, **~$0.002**;
+- a one-call `padding` run (the shape before the scenario became three calls):
+  **~60–90 KB per request** (the prompt and catalog decide), one 13.8 K-token
+  step, **~$0.002**;
+- the `padding` scenario **now makes three tool calls**, so it issues three
+  provider requests: the first carries the ~60–90 KB prompt and catalog, and each
+  later one replays the transcript and the earlier tool result, so budget
+  roughly **2–3× the one-call figure (~$0.004–0.006)**. That is an estimate from
+  the one-call measurement, not a re-measured three-call run;
 - opencode also issues a small title-generation request (no tools, ~3 KB);
 - the `reasoning-replay` scenario makes two tool turns and measured **~$0.002**
   in total, with the second request mostly served from the prompt cache;
 - the `schema` scenario with a two-tool catalog measured **~$0.0007**.
 
 The caps are the spend bound: the session stops at `--max-tool-calls` calls or
-`--deadline`, whichever comes first. Start with `--max-tool-calls 2` and a
+`--deadline`, whichever comes first. Start with `--max-tool-calls 4` and a
 3-minute deadline, and use `--dry-run` while wiring a new provider or config.
-A run that never reaches the provider costs nothing.
+The cap refuses the Nth call, so `3` answers only the scenario's first two calls
+and turns the third into a cap refusal instead of the `nothing_to_do` answer the
+run exists to see; `4` answers all three with one spare. A run that never reaches
+the provider costs nothing.
 
 ---
 

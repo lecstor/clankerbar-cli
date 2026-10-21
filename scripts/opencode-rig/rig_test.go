@@ -215,6 +215,28 @@ func TestThePaddingScenarioRefusesAPreCutoverCatalog(t *testing.T) {
 	}
 }
 
+// TestTheReasoningReplayScenarioRefusesACatalogWithoutGetTask pins the same
+// guard for the other scenario whose stub answers one tool: both of its turns
+// ask for get_task, so a catalog without it exercises nothing.
+func TestTheReasoningReplayScenarioRefusesACatalogWithoutGetTask(t *testing.T) {
+	dir := t.TempDir()
+	cat := filepath.Join(dir, "no-get-task.json")
+	if err := os.WriteFile(cat, []byte(`{"tools":[{"name":"edit_task","inputSchema":{"type":"object"}}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code := dispatch([]string{
+		"--model", "commandcode/gpt-6-luna",
+		"--scenario", "reasoning-replay",
+		"--schemas", cat,
+		"--upstream", "https://api.commandcode.invalid/provider/v1",
+		"--out", filepath.Join(dir, "run"),
+		"--dry-run",
+	})
+	if code != 1 {
+		t.Fatalf("dispatch = %d, want 1 (a catalog with no get_task exercises nothing)", code)
+	}
+}
+
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
 // printed.
 func captureStdout(t *testing.T, fn func() int) string {
