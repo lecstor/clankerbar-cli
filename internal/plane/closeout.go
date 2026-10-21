@@ -42,6 +42,12 @@ type CloseOutAPI interface {
 	// CompleteCloseOut records the delivery and closes the task done, in the
 	// claim's run.
 	CompleteCloseOut(ctx context.Context, taskID, runID string, d CloseOutDelivery) error
+
+	// TaskState reads one task's holder state (get_task): the status, the run
+	// holding it and the outcome text. The close-out uses it to tell what a
+	// conflict-only session left behind — it hands the task back itself, so the
+	// supervisor verifies the hand-back rather than assuming it (CLA-759).
+	TaskState(ctx context.Context, taskID string) (TaskState, error)
 }
 
 // ProjectPolicy is the part of the whose-turn policy a close-out acts on. The
@@ -109,6 +115,9 @@ func (coNotWired) ClaimCloseOut(context.Context, string) (string, error) {
 func (coNotWired) ReleaseCloseOut(context.Context, string, string, bool) error { return ErrNotWired }
 func (coNotWired) CompleteCloseOut(context.Context, string, string, CloseOutDelivery) error {
 	return ErrNotWired
+}
+func (coNotWired) TaskState(context.Context, string) (TaskState, error) {
+	return TaskState{}, ErrNotWired
 }
 
 // ProjectPolicy calls get_project_policy and reads the effective dials. A dial the

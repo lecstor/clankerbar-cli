@@ -25,11 +25,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
 const (
@@ -58,6 +60,19 @@ type closeOutFixture struct {
 	srv   string // roster URL base
 
 	headOID string // the task branch's tip, as the PR JSON advertises it
+
+	// conflictMu guards the conflict-session record below; the session runs on
+	// its own goroutine, so a test that reads it must wait for the session first
+	// (f.run does: d.waitConflict()).
+	conflictMu  sync.Mutex
+	conflicts   []conflictCall
+	conflictRun func(ctx context.Context, cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Result, error)
+}
+
+// conflictCall is one conflict-only session the fixture was asked to start.
+type conflictCall struct {
+	req  ConflictRunRequest
+	step config.ConflictStep
 }
 
 // newCloseOutFixture builds the world. conflicting controls whether the two
@@ -261,6 +276,13 @@ func (f *closeOutFixture) servePlane(t *testing.T, authority string) {
 		`{"tasks":[{"id":%q,"ref":%q,"title":"a task","branch":%q,"repo":%q}],"count":1,"total":1,"view":"full"}`,
 		closeOutTestTask, closeOutTestRef, closeOutTestHead, closeOutTestRepo))
 	f.plane.serveTool("claim_task", `{"task":{"id":"`+closeOutTestTask+`"},"run":{"id":"run-1"}}`)
+	// The post-session read (CLA-759): the default is the hand-back the conflict
+	// brief asks for, so a test that does not care about the classification gets
+	// the ordinary mechanical outcome. A test overrides this payload to drive
+	// the behavioural, failed and still-held cases.
+	f.plane.serveTool("get_task", fmt.Sprintf(
+		`{"task":{"id":%q,"ref":%q,"status":"approved","claimedByRun":null,"branch":%q,"outcome":"RESOLUTION: mechanical\n\n**Tests**\n- `+closeOutTestBase+`: pass\n\n- a.txt: kept both sides\n- b.txt: kept both sides"}}`,
+		closeOutTestTask, closeOutTestRef, closeOutTestHead))
 	srv := f.plane.serve(t)
 	f.srv = srv.URL
 }
@@ -277,13 +299,27 @@ func (f *closeOutFixture) supervisor(pollWindow time.Duration) *Supervisor {
 		CloseOutVerifier: func(dir string) *delivery.Verifier {
 			return delivery.New(dir, "").WithGHBin(f.ghBin).WithPollWindow(pollWindow, 20*time.Millisecond)
 		},
+		ConflictRun: func(ctx context.Context, cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Result, error) {
+			f.conflictMu.Lock()
+			f.conflicts = append(f.conflicts, conflictCall{req: req, step: step})
+			hook := f.conflictRun
+			f.conflictMu.Unlock()
+			if hook != nil {
+				return hook(ctx, cfg, slug, req, step)
+			}
+			return harness.Result{}, nil
+		},
 	}.withDefaults()
 	d := &Supervisor{o: o, ctx: context.Background()}
-	cfg := &config.Config{Projects: []config.Project{{
-		Slug:              closeOutTestSlug,
-		PrimaryRepo:       closeOutTestRepo,
-		IntegrationBranch: closeOutTestBase,
-	}}}
+	cfg := &config.Config{
+		Harness: "opencode",
+		Model:   "implement-model",
+		Projects: []config.Project{{
+			Slug:              closeOutTestSlug,
+			PrimaryRepo:       closeOutTestRepo,
+			IntegrationBranch: closeOutTestBase,
+		}},
+	}
 	d.instances = []*Instance{{
 		name:    "inst-1",
 		entry:   &RosterEntry{Name: "inst-1", DesiredState: RosterDesiredRunning, Placement: RosterPlacementLocal},
@@ -293,13 +329,42 @@ func (f *closeOutFixture) supervisor(pollWindow time.Duration) *Supervisor {
 	return d
 }
 
-// run drives the pass once with the log captured.
+// conflictCalls returns the conflict sessions the fixture was asked to start.
+func (f *closeOutFixture) conflictCalls() []conflictCall {
+	f.conflictMu.Lock()
+	defer f.conflictMu.Unlock()
+	return append([]conflictCall(nil), f.conflicts...)
+}
+
+// setConflictRun installs a hook the fake session runner calls, so a test can
+// block the session (the at-most-one case) or return a result/error.
+func (f *closeOutFixture) setConflictRun(hook func(ctx context.Context, cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Result, error)) {
+	f.conflictMu.Lock()
+	f.conflictRun = hook
+	f.conflictMu.Unlock()
+}
+
+// run drives the pass once with the log captured. It waits for any conflict-only
+// session the pass starts, so assertions about the session's outcome see a
+// completed hand-back rather than a goroutine still running.
 func (f *closeOutFixture) run(d *Supervisor) string {
+	f.t.Helper()
+	return f.runWith(d, nil)
+}
+
+// runWith is run with a seam between the pass and the wait: a conflict session
+// that blocks the pass's own progress can be released there, deterministically,
+// without the sleep a "wait until the pass has moved on" test would need.
+func (f *closeOutFixture) runWith(d *Supervisor, beforeWait func()) string {
 	f.t.Helper()
 	var buf bytes.Buffer
 	log.SetOutput(&buf)
 	defer log.SetOutput(os.Stderr)
 	d.reconcileCloseOuts()
+	if beforeWait != nil {
+		beforeWait()
+	}
+	d.waitConflict()
 	return buf.String()
 }
 
@@ -424,7 +489,6 @@ func TestCloseOutStandsDownWhenThePRIsNotReady(t *testing.T) {
 		rollup    string
 		want      string
 	}{
-		{"conflicting", "CONFLICTING", "DIRTY", passing, "CONFLICTING"},
 		{"failing check", "MERGEABLE", "CLEAN", `[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"FAILURE"}]`, "FAILING checks"},
 		{"empty rollup", "MERGEABLE", "CLEAN", `[]`, "NO checks"},
 		{"unknown past the budget", "UNKNOWN", "UNKNOWN", passing, "did not report whether"},
@@ -458,18 +522,33 @@ func TestCloseOutConflictNamesEveryPathOncePerPair(t *testing.T) {
 	d := f.supervisor(0)
 
 	first := f.run(d)
-	second := f.run(d)
 
 	for _, want := range []string{"CONFLICTING", "a.txt", "b.txt", closeOutTestRef} {
 		if !strings.Contains(first, want) {
 			t.Errorf("the conflict line does not name %q:\n%s", want, first)
 		}
 	}
+	// The conflict stand-down now takes the claim itself (CLA-759): the claim is
+	// the lock the conflict-only session works under, and is what makes "a task
+	// already claimed gets no session" true rather than hoped for.
+	if got := f.callsFor("claim_task"); len(got) != 1 {
+		t.Errorf("claim_task calls = %d, want exactly the conflict session's claim: %v", len(got), got)
+	}
+	if got := f.conflictCalls(); len(got) != 1 {
+		t.Fatalf("conflict sessions = %d, want exactly one", len(got))
+	}
+
+	// The claim moved the task out of the approved queue, so the next poll has
+	// nothing to report for it: the evidence line is one per head/base pair, and
+	// an unchanged conflict is silent.
+	f.plane.serveTool("list_tasks", `{"tasks":[],"count":0,"total":0,"view":"full"}`)
+	second := f.run(d)
+
 	if strings.Contains(second, "CONFLICTING") {
 		t.Errorf("an unchanged head/base pair was reported twice:\n%s", second)
 	}
-	if got := f.callsFor("claim_task"); len(got) != 0 {
-		t.Errorf("a conflicting PR was claimed: %v", got)
+	if got := f.conflictCalls(); len(got) != 1 {
+		t.Errorf("conflict sessions = %d after a poll with no approved task, want 1", len(got))
 	}
 }
 

@@ -326,7 +326,19 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 			return
 		}
 	case delivery.PRConflict:
-		d.logCloseOutConflict(ctx, verifier, dir, label, key, task, state, base)
+		paths := d.logCloseOutConflict(ctx, verifier, dir, label, key, task, state, base)
+		// A conflict needs judgement, so the deterministic path cannot finish it —
+		// but the fleet can still handle it without waiting for whichever clanker
+		// finishes its current task: a short conflict-only session (CLA-759) on
+		// the fleet's implement model. The session's brief is the narrow one (merge
+		// the base, only the conflicting hunks, the repo gate, push); it claims
+		// nothing, because this path takes the claim first. An unproven base is
+		// the one conflict the session cannot be briefed for: it must merge a
+		// named branch, and guessing which one is the wrong direction.
+		if state.Base == "" {
+			return
+		}
+		d.startConflictSession(ctx, cfg, slug, client, task, state.Number, base, paths, dir)
 		return
 	default:
 		d.closeOutSay(key, "close-out: %s PR #%d is not close-out ready - %s", label, state.Number, state.Check.Detail)
@@ -459,28 +471,39 @@ func (d *Supervisor) closeOutCleanupCtx() (context.Context, context.CancelFunc) 
 	return context.WithTimeout(context.WithoutCancel(d.baseCtx()), closeOutCallTimeout)
 }
 
-// logCloseOutConflict records the evidence for a conflicting PR: the task, the PR,
-// the base and EVERY conflicting path, computed without touching a worktree.
+// conflictEvidence is what one conflicting task's head/base pair is known to
+// conflict on: the pair the paths were computed against, and the paths
+// themselves. Cached so the conflict session started in the same pass is briefed
+// with them, and so a later pass for the same unchanged pair neither re-logs the
+// evidence nor has to recompute it.
+type conflictEvidence struct {
+	pair  string
+	paths []string
+}
+
+// logCloseOutConflict records the evidence for a conflicting PR — the task, the
+// PR, the base and EVERY conflicting path — and returns those paths for the
+// conflict-only session that follows.
 //
 // One line per head/base PAIR, not one per poll. The pair is the judged head's oid
 // plus the base tip read fresh from the remote (`ls-remote`, not a fetch), so a push
 // that changes the head — or a base that moves under it — earns a new line, while an
-// unchanged conflict is silent. That is what keeps this a greppable evidence trail
-// for deciding whether to build the conflict-only session path, rather than a line
-// repeated every 15 seconds. The paths themselves are computed in a throwaway clone,
-// so the evidence never touches the checkout the fleet's sessions are using.
-func (d *Supervisor) logCloseOutConflict(ctx context.Context, verifier *delivery.Verifier, dir, label, key string, task plane.CloseOutTask, state delivery.PRState, base string) {
+// unchanged conflict is silent and its cached paths are returned instead. That is
+// what keeps this a greppable evidence trail as well as the session's input. The
+// paths themselves are computed in a throwaway clone, so the evidence never touches
+// the checkout the fleet's sessions are using.
+func (d *Supervisor) logCloseOutConflict(ctx context.Context, verifier *delivery.Verifier, dir, label, key string, task plane.CloseOutTask, state delivery.PRState, base string) []string {
 	baseTip, err := verifier.RemoteTip(ctx, dir, "origin", base)
 	if err != nil {
 		d.closeOutSay(key+":conflict-tip", "close-out: %s PR #%d is CONFLICTING with %s, but its base tip could not be read (%v)", label, state.Number, base, err)
-		return
+		return nil
 	}
 	pair := state.HeadOID + "@" + baseTip
 	if d.closeOutConflicts == nil {
-		d.closeOutConflicts = map[string]string{}
+		d.closeOutConflicts = map[string]conflictEvidence{}
 	}
-	if d.closeOutConflicts[task.ID] == pair {
-		return // this exact head/base pair has already been reported
+	if prev, ok := d.closeOutConflicts[task.ID]; ok && prev.pair == pair {
+		return prev.paths // this exact head/base pair has already been reported
 	}
 
 	head := strings.TrimSpace(state.Head)
@@ -494,30 +517,31 @@ func (d *Supervisor) logCloseOutConflict(ctx context.Context, verifier *delivery
 	iso, cleanup, err := verifier.IsolatedClone(ctx, dir, "origin")
 	if err != nil {
 		d.closeOutSay(key+":conflict-iso", "close-out: %s PR #%d is CONFLICTING with %s, but a throwaway checkout to name the paths could not be made (%v)", label, state.Number, base, err)
-		return
+		return nil
 	}
 	defer cleanup()
 	dir = iso
 	if err := verifier.FetchRef(ctx, dir, "origin", base); err != nil {
 		d.closeOutSay(key+":conflict-fetch", "close-out: %s PR #%d is CONFLICTING with %s, but the base could not be fetched to name the paths (%v)", label, state.Number, base, err)
-		return
+		return nil
 	}
 	if err := verifier.FetchRef(ctx, dir, "origin", head); err != nil {
 		d.closeOutSay(key+":conflict-fetch", "close-out: %s PR #%d is CONFLICTING with %s, but its head could not be fetched to name the paths (%v)", label, state.Number, base, err)
-		return
+		return nil
 	}
 	paths, err := verifier.ConflictPaths(ctx, dir, "origin/"+base, "origin/"+head)
 	if err != nil {
 		d.closeOutSay(key+":conflict-paths", "close-out: %s PR #%d is CONFLICTING with %s (head %s@%s, base %s@%s), but its conflicting paths could not be computed (%v)", label, state.Number, base, head, shortSHA(state.HeadOID), base, shortSHA(baseTip), err)
-		return
+		return nil
 	}
-	d.closeOutConflicts[task.ID] = pair
+	d.closeOutConflicts[task.ID] = conflictEvidence{pair: pair, paths: paths}
 	named := strings.Join(paths, ", ")
 	if named == "" {
 		named = "(none reported - the fetched tips merged cleanly, so the PR's state is stale)"
 	}
-	d.closeOutSay(key, "close-out: %s PR #%d is CONFLICTING with %s (head %s@%s, base %s@%s) - conflicting paths: %s - leaving it to the agent close-out",
+	d.closeOutSay(key, "close-out: %s PR #%d is CONFLICTING with %s (head %s@%s, base %s@%s) - conflicting paths: %s - the conflict-only session handles it",
 		label, state.Number, base, head, shortSHA(state.HeadOID), base, shortSHA(baseTip), named)
+	return paths
 }
 
 // closeOutSay logs one close-out line, unless the line for that key is unchanged —

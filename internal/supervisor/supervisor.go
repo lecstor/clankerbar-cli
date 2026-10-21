@@ -80,6 +80,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
@@ -237,6 +238,15 @@ type Options struct {
 	// `gh`: a test cannot wait that window out, and must substitute its own gh.
 	CloseOutVerifier func(repo string) *delivery.Verifier
 
+	// ConflictRun launches the conflict-only session (CLA-759) for a conflicted
+	// approved task: the session that merges the PR's base into its branch,
+	// resolves only the conflicting hunks, runs the repo-wide gate and pushes.
+	// Nil = defaultConflictRun, which composes the real harness Invocation from
+	// the instance config. The hook exists so a test can drive the whole
+	// close-out pass without spending a paid session, and assert exactly what the
+	// fleet would have started.
+	ConflictRun func(ctx context.Context, cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Result, error)
+
 	// AfterConfigRewrite is called after a reconcile-time rewrite of a child's
 	// generated config and before the RESTART that applies it is queued
 	// (CLA-724). It is the deterministic seam for the rewrite-to-marker window,
@@ -272,6 +282,9 @@ func (o Options) withDefaults() Options {
 	}
 	if o.PollInterval <= 0 {
 		o.PollInterval = defaultPollInterval
+	}
+	if o.ConflictRun == nil {
+		o.ConflictRun = defaultConflictRun
 	}
 	return o
 }
@@ -409,14 +422,29 @@ type Supervisor struct {
 	closeOutSaid map[string]string
 	// closeOutConflicts remembers the head@base pair already reported as
 	// conflicting per task, so the conflicting-path evidence is logged once per
-	// pair rather than on every reconcile. Also pass-goroutine only.
-	closeOutConflicts map[string]string
+	// pair rather than on every reconcile — and the paths it computed, so a
+	// conflict session started later in the same pair does not have to recompute
+	// (or lose) them. Also pass-goroutine only.
+	closeOutConflicts map[string]conflictEvidence
 	// closeOutBusy is set while a close-out pass runs on its own goroutine, so the
 	// next poll skips instead of starting a second pass over the same queue.
 	closeOutBusy atomic.Bool
 	// closeOutWG tracks that pass, so a fleet stop can wait (bounded) for it to
 	// hand back a claim it had already taken.
 	closeOutWG sync.WaitGroup
+
+	// conflictBusy is set while a conflict-only session runs (CLA-759): at most
+	// one at a time per supervisor, so a second conflicting task waits for the
+	// next poll rather than spending a second paid session.
+	conflictBusy atomic.Bool
+	// conflictWG tracks the session goroutine, so a fleet stop can wait
+	// (bounded) for it to release a claim it holds.
+	conflictWG sync.WaitGroup
+	// conflictSaid remembers the last conflict stand-down line per key, the
+	// close-out's say-it-once discipline. Guarded by conflictMu because the pass
+	// goroutine and the session goroutine both write it.
+	conflictMu   sync.Mutex
+	conflictSaid map[string]string
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
@@ -504,6 +532,10 @@ func Supervise(ctx context.Context, o Options) error {
 			// already, and this bounded wait is what lets it hand back a claim it
 			// had taken before the process exits.
 			d.waitCloseOut()
+			// A conflict-only session is likewise cancelled already; the wait is
+			// what lets it release the claim it holds rather than leaving it to
+			// expire.
+			d.waitConflict()
 			return err
 		case ev := <-d.exits:
 			d.onExit(ev.inst, ev.err, ev.at)
