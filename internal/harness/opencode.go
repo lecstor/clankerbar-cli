@@ -1729,8 +1729,11 @@ var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
 //     so a message carrying no duration/window wording at all is still waitable.
 //   - the message names the window BEFORE the limit word: "5-hour usage limit",
 //     "Your 5-hour limit has been reached", "30-minute usage limit", "session
-//     usage limit", "daily usage limit". The word "usage" is not required — an
-//     untyped provider that calls it a "5-hour limit" is the same window.
+//     usage limit", "daily usage limit", "weekly usage limit". The word "usage"
+//     is not required — an untyped provider that calls it a "5-hour limit" is
+//     the same window. The weekly arm is not optional: it is the window this
+//     task adds, and a prose weekly cap must classify exactly like its sibling
+//     windows instead of reading as no limit at all (review 1.review-1.1).
 //   - the message names the window AFTER the limit word: "Your usage limit has
 //     been reached (5-hour window)". Same statement with the clause order
 //     swapped; without this arm it matches neither the window-first arm (the
@@ -1744,7 +1747,7 @@ var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
 var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"` +
 	`|\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b[^.\n"]{0,40}\blimit\b` +
 	`|\b(?:limit|quota)\b[^.\n"]{0,40}\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b` +
-	`|\b(session|daily)\s+usage\s+limit`)
+	`|\b(session|daily|weekly)\s+usage\s+limit`)
 
 // opencodeResetRe captures the reset instant a rolling quota STATES as RFC3339,
 // e.g. "Your limit resets at 2026-10-20T15:56:48.251Z." When the message does not
@@ -1808,7 +1811,7 @@ func (opencode) DetectLimit(res Result) Limit {
 	// its window there is classified from the window and the code, not from
 	// prose that may be reworded.
 	facts := opencodeErrorFactsOf(res)
-	if window := opencodeWindowLimit(facts, text); window != "" {
+	if window, planLimit := opencodeWindowLimit(facts, text); planLimit {
 		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: window}
 	}
 	// A rolling subscription quota is a LIMIT the loop waits out, so Stop stays
@@ -1834,13 +1837,24 @@ func (opencode) DetectLimit(res Result) Limit {
 
 // opencodeRateLimitWindows maps the provider's structured `rateLimit.window`
 // token onto the label the loop reports. The tokens are Command Code's own —
-// `fiveHour`, `weekly`, `daily` — not opencode's, and the mapping is deliberately
+// `fiveHour`, `weekly`, `daily` — not opencode's. Keys are normalised
+// (lower-case, separators stripped) because the provider's spelling is not
+// stable: `FiveHour` and `five-hour` are the documented token too, and an
+// exact-match map made those variants invisible, which is how a plan cap rode
+// the transient ladder (review 1.review-1.4). The mapping stays deliberately
 // closed: an unrecognised token names no window this adapter understands, and
 // guessing one is how a hard stop becomes an unbounded wait.
 var opencodeRateLimitWindows = map[string]string{
-	"fiveHour": "5-hour",
+	"fivehour": "5-hour",
 	"weekly":   "weekly",
 	"daily":    "daily",
+}
+
+// opencodeWindowToken normalises a structured window token before the closed
+// map lookup: case- and separator-insensitive, so `fiveHour`, `five_hour` and
+// `five-hour` are one window rather than one known token and two unknown ones.
+func opencodeWindowToken(s string) string {
+	return strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(strings.TrimSpace(s)))
 }
 
 // opencodeLimitWindowPhrase is the plan-limit wording a provider uses when it
@@ -1848,11 +1862,17 @@ var opencodeRateLimitWindows = map[string]string{
 // weekly statement labels weekly, and the plan's default cap is the 5-hour one.
 const opencodeLimitWindowPhrase = "usage limit for your plan"
 
-// opencodeWindowLimit resolves the usage window a failure names, or "" when it
-// names none. Two sources, in order:
+// opencodeWindowLimit resolves the plan limit a failure states: the LABEL of
+// the usage window it names (empty when it names none this adapter knows), and
+// whether the failure is a plan limit at all. Two sources, in order:
 //
 //  1. The STRUCTURED `rateLimit.window` from the provider's response body —
-//     top level or nested under the body's `error` object.
+//     top level or nested under the body's `error` object. Its token is
+//     authoritative: when it names a window the closed map does not know, the
+//     window is UNKNOWN — the wording is not consulted over it, because a
+//     window the provider named is not something prose may relabel, and the
+//     plan's default is a guess the map's own contract forbids (reviews
+//     1.review-1.4, 1.review-2.2).
 //  2. The message's "usage limit for your plan" phrase, which is the same
 //     statement in prose: weekly when it says weekly, otherwise the plan's
 //     default 5-hour window.
@@ -1862,22 +1882,28 @@ const opencodeLimitWindowPhrase = "usage limit for your plan"
 // window seen on a 5xx is not a plan cap, and a 429 that names no window stays
 // the transient burst limit IsTransient already handles — that is the difference
 // between waiting out a plan cap and backing off a burst.
-func opencodeWindowLimit(f opencodeErrorFacts, text string) string {
+func opencodeWindowLimit(f opencodeErrorFacts, text string) (window string, planLimit bool) {
 	rateLimited := f.Status == 429 || strings.EqualFold(f.Code, "RATE_LIMITED")
 	if !rateLimited {
-		return ""
+		return "", false
 	}
-	if label, ok := opencodeRateLimitWindows[f.Window]; ok {
-		return label
+	if f.Window != "" {
+		// The body NAMED a window. The closed map decides the label — including
+		// "no label" for a token it does not know. The failure is still a plan
+		// limit (a rate-limited failure that names a window is one by the task's
+		// own rule); what it is NOT is the 5-hour default, which would label a
+		// cap the provider never described as 5-hour and turn an unknown window
+		// into an unbounded wait (reviews 1.review-1.4, 1.review-2.2).
+		return opencodeRateLimitWindows[opencodeWindowToken(f.Window)], true
 	}
 	lower := strings.ToLower(text)
 	if !strings.Contains(lower, opencodeLimitWindowPhrase) {
-		return ""
+		return "", false
 	}
 	if window := opencodeNamedWindow(text); window != "" {
-		return window
+		return window, true
 	}
-	return "5-hour"
+	return "5-hour", true
 }
 
 // opencodeNamedWindow labels a window the text NAMES, when it names one. It is
@@ -1885,17 +1911,31 @@ func opencodeWindowLimit(f opencodeErrorFacts, text string) string {
 // shape rather than by the structured token: an untyped "daily usage limit" is
 // the daily window. A bare "30-minute usage limit" names a duration, not one of
 // the plan's windows, and stays unlabelled rather than being called 5-hour.
+//
+// The window word only counts inside the limit STATEMENT — the same clause as a
+// limit/quota word (either side of it, since the provider swaps the order). The
+// scan reads the whole diagnostic text, which includes the terminal error event
+// and the provider's raw body, so a stray "weekly" in a session id or a body
+// field must not relabel the cap (review 1.review-1.6).
+var opencodeNamedWindowRe = regexp.MustCompile(`(?i)\b(weekly|daily|5[- ]hour)\b[^.\n"]{0,40}\b(?:usage\s+)?(?:limit|quota)\b` +
+	`|\b(?:usage\s+)?(?:limit|quota)\b[^.\n"]{0,40}\b(weekly|daily|5[- ]hour)\b`)
+
 func opencodeNamedWindow(text string) string {
-	lower := strings.ToLower(text)
-	switch {
-	case strings.Contains(lower, "weekly"):
-		return "weekly"
-	case strings.Contains(lower, "daily"):
-		return "daily"
-	case strings.Contains(lower, "5-hour"), strings.Contains(lower, "5 hour"):
-		return "5-hour"
+	m := opencodeNamedWindowRe.FindStringSubmatch(text)
+	if m == nil {
+		return ""
 	}
-	return ""
+	token := m[1]
+	if token == "" {
+		token = m[2]
+	}
+	switch strings.ToLower(token) {
+	case "weekly":
+		return "weekly"
+	case "daily":
+		return "daily"
+	}
+	return "5-hour"
 }
 
 // opencodeErrorFacts is what the terminal error event states STRUCTURALLY:
@@ -1924,9 +1964,12 @@ type opencodeErrorFacts struct {
 // re-parsed by opencode, so `code` and `rateLimit` are only reachable by
 // decoding that string here.
 //
-// Body first, wrapper second: the provider's own fields outrank opencode's
-// restatement, and only a field the body does not carry falls back to the
-// envelope.
+// Wrapper first, body second: the transport's own `error.status` is the status
+// the request actually failed with, while a provider body may carry an envelope
+// `status: 200` (or any other non-HTTP value) that says nothing about the
+// failure. Filling the status from the body first masked a wrapper 429 and sent
+// a plan cap down the transient ladder (review 1.review-1.5). Code and window
+// live only in the body, so the wrapper merge leaves those holes for it.
 func opencodeErrorFactsOf(res Result) opencodeErrorFacts {
 	line := opencodeTerminalErrorLine(res)
 	if line == "" {
@@ -1939,7 +1982,7 @@ func opencodeErrorFactsOf(res Result) opencodeErrorFacts {
 	errObj := opencodeJSONObject(ev["error"])
 	dataObj := opencodeJSONObject(errObj["data"])
 
-	var f opencodeErrorFacts
+	f := opencodeMergeFacts(opencodeFactsFromObject(errObj), opencodeFactsFromObject(dataObj))
 	for _, raw := range []any{
 		opencodeJSONObject(errObj["response"])["body"],
 		dataObj["responseBody"],
@@ -1958,17 +2001,17 @@ func opencodeErrorFactsOf(res Result) opencodeErrorFacts {
 		// The provider's body is normally an {error:{…}} envelope itself.
 		f = opencodeMergeFacts(f, opencodeFactsFromObject(opencodeJSONObject(decoded["error"])))
 	}
-	f = opencodeMergeFacts(f, opencodeFactsFromObject(errObj))
-	return opencodeMergeFacts(f, opencodeFactsFromObject(dataObj))
+	return f
 }
 
 // opencodeFactsFromObject reads the three structured fields out of one decoded
-// JSON object. Absent or wrongly-typed fields stay zero.
+// JSON object. Absent or wrongly-typed fields stay zero, and a `status` outside
+// the HTTP range is not a status at all (review 1.review-1.5).
 func opencodeFactsFromObject(o map[string]any) opencodeErrorFacts {
 	var f opencodeErrorFacts
-	if n, ok := opencodeJSONNumber(o["status"]); ok {
+	if n, ok := opencodeJSONNumber(o["status"]); ok && n >= 100 && n <= 599 {
 		f.Status = n
-	} else if n, ok := opencodeJSONNumber(o["statusCode"]); ok {
+	} else if n, ok := opencodeJSONNumber(o["statusCode"]); ok && n >= 100 && n <= 599 {
 		f.Status = n
 	}
 	if s, ok := o["code"].(string); ok {
@@ -2294,6 +2337,17 @@ func (o opencode) IsTransient(res Result) bool {
 		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
 		return false
 	}
+	// CLA-752: the same veto for a plan cap stated STRUCTURALLY. A rate-limited
+	// failure whose body names a usage window — or that says "usage limit for
+	// your plan" — is a limit the loop WAITS out; DetectLimit says so from the
+	// same function, and the two classifiers agreeing is what makes the loop's
+	// DetectLimit-first ordering safe (CLA-381, review 1.review-1.2). Without
+	// this, the body-only shape was "limited" to one classifier and "retryable"
+	// to the other, so a caller that asked this one alone retried a plan cap as
+	// if it were a burst.
+	if _, planLimit := opencodeWindowLimit(opencodeErrorFactsOf(res), text); planLimit {
+		return false
+	}
 	// CLA-700: a session that RECOVERED from its provider errors is not retryable,
 	// however its exit status reads. 2.x emits the error, retries the request
 	// itself and finishes the work, then exits 1 anyway (pinned by the conformance
@@ -2338,6 +2392,12 @@ func (opencode) IsUnclassifiedTransient(res Result) bool {
 	text := opencodeErrorText(res)
 	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
 		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	// CLA-752: IsTransient's structural veto, for the same reason — the
+	// heuristic must not launder a body-named plan cap into a bounded guess
+	// (review 1.review-1.2).
+	if _, planLimit := opencodeWindowLimit(opencodeErrorFactsOf(res), text); planLimit {
 		return false
 	}
 	// CLA-700: the same rule as IsTransient's — a session that recovered from its

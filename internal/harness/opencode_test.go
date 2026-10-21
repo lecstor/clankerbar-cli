@@ -190,6 +190,13 @@ func TestOpencodeDetectLimit(t *testing.T) {
 		{"untyped 30-minute usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your 30-minute usage limit"}}`}, true, false, "", ""},
 		{"untyped session usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your session usage limit"}}`}, true, false, "", ""},
 		{"untyped daily usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your daily usage limit"}}`}, true, false, "", "daily"},
+		// Review 1.review-1.1: the WEEKLY window is the one this task adds, and a
+		// prose weekly cap must classify exactly like its siblings — a rolling
+		// limit labelled weekly — instead of reading as no limit at all (and, on
+		// a 429, riding the transient ladder).
+		{"untyped weekly usage limit on stderr", Result{Stderr: "You've reached your weekly usage limit for your plan"}, true, false, "", "weekly"},
+		{"untyped weekly usage limit without the plan phrase", Result{Stderr: "You've reached your weekly usage limit."}, true, false, "", "weekly"},
+		{"untyped weekly usage limit with a 429 but no plan phrase", Result{Stdout: `{"type":"error","error":{"message":"You've reached your weekly usage limit.","status":429}}`}, true, false, "", "weekly"},
 		// Review 1.review-2.2: the same rolling window with the limit word FIRST
 		// ("...has been reached (5-hour window)") matches neither the window-first
 		// arm nor the generic arm (which wants "usage limit reached" adjacent), so
@@ -209,6 +216,19 @@ func TestOpencodeDetectLimit(t *testing.T) {
 		// The older APIError shape puts the same provider body under
 		// error.data.responseBody (the tool-schema-rejection capture's wrapping).
 		{"structured weekly window in error.data.responseBody", Result{Stdout: `{"type":"error","error":{"name":"APIError","data":{"message":"Rate limit reached.","statusCode":429,"responseBody":"{\"error\":{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}}"}}}`}, true, false, "", "weekly"},
+		// Review 1.review-1.4: a token the closed map does not know names NO
+		// window. Falling through to the wording default labelled an unknown cap
+		// 5-hour — a guess the map's own contract forbids — while the provider
+		// plainly named a window, so the limit survives with no label.
+		{"unrecognised structured window token names no window", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You've reached the usage limit for your plan.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"monthly\"}}"}}}`}, true, false, "", ""},
+		// The documented token is matched case- and separator-insensitively: a
+		// "FiveHour" variant is the same window, not an invisible cap that rides
+		// the transient ladder (review 1.review-1.4).
+		{"structured FiveHour variant", Result{Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"FiveHour\"}}"}}}`}, true, false, "", "5-hour"},
+		// Review 1.review-1.5: the body's own status is a restatement, never the
+		// transport. A body that says 200 must not mask the wrapper's 429 and
+		// send the cap down the transient ladder.
+		{"wrapper 429 outranks a body's own 200 status", Result{Stdout: `{"type":"error","error":{"message":"You've reached your plan limit.","status":429,"response":{"body":"{\"status\":200,\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, true, false, "", "weekly"},
 		// The message-only fallback, when no body survived the wrapping at all.
 		{"plan-limit wording with no body (5-hour default)", Result{Stdout: `{"type":"error","error":{"message":"You've reached the usage limit for your plan. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z", "5-hour"},
 		{"plan-limit wording that says weekly", Result{Stdout: `{"type":"error","error":{"message":"You've reached the weekly usage limit for your plan.","status":429}}`}, true, false, "", "weekly"},
@@ -335,6 +355,20 @@ func TestOpencodeErrorFactsOf(t *testing.T) {
 			name:   "recovered error event carries no facts",
 			stdout: `{"type":"error","error":{"response":{"body":"{\"code\":\"RATE_LIMITED\"}"}}}` + "\n" + `{"type":"step_start","part":{"type":"step-start"}}`,
 		},
+		{
+			// Review 1.review-1.5: the body's own status is a restatement, so a
+			// provider envelope carrying status:200 must not mask the wrapper's
+			// 429. Code and window still come from the body.
+			name:       "wrapper status outranks a body status",
+			stdout:     `{"type":"error","error":{"message":"Rate limit","status":429,"response":{"body":"{\"status\":200,\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`,
+			wantStatus: 429, wantCode: "RATE_LIMITED", wantWindow: "weekly",
+		},
+		{
+			// A body status outside the HTTP range is not a status at all (review
+			// 1.review-1.5).
+			name:   "body status outside the HTTP range is ignored",
+			stdout: `{"type":"error","error":{"message":"Rate limit","response":{"body":"{\"status\":7}"}}}`,
+		},
 		{name: "clean stream", stdout: opencodeStream},
 	}
 	for _, tc := range tests {
@@ -353,6 +387,7 @@ func TestOpencodeErrorFactsOf(t *testing.T) {
 	}
 }
 
+// Review 1.review-2.2: a provider that states its window by DURATION states the
 // same thing as an absolute instant — when the limit lifts — so it classifies as
 // a wait, not as the generic arm's hard stop.
 func TestOpencodeDetectLimitRelativeReset(t *testing.T) {
@@ -393,6 +428,33 @@ func TestParseOpencodeResetAt(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := parseOpencodeResetAt(tc.msg, now); !got.Equal(tc.want) {
 				t.Errorf("parseOpencodeResetAt(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOpencodeNamedWindow pins the wording arm's label — and its SCOPE (review
+// 1.review-1.6): the window word only counts inside the limit statement, so the
+// rest of the diagnostic text (the error envelope, the provider's raw body, a
+// session id) cannot relabel the cap.
+func TestOpencodeNamedWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"weekly before the limit word", "You've reached your weekly usage limit", "weekly"},
+		{"daily after the limit word", "Your usage limit has been reached (daily window)", "daily"},
+		{"5-hour before the limit word", "You've reached your 5-hour limit", "5-hour"},
+		{"5 hour spelled out", "Your 5 hour usage limit has been reached", "5-hour"},
+		{"a duration that is not a plan window", "You have reached your 30-minute usage limit", ""},
+		{"session is not a plan window", "You have reached your session usage limit", ""},
+		{"a stray window word outside the limit statement", `{"type":"error","error":{"message":"Rate limit reached.","session":"weekly-report"}}`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := opencodeNamedWindow(tc.text); got != tc.want {
+				t.Errorf("opencodeNamedWindow(%q) = %q, want %q", tc.text, got, tc.want)
 			}
 		})
 	}
@@ -499,6 +561,11 @@ func TestOpencodeIsTransient(t *testing.T) {
 		// rolling-quota arm vetoes that, and the loop's DetectLimit branch is what
 		// actually waits the window out.
 		{"rolling 5-hour quota is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: opencodeQuotaEventFixture(t)}, false},
+		// Review 1.review-1.2: a plan cap whose only signal is the STRUCTURED
+		// window in the provider's body is a limit the loop WAITS out. DetectLimit
+		// says so from the same window arm; this classifier must agree, or a
+		// caller that asks IsTransient alone retries a weekly cap as a burst.
+		{"structured weekly body is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, false},
 		{"clean run", Result{Stdout: opencodeStream}, false},
 		// CLA-700, the 2026-10-19 incidents: an error event the session RECOVERED
 		// from classifies nothing. 2.x emits provider.invalid-output, retries the

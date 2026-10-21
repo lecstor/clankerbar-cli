@@ -5445,7 +5445,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					drainNum, limitReason(lim), logPath)
 				return tokens, cost, true, end, nil
 			}
-			log.Printf("iteration %d hit a usage limit", drainNum)
+			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
 			// A RESUMED phase must not wait one out (CLA-631). The seam's handback
 			// has already ended the claim: `release` puts a no-work claim straight
 			// back in the queue, and `expireLease` ends a pushed-work claim's lease
@@ -6874,9 +6874,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	waitedOnReset := waitingForReset
 	if waitingForReset {
 		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
-		log.Printf("paused%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
+		log.Printf("paused%s%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
 	} else {
-		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+		log.Printf("paused%s%s — probing every %s for an early reset", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), interval)
 	}
 
 	// CLA-728: the wait can outlast the plane's liveness window many times over,
@@ -8093,10 +8093,19 @@ func limitReason(lim harness.Limit) string {
 	if reason == "" {
 		reason = "usage limit"
 	}
-	if lim.Window != "" {
-		return reason + " (" + lim.Window + " window)"
+	return reason + limitWindowSuffix(lim)
+}
+
+// limitWindowSuffix names the usage window for a log line that already says what
+// it is doing, or "" when the adapter named none (CLA-752). The supervised wait
+// uses it so the pause an operator actually sits through distinguishes a
+// multi-day weekly cap from a 5-hour one (reviews 1.review-2.1, 1.review-3.1,
+// 1.review-5.1, 1.review-1.3).
+func limitWindowSuffix(lim harness.Limit) string {
+	if lim.Window == "" {
+		return ""
 	}
-	return reason
+	return " (" + lim.Window + " window)"
 }
 
 // isReviewPhase reports whether a phase is a review-phase (the gate where
