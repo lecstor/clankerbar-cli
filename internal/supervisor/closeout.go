@@ -79,10 +79,6 @@ const (
 // close-out that could not run must not stop the fleet from being reconciled — the
 // approved task is still waiting for the agent path.
 func (d *Supervisor) reconcileCloseOuts() {
-	if strings.TrimSpace(d.o.WorkdirRoot) == "" {
-		d.closeOutSay("no-root", "close-out: no workdir_root is configured, so there is no checkout to verify a merge against - approved tasks stay with the agent close-out")
-		return
-	}
 	budget := time.Now().Add(closeOutPassBudget)
 	seen := map[string]bool{}
 	for _, inst := range d.instances {
@@ -185,7 +181,7 @@ func (d *Supervisor) reconcileCloseOutTask(cfg *config.Config, slug string, clie
 		d.closeOutSay(key, "close-out: %s is approved but names no repo, so its checkout cannot be located - leaving it to the agent close-out", label)
 		return
 	}
-	dir, err := closeOutRepoDir(d.o.WorkdirRoot, slug, task.Repo)
+	dir, err := closeOutRepoDir(cfg, d.o.WorkdirRoot, slug, task.Repo)
 	if err != nil {
 		d.closeOutSay(key, "close-out: %s cannot be closed out from here: %v - leaving it to the agent close-out", label, err)
 		return
@@ -225,14 +221,20 @@ func (d *Supervisor) reconcileCloseOutTask(cfg *config.Config, slug string, clie
 		d.closeOutSay(key, "close-out: %s integrates into %s, which is a release branch - promotion is the operator's, so approved tasks here are not merged by the fleet", label, base)
 		return
 	}
-	if pr.Base != base {
-		d.closeOutSay(key, "close-out: %s PR #%d targets %q, not the integration branch %q - a release-targeted PR is the operator's promotion; leaving it", label, pr.Number, pr.Base, base)
-		return
-	}
 
 	// The judgement is the delivery gate's own (internal/delivery), so this path
 	// can never call a PR greener than the gate that judges an agent's delivery.
 	state := verifier.JudgePR(ctx, dir, task.Repo, pr.Number)
+
+	// The base is checked on the JUDGED read, not the listing above: the two are
+	// separate calls, and a PR retargeted between them must not be merged into the
+	// target the older read named. An empty base means the judgement could not read
+	// the PR at all, and that is reported by the verdict branch below.
+	if state.Base != "" && state.Base != base {
+		d.closeOutSay(key, "close-out: %s PR #%d targets %q, not the integration branch %q - a release-targeted PR is the operator's promotion; leaving it", label, state.Number, state.Base, base)
+		return
+	}
+
 	switch state.Verdict {
 	case delivery.PRReady:
 	case delivery.PRConflict:
@@ -376,9 +378,6 @@ func (d *Supervisor) closeOutFor(cfg *config.Config, project string) plane.Close
 	if endpoint == "" || d.o.APIKey == "" {
 		return nil
 	}
-	if d.o.CloseOutFor != nil {
-		return d.o.CloseOutFor(endpoint, d.o.APIKey)
-	}
 	return plane.NewCloseOutAPI(endpoint, d.o.APIKey)
 }
 
@@ -393,32 +392,73 @@ func (d *Supervisor) closeOutVerifier(dir string) *delivery.Verifier {
 	return delivery.New(dir, "")
 }
 
-// closeOutRepoDir resolves the fleet's checkout of one task's repo under the
-// machine root: <root>/<project slug>/<repo name>, which is the layout the workdir
-// derivation materializes. It VERIFIES the directory is that repo's checkout rather
-// than trusting the path: merging a task's PR into the base of whatever happens to
-// sit at that name would be a correctness failure invisible in the log.
-func closeOutRepoDir(root, slug, repo string) (string, error) {
-	pr, err := ProjectRoot(root, slug)
-	if err != nil {
-		return "", err
+// closeOutRepoDir resolves the checkout the close-out works a task's repo in. Two
+// sources, in the order the children themselves use:
+//
+//  1. the fleet's DERIVED clone at <root>/<project slug>/<repo name>, when a machine
+//     workdir root is stated (the layout the workdir derivation materializes);
+//  2. the operator's own declared checkout, resolved exactly as a session's spawn cwd
+//     is (`repos` entry, primary, then the workdir conventions).
+//
+// Whichever answers is VERIFIED to be a checkout of that repo before it is used:
+// fetching into, and merging the PR of, whatever happens to sit at a name would be a
+// correctness failure invisible in the log — the repo the PR belongs to is decided by
+// the task's own repo identity, not by the directory layout.
+func closeOutRepoDir(cfg *config.Config, root, slug, repo string) (string, error) {
+	var tried []string
+	if strings.TrimSpace(root) != "" {
+		if projectDir, err := ProjectRoot(root, slug); err == nil {
+			dir := filepath.Join(projectDir, basenameOfRepo(repo))
+			if err := checkCloseOutCheckout(dir, repo); err == nil {
+				return dir, nil
+			}
+			tried = append(tried, dir)
+		}
 	}
-	dir := filepath.Join(pr, basenameOfRepo(repo))
+	workdir := closeOutProjectWorkdir(cfg, slug)
+	if dir, err := config.ResolveCheckout(cfg.ReposFor(slug), cfg.PrimaryRepoFor(slug), workdir, repo); err == nil {
+		if err := checkCloseOutCheckout(dir, repo); err == nil {
+			return dir, nil
+		}
+		tried = append(tried, dir)
+	}
+	if len(tried) == 0 {
+		return "", fmt.Errorf("no checkout of %s could be located (no machine workdir root and no configured checkout)", repo)
+	}
+	return "", fmt.Errorf("no checkout of %s: %s", repo, strings.Join(tried, ", "))
+}
+
+// closeOutProjectWorkdir is the workdir a project's sessions run in, for the
+// configured-checkout fallback: its own when the project names one, else the
+// config's.
+func closeOutProjectWorkdir(cfg *config.Config, slug string) string {
+	for _, p := range cfg.Projects {
+		if strings.EqualFold(p.Slug, slug) && strings.TrimSpace(p.WorkDir) != "" {
+			return p.WorkDir
+		}
+	}
+	return cfg.WorkDir
+}
+
+// checkCloseOutCheckout verifies dir is a real directory (not a symlink) and a
+// checkout of repo, by its attributable origin remote. See checkoutOriginRemote for
+// what "attributable" means and delivery.MatchesRepoSlug for the comparison.
+func checkCloseOutCheckout(dir, repo string) error {
 	fi, err := os.Lstat(dir)
 	if err != nil {
-		return "", fmt.Errorf("no checkout at %s (%v)", dir, err)
+		return fmt.Errorf("no checkout at %s (%v)", dir, err)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 || !fi.IsDir() {
-		return "", fmt.Errorf("%s is not a directory the fleet owns", dir)
+		return fmt.Errorf("%s is not a directory the fleet owns", dir)
 	}
 	remote, err := checkoutOriginRemote(dir)
 	if err != nil {
-		return "", fmt.Errorf("%s is not a checkout (%v)", dir, err)
+		return fmt.Errorf("%s is not a checkout (%v)", dir, err)
 	}
 	if !delivery.MatchesRepoSlug(remote, repo) {
-		return "", fmt.Errorf("%s is a checkout of %s, not %s", dir, remote, repo)
+		return fmt.Errorf("%s is a checkout of %s, not %s", dir, remote, repo)
 	}
-	return dir, nil
+	return nil
 }
 
 // closeOutBase resolves the branch a task PR must target: the operator's per-repo

@@ -54,6 +54,13 @@
 // `<backlog_url>/api/daemon-roster/status` — so the console can tell a HALTed
 // instance from a crashed one without reading this machine's log. Reporting is
 // fail-soft telemetry and never control flow.
+//
+// CLA-758 adds the deterministic half of INTEGRATION: an approved-awaiting-merge
+// task whose pull request is mergeable, green and based on the project's
+// integration branch is claimed, merged as a merge commit and closed done by this
+// process, with no harness session at all. Everything it cannot do without
+// judgement — a conflict above all — is left exactly where the agent close-out
+// already picks it up. See closeout.go.
 package supervisor
 
 import (
@@ -222,12 +229,6 @@ type Options struct {
 	// a test's fake plane is not; a test supplies a client pointed at its own
 	// server so the wire shape is exercised for real.
 	PlaneFor func(endpoint, apiKey string) plane.Releaser
-
-	// CloseOutFor builds the plane client the deterministic close-out uses for one
-	// project's endpoint (CLA-758). Nil = plane.NewCloseOutAPI. Same rationale as
-	// PlaneFor: the endpoint resolved is a production one, and a test's fake plane
-	// is not it.
-	CloseOutFor func(endpoint, apiKey string) plane.CloseOutAPI
 
 	// CloseOutVerifier builds the local verifier a close-out judges one repo with.
 	// Nil = delivery.New(repo, "") with production defaults. The hook exists

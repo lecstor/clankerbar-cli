@@ -271,6 +271,18 @@ type fakePlane struct {
 	// planeRefusal, when set, is returned as an MCP tool-level refusal
 	// (`isError`, the shape the plane uses for not_holding/run_superseded).
 	planeRefusal string
+	// tools holds one JSON text payload per tool name: a tool listed here answers
+	// with it, and every other tool keeps the generic `{}` (the write-path answer).
+	// The close-out reads (policy, approved queue, claim) need real payloads, so
+	// this is how a test serves them over the wire rather than reaching around the
+	// client.
+	tools map[string]string
+	// toolRefusals holds one MCP tool-level refusal per tool name, so a test can
+	// refuse ONE call (claim_task) without refusing every other.
+	toolRefusals map[string]string
+	// refuseWhen, when set, can refuse a call by its ARGUMENTS as well as its tool
+	// name — the shape a close refused while a release is still allowed needs.
+	refuseWhen func(tool string, args map[string]any) string
 }
 
 type planeCall struct {
@@ -298,7 +310,19 @@ func (p *fakePlane) serve(t *testing.T) *httptest.Server {
 				p.calls = append(p.calls, planeCall{path: r.URL.Path, tool: rpc.Params.Name, args: rpc.Params.Arguments})
 			}
 			refusal := p.planeRefusal
+			if one := p.toolRefusals[rpc.Params.Name]; one != "" {
+				refusal = one
+			}
+			payload, hasPayload := p.tools[rpc.Params.Name]
+			hook := p.refuseWhen
 			p.mu.Unlock()
+			if hook != nil {
+				// Called OUTSIDE the lock: a hook that reads the plane's recorded
+				// calls would otherwise deadlock against the request it is serving.
+				if one := hook(rpc.Params.Name, rpc.Params.Arguments); one != "" {
+					refusal = one
+				}
+			}
 			if down {
 				http.Error(w, "plane unreachable", http.StatusServiceUnavailable)
 				return
@@ -310,6 +334,15 @@ func (p *fakePlane) serve(t *testing.T) *httptest.Server {
 					"result": map[string]any{
 						"isError": true,
 						"content": []map[string]any{{"type": "text", "text": refusal}},
+					},
+				})
+				return
+			}
+			if hasPayload {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"jsonrpc": "2.0", "id": 1,
+					"result": map[string]any{
+						"content": []map[string]any{{"type": "text", "text": payload}},
 					},
 				})
 				return
@@ -381,6 +414,28 @@ func (p *fakePlane) planeCalls() []planeCall {
 func (p *fakePlane) setPlaneRefusal(text string) {
 	p.mu.Lock()
 	p.planeRefusal = text
+	p.mu.Unlock()
+}
+
+// serveTool makes one MCP tool answer with payload (a JSON text payload), for the
+// reads the close-out needs real answers to.
+func (p *fakePlane) serveTool(tool, payload string) {
+	p.mu.Lock()
+	if p.tools == nil {
+		p.tools = map[string]string{}
+	}
+	p.tools[tool] = payload
+	p.mu.Unlock()
+}
+
+// refuseTool makes one MCP tool answer with a tool-level refusal, leaving every
+// other call alone: the shape a lost claim race takes.
+func (p *fakePlane) refuseTool(tool, text string) {
+	p.mu.Lock()
+	if p.toolRefusals == nil {
+		p.toolRefusals = map[string]string{}
+	}
+	p.toolRefusals[tool] = text
 	p.mu.Unlock()
 }
 
