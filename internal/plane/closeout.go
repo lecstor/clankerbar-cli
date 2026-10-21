@@ -33,11 +33,11 @@ type CloseOutAPI interface {
 	ClaimCloseOut(ctx context.Context, taskID string) (string, error)
 
 	// ReleaseCloseOut hands a claim back with the task still approved, so the
-	// agent close-out remains the fallback. checkGreen attests the PR's check was
-	// green at the hand-back — true whenever this path released, because it never
-	// merges an unjudged PR — which keeps the plane's CI-repair ladder from
-	// charging a failed repair to a merge that simply did not happen.
-	ReleaseCloseOut(ctx context.Context, taskID, runID string) error
+	// agent close-out remains the fallback. checkGreen attests whether the PR's
+	// checks were green at the hand-back: true when the failure was NOT the merge
+	// itself (a post-merge plane write, say), false when the merge is what failed —
+	// the plane's CI-repair ladder is what bounds a green-but-unmergeable PR.
+	ReleaseCloseOut(ctx context.Context, taskID, runID string, checkGreen bool) error
 
 	// CompleteCloseOut records the delivery and closes the task done, in the
 	// claim's run.
@@ -106,7 +106,7 @@ func (coNotWired) ApprovedForCloseOut(context.Context) (CloseOutQueue, error) {
 func (coNotWired) ClaimCloseOut(context.Context, string) (string, error) {
 	return "", ErrNotWired
 }
-func (coNotWired) ReleaseCloseOut(context.Context, string, string) error { return ErrNotWired }
+func (coNotWired) ReleaseCloseOut(context.Context, string, string, bool) error { return ErrNotWired }
 func (coNotWired) CompleteCloseOut(context.Context, string, string, CloseOutDelivery) error {
 	return ErrNotWired
 }
@@ -207,14 +207,20 @@ func (r *mcpReleaser) ClaimCloseOut(ctx context.Context, taskID string) (string,
 // ReleaseCloseOut hands a close-out claim back, leaving the task APPROVED (the
 // plane routes a release by the claim's own approve verdict, so an approved claim
 // returns to approved and never to the fresh queue). The driver marker records that
-// a driver made the hand-back; checkGreen attests the PR's check was green, which is
-// true by construction here (this path only claims what it judged mergeable and
-// green) and is what stops the CI-repair ladder counting our own failure to merge
-// as a failed repair.
+// a driver made the hand-back; checkGreen attests whether the PR's own checks were
+// green when it was released.
+//
+// checkGreen is load-bearing for the plane's repair ladder, which counts a release
+// that is NOT attested green. A merge this path could not make leaves a PR whose
+// checks are still green, so attesting true there is the honest CI statement — but
+// it also means the plane never bounds the repetition. The caller therefore passes
+// false when the MERGE is what failed: a green-but-unmergeable PR (branch
+// protection, a base that moved) has no failing check to escalate on, and the
+// ladder is the only thing that surfaces it.
 //
 // A plane older than one of the markers refuses the field by name; the retry
 // without the markers keeps the hand-back itself, which is the load-bearing part.
-func (r *mcpReleaser) ReleaseCloseOut(ctx context.Context, taskID, runID string) error {
+func (r *mcpReleaser) ReleaseCloseOut(ctx context.Context, taskID, runID string, checkGreen bool) error {
 	if taskID == "" || runID == "" {
 		return errors.New("release close-out: taskId and runId are both required")
 	}
@@ -223,7 +229,7 @@ func (r *mcpReleaser) ReleaseCloseOut(ctx context.Context, taskID, runID string)
 		"runId":          runID,
 		"release":        true,
 		"driverReleased": true,
-		"checkGreen":     true,
+		"checkGreen":     checkGreen,
 	})
 	if err == nil {
 		return nil

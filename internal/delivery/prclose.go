@@ -29,6 +29,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -148,6 +149,14 @@ func (v *Verifier) JudgePR(ctx context.Context, repo, slug string, num int) PRSt
 		Head:    view.HeadRefName,
 		HeadOID: view.HeadRefOid,
 	}
+	// A read that named no base cannot be shown to target anything, and this
+	// surface exists to merge into ONE configured branch. Whatever the check
+	// said, an unnamed merge target is a refusal — never a pass that a caller
+	// could act on.
+	if chk.Status == Pass && strings.TrimSpace(view.BaseRefName) == "" {
+		chk = Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
+			"PR %d was read without a base branch, so its merge target cannot be proven", num)}
+	}
 	state.Verdict = PRRefused
 	switch {
 	case chk.Status == Pass:
@@ -163,44 +172,108 @@ func (v *Verifier) JudgePR(ctx context.Context, repo, slug string, num int) PRSt
 // rebase: the batch-integration flow depends on the history the merge commit
 // keeps — and returns that merge commit's SHA.
 //
-// expectedHeadOID pins the merge to the revision that was JUDGED: the API's own
-// `sha` parameter refuses the merge when the head has moved since, so a push that
-// lands between the judgement and this call cannot be merged unreviewed and
-// unjudged. Empty skips the pin (only for a caller that has no head to name).
-func (v *Verifier) MergePR(ctx context.Context, repo, slug string, num int, expectedHeadOID string) (string, error) {
+// It names the BASE explicitly (GitHub's "merge a branch" endpoint) instead of
+// merging through the pull request. A PR's base is a mutable property of the PR:
+// whoever can retarget it can point it at `main` between the judgement and the
+// merge, and the pull-request merge endpoint has no parameter that pins it — that
+// endpoint merges into whatever base the PR carries when GitHub processes it. A
+// request that names the branch is the only mechanism where the target is an
+// invariant of the merge itself: a PR retargeted after the judgement is still
+// merged into the configured integration branch, or not merged at all.
+//
+// expectedHeadOID pins the merge to the revision that was JUDGED: it is the
+// request's `head`, so a push that lands between the judgement and this call is
+// not what gets merged. It is REQUIRED — a caller that cannot name the revision it
+// judged has no pin to offer, and dropping the pin silently is the hole this
+// parameter exists to close.
+func (v *Verifier) MergePR(ctx context.Context, repo, slug string, num int, base, expectedHeadOID string) (string, error) {
 	if strings.TrimSpace(slug) == "" {
 		return "", errors.New("merge PR: no repository slug")
 	}
 	if num <= 0 {
 		return "", errors.New("merge PR: no pull request number")
 	}
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return "", errors.New("merge PR: no base branch to merge into")
+	}
+	head := strings.TrimSpace(expectedHeadOID)
+	if head == "" {
+		return "", fmt.Errorf("merge PR: no judged head revision to pin PR %d to, so the merge would not be pinned to what was judged", num)
+	}
 	if _, err := exec.LookPath(v.ghBin); err != nil {
 		return "", fmt.Errorf("merge PR: %s is not on PATH", v.ghBin)
 	}
 	args := []string{
-		"api", "--method", "PUT",
-		fmt.Sprintf("repos/%s/pulls/%d/merge", slug, num),
-		"-f", "merge_method=merge",
-	}
-	if head := strings.TrimSpace(expectedHeadOID); head != "" {
-		args = append(args, "-f", "sha="+head)
+		"api", "--method", "POST",
+		fmt.Sprintf("repos/%s/merges", slug),
+		"-f", "base=" + base,
+		"-f", "head=" + head,
+		"-f", fmt.Sprintf("commit_message=Merge pull request #%d", num),
 	}
 	out, err := v.runGHScoped(ctx, repo, v.ghAPIScope(ctx, repo, slug), args...)
 	if err != nil {
 		return "", err
 	}
+	if strings.TrimSpace(out) == "" {
+		// 204: the base already contains the head, so there is no new merge
+		// commit to name. That is not a delivery this call can record.
+		return "", fmt.Errorf("PR %d's head %s is already merged into %s, so the merge produced no new commit", num, short(head), base)
+	}
 	var res struct {
-		Merged  bool   `json:"merged"`
+		Merged  *bool  `json:"merged"`
 		SHA     string `json:"sha"`
 		Message string `json:"message"`
 	}
 	if jerr := json.Unmarshal([]byte(out), &res); jerr != nil {
 		return "", fmt.Errorf("could not parse the merge response: %v", jerr)
 	}
-	if !res.Merged || strings.TrimSpace(res.SHA) == "" {
-		return "", fmt.Errorf("GitHub did not merge PR %d: %s", num, strings.TrimSpace(res.Message))
+	if res.Merged != nil && !*res.Merged {
+		return "", fmt.Errorf("GitHub did not merge PR %d into %s: %s", num, base, strings.TrimSpace(res.Message))
+	}
+	if strings.TrimSpace(res.SHA) == "" {
+		return "", fmt.Errorf("GitHub did not report a merge commit for PR %d into %s: %s", num, base, strings.TrimSpace(res.Message))
 	}
 	return res.SHA, nil
+}
+
+// IsolatedClone makes a THROWAWAY clone of repo for the close-out's remote reads,
+// and returns it with the func that removes it.
+//
+// The close-out's checkout is the fleet's derived clone, and every session's
+// worktree is linked into the same object database and ref store. A fetch there —
+// the ancestry check's, or the conflict evidence's — takes ref locks a session is
+// also taking, and a forced refspec rewrites a remote-tracking ref the session may
+// be reading. Both are faults in somebody else's working tree, so the close-out
+// reads in a clone of its own: `--shared` borrows repo's objects read-only (the
+// history is local and cheap) and every ref written is private to this clone.
+// Nothing done in it can be seen by a session.
+//
+// origin is pointed back at the REAL remote URL: a clone of the fleet's clone would
+// otherwise answer `ls-remote origin` from that clone's own (possibly stale) refs
+// instead of the remote's.
+func (v *Verifier) IsolatedClone(ctx context.Context, repo, remote string) (string, func(), error) {
+	url, err := v.run(ctx, repo, "remote", "get-url", remote)
+	if err != nil {
+		return "", nil, fmt.Errorf("isolated clone: read %s's URL: %v", remote, err)
+	}
+	if strings.TrimSpace(url) == "" {
+		return "", nil, fmt.Errorf("isolated clone: %s has no URL", remote)
+	}
+	dir, err := os.MkdirTemp("", "clankerbar-closeout-")
+	if err != nil {
+		return "", nil, fmt.Errorf("isolated clone: %v", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	if _, err := v.run(ctx, repo, "clone", "--quiet", "--shared", "--no-checkout", "--", repo, dir); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("isolated clone: %v", err)
+	}
+	if _, err := v.run(ctx, dir, "remote", "set-url", remote, url); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("isolated clone: point %s at %s: %v", remote, url, err)
+	}
+	return dir, cleanup, nil
 }
 
 // ConflictPaths computes the paths a merge of headRef into baseRef would conflict
@@ -250,6 +323,10 @@ func parseMergeTreeConflicts(out string) ([]string, error) {
 // fetch rather than fail an ancestry check for want of the newer object. The
 // fetch is scoped to the account that owns the remote, like every other network
 // read here.
+//
+// The force rewrites the destination ref, so a caller must own the repository it
+// passes: the close-out gives this an IsolatedClone, never a checkout a session is
+// working in.
 func (v *Verifier) FetchRef(ctx context.Context, repo, remote, branch string) error {
 	if strings.TrimSpace(branch) == "" {
 		return errors.New("fetch ref: no branch")

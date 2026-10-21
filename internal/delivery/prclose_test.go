@@ -187,6 +187,9 @@ func TestJudgePRMapsTheDeliveryGate(t *testing.T) {
 		{"conflicting", jsonConflicting, PRConflict, ""},
 		{"empty rollup", jsonEmptyRollup, PRRefused, "NO checks"},
 		{"failing check", jsonFailing, PRRefused, "FAILING checks"},
+		{"no base branch", `{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","baseRefName":"","headRefName":"clanker/x",` +
+			`"headRefOid":"abc1234def5678","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}`,
+			PRRefused, "without a base branch"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -194,6 +197,9 @@ func TestJudgePRMapsTheDeliveryGate(t *testing.T) {
 			state := v.JudgePR(context.Background(), repo, "acme/widgets", 7)
 			if state.Verdict != tc.want {
 				t.Fatalf("verdict = %s, want %s (%s)", state.Verdict, tc.want, state.Check.Detail)
+			}
+			if state.Verdict == PRReady && state.Base == "" {
+				t.Fatal("a pass without a base is exactly what must never be mergeable")
 			}
 			if tc.says != "" && !strings.Contains(state.Check.Detail, tc.says) {
 				t.Errorf("detail does not say %q: %s", tc.says, state.Check.Detail)
@@ -216,7 +222,7 @@ func TestJudgePRWithNoGHIsARefusalNotAPass(t *testing.T) {
 	}
 }
 
-func TestMergePRMergesAsAMergeCommitPinnedToTheJudgedHead(t *testing.T) {
+func TestMergePRMergesAsAMergeCommitPinnedToTheJudgedHeadAndBase(t *testing.T) {
 	root := prEnv(t)
 	repo := filepath.Join(root, "repo")
 	t.Setenv("GH_FAKE_TOKEN", ghFakeToken)
@@ -227,7 +233,7 @@ func TestMergePRMergesAsAMergeCommitPinnedToTheJudgedHead(t *testing.T) {
 		"cat <<'J'\n{\"merged\":true,\"sha\":\"" + mergeSHA + "\",\"message\":\"merged\"}\nJ\n"
 	v := New(root, "").WithGHBin(writeGHTo(t, filepath.Join(t.TempDir(), "gh"), script))
 
-	sha, err := v.MergePR(context.Background(), repo, "acme/widgets", 7, "abc1234def5678")
+	sha, err := v.MergePR(context.Background(), repo, "acme/widgets", 7, "staging", "abc1234def5678")
 	if err != nil {
 		t.Fatalf("MergePR: %v", err)
 	}
@@ -239,15 +245,43 @@ func TestMergePRMergesAsAMergeCommitPinnedToTheJudgedHead(t *testing.T) {
 		t.Fatalf("read the recorded invocation: %v", err)
 	}
 	got := string(recorded)
+	// The base is a REQUEST parameter, not the PR's own property: that is what a
+	// retarget between the judgement and the merge cannot redirect.
 	for _, want := range []string{
-		"api --method PUT repos/acme/widgets/pulls/7/merge",
-		"merge_method=merge",
-		"sha=abc1234def5678",
+		"api --method POST repos/acme/widgets/merges",
+		"base=staging",
+		"head=abc1234def5678",
 		"token=" + ghFakeToken,
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("the merge invocation does not carry %q:\n%s", want, got)
 		}
+	}
+	// The pull-request merge endpoint follows the PR's current base and pins no
+	// base at all; a close-out must never use it.
+	for _, forbidden := range []string{"/pulls/7/merge", "merge_method="} {
+		if strings.Contains(got, forbidden) {
+			t.Errorf("the merge went through the PR endpoint (%q), which follows a retargetable base:\n%s", forbidden, got)
+		}
+	}
+}
+
+func TestMergePRRefusesWithoutAJudgedHeadOrABase(t *testing.T) {
+	root := prEnv(t)
+	repo := filepath.Join(root, "repo")
+	// Any invocation at all is a failure: the guard must run before gh is spawned.
+	argsFile := filepath.Join(t.TempDir(), "args")
+	script := "printf '%s\\n' \"$*\" >> " + argsFile + "\nexit 0"
+	v := New(root, "").WithGHBin(writeGHTo(t, filepath.Join(t.TempDir(), "gh"), script))
+
+	if _, err := v.MergePR(context.Background(), repo, "acme/widgets", 7, "staging", ""); err == nil {
+		t.Error("a merge with no judged head oid must be refused: dropping the pin is the hole it closes")
+	}
+	if _, err := v.MergePR(context.Background(), repo, "acme/widgets", 7, "", "abc1234def5678"); err == nil {
+		t.Error("a merge with no base branch must be refused: the target would be the PR's own, retargetable base")
+	}
+	if _, err := os.Stat(argsFile); err == nil {
+		t.Error("gh was invoked for a merge that had no pin or no base")
 	}
 }
 
@@ -255,12 +289,62 @@ func TestMergePRRefusesWhenGitHubDidNotMerge(t *testing.T) {
 	root := prEnv(t)
 	v := New(root, "").WithGHBin(fakeGH(t, `{"merged":false,"message":"Pull Request is not mergeable"}`))
 
-	_, err := v.MergePR(context.Background(), filepath.Join(root, "repo"), "acme/widgets", 7, "")
+	_, err := v.MergePR(context.Background(), filepath.Join(root, "repo"), "acme/widgets", 7, "staging", "abc1234def5678")
 	if err == nil {
 		t.Fatal("a merge GitHub did not make must be an error")
 	}
 	if !strings.Contains(err.Error(), "not mergeable") {
 		t.Errorf("error does not carry GitHub's reason: %v", err)
+	}
+}
+
+func TestMergePRRefusesAnAlreadyMergedHead(t *testing.T) {
+	root := prEnv(t)
+	// The merges endpoint answers 204 with an empty body when the base already
+	// contains the head: there is no merge commit to name, so it is not a delivery.
+	v := New(root, "").WithGHBin(writeGHTo(t, filepath.Join(t.TempDir(), "gh"), "exit 0"))
+
+	_, err := v.MergePR(context.Background(), filepath.Join(root, "repo"), "acme/widgets", 7, "staging", "abc1234def5678")
+	if err == nil {
+		t.Fatal("a merge that produced no new commit must be an error")
+	}
+	if !strings.Contains(err.Error(), "already merged") {
+		t.Errorf("error does not say the head was already merged: %v", err)
+	}
+}
+
+func TestIsolatedCloneReadsTheRealRemoteAndTouchesNothingShared(t *testing.T) {
+	e := newEnv(t)
+	e.commit("main", "base.txt", "base")
+	e.push("main")
+	clone := filepath.Join(e.root, "fleet")
+	run(t, e.root, "git", "clone", e.remote, clone)
+
+	// A commit that only the remote has: the isolated clone must see it after a
+	// fetch, while the fleet clone's own refs stay exactly as they were.
+	e.checkout("main")
+	e.commit("main", "later.txt", "later")
+	e.push("main")
+	later := e.head()
+	before := strings.TrimSpace(run(t, clone, "git", "rev-parse", "refs/remotes/origin/main"))
+
+	v := New(clone, "")
+	iso, cleanup, err := v.IsolatedClone(context.Background(), clone, "origin")
+	if err != nil {
+		t.Fatalf("IsolatedClone: %v", err)
+	}
+	defer cleanup()
+	if iso == clone {
+		t.Fatal("the isolated clone is the shared checkout")
+	}
+	if err := v.FetchRef(context.Background(), iso, "origin", "main"); err != nil {
+		t.Fatalf("fetch in the isolated clone: %v", err)
+	}
+	if got := strings.TrimSpace(run(t, iso, "git", "rev-parse", "refs/remotes/origin/main")); got != later {
+		t.Errorf("isolated origin/main = %s, want the remote's %s", got, later)
+	}
+	if after := strings.TrimSpace(run(t, clone, "git", "rev-parse", "refs/remotes/origin/main")); after != before {
+		t.Errorf("the shared checkout's origin/main moved (%s -> %s): the close-out wrote into a session's refs", before, after)
 	}
 }
 

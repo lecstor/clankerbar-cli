@@ -262,6 +262,12 @@ func (v *Verifier) WithPollWindow(budget, interval time.Duration) *Verifier {
 	return v
 }
 
+// PollWindow is the budget a PR read is polled within. A caller that has to wait
+// for something GitHub has just changed to become visible — the close-out waiting
+// for a merge commit it made to appear on the base — uses it as its own retry
+// window, so a test that shrinks the judgement's window shrinks that wait with it.
+func (v *Verifier) PollWindow() time.Duration { return v.prBudget }
+
 // Verify checks a claim and returns what it found. It never returns an error:
 // everything that could go wrong is a check whose Status is Unknown, because the
 // caller's only correct response to "could not check" is to say so and carry on.

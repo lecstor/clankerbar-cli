@@ -132,8 +132,10 @@ func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
 }
 
 // writeGH writes the fake gh. Its merge path is the one that does real work: it
-// merges the PR head into the base in the seed clone and pushes, so the merge
-// commit GitHub "made" really is on the remote.
+// merges the requested head into the requested BASE in the seed clone and pushes,
+// so the merge commit GitHub "made" really is on the remote — and a request that
+// did not name the base, or went through the PR merge endpoint (which follows the
+// PR's own retargetable base), is refused loudly.
 func (f *closeOutFixture) writeGH() {
 	f.ghBin = filepath.Join(f.ghDir, "gh")
 	script := fmt.Sprintf(`#!/bin/sh
@@ -147,6 +149,7 @@ case "$1 $2" in
   cat "$dir/prlist.json"
   ;;
 "pr view")
+  sleep "$(cat "$dir/pr-view-delay" 2>/dev/null || echo 0)"
   cat "$dir/prview.json"
   ;;
 "auth token")
@@ -154,14 +157,35 @@ case "$1 $2" in
   exit 1
   ;;
 "api --method")
+  # The close-out must never merge through the pull request: that endpoint follows
+  # whatever base the PR carries when GitHub processes it.
+  case " $* " in
+  *"/pulls/"*) echo "refusing: the PR merge endpoint follows a retargetable base" >&2; exit 1 ;;
+  esac
   mode=$(cat "$dir/merge-mode" 2>/dev/null || echo ok)
+  printf '%%s\n' "$*" > "$dir/merge-args"
   if [ "$mode" = "fail" ]; then
     echo "merge is blocked by branch protection" >&2
     exit 1
   fi
+  got_base=""; got_head=""
+  for a in "$@"; do
+    case "$a" in
+    base=*) got_base=${a#base=} ;;
+    head=*) got_head=${a#head=} ;;
+    esac
+  done
+  if [ "$got_base" != "$base" ]; then
+    echo "merge named base '$got_base', want '$base'" >&2
+    exit 1
+  fi
+  if [ -z "$got_head" ]; then
+    echo "merge named no head revision to pin" >&2
+    exit 1
+  fi
   git -C "$seed" fetch -q origin || exit 1
   git -C "$seed" checkout -q -f "$base" || exit 1
-  git -C "$seed" merge -q --no-ff "origin/$head" -m "Merge pull request #%d" || exit 1
+  git -C "$seed" merge -q --no-ff "$got_head" -m "Merge pull request #%d" || exit 1
   git -C "$seed" push -q origin "$base" || exit 1
   sha=$(git -C "$seed" rev-parse HEAD)
   if [ "$mode" = "bogus" ]; then
@@ -184,6 +208,25 @@ func (f *closeOutFixture) setMergeMode(mode string) {
 	if err := os.WriteFile(filepath.Join(f.ghDir, "merge-mode"), []byte(mode), 0o600); err != nil {
 		f.t.Fatalf("write merge mode: %v", err)
 	}
+}
+
+// setViewDelay makes the fake gh's `pr view` take d, so a test can prove a pass
+// does not hold the supervisor's control path while it polls.
+func (f *closeOutFixture) setViewDelay(d time.Duration) {
+	secs := fmt.Sprintf("%.3f", d.Seconds())
+	if err := os.WriteFile(filepath.Join(f.ghDir, "pr-view-delay"), []byte(secs), 0o600); err != nil {
+		f.t.Fatalf("write view delay: %v", err)
+	}
+}
+
+// mergeArgs is the argument list the fake gh received for its merge call, empty
+// when no merge call was made.
+func (f *closeOutFixture) mergeArgs() string {
+	b, err := os.ReadFile(filepath.Join(f.ghDir, "merge-args"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 // writePR rewrites what `gh pr view` answers.
@@ -350,6 +393,21 @@ func TestCloseOutMergesACleanApprovedTask(t *testing.T) {
 	}
 	mustGit(t, f.remote, "merge-base", "--is-ancestor", mergeSHA, "refs/heads/"+closeOutTestBase)
 
+	// The merge named the base and the judged head itself: a retarget of the PR
+	// after the judgement cannot redirect it, and a push that landed after it
+	// cannot be what gets merged.
+	args := f.mergeArgs()
+	for _, want := range []string{"repos/" + closeOutTestRepo + "/merges", "base=" + closeOutTestBase, "head=" + f.headOID} {
+		if !strings.Contains(args, want) {
+			t.Errorf("the merge invocation does not carry %q: %q", want, args)
+		}
+	}
+	for _, forbidden := range []string{"/pulls/", "merge_method="} {
+		if strings.Contains(args, forbidden) {
+			t.Errorf("the merge went through the PR endpoint (%q), which follows a retargetable base: %q", forbidden, args)
+		}
+	}
+
 	if !strings.Contains(lines, "task closed done") {
 		t.Errorf("the close-out did not report the close:\n%s", lines)
 	}
@@ -448,6 +506,82 @@ func TestCloseOutNeverMergesAMainBasedPR(t *testing.T) {
 			t.Errorf("the stand-down does not name the promotion branch:\n%s", lines)
 		}
 	})
+}
+
+func TestCloseOutStandsDownWhenTheJudgedPRNamesNoBase(t *testing.T) {
+	const passing = `[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]`
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	// The judged response simply does not carry baseRefName.
+	body := fmt.Sprintf(`{"number":%d,"url":"https://github.com/%s/pull/%d","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":%s,"headRefName":%q,"headRefOid":%q}`,
+		closeOutTestPR, closeOutTestRepo, closeOutTestPR, passing, closeOutTestHead, f.headOID)
+	if err := os.WriteFile(filepath.Join(f.ghDir, "prview.json"), []byte(body), 0o600); err != nil {
+		t.Fatalf("write prview: %v", err)
+	}
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if got := f.callsFor("claim_task"); len(got) != 0 {
+		t.Errorf("a PR whose base the judgement did not name was claimed: %v", got)
+	}
+	if got := f.mergeArgs(); got != "" {
+		t.Errorf("a PR whose base the judgement did not name was merged: %q", got)
+	}
+	if !strings.Contains(lines, "without a base branch") {
+		t.Errorf("the stand-down does not say the base was missing:\n%s", lines)
+	}
+}
+
+func TestCloseOutPassNeverHoldsTheReconcileLoop(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	f.setViewDelay(600 * time.Millisecond)
+	d := f.supervisor(0)
+
+	start := time.Now()
+	d.startCloseOutPass()
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("starting the pass blocked the caller for %s: reconcile/select would have been held", elapsed)
+	}
+	// The next poll arrives while the pass is still working: it must not start a
+	// second pass over the same queue.
+	d.startCloseOutPass()
+	d.closeOutWG.Wait()
+
+	if got := len(f.callsFor("claim_task")); got != 1 {
+		t.Errorf("claim_task calls = %d, want 1 (one pass at a time)", got)
+	}
+}
+
+func TestCloseOutPassStopsWhenTheFleetStops(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	// The judgement takes two seconds; the fleet stops while it is in flight.
+	f.setViewDelay(2 * time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	d := f.supervisor(0)
+	d.ctx = ctx
+
+	done := make(chan struct{})
+	go func() {
+		d.reconcileCloseOuts()
+		close(done)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cancelled fleet did not abort the close-out pass: shutdown would wait out its budget")
+	}
+	if got := f.callsFor("claim_task"); len(got) != 0 {
+		t.Errorf("a cancelled fleet still claimed a task: %v", got)
+	}
+	if got := f.mergeArgs(); got != "" {
+		t.Errorf("a cancelled fleet still merged: %q", got)
+	}
 }
 
 func TestCloseOutStandsDownWithoutOneIdentifiedPR(t *testing.T) {
@@ -560,8 +694,11 @@ func TestCloseOutReleasesTheClaimAfterAMergeFailure(t *testing.T) {
 			if c.args["runId"] != "run-1" {
 				t.Errorf("release runId = %v, want run-1", c.args["runId"])
 			}
-			if c.args["checkGreen"] != true {
-				t.Errorf("release does not attest the green check (the repair ladder would charge a failed repair): %v", c.args)
+			// A failed MERGE is what the plane's repair ladder must bound: the
+			// checks are still green, so attesting green here would leave a
+			// green-but-unmergeable PR re-claimed and re-released forever.
+			if c.args["checkGreen"] != false {
+				t.Errorf("a merge failure released with checkGreen=%v, want false (the ladder must count it): %v", c.args["checkGreen"], c.args)
 			}
 		}
 		if c.args["status"] == "done" {
@@ -576,24 +713,40 @@ func TestCloseOutReleasesTheClaimAfterAMergeFailure(t *testing.T) {
 	}
 }
 
-func TestCloseOutReleasesTheClaimWhenTheMergeCannotBeVerified(t *testing.T) {
+func TestCloseOutClosesAMergeItCannotVerify(t *testing.T) {
 	f := newCloseOutFixture(t, false)
 	f.servePlane(t, "clanker")
 	f.setMergeMode("bogus")
-	d := f.supervisor(0)
+	// The verification retries within the verifier's poll window; shrink it so the
+	// test does not wait out the production window.
+	d := f.supervisor(150 * time.Millisecond)
 
 	lines := f.run(d)
 
+	var closed map[string]any
 	for _, c := range f.callsFor("update_task") {
+		if c.args["release"] == true {
+			t.Errorf("a merge that LANDED was released: the PR is no longer OPEN, so the task would be stranded on approved forever: %v", c.args)
+		}
 		if c.args["status"] == "done" {
-			t.Errorf("a task was closed on an unverified merge: %v", c.args)
+			closed = c.args
 		}
 	}
-	if !strings.Contains(lines, "could not be verified") {
-		t.Errorf("the stand-down does not name the failed verification:\n%s", lines)
+	if closed == nil {
+		t.Fatalf("a merge that landed but could not be verified was not closed. calls: %v", f.plane.planeCalls())
 	}
-	if releases := f.releases(); releases != 1 {
-		t.Errorf("release calls = %d, want 1", releases)
+	delivery, ok := closed["delivery"].(map[string]any)
+	if !ok {
+		t.Fatalf("done call carries no delivery block: %v", closed)
+	}
+	if got := delivery["mergeVerified"]; got != false {
+		t.Errorf("delivery.mergeVerified = %v, want false (the merge landed, the ancestor check did not settle)", got)
+	}
+	if got, _ := delivery["commit"].(string); len(got) != 40 {
+		t.Errorf("delivery.commit = %q, want the merge commit the API reported", got)
+	}
+	if !strings.Contains(lines, "mergeVerified:false") {
+		t.Errorf("the close was not reported as unverified:\n%s", lines)
 	}
 }
 

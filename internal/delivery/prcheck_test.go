@@ -27,7 +27,8 @@ import (
 const (
 	jsonMergeablePassing = `{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[` +
 		`{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"},` +
-		`{"__typename":"StatusContext","context":"docs","state":"SUCCESS"}],"url":"https://github.com/acme/widgets/pull/7"}`
+		`{"__typename":"StatusContext","context":"docs","state":"SUCCESS"}],"url":"https://github.com/acme/widgets/pull/7",` +
+		`"baseRefName":"staging","headRefName":"clanker/x","headRefOid":"abc1234def5678"}`
 	jsonEmptyRollup = `{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[]}`
 	jsonConflicting = `{"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","statusCheckRollup":[]}`
 	jsonUnknown     = `{"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","statusCheckRollup":null}`

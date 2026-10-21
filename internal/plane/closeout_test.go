@@ -105,7 +105,7 @@ func TestClaimCloseOutRefusesAnAnswerWithNoRun(t *testing.T) {
 func TestReleaseCloseOutAttestsGreenAndTheDriver(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 
-	if err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1"); err != nil {
+	if err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", true); err != nil {
 		t.Fatalf("ReleaseCloseOut: %v", err)
 	}
 	if name := toolName(t, got.body); name != "update_task" {
@@ -120,6 +120,18 @@ func TestReleaseCloseOutAttestsGreenAndTheDriver(t *testing.T) {
 		if _, ok := args[forbidden]; ok {
 			t.Errorf("release carries %q, which it must not: %+v", forbidden, args)
 		}
+	}
+}
+
+func TestReleaseCloseOutSendsTheAttestationItWasGiven(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+
+	if err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", false); err != nil {
+		t.Fatalf("ReleaseCloseOut: %v", err)
+	}
+	args := toolArgs(t, got.body)
+	if args["checkGreen"] != false {
+		t.Errorf("checkGreen = %v, want false: a failed MERGE must be counted by the repair ladder", args["checkGreen"])
 	}
 }
 
@@ -139,7 +151,7 @@ func TestReleaseCloseOutFallsBackOnAPlaneThatDoesNotKnowTheMarkers(t *testing.T)
 	}))
 	t.Cleanup(srv.Close)
 
-	if err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1"); err != nil {
+	if err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", true); err != nil {
 		t.Fatalf("ReleaseCloseOut: %v", err)
 	}
 	if len(calls) != 2 {
@@ -209,7 +221,7 @@ func TestNewCloseOutAPINotWiredRefusesAndStaysNarrow(t *testing.T) {
 	if _, err := api.ClaimCloseOut(ctx, "t-1"); !errors.Is(err, ErrNotWired) {
 		t.Errorf("ClaimCloseOut err = %v, want ErrNotWired", err)
 	}
-	if err := api.ReleaseCloseOut(ctx, "t-1", "r-1"); !errors.Is(err, ErrNotWired) {
+	if err := api.ReleaseCloseOut(ctx, "t-1", "r-1", true); !errors.Is(err, ErrNotWired) {
 		t.Errorf("ReleaseCloseOut err = %v, want ErrNotWired", err)
 	}
 	if err := api.CompleteCloseOut(ctx, "t-1", "r-1", CloseOutDelivery{Commit: "a", IntegrationBranch: "b"}); !errors.Is(err, ErrNotWired) {
