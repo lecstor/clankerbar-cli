@@ -5,10 +5,9 @@ package supervisor
 // state dir from machine conventions and the roster entry, and starts the
 // child with `run -c` pointing at it. The generated file is a cache — written
 // at spawn and rewritten at reconcile only when an edit changes it (CLA-724),
-// safe to delete — written to disk so it doubles as the offline
-// doubles as the offline last-known-good. In phase 3b the entry drives the
-// build: the projects come from the roster row, identity is the entry's name,
-// and the state dir is derived from the same name.
+// safe to delete — so it doubles as the offline last-known-good. In phase 3b
+// the entry drives the build: the projects come from the roster row, identity
+// is the entry's name, and the state dir is derived from the same name.
 
 import (
 	"context"

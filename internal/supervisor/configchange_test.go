@@ -21,6 +21,7 @@ package supervisor
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -172,29 +173,317 @@ func TestMaterializedBytesAreDeterministic(t *testing.T) {
 	}
 }
 
+// A RESTART write that fails AFTER the file has been rewritten must not lose the
+// edit: the bytes now match, so the next poll's comparison sees nothing, and
+// only the supervisor's own record of the outstanding restart can drive the
+// retry. The state dir is made read-only in the rewrite-to-marker window, so the
+// rewrite succeeds and the marker write fails for real (no stubbed error).
+func TestReconcileConfigEditRetriesAFailedRestartMarker(t *testing.T) {
+	basePath := writeBaseFile(t, `{"model": "sonnet"}`)
+	d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
+	path := materializedPath(dir)
+	before := readFileBytes(t, path)
+
+	// A read-only directory is writable again for cleanup (t.Cleanup is LIFO,
+	// so this runs before testing.TempDir's own removal).
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	d.o.AfterConfigRewrite = func(string) {
+		if err := os.Chmod(dir, 0o500); err != nil {
+			t.Fatalf("make the state dir read-only: %v", err)
+		}
+	}
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	if err := os.WriteFile(basePath, []byte(`{"model": "opus"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reconcileStep(d, inst)
+
+	if after := readFileBytes(t, path); bytes.Equal(before, after) {
+		t.Fatal("the edit did not reach the generated config before the marker write failed")
+	}
+	if markerPresent(dir, loop.MarkerRestart) {
+		t.Fatal("a RESTART was written although its directory was read-only")
+	}
+	if !inst.configRestartPending {
+		t.Fatal("a failed RESTART write left nothing to retry - the edit would be dropped silently")
+	}
+	if logText := buf.String(); !strings.Contains(logText, "retrying it on the next reconcile") {
+		t.Fatalf("the failed marker write was not reported as retryable:\n%s", logText)
+	}
+
+	// The next poll: the bytes already match, and the retry still queues the
+	// restart the failed write dropped.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	d.o.AfterConfigRewrite = nil
+	var retryBuf lockedBuffer
+	log.SetOutput(&retryBuf)
+	reconcileStep(d, inst)
+
+	if !markerPresent(dir, loop.MarkerRestart) {
+		t.Fatal("the retry did not queue the RESTART the failed write dropped")
+	}
+	if body := readFileBytes(t, filepath.Join(dir, loop.MarkerRestart)); !bytes.HasPrefix(body, []byte(supervisorRestartBodyPrefix)) {
+		t.Fatalf("the retried marker is not the supervisor's config-change one: %q", body)
+	}
+	if inst.configRestartPending {
+		t.Error("the retry flag survived the queued restart")
+	}
+	if logText := retryBuf.String(); !strings.Contains(logText, "queued the restart an earlier failed write could not") {
+		t.Fatalf("the retried restart was not logged:\n%s", logText)
+	}
+
+	// And once queued it stays a single marker: no third write.
+	reconcileStep(d, inst)
+	if inst.configRestartPending {
+		t.Error("a reconcile after the queued restart set the retry flag again")
+	}
+}
+
+// A STOP/HALT landing in the rewrite-to-marker window must win: the edit stays
+// in the file (the next spawn runs it), but no RESTART is queued behind the
+// stop, and the intent is retried if the operator clears the stop while the
+// child is still running.
+func TestReconcileConfigEditStopWinsTheRewriteToMarkerRace(t *testing.T) {
+	for _, stop := range []string{"STOP", "HALT"} {
+		t.Run(stop, func(t *testing.T) {
+			basePath := writeBaseFile(t, `{"model": "sonnet"}`)
+			d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
+			path := materializedPath(dir)
+			before := readFileBytes(t, path)
+
+			// The operator's stop lands while WriteFileAtomic runs — after the
+			// initial check, before the marker is written.
+			d.o.AfterConfigRewrite = func(string) {
+				if err := os.WriteFile(filepath.Join(dir, stop), []byte("operator\n"), 0o600); err != nil {
+					t.Fatalf("plant %s: %v", stop, err)
+				}
+			}
+
+			var buf lockedBuffer
+			log.SetOutput(&buf)
+			defer log.SetOutput(os.Stderr)
+
+			if err := os.WriteFile(basePath, []byte(`{"model": "opus"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reconcileStep(d, inst)
+
+			if after := readFileBytes(t, path); bytes.Equal(before, after) {
+				t.Fatalf("the edit did not reach the generated config when %s arrived mid-rewrite", stop)
+			}
+			if markerPresent(dir, loop.MarkerRestart) {
+				t.Fatalf("a RESTART was queued behind %s - the stale marker would re-exec the child after the stop", stop)
+			}
+			if !inst.configRestartPending {
+				t.Fatalf("the restart dropped by %s left nothing to retry", stop)
+			}
+			if logText := buf.String(); !strings.Contains(logText, "a stop marker arrived first") {
+				t.Fatalf("the lost restart was not reported:\n%s", logText)
+			}
+
+			// The stop is cleared with the child still running: the pending
+			// intent is what re-queues the restart the stop pre-empted.
+			d.o.AfterConfigRewrite = nil
+			if err := os.Remove(filepath.Join(dir, stop)); err != nil {
+				t.Fatal(err)
+			}
+			rewritten := readFileBytes(t, path)
+			reconcileStep(d, inst)
+			if !markerPresent(dir, loop.MarkerRestart) {
+				t.Fatalf("the restart %s pre-empted was never retried", stop)
+			}
+			if after := readFileBytes(t, path); !bytes.Equal(rewritten, after) {
+				t.Fatal("the retry rewrote an already-current config")
+			}
+		})
+	}
+}
+
+// A RESTART this supervisor queued for a config change is withdrawn once a stop
+// marker wins: the daemon prioritises STOP/HALT, so the marker would survive
+// the stop and re-exec the child the moment the operator resumes it. A marker
+// somebody else wrote (a ctl's) is never touched — it is their request, not
+// this poll's.
+func TestReconcileConfigEditWithdrawsItsQueuedRestartWhenAStopLands(t *testing.T) {
+	t.Run("its own marker", func(t *testing.T) {
+		basePath := writeBaseFile(t, `{"model": "sonnet"}`)
+		d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
+		if err := os.WriteFile(basePath, []byte(`{"model": "opus"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		reconcileStep(d, inst)
+		if !markerPresent(dir, loop.MarkerRestart) {
+			t.Fatal("no RESTART was queued for the edit")
+		}
+		rewritten := readFileBytes(t, materializedPath(dir))
+
+		if err := os.WriteFile(filepath.Join(dir, "HALT"), []byte("operator\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		var buf lockedBuffer
+		log.SetOutput(&buf)
+		defer log.SetOutput(os.Stderr)
+		reconcileStep(d, inst)
+
+		if markerPresent(dir, loop.MarkerRestart) {
+			t.Fatal("the RESTART queued for the config change survived a HALT")
+		}
+		if after := readFileBytes(t, materializedPath(dir)); !bytes.Equal(rewritten, after) {
+			t.Fatal("the stopped child's generated config was rewritten again")
+		}
+		if logText := buf.String(); !strings.Contains(logText, "the RESTART queued for its config change was withdrawn") {
+			t.Fatalf("the withdrawal was not logged:\n%s", logText)
+		}
+	})
+
+	t.Run("a ctl marker is left alone", func(t *testing.T) {
+		basePath := writeBaseFile(t, `{"model": "sonnet"}`)
+		d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
+		marker := filepath.Join(dir, loop.MarkerRestart)
+		if err := os.WriteFile(marker, []byte("ctl\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "STOP"), []byte("operator\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		reconcileStep(d, inst)
+
+		if got := readFileBytes(t, marker); string(got) != "ctl\n" {
+			t.Fatalf("a ctl's pending RESTART was removed (%q) by a stop", got)
+		}
+	})
+
+	// A child that has ALREADY exited on HALT is the case the byte comparison
+	// never reaches: the instance is halted and its child is gone, so the marker
+	// would sit there until the operator resumes it and then re-exec the fresh
+	// child once for no reason.
+	t.Run("a halted child that already exited", func(t *testing.T) {
+		basePath := writeBaseFile(t, `{"model": "sonnet"}`)
+		d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
+		if err := os.WriteFile(basePath, []byte(`{"model": "opus"}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		reconcileStep(d, inst)
+		if !markerPresent(dir, loop.MarkerRestart) {
+			t.Fatal("no RESTART was queued for the edit")
+		}
+
+		if err := os.WriteFile(filepath.Join(dir, "HALT"), []byte("operator\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		inst.halted = true
+		inst.mu.Lock()
+		inst.exited = true
+		inst.mu.Unlock()
+		reconcileStep(d, inst)
+
+		if markerPresent(dir, loop.MarkerRestart) {
+			t.Fatal("the RESTART queued for the config change outlived the HALT that ended the child")
+		}
+	})
+}
+
+// A build failure that is NOT the permission-policy gate keeps the child on the
+// last-known-good config and must write nothing: the edit never reaches the
+// generated file, and no RESTART is queued for a config that did not change.
+// This is the other half of the doneWhen's "a config that fails the
+// permission policy OR THE BUILD is not written" — the path's no-restart
+// guarantee rests on config.Load + Validate + materializedBytes reproducing the
+// child's file byte for byte.
+func TestReconcileConfigEditBuildFailureIsNotWritten(t *testing.T) {
+	basePath := writeBaseFile(t, `{"model": "sonnet"}`)
+	d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
+	path := materializedPath(dir)
+	before := readFileBytes(t, path)
+
+	// Loadable JSON that fails Validate (not the policy gate): an unknown
+	// harness, which also survives the base-config re-read above, so the build
+	// itself fails rather than the file load.
+	if err := os.WriteFile(basePath, []byte(`{"model": "opus", "harness": "not-a-harness"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var buf lockedBuffer
+	log.SetOutput(&buf)
+	defer log.SetOutput(os.Stderr)
+
+	for i := 0; i < 2; i++ {
+		reconcileStep(d, inst)
+	}
+
+	if after := readFileBytes(t, path); !bytes.Equal(before, after) {
+		t.Fatalf("a config whose build failed was written into the child's file:\nbefore: %s\nafter:  %s", before, after)
+	}
+	if markerPresent(dir, loop.MarkerRestart) {
+		t.Fatal("a config whose build failed queued a RESTART")
+	}
+	if logText := buf.String(); !strings.Contains(logText, "building its config failed") {
+		t.Fatalf("the failed build was not logged:\n%s", logText)
+	}
+}
+
 // A build failure falls back to the config loaded from materialized.json. That
 // reloaded config must serialize back to the SAME bytes: otherwise every poll
 // through a failed build would look like an edit and restart the fleet on a
 // config that never changed.
 func TestReloadedMaterializedConfigSerializesIdentically(t *testing.T) {
-	basePath := writeBaseFile(t, `{"model": "sonnet"}`)
-	d, _, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
-	path := materializedPath(dir)
-	before := readFileBytes(t, path)
+	// Both a trivial config and one whose normalisation has far more to do —
+	// projects with workdirs, env and a per-harness block carrying overrides —
+	// because config.Load applies defaults() and Validate rewrites paths in
+	// place: any shape whose normalisation is not idempotent turns every poll
+	// through a failed build into a rewrite and a RESTART.
+	acmeWork := t.TempDir()
+	type testCase struct {
+		body      string
+		overrides map[string]json.RawMessage
+	}
+	cases := map[string]testCase{
+		"trivial": {body: `{"model": "sonnet"}`},
+		// A per-instance harness override is part of the materialized document
+		// too (the roster's one permitted policy override), so the identity has
+		// to survive that as well as projects, env and a per-harness block.
+		"rich": {
+			body: fmt.Sprintf(`{
+			"model": "sonnet",
+			"harness": "opencode",
+			"env": {"TOP": "t"},
+			"harnesses": {"opencode": {"model": "opus", "models": {"strong": "opus"}}},
+			"projects": [{"slug": "acme", "workdir": %q}]
+		}`, acmeWork),
+			overrides: map[string]json.RawMessage{"harness": json.RawMessage(`"opencode"`)},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			basePath := writeBaseFile(t, tc.body)
+			entry := RosterEntry{Name: "daemon-" + name, DesiredState: RosterDesiredRunning,
+				Placement: RosterPlacementLocal, Projects: []RosterProject{{Slug: "acme"}},
+				Overrides: tc.overrides}
+			d, _, dir := materializedInstance(t, basePath, entry)
+			path := materializedPath(dir)
+			before := readFileBytes(t, path)
 
-	reloaded, err := config.Load(path)
-	if err != nil {
-		t.Fatalf("the generated config does not load: %v", err)
-	}
-	if err := reloaded.Validate(); err != nil {
-		t.Fatalf("the generated config does not validate: %v", err)
-	}
-	again, err := d.materializedBytes(reloaded, dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(before, again) {
-		t.Fatalf("a reloaded materialized config serializes differently, so the fallback would queue a restart with no edit:\nfile:      %s\nreserialized: %s", before, again)
+			reloaded, err := config.Load(path)
+			if err != nil {
+				t.Fatalf("the generated config does not load: %v", err)
+			}
+			if err := reloaded.Validate(); err != nil {
+				t.Fatalf("the generated config does not validate: %v", err)
+			}
+			again, err := d.materializedBytes(reloaded, dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, again) {
+				t.Fatalf("a reloaded materialized config serializes differently, so the fallback would queue a restart with no edit:\nfile:         %s\nreserialized: %s", before, again)
+			}
+		})
 	}
 }
 
@@ -253,27 +542,41 @@ func TestReconcileConfigEditQueuesOneRestart(t *testing.T) {
 
 // A restart already pending from another source (a roll, a ctl) is not stacked
 // on: the file is still rewritten — so the pending restart re-execs onto the
-// edit — but the marker that was there is left exactly as it was.
+// edit — but the marker that was there is left exactly as it was. Both restart
+// markers are covered: a pending RESTART_NOW takes the same path (decision
+// 427b9a6c leg b), and the check runs after the rewrite so a marker consumed
+// during it gets a replacement rather than being lost.
 func TestReconcileConfigEditDoesNotStackOnAPendingRestart(t *testing.T) {
-	basePath := writeBaseFile(t, `{"model": "sonnet"}`)
-	d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
-	path := materializedPath(dir)
-	before := readFileBytes(t, path)
+	for _, pending := range []string{loop.MarkerRestart, loop.MarkerRestartNow} {
+		t.Run(pending, func(t *testing.T) {
+			basePath := writeBaseFile(t, `{"model": "sonnet"}`)
+			d, inst, dir := materializedInstance(t, basePath, runEntry("daemon-one", ""))
+			path := materializedPath(dir)
+			before := readFileBytes(t, path)
 
-	marker := filepath.Join(dir, loop.MarkerRestart)
-	if err := os.WriteFile(marker, []byte("ctl\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(basePath, []byte(`{"model": "opus"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	reconcileStep(d, inst)
+			marker := filepath.Join(dir, pending)
+			if err := os.WriteFile(marker, []byte("ctl\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(basePath, []byte(`{"model": "opus"}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			reconcileStep(d, inst)
 
-	if after := readFileBytes(t, path); bytes.Equal(before, after) {
-		t.Fatal("the edit did not reach the generated config while a restart was pending")
-	}
-	if got := readFileBytes(t, marker); string(got) != "ctl\n" {
-		t.Fatalf("the pending RESTART was replaced (%q) instead of left alone", got)
+			if after := readFileBytes(t, path); bytes.Equal(before, after) {
+				t.Fatalf("the edit did not reach the generated config while a %s was pending", pending)
+			}
+			if got := readFileBytes(t, marker); string(got) != "ctl\n" {
+				t.Fatalf("the pending %s was replaced (%q) instead of left alone", pending, got)
+			}
+			other := loop.MarkerRestart
+			if pending == other {
+				other = loop.MarkerRestartNow
+			}
+			if markerPresent(dir, other) {
+				t.Fatalf("a %s was written alongside the pending %s", other, pending)
+			}
+		})
 	}
 }
 

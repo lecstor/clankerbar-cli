@@ -221,6 +221,14 @@ type Options struct {
 	// a test's fake plane is not; a test supplies a client pointed at its own
 	// server so the wire shape is exercised for real.
 	PlaneFor func(endpoint, apiKey string) plane.Releaser
+
+	// AfterConfigRewrite is called after a reconcile-time rewrite of a child's
+	// generated config and before the RESTART that applies it is queued
+	// (CLA-724). It is the deterministic seam for the rewrite-to-marker window,
+	// which is otherwise a few filesystem syscalls wide: a test can plant a
+	// STOP or HALT here and assert the stop wins, or make the marker write fail
+	// and assert the retry queues it on the next poll. Nil in production.
+	AfterConfigRewrite func(instName string)
 }
 
 // childVersionEnv is the environment variable the supervisor sets on every
@@ -282,6 +290,15 @@ type Instance struct {
 	// build — a restored policy file brings the daemon back without a
 	// supervisor restart (phase 2c).
 	policyRefused bool
+	// configRestartPending is set when a reconcile rewrote this child's
+	// generated config but could not queue the RESTART that applies it (a
+	// failed marker write). The byte comparison alone cannot see that
+	// outstanding work — the file already holds the new bytes — so the retry
+	// lives here and every reconcile re-attempts the marker while it is set.
+	// Cleared when a RESTART/RESTART_NOW is confirmed pending, and on the next
+	// spawn, which materializes the current config and therefore satisfies it
+	// (CLA-724 review findings 1.review-3.1 / 1.review-4.1).
+	configRestartPending bool
 
 	mu         sync.Mutex
 	cmd        *exec.Cmd // current child, nil while in backoff
@@ -978,6 +995,10 @@ func (d *Supervisor) spawn(inst *Instance) {
 		inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
 		return
 	}
+	// The child is about to start on the current effective config, so a
+	// restart-marker retry left pending by an earlier poll has been satisfied
+	// (CLA-724 review findings 1.review-3.1 / 1.review-4.1).
+	inst.configRestartPending = false
 	v := childVersion(d.o.VersionOf)
 	cmd := exec.Command(d.o.Binary, "run", "-c", cfgPath)
 	// The version recorded for this child rides the spawn environment (phase
