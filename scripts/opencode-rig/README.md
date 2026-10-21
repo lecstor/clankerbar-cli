@@ -113,11 +113,10 @@ This makes the residual visible without a fleet run:
 scripts/opencode-rig/run.sh --model commandcode/gpt-6-luna --scenario padding
 ```
 
-The scenario needs a catalog that serves `edit_task`. A plane still serving the
-deleted `update_task` is pre-cutover, and the rig refuses that run up front
-rather than reporting a run that exercised nothing — pass `--schemas <file>`
-with a catalog from a protocol-41 plane (or a copy of one) until the cutover is
-promoted.
+The scenario needs a catalog that serves `edit_task`. A plane predating the
+tool cutover does not, and the rig refuses that run up front rather than
+reporting a run that exercised nothing — pass `--schemas <file>` with a catalog
+from a protocol-41 plane (or a copy of one) until the cutover is promoted.
 
 ### `reasoning-replay` — does the provider replay `reasoning_content`?
 

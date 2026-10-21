@@ -193,13 +193,13 @@ func TestDispatchAcceptsTheDocumentedFlagOnlyInvocation(t *testing.T) {
 }
 
 // TestThePaddingScenarioRefusesAPreCutoverCatalog pins the loud failure: the
-// residual lives on edit_task, so a catalog still serving the deleted
-// update_task (a plane before the CLA-746/CLA-748 cutover is promoted) would
-// leave the model with every tool except the one the scenario studies.
+// residual lives on edit_task, so a catalog that predates the tool cutover
+// would leave the model with every tool except the one the scenario studies,
+// and the report would describe a run that proved nothing.
 func TestThePaddingScenarioRefusesAPreCutoverCatalog(t *testing.T) {
 	dir := t.TempDir()
 	cat := filepath.Join(dir, "pre-cutover.json")
-	if err := os.WriteFile(cat, []byte(`{"tools":[{"name":"update_task","inputSchema":{"type":"object"}}]}`), 0o644); err != nil {
+	if err := os.WriteFile(cat, []byte(`{"tools":[{"name":"old_task_tool","inputSchema":{"type":"object"}}]}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	code := dispatch([]string{

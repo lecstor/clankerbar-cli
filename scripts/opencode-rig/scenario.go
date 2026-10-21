@@ -172,9 +172,9 @@ func catalogTool(scenario, schemaTool string) string {
 	case "schema":
 		return schemaToolID(schemaTool)
 	case "padding":
-		// The residual lives on edit_task. A catalog that still serves the
-		// deleted update_task is a pre-cutover plane, and the model would be
-		// offered everything except the surface this scenario studies.
+		// The residual lives on edit_task. A catalog that predates the tool
+		// cutover does not serve it, and the model would be offered everything
+		// except the surface this scenario studies.
 		return "edit_task"
 	}
 	return ""
