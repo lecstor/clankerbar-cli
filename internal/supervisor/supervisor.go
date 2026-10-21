@@ -71,6 +71,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
@@ -221,6 +222,18 @@ type Options struct {
 	// a test's fake plane is not; a test supplies a client pointed at its own
 	// server so the wire shape is exercised for real.
 	PlaneFor func(endpoint, apiKey string) plane.Releaser
+
+	// CloseOutFor builds the plane client the deterministic close-out uses for one
+	// project's endpoint (CLA-758). Nil = plane.NewCloseOutAPI. Same rationale as
+	// PlaneFor: the endpoint resolved is a production one, and a test's fake plane
+	// is not it.
+	CloseOutFor func(endpoint, apiKey string) plane.CloseOutAPI
+
+	// CloseOutVerifier builds the local verifier a close-out judges one repo with.
+	// Nil = delivery.New(repo, "") with production defaults. The hook exists
+	// because the PR judgement polls within a 30-second window and shells out to
+	// `gh`: a test cannot wait that window out, and must substitute its own gh.
+	CloseOutVerifier func(repo string) *delivery.Verifier
 
 	// AfterConfigRewrite is called after a reconcile-time rewrite of a child's
 	// generated config and before the RESTART that applies it is queued
@@ -385,6 +398,14 @@ type Supervisor struct {
 	// a timed-out drain resumes the loop and respawns the fleet, so the flag
 	// cannot mean "this supervisor is exiting".
 	replacing bool
+
+	// closeOutSaid remembers the last close-out line logged per key, so an
+	// unchanged stand-down is said once rather than on every poll (CLA-758).
+	closeOutSaid map[string]string
+	// closeOutConflicts remembers the head@base pair already reported as
+	// conflicting per task, so the conflicting-path evidence is logged once per
+	// pair rather than on every reconcile.
+	closeOutConflicts map[string]string
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
@@ -626,6 +647,12 @@ func (d *Supervisor) reconcile() error {
 	// spawn, a stop, a flip or a removal is reflected within the same poll —
 	// and an unchanged pass prints nothing.
 	d.publishStatus()
+
+	// The deterministic close-out (CLA-758) runs last, on configs this pass just
+	// refreshed: an approved task whose PR is clean is merged and closed here,
+	// with no agent session, and everything it cannot finish deterministically is
+	// left exactly where the agent close-out expects it.
+	d.reconcileCloseOuts()
 
 	d.armRestart()
 	return nil
