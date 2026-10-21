@@ -92,12 +92,7 @@ func (d *Supervisor) handBackDeadClaim(inst *Instance) {
 	action := "ended the lease on"
 	if branch == "" {
 		action = "released"
-		// A no-branch task needs only the old `release` primitive; the driver
-		// marker is the one new thing, and a plane without it still has release.
 		err = rel.ReleaseDriver(ctx, claim.TaskID, claim.RunID)
-		if errors.Is(err, plane.ErrFieldUnsupported) {
-			err = rel.Release(ctx, claim.TaskID, claim.RunID)
-		}
 	} else {
 		err = rel.ExpireLease(ctx, claim.TaskID, claim.RunID)
 	}
@@ -112,9 +107,9 @@ func (d *Supervisor) handBackDeadClaim(inst *Instance) {
 	case refusedClaimHandback(err):
 		log.Printf("%s: nothing to hand back for %s - the plane says that run already ended (%v)",
 			inst.name, claimLabel(claim), err)
-	case errors.Is(err, plane.ErrFieldUnsupported):
-		log.Printf("%s: the backlog plane predates expireLease - %s keeps its lease for the takeover hand-off; it will expire as before",
-			inst.name, claimLabel(claim))
+	case errors.Is(err, plane.ErrPlaneTooOld):
+		log.Printf("%s: the backlog plane does not serve this build's task tools - %s keeps its lease for the takeover hand-off until the plane is promoted to protocol %d",
+			inst.name, claimLabel(claim), plane.RequiredPlaneProtocol)
 	case errors.Is(err, plane.ErrNotWired):
 		log.Printf("%s: cannot hand %s back - no plane writes are configured; its lease will expire",
 			inst.name, claimLabel(claim))

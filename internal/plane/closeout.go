@@ -218,30 +218,20 @@ func (r *mcpReleaser) ClaimCloseOut(ctx context.Context, taskID string) (string,
 // protection, a base that moved) has no failing check to escalate on, and the
 // ladder is the only thing that surfaces it.
 //
-// A plane older than one of the markers refuses the field by name; the retry
-// without the markers keeps the hand-back itself, which is the load-bearing part.
+// A driver marker and the checkGreen attestation both ride `release_task`; no
+// retry-without-markers path exists any more. An older plane answers the tool as
+// not found, and that is an ErrPlaneTooOld error naming the protocol this build
+// needs - the back-stop is the coordinated cutover, never a fallback.
 func (r *mcpReleaser) ReleaseCloseOut(ctx context.Context, taskID, runID string, checkGreen bool) error {
 	if taskID == "" || runID == "" {
 		return errors.New("release close-out: taskId and runId are both required")
 	}
-	err := r.call(ctx, "update_task", map[string]any{
-		"taskId":         taskID,
-		"runId":          runID,
-		"release":        true,
-		"driverReleased": true,
-		"checkGreen":     checkGreen,
+	return r.call(ctx, "release_task", map[string]any{
+		"taskId":     taskID,
+		"runId":      runID,
+		"driver":     true,
+		"checkGreen": checkGreen,
 	})
-	if err == nil {
-		return nil
-	}
-	if refusedField(err, "driverReleased") || refusedField(err, "checkGreen") {
-		return r.call(ctx, "update_task", map[string]any{
-			"taskId":  taskID,
-			"runId":   runID,
-			"release": true,
-		})
-	}
-	return err
 }
 
 // CompleteCloseOut declares the delivery and closes the task done in the claim's
@@ -267,10 +257,9 @@ func (r *mcpReleaser) CompleteCloseOut(ctx context.Context, taskID, runID string
 	if d.PR != "" {
 		delivery["pr"] = d.PR
 	}
-	return r.call(ctx, "update_task", map[string]any{
+	return r.call(ctx, "complete_task", map[string]any{
 		"taskId":   taskID,
 		"runId":    runID,
-		"status":   "done",
 		"delivery": delivery,
 	})
 }
