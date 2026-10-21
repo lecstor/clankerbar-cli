@@ -171,6 +171,12 @@ func TestOpencodeDetectLimit(t *testing.T) {
 		{"untyped 30-minute usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your 30-minute usage limit"}}`}, true, false, ""},
 		{"untyped session usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your session usage limit"}}`}, true, false, ""},
 		{"untyped daily usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your daily usage limit"}}`}, true, false, ""},
+		// Review 1.review-2.2: the same rolling window with the limit word FIRST
+		// ("...has been reached (5-hour window)") matches neither the window-first
+		// arm nor the generic arm (which wants "usage limit reached" adjacent), so
+		// before the second rolling arm it rode the transient ladder instead of a
+		// supervised wait.
+		{"untyped limit with the window AFTER it", Result{Stdout: `{"type":"error","error":{"message":"Your usage limit has been reached (5-hour window)","status":429}}`}, true, false, ""},
 		// A plain 429 rate limit names no window: still transient, not a limit.
 		{"429 is transient not the cap", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`}, false, false, ""},
 		{"agent narration about credits is NOT a stop", Result{Stdout: `{"type":"text","part":{"type":"text","text":"The billing note says the account is out of credits and hit its monthly limit."}}`}, false, false, ""},
@@ -202,6 +208,52 @@ func TestOpencodeDetectLimit(t *testing.T) {
 			}
 			if !got.ResetAt.Equal(want) {
 				t.Errorf("DetectLimit.ResetAt = %v, want %v", got.ResetAt, want)
+			}
+		})
+	}
+}
+
+// Review 1.review-2.2: a provider that states its window by DURATION states the
+// same thing as an absolute instant — when the limit lifts — so it classifies as
+// a wait, not as the generic arm's hard stop.
+func TestOpencodeDetectLimitRelativeReset(t *testing.T) {
+	got := (opencode{}).DetectLimit(Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Resets in 4 hours.","status":429}}`})
+	if !got.Limited {
+		t.Fatal("Limited = false, want the rolling window to be a limit")
+	}
+	if got.Stop {
+		t.Error("Stop = true — a message that says when it lifts is a wait, not a top-up")
+	}
+	if d := time.Until(got.ResetAt); d < 4*time.Hour-time.Minute || d > 4*time.Hour {
+		t.Errorf("ResetAt = %v (%v away), want ~4h from now", got.ResetAt, d)
+	}
+}
+
+// parseOpencodeResetAt resolves both forms a provider states its window in: an
+// absolute RFC3339 instant, and a duration relative to the drain's now
+// ("resets in 4 hours"). The relative form was the gap review 1.review-2.2
+// found: the wording says when it lifts, but only the absolute form parsed, so
+// the generic arm turned the wait into a hard budget stop.
+func TestParseOpencodeResetAt(t *testing.T) {
+	now := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		msg  string
+		want time.Time
+	}{
+		{"absolute RFC3339 instant", "Your limit resets at 2026-10-21T15:56:48.251Z", time.Date(2026, 10, 21, 15, 56, 48, 251000000, time.UTC)},
+		{"relative hours", "Usage limit reached. Resets in 4 hours.", now.Add(4 * time.Hour)},
+		{"relative singular hour", "reset in 1 hour", now.Add(time.Hour)},
+		{"relative short hours", "resets in 5h", now.Add(5 * time.Hour)},
+		{"relative minutes", "Your limit reset in 45m", now.Add(45 * time.Minute)},
+		{"relative minutes spelled out", "resets in 30 minutes", now.Add(30 * time.Minute)},
+		{"nothing stated", "Usage limit reached.", time.Time{}},
+		{"a zero window is not a reset", "resets in 0 minutes", time.Time{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseOpencodeResetAt(tc.msg, now); !got.Equal(tc.want) {
+				t.Errorf("parseOpencodeResetAt(%q) = %v, want %v", tc.msg, got, tc.want)
 			}
 		})
 	}
@@ -258,6 +310,11 @@ func TestOpencodeIsTransient(t *testing.T) {
 		{"402 after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"data":{"statusCode":402,"isRetryable":false}}}`}, false},
 		{"budget exhaustion after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "Your account is out of credits"}, false},
 		{"auth failure after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "Error: authentication failed - invalid api key"}, false},
+		// Review 1.review-2.2: a rolling window named AFTER the limit word is
+		// still a limit the loop WAITS out, never a blip it retries — the same
+		// opencodeRollingQuotaRe arm that makes DetectLimit waitable also has to
+		// keep this off the backoff ladder.
+		{"a rolling window after the limit word is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"message":"Your usage limit has been reached (5-hour window)","status":429}}`}, false},
 		{"a key revoked mid-session is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"data":{"statusCode":401}}}`}, false},
 		// The bare-word `transport` regression. stderr carries text this adapter
 		// did not author, and the MCP SDK's class names all end in `Transport` —

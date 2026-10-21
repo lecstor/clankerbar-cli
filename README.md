@@ -1397,7 +1397,10 @@ poll cadence stops:
   dollar figure, when there is one. The breakdown is what the operator's cost
   analysis reads; the dollar figure is labelled as harness-reported because on a
   subscription it is the API-rate equivalent, not what was paid, and it is
-  omitted for a harness that reports no cost at all (codex today).
+  omitted for a harness that reports no cost at all (codex today), and for a
+  session that reported no usage at all — the plane refuses a report carrying a
+  session's cost without its usage report, so the figure rides only when the
+  usage report does.
   The plane keeps a session's usage on the task, as a durable `phase_session`
   record (`list_phase_sessions` reads it back), alongside the run that session
   worked under — the run's UUID, never the credential the session holds, which

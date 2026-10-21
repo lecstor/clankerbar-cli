@@ -605,8 +605,25 @@ func wireSessions(sessions []Session) []wireSession {
 				CacheWrite: s.Usage.CacheWrite,
 			}
 		}
-		if s.CostUSD != nil {
+		// CLA-737: the plane refuses a session carrying costUsd without
+		// usageReported: true ("session.costUsd requires session.usageReported"),
+		// and it refuses the WHOLE report with it. sessionSpend already withholds
+		// the figure at the aggregated source, but Session is constructible by any
+		// caller and the wire is where the contract lives — so the guarantee is
+		// made here too, rather than trusting every future producer to remember a
+		// rule whose violation costs unrelated iterations and presence as well.
+		if s.UsageReported && s.CostUSD != nil {
 			w.CostUSD = s.CostUSD
+		}
+		// Dropping a figure the caller DID report is a producer bug, and a silent
+		// one would let the session sums stop tying up to the iteration-level
+		// costUsd with nothing to explain the gap. Every other contract stumble on
+		// this wire is logged (the clamp above, endIteration's BUG line,
+		// marshalReport's refusal); the guard's job is protecting the batch, not
+		// hiding the case it was written to catch (review 1.review-2.3).
+		if s.CostUSD != nil && !s.UsageReported {
+			log.Printf("fleet: session %q (%s/%s) reported costUsd %v with no usage report — dropping the figure (BUG: the producer bypassed sessionSpend, whose contract is that a cost is known only when the attempt reported usage)",
+				s.Phase, s.Harness, s.Model, *s.CostUSD)
 		}
 		out = append(out, w)
 	}
