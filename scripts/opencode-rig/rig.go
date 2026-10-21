@@ -18,29 +18,33 @@ import (
 
 // runOptions is one rig run, fully resolved from flags and the environment.
 type runOptions struct {
-	Scenario         string
-	Model            string
-	Provider         string
-	Upstream         string
-	MCPConfig        string
-	ConfigDir        string
-	Workdir          string
-	Out              string
-	Schemas          string
-	PlaneURL         string
-	SchemaTool       string
-	PlaneKeyFile     string
-	ProviderKeyFile  string
-	ProviderKeyEnv   string
-	ExtraEnv         []string
-	Deadline         time.Duration
-	MaxToolCalls     int
-	Prompt           string
-	OpencodeBin      string
-	DryRun           bool
-	Keep             bool
-	StartedAt        time.Time
-	StubStartTimeout time.Duration
+	Scenario        string
+	Model           string
+	Provider        string
+	Upstream        string
+	MCPConfig       string
+	ConfigDir       string
+	Workdir         string
+	Out             string
+	Schemas         string
+	PlaneURL        string
+	SchemaTool      string
+	PlaneKeyFile    string
+	ProviderKeyFile string
+	ProviderKeyEnv  string
+	ExtraEnv        []string
+	Deadline        time.Duration
+	MaxToolCalls    int
+	Prompt          string
+	OpencodeBin     string
+	DryRun          bool
+	Keep            bool
+	StartedAt       time.Time
+	// ServerURL and ServerPassword are set after the MCP preflight: the run
+	// attaches to the private server the rig started, never to a second one of
+	// its own (that is the race the preflight exists to close).
+	ServerURL      string
+	ServerPassword string
 }
 
 // runRecord is the run.json artifact: everything needed to understand the run
@@ -157,6 +161,9 @@ func runRig(o runOptions) (int, error) {
 	if o.Deadline <= 0 {
 		return 1, fmt.Errorf("--deadline must be positive")
 	}
+	if o.ConfigDir != "" {
+		o.ConfigDir = expandHome(o.ConfigDir)
+	}
 
 	// Run directory. Everything the run produces lives under it, so a report can
 	// always be tied to its raw logs.
@@ -170,6 +177,12 @@ func runRig(o runOptions) (int, error) {
 	o.Out = out
 	if err := os.MkdirAll(o.Out, 0o755); err != nil {
 		return 1, err
+	}
+	// One run per directory. Reusing a directory would mix this run's logs with
+	// a previous run's and let a stale stub-capped marker stop a healthy
+	// session, so refuse rather than silently contaminate the evidence.
+	if fileExists(filepath.Join(o.Out, "run.json")) {
+		return 1, fmt.Errorf("run directory %s already holds a run (run.json); pass a new --out", o.Out)
 	}
 
 	// The sandbox: an empty directory, deliberately not the repo. The rig studies
@@ -373,6 +386,22 @@ func runRig(o runOptions) (int, error) {
 		extraEnv = append(extraEnv, o.ProviderKeyEnv+"="+key)
 	}
 
+	// CLA-703's preflight, mirrored: start the private server, wait until the
+	// stub's MCP server reports connected, and only then attach the run. Without
+	// this the model's first turn can be offered no clankerbar tools at all -
+	// verified, not assumed: the first live run of this rig did exactly that.
+	serverEnv := sessionEnv(o, content, isolation, extraEnv)
+	fmt.Printf("  starting opencode serve; waiting for MCP server %q to connect...\n", "clankerbar")
+	sessionServer, err := startRigServer(o.OpencodeBin, serverEnv, o.Workdir, o.Out)
+	if err != nil {
+		return 1, err
+	}
+	defer sessionServer.stop()
+	if err := sessionServer.waitForMCP(context.Background(), "clankerbar", o.Workdir, rigMCPTimeout); err != nil {
+		return 1, fmt.Errorf("MCP preflight: %w", err)
+	}
+	o.ServerURL, o.ServerPassword = sessionServer.url, sessionServer.password
+
 	code, err := runSession(o, content, isolation, extraEnv)
 	if err != nil {
 		return 1, err
@@ -454,7 +483,7 @@ func runSession(o runOptions, content []byte, isolation, extraEnv []string) (int
 	cmd.Env = env
 	configureProcessGroup(cmd)
 
-	fmt.Printf("  session: %s %s\n", o.OpencodeBin, strings.Join(args[:len(args)-1], " "))
+	fmt.Printf("  session: %s %s\n", o.OpencodeBin, strings.Join(args, " "))
 	fmt.Printf("  waiting for the session (deadline %s, cap %d calls)...\n", o.Deadline, o.MaxToolCalls)
 
 	if err := cmd.Start(); err != nil {
@@ -536,7 +565,15 @@ loop:
 func opencodeArgs(o runOptions) []string {
 	args := []string{
 		"--print-logs",
-		"run", "--standalone", "--format", "json", "--agent", "build",
+		"run", "--format", "json", "--agent", "build",
+	}
+	if o.ServerURL != "" {
+		// Attach to the server whose MCP connection the preflight proved. No
+		// --standalone: that asks the CLI for a SECOND server, reintroducing the
+		// race against the one that was just verified.
+		args = append(args, "--server", o.ServerURL)
+	} else {
+		args = append(args, "--standalone")
 	}
 	if o.Model != "" {
 		args = append(args, "--model", o.Model)
@@ -554,17 +591,23 @@ func sessionEnv(o runOptions, content []byte, isolation, extra []string) []strin
 		"OPENCODE_CONFIG_CONTENT=" + string(content),
 	}
 	if o.ConfigDir != "" {
-		overrides = append(overrides, "OPENCODE_CONFIG_DIR="+expandHome(o.ConfigDir))
+		overrides = append(overrides, "OPENCODE_CONFIG_DIR="+o.ConfigDir)
 	}
 	overrides = append(overrides, isolation...)
 	// A caller-supplied OPENCODE_PERMISSION is a 1.x relic and must not shadow
-	// the content layer's policy.
-	overrides = append(overrides, "OPENCODE_PERMISSION=")
+	// the content layer's policy. OPENCODE_PASSWORD is cleared here so an
+	// inherited value cannot reach the server; the run adds its own below.
+	overrides = append(overrides, "OPENCODE_PERMISSION=", "OPENCODE_PASSWORD=")
+	if o.ServerPassword != "" {
+		overrides = append(overrides, "OPENCODE_PASSWORD="+o.ServerPassword)
+	}
 	overrides = append(overrides, extra...)
 	return mergeEnv(os.Environ(), overrides)
 }
 
-// mergeEnv replaces keys named in overrides and appends new ones.
+// mergeEnv replaces keys named in overrides and appends new ones. A key that
+// appears more than once in base keeps its LAST value (exec's rule), and the
+// output holds one entry per key in first-appearance order.
 func mergeEnv(base, overrides []string) []string {
 	keyOf := func(s string) string {
 		if i := strings.Index(s, "="); i >= 0 {
@@ -572,19 +615,18 @@ func mergeEnv(base, overrides []string) []string {
 		}
 		return s
 	}
-	index := map[string]int{}
-	out := append([]string{}, base...)
-	for i, s := range out {
-		index[keyOf(s)] = i
-	}
-	for _, s := range overrides {
+	var order []string
+	values := map[string]string{}
+	for _, s := range append(append([]string{}, base...), overrides...) {
 		k := keyOf(s)
-		if i, ok := index[k]; ok {
-			out[i] = s
-		} else {
-			index[k] = len(out)
-			out = append(out, s)
+		if _, seen := values[k]; !seen {
+			order = append(order, k)
 		}
+		values[k] = s
+	}
+	out := make([]string, 0, len(order))
+	for _, k := range order {
+		out = append(out, values[k])
 	}
 	return out
 }

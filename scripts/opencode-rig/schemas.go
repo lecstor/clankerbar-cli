@@ -45,23 +45,31 @@ func loadCatalog(path string) (catalog, error) {
 		return catalog{}, err
 	}
 	var c catalog
-	var probe struct {
-		Tools  []json.RawMessage `json:"tools"`
-		Result *struct {
-			Tools []json.RawMessage `json:"tools"`
-		} `json:"result"`
+	trimmed := bytes.TrimSpace(data)
+	if len(trimmed) == 0 {
+		return catalog{}, fmt.Errorf("%s: empty file", path)
 	}
-	if err := json.Unmarshal(data, &probe); err != nil {
-		return catalog{}, fmt.Errorf("%s: not a tool catalog: %w", path, err)
-	}
-	switch {
-	case probe.Result != nil && probe.Result.Tools != nil:
-		c.Tools = probe.Result.Tools
-	case probe.Tools != nil:
-		c.Tools = probe.Tools
-	default:
-		// A bare array.
-		if err := json.Unmarshal(data, &c.Tools); err != nil {
+	if trimmed[0] == '[' {
+		// A bare array of tools.
+		if err := json.Unmarshal(trimmed, &c.Tools); err != nil {
+			return catalog{}, fmt.Errorf("%s: not a tool array: %w", path, err)
+		}
+	} else {
+		var probe struct {
+			Tools  []json.RawMessage `json:"tools"`
+			Result *struct {
+				Tools []json.RawMessage `json:"tools"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal(data, &probe); err != nil {
+			return catalog{}, fmt.Errorf("%s: not a tool catalog: %w", path, err)
+		}
+		switch {
+		case probe.Result != nil && probe.Result.Tools != nil:
+			c.Tools = probe.Result.Tools
+		case probe.Tools != nil:
+			c.Tools = probe.Tools
+		default:
 			return catalog{}, fmt.Errorf("%s: no tools array (expected {\"tools\":[...]}, a tools/list result, or a bare array)", path)
 		}
 	}
@@ -78,23 +86,35 @@ func loadCatalog(path string) (catalog, error) {
 	return c, nil
 }
 
-// saveCatalog writes the catalog envelope. Raw tool objects are passed through
-// untouched: the point of the rig's schema scenario is the bytes the plane
-// (or a proposal) serves, so re-marshalling must not reorder or normalise them.
+// saveCatalog writes the catalog envelope. The tool objects are written as the
+// exact bytes they arrived as, not re-marshalled: the schema scenario's whole
+// point is the shape the plane (or a proposal) serves, so a round trip must not
+// reorder keys or normalise a rendering.
 func saveCatalog(path string, c catalog) error {
-	if c.FetchedAt == "" {
-		c.FetchedAt = time.Now().UTC().Format(time.RFC3339)
+	fetched := c.FetchedAt
+	if fetched == "" {
+		fetched = time.Now().UTC().Format(time.RFC3339)
 	}
-	data, err := json.MarshalIndent(struct {
-		Source    string            `json:"source,omitempty"`
-		FetchedAt string            `json:"fetchedAt,omitempty"`
-		Tools     []json.RawMessage `json:"tools"`
-	}{c.Source, c.FetchedAt, c.Tools}, "", "  ")
-	if err != nil {
-		return err
+	var b bytes.Buffer
+	b.WriteString("{\n")
+	if c.Source != "" {
+		src, _ := json.Marshal(c.Source)
+		fmt.Fprintf(&b, "  \"source\": %s,\n", src)
 	}
-	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o644)
+	if fetched != "" {
+		ts, _ := json.Marshal(fetched)
+		fmt.Fprintf(&b, "  \"fetchedAt\": %s,\n", ts)
+	}
+	b.WriteString("  \"tools\": [\n")
+	for i, raw := range c.Tools {
+		if i > 0 {
+			b.WriteString(",\n")
+		}
+		b.WriteString("    ")
+		b.Write(bytes.TrimSpace(raw))
+	}
+	b.WriteString("\n  ]\n}\n")
+	return os.WriteFile(path, b.Bytes(), 0o644)
 }
 
 // fetchCatalog performs a read-only tools/list against an MCP Streamable HTTP
@@ -207,7 +227,7 @@ func responseJSON(body []byte) (json.RawMessage, error) {
 		}
 		line := bytes.TrimSpace(data.Bytes())
 		data.Reset()
-		if len(line) == 0 || line[0] != '{' {
+		if len(line) == 0 || line[0] != '{' || !json.Valid(line) {
 			return nil, false
 		}
 		return append(json.RawMessage(nil), line...), true

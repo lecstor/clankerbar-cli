@@ -159,9 +159,10 @@ func (p *recordingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// recordRequest writes one request envelope. The body is embedded as raw JSON
-// when it is JSON (it always is for the OpenAI-compatible provider), so the
-// report can read it without a second parse and the file stays a single object.
+// recordRequest writes one request envelope. The body is embedded as the exact
+// bytes the client sent (never re-indented or re-marshalled), so the reported
+// size and hash are the wire values and a schema difference is visible byte for
+// byte. The Authorization header is omitted, and the record says so.
 func (p *recordingProxy) recordRequest(seq int, r *http.Request, body []byte) error {
 	headers := map[string]string{}
 	for k, v := range r.Header {
@@ -170,37 +171,32 @@ func (p *recordingProxy) recordRequest(seq int, r *http.Request, body []byte) er
 		}
 		headers[k] = strings.Join(v, ", ")
 	}
-	env := struct {
-		Seq       int               `json:"seq"`
-		At        string            `json:"at"`
-		Method    string            `json:"method"`
-		Path      string            `json:"path"`
-		Query     string            `json:"query,omitempty"`
-		Headers   map[string]string `json:"headers"`
-		AuthOmit  bool              `json:"authorizationOmitted"`
-		Body      json.RawMessage   `json:"body"`
-		BodyText  string            `json:"bodyText,omitempty"`
-		BodyBytes int               `json:"bodyBytes"`
-	}{
-		Seq:       seq,
-		At:        time.Now().UTC().Format(time.RFC3339Nano),
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Query:     r.URL.RawQuery,
-		Headers:   headers,
-		AuthOmit:  true,
-		BodyBytes: len(body),
+	var b bytes.Buffer
+	b.WriteString("{\n")
+	fmt.Fprintf(&b, "  \"seq\": %d,\n", seq)
+	at, _ := json.Marshal(time.Now().UTC().Format(time.RFC3339Nano))
+	fmt.Fprintf(&b, "  \"at\": %s,\n", at)
+	method, _ := json.Marshal(r.Method)
+	fmt.Fprintf(&b, "  \"method\": %s,\n", method)
+	path, _ := json.Marshal(r.URL.Path)
+	fmt.Fprintf(&b, "  \"path\": %s,\n", path)
+	if r.URL.RawQuery != "" {
+		q, _ := json.Marshal(r.URL.RawQuery)
+		fmt.Fprintf(&b, "  \"query\": %s,\n", q)
 	}
-	if json.Valid(body) && len(body) > 0 {
-		env.Body = append(json.RawMessage(nil), body...)
+	h, _ := json.Marshal(headers)
+	fmt.Fprintf(&b, "  \"headers\": %s,\n", h)
+	fmt.Fprintf(&b, "  \"authorizationOmitted\": true,\n")
+	fmt.Fprintf(&b, "  \"bodyBytes\": %d,\n", len(body))
+	b.WriteString("  \"body\": ")
+	if len(body) > 0 && json.Valid(body) {
+		b.Write(bytes.TrimSpace(body))
 	} else {
-		env.BodyText = string(body)
+		s, _ := json.Marshal(string(body))
+		b.Write(s)
 	}
-	data, err := json.MarshalIndent(env, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(p.requestPath(seq, r.URL.Path), append(data, '\n'), 0o644)
+	b.WriteString("\n}\n")
+	return os.WriteFile(p.requestPath(seq, r.URL.Path), b.Bytes(), 0o644)
 }
 
 func (p *recordingProxy) requestPath(seq int, path string) string {

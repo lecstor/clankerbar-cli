@@ -35,13 +35,15 @@ type rigPart struct {
 }
 
 type rigTokens struct {
-	Input     int `json:"input"`
-	Output    int `json:"output"`
-	Reasoning int `json:"reasoning"`
-	Cache     *struct {
-		Read  int `json:"read"`
-		Write int `json:"write"`
-	} `json:"cache"`
+	Input     int       `json:"input"`
+	Output    int       `json:"output"`
+	Reasoning int       `json:"reasoning"`
+	Cache     *rigCache `json:"cache"`
+}
+
+type rigCache struct {
+	Read  int `json:"read"`
+	Write int `json:"write"`
 }
 
 type rigState struct {
@@ -293,7 +295,7 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 			line("")
 			h := sha256.Sum256(req.Body)
 			line("- body: %d bytes, sha256 `%s`", len(req.Body), hex.EncodeToString(h[:8]))
-			line("- authorization header recorded: %v (never written to disk)", !req.AuthOmit)
+			line("- Authorization header: omitted from the record (forwarded to the provider, never written to disk)")
 			line("- model: `%s`; messages: %d; tools: %d; stream: %s",
 				chat.Model, len(chat.Messages), len(chat.Tools), boolLabel(chat.Stream))
 			if effort := reasoningEffort(chat); effort != "" {
@@ -321,9 +323,9 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 		}
 		if firstTools != "" {
 			if toolsVary {
-				line("The tools array CHANGED between requests (see each tool sha256 above).")
+				line("The tools array CHANGED between the requests that carried tools (see each tool sha256 above).")
 			} else {
-				line("The tools array was byte-identical in every request (sha256 `%s`).", firstTools)
+				line("The tools array was byte-identical in every request that carried tools (sha256 `%s`).", firstTools)
 			}
 			line("")
 		}

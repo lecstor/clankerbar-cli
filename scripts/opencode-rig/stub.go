@@ -17,11 +17,10 @@ import (
 // the environment, so the smoke test drives exactly the same server the rig's
 // config spawns.
 type stubOptions struct {
-	Scenario  string
-	Out       string
-	Catalog   catalog
-	MaxCalls  int // 0 = no cap
-	StartedAt time.Time
+	Scenario string
+	Out      string
+	Catalog  catalog
+	MaxCalls int // 0 = no cap
 }
 
 // stubCall is one line of stub-calls.jsonl: the whole tools/call, the top-level
@@ -227,11 +226,10 @@ func stubCmd(args []string) int {
 		return 1
 	}
 	if err := serveStub(context.Background(), os.Stdin, os.Stdout, stubOptions{
-		Scenario:  *scenario,
-		Out:       *out,
-		Catalog:   cat,
-		MaxCalls:  *maxCalls,
-		StartedAt: time.Now(),
+		Scenario: *scenario,
+		Out:      *out,
+		Catalog:  cat,
+		MaxCalls: *maxCalls,
 	}); err != nil {
 		fmt.Fprintf(os.Stderr, "opencode-rig stub: %v\n", err)
 		return 1
