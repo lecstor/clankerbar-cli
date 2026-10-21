@@ -108,7 +108,7 @@ func runCmd(args []string) int {
 	fs.StringVar(&o.Out, "out", "", "run directory (default $TMPDIR/opencode-rig/<scenario>-<stamp>)")
 	fs.StringVar(&o.Schemas, "schemas", "live", "tool catalog: live, or a file")
 	fs.StringVar(&o.PlaneURL, "plane-url", "https://clankerbar.com/mcp/clankerbar", "plane MCP URL for the live schema fetch")
-	fs.StringVar(&o.SchemaTool, "schema-tool", "update_task", "tool the schema scenario calls, as the catalog names it")
+	fs.StringVar(&o.SchemaTool, "schema-tool", "edit_task", "tool the schema scenario calls, as the catalog names it")
 	fs.StringVar(&o.PlaneKeyFile, "plane-key-file", "", "read CLANKERBAR_API_KEY from this file")
 	fs.StringVar(&o.ProviderKeyFile, "provider-key-file", "", "read the provider key from this file")
 	fs.StringVar(&o.ProviderKeyEnv, "provider-key-env", "COMMANDCODE_API_KEY", "environment variable the provider key is set in")

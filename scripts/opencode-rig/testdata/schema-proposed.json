@@ -2,8 +2,8 @@
   "$comment": "An example proposed tool catalog for `run.sh --scenario schema --schemas testdata/schema-proposed.json`. It is deliberately NOT the live catalog: it shows the shape a proposal can be tested against before the plane ships it. For the real catalog, run `run.sh fetch-schemas --out /tmp/schemas-live.json` and edit a copy.",
   "tools": [
     {
-      "name": "update_task",
-      "description": "Proposed update_task shape: nullable enums rendered as anyOf [enum, null], which is what zod .nullable() serialises (CLA-745).",
+      "name": "edit_task",
+      "description": "Proposed edit_task shape: nullable enums and nullable booleans rendered as anyOf [type, null], which is what zod .nullable() serialises (CLA-745).",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -11,16 +11,13 @@
             "type": "string",
             "description": "REQUIRED. A UUID or a CB-<n>."
           },
-          "status": {
-            "anyOf": [
-              {
-                "type": "string",
-                "enum": ["backlog", "ready", "in_progress", "in_review", "approved", "blocked", "parked", "archived", "done"]
-              },
-              {
-                "type": "null"
-              }
-            ]
+          "detail": {
+            "type": "string",
+            "description": "Markdown body."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repo 'owner/name'. \"\" clears to primary; null means not sent."
           },
           "priority": {
             "anyOf": [
@@ -44,9 +41,25 @@
               }
             ]
           },
-          "detail": {
-            "type": "string",
-            "description": "Markdown body."
+          "container": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "humanOnly": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": ["taskId"],
