@@ -368,6 +368,29 @@ type ghNotFoundError struct{ detail string }
 
 func (e *ghNotFoundError) Error() string { return e.detail }
 
+// ghParseError marks gh output that is not the JSON this gate asked for. It is
+// deliberately NOT an absence of evidence: gh ran and answered, and the answer
+// is unintelligible — a defect in the gate's own contract (CLA-776: an
+// inherited GH_FORCE_TTY made gh colour its JSON, and the parse error was
+// logged as "could not verify … carrying on" on every delivery for two
+// months). Callers refuse the delivery on it, loudly, rather than carrying on.
+type ghParseError struct {
+	detail string
+	err    error
+}
+
+func (e *ghParseError) Error() string { return e.detail }
+func (e *ghParseError) Unwrap() error { return e.err }
+
+// IsGHParseError reports whether err is gh output this package could not parse.
+// The doctor preflight classifies its probe's failures with it: a parse failure
+// means the delivery gate is broken NOW and is a FAIL, while auth and network
+// failures of the same probe are only a WARN.
+func IsGHParseError(err error) bool {
+	var pe *ghParseError
+	return errors.As(err, &pe)
+}
+
 // normalizePR accepts the shapes a session actually reports - "42", "#42" -
 // and rejects everything else BEFORE gh sees it. The rejection is the point:
 // gh resolves a non-number argument as a BRANCH name, so an unvalidated
@@ -482,6 +505,19 @@ func (v *Verifier) pollPR(ctx context.Context, repo, slug string, prNum int, ghS
 				return ghPR{}, Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
 					"PR %s was not found in %s — the delivery names a pull request that does not exist; correct the number and declare again", pr, slug)}
 			}
+			// A parse failure is a refusal, not a "could not verify" (CLA-776).
+			// gh ran and answered, and its answer is unintelligible — that is a
+			// defect in this gate's own contract, and carrying on is exactly how
+			// an inherited GH_FORCE_TTY hid the hole on every real delivery for
+			// two months. It names the preflight that catches the same fault
+			// before a run starts.
+			if IsGHParseError(err) {
+				return ghPR{}, Check{Kind: PRVerified, Status: Fail, Detail: fmt.Sprintf(
+					"PR %s could not be verified: %v — the delivery is REFUSED, not carried on. "+
+						"gh ran, but its output is not the plain JSON this gate asked for, so the pull request was NOT judged. "+
+						"Run `clankerbar doctor` (its pr_gate probe parses a real `gh pr view --json`) and clear whatever is decorating gh's output",
+					pr, err)}
+			}
 			return ghPR{}, Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
 				"PR %s could not be verified: %v", pr, err)}
 		}
@@ -519,7 +555,10 @@ func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string, scope []
 	}
 	var view ghPR
 	if jerr := json.Unmarshal([]byte(out), &view); jerr != nil {
-		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, fmt.Errorf("could not parse gh pr view output: %v", jerr)
+		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, &ghParseError{
+			detail: fmt.Sprintf("could not parse gh pr view output: %v", jerr),
+			err:    jerr,
+		}
 	}
 	return view, judgePR(view), nil
 }
@@ -550,24 +589,9 @@ func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []strin
 // "gh" here. extraEnv carries per-invocation environment additions (see
 // runGHScoped); pass nil for the plain spawn.
 func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ...string) (string, error) {
-	env := append(os.Environ(),
-		"GH_NO_UPDATE_NOTIFIER=1",
-		"GH_FORCE_TTY=0",
-		"GIT_TERMINAL_PROMPT=0",
-	)
-	if len(extraEnv) > 0 {
-		scoped := make([]string, 0, len(env)+len(extraEnv))
-		for _, e := range env {
-			if i := strings.IndexByte(e, '='); i > 0 && isGhTokenVar(e[:i]) {
-				continue
-			}
-			scoped = append(scoped, e)
-		}
-		env = append(scoped, extraEnv...)
-	}
 	cmd := exec.CommandContext(ctx, ghBin, args...)
 	cmd.Dir = dir
-	cmd.Env = env
+	cmd.Env = ghEnv(os.Environ(), extraEnv)
 	cmd.WaitDelay = ghWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -586,6 +610,63 @@ func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ..
 		return "", fmt.Errorf("gh %s: %w", args[0], err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
+}
+
+// ghEnv builds the environment for one gh invocation: the parent environment
+// with every variable this function OWNS removed (so an ambient value cannot
+// win by accident of position — duplicate entries have no portable
+// precedence), the non-interactive and no-colour settings this driver
+// requires, then any per-invocation additions the caller passes.
+//
+// # Why GH_FORCE_TTY is gone, not zeroed (CLA-776)
+//
+// gh treats ANY value of GH_FORCE_TTY as "force terminal-style output", and
+// reads a number as a column width. The CLA-310 gate shipped `GH_FORCE_TTY=0`,
+// which therefore turned colour ON: `gh pr view --json` printed
+// ANSI-coloured, pretty-printed JSON, encoding/json refused it at the first
+// `\x1b`, and every delivery's PR check degraded to a "could not verify …
+// carrying on" — unnoticed for two months because the unit tests drive a fake
+// gh that never colours anything.
+//
+// So the variable is REMOVED (from the inherited environment too: an ambient
+// value would do the same damage) and the colour-forcing family is stripped
+// alongside it. NO_COLOR and CLICOLOR=0 are set as the positive statement of
+// the same requirement, so a gh version that ignores one honours the other.
+func ghEnv(parent, extraEnv []string) []string {
+	// Colour and interaction settings this child OWNS. Setting ours by
+	// appending over an inherited value is not enough: duplicate entries have
+	// unspecified precedence, so the parent's must be gone.
+	owned := func(name string) bool {
+		switch name {
+		case "GH_FORCE_TTY", "CLICOLOR_FORCE", "FORCE_COLOR", "NO_COLOR", "CLICOLOR",
+			"GH_NO_UPDATE_NOTIFIER", "GIT_TERMINAL_PROMPT":
+			return true
+		}
+		return false
+	}
+	env := make([]string, 0, len(parent)+len(extraEnv)+4)
+	for _, e := range parent {
+		name := e
+		if i := strings.IndexByte(e, '='); i > 0 {
+			name = e[:i]
+		}
+		if owned(name) {
+			continue
+		}
+		// An ambient token only goes when a scoped one rides this invocation;
+		// with no additions the previous behaviour is kept exactly.
+		if len(extraEnv) > 0 && isGhTokenVar(name) {
+			continue
+		}
+		env = append(env, e)
+	}
+	env = append(env,
+		"GH_NO_UPDATE_NOTIFIER=1",
+		"NO_COLOR=1",
+		"CLICOLOR=0",
+		"GIT_TERMINAL_PROMPT=0",
+	)
+	return append(env, extraEnv...)
 }
 
 // isGhTokenVar reports whether an environment NAME is one of the variables gh

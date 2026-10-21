@@ -13,9 +13,12 @@ package delivery
 // credentials the child resolved.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -607,5 +610,118 @@ func TestJudgePRReadsBothRollupShapes(t *testing.T) {
 	dirty := judgePR(ghPR{Mergeable: "UNKNOWN", MergeStateStatus: "DIRTY"})
 	if dirty.verdict != prConflict {
 		t.Errorf("DIRTY merge state: got %+v, want prConflict without waiting", dirty)
+	}
+}
+
+// --- environment: gh must not decorate the JSON the gate parses (CLA-776) ---
+
+// THE regression: GH_FORCE_TTY went to gh as "0" from CLA-310 until CLA-776.
+// gh reads ANY value as "force terminal-style output" (a number is a column
+// width), so 0 turned colour ON and every real `gh pr view --json` was coloured
+// JSON that encoding/json rejected — invisible for two months because the fake
+// gh below never coloured anything.
+//
+// Mutation check: put GH_FORCE_TTY back, at any value, and this fails.
+func TestGHChildEnvironmentCarriesNoColourSwitch(t *testing.T) {
+	t.Setenv("GH_FORCE_TTY", "0") // the value the bug shipped, now ambient
+	t.Setenv("CLICOLOR_FORCE", "1")
+	t.Setenv("FORCE_COLOR", "1")
+
+	gh := writeGH(t, "env\n")
+	out, err := runGHBin(context.Background(), gh, t.TempDir(), nil, "pr", "view")
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	got := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if i := strings.IndexByte(line, '='); i > 0 {
+			got[line[:i]] = line[i+1:]
+		}
+	}
+	for _, name := range []string{"GH_FORCE_TTY", "CLICOLOR_FORCE", "FORCE_COLOR"} {
+		if v, ok := got[name]; ok {
+			t.Errorf("%s reached gh as %q — any value of GH_FORCE_TTY forces terminal-style output, and the colour-forcing pair overrides NO_COLOR", name, v)
+		}
+	}
+	if got["NO_COLOR"] != "1" {
+		t.Errorf("NO_COLOR = %q, want 1: the child must be told not to colour output this package parses", got["NO_COLOR"])
+	}
+	if got["CLICOLOR"] != "0" {
+		t.Errorf("CLICOLOR = %q, want 0: the same requirement, in the spelling older gh versions read", got["CLICOLOR"])
+	}
+}
+
+// colouredWhenForcedGH mirrors real gh: its JSON is ANSI-coloured exactly when
+// GH_FORCE_TTY is in its environment. With the gate's environment fixed the
+// variable never arrives, so the same fake answers plain JSON and the check
+// passes — which is what proves the fix, not the fixture.
+func colouredWhenForcedGH(t *testing.T) string {
+	t.Helper()
+	coloured := "\x1b[1;37m{\x1b[m\n" +
+		"  \x1b[1;34m\"mergeable\"\x1b[m\x1b[1;37m:\x1b[m \"MERGEABLE\",\n" +
+		"  \x1b[1;34m\"mergeStateStatus\"\x1b[m\x1b[1;37m:\x1b[m \"CLEAN\",\n" +
+		"  \x1b[1;34m\"statusCheckRollup\"\x1b[m\x1b[1;37m:\x1b[m [\n" +
+		"    \x1b[1;37m{\x1b[m\n" +
+		"      \x1b[1;34m\"__typename\"\x1b[m\x1b[1;37m:\x1b[m \"CheckRun\",\n" +
+		"      \x1b[1;34m\"name\"\x1b[m\x1b[1;37m:\x1b[m \"ci\",\n" +
+		"      \x1b[1;34m\"status\"\x1b[m\x1b[1;37m:\x1b[m \"COMPLETED\",\n" +
+		"      \x1b[1;34m\"conclusion\"\x1b[m\x1b[1;37m:\x1b[m \"SUCCESS\"\n" +
+		"    \x1b[1;37m}\x1b[m\n" +
+		"  ],\n" +
+		"  \x1b[1;34m\"url\"\x1b[m\x1b[1;37m:\x1b[m \"https://github.com/acme/widgets/pull/7\"\n" +
+		"\x1b[1;37m}\x1b[m\n"
+	body := "if [ -n \"${GH_FORCE_TTY+x}\" ]; then\n" +
+		"cat <<'COLOURED'\n" + coloured + "COLOURED\n" +
+		"else\ncat <<'PLAIN'\n" + jsonMergeablePassing + "\nPLAIN\nfi\n"
+	return writeGH(t, body)
+}
+
+func TestColourEmittingGHIsParsedUnderTheFixedEnvironment(t *testing.T) {
+	t.Setenv("GH_FORCE_TTY", "0") // an ambient value, as the operator machine had
+	dir := prEnv(t)
+	gh := colouredWhenForcedGH(t)
+
+	// Prove the fixture mirrors real gh first: handed the variable, it emits
+	// bytes encoding/json rejects. Without this the Pass below could just mean
+	// the fake never coloured anything.
+	cmd := exec.Command(gh, "pr", "view", "7")
+	cmd.Env = append(os.Environ(), "GH_FORCE_TTY=0")
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("\x1b")) {
+		t.Fatal("fixture did not colour its output under GH_FORCE_TTY — it does not mirror gh, so this test proves nothing")
+	}
+	var probe ghPR
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		t.Fatal("coloured gh output parsed — the fixture is not faithful to the bug")
+	}
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+}
+
+// If gh decorates its output anyway — a future colour-forcing variable this
+// package cannot strip — the delivery must be REFUSED, not logged as "could
+// not verify … carrying on". A parse failure is a finding: gh ran and its
+// answer is unintelligible, which is a defect in this gate's own contract
+// rather than an absence of evidence.
+func TestUnparseableGHOutputIsRefusedNotCarriedOn(t *testing.T) {
+	dir := prEnv(t)
+	gh := fakeGH(t, "\x1b[1;37m{\x1b[m\n  \x1b[1;34m\"mergeable\"\x1b[m: \"MERGEABLE\"\n\x1b[1;37m}\x1b[m")
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	c := mustStatus(t, rep, PRVerified, Fail)
+	if !rep.Failed() {
+		t.Error("a parse failure must count as a failed delivery check")
+	}
+	if !strings.Contains(c.Detail, "could not parse") {
+		t.Errorf("refusal must name the parse failure: %s", c.Detail)
+	}
+	if !strings.Contains(c.Detail, "doctor") {
+		t.Errorf("refusal must point at the preflight that catches this up front: %s", c.Detail)
 	}
 }
