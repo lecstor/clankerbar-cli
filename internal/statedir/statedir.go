@@ -87,9 +87,10 @@ const sentinelBody = "clankerbar loop state dir: iteration transcripts, the daem
 // MaterializedConfigName is the generated effective config the fleet
 // supervisor writes into each child's state dir (daemon-supervisor phase 2b)
 // and starts the child with: `run -c <state dir>/materialized.json`. It is a
-// cache — regenerated on every reconcile, never hand-edited, safe to delete —
-// which is why the adoption check below must count it as ours: a state dir
-// holding it must stay adoptable by the daemon and by doctor.
+// cache — written at spawn, rewritten at reconcile only when an edit changes
+// its bytes (CLA-724), never hand-edited, safe to delete — which is why the
+// adoption check below must count it as ours: a state dir holding it must stay
+// adoptable by the daemon and by doctor.
 const MaterializedConfigName = "materialized.json"
 
 // DaemonLogName is the daemon's own log file in its state dir (CLA-701): the
@@ -530,6 +531,32 @@ func (d *Dir) WriteFileAtomic(name string, data []byte) error {
 // ReadFile reads a file from the directory, refusing to follow a symlink and
 // reading at most maxMarkerBytes.
 func (d *Dir) ReadFile(name string) ([]byte, error) {
+	f, err := d.openRegular(name, "a control marker")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, maxMarkerBytes))
+}
+
+// ReadFileAll reads a whole file from the directory with ReadFile's open
+// discipline — a symlink at the name is refused and the open goes through the
+// root, so nothing resolves outside the directory — but with no size cap. It
+// exists for the generated config, a whole document rather than a one-line
+// marker; every other read here is a marker and keeps the cap.
+func (d *Dir) ReadFileAll(name string) ([]byte, error) {
+	f, err := d.openRegular(name, "a generated config")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// openRegular opens one regular file by name through the root, after refusing
+// a symlink or anything else at that name. kind names what is being read, for
+// the refusal message.
+func (d *Dir) openRegular(name, kind string) (*os.File, error) {
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
@@ -538,17 +565,12 @@ func (d *Dir) ReadFile(name string) ([]byte, error) {
 		return nil, err
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s is a symlink - refusing to read a control marker through one", filepath.Join(d.path, name))
+		return nil, fmt.Errorf("%s is a symlink - refusing to read %s through one", filepath.Join(d.path, name), kind)
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", filepath.Join(d.path, name))
 	}
-	f, err := d.root.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, maxMarkerBytes))
+	return d.root.Open(name)
 }
 
 // Exists reports whether name is present, without following a symlink and
@@ -627,8 +649,11 @@ func (d *Dir) isOurArtifact(name string) bool {
 		name == "RESTART", name == "RESTART_NOW", name == "RELOAD",
 		// The supervisor's generated effective config (phase 2b). The daemon
 		// that opens this directory next was started with `run -c` pointing at
-		// it, and doctor opens the same directory — both must adopt it.
-		name == MaterializedConfigName,
+		// it, and doctor opens the same directory — both must adopt it. The
+		// `.tmp` sibling is the in-flight half of the atomic replace a
+		// reconcile-time config edit performs (CLA-724); a crash can leave one
+		// behind, exactly as with CURRENT_CLAIM.tmp.
+		name == MaterializedConfigName, name == MaterializedConfigName+".tmp",
 		// The daemon's record of the claim its current child holds, written for
 		// the supervisor to hand back if the child dies without letting go
 		// (CLA-708). Its `.tmp` sibling is the in-flight half of an atomic
