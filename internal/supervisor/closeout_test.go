@@ -7,7 +7,7 @@ package supervisor
 // stub: whether the merge commit GitHub made is really an ancestor of the base on
 // the remote (so the fixture has a bare remote, a fleet clone and a clone the fake
 // `gh` merges in), and what the plane is actually told (so the fake plane records
-// the `claim_task` / `update_task` arguments it receives).
+// the `claim_task` / `complete_task` / `release_task` arguments it receives).
 //
 // The fake `gh` is a shell script on the verifier's own gh path: `pr list` and
 // `pr view` answer from JSON files the test rewrites, and the merge endpoint
@@ -355,15 +355,11 @@ func TestCloseOutMergesACleanApprovedTask(t *testing.T) {
 		t.Errorf("claim_task taskId = %v, want %q", got, closeOutTestTask)
 	}
 
-	var closed map[string]any
-	for _, c := range f.callsFor("update_task") {
-		if c.args["status"] == "done" {
-			closed = c.args
-		}
+	closedCalls := f.callsFor("complete_task")
+	if len(closedCalls) != 1 {
+		t.Fatalf("complete_task calls = %d, want 1 (the task was not closed). calls: %v", len(closedCalls), f.plane.planeCalls())
 	}
-	if closed == nil {
-		t.Fatalf("no update_task(status: done); the task was not closed. calls: %v", f.plane.planeCalls())
-	}
+	closed := closedCalls[0].args
 	if got := closed["runId"]; got != "run-1" {
 		t.Errorf("close runId = %v, want the claim's run (run-1)", got)
 	}
@@ -441,8 +437,8 @@ func TestCloseOutStandsDownWhenThePRIsNotReady(t *testing.T) {
 			if got := f.callsFor("claim_task"); len(got) != 0 {
 				t.Errorf("claim_task was called for a PR that is not ready: %v", got)
 			}
-			if got := f.callsFor("update_task"); len(got) != 0 {
-				t.Errorf("update_task was called for a PR that is not ready: %v", got)
+			if got := f.callsFor("complete_task"); len(got) != 0 {
+				t.Errorf("complete_task was called for a PR that is not ready: %v", got)
 			}
 			if !strings.Contains(lines, tc.want) {
 				t.Errorf("the stand-down line does not say %q:\n%s", tc.want, lines)
@@ -627,7 +623,7 @@ func TestCloseOutUsesTheConfiguredCheckoutWithoutAMachineRoot(t *testing.T) {
 
 	lines := f.run(d)
 
-	if got := f.callsFor("update_task"); len(got) == 0 {
+	if got := f.callsFor("complete_task"); len(got) == 0 {
 		t.Fatalf("the close-out did not run on the configured checkout:\n%s", lines)
 	}
 	if !strings.Contains(lines, "task closed done") {
@@ -667,7 +663,7 @@ func TestCloseOutClaimRefusedDoesNotMerge(t *testing.T) {
 
 	lines := f.run(d)
 
-	if got := f.callsFor("update_task"); len(got) != 0 {
+	if got := append(f.callsFor("complete_task"), f.callsFor("release_task")...); len(got) != 0 {
 		t.Errorf("the plane was written to after a refused claim: %v", got)
 	}
 	after := strings.TrimSpace(mustGit(t, f.remote, "rev-parse", "refs/heads/"+closeOutTestBase))
@@ -688,22 +684,20 @@ func TestCloseOutReleasesTheClaimAfterAMergeFailure(t *testing.T) {
 	lines := f.run(d)
 
 	releases := 0
-	for _, c := range f.callsFor("update_task") {
-		if c.args["release"] == true {
-			releases++
-			if c.args["runId"] != "run-1" {
-				t.Errorf("release runId = %v, want run-1", c.args["runId"])
-			}
-			// A failed MERGE is what the plane's repair ladder must bound: the
-			// checks are still green, so attesting green here would leave a
-			// green-but-unmergeable PR re-claimed and re-released forever.
-			if c.args["checkGreen"] != false {
-				t.Errorf("a merge failure released with checkGreen=%v, want false (the ladder must count it): %v", c.args["checkGreen"], c.args)
-			}
+	for _, c := range f.callsFor("release_task") {
+		releases++
+		if c.args["runId"] != "run-1" {
+			t.Errorf("release runId = %v, want run-1", c.args["runId"])
 		}
-		if c.args["status"] == "done" {
-			t.Errorf("the task was closed after a failed merge: %v", c.args)
+		// A failed MERGE is what the plane's repair ladder must bound: the
+		// checks are still green, so attesting green here would leave a
+		// green-but-unmergeable PR re-claimed and re-released forever.
+		if c.args["checkGreen"] != false {
+			t.Errorf("a merge failure released with checkGreen=%v, want false (the ladder must count it): %v", c.args["checkGreen"], c.args)
 		}
+	}
+	if got := f.callsFor("complete_task"); len(got) != 0 {
+		t.Errorf("the task was closed after a failed merge: %v", got)
 	}
 	if releases != 1 {
 		t.Fatalf("release calls = %d, want 1 (the claim must never be left held). calls: %v", releases, f.plane.planeCalls())
@@ -723,18 +717,14 @@ func TestCloseOutClosesAMergeItCannotVerify(t *testing.T) {
 
 	lines := f.run(d)
 
-	var closed map[string]any
-	for _, c := range f.callsFor("update_task") {
-		if c.args["release"] == true {
-			t.Errorf("a merge that LANDED was released: the PR is no longer OPEN, so the task would be stranded on approved forever: %v", c.args)
-		}
-		if c.args["status"] == "done" {
-			closed = c.args
-		}
+	if released := f.callsFor("release_task"); len(released) != 0 {
+		t.Errorf("a merge that LANDED was released: the PR is no longer OPEN, so the task would be stranded on approved forever: %v", released)
 	}
-	if closed == nil {
+	closedCalls := f.callsFor("complete_task")
+	if len(closedCalls) != 1 {
 		t.Fatalf("a merge that landed but could not be verified was not closed. calls: %v", f.plane.planeCalls())
 	}
+	closed := closedCalls[0].args
 	delivery, ok := closed["delivery"].(map[string]any)
 	if !ok {
 		t.Fatalf("done call carries no delivery block: %v", closed)
@@ -754,7 +744,7 @@ func TestCloseOutReleasesTheClaimWhenThePlaneRefusesTheClose(t *testing.T) {
 	f := newCloseOutFixture(t, false)
 	f.servePlane(t, "clanker")
 	f.plane.refuseWhen = func(tool string, args map[string]any) string {
-		if tool == "update_task" && args["status"] == "done" {
+		if tool == "complete_task" {
 			return "done refused: evidence_required"
 		}
 		return ""
@@ -792,11 +782,5 @@ func TestCloseOutNotWiredIsSilentOnThePlane(t *testing.T) {
 
 // releases counts the release calls the plane received.
 func (f *closeOutFixture) releases() int {
-	n := 0
-	for _, c := range f.callsFor("update_task") {
-		if c.args["release"] == true {
-			n++
-		}
-	}
-	return n
+	return len(f.callsFor("release_task"))
 }

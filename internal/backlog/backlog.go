@@ -81,7 +81,7 @@ type Summary struct {
 	// tool the plane answers as unknown.
 	//
 	// 0 means UNKNOWN — a plane older than the field, or blind mode with no poll —
-	// and every caller treats it as older: the legacy update_task(review: ...)
+	// and every caller treats it as older: the legacy review record shape
 	// wording works on every plane that serves record_review too, so an unknown
 	// version degrades to the call that cannot fail on tool lookup.
 	ProtocolVersion int

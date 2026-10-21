@@ -10,7 +10,7 @@ import (
 // call.
 //
 // The measured failure (2026-10-20): nine review-panel sessions on one model each
-// called clankerbar_update_task with an argument the plane refuses, got the same
+// called a clankerbar task tool with an argument the plane refuses, got the same
 // `invalid_release` error back, and called it again - 65 to 316 times per
 // session, 1,538 calls in all. Every retry is a model request that re-sends the
 // whole context (~180K tokens), so the nine used ~273M tokens in ~45 minutes and

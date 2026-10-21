@@ -502,59 +502,6 @@ func TestRun_GateDecision(t *testing.T) {
 	})
 }
 
-// The protocol capture itself (CLA-743): the cheap poll is the ONLY thing that
-// carries the plane's protocol version from the summary into the target the
-// spawn path reads. Neither the JSON decode (internal/backlog) nor the
-// spawn-time substitution (internal/config) fails if this assignment is dropped
-// or moved, so without this test every plane would silently keep the legacy
-// update_task(review: ...) wording with a green suite. The second case seeds a
-// stale non-zero value to prove the capture ASSIGNS on every successful poll
-// rather than only ever setting it once: a summary without the field is
-// UNKNOWN (0, the legacy/unknown door) and must overwrite the stale value.
-func TestRun_CapturesThePlaneProtocolVersion(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		sum  backlog.Summary
-		seed int
-		want int
-	}{
-		{
-			name: "a protocol-40 summary lands on the target",
-			sum:  backlog.Summary{Ready: 3, Claimable: 0, ProtocolVersion: 40},
-			want: 40,
-		},
-		{
-			name: "a summary without the field is UNKNOWN, even over a stale value",
-			sum:  backlog.Summary{Ready: 3, Claimable: 0},
-			seed: 40,
-			want: 0,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			cfg := fastCfg()
-			cfg.StateDir = t.TempDir()
-			p := &fakePoller{sum: tc.sum}
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			// Cancel on the poll after the first: the capture is what this test
-			// is about, not the spawn a claimable queue would otherwise start.
-			// Claimable is 0 so the first poll spawns nothing anyway.
-			p.onCall = func(i int) {
-				if i >= 1 {
-					cancel()
-				}
-			}
-			d := NewMulti(cfg, &fakeAdapter{}, []Target{{Poller: p, PlaneProtocol: tc.seed}})
-			if err := d.Run(ctx); err != nil {
-				t.Fatalf("Run returned error: %v", err)
-			}
-			if got := d.targets[0].PlaneProtocol; got != tc.want {
-				t.Errorf("PlaneProtocol after a poll = %d, want %d", got, tc.want)
-			}
-		})
-	}
-}
-
 // ---------------------------------------------------------------------------
 // A reset that lands past the run's wall-clock ceiling must not be waited out.
 // The budget breaker only runs BETWEEN drains and the supervised wait sits inside

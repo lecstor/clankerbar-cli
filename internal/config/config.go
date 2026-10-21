@@ -1101,7 +1101,7 @@ const implementResumedBranchRule = "RESUMED WORK comes first when you find it: i
 	"proof the task still needs doing - a non-conflicting merge can silently revert a newer fix - so the " +
 	"check is the task's own bar (for a bug: does it still reproduce?), not the absence of conflict markers. " +
 	"If the merged tip supersedes the task, record the decision (record_decision), then PARK the task with an " +
-	"outcome citing it (settle_task(disposition: \"parked\", outcome: ...)) - task.branch is already set on a resumed branch, so a bare " +
+	"outcome citing it (settle_task(taskId, runId, disposition: \"parked\", outcome: ...)) - task.branch is already set on a resumed branch, so a bare " +
 	"stop reads as checkpointed WIP and spends a phase 2 rediscovering the staleness - or salvage only what " +
 	"still adds value and carry on with the normal flow; either way do NOT spend the run re-verifying and " +
 	"pushing stale work."
@@ -1484,11 +1484,11 @@ const fixCore = "Read BOTH the durable record and the block: `reviews.records` c
 	"verification round) the newest record carries only the verifier's NEW findings: the work list is every " +
 	"MUST the plane still shows OPEN on ANY released record (get_task's `reviews.openMustIds`), which the driver " +
 	"prepends when it can read it - an open MUST from an earlier round is yours to fix or refute too. If there is neither a released review " +
-	"record nor a review block, that is a FAILED hand-off: park the task with settle_task(disposition: \"parked\", " +
+	"record nor a review block, that is a FAILED hand-off: park the task with settle_task(taskId, runId, disposition: \"parked\", " +
 	"outcome: ...) naming the missing record - do NOT review the work yourself, do NOT invent findings, and do " +
 	"NOT open a PR over unreviewed work. Read the record's reviewedTip and compare it with " +
 	"`git rev-parse HEAD` in the worktree: if they differ, the branch moved after the review, so do NOT apply " +
-	"stale findings - park the task with settle_task(disposition: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
+	"stale findings - park the task with settle_task(taskId, runId, disposition: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
 	PhaseBranchPlaceholder + " recorded on the task, and never commit to the repo's PR base branch (" +
 	PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout sitting on that branch is " +
 	"not a decision to commit where you are, it is this failure mode. Apply the review's findings, each by its " +

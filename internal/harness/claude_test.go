@@ -103,7 +103,7 @@ func TestClaudeClaimTracking(t *testing.T) {
 		{
 			name: "settled at in_review by UUID",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review"}`),
+				toolUse("u2", submitForReviewTool, `{"taskId":"`+claimUUID+`","outcome":"**Tests** - x"}`),
 				toolResult("u2", `{"task":{"id":"`+claimUUID+`"}}`),
 			),
 			want: settled(),
@@ -113,7 +113,7 @@ func TestClaudeClaimTracking(t *testing.T) {
 			// driver posts `ready` over a task already handed to review.
 			name: "settled at in_review by REF",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimRef+`","status":"in_review"}`),
+				toolUse("u2", submitForReviewTool, `{"taskId":"`+claimRef+`","outcome":"**Tests** - x"}`),
 				toolResult("u2", `{"task":{"id":"`+claimUUID+`"}}`),
 			),
 			want: settled(),
@@ -121,18 +121,18 @@ func TestClaudeClaimTracking(t *testing.T) {
 		{
 			name: "ref matching is case-insensitive, as the plane's own parse is",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"cla-242","status":"done"}`),
+				toolUse("u2", completeTaskTool, `{"taskId":"cla-242","outcome":"**Tests** - x","delivery":{"commit":"abc"}}`),
 				toolResult("u2", `{}`),
 			),
 			want: settled(),
 		},
 		{
-			// updateStatus clears the holder for every status but in_progress, so
+			// The plane clears the holder for every status but in_progress, so
 			// an allowlist of "terminal" ones would read this as still held and
 			// promote an explicitly de-scoped task back to ready.
 			name: "demoting the task to backlog also lets go of it",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"backlog"}`),
+				toolUse("u2", setLaneTool, `{"taskId":"`+claimUUID+`","lane":"backlog"}`),
 				toolResult("u2", `{}`),
 			),
 			want: settled(),
@@ -142,7 +142,7 @@ func TestClaudeClaimTracking(t *testing.T) {
 			// held, and this is exactly the session whose claim wants handing back.
 			name: "a REFUSED terminal update leaves the claim standing",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review"}`),
+				toolUse("u2", submitForReviewTool, `{"taskId":"`+claimUUID+`","outcome":"**Tests** - x"}`),
 				toolResultErr("u2", "evidence_required"),
 			),
 			want: heldClaim(),
@@ -150,14 +150,14 @@ func TestClaudeClaimTracking(t *testing.T) {
 		{
 			name: "a status-less revision of the held task leaves the claim standing",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","outcome":"still going"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimUUID+`","outcome":"still going"}`),
 				toolResult("u2", `{}`),
 			),
 			want: heldClaim(),
 		},
 		{
 			// A blocking question ends the run and sets the task `blocked` with no
-			// update_task at all. Releasing it would drop a task awaiting the
+			// task write at all. Releasing it would drop a task awaiting the
 			// operator back into the claimable queue, question unanswered.
 			name: "a BLOCKING question is a handback",
 			lines: withClaim(
@@ -201,14 +201,14 @@ func TestClaudeClaimTracking(t *testing.T) {
 		{
 			name: "recording a branch marks the claim as carrying pushed work",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
 			),
 			want: withWIP(),
 		},
 		{
 			name: "a branch recorded by REF is still my pushed work",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimRef+`","branch":"clanker/x"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimRef+`","branch":"clanker/x"}`),
 			),
 			want: withWIP(),
 		},
@@ -223,14 +223,14 @@ func TestClaudeClaimTracking(t *testing.T) {
 		{
 			name: "another task's branch is not my WIP",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"t-99","branch":"clanker/other"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"t-99","branch":"clanker/other"}`),
 			),
 			want: heldClaim(),
 		},
 		{
 			name: "closing a DIFFERENT task must not look like letting go of mine",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"t-99","status":"done"}`),
+				toolUse("u2", completeTaskTool, `{"taskId":"t-99","outcome":"**Tests** - x","delivery":{"commit":"abc"}}`),
 				toolResult("u2", `{}`),
 			),
 			want: heldClaim(),
@@ -259,7 +259,7 @@ func TestClaudeClaimTracking(t *testing.T) {
 		{
 			name: "the latest claim supersedes a settled earlier one",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review"}`),
+				toolUse("u2", submitForReviewTool, `{"taskId":"`+claimUUID+`","outcome":"**Tests** - x"}`),
 				toolResult("u2", `{}`),
 				toolUse("u3", claimTaskTool, `{"taskId":"t-2"}`),
 				toolResult("u3", `{"task":{"id":"t-2","ref":"CLA-2"},"run":{"id":"r-2"}}`),

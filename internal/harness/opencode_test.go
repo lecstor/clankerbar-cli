@@ -1391,14 +1391,14 @@ func TestOpencodeRefusedClaimChangesNothing(t *testing.T) {
 // never recorded.
 func TestOpencodeRefusedSettleChangesNothing(t *testing.T) {
 	stream := opencodeRecording(t, 3) +
-		opencodeToolLine("call-refused", "clankerbar_update_task",
-			`{"taskId":"`+opencodeFixtureTask+`","status":"in_review","branch":"`+opencodeFixtureBranch+`"}`,
+		opencodeToolLine("call-refused", "clankerbar_submit_for_review",
+			`{"taskId":"`+opencodeFixtureTask+`","outcome":"**Tests** - fixture"}`,
 			"error", `{"error":{"code":"evidence_required","message":"outcome needs a **Tests** section"}}`) + "\n"
 
 	res := opencodeParsedFrom(Invocation{}, io.Discard, stream)
 
 	if res.Claim.Settled {
-		t.Error("a REFUSED update_task settled the claim — the driver would read a task the session still holds as one it let go of, and hand nothing back")
+		t.Error("a REFUSED submit_for_review settled the claim — the driver would read a task the session still holds as one it let go of, and hand nothing back")
 	}
 	if !res.Claim.Held() {
 		t.Errorf("Claim.Held() = false after a refused settle; Claim = %+v", res.Claim)
@@ -1442,11 +1442,13 @@ func TestOpencodeObservesTheSettleAndTheDeliveryReport(t *testing.T) {
 		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
 	}
 	if res.Claim.Held() {
-		t.Error("Claim.Held() is still true after update_task settled the task — the driver would post `ready` over a task the session had already let go of")
+		t.Error("Claim.Held() is still true after submit_for_review settled the task — the driver would post `ready` over a task the session had already let go of")
 	}
+	// The branch comes from record_progress and the settle from settle_task; the
+	// split means the report carries no status of its own.
 	wantReports := []Report{{
 		TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun,
-		Status: "parked", Branch: opencodeFixtureBranch,
+		Branch: opencodeFixtureBranch,
 	}}
 	if len(res.Reports) != 1 || res.Reports[0] != wantReports[0] {
 		t.Errorf("Reports = %+v, want %+v", res.Reports, wantReports)
@@ -1463,25 +1465,25 @@ func TestOpencodeObservesTheSettleAndTheDeliveryReport(t *testing.T) {
 
 // A resumed phase never calls claim_task, so its claim can only come from the
 // Invocation. The behavioural payload of the seed is that noteToolUse's
-// update_task arm matches — see the claude twin in resume_test.go.
+// record_progress/submit_for_review arms match — see the claude twin in resume_test.go.
 func TestOpencodeSeedsAResumedPhasesClaim(t *testing.T) {
-	stream := opencodeToolLine("call-1", "clankerbar_update_task", `{"taskId":"task-abc","branch":"clanker/task-abc-work"}`, "completed", `{}`) + "\n" +
-		opencodeToolLine("call-2", "clankerbar_update_task", `{"taskId":"task-abc","status":"in_review","branch":"clanker/task-abc-work","delivery":{"pr":"#42"}}`, "completed", `{}`) + "\n"
+	stream := opencodeToolLine("call-1", "clankerbar_record_progress", `{"taskId":"task-abc","branch":"clanker/task-abc-work"}`, "completed", `{}`) + "\n" +
+		opencodeToolLine("call-2", "clankerbar_submit_for_review", `{"taskId":"task-abc","outcome":"**Tests** - fixture"}`, "completed", `{}`) + "\n"
 
 	res := opencodeParsedFrom(Invocation{ResumeClaim: Claim{TaskID: "task-abc", RunID: "run-xyz"}}, io.Discard, stream)
 
 	if !res.Claim.HasWIP {
-		t.Error("update_task(branch:) did not set HasWIP on the seeded claim — the driver would read the task as safe to release and post it back to the queue over pushed work")
+		t.Error("record_progress(branch) did not set HasWIP on the seeded claim — the driver would read the task as safe to release and post it back to the queue over pushed work")
 	}
 	if res.Claim.Branch != "clanker/task-abc-work" {
 		t.Errorf("Claim.Branch = %q, want clanker/task-abc-work — CURRENT_CLAIM needs the NAME, not only the fact, to choose expireLease over release", res.Claim.Branch)
 	}
 	if !res.Claim.Settled {
-		t.Error("update_task(status: in_review) did not settle the seeded claim")
+		t.Error("submit_for_review did not settle the seeded claim")
 	}
-	// Two updates restating the same branch collapse to one report, and the later
-	// status wins — the same dedup claude's stream gets.
-	want := Report{TaskID: "task-abc", RunID: "run-xyz", Status: "in_review", Branch: "clanker/task-abc-work", PR: "#42"}
+	// The branch record survives as the report; the hand-over carries no branch
+	// and asserts nothing locally checkable.
+	want := Report{TaskID: "task-abc", RunID: "run-xyz", Branch: "clanker/task-abc-work"}
 	if len(res.Reports) != 1 || res.Reports[0] != want {
 		t.Errorf("Reports = %+v, want exactly %+v", res.Reports, want)
 	}
@@ -1532,7 +1534,9 @@ func TestOpencodeIgnoresNonTerminalAndForeignToolEvents(t *testing.T) {
 func TestOpencodeClankerbarToolMapsOntoTheWatchedNames(t *testing.T) {
 	for _, tt := range []struct{ in, want string }{
 		{"clankerbar_claim_task", claimTaskTool},
-		{"clankerbar_update_task", updateTaskTool},
+		{"clankerbar_submit_for_review", submitForReviewTool},
+		{"clankerbar_record_progress", recordProgressTool},
+		{"clankerbar_settle_task", settleTaskTool},
 		{"clankerbar_ask_question", askQuestionTool},
 		{"clankerbar_escalate_question", escalateQuestionTool},
 		{"clankerbar_", "mcp__clankerbar__"},

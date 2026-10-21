@@ -8,19 +8,6 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
-// resolveReviewCalls substitutes the protocol-dependent review-write
-// placeholders, the way the driver does at spawn time (CLA-743). Tests that pin
-// the review shape read the RESOLVED brief, so a protocol choice that made a
-// brief unexecutable fails here rather than in a session.
-func resolveReviewCalls(brief string, protocolVersion int) string {
-	return strings.NewReplacer(
-		ReviewRecordCallPlaceholder, ReviewRecordCall(protocolVersion),
-		ReviewCloseCallPlaceholder, ReviewCloseCall(protocolVersion),
-		ReviewFindingsCallPlaceholder, ReviewFindingsCall(protocolVersion),
-		VerifyHandoverStepPlaceholder, VerifyHandoverStep(protocolVersion, "staging"),
-	).Replace(brief)
-}
-
 // A config with no phases must behave exactly as it always has. This is the
 // back-compat guarantee that lets phases be opt-in rather than a migration.
 func TestEffectivePhases_UnphasedIsOnePhaseCarryingThePrompt(t *testing.T) {
@@ -283,7 +270,7 @@ func TestBuiltinImplementBriefAdmitsTheCloseOutOffer(t *testing.T) {
 }
 
 // CLA-544: a wall-clock kill earns a checkpoint only with WIP, and WIP is a
-// branch recorded on the TASK — the session's own update_task(branch), or the
+// branch recorded on the TASK — the session's own record_progress(branch), or the
 // salvage recording one. The salvage refuses a clean worktree on purpose
 // (salvage.go: "The one thing that must NOT happen here is recording a branch"),
 // so a commit nobody pushed and recorded is as invisible to the plane as no
@@ -319,7 +306,7 @@ func TestBuiltinImplementBriefDemandsAnEarlyCommit(t *testing.T) {
 		"skeleton, a failing test, a stub with the signatures",
 		"commit and push as you go rather than once at the end",
 		"push it and record the branch",
-		"update_task(taskid, runid, branch)",
+		"record_progress(taskid, runid, branch)",
 		"record it as soon as the first commit is pushed",
 		"not only at the end",
 		"uncommitted worktree is lost",
@@ -736,7 +723,7 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 
 	for _, want := range []string{
 		// The call, by name, with the arguments the plane actually requires.
-		"update_task(taskId, runId, status: \"in_review\", outcome: ...)",
+		"submit_for_review(taskId, runId, outcome: ...)",
 		// The outcome requirement, which the brief omitted entirely before this —
 		// a second way to end one call short, since the plane refuses an outcome
 		// with no Tests section and a session can read that refusal as "done".
@@ -773,7 +760,7 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 // across four review-phase transcripts, and two tasks committed straight onto
 // `staging` because a session's cwd was already sitting there and nothing told it
 // that was wrong. This pins the fix's three parts: the PR step itself, its
-// position relative to the terminal update_task call (CLA-384 made that call
+// position relative to the terminal hand-off call (CLA-384 made that call
 // emphatic and final, which pulls harder on anything mentioned before it), and
 // the worktree/never-commit-to-the-base-branch rule that names the failure mode
 // rather than leaving "commit where I am" looking like no decision at all.
@@ -800,21 +787,21 @@ func TestReviewBriefStatesThePRStep(t *testing.T) {
 		t.Errorf("the review brief does not say the PR step is a no-op when a PR already exists for the branch:\n%s", brief)
 	}
 
-	// Position: push -> PR -> update_task, in that order, matching the doneWhen's
+	// Position: push -> PR -> hand-off, in that order, matching the doneWhen's
 	// explicit sequencing. Presence alone would pass on a brief that mentions a
 	// PR somewhere far from the terminal step, which is exactly the shape CLA-384
 	// warned would happen to anything not folded into the same emphatic block.
 	pushIdx := strings.Index(brief, "COMMIT and PUSH")
-	updateTaskIdx := strings.Index(brief, "update_task(taskId, runId, status: \"in_review\"")
-	if pushIdx == -1 || updateTaskIdx == -1 {
-		t.Fatalf("push (%d) or update_task (%d) not found in the brief:\n%s", pushIdx, updateTaskIdx, brief)
+	handOverIdx := strings.Index(brief, "submit_for_review(taskId, runId, outcome:")
+	if pushIdx == -1 || handOverIdx == -1 {
+		t.Fatalf("push (%d) or hand-off (%d) not found in the brief:\n%s", pushIdx, handOverIdx, brief)
 	}
-	if !(pushIdx < prIdx && prIdx < updateTaskIdx) {
-		t.Errorf("the brief's terminal sequence is not push (%d) -> PR (%d) -> update_task (%d), in that order:\n%s",
-			pushIdx, prIdx, updateTaskIdx, brief)
+	if !(pushIdx < prIdx && prIdx < handOverIdx) {
+		t.Errorf("the brief's terminal sequence is not push (%d) -> PR (%d) -> hand-off (%d), in that order:\n%s",
+			pushIdx, prIdx, handOverIdx, brief)
 	}
 
-	// The PR step lives in the same pinned terminal block as the update_task call,
+	// The PR step lives in the same pinned terminal block as the hand-off call,
 	// not one paragraph earlier where CLA-384 showed salience is lost.
 	if !strings.Contains(reviewTerminalStep, "PR") {
 		t.Errorf("the PR step is not part of reviewTerminalStep, so it does not share the position pinned by TestReviewBriefStatesItsTerminalStep:\n%s", reviewTerminalStep)
@@ -862,7 +849,7 @@ func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
 		// The successor is not told to treat the empty branch as a failure.
 		"NOT a failed hand-off",
 		// The terminal step: the handover, with the outcome's Tests section.
-		"update_task(taskId, runId, status: \"in_review\", outcome: ...)",
+		"submit_for_review(taskId, runId, outcome: ...)",
 		"**Tests**",
 		"REFUSES",
 		// The form-(b) case where phase 1 already settled the task.
@@ -983,7 +970,7 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
 	} {
 		for _, want := range []string{
-			ReviewRecordCallPlaceholder,
+			"record_review(taskId, runId, {...})",
 			`reviewerRole: "` + ReviewerRolePlaceholder + `"`,
 			"reviewedTip",
 			"raisedByModel",
@@ -1005,7 +992,7 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
 	} {
 		for _, banned := range []string{
-			"update_task(taskId, runId, outcome: ...)",
+			"record_progress(taskId, runId, outcome: ...)",
 			"Record the LEGACY block",
 			"only after that outcome write has SUCCEEDED",
 			ReviewRecordHeading,
@@ -1030,10 +1017,10 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	// The branchless variant prescribes the block ALONE: it must name the block
 	// write, must NOT name the durable-record call (the plane would refuse it
 	// for a settled task), and its terminal step must say so.
-	if !strings.Contains(noCodeReviewOnlyBrief, "update_task(taskId, runId, outcome: ...)") {
+	if !strings.Contains(noCodeReviewOnlyBrief, "record_progress(taskId, runId, outcome: ...)") {
 		t.Errorf("the no-code review-only brief does not prescribe the legacy block write:\n%s", noCodeReviewOnlyBrief)
 	}
-	for _, banned := range []string{ReviewRecordCallPlaceholder, "update_task(taskId, runId, review: {...})", "THEN append THIS run's durable"} {
+	for _, banned := range []string{"record_review(taskId, runId, {...})", "record_review(taskId, runId, {...})", "THEN append THIS run's durable"} {
 		if strings.Contains(noCodeReviewOnlyBrief, banned) {
 			t.Errorf("the no-code review-only brief prescribes %q, but the plane refuses every review write on a settled task (question 03a12578, option 1):\n%s", banned, noCodeReviewOnlyBrief)
 		}
@@ -1043,101 +1030,64 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	}
 }
 
-// CLA-743: the review write's door follows the plane's protocol version.
-// record_review is served from protocol 40; below it (and for an unknown
-// version) the brief must prescribe update_task(review: ...), which every
-// plane accepts. A brief that names a tool the plane does not serve sends every
-// review session into an unknown-tool refusal, so both resolutions are pinned.
-func TestReviewWriteToolFollowsPlaneProtocol(t *testing.T) {
-	for _, tc := range []struct {
-		version int
-		served  bool
-	}{
-		{0, false},  // unknown: blind mode, or a summary without the field
-		{39, false}, // the last protocol before record_review
-		{40, true},  // the first protocol serving it
-		{41, true},
+// CLA-748: the cutover deletes `update_task`, so no baked brief may name it. A
+// brief is text and cannot feature-detect: one that sends a session to a
+// removed tool is a dead end with no refusal to explain it. Every built-in
+// brief and every terminal step a brief embeds is checked here, and each moved
+// shape must name the tool that now owns it.
+func TestNoBriefNamesTheRemovedUpdateTaskTool(t *testing.T) {
+	briefs := map[string]string{
+		"implement":                           builtinPhasePrompts[ImplementPhaseName],
+		"review":                              builtinPhasePrompts[ReviewPhaseName],
+		"fix":                                 builtinPhasePrompts[FixPhaseName],
+		"verify":                              builtinPhasePrompts[VerifyPhaseName],
+		"review-only":                         reviewOnlyBrief,
+		"unverified review-only":              unverifiedReviewOnlyBrief,
+		"no-code review":                      noCodeReviewBrief,
+		"no-code review-only":                 noCodeReviewOnlyBrief,
+		"panel member review-only":            panelMemberReviewOnlyBrief,
+		"unverified panel member review-only": panelMemberUnverifiedReviewOnlyBrief,
+		"fix-verify":                          fixVerifyBrief,
+		"no-code fix":                         noCodeFixBrief,
+		"no-code fix-verify":                  noCodeFixVerifyBrief,
+		"no-code verify":                      noCodeVerifyBrief,
+		"review terminal step":                reviewTerminalStep,
+		"review-only terminal step":           reviewOnlyTerminalStep,
+		"panel member terminal step":          panelMemberTerminalStep,
+		"no-code review terminal step":        noCodeReviewTerminalStep,
+		"no-code review-only terminal step":   noCodeReviewOnlyTerminalStep,
+		"fix only terminal step":              fixOnlyTerminalStep,
+		"no-code fix only terminal step":      noCodeFixOnlyTerminalStep,
+		"verify terminal step":                verifyTerminalStep,
+		"no-code verify terminal step":        noCodeVerifyTerminalStep,
+		"review record outcome shape":         reviewRecordOutcomeShape,
+		"review record durable shape":         reviewRecordDurableShape,
+		"panel member record body":            panelMemberRecordBody,
+		"fix finding updates":                 fixFindingUpdates,
+		"implement resumed branch rule":       implementResumedBranchRule,
+		"implement commit early rule":         implementCommitEarlyRule,
+		"implement close-out rule":            implementCloseOutRule,
+	}
+	for name, brief := range briefs {
+		if strings.Contains(brief, "update_task") {
+			t.Errorf("the %s names update_task, which this release's plane does not serve:\n%s", name, brief)
+		}
+	}
+
+	// Each moved shape names its new owner, so the test above cannot be
+	// satisfied by a brief that simply says nothing.
+	for name, want := range map[string][]string{
+		"review-only":              {"record_review(taskId, runId, {...})"},
+		"fix":                      {"record_review(taskId, runId, {findingUpdates:"},
+		"fix-verify":               {"record_review(taskId, runId, {findingUpdates:"},
+		"verify":                   {"record_review(taskId, runId, {findingUpdates:", "submit_for_review(taskId, runId, closeRound:"},
+		"no-code verify":           {"record_progress(taskId, runId, outcome: ...)", "settle_task(taskId, runId,", "submit_for_review(taskId, runId)"},
+		"implement close-out rule": {},
 	} {
-		if got := ReviewToolServed(tc.version); got != tc.served {
-			t.Errorf("ReviewToolServed(%d) = %t, want %t", tc.version, got, tc.served)
-		}
-	}
-
-	durable := map[string]string{
-		"review-only brief":             reviewOnlyBrief,
-		"unverified review-only brief":  unverifiedReviewOnlyBrief,
-		"panel member brief":            panelMemberReviewOnlyBrief,
-		"unverified panel member brief": panelMemberUnverifiedReviewOnlyBrief,
-		"fix brief":                     fixBrief,
-		"fix-verify brief":              fixVerifyBrief,
-		"verify brief":                  verifyBrief,
-		"review-only terminal step":     reviewOnlyTerminalStep,
-		"panel member terminal step":    panelMemberTerminalStep,
-	}
-	for name, brief := range durable {
-		if !strings.Contains(brief, ReviewRecordCallPlaceholder) && !strings.Contains(brief, ReviewFindingsCallPlaceholder) {
-			continue
-		}
-		current := resolveReviewCalls(brief, ReviewToolProtocol)
-		if !strings.Contains(current, "record_review(") {
-			t.Errorf("the %s does not resolve to record_review on protocol %d:\n%s", name, ReviewToolProtocol, current)
-		}
-		if strings.Contains(current, "update_task(taskId, runId, review:") || strings.Contains(current, "update_task(review:") {
-			t.Errorf("the %s still prescribes update_task(review:) on protocol %d:\n%s", name, ReviewToolProtocol, current)
-		}
-		old := resolveReviewCalls(brief, ReviewToolProtocol-1)
-		if !strings.Contains(old, "update_task(taskId, runId, review:") && !strings.Contains(old, "update_task(review:") {
-			t.Errorf("the %s does not fall back to update_task(review:) on protocol %d:\n%s", name, ReviewToolProtocol-1, old)
-		}
-		if strings.Contains(old, "record_review(") {
-			t.Errorf("the %s prescribes record_review on protocol %d, which does not serve it:\n%s", name, ReviewToolProtocol-1, old)
-		}
-	}
-
-	// The verify hand-over: on a plane serving record_review it is TWO calls,
-	// and the close comes FIRST. The order is load-bearing — the plane accepts a
-	// close only from the run that still holds the task, so a close sent after
-	// the in_review move is refused.
-	current := resolveReviewCalls(verifyBrief, ReviewToolProtocol)
-	closeAt := strings.Index(current, "record_review(taskId, runId, { closeRound:")
-	moveAt := strings.Index(current, `status: "in_review"`)
-	if closeAt < 0 || moveAt < 0 || closeAt > moveAt {
-		t.Errorf("the verify hand-over does not close the round with record_review BEFORE the in_review move (close at %d, move at %d):\n%s", closeAt, moveAt, current)
-	}
-	if !strings.Contains(current, "TWO calls, IN THIS ORDER") || !strings.Contains(current, "still HOLDS the task") {
-		t.Errorf("the verify hand-over does not state the two-call order and why it is load-bearing:\n%s", current)
-	}
-
-	// Below protocol 40 the one-call shape is the only legal one: the plane
-	// refuses a close once the task has left in_progress, so the status move and
-	// closeRound must travel in the SAME call.
-	old := resolveReviewCalls(verifyBrief, ReviewToolProtocol-1)
-	if !strings.Contains(old, `status: "in_review", review: { closeRound:`) {
-		t.Errorf("the verify hand-over does not carry the legacy one-call status+closeRound shape below protocol %d:\n%s", ReviewToolProtocol, old)
-	}
-	if strings.Contains(old, "TWO calls") {
-		t.Errorf("the legacy verify hand-over claims a two-call order it cannot use:\n%s", old)
-	}
-
-	// A branchless round writes no durable record at all, at either protocol: a
-	// placeholder that reached these briefs would be a call the plane refuses.
-	for name, brief := range map[string]string{
-		"no-code review-only brief": noCodeReviewOnlyBrief,
-		"no-code fix brief":         noCodeFixBrief,
-		"no-code fix-verify brief":  noCodeFixVerifyBrief,
-		"no-code verify brief":      noCodeVerifyBrief,
-	} {
-		for _, banned := range []string{
-			ReviewRecordCallPlaceholder,
-			ReviewCloseCallPlaceholder,
-			ReviewFindingsCallPlaceholder,
-			// The verify hand-over is the fourth member of the family: the
-			// branch-shaped one tells the session to open a PR and then move
-			// the task to in_review, which a branchless round must never do.
-			VerifyHandoverStepPlaceholder,
-		} {
-			if strings.Contains(brief, banned) {
-				t.Errorf("the %s carries %s, but a branchless round writes no durable record:\n%s", name, banned, brief)
+		src := briefs[name]
+		for _, w := range want {
+			if !strings.Contains(src, w) {
+				t.Errorf("the %s does not name %q, so it does not tell the session which tool does the job:\n%s", name, w, src)
 			}
 		}
 	}
@@ -1159,7 +1109,7 @@ func TestPanelMemberBriefWritesOnlyItsSealedRecord(t *testing.T) {
 		if !strings.Contains(brief, panelMemberTerminalStep) {
 			t.Errorf("the %s does not end on the record-only terminal step:\n%s", name, brief)
 		}
-		if !strings.Contains(brief, ReviewRecordCallPlaceholder) {
+		if !strings.Contains(brief, "record_review(taskId, runId, {...})") {
 			t.Errorf("the %s does not prescribe the sealed durable record:\n%s", name, brief)
 		}
 		// The member is told what its outcome write would do to the next member,
@@ -1328,7 +1278,7 @@ func TestRerunGuidanceSitsBeforeEachBriefsEnding(t *testing.T) {
 	// bury it at the front, which the first version of this test permitted),
 	// and never displacing the emphatic ending each brief must keep.
 	impl := builtinPhasePrompts[ImplementPhaseName]
-	ci := strings.Index(impl, "update_task(taskId, runId, branch)")
+	ci := strings.Index(impl, "record_progress(taskId, runId, branch)")
 	ri, hi := strings.Index(impl, rerunGuidance), strings.Index(impl, handoffGuidance)
 	if ri == -1 || hi == -1 || ci == -1 || ri < ci || ri > hi {
 		t.Errorf("the implement brief does not carry the rerun bound after its checkpoint instruction (%d) and before its handoff guidance (%d); got rerun at %d:\n%s", ci, hi, ri, impl)
@@ -1759,7 +1709,7 @@ func TestNoCodeFixBriefReadsTheBlockAlone(t *testing.T) {
 		"PLANE ids",
 		"findingUpdates",
 		"durable review record",
-		"update_task(taskId, runId, review: {...})",
+		"record_review(taskId, runId, {...})",
 	} {
 		if strings.Contains(noCodeFixBrief, banned) {
 			t.Errorf("the no-code fix brief prescribes %q, but a branchless round writes no durable record (question 03a12578, option 1):\n%s", banned, noCodeFixBrief)
@@ -2137,7 +2087,7 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 	// The ID-based machinery is the CODE shape's: plane ids to adjudicate by,
 	// the driver's round cap, and the non-convergence breaker. Read the
 	// protocol-40 resolution: that is the shape a current plane's session runs.
-	verify := resolveReviewCalls(verifyBrief, ReviewToolProtocol)
+	verify := verifyBrief
 	for _, want := range []string{
 		"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
 		"RESOLVED",
@@ -2148,7 +2098,7 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 		"takeover or reclaim does not",
 		"fix-delta",
 		"ONLY within the fix delta",
-		`status: "in_review"`,
+		"submit_for_review(taskId, runId, closeRound:",
 		"closeRound",
 		"review_sealed",
 		"do NOT open a PR",
@@ -2169,8 +2119,8 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 		"no durable record",
 		"no plane finding ids",
 		"the LAST",
-		`status: "in_review"`,
-		`status: "parked"`,
+		"submit_for_review(taskId, runId)",
+		`disposition: "parked"`,
 		"do NOT open a PR",
 	} {
 		if !strings.Contains(noCodeVerifyBrief, want) {
@@ -2254,7 +2204,7 @@ func TestFixVerifyVariantsDoNotHandTheTaskOver(t *testing.T) {
 		// Dropping the hand-over must not drop the rest of the contract: the
 		// terminal step that ends the phase, and the record requirement the
 		// successor's own outcome depends on.
-		resolved := resolveReviewCalls(tc.brief, ReviewToolProtocol)
+		resolved := tc.brief
 		if !strings.Contains(tc.brief, tc.terminal) {
 			t.Errorf("%s lost the terminal step that stops it before the hand-over:\n%s", tc.name, tc.brief)
 		}

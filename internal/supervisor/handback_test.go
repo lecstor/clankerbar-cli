@@ -57,32 +57,24 @@ func TestDeadChildsClaimIsHandedBack(t *testing.T) {
 			if call.path != "/mcp/acme" {
 				t.Errorf("call path = %q, want the project's MCP endpoint /mcp/acme", call.path)
 			}
-			if call.tool != "update_task" {
-				t.Errorf("tool = %q, want update_task", call.tool)
+			if call.tool != "release_task" {
+				t.Errorf("tool = %q, want release_task", call.tool)
 			}
 			for key, want := range map[string]any{
-				"taskId":         "t-claim",
-				"runId":          "r-claim",
-				"driverReleased": true,
+				"taskId": "t-claim",
+				"runId":  "r-claim",
+				"driver": true,
 			} {
 				if got := call.args[key]; got != want {
 					t.Errorf("arguments[%q] = %v, want %v (args: %+v)", key, got, want, call.args)
 				}
 			}
 			if tc.branch == "" {
-				if call.args["release"] != true {
-					t.Errorf("a claim with no branch must be released (args: %+v)", call.args)
+				if _, present := call.args["expire"]; present {
+					t.Errorf("a no-branch claim takes the default handback, not an expiry: %+v", call.args)
 				}
-				if _, present := call.args["expireLease"]; present {
-					t.Errorf("release and expireLease are mutually exclusive; got both: %+v", call.args)
-				}
-			} else {
-				if call.args["expireLease"] != true {
-					t.Errorf("a claim with a recorded branch must use expireLease (args: %+v)", call.args)
-				}
-				if _, present := call.args["release"]; present {
-					t.Errorf("expireLease must not be paired with release; got both: %+v", call.args)
-				}
+			} else if call.args["expire"] != true {
+				t.Errorf("a claim with a recorded branch must expire the lease (args: %+v)", call.args)
 			}
 
 			// The record describes a process that is gone; leaving it would make
@@ -242,28 +234,20 @@ func TestShutdownHandsBackAClaimStillPresent(t *testing.T) {
 			}
 			call := calls[0]
 			for key, want := range map[string]any{
-				"taskId":         "t-claim",
-				"runId":          "r-claim",
-				"driverReleased": true,
+				"taskId": "t-claim",
+				"runId":  "r-claim",
+				"driver": true,
 			} {
 				if got := call.args[key]; got != want {
 					t.Errorf("arguments[%q] = %v, want %v (args: %+v)", key, got, want, call.args)
 				}
 			}
 			if tc.branch == "" {
-				if call.args["release"] != true {
-					t.Errorf("a claim with no branch must be released (args: %+v)", call.args)
+				if _, present := call.args["expire"]; present {
+					t.Errorf("a no-branch claim takes the default handback, not an expiry: %+v", call.args)
 				}
-				if _, present := call.args["expireLease"]; present {
-					t.Errorf("release and expireLease are mutually exclusive; got both: %+v", call.args)
-				}
-			} else {
-				if call.args["expireLease"] != true {
-					t.Errorf("a claim with a recorded branch must use expireLease (args: %+v)", call.args)
-				}
-				if _, present := call.args["release"]; present {
-					t.Errorf("expireLease must not be paired with release; got both: %+v", call.args)
-				}
+			} else if call.args["expire"] != true {
+				t.Errorf("a claim with a recorded branch must expire the lease (args: %+v)", call.args)
 			}
 
 			waitFor(t, 5*time.Second, "the supervisor to return after the stop", func() bool {
