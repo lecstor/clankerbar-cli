@@ -85,7 +85,7 @@ func TestOutputCapStall_InvokeResumesOnceWithTheSteer(t *testing.T) {
 echo "$*" >> "`+logPath+`"
 case "$*" in
   *"hit the output token limit"*)
-    echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_stall","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *)
@@ -127,7 +127,7 @@ esac
 	if got := res.Raw[FinishReasonKey]; got != "stop" {
 		t.Errorf("finish_reason = %v, want the resume's \"stop\" — a recovered result must not look stalled", got)
 	}
-	// The continuation's update_task must survive into the merged Claim (the
+	// The continuation's branch record must survive into the merged Claim (the
 	// ResumeClaim seed), exactly as CLA-406's arm needs.
 	if !res.Claim.HasWIP {
 		t.Error("Claim.HasWIP = false; the resumed turn's branch recording was not observed — ResumeClaim seed missing")
@@ -283,7 +283,7 @@ func TestOutputCapStall_ErroredResumeKeepsTheClaimObservation(t *testing.T) {
 	logPath := filepath.Join(dir, "log")
 	opencodeStub(t, `#!/bin/sh
 echo "$*" >> "`+logPath+`"
-echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+echo '{"type":"tool_use","sessionID":"ses_stall","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
 echo '{"type":"step_finish","sessionID":"ses_stall","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
 `)
 
@@ -304,7 +304,7 @@ echo '{"type":"step_finish","sessionID":"ses_stall","part":{"type":"step-finish"
 		t.Fatalf("stub ran %d times, want the single resume attempt:\n%s", n, data)
 	}
 	if !res.Claim.HasWIP {
-		t.Error("the errored resume's update_task observation was dropped — the driver would release the task over work the resume pushed")
+		t.Error("the errored resume's branch record was dropped — the driver would release the task over work the resume pushed")
 	}
 	if !(opencode{}).OutputCapNoOutput(res) {
 		t.Error("the stall marker must survive an errored resume — the stall still stands")

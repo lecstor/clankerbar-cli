@@ -11,8 +11,9 @@
 // hand — except the file is the GENERATED effective config in the child's
 // state dir (phase 2b): the operator's machine-layer local config with the
 // roster entry's project and its one permitted policy override (`harness` and
-// its per-harness block, Decision 1) materialized over it, regenerated on
-// every reconcile. Instance identity (`instance_name`), per-instance state
+// its per-harness block, Decision 1) materialized over it, written when the
+// child is spawned and rewritten at reconcile when an edit changes it
+// (CLA-724). Instance identity (`instance_name`), per-instance state
 // dirs and the fleet beacon all behave exactly as before — identity because
 // the generated file pins the roster name, and the state dir because the
 // generated file pins that too.
@@ -53,6 +54,13 @@
 // `<backlog_url>/api/daemon-roster/status` — so the console can tell a HALTed
 // instance from a crashed one without reading this machine's log. Reporting is
 // fail-soft telemetry and never control flow.
+//
+// CLA-758 adds the deterministic half of INTEGRATION: an approved-awaiting-merge
+// task whose pull request is mergeable, green and based on the project's
+// integration branch is claimed, merged as a merge commit and closed done by this
+// process, with no harness session at all. Everything it cannot do without
+// judgement — a conflict above all — is left exactly where the agent close-out
+// already picks it up. See closeout.go.
 package supervisor
 
 import (
@@ -67,9 +75,12 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
@@ -220,6 +231,29 @@ type Options struct {
 	// a test's fake plane is not; a test supplies a client pointed at its own
 	// server so the wire shape is exercised for real.
 	PlaneFor func(endpoint, apiKey string) plane.Releaser
+
+	// CloseOutVerifier builds the local verifier a close-out judges one repo with.
+	// Nil = delivery.New(repo, "") with production defaults. The hook exists
+	// because the PR judgement polls within a 30-second window and shells out to
+	// `gh`: a test cannot wait that window out, and must substitute its own gh.
+	CloseOutVerifier func(repo string) *delivery.Verifier
+
+	// ConflictRun launches the conflict-only session (CLA-759) for a conflicted
+	// approved task: the session that merges the PR's base into its branch,
+	// resolves only the conflicting hunks, runs the repo-wide gate and pushes.
+	// Nil = defaultConflictRun, which composes the real harness Invocation from
+	// the instance config. The hook exists so a test can drive the whole
+	// close-out pass without spending a paid session, and assert exactly what the
+	// fleet would have started.
+	ConflictRun func(ctx context.Context, cfg *config.Config, slug string, req ConflictRunRequest, step config.ConflictStep) (harness.Result, error)
+
+	// AfterConfigRewrite is called after a reconcile-time rewrite of a child's
+	// generated config and before the RESTART that applies it is queued
+	// (CLA-724). It is the deterministic seam for the rewrite-to-marker window,
+	// which is otherwise a few filesystem syscalls wide: a test can plant a
+	// STOP or HALT here and assert the stop wins, or make the marker write fail
+	// and assert the retry queues it on the next poll. Nil in production.
+	AfterConfigRewrite func(instName string)
 }
 
 // childVersionEnv is the environment variable the supervisor sets on every
@@ -249,6 +283,9 @@ func (o Options) withDefaults() Options {
 	if o.PollInterval <= 0 {
 		o.PollInterval = defaultPollInterval
 	}
+	if o.ConflictRun == nil {
+		o.ConflictRun = defaultConflictRun
+	}
 	return o
 }
 
@@ -271,9 +308,10 @@ type Instance struct {
 	// refused marks an instance whose entry failed the allowlist or shape
 	// checks: refused loudly, child stopped, never respawned.
 	refused bool
-	// stopRequested is set once a STOP marker has been written for a stopped
-	// instance's live child, so repeated polls write nothing (idempotent
-	// reconcile). Cleared on the next spawn.
+	// stopRequested is set once a readable STOP marker is in place for a
+	// stopped instance's live child, so repeated polls write nothing
+	// (idempotent reconcile) and a failed write is retried instead. Cleared on
+	// the next spawn.
 	stopRequested bool
 	// policyRefused is set when the last config build hit the permission-
 	// policy gate: the spawn is refused (even on a last-known-good config
@@ -281,6 +319,15 @@ type Instance struct {
 	// build — a restored policy file brings the daemon back without a
 	// supervisor restart (phase 2c).
 	policyRefused bool
+	// configRestartPending is set when a reconcile rewrote this child's
+	// generated config but could not queue the RESTART that applies it (a
+	// failed marker write). The byte comparison alone cannot see that
+	// outstanding work — the file already holds the new bytes — so the retry
+	// lives here and every reconcile re-attempts the marker while it is set.
+	// Cleared when a RESTART/RESTART_NOW is confirmed pending, and on the next
+	// spawn, which materializes the current config and therefore satisfies it
+	// (CLA-724 review findings 1.review-3.1 / 1.review-4.1).
+	configRestartPending bool
 
 	mu         sync.Mutex
 	cmd        *exec.Cmd // current child, nil while in backoff
@@ -312,9 +359,11 @@ type exitEvent struct {
 }
 
 // Supervisor holds the fleet state. Everything except the per-child Wait
-// goroutines runs on the single Supervise goroutine, so no locks guard the
-// scheduling fields — the mutex on Instance exists only for the hand-off
-// between a Wait goroutine (exited/exitErr) and the main goroutine.
+// goroutines and the close-out pass (CLA-758) runs on the single Supervise
+// goroutine, so no locks guard the scheduling fields — the mutex on Instance
+// exists only for the hand-off between a Wait goroutine (exited/exitErr) and the
+// main goroutine, and for the config pointer the pass snapshots before it leaves
+// that goroutine.
 type Supervisor struct {
 	o Options
 
@@ -367,6 +416,43 @@ type Supervisor struct {
 	// a timed-out drain resumes the loop and respawns the fleet, so the flag
 	// cannot mean "this supervisor is exiting".
 	replacing bool
+
+	// closeOutSaid remembers the last close-out line logged per key, so an
+	// unchanged stand-down is said once rather than on every poll (CLA-758). It
+	// is written only by the close-out pass goroutine.
+	closeOutSaid map[string]string
+	// closeOutConflicts remembers the head@base pair already reported as
+	// conflicting per task, so the conflicting-path evidence is logged once per
+	// pair rather than on every reconcile — and the paths it computed, so a
+	// conflict session started later in the same pair does not have to recompute
+	// (or lose) them. Also pass-goroutine only.
+	closeOutConflicts map[string]conflictEvidence
+	// closeOutBusy is set while a close-out pass runs on its own goroutine, so the
+	// next poll skips instead of starting a second pass over the same queue.
+	closeOutBusy atomic.Bool
+	// closeOutWG tracks that pass, so a fleet stop can wait (bounded) for it to
+	// hand back a claim it had already taken.
+	closeOutWG sync.WaitGroup
+
+	// conflictBusy is set while a conflict-only session runs (CLA-759): at most
+	// one at a time on this supervisor, so a second conflicting task waits for the
+	// next poll rather than spending a second paid session. It is only the FAST
+	// in-process gate: the bound that holds across supervisors is the shared slot
+	// in conflictlock.go, taken before the claim.
+	conflictBusy atomic.Bool
+	// conflictWG tracks the session goroutine, so a fleet stop can wait
+	// (bounded) for it to release a claim it holds.
+	conflictWG sync.WaitGroup
+	// conflictSaid remembers the last conflict stand-down line per key, the
+	// close-out's say-it-once discipline. Guarded by conflictMu because the pass
+	// goroutine and the session goroutine both write it.
+	conflictMu   sync.Mutex
+	conflictSaid map[string]string
+	// conflictTried bounds the paid retries per task (CLA-759): a failed session
+	// leaves the task approved, so without it the next poll would start another
+	// session forever instead of falling back to the agent close-out. Also under
+	// conflictMu.
+	conflictTried map[string]conflictAttempt
 }
 
 // Supervise runs the fleet until ctx is cancelled. Cancellation IS the
@@ -449,7 +535,16 @@ func Supervise(ctx context.Context, o Options) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return d.stopAll()
+			err := d.stopAll()
+			// The close-out pass runs off this loop; its context is cancelled
+			// already, and this bounded wait is what lets it hand back a claim it
+			// had taken before the process exits.
+			d.waitCloseOut()
+			// A conflict-only session is likewise cancelled already; the wait is
+			// what lets it release the claim it holds rather than leaving it to
+			// expire.
+			d.waitConflict()
+			return err
 		case ev := <-d.exits:
 			d.onExit(ev.inst, ev.err, ev.at)
 		case <-d.timerCh:
@@ -581,6 +676,15 @@ func (d *Supervisor) reconcile() error {
 		}
 	}
 
+	// Reach the children that are already up with an edit (CLA-724). This runs
+	// AFTER the act loop on purpose: a child stopped in this pass already
+	// carries its STOP (so the refresh leaves it alone), and a child spawned in
+	// it is compared against the very file its spawn just wrote (so an
+	// unchanged fleet writes nothing).
+	for _, inst := range d.instances {
+		d.refreshMaterialized(inst)
+	}
+
 	// Drop instances that are gone and have already exited; the ones still
 	// draining stay until their child's exit event arrives.
 	kept := d.instances[:0]
@@ -599,6 +703,15 @@ func (d *Supervisor) reconcile() error {
 	// spawn, a stop, a flip or a removal is reflected within the same poll —
 	// and an unchanged pass prints nothing.
 	d.publishStatus()
+
+	// The deterministic close-out (CLA-758) starts last, on configs this pass just
+	// refreshed, and on its OWN goroutine: an approved task whose PR is clean is
+	// merged and closed with no agent session, and everything it cannot finish
+	// deterministically is left exactly where the agent close-out expects it. The
+	// goroutine matters because a judgement can poll a `gh` read for 90 seconds and
+	// the loop below reaps children, respawns and restarts — it must never wait
+	// behind a close-out.
+	d.startCloseOutPass()
 
 	d.armRestart()
 	return nil
@@ -860,8 +973,13 @@ func (d *Supervisor) ensureStopped(inst *Instance) {
 	if _, err := os.Lstat(dir); err != nil {
 		return // no state dir yet; the next poll writes it
 	}
-	d.writeStop(inst, dir)
-	inst.stopRequested = true
+	// Set only when a marker the daemon can read is in place. A genuine write
+	// failure leaves it unset, so the next reconcile retries instead of the
+	// status card reporting a drain that is not happening (CLA-765 review
+	// finding 1.review-1.3).
+	if d.writeStop(inst, dir) != stopFailed {
+		inst.stopRequested = true
+	}
 }
 
 func (d *Supervisor) baseCtx() context.Context {
@@ -968,6 +1086,10 @@ func (d *Supervisor) spawn(inst *Instance) {
 		inst.scheduleRestart(d, err, time.Since(inst.aliveSince))
 		return
 	}
+	// The child is about to start on the current effective config, so a
+	// restart-marker retry left pending by an earlier poll has been satisfied
+	// (CLA-724 review findings 1.review-3.1 / 1.review-4.1).
+	inst.configRestartPending = false
 	v := childVersion(d.o.VersionOf)
 	cmd := exec.Command(d.o.Binary, "run", "-c", cfgPath)
 	// The version recorded for this child rides the spawn environment (phase
@@ -1216,11 +1338,7 @@ func (d *Supervisor) haltPresent(inst *Instance) bool {
 	inst.mu.Lock()
 	dir := inst.stateDir
 	inst.mu.Unlock()
-	if dir == "" {
-		return false
-	}
-	_, err := os.Lstat(filepath.Join(dir, "HALT"))
-	return err == nil
+	return markerPresent(dir, "HALT")
 }
 
 // respawnDue starts every instance whose restart time has arrived.
@@ -1365,41 +1483,99 @@ func (d *Supervisor) stopAll() error {
 	return nil
 }
 
+// stopOutcome is what one writeStop call achieved: whether a marker the daemon
+// can read now sits in the child's state dir, and whether this call put it
+// there. Callers that retry use it to tell "pending, stop asking" from "failed,
+// ask again on the next poll".
+type stopOutcome int
+
+const (
+	// stopFailed means no readable marker is in place: the child keeps running,
+	// and the operator was told so loudly.
+	stopFailed stopOutcome = iota
+	// stopWritten means this call wrote a fresh STOP marker.
+	stopWritten
+	// stopPending means a readable STOP marker was already there, and it was
+	// left untouched.
+	stopPending
+)
+
 // writeStop writes the STOP marker into one instance's state dir, or logs
-// loudly why it could not. Two rules keep the write honest:
+// loudly why it could not, and reports which of the three happened. Two rules
+// keep the write honest:
 //
-//   - The child must be past its STARTUP marker consumption before a STOP
-//     lands. A STOP the daemon finds at startup is consumed WITHOUT stopping
-//     (CLA-491: a marker a previous run left behind must not kill the next
-//     one), so a stop written into that window would be eaten and the child
-//     would run on. The callers only call this once the child has been alive
-//     for the settle window, which guarantees it has passed that consumption.
+//   - A STOP the supervisor writes only lands if the child is PAST its STARTUP
+//     marker consumption. A STOP the daemon finds at startup is consumed
+//     WITHOUT stopping (CLA-491: a marker a previous run left behind must not
+//     kill the next one), so a marker dropped into that window would be eaten
+//     and the child would run on. The callers therefore only call this once the
+//     child has been alive for the settle window, which guarantees it has
+//     passed that consumption. That guarantee is about WHEN this call writes:
+//     the supervisor cannot know when a marker it did not write was written.
 //   - The state dir is never CREATED here: a dir the supervisor created for a
 //     child that has not started yet would be adopted by that child, whose
 //     startup would then eat the marker exactly as above. Writing into a dir
 //     the child itself created (the Lstat gate in the callers) is what
 //     guarantees the child is past its startup marker check.
 //
-// A child that cannot be stopped this way — the state dir refuses to open, or
-// the marker write fails — is logged loudly and left running: the supervisor
-// keeps waiting for its exit, because stopping it by killing the process is
-// exactly what this phase must not do.
-func (d *Supervisor) writeStop(inst *Instance, dir string) {
+// A readable regular STOP already sitting in the state dir is not a failed
+// write: it is left untouched (its body records who asked first) and the daemon
+// picks it up at its next iteration boundary, so the line says only that —
+// never that this child will drain, which the supervisor cannot know about a
+// marker of unknown provenance. The occupancy alone proves nothing, though:
+// WriteFile also reports ErrExists for a symlink or a directory at the name, and
+// the daemon refuses to read either, so only a successful safe read of the
+// marker counts as pending. Everything else — the state dir refuses to open, an
+// unreadable occupant, any other marker write failure — is logged loudly and
+// the child is left running: the supervisor keeps waiting for its exit, because
+// stopping it by killing the process is exactly what this phase must not do.
+func (d *Supervisor) writeStop(inst *Instance, dir string) stopOutcome {
 	inst.mu.Lock()
 	cfg := inst.cfg
 	inst.mu.Unlock()
 	st, err := statedir.Open(dir, cfg.SessionWorkDirs()...)
 	if err != nil {
 		log.Printf("%s: cannot open its state dir to write STOP: %v - the child keeps running; stop it by hand (kill the supervisor's child pid %d)", inst.name, err, instPid(inst))
-		return
+		return stopFailed
 	}
 	defer st.Close() //nolint:errcheck // read-side handle on the way out
 	body := []byte(fmt.Sprintf("fleet-wide stop requested by the supervisor at %s\n", time.Now().UTC().Format(time.RFC3339)))
 	if err := st.WriteFile("STOP", body); err != nil {
+		if errors.Is(err, statedir.ErrExists) {
+			// Something already occupies STOP. Only a marker the daemon can
+			// actually read counts as a pending stop: the same ErrExists is
+			// what WriteFile reports for a symlink or a directory at the name,
+			// and the daemon's readMarker refuses both, so calling those
+			// pending would tell the operator a child is draining while it
+			// keeps running. The safe read is the only proof that counts.
+			if existing, rerr := st.ReadFile("STOP"); rerr == nil {
+				log.Printf("%s: STOP already present in %s%s - left in place for the daemon to read at its next iteration boundary", inst.name, dir, markerRequestedBy(existing))
+				return stopPending
+			}
+			// Occupied by something the daemon will not read (a symlink, a
+			// directory, anything else non-regular): fall through to the loud
+			// failure line. Nothing stops this child.
+		}
 		log.Printf("%s: cannot write STOP into %s: %v - the child keeps running; stop it by hand", inst.name, dir, err)
-		return
+		return stopFailed
 	}
 	log.Printf("%s: STOP written to %s - draining at its iteration boundary", inst.name, dir)
+	return stopWritten
+}
+
+// markerRequestedBy renders an existing STOP marker's first line for the
+// pending stop log — its body is the record of who asked first, and the daemon
+// discards the message when it honours the marker. %q keeps a hostile body from
+// injecting log lines.
+func markerRequestedBy(body []byte) string {
+	line := strings.TrimSpace(string(body))
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	if line == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (requested by %q)", line)
 }
 
 // instPid is the child's pid for a stop-failure log line, or 0 when there is

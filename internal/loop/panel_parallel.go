@@ -188,16 +188,27 @@ type panelRunOutcome struct {
 // runPanelMembers runs n work functions with at most `concurrency` in flight.
 // A slot is acquired BEFORE the member's goroutine is spawned, and the loop
 // waits for that member to call started() before spawning the next, so no
-// member is spawned until its predecessor's checkout exists and it is about to
-// drain: the panel's sessions begin in the config's list order. A finished
-// member frees its slot and the next member in list order starts immediately —
-// a backfill queue, not a wave barrier, so a short reviewer never waits for a
-// long one in its batch.
+// member is spawned until its predecessor's work has begun: the panel's
+// sessions begin in the config's list order. A finished member frees its slot
+// and the next member in list order starts immediately — a backfill queue, not a
+// wave barrier, so a short reviewer never waits for a long one in its batch.
 //
-// run MUST call started exactly once, as soon as its work has begun. The member
-// shape calls it after creating its worktree and before draining its session;
-// the test calls it at the top of its callback.
-func runPanelMembers(n, concurrency int, run func(k int, started func())) {
+// run MUST call started exactly once, as soon as its work has begun. A panel
+// member's "work" is its SESSION LAUNCH, so it passes started down to the
+// launch boundary (phaseRunOpts.onSessionLaunch) rather than calling it when its
+// checkout exists (CLA-738 review 3.2); a member that never launches — setup
+// failed, budget refused — calls it itself before returning. The test calls it
+// at the top of its callback.
+//
+// onRelease, when non-nil, is called with the member's index at the moment that
+// member releases its successor — from inside the started wrapper, before the
+// successor is unblocked, on every path that ends the wait including the
+// safety-net defer. It exists so the release POINT can be observed where a
+// release actually is, not inferred from the panel's intentions: a regression
+// that calls started() from somewhere earlier (worktree-ready) is reported
+// there, which a probe wrapped around the panel's own call site could not see
+// (CLA-757). Nil in production: it is a test seam, like panelLaunch.
+func runPanelMembers(n, concurrency int, run func(k int, started func()), onRelease func(k int)) {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -207,6 +218,11 @@ func runPanelMembers(n, concurrency int, run func(k int, started func())) {
 		sem <- struct{}{}
 		started := make(chan struct{})
 		var once sync.Once
+		release := func() {
+			once.Do(func() {
+				releaseMember(k, onRelease, func() { close(started) })
+			})
+		}
 		wg.Add(1)
 		go func(k int) {
 			defer wg.Done()
@@ -214,12 +230,29 @@ func runPanelMembers(n, concurrency int, run func(k int, started func())) {
 			// The defer is a safety net: a path that forgets to call started
 			// still unblocks the loop when the member ends, instead of deadlocking
 			// the panel.
-			defer once.Do(func() { close(started) })
-			run(k, func() { once.Do(func() { close(started) }) })
+			defer release()
+			run(k, release)
 		}(k)
 		<-started
 	}
 	wg.Wait()
+}
+
+// releaseMember is the WHOLE of a member's release: it reports the release to
+// the observer (onRelease, test-only), and only then unblocks the scheduler that
+// spawns the successor. The order is the guarantee the release-point probe rests
+// on (CLA-757): when member k+1's session launches, exactly members 0..k have
+// been released. Keeping both steps in one function makes that order structural
+// rather than two adjacent statements a later edit could silently swap: a swap
+// would leave the panel fixture green, because the successor needs a
+// `git worktree add` subprocess before it can reach its own launch and would win
+// that race every time, turning the count observed at a launch into a race.
+// TestReleaseFiresBeforeTheSuccessorIsUnblocked pins it without a schedule.
+func releaseMember(k int, onRelease func(k int), unblock func()) {
+	if onRelease != nil {
+		onRelease(k)
+	}
+	unblock()
 }
 
 // runPanelInParallel runs phases[start:end] concurrently, each in its own
@@ -290,14 +323,13 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		if werr != nil {
 			m.setupErr = "could not create its own detached worktree: " + werr.Error()
 			out.members[k] = m
+			// This member never launches a session, so nothing will fire the
+			// launch boundary: release the next member here or the panel waits
+			// forever for a session that will not run.
 			started()
 			return
 		}
 		defer d.removePanelWorktree(repoRoot, dir)
-
-		// The member is ready to drain its session. Release the next member's
-		// start only now, so the panel's start order is the config's list order.
-		started()
 
 		tag := "-p" + label
 		m.tokens, m.cost, m.stop, m.end, m.perr = d.drainPhase(
@@ -306,9 +338,28 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 				worktree:      dir,
 				panelParallel: true,
 				panelSpend:    &panelSpendHandle{ledger: ledger, self: ledger.join()},
+				// The next member starts only once THIS member's session launch
+				// has actually begun (CLA-738 review 3.2). Signalling when the
+				// worktree was ready woke the scheduler first: a later member
+				// whose setup happened to finish sooner could reach its adapter
+				// ahead of this one, so the config list order was not the
+				// adapter/start order the panel promises.
+				//
+				// The release is also the only point a test can see the launch
+				// order exactly, so d.panelLaunch fires here, BEFORE the release:
+				// the recorded sequence cannot then be reordered by the
+				// scheduling gap between the release and the adapter call, which
+				// is what made an Invoke-entry assertion race (CLA-755
+				// 1.review-5.1).
+				onSessionLaunch: func() {
+					if d.panelLaunch != nil {
+						d.panelLaunch(role)
+					}
+					started()
+				},
 			})
 		out.members[k] = m
-	})
+	}, d.panelRelease)
 
 	for k, m := range out.members {
 		out.tokens += m.tokens

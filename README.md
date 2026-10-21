@@ -86,10 +86,10 @@ targeted probe of a suspected defect, and the worktree is left clean. It is
 **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task: a sealed per-reviewer durable record written through
-`update_task(review: ...)` — round, reviewer role, the phase's resolved
+`record_review` — round, reviewer role, the phase's resolved
 harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
 severity grade and `raisedByModel` — plus, for one release, the legacy block
-in the outcome (`update_task(outcome: ...)`, no status move) carrying the
+in the outcome (`record_progress(outcome: ...)`, no status move) carrying the
 reviewed tip, both sides' harness/model, the `verdict`, and every finding by ID
 with the required fix. Findings are graded
 — `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
@@ -182,10 +182,12 @@ only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, and a `status: "in_review"` move. It releases its own round in that same
-`update_task` call (`review: {closeRound: …}`), because the plane refuses a
-sealed holder's outcome write and refuses a close after the task has left
-`in_progress`; the fix phase has already written the outcome with the
+PR, and a hand-over. That is ONE call: `submit_for_review(…, closeRound: …)`
+carries the round close in the same atomic write that moves the task to
+`in_review`, so the order that used to be load-bearing is now the plane's own
+guard rather than two client calls. The plane refuses a sealed holder's outcome
+write, so no outcome is sent on that call. The fix phase has already written
+the outcome with the
 `**Tests**` section the `in_review` guard reads. A round with any open MUST
 releases its round the same way but ends **without** the PR and without moving
 the task; the driver spawns another `fix`, then verifies again. SHOULD and NIT
@@ -804,13 +806,97 @@ waiting out the lease. The same happens inside the daemon when a phase is
 abandoned holding pushed work. A plane that refuses because the run already
 ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
 
+**A clean approved task is integrated without a session.** An
+approved-awaiting-merge task used to wait for a fresh agent session to merge its
+PR — which waits for some clanker to finish the task it is on, and a task with a
+review panel runs 30-60 minutes. Every step except resolving a conflict is
+mechanical, so the supervisor does them: for each supervised project whose
+policy says a clanker integrates (`authorityIntegrate: clanker`), it finds the
+open PR for the task's recorded branch, judges it with the same delivery check
+the driver applies to an agent's claim (mergeable, and a check rollup that ran
+and passed), **claims the task first** so an agent close-out and this path can
+never both merge it, merges the PR as a merge commit, verifies that merge commit
+is an ancestor of the base on origin, and closes the task done with that
+delivery. It does nothing under `authorityIntegrate: human`, for a PR based on
+`main` (the promotion is yours), for a failing, unchecked or unresolvable PR, or
+when the claim is refused. A conflict is the one stand-down that hands work
+somewhere instead of just leaving the task alone: the conflicting paths are
+logged once per head/base pair, and a conflict-only session is started for it.
+Anything after a
+successful claim that cannot be finished releases it, so the task goes back to
+`approved` rather than being left held — with one exception: a merge that LANDED
+but whose ancestry could not be verified is closed `done` with `mergeVerified:
+false`, because the PR is no longer open and a release would strand the task.
+The merge itself names the configured base and the judged head revision, so a
+PR retargeted after the judgement cannot be merged into `main`; its verification
+and conflict reads run in a throwaway clone, never in the checkout the fleet's
+sessions share.
+
+**A conflict gets a short dedicated session, not the next clanker's full one.**
+A CONFLICTING PR used to wait for whichever clanker finished its current task — a
+full implement-phase session, with the whole drain brief, to resolve a merge
+conflict. The supervisor now handles it: it takes the claim itself (so an agent
+close-out and this path cannot both work the task — a refused claim means no
+session), then starts **one** short session on the fleet's implement harness and
+model, configurable as the `conflict` step:
+
+```json
+"conflict": { "harness": "opencode", "model": "commandcode/deepseek/deepseek-v4.1-flash", "max_turns": 80 }
+```
+
+Every field is optional and defaults to the implement step's own, so an untouched
+config runs the conflict session on the model that implemented the branch. The
+brief is narrow: create a worktree of the branch, merge the PR's base into it (a
+merge, **never** a rebase — the branch is already pushed), resolve **only** the
+conflicting hunks, run the repo-wide gate (`go test ./...` when the checkout has
+a `go.mod`, `pnpm test` when it has a `package.json`, else the repo's own
+documented gate), and push. It then hands the task back by the nature of the
+resolution: **mechanical** (renumbering, keeping both sides of a list,
+regenerating a pinned figure — no change to what the code does) releases the
+claim and leaves the task `approved` for the close-out above to merge once CI is
+green; **behavioural** or uncertain moves it back to `in_review` with a note
+naming what changed, because that code has not been reviewed; a **failure** (a
+gate that will not go green, a hunk that cannot be resolved without guessing)
+releases the claim (attesting `checkGreen: false`, since the merge never
+happened — that is what makes the plane's CI-repair ladder bound a
+green-but-unmergeable PR), leaves the task `approved` and is logged with its
+reason.
+
+At most one conflict session runs at a time, and the bound is a **shared lease,
+not a per-process flag**: the supervisor takes an exclusive lock on
+`conflict-session.lock` under its state root for the session's lifetime, so every
+supervisor using that state root contends for one slot — two processes on a
+machine, or two instances in one process. The kernel drops the lock when the
+holder exits, so a session that crashed or was rolled never strands the slot, and
+a second conflicting task waits for the next poll. The plane claim remains the
+guard for the SAME task (a refused claim means someone else has it). Machines
+whose state roots are separate each hold their own slot, so a fleet spanning
+machines should give them a shared state root if the one-session-at-a-time bound
+has to hold across all of them; a cross-machine slot for *different* tasks needs a
+lease in the plane, which does not exist yet.
+
+A CONFLICTING read whose fetched tips merge cleanly starts no session at all:
+GitHub's mergeable state lags a push, so that is the evidence that the conflict is
+already resolved (exactly the shape a mechanical resolution leaves behind), and a
+session there would be a second paid attempt at a conflict that no longer exists.
+The task is left to the deterministic close-out, which merges it as soon as the
+stale read catches up. Daemon-started sessions never run on Claude: a
+`conflict` step resolving to `claude` stands down with a log line and leaves the
+task to the agent close-out.
+
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
 (loaded exactly as `clankerbar run` loads it, or bare defaults when no file
-exists). When the file exists it is re-read on every reconcile, so an edit
-lands without a supervisor restart. Everything the plane may not set — `env`
-and `@file` secrets, `settings_path`, `config_dir`, `mcp_config_path`,
-`backlog_url` and the rest — comes from this file.
+exists). When the file exists it is re-read on every reconcile. An edit that
+changes a running child's effective config is written into that child's
+generated config and queued as a graceful `RESTART`, so it reaches the child at
+its next iteration boundary — no supervisor restart and no hand-written `STOP`.
+An edit that changes nothing writes nothing (an unchanged config serializes to
+the same bytes, so there is no restart loop), and an edit the permission-policy
+check refuses is logged and never written: the running child stays on its
+current file. Everything the plane may not set — `env` and `@file` secrets,
+`settings_path`, `config_dir`, `mcp_config_path`, `backlog_url` and the rest —
+comes from this file.
 
 **The roster names the projects; the base config wires them.** A roster entry
 carries the project(s) the instance drives. For each one the supervisor starts
@@ -924,9 +1010,10 @@ resolved `settings_path` / `config_dir` / `mcp_config_path` and the default
 `backlog_url`; the credential itself stays in `CLANKERBAR_API_KEY` in the
 environment, which the child inherits) — is written to `materialized.json` in
 the child's own state dir, and the child is started with `run -c` pointing at
-it. The generated file is a **cache**: regenerated on every reconcile (each
-spawn re-reads the base config), never hand-edited, and safe to delete while a
-child runs — the next spawn regenerates it. It is written to disk rather than
+it. The generated file is a **cache**: written when the child is spawned and
+rewritten at reconcile when an edit changes it (see "The base config is the
+machine layer"), never hand-edited, and safe to delete while a child runs — the
+next spawn regenerates it. It is written to disk rather than
 held in memory so it doubles as the offline last-known-good: with the plane
 unreachable the supervisor reconciles against the cached roster and starts
 children from their materialized configs, rather than starting nothing (a cold
@@ -1053,7 +1140,10 @@ config the driver never named that a session merges anyway: one whose
 what a session may do), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
 long enough to do the work), **deploy_lag** (how far the deployed build lags the
-project's integration branch), and **budget** (ceilings parse and are sane).
+project's integration branch), **pr_gate** (gh is on PATH *and* a real
+`gh pr view --json` parses — decorated output is a FAIL, an unreachable GitHub a
+WARN, and "no PR to read" says the probe was not exercised), and **budget**
+(ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
@@ -1285,6 +1375,11 @@ re-reads the config file at the next iteration boundary without replacing
 anything: budget, ceiling, prompt and poll-interval edits apply to the next
 iteration; harness, env and binary changes need a restart.
 
+On a **supervised** child there is nothing to reach for: the file its `-c`
+names is the supervisor's generated `materialized.json`, not the base config
+you edit, and the supervisor itself rewrites that file and queues the `RESTART`
+when your base-config edit lands (see "The base config is the machine layer").
+
 One limit worth knowing before you reach for restart: **re-exec preserves the
 daemon's CURRENT environment.** It cannot conjure env the daemon was never
 launched with - a tokenless daemon restarts tokenless (that class of problem is
@@ -1355,7 +1450,17 @@ stderr still streams to the supervisor's own terminal, as before.
 The daemon also reports what it is doing to the plane, so the console's Fleet
 page shows every instance — working *and* idle, where the run-based panel only
 sees a daemon that currently holds a task. Two things are reported, both riding
-cadences the loop already runs (no new timers):
+cadences the loop already runs — presence on each backlog poll and on each
+in-session lease-renewal tick, iteration history at each drain boundary — with
+one exception: a run parked on a usage limit re-beacons on a ticker of its own,
+because the pause is the one time that poll and session cadences both stop:
+
+> **Release order**: a plane older than CLA-727 refuses an unknown
+> `state.kind` for the WHOLE report (400), so `limited` has to be promoted on
+> the plane — accepting `state.kind: "limited"` and `state.resetAt` — before a
+> CLI that sends it reaches the fleet. Against an older plane every beacon is
+> rejected, not just the `limited` ones, and the instance goes dark in every
+> state.
 
 - **Presence** rides each backlog poll: who the instance is (`instance_name`;
   when unset it resolves to the machine's hostname plus the config file's
@@ -1364,10 +1469,23 @@ cadences the loop already runs (no new timers):
   the host and binary version, a
   fingerprint of the config in force, and the state — `idle`,
   `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
-  holds spawns, `stopping` as the final beacon when the run ends. State changes
+  holds spawns, `limited` {resetAt} while the run is parked on a harness usage
+  limit (with the stated reset instant when the harness stated one), `stopping`
+  as the final beacon when the run ends. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
-  to learn which phase is running. The plane stores exactly what you report; it
-  infers nothing.
+  to learn which phase is running; a session in progress re-beacons the same
+  `iteration` state on every lease renewal (a third of the plane's 30-minute
+  lease, so ten minutes apart at most), because the poll does not run while a
+  session does and a session longer than the plane's 15-minute liveness window
+  would otherwise read as a dead instance — and that tick keeps firing, without
+  the lease beat, after renewal stands down on a plane that refuses it, since
+  the fleet report is a different transport and a healthy instance must not go
+  dark mid-session; every other project the daemon serves is re-beaconed its own
+  `idle`/`draining` state on the same tick, for the same reason one project over;
+  and a limit wait re-beacons `limited`
+  every five minutes — well inside the plane's liveness window — so hours spent
+  waiting out a cap do not read on the console as a dead instance. The plane
+  stores exactly what you report; it infers nothing.
 - **Iteration history**: exactly one record per drain, posted at the boundary it
   just crossed — the task, the phases attempted, how it ended (`checkpoint`
   work left for a takeover / `released` back to the queue or settled /
@@ -1383,7 +1501,10 @@ cadences the loop already runs (no new timers):
   dollar figure, when there is one. The breakdown is what the operator's cost
   analysis reads; the dollar figure is labelled as harness-reported because on a
   subscription it is the API-rate equivalent, not what was paid, and it is
-  omitted for a harness that reports no cost at all (codex today).
+  omitted for a harness that reports no cost at all (codex today), and for a
+  session that reported no usage at all — the plane refuses a report carrying a
+  session's cost without its usage report, so the figure rides only when the
+  usage report does.
   The plane keeps a session's usage on the task, as a durable `phase_session`
   record (`list_phase_sessions` reads it back), alongside the run that session
   worked under — the run's UUID, never the credential the session holds, which
@@ -1404,7 +1525,7 @@ daemon's presence row.
 ### Checking what a session says it delivered
 
 The control plane holds the backlog and takes a clanker at its word. When a session
-records a branch (`update_task(branch: …)`) or declares a delivery merged
+records a branch (`record_progress(branch: …)`) or declares a delivery merged
 (`delivery.commit` + `integrationBranch`), nothing on the plane can look at a
 repository to see whether either is true. One task read `done` for four days while
 about 900 lines of its work sat unpushed on one laptop, and its own PR merged a
@@ -1476,6 +1597,20 @@ a bounded window (30s) and then **refused**, never assumed. Failing or
 unfinished checks refuse by name. If `gh` is not installed the check degrades
 to an explicit could-not-verify - never a pass - and `clankerbar doctor`'s
 `pr_gate` line warns about it up front.
+
+The gate parses `gh`'s `--json` output, so it owns that child's environment:
+`GH_FORCE_TTY` is **removed** (from the inherited environment too — gh treats
+ANY value as "force terminal-style output", and the `GH_FORCE_TTY=0` this gate
+shipped itself turned colour ON) and `NO_COLOR=1` / `CLICOLOR=0` are set. When
+the output still does not parse, the delivery is **refused**: gh ran and its
+answer is unintelligible, which is a defect in the gate's own contract, not an
+absence of evidence. That is deliberately *not* the same as "could not verify":
+a missing `gh` or an unreachable GitHub stays an explicit could-not-verify,
+while a parse failure refuses. Until CLA-776 the difference was invisible —
+every real delivery logged "could not verify … carrying on" for two months.
+A remote whose host is an SSH config alias (`git@github-personal:…`) is resolved
+through `ssh -G` and checked when the alias lands on github.com, rather than
+being skipped as "not a github.com repository".
 
 **Repos with no CI at all:** refusing every delivery there would wedge the
 driver shut, so a per-project opt-out exists - set `"allow_unchecked_pr": true`
@@ -2196,7 +2331,7 @@ heartbeats. When a session ends mid-task, that lease is left ticking with nobody
 renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
 there are only two before the task is parked for a human. So the driver watches
 the session's stream for what it claimed, and hands the task straight back
-(`update_task(status: ready)`) on **every** exit: usage limit, transient blip,
+(`release_task`, the driver-marked variant) on **every** exit: usage limit, transient blip,
 outright failure, or a clean finish with the work unfinished. The usage-limit case
 is why this matters most — the pause that follows can be hours, and the release is
 ordered before it.

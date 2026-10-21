@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -43,12 +44,17 @@ func init() { Register(opencode{}) }
 //     network with webfetch denied. The adapter sets `codemode: false` on every
 //     server it hands over and denies `execute`.
 //   - Billing depends on the configured backend, not opencode: metered pay-per-token
-//     (OpenRouter / Zen) or a monthly-limit subscription (opencode Go). NONE impose a
-//     short rolling-window cap, so there is no supervised-wait/early-reset case here.
-//     DetectLimit instead recognizes a HARD budget/credit-exhaustion stop (402 /
-//     "out of credits" / "monthly limit reached") and flags Limit.Stop so the loop
-//     stops cleanly rather than waiting for a reset that never comes. The
-//     self-accounted budget breaker is the primary control; ReadUsage is unsupported.
+//     (OpenRouter / Zen), a monthly-limit subscription (opencode Go), or the Command
+//     Code plan's rolling usage windows — 5-hour, daily and weekly. The first two
+//     are hard caps; a rolling window names the cap and usually states its reset,
+//     so DetectLimit reports it as a WAITABLE limit (Limit.Stop unset, ResetAt
+//     parsed when stated, Limit.Window labelled) and the loop supervises the wait.
+//     The window is read from the provider's structured `rateLimit.window` in the
+//     response body opencode passes through verbatim, falling back to the message
+//     wording. The hard cases (402 / "out of credits" / "monthly limit reached")
+//     still set Limit.Stop so the loop stops cleanly rather than waiting for a
+//     reset that never comes. The self-accounted budget breaker is the primary
+//     control; ReadUsage is unsupported.
 //   - Usage: 2.x emits step_finish only for tool-call steps, never for the final
 //     answer, so the stream under-counts. After each process exits the adapter
 //     reads `opencode session export --standalone <sid>` for the authoritative
@@ -224,7 +230,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// Coherent: continue the session for real. The continuation's parser is
 		// seeded with the DEAD RUN'S live claim (not in.ResumeClaim, which on a
 		// phase 2+ holds the staler predecessor): `opencode run -s` streams only
-		// the new turn, so without the seed every update_task the continuation
+		// the new turn, so without the seed every progress write the continuation
 		// makes would go unobserved — no settle, no HasWIP, no delivery report —
 		// and releaseHeldClaim would post ready over work the session pushed.
 		contIn := in
@@ -1400,13 +1406,13 @@ func (p *opencodeParse) line(line []byte) {
 //
 // A tool part is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so
 // a re-delivered terminal event for a claim already settled by a later
-// update_task would resurrect it — and the driver would post `ready` over a task
+// a status write would resurrect it — and the driver would post `ready` over a task
 // that is in review. This is insurance, not an observed bug.
 //
 // # What this shape cannot do, and what it costs
 //
 // claude sets Claim.HasWIP on the REQUEST (see noteToolUse), deliberately: a
-// session killed between issuing `update_task(branch: …)` and its result has
+// session killed between issuing `record_progress(branch: …)` and its result has
 // still pushed work, and erring towards "there is WIP" only costs the reclaim an
 // expiring lease already costs. opencode gives no request-side event at all — the
 // arguments arrive fused to the result — so that arm cannot fire early here. A
@@ -1678,17 +1684,114 @@ func (p *opencodeParse) finish(res *Result) {
 }
 
 // opencodeBudgetRe recognizes a HARD budget/credit-exhaustion stop from the
-// configured provider: out of credits, spend-cap or monthly-limit reached, or an
-// HTTP 402 Payment Required. This is a STOP (Limit.Stop), NOT the rolling-window
-// wait case — opencode's backends have no short reset to poll for. A plain 429
-// "rate limit" is a transient blip (IsTransient), not this.
+// configured provider: out of credits, spend-cap or monthly/billing-limit
+// reached, or an HTTP 402 Payment Required. This is a STOP (Limit.Stop) — there
+// is no window to wait out.
+//
+// It carries only phrasings that NAME a hard condition. The generic wordings
+// that name an exhausted quota without saying which window it is — "usage limit
+// reached", "insufficient quota" — live in opencodeGenericLimitRe, because the
+// SAME words arrive on a rolling subscription window that a wait can outlast: a
+// provider.quota event whose text is "Usage limit reached ... resets at ..." was
+// a Stop here and threw the stated reset away (CLA-736 review). A rolling
+// subscription quota (an N-hour/N-minute/session/daily usage limit, or
+// error.type "provider.quota") is the separate, WAITABLE case, matched by
+// opencodeRollingQuotaRe; a plain 429 "rate limit" with no quota wording is a
+// transient blip (IsTransient), not this.
 var opencodeBudgetRe = regexp.MustCompile(`(?i)"status(code)?": ?402` +
 	`|payment required` +
 	`|out of (credit|credits|balance)` +
-	`|insufficient (credit|credits|fund|funds|balance|quota)` +
+	`|insufficient (credit|credits|fund|funds|balance)` +
 	`|(credit|token) balance (is )?(too low|depleted)` +
 	`|spend[ -]?(cap|limit)|spending limit` +
-	`|monthly (usage )?limit|billing (hard )?limit|usage limit reached`)
+	`|monthly (usage )?limit|billing (hard )?limit`)
+
+// opencodeGenericLimitRe names an exhausted quota WITHOUT naming a window or a
+// hard condition: the legacy "usage limit reached", and "insufficient
+// [provider] quota". On its own that is still a Stop — nothing in it says the
+// window lifts — but DetectLimit lets the rolling classification win when the
+// same event is typed provider.quota or states a reset instant, which is the
+// whole difference between a top-up and a wait (CLA-736 review).
+var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
+	`|insufficient (?:[\w-]+ )?quota`)
+
+// opencodeRollingQuotaRe recognizes the OTHER kind of provider limit: a rolling
+// subscription window that a wait can outlast (CLA-736). The Command Code plan's
+// 5-hour quota arrives as an HTTP 429 typed `provider.quota` and states the
+// reset instant in its message; the loop supervises that wait and re-runs the
+// session once the window lifts, so this must be reported as Limited with Stop
+// UNSET rather than falling through to the transient ladder.
+//
+// Three arms, all read from opencodeErrorText (stderr + a TERMINAL error event),
+// never the agent's narration:
+//   - 2.x types it: error.type == "provider.quota". This alone is enough — the
+//     type is the provider's own statement that the cap is a quota it will lift,
+//     so a message carrying no duration/window wording at all is still waitable.
+//   - the message names the window BEFORE the limit word: "5-hour usage limit",
+//     "Your 5-hour limit has been reached", "30-minute usage limit", "session
+//     usage limit", "daily usage limit", "weekly usage limit". The word "usage"
+//     is not required — an untyped provider that calls it a "5-hour limit" is
+//     the same window. The weekly arm is not optional: it is the window this
+//     task adds, and a prose weekly cap must classify exactly like its sibling
+//     windows instead of reading as no limit at all (review 1.review-1.1).
+//   - the message names the window AFTER the limit word: "Your usage limit has
+//     been reached (5-hour window)". Same statement with the clause order
+//     swapped; without this arm it matches neither the window-first arm (the
+//     limit must follow the window) nor the generic quota arm ("usage limit
+//     reached" wants those words adjacent), so a waitable window rode the
+//     transient ladder instead of a supervised wait (review 1.review-2.2).
+//
+// Deliberately narrow. A bare 429 "rate limit" names no window and stays
+// transient, and the hard budget arms above are checked FIRST — so a monthly cap
+// typed as provider.quota is still a Stop.
+var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"` +
+	`|\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b[^.\n"]{0,40}\blimit\b` +
+	`|\b(?:limit|quota)\b[^.\n"]{0,40}\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b` +
+	`|\b(session|daily|weekly)\s+usage\s+limit`)
+
+// opencodeResetRe captures the reset instant a rolling quota STATES as RFC3339,
+// e.g. "Your limit resets at 2026-10-20T15:56:48.251Z." When the message does not
+// state one the parse returns the zero time and the supervised wait falls back to
+// interval probing — a missing reset must not demote the limit to "no limit".
+var opencodeResetRe = regexp.MustCompile(`(?i)resets?\s+at\s+` +
+	`(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))`)
+
+// opencodeResetInRe captures a RELATIVE reset a rolling quota states by duration,
+// e.g. "Usage limit reached. Resets in 4 hours." or "reset in 45m". The same
+// provider family emits either form, and a relative window is the same statement
+// of when the limit lifts — the classifier's own rule is that "a message that
+// says when it lifts is a wait" (review 1.review-2.2), and reading only the
+// absolute form turned the wait into an engineer-visible stop.
+var opencodeResetInRe = regexp.MustCompile(`(?i)resets?\s+in\s+(\d+)\s*(hours?|hrs?|minutes?|mins?|h|m)\b`)
+
+func parseOpencodeReset(s string) time.Time { return parseOpencodeResetAt(s, time.Now()) }
+
+// parseOpencodeResetAt is parseOpencodeReset with an injectable "now" for
+// testing — the same split parseClaudeResetAt uses. "now" is the drain's now: a
+// relative window is resolved at the moment the session's diagnostics are
+// classified.
+func parseOpencodeResetAt(s string, now time.Time) time.Time {
+	if m := opencodeResetRe.FindStringSubmatch(s); m != nil {
+		if t, err := time.Parse(time.RFC3339Nano, m[1]); err == nil {
+			return t
+		}
+	}
+	m := opencodeResetInRe.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return time.Time{}
+	}
+	switch strings.ToLower(m[2])[0] {
+	case 'h':
+		return now.Add(time.Duration(n) * time.Hour)
+	case 'm':
+		return now.Add(time.Duration(n) * time.Minute)
+	}
+	return time.Time{}
+}
 
 func (opencode) DetectLimit(res Result) Limit {
 	// Scan only the harness's own diagnostics, NOT the agent's narration: with
@@ -1696,10 +1799,259 @@ func (opencode) DetectLimit(res Result) Limit {
 	// task that merely discusses billing ("we're out of credits") must not trip a
 	// terminal stop. Budget errors arrive as a {"type":"error"} event (or plain
 	// text on stderr), which is what opencodeErrorText gathers.
-	if opencodeBudgetRe.MatchString(opencodeErrorText(res)) {
+	text := opencodeErrorText(res)
+	// Hard budget stops keep winning (CLA-736 settled 2): a monthly cap or an
+	// exhausted balance has no window to wait out, however the event is typed.
+	if opencodeBudgetRe.MatchString(text) {
+		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
+	}
+	// CLA-752: the provider's own STRUCTURED statement comes before its wording.
+	// The terminal error event carries the provider's response body verbatim
+	// (opencode 2.0.32 stores it under error.response.body), so a 429 that names
+	// its window there is classified from the window and the code, not from
+	// prose that may be reworded.
+	facts := opencodeErrorFactsOf(res)
+	if window, planLimit := opencodeWindowLimit(facts, text); planLimit {
+		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: window}
+	}
+	// A rolling subscription quota is a LIMIT the loop waits out, so Stop stays
+	// false. ResetAt is the provider's own stated instant when present.
+	if opencodeRollingQuotaRe.MatchString(text) {
+		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: opencodeNamedWindow(text)}
+	}
+	// The generic exhausted-quota phrasings are a Stop only when nothing makes
+	// the limit waitable. A provider.quota type or a rolling window is the case
+	// above; here the one remaining signal is a STATED reset — absolute
+	// ("resets at <RFC3339>") or relative ("resets in 4 hours") — a message that
+	// says when it lifts is a wait, not a top-up, so it must not be turned into a
+	// hard stop by wording that names no hard condition (CLA-736 review,
+	// 1.review-2.2).
+	if opencodeGenericLimitRe.MatchString(text) {
+		if reset := parseOpencodeReset(text); !reset.IsZero() {
+			return Limit{Limited: true, ResetAt: reset, Reason: "usage_limit"}
+		}
 		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
 	}
 	return Limit{}
+}
+
+// opencodeRateLimitWindows maps the provider's structured `rateLimit.window`
+// token onto the label the loop reports. The tokens are Command Code's own —
+// `fiveHour`, `weekly`, `daily` — not opencode's. Keys are normalised
+// (lower-case, separators stripped) because the provider's spelling is not
+// stable: `FiveHour` and `five-hour` are the documented token too, and an
+// exact-match map made those variants invisible, which is how a plan cap rode
+// the transient ladder (review 1.review-1.4). The mapping stays deliberately
+// closed: an unrecognised token names no window this adapter understands, and
+// guessing one is how a hard stop becomes an unbounded wait.
+var opencodeRateLimitWindows = map[string]string{
+	"fivehour": "5-hour",
+	"weekly":   "weekly",
+	"daily":    "daily",
+}
+
+// opencodeWindowToken normalises a structured window token before the closed
+// map lookup: case- and separator-insensitive, so `fiveHour`, `five_hour` and
+// `five-hour` are one window rather than one known token and two unknown ones.
+func opencodeWindowToken(s string) string {
+	return strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(strings.TrimSpace(s)))
+}
+
+// opencodeLimitWindowPhrase is the plan-limit wording a provider uses when it
+// names no window in its body. It is the message-only fallback (CLA-752): a
+// weekly statement labels weekly, and the plan's default cap is the 5-hour one.
+const opencodeLimitWindowPhrase = "usage limit for your plan"
+
+// opencodeWindowLimit resolves the plan limit a failure states: the LABEL of
+// the usage window it names (empty when it names none this adapter knows), and
+// whether the failure is a plan limit at all. Two sources, in order:
+//
+//  1. The STRUCTURED `rateLimit.window` from the provider's response body —
+//     top level or nested under the body's `error` object. Its token is
+//     authoritative: when it names a window the closed map does not know, the
+//     window is UNKNOWN — the wording is not consulted over it, because a
+//     window the provider named is not something prose may relabel, and the
+//     plan's default is a guess the map's own contract forbids (reviews
+//     1.review-1.4, 1.review-2.2).
+//  2. The message's "usage limit for your plan" phrase, which is the same
+//     statement in prose: weekly when it says weekly, otherwise the plan's
+//     default 5-hour window.
+//
+// Only a rate limit can be a PLAN limit: the structured path requires a 429
+// status or the RATE_LIMITED code, and the wording path requires the same. A
+// window seen on a 5xx is not a plan cap, and a 429 that names no window stays
+// the transient burst limit IsTransient already handles — that is the difference
+// between waiting out a plan cap and backing off a burst.
+func opencodeWindowLimit(f opencodeErrorFacts, text string) (window string, planLimit bool) {
+	rateLimited := f.Status == 429 || strings.EqualFold(f.Code, "RATE_LIMITED")
+	if !rateLimited {
+		return "", false
+	}
+	if f.Window != "" {
+		// The body NAMED a window. The closed map decides the label — including
+		// "no label" for a token it does not know. The failure is still a plan
+		// limit (a rate-limited failure that names a window is one by the task's
+		// own rule); what it is NOT is the 5-hour default, which would label a
+		// cap the provider never described as 5-hour and turn an unknown window
+		// into an unbounded wait (reviews 1.review-1.4, 1.review-2.2).
+		return opencodeRateLimitWindows[opencodeWindowToken(f.Window)], true
+	}
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, opencodeLimitWindowPhrase) {
+		return "", false
+	}
+	if window := opencodeNamedWindow(text); window != "" {
+		return window, true
+	}
+	return "5-hour", true
+}
+
+// opencodeNamedWindow labels a window the text NAMES, when it names one. It is
+// the wording arm's label, used where a rolling window is recognised by its
+// shape rather than by the structured token: an untyped "daily usage limit" is
+// the daily window. A bare "30-minute usage limit" names a duration, not one of
+// the plan's windows, and stays unlabelled rather than being called 5-hour.
+//
+// The window word only counts inside the limit STATEMENT — the same clause as a
+// limit/quota word (either side of it, since the provider swaps the order). The
+// scan reads the whole diagnostic text, which includes the terminal error event
+// and the provider's raw body, so a stray "weekly" in a session id or a body
+// field must not relabel the cap (review 1.review-1.6).
+var opencodeNamedWindowRe = regexp.MustCompile(`(?i)\b(weekly|daily|5[- ]hour)\b[^.\n"]{0,40}\b(?:usage\s+)?(?:limit|quota)\b` +
+	`|\b(?:usage\s+)?(?:limit|quota)\b[^.\n"]{0,40}\b(weekly|daily|5[- ]hour)\b`)
+
+func opencodeNamedWindow(text string) string {
+	m := opencodeNamedWindowRe.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	token := m[1]
+	if token == "" {
+		token = m[2]
+	}
+	switch strings.ToLower(token) {
+	case "weekly":
+		return "weekly"
+	case "daily":
+		return "daily"
+	}
+	return "5-hour"
+}
+
+// opencodeErrorFacts is what the terminal error event states STRUCTURALLY:
+// fields a caller can trust without reading prose. The zero value means the
+// stream carried no terminal error event, or one whose JSON did not parse.
+type opencodeErrorFacts struct {
+	// Status is the HTTP status the wrapper reported (error.status, or the older
+	// APIError shape's error.data.statusCode).
+	Status int
+	// Code is the provider body's machine-readable error code, e.g.
+	// RATE_LIMITED. It is the body's, not opencode's error.type.
+	Code string
+	// Window is the raw `rateLimit.window` token, when the body carried one.
+	Window string
+}
+
+// opencodeErrorFactsOf reads the structured facts out of a finished Result's
+// terminal error event.
+//
+// What survives opencode's wrapping is verified against the 2.0.32 binary and
+// the 2026-10-20 capture in testdata/opencode-quota-five-hour.jsonl: the
+// provider's message and status are lifted onto `error`, and its raw response
+// body is passed through as a JSON STRING under `error.response.body` (the
+// binary's provider error is built with `response:{body:…}`). The older
+// APIError shape puts the same body under `error.data.responseBody`. Neither is
+// re-parsed by opencode, so `code` and `rateLimit` are only reachable by
+// decoding that string here.
+//
+// Wrapper first, body second: the transport's own `error.status` is the status
+// the request actually failed with, while a provider body may carry an envelope
+// `status: 200` (or any other non-HTTP value) that says nothing about the
+// failure. Filling the status from the body first masked a wrapper 429 and sent
+// a plan cap down the transient ladder (review 1.review-1.5). Code and window
+// live only in the body, so the wrapper merge leaves those holes for it.
+func opencodeErrorFactsOf(res Result) opencodeErrorFacts {
+	line := opencodeTerminalErrorLine(res)
+	if line == "" {
+		return opencodeErrorFacts{}
+	}
+	var ev map[string]any
+	if json.Unmarshal([]byte(line), &ev) != nil {
+		return opencodeErrorFacts{}
+	}
+	errObj := opencodeJSONObject(ev["error"])
+	dataObj := opencodeJSONObject(errObj["data"])
+
+	f := opencodeMergeFacts(opencodeFactsFromObject(errObj), opencodeFactsFromObject(dataObj))
+	for _, raw := range []any{
+		opencodeJSONObject(errObj["response"])["body"],
+		dataObj["responseBody"],
+		ev["responseBody"],
+		errObj["body"],
+	} {
+		body, ok := raw.(string)
+		if !ok || body == "" {
+			continue
+		}
+		var decoded map[string]any
+		if json.Unmarshal([]byte(body), &decoded) != nil {
+			continue
+		}
+		f = opencodeMergeFacts(f, opencodeFactsFromObject(decoded))
+		// The provider's body is normally an {error:{…}} envelope itself.
+		f = opencodeMergeFacts(f, opencodeFactsFromObject(opencodeJSONObject(decoded["error"])))
+	}
+	return f
+}
+
+// opencodeFactsFromObject reads the three structured fields out of one decoded
+// JSON object. Absent or wrongly-typed fields stay zero, and a `status` outside
+// the HTTP range is not a status at all (review 1.review-1.5).
+func opencodeFactsFromObject(o map[string]any) opencodeErrorFacts {
+	var f opencodeErrorFacts
+	if n, ok := opencodeJSONNumber(o["status"]); ok && n >= 100 && n <= 599 {
+		f.Status = n
+	} else if n, ok := opencodeJSONNumber(o["statusCode"]); ok && n >= 100 && n <= 599 {
+		f.Status = n
+	}
+	if s, ok := o["code"].(string); ok {
+		f.Code = s
+	}
+	if rl := opencodeJSONObject(o["rateLimit"]); rl != nil {
+		if w, ok := rl["window"].(string); ok {
+			f.Window = w
+		}
+	}
+	return f
+}
+
+// opencodeMergeFacts keeps base's facts and fills only its holes from next.
+func opencodeMergeFacts(base, next opencodeErrorFacts) opencodeErrorFacts {
+	if base.Status == 0 {
+		base.Status = next.Status
+	}
+	if base.Code == "" {
+		base.Code = next.Code
+	}
+	if base.Window == "" {
+		base.Window = next.Window
+	}
+	return base
+}
+
+// opencodeJSONObject is a decoded JSON object, or nil for anything else.
+func opencodeJSONObject(v any) map[string]any {
+	o, _ := v.(map[string]any)
+	return o
+}
+
+// opencodeJSONNumber is a decoded JSON number as an int, or false.
+func opencodeJSONNumber(v any) (int, bool) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(f), true
 }
 
 // opencodeErrorText collects the harness-level diagnostic text — all of stderr,
@@ -1731,6 +2083,26 @@ func opencodeErrorText(res Result) string {
 func buildOpencodeErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
+	// The error event is appended ONLY when the stream ENDED on it — the rule
+	// opencodeTerminalErrorLine owns, shared with the structured fact scan so
+	// the two can never disagree about which event is the failure.
+	if line := opencodeTerminalErrorLine(res); line != "" {
+		b.WriteByte('\n')
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// opencodeTerminalErrorLine returns the LAST typed event on the stream when it
+// is a {"type":"error"} event, verbatim; "" otherwise.
+//
+// 2.x emits provider errors mid-session, retries the request itself and carries
+// on: a stream whose error event is followed by a step_start / tool_use / text
+// part is a session that RECOVERED, and calling that session failed or retryable
+// is how a delivered phase got classified as a failed attempt (both 2026-10-19
+// incidents). So an error event with any typed event after it contributes
+// nothing.
+func opencodeTerminalErrorLine(res Result) string {
 	last := ""
 	for _, line := range strings.Split(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
@@ -1745,16 +2117,16 @@ func buildOpencodeErrorText(res Result) string {
 		}
 		last = line
 	}
-	if last != "" {
-		var ev struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal([]byte(last), &ev) == nil && ev.Type == "error" {
-			b.WriteByte('\n')
-			b.WriteString(last)
-		}
+	if last == "" {
+		return ""
 	}
-	return b.String()
+	var ev struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(last), &ev) != nil || ev.Type != "error" {
+		return ""
+	}
+	return last
 }
 
 // opencodeFatalRe: failures that are NEVER a blip, scanned before the transient
@@ -1834,8 +2206,9 @@ var opencodeFatalRe = regexp.MustCompile(`(?i)"type": ?"provider\.(auth|no-route
 // 2.x's `provider.rate-limit` is the typed form of the 429 arm. 2.0.32 retries a
 // 429 itself (about ten attempts over ~82s) before it exits 1 with that type,
 // so by the time the adapter sees it the burst has lasted a minute and a half;
-// it is still a rate limit and still rides the loop's backoff, and a budget
-// stop worded inside it is caught first by opencodeBudgetRe.
+// it is still a rate limit and still rides the loop's backoff, and a budget stop
+// or a rolling quota window worded inside it is caught first by opencodeBudgetRe
+// / opencodeRollingQuotaRe.
 var opencodeTransientRe = regexp.MustCompile(`(?i)"type": ?"provider\.rate-limit"` +
 	`|"status(code)?": ?(408|429|5\d\d)` +
 	`|"isretryable": ?true` +
@@ -1952,11 +2325,27 @@ func (o opencode) IsTransient(res Result) bool {
 	// A named stop wins over every retry path below, including the heuristic. The
 	// loop already runs DetectLimit before IsTransient, so the budget arm is
 	// belt-and-braces there — but this function must not answer "retryable" about
-	// an exhausted account just because it happens to be asked out of that order.
-	// The braces are why the loop's ordering has no test of its own: with both
-	// classifiers agreeing, no order produces a retry, so there is nothing left for
-	// a test to distinguish (CLA-381).
-	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+	// an exhausted account just because it happens to be asked out of that order,
+	// and a rolling quota is the same shape: it is WAITED, not retried. The
+	// generic quota phrasings belong here even though DetectLimit may make them
+	// waitable on a stated reset: either way there is nothing to RETRY, and a 429
+	// saying "usage limit reached" must never ride the transient ladder. The
+	// braces are why the loop's ordering has no test of its own: with both
+	// classifiers agreeing, no order produces a retry, so there is nothing left
+	// for a test to distinguish (CLA-381).
+	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
+		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	// CLA-752: the same veto for a plan cap stated STRUCTURALLY. A rate-limited
+	// failure whose body names a usage window — or that says "usage limit for
+	// your plan" — is a limit the loop WAITS out; DetectLimit says so from the
+	// same function, and the two classifiers agreeing is what makes the loop's
+	// DetectLimit-first ordering safe (CLA-381, review 1.review-1.2). Without
+	// this, the body-only shape was "limited" to one classifier and "retryable"
+	// to the other, so a caller that asked this one alone retried a plan cap as
+	// if it were a burst.
+	if _, planLimit := opencodeWindowLimit(opencodeErrorFactsOf(res), text); planLimit {
 		return false
 	}
 	// CLA-700: a session that RECOVERED from its provider errors is not retryable,
@@ -2001,7 +2390,14 @@ func (opencode) IsUnclassifiedTransient(res Result) bool {
 		return false
 	}
 	text := opencodeErrorText(res)
-	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
+		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	// CLA-752: IsTransient's structural veto, for the same reason — the
+	// heuristic must not launder a body-named plan cap into a bounded guess
+	// (review 1.review-1.2).
+	if _, planLimit := opencodeWindowLimit(opencodeErrorFactsOf(res), text); planLimit {
 		return false
 	}
 	// CLA-700: the same rule as IsTransient's — a session that recovered from its

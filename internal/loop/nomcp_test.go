@@ -92,8 +92,11 @@ func TestDrainPhases_ReviewPanelMemberNoMCPIsRetriedOnce(t *testing.T) {
 		t.Errorf("review-1 streak = %d, want 0 after a successful retry", n)
 	}
 	recs := ff.records()
-	if len(recs) != 1 || strings.Contains(recs[0].Outcome, "INCOMPLETE") {
-		t.Errorf("a recovered member left the panel incomplete: %+v", recs)
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1", len(recs))
+	}
+	if strings.Contains(logs.String(), "INCOMPLETE") {
+		t.Errorf("a recovered member left the panel incomplete:\n%s", logs.String())
 	}
 }
 
@@ -144,8 +147,11 @@ func TestDrainPhases_ReviewPanelMemberNoMCPRepeatIsIncomplete(t *testing.T) {
 	if recs[0].Outcome == fleet.OutcomeDead {
 		t.Errorf("a no_mcp member marked the whole drain dead: %q", recs[0].Outcome)
 	}
-	if !strings.Contains(recs[0].Outcome, "no_mcp") {
-		t.Errorf("the iteration outcome does not name no_mcp: %q", recs[0].Outcome)
+	requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeReleased)
+	for _, want := range []string{"no_mcp", "review-2"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the daemon log does not name %q for the incomplete panel:\n%s", want, out)
+		}
 	}
 	cell := d.deadTally[tallyKey{phase: "review-2", harness: "opencode"}]
 	if cell == nil || cell.noMCP != 1 || cell.dead != 0 {
@@ -218,9 +224,12 @@ func TestDrainPhases_ReviewOnlyNoMCPIsRetriedOnce(t *testing.T) {
 		t.Errorf("review tally = %+v, want 1 no-mcp and 0 dead (all cells: %+v)", cell, d.deadTally)
 	}
 	recs := ff.records()
-	if len(recs) != 1 || !strings.Contains(recs[0].Outcome, "no_mcp") {
-		t.Errorf("the iteration outcome does not carry no_mcp: %+v", recs)
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1", len(recs))
 	}
+	// The record keeps the four-word enum (CLA-738); the log names the miss,
+	// which the assertion above already pins.
+	requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeReleased)
 	if recs[0].Outcome == fleet.OutcomeDead {
 		t.Errorf("a no_mcp review was reported dead: %q", recs[0].Outcome)
 	}

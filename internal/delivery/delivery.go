@@ -8,7 +8,7 @@
 //
 // The driver is the right place to close that: it is already local, already in
 // the git tree, and already watches the session stream for `claim_task` and
-// `update_task` (CLA-242). This adds a check to an observation that already
+// the plane's task writes (CLA-242). This adds a check to an observation that already
 // happens. It needs no new configured credentials - GitHub access rides the
 // operator's own `gh` auth, resolved per remote below - and no plane change.
 //
@@ -74,7 +74,7 @@ const (
 type Kind string
 
 const (
-	// BranchPushed: a branch recorded via `update_task(branch: ...)` is really on
+	// BranchPushed: a branch recorded via `record_progress(branch: ...)` is really on
 	// the remote, and the local tip is an ancestor of the remote tip.
 	BranchPushed Kind = "branch"
 	// CommitMerged: a declared `delivery.commit` is an ancestor of the declared
@@ -230,10 +230,43 @@ func New(workdir, remote string) *Verifier {
 // on a delivery's PR becomes a WARN instead of a refusal. It never relaxes
 // the mergeability condition, and it changes nothing for repos whose PRs do
 // carry checks. Returns the verifier, for chaining off New.
+//
+// It deliberately does NOT reach the close-out's judgement (JudgePR): a
+// deterministic merge has nobody reading it afterwards, so an empty rollup stays
+// a refusal there whatever the project's delivery opt-out says.
 func (v *Verifier) AllowUncheckedPR() *Verifier {
 	v.allowUncheckedPR = true
 	return v
 }
+
+// WithGHBin points the verifier at an alternative gh binary, for the callers that
+// are not the delivery gate: a supervisor's close-out shares this judgement, and its
+// tests substitute a fake gh exactly as this package's own do.
+func (v *Verifier) WithGHBin(bin string) *Verifier {
+	if strings.TrimSpace(bin) != "" {
+		v.ghBin = bin
+	}
+	return v
+}
+
+// WithPollWindow shrinks (or widens) the window a PR is polled within, for callers
+// whose tests cannot wait out the production 30 seconds. A non-positive value leaves
+// the field alone, so a caller can set only the one it cares about.
+func (v *Verifier) WithPollWindow(budget, interval time.Duration) *Verifier {
+	if budget > 0 {
+		v.prBudget = budget
+	}
+	if interval > 0 {
+		v.prInterval = interval
+	}
+	return v
+}
+
+// PollWindow is the budget a PR read is polled within. A caller that has to wait
+// for something GitHub has just changed to become visible — the close-out waiting
+// for a merge commit it made to appear on the base — uses it as its own retry
+// window, so a test that shrinks the judgement's window shrinks that wait with it.
+func (v *Verifier) PollWindow() time.Duration { return v.prBudget }
 
 // Verify checks a claim and returns what it found. It never returns an error:
 // everything that could go wrong is a check whose Status is Unknown, because the
@@ -436,6 +469,20 @@ func (v *Verifier) checkBranch(ctx context.Context, repo, remote, branch string)
 // ref answers a question nobody asked.
 // sha is already resolved and confirmed present in repo by mergeCheck.
 func (v *Verifier) checkMerged(ctx context.Context, repo, remote, sha, integration string) Check {
+	return v.mergedOnRemote(ctx, repo, remote, sha, integration)
+}
+
+// mergedOnRemote is the ancestor test both the delivery gate (checkMerged) and the
+// supervisor's close-out (MergedOnRemote) run, so the two can never disagree about
+// what "merged" means.
+//
+// The commit is fetched FOR when it is not local. That case is unreachable from the
+// delivery gate — mergeCheck only calls this once it has resolved sha in the tree —
+// and is the normal one for a close-out, where GitHub made the merge commit and the
+// driver has never seen it. One fetch of the integration branch brings both: the
+// merge commit is on it by definition, and the tip it was merged to is what the
+// ancestry is judged against.
+func (v *Verifier) mergedOnRemote(ctx context.Context, repo, remote, sha, integration string) Check {
 	tip, err := v.lsRemote(ctx, repo, remote, integration)
 	if err != nil {
 		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
@@ -445,8 +492,13 @@ func (v *Verifier) checkMerged(ctx context.Context, repo, remote, sha, integrati
 		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
 			"%s has no branch %q to check the delivery against", remote, integration)}
 	}
-	if !v.haveObject(ctx, repo, tip) {
-		_, _ = v.runScoped(ctx, repo, "fetch", "--quiet", "--", remote, integration)
+	if !v.haveObject(ctx, repo, tip) || !v.haveObject(ctx, repo, sha) {
+		_, _ = v.runScoped(ctx, repo, "fetch", "--quiet", "--no-tags", "--", remote, "+refs/heads/"+integration+":refs/remotes/"+remote+"/"+integration)
+	}
+	if !v.haveObject(ctx, repo, sha) {
+		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
+			"commit %s is not in %s and could not be fetched from %s/%s — ancestry cannot be settled here",
+			short(sha), repo, remote, integration)}
 	}
 	if !v.haveObject(ctx, repo, tip) {
 		return Check{Kind: CommitMerged, Status: Unknown, Detail: fmt.Sprintf(
@@ -736,6 +788,18 @@ func (v *Verifier) runScoped(ctx context.Context, dir string, args ...string) (s
 // would have read as a successful check. WaitDelay is what actually cuts it
 // off, and the truncated read is reported as the failure it is.
 func (v *Verifier) gitRun(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
+	out, err := v.gitRunOut(ctx, dir, extraEnv, args...)
+	if err != nil {
+		return "", err
+	}
+	return out, nil
+}
+
+// gitRunOut is gitRun that also returns the child's stdout when it FAILED, for the
+// commands whose exit status is part of their answer: `merge-tree` exits 1 when the
+// merge conflicts, and the conflicting paths are on the stdout that status came with.
+// Every other caller wants gitRun, whose contract is "no output with an error".
+func (v *Verifier) gitRunOut(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, v.gitBin, args...)
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
@@ -752,9 +816,9 @@ func (v *Verifier) gitRun(ctx context.Context, dir string, extraEnv []string, ar
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return "", fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
+			return stdout.String(), fmt.Errorf("git %s: %w: %s", args[0], err, firstLine(msg))
 		}
-		return "", fmt.Errorf("git %s: %w", args[0], err)
+		return stdout.String(), fmt.Errorf("git %s: %w", args[0], err)
 	}
 	return strings.TrimSpace(stdout.String()), nil
 }

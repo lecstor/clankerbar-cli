@@ -26,6 +26,30 @@ This mirrors the web repo (`lecstor/clankerbar`) deliberately - one mental model
 across both, decided 2026-08-10 - though what a promotion *does* differs: over
 there it deploys a Worker, here it publishes a public GitHub release.
 
+## This release requires the matching plane
+
+The intent-specific tool cutover (CLA-746 in the plane, CLA-748 here) deleted
+`update_task` and replaced it with the nine task tools. This release is the
+**breaking CLI half of a plane/CLI pair**: it speaks plane protocol **41** and
+nothing else.
+
+- **Older planes are not supported.** There is no fallback and no feature
+  detection: every baked brief names the new tools, and every driver write calls
+  one. An older plane answers them as unknown tools, and the driver surfaces that
+  as an error naming protocol 41 - never as a retry with the deleted spelling.
+- **There is no compatibility floor to maintain.** That is what the coordinated
+  cutover bought: the fleet is stopped, the plane promotion and this release go
+  out, the new binary is installed, and the fleet is restarted. A bad cutover is
+  rolled back on both sides together, because a mixed pair is never a supported
+  state.
+- **Do not publish ahead of the plane.** The plane promotion (CLA-746) must land
+  in the same window as this release; publishing this binary against the old
+  plane leaves every daemon unable to write a task.
+
+The constant the code and its tests hold themselves to is
+`plane.RequiredPlaneProtocol` in `internal/plane`; the version is the plane's
+`protocolVersion`, reported beside `runConfigVersion` on every backlog summary.
+
 ## Why publishing is gated this way
 
 Before this, clankers merged CLI task PRs straight to `main` and a human cut

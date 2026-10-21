@@ -174,6 +174,7 @@ func effectLines(action string, now bool) []string {
 	default:
 		return []string{
 			"the running daemon re-reads its config file at the next iteration boundary - no process replacement; env and binary changes need restart",
+			"(on a supervised child that file is the supervisor's generated config, not the base config you edit: the supervisor rewrites it and queues the restart itself when your base-config edit lands)",
 		}
 	}
 }

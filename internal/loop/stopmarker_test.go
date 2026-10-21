@@ -326,7 +326,7 @@ func TestRun_SoftStopThenRelaunchDoesNotSelfStop(t *testing.T) {
 // while the blind cases isolate the new task-boundary read itself — in wired
 // mode the cycle-top read would also see the drop before the next poll, so
 // only the blind pair fails without the boundary (the wait path logs
-// "during wait" for STOP, and HALT is not read during waits at all, so either
+// "during wait" for STOP, and the idle wait does not read HALT at all, so either
 // falling through to the idle wait is observable).
 func TestRun_TaskBoundaryStopMarker(t *testing.T) {
 	t.Run("STOP placed mid-drain stops before the next spawn and is consumed", func(t *testing.T) {

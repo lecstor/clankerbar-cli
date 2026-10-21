@@ -3,11 +3,11 @@ package supervisor
 // Phase 2b of docs/proposals/daemon-supervisor.md (in the clankerbar repo):
 // the supervisor generates each child's effective config into the child's own
 // state dir from machine conventions and the roster entry, and starts the
-// child with `run -c` pointing at it. The generated file is a cache —
-// regenerated on every reconcile, safe to delete — written to disk so it
-// doubles as the offline last-known-good. In phase 3b the entry drives the
-// build: the projects come from the roster row, identity is the entry's name,
-// and the state dir is derived from the same name.
+// child with `run -c` pointing at it. The generated file is a cache — written
+// at spawn and rewritten at reconcile only when an edit changes it (CLA-724),
+// safe to delete — so it doubles as the offline last-known-good. In phase 3b
+// the entry drives the build: the projects come from the roster row, identity
+// is the entry's name, and the state dir is derived from the same name.
 
 import (
 	"context"

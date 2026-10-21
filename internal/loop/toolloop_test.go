@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -25,9 +26,10 @@ func toolLoopResult(exit int) harness.Result {
 
 // A panel member killed this way is recorded as a FAILED member through the
 // existing path, named by its cause: the panel runs on, the fix is told the
-// member is INCOMPLETE and why, the iteration record and the session's fleet
-// entry carry the cause, the dead tally books it exactly once, and the daemon
-// log says what happened.
+// member is INCOMPLETE and why, the SESSION's fleet entry carries the cause, the
+// dead tally books it exactly once, and the daemon log says what happened. The
+// iteration Outcome itself stays one of the four words the plane accepts
+// (CLA-738) — the cause rides the session, never the outcome.
 func TestDrainPhases_ToolLoopKilledPanelMemberIsAFailedMember(t *testing.T) {
 	logs := captureLogs(t)
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
@@ -73,9 +75,9 @@ func TestDrainPhases_ToolLoopKilledPanelMemberIsAFailedMember(t *testing.T) {
 	if len(recs) != 1 {
 		t.Fatalf("iteration records = %d, want 1", len(recs))
 	}
-	if !strings.Contains(recs[0].Outcome, "review-2: repeated failing tool call: clankerbar_update_task x5") {
-		t.Errorf("the iteration outcome does not name the member and its cause: %q", recs[0].Outcome)
-	}
+	// The record keeps the four-word enum (CLA-738); the killed member's cause
+	// rides the SESSION entry below and the daemon log, never the outcome.
+	requireFleetOutcome(t, recs[0].Outcome, fleet.OutcomeReleased)
 	if got := len(recs[0].Sessions); got != 5 {
 		t.Fatalf("sessions on the record = %d, want 5", got)
 	}
@@ -110,7 +112,7 @@ func TestDrainPhases_ParallelPanelToolLoopKilledMemberIsAFailedMember(t *testing
 	a.failLabel = "review-2"
 	a.failToolLoop = loopCause
 	a.wantRecords = len(members) - 1
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -126,6 +128,18 @@ func TestDrainPhases_ParallelPanelToolLoopKilledMemberIsAFailedMember(t *testing
 	}
 	if !strings.Contains(fix, "INCOMPLETE") || !strings.Contains(fix, "repeated failing tool call: clankerbar_update_task x5") {
 		t.Errorf("the fix brief does not name the killed member by its cause:\n%s", fix)
+	}
+	// The killed member's cause rides its SESSION entry, never the iteration
+	// outcome, which stays one of the four the plane accepts (CLA-738).
+	rec := requireOneFleetRecord(t, ff)
+	found := false
+	for _, s := range rec.Sessions {
+		if s.Cause == loopCause {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("no session on the iteration record carries the kill cause %q: %+v", loopCause, rec.Sessions)
 	}
 }
 

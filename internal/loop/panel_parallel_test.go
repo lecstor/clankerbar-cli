@@ -29,6 +29,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
@@ -104,6 +105,19 @@ type panelParallelAdapter struct {
 	// per member label: the directory it ran in and that directory's HEAD.
 	workdirs map[string]string
 	heads    map[string]string
+	// order is the reviewer role of each panel member, in the order the DRIVER
+	// LAUNCHED it: recorded by the driver's panelLaunch seam at the launch
+	// boundary (phaseRunOpts.onSessionLaunch), before the member releases its
+	// successor. This is deliberately NOT the order the adapters were entered:
+	// the adapter is called one statement after the boundary, so a goroutine
+	// descheduled in between lets the next member append first and makes a
+	// correctly ordered panel look out of order — the CI flake this test fixes
+	// (CLA-755 review 1.review-5.1).
+	order []string
+	// releases is the member index reported by the driver's panelRelease seam,
+	// in release order — recorded at the scheduler's started wrapper, so it is
+	// the release POINT (CLA-757), not the panel's intention to release.
+	releases []int
 	errs     []string
 }
 
@@ -281,8 +295,10 @@ func panelGitOutput(dir string, args ...string) (string, error) {
 }
 
 // panelParallelDriver wires a panel over a real checkout. concurrency 0 means
-// the config's default (the whole panel).
-func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, members []config.ReviewPanelMember, workdir, tip string, concurrency int) *Driver {
+// the config's default (the whole panel). The fakeFleet is on the target so the
+// iteration RECORD is observable: free text in its Outcome is what the plane
+// refused in CLA-738, and the parallel path is the shipped default.
+func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, members []config.ReviewPanelMember, workdir, tip string, concurrency int) (*Driver, *fakeFleet) {
 	t.Helper()
 	cfg := fastCfg()
 	cfg.Prompt = ""
@@ -291,20 +307,102 @@ func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, m
 	cfg.ReviewPanelConcurrency = concurrency
 	cfg.WorkDir = workdir
 	cfg.MaxIterations = 1
-	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel, Fleet: ff}})
 	d.newAdapter = func(string) (harness.Adapter, error) { return h, nil }
 	openTestStateDir(t, d)
 	d.newVerifier = func(string, bool) deliveryVerifier { return &panelVerifier{tip: tip} }
 	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
-	return d
+	return d, ff
+}
+
+// memberIndex is a member's position within the panel run — the index the
+// release seam reports — derived from the POSITIONAL roles the driver reports
+// (panelRoles), not from the member's log label. Indexing ReviewPanelMember.Name
+// instead would line up only while panelMembers() happens to label its members
+// review-1..review-N: a renamed member makes the lookup fail (silently skipping
+// the release-count assertion) and a label naming another member's role checks
+// the wrong index (CLA-757 review 1.review-1.1).
+func memberIndex(roles []string, role string) int {
+	for k, r := range roles {
+		if r == role {
+			return k
+		}
+	}
+	return -1
+}
+
+// requireOneFleetRecord is CLA-738's invariant on the PARALLEL path — the
+// shipped default, and the shape the CLA-598/CLA-717/CLA-727 incident ran. The
+// panel must post exactly one iteration record and its Outcome must be one of
+// the four words the plane knows: free text there made marshalReport refuse the
+// WHOLE report, dropping the record and the presence refresh riding it.
+func requireOneFleetRecord(t *testing.T, ff *fakeFleet) fleet.Iteration {
+	t.Helper()
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1 — the panel's report was dropped or duplicated", len(recs))
+	}
+	requireFleetOutcome(t, recs[0].Outcome, "")
+	return recs[0]
 }
 
 func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testing.T) {
 	repo, branch, tip := panelParallelRepo(t)
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
 	members := panelMembers()
+	// The labels deliberately do NOT name the members' positional roles: Name is
+	// the log label only, not the reviewer role (internal/config/config.go:
+	// 323-329). The expected release index below must therefore come from the
+	// role the driver reports — an assertion keyed on the label would either
+	// skip the count or check another member's index (CLA-757 review 1.review-1.1).
+	for i := range members {
+		members[i].Name = fmt.Sprintf("label-%d", i)
+	}
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	// The expanded sequence is what the driver iterates; the positional roles
+	// below come from it — never from the members' log labels.
+	phases := d.cfg.EffectivePhases()
+	wantRoles := panelRoles(phases, len(phases)-1)
+	// CLA-755: record the launch order AT the launch boundary, through the
+	// driver's panelLaunch seam, instead of inferring it from the fake adapter's
+	// Invoke entry. Entry is one call after the boundary, so a member released
+	// from member 1's launch can still be descheduled before its own Invoke and
+	// let the next member append first, failing a panel that launched correctly.
+	// The seam fires on every launch attempt; the panel's release is idempotent,
+	// so the order asserted here is each member's FIRST launch.
+	//
+	// CLA-757 adds the other half: the release POINT. panelRelease fires from the
+	// scheduler's started wrapper, before the successor is unblocked, so at
+	// member k's launch exactly members 0..k-1 have been released. A panel that
+	// released its successor from its worktree-ready point has release_k BEFORE
+	// launch_k, so member k launches with k+1 releases recorded — no scheduling
+	// window is involved, because the checkout always exists before the session
+	// starts.
+	launched := map[string]bool{}
+	d.panelRelease = func(k int) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.releases = append(a.releases, k)
+	}
+	d.panelLaunch = func(role string) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if role == "" || launched[role] {
+			return
+		}
+		launched[role] = true
+		if k := memberIndex(wantRoles, role); k < 0 {
+			a.errs = append(a.errs, fmt.Sprintf(
+				"a member launched as role %q, which is not one of the panel's roles %v", role, wantRoles))
+		} else if got := len(a.releases); got != k {
+			a.errs = append(a.errs, fmt.Sprintf(
+				"member %d (%s) launched with %d releases already recorded (%v); want exactly %d — a release fired before this member's launch boundary, so it came from the worktree-ready point, not from a predecessor's launch",
+				k, role, got, append([]int(nil), a.releases...), k))
+		}
+		a.order = append(a.order, role)
+	}
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -322,6 +420,8 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	for k, v := range a.heads {
 		heads[k] = v
 	}
+	order := append([]string(nil), a.order...)
+	releases := append([]int(nil), a.releases...)
 	a.mu.Unlock()
 	if maxInFlight != len(members) {
 		t.Errorf("max reviews in flight = %d, want %d — the members did not run concurrently", maxInFlight, len(members))
@@ -329,6 +429,35 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	if len(workdirs) != len(members) {
 		t.Fatalf("reviews ran in %d distinct worktrees, want %d: %v", len(workdirs), len(members), workdirs)
 	}
+	// The members were LAUNCHED in the config's list order (CLA-738 review 3.2):
+	// each is released from its predecessor's launch boundary, not from its
+	// checkout being ready. Recorded at that boundary via the panelLaunch seam,
+	// so the assertion is not racing the adapter entry (CLA-755 1.review-5.1).
+	// The expected sequence is the panel's POSITIONAL roles, which is what both
+	// seams report, not the members' log labels.
+	if len(order) != len(wantRoles) {
+		t.Fatalf("panel launched %d members (%v), want %d (%v)", len(order), order, len(wantRoles), wantRoles)
+	}
+	for k, want := range wantRoles {
+		if order[k] != want {
+			t.Fatalf("panel launch order = %v, want the panel's positional roles %v", order, wantRoles)
+		}
+	}
+	// And the release POINT that order depends on (CLA-757): each member is
+	// released from its own launch boundary, so the releases arrive one per
+	// member in list order. A regression to worktree-ready releases would have
+	// been caught by the launch probe above; this asserts the seam itself saw
+	// every release, so a silently unwired probe cannot pass for a fixed panel.
+	if len(releases) != len(members) {
+		t.Fatalf("release probe recorded %v, want one release for each of the panel's %d members", releases, len(members))
+	}
+	for k, got := range releases {
+		if got != k {
+			t.Fatalf("releases recorded in order %v, want 0..%d — the panel did not release members in list order", releases, len(members)-1)
+		}
+	}
+	// And the iteration record the plane receives keeps the four-word enum.
+	requireOneFleetRecord(t, ff)
 	seen := map[string]bool{}
 	for label, dir := range workdirs {
 		if dir == repo {
@@ -379,7 +508,7 @@ func TestDrainPhases_ParallelPanelOneMemberFailingStillRunsTheFix(t *testing.T) 
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	a.failLabel = "review-2"
 	a.wantRecords = len(members) - 1
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -410,6 +539,9 @@ func TestDrainPhases_ParallelPanelOneMemberFailingStillRunsTheFix(t *testing.T) 
 	if !strings.Contains(fix, "1.review-1.1") || !strings.Contains(fix, "1.review-3.1") {
 		t.Errorf("the fix brief does not carry the healthy members' findings:\n%s", fix)
 	}
+	// CLA-738: the INCOMPLETE panel is a log fact, never free text in the
+	// iteration outcome — a prose outcome makes the plane refuse the whole report.
+	requireOneFleetRecord(t, ff)
 }
 
 func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
@@ -418,7 +550,7 @@ func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
 	members := panelMembers()
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	a.expectConcurrent = 1
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 1)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 1)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -451,6 +583,7 @@ func TestDrainPhases_ParallelPanelCapOneIsTheSequentialPath(t *testing.T) {
 	if fixCalls != 1 {
 		t.Errorf("fix sessions = %d, want 1", fixCalls)
 	}
+	requireOneFleetRecord(t, ff)
 }
 
 // --- CLA-697, review round 1: the fix delta --------------------------------
@@ -518,7 +651,7 @@ func TestDrainPhases_ParallelPanelStopsAMemberWhenTheAggregateReachesTheCeiling(
 	// Only the concurrent pair runs to the barrier; the third member is parked on
 	// the cap until one of them ends, which is what staggers the starts.
 	a.expectConcurrent = 2
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 2)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 2)
 	// The implement attempt spends $0.10; each review costs $0.50.
 	d.cfg.Budget = config.Budget{MaxCostUSD: 0.50}
 
@@ -543,6 +676,7 @@ func TestDrainPhases_ParallelPanelStopsAMemberWhenTheAggregateReachesTheCeiling(
 	if fixCalls != 0 {
 		t.Errorf("fix sessions = %d, want 0 — the run stopped on the ceiling instead", fixCalls)
 	}
+	requireOneFleetRecord(t, ff)
 }
 
 // TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin is
@@ -562,7 +696,7 @@ func TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin(t
 	}
 	members := panelMembers()
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
-	d := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -574,6 +708,7 @@ func TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin(t
 	for _, e := range errs {
 		t.Error(e)
 	}
+	requireOneFleetRecord(t, ff)
 	if reviews != 0 {
 		t.Fatalf("review sessions = %d, want 0 — every member's baseline read failed", reviews)
 	}

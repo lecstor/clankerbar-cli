@@ -193,12 +193,12 @@ func TestReleaseHeldClaim_EndsTheLeaseOnPushedWork(t *testing.T) {
 	}
 }
 
-// A plane older than CLA-707 refuses the field. That is not a failed handback —
-// it is the old behaviour, announced once — and the old line stays, because it
-// is still what happened.
+// A plane that does not serve release_task (an older protocol) is not a failed
+// handback — it is the old behaviour, announced once — and the old line stays,
+// because it is still what happened.
 func TestReleaseHeldClaim_FallsBackWhenThePlanePredatesExpireLease(t *testing.T) {
 	logs := captureLogs(t)
-	rel := &fakeReleaser{expireErr: fmt.Errorf("%w: unrecognized key expireLease", plane.ErrFieldUnsupported)}
+	rel := &fakeReleaser{expireErr: fmt.Errorf("%w: MCP error -32602: Tool release_task not found", plane.ErrPlaneTooOld)}
 	d := &Driver{}
 
 	for i := 0; i < 2; i++ {
@@ -214,7 +214,7 @@ func TestReleaseHeldClaim_FallsBackWhenThePlanePredatesExpireLease(t *testing.T)
 	if !strings.Contains(out, "leaving the lease to expire so the takeover hand-off survives") {
 		t.Errorf("the old behaviour line is missing:\n%s", out)
 	}
-	if got := strings.Count(out, "predates expireLease"); got != 1 {
+	if got := strings.Count(out, "does not serve this build's task tools"); got != 1 {
 		t.Errorf("the unsupported-plane line appeared %d times, want once per run:\n%s", got, out)
 	}
 }

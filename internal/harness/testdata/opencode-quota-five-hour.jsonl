@@ -1,0 +1,1 @@
+{"type":"error","sessionID":"ses_quota","error":{"type":"provider.quota","message":"You've reached your 5-hour usage limit for your plan. Your limit resets at 2026-10-20T15:56:48.251Z. Please wait for the window to reset or upgrade your plan to continue.","status":429,"response":{"body":"{\"error\":{\"type\":\"rate_limit_error\",\"code\":\"RATE_LIMITED\"}}"}}}

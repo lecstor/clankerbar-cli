@@ -45,11 +45,17 @@ import (
 //   - draining  alive but not spawning new sessions (console pause, fleet pause)
 //   - stopping  shutting down on purpose (STOP/HALT, a marker restart, budget or
 //     max-iterations reached, signal); sent as the final beacon
+//   - limited   parked by a harness usage limit and waiting it out (CLA-728):
+//     the daemon is healthy, it simply cannot spend anything until the cap
+//     lifts. ResetAt carries the instant the harness stated, when it stated
+//     one, so the console can say which moment it is waiting for instead of
+//     showing the instance as dead.
 const (
 	StateIdle      = "idle"
 	StateIteration = "iteration"
 	StateDraining  = "draining"
 	StateStopping  = "stopping"
+	StateLimited   = "limited"
 )
 
 // How one iteration ended — the driver's own words for how its loop step
@@ -85,6 +91,11 @@ type State struct {
 	N       int    // iteration number, when Kind is iteration
 	TaskRef string // task being worked ("CLA-466"), when known
 	Phase   string // phase label, when Kind is iteration
+	// ResetAt is the harness's stated limit-reset instant, only meaningful on
+	// Kind == limited (CLA-728). The zero value means the harness stated no
+	// reset — the console then says "probing for a reset" rather than guessing
+	// a moment it was never told.
+	ResetAt time.Time
 }
 
 // Usage is one session's token accounting, normalised across harnesses: the
@@ -416,6 +427,22 @@ func (r *httpReporter) sendOnce(rep Report) error {
 	return nil
 }
 
+// wireResetAt renders a `limited` state's stated reset instant in the one shape
+// the plane accepts (an ISO-8601 instant with an explicit zone), or "" — which
+// `omitempty` drops — when the harness stated none (CLA-728). UTC so the bytes
+// never depend on the sending machine's zone; second precision because a
+// stated reset is a boundary, not a sub-second deadline.
+//
+// Restricted to StateLimited on purpose: the plane reads resetAt only there, so
+// a reset left on some other state is dropped here rather than shipped as a
+// field the plane would ignore — one representation of "no reset", not two.
+func wireResetAt(st State) string {
+	if st.Kind != StateLimited || st.ResetAt.IsZero() {
+		return ""
+	}
+	return st.ResetAt.UTC().Format(time.RFC3339)
+}
+
 // ── Wire shape ────────────────────────────────────────────────────────────────
 // Exactly what apps/web/src/server/fleet-report.ts parseFleetReport reads
 // (CLA-465). Kept as a separate marshalling step with its own tags so the Go
@@ -426,6 +453,13 @@ type wireState struct {
 	N       int    `json:"n,omitempty"`
 	TaskRef string `json:"taskRef,omitempty"`
 	Phase   string `json:"phase,omitempty"`
+	// ResetAt is the `limited` state's payload (CLA-728), RFC 3339 with an
+	// explicit zone — the only shape the plane's parser accepts. Omitted when
+	// the harness stated no reset, so the plane reads "probing", never a
+	// guessed instant. A string rather than a time.Time so `omitempty` can
+	// actually omit it: time.Time is a struct, and the encoder never treats
+	// its zero value as empty.
+	ResetAt string `json:"resetAt,omitempty"`
 }
 
 // wireUsage is the normalised breakdown on the wire. Each key is omitted when
@@ -497,7 +531,13 @@ func marshalReport(rep Report) ([]byte, error) {
 		Host:           rep.Host,
 		Version:        rep.Version,
 		ConfigIdentity: rep.ConfigIdentity,
-		State:          &wireState{Kind: rep.State.Kind, N: rep.State.N, TaskRef: rep.State.TaskRef, Phase: rep.State.Phase},
+		State: &wireState{
+			Kind:    rep.State.Kind,
+			N:       rep.State.N,
+			TaskRef: rep.State.TaskRef,
+			Phase:   rep.State.Phase,
+			ResetAt: wireResetAt(rep.State),
+		},
 	}
 	if w.State.Kind == "" {
 		w.State.Kind = StateIdle
@@ -565,8 +605,25 @@ func wireSessions(sessions []Session) []wireSession {
 				CacheWrite: s.Usage.CacheWrite,
 			}
 		}
-		if s.CostUSD != nil {
+		// CLA-737: the plane refuses a session carrying costUsd without
+		// usageReported: true ("session.costUsd requires session.usageReported"),
+		// and it refuses the WHOLE report with it. sessionSpend already withholds
+		// the figure at the aggregated source, but Session is constructible by any
+		// caller and the wire is where the contract lives — so the guarantee is
+		// made here too, rather than trusting every future producer to remember a
+		// rule whose violation costs unrelated iterations and presence as well.
+		if s.UsageReported && s.CostUSD != nil {
 			w.CostUSD = s.CostUSD
+		}
+		// Dropping a figure the caller DID report is a producer bug, and a silent
+		// one would let the session sums stop tying up to the iteration-level
+		// costUsd with nothing to explain the gap. Every other contract stumble on
+		// this wire is logged (the clamp above, endIteration's BUG line,
+		// marshalReport's refusal); the guard's job is protecting the batch, not
+		// hiding the case it was written to catch (review 1.review-2.3).
+		if s.CostUSD != nil && !s.UsageReported {
+			log.Printf("fleet: session %q (%s/%s) reported costUsd %v with no usage report — dropping the figure (BUG: the producer bypassed sessionSpend, whose contract is that a cost is known only when the attempt reported usage)",
+				s.Phase, s.Harness, s.Model, *s.CostUSD)
 		}
 		out = append(out, w)
 	}

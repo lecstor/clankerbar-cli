@@ -16,7 +16,7 @@ package supervisor
 //   - The key is the holding key. Children inherit CLANKERBAR_API_KEY from the
 //     supervisor (materialize), so the plane's NOT-YOURS check passes.
 //   - The plane refuses a claim whose run already ended or was taken over
-//     (`not_holding`, `run_superseded`), and that refusal is a logged no-op.
+//     (`not_holding`, `not_your_claim`), and that refusal is a logged no-op.
 //     Removing the file after a refusal is therefore safe: a stale record can
 //     cost one refused call and never a second ended lease.
 
@@ -92,12 +92,7 @@ func (d *Supervisor) handBackDeadClaim(inst *Instance) {
 	action := "ended the lease on"
 	if branch == "" {
 		action = "released"
-		// A no-branch task needs only the old `release` primitive; the driver
-		// marker is the one new thing, and a plane without it still has release.
 		err = rel.ReleaseDriver(ctx, claim.TaskID, claim.RunID)
-		if errors.Is(err, plane.ErrFieldUnsupported) {
-			err = rel.Release(ctx, claim.TaskID, claim.RunID)
-		}
 	} else {
 		err = rel.ExpireLease(ctx, claim.TaskID, claim.RunID)
 	}
@@ -112,9 +107,9 @@ func (d *Supervisor) handBackDeadClaim(inst *Instance) {
 	case refusedClaimHandback(err):
 		log.Printf("%s: nothing to hand back for %s - the plane says that run already ended (%v)",
 			inst.name, claimLabel(claim), err)
-	case errors.Is(err, plane.ErrFieldUnsupported):
-		log.Printf("%s: the backlog plane predates expireLease - %s keeps its lease for the takeover hand-off; it will expire as before",
-			inst.name, claimLabel(claim))
+	case errors.Is(err, plane.ErrPlaneTooOld):
+		log.Printf("%s: the backlog plane does not serve this build's task tools - %s keeps its lease for the takeover hand-off until the plane is promoted to protocol %d",
+			inst.name, claimLabel(claim), plane.RequiredPlaneProtocol)
 	case errors.Is(err, plane.ErrNotWired):
 		log.Printf("%s: cannot hand %s back - no plane writes are configured; its lease will expire",
 			inst.name, claimLabel(claim))
@@ -195,16 +190,18 @@ func mcpEndpointFromRoster(rosterURL, project string) string {
 }
 
 // refusedClaimHandback reports the two refusals that mean "there is nothing to
-// do here": the run already ended, or a later run holds the task. Both are
-// normal after a child exit — the daemon may have settled the task and died
-// before removing its record — so they are logged and not treated as errors.
+// do here": the run already ended, or a later run holds the task. Both are the
+// refusal codes `release_task` documents (`not_holding`, `not_your_claim`) and
+// both are normal after a child exit — the daemon may have settled the task and
+// died before removing its record — so they are logged and not treated as
+// errors.
 func refusedClaimHandback(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	msg = strings.NewReplacer(" ", "_", "-", "_").Replace(msg)
-	return strings.Contains(msg, "not_holding") || strings.Contains(msg, "run_superseded")
+	return strings.Contains(msg, "not_holding") || strings.Contains(msg, "not_your_claim")
 }
 
 func claimLabel(c *loop.CurrentClaim) string {

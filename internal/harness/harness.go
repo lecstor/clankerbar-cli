@@ -674,9 +674,10 @@ type Result struct {
 	// usable — which is the fact CLA-703's no-MCP classification needs.
 	clankerbarCalls map[string]bool
 
-	// pendingReports is the same discipline for delivery claims: an `update_task`
-	// REFUSED by the plane (a missing Tests header, a superseded run) recorded
-	// nothing, so there is nothing to check and nothing to complain about.
+	// pendingReports is the same discipline for delivery claims: a progress or
+	// terminal call REFUSED by the plane (a missing Tests header, a superseded
+	// run) recorded nothing, so there is nothing to check and nothing to complain
+	// about.
 	pendingReports map[string]Report
 
 	// claimRequests maps a claim_task tool_use id to the task it ASKED for. Kept
@@ -873,10 +874,11 @@ type Report struct {
 	Branch string
 
 	// Repo is the repository the session declared its work lives in
-	// ("owner/name"), carried alongside the branch on the same update_task
-	// (CLA-351). Empty when the session did not declare one — the verifier then
-	// falls back to its existing behaviour, and the driver resolves the
-	// ambiguity-free case as before.
+	// ("owner/name") (CLA-351). Empty when the session did not declare one — and
+	// the cutover to intent-specific tools left no call that carries `repo`
+	// beside a branch, so it is normally empty and the plane's own task row is
+	// the authority (CLA-437). The verifier then falls back to its existing
+	// behaviour, and the driver resolves the ambiguity-free case as before.
 	Repo string
 
 	// Commit and IntegrationBranch are a declared delivery, and PR is the pull
@@ -1005,7 +1007,7 @@ func (r *Result) notifyClaim() {
 	}
 }
 
-// settlesTask reports whether an update_task carrying this status would release
+// settlesTask reports whether a terminal call carrying this status would release
 // the task plane-side.
 //
 // Stated as "anything but in_progress" rather than as a list of terminal
@@ -1024,10 +1026,22 @@ type Limit struct {
 	// exhaustion (out of credits, spend-cap or monthly-limit reached) with no
 	// rolling-window reset to poll for. The loop stops the run cleanly instead of
 	// entering the supervised wait. Zero value (false) keeps the wait-and-poll
-	// behaviour for the rolling-window subscription caps that claude/codex hit.
+	// behaviour for the rolling-window subscription caps that claude, codex and
+	// opencode hit.
 	Stop    bool
 	ResetAt time.Time // zero = unknown
 	Reason  string
+	// Window is the usage window the limit names, as a human label: "5-hour",
+	// "weekly" or "daily". Empty when the provider named no window (a bare
+	// "usage limit reached"), which is NOT the same as an unknown reset: the
+	// reset says when the limit lifts, the window says which plan cap it is.
+	//
+	// It is diagnostic, not decision-making: Stop already carries whether the
+	// loop may wait, and a weekly or daily window is a rolling cap like the
+	// 5-hour one, so it is never a reason to stop. The loop prints it beside the
+	// reason (a multi-day wait should say WHICH cap it is waiting out), and an
+	// adapter that names no window leaves it blank rather than guessing.
+	Window string
 }
 
 // ProbeResult is what a liveness probe learned, and what it cost.

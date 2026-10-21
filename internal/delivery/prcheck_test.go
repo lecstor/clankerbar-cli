@@ -13,9 +13,13 @@ package delivery
 // credentials the child resolved.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,7 +31,8 @@ import (
 const (
 	jsonMergeablePassing = `{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[` +
 		`{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"},` +
-		`{"__typename":"StatusContext","context":"docs","state":"SUCCESS"}],"url":"https://github.com/acme/widgets/pull/7"}`
+		`{"__typename":"StatusContext","context":"docs","state":"SUCCESS"}],"url":"https://github.com/acme/widgets/pull/7",` +
+		`"baseRefName":"staging","headRefName":"clanker/x","headRefOid":"abc1234def5678"}`
 	jsonEmptyRollup = `{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[]}`
 	jsonConflicting = `{"mergeable":"CONFLICTING","mergeStateStatus":"DIRTY","statusCheckRollup":[]}`
 	jsonUnknown     = `{"mergeable":"UNKNOWN","mergeStateStatus":"UNKNOWN","statusCheckRollup":null}`
@@ -48,12 +53,19 @@ const (
 // is only configuration, so no network is ever touched.
 func prEnv(t *testing.T) string {
 	t.Helper()
+	return repoWithRemote(t, "https://github.com/acme/widgets.git")
+}
+
+// repoWithRemote is prEnv with the origin URL spelled out, for the SSH-alias
+// case where the URL itself is the thing under test.
+func repoWithRemote(t *testing.T, remote string) string {
+	t.Helper()
 	requireGit(t)
 	root := t.TempDir()
 	work := filepath.Join(root, "repo")
 	run(t, root, "git", "init", "-b", "main", work)
 	configure(t, work)
-	run(t, work, "git", "remote", "add", "origin", "https://github.com/acme/widgets.git")
+	run(t, work, "git", "remote", "add", "origin", remote)
 	writeFile(t, filepath.Join(work, "f.txt"), "x")
 	run(t, work, "git", "add", ".")
 	run(t, work, "git", "commit", "-m", "init")
@@ -425,6 +437,41 @@ func TestPRCheckScopesTheAPIReadToTheRemoteOwner(t *testing.T) {
 	}
 }
 
+// An scp-like SSH remote is scoped by the RESOLVED slug, not the raw URL:
+// githubOwner only parses http(s), so deriving from the URL left every SSH
+// remote unscoped as the ambient account (CLA-776 review 1.review-1.1). The
+// close-out scopes by the slug (ghAPIScope); the gate must do the same.
+func TestPRCheckScopesAnSSHRemoteByItsResolvedSlug(t *testing.T) {
+	dir := repoWithRemote(t, "git@github-personal:acme/widgets.git")
+	// ssh -G resolves the alias to github.com, as a developer's config does.
+	sshDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sshDir, "ssh"),
+		[]byte("#!/bin/sh\nprintf 'host %s\\nhostname github.com\\n' \"$3\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	record := filepath.Join(t.TempDir(), "gh-record.log")
+	t.Setenv("GH_RECORD", record)
+	t.Setenv("GH_FAKE_TOKEN", ghFakeToken)
+	t.Setenv("GH_TOKEN", "ambient-decoy-not-the-owners")
+	gh := recordingGH(t, jsonMergeablePassing)
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+
+	pr := ghSections(t, record)["pr view"]
+	if len(pr) == 0 {
+		t.Fatal("the PR read never ran - scoping cannot have ridden it")
+	}
+	for _, l := range pr {
+		if l != "ghtoken="+ghFakeToken && l != "githubtoken=UNSET" {
+			t.Errorf("SSH-remote PR read carried %q; want ghtoken=%s and GITHUB_TOKEN dropped", l, ghFakeToken)
+		}
+	}
+}
+
 // The fallback is today's behavior, byte for byte: an owner whose token does
 // not resolve leaves the PR read UNscoped, and the ambient credentials such a
 // read has always seen survive untouched — stripping them would be a second
@@ -513,6 +560,65 @@ func TestNonGitHubRemoteIsAnExplicitRefusalToVerify(t *testing.T) {
 	}
 }
 
+// CLA-776's second hole, end to end: an origin spelled through an SSH host
+// alias that resolves to github.com must be CHECKED, not reported as "not a
+// github.com repository" and skipped. The fake ssh answers `ssh -G`, and the
+// fake gh records the --repo it was asked for, so the test pins that the
+// resolved slug reached gh rather than merely that something ran.
+func TestPRCheckChecksAnSSHHostAliasRemote(t *testing.T) {
+	root := repoWithRemote(t, "git@github-personal:lecstor/clankerbar-cli.git")
+	forceSSH(t, "github-personal", "github.com")
+
+	record := filepath.Join(t.TempDir(), "gh-argv")
+	gh := writeGH(t, "printf '%s\\n' \"$*\" > "+record+"\ncat <<'J'\n"+jsonMergeablePassing+"\nJ\n")
+
+	v := prVerifier(t, root, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh was never asked to read the PR: %v", err)
+	}
+	if !strings.Contains(string(argv), "--repo lecstor/clankerbar-cli") {
+		t.Errorf("gh was asked for the wrong repository: %s", argv)
+	}
+}
+
+// ... and an alias that resolves somewhere else is still not GitHub, so the
+// check degrades exactly as it did before rather than pretending to run.
+func TestPRCheckRefusesAnSSHAliasThatIsNotGitHub(t *testing.T) {
+	root := repoWithRemote(t, "git@gitlab-personal:lecstor/clankerbar-cli.git")
+	forceSSH(t, "gitlab-personal", "gitlab.com")
+
+	v := prVerifier(t, root, fakeGH(t, jsonMergeablePassing))
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	c := mustStatus(t, rep, PRVerified, Unknown)
+	// The candidate search found no GitHub repository, so its message is the
+	// one that names the alias attempt — the important part is that a non-GitHub
+	// alias is a could-not-verify, not a pass and not a crash.
+	if !strings.Contains(c.Detail, "has a github.com remote") || !strings.Contains(c.Detail, "ssh -G") {
+		t.Errorf("detail should name the missing github.com remote and the alias check: %s", c.Detail)
+	}
+}
+
+// forceSSH puts a fake `ssh` first on PATH whose `ssh -G <alias>` reports the
+// given hostname, the way an operator's ~/.ssh/config entry would.
+func forceSSH(t *testing.T, alias, hostname string) {
+	t.Helper()
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ssh")
+	// The host arrives after `--` (it comes from a remote URL, so it must not
+	// be readable as an option); refuse an argv without the marker.
+	body := "#!/bin/sh\nif [ \"$1\" != \"-G\" ] || [ \"$2\" != \"--\" ]; then exit 255; fi\ncase \"$3\" in\n" +
+		alias + ") printf 'host " + alias + "\\nhostname " + hostname + "\\nport 22\\n' ;;\n" +
+		"*) printf 'host %s\\nhostname %s\\n' \"$3\" \"$3\" ;;\nesac\n"
+	if err := os.WriteFile(fake, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // A delivery naming a PR that does not exist is a false claim — refused, not
 // ridden through as an outage.
 func TestNonexistentPRIsRefused(t *testing.T) {
@@ -575,6 +681,97 @@ func TestGithubSlug(t *testing.T) {
 			t.Errorf("githubSlug(%q) = %q, want %q", tc.url, got, tc.want)
 		}
 	}
+	// The direct grammar is deliberately blind to an SSH host alias: only the
+	// resolving form knows how to ask ssh, and mixing the two would make this
+	// pure function spawn processes.
+	if got, ok := githubSlug("git@github-personal:lecstor/clankerbar-cli.git"); ok {
+		t.Errorf("githubSlug accepted an unresolved SSH alias as %q — the alias must go through githubSlugResolving", got)
+	}
+}
+
+// CLA-776's second hole: a checkout whose origin is an SSH host alias that
+// resolves to github.com was reported as "not a github.com repository", so the
+// PR check was skipped rather than run (CLA-728 PR 230 on the Mac). The alias
+// resolves through `ssh -G`; anything that does not land on github.com is
+// still rejected, and an https URL is never alias-resolved (an SSH alias says
+// nothing about https).
+func TestGithubSlugResolvesAnSSHHostAlias(t *testing.T) {
+	resolve := func(host string) (string, bool) {
+		switch host {
+		case "github-personal", "github-work":
+			return "github.com", true
+		case "gitlab-personal":
+			return "gitlab.com", true
+		}
+		return "", false
+	}
+	cases := []struct{ url, want string }{
+		{"git@github-personal:lecstor/clankerbar-cli.git", "lecstor/clankerbar-cli"},
+		{"ssh://git@github-personal/lecstor/clankerbar-cli.git", "lecstor/clankerbar-cli"},
+		{"ssh://git@github-personal:22/lecstor/clankerbar-cli.git", "lecstor/clankerbar-cli"},
+		{"git@github-work:acme/widgets", "acme/widgets"},
+		{"git@gitlab-personal:lecstor/clankerbar-cli.git", ""},     // resolves, but not to github.com
+		{"git@unknown-alias:lecstor/clankerbar-cli.git", ""},       // nothing to resolve
+		{"https://gitlab.com/lecstor/clankerbar-cli.git", ""},      // https is never alias-resolved
+		{"https://github-personal/lecstor/clankerbar-cli.git", ""}, // ... and neither is this one
+		{"/Users/j/dev/clankerbar-cli", ""},                        // a local path is not a remote host
+	}
+	for _, tc := range cases {
+		if got, _ := githubSlugResolving(tc.url, resolve); got != tc.want {
+			t.Errorf("githubSlugResolving(%q) = %q, want %q", tc.url, got, tc.want)
+		}
+	}
+
+	// A direct github.com host never pays for a lookup: ssh must not be
+	// consulted when the answer is already in the URL.
+	if got, ok := githubSlugResolving("git@github.com:lecstor/clankerbar-cli.git", func(string) (string, bool) {
+		t.Fatal("the resolver was consulted for a direct github.com host")
+		return "", false
+	}); !ok || got != "lecstor/clankerbar-cli" {
+		t.Errorf("direct github.com remote resolved as (%q, %v)", got, ok)
+	}
+}
+
+// sshAliasHost asks ssh's OWN effective configuration, which is the whole point:
+// guessing from ~/.ssh/config would miss an Include or a Match block. The fake
+// mirrors `ssh -G`'s shape (one `hostname` line among many) and refuses an argv
+// without the end-of-options marker, so the marker is pinned: a host taken from
+// a remote URL could otherwise begin with '-' and be read as an OPTION.
+func TestSSHAliasHostReadsSSHConfig(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(fake, []byte(`#!/bin/sh
+if [ "$1" != "-G" ] || [ "$2" != "--" ]; then
+  printf 'usage: ssh [-46AaCfGgKkMNnqsTtVvXxYyZ] [-b bind_address] ...\n' >&2
+  exit 255
+fi
+case "$3" in
+github-personal) printf 'host github-personal\nuser git\nhostname github.com\nport 22\n' ;;
+gitlab-personal) printf 'host gitlab-personal\nhostname gitlab.com\n' ;;
+*) printf 'host %s\nhostname %s\n' "$3" "$3" ;;
+esac
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if got, ok := sshAliasHost(context.Background(), "github-personal"); !ok || got != "github.com" {
+		t.Errorf("sshAliasHost(github-personal) = (%q, %v), want (github.com, true)", got, ok)
+	}
+	if got, ok := sshAliasHost(context.Background(), "gitlab-personal"); !ok || got != "gitlab.com" {
+		t.Errorf("sshAliasHost(gitlab-personal) = (%q, %v), want (gitlab.com, true)", got, ok)
+	}
+	if got, ok := sshAliasHost(context.Background(), "not-configured"); !ok || got != "not-configured" {
+		// ssh -G answers an unknown alias by echoing it as its own hostname.
+		// The caller compares the answer with github.com, so identity is not a
+		// resolution — pinning that here keeps the guard honest.
+		t.Errorf("sshAliasHost(not-configured) = (%q, %v), want the alias echoed back", got, ok)
+	}
+	if _, ok := githubSlugResolving("git@not-configured:lecstor/x.git", func(host string) (string, bool) {
+		return sshAliasHost(context.Background(), host)
+	}); ok {
+		t.Error("an alias ssh echoes back was accepted as github.com")
+	}
 }
 
 // The rollup mixes two entry shapes; both must be read, and an unrecognised
@@ -606,5 +803,364 @@ func TestJudgePRReadsBothRollupShapes(t *testing.T) {
 	dirty := judgePR(ghPR{Mergeable: "UNKNOWN", MergeStateStatus: "DIRTY"})
 	if dirty.verdict != prConflict {
 		t.Errorf("DIRTY merge state: got %+v, want prConflict without waiting", dirty)
+	}
+}
+
+// --- environment: gh must not decorate the JSON the gate parses (CLA-776) ---
+
+// THE regression: GH_FORCE_TTY went to gh as "0" from CLA-310 until CLA-776.
+// gh reads ANY value as "force terminal-style output" (a number is a column
+// width), so 0 turned colour ON and every real `gh pr view --json` was coloured
+// JSON that encoding/json rejected — invisible for two months because the fake
+// gh below never coloured anything.
+//
+// Mutation check: put GH_FORCE_TTY back, at any value, and this fails.
+func TestGHChildEnvironmentCarriesNoColourSwitch(t *testing.T) {
+	t.Setenv("GH_FORCE_TTY", "0") // the value the bug shipped, now ambient
+	t.Setenv("CLICOLOR_FORCE", "1")
+	t.Setenv("FORCE_COLOR", "1")
+
+	gh := writeGH(t, "env\n")
+	out, err := runGHBin(context.Background(), gh, t.TempDir(), nil, "pr", "view")
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	got := map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if i := strings.IndexByte(line, '='); i > 0 {
+			got[line[:i]] = line[i+1:]
+		}
+	}
+	for _, name := range []string{"GH_FORCE_TTY", "CLICOLOR_FORCE", "FORCE_COLOR"} {
+		if v, ok := got[name]; ok {
+			t.Errorf("%s reached gh as %q — any value of GH_FORCE_TTY forces terminal-style output, and the colour-forcing pair overrides NO_COLOR", name, v)
+		}
+	}
+	if got["NO_COLOR"] != "1" {
+		t.Errorf("NO_COLOR = %q, want 1: the child must be told not to colour output this package parses", got["NO_COLOR"])
+	}
+	if got["CLICOLOR"] != "0" {
+		t.Errorf("CLICOLOR = %q, want 0: the same requirement, in the spelling older gh versions read", got["CLICOLOR"])
+	}
+
+	// Per-invocation additions ride this spawn too (GH_TOKEN, CLA-460). They are
+	// held to the same ownership rule: an addition must not be able to turn
+	// colour back on behind the parser's back.
+	out, err = runGHBin(context.Background(), gh, t.TempDir(),
+		[]string{"GH_FORCE_TTY=1", "NO_COLOR=0", "CLICOLOR=1"}, "pr", "view")
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	got = map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if i := strings.IndexByte(line, '='); i > 0 {
+			got[line[:i]] = line[i+1:]
+		}
+	}
+	if v, ok := got["GH_FORCE_TTY"]; ok {
+		t.Errorf("an extraEnv GH_FORCE_TTY reached gh as %q — the additions must not override the owned colour switches", v)
+	}
+	if got["NO_COLOR"] != "1" || got["CLICOLOR"] != "0" {
+		t.Errorf("extraEnv overrode the colour settings: NO_COLOR=%q CLICOLOR=%q, want 1 / 0", got["NO_COLOR"], got["CLICOLOR"])
+	}
+}
+
+// colouredWhenForcedGH mirrors real gh: its JSON is ANSI-coloured exactly when
+// GH_FORCE_TTY is in its environment. With the gate's environment fixed the
+// variable never arrives, so the same fake answers plain JSON and the check
+// passes — which is what proves the fix, not the fixture.
+func colouredWhenForcedGH(t *testing.T) string {
+	t.Helper()
+	coloured := "\x1b[1;37m{\x1b[m\n" +
+		"  \x1b[1;34m\"mergeable\"\x1b[m\x1b[1;37m:\x1b[m \"MERGEABLE\",\n" +
+		"  \x1b[1;34m\"mergeStateStatus\"\x1b[m\x1b[1;37m:\x1b[m \"CLEAN\",\n" +
+		"  \x1b[1;34m\"statusCheckRollup\"\x1b[m\x1b[1;37m:\x1b[m [\n" +
+		"    \x1b[1;37m{\x1b[m\n" +
+		"      \x1b[1;34m\"__typename\"\x1b[m\x1b[1;37m:\x1b[m \"CheckRun\",\n" +
+		"      \x1b[1;34m\"name\"\x1b[m\x1b[1;37m:\x1b[m \"ci\",\n" +
+		"      \x1b[1;34m\"status\"\x1b[m\x1b[1;37m:\x1b[m \"COMPLETED\",\n" +
+		"      \x1b[1;34m\"conclusion\"\x1b[m\x1b[1;37m:\x1b[m \"SUCCESS\"\n" +
+		"    \x1b[1;37m}\x1b[m\n" +
+		"  ],\n" +
+		"  \x1b[1;34m\"url\"\x1b[m\x1b[1;37m:\x1b[m \"https://github.com/acme/widgets/pull/7\"\n" +
+		"\x1b[1;37m}\x1b[m\n"
+	body := "if [ -n \"${GH_FORCE_TTY+x}\" ]; then\n" +
+		"cat <<'COLOURED'\n" + coloured + "COLOURED\n" +
+		"else\ncat <<'PLAIN'\n" + jsonMergeablePassing + "\nPLAIN\nfi\n"
+	return writeGH(t, body)
+}
+
+func TestColourEmittingGHIsParsedUnderTheFixedEnvironment(t *testing.T) {
+	t.Setenv("GH_FORCE_TTY", "0") // an ambient value, as the operator machine had
+	dir := prEnv(t)
+	gh := colouredWhenForcedGH(t)
+
+	// Prove the fixture mirrors real gh first: handed the variable, it emits
+	// bytes encoding/json rejects. Without this the Pass below could just mean
+	// the fake never coloured anything.
+	cmd := exec.Command(gh, "pr", "view", "7")
+	cmd.Env = append(os.Environ(), "GH_FORCE_TTY=0")
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	if !bytes.Contains(raw, []byte("\x1b")) {
+		t.Fatal("fixture did not colour its output under GH_FORCE_TTY — it does not mirror gh, so this test proves nothing")
+	}
+	var probe ghPR
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		t.Fatal("coloured gh output parsed — the fixture is not faithful to the bug")
+	}
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+}
+
+// If gh decorates its output anyway — a future colour-forcing variable this
+// package cannot strip — the delivery must be REFUSED, not logged as "could
+// not verify … carrying on". A parse failure is a finding: gh ran and its
+// answer is unintelligible, which is a defect in this gate's own contract
+// rather than an absence of evidence.
+func TestUnparseableGHOutputIsRefusedNotCarriedOn(t *testing.T) {
+	dir := prEnv(t)
+	gh := fakeGH(t, "\x1b[1;37m{\x1b[m\n  \x1b[1;34m\"mergeable\"\x1b[m: \"MERGEABLE\"\n\x1b[1;37m}\x1b[m")
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	c := mustStatus(t, rep, PRVerified, Fail)
+	if !rep.Failed() {
+		t.Error("a parse failure must count as a failed delivery check")
+	}
+	if !strings.Contains(c.Detail, "could not parse") {
+		t.Errorf("refusal must name the parse failure: %s", c.Detail)
+	}
+	if !strings.Contains(c.Detail, "doctor") {
+		t.Errorf("refusal must point at the preflight that catches this up front: %s", c.Detail)
+	}
+}
+
+// --- doctor's probe (CLA-776) ------------------------------------------------
+
+// ProbeGHJSON is what `clankerbar doctor` runs. It must read the pull request
+// through the GATE'S command and decoder — a preflight that parses something
+// else would stop proving the gate works — and it must discover the PR rather
+// than require an open one.
+func TestProbeGHJSONReadsARealPRViewAndParsesIt(t *testing.T) {
+	root := prEnv(t)
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+else
+  cat <<'J'
+`+jsonMergeablePassing+`
+J
+fi
+`)
+
+	probe, err := ProbeGHJSON(context.Background(), gh, root)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if probe.Slug != "acme/widgets" || probe.Number != 7 {
+		t.Errorf("probe = %+v, want acme/widgets#7", probe)
+	}
+
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	lines := string(argv)
+	if !strings.Contains(lines, "pr list --repo acme/widgets") {
+		t.Errorf("the probe did not discover the PR through gh: %q", lines)
+	}
+	// THE coupling: the probe decodes the exact selection the gate decodes.
+	if want := "pr view 7 --repo acme/widgets --json " + prViewJSONFields; !strings.Contains(lines, want) {
+		t.Errorf("the probe did not run the gate's own read.\nwant: %s\ngot:\n%s", want, lines)
+	}
+}
+
+// A multi-project config gives each project its own workdir, so the probe must
+// search EVERY workdir doctor hands it (CLA-776 review 1.review-3.1): a PR in
+// the second project's checkout still exercises the gate's parse path. Before
+// this, only cfg.WorkDir was searched and doctor reported NOT exercised.
+func TestProbeGHJSONDirsSearchesEveryConfiguredWorkdir(t *testing.T) {
+	noPR := repoWithRemote(t, "https://github.com/acme/first.git")
+	withPR := repoWithRemote(t, "https://github.com/acme/second.git")
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+case "$1/$2" in
+pr/list)
+  case "$*" in
+  *"--repo acme/second"*) printf '[{"number":9}]\n' ;;
+  *) printf '[]\n' ;;
+  esac
+  ;;
+*)
+  cat <<'J'
+`+jsonMergeablePassing+`
+J
+  ;;
+esac
+`)
+
+	probe, err := ProbeGHJSONDirs(context.Background(), gh, []string{noPR, withPR})
+	if err != nil {
+		t.Fatalf("probe across two workdirs: %v", err)
+	}
+	if probe.Slug != "acme/second" || probe.Number != 9 {
+		t.Errorf("probe = %+v, want acme/second#9", probe)
+	}
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	if lines := strings.Count(string(argv), "pr list"); lines != 2 {
+		t.Errorf("pr list ran %d times, want once per workdir (2): %q", lines, string(argv))
+	}
+}
+
+// The gate's workdir and its declared checkout can name the same repository;
+// the probe deduplicates by git common dir so that repository is read once.
+func TestProbeGHJSONDirsDeduplicatesRepositories(t *testing.T) {
+	root := prEnv(t)
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+else
+  cat <<'J'
+`+jsonMergeablePassing+`
+J
+fi
+`)
+
+	probe, err := ProbeGHJSONDirs(context.Background(), gh, []string{root, filepath.Join(root, "repo")})
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if probe.Slug != "acme/widgets" || probe.Number != 7 {
+		t.Errorf("probe = %+v, want acme/widgets#7", probe)
+	}
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	if lines := strings.Count(string(argv), "pr list"); lines != 1 {
+		t.Errorf("pr list ran %d times for one repository, want 1: %q", lines, string(argv))
+	}
+}
+
+// probeMaxRepos bounds how many repositories the probe TRIES; comparing before
+// incrementing is what makes the constant bound what its name says.
+func TestProbeGHJSONDirsTriesAtMostProbeMaxRepos(t *testing.T) {
+	var roots []string
+	for i := 0; i <= probeMaxRepos; i++ {
+		roots = append(roots, repoWithRemote(t, fmt.Sprintf("https://github.com/acme/r%d.git", i)))
+	}
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+if [ "$1/$2" = "pr/list" ]; then
+  printf '[]\n'
+else
+  printf '{}\n'
+fi
+`)
+
+	if _, err := ProbeGHJSONDirs(context.Background(), gh, roots); !errors.Is(err, ErrNoPRProbeTarget) {
+		t.Fatalf("got %v, want ErrNoPRProbeTarget", err)
+	}
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	if lines := strings.Count(string(argv), "pr list"); lines != probeMaxRepos {
+		t.Errorf("pr list ran %d times, want probeMaxRepos=%d: %q", lines, probeMaxRepos, string(argv))
+	}
+}
+
+// The probe is classified by doctor with IsGHParseError, so a decorated answer
+// must carry that type: a plain format error would be read as an unavailable
+// prerequisite (WARN) instead of a broken gate (FAIL).
+func TestProbeGHJSONReportsDecoratedOutputAsAParseError(t *testing.T) {
+	root := prEnv(t)
+	gh := writeGH(t, `if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+else
+  printf '\033[1;37m{\033[m\n  \033[1;34m"mergeable"\033[m\033[1;37m:\033[m "MERGEABLE"\n\033[1;37m}\033[m\n'
+fi
+`)
+
+	_, err := ProbeGHJSON(context.Background(), gh, root)
+	if err == nil {
+		t.Fatal("coloured `gh pr view --json` parsed — the probe would pass doctor while the gate is broken")
+	}
+	if !IsGHParseError(err) {
+		t.Fatalf("got %v (%T), want a ghParseError so doctor FAILs rather than warns", err, err)
+	}
+}
+
+// A repository with no pull request is not a broken gate: the probe reports a
+// no-target sentinel so doctor can say the parse path went unexercised.
+func TestProbeGHJSONWithNoPRIsNoTarget(t *testing.T) {
+	root := prEnv(t)
+	_, err := ProbeGHJSON(context.Background(), writeGH(t, "printf '[]\\n'\n"), root)
+	if !errors.Is(err, ErrNoPRProbeTarget) {
+		t.Fatalf("got %v, want ErrNoPRProbeTarget", err)
+	}
+}
+
+// A non-GitHub repository is skipped entirely: its remote says nothing about
+// whether gh's JSON parses for the repos the gate judges.
+func TestProbeGHJSONSkipsANonGitHubRepository(t *testing.T) {
+	root := repoWithRemote(t, "https://gitlab.com/acme/widgets.git")
+	// A gh that would fail loudly if the probe had run it.
+	_, err := ProbeGHJSON(context.Background(), writeGH(t, "exit 42\n"), root)
+	if !errors.Is(err, ErrNoPRProbeTarget) {
+		t.Fatalf("got %v, want ErrNoPRProbeTarget", err)
+	}
+	if !strings.Contains(err.Error(), "no github.com repository") {
+		t.Errorf("no-target error should name what was missing: %v", err)
+	}
+}
+
+// The probe inherits the gate's fixed environment, so an ambient GH_FORCE_TTY
+// cannot make the preflight fail (or the gate unreadable). The fixture mirrors
+// real gh: it colours exactly when the variable reaches it.
+func TestProbeGHJSONUsesTheColourFreeEnvironment(t *testing.T) {
+	t.Setenv("GH_FORCE_TTY", "0") // the value the bug shipped, now ambient
+	root := prEnv(t)
+	gh := writeGH(t, `if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+  exit 0
+fi
+if [ -n "${GH_FORCE_TTY+x}" ]; then
+  printf '\033[1;37m{\033[m\n'
+  exit 0
+fi
+cat <<'J'
+`+jsonMergeablePassing+`
+J
+`)
+
+	// Prove the fixture is faithful before trusting the probe's Pass.
+	cmd := exec.Command(gh, "pr", "view", "7")
+	cmd.Env = append(os.Environ(), "GH_FORCE_TTY=0")
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	var probe ghPR
+	if json.Unmarshal(raw, &probe) == nil {
+		t.Fatal("fixture did not colour under GH_FORCE_TTY — it does not mirror gh")
+	}
+
+	got, err := ProbeGHJSON(context.Background(), gh, root)
+	if err != nil {
+		t.Fatalf("probe with an ambient GH_FORCE_TTY: %v", err)
+	}
+	if got.Number != 7 {
+		t.Errorf("probe = %+v, want #7", got)
 	}
 }

@@ -212,6 +212,36 @@ type Driver struct {
 	// own stderr; with EchoSessions false nothing is echoed regardless.
 	echoOut io.Writer
 
+	// panelLaunch, when non-nil, is called with the launching member's reviewer
+	// role at a PARALLEL panel's launch boundary: the first moment that member's
+	// session launch has actually begun, immediately before the panel releases
+	// its successor. It is a test seam, and it exists because the launch ORDER
+	// cannot be observed soundly from inside a fake adapter: the adapter is
+	// entered one call after the boundary, so a goroutine descheduled in between
+	// lets a correctly ordered panel look out of order, which is exactly the
+	// assertion that flaked on CI (CLA-755 review 1.review-5.1). Recording here,
+	// before the release, is the order the panel guarantees.
+	//
+	// Nil in every production build — nothing but a test sets it — so it costs
+	// one nil check and changes nothing the panel does.
+	panelLaunch func(role string)
+
+	// panelRelease, when non-nil, is called with the member's index each time a
+	// PARALLEL panel member releases its successor, before that successor is
+	// unblocked. panelLaunch pins the launch ORDER; this pins the release POINT,
+	// which is the guarantee itself: a member must release from its launch
+	// boundary (phaseRunOpts.onSessionLaunch), not from its worktree being
+	// ready. At member k's launch exactly members 0..k-1 have been released, so
+	// a panel that released at worktree-ready — where release_k always precedes
+	// launch_k — reports k+1 releases at that launch. Deterministic, no
+	// scheduling window (CLA-757).
+	//
+	// It is wired at the scheduler's started wrapper rather than at the panel's
+	// call site, so a regression that calls started() earlier still reports the
+	// release where it really happened. Nil in every production build, like
+	// panelLaunch: a test seam, no behaviour change.
+	panelRelease func(k int)
+
 	// undeclared counts the sessions this run that ended still holding a task
 	// whose work they had already pushed — the phase did its job and then did not
 	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a
@@ -358,6 +388,21 @@ type Driver struct {
 	// minute, and no test should sleep a minute to watch a boundary land.
 	waitGrace time.Duration
 
+	// limitBeaconInterval is how often a paused wait re-beacons `limited`
+	// (CLA-728). The plane calls an instance dead once its last beacon is
+	// INSTANCE_STALE_AFTER_MS (15 minutes) old, and a limit wait can be hours,
+	// so the wait speaks at half that window — 5 minutes, since half is 7.5 and
+	// the task takes the shorter of the two. A field for the same reason as
+	// waitGrace: no test should sleep five minutes to watch a beacon repeat.
+	limitBeaconInterval time.Duration
+
+	// leaseRenewalInterval overrides the in-session renewal cadence, which
+	// carries the CLA-771 presence beacon as well as the lease heartbeat.
+	// Production leaves it zero: heartbeatInterval(planeLeaseDuration), a third
+	// of the plane's 30-minute lease. A field for the same reason as
+	// limitBeaconInterval — no test should wait ten minutes to watch a tick.
+	leaseRenewalInterval time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
 	// second argument is CLA-310's empty-check-rollup opt-out for the target
@@ -447,9 +492,10 @@ type Driver struct {
 	restartRequested atomic.Bool
 
 	// expireUnsupportedOnce says once, not once per abandoned phase, that the
-	// plane predates expireLease (CLA-707/708). Every such handback falls back
-	// to leaving the lease to expire, which is the old behaviour, so repeating
-	// the line adds nothing.
+	// plane does not serve this build's task tools at all — it is older than the
+	// protocol this release requires (CLA-707/708 predate that check). Every
+	// such handback falls back to leaving the lease to expire, which is the old
+	// behaviour, so repeating the line adds nothing.
 	expireUnsupportedOnce sync.Once
 
 	// beaconWriteFailed is the streak latch for the LOCAL beacon write
@@ -545,31 +591,32 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 	n := len(targets)
 	d := &Driver{
 		cfg: cfg, h: h, targets: targets,
-		paused:        make([]bool, n),
-		quietTokens:   make([]int, n),
-		spent:         make([]int, n),
-		baseline:      make([]int, n),
-		openQs:        make([]int, n),
-		pending:       make([]bool, n),
-		skipUntil:     make([]time.Time, n),
-		harnessFails:  make([]int, n),
-		harnessErrs:   make([]error, n),
-		fleetDead:     make([]int, n),
-		fleetPaused:   make([]bool, n),
-		fleetRaised:   make([]bool, n),
-		fleetOpenQ:    make([]int, n),
-		startupFails:  make([]int, n),
-		startupPaused: make([]bool, n),
-		startupRaised: make([]bool, n),
-		startupOpenQ:  make([]int, n),
-		iter:          make([]iterState, n),
-		rcVersions:    make([]int, n),
-		rcAttempt:     make([]time.Time, n),
-		rcAttemptVer:  make([]int, n),
-		rcFails:       make([]int, n),
-		tgtTokens:     make([]int, n),
-		tgtCost:       make([]float64, n),
-		waitGrace:     time.Minute,
+		paused:              make([]bool, n),
+		quietTokens:         make([]int, n),
+		spent:               make([]int, n),
+		baseline:            make([]int, n),
+		openQs:              make([]int, n),
+		pending:             make([]bool, n),
+		skipUntil:           make([]time.Time, n),
+		harnessFails:        make([]int, n),
+		harnessErrs:         make([]error, n),
+		fleetDead:           make([]int, n),
+		fleetPaused:         make([]bool, n),
+		fleetRaised:         make([]bool, n),
+		fleetOpenQ:          make([]int, n),
+		startupFails:        make([]int, n),
+		startupPaused:       make([]bool, n),
+		startupRaised:       make([]bool, n),
+		startupOpenQ:        make([]int, n),
+		iter:                make([]iterState, n),
+		rcVersions:          make([]int, n),
+		rcAttempt:           make([]time.Time, n),
+		rcAttemptVer:        make([]int, n),
+		rcFails:             make([]int, n),
+		tgtTokens:           make([]int, n),
+		tgtCost:             make([]float64, n),
+		waitGrace:           time.Minute,
+		limitBeaconInterval: 5 * time.Minute,
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -789,6 +836,9 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 				// It fires whatever the poll answered (even an error poll proves
 				// the daemon is alive and looping), and carries the state derived
 				// below, so a console-paused target reads `draining`, not `idle`.
+				// The poll is not the only carrier: a session blocks the poll for
+				// as long as it runs, so the in-session lease-renewal tick carries
+				// the same per-target lap (CLA-771, Driver.beaconSessionTargets).
 				d.beacon(i, t, d.fleetState(i))
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):
@@ -1307,7 +1357,17 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		seen        harness.Claim
 		parkFired   bool // the per-task dead budget parked the task
 		tripFired   bool // the fleet dead counter tripped and paused this target
-		finalDisp   string
+		// finalOutcome is the CLAIM's disposition at the drain boundary: one of
+		// the fleet.Outcome* constants, or "" when nothing was observed (no
+		// claim state at all, or claimDisposition's nil return). The deferred
+		// switch below is what makes the RECORDED outcome one of the four — it
+		// maps "" to released and the drain's own verdicts (parked/dead) over
+		// the disposition — so the variable itself is not always safe to hand
+		// on (CLA-738). Never append prose to it: marshalReport refuses the
+		// WHOLE report on a word it does not know, so free text here loses the
+		// iteration record AND the presence refresh riding the same report.
+		// Free-text notes belong in the log.
+		finalOutcome string
 		// CLA-631/CLA-651/CLA-662: the wait a RESUMED phase's sequence-end
 		// signal asks the run for. A rolling limit (CLA-631) hands its reset
 		// down here; the transient arm (CLA-662) hands its backoff rung down as
@@ -1327,21 +1387,23 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		lastProducedNothing bool
 	)
 	defer func() {
-		// CLA-639: the iteration record says the panel was incomplete, by member,
-		// whether the drain then reached the fix phase or stopped before it. The
-		// reviewers that DID record are what the fix phase receives; this names the
-		// ones that did not, so "the panel" never reads as the full panel when it
-		// was not.
+		// CLA-639: the LOG says the panel was incomplete, by member, whether the
+		// drain then reached the fix phase or stopped before it. The reviewers
+		// that DID record are what the fix phase receives; this names the ones
+		// that did not, so "the panel" never reads as the full panel when it was
+		// not.
+		//
+		// CLA-738: the note is a log line and NOTHING more. It must never be
+		// folded into the iteration Outcome, which is one of the four
+		// fleet.Outcome* words: the pre-CLA-738 code appended it to the
+		// disposition, and marshalReport then refused the whole report on the
+		// free text — dropping the iteration record and the presence refresh for
+		// exactly the drains the operator most needs to see. The per-member
+		// failures already ride each session's `cause`.
 		if len(panelIncomplete) > 0 {
-			note := fmt.Sprintf("review panel INCOMPLETE: %s", strings.Join(panelIncomplete, "; "))
-			log.Printf("%siteration %d: %s", labelOf(t), drainNum, note)
-			if finalDisp == "" {
-				finalDisp = note
-			} else {
-				finalDisp += " — " + note
-			}
+			log.Printf("%siteration %d: review panel INCOMPLETE: %s", labelOf(t), drainNum, strings.Join(panelIncomplete, "; "))
 		}
-		outcome := finalDisp
+		outcome := finalOutcome
 		switch {
 		case parkFired:
 			outcome = fleet.OutcomeParked
@@ -1462,7 +1524,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// phase an unverified-looking checkpoint.
 					if out.claim != nil && (carried == nil || out.claim.Claim.TaskID == carried.Claim.TaskID) {
 						seen = out.claim.Claim
-						finalDisp = out.disposition
+						finalOutcome = out.disposition
 					}
 					finalDead = out.finalDead
 					lastProducedNothing = out.lastProducedNothing
@@ -1518,7 +1580,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// same reason: the phase's OWN brief — not only the preamble's
 			// contract — is otherwise dropped on a handoff, since ph.Prompt is
 			// replaced wholesale rather than framing the built-in text. For the
-			// review phase that would silently drop the PR-then-update_task
+			// review phase that would silently drop the PR-then-hand-off
 			// terminal step the moment a session hands off mid-review.
 			//
 			// Gated on the phase actually RUNNING the built-in brief (review
@@ -1667,7 +1729,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// arm: a claim on a DIFFERENT task does not re-attribute the iteration.
 		if end.claim != nil && !(carried != nil && carried.Claim.TaskID != end.claim.Claim.TaskID) {
 			seen = end.claim.Claim
-			finalDisp = claimDisposition(end.claim)
+			finalOutcome = claimDisposition(end.claim)
 		}
 		// What, if anything, is still owed a handback. Three cases, and getting any
 		// of them wrong is a task either stranded on a dead lease or posted back to
@@ -2025,17 +2087,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// backlog is an infrastructure miss, not a dead phase and not a review
 		// verdict. It gets its own drained ending: the claim was handed back (or
 		// left to lapse) by drainPhase, the tally books the miss separately, and
-		// the iteration outcome names it so the operator does not read a review
-		// as having been attempted when the tools were absent.
+		// the LOG names it so the operator does not read a review as having been
+		// attempted when the tools were absent.
+		//
+		// CLA-738: the name is a log line only. The iteration Outcome stays the
+		// four-word enum the plane accepts — prose there makes marshalReport
+		// refuse the whole report, presence refresh included.
 		if end.noMCP && !end.panelMember {
 			d.tallyNoMCP(ph.Label(i), tc.HarnessFor(ph))
 			note := fmt.Sprintf("no_mcp: the %s session made no successful clankerbar MCP call and recorded no review record", ph.Label(i))
 			log.Printf("%siteration %d: %s — ending the drain; this is an infrastructure miss, not a review result", labelOf(t), drainNum, note)
-			if finalDisp == "" {
-				finalDisp = note
-			} else {
-				finalDisp += " — " + note
-			}
 			break
 		}
 
@@ -2683,7 +2744,7 @@ func deadPhase(res harness.Result) bool {
 }
 
 // recordedBranches lists the branch names the plane's record carries for a
-// phase result: every branch this run recorded via update_task(branch) that the
+// phase result: every branch this run recorded via record_progress(branch) that the
 // plane accepted (the accepted Reports), plus the branch that came in on the
 // claim itself (a resumed predecessor's recorded WIP, or the task's branch at
 // claim time). These are the names a checkpoint can be verified against.
@@ -3044,7 +3105,7 @@ func reviewFindingsDigest(outcome string) string {
 //     one-token task-body edit) burned nine sessions in a claim -> empty-exit
 //     -> release loop before this existed.
 //   - (c) a DECLARED no-code delivery on the task: the same delivery.noCode
-//     flag update_task requires to close such a task, read off the plane's
+//     flag the terminal tools require to close such a task, read off the plane's
 //     record. It counts whether or not the session still holds the lease.
 //
 // Forms (b) and (c) are read through the SAME single-task plane peek CLA-451
@@ -3409,8 +3470,8 @@ func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness
 	return st.Outcome, true
 }
 
-// closeReviewRound releases a review round's sealed findings (CLA-637) by
-// calling update_task(review: {closeRound: n}) as the holding run. The round is
+// closeReviewRound releases a review round's sealed findings (CLA-637) as the
+// holding run: record_review({closeRound: n}). The round is
 // the one the seam gate MATCHED, never a number predicted at spawn time: the
 // plane assigns rounds, and the driver reads them back off the record — which
 // is also what keeps this correct across void rounds and panel members.
@@ -3589,7 +3650,7 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 		}
 	}
 	if len(settledIDs) > 0 {
-		b.WriteString("The following MUST(s) of this review cycle are already MARKED settled on the plane — by the fix phase, or by an earlier verification round. A fixer's own marking is its claim, not a verdict, and a refutation changes no code, so the fix delta will not show it: check each one against HEAD and its stated evidence. CONFIRM it by leaving its status as it is. REJECT it by setting its status back to \"open\" through update_task(review: {findingUpdates: [...]}) and recording why in this round's record; a rejected MUST is open, so the gate does not pass and the driver spawns another fix:\n")
+		b.WriteString("The following MUST(s) of this review cycle are already MARKED settled on the plane — by the fix phase, or by an earlier verification round. A fixer's own marking is its claim, not a verdict, and a refutation changes no code, so the fix delta will not show it: check each one against HEAD and its stated evidence. CONFIRM it by leaving its status as it is. REJECT it by setting its status back to \"open\" through " + config.ReviewFindingsCall + " and recording why in this round's record; a rejected MUST is open, so the gate does not pass and the driver spawns another fix:\n")
 		for _, id := range settledIDs {
 			b.WriteString(digestFindingLine(id, byID))
 		}
@@ -3711,7 +3772,7 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 		fmt.Fprintf(&b, "The list is round %d's records only — an earlier round's findings, and anything already marked fixed, refuted or filed on the plane, are not relisted here.\n", round)
 	}
 	if settled > 0 {
-		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through update_task(review: {findingUpdates: [...]}), not by re-fixing it blind.\n", settled)
+		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through "+config.ReviewFindingsCall+", not by re-fixing it blind.\n", settled)
 	}
 	// CLA-639 M5: a panel member writes no `## Review` block — its record is the
 	// durable one — so the fixer must not wait for a block to preserve, and its
@@ -4156,6 +4217,16 @@ type phaseRunOpts struct {
 	// local spend against a run-wide ceiling none of them could see the others
 	// approaching. Nil for every caller that is not a parallel panel member.
 	panelSpend *panelSpendHandle
+
+	// onSessionLaunch, when non-nil, is called immediately before the adapter is
+	// invoked — the first moment this phase's session launch has actually BEGUN —
+	// on every attempt the ladder makes. A parallel panel member uses it to
+	// release the NEXT member's start: signalling when its worktree was ready let
+	// a later member's own setup and launch overtake an earlier member's, so the
+	// scheduler's list-order guarantee (CLA-697) did not extend to the adapters
+	// (CLA-738 review 3.2). Idempotent on the panel side, so a retry's repeat
+	// call is harmless. Nil for every other caller.
+	onSessionLaunch func()
 }
 
 // panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).
@@ -4651,6 +4722,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// run its own resurrection machinery (opencode CLA-406): those processes
 		// continue the SAME session on the SAME claim, so renewal spans them.
 		renewer := d.startLeaseRenewal(ctx, ti, t, &inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
+		// The launch boundary itself (CLA-738 review 3.2): a panel member releases
+		// its successor here, so nothing this member did before its adapter call
+		// (worktree, brief, budget check) can be overtaken by a later member's.
+		if opts.onSessionLaunch != nil {
+			opts.onSessionLaunch()
+		}
 		res, ierr := a.Invoke(ctx, inv)
 		renewer.stop()
 		if f != nil {
@@ -5410,7 +5487,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					drainNum, limitReason(lim), logPath)
 				return tokens, cost, true, end, nil
 			}
-			log.Printf("iteration %d hit a usage limit", drainNum)
+			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
 			// A RESUMED phase must not wait one out (CLA-631). The seam's handback
 			// has already ended the claim: `release` puts a no-work claim straight
 			// back in the queue, and `expireLease` ends a pushed-work claim's lease
@@ -6289,9 +6366,9 @@ func (d *Driver) expireHeldClaim(ctx context.Context, t Target, res harness.Resu
 		// Nothing to call. The old line is the honest one, and it is what the
 		// caller logs when this returns false.
 		return false
-	case errors.Is(err, plane.ErrFieldUnsupported):
+	case errors.Is(err, plane.ErrPlaneTooOld):
 		d.expireUnsupportedOnce.Do(func() {
-			log.Printf("%sthe backlog plane predates expireLease — dead runs' leases will expire on their own as before; upgrade the plane to hand a dead session's claim back immediately", labelOf(t))
+			log.Printf("%sthe backlog plane does not serve this build's task tools — it needs plane protocol %d (the same cutover as this release); dead runs' leases will expire on their own until it is promoted", labelOf(t), plane.RequiredPlaneProtocol)
 		})
 		return false
 	default:
@@ -6348,11 +6425,12 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 	for _, rep := range res.Reports {
 		// Resolve the claim's repo AUTHORITATIVELY from the task's own record —
 		// "the task's repo field (primary repo when unset)" is the doneWhen's
-		// words, and the session-declared value on update_task is secondary: a
-		// session can omit it (nothing in the served protocol tells it to pass
-		// `repo`), while the plane's task row always carries it (CLA-437). Mirror
-		// sessionDir's degradation exactly: an unwired plane falls back to the
-		// session's declaration, then to this target's primary repo.
+		// words, and the plane's task row always carries it (CLA-437). The
+		// session-declared value is secondary: the new tool set has no call that
+		// carries `repo` alongside a branch (record_progress has no repo field),
+		// so it is normally empty. Mirror sessionDir's degradation exactly: an
+		// unwired plane falls back to the session's declaration, then to this
+		// target's primary repo.
 		repo := rep.Repo
 		if src, ok := t.Releaser.(plane.TaskRepoSource); ok && rep.TaskID != "" {
 			r, err := src.TaskRepo(ctx, rep.TaskID)
@@ -6776,24 +6854,6 @@ func waitPastBudget(resetAt time.Time, remaining time.Duration, bounded bool) (t
 	return resetAt, time.Until(resetAt) > remaining
 }
 
-// supervisedWait pauses on a usage limit, then polls for an early reset rather
-// than sleeping blindly to the stated reset. Returns the probe spend it incurred,
-// and stop=true if the loop should stop (STOP marker, context cancel, or a budget
-// ceiling reached during the wait).
-//
-// sofar is everything the run has spent, including this drain's attempts. The
-// breaker is consulted HERE and not only by the caller, because this loop does not
-// return to the caller while the limit persists: it waits, probes, and waits again
-// for as long as it takes. Without this, the one shape the task names — a drain
-// stuck in a supervised wait — was the one shape no ceiling could end, and it is
-// the shape codex always produces, since it states no reset for waitPastBudget to
-// measure (CLA-258).
-//
-// The probes are themselves paid sessions, so their spend is added to `sofar` as it
-// accrues and returned to the caller for the run's accumulator. A breaker that can
-// only be tripped by spend it can SEE was blind to exactly the spend this loop
-// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
-// and this is the one loop with no other way out (CLA-287).
 // probeWait returns how long the paused loop sleeps before its next probe.
 //
 // A known reset still ahead of us is worth waiting for precisely: sleep until
@@ -6818,6 +6878,33 @@ func probeWait(now, resetAt time.Time, interval, grace time.Duration) time.Durat
 	return interval
 }
 
+// supervisedWait pauses on a usage limit, then polls for an early reset rather
+// than sleeping blindly to the stated reset. Returns the probe spend it incurred,
+// and stop=true if the loop should stop (STOP marker, context cancel, or a budget
+// ceiling reached during the wait).
+//
+// sofar is everything the run has spent, including this drain's attempts. The
+// breaker is consulted HERE and not only by the caller, because this loop does not
+// return to the caller while the limit persists: it waits, probes, and waits again
+// for as long as it takes. Without this, the one shape the task names — a drain
+// stuck in a supervised wait — was the one shape no ceiling could end, and it is
+// the shape codex always produces, since it states no reset for waitPastBudget to
+// measure (CLA-258).
+//
+// The probes are themselves paid sessions, so their spend is added to `sofar` as it
+// accrues and returned to the caller for the run's accumulator. A breaker that can
+// only be tripped by spend it can SEE was blind to exactly the spend this loop
+// generates: a week-long cap polled every 30 minutes is ~336 unaccounted sessions,
+// and this is the one loop with no other way out (CLA-287).
+//
+// While it waits it speaks: a `limited` presence beacon on entry and again at
+// limitBeaconInterval while the pause lasts (CLA-728). A wait can be hours, and
+// the plane calls an instance dead once its last beacon is stale, so silence
+// here is what made a healthy daemon look crashed. Beacons cost nothing, and
+// they ride their own ticker rather than the probe loop, so the two cadences are
+// independent in both directions: a beacon never spends (probes are paid
+// sessions, CLA-287), and a probe in flight — a harness session with no ceiling
+// of its own — never silences the beacon.
 func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harness.Adapter, ph config.Phase, t Target, sofar spend) (tokens int, cost float64, stop bool) {
 	tc := d.targetCfg(t)
 	interval := d.cfg.PollInterval.OrDefault(30 * time.Minute)
@@ -6830,10 +6917,77 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	waitedOnReset := waitingForReset
 	if waitingForReset {
 		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
-		log.Printf("paused%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
+		log.Printf("paused%s%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
 	} else {
-		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+		log.Printf("paused%s%s — probing every %s for an early reset", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), interval)
 	}
+
+	// CLA-728: the wait can outlast the plane's liveness window many times over,
+	// and a healthy daemon that stops talking reads on the console as dead -
+	// which is what sent the operator looking for a crash on 2026-10-20. Say
+	// `limited` on entry and keep saying it at limitBeaconInterval; the next
+	// ordinary beacon (`iteration` or `idle`) is what replaces it on resume, so
+	// there is no exit call.
+	beaconInterval := d.limitBeaconInterval
+	if beaconInterval <= 0 {
+		// A Driver built by hand in a test carries the zero value; the default
+		// is the production window, never "beacon in a tight loop".
+		beaconInterval = 5 * time.Minute
+	}
+
+	// What the beacon carries is the harness's stated reset only while the wait
+	// still believes it. The fallback below measures a stated reset false, and
+	// from that moment the console must read "probing for a reset" rather than a
+	// countdown to an instant this loop already knows did not lift the limit.
+	// Mutex-guarded because the re-beacon goroutine reads it while this loop
+	// writes it.
+	var resetMu sync.Mutex
+	beaconReset := lim.ResetAt
+	currentReset := func() time.Time {
+		resetMu.Lock()
+		defer resetMu.Unlock()
+		return beaconReset
+	}
+	dropBeaconReset := func() {
+		resetMu.Lock()
+		beaconReset = time.Time{}
+		resetMu.Unlock()
+	}
+
+	d.beaconLimited(currentReset())
+
+	// The re-beacon runs on its OWN goroutine, not as another wake in the probe
+	// loop below. A probe is a harness session with no ceiling of its own — the
+	// session wall-clock cap exempts probes (CLA-368) — so a cadence driven by
+	// the same loop goes silent for the whole probe, and a probe longer than the
+	// plane's liveness window puts the instance back to `dead`: the exact
+	// failure this state exists to fix. The goroutine is joined before the wait
+	// returns, so the boundary's next ordinary beacon is still the last word.
+	beaconStop := make(chan struct{})
+	beaconDone := make(chan struct{})
+	go func() {
+		defer close(beaconDone)
+		tk := time.NewTicker(beaconInterval)
+		defer tk.Stop()
+		for {
+			select {
+			case <-beaconStop:
+				return
+			case <-tk.C:
+				d.beaconLimited(currentReset())
+			}
+		}
+	}()
+	defer func() {
+		close(beaconStop)
+		<-beaconDone
+	}()
+
+	// The FIRST probe's deadline is the only one measured from the wake: it is
+	// the wait's entry, and probeWait is what aims it at a stated reset. Every
+	// later deadline is measured from the END of the attempt that preceded it
+	// (see the probe branches below).
+	nextProbe := time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 
 	for {
 		if dim := d.budgetTrip(sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start)); dim != "" {
@@ -6841,10 +6995,15 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 				dim, sofar.tokens+tokens, sofar.cost+cost, time.Since(sofar.start).Round(time.Second))
 			return tokens, cost, true
 		}
-		waitDur := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
-		if d.waitOrStop(ctx, waitDur) {
-			return tokens, cost, true
+		// waitOrStopHalt stays the sleep, so STOP / RESTART / RELOAD - and, in
+		// this wait, HALT - keep ending it promptly however long the limit lasts.
+		if waitDur := time.Until(nextProbe); waitDur > 0 {
+			if d.waitOrStopHalt(ctx, waitDur) {
+				return tokens, cost, true
+			}
 		}
+		// Probe time.
+		//
 		// A stated reset is the provider's claim, not a guarantee, so crossing it
 		// mid-wait does NOT resume the run the way a blind-grid wake used to: it
 		// falls back to interval polling, and the very next probe is what confirms
@@ -6856,6 +7015,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 		if !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) && waitingForReset {
 			log.Print("stated reset passed - falling back to interval polling (a stated reset is a claim, not a guarantee)")
 			waitingForReset = false
+			// The loop has just measured the claim false: stop repeating it to
+			// the console.
+			dropBeaconReset()
 		} else if !waitedOnReset && !lim.ResetAt.IsZero() && !time.Now().Before(lim.ResetAt) {
 			log.Print("stated reset already past — resuming")
 			return tokens, cost, false
@@ -6867,9 +7029,22 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			// named variable (the error carries it) and poll again next
 			// interval. The wait stays bounded by its own dials.
 			log.Printf("probe error: %v — will retry next interval", ierr)
+			// A refusal is still a probe ATTEMPT: the next one is a full
+			// probeWait from the end of this one, never sooner.
+			nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 			continue
 		}
 		got, err := a.Probe(ctx, inv)
+		// The successor deadline is measured from HERE, the end of the attempt,
+		// and only here. Anchoring it at the wake instead would let a probe that
+		// outlives the poll interval consume the whole wait: the next paid
+		// session would start the instant this one returned, which is more
+		// probes than the pre-CLA-728 loop ever spawned (it slept the interval
+		// AFTER each probe) and, for a harness whose probe reports no spend, a
+		// cadence the CLA-287 breaker cannot see. The attempt counts as finished
+		// before its verdict is read, so an error path that retries is spaced
+		// exactly like a successful one.
+		nextProbe = time.Now().Add(probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace))
 		// Count the probe BEFORE reading its verdict, and before the error branch: a
 		// probe that failed still spawned the harness and still spent. Every path out
 		// of here — resume, stop, or another lap — carries it.
@@ -7797,6 +7972,27 @@ func labelOf(t Target) string {
 // very limit being waited out. A changed poll_interval applies from the NEXT
 // pause, which recomputes it.
 func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
+	return d.waitResponsive(ctx, dur, false)
+}
+
+// waitOrStopHalt is waitOrStop with one addition: a HALT marker ends the wait
+// too (CLA-728).
+//
+// HALT is deliberately NOT consumed here — it is the operator's note, and the
+// next run's start-up read reports it again without clearing it either. Ending
+// the wait early therefore does not change where the run ends, only WHEN: the
+// same halt, at most a poll interval sooner, which is what "STOP/HALT still end
+// the wait promptly" asks for a pause that can last hours.
+//
+// It is a separate entry point rather than a widening of waitOrStop because the
+// idle polls are not this wait: widening those is a change to every wait in the
+// loop, and this task is about the limit pause.
+func (d *Driver) waitOrStopHalt(ctx context.Context, dur time.Duration) bool {
+	return d.waitResponsive(ctx, dur, true)
+}
+
+// waitResponsive is the shared body of waitOrStop and waitOrStopHalt.
+func (d *Driver) waitResponsive(ctx context.Context, dur time.Duration, haltEndsWait bool) bool {
 	const chunk = 3 * time.Second
 	// Round(0) strips the monotonic reading, so wallStart measures REAL elapsed
 	// time. Everything else here runs on the monotonic clock, which does not
@@ -7812,7 +8008,7 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 		// members all reach this loop, and two of them reading one RELOAD before
 		// either removed it would apply the reload twice, from two goroutines.
 		d.controlMu.Lock()
-		stop := d.consumeWaitControls()
+		stop := d.consumeWaitControls(haltEndsWait)
 		d.controlMu.Unlock()
 		if stop {
 			return true
@@ -7842,15 +8038,29 @@ func (d *Driver) waitOrStop(ctx context.Context, dur time.Duration) bool {
 // control.go describes). It reports whether the wait must stop, which is true
 // for STOP and either restart marker.
 //
+// haltEndsWait asks for HALT to end the wait as well (waitOrStopHalt, the
+// supervised limit pause). HALT is READ but never consumed: it is the operator's
+// note, so it is still there for the next run's start-up read.
+//
 // The caller MUST hold d.controlMu: the read-then-remove of a marker is not
 // atomic, and a parallel panel's members can be in this wait at the same time
 // (CLA-697 review finding 1.review-1.2). The lock is what makes a marker a
 // single-consumer switch no matter how many waiters are parked on it.
-func (d *Driver) consumeWaitControls() bool {
+func (d *Driver) consumeWaitControls(haltEndsWait bool) bool {
 	if present, _ := d.readMarker("STOP"); present {
 		_ = d.state.Remove("STOP")
 		log.Print("STOP requested during wait — stopping")
 		return true
+	}
+	if haltEndsWait {
+		if present, msg := d.readMarker("HALT"); present {
+			// Left in place on purpose: it is the operator's note, and the next
+			// run's start-up read is what reports it again. The path is named
+			// here because this exit does not reach the boundary read that
+			// normally prints it.
+			log.Printf("HALT present during wait: %s — ending the wait; resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
+			return true
+		}
 	}
 	if present, msg := d.readMarker(MarkerRestart); present {
 		_ = d.state.Remove(MarkerRestart)
@@ -7918,12 +8128,27 @@ func resetSuffix(t time.Time) string {
 }
 
 // limitReason renders a limit's reason for a log line, defaulting when a harness
-// leaves it blank.
+// leaves it blank. The window rides along when the adapter named one (CLA-752): a
+// multi-day weekly wait should say which cap it is waiting out, not just "usage
+// limit".
 func limitReason(lim harness.Limit) string {
-	if lim.Reason != "" {
-		return lim.Reason
+	reason := lim.Reason
+	if reason == "" {
+		reason = "usage limit"
 	}
-	return "usage limit"
+	return reason + limitWindowSuffix(lim)
+}
+
+// limitWindowSuffix names the usage window for a log line that already says what
+// it is doing, or "" when the adapter named none (CLA-752). The supervised wait
+// uses it so the pause an operator actually sits through distinguishes a
+// multi-day weekly cap from a 5-hour one (reviews 1.review-2.1, 1.review-3.1,
+// 1.review-5.1, 1.review-1.3).
+func limitWindowSuffix(lim harness.Limit) string {
+	if lim.Window == "" {
+		return ""
+	}
+	return " (" + lim.Window + " window)"
 }
 
 // isReviewPhase reports whether a phase is a review-phase (the gate where

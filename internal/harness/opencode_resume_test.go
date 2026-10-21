@@ -199,6 +199,71 @@ func TestMergeResumeUnobservedContinuationKeepsClaim(t *testing.T) {
 	}
 }
 
+// CLA-739 / review 1.review-2.1: the ToolLoop verdict is CARRIED by mergeResume,
+// and the carry is load-bearing in both directions: opencode Invoke returns
+// early on a merged cause (`if res.ToolLoop != ""` — no stall resume, no
+// resurrection) and the resurrection loop's own condition requires
+// `res.ToolLoop == ""`. A regression that dropped the carry would resurrect a
+// session that was killed for repeating a failing tool call, re-sending its
+// whole transcript per attempt — the incident CLA-739 bounds. The continuation
+// here is built through the REAL parser and guard (the cause is set on the
+// Result after the stream is parsed, exactly as Invoke does), not hand-set, so
+// the test fails if that seam stops producing one too.
+func TestMergeResumeCarriesTheToolLoopCause(t *testing.T) {
+	// The continuation's stream: one refused clankerbar call, then nothing —
+	// opencode exiting after the adapter's own kill. Threshold 1 trips the guard.
+	continuation := func(t *testing.T) Result {
+		t.Helper()
+		p := newOpencodeParse(Invocation{MaxRepeatedToolFailures: 1}, nil)
+		p.line([]byte(`{"type":"tool_use","sessionID":"ses_dead","part":{"partID":"prt_9","type":"tool","id":"call_9","tool":"clankerbar_release_task","state":{"status":"error","input":{"expire":true,"driver":true},"error":"{\"error\":{\"code\":\"invalid_release\"}}"}}}`))
+		var res Result
+		p.finish(&res)
+		res.ToolLoop = p.observed.toolLoop.tripped()
+		return res
+	}
+
+	t.Run("a killed continuation's cause becomes the merged session's", func(t *testing.T) {
+		base := quietDeathResult("ses_dead")
+		cont := continuation(t)
+		if cont.ToolLoop == "" {
+			t.Fatalf("test precondition: the parser/guard produced no cause (Raw: %v)", cont.Raw)
+		}
+
+		mergeResume(&base, cont)
+
+		if base.ToolLoop != cont.ToolLoop {
+			t.Errorf("ToolLoop = %q after merging a continuation killed for looping (%q) — the merged session would read as resurrectable and re-send its whole transcript", base.ToolLoop, cont.ToolLoop)
+		}
+		if !strings.HasPrefix(base.ToolLoop, ToolLoopCausePrefix) {
+			t.Errorf("ToolLoop = %q, want the %q cause", base.ToolLoop, ToolLoopCausePrefix)
+		}
+	})
+
+	t.Run("a base that already carries a cause keeps it", func(t *testing.T) {
+		const dead = "repeated failing tool call: clankerbar_release_task x5: invalid_release"
+		base := quietDeathResult("ses_dead")
+		base.ToolLoop = dead
+
+		// A DIFFERENT cause: threshold 2 names x2, so an overwrite cannot pass
+		// by looking like a no-op.
+		p := newOpencodeParse(Invocation{MaxRepeatedToolFailures: 2}, nil)
+		p.line([]byte(`{"type":"tool_use","sessionID":"ses_dead","part":{"partID":"prt_1","type":"tool","id":"call_1","tool":"shell","state":{"status":"error","input":{},"error":"Permission denied: external_directory"}}}`))
+		p.line([]byte(`{"type":"tool_use","sessionID":"ses_dead","part":{"partID":"prt_2","type":"tool","id":"call_2","tool":"shell","state":{"status":"error","input":{},"error":"Permission denied: external_directory"}}}`))
+		var cont Result
+		p.finish(&cont)
+		cont.ToolLoop = p.observed.toolLoop.tripped()
+		if cont.ToolLoop == "" || cont.ToolLoop == dead {
+			t.Fatalf("test precondition: continuation cause = %q, want a cause distinct from the base's", cont.ToolLoop)
+		}
+
+		mergeResume(&base, cont)
+
+		if base.ToolLoop != dead {
+			t.Errorf("ToolLoop = %q, want the dead run's own cause %q kept — the first cause is the loop the session was killed for and a later one must not rewrite that history", base.ToolLoop, dead)
+		}
+	})
+}
+
 // Review WARN (finish_reason asymmetry): a continuation that names NO finish
 // reason must clear the corpse's, symmetrically with terminal_reason. The
 // parser writes finish_reason only when the stream carried a step_finish
@@ -240,7 +305,7 @@ func TestMergeResumeRecomputesTheRecoveredMarker(t *testing.T) {
 		// One recovered provider error, a claim observation, then the zero-usage
 		// quiet death. Both markers come from the parser.
 		return opencodeParsed(`{"type":"error","sessionID":"ses_dead","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}
-{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
+{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"unknown","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
 	}
 
@@ -317,7 +382,8 @@ const (
 	resumeProbeWrong = `{"type":"text","sessionID":"ses_dead","part":{"type":"text","text":"EZY-260 — continuing that one."}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}`
 	// The continuation: does the work (update_task settle + branch), ends clean.
-	resumeContinuation = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
+	resumeContinuation = `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c0b","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}
+{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_submit_for_review","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","outcome":"**Tests** - fixture"},"output":"{\"ok\":true}"}}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}`
 )
 
@@ -339,7 +405,8 @@ case "$*" in
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *"Continue exactly where you left off"*)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c0b","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_submit_for_review","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","outcome":"**Tests** - fixture"},"output":"{\"ok\":true}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":5000,"input":4000,"output":1000,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.01}}'
     ;;
   *)
@@ -369,10 +436,10 @@ esac
 	}
 	// ERROR 1 regression: the settle observed by the CONTINUATION must survive
 	// into the merged Claim. Unseeded, the continuation's parser starts with a
-	// zero claim, update_task goes unobserved, Settled stays false, and
+	// zero claim, the hand-over goes unobserved, Settled stays false, and
 	// releaseHeldClaim posts ready over an in_review task.
 	if !res.Claim.Settled {
-		t.Errorf("Claim.Settled = false; the continuation's update_task was not observed — ResumeClaim seed missing")
+		t.Errorf("Claim.Settled = false; the continuation's submit_for_review was not observed — ResumeClaim seed missing")
 	}
 	if !res.Claim.HasWIP {
 		t.Errorf("Claim.HasWIP = false; the continuation's branch recording was not observed")
@@ -563,7 +630,8 @@ func TestResurrectionInvokeProbeObservationSurvives(t *testing.T) {
 	opencodeStub(t, `#!/bin/sh
 case "$*" in
   *"Confirm you are intact"*)
-    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"in_review","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_record_progress","id":"c0b","state":{"status":"completed","input":{"taskId":"uuid-1","branch":"clanker/x"},"output":"{\"ok\":true}"}}}'
+    echo '{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_submit_for_review","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","outcome":"**Tests** - fixture"},"output":"{\"ok\":true}"}}}'
     echo '{"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":900,"input":800,"output":100,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0.001}}'
     ;;
   *"Continue exactly where you left off"*)
@@ -582,7 +650,7 @@ esac
 		t.Fatalf("Invoke: %v", err)
 	}
 	if !res.Claim.Settled {
-		t.Error("Claim.Settled = false; the PROBE's update_task was dropped - probe observations must fold into the merged result")
+		t.Error("Claim.Settled = false; the PROBE's hand-over was dropped - probe observations must fold into the merged result")
 	}
 	if !res.Claim.HasWIP {
 		t.Error("Claim.HasWIP = false; the probe's branch recording was dropped")
@@ -733,20 +801,26 @@ func TestMergeResumeLaterReportWinsStatusUpgrade(t *testing.T) {
 	}}
 
 	// The continuation runs SEEDED (as Invoke now seeds it) — without the seed
-	// its update_task would be unobserved and there would be nothing to dedupe.
+	// its hand-over would be unobserved and there would be nothing to dedupe.
 	seeded := Invocation{Prompt: "Work."}
 	seeded.ResumeClaim = Claim{TaskID: "uuid-1", Ref: "EZY-196", RunID: "run-1"}
-	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_update_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","status":"done","branch":"clanker/x","delivery":{"commit":"abc123","integrationBranch":"staging"}},"output":"{\"ok\":true}"}}}
+	cont := opencodeParsedFrom(seeded, nil, `{"type":"tool_use","sessionID":"ses_dead","part":{"type":"tool","tool":"clankerbar_complete_task","id":"c1","state":{"status":"completed","input":{"taskId":"uuid-1","delivery":{"commit":"abc123","integrationBranch":"staging"}},"output":"{\"ok\":true}"}}}
 {"type":"step_finish","sessionID":"ses_dead","part":{"type":"step-finish","reason":"stop","tokens":{"total":10,"input":10,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}`)
 	mergeResume(&base, cont)
 
-	if len(base.Reports) != 1 {
-		t.Fatalf("Reports = %d entries, want 1 deduped", len(base.Reports))
+	// The cutover split the old one-call shape in two: the branch record is one
+	// claim and the close's delivery is another. Both are kept - the branch check
+	// still has to run, and the delivery is what the merge attestation reads.
+	if len(base.Reports) != 2 {
+		t.Fatalf("Reports = %+v, want the branch record and the delivery", base.Reports)
 	}
-	if got := base.Reports[0].Status; got != "done" {
-		t.Errorf("Report.Status = %q, want the later 'done' (the upgrade must not be dropped)", got)
+	if got := base.Reports[0].Branch; got != "clanker/x" {
+		t.Errorf("Reports[0].Branch = %q, want the branch record to survive", got)
 	}
-	if !base.Reports[0].ClaimsMerge() {
-		t.Error("the upgraded report must claim the merge landed - attestation depends on it")
+	if got := base.Reports[1].Status; got != "done" {
+		t.Errorf("Report.Status = %q, want the close's 'done'", got)
+	}
+	if !base.Reports[1].ClaimsMerge() {
+		t.Error("the close's report must claim the merge landed - attestation depends on it")
 	}
 }

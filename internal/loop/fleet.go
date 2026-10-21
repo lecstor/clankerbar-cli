@@ -128,6 +128,14 @@ func (d *Driver) startupPausedAt(ti int) bool {
 // tests and not-wired targets need no branching at the call sites.
 func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.Iteration) {
 	d.writeLocalBeacon(st)
+	d.sendBeacon(ti, t, st, iterations...)
+}
+
+// sendBeacon is beacon without the local file: the plane half alone. Split out
+// for the callers that report one daemon-wide state to several targets, so the
+// local BEACON file (which takes no target) is written ONCE per lap instead of
+// once per target.
+func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...fleet.Iteration) {
 	if t.Fleet == nil {
 		return
 	}
@@ -136,6 +144,56 @@ func (d *Driver) beacon(ti int, t Target, st fleet.State, iterations ...fleet.It
 		State:      st,
 		Iterations: iterations,
 	})
+}
+
+// beaconLimited tells the plane this daemon is parked on a usage limit
+// (CLA-728), for EVERY target it serves. The wait blocks the whole loop, so no
+// other project's queue is being serviced either — beaconing only the target
+// whose harness hit the limit would leave the other projects' presence rows
+// silent, and each of those reads as a dead instance for exactly the reason
+// this state exists to correct.
+//
+// It rides the ordinary beacon path, so the local BEACON file in the state dir
+// carries the same state: `supervise` status and the console agree by
+// construction rather than by two writers that could drift. resetAt is the
+// harness's stated instant, or the zero time when it stated none (or when the
+// wait has already measured that instant false).
+func (d *Driver) beaconLimited(resetAt time.Time) {
+	st := fleet.State{Kind: fleet.StateLimited, ResetAt: resetAt}
+	// One daemon-wide state, one daemon-wide file: writeLocalBeacon takes no
+	// target, so writing it inside the per-target loop below would
+	// remove-then-create the identical bytes once per target on every lap.
+	d.writeLocalBeacon(st)
+	for i := range d.targets {
+		d.sendBeacon(i, d.targets[i], st)
+	}
+}
+
+// beaconSessionTargets is the in-session presence lap (CLA-771): the poll's own
+// per-target beacon, for the window in which the poll does not run. The running
+// target reports what fleetState derives for it (iteration with the current
+// claim's ref and phase); every other target the daemon serves reports its own
+// state, which is idle - or draining while a pause holds its spawns - because no
+// session is running there.
+//
+// The other targets are not decoration. Each project has its own Fleet reporter
+// and its own project-scoped presence row, so beaconing only the running target
+// would leave every sibling project's row to go stale for the whole session, and
+// that project's console would show the daemon as a dead instance (the same
+// symptom CLA-771 exists to fix, one project over). beaconLimited beacons every
+// target for the same reason.
+//
+// running and runningTarget are handed in rather than indexed out of d.targets
+// so a hand-built driver - the unit tests - still beacons the target it was
+// given; the lap then adds any other target, skipping that index.
+func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
+	d.beacon(running, runningTarget, d.fleetState(running))
+	for i := range d.targets {
+		if i == running {
+			continue
+		}
+		d.beacon(i, d.targets[i], d.fleetState(i))
+	}
 }
 
 // LocalBeaconName is the local presence file the daemon keeps beside its plane
@@ -148,10 +206,29 @@ const LocalBeaconName = "BEACON"
 // localBeacon is the JSON shape of LocalBeaconName. The supervisor's roll
 // mirrors it for reading (the same roster-style lockstep: two packages, one
 // contract), so a new field here must land in internal/supervisor/roll.go too.
+//
+// ResetAt is the `limited` state's payload (CLA-728): the instant the harness
+// stated, present only while the wait still believes it — exactly the field the
+// plane POST carries, so the local file keeps mirroring the next report rather
+// than saying `limited` with no moment while the console shows a countdown. A
+// pointer rather than a time.Time so `omitempty` can actually omit it (the
+// encoder never treats a time.Time's zero value as empty).
 type localBeacon struct {
-	Version string    `json:"version"`
-	State   string    `json:"state"`
-	At      time.Time `json:"at"`
+	Version string     `json:"version"`
+	State   string     `json:"state"`
+	At      time.Time  `json:"at"`
+	ResetAt *time.Time `json:"resetAt,omitempty"`
+}
+
+// localBeaconResetAt is the reset instant the local file carries: the stated
+// one on a `limited` state, and nothing on any other kind (the plane drops it
+// there too), so one representation of "no reset" rather than two.
+func localBeaconResetAt(st fleet.State) *time.Time {
+	if st.Kind != fleet.StateLimited || st.ResetAt.IsZero() {
+		return nil
+	}
+	at := st.ResetAt.UTC()
+	return &at
 }
 
 // writeLocalBeacon refreshes the local beacon file. Fail-soft exactly like the
@@ -168,6 +245,7 @@ func (d *Driver) writeLocalBeacon(st fleet.State) {
 		Version: version.Current,
 		State:   st.Kind,
 		At:      time.Now().UTC(),
+		ResetAt: localBeaconResetAt(st),
 	})
 	if err != nil {
 		return // the four state kinds and a version string cannot fail to marshal
@@ -296,7 +374,32 @@ func (d *Driver) beginIteration(ti int, t Target, drainNum int, ref, phase strin
 //     settled by the session itself) -> released
 //   - nothing observed at all -> released, best-effort (the iteration ran;
 //     exactly one record posts per iteration, always)
+//
+// Free text is NEVER an outcome (CLA-738): marshalReport refuses the whole
+// report on a word it does not know, so a note about the drain belongs in the
+// log. A caller that appends prose to the disposition loses the record AND the
+// presence refresh riding the same report.
+//
+// That invariant is enforced here as a last line of defence, not left to
+// convention: an outcome outside the four is posted as released with one loud
+// line naming the caller's mistake. The alternative is what CLA-738's incident
+// did — the reporter refuses the WHOLE report (every iteration plus the presence
+// refresh) and then logs only the first failure of the streak, so one prose
+// outcome would silently starve the plane for the rest of the session. One
+// degraded iteration is the cheaper failure, and the loud line is what gets the
+// convention fixed.
 func (d *Driver) endIteration(ti int, t Target, rec fleet.Iteration) {
+	switch rec.Outcome {
+	case fleet.OutcomeCheckpoint, fleet.OutcomeReleased, fleet.OutcomeParked, fleet.OutcomeDead:
+	default:
+		task := ""
+		if rec.TaskRef != "" {
+			task = " (task " + rec.TaskRef + ")"
+		}
+		log.Printf("%sBUG: iteration outcome %q%s is not one of the four the plane knows (checkpoint/released/parked/dead) - reporting it as %q so the fleet report and its presence refresh are not dropped; the caller must put prose in the log, never the outcome",
+			labelOf(t), rec.Outcome, task, fleet.OutcomeReleased)
+		rec.Outcome = fleet.OutcomeReleased
+	}
 	d.iterMu.Lock()
 	if ti >= 0 && ti < len(d.iter) {
 		d.iter[ti] = iterState{}
@@ -388,7 +491,9 @@ func sessionCost(a harness.Adapter, res *harness.Result) *float64 {
 // Cost is summed only while EVERY attempt that ran produced a figure; one
 // attempt whose dollars were never reported leaves the pass's cost UNKNOWN
 // rather than partial, because a partial figure presented as the session's cost
-// understates it. The token buckets have no such problem: they sum exactly.
+// understates it. A pass that reported no usage at all has no figure either,
+// however many attempts carried one — see cost(). The token buckets have no such
+// problem: they sum exactly.
 type sessionSpend struct {
 	usage         harness.TokenUsage
 	usageReported bool
@@ -419,8 +524,19 @@ func (s *sessionSpend) add(a harness.Adapter, res harness.Result) {
 }
 
 // cost returns the pass's dollar figure as a pointer, or nil when it is unknown.
+//
+// A figure only counts as one when the pass actually REPORTED usage (CLA-737).
+// `CostReported` and `UsageReported` answer different questions, and an adapter
+// that reports money can still set the first with no usage report at all:
+// opencode's export path does exactly that for a session killed before its first
+// answered request (a provider.quota error is the common one), where the run's
+// export is all zeroes but still a document with a cost. Its zero is silence,
+// not "$0 spent", so the pass has no figure to publish — and the wire must not
+// carry one, because the plane refuses the WHOLE report with
+// "session.costUsd requires session.usageReported" and every other iteration in
+// that batch, presence refresh included, is lost with it.
 func (s *sessionSpend) cost() *float64 {
-	if !s.costKnown {
+	if !s.costKnown || !s.usageReported {
 		return nil
 	}
 	cost := s.costUSD

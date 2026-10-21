@@ -48,8 +48,8 @@ implement  →  review            →  fix
 | phase | actor | job | ends by |
 |---|---|---|---|
 | `implement` | cheap harness | claim, build, self-verify, commit, push, record branch | STOP holding the claim |
-| `review` (non-final) | the expensive reviewer | read the diff, run the adversarial gate (the record, not the repo's gates — see the brief's gate-scope rule), **record findings, change nothing** | `update_task(outcome)` then STOP holding the claim |
-| `fix` | cheap harness | apply findings by ID, re-verify scoped to them, commit, push, open the PR, hand over | `update_task(status: in_review, outcome)` |
+| `review` (non-final) | the expensive reviewer | read the diff, run the adversarial gate (the record, not the repo's gates — see the brief's gate-scope rule), **record findings, change nothing** | `record_progress(outcome)` then STOP holding the claim |
+| `fix` | cheap harness | apply findings by ID, re-verify scoped to them, commit, push, open the PR, hand over | `submit_for_review(outcome)` |
 
 `review` selects the read-only brief **by position**: a review with a phase after
 it is the gate; a *final* `review` keeps the historical review-and-fix brief. That
@@ -72,7 +72,7 @@ config is the one most exposed.
 
 **Today (CLI only, no plane change): the task's `outcome`.**
 
-- The review phase calls `update_task(taskId, runId, outcome: ...)` with no status
+- The review phase calls `record_progress(taskId, runId, outcome: ...)` with no status
   change — the plane's documented way to write or correct an outcome without a
   fake transition.
 - The record is a fixed, compact shape (the heading is a shared constant,
@@ -125,7 +125,7 @@ injected by the driver, because a session cannot reliably name its own model and
 cannot see its predecessor's.
 
 **Limit of the CLI-only record:** `outcome` is one text field, and a statusless
-`update_task(outcome: ...)` replaces it wholesale. A second round would overwrite
+`record_progress(outcome: ...)` replaces it wholesale. A second round would overwrite
 the first unless the second session copies it forward, so both shipped briefs say
 to append: the review copies the existing outcome unchanged and adds its block
 below it, and the fix keeps everything above the **last** review block while
@@ -144,7 +144,7 @@ branch — would pass it with nothing recorded at all. Two guards close that:
 
 1. **The review→fix checkpoint requires a durable record from THIS run.** Since
    CLA-636/637 the review phase's deliverable is a sealed per-reviewer record
-   written through `update_task(review: ...)`, and the seam gate is that record:
+   written through `record_review`, and the seam gate is that record:
    the driver reads the task's `reviews` block at the seam and refuses a
    checkpoint unless it carries a record this run wrote, under this phase's
    reviewer role, whose `reviewedTip` equals the branch tip the driver verified
@@ -221,10 +221,12 @@ The backlog tasks that own this, so this change does not re-file them:
   prune. **CLA-630** (`lecstor/clankerbar-cli`, ready, depends on CLA-629) sends
   it from the CLI. That is the attribution half of "which model reviewed this".
 - **CLA-636** (done, `lecstor/clankerbar`) — the durable per-reviewer
-  `task_review` store written through `update_task(review: ...)`, sealed until
-  the round closes. **CLA-637** (this work, `lecstor/clankerbar-cli`) makes the
-  review phase write it, gates the seam on it and closes the round before `fix`.
-  CLA-210 was archived pointing at CLA-636 and the `agent_review` state.
+  `task_review` store, written through `record_review`, sealed until
+  the round closes. **CLA-742** (plane, protocol 40) adds `record_review`, the
+  review-only tool a strict-tool-call client can use, which is the door a plane
+  at protocol 40+ serves. **CLA-637** (this work, `lecstor/clankerbar-cli`) makes
+  the review phase write it, gates the seam on it and closes the round before
+  `fix`. CLA-210 was archived pointing at CLA-636 and the `agent_review` state.
 
 If the operator wants the full multi-round history, unpark CLA-210 and give it
 this shape:
@@ -243,12 +245,18 @@ this shape:
 | `fix_commit`, `fixed_by_run` | which fixes landed, attributed |
 | `created_at` | receipt time |
 
-Write path: **extend `update_task` with an optional `review` object**, not a new
-MCP tool. The tool surface is token-budget-sensitive
-(`server/mcp/tool-surface.test.ts`, `docs/token-budget.md`); `update_task` is
-already the write path for everything that changes a task, and its receipt is
-compact. Read path: a compact `reviews` block on `get_task` only when reviews
-exist (newest first, bounded), with full text in `export_project` / the task page.
+Write path: **`record_review`.** CLA-636 first carried the store on
+`update_task`; CLA-742 added `record_review`, a review-only tool whose schema has
+nothing but review fields — which is what a model served with strict tool calls
+forced on needs, because it pads a general-purpose call with task fields until
+the call is refused. The CLI's cutover (CLA-746/CLA-748) deletes `update_task`
+entirely and its nine intent-specific successors are what every brief and every
+driver write names, so there is no protocol-dependent door left to resolve at
+spawn. `record_review` is
+token-budget-sensitive (`server/mcp/tool-surface.test.ts`, `docs/token-budget.md`)
+like the rest of the surface. Read path: a compact
+`reviews` block on `get_task` only when reviews exist (newest first, bounded),
+with full text in `export_project` / the task page.
 
 **Ordering that matters:** CLA-629 must deploy before CLA-630 ships (CLA-492's
 precedent: a CLI ahead of the plane's parser had its fleet reports rejected). The
@@ -266,17 +274,23 @@ PR: a clean verification round carries the terminal step (push check, PR,
 The verifier is review-shaped (it writes a durable record like the review gate)
 and is scoped to the **fix delta** — the reviewed tip the previous record names
 through `HEAD`, plus the regression surface the fixes touch. Unlike the review
-gate, the verifier releases its OWN round in its terminal call: the plane
-refuses a sealed holder's outcome write, and the close must ride the same
-`update_task` call as the `in_review` move, because after the status move the
-run is no longer the task's live holder and cannot close. The driver accepts
-either state — sealed (it closes, as it does for the review gate) or already
-released — and never closes twice. Its brief lists the prior open MUST ids
-(read from the plane's released
-records), and it adjudicates each one **by its plane id**
-(`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
-(`filed`), refutation accepted (`refuted`), or left open with a reason. New
-MUSTs are allowed only inside the delta and get new ids.
+gate, the verifier releases its OWN round in its terminal step, and a clean
+round does that in the hand-over: **ONE call**, `submit_for_review(taskId,
+runId, closeRound: n)`, made after the branch is pushed and the PR is open. The
+close rides that call's atomic write and sits behind every guard the status move
+goes through — the only order the plane accepts, because once the task leaves
+`in_progress` this run can no longer close the round. A refused transition
+reopens the round rather than leaving the findings released against a task still
+in progress, and a sealed holder's outcome write is refused, so the hand-over
+carries no `outcome`. A round that still has an open MUST does not hand over at
+all: it closes the round with `record_review(..., { closeRound: n })` and ends
+holding the task, so the driver spawns the next fix. The driver accepts either
+state — sealed (it closes, as it does for the review gate) or already released —
+and never closes twice. Its brief lists the
+prior open MUST ids (read from the plane's released records), and it adjudicates
+each one **by its plane id** (`<round>.<reviewer role>.<n>`): resolved (`fixed`),
+resolved by dispatch (`filed`), refutation accepted (`refuted`), or left open with
+a reason. New MUSTs are allowed only inside the delta and get new ids.
 
 On a **branchless** task (the CLA-670 shape above) the verifier follows the
 review's block-only path instead: no durable record, no plane finding ids, no
@@ -352,7 +366,7 @@ close-out.
 | linear `[implement, review, fix]` | **done**: 2 briefs + variants, positional selection, attribution/position placeholders, validation, tests | none for the first round; the review record is an `outcome` block | low — no new loop control | now |
 | bounded second review | one more brief + a conditional-phase predicate in `drainPhases` | none | medium — conditional spawning is new control flow | after a live run measures the split |
 | new task on the branch | no CLI change | task-linking + round counter + close-out semantics | high — two tasks per unit of work | not recommended pre-PR |
-| durable review history | **done** (CLA-637): the record is a sealed per-reviewer row written via `update_task(review: ...)`; the seam gates on it and the driver closes the round | CLA-636 (done): the append-only `task_review` store; CLA-629/630 carry the attribution | low — additive, bounded, token-budgeted | shipped alongside this doc's split |
+| durable review history | **done** (CLA-637): the record is a sealed per-reviewer row written via `record_review`; the seam gates on it and the driver closes the round | CLA-636 (done): the append-only `task_review` store; CLA-629/630 carry the attribution | low — additive, bounded, token-budgeted | shipped alongside this doc's split |
 
 ## Answers, explicitly
 
