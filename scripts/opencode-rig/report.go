@@ -70,6 +70,7 @@ type capturedRequest struct {
 	Body      json.RawMessage   `json:"body"`
 	BodyText  string            `json:"bodyText"`
 	AuthOmit  bool              `json:"authorizationOmitted"`
+	Redacted  []string          `json:"redactedHeaders"`
 	BodyBytes int               `json:"bodyBytes"`
 }
 
@@ -295,7 +296,7 @@ func renderReport(rec runRecord, events []rigEvent, calls []stubCall, requests [
 			line("")
 			h := sha256.Sum256(req.Body)
 			line("- body: %d bytes, sha256 `%s`", len(req.Body), hex.EncodeToString(h[:8]))
-			line("- Authorization header: omitted from the record (forwarded to the provider, never written to disk)")
+			line("- credentials: %s", credentialSummary(req))
 			line("- model: `%s`; messages: %d; tools: %d; stream: %s",
 				chat.Model, len(chat.Messages), len(chat.Tools), boolLabel(chat.Stream))
 			if effort := reasoningEffort(chat); effort != "" {
@@ -383,6 +384,21 @@ func schemaSourceLabel(source string) string {
 		return "the live plane"
 	}
 	return source
+}
+
+// credentialSummary states what the record dropped for this request, by name, so
+// the "never written to disk" claim is checkable rather than a blanket
+// assurance about one header.
+func credentialSummary(req capturedRequest) string {
+	if len(req.Redacted) > 0 {
+		return fmt.Sprintf("headers omitted from the record (forwarded to the provider, never written to disk): %s",
+			strings.Join(req.Redacted, ", "))
+	}
+	if req.AuthOmit {
+		// A record written before redactedHeaders existed.
+		return "Authorization header: omitted from the record (forwarded to the provider, never written to disk)"
+	}
+	return "no credential header was sent on this request"
 }
 
 func boolLabel(b *bool) string {

@@ -15,12 +15,39 @@ import (
 // proves is in the captured requests and the stub's call log, not in any write.
 type scenarioDef struct {
 	Name string
-	// Prompt is the message `opencode run` sends.
+	// Prompt is the message `opencode run` sends. It is empty when PromptFor
+	// builds it from the run's flags instead.
 	Prompt string
+	// PromptFor builds the prompt from the run's selection, for a scenario whose
+	// prompt names a flag-chosen tool (the schema scenario's --schema-tool).
+	PromptFor func(schemaTool string) string
 	// Respond decides the MCP tool result for one call. A nil Respond means the
 	// stub's default ("no canned response"), which is enough for a scenario
 	// that only wants the call captured.
 	Respond func(tool string, args map[string]any) toolResult
+}
+
+// promptFor resolves the scenario's prompt for these flags.
+func (s scenarioDef) promptFor(schemaTool string) string {
+	if s.PromptFor != nil {
+		return s.PromptFor(schemaTool)
+	}
+	return s.Prompt
+}
+
+// schemaToolName is the tool name the session sees. The catalog's tools are
+// served by the clankerbar MCP server, so opencode exposes `update_task` as
+// `clankerbar_update_task`; --schema-tool names the catalog's (unprefixed) tool
+// and this is the prefixed form the prompt must ask for.
+func schemaToolName(tool string) string {
+	tool = strings.TrimSpace(tool)
+	if tool == "" {
+		tool = "update_task"
+	}
+	if strings.HasPrefix(tool, "clankerbar_") {
+		return tool
+	}
+	return "clankerbar_" + tool
 }
 
 // toolResult is what the stub puts on the wire for one tools/call.
@@ -97,13 +124,21 @@ clankerbar_get_task once for CLA-754. Then say DONE and stop.`),
 
 		// schema serves whatever catalog --schemas names, so a proposed tool
 		// shape (nullable enums, a new tool) can be tested before the plane
-		// ships it. The prompt asks for exactly the shape a nullable enum is
-		// easy to get wrong on: nulls for the optional fields.
+		// ships it. The prompt names the tool --schema-tool selects, so the
+		// selected tool is the one actually exercised; for update_task it also
+		// asks for exactly the shape a nullable enum is easy to get wrong on:
+		// nulls for the optional fields.
 		"schema": {
 			Name: "schema",
-			Prompt: strings.TrimSpace(`
-Call the tool clankerbar_update_task exactly once with taskId "CLA-753",
-status "ready", priority null and schedule null. Then say DONE and stop.`),
+			PromptFor: func(schemaTool string) string {
+				name := schemaToolName(schemaTool)
+				if strings.TrimPrefix(name, "clankerbar_") == "update_task" {
+					return strings.TrimSpace(fmt.Sprintf(`
+Call the tool %s exactly once with taskId "CLA-753", status "ready", priority null and schedule null. Then say DONE and stop.`, name))
+				}
+				return strings.TrimSpace(fmt.Sprintf(`
+Call the tool %s exactly once, sending null for every optional argument its schema allows to be null, and the arguments its schema requires. Then say DONE and stop.`, name))
+			},
 			Respond: func(tool string, args map[string]any) toolResult {
 				return jsonResult(map[string]any{
 					"ok":   true,

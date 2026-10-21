@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -21,9 +22,11 @@ import (
 //
 // Two rules are load-bearing:
 //
-//   - The Authorization header is NEVER written to disk. It is forwarded to the
-//     provider and omitted from the recorded headers; the record states that it
-//     was omitted so a reader knows the absence is deliberate.
+//   - No credential header is ever written to disk. The Authorization header is
+//     forwarded to the provider and omitted from the recorded headers, as is any
+//     other header whose name marks it as a credential (see secretHeader);
+//     the record names each one it dropped so a reader knows the absence is
+//     deliberate.
 //   - The response is streamed, and flushed per chunk. A provider answering SSE
 //     must reach opencode as it arrives, or the session stalls until the whole
 //     completion is buffered - which changes the timing under test.
@@ -38,13 +41,25 @@ type recordingProxy struct {
 	seq      atomic.Int64
 }
 
-// secretHeaders are never recorded: an Authorization value is the provider key,
-// and a cookie/Proxy-Authorization is the same class of thing.
-var secretHeaders = map[string]bool{
-	"Authorization":       true,
-	"Proxy-Authorization": true,
-	"Cookie":              true,
-	"Set-Cookie":          true,
+// secretHeader reports whether a request header must never be recorded.
+//
+// It is a RULE, not a list of four names: providers carry their key under many
+// names (x-api-key, api-key, x-goog-api-key, x-auth-token ...), and the record's
+// "omitted" claim must be true for every provider, not just the ones named here.
+// A header whose name contains key, token, auth, secret, password or credential
+// is dropped; Cookie/Set-Cookie are session credentials by another name.
+func secretHeader(name string) bool {
+	n := strings.ToLower(name)
+	switch n {
+	case "cookie", "set-cookie":
+		return true
+	}
+	for _, frag := range []string{"key", "token", "auth", "secret", "password", "credential"} {
+		if strings.Contains(n, frag) {
+			return true
+		}
+	}
+	return false
 }
 
 func newRecordingProxy(upstream *url.URL, dir string) (*recordingProxy, error) {
@@ -162,15 +177,19 @@ func (p *recordingProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // recordRequest writes one request envelope. The body is embedded as the exact
 // bytes the client sent (never re-indented or re-marshalled), so the reported
 // size and hash are the wire values and a schema difference is visible byte for
-// byte. The Authorization header is omitted, and the record says so.
+// byte. Credential headers are omitted, and the record names every one it
+// dropped so the absence is deliberate and checkable.
 func (p *recordingProxy) recordRequest(seq int, r *http.Request, body []byte) error {
 	headers := map[string]string{}
+	var redacted []string
 	for k, v := range r.Header {
-		if secretHeaders[http.CanonicalHeaderKey(k)] {
+		if secretHeader(k) {
+			redacted = append(redacted, http.CanonicalHeaderKey(k))
 			continue
 		}
 		headers[k] = strings.Join(v, ", ")
 	}
+	sort.Strings(redacted)
 	var b bytes.Buffer
 	b.WriteString("{\n")
 	fmt.Fprintf(&b, "  \"seq\": %d,\n", seq)
@@ -186,7 +205,11 @@ func (p *recordingProxy) recordRequest(seq int, r *http.Request, body []byte) er
 	}
 	h, _ := json.Marshal(headers)
 	fmt.Fprintf(&b, "  \"headers\": %s,\n", h)
-	fmt.Fprintf(&b, "  \"authorizationOmitted\": true,\n")
+	rh, _ := json.Marshal(redacted)
+	fmt.Fprintf(&b, "  \"redactedHeaders\": %s,\n", rh)
+	// Kept for readers of older records: Authorization always matches the rule,
+	// so this is true for every provider, not just the ones once named.
+	fmt.Fprintf(&b, "  \"authorizationOmitted\": %t,\n", contains(redacted, "Authorization"))
 	fmt.Fprintf(&b, "  \"bodyBytes\": %d,\n", len(body))
 	b.WriteString("  \"body\": ")
 	if len(body) > 0 && json.Valid(body) {

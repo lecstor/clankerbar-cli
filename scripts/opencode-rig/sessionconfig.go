@@ -145,10 +145,22 @@ func buildSourceConfig(opt sourceConfigOpts) ([]byte, string, error) {
 // artifacts and returns its path.
 func writeSourceConfig(dir string, data []byte) (string, error) {
 	path := filepath.Join(dir, "opencode-config.json")
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := writeCredentialFile(path, data); err != nil {
 		return "", err
 	}
 	return path, nil
+}
+
+// writeCredentialFile writes a generated config artifact that may carry a
+// provider key. os.WriteFile applies its mode only when it CREATES the file, so
+// an artifact left behind by an earlier run (0644, or any other mode) is
+// chmodded too: replacing it must not keep the old permissions.
+func writeCredentialFile(path string, data []byte) error {
+	const mode os.FileMode = 0o600
+	if err := os.WriteFile(path, data, mode); err != nil {
+		return err
+	}
+	return os.Chmod(path, mode)
 }
 
 // providerFromModel splits a `provider/model` id on the FIRST slash; model ids

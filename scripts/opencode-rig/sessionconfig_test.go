@@ -198,3 +198,71 @@ func TestSessionEnvPinsTheFleetLayersAndIsolation(t *testing.T) {
 		t.Error("an inherited OPENCODE_PASSWORD was not cleared for the server")
 	}
 }
+
+// TestSessionEnvClearsThePlaneKey: the session has no plane connection, so the
+// key would only be an exposure an ambient MCP server could inherit.
+func TestSessionEnvClearsThePlaneKey(t *testing.T) {
+	o := runOptions{Out: "/runs/x", Workdir: "/runs/x/sandbox"}
+	env := sessionEnv(o, []byte(`{"mcp":{}}`), nil, nil)
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "CLANKERBAR_API_KEY=") && strings.TrimPrefix(kv, "CLANKERBAR_API_KEY=") != "" {
+			t.Fatalf("the session environment still carries the plane key: %q", kv)
+		}
+	}
+	// An explicit --env still wins: the operator can put it back deliberately.
+	env = sessionEnv(o, []byte(`{"mcp":{}}`), nil, []string{"CLANKERBAR_API_KEY=explicit"})
+	var found bool
+	for _, kv := range env {
+		if kv == "CLANKERBAR_API_KEY=explicit" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("--env CLANKERBAR_API_KEY was overridden by the scrub")
+	}
+}
+
+// TestWriteSourceConfigIsOwnerOnly: the copied source config can carry a literal
+// provider key, so it must never be world-readable - including when it replaces
+// an artifact left by an earlier run.
+func TestWriteSourceConfigIsOwnerOnly(t *testing.T) {
+	dir := t.TempDir()
+	path, err := writeSourceConfig(dir, []byte(`{"provider":{"p":{"options":{"apiKey":"literal-key"}}}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOwnerOnly(t, path)
+
+	// Replacing an existing 0644 artifact must tighten it, not keep the old mode.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writeSourceConfig(dir, []byte(`{"provider":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+	assertOwnerOnly(t, path)
+}
+
+// TestWriteCredentialFileTightensAnExistingArtifact covers the content layer,
+// which rig.go writes through the same helper.
+func TestWriteCredentialFileTightensAnExistingArtifact(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opencode-config-content.json")
+	if err := os.WriteFile(path, []byte(`{}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCredentialFile(path, []byte(`{"provider":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+	assertOwnerOnly(t, path)
+}
+
+func assertOwnerOnly(t *testing.T, path string) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("%s mode = %04o, want 0600 (a credential-bearing artifact)", path, got)
+	}
+}

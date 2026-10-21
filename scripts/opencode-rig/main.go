@@ -28,30 +28,44 @@ import (
 )
 
 func main() {
-	if len(os.Args) < 2 {
+	os.Exit(dispatch(os.Args[1:]))
+}
+
+// dispatch is main's argument handling, split out so a test can drive the
+// documented invocations (including a bare flag list with no `run`).
+func dispatch(args []string) int {
+	if len(args) == 0 {
 		usage(os.Stderr)
-		os.Exit(2)
+		return 2
 	}
-	switch os.Args[1] {
+	// `run` is optional, and that is the documented form: every README example
+	// is `run.sh --model ...`, and the usage line brackets the subcommand. A
+	// leading flag can only be the run subcommand's, so treat the whole argv as
+	// its flags rather than rejecting the invocation the README teaches.
+	if strings.HasPrefix(args[0], "-") && args[0] != "-h" && args[0] != "--help" {
+		return runCmd(args)
+	}
+	switch args[0] {
 	case "run":
-		os.Exit(runCmd(os.Args[2:]))
+		return runCmd(args[1:])
 	case "stub":
 		// Internal: the stdio MCP server opencode spawns. Exposed so a failing
 		// rig can be reproduced by hand, and so the smoke test drives the same
 		// entry point.
-		os.Exit(stubCmd(os.Args[2:]))
+		return stubCmd(args[1:])
 	case "session-config":
 		// The tiny "go run" entry point: print the document the adapter would
 		// pin as OPENCODE_CONFIG_CONTENT, from the CLI's own code.
-		os.Exit(sessionConfigCmd(os.Args[2:]))
+		return sessionConfigCmd(args[1:])
 	case "fetch-schemas":
-		os.Exit(fetchSchemasCmd(os.Args[2:]))
+		return fetchSchemasCmd(args[1:])
 	case "help", "-h", "--help":
 		usage(os.Stdout)
+		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "opencode-rig: unknown subcommand %q\n\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "opencode-rig: unknown subcommand %q\n\n", args[0])
 		usage(os.Stderr)
-		os.Exit(2)
+		return 2
 	}
 }
 
@@ -78,13 +92,18 @@ Run flags (run):
   --schemas live|file                          tool catalog: fetch the plane's real
                                                tools/list, or load a file
   --plane-url URL                              plane MCP URL for the live fetch
-  --schema-tool name                           tool the schema scenario calls
+  --schema-tool name                           tool the schema scenario calls, as the
+                                               catalog names it (default update_task)
   --plane-key-file file                        read CLANKERBAR_API_KEY from this file
-  --provider-key-file file                     read COMMANDCODE_API_KEY from this file
+  --provider-key-file file                     read the provider key from this file
+  --provider-key-env VAR                       environment variable the provider key is
+                                               set in (default COMMANDCODE_API_KEY)
+  --env KEY=VALUE                              extra environment for the session (repeatable)
   --out dir                                    run directory (default
                                                $TMPDIR/opencode-rig/<scenario>-<stamp>)
   --deadline duration                          kill the session after this (default 5m)
-  --max-tool-calls N                           stop after N stub calls (default 6)
+  --max-tool-calls N                           the stub refuses the Nth call and the run
+                                               stops there (0 = no cap; default 6)
   --prompt text                                override the scenario prompt
   --opencode-bin path                          opencode binary (default "opencode")
   --dry-run                                    resolve and print everything, spawn nothing

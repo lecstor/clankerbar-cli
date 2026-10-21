@@ -96,20 +96,42 @@ func TestStubCapsCalls(t *testing.T) {
 	if len(responses) != 2 {
 		t.Fatalf("got %d responses", len(responses))
 	}
+	// --max-tool-calls N stops the session AT N calls: the Nth is refused, not
+	// answered with an N+1'th.
 	first := responses[1].(map[string]any)
-	if first["isError"] == true {
-		t.Error("first call should be within the cap")
+	if first["isError"] != true {
+		t.Fatalf("the 1st call with --max-tool-calls 1 isError = %v, want true", first["isError"])
 	}
-	second := responses[2].(map[string]any)
-	if second["isError"] != true {
-		t.Fatalf("call beyond the cap isError = %v, want true", second["isError"])
-	}
-	text := second["content"].([]any)[0].(map[string]any)["text"].(string)
+	text := first["content"].([]any)[0].(map[string]any)["text"].(string)
 	if !strings.Contains(text, "rig_tool_cap") {
 		t.Errorf("cap response = %s", text)
 	}
+	second := responses[2].(map[string]any)
+	if second["isError"] != true {
+		t.Fatalf("a call past the cap isError = %v, want true", second["isError"])
+	}
 	if !fileExists(dir + "/stub-capped") {
 		t.Error("stub-capped marker missing")
+	}
+}
+
+// TestStubCapIsOffAtZero pins the "0 = no cap" reading: no call is refused and
+// no marker is written.
+func TestStubCapIsOffAtZero(t *testing.T) {
+	dir := t.TempDir()
+	stdin := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_task","arguments":{"taskId":"CLA-1"}}}`)
+	var out bytes.Buffer
+	if err := serveStub(context.Background(), stdin, &out, stubOptions{
+		Scenario: "reasoning-replay", Out: dir, Catalog: testCatalog(t), MaxCalls: 0,
+	}); err != nil {
+		t.Fatalf("serveStub: %v", err)
+	}
+	responses := parseStubResponses(t, out.String())
+	if responses[1].(map[string]any)["isError"] == true {
+		t.Error("a call was refused with no cap set")
+	}
+	if fileExists(dir + "/stub-capped") {
+		t.Error("stub-capped marker written with no cap set")
 	}
 }
 
@@ -129,7 +151,7 @@ func TestReviewPadding(t *testing.T) {
 
 func TestEveryScenarioHasAPromptAndResponder(t *testing.T) {
 	for name, sc := range scenarios() {
-		if strings.TrimSpace(sc.Prompt) == "" {
+		if sc.PromptFor == nil && strings.TrimSpace(sc.Prompt) == "" {
 			t.Errorf("%s: empty prompt", name)
 		}
 		if sc.Respond == nil {
@@ -138,6 +160,40 @@ func TestEveryScenarioHasAPromptAndResponder(t *testing.T) {
 		if sc.Name != name {
 			t.Errorf("%s: Name = %q", name, sc.Name)
 		}
+	}
+}
+
+// TestSchemaScenarioPromptFollowsTheSelectedTool is the regression this exists
+// for: a proposed tool (or any other catalog tool) must be the one the prompt
+// asks for, or the scenario tests the wrong schema.
+func TestSchemaScenarioPromptFollowsTheSelectedTool(t *testing.T) {
+	schema := scenarios()["schema"]
+
+	got := schema.promptFor("frobnicate")
+	if !strings.Contains(got, "clankerbar_frobnicate") {
+		t.Errorf("--schema-tool frobnicate prompt = %q, want it to ask for clankerbar_frobnicate", got)
+	}
+	if strings.Contains(got, "clankerbar_update_task") {
+		t.Errorf("--schema-tool frobnicate prompt still asks for update_task: %q", got)
+	}
+
+	// The default selection keeps the nullable-null shape update_task exists for.
+	defaulted := schema.promptFor("update_task")
+	if !strings.Contains(defaulted, "clankerbar_update_task") || !strings.Contains(defaulted, "priority null") {
+		t.Errorf("default schema prompt = %q", defaulted)
+	}
+
+	// An already-prefixed name is not prefixed twice.
+	if got := schemaToolName("clankerbar_frobnicate"); got != "clankerbar_frobnicate" {
+		t.Errorf("schemaToolName = %q", got)
+	}
+	if got := schemaToolName(""); got != "clankerbar_update_task" {
+		t.Errorf("schemaToolName(\"\") = %q", got)
+	}
+
+	// A scenario that does not name a tool is unaffected by the flag.
+	if got := scenarios()["padding"].promptFor("frobnicate"); strings.Contains(got, "frobnicate") {
+		t.Errorf("padding prompt drifted with --schema-tool: %q", got)
 	}
 }
 

@@ -108,13 +108,13 @@ func runCmd(args []string) int {
 	fs.StringVar(&o.Out, "out", "", "run directory (default $TMPDIR/opencode-rig/<scenario>-<stamp>)")
 	fs.StringVar(&o.Schemas, "schemas", "live", "tool catalog: live, or a file")
 	fs.StringVar(&o.PlaneURL, "plane-url", "https://clankerbar.com/mcp/clankerbar", "plane MCP URL for the live schema fetch")
-	fs.StringVar(&o.SchemaTool, "schema-tool", "update_task", "tool the schema scenario calls")
+	fs.StringVar(&o.SchemaTool, "schema-tool", "update_task", "tool the schema scenario calls, as the catalog names it")
 	fs.StringVar(&o.PlaneKeyFile, "plane-key-file", "", "read CLANKERBAR_API_KEY from this file")
 	fs.StringVar(&o.ProviderKeyFile, "provider-key-file", "", "read the provider key from this file")
 	fs.StringVar(&o.ProviderKeyEnv, "provider-key-env", "COMMANDCODE_API_KEY", "environment variable the provider key is set in")
 	fs.Var((*stringList)(&o.ExtraEnv), "env", "extra KEY=VALUE for the session (repeatable)")
 	fs.DurationVar(&o.Deadline, "deadline", 5*time.Minute, "kill the session after this")
-	fs.IntVar(&o.MaxToolCalls, "max-tool-calls", 6, "stop after this many stub calls (0 = no cap)")
+	fs.IntVar(&o.MaxToolCalls, "max-tool-calls", 6, "the stub refuses the Nth call and the run stops there (0 = no cap)")
 	fs.StringVar(&o.Prompt, "prompt", "", "override the scenario prompt")
 	fs.StringVar(&o.OpencodeBin, "opencode-bin", "opencode", "opencode binary")
 	fs.BoolVar(&o.DryRun, "dry-run", false, "resolve and print everything, spawn nothing")
@@ -293,17 +293,23 @@ func runRig(o runOptions) (int, error) {
 	if err != nil {
 		return 1, err
 	}
-	content, err := generatedContent(sourcePath, o.Workdir, false)
+	// readOnly=true pins the adapter's READ-ONLY policy (internal/harness:
+	// shell and edit denied, reads scoped to the workdir). The rig never studies
+	// a write, and the fleet's writable policy allows `shell` unscoped - a shell
+	// tool would read the whole checkout regardless of the sandbox's path rules.
+	content, err := generatedContent(sourcePath, o.Workdir, true)
 	if err != nil {
 		return 1, fmt.Errorf("generating the session config through harness.OpencodeSessionConfig: %w", err)
 	}
 	contentPath := filepath.Join(o.Out, "opencode-config-content.json")
-	if err := os.WriteFile(contentPath, content, 0o644); err != nil {
+	// The content layer carries the provider block, so a literal apiKey in the
+	// source config lands here too: never world-readable.
+	if err := writeCredentialFile(contentPath, content); err != nil {
 		return 1, err
 	}
 
 	scenario := scenarios()[o.Scenario]
-	prompt := scenario.Prompt
+	prompt := scenario.promptFor(o.SchemaTool)
 	if o.Prompt != "" {
 		prompt = o.Prompt
 	}
@@ -358,8 +364,10 @@ func runRig(o runOptions) (int, error) {
 		rec.RunID, o.Scenario, o.Model, o.Provider, len(cat.Tools), schemaSourceLabel(o.Schemas), proxyURL, upstream, o.Out)
 
 	if o.DryRun {
-		rec.FinishedAt = time.Now().UTC().Format(time.RFC3339)
-		_ = writeJSON(filepath.Join(o.Out, "run.json"), rec)
+		// Deliberately no run.json: a dry run spawns nothing, and the reuse guard
+		// above refuses any directory holding one - so writing the record here
+		// would make the very directory unusable for the real run it exists to
+		// prepare.
 		display := o
 		display.ServerURL = "<url>"
 		fmt.Printf("  dry run: would start opencode serve, wait for MCP server %q, then attach with:\n  %s %s\n",
@@ -599,7 +607,10 @@ func sessionEnv(o runOptions, content []byte, isolation, extra []string) []strin
 	// A caller-supplied OPENCODE_PERMISSION is a 1.x relic and must not shadow
 	// the content layer's policy. OPENCODE_PASSWORD is cleared here so an
 	// inherited value cannot reach the server; the run adds its own below.
-	overrides = append(overrides, "OPENCODE_PERMISSION=", "OPENCODE_PASSWORD=")
+	// CLANKERBAR_API_KEY is cleared too: the session talks to the stub and has no
+	// plane connection, so the key is only an exposure - an ambient MCP server
+	// loaded from another config layer would otherwise inherit it.
+	overrides = append(overrides, "OPENCODE_PERMISSION=", "OPENCODE_PASSWORD=", "CLANKERBAR_API_KEY=")
 	if o.ServerPassword != "" {
 		overrides = append(overrides, "OPENCODE_PASSWORD="+o.ServerPassword)
 	}

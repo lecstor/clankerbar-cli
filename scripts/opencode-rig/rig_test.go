@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -130,6 +132,87 @@ echo 'stderr note' >&2
 	if !strings.Contains(string(stderr), "stderr note") {
 		t.Errorf("stderr = %q", stderr)
 	}
+}
+
+// TestDispatchAcceptsTheDocumentedFlagOnlyInvocation is the regression for the
+// rig's own Quick start: `run.sh --model ...` (no `run` word) must run, and a
+// --dry-run must not poison the directory it prepared.
+func TestDispatchAcceptsTheDocumentedFlagOnlyInvocation(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "run")
+	args := []string{
+		"--model", "commandcode/gpt-6-luna",
+		"--scenario", "schema",
+		"--schema-tool", "frobnicate",
+		"--schemas", filepath.Join("testdata", "schema-proposed.json"),
+		"--upstream", "https://api.commandcode.invalid/provider/v1",
+		"--out", out,
+		"--dry-run",
+	}
+	printed := captureStdout(t, func() int { return dispatch(args) })
+	if !strings.Contains(printed, "clankerbar_frobnicate") {
+		t.Errorf("the dry run's printed session does not ask for the selected tool:\n%s", printed)
+	}
+
+	// A dry run writes no run.json, so the very directory it prepared is usable
+	// by the real run (the reuse guard refuses a directory that holds one).
+	if fileExists(filepath.Join(out, "run.json")) {
+		t.Fatal("--dry-run wrote run.json; the directory is now refused for the real run")
+	}
+	if code := dispatch(args); code != 0 {
+		t.Fatalf("second dispatch into the same --out = %d, want 0", code)
+	}
+
+	// The rig pins the adapter's read-only policy: `shell` unscoped would let the
+	// model read the repo the sandbox rules were meant to hide.
+	content, err := os.ReadFile(filepath.Join(out, "opencode-config-content.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(content, &doc); err != nil {
+		t.Fatal(err)
+	}
+	perm := doc["permission"].(map[string]any)
+	if perm["shell"] != "deny" {
+		t.Errorf("permission.shell = %v, want deny (the read-only policy)", perm["shell"])
+	}
+	if perm["edit"] != "deny" {
+		t.Errorf("permission.edit = %v, want deny", perm["edit"])
+	}
+
+	// Both config artifacts can carry a literal provider key: owner-only.
+	for _, name := range []string{"opencode-config.json", "opencode-config-content.json"} {
+		info, err := os.Stat(filepath.Join(out, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Errorf("%s mode = %04o, want 0600", name, got)
+		}
+	}
+}
+
+// captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
+// printed.
+func captureStdout(t *testing.T, fn func() int) string {
+	t.Helper()
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := os.Stdout
+	os.Stdout = w
+	code := fn()
+	os.Stdout = old
+	w.Close()
+	data, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("dispatch = %d, want 0", code)
+	}
+	return string(data)
 }
 
 func runDirs(t *testing.T) (out, work string) {

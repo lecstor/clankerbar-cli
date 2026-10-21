@@ -157,7 +157,9 @@ func serveStub(ctx context.Context, in io.Reader, out io.Writer, opts stubOption
 			mu.Unlock()
 
 			var res toolResult
-			capped := opts.MaxCalls > 0 && n > opts.MaxCalls
+			// The Nth call is the one refused: --max-tool-calls N means the
+			// session is stopped AT N calls, not after N were answered.
+			capped := opts.MaxCalls > 0 && n >= opts.MaxCalls
 			if capped {
 				// Stop the model rather than let it loop: the rig kills the
 				// session when this marker lands, and the call is still logged.

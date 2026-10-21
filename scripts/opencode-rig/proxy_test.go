@@ -130,12 +130,42 @@ func TestProxyDoesNotRecordAnInboundAuthorizationHeaderUnderAnyName(t *testing.T
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Proxy-Authorization", "Bearer "+secret)
 	req.Header.Set("Cookie", "session="+secret)
+	// Providers carrying the key under another name are the same secret: the
+	// redaction is a rule, not the four headers the first version named.
+	req.Header.Set("x-api-key", secret)
+	req.Header.Set("api-key", secret)
+	req.Header.Set("x-goog-api-key", secret)
+	req.Header.Set("x-auth-token", secret)
+	req.Header.Set("x-secret", secret)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-request-id", "kept-on-purpose")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
 	assertNoSecretOnDisk(t, dir, secret)
+
+	// And the record says what it dropped, so the omission is checkable.
+	requests, err := readRequests(filepath.Join(dir, "requests"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(requests) != 1 {
+		t.Fatalf("recorded %d requests, want 1", len(requests))
+	}
+	got := strings.Join(requests[0].Redacted, ",")
+	for _, want := range []string{"Api-Key", "Authorization", "Cookie", "Proxy-Authorization", "X-Api-Key", "X-Auth-Token", "X-Goog-Api-Key", "X-Secret"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("redactedHeaders = %s, missing %s", got, want)
+		}
+	}
+	if _, kept := requests[0].Headers["X-Request-Id"]; !kept {
+		t.Errorf("a non-credential header was dropped: %v", requests[0].Headers)
+	}
+	if !requests[0].AuthOmit {
+		t.Error("record does not state that Authorization was omitted")
+	}
 }
 
 func TestProxyPassesThroughUpstreamErrors(t *testing.T) {
