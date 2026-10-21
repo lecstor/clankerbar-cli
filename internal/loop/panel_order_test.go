@@ -82,12 +82,17 @@ func TestPanelMembersStartInListOrderAndBackfill(t *testing.T) {
 	}
 }
 
-// TestPanelMembersReleaseBeforeTheSuccessorRuns pins the ORDER of the release
-// against the scheduler: member k's release must be observed BEFORE member k+1's
-// run function begins. Closing the member's started channel is what unblocks the
-// scheduler, so a release observed after that close would let the successor run
-// first; the panel's release-point assertion counts releases at a launch and
-// would silently become a race (CLA-757 review 1.review-1.2).
+// TestPanelMembersReleaseBeforeTheSuccessorRuns observes that member k's release
+// is recorded before member k+1's run function begins, and would catch a
+// consistently wrong order. Whether the successor's run function begins before
+// the release is recorded is schedule-dependent, not pinned: the successor's
+// start after the close is a scheduling race — in the real panel it also has its
+// own git worktree add to get through — so a lucky run can still see the release
+// first. A swap in the release's order would silently turn the panel's
+// release-point assertion, which counts releases at a launch, into a race.
+// TestReleaseFiresBeforeTheSuccessorIsUnblocked is the deterministic pin for that
+// ordering; do not read this test as covering it (CLA-757 review rounds
+// 1.review-1.2 and 2.review-5.1).
 func TestPanelMembersReleaseBeforeTheSuccessorRuns(t *testing.T) {
 	const n = 4
 	var mu sync.Mutex
