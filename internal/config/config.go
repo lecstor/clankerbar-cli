@@ -495,7 +495,7 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE TASK " +
 	"in BOTH forms the shape above prescribes, in that order - FIRST the legacy outcome block with " +
 	"update_task(taskId, runId, outcome: ...), THEN the sealed durable record with " +
-	"update_task(taskId, runId, review: {...}). The durable record is the driver's seam evidence; the block is " +
+	ReviewRecordCallPlaceholder + ". The durable record is the driver's seam evidence; the block is " +
 	"the one-release compatibility copy. This is a CHECKPOINT, not a hand-off: " +
 	"keep holding the task - do NOT release it, do NOT move it to in_review, and do NOT COMMIT, PUSH or open a " +
 	"PR. The driver checkpoints on the branch the implement phase recorded, and the phase after you resumes " +
@@ -510,8 +510,8 @@ const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the pha
 // (the round is sealed the moment the record lands, CLA-636 B3) and could
 // easily read that refusal as the phase failing.
 const panelMemberTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
-	"TASK in the ONE form the shape above prescribes - the sealed durable record with update_task(taskId, runId, " +
-	"review: {...}) - and write NOTHING ELSE on the task: do NOT call update_task with an outcome, do not write " +
+	"TASK in the ONE form the shape above prescribes - the sealed durable record with " +
+	ReviewRecordCallPlaceholder + " - and write NOTHING ELSE on the task: do NOT call update_task with an outcome, do not write " +
 	"an outcome of your own, and do not touch the task's status or body. That is a CHECKPOINT, not a hand-off: " +
 	"keep holding the task - do NOT release it, do NOT move it to in_review, and do NOT COMMIT, PUSH or open a " +
 	"PR. The driver checkpoints on the branch the implement phase recorded, and the phase after you (the next " +
@@ -583,7 +583,9 @@ const reviewRecordTipNone = " There is NO branch and NO tip to review: this reco
 	"this variant's review record, and the driver gates the seam on it."
 
 // reviewRecordDurableShape is the durable half (CLA-637): one sealed
-// per-reviewer record per run, written through update_task.review. It is the
+// per-reviewer record per run, written through record_review where the plane
+// serves it and update_task.review below that (CLA-743 - the placeholder is
+// resolved at spawn from the plane's protocol version). It is the
 // driver's seam evidence — round, role, run and reviewed tip are what the gate
 // matches — and per-finding `raisedByModel` is what the analytics need.
 //
@@ -592,7 +594,7 @@ const reviewRecordTipNone = " There is NO branch and NO tip to review: this reco
 // the legacy outcome block must be written FIRST. The driver closes the round
 // before spawning the fix phase, which releases the findings to it.
 const reviewRecordDurableShape = " THEN, and only after that outcome write has SUCCEEDED, append THIS run's durable " +
-	"review record with update_task(taskId, runId, review: {...}). This order is load-bearing: the plane seals the " +
+	"review record with " + ReviewRecordCallPlaceholder + ". This order is load-bearing: the plane seals the " +
 	"record's round, and a sealed record makes this run's outcome, body and decision writes illegal - so the legacy " +
 	"block above must already be on the task. The durable record is what the driver's review->fix seam checks; a " +
 	"missing or mismatched one means the fix phase does not spawn. Send exactly: reviewerRole: \"" +
@@ -666,7 +668,7 @@ const panelMemberRecordIntro = " You are ONE MEMBER of a review PANEL: several r
 	"findings - review the revision yourself and record your own."
 
 const panelMemberRecordBody = " THE RECORD IS YOUR DELIVERABLE, and it is the ONLY thing you write on the " +
-	"task: record it with update_task(taskId, runId, review: {...}). Do NOT write the task's outcome - do not " +
+	"task: record it with " + ReviewRecordCallPlaceholder + ". Do NOT write the task's outcome - do not " +
 	"call update_task with an outcome or a status, and do not hand the task over: the fix phase carries the " +
 	"panel's findings into the task's outcome, and the member after you reads the task, so an outcome write here " +
 	"would leak this review to a reviewer that must not see it. Send exactly: reviewerRole: \"" +
@@ -801,7 +803,7 @@ const fixOutcomeRecord = "the outcome MUST keep everything the existing outcome 
 // ordering rule that DOES name the hand-over lives in fixTerminalRecord, where
 // the phase making that call is the one reading it.
 const fixFindingUpdates = " While you still hold the task, update every finding's " +
-	"status on the DURABLE review record with update_task(taskId, runId, review: {findingUpdates: [...]}) — one " +
+	"status on the DURABLE review record with " + ReviewFindingsCallPlaceholder + " — one " +
 	"entry per finding, by the plane-assigned `id` the record gave you: {findingId, status: \"fixed\", " +
 	"fixCommit: <the commit SHA>} for a fixed finding; {findingId, status: \"refuted\", refutedReason: <the " +
 	"evidence that refutes it>} for a MUST you did not fix; {findingId, status: \"filed\", filedTaskRef: <the " +
@@ -1432,7 +1434,7 @@ var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of
 // refused call at best and a wedged run at worst, and the seam does not need it.
 const noCodeReviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
 	"TASK with update_task(taskId, runId, outcome: ...), in the shape above - the LEGACY `" + ReviewRecordHeading +
-	"` block ONLY. Do NOT attempt update_task(review: ...) here: a settled task has no live holder to accept it, " +
+	"` block ONLY. Do NOT attempt a durable review record write here: a settled task has no live holder to accept it, " +
 	"and on a still-held no-code task it would seal a round this variant never closes - the block IS this " +
 	"variant's review record and the driver's seam gates on it. This " +
 	"is a CHECKPOINT, not a " +
@@ -1639,18 +1641,11 @@ const verifyDriverBounds = " The driver counts rounds: this is a hard cap of thr
 // remains open, otherwise a silent hold for the driver to spawn another fix.
 const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
 	"any MUST is still open after your adjudication, and the round number the append returned.\n\n" +
-	"If ANY MUST remains open: release this round with ONE call — update_task(taskId, runId, review: " +
-	"{ closeRound: <the round the append returned> }) — then do NOT open a PR, do NOT move the task to " +
+	"If ANY MUST remains open: release this round with ONE call — " + ReviewCloseCallPlaceholder +
+	" — then do NOT open a PR, do NOT move the task to " +
 	"in_review, and do NOT change its status. End holding the task. The driver spawns another fix against " +
 	"the released findings, or parks the task at the round cap.\n\n" +
-	"If NO MUST remains open, carry the hand-over in the SAME call that releases the round: confirm the " +
-	"branch is pushed (push any fix commit that is still local), open a PR targeting the repo's PR base (" +
-	PhasePRBasePlaceholder + ") if none exists for the branch, then call update_task(taskId, runId, status: " +
-	"\"in_review\", review: { closeRound: <the round the append returned> }). Do NOT send an outcome in " +
-	"that call: your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), " +
-	"and the fix phase has already written the **Tests** section the in_review guard reads. Releasing the " +
-	"round in the same call is what makes the status move legal — after the task leaves in_progress the plane " +
-	"no longer accepts a close from this run. Never decide to run one more round yourself."
+	VerifyHandoverStepPlaceholder
 
 // noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
 // counterpart of verifyTerminalStep. This shape writes no durable record
@@ -1707,7 +1702,7 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"whole diff, whose full pass already happened; a full second pass is the exception you state a reason for " +
 	"in the record. " +
 	"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID — exactly one disposition each, recorded through " +
-	"update_task(review: {findingUpdates: [...]}) on the CLOSED record it belongs to: " +
+	ReviewFindingsCallPlaceholder + " on the CLOSED record it belongs to: " +
 	"(1) RESOLVED — the fix is present and correct: status \"fixed\" with fixCommit. " +
 	"(2) RESOLVED BY DISPATCH — the fix is a follow-up task: status \"filed\" with filedTaskRef. " +
 	"(3) REFUTATION ACCEPTED — the fixer's evidence shows the finding was wrong: status \"refuted\" with " +
@@ -1726,7 +1721,7 @@ var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTota
 	"(and pushing a fix commit that the fixer left local) is the terminal step, not a review change. " +
 	"RECORD THE ROUND IN BOTH FORMS: first append the legacy `" + ReviewRecordHeading + "` block to the task's " +
 	"outcome with update_task(taskId, runId, outcome: ...) — append, never replace what sits above it — then " +
-	"append the sealed durable record with update_task(taskId, runId, review: {...}) naming reviewerRole " +
+	"append the sealed durable record with " + ReviewRecordCallPlaceholder + " naming reviewerRole " +
 	"\"{{reviewerRole}}\", reviewedTip `git rev-parse HEAD`, scope kind \"fix-delta\" with base and range " +
 	"(`<reviewedTip>..HEAD`), a verdict of pass or findings, and every new finding graded must/should/nit with " +
 	"the evidence a MUST requires. The durable record is the driver's seam evidence; the block is the " +
@@ -1920,14 +1915,107 @@ const (
 	// check out and review.
 	ReviewerRolePlaceholder = "{{reviewerRole}}"
 	ReviewedTipPlaceholder  = "{{reviewedTip}}"
+
+	// ReviewRecordCallPlaceholder, ReviewCloseCallPlaceholder,
+	// ReviewFindingsCallPlaceholder and VerifyHandoverStepPlaceholder are the
+	// review WRITE shape, which depends on the plane's protocol version
+	// (CLA-743): `record_review` is served from ReviewToolProtocol up, and
+	// `update_task(review: ...)` is the only door below it. They are placeholders
+	// rather than two whole variants of every brief because ReviewShaped and
+	// VerifyShaped compare a resolved prompt against the shipped constants by
+	// identity - a second copy of each brief would have to be added to those
+	// switches and could silently fall out of them.
+	ReviewRecordCallPlaceholder   = "{{reviewRecordCall}}"
+	ReviewCloseCallPlaceholder    = "{{reviewCloseCall}}"
+	ReviewFindingsCallPlaceholder = "{{reviewFindingsCall}}"
+	VerifyHandoverStepPlaceholder = "{{verifyHandoverStep}}"
 )
+
+// ReviewToolProtocol is the first plane protocol version that serves
+// `record_review` (CLA-742, changelog entry 40). At or above it, a review write
+// goes through the strict-client-safe tool; below it, the only door is
+// `update_task(review: ...)`, which every plane that serves record_review still
+// accepts as well.
+const ReviewToolProtocol = 40
+
+// ReviewToolServed reports whether a plane at protocolVersion serves
+// `record_review`. 0 is "unknown" - blind mode never polls, and an older plane's
+// summary may omit the field - and takes the legacy wording, which works on
+// every plane and so cannot fail on a tool the plane has never heard of.
+func ReviewToolServed(protocolVersion int) bool {
+	return protocolVersion >= ReviewToolProtocol
+}
+
+// ReviewRecordCall is the call that appends a whole durable review record.
+func ReviewRecordCall(protocolVersion int) string {
+	if ReviewToolServed(protocolVersion) {
+		return "record_review(taskId, runId, {...})"
+	}
+	return "update_task(taskId, runId, review: {...})"
+}
+
+// ReviewCloseCall is the call that closes a review round.
+func ReviewCloseCall(protocolVersion int) string {
+	if ReviewToolServed(protocolVersion) {
+		return "record_review(taskId, runId, {closeRound: <the round the append returned>})"
+	}
+	return "update_task(taskId, runId, review: {closeRound: <the round the append returned>})"
+}
+
+// ReviewFindingsCall is the call that updates findings on a closed record.
+func ReviewFindingsCall(protocolVersion int) string {
+	if ReviewToolServed(protocolVersion) {
+		return "record_review(taskId, runId, {findingUpdates: [...]})"
+	}
+	return "update_task(taskId, runId, review: {findingUpdates: [...]})"
+}
+
+// VerifyHandoverStep is the verification round's "no MUST remains open" ending.
+// It differs by protocol because record_review cannot carry a status move: a
+// plane serving it takes TWO calls, in an order that is load-bearing (the
+// plane accepts a round close only from a run that still HOLDS the task, so the
+// close must land before the in_review move), while an older plane takes the one
+// call the pre-record_review CLI always made.
+//
+// prBase is passed in rather than left as PhasePRBasePlaceholder in the text:
+// this string is itself a REPLACEMENT VALUE in the driver's single replacer
+// pass, and a placeholder inside a replacement is never rescanned (the one-pass
+// rule that keeps a claim-derived value containing "{{model}}" intact). A
+// literal placeholder here would reach the session unresolved.
+func VerifyHandoverStep(protocolVersion int, prBase string) string {
+	base := ""
+	if prBase != "" {
+		base = " (" + prBase + ")"
+	}
+	if !ReviewToolServed(protocolVersion) {
+		return "If NO MUST remains open, carry the hand-over in the SAME call that releases the round: confirm the " +
+			"branch is pushed (push any fix commit that is still local), open a PR targeting the repo's PR base" +
+			base + " if none exists for the branch, then call update_task(taskId, runId, status: " +
+			"\"in_review\", review: { closeRound: <the round the append returned> }). Do NOT send an outcome in " +
+			"that call: your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), " +
+			"and the fix phase has already written the **Tests** section the in_review guard reads. Releasing the " +
+			"round in the same call is what makes the status move legal — after the task leaves in_progress the plane " +
+			"no longer accepts a close from this run. Never decide to run one more round yourself."
+	}
+	return "If NO MUST remains open: carry the hand-over in TWO calls, IN THIS ORDER. FIRST confirm the " +
+		"branch is pushed (push any fix commit that is still local) and open a PR targeting the repo's PR base" +
+		base + " if none exists for the branch. THEN close the round with " +
+		"record_review(taskId, runId, { closeRound: <the round the append returned> }) while the task is " +
+		"still in_progress: this order is load-bearing, because the plane accepts a round close only from the run " +
+		"that still HOLDS the task, and once the task leaves in_progress this run can no longer close it. " +
+		"FINALLY move the task with update_task(taskId, runId, status: \"in_review\"). Do NOT send an outcome in " +
+		"that call: your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), " +
+		"and the fix phase has already written the **Tests** section the in_review guard reads. Never decide to " +
+		"run one more round yourself."
+}
 
 // ReviewRecordHeading is the marker of the LEGACY block a review-only phase
 // still records in the task's outcome for one release (CLA-637), so older
 // planes and readers keep seeing a review where they expect one. The durable
-// per-reviewer record written through update_task.review is the interface the
-// driver's review→fix seam gate reads now; this block is carried for
-// compatibility, and the fix phase keeps it verbatim in its own outcome.
+// per-reviewer record (record_review on a plane that serves it, and
+// update_task.review below that) is the interface the driver's review→fix seam
+// gate reads now; this block is carried for compatibility, and the fix phase
+// keeps it verbatim in its own outcome.
 //
 // It deliberately carries no round number. The round lives in the durable
 // record, assigned by the plane; a hard-coded "round 1" would be false on any

@@ -72,6 +72,19 @@ type Summary struct {
 	// to 0, which is also "nothing stored", so an old plane degrades to today's
 	// behaviour with no version negotiation — the same shape StaleClaimable rides.
 	RunConfigVersion int
+
+	// ProtocolVersion is the plane's served protocol version (CLA-743), the same
+	// number the MCP `backlog` block and the served skill carry. The driver reads
+	// it off this cheap poll so a phase brief can name the tool the plane
+	// actually serves: record_review exists from protocol 40, and a brief that
+	// prescribed it against an older plane would send every review session to a
+	// tool the plane answers as unknown.
+	//
+	// 0 means UNKNOWN — a plane older than the field, or blind mode with no poll —
+	// and every caller treats it as older: the legacy update_task(review: ...)
+	// wording works on every plane that serves record_review too, so an unknown
+	// version degrades to the call that cannot fail on tool lookup.
+	ProtocolVersion int
 }
 
 // Settled is the count of work that has reached a reviewer or is finished — the
@@ -290,6 +303,7 @@ func parseSummary(body []byte) (Summary, error) {
 		LoopPaused     bool `json:"loopPaused"`
 
 		RunConfigVersion int `json:"runConfigVersion"`
+		ProtocolVersion  int `json:"protocolVersion"`
 	}
 	if err := json.Unmarshal(trimmed, &payload); err != nil {
 		return Summary{}, fmt.Errorf("decode backlog summary: %w", err)
@@ -305,6 +319,7 @@ func parseSummary(body []byte) (Summary, error) {
 		InReview:         payload.Counts.InReview,
 		Done:             payload.Counts.Done,
 		RunConfigVersion: payload.RunConfigVersion,
+		ProtocolVersion:  payload.ProtocolVersion,
 	}, nil
 }
 

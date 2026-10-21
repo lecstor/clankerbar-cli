@@ -152,11 +152,14 @@ type Recorder interface {
 // compile. The driver refuses the checkpoint when the closer is unavailable: a
 // fix phase that cannot see the findings would be spawned to apply nothing.
 type ReviewRoundCloser interface {
-	// CloseReviewRound closes round on taskID through update_task(review:
-	// {closeRound: round}), signed by runID. The plane refuses a caller that is
-	// not the task's holding run, and answers no_open_round for a round that was
-	// already closed or voided - both are reported as errors.
-	CloseReviewRound(ctx context.Context, taskID, runID string, round int) error
+	// CloseReviewRound closes round on taskID, signed by runID. useRecordReview
+	// selects the door: true sends record_review (the plane serves it from
+	// protocol 40), false sends update_task(review: {closeRound: round}), the
+	// only shape an older plane understands. Both write the same record and are
+	// refused for a caller that is not the task's holding run, and answer
+	// no_open_round for a round already closed or voided - both reported as
+	// errors.
+	CloseReviewRound(ctx context.Context, taskID, runID string, round int, useRecordReview bool) error
 }
 
 // ParkAPI is the optional interface a Releaser may implement to let the driver
@@ -395,21 +398,33 @@ func (r *mcpReleaser) RecordBranch(ctx context.Context, taskID, runID, branch st
 	})
 }
 
-// CloseReviewRound closes one round of the durable review record (CLA-637) in
-// the shape CLA-636 added: update_task(review: {closeRound: round}), signed by
-// the holding run. It sends nothing else - a close is not a revision, not a
-// status move and not an outcome write.
+// CloseReviewRound closes one round of the durable review record (CLA-637),
+// signed by the holding run. It sends nothing else - a close is not a revision,
+// not a status move and not an outcome write.
+//
+// The door is chosen by the caller from the plane's protocol version (CLA-743):
+// record_review({taskId, runId, closeRound}) where the plane serves it, and
+// update_task(review: {closeRound}) below it. Both are the same write path on the
+// plane; the separate tool exists for strict-mode clients, and a plane older
+// than it answers record_review as an unknown tool.
 //
 // The round is the driver's, not the reviewer's: the session writes the sealed
 // record and the driver closes it at the seam, which is what releases the
 // findings to the fix phase while keeping each reviewer's record sealed from
 // the next reviewer reading the task.
-func (r *mcpReleaser) CloseReviewRound(ctx context.Context, taskID, runID string, round int) error {
+func (r *mcpReleaser) CloseReviewRound(ctx context.Context, taskID, runID string, round int, useRecordReview bool) error {
 	if taskID == "" || runID == "" {
 		return errors.New("close review round: taskId and runId are both required")
 	}
 	if round <= 0 {
 		return errors.New("close review round: round must be positive")
+	}
+	if useRecordReview {
+		return r.call(ctx, "record_review", map[string]any{
+			"taskId":     taskID,
+			"runId":      runID,
+			"closeRound": round,
+		})
 	}
 	return r.call(ctx, "update_task", map[string]any{
 		"taskId": taskID,

@@ -597,7 +597,7 @@ func TestMergedFindingsDigest(t *testing.T) {
 			},
 		},
 	}
-	got := mergedFindingsDigest(records, []string{"review-1", "review-2"}, 1, nil)
+	got := mergedFindingsDigest(records, []string{"review-1", "review-2"}, 1, nil, config.ReviewToolProtocol)
 
 	// A MUST only review-1 raised is still listed, alone in its severity.
 	if !strings.Contains(got, "MUST (1):") || !strings.Contains(got, "1.review-1.1") {
@@ -623,7 +623,7 @@ func TestMergedFindingsDigest(t *testing.T) {
 	// A member with no record is named incomplete, so the fixer knows the list
 	// is the union of the reviewers that RAN — and with its reason, when the
 	// panel handler has one (M4).
-	got = mergedFindingsDigest(records, []string{"review-1", "review-2", "review-3"}, 1, map[string]string{"review-3": "hit a usage limit before recording"})
+	got = mergedFindingsDigest(records, []string{"review-1", "review-2", "review-3"}, 1, map[string]string{"review-3": "hit a usage limit before recording"}, config.ReviewToolProtocol)
 	if !strings.Contains(got, "INCOMPLETE") || !strings.Contains(got, "review-3") {
 		t.Errorf("the missing member is not named:\n%s", got)
 	}
@@ -635,7 +635,7 @@ func TestMergedFindingsDigest(t *testing.T) {
 	// plane released. Its member is therefore named incomplete — the panel's
 	// records exist but the fixer cannot see their content — and no finding text
 	// can leak.
-	got = mergedFindingsDigest([]plane.ReviewRecordState{{Round: 1, ReviewerRole: "review-1", State: "sealed"}}, []string{"review-1"}, 1, nil)
+	got = mergedFindingsDigest([]plane.ReviewRecordState{{Round: 1, ReviewerRole: "review-1", State: "sealed"}}, []string{"review-1"}, 1, nil, config.ReviewToolProtocol)
 	if !strings.Contains(got, "INCOMPLETE") {
 		t.Errorf("a sealed record left the panel reading complete:\n%s", got)
 	}
@@ -651,7 +651,7 @@ func TestMergedFindingsDigest(t *testing.T) {
 		Round: 4, ReviewerRole: "review-3", RunID: "r-0", State: "open",
 		Findings: []plane.ReviewFindingState{mustFinding("4.review-3.1", "open", "an earlier cycle's MUST")},
 	}
-	got = mergedFindingsDigest(append(append([]plane.ReviewRecordState{}, records...), older), []string{"review-1", "review-2", "review-3"}, 1, nil)
+	got = mergedFindingsDigest(append(append([]plane.ReviewRecordState{}, records...), older), []string{"review-1", "review-2", "review-3"}, 1, nil, config.ReviewToolProtocol)
 	if strings.Contains(got, "4.review-3.1") || strings.Contains(got, "MUST (2)") {
 		t.Errorf("an earlier round's finding was relisted as this round's open work:\n%s", got)
 	}
@@ -659,7 +659,7 @@ func TestMergedFindingsDigest(t *testing.T) {
 		t.Errorf("a member that recorded only in an earlier round read as having recorded this one:\n%s", got)
 	}
 	// ... and the round filter is the round it is told, not a fixed one.
-	got = mergedFindingsDigest(append(append([]plane.ReviewRecordState{}, records...), older), []string{"review-3"}, 4, nil)
+	got = mergedFindingsDigest(append(append([]plane.ReviewRecordState{}, records...), older), []string{"review-3"}, 4, nil, config.ReviewToolProtocol)
 	if !strings.Contains(got, "4.review-3.1") || strings.Contains(got, "1.review-1.1") {
 		t.Errorf("round 4 did not select only round 4's records:\n%s", got)
 	}
@@ -679,7 +679,7 @@ func TestMergedFindingsDigest(t *testing.T) {
 			mustFinding("1.review-1.4", "filed", "already dispatched"),
 		},
 	}}
-	got = mergedFindingsDigest(settled, []string{"review-1"}, 1, nil)
+	got = mergedFindingsDigest(settled, []string{"review-1"}, 1, nil, config.ReviewToolProtocol)
 	if !strings.Contains(got, "1.review-1.1") {
 		t.Errorf("the open MUST is not listed:\n%s", got)
 	}
@@ -700,7 +700,7 @@ func TestMergedFindingsDigest(t *testing.T) {
 	got = mergedFindingsDigest([]plane.ReviewRecordState{{
 		Round: 1, ReviewerRole: "review-1", State: "open",
 		Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "fixed", "already fixed")},
-	}}, []string{"review-1"}, 1, nil)
+	}}, []string{"review-1"}, 1, nil, config.ReviewToolProtocol)
 	if strings.Contains(got, "INCOMPLETE") {
 		t.Errorf("a member whose findings are all settled read as not having recorded:\n%s", got)
 	}
@@ -1038,10 +1038,10 @@ func TestReviewReleaser_EnforcesThePlanesWriteRules(t *testing.T) {
 		t.Errorf("an outcome write that should have been refused landed: %q", rel.outcome)
 	}
 	// Only the live holder may close the round.
-	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-2", 1); err == nil || !strings.Contains(err.Error(), "not the live holder") {
+	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-2", 1, false); err == nil || !strings.Contains(err.Error(), "not the live holder") {
 		t.Errorf("a non-holder closed the round: %v", err)
 	}
-	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1); err != nil {
+	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1, false); err != nil {
 		t.Fatalf("the live holder could not close the round: %v", err)
 	}
 	// Which is what releases the findings to a reader.
@@ -1049,7 +1049,7 @@ func TestReviewReleaser_EnforcesThePlanesWriteRules(t *testing.T) {
 		t.Errorf("the close did not release the round's findings: %+v", st.Reviews)
 	}
 	// ... and a second close has nothing to release.
-	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1); err == nil || !strings.Contains(err.Error(), "no_open_round") {
+	if err := rel.CloseReviewRound(context.Background(), "t-1", "r-1", 1, false); err == nil || !strings.Contains(err.Error(), "no_open_round") {
 		t.Errorf("a second close of the same round was accepted: %v", err)
 	}
 
@@ -1066,7 +1066,7 @@ func TestReviewReleaser_EnforcesThePlanesWriteRules(t *testing.T) {
 	if err := rel2.writeOutcome("r-1", "a displaced run's outcome\n"); err == nil || !strings.Contains(err.Error(), "round_voided") {
 		t.Errorf("a displaced run wrote to the task: %v", err)
 	}
-	if err := rel2.CloseReviewRound(context.Background(), "t-1", "r-1", 1); err == nil || !strings.Contains(err.Error(), "void") {
+	if err := rel2.CloseReviewRound(context.Background(), "t-1", "r-1", 1, false); err == nil || !strings.Contains(err.Error(), "void") {
 		t.Errorf("a displaced run closed the round: %v", err)
 	}
 }
