@@ -4,18 +4,25 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
 
 const okBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`
 
+// unknownToolBody is the plane's real answer to a tool it does not register,
+// captured from the live server (protocol 39) and parameterised on the tool
+// name: a 200 carrying result.isError and this text.
+const unknownToolBody = `{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"MCP error -32602: Tool %s not found"}],"isError":true}}`
+
 // capture records what the driver actually put on the wire, so the request shape
 // is asserted rather than assumed. bodies holds EVERY request, in order — a call
-// that makes two writes (a park: update_task then ask_question) needs both.
+// that makes two writes (a park: settle_task then ask_question) needs both.
 type capture struct {
 	method string
 	path   string
@@ -69,25 +76,20 @@ func TestRelease_RequestShape(t *testing.T) {
 	}
 
 	params, _ := got.body["params"].(map[string]any)
-	if params["name"] != "update_task" {
-		t.Errorf("tool = %v, want update_task", params["name"])
+	if params["name"] != "release_task" {
+		t.Errorf("tool = %v, want release_task", params["name"])
 	}
 	args, _ := params["arguments"].(map[string]any)
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
 		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
 	}
-	// `release: true` is what returns the task to the claimable queue without
-	// charging it a reclaim, and records the run as `released`, never `failed`. It
-	// must not be combined with a status or a delivery: a bare release IS the call.
-	if args["release"] != true {
-		t.Errorf("release = %v, want true", args["release"])
-	}
-	if _, present := args["status"]; present {
-		t.Errorf("release must not carry a status (%+v) — `release` cannot be combined with `status` plane-side", args)
-	}
-	// The session may have written an outcome; a handback must not clobber it.
-	if _, present := args["outcome"]; present {
-		t.Errorf("release must not send an outcome, got %+v", args)
+	// The default handback is the call itself: neither the expiry nor the driver
+	// marker is set, and a handback must not carry a status or an outcome. The
+	// session may have written an outcome; releasing must not clobber it.
+	for _, forbidden := range []string{"expire", "driver", "checkGreen", "status", "outcome", "delivery"} {
+		if _, present := args[forbidden]; present {
+			t.Errorf("release must not carry %q: %+v", forbidden, args)
+		}
 	}
 }
 
@@ -192,9 +194,6 @@ func TestRelease_RequiresBothIDs(t *testing.T) {
 	}
 }
 
-// Recording a work-in-progress branch (CLA-314). The shape is the safety
-// property, not a detail: this call has to be legal on a session whose stream
-// could not be read whole, and it is legal only because it cannot move the task.
 func TestRecordBranch_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 
@@ -207,17 +206,17 @@ func TestRecordBranch_RequestShape(t *testing.T) {
 	}
 
 	params, _ := got.body["params"].(map[string]any)
-	if params["name"] != "update_task" {
-		t.Errorf("tool = %v, want update_task", params["name"])
+	if params["name"] != "record_progress" {
+		t.Errorf("tool = %v, want record_progress", params["name"])
 	}
 	args, _ := params["arguments"].(map[string]any)
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" || args["branch"] != "clanker/x" {
 		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1 branch=clanker/x", args)
 	}
-	// The whole distinction from Release. A status is what clears a holder
-	// plane-side, so carrying one here would turn a hand-off record into a settle
-	// - the one thing CLA-262 forbids on an unreadable stream.
-	for _, forbidden := range []string{"status", "outcome", "delivery"} {
+	// The whole distinction from Release. record_progress has no status field at
+	// all, but it can carry an outcome and a delivery, so those must stay absent:
+	// this call is a hand-off record and nothing else.
+	for _, forbidden := range []string{"outcome", "delivery"} {
 		if _, present := args[forbidden]; present {
 			t.Errorf("a branch record carried %q (%+v) - it must revise the record and nothing else", forbidden, args)
 		}
@@ -253,14 +252,49 @@ func TestRecordBranch_NotWiredIsNotARecorder(t *testing.T) {
 	}
 }
 
-// A dead-phase park makes two calls in order — the status write first, then the
-// OPEN question that raises the park to the operator. Both must carry exactly
-// the keys the MCP tool schemas name, or a park fails silently at 3am as "left
-// for the next claim" while the task never actually moves (review finding). The
-// question must be a non-blocking `clarification`: a `decision` is born answered
-// and raises nothing, and a blocking question would un-block to `ready` on any
-// answer, handing the task straight back to the fleet the guard just withheld it
-// from (CLA-395).
+func TestCloseReviewRound_RequestShape(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+	if err := New(srv.URL+"/mcp/demo", "k-1").(ReviewRoundCloser).
+		CloseReviewRound(context.Background(), "t-1", "r-1", 2); err != nil {
+		t.Fatalf("CloseReviewRound: %v", err)
+	}
+	params, _ := got.body["params"].(map[string]any)
+	if params["name"] != "record_review" {
+		t.Errorf("tool = %v, want record_review", params["name"])
+	}
+	args, _ := params["arguments"].(map[string]any)
+	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
+		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
+	}
+	if args["closeRound"] != float64(2) {
+		t.Errorf("closeRound = %v, want 2", args["closeRound"])
+	}
+	// A close is not a revision, a status move or an outcome write.
+	if len(args) != 3 {
+		t.Errorf("arguments = %+v, want only taskId, runId and closeRound", args)
+	}
+}
+
+// A close is a write like any other: an empty id or a non-positive round is a
+// caller bug, refused before anything reaches the plane (the same guard the
+// other writes carry).
+func TestCloseReviewRound_RefusesEmptyIdentity(t *testing.T) {
+	rel := New("https://plane.test/mcp/demo", "k-1").(ReviewRoundCloser)
+	for _, tc := range []struct {
+		name          string
+		taskID, runID string
+		round         int
+	}{
+		{"no task", "", "r-1", 1},
+		{"no run", "t-1", "", 1},
+		{"no round", "t-1", "r-1", 0},
+	} {
+		if err := rel.CloseReviewRound(context.Background(), tc.taskID, tc.runID, tc.round); err == nil {
+			t.Errorf("%s: CloseReviewRound succeeded, want a refusal", tc.name)
+		}
+	}
+}
+
 func TestPark_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 
@@ -280,22 +314,25 @@ func TestPark_RequestShape(t *testing.T) {
 	}
 
 	if len(got.bodies) != 2 {
-		t.Fatalf("park made %d calls, want 2 (update_task then ask_question): %+v", len(got.bodies), got.bodies)
+		t.Fatalf("park made %d calls, want 2 (settle_task then ask_question): %+v", len(got.bodies), got.bodies)
 	}
 
 	first, _ := got.bodies[0]["params"].(map[string]any)
-	if first["name"] != "update_task" {
-		t.Errorf("first tool = %v, want update_task", first["name"])
+	if first["name"] != "settle_task" {
+		t.Errorf("first tool = %v, want settle_task", first["name"])
 	}
 	args, _ := first["arguments"].(map[string]any)
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
 		t.Errorf("first arguments = %+v, want taskId=t-1 runId=r-1", args)
 	}
-	if args["status"] != "parked" {
-		t.Errorf("status = %v, want parked", args["status"])
+	if args["disposition"] != "parked" {
+		t.Errorf("disposition = %v, want parked", args["disposition"])
 	}
 	if args["outcome"] != outcome {
-		t.Errorf("outcome = %v, want the park outcome", args["outcome"])
+		t.Errorf("outcome = %v, want the park's reason", args["outcome"])
+	}
+	if _, present := args["status"]; present {
+		t.Errorf("settle_task has no status field, but the call carried one: %+v", args)
 	}
 
 	second, _ := got.bodies[1]["params"].(map[string]any)
@@ -313,14 +350,11 @@ func TestPark_RequestShape(t *testing.T) {
 	if len(opts) != 2 || opts[0] != "a" || opts[1] != "b" {
 		t.Errorf("question options = %+v, want the driver's options", qargs["options"])
 	}
-	// The shape that makes the park reach the operator: an OPEN question, not a
-	// born-answered decision. A blocking question would un-block to `ready` on
-	// any answer; a `decision` would read as project-wide standing law.
 	if qargs["blocking"] != false {
-		t.Errorf("question blocking = %v, want false", qargs["blocking"])
+		t.Errorf("blocking = %v, want false - a parked task has nothing left to block", qargs["blocking"])
 	}
 	if qargs["kind"] != "clarification" {
-		t.Errorf("question kind = %v, want clarification", qargs["kind"])
+		t.Errorf("kind = %v, want clarification - a decision is born answered", qargs["kind"])
 	}
 
 	// No decision is recorded anywhere: the park's record is the outcome plus
@@ -477,23 +511,24 @@ func TestExpireLease_RequestShape(t *testing.T) {
 		t.Fatalf("ExpireLease: %v", err)
 	}
 	params, _ := got.body["params"].(map[string]any)
-	if params["name"] != "update_task" {
-		t.Errorf("tool = %v, want update_task", params["name"])
+	if params["name"] != "release_task" {
+		t.Errorf("tool = %v, want release_task", params["name"])
 	}
 	args, _ := params["arguments"].(map[string]any)
 	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
 		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
 	}
-	if args["expireLease"] != true {
-		t.Errorf("expireLease = %v, want true", args["expireLease"])
+	if args["expire"] != true {
+		t.Errorf("expire = %v, want true", args["expire"])
 	}
-	if args["driverReleased"] != true {
-		t.Errorf("driverReleased = %v, want true — the plane records this as a driver's call for a dead session", args["driverReleased"])
+	if args["driver"] != true {
+		t.Errorf("driver = %v, want true - the plane records this as a driver's call for a dead session", args["driver"])
 	}
-	// `release` and `status` may not be paired with expireLease plane-side.
-	for _, forbidden := range []string{"release", "status", "delivery"} {
+	// `checkGreen` is the other attestation and belongs to a close-out release;
+	// the expiry and a green-check claim are two different assertions.
+	for _, forbidden := range []string{"checkGreen", "status", "outcome", "delivery"} {
 		if _, present := args[forbidden]; present {
-			t.Errorf("expireLease must not carry %q: %+v", forbidden, args)
+			t.Errorf("expire must not carry %q: %+v", forbidden, args)
 		}
 	}
 }
@@ -505,64 +540,120 @@ func TestReleaseDriver_RequestShape(t *testing.T) {
 		t.Fatalf("ReleaseDriver: %v", err)
 	}
 	params, _ := got.body["params"].(map[string]any)
-	args, _ := params["arguments"].(map[string]any)
-	if args["release"] != true || args["driverReleased"] != true {
-		t.Errorf("arguments = %+v, want release=true driverReleased=true", args)
+	if params["name"] != "release_task" {
+		t.Errorf("tool = %v, want release_task", params["name"])
 	}
-	if _, present := args["expireLease"]; present {
-		t.Errorf("ReleaseDriver must not send expireLease: %+v", args)
+	args, _ := params["arguments"].(map[string]any)
+	if args["driver"] != true {
+		t.Errorf("arguments = %+v, want driver=true", args)
+	}
+	if _, present := args["expire"]; present {
+		t.Errorf("ReleaseDriver must not send expire: %+v", args)
 	}
 }
 
-// A plane older than CLA-707 refuses the FIELD, and the caller must be able to
-// tell that refusal from a real one so it can fall back to leaving the lease to
-// expire. Both calls classify it the same way.
-func TestUnsupportedField_IsDistinguishable(t *testing.T) {
-	for _, tc := range []struct {
-		name  string
-		call  func(Releaser) error
-		field string
-	}{
-		{
-			name:  "expireLease",
-			field: "expireLease",
-			call: func(r Releaser) error {
-				return r.ExpireLease(context.Background(), "t-1", "r-1")
-			},
-		},
-		{
-			name:  "driverReleased",
-			field: "driverReleased",
-			call: func(r Releaser) error {
-				return r.ReleaseDriver(context.Background(), "t-1", "r-1")
-			},
-		},
+// CLA-748: the merge attestation is a RECORD write. It goes through
+// record_progress with the delivery echoed whole, and it must NOT call
+// complete_task - attesting a delivery is not closing the task, and a CLI that
+// closed as a side effect would end the run the session is still working in.
+func TestAttestMergeVerified_WritesTheDeliveryWithoutClosing(t *testing.T) {
+	srv, got := serve(t, http.StatusOK, okBody)
+	d := Delivery{Commit: "abc123", IntegrationBranch: "staging", PR: "#12"}
+
+	if err := New(srv.URL+"/mcp/demo", "k-1").(Attester).
+		AttestMergeVerified(context.Background(), "t-1", "r-1", d, true); err != nil {
+		t.Fatalf("AttestMergeVerified: %v", err)
+	}
+	params, _ := got.body["params"].(map[string]any)
+	if params["name"] != "record_progress" {
+		t.Errorf("tool = %v, want record_progress (not complete_task: an attestation must not close the task)", params["name"])
+	}
+	args, _ := params["arguments"].(map[string]any)
+	if args["taskId"] != "t-1" || args["runId"] != "r-1" {
+		t.Errorf("arguments = %+v, want taskId=t-1 runId=r-1", args)
+	}
+	delivery, _ := args["delivery"].(map[string]any)
+	for field, want := range map[string]any{
+		"commit":            "abc123",
+		"integrationBranch": "staging",
+		"mergeVerified":     true,
+		"pr":                "#12",
 	} {
+		if delivery[field] != want {
+			t.Errorf("delivery.%s = %v, want %v (delivery = %+v)", field, delivery[field], want, delivery)
+		}
+	}
+	// No outcome and no status: this revises the record the session declared.
+	for _, forbidden := range []string{"outcome", "status"} {
+		if _, present := args[forbidden]; present {
+			t.Errorf("the attestation carried %q: %+v", forbidden, args)
+		}
+	}
+}
+
+// CLA-748: the plane and the CLI are released as one coordinated cutover, so an
+// unknown tool is a hard error, never a cue to retry an older spelling. Every
+// moved write must report the version it needs, and no call may fall back to
+// update_task.
+func TestUnknownTool_NamesTheRequiredPlaneVersionAndDoesNotRetry(t *testing.T) {
+	calls := []struct {
+		name string
+		tool string
+		call func(Releaser) error
+	}{
+		{"Release", "release_task", func(r Releaser) error { return r.Release(context.Background(), "t-1", "r-1") }},
+		{"ReleaseDriver", "release_task", func(r Releaser) error { return r.ReleaseDriver(context.Background(), "t-1", "r-1") }},
+		{"ExpireLease", "release_task", func(r Releaser) error { return r.ExpireLease(context.Background(), "t-1", "r-1") }},
+		{"RecordBranch", "record_progress", func(r Releaser) error {
+			return r.(Recorder).RecordBranch(context.Background(), "t-1", "r-1", "clanker/x")
+		}},
+		{"CloseReviewRound", "record_review", func(r Releaser) error {
+			return r.(ReviewRoundCloser).CloseReviewRound(context.Background(), "t-1", "r-1", 1)
+		}},
+		{"Park", "settle_task", func(r Releaser) error {
+			return r.(ParkAPI).Park(context.Background(), "t-1", "r-1", "why")
+		}},
+		{"AttestMergeVerified", "record_progress", func(r Releaser) error {
+			return r.(Attester).AttestMergeVerified(context.Background(), "t-1", "r-1",
+				Delivery{Commit: "abc", IntegrationBranch: "staging"}, true)
+		}},
+	}
+	for _, tc := range calls {
 		t.Run(tc.name, func(t *testing.T) {
-			refusal := `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"update_task refused: Unrecognized key(s) in object: '` + tc.field + `'"}]}}`
-			srv, _ := serve(t, http.StatusOK, refusal)
+			srv, got := serve(t, http.StatusOK, fmt.Sprintf(unknownToolBody, tc.tool))
 			err := tc.call(New(srv.URL+"/mcp/demo", "k-1"))
-			if !errors.Is(err, ErrFieldUnsupported) {
-				t.Fatalf("err = %v, want ErrFieldUnsupported", err)
+			if !errors.Is(err, ErrPlaneTooOld) {
+				t.Fatalf("err = %v, want ErrPlaneTooOld", err)
 			}
-			if !strings.Contains(err.Error(), tc.field) {
-				t.Errorf("wrapped error lost the field name: %v", err)
+			if !strings.Contains(err.Error(), strconv.Itoa(RequiredPlaneProtocol)) {
+				t.Errorf("the error does not name the plane protocol this release needs (%d): %v", RequiredPlaneProtocol, err)
+			}
+			// One call and no retry: the fallback that used to make a second call
+			// with the old spelling is gone with update_task itself.
+			if len(got.bodies) != 1 {
+				t.Fatalf("made %d calls, want exactly 1 (no retry): %+v", len(got.bodies), got.bodies)
+			}
+			params, _ := got.bodies[0]["params"].(map[string]any)
+			if params["name"] == "update_task" {
+				t.Errorf("retried the deleted tool: %+v", params)
 			}
 		})
 	}
 }
 
-// A refusal that is NOT about an unknown field stays a plain error: a
-// not_holding or a network failure must never be read as "the plane is old".
-func TestFieldRefusal_IsNotAnyRefusal(t *testing.T) {
+// A refusal of the CALL is not an unknown tool, even when it mentions a task by a
+// name that looks like one: only a message naming the tool AND calling it not
+// found is classified.
+func TestToolRefusal_IsNotAnUnknownTool(t *testing.T) {
 	for _, body := range []string{
 		`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"not_holding"}]}}`,
 		`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"run_superseded"}]}}`,
+		`{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"record_progress refused: not_found: No task t-1 in this project."}]}}`,
 	} {
 		srv, _ := serve(t, http.StatusOK, body)
 		err := New(srv.URL+"/mcp/demo", "k-1").ExpireLease(context.Background(), "t-1", "r-1")
-		if err == nil || errors.Is(err, ErrFieldUnsupported) {
-			t.Errorf("refusal %s classified as a field problem: %v", body, err)
+		if err == nil || errors.Is(err, ErrPlaneTooOld) {
+			t.Errorf("refusal %s classified as an unknown tool: %v", body, err)
 		}
 	}
 }

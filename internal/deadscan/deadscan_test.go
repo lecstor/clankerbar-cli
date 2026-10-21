@@ -59,7 +59,7 @@ const refusedClaimLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_ref
 // is load-bearing).
 const branchThenDeadLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_wip","part":{"id":"p1","type":"step-start"}}
 {"type":"tool_use","timestamp":2,"sessionID":"ses_wip","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c1","state":{"status":"completed","input":{"taskId":"t4"},"output":"{\"task\":{\"id\":\"t4\",\"ref\":\"CLA-4\"},\"branch\":\"clanker/z\",\"hasWip\":false}"}}}
-{"type":"tool_use","timestamp":3,"sessionID":"ses_wip","part":{"type":"tool","tool":"clankerbar_update_task","callID":"c2","state":{"status":"completed","input":{"taskId":"t4","branch":"clanker/z"},"output":"{\"task\":{\"id\":\"t4\",\"status\":\"in_progress\"},\"changed\":[\"branch\"]}"}}}
+{"type":"tool_use","timestamp":3,"sessionID":"ses_wip","part":{"type":"tool","tool":"clankerbar_record_progress","callID":"c2","state":{"status":"completed","input":{"taskId":"t4","branch":"clanker/z"},"output":"{\"task\":{\"id\":\"t4\",\"status\":\"in_progress\"},\"changed\":[\"branch\"]}"}}}
 {"type":"step_finish","timestamp":4,"sessionID":"ses_wip","part":{"id":"p2","reason":"unknown","tokens":{"total":0,"input":0,"output":0}}}
 `
 
@@ -76,7 +76,7 @@ const claudeLog = `I'll work the next task.
 // MCP tool result, flattened by the opencode adapter to a STRING (see
 // opencodeToolState.Output, internal/harness/opencode.go) — reports
 // "hasWip":true, and the session then dies with reason "unknown" WITHOUT ever
-// calling update_task again. It must be a run, not dead: the inherited WIP is
+// calling record_progress again. It must be a run, not dead: the inherited WIP is
 // the driver's own Claim.HasWIP signal, carried on the claim itself.
 const takeoverWipThenDeadLog = `{"type":"step_start","timestamp":1,"sessionID":"ses_takeover","part":{"id":"p1","type":"step-start"}}
 {"type":"tool_use","timestamp":2,"sessionID":"ses_takeover","part":{"type":"tool","tool":"clankerbar_claim_task","callID":"c1","state":{"status":"completed","input":{"taskId":"t7","takeover":true},"output":"{\"task\":{\"id\":\"t7\",\"ref\":\"CLA-7\"},\"branch\":\"clanker/w\",\"hasWip\":true}"}}}

@@ -772,7 +772,7 @@ func TestDrainPhases_ReviewPanelMembersWriteOnlyTheirRecord(t *testing.T) {
 	for i := 1; i <= 2; i++ {
 		p := h.invocations[i].Prompt
 		for _, banned := range []string{
-			"update_task(taskId, runId, outcome: ...)",
+			"record_progress(taskId, runId, outcome: ...)",
 			config.ReviewRecordHeading,
 			"Record the LEGACY block",
 		} {
@@ -780,7 +780,7 @@ func TestDrainPhases_ReviewPanelMembersWriteOnlyTheirRecord(t *testing.T) {
 				t.Errorf("panel member %d's brief instructs %q, which it must not write:\n%s", i, banned, p)
 			}
 		}
-		for _, want := range []string{"update_task(taskId, runId, review: {...})", "Do NOT write the task's outcome"} {
+		for _, want := range []string{"record_review(taskId, runId, {...})", "Do NOT write the task's outcome"} {
 			if !strings.Contains(p, want) {
 				t.Errorf("panel member %d's brief does not say %q:\n%s", i, want, p)
 			}

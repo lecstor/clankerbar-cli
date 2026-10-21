@@ -16,7 +16,7 @@ package loop
 // new channel, and a normal daemon exit leaves nothing to find.
 //
 // The schema is deliberately small and stable: the supervisor only needs the
-// ids to call update_task, the project to pick the right MCP endpoint, and the
+// ids to call the task tools, the project to pick the right MCP endpoint, and the
 // branch to choose between release (none) and expireLease (pushed work). The
 // claim file is NOT a source of truth about the plane: the plane refuses the
 // call if the run already ended or was taken over, and that refusal is a

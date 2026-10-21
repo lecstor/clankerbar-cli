@@ -86,10 +86,10 @@ targeted probe of a suspected defect, and the worktree is left clean. It is
 **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task: a sealed per-reviewer durable record written through
-`update_task(review: ...)` — round, reviewer role, the phase's resolved
+`record_review` — round, reviewer role, the phase's resolved
 harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
 severity grade and `raisedByModel` — plus, for one release, the legacy block
-in the outcome (`update_task(outcome: ...)`, no status move) carrying the
+in the outcome (`record_progress(outcome: ...)`, no status move) carrying the
 reviewed tip, both sides' harness/model, the `verdict`, and every finding by ID
 with the required fix. Findings are graded
 — `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
@@ -182,10 +182,12 @@ only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, and a `status: "in_review"` move. It releases its own round in that same
-`update_task` call (`review: {closeRound: …}`), because the plane refuses a
-sealed holder's outcome write and refuses a close after the task has left
-`in_progress`; the fix phase has already written the outcome with the
+PR, and a hand-over. That is ONE call: `submit_for_review(…, closeRound: …)`
+carries the round close in the same atomic write that moves the task to
+`in_review`, so the order that used to be load-bearing is now the plane's own
+guard rather than two client calls. The plane refuses a sealed holder's outcome
+write, so no outcome is sent on that call. The fix phase has already written
+the outcome with the
 `**Tests**` section the `in_review` guard reads. A round with any open MUST
 releases its round the same way but ends **without** the PR and without moving
 the task; the driver spawns another `fix`, then verifies again. SHOULD and NIT
@@ -792,13 +794,44 @@ waiting out the lease. The same happens inside the daemon when a phase is
 abandoned holding pushed work. A plane that refuses because the run already
 ended or was taken over (`not_holding`, `run_superseded`) is logged and ignored.
 
+**A clean approved task is integrated without a session.** An
+approved-awaiting-merge task used to wait for a fresh agent session to merge its
+PR — which waits for some clanker to finish the task it is on, and a task with a
+review panel runs 30-60 minutes. Every step except resolving a conflict is
+mechanical, so the supervisor does them: for each supervised project whose
+policy says a clanker integrates (`authorityIntegrate: clanker`), it finds the
+open PR for the task's recorded branch, judges it with the same delivery check
+the driver applies to an agent's claim (mergeable, and a check rollup that ran
+and passed), **claims the task first** so an agent close-out and this path can
+never both merge it, merges the PR as a merge commit, verifies that merge commit
+is an ancestor of the base on origin, and closes the task done with that
+delivery. It does nothing under `authorityIntegrate: human`, for a PR based on
+`main` (the promotion is yours), for a conflicting, failing, unchecked or
+unresolvable PR, or when the claim is refused. A conflict is the one stand-down
+that carries evidence: the conflicting paths are logged once per head/base pair,
+for deciding whether a conflict needs an agent at all. Anything after a
+successful claim that cannot be finished releases it, so the task goes back to
+`approved` rather than being left held — with one exception: a merge that LANDED
+but whose ancestry could not be verified is closed `done` with `mergeVerified:
+false`, because the PR is no longer open and a release would strand the task.
+The merge itself names the configured base and the judged head revision, so a
+PR retargeted after the judgement cannot be merged into `main`; its verification
+and conflict reads run in a throwaway clone, never in the checkout the fleet's
+sessions share.
+
 **The base config is the machine layer.** The supervisor reads your local
 config from the one discovered location, `~/.config/clankerbar/config.json`
 (loaded exactly as `clankerbar run` loads it, or bare defaults when no file
-exists). When the file exists it is re-read on every reconcile, so an edit
-lands without a supervisor restart. Everything the plane may not set — `env`
-and `@file` secrets, `settings_path`, `config_dir`, `mcp_config_path`,
-`backlog_url` and the rest — comes from this file.
+exists). When the file exists it is re-read on every reconcile. An edit that
+changes a running child's effective config is written into that child's
+generated config and queued as a graceful `RESTART`, so it reaches the child at
+its next iteration boundary — no supervisor restart and no hand-written `STOP`.
+An edit that changes nothing writes nothing (an unchanged config serializes to
+the same bytes, so there is no restart loop), and an edit the permission-policy
+check refuses is logged and never written: the running child stays on its
+current file. Everything the plane may not set — `env` and `@file` secrets,
+`settings_path`, `config_dir`, `mcp_config_path`, `backlog_url` and the rest —
+comes from this file.
 
 **The roster names the projects; the base config wires them.** A roster entry
 carries the project(s) the instance drives. For each one the supervisor starts
@@ -912,9 +945,10 @@ resolved `settings_path` / `config_dir` / `mcp_config_path` and the default
 `backlog_url`; the credential itself stays in `CLANKERBAR_API_KEY` in the
 environment, which the child inherits) — is written to `materialized.json` in
 the child's own state dir, and the child is started with `run -c` pointing at
-it. The generated file is a **cache**: regenerated on every reconcile (each
-spawn re-reads the base config), never hand-edited, and safe to delete while a
-child runs — the next spawn regenerates it. It is written to disk rather than
+it. The generated file is a **cache**: written when the child is spawned and
+rewritten at reconcile when an edit changes it (see "The base config is the
+machine layer"), never hand-edited, and safe to delete while a child runs — the
+next spawn regenerates it. It is written to disk rather than
 held in memory so it doubles as the offline last-known-good: with the plane
 unreachable the supervisor reconciles against the cached roster and starts
 children from their materialized configs, rather than starting nothing (a cold
@@ -1273,6 +1307,11 @@ re-reads the config file at the next iteration boundary without replacing
 anything: budget, ceiling, prompt and poll-interval edits apply to the next
 iteration; harness, env and binary changes need a restart.
 
+On a **supervised** child there is nothing to reach for: the file its `-c`
+names is the supervisor's generated `materialized.json`, not the base config
+you edit, and the supervisor itself rewrites that file and queues the `RESTART`
+when your base-config edit lands (see "The base config is the machine layer").
+
 One limit worth knowing before you reach for restart: **re-exec preserves the
 daemon's CURRENT environment.** It cannot conjure env the daemon was never
 launched with - a tokenless daemon restarts tokenless (that class of problem is
@@ -1409,7 +1448,7 @@ daemon's presence row.
 ### Checking what a session says it delivered
 
 The control plane holds the backlog and takes a clanker at its word. When a session
-records a branch (`update_task(branch: …)`) or declares a delivery merged
+records a branch (`record_progress(branch: …)`) or declares a delivery merged
 (`delivery.commit` + `integrationBranch`), nothing on the plane can look at a
 repository to see whether either is true. One task read `done` for four days while
 about 900 lines of its work sat unpushed on one laptop, and its own PR merged a
@@ -2191,7 +2230,7 @@ heartbeats. When a session ends mid-task, that lease is left ticking with nobody
 renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
 there are only two before the task is parked for a human. So the driver watches
 the session's stream for what it claimed, and hands the task straight back
-(`update_task(status: ready)`) on **every** exit: usage limit, transient blip,
+(`release_task`, the driver-marked variant) on **every** exit: usage limit, transient blip,
 outright failure, or a clean finish with the work unfinished. The usage-limit case
 is why this matters most — the pause that follows can be hours, and the release is
 ordered before it.

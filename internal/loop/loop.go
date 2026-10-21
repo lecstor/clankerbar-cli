@@ -211,6 +211,36 @@ type Driver struct {
 	// own stderr; with EchoSessions false nothing is echoed regardless.
 	echoOut io.Writer
 
+	// panelLaunch, when non-nil, is called with the launching member's reviewer
+	// role at a PARALLEL panel's launch boundary: the first moment that member's
+	// session launch has actually begun, immediately before the panel releases
+	// its successor. It is a test seam, and it exists because the launch ORDER
+	// cannot be observed soundly from inside a fake adapter: the adapter is
+	// entered one call after the boundary, so a goroutine descheduled in between
+	// lets a correctly ordered panel look out of order, which is exactly the
+	// assertion that flaked on CI (CLA-755 review 1.review-5.1). Recording here,
+	// before the release, is the order the panel guarantees.
+	//
+	// Nil in every production build — nothing but a test sets it — so it costs
+	// one nil check and changes nothing the panel does.
+	panelLaunch func(role string)
+
+	// panelRelease, when non-nil, is called with the member's index each time a
+	// PARALLEL panel member releases its successor, before that successor is
+	// unblocked. panelLaunch pins the launch ORDER; this pins the release POINT,
+	// which is the guarantee itself: a member must release from its launch
+	// boundary (phaseRunOpts.onSessionLaunch), not from its worktree being
+	// ready. At member k's launch exactly members 0..k-1 have been released, so
+	// a panel that released at worktree-ready — where release_k always precedes
+	// launch_k — reports k+1 releases at that launch. Deterministic, no
+	// scheduling window (CLA-757).
+	//
+	// It is wired at the scheduler's started wrapper rather than at the panel's
+	// call site, so a regression that calls started() earlier still reports the
+	// release where it really happened. Nil in every production build, like
+	// panelLaunch: a test seam, no behaviour change.
+	panelRelease func(k int)
+
 	// undeclared counts the sessions this run that ended still holding a task
 	// whose work they had already pushed — the phase did its job and then did not
 	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a
@@ -454,9 +484,10 @@ type Driver struct {
 	restartRequested atomic.Bool
 
 	// expireUnsupportedOnce says once, not once per abandoned phase, that the
-	// plane predates expireLease (CLA-707/708). Every such handback falls back
-	// to leaving the lease to expire, which is the old behaviour, so repeating
-	// the line adds nothing.
+	// plane does not serve this build's task tools at all — it is older than the
+	// protocol this release requires (CLA-707/708 predate that check). Every
+	// such handback falls back to leaving the lease to expire, which is the old
+	// behaviour, so repeating the line adds nothing.
 	expireUnsupportedOnce sync.Once
 
 	// beaconWriteFailed is the streak latch for the LOCAL beacon write
@@ -1538,7 +1569,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// same reason: the phase's OWN brief — not only the preamble's
 			// contract — is otherwise dropped on a handoff, since ph.Prompt is
 			// replaced wholesale rather than framing the built-in text. For the
-			// review phase that would silently drop the PR-then-update_task
+			// review phase that would silently drop the PR-then-hand-off
 			// terminal step the moment a session hands off mid-review.
 			//
 			// Gated on the phase actually RUNNING the built-in brief (review
@@ -2702,7 +2733,7 @@ func deadPhase(res harness.Result) bool {
 }
 
 // recordedBranches lists the branch names the plane's record carries for a
-// phase result: every branch this run recorded via update_task(branch) that the
+// phase result: every branch this run recorded via record_progress(branch) that the
 // plane accepted (the accepted Reports), plus the branch that came in on the
 // claim itself (a resumed predecessor's recorded WIP, or the task's branch at
 // claim time). These are the names a checkpoint can be verified against.
@@ -3063,7 +3094,7 @@ func reviewFindingsDigest(outcome string) string {
 //     one-token task-body edit) burned nine sessions in a claim -> empty-exit
 //     -> release loop before this existed.
 //   - (c) a DECLARED no-code delivery on the task: the same delivery.noCode
-//     flag update_task requires to close such a task, read off the plane's
+//     flag the terminal tools require to close such a task, read off the plane's
 //     record. It counts whether or not the session still holds the lease.
 //
 // Forms (b) and (c) are read through the SAME single-task plane peek CLA-451
@@ -3428,8 +3459,8 @@ func (d *Driver) readReviewBaseline(ctx context.Context, t Target, prev *harness
 	return st.Outcome, true
 }
 
-// closeReviewRound releases a review round's sealed findings (CLA-637) by
-// calling update_task(review: {closeRound: n}) as the holding run. The round is
+// closeReviewRound releases a review round's sealed findings (CLA-637) as the
+// holding run: record_review({closeRound: n}). The round is
 // the one the seam gate MATCHED, never a number predicted at spawn time: the
 // plane assigns rounds, and the driver reads them back off the record — which
 // is also what keeps this correct across void rounds and panel members.
@@ -3608,7 +3639,7 @@ func verificationDigest(records []plane.ReviewRecordState, openMustIDs []string,
 		}
 	}
 	if len(settledIDs) > 0 {
-		b.WriteString("The following MUST(s) of this review cycle are already MARKED settled on the plane — by the fix phase, or by an earlier verification round. A fixer's own marking is its claim, not a verdict, and a refutation changes no code, so the fix delta will not show it: check each one against HEAD and its stated evidence. CONFIRM it by leaving its status as it is. REJECT it by setting its status back to \"open\" through update_task(review: {findingUpdates: [...]}) and recording why in this round's record; a rejected MUST is open, so the gate does not pass and the driver spawns another fix:\n")
+		b.WriteString("The following MUST(s) of this review cycle are already MARKED settled on the plane — by the fix phase, or by an earlier verification round. A fixer's own marking is its claim, not a verdict, and a refutation changes no code, so the fix delta will not show it: check each one against HEAD and its stated evidence. CONFIRM it by leaving its status as it is. REJECT it by setting its status back to \"open\" through " + config.ReviewFindingsCall + " and recording why in this round's record; a rejected MUST is open, so the gate does not pass and the driver spawns another fix:\n")
 		for _, id := range settledIDs {
 			b.WriteString(digestFindingLine(id, byID))
 		}
@@ -3730,7 +3761,7 @@ func mergedFindingsDigest(records []plane.ReviewRecordState, expected []string, 
 		fmt.Fprintf(&b, "The list is round %d's records only — an earlier round's findings, and anything already marked fixed, refuted or filed on the plane, are not relisted here.\n", round)
 	}
 	if settled > 0 {
-		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through update_task(review: {findingUpdates: [...]}), not by re-fixing it blind.\n", settled)
+		fmt.Fprintf(&b, "%d finding(s) of this round are already MARKED settled on the plane and are not listed; `reviews.openMustIds` is the plane's own open set, and a settled marking you disagree with is refuted through "+config.ReviewFindingsCall+", not by re-fixing it blind.\n", settled)
 	}
 	// CLA-639 M5: a panel member writes no `## Review` block — its record is the
 	// durable one — so the fixer must not wait for a block to preserve, and its
@@ -5445,7 +5476,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					drainNum, limitReason(lim), logPath)
 				return tokens, cost, true, end, nil
 			}
-			log.Printf("iteration %d hit a usage limit", drainNum)
+			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
 			// A RESUMED phase must not wait one out (CLA-631). The seam's handback
 			// has already ended the claim: `release` puts a no-work claim straight
 			// back in the queue, and `expireLease` ends a pushed-work claim's lease
@@ -6324,9 +6355,9 @@ func (d *Driver) expireHeldClaim(ctx context.Context, t Target, res harness.Resu
 		// Nothing to call. The old line is the honest one, and it is what the
 		// caller logs when this returns false.
 		return false
-	case errors.Is(err, plane.ErrFieldUnsupported):
+	case errors.Is(err, plane.ErrPlaneTooOld):
 		d.expireUnsupportedOnce.Do(func() {
-			log.Printf("%sthe backlog plane predates expireLease — dead runs' leases will expire on their own as before; upgrade the plane to hand a dead session's claim back immediately", labelOf(t))
+			log.Printf("%sthe backlog plane does not serve this build's task tools — it needs plane protocol %d (the same cutover as this release); dead runs' leases will expire on their own until it is promoted", labelOf(t), plane.RequiredPlaneProtocol)
 		})
 		return false
 	default:
@@ -6383,11 +6414,12 @@ func (d *Driver) verifyDeliveries(ctx context.Context, t Target, res harness.Res
 	for _, rep := range res.Reports {
 		// Resolve the claim's repo AUTHORITATIVELY from the task's own record —
 		// "the task's repo field (primary repo when unset)" is the doneWhen's
-		// words, and the session-declared value on update_task is secondary: a
-		// session can omit it (nothing in the served protocol tells it to pass
-		// `repo`), while the plane's task row always carries it (CLA-437). Mirror
-		// sessionDir's degradation exactly: an unwired plane falls back to the
-		// session's declaration, then to this target's primary repo.
+		// words, and the plane's task row always carries it (CLA-437). The
+		// session-declared value is secondary: the new tool set has no call that
+		// carries `repo` alongside a branch (record_progress has no repo field),
+		// so it is normally empty. Mirror sessionDir's degradation exactly: an
+		// unwired plane falls back to the session's declaration, then to this
+		// target's primary repo.
 		repo := rep.Repo
 		if src, ok := t.Releaser.(plane.TaskRepoSource); ok && rep.TaskID != "" {
 			r, err := src.TaskRepo(ctx, rep.TaskID)
@@ -6874,9 +6906,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	waitedOnReset := waitingForReset
 	if waitingForReset {
 		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
-		log.Printf("paused%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
+		log.Printf("paused%s%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
 	} else {
-		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+		log.Printf("paused%s%s — probing every %s for an early reset", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), interval)
 	}
 
 	// CLA-728: the wait can outlast the plane's liveness window many times over,
@@ -8085,12 +8117,27 @@ func resetSuffix(t time.Time) string {
 }
 
 // limitReason renders a limit's reason for a log line, defaulting when a harness
-// leaves it blank.
+// leaves it blank. The window rides along when the adapter named one (CLA-752): a
+// multi-day weekly wait should say which cap it is waiting out, not just "usage
+// limit".
 func limitReason(lim harness.Limit) string {
-	if lim.Reason != "" {
-		return lim.Reason
+	reason := lim.Reason
+	if reason == "" {
+		reason = "usage limit"
 	}
-	return "usage limit"
+	return reason + limitWindowSuffix(lim)
+}
+
+// limitWindowSuffix names the usage window for a log line that already says what
+// it is doing, or "" when the adapter named none (CLA-752). The supervised wait
+// uses it so the pause an operator actually sits through distinguishes a
+// multi-day weekly cap from a 5-hour one (reviews 1.review-2.1, 1.review-3.1,
+// 1.review-5.1, 1.review-1.3).
+func limitWindowSuffix(lim harness.Limit) string {
+	if lim.Window == "" {
+		return ""
+	}
+	return " (" + lim.Window + " window)"
 }
 
 // isReviewPhase reports whether a phase is a review-phase (the gate where

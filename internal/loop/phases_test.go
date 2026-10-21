@@ -1444,7 +1444,7 @@ func TestDrainPhases_AReloadMidDrainDoesNotReshapeTheInFlightSequence(t *testing
 		// terminal step from the successor — the in-flight sequence reshaped
 		// by the reload (CLA-664), one phase later than the mode and count.
 		successor := h.invocations[4].Prompt
-		if !strings.Contains(successor, `status: "in_review"`) {
+		if !strings.Contains(successor, `submit_for_review(`) {
 			t.Errorf("the in-flight fix's handoff successor lost the terminal step its captured position selects:\n%s", successor)
 		}
 		if strings.Contains(successor, "review-only ending") {
@@ -2934,7 +2934,7 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 	}
 	// The review must not be told to do the fix phase's job. "Open a PR" in the
 	// positive is the tell; the review's own "do not open a PR" is lowercase.
-	if strings.Contains(p2, "Open a PR") || strings.Contains(p2, `status: "in_review"`) {
+	if strings.Contains(p2, "Open a PR") || strings.Contains(p2, `submit_for_review(`) {
 		t.Errorf("the review-only phase carries the fix phase's terminal actions:\n%s", p2)
 	}
 	if !strings.Contains(p2, "reviewed by: harness claude, model opus-test") ||
@@ -2956,7 +2956,7 @@ func TestDrainPhases_RunsTheThreePhaseSplit(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Open a PR",
-		`status: "in_review"`,
+		`submit_for_review(`,
 		"fixed by: harness claude, model cheap-test",
 		"### Fixes",
 		// CLA-637: the fix brief must tell the session to answer the released
@@ -3143,7 +3143,7 @@ func TestDrainPhases_AHandoffDuringReviewOnlyKeepsTheReviewMode(t *testing.T) {
 	if !strings.Contains(successor, "review-only ending") {
 		t.Errorf("the review-only handoff successor did not get the review-only ending:\n%s", successor)
 	}
-	if strings.Contains(successor, "Open a PR") || strings.Contains(successor, `status: "in_review"`) {
+	if strings.Contains(successor, "Open a PR") || strings.Contains(successor, `submit_for_review(`) {
 		t.Errorf("the review-only handoff successor was told to finish the task:\n%s", successor)
 	}
 	if !strings.Contains(successor, `"review-1"`) || !strings.Contains(successor, testCheckpointTip) {
@@ -4469,7 +4469,7 @@ func TestDrainPhases_VerificationOpenMustSpawnsAnotherFix(t *testing.T) {
 			"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID",
 			"fix-delta",
 			"NO OPEN MUST",
-			"status: \"in_review\"",
+			"submit_for_review(taskId, runId, closeRound:",
 		} {
 			if !strings.Contains(p, want) {
 				t.Errorf("the verification brief %d does not carry %q:\n%s", i+1, want, p)
@@ -5110,7 +5110,7 @@ func TestDrainPhases_AHandoffDuringBranchlessFixVerifyStopsBeforeTheHandover(t *
 		t.Fatalf("spawned %d sessions, want 5: implement, review, fix, its handoff successor, verify", h.invokeCalls)
 	}
 	successor := h.invocations[3].Prompt
-	if strings.Contains(successor, `status: "in_review"`) {
+	if strings.Contains(successor, `submit_for_review(`) {
 		t.Errorf("the branchless fix's handoff successor was told to move the task to in_review before verification:\n%s", successor)
 	}
 	if !strings.Contains(successor, "the VERIFICATION round after you carries") {
@@ -5158,6 +5158,79 @@ func TestBranchlessVerificationDigest(t *testing.T) {
 	}
 }
 
+// CLA-748: the driver's own digests are brief text too — they are PREPENDED to
+// the fix and verify briefs — so every tool they name must exist. The cutover has
+// one review door, record_review, and no protocol-dependent wording left.
+func TestReviewDigestsNameTheRecordReviewTool(t *testing.T) {
+	records := []plane.ReviewRecordState{{
+		Round: 1, Cycle: 1, ReviewerRole: "review-1", ReviewedTip: "aaaa", State: "open",
+		Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "fixed", "already fixed")},
+	}}
+	const want = "record_review(taskId, runId, {findingUpdates: [...]})"
+	verify := verificationDigest(records, nil, 1)
+	if !strings.Contains(verify, want) {
+		t.Errorf("the verification digest does not name %q:\n%s", want, verify)
+	}
+	merged := mergedFindingsDigest(records, []string{"review-1"}, 1, nil)
+	if !strings.Contains(merged, want) {
+		t.Errorf("the panel fix digest does not name %q:\n%s", want, merged)
+	}
+	for name, got := range map[string]string{"verification": verify, "merged fix": merged} {
+		if strings.Contains(got, "update_task") {
+			t.Errorf("the %s digest names the removed update_task tool:\n%s", name, got)
+		}
+	}
+}
+
+// CLA-748: every brief invocationFor resolves names the intent-specific tools,
+// carries no removed tool, and leaves no placeholder unresolved - including the
+// {{prBase}} that the verify terminal step now embeds directly rather than
+// passing in as a replacement value.
+func TestInvocationForResolvesTheIntentToolBriefs(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	d, _ := phaseDriver(t, h, []config.Phase{
+		{Name: config.ImplementPhaseName},
+		{Name: config.ReviewPhaseName},
+		{Name: config.FixPhaseName},
+		{Name: config.VerifyPhaseName},
+	})
+	phases := d.cfg.EffectivePhases()
+	verified := &harness.Result{
+		Claim:         harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: "clanker/x"},
+		CheckpointTip: testCheckpointTip,
+	}
+	for idx := range phases {
+		inv, err := d.invocationFor(d.targets[0], idx, phases[idx], verified, "", "staging", phases)
+		if err != nil {
+			t.Fatalf("invocationFor phase %d: %v", idx+1, err)
+		}
+		if strings.Contains(inv.Prompt, "{{") {
+			t.Fatalf("phase %d carries an unresolved placeholder:\n%s", idx+1, inv.Prompt)
+		}
+		if strings.Contains(inv.Prompt, "update_task") {
+			t.Errorf("phase %d names the removed update_task tool:\n%s", idx+1, inv.Prompt)
+		}
+	}
+
+	// The review records through record_review; the verifier closes its round on
+	// the hand-over itself (submit_for_review.closeRound), which is the one-call
+	// shape the plane's post-cutover guards accept.
+	review, err := d.invocationFor(d.targets[0], 1, phases[1], verified, "", "staging", phases)
+	if err != nil {
+		t.Fatalf("invocationFor review: %v", err)
+	}
+	if !strings.Contains(review.Prompt, "record_review(taskId, runId, {...})") {
+		t.Errorf("the review brief does not name record_review:\n%s", review.Prompt)
+	}
+	verify, err := d.invocationFor(d.targets[0], 3, phases[3], verified, "", "staging", phases)
+	if err != nil {
+		t.Fatalf("invocationFor verify: %v", err)
+	}
+	if !strings.Contains(verify.Prompt, "submit_for_review(taskId, runId, closeRound:") {
+		t.Errorf("the verify hand-over does not carry the round close on submit_for_review:\n%s", verify.Prompt)
+	}
+}
+
 // TestInvocationForSelectsTheVerifyVariants: the CLA-638 arms are
 // prompt-invisible to the config tests — only a driver call shows which brief
 // the four-phase shape actually spawns with. The fix gets the no-PR variant
@@ -5195,7 +5268,7 @@ func TestInvocationForSelectsTheVerifyVariants(t *testing.T) {
 	if !strings.Contains(inv.Prompt, "VERIFICATION round") || !strings.Contains(inv.Prompt, `"review-2"`) {
 		t.Errorf("the verify phase did not get the verification brief with its plane role:\n%s", inv.Prompt)
 	}
-	if !strings.Contains(inv.Prompt, `status: "in_review"`) || !strings.Contains(inv.Prompt, "closeRound") {
+	if !strings.Contains(inv.Prompt, `submit_for_review(`) || !strings.Contains(inv.Prompt, "closeRound") {
 		t.Errorf("the verification brief does not carry the terminal hand-over:\n%s", inv.Prompt)
 	}
 	if strings.Contains(inv.Prompt, "{{") {
@@ -5219,7 +5292,7 @@ func TestInvocationForSelectsTheVerifyVariants(t *testing.T) {
 	if err != nil {
 		t.Fatalf("invocationFor branchless verify: %v", err)
 	}
-	if !strings.Contains(inv.Prompt, "NO CODE") || !strings.Contains(inv.Prompt, `status: "in_review"`) {
+	if !strings.Contains(inv.Prompt, "NO CODE") || !strings.Contains(inv.Prompt, `submit_for_review(`) {
 		t.Errorf("a branchless verification round did not get its brief with the hand-over:\n%s", inv.Prompt)
 	}
 	if strings.Contains(inv.Prompt, "COMMIT and PUSH") {

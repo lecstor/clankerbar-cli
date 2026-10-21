@@ -7,11 +7,12 @@ package supervisor
 // artifact rather than something the operator maintains — the precondition
 // for the roster driving it in phase 3b.
 //
-// The generated file is a CACHE: regenerated on every reconcile (each spawn
-// re-reads the source config and rewrites it), never hand-edited, safe to
-// delete while the child runs, and written to disk rather than held in memory
-// so it doubles as the offline last-known-good (phase 3b: an unreachable plane
-// means starting from cache, not starting nothing).
+// The generated file is a CACHE: written when the child is spawned, rewritten
+// at reconcile only when an edit changes its bytes (configchange.go), never
+// hand-edited, safe to delete while the child runs (the next spawn regenerates
+// it), and written to disk rather than held in memory so it doubles as the
+// offline last-known-good (phase 3b: an unreachable plane means starting from
+// cache, not starting nothing).
 //
 // What the generated file carries:
 //
@@ -165,6 +166,24 @@ func managedCheckouts(repos map[string]string, projectRoot string) (map[string]s
 	return out, nil
 }
 
+// materializedBytes is the ONE serializer for a child's generated config: the
+// effective config with the two values the child must not derive for itself
+// pinned (see the package comment). Both the spawn path and the reconcile-time
+// refresh go through it, so "the file an edit produces" and "the file a spawn
+// produces" are the same bytes — which is what makes change detection
+// byte-exact. encoding/json sorts map keys, and every input here is a struct,
+// slice or sorted map, so the same config always serializes to the same bytes.
+func (d *Supervisor) materializedBytes(cfg *config.Config, dir string) ([]byte, error) {
+	eff := *cfg
+	eff.InstanceName = cfg.ResolvedInstanceName(d.hostname)
+	eff.StateDir = dir
+	data, err := json.MarshalIndent(&eff, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode %s: %w", statedir.MaterializedConfigName, err)
+	}
+	return data, nil
+}
+
 // materializeConfig builds the instance's effective config and writes it into
 // the instance's state dir, then returns the path the child is spawned with.
 //
@@ -192,14 +211,9 @@ func (d *Supervisor) materializeConfig(inst *Instance) (string, error) {
 	}
 	defer st.Close() //nolint:errcheck // read-side handle on the way out
 
-	// The effective config: the validated instance config with the two values
-	// the child must not derive for itself pinned (see the package comment).
-	eff := *cfg
-	eff.InstanceName = cfg.ResolvedInstanceName(d.hostname)
-	eff.StateDir = dir
-	data, err := json.MarshalIndent(&eff, "", "  ")
+	data, err := d.materializedBytes(cfg, dir)
 	if err != nil {
-		return "", fmt.Errorf("encode %s: %w", statedir.MaterializedConfigName, err)
+		return "", err
 	}
 
 	if st.Exists(statedir.MaterializedConfigName) {
