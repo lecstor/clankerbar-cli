@@ -35,7 +35,7 @@ func TestPanelMembersStartInListOrderAndBackfill(t *testing.T) {
 			started <- k
 			begun()
 			<-release[k]
-		})
+		}, nil)
 		close(done)
 	}()
 

@@ -113,15 +113,12 @@ type panelParallelAdapter struct {
 	// descheduled in between lets the next member append first and makes a
 	// correctly ordered panel look out of order — the CI flake this test fixes
 	// (CLA-755 review 1.review-5.1).
-	//
-	// Residual, stated rather than papered over (CLA-755 review 1.review-1.1):
-	// this pins the LAUNCH order, not the release POINT. A regression that
-	// released a member's successor from its worktree-ready point while still
-	// passing the launch callback would go unseen, because the successor has a
-	// `git worktree add` subprocess to get through either way. Pinning the
-	// release point needs the release itself observed; CLA-757 tracks it.
 	order []string
-	errs  []string
+	// releases is the member index reported by the driver's panelRelease seam,
+	// in release order — recorded at the scheduler's started wrapper, so it is
+	// the release POINT (CLA-757), not the panel's intention to release.
+	releases []int
+	errs     []string
 }
 
 func newPanelParallelAdapter(rel *reviewReleaser, branch, tip string, members int) *panelParallelAdapter {
@@ -328,6 +325,16 @@ func memberNames(members []config.ReviewPanelMember) []string {
 	return out
 }
 
+// memberIndex is a member's position in the panel's configured list, or -1.
+func memberIndex(members []config.ReviewPanelMember, role string) int {
+	for k, m := range members {
+		if m.Name == role {
+			return k
+		}
+	}
+	return -1
+}
+
 // requireOneFleetRecord is CLA-738's invariant on the PARALLEL path — the
 // shipped default, and the shape the CLA-598/CLA-717/CLA-727 incident ran. The
 // panel must post exactly one iteration record and its Outcome must be one of
@@ -356,7 +363,20 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	// let the next member append first, failing a panel that launched correctly.
 	// The seam fires on every launch attempt; the panel's release is idempotent,
 	// so the order asserted here is each member's FIRST launch.
+	//
+	// CLA-757 adds the other half: the release POINT. panelRelease fires from the
+	// scheduler's started wrapper, before the successor is unblocked, so at
+	// member k's launch exactly members 0..k-1 have been released. A panel that
+	// released its successor from its worktree-ready point has release_k BEFORE
+	// launch_k, so member k launches with k+1 releases recorded — no scheduling
+	// window is involved, because the checkout always exists before the session
+	// starts.
 	launched := map[string]bool{}
+	d.panelRelease = func(k int) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		a.releases = append(a.releases, k)
+	}
 	d.panelLaunch = func(role string) {
 		a.mu.Lock()
 		defer a.mu.Unlock()
@@ -364,6 +384,14 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 			return
 		}
 		launched[role] = true
+		if k := memberIndex(members, role); k < 0 {
+			a.errs = append(a.errs, fmt.Sprintf(
+				"a member launched as role %q, which is not one of the panel's members %v", role, memberNames(members)))
+		} else if len(a.releases) != k {
+			a.errs = append(a.errs, fmt.Sprintf(
+				"member %d (%s) launched with releases %v already recorded, want exactly %d — its predecessor released it before this member's session launch, so the release came from the worktree-ready point rather than from the launch boundary",
+				k, role, append([]int(nil), a.releases...), k))
+		}
 		a.order = append(a.order, role)
 	}
 
@@ -384,6 +412,7 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 		heads[k] = v
 	}
 	order := append([]string(nil), a.order...)
+	releases := append([]int(nil), a.releases...)
 	a.mu.Unlock()
 	if maxInFlight != len(members) {
 		t.Errorf("max reviews in flight = %d, want %d — the members did not run concurrently", maxInFlight, len(members))
@@ -398,6 +427,19 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	for k, m := range members {
 		if k >= len(order) || order[k] != m.Name {
 			t.Fatalf("panel launch order = %v, want the panel's list order %v", order, memberNames(members))
+		}
+	}
+	// And the release POINT that order depends on (CLA-757): each member is
+	// released from its own launch boundary, so the releases arrive one per
+	// member in list order. A regression to worktree-ready releases would have
+	// been caught by the launch probe above; this asserts the seam itself saw
+	// every release, so a silently unwired probe cannot pass for a fixed panel.
+	if len(releases) != len(members) {
+		t.Fatalf("release probe recorded %v, want one release for each of the panel's %d members", releases, len(members))
+	}
+	for k, got := range releases {
+		if got != k {
+			t.Fatalf("releases recorded in order %v, want 0..%d — the panel did not release members in list order", releases, len(members)-1)
 		}
 	}
 	// And the iteration record the plane receives keeps the four-word enum.

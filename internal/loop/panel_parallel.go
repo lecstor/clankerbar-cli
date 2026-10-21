@@ -199,7 +199,16 @@ type panelRunOutcome struct {
 // checkout exists (CLA-738 review 3.2); a member that never launches — setup
 // failed, budget refused — calls it itself before returning. The test calls it
 // at the top of its callback.
-func runPanelMembers(n, concurrency int, run func(k int, started func())) {
+//
+// onRelease, when non-nil, is called with the member's index at the moment that
+// member releases its successor — from inside the started wrapper, before the
+// successor is unblocked, on every path that ends the wait including the
+// safety-net defer. It exists so the release POINT can be observed where a
+// release actually is, not inferred from the panel's intentions: a regression
+// that calls started() from somewhere earlier (worktree-ready) is reported
+// there, which a probe wrapped around the panel's own call site could not see
+// (CLA-757). Nil in production: it is a test seam, like panelLaunch.
+func runPanelMembers(n, concurrency int, run func(k int, started func()), onRelease func(k int)) {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -209,6 +218,14 @@ func runPanelMembers(n, concurrency int, run func(k int, started func())) {
 		sem <- struct{}{}
 		started := make(chan struct{})
 		var once sync.Once
+		release := func() {
+			once.Do(func() {
+				if onRelease != nil {
+					onRelease(k)
+				}
+				close(started)
+			})
+		}
 		wg.Add(1)
 		go func(k int) {
 			defer wg.Done()
@@ -216,8 +233,8 @@ func runPanelMembers(n, concurrency int, run func(k int, started func())) {
 			// The defer is a safety net: a path that forgets to call started
 			// still unblocks the loop when the member ends, instead of deadlocking
 			// the panel.
-			defer once.Do(func() { close(started) })
-			run(k, func() { once.Do(func() { close(started) }) })
+			defer release()
+			run(k, release)
 		}(k)
 		<-started
 	}
@@ -328,7 +345,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 				},
 			})
 		out.members[k] = m
-	})
+	}, d.panelRelease)
 
 	for k, m := range out.members {
 		out.tokens += m.tokens
