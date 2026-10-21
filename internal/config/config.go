@@ -2041,6 +2041,21 @@ type Config struct {
 	// two prompts their sessions are actually being handed.
 	Phases []Phase `json:"phases"`
 
+	// Conflict is the supervisor's conflict-only session step (CLA-759): the
+	// harness and model for the short session it starts when CLA-758's
+	// deterministic close-out stands down on a CONFLICTING approved task. It is
+	// NOT a phase — it runs outside any task's sequence, for one task the
+	// supervisor picked, at most one at a time fleet-wide — so it is its own
+	// block rather than another entry in `phases`.
+	//
+	// ABSENT/partial = the fleet's IMPLEMENT step's harness and model, which is
+	// the documented default: resolving a conflict is implementation work that
+	// wants the model already trusted with the task's code. See ConflictStep.
+	//
+	// A pointer so an unset block is omitted from Identity(), exactly as
+	// ReviewPanel's `omitempty` keeps an untouched config's identity unchanged.
+	Conflict *ConflictStep `json:"conflict,omitempty"`
+
 	// ReviewPanel is the ordered list of independent reviewers a built-in review
 	// phase expands into (CLA-639). There is NO default and NO preset: the CLI
 	// cannot know which harnesses, providers or models an operator has, so it
@@ -3527,12 +3542,23 @@ func (c *Config) PhaseHarnesses() []string {
 			out = append(out, h)
 		}
 	}
+	// The conflict-only session's own harness (CLA-759), when the block names one
+	// that is not already listed. It is a harness this config can spawn a session
+	// on, so both questions below have to see it: doctor checks a DECLARED
+	// harness's binary, config dir and permission policy, and the spawn question
+	// must know the supervisor will really start one there.
+	if h := c.conflictHarness(); h != "" && !seen[h] {
+		seen[h] = true
+		out = append(out, h)
+	}
 	return out
 }
 
 // SpawnedHarnesses lists every harness this config will actually START A SESSION
 // on: the run-wide one for an unphased run, and otherwise exactly the harnesses
-// its phases resolve to. Deduplicated, in sequence order.
+// its phases resolve to — plus the conflict-only session's own harness (CLA-759)
+// when the `conflict` block names a different one, because the supervisor starts
+// a real session there on a conflicted approved task. Deduplicated, in sequence order.
 //
 // It differs from PhaseHarnesses in one shape, and the difference is the whole
 // reason it exists: when EVERY phase names its own harness, the run-wide
@@ -3558,7 +3584,11 @@ func (c *Config) SpawnedHarnesses() []string {
 	// beside an unphased run is inert (there is no sequence to multiply), so it
 	// adds nothing here either.
 	if len(c.Phases) == 0 {
-		return []string{c.Harness}
+		out := []string{c.Harness}
+		if h := c.conflictHarness(); h != "" && h != c.Harness {
+			out = append(out, h)
+		}
+		return out
 	}
 	var out []string
 	seen := map[string]bool{}
@@ -3579,6 +3609,13 @@ func (c *Config) SpawnedHarnesses() []string {
 			seen[h] = true
 			out = append(out, h)
 		}
+	}
+	// The conflict-only session's own harness (CLA-759), when the block names one
+	// that is not already listed: the supervisor really starts a session there on
+	// a conflicted approved task, so this list must know about it.
+	if h := c.conflictHarness(); h != "" && !seen[h] {
+		seen[h] = true
+		out = append(out, h)
 	}
 	return out
 }
@@ -4136,6 +4173,31 @@ func (c *Config) Validate() error {
 				"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
 				"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
 				i, ph.Label(i), h, h, h)
+		}
+	}
+	// The conflict-only session step (CLA-759). It names a harness the SUPERVISOR
+	// will start a session on, so it is held to the same two rules as a phase's
+	// own harness above: it must exist in the registry, and when it is not the
+	// run-wide one it must carry a block of its own — inheriting another
+	// harness's dialect is the 3am failure the phase rule exists to prevent.
+	// Checked even when the block only pins the model, because the effective
+	// harness is then the implement step's and has already been checked.
+	if c.conflictDeclared() {
+		h := c.ConflictStep().Harness
+		if !harness.Known(h) {
+			return fmt.Errorf("conflict.harness: unknown harness %q (want: %s)%s",
+				h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
+		}
+		if c.Conflict.MaxTurns < 0 {
+			return errors.New("conflict.max_turns must not be negative")
+		}
+		if h != c.Harness {
+			hc, ok := c.Harnesses[h]
+			if !ok || hc.Empty() {
+				return fmt.Errorf("conflict.harness runs on harness %q, but `harnesses.%s` is missing or empty: "+
+					"a conflict session on a harness other than the run's `harness` inherits none of config_dir / "+
+					"mcp_config_path / settings_path / model — declare them under `harnesses.%s`", h, h, h)
+			}
 		}
 	}
 	// The review panel (CLA-639). Its members run one review phase each, so a
