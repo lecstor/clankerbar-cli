@@ -83,6 +83,14 @@ func heartbeatWaitFor(t *testing.T, what string, cond func() bool) {
 // with a context the test owns. The caller must stop it (directly or via ctx).
 func newStartedRenewer(t *testing.T, hb plane.Heartbeat, seed harness.Claim) (*leaseRenewer, context.CancelFunc) {
 	t.Helper()
+	return newStartedRenewerWithPresence(t, hb, seed, nil)
+}
+
+// newStartedRenewerWithPresence is newStartedRenewer with the CLA-771 presence
+// seam wired. The hook has to be installed BEFORE run starts, or writing it
+// afterwards would race the goroutine reading it.
+func newStartedRenewerWithPresence(t *testing.T, hb plane.Heartbeat, seed harness.Claim, presence func()) (*leaseRenewer, context.CancelFunc) {
+	t.Helper()
 	r := &leaseRenewer{
 		hb:       hb,
 		interval: time.Millisecond,
@@ -90,6 +98,7 @@ func newStartedRenewer(t *testing.T, hb plane.Heartbeat, seed harness.Claim) (*l
 		claims:   make(chan harness.Claim, 4),
 		done:     make(chan struct{}),
 		stopped:  make(chan struct{}),
+		presence: presence,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	go r.run(ctx, seed)
@@ -167,6 +176,37 @@ func TestStartLeaseRenewalSkipsWhenThereIsNothingToRenewWith(t *testing.T) {
 				r.stop()
 			}
 		})
+	}
+}
+
+// TestStartLeaseRenewalPinsTheProductionCadence pins the value the zero
+// leaseRenewalInterval fallback produces (CLA-771 review): the doneWhen's "at
+// most 10 minutes apart, inside the plane's 15-minute staleness window" is
+// decided HERE, and the two CLA-771 tests override the field with milliseconds,
+// so nothing else observes it. A fallback of, say, heartbeatInterval(2 *
+// planeLeaseDuration) would push presence outside the plane's window and bring
+// the bug straight back with every other test still green.
+func TestStartLeaseRenewalPinsTheProductionCadence(t *testing.T) {
+	d := &Driver{} // leaseRenewalInterval zero: the production path
+	inv := harness.Invocation{}
+	r := d.startLeaseRenewal(context.Background(), 0, Target{Releaser: renewingReleaser{hb: &recordingHeartbeat{}}}, &inv, "")
+	if r == nil {
+		t.Fatal("startLeaseRenewal declined a heartbeat-capable releaser; nothing below can be checked")
+	}
+	defer r.stop()
+
+	want := heartbeatInterval(planeLeaseDuration)
+	if r.interval != want {
+		t.Fatalf("production renewal interval = %s, want %s (a third of the plane's lease)", r.interval, want)
+	}
+	// 10 minutes is the cadence itself, and it must stay inside the plane's
+	// INSTANCE_STALE_AFTER_MS window (15 minutes, FleetSignal on the plane side)
+	// with room for one missed tick.
+	if want != 10*time.Minute {
+		t.Fatalf("heartbeatInterval(planeLeaseDuration) = %s, want 10m", want)
+	}
+	if r.interval >= 15*time.Minute {
+		t.Fatalf("production renewal interval = %s, outside the plane's 15-minute presence window", r.interval)
 	}
 }
 
@@ -333,35 +373,56 @@ func TestLeaseRenewerNeverBeatsWithoutAClaim(t *testing.T) {
 // --- standing down -----------------------------------------------------------
 
 func TestLeaseRenewerStandsDownOnANotWiredPlane(t *testing.T) {
-	// One refusal said once, then silence for the rest of the session: the lease
-	// behaves exactly as before CLA-358.
+	// One refusal said once, then no more beats for the rest of the session: the
+	// lease behaves exactly as before CLA-358. The TICK does not stand down - it
+	// keeps carrying presence (CLA-771), which is a different transport and may
+	// be perfectly healthy on the same plane.
 	hb := &recordingHeartbeat{err: plane.ErrNotWired, failuresLeft: 999}
-	r, cancel := newStartedRenewer(t, hb, heartbeatClaim("r-1"))
+	var beacons atomic.Int64
+	r, cancel := newStartedRenewerWithPresence(t, hb, heartbeatClaim("r-1"), func() { beacons.Add(1) })
 	defer cancel()
+	defer r.stop()
 
+	heartbeatWaitFor(t, "the not-wired refusal", func() bool { return hb.count() >= 1 })
+	beat := hb.count()
+	heartbeatWaitFor(t, "presence to keep flowing after the beat stood down", func() bool {
+		return beacons.Load() >= 4
+	})
+	time.Sleep(10 * time.Millisecond)
+	if n := hb.count(); n != beat {
+		t.Fatalf("made %d call(s) on a not-wired plane, want %d and no more", n, beat)
+	}
+	if beat != 1 {
+		t.Fatalf("refused %d time(s) on a not-wired plane, want exactly 1 before standing down", beat)
+	}
 	select {
 	case <-r.stopped:
-	case <-time.After(2 * time.Second):
-		t.Fatal("renewer did not stand down on ErrNotWired")
-	}
-	time.Sleep(20 * time.Millisecond)
-	if n := hb.count(); n != 1 {
-		t.Fatalf("made %d call(s) on a not-wired plane, want exactly 1", n)
+		t.Fatal("the renewer returned after the beat stood down; its tick must keep firing so presence keeps flowing (CLA-771)")
+	default:
 	}
 }
 
 func TestLeaseRenewerGivesUpAfterThreeConsecutiveFailures(t *testing.T) {
 	hb := &recordingHeartbeat{err: errors.New("plane unreachable"), failuresLeft: 999}
-	r, cancel := newStartedRenewer(t, hb, heartbeatClaim("r-1"))
+	var beacons atomic.Int64
+	r, cancel := newStartedRenewerWithPresence(t, hb, heartbeatClaim("r-1"), func() { beacons.Add(1) })
 	defer cancel()
+	defer r.stop()
 
+	heartbeatWaitFor(t, "the third consecutive failure", func() bool { return hb.count() >= heartbeatGiveUp })
+	// Give up the BEAT, not the tick: presence must keep going out every
+	// interval for the rest of the session (CLA-771).
+	heartbeatWaitFor(t, "presence to keep flowing after the beat gave up", func() bool {
+		return beacons.Load() >= 4
+	})
+	time.Sleep(10 * time.Millisecond)
+	if n := hb.count(); n != heartbeatGiveUp {
+		t.Fatalf("made %d call(s) before giving up, want %d and no more", n, heartbeatGiveUp)
+	}
 	select {
 	case <-r.stopped:
-	case <-time.After(2 * time.Second):
-		t.Fatal("renewer did not give up after consecutive failures")
-	}
-	if n := hb.count(); n != heartbeatGiveUp {
-		t.Fatalf("made %d call(s) before giving up, want %d", n, heartbeatGiveUp)
+		t.Fatal("the renewer returned after the beat gave up; its tick must keep firing so presence keeps flowing (CLA-771)")
+	default:
 	}
 }
 
@@ -462,6 +523,75 @@ func TestLeaseRenewerBeaconsOnEveryRenewalTick(t *testing.T) {
 	}
 	if got, want := beacons.Load(), int64(hb.count()+1); got != want {
 		t.Fatalf("%d presence beacon(s) for %d beat(s), want exactly one beacon per tick (%d)", got, hb.count(), want)
+	}
+}
+
+// TestLeaseRenewerKeepsBeaconingAfterTheBeatStandsDown is the stand-down half of
+// CLA-771's cadence: the beat may give up (a not-wired plane, or
+// heartbeatGiveUp consecutive failures) while the session keeps running, and
+// presence must not go with it - the fleet report is a different transport, and
+// an instance going dark mid-session is the exact symptom this task fixes.
+//
+// Hand-driven ticks make the counts exact: N ticks to stand the beat down, then
+// further ticks that must beacon and must NOT beat.
+func TestLeaseRenewerKeepsBeaconingAfterTheBeatStandsDown(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		// beats is how many Heartbeat CALLS the stand-down takes: the single
+		// refusal on ErrNotWired, heartbeatGiveUp consecutive failures otherwise.
+		beats int
+	}{
+		{"not wired plane", plane.ErrNotWired, 1},
+		{"three consecutive failures", errors.New("plane unreachable"), heartbeatGiveUp},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hb := &recordingHeartbeat{err: tc.err, failuresLeft: 999}
+			var beacons atomic.Int64
+			ticks := make(chan time.Time, 16)
+			r := &leaseRenewer{
+				hb:       hb,
+				interval: time.Minute, // cadence is hand-driven via r.tick
+				prefix:   "test: ",
+				claims:   make(chan harness.Claim, 4),
+				done:     make(chan struct{}),
+				stopped:  make(chan struct{}),
+				tick:     ticks,
+				presence: func() { beacons.Add(1) },
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			defer r.stop()
+			go r.run(ctx, heartbeatClaim("r-1"))
+
+			// The ticks that stand the beat down: one beacon each, one beat each.
+			for i := 1; i <= tc.beats; i++ {
+				ticks <- time.Now()
+				heartbeatWaitFor(t, "the tick's beat and its presence beacon", func() bool {
+					return hb.count() >= i && beacons.Load() >= int64(i)
+				})
+			}
+			// Further ticks while the session runs: presence only.
+			for i := 0; i < 3; i++ {
+				before := beacons.Load()
+				ticks <- time.Now()
+				heartbeatWaitFor(t, "a presence beacon on a tick after the beat stood down", func() bool {
+					return beacons.Load() > before
+				})
+			}
+			if n := hb.count(); n != tc.beats {
+				t.Fatalf("made %d heartbeat call(s), want %d and no more after standing down", n, tc.beats)
+			}
+			select {
+			case <-r.stopped:
+				t.Fatal("run returned after the beat stood down; the tick must keep carrying presence for the rest of the session")
+			default:
+			}
+			if got, want := beacons.Load(), int64(tc.beats+3); got != want {
+				t.Fatalf("%d presence beacon(s) over %d ticks, want one per tick (%d)", got, tc.beats+3, want)
+			}
+		})
 	}
 }
 

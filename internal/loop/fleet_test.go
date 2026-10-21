@@ -501,6 +501,77 @@ func TestDrainPhases_LongSessionBeaconsPresenceOnEveryRenewalTick(t *testing.T) 
 	}
 }
 
+// A session on ONE target must not silence the sibling projects' presence rows:
+// each configured project has its own reporter and its own project-scoped row,
+// and the poll that covers them all does not run while a drain is in progress.
+// The renewal tick therefore carries the poll's per-target lap: the running
+// target reports its iteration, every other target its own idle (or draining)
+// state (CLA-771 review — beaconLimited is the same precedent for a
+// daemon-wide state).
+func TestDrainPhases_LongSessionBeaconsEveryTargetNotOnlyTheRunningOne(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-multi"
+	cfg.Phases = []config.Phase{{Name: "implement"}}
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	idleFF := &fakeFleet{}
+	busyFF := &fakeFleet{}
+	hb := &recordingHeartbeat{}
+	countIdle := func() int {
+		sent, _ := idleFF.reports()
+		n := 0
+		for _, r := range sent {
+			if r.State.Kind == fleet.StateIdle {
+				n++
+			}
+		}
+		return n
+	}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// Hold the session open across several renewal ticks, the way the
+			// single-target cadence test does: the sibling's row is refreshed by
+			// the tick, not by the drain boundary.
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && countIdle() < 3 {
+				time.Sleep(time.Millisecond)
+			}
+			if countIdle() < 3 {
+				t.Error("a session on another target sent no idle presence to this project")
+			}
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d := NewMulti(cfg, h, []Target{
+		{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: idleFF},
+		{Poller: busyPoller(), Releaser: renewingReleaser{fakeReleaser: &fakeReleaser{}, hb: hb}, Fleet: busyFF},
+	})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.leaseRenewalInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, _, _, err := d.drainPhases(ctx, 1, 1, d.targets[1], spend{start: time.Now()}); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+
+	if n := countIdle(); n < 3 {
+		t.Fatalf("%d idle presence beacon(s) on the sibling target, want at least 3 across the session's renewal ticks", n)
+	}
+	// The sibling's row must not borrow the running target's work.
+	sent, _ := idleFF.reports()
+	for i, r := range sent {
+		if r.State.TaskRef != "" {
+			t.Errorf("sibling beacon %d carries taskRef %q from another target's session", i, r.State.TaskRef)
+		}
+	}
+	if n := hb.count(); n < 3 {
+		t.Errorf("renewed %d time(s) during the session, want at least 3 - each tick beacons every target", n)
+	}
+}
+
 // A failing presence report is telemetry: it must neither stop nor delay the
 // lease renewal that carries it. Every beacon this session sends is refused
 // (500), and the renewal keeps beating straight through the outage.

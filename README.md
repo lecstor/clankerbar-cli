@@ -1409,7 +1409,12 @@ because the pause is the one time that poll and session cadences both stop:
   `iteration` state on every lease renewal (a third of the plane's 30-minute
   lease, so ten minutes apart at most), because the poll does not run while a
   session does and a session longer than the plane's 15-minute liveness window
-  would otherwise read as a dead instance; and a limit wait re-beacons `limited`
+  would otherwise read as a dead instance — and that tick keeps firing, without
+  the lease beat, after renewal stands down on a plane that refuses it, since
+  the fleet report is a different transport and a healthy instance must not go
+  dark mid-session; every other project the daemon serves is re-beaconed its own
+  `idle`/`draining` state on the same tick, for the same reason one project over;
+  and a limit wait re-beacons `limited`
   every five minutes — well inside the plane's liveness window — so hours spent
   waiting out a cap do not read on the console as a dead instance. The plane
   stores exactly what you report; it infers nothing.

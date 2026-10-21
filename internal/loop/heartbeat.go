@@ -90,15 +90,21 @@ type leaseRenewer struct {
 	// Heartbeat. Nil in the heartbeat unit tests, which construct the renewer
 	// directly.
 	claimFile func(harness.Claim)
-	// presence, when non-nil, sends one presence beacon on every renewal tick
-	// (CLA-771). The renewal tick is the only cadence that still fires while a
-	// session runs - the backlog poll that otherwise carries presence does not
-	// run mid-drain - so without this a session longer than the plane's
+	// presence, when non-nil, sends one lap of presence beacons on every
+	// renewal tick (CLA-771), exactly what the poll's per-target lap sends: the
+	// running target's live state and every other served target's own. The
+	// renewal tick is the only cadence that still fires while a session runs -
+	// the backlog poll that otherwise carries presence does not run mid-drain -
+	// so without this a session longer than the plane's
 	// INSTANCE_STALE_AFTER_MS (15 minutes) reads on the console as a dead
 	// instance. It is called BEFORE the beat decision, so a session that holds
 	// no claim yet (a first-phase session claims minutes in) is still visibly
-	// alive. Nil for a target with no fleet reporter, and nil in the heartbeat
-	// unit tests, which construct the renewer directly.
+	// alive, and the tick itself keeps firing after the BEAT stands down (see
+	// run), so presence never depends on the heartbeat's health: the fleet
+	// report is a different transport from the MCP heartbeat, and a plane that
+	// refuses renewals may still accept presence. Nil for a target with no
+	// fleet reporter, and nil in the heartbeat unit tests, which construct the
+	// renewer directly.
 	//
 	// Its signature carries no error on purpose: reporting is fail-soft by
 	// contract, so a failed report is the Reporter's to log and drop, and there
@@ -150,11 +156,12 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 		// done is handed over so the reflector can refuse writes after stop()
 		// at its own write site, not only at apply's guard.
 		r.reflect = d.reflectClaim(ti, t, r.done)
-		// CLA-771: presence on the renewal cadence. The state is the one the
-		// poll would render (fleetState), read fresh at each tick so it carries
-		// the CURRENT claim ref and phase; a nil Fleet has nothing to send it
-		// to, so it is not wired.
-		r.presence = func() { d.beacon(ti, t, d.fleetState(ti)) }
+		// CLA-771: presence on the renewal cadence. The state is read fresh at
+		// each tick so it carries the CURRENT claim ref and phase; every target
+		// gets its lap, because the poll that covers the sibling projects does
+		// not run while a session does (see Driver.beaconSessionTargets). A nil
+		// Fleet has nothing to send it to, so it is not wired.
+		r.presence = func() { d.beaconSessionTargets(ti, t) }
 	}
 	inv.OnClaim = r.observe
 	go r.run(ctx, inv.ResumeClaim)
@@ -246,8 +253,16 @@ func (r *leaseRenewer) apply(c, current harness.Claim) harness.Claim {
 // run is the renewer's loop: beat every interval for as long as the current
 // claim is HELD (Claim.Held: a task held and not yet settled by the session
 // itself), follow the claim as the session settles one task and claims the
-// next, and stand down on cancellation, stop(), a not-wired plane, or
-// heartbeatGiveUp consecutive failures.
+// next, and exit on cancellation or stop().
+//
+// The BEAT stands down - permanently, for this renewer - on a not-wired plane
+// or heartbeatGiveUp consecutive failures. The TICK does not: it keeps firing
+// for the rest of the Invoke so the presence beacon still goes out every
+// interval (CLA-771). Two transports, two fates: the MCP heartbeat may be
+// refusing (an older plane with no tool, a broken MCP transport) while the
+// fleet-report POST is perfectly healthy, and a session that goes dark on the
+// console for the rest of its life is exactly the symptom CLA-771 exists to
+// fix. Standing the whole goroutine down here would bring it back.
 //
 // Held is the gate, not RunID != "": a settle keeps the run id on the tracked
 // claim (the driver reads it after exit) and flips Settled instead, so a
@@ -272,6 +287,12 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 	defer stopTicker()
 	beats := 0
 	failures := 0
+	// stoodDown disables the BEAT only. The tick keeps firing, so the presence
+	// beacon keeps flowing every interval for the rest of the session (CLA-771):
+	// a plane that will not renew this lease may still accept the fleet report,
+	// which is a different transport, and a healthy long session must not read
+	// as a dead instance just because the heartbeat endpoint is refusing.
+	stoodDown := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -304,6 +325,9 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 			// beat decision so a session that has not claimed yet (a
 			// first-phase session claims minutes into its stream) still shows
 			// its instance alive; a held claim's tick then beats as before.
+			// It also goes out BEFORE the stand-down guards below, so a beat
+			// that is disabled (or a claim that is settled) never takes the
+			// presence cadence with it.
 			// The beacon is fail-soft by contract (fleet.Reporter.Send drops a
 			// failed report and returns), so it cannot stop or delay renewal.
 			// The done-guard is the reflector's rule: a tick that loses the
@@ -317,7 +341,7 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 			if r.presence != nil {
 				r.presence()
 			}
-			if !current.Held() {
+			if stoodDown || !current.Held() {
 				continue
 			}
 			bctx, cancel := context.WithTimeout(ctx, heartbeatBeatTimeout)
@@ -329,18 +353,21 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 				failures = 0
 			case errors.Is(err, plane.ErrNotWired):
 				// A not-wired plane cannot renew anything, ever. Said once,
-				// then the renewer stands down rather than log the same
-				// refusal every tick for the rest of the session.
-				log.Printf("%slease renewal unavailable: %v - standing down (the lease behaves as before CLA-358: it expires if the session outlives it)", r.prefix, err)
-				return
+				// then the BEAT stands down rather than log the same refusal
+				// every tick for the rest of the session. The tick itself does
+				// not: presence keeps flowing (CLA-771).
+				log.Printf("%slease renewal unavailable: %v - standing down on the beat (the lease behaves as before CLA-358: it expires if the session outlives it); presence beacons continue every %s", r.prefix, err, r.interval)
+				stoodDown = true
 			case ctx.Err() != nil:
 				return
 			default:
 				failures++
 				log.Printf("%slease renewal failed (%d in a row): %v", r.prefix, failures, err)
 				if failures >= heartbeatGiveUp {
-					log.Printf("%sgiving up on lease renewal after %d consecutive failures - the lease may expire mid-session", r.prefix, failures)
-					return
+					// Same rule as ErrNotWired: no more beats, but the tick
+					// keeps carrying presence for the rest of the session.
+					log.Printf("%sgiving up on lease renewal after %d consecutive failures - the lease may expire mid-session; presence beacons continue every %s", r.prefix, failures, r.interval)
+					stoodDown = true
 				}
 			}
 		}
