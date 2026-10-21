@@ -211,6 +211,20 @@ type Driver struct {
 	// own stderr; with EchoSessions false nothing is echoed regardless.
 	echoOut io.Writer
 
+	// panelLaunch, when non-nil, is called with the launching member's reviewer
+	// role at a PARALLEL panel's launch boundary: the first moment that member's
+	// session launch has actually begun, immediately before the panel releases
+	// its successor. It is a test seam, and it exists because the launch ORDER
+	// cannot be observed soundly from inside a fake adapter: the adapter is
+	// entered one call after the boundary, so a goroutine descheduled in between
+	// lets a correctly ordered panel look out of order, which is exactly the
+	// assertion that flaked on CI (CLA-755 review 1.review-5.1). Recording here,
+	// before the release, is the order the panel guarantees.
+	//
+	// Nil in every production build — nothing but a test sets it — so it costs
+	// one nil check and changes nothing the panel does.
+	panelLaunch func(role string)
+
 	// undeclared counts the sessions this run that ended still holding a task
 	// whose work they had already pushed — the phase did its job and then did not
 	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a

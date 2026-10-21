@@ -313,7 +313,19 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 				// whose setup happened to finish sooner could reach its adapter
 				// ahead of this one, so the config list order was not the
 				// adapter/start order the panel promises.
-				onSessionLaunch: started,
+				//
+				// The release is also the only point a test can see the launch
+				// order exactly, so d.panelLaunch fires here, BEFORE the release:
+				// the recorded sequence cannot then be reordered by the
+				// scheduling gap between the release and the adapter call, which
+				// is what made an Invoke-entry assertion race (CLA-755
+				// 1.review-5.1).
+				onSessionLaunch: func() {
+					if d.panelLaunch != nil {
+						d.panelLaunch(role)
+					}
+					started()
+				},
 			})
 		out.members[k] = m
 	})

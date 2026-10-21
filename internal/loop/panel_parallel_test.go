@@ -105,12 +105,21 @@ type panelParallelAdapter struct {
 	// per member label: the directory it ran in and that directory's HEAD.
 	workdirs map[string]string
 	heads    map[string]string
-	// order is the reviewer role of every adapter invocation, in the order the
-	// adapters were actually ENTERED: the launch order the panel promises. It is
-	// recorded at the top of Invoke — the invocation boundary, immediately after
-	// the driver's launch signal (phaseRunOpts.onSessionLaunch) — and never after
-	// a subprocess or a file write, which is what made the assertion observe a
-	// different order than the code promises (CLA-755).
+	// order is the reviewer role of each panel member, in the order the DRIVER
+	// LAUNCHED it: recorded by the driver's panelLaunch seam at the launch
+	// boundary (phaseRunOpts.onSessionLaunch), before the member releases its
+	// successor. This is deliberately NOT the order the adapters were entered:
+	// the adapter is called one statement after the boundary, so a goroutine
+	// descheduled in between lets the next member append first and makes a
+	// correctly ordered panel look out of order — the CI flake this test fixes
+	// (CLA-755 review 1.review-5.1).
+	//
+	// Residual, stated rather than papered over (CLA-755 review 1.review-1.1):
+	// this pins the LAUNCH order, not the release POINT. A regression that
+	// released a member's successor from its worktree-ready point while still
+	// passing the launch callback would go unseen, because the successor has a
+	// `git worktree add` subprocess to get through either way. Pinning the
+	// release point needs the release itself observed; CLA-757 tracks it.
 	order []string
 	errs  []string
 }
@@ -149,20 +158,6 @@ func reviewRoleFromPrompt(prompt string) string {
 }
 
 func (a *panelParallelAdapter) Invoke(ctx context.Context, in harness.Invocation) (harness.Result, error) {
-	// CLA-755: the panel's order guarantee is the LAUNCH order, and a launch
-	// becomes observable to a fake exactly here: phaseRunOpts.onSessionLaunch
-	// fires immediately before this call, and it is what releases the next
-	// member. Record before anything else — before the prompt is routed, before
-	// review() runs `git rev-parse HEAD`, before either file write — because
-	// appending from inside review() measured when the I/O finished. A member
-	// released at member 1's launch can get through a subprocess and two writes
-	// before member 1 does, so the old recording raced the thing it was meant to
-	// pin (CI: adapter invocation order = [review-3 review-1 review-2]).
-	if strings.Contains(in.Prompt, "REVIEW-ONLY gate") {
-		a.mu.Lock()
-		a.order = append(a.order, reviewRoleFromPrompt(in.Prompt))
-		a.mu.Unlock()
-	}
 	a.mu.Lock()
 	a.calls++
 	call := a.calls
@@ -354,6 +349,23 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	members := panelMembers()
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	// CLA-755: record the launch order AT the launch boundary, through the
+	// driver's panelLaunch seam, instead of inferring it from the fake adapter's
+	// Invoke entry. Entry is one call after the boundary, so a member released
+	// from member 1's launch can still be descheduled before its own Invoke and
+	// let the next member append first, failing a panel that launched correctly.
+	// The seam fires on every launch attempt; the panel's release is idempotent,
+	// so the order asserted here is each member's FIRST launch.
+	launched := map[string]bool{}
+	d.panelLaunch = func(role string) {
+		a.mu.Lock()
+		defer a.mu.Unlock()
+		if role == "" || launched[role] {
+			return
+		}
+		launched[role] = true
+		a.order = append(a.order, role)
+	}
 
 	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
@@ -379,14 +391,13 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	if len(workdirs) != len(members) {
 		t.Fatalf("reviews ran in %d distinct worktrees, want %d: %v", len(workdirs), len(members), workdirs)
 	}
-	// The adapters were ENTERED in the config's list order, not merely created
-	// in it (CLA-738 review 3.2): the next member is released from this one's
-	// launch boundary — the entry to Invoke, immediately after onSessionLaunch —
-	// not from its checkout being ready, and nothing is recorded after I/O
-	// (CLA-755).
+	// The members were LAUNCHED in the config's list order (CLA-738 review 3.2):
+	// each is released from its predecessor's launch boundary, not from its
+	// checkout being ready. Recorded at that boundary via the panelLaunch seam,
+	// so the assertion is not racing the adapter entry (CLA-755 1.review-5.1).
 	for k, m := range members {
 		if k >= len(order) || order[k] != m.Name {
-			t.Fatalf("adapter invocation order = %v, want the panel's list order %v", order, memberNames(members))
+			t.Fatalf("panel launch order = %v, want the panel's list order %v", order, memberNames(members))
 		}
 	}
 	// And the iteration record the plane receives keeps the four-word enum.
