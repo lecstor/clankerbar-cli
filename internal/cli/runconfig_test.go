@@ -300,3 +300,48 @@ func TestCheckRunConfigs_StoredStepOnAnUnrunnableHarnessFails(t *testing.T) {
 		t.Errorf("remedy=%q, want it to name the block to declare", c.remedy)
 	}
 }
+
+// 2.review-3.3 (CLA-598 fix round 2): a panel with no phase sequence to expand
+// passes the CLI's own Validate (the key is inert locally), but the PLANE refuses
+// it as stored policy (decision 94497792). propose-config must refuse it locally
+// with a message the operator can act on, never send it.
+func TestProposeConfig_RefusesAPanelThePlaneCannotExpand(t *testing.T) {
+	var gotDoc map[string]any
+	called := false
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Params struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			} `json:"params"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.Params.Name == "propose_project_run_config" {
+			called = true
+			gotDoc, _ = body.Params.Arguments["config"].(map[string]any)
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`))
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"harness": "opencode", "prompt": "work the backlog", "backlog_url": "` + srv.URL + `/mcp/demo",` +
+		` "review_panel": [{"model": "opencode-go/gpt-6-luna"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLANKERBAR_API_KEY", "k-test")
+
+	err := ProposeConfig(context.Background(), []string{"--config", path})
+	if err == nil {
+		t.Fatalf("propose-config proposed %v; the plane refuses a panel with no expandable review phase", gotDoc)
+	}
+	if !strings.Contains(err.Error(), "review_panel") || !strings.Contains(err.Error(), "review") {
+		t.Errorf("the refusal does not name the panel and the missing review phase: %v", err)
+	}
+	if called {
+		t.Error("a proposal was sent for a document the plane cannot ratify")
+	}
+}

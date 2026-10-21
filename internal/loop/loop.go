@@ -7314,11 +7314,25 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 			}
 			tier, rule := tc.Escalation.Evaluate(changedPaths, category)
 			if tier != "" {
-				log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
+				// A pinned Phase.Model would otherwise make the rule INERT:
+				// ModelForPhase resolves Model before Tier, so setting the tier
+				// alone leaves the session on the pinned alias while the log
+				// claims an escalation (CLA-379's whole point is to raise the
+				// review to the escalated tier's alias). The rule fires on a
+				// phase, not the operator's per-phase wish, so the tier wins and
+				// the pinned alias is dropped.
+				raised := model
 				ph.Tier = tier
+				ph.Model = ""
 				model, ok = tc.ModelForPhase(ph)
 				if !ok {
 					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
+				}
+				// An escalation that lands on the model the phase already ran
+				// changed nothing, and logging one would attribute spend to a
+				// rule that made no difference.
+				if model != raised {
+					log.Printf("%sreview escalated to tier %q: %s (changed paths: %v, category=%q, branch=%q)", labelOf(t), tier, rule, changedPaths, category, branchName)
 				}
 			}
 		}

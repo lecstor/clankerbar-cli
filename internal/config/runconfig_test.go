@@ -354,7 +354,11 @@ func TestRunConfigDocument_RoundTripsThroughTheStoredShape(t *testing.T) {
 	c.MaxSessionWallClock = Duration(90 * time.Second)
 	c.Budget.MaxWallClock = Duration(3600 * time.Second)
 
-	data, err := json.Marshal(c.RunConfigDocument())
+	rendered, err := c.RunConfigDocument()
+	if err != nil {
+		t.Fatalf("RunConfigDocument: %v", err)
+	}
+	data, err := json.Marshal(rendered)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -373,7 +377,7 @@ func TestRunConfigDocument_RoundTripsThroughTheStoredShape(t *testing.T) {
 	}
 	// Nothing machine-local may ride along.
 	for _, banned := range []string{"workdir", "mcp_config_path", "env", "state_dir", "settings_path", "config_dir"} {
-		if _, ok := c.RunConfigDocument()[banned]; ok {
+		if _, ok := rendered[banned]; ok {
 			t.Errorf("rendered document carries machine-local key %q", banned)
 		}
 	}
@@ -608,7 +612,11 @@ func TestRunConfigDocument_RoundTripsThePipelineAndPhaseModel(t *testing.T) {
 	c.Phases[0].MaxWallClock = Duration(45 * time.Minute)
 	c.Phases[1].Tier = "strong"
 
-	data, err := json.Marshal(c.RunConfigDocument())
+	rendered, err := c.RunConfigDocument()
+	if err != nil {
+		t.Fatalf("RunConfigDocument: %v", err)
+	}
+	data, err := json.Marshal(rendered)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
@@ -720,5 +728,89 @@ func TestValidate_StoredStepOnAnUnrunnableHarnessIsATypedRefusal(t *testing.T) {
 	}
 	if !strings.Contains(she.Error(), "codex") || !strings.Contains(she.Error(), "review") {
 		t.Errorf("the refusal does not name the step and harness: %v", she)
+	}
+}
+
+// The pipeline section is judged by KEY presence (decision 6bf1fa15): a stored
+// `{"prompt": ""}` is a pipeline statement and must clear the local phases and
+// panel, not read as an absent section (CLA-598 fix round 2, 2.review-3.2).
+func TestApplyRunConfig_AnExplicitlyEmptyPromptIsAPipelineKey(t *testing.T) {
+	base := pipelineBase()
+	base.Prompt = "local prompt"
+
+	var doc RunConfigDoc
+	if err := json.Unmarshal([]byte(`{"$schema_version": 1, "prompt": ""}`), &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !doc.pipelineSet() {
+		t.Fatal("an explicitly present empty `prompt` did not mark the pipeline section")
+	}
+	if doc.Empty() {
+		t.Fatal("a document carrying `prompt` read as empty, so it would not overlay at all")
+	}
+	if err := base.ApplyRunConfig(&doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if base.Prompt != "" {
+		t.Errorf("prompt = %q, want the stored empty string", base.Prompt)
+	}
+	if base.Phases != nil {
+		t.Errorf("phases = %+v, want them cleared: the stored section omitted them", base.Phases)
+	}
+	if base.ReviewPanel != nil {
+		t.Errorf("panel = %+v, want it cleared: the stored section omitted it", base.ReviewPanel)
+	}
+	if base.ReviewPanelConcurrency != 3 {
+		t.Errorf("review_panel_concurrency = %d, want the local 3 kept — it is machine-owned", base.ReviewPanelConcurrency)
+	}
+
+	// CONTRAST: a document without the key still leaves the local pipeline alone.
+	absent, err := json.Marshal(map[string]any{"$schema_version": 1, "max_turns": 9})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var noPrompt RunConfigDoc
+	if err := json.Unmarshal(absent, &noPrompt); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if noPrompt.pipelineSet() {
+		t.Error("a document with no pipeline key marked the section set")
+	}
+}
+
+// The plane is deliberately stricter than the CLI about a panel with no
+// sequence to expand (decision 94497792): it stores a panel only beside the
+// phase it multiplies. propose-config must refuse that shape rather than offer
+// a document the operator could never ratify (CLA-598 fix round 2,
+// 2.review-3.3/1.3/5.2).
+func TestRunConfigDocument_RefusesAPanelThePlaneCannotRatify(t *testing.T) {
+	c := defaults()
+	c.Harness = "opencode"
+	c.Prompt = "custom operator prompt"
+	c.ReviewPanel = []ReviewPanelMember{{Name: "a", Model: "opencode-go/gpt-6-luna"}}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("the CLI itself tolerates this shape (the panel is inert locally): %v", err)
+	}
+
+	doc, err := c.RunConfigDocument()
+	if err == nil {
+		t.Fatalf("RunConfigDocument exported %v, want a refusal: the plane refuses a panel with no expandable review phase", doc)
+	}
+	if !strings.Contains(err.Error(), "review_panel") || !strings.Contains(err.Error(), "review") {
+		t.Errorf("the refusal does not name the panel and the missing review phase: %v", err)
+	}
+
+	// A config whose sequence CAN expand the panel still exports.
+	ok := pipelineBase()
+	ok.Prompt = ""
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("the expandable fixture must validate: %v", err)
+	}
+	rendered, err := ok.RunConfigDocument()
+	if err != nil {
+		t.Fatalf("RunConfigDocument refused an expandable panel: %v", err)
+	}
+	if _, has := rendered["review_panel"]; !has {
+		t.Errorf("the expandable panel was omitted from the document: %v", rendered)
 	}
 }

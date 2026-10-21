@@ -204,12 +204,12 @@ Two bounds make the loop terminate:
   one a verifier marked resolved that a later verifier reopens, parks the task
   with a question instead of spending another round on the disagreement.
 
-The verifier is configurable like any phase (`harness`, `tier`). Left unset, it
-inherits the **fix** phase's harness and tier — the cheap, non-reviewer side of
-the split — because verification rounds are scoped and cheap and a reviewer's
-Claude subscription limit is shared with the operator's interactive use. In the
-shipped example above that means the verifier runs on opencode, not on the
-expensive review model.
+The verifier is configurable like any phase (`harness`, `tier`, `model`). Left
+unset, it inherits the **fix** phase's harness and its model/tier pair — the
+cheap, non-reviewer side of the split — because verification rounds are scoped
+and cheap and a reviewer's Claude subscription limit is shared with the
+operator's interactive use. In the shipped example above that means the verifier
+runs on opencode, not on the expensive review model.
 
 This loop is **interim**. It lives in the CLI's `drainPhases` because it ships
 before the state-machine reshape, which moves phase sequencing and the
@@ -368,8 +368,8 @@ Each member's reviewer role is **positional** — `review-1` .. `review-N`, coun
 over the review-shaped phases — and that is the role the durable record is keyed
 on. `name` is only the member's log label (it defaults to the same positional
 string); naming a member `alpha` changes what the logs call it, never which
-record it writes. A member may set `tier` instead of `model` to resolve through a
-harness's tier map.
+record it writes. A member may set a `tier`, a `model`, or both — the model
+alias wins on expansion — so a tier resolves through a harness's tier map.
 
 **Independence is a seal, not a promise.** The plane holds a round's records
 sealed: written, but with their findings withheld from every `get_task` until

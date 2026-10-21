@@ -30,6 +30,7 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 )
@@ -109,7 +110,9 @@ type RunConfigPanelMember struct {
 // Prompt, Phases and ReviewPanel are the PIPELINE section (CLA-598). Its
 // presence is judged by KEY, not by value: a nil Phases/ReviewPanel is an
 // absent key, while an empty non-nil slice is a key that clears the local
-// value; a non-empty Prompt marks the section too.
+// value, and a `prompt` key counts however empty its string is (presence rides
+// in promptSet, which UnmarshalJSON fills — a plain string cannot tell `"prompt":
+// ""` from an absent key).
 //
 // ReviewPanelConcurrency is deliberately NOT part of that section: it is
 // machine-owned (decision e1365721), so the overlay never applies it. The field
@@ -123,6 +126,7 @@ type RunConfigDoc struct {
 	Models                 map[string]string                `json:"models"`
 	Harnesses              map[string]RunConfigHarnessBlock `json:"harnesses"`
 	Prompt                 string                           `json:"prompt"`
+	promptSet              bool                             // the `prompt` KEY was present (see UnmarshalJSON)
 	Phases                 []RunConfigPhase                 `json:"phases"`
 	ReviewPanel            []RunConfigPanelMember           `json:"review_panel"`
 	ReviewPanelConcurrency int                              `json:"review_panel_concurrency"`
@@ -130,6 +134,28 @@ type RunConfigDoc struct {
 	MaxSessionWallClock    Duration                         `json:"max_session_wall_clock"`
 	Budget                 *RunConfigBudget                 `json:"budget"`
 	Escalation             *RunConfigEscalation             `json:"escalation"`
+}
+
+// UnmarshalJSON decodes the document and records whether the `prompt` KEY was
+// present, because the pipeline section is judged on key presence
+// (decision 6bf1fa15): a document carrying `"prompt": ""` is a stored statement
+// that clears the local pipeline, exactly like an empty non-nil `phases` array,
+// and a string field cannot tell that from an absent key.
+func (d *RunConfigDoc) UnmarshalJSON(data []byte) error {
+	type docAlias RunConfigDoc // no methods: decoding into it cannot recurse here
+	var a docAlias
+	if err := json.Unmarshal(data, &a); err != nil {
+		return err
+	}
+	// A map probe, not a *string: `"prompt": null` still carries the key, and the
+	// section rule is about the key, not the value.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err != nil {
+		return err
+	}
+	*d = RunConfigDoc(a)
+	_, d.promptSet = probe["prompt"]
+	return nil
 }
 
 // SchemaNewer reports whether the document carries a `$schema_version` newer
@@ -149,7 +175,8 @@ func (d *RunConfigDoc) SchemaNewer() bool {
 // overlay replace all three: the section is one unit, exactly as the plane
 // stores it (decision 6bf1fa15). Presence is judged the way JSON can express it
 // — a nil slice is an absent key, an empty one is a key that clears — so
-// `"phases": []` still counts.
+// `"phases": []` still counts. `prompt` counts by KEY too: an explicitly present
+// empty string clears the local pipeline rather than reading as absent.
 //
 // `review_panel_concurrency` is NOT a section key (decision e1365721): a
 // document carrying only that is not a pipeline statement at all, so the local
@@ -158,7 +185,7 @@ func (d *RunConfigDoc) pipelineSet() bool {
 	if d == nil {
 		return false
 	}
-	return d.Prompt != "" || d.Phases != nil || d.ReviewPanel != nil
+	return d.promptSet || d.Prompt != "" || d.Phases != nil || d.ReviewPanel != nil
 }
 
 // Empty reports whether the document consumes to nothing: every field a stored
@@ -469,7 +496,12 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 // it is how many panel seats run at once on THIS machine, not part of the
 // run's result, so it stays machine-owned. A ratifying round-trip therefore
 // cannot move one machine's cap onto every other.
-func (c *Config) RunConfigDocument() map[string]any {
+//
+// It returns an error for a pipeline shape the PLANE refuses even though this
+// file's Validate tolerates it: a panel with no built-in, non-final review phase
+// to expand (inert locally, a stored no-op on the plane — decision 94497792).
+// propose-config must never offer a document the operator cannot ratify.
+func (c *Config) RunConfigDocument() (map[string]any, error) {
 	doc := map[string]any{}
 	if c.Harness != "" {
 		doc["harness"] = c.Harness
@@ -503,6 +535,17 @@ func (c *Config) RunConfigDocument() map[string]any {
 	// exported only when it is the OPERATOR's: defaults() fills in the built-in
 	// prompt, and exporting that would have propose-config replace the plane's
 	// pipeline with prose the operator never wrote.
+	//
+	// A panel the exported sequence cannot expand is refused, not exported: the
+	// plane stores a panel only beside the sequence it multiplies, and also
+	// refuses `prompt` beside one (decision 94497792), so an unphased config's
+	// panel is a document the operator could never ratify.
+	if len(c.ReviewPanel) > 0 && !c.expandsReviewPanel() {
+		return nil, fmt.Errorf("cannot propose this config: `review_panel` needs a built-in, non-final %q phase "+
+			"to expand, and this config's sequence has none, so the plane would refuse the document (a panel is "+
+			"stored policy there, never a key that can do nothing). Give the config a built-in %q phase with a "+
+			"phase after it (the fix), or remove `review_panel`", ReviewPhaseName, ReviewPhaseName)
+	}
 	pipeline := map[string]any{}
 	if c.Prompt != "" && c.Prompt != defaultPrompt {
 		pipeline["prompt"] = c.Prompt
@@ -611,5 +654,5 @@ func (c *Config) RunConfigDocument() map[string]any {
 		}
 		doc["escalation"] = e
 	}
-	return doc
+	return doc, nil
 }

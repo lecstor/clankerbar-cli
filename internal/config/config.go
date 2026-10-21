@@ -1866,8 +1866,12 @@ func NoCodeHandoffContinuation() string {
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
-// iteration log's filename.
-var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
+// iteration log's filename. It is the PLANE's own pattern verbatim
+// (/^[a-z0-9]+(-[a-z0-9]+)*$/, RUN_CONFIG built-ins aside): a proposal is
+// ratified by that validator, so a name this file accepts but the plane refuses
+// (a double hyphen, a leading or trailing one) would be a config `propose-config`
+// could never lift.
+var phaseNameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
 // panelMemberPositionRe matches the DERIVED member-label family (`review-N`),
 // which is owned by member position (CLA-639). An explicit name from this family
@@ -3146,15 +3150,21 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 		ph.Harness = h
 	}
 	// Model and Tier are the same choice at two levels of indirection, and a
-	// member states one of them: an alias is the more specific statement, so it
-	// clears the tier it overrides. An empty member field leaves the review
-	// phase's own value in place (itself empty on a config that resolved
-	// neither), which is the fall-through to the harness default.
+	// member states one of them: either is the more specific statement than
+	// whatever the review phase carries, so setting one clears the other. An
+	// empty member field leaves the review phase's own value in place (itself
+	// empty on a config that resolved neither), which is the fall-through to
+	// the harness default.
 	if v := strings.TrimSpace(m.Model); v != "" {
 		ph.Model = v
 		ph.Tier = ""
 	} else if t := strings.TrimSpace(m.Tier); t != "" {
 		ph.Tier = t
+		// The inherited model would otherwise WIN: ModelForPhase resolves Model
+		// before Tier, so a member that asked for a bucket would silently run on
+		// the review phase's pinned alias. The member's own tier is the more
+		// specific statement, so it clears the inherited model too.
+		ph.Model = ""
 	}
 	return ph
 }
@@ -3232,14 +3242,15 @@ func (c *Config) EffectivePhases() []Phase {
 		}
 		out = append(out, ph)
 	}
-	// A verify phase that names neither a harness nor a tier would otherwise run
-	// on the REVIEWER'S model — the one that raised the findings — which A5
-	// (throughput, not only dollars) says is the wrong default: verification
-	// rounds are scoped and cheap, and a Claude subscription limit is shared with
-	// the operator's interactive use. So it inherits the FIX phase's harness and
-	// tier instead (the shipped shape has fix on a cheap non-Claude harness), and
-	// an explicit harness/tier on the verify phase always wins. Configurable,
-	// never silent magic: the resolved values are what the spawn line stamps.
+	// A verify phase that names neither a harness nor a tier nor a model would
+	// otherwise run on the REVIEWER'S model — the one that raised the findings —
+	// which A5 (throughput, not only dollars) says is the wrong default:
+	// verification rounds are scoped and cheap, and a Claude subscription limit is
+	// shared with the operator's interactive use. So it inherits the FIX phase's
+	// harness and its model/tier pair instead (the shipped shape has fix on a
+	// cheap non-Claude harness), and an explicit harness/model/tier on the verify
+	// phase always wins. Configurable, never silent magic: the resolved values
+	// are what the spawn line stamps.
 	//
 	// Keyed on the RESOLVED built-in brief, not the name: an operator's own
 	// prompt under the name "verify" owns its own contract (the same convention
@@ -3258,7 +3269,13 @@ func (c *Config) EffectivePhases() []Phase {
 			if out[i].Harness == "" {
 				out[i].Harness = out[lastFix].Harness
 			}
-			if out[i].Tier == "" {
+			// Model and tier are one choice, and the verify phase's own statement
+			// wins: inherit the fix phase's pair only when the verifier named
+			// neither. Inheriting the MODEL beside a tier the verifier named
+			// would make that tier inert, because ModelForPhase resolves Model
+			// first — the same trap a panel member's tier has.
+			if out[i].Model == "" && out[i].Tier == "" {
+				out[i].Model = out[lastFix].Model
 				out[i].Tier = out[lastFix].Tier
 			}
 		}
@@ -4311,7 +4328,7 @@ func (c *Config) Validate() error {
 		}
 		labels[label] = i
 		if name := strings.TrimSpace(m.Name); name != "" && !phaseNameRe.MatchString(name) {
-			return fmt.Errorf("review_panel[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, name)
+			return fmt.Errorf("review_panel[%d]: name %q must be lowercase letters, digits and hyphens, with no leading, trailing or doubled hyphen (it becomes part of the iteration log filename)", i, name)
 		}
 		// The review-N family is owned by member POSITION: a member may write its
 		// own derived label, but not another member's, or the logs, the
@@ -4439,7 +4456,7 @@ func (c *Config) Validate() error {
 		// like — which would cost the phase its iteration log entirely, the one
 		// artifact an operator has to debug the sequence with.
 		if ph.Name != "" && !phaseNameRe.MatchString(ph.Name) {
-			return fmt.Errorf("phases[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, ph.Name)
+			return fmt.Errorf("phases[%d]: name %q must be lowercase letters, digits and hyphens, with no leading, trailing or doubled hyphen (it becomes part of the iteration log filename)", i, ph.Name)
 		}
 		if ph.MaxTurns < 0 {
 			return fmt.Errorf("phases[%d]: max_turns is negative", i)

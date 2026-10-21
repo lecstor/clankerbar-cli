@@ -69,7 +69,10 @@ func ProposeConfig(ctx context.Context, args []string) error {
 		return err
 	}
 
-	doc := cfg.RunConfigDocument()
+	doc, err := cfg.RunConfigDocument()
+	if err != nil {
+		return err
+	}
 	if len(doc) == 0 {
 		return errors.New("nothing to import: this config sets none of the dials the plane stores (prompt, phases, review_panel, harness, model, models, budget, escalation, max_turns, max_session_wall_clock)")
 	}

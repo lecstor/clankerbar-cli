@@ -3762,9 +3762,12 @@ func plural(n int, one, many string) string {
 // under opencode, a cost ceiling on a harness that never reports cost), which is
 // the validation split the design memo draws.
 //
-// Never FAILs on plane trouble: an unreadable stored document leaves the loop
+// Plane trouble never FAILs: an unreadable stored document leaves the loop
 // running its previous config (the same posture applyReload takes), so doctor
-// says WARN and keeps `doctor && run` usable.
+// says WARN and keeps `doctor && run` usable. A stored step this machine cannot
+// spawn is NOT plane trouble — it is ratified policy that would silently not
+// run here — so that one deliberately FAILs, and `doctor && run` refuses to
+// start until it is fixed.
 func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []check {
 	type rcTarget struct {
 		name string // "" for the unnamed single target
@@ -3854,9 +3857,10 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 			// A stored STEP this machine cannot spawn is the one refusal that
 			// earns FAIL: the document is ratified policy that silently will not
 			// run here, and the operator has to know before an unattended drain
-			// quietly falls back to local rules instead (CLA-598). Every other
-			// refusal stays WARN — plane trouble must not make `doctor && run`
-			// unusable (applyRunConfig's own posture).
+			// quietly falls back to local rules instead (CLA-598). That FAIL is
+			// the point — `doctor && run` refuses to start on such a document.
+			// Every OTHER refusal stays WARN, because plane trouble must not make
+			// `doctor && run` unusable (applyRunConfig's own posture).
 			var she *config.StepHarnessError
 			if errors.As(err, &she) {
 				where := ""
@@ -3866,7 +3870,7 @@ func checkRunConfigs(ctx context.Context, cfg *config.Config, e doctorEnv) []che
 				c.status = fail
 				c.detail = fmt.Sprintf("%sstored v%d step %s runs on harness %q, which this machine cannot run (%s) - local rules (%s) stay in force",
 					where, st.Version, she.Step, she.Harness, she.Problem, src)
-				c.remedy = fmt.Sprintf("declare `harnesses.%s` locally (or change the stored step's harness) and ratify again; until then the loop ignores the document", she.Harness)
+				c.remedy = fmt.Sprintf("declare `harnesses.%s` locally, or change the stored step's harness and ratify again; until then the loop ignores the document", she.Harness)
 				checks = append(checks, c)
 				continue
 			}

@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -643,4 +644,169 @@ func TestRun_ReloadRebuildsAnInForceStoredOverlayOnTheFreshBase(t *testing.T) {
 		t.Error("the stored overlay should still be in force after the reload")
 	}
 	markerAbsent(t, dir, MarkerReload)
+}
+
+// 2.review-1.1 (CLA-598 fix round 2): a review phase that pins `model` must not
+// make the review-tier escalation inert. ModelForPhase resolves Model BEFORE
+// Tier, so the loop has to drop the pinned alias when a rule fires, or the
+// session keeps the pin while the log claims an escalation. And an escalation
+// that lands on the model the phase already ran changed nothing, so it must not
+// be logged as one.
+func TestRun_ReviewTierEscalationBeatsAPinnedPhaseModel(t *testing.T) {
+	reviewPhases := func() []config.Phase {
+		return []config.Phase{
+			{Name: config.ImplementPhaseName},
+			{Name: config.ReviewPhaseName, Model: "pinned/review-model"},
+		}
+	}
+	// A checkpointed implement phase whose claim declares the category the
+	// category rule fires on, so the escalation is evaluated on real driver state.
+	bugCheckpoint := reported(held(okResult(1, 0), harness.Claim{
+		TaskID: "t-1", RunID: "r-1", Category: "bug",
+	}), branchReport())
+
+	t.Run("the escalated tier's alias wins over the pinned model", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.Phases = reviewPhases()
+		cfg.Prompt = ""
+		cfg.Models = map[string]string{"strong": "opencode-go/glm-5.3-flash"}
+		cfg.Escalation = config.Escalation{CategoryRules: map[string]string{"bug": "strong"}}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: bugCheckpoint}, // implement
+			{res: bugCheckpoint}, // review
+		}}
+		d, _ := phaseDriver(t, h, cfg.Phases)
+		d.cfg.Models = cfg.Models
+		d.cfg.Escalation = cfg.Escalation
+		buf := captureLogs(t)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if len(h.invocations) != 2 {
+			t.Fatalf("spawned %d sessions, want 2", len(h.invocations))
+		}
+		if got := h.invocations[1].Model; got != "opencode-go/glm-5.3-flash" {
+			t.Errorf("the escalated review ran on %q, want the strong tier's alias — the pinned model made the rule inert", got)
+		}
+		if logs := buf.String(); !strings.Contains(logs, `review escalated to tier "strong"`) {
+			t.Errorf("the escalation was not logged; log was:\n%s", logs)
+		}
+	})
+
+	t.Run("an escalation that changes no model is not logged as one", func(t *testing.T) {
+		cfg := fastCfg()
+		cfg.Phases = reviewPhases()
+		cfg.Prompt = ""
+		cfg.Models = map[string]string{"strong": "pinned/review-model"} // same alias
+		cfg.Escalation = config.Escalation{CategoryRules: map[string]string{"bug": "strong"}}
+		h := &fakeAdapter{steps: []invokeStep{
+			{res: bugCheckpoint},
+			{res: bugCheckpoint},
+		}}
+		d, _ := phaseDriver(t, h, cfg.Phases)
+		d.cfg.Models = cfg.Models
+		d.cfg.Escalation = cfg.Escalation
+		buf := captureLogs(t)
+
+		if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+			t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+		}
+		if len(h.invocations) != 2 {
+			t.Fatalf("spawned %d sessions, want 2", len(h.invocations))
+		}
+		if got := h.invocations[1].Model; got != "pinned/review-model" {
+			t.Errorf("review ran on %q, want the pinned alias", got)
+		}
+		if logs := buf.String(); strings.Contains(logs, "review escalated to tier") {
+			t.Errorf("an escalation that changed no model was still logged as one:\n%s", logs)
+		}
+	})
+}
+
+// 2.review-1.4 (CLA-598 fix round 2): the doneWhen's headline behaviour at the
+// DAEMON level — a stored document's pipeline (phases, per-phase model and the
+// review panel) is what a drain actually spawns, over a DIFFERENT local file.
+// The config-level tests pin the overlay; this one pins its consumption.
+func TestRun_StoredPipelineReachesTheSpawn(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(1, 0)},             // stored implement
+		{res: mcpReached(checkpointed(1, 0))}, // review-1
+		{res: mcpReached(checkpointed(1, 0))}, // review-2
+		{res: mcpReached(checkpointed(1, 0))}, // review-3
+		{res: mcpReached(checkpointed(1, 0))}, // review-4
+		{res: mcpReached(checkpointed(1, 0))}, // review-5
+		{res: checkpointed(1, 0)},             // stored fix
+		{res: checkpointed(1, 0)},             // stored verify
+	}}
+	// Every stored panel member records a sealed round-1 record as it finishes,
+	// and the verifier its round-2 record: the fixture is a HEALTHY stored
+	// pipeline, not a panel of failures.
+	h.onInvoke = func(i int) {
+		switch {
+		case i >= 1 && i <= 5:
+			rel.records = append(rel.records, recordFor(1, "review-"+strconv.Itoa(i), "r-1", testCheckpointTip, "sealed"))
+		case i == 7:
+			rel.records = append(rel.records, recordFor(2, "review-6", "r-1", testCheckpointTip, "sealed"))
+			rel.counted = 2
+			rel.openMusts = nil
+			rel.status = "in_review"
+		}
+	}
+	cfg := fastCfg()
+	cfg.Prompt = ""
+	// The LOCAL file is a two-phase config with no panel: everything the drain
+	// runs below has to come from the stored document.
+	cfg.Phases = []config.Phase{{Name: config.ImplementPhaseName}, {Name: config.ReviewPhaseName}}
+	cfg.Model = "local/implement-model"
+	// The panel cap is MACHINE-owned (decision e1365721), so the local 1 keeps
+	// the stored five-member panel sequential in this fixture.
+	cfg.ReviewPanelConcurrency = 1
+
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel, RCfg: &fakeRCfg{}}})
+	d.newAdapter = func(string) (harness.Adapter, error) { return h, nil }
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
+
+	// The daemon's consume point, exactly what the poll calls at a boundary.
+	d.applyRunConfig(0, &d.targets[0], &plane.RunConfigState{Version: 1, Config: []byte(`{
+		"$schema_version": 1,
+		"phases": [
+			{"name": "implement", "model": "stored/implement-model"},
+			{"name": "review"},
+			{"name": "fix"},
+			{"name": "verify"}
+		],
+		"review_panel": [
+			{"model": "stored/member-1"},
+			{"model": "stored/member-2"},
+			{"model": "stored/member-3"},
+			{"model": "stored/member-4"},
+			{"model": "stored/member-5"}
+		]
+	}`)})
+	if d.targets[0].Cfg == nil {
+		t.Fatal("the stored document was refused; want it in force")
+	}
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(h.invocations) != 8 {
+		t.Fatalf("spawned %d sessions, want 8 — the STORED four-phase sequence with its five-member panel (implement, 5 reviewers, fix, verify)", len(h.invocations))
+	}
+	if got := h.invocations[0].Model; got != "stored/implement-model" {
+		t.Errorf("the stored implement phase ran on %q, want the STORED model — the daemon ran the local pipeline", got)
+	}
+	for i := 1; i <= 5; i++ {
+		if got := h.invocations[i].Model; got != "stored/member-"+strconv.Itoa(i) {
+			t.Errorf("review %d ran on %q, want the stored member's model", i, got)
+		}
+		if p := h.invocations[i].Prompt; !strings.Contains(p, "REVIEW-ONLY gate") {
+			t.Errorf("review %d is not running the review-only brief:\n%s", i, p)
+		}
+	}
 }

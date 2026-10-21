@@ -715,3 +715,41 @@ func phaseNames(phases []Phase) []string {
 	}
 	return out
 }
+
+// TestReviewPanel_MemberTierBeatsTheReviewPhasesModel: a member that names a
+// TIER must run on that tier, not on the model inherited from the configured
+// review phase. ModelForPhase resolves Model before Tier, so the tier branch of
+// panelMember has to clear the inherited model — otherwise the member's explicit
+// choice is silently inert (CLA-598 fix round 2, 2.review-1.2/3.1/2.1/4.1/5.1).
+func TestReviewPanel_MemberTierBeatsTheReviewPhasesModel(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "opencode",
+		"models": {"strong": "opencode-go/glm-5.3-flash"},
+		"phases": [
+			{"name": "implement"},
+			{"name": "review", "model": "opencode-go/gpt-6-luna"},
+			{"name": "fix"}
+		],
+		"review_panel": [
+			{"tier": "strong"},
+			{"model": "opencode-go/gpt-6-luna"}
+		]
+	}`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
+	got := cfg.EffectivePhases()
+	if len(got) != 4 {
+		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(got))
+	}
+	tiered, modeld := got[1], got[2]
+	if tiered.Tier != "strong" || tiered.Model != "" {
+		t.Errorf("the tier member expanded to model=%q tier=%q, want tier strong with NO inherited model", tiered.Model, tiered.Tier)
+	}
+	if model, ok := cfg.ModelForPhase(tiered); !ok || model != "opencode-go/glm-5.3-flash" {
+		t.Errorf("the tier member resolves to %q/%v, want opencode-go/glm-5.3-flash — the tier it named", model, ok)
+	}
+	if modeld.Model != "opencode-go/gpt-6-luna" || modeld.Tier != "" {
+		t.Errorf("the model member expanded to model=%q tier=%q, want its own alias and no tier", modeld.Model, modeld.Tier)
+	}
+}
