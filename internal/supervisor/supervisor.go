@@ -1407,10 +1407,13 @@ func (d *Supervisor) stopAll() error {
 //     the child itself created (the Lstat gate in the callers) is what
 //     guarantees the child is past its startup marker check.
 //
-// A child that cannot be stopped this way — the state dir refuses to open, or
-// the marker write fails — is logged loudly and left running: the supervisor
-// keeps waiting for its exit, because stopping it by killing the process is
-// exactly what this phase must not do.
+// A STOP already sitting in the state dir is a stop already PENDING, not a
+// failure: it drains the child exactly as a fresh one would, and it is left
+// untouched because its body records who asked first. A child that cannot be
+// stopped this way — the state dir refuses to open, or any other marker write
+// failure — is logged loudly and left running: the supervisor keeps waiting for
+// its exit, because stopping it by killing the process is exactly what this
+// phase must not do.
 func (d *Supervisor) writeStop(inst *Instance, dir string) {
 	inst.mu.Lock()
 	cfg := inst.cfg
@@ -1423,6 +1426,15 @@ func (d *Supervisor) writeStop(inst *Instance, dir string) {
 	defer st.Close() //nolint:errcheck // read-side handle on the way out
 	body := []byte(fmt.Sprintf("fleet-wide stop requested by the supervisor at %s\n", time.Now().UTC().Format(time.RFC3339)))
 	if err := st.WriteFile("STOP", body); err != nil {
+		if errors.Is(err, statedir.ErrExists) {
+			// A STOP is already pending - the operator wrote it by hand, or an
+			// earlier stop path did - and it drains the child at its iteration
+			// boundary exactly as this one would. Not a failure, and nothing to
+			// send the operator to fix by hand. The existing marker is left
+			// alone on purpose: its body records who asked first.
+			log.Printf("%s: STOP already present in %s - draining at its iteration boundary", inst.name, dir)
+			return
+		}
 		log.Printf("%s: cannot write STOP into %s: %v - the child keeps running; stop it by hand", inst.name, dir, err)
 		return
 	}
