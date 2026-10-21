@@ -102,7 +102,15 @@ func (v *Verifier) OpenPRs(ctx context.Context, repo, slug, head string) ([]PRRe
 		HeadRefOid  string `json:"headRefOid"`
 	}
 	if jerr := json.Unmarshal([]byte(out), &listed); jerr != nil {
-		return nil, fmt.Errorf("could not parse gh pr list output: %v", jerr)
+		// The same classification every gh JSON reader in this package uses
+		// (CLA-776 review 1.review-1.6): gh ran and answered, and the answer is
+		// not the JSON asked for. A generic error here would read as an
+		// unavailable prerequisite while the gate calls the same fault a
+		// refusal.
+		return nil, &ghParseError{
+			detail: fmt.Sprintf("could not parse gh pr list output: %v", jerr),
+			err:    jerr,
+		}
 	}
 	refs := make([]PRRef, 0, len(listed))
 	for _, pr := range listed {
