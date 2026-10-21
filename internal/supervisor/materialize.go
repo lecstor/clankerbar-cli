@@ -7,11 +7,12 @@ package supervisor
 // artifact rather than something the operator maintains — the precondition
 // for the roster driving it in phase 3b.
 //
-// The generated file is a CACHE: regenerated on every reconcile (each spawn
-// re-reads the source config and rewrites it), never hand-edited, safe to
-// delete while the child runs, and written to disk rather than held in memory
-// so it doubles as the offline last-known-good (phase 3b: an unreachable plane
-// means starting from cache, not starting nothing).
+// The generated file is a CACHE: written when the child is spawned, rewritten
+// at reconcile only when an edit changes its bytes (configchange.go), never
+// hand-edited, safe to delete while the child runs (the next spawn regenerates
+// it), and written to disk rather than held in memory so it doubles as the
+// offline last-known-good (phase 3b: an unreachable plane means starting from
+// cache, not starting nothing).
 //
 // What the generated file carries:
 //

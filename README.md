@@ -918,9 +918,10 @@ resolved `settings_path` / `config_dir` / `mcp_config_path` and the default
 `backlog_url`; the credential itself stays in `CLANKERBAR_API_KEY` in the
 environment, which the child inherits) — is written to `materialized.json` in
 the child's own state dir, and the child is started with `run -c` pointing at
-it. The generated file is a **cache**: regenerated on every reconcile (each
-spawn re-reads the base config), never hand-edited, and safe to delete while a
-child runs — the next spawn regenerates it. It is written to disk rather than
+it. The generated file is a **cache**: written when the child is spawned and
+rewritten at reconcile when an edit changes it (see "The base config is the
+machine layer"), never hand-edited, and safe to delete while a child runs — the
+next spawn regenerates it. It is written to disk rather than
 held in memory so it doubles as the offline last-known-good: with the plane
 unreachable the supervisor reconciles against the cached roster and starts
 children from their materialized configs, rather than starting nothing (a cold

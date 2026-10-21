@@ -11,8 +11,9 @@
 // hand — except the file is the GENERATED effective config in the child's
 // state dir (phase 2b): the operator's machine-layer local config with the
 // roster entry's project and its one permitted policy override (`harness` and
-// its per-harness block, Decision 1) materialized over it, regenerated on
-// every reconcile. Instance identity (`instance_name`), per-instance state
+// its per-harness block, Decision 1) materialized over it, written when the
+// child is spawned and rewritten at reconcile when an edit changes it
+// (CLA-724). Instance identity (`instance_name`), per-instance state
 // dirs and the fleet beacon all behave exactly as before — identity because
 // the generated file pins the roster name, and the state dir because the
 // generated file pins that too.
