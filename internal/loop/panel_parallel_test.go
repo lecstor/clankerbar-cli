@@ -316,19 +316,16 @@ func panelParallelDriver(t *testing.T, h harness.Adapter, rel *reviewReleaser, m
 	return d, ff
 }
 
-// memberNames is the panel's configured order, for the launch-order assertion.
-func memberNames(members []config.ReviewPanelMember) []string {
-	out := make([]string, len(members))
-	for i, m := range members {
-		out[i] = m.Name
-	}
-	return out
-}
-
-// memberIndex is a member's position in the panel's configured list, or -1.
-func memberIndex(members []config.ReviewPanelMember, role string) int {
-	for k, m := range members {
-		if m.Name == role {
+// memberIndex is a member's position within the panel run — the index the
+// release seam reports — derived from the POSITIONAL roles the driver reports
+// (panelRoles), not from the member's log label. Indexing ReviewPanelMember.Name
+// instead would line up only while panelMembers() happens to label its members
+// review-1..review-N: a renamed member makes the lookup fail (silently skipping
+// the release-count assertion) and a label naming another member's role checks
+// the wrong index (CLA-757 review 1.review-1.1).
+func memberIndex(roles []string, role string) int {
+	for k, r := range roles {
+		if r == role {
 			return k
 		}
 	}
@@ -354,8 +351,20 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	repo, branch, tip := panelParallelRepo(t)
 	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
 	members := panelMembers()
+	// The labels deliberately do NOT name the members' positional roles: Name is
+	// the log label only, not the reviewer role (internal/config/config.go:
+	// 323-329). The expected release index below must therefore come from the
+	// role the driver reports — an assertion keyed on the label would either
+	// skip the count or check another member's index (CLA-757 review 1.review-1.1).
+	for i := range members {
+		members[i].Name = fmt.Sprintf("label-%d", i)
+	}
 	a := newPanelParallelAdapter(rel, branch, tip, len(members))
 	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	// The expanded sequence is what the driver iterates; the positional roles
+	// below come from it — never from the members' log labels.
+	phases := d.cfg.EffectivePhases()
+	wantRoles := panelRoles(phases, len(phases)-1)
 	// CLA-755: record the launch order AT the launch boundary, through the
 	// driver's panelLaunch seam, instead of inferring it from the fake adapter's
 	// Invoke entry. Entry is one call after the boundary, so a member released
@@ -384,13 +393,13 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 			return
 		}
 		launched[role] = true
-		if k := memberIndex(members, role); k < 0 {
+		if k := memberIndex(wantRoles, role); k < 0 {
 			a.errs = append(a.errs, fmt.Sprintf(
-				"a member launched as role %q, which is not one of the panel's members %v", role, memberNames(members)))
-		} else if len(a.releases) != k {
+				"a member launched as role %q, which is not one of the panel's roles %v", role, wantRoles))
+		} else if got := len(a.releases); got != k {
 			a.errs = append(a.errs, fmt.Sprintf(
-				"member %d (%s) launched with releases %v already recorded, want exactly %d — its predecessor released it before this member's session launch, so the release came from the worktree-ready point rather than from the launch boundary",
-				k, role, append([]int(nil), a.releases...), k))
+				"member %d (%s) launched with %d releases already recorded (%v); want exactly %d — a release fired before this member's launch boundary, so it came from the worktree-ready point, not from a predecessor's launch",
+				k, role, got, append([]int(nil), a.releases...), k))
 		}
 		a.order = append(a.order, role)
 	}
@@ -424,9 +433,14 @@ func TestDrainPhases_ParallelPanelRunsMembersAtOnceInDetachedWorktrees(t *testin
 	// each is released from its predecessor's launch boundary, not from its
 	// checkout being ready. Recorded at that boundary via the panelLaunch seam,
 	// so the assertion is not racing the adapter entry (CLA-755 1.review-5.1).
-	for k, m := range members {
-		if k >= len(order) || order[k] != m.Name {
-			t.Fatalf("panel launch order = %v, want the panel's list order %v", order, memberNames(members))
+	// The expected sequence is the panel's POSITIONAL roles, which is what both
+	// seams report, not the members' log labels.
+	if len(order) != len(wantRoles) {
+		t.Fatalf("panel launched %d members (%v), want %d (%v)", len(order), order, len(wantRoles), wantRoles)
+	}
+	for k, want := range wantRoles {
+		if order[k] != want {
+			t.Fatalf("panel launch order = %v, want the panel's positional roles %v", order, wantRoles)
 		}
 	}
 	// And the release POINT that order depends on (CLA-757): each member is

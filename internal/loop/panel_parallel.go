@@ -220,10 +220,7 @@ func runPanelMembers(n, concurrency int, run func(k int, started func()), onRele
 		var once sync.Once
 		release := func() {
 			once.Do(func() {
-				if onRelease != nil {
-					onRelease(k)
-				}
-				close(started)
+				releaseMember(k, onRelease, func() { close(started) })
 			})
 		}
 		wg.Add(1)
@@ -239,6 +236,23 @@ func runPanelMembers(n, concurrency int, run func(k int, started func()), onRele
 		<-started
 	}
 	wg.Wait()
+}
+
+// releaseMember is the WHOLE of a member's release: it reports the release to
+// the observer (onRelease, test-only), and only then unblocks the scheduler that
+// spawns the successor. The order is the guarantee the release-point probe rests
+// on (CLA-757): when member k+1's session launches, exactly members 0..k have
+// been released. Keeping both steps in one function makes that order structural
+// rather than two adjacent statements a later edit could silently swap: a swap
+// would leave the panel fixture green, because the successor needs a
+// `git worktree add` subprocess before it can reach its own launch and would win
+// that race every time, turning the count observed at a launch into a race.
+// TestReleaseFiresBeforeTheSuccessorIsUnblocked pins it without a schedule.
+func releaseMember(k int, onRelease func(k int), unblock func()) {
+	if onRelease != nil {
+		onRelease(k)
+	}
+	unblock()
 }
 
 // runPanelInParallel runs phases[start:end] concurrently, each in its own
