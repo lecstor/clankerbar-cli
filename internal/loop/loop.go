@@ -395,6 +395,13 @@ type Driver struct {
 	// waitGrace: no test should sleep five minutes to watch a beacon repeat.
 	limitBeaconInterval time.Duration
 
+	// leaseRenewalInterval overrides the in-session renewal cadence, which
+	// carries the CLA-771 presence beacon as well as the lease heartbeat.
+	// Production leaves it zero: heartbeatInterval(planeLeaseDuration), a third
+	// of the plane's 30-minute lease. A field for the same reason as
+	// limitBeaconInterval — no test should wait ten minutes to watch a tick.
+	leaseRenewalInterval time.Duration
+
 	// newVerifier builds the delivery checker for a workdir (CLA-253). A field so
 	// tests can substitute one; production always gets internal/delivery. The
 	// second argument is CLA-310's empty-check-rollup opt-out for the target
@@ -828,6 +835,9 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 				// It fires whatever the poll answered (even an error poll proves
 				// the daemon is alive and looping), and carries the state derived
 				// below, so a console-paused target reads `draining`, not `idle`.
+				// The poll is not the only carrier: a session blocks the poll for
+				// as long as it runs, so the in-session lease-renewal tick carries
+				// the same per-target lap (CLA-771, Driver.beaconSessionTargets).
 				d.beacon(i, t, d.fleetState(i))
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):

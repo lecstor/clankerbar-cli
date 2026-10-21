@@ -169,6 +169,33 @@ func (d *Driver) beaconLimited(resetAt time.Time) {
 	}
 }
 
+// beaconSessionTargets is the in-session presence lap (CLA-771): the poll's own
+// per-target beacon, for the window in which the poll does not run. The running
+// target reports what fleetState derives for it (iteration with the current
+// claim's ref and phase); every other target the daemon serves reports its own
+// state, which is idle - or draining while a pause holds its spawns - because no
+// session is running there.
+//
+// The other targets are not decoration. Each project has its own Fleet reporter
+// and its own project-scoped presence row, so beaconing only the running target
+// would leave every sibling project's row to go stale for the whole session, and
+// that project's console would show the daemon as a dead instance (the same
+// symptom CLA-771 exists to fix, one project over). beaconLimited beacons every
+// target for the same reason.
+//
+// running and runningTarget are handed in rather than indexed out of d.targets
+// so a hand-built driver - the unit tests - still beacons the target it was
+// given; the lap then adds any other target, skipping that index.
+func (d *Driver) beaconSessionTargets(running int, runningTarget Target) {
+	d.beacon(running, runningTarget, d.fleetState(running))
+	for i := range d.targets {
+		if i == running {
+			continue
+		}
+		d.beacon(i, d.targets[i], d.fleetState(i))
+	}
+}
+
 // LocalBeaconName is the local presence file the daemon keeps beside its plane
 // beacons: the same identity+state the next POST carries, written into the
 // state dir so the supervisor's roll (phase 5b) can verify a restarted child
