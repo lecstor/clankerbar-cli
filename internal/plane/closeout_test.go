@@ -108,15 +108,15 @@ func TestReleaseCloseOutAttestsGreenAndTheDriver(t *testing.T) {
 	if err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", true); err != nil {
 		t.Fatalf("ReleaseCloseOut: %v", err)
 	}
-	if name := toolName(t, got.body); name != "update_task" {
-		t.Errorf("tool = %q, want update_task", name)
+	if name := toolName(t, got.body); name != "release_task" {
+		t.Errorf("tool = %q, want release_task", name)
 	}
 	args := toolArgs(t, got.body)
-	if args["release"] != true || args["driverReleased"] != true || args["checkGreen"] != true {
-		t.Errorf("arguments = %+v, want release+driverReleased+checkGreen", args)
+	if args["driver"] != true || args["checkGreen"] != true {
+		t.Errorf("arguments = %+v, want driver+checkGreen", args)
 	}
-	// A release moves nothing: no status, no delivery, no outcome.
-	for _, forbidden := range []string{"status", "delivery", "outcome"} {
+	// A release moves nothing: no expiry, no status, no delivery, no outcome.
+	for _, forbidden := range []string{"expire", "status", "delivery", "outcome"} {
 		if _, ok := args[forbidden]; ok {
 			t.Errorf("release carries %q, which it must not: %+v", forbidden, args)
 		}
@@ -135,34 +135,20 @@ func TestReleaseCloseOutSendsTheAttestationItWasGiven(t *testing.T) {
 	}
 }
 
-func TestReleaseCloseOutFallsBackOnAPlaneThatDoesNotKnowTheMarkers(t *testing.T) {
-	var calls []map[string]any
+func TestReleaseCloseOutDoesNotRetryAnUnknownTool(t *testing.T) {
+	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		raw, _ := io.ReadAll(r.Body)
-		var body map[string]any
-		_ = json.Unmarshal(raw, &body)
-		calls = append(calls, body)
-		w.Header().Set("Content-Type", "application/json")
-		if len(calls) == 1 {
-			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"unrecognized key: driverReleased and checkGreen are unknown arguments"}]}}`)
-			return
-		}
-		_, _ = io.WriteString(w, okBody)
+		calls++
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"MCP error -32602: Tool release_task not found"}],"isError":true}}`)
 	}))
 	t.Cleanup(srv.Close)
 
-	if err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", true); err != nil {
-		t.Fatalf("ReleaseCloseOut: %v", err)
+	err := NewCloseOutAPI(srv.URL+"/mcp/demo", "k-1").ReleaseCloseOut(context.Background(), "t-1", "run-1", true)
+	if !errors.Is(err, ErrPlaneTooOld) {
+		t.Fatalf("err = %v, want ErrPlaneTooOld", err)
 	}
-	if len(calls) != 2 {
-		t.Fatalf("calls = %d, want 2 (the marker refused, then the plain release)", len(calls))
-	}
-	args := toolArgs(t, calls[1])
-	if args["release"] != true {
-		t.Errorf("the fallback call does not release: %+v", args)
-	}
-	if _, ok := args["driverReleased"]; ok {
-		t.Errorf("the fallback repeats the field the plane refused: %+v", args)
+	if calls != 1 {
+		t.Fatalf("calls = %d, want exactly 1: there is no fallback to retry with", calls)
 	}
 }
 
@@ -178,12 +164,15 @@ func TestCompleteCloseOutSendsTheDeliveryAndNoOutcome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CompleteCloseOut: %v", err)
 	}
-	if name := toolName(t, got.body); name != "update_task" {
-		t.Errorf("tool = %q, want update_task", name)
+	if name := toolName(t, got.body); name != "complete_task" {
+		t.Errorf("tool = %q, want complete_task", name)
 	}
 	args := toolArgs(t, got.body)
-	if args["status"] != "done" || args["runId"] != "run-1" || args["taskId"] != "t-1" {
-		t.Errorf("arguments = %+v, want status=done signed by the claim's run", args)
+	if args["runId"] != "run-1" || args["taskId"] != "t-1" {
+		t.Errorf("arguments = %+v, want the close signed by the claim's run", args)
+	}
+	if _, ok := args["status"]; ok {
+		t.Errorf("complete_task has no status field, but the call carried one: %+v", args)
 	}
 	if _, ok := args["outcome"]; ok {
 		t.Errorf("the close asserts an outcome; it must inherit the reviewed one: %+v", args)

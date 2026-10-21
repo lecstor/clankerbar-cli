@@ -43,9 +43,9 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // was told to continue a run, not start one — so without this its claim would be
 // the zero value, and Result.Claim.Held() is what gates the driver's handback,
 // the CLA-314 salvage and the CLA-253 delivery check. Seeding leaves the stream
-// to supply Settled/HasWIP on top: noteToolUse matches `update_task` against this
-// TaskID, which is precisely the arm that would otherwise never fire for the
-// phase that pushes the branch and opens the PR.
+// to supply Settled/HasWIP on top: noteToolUse matches the progress and terminal
+// tools against this TaskID, which is precisely the arm that would otherwise
+// never fire for the phase that pushes the branch and opens the PR.
 //
 // Extracted rather than assigned inline because a test that builds its own
 // Result does not exercise an assignment inside Invoke — which is exactly how the
@@ -445,9 +445,9 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 		}
 	}
 	// A delivery claim is kept only if the plane ACCEPTED the call that made it —
-	// same rule, same reason: a refused `update_task` recorded no branch and
-	// declared no delivery, so there is nothing to check and nothing to complain
-	// about.
+	// same rule, same reason: a refused progress or terminal call recorded no
+	// branch and declared no delivery, so there is nothing to check and nothing
+	// to complain about.
 	res.settleReport(toolUseID, !isError)
 
 	kind, waiting := res.pending[toolUseID]
@@ -473,7 +473,11 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 // before calling noteToolUse — see opencodeClankerbarTool.
 const (
 	claimTaskTool        = "mcp__clankerbar__claim_task"
-	updateTaskTool       = "mcp__clankerbar__update_task"
+	recordProgressTool   = "mcp__clankerbar__record_progress"
+	submitForReviewTool  = "mcp__clankerbar__submit_for_review"
+	completeTaskTool     = "mcp__clankerbar__complete_task"
+	settleTaskTool       = "mcp__clankerbar__settle_task"
+	setLaneTool          = "mcp__clankerbar__set_lane"
 	askQuestionTool      = "mcp__clankerbar__ask_question"
 	escalateQuestionTool = "mcp__clankerbar__escalate_question"
 
@@ -490,10 +494,10 @@ func isClankerbarTool(name string) bool { return strings.HasPrefix(name, clanker
 
 // noteToolUse records what a clankerbar call will mean once its result lands.
 //
-// `update_task` is not the only way a session lets go. A BLOCKING question ends
-// the run and sets the task `blocked` without any `update_task` at all — it is
-// the documented one-call handback, and the protocol explicitly calls
-// `update_task(status: "blocked")` a trap and steers clankers here instead.
+// A terminal tool is not the only way a session lets go. A BLOCKING question
+// ends the run and sets the task `blocked` without any task write at all — it is
+// the documented one-call handback, and the protocol steers clankers here
+// instead of any bare status write.
 // Missing it is not a missed handback but a wrong one: the driver would post
 // `ready` over a task that is waiting on the operator, dropping it back into the
 // claimable queue with the question unanswered.
@@ -522,13 +526,13 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			res.noteClaimRequest(toolUseID, args.TaskID)
 		}
 
-	case updateTaskTool:
+	case recordProgressTool, submitForReviewTool, completeTaskTool, settleTaskTool, setLaneTool:
 		var args struct {
-			TaskID   string `json:"taskId"`
-			Status   string `json:"status"`
-			Branch   string `json:"branch"`
-			Repo     string `json:"repo"`
-			Delivery struct {
+			TaskID      string `json:"taskId"`
+			Branch      string `json:"branch"`
+			Disposition string `json:"disposition"`
+			Lane        string `json:"lane"`
+			Delivery    struct {
 				Commit            string `json:"commit"`
 				IntegrationBranch string `json:"integrationBranch"`
 				PR                string `json:"pr"`
@@ -537,21 +541,36 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		if json.Unmarshal(input, &args) != nil || !res.Claim.Names(args.TaskID) {
 			return
 		}
-		if settlesTask(args.Status) {
+		// The tool set is one job per call (CLA-748), so what a call means is
+		// read off WHICH tool it is rather than off a status field.
+		status := ""
+		switch name {
+		case submitForReviewTool:
+			status = "in_review"
+			res.expect(toolUseID, pendingSettle)
+		case completeTaskTool:
+			status = "done"
+			res.expect(toolUseID, pendingSettle)
+		case settleTaskTool:
+			// parked/archived: both clear the holder plane-side.
+			status = args.Disposition
+			res.expect(toolUseID, pendingSettle)
+		case setLaneTool:
+			// A lane move (ready/backlog) is a status write too: the plane clears
+			// the holder for every status but in_progress.
+			status = args.Lane
 			res.expect(toolUseID, pendingSettle)
 		}
 		// The two claims the plane cannot check for itself. Armed here, kept only if
 		// the call is accepted, and verified against local git once the session ends
-		// (CLA-253). Repo rides along (CLA-351): the session declares where its work
-		// lives, and the driver's post-iteration branch check uses it to tell two
-		// working copies with the same branch name apart.
+		// (CLA-253). Only the tools that can carry one are reported; an
+		// outcome-only progress write asserts nothing checkable.
 		res.expectReport(toolUseID, Report{
 			TaskID:            res.Claim.TaskID,
 			Ref:               res.Claim.Ref,
 			RunID:             res.Claim.RunID,
-			Status:            args.Status,
+			Status:            status,
 			Branch:            args.Branch,
-			Repo:              args.Repo,
 			Commit:            args.Delivery.Commit,
 			IntegrationBranch: args.Delivery.IntegrationBranch,
 			PR:                args.Delivery.PR,

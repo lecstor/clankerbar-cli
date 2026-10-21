@@ -34,13 +34,21 @@ func (s scenarioDef) promptFor(schemaTool string) string {
 	return s.Prompt
 }
 
+// defaultSchemaTool is the tool the schema scenario probes when --schema-tool
+// is not given. It must be a tool this release's plane serves (CLA-748): the
+// cutover deletes update_task, so a probe defaulting to it would exercise a
+// name the plane answers as unknown and prove nothing about a real schema.
+// edit_task is also the surface the padding scenario studies.
+const defaultSchemaTool = "edit_task"
+
 // schemaToolID is the catalog's (unprefixed) name for the schema scenario's
-// selected tool: --schema-tool when it is set, otherwise the tool the
-// protocol-41 plane serves for the residual.
+// selected tool: --schema-tool when it is set, otherwise the default. The
+// catalog serves unprefixed names, so an already-prefixed --schema-tool is
+// unwrapped rather than prefixed twice.
 func schemaToolID(tool string) string {
 	tool = strings.TrimSpace(tool)
 	if tool == "" {
-		return "edit_task"
+		return defaultSchemaTool
 	}
 	return strings.TrimPrefix(tool, "clankerbar_")
 }

@@ -8,7 +8,7 @@
 //
 // The driver is the right place to close that: it is already local, already in
 // the git tree, and already watches the session stream for `claim_task` and
-// `update_task` (CLA-242). This adds a check to an observation that already
+// the plane's task writes (CLA-242). This adds a check to an observation that already
 // happens. It needs no new configured credentials - GitHub access rides the
 // operator's own `gh` auth, resolved per remote below - and no plane change.
 //
@@ -74,7 +74,7 @@ const (
 type Kind string
 
 const (
-	// BranchPushed: a branch recorded via `update_task(branch: ...)` is really on
+	// BranchPushed: a branch recorded via `record_progress(branch: ...)` is really on
 	// the remote, and the local tip is an ancestor of the remote tip.
 	BranchPushed Kind = "branch"
 	// CommitMerged: a declared `delivery.commit` is an ancestor of the declared

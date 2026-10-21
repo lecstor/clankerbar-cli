@@ -277,17 +277,22 @@ func TestSchemaScenarioPromptFollowsTheSelectedTool(t *testing.T) {
 		t.Errorf("--schema-tool frobnicate prompt still asks for edit_task: %q", got)
 	}
 
-	// The default selection names a tool the plane serves.
-	defaulted := schema.promptFor("edit_task")
-	if !strings.Contains(defaulted, "clankerbar_edit_task") || !strings.Contains(defaulted, "send null") {
+	// The default selection names a tool this release's plane still serves: the
+	// cutover deletes update_task, so a probe that defaulted to it would exercise
+	// a name the plane answers as unknown.
+	defaulted := schema.promptFor(defaultSchemaTool)
+	if !strings.Contains(defaulted, "clankerbar_"+defaultSchemaTool) || !strings.Contains(defaulted, "send null") {
 		t.Errorf("default schema prompt = %q", defaulted)
+	}
+	if defaultSchemaTool == "update_task" {
+		t.Error("the schema probe defaults to update_task, which this release's plane does not serve")
 	}
 
 	// An already-prefixed name is not prefixed twice.
 	if got := schemaToolName("clankerbar_frobnicate"); got != "clankerbar_frobnicate" {
 		t.Errorf("schemaToolName = %q", got)
 	}
-	if got := schemaToolName(""); got != "clankerbar_edit_task" {
+	if got := schemaToolName(""); got != "clankerbar_"+defaultSchemaTool {
 		t.Errorf("schemaToolName(\"\") = %q", got)
 	}
 
