@@ -1799,10 +1799,19 @@ func (opencode) DetectLimit(res Result) Limit {
 	if opencodeBudgetRe.MatchString(text) {
 		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
 	}
+	// CLA-752: the provider's own STRUCTURED statement comes before its wording.
+	// The terminal error event carries the provider's response body verbatim
+	// (opencode 2.0.32 stores it under error.response.body), so a 429 that names
+	// its window there is classified from the window and the code, not from
+	// prose that may be reworded.
+	facts := opencodeErrorFactsOf(res)
+	if window := opencodeWindowLimit(facts, text); window != "" {
+		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: window}
+	}
 	// A rolling subscription quota is a LIMIT the loop waits out, so Stop stays
 	// false. ResetAt is the provider's own stated instant when present.
 	if opencodeRollingQuotaRe.MatchString(text) {
-		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit"}
+		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: opencodeNamedWindow(text)}
 	}
 	// The generic exhausted-quota phrasings are a Stop only when nothing makes
 	// the limit waitable. A provider.quota type or a rolling window is the case
@@ -1818,6 +1827,185 @@ func (opencode) DetectLimit(res Result) Limit {
 		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
 	}
 	return Limit{}
+}
+
+// opencodeRateLimitWindows maps the provider's structured `rateLimit.window`
+// token onto the label the loop reports. The tokens are Command Code's own —
+// `fiveHour`, `weekly`, `daily` — not opencode's, and the mapping is deliberately
+// closed: an unrecognised token names no window this adapter understands, and
+// guessing one is how a hard stop becomes an unbounded wait.
+var opencodeRateLimitWindows = map[string]string{
+	"fiveHour": "5-hour",
+	"weekly":   "weekly",
+	"daily":    "daily",
+}
+
+// opencodeLimitWindowPhrase is the plan-limit wording a provider uses when it
+// names no window in its body. It is the message-only fallback (CLA-752): a
+// weekly statement labels weekly, and the plan's default cap is the 5-hour one.
+const opencodeLimitWindowPhrase = "usage limit for your plan"
+
+// opencodeWindowLimit resolves the usage window a failure names, or "" when it
+// names none. Two sources, in order:
+//
+//  1. The STRUCTURED `rateLimit.window` from the provider's response body —
+//     top level or nested under the body's `error` object.
+//  2. The message's "usage limit for your plan" phrase, which is the same
+//     statement in prose: weekly when it says weekly, otherwise the plan's
+//     default 5-hour window.
+//
+// Only a rate limit can be a PLAN limit: the structured path requires a 429
+// status or the RATE_LIMITED code, and the wording path requires the same. A
+// window seen on a 5xx is not a plan cap, and a 429 that names no window stays
+// the transient burst limit IsTransient already handles — that is the difference
+// between waiting out a plan cap and backing off a burst.
+func opencodeWindowLimit(f opencodeErrorFacts, text string) string {
+	rateLimited := f.Status == 429 || strings.EqualFold(f.Code, "RATE_LIMITED")
+	if !rateLimited {
+		return ""
+	}
+	if label, ok := opencodeRateLimitWindows[f.Window]; ok {
+		return label
+	}
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, opencodeLimitWindowPhrase) {
+		return ""
+	}
+	if window := opencodeNamedWindow(text); window != "" {
+		return window
+	}
+	return "5-hour"
+}
+
+// opencodeNamedWindow labels a window the text NAMES, when it names one. It is
+// the wording arm's label, used where a rolling window is recognised by its
+// shape rather than by the structured token: an untyped "daily usage limit" is
+// the daily window. A bare "30-minute usage limit" names a duration, not one of
+// the plan's windows, and stays unlabelled rather than being called 5-hour.
+func opencodeNamedWindow(text string) string {
+	lower := strings.ToLower(text)
+	switch {
+	case strings.Contains(lower, "weekly"):
+		return "weekly"
+	case strings.Contains(lower, "daily"):
+		return "daily"
+	case strings.Contains(lower, "5-hour"), strings.Contains(lower, "5 hour"):
+		return "5-hour"
+	}
+	return ""
+}
+
+// opencodeErrorFacts is what the terminal error event states STRUCTURALLY:
+// fields a caller can trust without reading prose. The zero value means the
+// stream carried no terminal error event, or one whose JSON did not parse.
+type opencodeErrorFacts struct {
+	// Status is the HTTP status the wrapper reported (error.status, or the older
+	// APIError shape's error.data.statusCode).
+	Status int
+	// Code is the provider body's machine-readable error code, e.g.
+	// RATE_LIMITED. It is the body's, not opencode's error.type.
+	Code string
+	// Window is the raw `rateLimit.window` token, when the body carried one.
+	Window string
+}
+
+// opencodeErrorFactsOf reads the structured facts out of a finished Result's
+// terminal error event.
+//
+// What survives opencode's wrapping is verified against the 2.0.32 binary and
+// the 2026-10-20 capture in testdata/opencode-quota-five-hour.jsonl: the
+// provider's message and status are lifted onto `error`, and its raw response
+// body is passed through as a JSON STRING under `error.response.body` (the
+// binary's provider error is built with `response:{body:…}`). The older
+// APIError shape puts the same body under `error.data.responseBody`. Neither is
+// re-parsed by opencode, so `code` and `rateLimit` are only reachable by
+// decoding that string here.
+//
+// Body first, wrapper second: the provider's own fields outrank opencode's
+// restatement, and only a field the body does not carry falls back to the
+// envelope.
+func opencodeErrorFactsOf(res Result) opencodeErrorFacts {
+	line := opencodeTerminalErrorLine(res)
+	if line == "" {
+		return opencodeErrorFacts{}
+	}
+	var ev map[string]any
+	if json.Unmarshal([]byte(line), &ev) != nil {
+		return opencodeErrorFacts{}
+	}
+	errObj := opencodeJSONObject(ev["error"])
+	dataObj := opencodeJSONObject(errObj["data"])
+
+	var f opencodeErrorFacts
+	for _, raw := range []any{
+		opencodeJSONObject(errObj["response"])["body"],
+		dataObj["responseBody"],
+		ev["responseBody"],
+		errObj["body"],
+	} {
+		body, ok := raw.(string)
+		if !ok || body == "" {
+			continue
+		}
+		var decoded map[string]any
+		if json.Unmarshal([]byte(body), &decoded) != nil {
+			continue
+		}
+		f = opencodeMergeFacts(f, opencodeFactsFromObject(decoded))
+		// The provider's body is normally an {error:{…}} envelope itself.
+		f = opencodeMergeFacts(f, opencodeFactsFromObject(opencodeJSONObject(decoded["error"])))
+	}
+	f = opencodeMergeFacts(f, opencodeFactsFromObject(errObj))
+	return opencodeMergeFacts(f, opencodeFactsFromObject(dataObj))
+}
+
+// opencodeFactsFromObject reads the three structured fields out of one decoded
+// JSON object. Absent or wrongly-typed fields stay zero.
+func opencodeFactsFromObject(o map[string]any) opencodeErrorFacts {
+	var f opencodeErrorFacts
+	if n, ok := opencodeJSONNumber(o["status"]); ok {
+		f.Status = n
+	} else if n, ok := opencodeJSONNumber(o["statusCode"]); ok {
+		f.Status = n
+	}
+	if s, ok := o["code"].(string); ok {
+		f.Code = s
+	}
+	if rl := opencodeJSONObject(o["rateLimit"]); rl != nil {
+		if w, ok := rl["window"].(string); ok {
+			f.Window = w
+		}
+	}
+	return f
+}
+
+// opencodeMergeFacts keeps base's facts and fills only its holes from next.
+func opencodeMergeFacts(base, next opencodeErrorFacts) opencodeErrorFacts {
+	if base.Status == 0 {
+		base.Status = next.Status
+	}
+	if base.Code == "" {
+		base.Code = next.Code
+	}
+	if base.Window == "" {
+		base.Window = next.Window
+	}
+	return base
+}
+
+// opencodeJSONObject is a decoded JSON object, or nil for anything else.
+func opencodeJSONObject(v any) map[string]any {
+	o, _ := v.(map[string]any)
+	return o
+}
+
+// opencodeJSONNumber is a decoded JSON number as an int, or false.
+func opencodeJSONNumber(v any) (int, bool) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(f), true
 }
 
 // opencodeErrorText collects the harness-level diagnostic text — all of stderr,
@@ -1849,6 +2037,26 @@ func opencodeErrorText(res Result) string {
 func buildOpencodeErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
+	// The error event is appended ONLY when the stream ENDED on it — the rule
+	// opencodeTerminalErrorLine owns, shared with the structured fact scan so
+	// the two can never disagree about which event is the failure.
+	if line := opencodeTerminalErrorLine(res); line != "" {
+		b.WriteByte('\n')
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// opencodeTerminalErrorLine returns the LAST typed event on the stream when it
+// is a {"type":"error"} event, verbatim; "" otherwise.
+//
+// 2.x emits provider errors mid-session, retries the request itself and carries
+// on: a stream whose error event is followed by a step_start / tool_use / text
+// part is a session that RECOVERED, and calling that session failed or retryable
+// is how a delivered phase got classified as a failed attempt (both 2026-10-19
+// incidents). So an error event with any typed event after it contributes
+// nothing.
+func opencodeTerminalErrorLine(res Result) string {
 	last := ""
 	for _, line := range strings.Split(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
@@ -1863,16 +2071,16 @@ func buildOpencodeErrorText(res Result) string {
 		}
 		last = line
 	}
-	if last != "" {
-		var ev struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal([]byte(last), &ev) == nil && ev.Type == "error" {
-			b.WriteByte('\n')
-			b.WriteString(last)
-		}
+	if last == "" {
+		return ""
 	}
-	return b.String()
+	var ev struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(last), &ev) != nil || ev.Type != "error" {
+		return ""
+	}
+	return last
 }
 
 // opencodeFatalRe: failures that are NEVER a blip, scanned before the transient

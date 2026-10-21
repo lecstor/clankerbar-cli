@@ -8085,12 +8085,18 @@ func resetSuffix(t time.Time) string {
 }
 
 // limitReason renders a limit's reason for a log line, defaulting when a harness
-// leaves it blank.
+// leaves it blank. The window rides along when the adapter named one (CLA-752): a
+// multi-day weekly wait should say which cap it is waiting out, not just "usage
+// limit".
 func limitReason(lim harness.Limit) string {
-	if lim.Reason != "" {
-		return lim.Reason
+	reason := lim.Reason
+	if reason == "" {
+		reason = "usage limit"
 	}
-	return "usage limit"
+	if lim.Window != "" {
+		return reason + " (" + lim.Window + " window)"
+	}
+	return reason
 }
 
 // isReviewPhase reports whether a phase is a review-phase (the gate where

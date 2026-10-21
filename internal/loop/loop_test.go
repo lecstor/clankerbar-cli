@@ -2933,3 +2933,28 @@ func TestDrainExitLine_NamesTheSignalNotJustTheCode(t *testing.T) {
 		})
 	}
 }
+
+// TestLimitReasonNamesTheWindow pins what a paused log line says about WHICH cap
+// it is waiting out (CLA-752). The window is diagnostic only — Stop already
+// decided whether the loop may wait — but a multi-day weekly wait that logs a
+// bare "usage_limit" hides the one thing the operator needs to tell a plan cap
+// from a burst.
+func TestLimitReasonNamesTheWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		lim  harness.Limit
+		want string
+	}{
+		{"the adapter's own reason", harness.Limit{Reason: "budget_exhausted"}, "budget_exhausted"},
+		{"a named window rides along", harness.Limit{Reason: "usage_limit", Window: "weekly"}, "usage_limit (weekly window)"},
+		{"an unnamed window leaves the reason alone", harness.Limit{Reason: "usage_limit"}, "usage_limit"},
+		{"a blank reason still defaults", harness.Limit{}, "usage limit"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := limitReason(tc.lim); got != tc.want {
+				t.Errorf("limitReason(%+v) = %q, want %q", tc.lim, got, tc.want)
+			}
+		})
+	}
+}

@@ -1029,6 +1029,17 @@ type Limit struct {
 	Stop    bool
 	ResetAt time.Time // zero = unknown
 	Reason  string
+	// Window is the usage window the limit names, as a human label: "5-hour",
+	// "weekly" or "daily". Empty when the provider named no window (a bare
+	// "usage limit reached"), which is NOT the same as an unknown reset: the
+	// reset says when the limit lifts, the window says which plan cap it is.
+	//
+	// It is diagnostic, not decision-making: Stop already carries whether the
+	// loop may wait, and a weekly or daily window is a rolling cap like the
+	// 5-hour one, so it is never a reason to stop. The loop prints it beside the
+	// reason (a multi-day wait should say WHICH cap it is waiting out), and an
+	// adapter that names no window leaves it blank rather than guessing.
+	Window string
 }
 
 // ProbeResult is what a liveness probe learned, and what it cost.
