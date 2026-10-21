@@ -192,6 +192,51 @@ func TestDispatchAcceptsTheDocumentedFlagOnlyInvocation(t *testing.T) {
 	}
 }
 
+// TestThePaddingScenarioRefusesAPreCutoverCatalog pins the loud failure: the
+// residual lives on edit_task, so a catalog that predates the tool cutover
+// would leave the model with every tool except the one the scenario studies,
+// and the report would describe a run that proved nothing.
+func TestThePaddingScenarioRefusesAPreCutoverCatalog(t *testing.T) {
+	dir := t.TempDir()
+	cat := filepath.Join(dir, "pre-cutover.json")
+	if err := os.WriteFile(cat, []byte(`{"tools":[{"name":"old_task_tool","inputSchema":{"type":"object"}}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code := dispatch([]string{
+		"--model", "commandcode/gpt-6-luna",
+		"--scenario", "padding",
+		"--schemas", cat,
+		"--upstream", "https://api.commandcode.invalid/provider/v1",
+		"--out", filepath.Join(dir, "run"),
+		"--dry-run",
+	})
+	if code != 1 {
+		t.Fatalf("dispatch = %d, want 1 (a catalog with no edit_task exercises nothing)", code)
+	}
+}
+
+// TestTheReasoningReplayScenarioRefusesACatalogWithoutGetTask pins the same
+// guard for the other scenario whose stub answers one tool: both of its turns
+// ask for get_task, so a catalog without it exercises nothing.
+func TestTheReasoningReplayScenarioRefusesACatalogWithoutGetTask(t *testing.T) {
+	dir := t.TempDir()
+	cat := filepath.Join(dir, "no-get-task.json")
+	if err := os.WriteFile(cat, []byte(`{"tools":[{"name":"edit_task","inputSchema":{"type":"object"}}]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code := dispatch([]string{
+		"--model", "commandcode/gpt-6-luna",
+		"--scenario", "reasoning-replay",
+		"--schemas", cat,
+		"--upstream", "https://api.commandcode.invalid/provider/v1",
+		"--out", filepath.Join(dir, "run"),
+		"--dry-run",
+	})
+	if code != 1 {
+		t.Fatalf("dispatch = %d, want 1 (a catalog with no get_task exercises nothing)", code)
+	}
+}
+
 // captureStdout runs fn with os.Stdout redirected to a pipe and returns what it
 // printed.
 func captureStdout(t *testing.T, fn func() int) string {
