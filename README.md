@@ -1382,10 +1382,10 @@ stderr still streams to the supervisor's own terminal, as before.
 The daemon also reports what it is doing to the plane, so the console's Fleet
 page shows every instance — working *and* idle, where the run-based panel only
 sees a daemon that currently holds a task. Two things are reported, both riding
-cadences the loop already runs — presence on each backlog poll, iteration
-history at each drain boundary — with one exception: a run parked on a usage
-limit re-beacons on a ticker of its own, because the pause is the one time the
-poll cadence stops:
+cadences the loop already runs — presence on each backlog poll and on each
+in-session lease-renewal tick, iteration history at each drain boundary — with
+one exception: a run parked on a usage limit re-beacons on a ticker of its own,
+because the pause is the one time that poll and session cadences both stop:
 
 > **Release order**: a plane older than CLA-727 refuses an unknown
 > `state.kind` for the WHOLE report (400), so `limited` has to be promoted on
@@ -1405,8 +1405,12 @@ poll cadence stops:
   limit (with the stated reset instant when the harness stated one), `stopping`
   as the final beacon when the run ends. State changes
   beacon at phase boundaries too, so the page does not wait out a poll interval
-  to learn which phase is running, and a limit wait re-beacons `limited` every
-  five minutes — well inside the plane's liveness window — so hours spent
+  to learn which phase is running; a session in progress re-beacons the same
+  `iteration` state on every lease renewal (a third of the plane's 30-minute
+  lease, so ten minutes apart at most), because the poll does not run while a
+  session does and a session longer than the plane's 15-minute liveness window
+  would otherwise read as a dead instance; and a limit wait re-beacons `limited`
+  every five minutes — well inside the plane's liveness window — so hours spent
   waiting out a cap do not read on the console as a dead instance. The plane
   stores exactly what you report; it infers nothing.
 - **Iteration history**: exactly one record per drain, posted at the boundary it

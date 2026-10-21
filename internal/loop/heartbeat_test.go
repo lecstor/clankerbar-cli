@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -410,6 +411,58 @@ func TestStopEndsARenewerStuckInsideABeat(t *testing.T) {
 		t.Fatal("stop() outlived its own bound")
 	}
 	close(hb.stall)
+}
+
+// --- presence on the renewal tick (CLA-771) ---------------------------------
+
+// TestLeaseRenewerBeaconsOnEveryRenewalTick pins CLA-771's cadence: the renewal
+// tick carries a presence beacon, whether or not the session holds a claim yet.
+// That is the bug's own shape - an instance whose last beacon was the moment its
+// session started falls off the plane's liveness window mid-session - and the
+// pre-claim tick is not decoration: a first-phase session claims minutes into
+// its stream, and the instance must read alive while it is still reading.
+//
+// The tick channel is hand-driven, so "one beacon per tick" is an exact count
+// rather than a race against a timer.
+func TestLeaseRenewerBeaconsOnEveryRenewalTick(t *testing.T) {
+	hb := &recordingHeartbeat{}
+	var beacons int64
+	ticks := make(chan time.Time, 4)
+	r := &leaseRenewer{
+		hb:       hb,
+		interval: time.Minute, // cadence is hand-driven via r.tick, not the timer
+		prefix:   "test: ",
+		claims:   make(chan harness.Claim, 4),
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+		tick:     ticks,
+		presence: func() { atomic.AddInt64(&beacons, 1) },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer r.stop()
+	go r.run(ctx, harness.Claim{})
+
+	// No claim yet: the tick beacons presence and, correctly, bets nothing.
+	ticks <- time.Now()
+	heartbeatWaitFor(t, "a presence beacon on a tick with no claim", func() bool {
+		return atomic.LoadInt64(&beacons) == 1
+	})
+	if n := hb.count(); n != 0 {
+		t.Fatalf("renewed %d lease(s) with no claim held, want 0", n)
+	}
+
+	// A held claim: every further tick beacons AND beats.
+	r.observe(heartbeatClaim("r-1"))
+	for i := int64(2); i <= 3; i++ {
+		ticks <- time.Now()
+		heartbeatWaitFor(t, "the tick's beat and its presence beacon", func() bool {
+			return hb.count() >= int(i-1) && atomic.LoadInt64(&beacons) >= i
+		})
+	}
+	if got, want := atomic.LoadInt64(&beacons), int64(hb.count()+1); got != want {
+		t.Fatalf("%d presence beacon(s) for %d beat(s), want exactly one beacon per tick (%d)", got, hb.count(), want)
+	}
 }
 
 // --- snapshot plumbing --------------------------------------------------------

@@ -90,6 +90,20 @@ type leaseRenewer struct {
 	// Heartbeat. Nil in the heartbeat unit tests, which construct the renewer
 	// directly.
 	claimFile func(harness.Claim)
+	// presence, when non-nil, sends one presence beacon on every renewal tick
+	// (CLA-771). The renewal tick is the only cadence that still fires while a
+	// session runs - the backlog poll that otherwise carries presence does not
+	// run mid-drain - so without this a session longer than the plane's
+	// INSTANCE_STALE_AFTER_MS (15 minutes) reads on the console as a dead
+	// instance. It is called BEFORE the beat decision, so a session that holds
+	// no claim yet (a first-phase session claims minutes in) is still visibly
+	// alive. Nil for a target with no fleet reporter, and nil in the heartbeat
+	// unit tests, which construct the renewer directly.
+	//
+	// Its signature carries no error on purpose: reporting is fail-soft by
+	// contract, so a failed report is the Reporter's to log and drop, and there
+	// is nothing a caller could do with the failure anyway.
+	presence func()
 }
 
 // startLeaseRenewal begins renewing the spawned session's claim lease and
@@ -101,7 +115,8 @@ type leaseRenewer struct {
 //
 // ti is the target's index, so the fleet claim reflector can revise the right
 // presence row (CLA-510). When the target carries a fleet reporter, the same
-// OnClaim seam that feeds renewal also feeds that reflector.
+// OnClaim seam that feeds renewal also feeds that reflector, and every renewal
+// tick also sends a presence beacon (CLA-771).
 //
 // The returned renewer's stop() must be called when Invoke returns.
 func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *harness.Invocation, prefix string) *leaseRenewer {
@@ -112,9 +127,13 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 	if !ok {
 		return nil
 	}
+	interval := d.leaseRenewalInterval
+	if interval <= 0 {
+		interval = heartbeatInterval(planeLeaseDuration)
+	}
 	r := &leaseRenewer{
 		hb:       hb,
-		interval: heartbeatInterval(planeLeaseDuration),
+		interval: interval,
 		prefix:   prefix,
 		claims:   make(chan harness.Claim, 4),
 		done:     make(chan struct{}),
@@ -131,6 +150,11 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 		// done is handed over so the reflector can refuse writes after stop()
 		// at its own write site, not only at apply's guard.
 		r.reflect = d.reflectClaim(ti, t, r.done)
+		// CLA-771: presence on the renewal cadence. The state is the one the
+		// poll would render (fleetState), read fresh at each tick so it carries
+		// the CURRENT claim ref and phase; a nil Fleet has nothing to send it
+		// to, so it is not wired.
+		r.presence = func() { d.beacon(ti, t, d.fleetState(ti)) }
 	}
 	inv.OnClaim = r.observe
 	go r.run(ctx, inv.ResumeClaim)
@@ -274,6 +298,24 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 				default:
 					break drain
 				}
+			}
+			// CLA-771: the presence beacon rides THIS tick - the one cadence
+			// that still fires while a session runs. It goes out before the
+			// beat decision so a session that has not claimed yet (a
+			// first-phase session claims minutes into its stream) still shows
+			// its instance alive; a held claim's tick then beats as before.
+			// The beacon is fail-soft by contract (fleet.Reporter.Send drops a
+			// failed report and returns), so it cannot stop or delay renewal.
+			// The done-guard is the reflector's rule: a tick that loses the
+			// race with stop() must not revise a row the next phase is about
+			// to own.
+			select {
+			case <-r.done:
+				return
+			default:
+			}
+			if r.presence != nil {
+				r.presence()
 			}
 			if !current.Held() {
 				continue
