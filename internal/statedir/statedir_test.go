@@ -570,6 +570,11 @@ func TestOpenAdoptsAPreSentinelStateDir(t *testing.T) {
 		// atomic rewrite must not make an otherwise-ours directory unadoptable.
 		"CURRENT_CLAIM":     `{"taskId":"t-1","runId":"r-1"}`,
 		"CURRENT_CLAIM.tmp": `{"taskId":"t-1"}`,
+		// CLA-724: the supervisor's generated config and the in-flight half of
+		// its atomic reconcile-time rewrite. A crash between the write and the
+		// rename must not leave a dir the daemon refuses to adopt.
+		MaterializedConfigName:          `{"instance_name":"one"}`,
+		MaterializedConfigName + ".tmp": `{"instance_name":"two"}`,
 		// CLA-701: the daemon's own log and the rotated siblings it keeps
 		// beside it. A log file must not make an otherwise-ours dir foreign.
 		"daemon.log":   "iteration 1 done\n",

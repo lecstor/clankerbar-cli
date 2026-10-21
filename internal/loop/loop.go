@@ -219,6 +219,20 @@ type Driver struct {
 	// own stderr; with EchoSessions false nothing is echoed regardless.
 	echoOut io.Writer
 
+	// panelLaunch, when non-nil, is called with the launching member's reviewer
+	// role at a PARALLEL panel's launch boundary: the first moment that member's
+	// session launch has actually begun, immediately before the panel releases
+	// its successor. It is a test seam, and it exists because the launch ORDER
+	// cannot be observed soundly from inside a fake adapter: the adapter is
+	// entered one call after the boundary, so a goroutine descheduled in between
+	// lets a correctly ordered panel look out of order, which is exactly the
+	// assertion that flaked on CI (CLA-755 review 1.review-5.1). Recording here,
+	// before the release, is the order the panel guarantees.
+	//
+	// Nil in every production build — nothing but a test sets it — so it costs
+	// one nil check and changes nothing the panel does.
+	panelLaunch func(role string)
+
 	// undeclared counts the sessions this run that ended still holding a task
 	// whose work they had already pushed — the phase did its job and then did not
 	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a
@@ -5464,7 +5478,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 					drainNum, limitReason(lim), logPath)
 				return tokens, cost, true, end, nil
 			}
-			log.Printf("iteration %d hit a usage limit", drainNum)
+			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
 			// A RESUMED phase must not wait one out (CLA-631). The seam's handback
 			// has already ended the claim: `release` puts a no-work claim straight
 			// back in the queue, and `expireLease` ends a pushed-work claim's lease
@@ -6893,9 +6907,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 	waitedOnReset := waitingForReset
 	if waitingForReset {
 		firstWake := probeWait(time.Now(), lim.ResetAt, interval, d.waitGrace)
-		log.Printf("paused%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
+		log.Printf("paused%s%s - waiting out the stated reset (first probe in ~%s, capped at the poll interval)", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), firstWake.Round(time.Second))
 	} else {
-		log.Printf("paused%s — probing every %s for an early reset", resetSuffix(lim.ResetAt), interval)
+		log.Printf("paused%s%s — probing every %s for an early reset", limitWindowSuffix(lim), resetSuffix(lim.ResetAt), interval)
 	}
 
 	// CLA-728: the wait can outlast the plane's liveness window many times over,
@@ -8113,12 +8127,27 @@ func resetSuffix(t time.Time) string {
 }
 
 // limitReason renders a limit's reason for a log line, defaulting when a harness
-// leaves it blank.
+// leaves it blank. The window rides along when the adapter named one (CLA-752): a
+// multi-day weekly wait should say which cap it is waiting out, not just "usage
+// limit".
 func limitReason(lim harness.Limit) string {
-	if lim.Reason != "" {
-		return lim.Reason
+	reason := lim.Reason
+	if reason == "" {
+		reason = "usage limit"
 	}
-	return "usage limit"
+	return reason + limitWindowSuffix(lim)
+}
+
+// limitWindowSuffix names the usage window for a log line that already says what
+// it is doing, or "" when the adapter named none (CLA-752). The supervised wait
+// uses it so the pause an operator actually sits through distinguishes a
+// multi-day weekly cap from a 5-hour one (reviews 1.review-2.1, 1.review-3.1,
+// 1.review-5.1, 1.review-1.3).
+func limitWindowSuffix(lim harness.Limit) string {
+	if lim.Window == "" {
+		return ""
+	}
+	return " (" + lim.Window + " window)"
 }
 
 // isReviewPhase reports whether a phase is a review-phase (the gate where
