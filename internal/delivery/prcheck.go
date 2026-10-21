@@ -82,6 +82,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"strconv"
@@ -339,26 +340,150 @@ func settlePR(j prJudgement, prNum, slug string, waited time.Duration, allowUnch
 // remote is not a github.com one. The known prefix forms are matched
 // explicitly rather than searching for "github.com" anywhere in the string —
 // a host like "mygithub.example.com" contains the needle and must not match.
+//
+// This is the DIRECT grammar only. A remote whose host is an SSH config alias
+// (git@github-personal:lecstor/clankerbar-cli.git) is not a github.com remote
+// to this function; githubSlugResolving resolves the alias through ssh, which
+// is what the PR check uses. Kept pure so the grammar is pinned without a
+// process spawn.
 func githubSlug(remoteURL string) (string, bool) {
-	u := strings.TrimSpace(remoteURL)
-	u = strings.TrimSuffix(u, ".git")
-	for _, p := range []string{
-		"https://github.com/",
-		"http://github.com/",
-		"ssh://git@github.com/",
-		"git@github.com:",
-		"github.com:",
-	} {
-		if i := strings.Index(u, p); i >= 0 {
-			rest := strings.TrimLeft(u[i+len(p):], "/")
-			parts := strings.Split(rest, "/")
-			if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
-				return parts[0] + "/" + parts[1], true
-			}
+	return githubSlugResolving(remoteURL, nil)
+}
+
+// githubSlugResolving is githubSlug plus SSH host alias resolution. When the
+// URL is an ssh form whose host is not github.com, resolve is asked for the
+// hostname that alias selects (production: `ssh -G`, the effective config);
+// the remote is accepted when that comes back as github.com. resolve == nil
+// means "direct forms only".
+//
+// The alias case is not exotic: a machine with
+//
+//	Host github-personal
+//	  HostName github.com
+//
+// in ~/.ssh/config has `git@github-personal:lecstor/clankerbar-cli.git` as its
+// origin, and every remote read reported it as "not a github.com repository",
+// so the PR check was skipped rather than run (CLA-728 PR 230, 2026-10-21).
+func githubSlugResolving(remoteURL string, resolve func(host string) (string, bool)) (string, bool) {
+	host, path, sshish, ok := splitRemoteHostPath(remoteURL)
+	if !ok {
+		return "", false
+	}
+	if !isGitHubHost(host) {
+		if !sshish || resolve == nil {
+			return "", false
+		}
+		real, ok := resolve(host)
+		if !ok || !isGitHubHost(real) {
 			return "", false
 		}
 	}
+	parts := strings.Split(path, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return "", false
+	}
+	return parts[0] + "/" + parts[1], true
+}
+
+// splitRemoteHostPath splits a git remote URL into the host and the owner/name
+// path below it, for the forms git actually writes: scheme URLs (https, http,
+// ssh, git+ssh) and scp-like syntax ([user@]host:path). sshish reports an ssh
+// form — the only kind a Host alias can apply to. ok is false for anything
+// else, including a local filesystem path, which is not a remote host at all.
+func splitRemoteHostPath(remoteURL string) (host, path string, sshish, ok bool) {
+	u := strings.TrimSpace(remoteURL)
+	u = strings.TrimSuffix(u, ".git")
+	if u == "" {
+		return "", "", false, false
+	}
+	if i := strings.Index(u, "://"); i > 0 {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return "", "", false, false
+		}
+		switch strings.ToLower(parsed.Scheme) {
+		case "http", "https":
+		case "ssh", "git+ssh":
+			sshish = true
+		default:
+			return "", "", false, false
+		}
+		path = strings.TrimPrefix(parsed.Path, "/")
+		host = parsed.Hostname()
+		return host, path, sshish, host != "" && path != ""
+	}
+	// scp-like: [user@]host:path. A colon after a slash is a path
+	// separator (a local path, or a Windows drive), not a host.
+	if i := strings.LastIndex(u, ":"); i > 0 && !strings.Contains(u[:i], "/") {
+		host = u[:i]
+		if j := strings.LastIndex(host, "@"); j >= 0 {
+			host = host[j+1:]
+		}
+		path = strings.TrimPrefix(u[i+1:], "/")
+		return host, path, true, host != "" && path != ""
+	}
+	return "", "", false, false
+}
+
+// isGitHubHost is an EXACT host comparison, because "mygithub.example.com"
+// contains the needle and must not match.
+func isGitHubHost(host string) bool {
+	return strings.EqualFold(strings.TrimSpace(host), "github.com")
+}
+
+// sshAliasTimeout bounds one `ssh -G` lookup. It reads configuration and never
+// opens a connection, so it is fast; the bound exists so a pathological config
+// (a Match exec block that blocks) cannot hold a delivery check open.
+const sshAliasTimeout = 5 * time.Second
+
+// sshAliasHost resolves an SSH host alias to the HostName its configuration
+// selects, using `ssh -G <alias>` — the effective configuration ssh itself
+// would use, which is exactly the question. An unknown alias resolves to
+// itself, which is why the caller still compares the ANSWER with github.com
+// rather than trusting that resolution happened.
+func sshAliasHost(ctx context.Context, host string) (string, bool) {
+	cctx, cancel := context.WithTimeout(ctx, sshAliasTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "ssh", "-G", host)
+	cmd.WaitDelay = ghWaitDelay
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", false
+	}
+	for _, line := range strings.Split(stdout.String(), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && strings.EqualFold(f[0], "hostname") {
+			return f[1], true
+		}
+	}
 	return "", false
+}
+
+// sshAliasLookup returns a memoized resolver for one check. A workdir of many
+// repositories routinely shares one alias, and `ssh -G` costs a process spawn:
+// without the cache, narrowing to the right repository would pay it once per
+// candidate. Failures are remembered too — an absent ssh or an unreadable
+// config does not change between candidates.
+func (v *Verifier) sshAliasLookup(ctx context.Context) func(host string) (string, bool) {
+	resolved := map[string]string{}
+	failed := map[string]bool{}
+	return func(host string) (string, bool) {
+		if h, ok := resolved[host]; ok {
+			return h, true
+		}
+		if failed[host] {
+			return "", false
+		}
+		h, ok := sshAliasHost(ctx, host)
+		if !ok {
+			failed[host] = true
+			return "", false
+		}
+		resolved[host] = h
+		return h, true
+	}
 }
 
 // ghNotFoundError marks a `gh` failure that means THE PR IS NOT THERE, rather
@@ -432,11 +557,16 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 			"PR %s cannot be verified: %s is not on PATH — the delivery's pull request goes unchecked, which is not a pass. Install the GitHub CLI so this gate can run", prNum, v.ghBin)}
 	}
 
+	// One alias cache for the whole check: the candidate search below can probe
+	// several repositories, and an SSH host alias is resolved once, not per
+	// repo.
+	lookupHost := v.sshAliasLookup(ctx)
+
 	repo := rep.Repo
 	if repo == "" {
 		for _, r := range repos {
 			if url, err := v.remoteURL(ctx, r); err == nil {
-				if _, ok := githubSlug(url); ok {
+				if _, ok := githubSlugResolving(url, lookupHost); ok {
 					repo = r
 					break
 				}
@@ -445,7 +575,7 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 	}
 	if repo == "" && len(repos) > 0 {
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
-			"PR %s cannot be verified: no repository at or below %s has a github.com remote, so where the pull request lives cannot be told", prNum, v.workdir)}
+			"PR %s cannot be verified: no repository at or below %s has a github.com remote (SSH host aliases were resolved through `ssh -G`)", prNum, v.workdir)}
 	}
 	if repo == "" {
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
@@ -456,10 +586,10 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
 			"PR %s cannot be verified: could not read the remote of %s: %v", prNum, repo, err)}
 	}
-	slug, ok := githubSlug(url)
+	slug, ok := githubSlugResolving(url, lookupHost)
 	if !ok {
 		return Check{Kind: PRVerified, Status: Unknown, Detail: fmt.Sprintf(
-			"PR %s cannot be verified: the remote of %s (%s) is not a github.com repository", prNum, repo, url)}
+			"PR %s cannot be verified: the remote of %s (%s) is not a github.com repository, and any SSH host alias it names did not resolve to github.com (checked with `ssh -G`)", prNum, repo, url)}
 	}
 
 	// Scope every API read below to the account that owns the remote, the way

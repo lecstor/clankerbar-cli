@@ -52,12 +52,19 @@ const (
 // is only configuration, so no network is ever touched.
 func prEnv(t *testing.T) string {
 	t.Helper()
+	return repoWithRemote(t, "https://github.com/acme/widgets.git")
+}
+
+// repoWithRemote is prEnv with the origin URL spelled out, for the SSH-alias
+// case where the URL itself is the thing under test.
+func repoWithRemote(t *testing.T, remote string) string {
+	t.Helper()
 	requireGit(t)
 	root := t.TempDir()
 	work := filepath.Join(root, "repo")
 	run(t, root, "git", "init", "-b", "main", work)
 	configure(t, work)
-	run(t, work, "git", "remote", "add", "origin", "https://github.com/acme/widgets.git")
+	run(t, work, "git", "remote", "add", "origin", remote)
 	writeFile(t, filepath.Join(work, "f.txt"), "x")
 	run(t, work, "git", "add", ".")
 	run(t, work, "git", "commit", "-m", "init")
@@ -517,6 +524,63 @@ func TestNonGitHubRemoteIsAnExplicitRefusalToVerify(t *testing.T) {
 	}
 }
 
+// CLA-776's second hole, end to end: an origin spelled through an SSH host
+// alias that resolves to github.com must be CHECKED, not reported as "not a
+// github.com repository" and skipped. The fake ssh answers `ssh -G`, and the
+// fake gh records the --repo it was asked for, so the test pins that the
+// resolved slug reached gh rather than merely that something ran.
+func TestPRCheckChecksAnSSHHostAliasRemote(t *testing.T) {
+	root := repoWithRemote(t, "git@github-personal:lecstor/clankerbar-cli.git")
+	forceSSH(t, "github-personal", "github.com")
+
+	record := filepath.Join(t.TempDir(), "gh-argv")
+	gh := writeGH(t, "printf '%s\\n' \"$*\" > "+record+"\ncat <<'J'\n"+jsonMergeablePassing+"\nJ\n")
+
+	v := prVerifier(t, root, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh was never asked to read the PR: %v", err)
+	}
+	if !strings.Contains(string(argv), "--repo lecstor/clankerbar-cli") {
+		t.Errorf("gh was asked for the wrong repository: %s", argv)
+	}
+}
+
+// ... and an alias that resolves somewhere else is still not GitHub, so the
+// check degrades exactly as it did before rather than pretending to run.
+func TestPRCheckRefusesAnSSHAliasThatIsNotGitHub(t *testing.T) {
+	root := repoWithRemote(t, "git@gitlab-personal:lecstor/clankerbar-cli.git")
+	forceSSH(t, "gitlab-personal", "gitlab.com")
+
+	v := prVerifier(t, root, fakeGH(t, jsonMergeablePassing))
+	rep := verifyWith(t, v, Claim{Label: "CLA-776", PR: "7"})
+	c := mustStatus(t, rep, PRVerified, Unknown)
+	// The candidate search found no GitHub repository, so its message is the
+	// one that names the alias attempt — the important part is that a non-GitHub
+	// alias is a could-not-verify, not a pass and not a crash.
+	if !strings.Contains(c.Detail, "has a github.com remote") || !strings.Contains(c.Detail, "ssh -G") {
+		t.Errorf("detail should name the missing github.com remote and the alias check: %s", c.Detail)
+	}
+}
+
+// forceSSH puts a fake `ssh` first on PATH whose `ssh -G <alias>` reports the
+// given hostname, the way an operator's ~/.ssh/config entry would.
+func forceSSH(t *testing.T, alias, hostname string) {
+	t.Helper()
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ssh")
+	body := "#!/bin/sh\ncase \"$2\" in\n" +
+		alias + ") printf 'host " + alias + "\\nhostname " + hostname + "\\nport 22\\n' ;;\n" +
+		"*) printf 'host %s\\nhostname %s\\n' \"$2\" \"$2\" ;;\nesac\n"
+	if err := os.WriteFile(fake, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // A delivery naming a PR that does not exist is a false claim — refused, not
 // ridden through as an outage.
 func TestNonexistentPRIsRefused(t *testing.T) {
@@ -578,6 +642,91 @@ func TestGithubSlug(t *testing.T) {
 		if got, _ := githubSlug(tc.url); got != tc.want {
 			t.Errorf("githubSlug(%q) = %q, want %q", tc.url, got, tc.want)
 		}
+	}
+	// The direct grammar is deliberately blind to an SSH host alias: only the
+	// resolving form knows how to ask ssh, and mixing the two would make this
+	// pure function spawn processes.
+	if got, ok := githubSlug("git@github-personal:lecstor/clankerbar-cli.git"); ok {
+		t.Errorf("githubSlug accepted an unresolved SSH alias as %q — the alias must go through githubSlugResolving", got)
+	}
+}
+
+// CLA-776's second hole: a checkout whose origin is an SSH host alias that
+// resolves to github.com was reported as "not a github.com repository", so the
+// PR check was skipped rather than run (CLA-728 PR 230 on the Mac). The alias
+// resolves through `ssh -G`; anything that does not land on github.com is
+// still rejected, and an https URL is never alias-resolved (an SSH alias says
+// nothing about https).
+func TestGithubSlugResolvesAnSSHHostAlias(t *testing.T) {
+	resolve := func(host string) (string, bool) {
+		switch host {
+		case "github-personal", "github-work":
+			return "github.com", true
+		case "gitlab-personal":
+			return "gitlab.com", true
+		}
+		return "", false
+	}
+	cases := []struct{ url, want string }{
+		{"git@github-personal:lecstor/clankerbar-cli.git", "lecstor/clankerbar-cli"},
+		{"ssh://git@github-personal/lecstor/clankerbar-cli.git", "lecstor/clankerbar-cli"},
+		{"ssh://git@github-personal:22/lecstor/clankerbar-cli.git", "lecstor/clankerbar-cli"},
+		{"git@github-work:acme/widgets", "acme/widgets"},
+		{"git@gitlab-personal:lecstor/clankerbar-cli.git", ""},     // resolves, but not to github.com
+		{"git@unknown-alias:lecstor/clankerbar-cli.git", ""},       // nothing to resolve
+		{"https://gitlab.com/lecstor/clankerbar-cli.git", ""},      // https is never alias-resolved
+		{"https://github-personal/lecstor/clankerbar-cli.git", ""}, // ... and neither is this one
+		{"/Users/j/dev/clankerbar-cli", ""},                        // a local path is not a remote host
+	}
+	for _, tc := range cases {
+		if got, _ := githubSlugResolving(tc.url, resolve); got != tc.want {
+			t.Errorf("githubSlugResolving(%q) = %q, want %q", tc.url, got, tc.want)
+		}
+	}
+
+	// A direct github.com host never pays for a lookup: ssh must not be
+	// consulted when the answer is already in the URL.
+	if got, ok := githubSlugResolving("git@github.com:lecstor/clankerbar-cli.git", func(string) (string, bool) {
+		t.Fatal("the resolver was consulted for a direct github.com host")
+		return "", false
+	}); !ok || got != "lecstor/clankerbar-cli" {
+		t.Errorf("direct github.com remote resolved as (%q, %v)", got, ok)
+	}
+}
+
+// sshAliasHost asks ssh's OWN effective configuration, which is the whole point:
+// guessing from ~/.ssh/config would miss an Include or a Match block. The fake
+// mirrors `ssh -G`'s shape (one `hostname` line among many).
+func TestSSHAliasHostReadsSSHConfig(t *testing.T) {
+	dir := t.TempDir()
+	fake := filepath.Join(dir, "ssh")
+	if err := os.WriteFile(fake, []byte(`#!/bin/sh
+case "$2" in
+github-personal) printf 'host github-personal\nuser git\nhostname github.com\nport 22\n' ;;
+gitlab-personal) printf 'host gitlab-personal\nhostname gitlab.com\n' ;;
+*) printf 'host %s\nhostname %s\n' "$2" "$2" ;;
+esac
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if got, ok := sshAliasHost(context.Background(), "github-personal"); !ok || got != "github.com" {
+		t.Errorf("sshAliasHost(github-personal) = (%q, %v), want (github.com, true)", got, ok)
+	}
+	if got, ok := sshAliasHost(context.Background(), "gitlab-personal"); !ok || got != "gitlab.com" {
+		t.Errorf("sshAliasHost(gitlab-personal) = (%q, %v), want (gitlab.com, true)", got, ok)
+	}
+	if got, ok := sshAliasHost(context.Background(), "not-configured"); !ok || got != "not-configured" {
+		// ssh -G answers an unknown alias by echoing it as its own hostname.
+		// The caller compares the answer with github.com, so identity is not a
+		// resolution — pinning that here keeps the guard honest.
+		t.Errorf("sshAliasHost(not-configured) = (%q, %v), want the alias echoed back", got, ok)
+	}
+	if _, ok := githubSlugResolving("git@not-configured:lecstor/x.git", func(host string) (string, bool) {
+		return sshAliasHost(context.Background(), host)
+	}); ok {
+		t.Error("an alias ssh echoes back was accepted as github.com")
 	}
 }
 
