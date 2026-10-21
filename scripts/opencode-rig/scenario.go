@@ -62,10 +62,9 @@ type toolResult struct {
 // scenarios is the shipped set. Each one is small on purpose: one question, one
 // run, one report.
 func scenarios() map[string]scenarioDef {
-	// The padding scenario's canned task row starts with both flags SET and
-	// routing set, because those are the states the residual is about: a padded
-	// `false` CLEARS a SET flag, and `repo: ""` clears routing where `null`
-	// leaves it alone.
+	// The padding scenario's canned task row starts with both flags SET,
+	// because that is the state the residual is about: a padded `false` CLEARS
+	// a SET flag, and a `false` on an already-false one is a no-op.
 	edit := newEditTaskState()
 	return map[string]scenarioDef{
 		// padding reproduces strict-mode provider padding against the one
