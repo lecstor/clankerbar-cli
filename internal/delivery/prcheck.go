@@ -441,10 +441,15 @@ const sshAliasTimeout = 5 * time.Second
 // would use, which is exactly the question. An unknown alias resolves to
 // itself, which is why the caller still compares the ANSWER with github.com
 // rather than trusting that resolution happened.
+//
+// The host is passed AFTER `--`: it comes from a git remote URL, which can
+// spell a host beginning with '-' (the scp-like split only requires no '/'
+// before the colon), and without the marker ssh would read that string as an
+// OPTION rather than a destination.
 func sshAliasHost(ctx context.Context, host string) (string, bool) {
 	cctx, cancel := context.WithTimeout(ctx, sshAliasTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(cctx, "ssh", "-G", host)
+	cmd := exec.CommandContext(cctx, "ssh", "-G", "--", host)
 	cmd.WaitDelay = ghWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -592,12 +597,15 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 			"PR %s cannot be verified: the remote of %s (%s) is not a github.com repository, and any SSH host alias it names did not resolve to github.com (checked with `ssh -G`)", prNum, repo, url)}
 	}
 
-	// Scope every API read below to the account that owns the remote, the way
-	// CLA-458 scoped the git ones. Resolved once here, not per poll: the polls
-	// then share one identity, and the worst case stays a couple of gh spawns
-	// per verification. Empty means "run unscoped" — the fallback the header
-	// documents.
-	ghScope := v.ghScopeFor(ctx, repo, url)
+	// Scope every API read below to the account that owns the RESOLVED slug,
+	// the way CLA-458 scoped the git ones. The slug has already been resolved
+	// through the SSH alias machinery above, so an scp-like or aliased remote
+	// is scoped like an HTTPS one — and the close-out scopes by the same slug
+	// (ghAPIScope), so gate and close-out read one PR under one identity.
+	// Resolved once here, not per poll: the polls then share one identity, and
+	// the worst case stays a couple of gh spawns per verification. Empty means
+	// "run unscoped" — the fallback the header documents.
+	ghScope := v.ghAPIScope(ctx, repo, slug)
 
 	_, chk := v.pollPR(ctx, repo, slug, atoiPR(prNum), ghScope)
 	return chk
@@ -733,21 +741,65 @@ const prProbeTimeout = 20 * time.Second
 // and every delivery silently went unjudged for two months.
 //
 // The pull request is discovered rather than configured: the first github.com
-// repository under workdir with a PR (any state) is read through the gate's own
-// command and parser. Repositories with no PR are skipped, and an SSH host
-// alias is resolved exactly as the gate resolves it. The error the caller
-// classifies is the parse one (IsGHParseError); every other failure — gh not
-// authenticated, no network — is an unavailable prerequisite, not a broken gate.
+// repository with a PR (any state) is read through the gate's own command and
+// parser. Repositories with no PR are skipped, and an SSH host alias is
+// resolved exactly as the gate resolves it. The error the caller classifies is
+// the parse one (IsGHParseError); every other failure — gh not authenticated,
+// no network — is an unavailable prerequisite, not a broken gate.
+//
+// ProbeGHJSON is the single-workdir form. doctor uses ProbeGHJSONDirs, because
+// the delivery gate judges each project's effective workdir and its declared
+// checkouts, which need not live under the top-level cfg.WorkDir.
 func ProbeGHJSON(ctx context.Context, ghBin, workdir string) (PRProbe, error) {
+	return ProbeGHJSONDirs(ctx, ghBin, []string{workdir})
+}
+
+// ProbeGHJSONDirs is ProbeGHJSON over EVERY workdir the delivery gate judges:
+// each configured project's effective workdir plus the checkouts its repos map
+// declares (doctor assembles that list). It reads the first pull request found
+// in any of them, so a multi-project config whose projects carry their own
+// workdirs exercises the gate's parse path instead of reporting it untested.
+//
+// Repositories are deduplicated by git common directory, so a project whose
+// workdir and declared checkout name the same repository — or one workdir
+// nested inside another — is tried once.
+func ProbeGHJSONDirs(ctx context.Context, ghBin string, workdirs []string) (PRProbe, error) {
 	ctx, cancel := context.WithTimeout(ctx, prProbeTimeout)
 	defer cancel()
 
-	v := New(workdir, "")
+	v := New("", "")
 	if ghBin != "" {
 		v.ghBin = ghBin
 	}
 	lookupHost := v.sshAliasLookup(ctx)
-	repos := v.candidateRepos(ctx)
+
+	// Collect the candidate repositories across every workdir FIRST, deduped by
+	// the shared git common dir (the same identity candidateRepos uses within
+	// one workdir).
+	var repos []string
+	seenRepo := map[string]bool{}
+	for _, workdir := range workdirs {
+		if strings.TrimSpace(workdir) == "" {
+			continue
+		}
+		wv := New(workdir, "")
+		for _, repo := range wv.candidateRepos(ctx) {
+			common, root, ok := wv.repoAt(ctx, repo)
+			key := common
+			if !ok || key == "" {
+				key = root
+			}
+			if key == "" {
+				key = repo
+			}
+			if seenRepo[key] {
+				continue
+			}
+			seenRepo[key] = true
+			repos = append(repos, repo)
+		}
+	}
+
 	tried := 0
 	var lastNoTarget error
 	for _, repo := range repos {
@@ -762,10 +814,17 @@ func ProbeGHJSON(ctx context.Context, ghBin, workdir string) (PRProbe, error) {
 		if !ok {
 			continue
 		}
-		if tried++; tried > probeMaxRepos {
+		// probeMaxRepos bounds the repositories actually READ; comparing before
+		// incrementing is what makes the constant bound what it says.
+		if tried >= probeMaxRepos {
 			break
 		}
-		scope := v.ghScopeFor(ctx, repo, url)
+		tried++
+		// Scope by the RESOLVED slug, not the raw remote URL: an scp-like SSH
+		// remote (or a host alias) is not parsed by githubOwner, and the
+		// close-out scopes by this same slug (ghAPIScope). One PR must not be
+		// read under two identities.
+		scope := v.ghAPIScope(ctx, repo, slug)
 		num, err := v.probePRNumber(ctx, repo, slug, scope)
 		if err != nil {
 			if errors.Is(err, ErrNoPRProbeTarget) {
@@ -784,7 +843,11 @@ func ProbeGHJSON(ctx context.Context, ghBin, workdir string) (PRProbe, error) {
 	if lastNoTarget != nil {
 		return PRProbe{}, lastNoTarget
 	}
-	return PRProbe{}, fmt.Errorf("%w: no github.com repository at or below %s", ErrNoPRProbeTarget, workdir)
+	where := strings.Join(workdirs, ", ")
+	if strings.TrimSpace(where) == "" {
+		where = "an empty workdir"
+	}
+	return PRProbe{}, fmt.Errorf("%w: no github.com repository at or below %s", ErrNoPRProbeTarget, where)
 }
 
 // probePRNumber asks gh for one pull request number in slug, any state: a
@@ -809,22 +872,6 @@ func (v *Verifier) probePRNumber(ctx context.Context, dir, slug string, scope []
 		return 0, ErrNoPRProbeTarget
 	}
 	return rows[0].Number, nil
-}
-
-// ghScopeFor derives the per-owner credential additions for one gh invocation
-// (CLA-460): the token of the account that owns remoteURL, carried as GH_TOKEN.
-// Empty means "run unscoped", the documented fallback. Shared by the delivery
-// check and the doctor probe so the two cannot scope differently.
-func (v *Verifier) ghScopeFor(ctx context.Context, dir, remoteURL string) []string {
-	owner := githubOwner(remoteURL)
-	if owner == "" {
-		return nil
-	}
-	token := v.ghTokenFor(ctx, dir, owner)
-	if token == "" {
-		return nil
-	}
-	return []string{"GH_TOKEN=" + token}
 }
 
 // runGH executes one gh command in dir and returns its trimmed stdout, with

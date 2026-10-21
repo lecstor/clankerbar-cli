@@ -164,6 +164,22 @@ func TestOpenPRsListsTheBranchsOpenPR(t *testing.T) {
 	}
 }
 
+// A decorated answer is the same fault the gate classifies as a refusal, so
+// this reader must classify it identically rather than as a generic error.
+func TestOpenPRsClassifiesDecoratedOutputAsAParseError(t *testing.T) {
+	root := prEnv(t)
+	repo := filepath.Join(root, "repo")
+	v := New(root, "").WithGHBin(fakeGH(t, "\x1b[1;37m[\x1b[m"))
+
+	_, err := v.OpenPRs(context.Background(), repo, "acme/widgets", "clanker/x")
+	if err == nil {
+		t.Fatal("decorated `gh pr list` output parsed")
+	}
+	if !IsGHParseError(err) {
+		t.Fatalf("got %v (%T), want a ghParseError", err, err)
+	}
+}
+
 func TestOpenPRsNamesNoBranchOrSlug(t *testing.T) {
 	v := New(t.TempDir(), "")
 	if _, err := v.OpenPRs(context.Background(), t.TempDir(), "", "b"); err == nil {

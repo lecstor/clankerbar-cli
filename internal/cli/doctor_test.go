@@ -64,9 +64,9 @@ func okEnv() doctorEnv {
 		// plane that is reachable and accepts the key. Tests break it explicitly.
 		fleetProbe: func(context.Context, string, string) error { return nil },
 		// The pr_gate probe (CLA-776): by default there is nothing to read, so
-		// the check stays PASS with an honest "not exercised" line. Tests that
-		// care about the probe install their own outcome.
-		probePRGate: func(context.Context, string, string) (delivery.PRProbe, error) {
+		// the check stays an honest "not exercised" WARN. Tests that care about
+		// the probe install their own outcome.
+		probePRGate: func(context.Context, string, []string) (delivery.PRProbe, error) {
 			return delivery.PRProbe{}, delivery.ErrNoPRProbeTarget
 		},
 	}
@@ -1845,8 +1845,14 @@ func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
 
 func TestPRGateWithGHPassesAndNamesTheDefault(t *testing.T) {
 	cfg := validCfg(t)
+	e := okEnv()
+	// A project/checkout with a readable PR is what earns a PASS; the
+	// unexercised probe is pinned as a WARN by its own test.
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{Slug: "acme/widgets", Number: 7}, nil
+	}
 
-	c := checkPRGate(context.Background(), cfg, okEnv())
+	c := checkPRGate(context.Background(), cfg, e)
 	if c.status != pass {
 		t.Errorf("gh present, default config: got %v, want PASS", c.status)
 	}
@@ -1869,8 +1875,12 @@ func TestPRGateNamesPerProjectOptOut(t *testing.T) {
 		{Slug: "strict"},
 		{Slug: "loose", AllowUncheckedPR: true},
 	}
+	e := okEnv()
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{Slug: "acme/widgets", Number: 7}, nil
+	}
 
-	c := checkPRGate(context.Background(), cfg, okEnv())
+	c := checkPRGate(context.Background(), cfg, e)
 	if c.status != pass {
 		t.Errorf("gh present: got %v, want PASS", c.status)
 	}
@@ -1910,7 +1920,7 @@ esac
 
 	e := okEnv()
 	e.lookPath = func(string) (string, error) { return gh, nil }
-	e.probePRGate = delivery.ProbeGHJSON // the production probe, against the fake gh
+	e.probePRGate = delivery.ProbeGHJSONDirs // the production probe, against the fake gh
 
 	c := checkPRGate(context.Background(), validCfgIn(t, repo), e)
 	if c.status != fail {
@@ -1933,7 +1943,7 @@ esac
 // run whose gate might work fine an hour later.
 func TestPRGateWarnsWhenTheProbeCannotReachGitHub(t *testing.T) {
 	e := okEnv()
-	e.probePRGate = func(context.Context, string, string) (delivery.PRProbe, error) {
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
 		return delivery.PRProbe{}, errors.New("gh pr list: exit status 1: authentication required")
 	}
 
@@ -1954,7 +1964,7 @@ func TestPRGateWarnsWhenTheProbeCannotReachGitHub(t *testing.T) {
 // exact command parsed" rather than "gh is installed".
 func TestPRGateProbeNamesThePullRequestItParsed(t *testing.T) {
 	e := okEnv()
-	e.probePRGate = func(context.Context, string, string) (delivery.PRProbe, error) {
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
 		return delivery.PRProbe{Slug: "acme/widgets", Number: 7}, nil
 	}
 
@@ -1967,15 +1977,86 @@ func TestPRGateProbeNamesThePullRequestItParsed(t *testing.T) {
 	}
 }
 
-// No PR to read is not a pass on the parse path: the line says the probe was
-// NOT exercised, so nobody mistakes the PASS for evidence gh output is clean.
-func TestPRGateSaysWhenTheProbeHadNothingToRead(t *testing.T) {
-	c := checkPRGate(context.Background(), validCfg(t), okEnv()) // okEnv's probe: no target
-	if c.status != pass {
-		t.Errorf("nothing to probe: got %v, want PASS (an unexercised probe is not a fault)", c.status)
+// The probe must cover every configured project's EFFECTIVE workdir, not only
+// cfg.WorkDir (CLA-776 review 1.review-2.1 / 1.review-3.1): a project whose
+// checkout lives outside the top-level workdir still holds the PRs the delivery
+// gate will judge, and a probe that misses them reports the parse path untested.
+func TestPRGateProbesEachProjectsEffectiveWorkdir(t *testing.T) {
+	cfg := validCfgIn(t, t.TempDir()) // no repository at the top level
+	withPR := cliGitRepoWithRemote(t, "https://github.com/acme/widgets.git")
+	cfg.Projects = []config.Project{
+		{Slug: "empty", WorkDir: t.TempDir()},
+		{Slug: "withpr", WorkDir: withPR},
 	}
-	if !strings.Contains(strings.Join(c.info, "\n"), "NOT exercised") {
+	gh := cliPRProbeGH(t)
+
+	e := okEnv()
+	e.lookPath = func(string) (string, error) { return gh, nil }
+	e.probePRGate = delivery.ProbeGHJSONDirs
+
+	c := checkPRGate(context.Background(), cfg, e)
+	if c.status != pass {
+		t.Fatalf("a PR in the second project's workdir: got %v, want PASS (info=%q)", c.status, c.info)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "gh pr view 7 --repo acme/widgets --json` parsed") {
+		t.Errorf("the probe did not read the project workdir's PR: %q", c.info)
+	}
+}
+
+// A project's sessions start in a checkout its repos map declares, which need
+// not be under any workdir; the probe must search those declared checkouts too
+// (CLA-776 review 1.review-3.1).
+func TestPRGateProbesDeclaredCheckouts(t *testing.T) {
+	cfg := validCfgIn(t, t.TempDir())
+	repo := cliGitRepoWithRemote(t, "https://github.com/acme/widgets.git")
+	cfg.Repos = map[string]string{"acme/widgets": repo}
+	cfg.PrimaryRepo = "acme/widgets"
+	gh := cliPRProbeGH(t)
+
+	e := okEnv()
+	e.lookPath = func(string) (string, error) { return gh, nil }
+	e.probePRGate = delivery.ProbeGHJSONDirs
+
+	c := checkPRGate(context.Background(), cfg, e)
+	if c.status != pass {
+		t.Fatalf("a PR in a declared checkout: got %v, want PASS (info=%q)", c.status, c.info)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "gh pr view 7 --repo acme/widgets --json` parsed") {
+		t.Errorf("the probe did not read the declared checkout's PR: %q", c.info)
+	}
+}
+
+// cliPRProbeGH writes a fake gh that answers the probe's discovery and read.
+func cliPRProbeGH(t *testing.T) string {
+	t.Helper()
+	gh := filepath.Join(t.TempDir(), "gh")
+	body := `#!/bin/sh
+case "$1/$2" in
+auth/token) exit 0 ;;
+pr/list) printf '[{"number":7}]\n' ;;
+*) printf '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}\n' ;;
+esac
+`
+	if err := os.WriteFile(gh, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return gh
+}
+
+// No PR to read is not a pass on the parse path: the check WARNs (CLA-776
+// review 1.review-5.1) and says the probe was NOT exercised, so nobody mistakes
+// a pr_gate result for evidence gh output is clean.
+func TestPRGateWarnsWhenTheProbeHadNothingToRead(t *testing.T) {
+	c := checkPRGate(context.Background(), validCfg(t), okEnv()) // okEnv's probe: no target
+	if c.status != warn {
+		t.Errorf("nothing to probe: got %v, want WARN (an unexercised probe is not a validated gate)", c.status)
+	}
+	joined := strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "NOT exercised") {
 		t.Errorf("doctor must say the probe did not run: %q", c.info)
+	}
+	if c.remedy == "" || !strings.Contains(c.remedy, "pull request") || !strings.Contains(c.remedy, "NOT validated") {
+		t.Errorf("an unexercised probe needs a remedy naming what was not validated: %q", c.remedy)
 	}
 }
 

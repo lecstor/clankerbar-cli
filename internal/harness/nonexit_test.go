@@ -54,9 +54,16 @@ func stripPath(t *testing.T) {
 func TestCodexInvokeReturnsAParsedResultAlongsideANonExitRunError(t *testing.T) {
 	dir := t.TempDir()
 	stub := filepath.Join(dir, "codex")
+	// ONE event carrying BOTH the usage total and the agent message, and the
+	// console failing on its FIRST write. The capture's tail+parser sit BEFORE
+	// the console in the writer chain, so the chunk containing this line is
+	// parsed before the console write fails — deterministically, whatever the
+	// pipe does. Two lines made the assertion depend on the reader coalescing
+	// both into one chunk (it failed whenever the second line arrived
+	// separately, because os/exec stops copying at the console error): the
+	// flake this fixture used to have.
 	script := `#!/bin/sh
-echo '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":5}}'
-echo '{"type":"agent_message","item":{"type":"message","text":"done"}}'
+echo '{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":50,"reasoning_output_tokens":5},"item":{"type":"agent_message","text":"done"}}'
 `
 	if err := os.WriteFile(stub, []byte(script), 0o755); err != nil {
 		t.Fatalf("writing stub: %v", err)

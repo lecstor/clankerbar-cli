@@ -437,6 +437,41 @@ func TestPRCheckScopesTheAPIReadToTheRemoteOwner(t *testing.T) {
 	}
 }
 
+// An scp-like SSH remote is scoped by the RESOLVED slug, not the raw URL:
+// githubOwner only parses http(s), so deriving from the URL left every SSH
+// remote unscoped as the ambient account (CLA-776 review 1.review-1.1). The
+// close-out scopes by the slug (ghAPIScope); the gate must do the same.
+func TestPRCheckScopesAnSSHRemoteByItsResolvedSlug(t *testing.T) {
+	dir := repoWithRemote(t, "git@github-personal:acme/widgets.git")
+	// ssh -G resolves the alias to github.com, as a developer's config does.
+	sshDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(sshDir, "ssh"),
+		[]byte("#!/bin/sh\nprintf 'host %s\\nhostname github.com\\n' \"$3\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", sshDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	record := filepath.Join(t.TempDir(), "gh-record.log")
+	t.Setenv("GH_RECORD", record)
+	t.Setenv("GH_FAKE_TOKEN", ghFakeToken)
+	t.Setenv("GH_TOKEN", "ambient-decoy-not-the-owners")
+	gh := recordingGH(t, jsonMergeablePassing)
+
+	v := prVerifier(t, dir, gh)
+	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
+	mustStatus(t, rep, PRVerified, Pass)
+
+	pr := ghSections(t, record)["pr view"]
+	if len(pr) == 0 {
+		t.Fatal("the PR read never ran - scoping cannot have ridden it")
+	}
+	for _, l := range pr {
+		if l != "ghtoken="+ghFakeToken && l != "githubtoken=UNSET" {
+			t.Errorf("SSH-remote PR read carried %q; want ghtoken=%s and GITHUB_TOKEN dropped", l, ghFakeToken)
+		}
+	}
+}
+
 // The fallback is today's behavior, byte for byte: an owner whose token does
 // not resolve leaves the PR read UNscoped, and the ambient credentials such a
 // read has always seen survive untouched — stripping them would be a second
@@ -573,9 +608,11 @@ func forceSSH(t *testing.T, alias, hostname string) {
 	t.Helper()
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "ssh")
-	body := "#!/bin/sh\ncase \"$2\" in\n" +
+	// The host arrives after `--` (it comes from a remote URL, so it must not
+	// be readable as an option); refuse an argv without the marker.
+	body := "#!/bin/sh\nif [ \"$1\" != \"-G\" ] || [ \"$2\" != \"--\" ]; then exit 255; fi\ncase \"$3\" in\n" +
 		alias + ") printf 'host " + alias + "\\nhostname " + hostname + "\\nport 22\\n' ;;\n" +
-		"*) printf 'host %s\\nhostname %s\\n' \"$2\" \"$2\" ;;\nesac\n"
+		"*) printf 'host %s\\nhostname %s\\n' \"$3\" \"$3\" ;;\nesac\n"
 	if err := os.WriteFile(fake, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -697,15 +734,21 @@ func TestGithubSlugResolvesAnSSHHostAlias(t *testing.T) {
 
 // sshAliasHost asks ssh's OWN effective configuration, which is the whole point:
 // guessing from ~/.ssh/config would miss an Include or a Match block. The fake
-// mirrors `ssh -G`'s shape (one `hostname` line among many).
+// mirrors `ssh -G`'s shape (one `hostname` line among many) and refuses an argv
+// without the end-of-options marker, so the marker is pinned: a host taken from
+// a remote URL could otherwise begin with '-' and be read as an OPTION.
 func TestSSHAliasHostReadsSSHConfig(t *testing.T) {
 	dir := t.TempDir()
 	fake := filepath.Join(dir, "ssh")
 	if err := os.WriteFile(fake, []byte(`#!/bin/sh
-case "$2" in
+if [ "$1" != "-G" ] || [ "$2" != "--" ]; then
+  printf 'usage: ssh [-46AaCfGgKkMNnqsTtVvXxYyZ] [-b bind_address] ...\n' >&2
+  exit 255
+fi
+case "$3" in
 github-personal) printf 'host github-personal\nuser git\nhostname github.com\nport 22\n' ;;
 gitlab-personal) printf 'host gitlab-personal\nhostname gitlab.com\n' ;;
-*) printf 'host %s\nhostname %s\n' "$2" "$2" ;;
+*) printf 'host %s\nhostname %s\n' "$3" "$3" ;;
 esac
 `), 0o755); err != nil {
 		t.Fatal(err)
@@ -935,6 +978,105 @@ fi
 	// THE coupling: the probe decodes the exact selection the gate decodes.
 	if want := "pr view 7 --repo acme/widgets --json " + prViewJSONFields; !strings.Contains(lines, want) {
 		t.Errorf("the probe did not run the gate's own read.\nwant: %s\ngot:\n%s", want, lines)
+	}
+}
+
+// A multi-project config gives each project its own workdir, so the probe must
+// search EVERY workdir doctor hands it (CLA-776 review 1.review-3.1): a PR in
+// the second project's checkout still exercises the gate's parse path. Before
+// this, only cfg.WorkDir was searched and doctor reported NOT exercised.
+func TestProbeGHJSONDirsSearchesEveryConfiguredWorkdir(t *testing.T) {
+	noPR := repoWithRemote(t, "https://github.com/acme/first.git")
+	withPR := repoWithRemote(t, "https://github.com/acme/second.git")
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+case "$1/$2" in
+pr/list)
+  case "$*" in
+  *"--repo acme/second"*) printf '[{"number":9}]\n' ;;
+  *) printf '[]\n' ;;
+  esac
+  ;;
+*)
+  cat <<'J'
+`+jsonMergeablePassing+`
+J
+  ;;
+esac
+`)
+
+	probe, err := ProbeGHJSONDirs(context.Background(), gh, []string{noPR, withPR})
+	if err != nil {
+		t.Fatalf("probe across two workdirs: %v", err)
+	}
+	if probe.Slug != "acme/second" || probe.Number != 9 {
+		t.Errorf("probe = %+v, want acme/second#9", probe)
+	}
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	if lines := strings.Count(string(argv), "pr list"); lines != 2 {
+		t.Errorf("pr list ran %d times, want once per workdir (2): %q", lines, string(argv))
+	}
+}
+
+// The gate's workdir and its declared checkout can name the same repository;
+// the probe deduplicates by git common dir so that repository is read once.
+func TestProbeGHJSONDirsDeduplicatesRepositories(t *testing.T) {
+	root := prEnv(t)
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+else
+  cat <<'J'
+`+jsonMergeablePassing+`
+J
+fi
+`)
+
+	probe, err := ProbeGHJSONDirs(context.Background(), gh, []string{root, filepath.Join(root, "repo")})
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if probe.Slug != "acme/widgets" || probe.Number != 7 {
+		t.Errorf("probe = %+v, want acme/widgets#7", probe)
+	}
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	if lines := strings.Count(string(argv), "pr list"); lines != 1 {
+		t.Errorf("pr list ran %d times for one repository, want 1: %q", lines, string(argv))
+	}
+}
+
+// probeMaxRepos bounds how many repositories the probe TRIES; comparing before
+// incrementing is what makes the constant bound what its name says.
+func TestProbeGHJSONDirsTriesAtMostProbeMaxRepos(t *testing.T) {
+	var roots []string
+	for i := 0; i <= probeMaxRepos; i++ {
+		roots = append(roots, repoWithRemote(t, fmt.Sprintf("https://github.com/acme/r%d.git", i)))
+	}
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+if [ "$1/$2" = "pr/list" ]; then
+  printf '[]\n'
+else
+  printf '{}\n'
+fi
+`)
+
+	if _, err := ProbeGHJSONDirs(context.Background(), gh, roots); !errors.Is(err, ErrNoPRProbeTarget) {
+		t.Fatalf("got %v, want ErrNoPRProbeTarget", err)
+	}
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	if lines := strings.Count(string(argv), "pr list"); lines != probeMaxRepos {
+		t.Errorf("pr list ran %d times, want probeMaxRepos=%d: %q", lines, probeMaxRepos, string(argv))
 	}
 }
 
