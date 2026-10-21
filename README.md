@@ -1075,7 +1075,10 @@ config the driver never named that a session merges anyway: one whose
 what a session may do), **toolchains** (the build tools the project's
 repos need are actually granted), **power** (whether the machine will stay awake
 long enough to do the work), **deploy_lag** (how far the deployed build lags the
-project's integration branch), and **budget** (ceilings parse and are sane).
+project's integration branch), **pr_gate** (gh is on PATH *and* a real
+`gh pr view --json` parses — decorated output is a FAIL, an unreachable GitHub a
+WARN, and "no PR to read" says the probe was not exercised), and **budget**
+(ceilings parse and are sane).
 
 A multi-project config gets **one backlog check and one workdir check per
 project** — one queue can be wired wrong while the others are fine. A project
@@ -1520,6 +1523,20 @@ a bounded window (30s) and then **refused**, never assumed. Failing or
 unfinished checks refuse by name. If `gh` is not installed the check degrades
 to an explicit could-not-verify - never a pass - and `clankerbar doctor`'s
 `pr_gate` line warns about it up front.
+
+The gate parses `gh`'s `--json` output, so it owns that child's environment:
+`GH_FORCE_TTY` is **removed** (from the inherited environment too — gh treats
+ANY value as "force terminal-style output", and the `GH_FORCE_TTY=0` this gate
+shipped itself turned colour ON) and `NO_COLOR=1` / `CLICOLOR=0` are set. When
+the output still does not parse, the delivery is **refused**: gh ran and its
+answer is unintelligible, which is a defect in the gate's own contract, not an
+absence of evidence. That is deliberately *not* the same as "could not verify":
+a missing `gh` or an unreachable GitHub stays an explicit could-not-verify,
+while a parse failure refuses. Until CLA-776 the difference was invisible —
+every real delivery logged "could not verify … carrying on" for two months.
+A remote whose host is an SSH config alias (`git@github-personal:…`) is resolved
+through `ssh -G` and checked when the alias lands on github.com, rather than
+being skipped as "not a github.com repository".
 
 **Repos with no CI at all:** refusing every delivery there would wedge the
 driver shut, so a per-project opt-out exists - set `"allow_unchecked_pr": true`

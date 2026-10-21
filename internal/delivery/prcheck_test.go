@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -798,6 +799,27 @@ func TestGHChildEnvironmentCarriesNoColourSwitch(t *testing.T) {
 	if got["CLICOLOR"] != "0" {
 		t.Errorf("CLICOLOR = %q, want 0: the same requirement, in the spelling older gh versions read", got["CLICOLOR"])
 	}
+
+	// Per-invocation additions ride this spawn too (GH_TOKEN, CLA-460). They are
+	// held to the same ownership rule: an addition must not be able to turn
+	// colour back on behind the parser's back.
+	out, err = runGHBin(context.Background(), gh, t.TempDir(),
+		[]string{"GH_FORCE_TTY=1", "NO_COLOR=0", "CLICOLOR=1"}, "pr", "view")
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	got = map[string]string{}
+	for _, line := range strings.Split(out, "\n") {
+		if i := strings.IndexByte(line, '='); i > 0 {
+			got[line[:i]] = line[i+1:]
+		}
+	}
+	if v, ok := got["GH_FORCE_TTY"]; ok {
+		t.Errorf("an extraEnv GH_FORCE_TTY reached gh as %q — the additions must not override the owned colour switches", v)
+	}
+	if got["NO_COLOR"] != "1" || got["CLICOLOR"] != "0" {
+		t.Errorf("extraEnv overrode the colour settings: NO_COLOR=%q CLICOLOR=%q, want 1 / 0", got["NO_COLOR"], got["CLICOLOR"])
+	}
 }
 
 // colouredWhenForcedGH mirrors real gh: its JSON is ANSI-coloured exactly when
@@ -872,5 +894,131 @@ func TestUnparseableGHOutputIsRefusedNotCarriedOn(t *testing.T) {
 	}
 	if !strings.Contains(c.Detail, "doctor") {
 		t.Errorf("refusal must point at the preflight that catches this up front: %s", c.Detail)
+	}
+}
+
+// --- doctor's probe (CLA-776) ------------------------------------------------
+
+// ProbeGHJSON is what `clankerbar doctor` runs. It must read the pull request
+// through the GATE'S command and decoder — a preflight that parses something
+// else would stop proving the gate works — and it must discover the PR rather
+// than require an open one.
+func TestProbeGHJSONReadsARealPRViewAndParsesIt(t *testing.T) {
+	root := prEnv(t)
+	record := filepath.Join(t.TempDir(), "argv")
+	gh := writeGH(t, `printf '%s\n' "$*" >> '`+record+`'
+if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+else
+  cat <<'J'
+`+jsonMergeablePassing+`
+J
+fi
+`)
+
+	probe, err := ProbeGHJSON(context.Background(), gh, root)
+	if err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if probe.Slug != "acme/widgets" || probe.Number != 7 {
+		t.Errorf("probe = %+v, want acme/widgets#7", probe)
+	}
+
+	argv, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("fake gh never ran: %v", err)
+	}
+	lines := string(argv)
+	if !strings.Contains(lines, "pr list --repo acme/widgets") {
+		t.Errorf("the probe did not discover the PR through gh: %q", lines)
+	}
+	// THE coupling: the probe decodes the exact selection the gate decodes.
+	if want := "pr view 7 --repo acme/widgets --json " + prViewJSONFields; !strings.Contains(lines, want) {
+		t.Errorf("the probe did not run the gate's own read.\nwant: %s\ngot:\n%s", want, lines)
+	}
+}
+
+// The probe is classified by doctor with IsGHParseError, so a decorated answer
+// must carry that type: a plain format error would be read as an unavailable
+// prerequisite (WARN) instead of a broken gate (FAIL).
+func TestProbeGHJSONReportsDecoratedOutputAsAParseError(t *testing.T) {
+	root := prEnv(t)
+	gh := writeGH(t, `if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+else
+  printf '\033[1;37m{\033[m\n  \033[1;34m"mergeable"\033[m\033[1;37m:\033[m "MERGEABLE"\n\033[1;37m}\033[m\n'
+fi
+`)
+
+	_, err := ProbeGHJSON(context.Background(), gh, root)
+	if err == nil {
+		t.Fatal("coloured `gh pr view --json` parsed — the probe would pass doctor while the gate is broken")
+	}
+	if !IsGHParseError(err) {
+		t.Fatalf("got %v (%T), want a ghParseError so doctor FAILs rather than warns", err, err)
+	}
+}
+
+// A repository with no pull request is not a broken gate: the probe reports a
+// no-target sentinel so doctor can say the parse path went unexercised.
+func TestProbeGHJSONWithNoPRIsNoTarget(t *testing.T) {
+	root := prEnv(t)
+	_, err := ProbeGHJSON(context.Background(), writeGH(t, "printf '[]\\n'\n"), root)
+	if !errors.Is(err, ErrNoPRProbeTarget) {
+		t.Fatalf("got %v, want ErrNoPRProbeTarget", err)
+	}
+}
+
+// A non-GitHub repository is skipped entirely: its remote says nothing about
+// whether gh's JSON parses for the repos the gate judges.
+func TestProbeGHJSONSkipsANonGitHubRepository(t *testing.T) {
+	root := repoWithRemote(t, "https://gitlab.com/acme/widgets.git")
+	// A gh that would fail loudly if the probe had run it.
+	_, err := ProbeGHJSON(context.Background(), writeGH(t, "exit 42\n"), root)
+	if !errors.Is(err, ErrNoPRProbeTarget) {
+		t.Fatalf("got %v, want ErrNoPRProbeTarget", err)
+	}
+	if !strings.Contains(err.Error(), "no github.com repository") {
+		t.Errorf("no-target error should name what was missing: %v", err)
+	}
+}
+
+// The probe inherits the gate's fixed environment, so an ambient GH_FORCE_TTY
+// cannot make the preflight fail (or the gate unreadable). The fixture mirrors
+// real gh: it colours exactly when the variable reaches it.
+func TestProbeGHJSONUsesTheColourFreeEnvironment(t *testing.T) {
+	t.Setenv("GH_FORCE_TTY", "0") // the value the bug shipped, now ambient
+	root := prEnv(t)
+	gh := writeGH(t, `if [ "$1/$2" = "pr/list" ]; then
+  printf '[{"number":7}]\n'
+  exit 0
+fi
+if [ -n "${GH_FORCE_TTY+x}" ]; then
+  printf '\033[1;37m{\033[m\n'
+  exit 0
+fi
+cat <<'J'
+`+jsonMergeablePassing+`
+J
+`)
+
+	// Prove the fixture is faithful before trusting the probe's Pass.
+	cmd := exec.Command(gh, "pr", "view", "7")
+	cmd.Env = append(os.Environ(), "GH_FORCE_TTY=0")
+	raw, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("fake gh: %v", err)
+	}
+	var probe ghPR
+	if json.Unmarshal(raw, &probe) == nil {
+		t.Fatal("fixture did not colour under GH_FORCE_TTY — it does not mirror gh")
+	}
+
+	got, err := ProbeGHJSON(context.Background(), gh, root)
+	if err != nil {
+		t.Fatalf("probe with an ambient GH_FORCE_TTY: %v", err)
+	}
+	if got.Number != 7 {
+		t.Errorf("probe = %+v, want #7", got)
 	}
 }

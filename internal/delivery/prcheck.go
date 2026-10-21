@@ -597,12 +597,7 @@ func (v *Verifier) prCheck(ctx context.Context, repos []string, prNum string, re
 	// then share one identity, and the worst case stays a couple of gh spawns
 	// per verification. Empty means "run unscoped" — the fallback the header
 	// documents.
-	var ghScope []string
-	if owner := githubOwner(url); owner != "" {
-		if token := v.ghTokenFor(ctx, repo, owner); token != "" {
-			ghScope = []string{"GH_TOKEN=" + token}
-		}
-	}
+	ghScope := v.ghScopeFor(ctx, repo, url)
 
 	_, chk := v.pollPR(ctx, repo, slug, atoiPR(prNum), ghScope)
 	return chk
@@ -679,18 +674,157 @@ func (v *Verifier) pollPR(ctx context.Context, repo, slug string, prNum int, ghS
 func (v *Verifier) readPR(ctx context.Context, dir, slug, prNum string, scope []string) (ghPR, prJudgement, error) {
 	out, err := v.runGHScoped(ctx, dir, scope, "pr", "view", prNum,
 		"--repo", slug,
-		"--json", "mergeable,mergeStateStatus,statusCheckRollup,url,baseRefName,headRefName,headRefOid")
+		"--json", prViewJSONFields)
 	if err != nil {
 		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, err
 	}
-	var view ghPR
-	if jerr := json.Unmarshal([]byte(out), &view); jerr != nil {
-		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, &ghParseError{
-			detail: fmt.Sprintf("could not parse gh pr view output: %v", jerr),
-			err:    jerr,
-		}
+	view, err := parseGHPR(out)
+	if err != nil {
+		return ghPR{}, prJudgement{verdict: prMergeableUnknown}, err
 	}
 	return view, judgePR(view), nil
+}
+
+// prViewJSONFields is the exact --json selection of the delivery gate's read.
+// The doctor probe (ProbeGHJSON) sends the SAME fields: a preflight that parsed
+// a different command would stop proving the thing the gate depends on.
+const prViewJSONFields = "mergeable,mergeStateStatus,statusCheckRollup,url,baseRefName,headRefName,headRefOid"
+
+// parseGHPR decodes one `gh pr view --json` answer. A decode failure is a
+// ghParseError — gh ran and answered, and the answer is not what this package
+// asked for (see ghParseError for why that is a refusal, not an absence).
+func parseGHPR(out string) (ghPR, error) {
+	var view ghPR
+	if err := json.Unmarshal([]byte(out), &view); err != nil {
+		return ghPR{}, &ghParseError{
+			detail: fmt.Sprintf("could not parse gh pr view output: %v", err),
+			err:    err,
+		}
+	}
+	return view, nil
+}
+
+// PRProbe names the pull request a successful doctor probe read.
+type PRProbe struct {
+	Slug   string
+	Number int
+}
+
+// ErrNoPRProbeTarget reports that the doctor probe found no pull request it
+// could read — no github.com repository under the workdir, or none of them has
+// a pull request. It is NOT a gate failure: there was simply nothing to read,
+// and the probe says so rather than pretending it exercised the parse path.
+var ErrNoPRProbeTarget = errors.New("no pull request to probe")
+
+// probeMaxRepos bounds how many github.com repositories the doctor probe tries
+// before giving up. A fleet workdir holds a dozen; the first one with a PR
+// proves the parse path, and a repo with none costs one `gh pr list` to skip.
+const probeMaxRepos = 4
+
+// prProbeTimeout bounds the whole probe. doctor is documented as a cron gate,
+// so a wedged gh or an unreachable API must not hold the preflight open.
+const prProbeTimeout = 20 * time.Second
+
+// ProbeGHJSON runs a REAL `gh pr view --json` against a pull request found in a
+// repository under workdir and reports whether the answer parsed. It exists so
+// `clankerbar doctor` can catch the CLA-776 class of fault before a run: gh on
+// PATH is necessary but not sufficient, because a gh that decorates its stdout
+// (the shipped GH_FORCE_TTY=0 did exactly that) cannot be parsed by the gate
+// and every delivery silently went unjudged for two months.
+//
+// The pull request is discovered rather than configured: the first github.com
+// repository under workdir with a PR (any state) is read through the gate's own
+// command and parser. Repositories with no PR are skipped, and an SSH host
+// alias is resolved exactly as the gate resolves it. The error the caller
+// classifies is the parse one (IsGHParseError); every other failure — gh not
+// authenticated, no network — is an unavailable prerequisite, not a broken gate.
+func ProbeGHJSON(ctx context.Context, ghBin, workdir string) (PRProbe, error) {
+	ctx, cancel := context.WithTimeout(ctx, prProbeTimeout)
+	defer cancel()
+
+	v := New(workdir, "")
+	if ghBin != "" {
+		v.ghBin = ghBin
+	}
+	lookupHost := v.sshAliasLookup(ctx)
+	repos := v.candidateRepos(ctx)
+	tried := 0
+	var lastNoTarget error
+	for _, repo := range repos {
+		if ctx.Err() != nil {
+			return PRProbe{}, ctx.Err()
+		}
+		url, err := v.remoteURL(ctx, repo)
+		if err != nil {
+			continue
+		}
+		slug, ok := githubSlugResolving(url, lookupHost)
+		if !ok {
+			continue
+		}
+		if tried++; tried > probeMaxRepos {
+			break
+		}
+		scope := v.ghScopeFor(ctx, repo, url)
+		num, err := v.probePRNumber(ctx, repo, slug, scope)
+		if err != nil {
+			if errors.Is(err, ErrNoPRProbeTarget) {
+				lastNoTarget = fmt.Errorf("%w: %s has no pull request to read", ErrNoPRProbeTarget, slug)
+				continue
+			}
+			return PRProbe{}, err
+		}
+		// The read itself is the gate's own: same --json selection, same
+		// parser, so the probe cannot pass while the gate's parse is broken.
+		if _, _, err := v.readPR(ctx, repo, slug, strconv.Itoa(num), scope); err != nil {
+			return PRProbe{}, err
+		}
+		return PRProbe{Slug: slug, Number: num}, nil
+	}
+	if lastNoTarget != nil {
+		return PRProbe{}, lastNoTarget
+	}
+	return PRProbe{}, fmt.Errorf("%w: no github.com repository at or below %s", ErrNoPRProbeTarget, workdir)
+}
+
+// probePRNumber asks gh for one pull request number in slug, any state: a
+// merged or closed PR proves the `--json` output just as well as an open one,
+// and an open one is not guaranteed to exist.
+func (v *Verifier) probePRNumber(ctx context.Context, dir, slug string, scope []string) (int, error) {
+	out, err := v.runGHScoped(ctx, dir, scope, "pr", "list",
+		"--repo", slug, "--state", "all", "--limit", "1", "--json", "number")
+	if err != nil {
+		return 0, err
+	}
+	var rows []struct {
+		Number int `json:"number"`
+	}
+	if err := json.Unmarshal([]byte(out), &rows); err != nil {
+		return 0, &ghParseError{
+			detail: fmt.Sprintf("could not parse gh pr list output: %v", err),
+			err:    err,
+		}
+	}
+	if len(rows) == 0 || rows[0].Number <= 0 {
+		return 0, ErrNoPRProbeTarget
+	}
+	return rows[0].Number, nil
+}
+
+// ghScopeFor derives the per-owner credential additions for one gh invocation
+// (CLA-460): the token of the account that owns remoteURL, carried as GH_TOKEN.
+// Empty means "run unscoped", the documented fallback. Shared by the delivery
+// check and the doctor probe so the two cannot scope differently.
+func (v *Verifier) ghScopeFor(ctx context.Context, dir, remoteURL string) []string {
+	owner := githubOwner(remoteURL)
+	if owner == "" {
+		return nil
+	}
+	token := v.ghTokenFor(ctx, dir, owner)
+	if token == "" {
+		return nil
+	}
+	return []string{"GH_TOKEN=" + token}
 }
 
 // runGH executes one gh command in dir and returns its trimmed stdout, with
@@ -745,8 +879,10 @@ func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ..
 // ghEnv builds the environment for one gh invocation: the parent environment
 // with every variable this function OWNS removed (so an ambient value cannot
 // win by accident of position — duplicate entries have no portable
-// precedence), the non-interactive and no-colour settings this driver
-// requires, then any per-invocation additions the caller passes.
+// precedence), the per-invocation additions the caller passes (held to the same
+// ownership rule), and LAST the non-interactive and no-colour settings this
+// driver requires — so neither an inherited value nor an addition can
+// reintroduce a colour switch the output parser depends on.
 //
 // # Why GH_FORCE_TTY is gone, not zeroed (CLA-776)
 //
@@ -776,10 +912,7 @@ func ghEnv(parent, extraEnv []string) []string {
 	}
 	env := make([]string, 0, len(parent)+len(extraEnv)+4)
 	for _, e := range parent {
-		name := e
-		if i := strings.IndexByte(e, '='); i > 0 {
-			name = e[:i]
-		}
+		name := envName(e)
 		if owned(name) {
 			continue
 		}
@@ -790,13 +923,29 @@ func ghEnv(parent, extraEnv []string) []string {
 		}
 		env = append(env, e)
 	}
-	env = append(env,
+	// Additions ride the same rule: a variable this function OWNS cannot re-enter
+	// through the caller, so no extraEnv can turn colour back on behind the
+	// parser's back.
+	for _, e := range extraEnv {
+		if owned(envName(e)) {
+			continue
+		}
+		env = append(env, e)
+	}
+	return append(env,
 		"GH_NO_UPDATE_NOTIFIER=1",
 		"NO_COLOR=1",
 		"CLICOLOR=0",
 		"GIT_TERMINAL_PROMPT=0",
 	)
-	return append(env, extraEnv...)
+}
+
+// envName is the NAME part of a NAME=value environment entry.
+func envName(e string) string {
+	if i := strings.IndexByte(e, '='); i > 0 {
+		return e[:i]
+	}
+	return e
 }
 
 // isGhTokenVar reports whether an environment NAME is one of the variables gh

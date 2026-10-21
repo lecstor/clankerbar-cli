@@ -119,6 +119,12 @@ type doctorEnv struct {
 	// 2.x's credential store, per provider, without reading any secret.
 	// Production runs sqlite3 read-only; tests substitute counts.
 	opencodeCredentials func(ctx context.Context, dbPath string) (map[string]int, error)
+
+	// The pr_gate probe's seam (CLA-776): run a REAL `gh pr view --json` against
+	// a pull request found under the workdir and parse it with the gate's own
+	// decoder. Production is delivery.ProbeGHJSON; tests substitute every
+	// outcome so doctor's classification is pinned without a network or a gh.
+	probePRGate func(ctx context.Context, ghBin, workdir string) (delivery.PRProbe, error)
 }
 
 func defaultDoctorEnv() doctorEnv {
@@ -156,6 +162,7 @@ func defaultDoctorEnv() doctorEnv {
 		fleetProbe:          fleet.Probe,
 		newRCfgAPI:          plane.NewRunConfigAPI,
 		opencodeCredentials: sqliteOpencodeCredentials,
+		probePRGate:         delivery.ProbeGHJSON,
 	}
 }
 
@@ -265,7 +272,7 @@ func doctorChecks(ctx context.Context, cfg *config.Config, e doctorEnv) []check 
 	checks = append(checks, checkOpencodeAuth(ctx, cfg, e)...)
 	checks = append(checks, checkOpencodeMCPDisables(cfg)...)
 	checks = append(checks, checkPermissionsAll(cfg)...)
-	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(cfg, e))
+	return append(checks, checkToolchains(cfg), checkPower(ctx, e), checkBudget(cfg), checkPRGate(ctx, cfg, e))
 }
 
 func doctorFailed(n int) error {
@@ -3563,14 +3570,28 @@ func anyPhaseRunsTheDefaultTurnCap(cfg *config.Config) bool {
 
 // --- 13. delivery PR gate ----------------------------------------------------
 
-// checkPRGate reports CLA-310's delivery gate and its one prerequisite: the
-// driver's verifier reaches GitHub through the `gh` CLI, and a delivery whose
-// PR is CONFLICTING or carries NO checks is refused when it runs. A missing
-// `gh` is a WARN, not a FAIL — the check degrades to an explicit
+// checkPRGate reports CLA-310's delivery gate and its prerequisites: the
+// driver's verifier reaches GitHub through the `gh` CLI, a delivery whose PR is
+// CONFLICTING or carries NO checks is refused when it runs, and — since CLA-776
+// — gh's `--json` output must actually be parseable, because the shipped
+// GH_FORCE_TTY=0 made gh colour it and every real delivery's PR went unjudged
+// for two months.
+//
+// A missing `gh` is a WARN, not a FAIL — the check degrades to an explicit
 // refusal-to-verify and the run carries on, which is the package's fail-open
 // discipline — but the operator should see the gate's prerequisite BEFORE the
-// first delivery goes out unchecked.
-func checkPRGate(cfg *config.Config, e doctorEnv) check {
+// first delivery goes out unchecked. The probe's own outcomes are classified by
+// what they say about the GATE:
+//
+//   - output that does not parse is a FAIL: gh ran, and every delivery's PR is
+//     unjudgeable now. It is the one fault an operator must fix before a run.
+//   - gh cannot reach GitHub (auth, network) is a WARN: the prerequisite is
+//     unavailable, not the gate broken, and the delivery path degrades the same
+//     way it always did.
+//   - there is no pull request to read is INFO under a PASS: the probe did not
+//     exercise the parse path, and saying so is better than a PASS that implies
+//     it did.
+func checkPRGate(ctx context.Context, cfg *config.Config, e doctorEnv) check {
 	c := check{name: "pr_gate", status: pass}
 	path, err := e.lookPath("gh")
 	if err != nil {
@@ -3580,6 +3601,36 @@ func checkPRGate(cfg *config.Config, e doctorEnv) check {
 		return c
 	}
 	c.detail = path + " present; a delivery's PR must be MERGEABLE with a passing check rollup"
+
+	// Probe a REAL `gh pr view --json` (CLA-776). Before this, doctor checked
+	// only that gh existed; a gh whose output is coloured passed doctor every
+	// time while the delivery gate parsed nothing.
+	if e.probePRGate != nil {
+		probe, perr := e.probePRGate(ctx, path, cfg.WorkDir)
+		switch {
+		case perr == nil:
+			c.info = append(c.info, fmt.Sprintf(
+				"probe: `gh pr view %d --repo %s --json` parsed — the gate can read gh's output",
+				probe.Number, probe.Slug))
+		case errors.Is(perr, delivery.ErrNoPRProbeTarget):
+			c.info = append(c.info, "probe: NOT exercised — "+firstLine(perr.Error())+
+				"; the gate's parse path is untested until a repository with a PR is in the workdir")
+		case delivery.IsGHParseError(perr):
+			c.status = fail
+			c.detail = "gh ran, but its `--json` output is not parseable — EVERY delivery's PR goes unjudged"
+			c.info = append(c.info, "probe: "+firstLine(perr.Error()))
+			c.remedy = "clear whatever decorates gh's stdout — a wrapper or alias on gh forcing colour (GH_FORCE_TTY / CLICOLOR_FORCE / FORCE_COLOR), or a gh that ignores NO_COLOR; colour in parsed output is the CLA-776 fault"
+		case errors.Is(perr, context.DeadlineExceeded), errors.Is(perr, context.Canceled):
+			c.status = warn
+			c.info = append(c.info, "probe: timed out reading a real PR — "+firstLine(perr.Error()))
+			c.remedy = "check network access to api.github.com; the delivery check degrades to could-not-verify while the probe cannot reach GitHub"
+		default:
+			c.status = warn
+			c.info = append(c.info, "probe: could not read a real PR — "+firstLine(perr.Error()))
+			c.remedy = "run `gh auth status` and confirm it can read `gh pr view --json`; the delivery check degrades to could-not-verify while gh cannot"
+		}
+	}
+
 	if len(cfg.Projects) == 0 {
 		if cfg.AllowUncheckedPR {
 			c.info = append(c.info, "empty check rollups: WARNED, not refused (allow_unchecked_pr: true)")

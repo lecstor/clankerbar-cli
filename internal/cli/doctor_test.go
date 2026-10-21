@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -61,6 +63,12 @@ func okEnv() doctorEnv {
 		// The fleet seam (CLA-466): an empty-body probe that succeeds, i.e. a
 		// plane that is reachable and accepts the key. Tests break it explicitly.
 		fleetProbe: func(context.Context, string, string) error { return nil },
+		// The pr_gate probe (CLA-776): by default there is nothing to read, so
+		// the check stays PASS with an honest "not exercised" line. Tests that
+		// care about the probe install their own outcome.
+		probePRGate: func(context.Context, string, string) (delivery.PRProbe, error) {
+			return delivery.PRProbe{}, delivery.ErrNoPRProbeTarget
+		},
 	}
 }
 
@@ -1826,7 +1834,7 @@ func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
 		return "/usr/local/bin/" + file, nil
 	}
 
-	c := checkPRGate(validCfg(t), e)
+	c := checkPRGate(context.Background(), validCfg(t), e)
 	if c.status != warn {
 		t.Errorf("missing gh: got %v, want WARN", c.status)
 	}
@@ -1838,7 +1846,7 @@ func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
 func TestPRGateWithGHPassesAndNamesTheDefault(t *testing.T) {
 	cfg := validCfg(t)
 
-	c := checkPRGate(cfg, okEnv())
+	c := checkPRGate(context.Background(), cfg, okEnv())
 	if c.status != pass {
 		t.Errorf("gh present, default config: got %v, want PASS", c.status)
 	}
@@ -1862,7 +1870,7 @@ func TestPRGateNamesPerProjectOptOut(t *testing.T) {
 		{Slug: "loose", AllowUncheckedPR: true},
 	}
 
-	c := checkPRGate(cfg, okEnv())
+	c := checkPRGate(context.Background(), cfg, okEnv())
 	if c.status != pass {
 		t.Errorf("gh present: got %v, want PASS", c.status)
 	}
@@ -1878,6 +1886,117 @@ func TestPRGateNamesPerProjectOptOut(t *testing.T) {
 	if !strict || !loose {
 		t.Errorf("per-project lines missing: %q", c.info)
 	}
+}
+
+// CLA-776: doctor's pr_gate used to check only that gh EXISTED. gh existed on
+// every machine the bug broke; it coloured its `--json` output, so every real
+// delivery's PR went unjudged while doctor passed. The probe now runs a REAL
+// `gh pr view --json` and parses it with the gate's own decoder, so decorated
+// output is a FAIL — every delivery is affected at that moment, which is the
+// loudness this task exists to add.
+func TestPRGateFailsWhenTheProbeCannotParseGHOutput(t *testing.T) {
+	repo := cliGitRepoWithRemote(t, "https://github.com/acme/widgets.git")
+	gh := filepath.Join(t.TempDir(), "gh")
+	// Real gh with GH_FORCE_TTY set: pretty-printed, ANSI-coloured JSON.
+	body := `#!/bin/sh
+case "$1/$2" in
+pr/list) printf '[{"number":7}]\n' ;;
+*) printf '\033[1;37m{\033[m\n  \033[1;34m"mergeable"\033[m\033[1;37m:\033[m "MERGEABLE"\n\033[1;37m}\033[m\n' ;;
+esac
+`
+	if err := os.WriteFile(gh, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	e := okEnv()
+	e.lookPath = func(string) (string, error) { return gh, nil }
+	e.probePRGate = delivery.ProbeGHJSON // the production probe, against the fake gh
+
+	c := checkPRGate(context.Background(), validCfgIn(t, repo), e)
+	if c.status != fail {
+		t.Fatalf("decorated gh output: got %v, want FAIL — this is the CLA-776 fault and doctor must stop the run (detail=%q info=%q)", c.status, c.detail, c.info)
+	}
+	if !strings.Contains(c.detail, "not parseable") {
+		t.Errorf("detail must say the output cannot be parsed: %q", c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "could not parse") {
+		t.Errorf("the probe line must carry gh's parse error: %q", c.info)
+	}
+	if !strings.Contains(c.remedy, "GH_FORCE_TTY") {
+		t.Errorf("remedy must name the known cause: %q", c.remedy)
+	}
+}
+
+// The other half of the classification: gh cannot READ a PR (no auth, no
+// network) is the prerequisite unavailable, not the gate broken. The delivery
+// path degrades exactly as it always did, so doctor warns rather than failing a
+// run whose gate might work fine an hour later.
+func TestPRGateWarnsWhenTheProbeCannotReachGitHub(t *testing.T) {
+	e := okEnv()
+	e.probePRGate = func(context.Context, string, string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{}, errors.New("gh pr list: exit status 1: authentication required")
+	}
+
+	c := checkPRGate(context.Background(), validCfg(t), e)
+	if c.status != warn {
+		t.Fatalf("unreachable GitHub: got %v, want WARN", c.status)
+	}
+	joined := strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "could not read a real PR") || !strings.Contains(joined, "authentication required") {
+		t.Errorf("the probe line must name what failed: %q", c.info)
+	}
+	if c.remedy == "" {
+		t.Error("an unavailable prerequisite needs a remedy")
+	}
+}
+
+// A successful probe states WHICH pull request it read, so a PASS means "this
+// exact command parsed" rather than "gh is installed".
+func TestPRGateProbeNamesThePullRequestItParsed(t *testing.T) {
+	e := okEnv()
+	e.probePRGate = func(context.Context, string, string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{Slug: "acme/widgets", Number: 7}, nil
+	}
+
+	c := checkPRGate(context.Background(), validCfg(t), e)
+	if c.status != pass {
+		t.Fatalf("parseable gh: got %v, want PASS", c.status)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "gh pr view 7 --repo acme/widgets --json` parsed") {
+		t.Errorf("the probe line must name the PR it read: %q", c.info)
+	}
+}
+
+// No PR to read is not a pass on the parse path: the line says the probe was
+// NOT exercised, so nobody mistakes the PASS for evidence gh output is clean.
+func TestPRGateSaysWhenTheProbeHadNothingToRead(t *testing.T) {
+	c := checkPRGate(context.Background(), validCfg(t), okEnv()) // okEnv's probe: no target
+	if c.status != pass {
+		t.Errorf("nothing to probe: got %v, want PASS (an unexercised probe is not a fault)", c.status)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "NOT exercised") {
+		t.Errorf("doctor must say the probe did not run: %q", c.info)
+	}
+}
+
+// cliGitRepoWithRemote builds a real working tree with the given origin, so the
+// production probe can find it the way it finds a fleet repository. git is a
+// dev prerequisite for this repo (go test ./internal/delivery uses it too).
+func cliGitRepoWithRemote(t *testing.T, remote string) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not on PATH")
+	}
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "main", dir},
+		{"-C", dir, "remote", "add", "origin", remote},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	return dir
 }
 
 // --- CLA-344: the guards that were silently absent --------------------------
