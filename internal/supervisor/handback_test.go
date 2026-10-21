@@ -102,7 +102,7 @@ func TestDeadChildsClaimIsHandedBack(t *testing.T) {
 // nothing to crash the supervisor over. This is the common shape after a daemon
 // settles its task and dies before removing its record.
 func TestDeadChildsClaimRefusalIsALoggedNoOp(t *testing.T) {
-	for _, refusal := range []string{"run_superseded", "not_holding"} {
+	for _, refusal := range []string{"not_your_claim", "not_holding"} {
 		t.Run(refusal, func(t *testing.T) {
 			var buf lockedBuffer
 			log.SetOutput(&buf)
@@ -291,11 +291,12 @@ func TestRefusedClaimHandback(t *testing.T) {
 		msg  string
 		want bool
 	}{
-		{"update_task refused: not_holding", true},
-		{"run_superseded", true},
-		{"update_task refused: run superseded", true},
-		{"update_task: HTTP 500: boom", false},
+		{"release_task refused: not_holding", true},
+		{"not_your_claim", true},
+		{"release_task refused: not your claim", true},
+		{"release_task: HTTP 500: boom", false},
 		{"not_holding_but_broken", true},
+		{"run_superseded", false},
 	} {
 		err := errors.New(tc.msg)
 		if got := refusedClaimHandback(err); got != tc.want {

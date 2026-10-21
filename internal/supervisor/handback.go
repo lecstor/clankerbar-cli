@@ -16,7 +16,7 @@ package supervisor
 //   - The key is the holding key. Children inherit CLANKERBAR_API_KEY from the
 //     supervisor (materialize), so the plane's NOT-YOURS check passes.
 //   - The plane refuses a claim whose run already ended or was taken over
-//     (`not_holding`, `run_superseded`), and that refusal is a logged no-op.
+//     (`not_holding`, `not_your_claim`), and that refusal is a logged no-op.
 //     Removing the file after a refusal is therefore safe: a stale record can
 //     cost one refused call and never a second ended lease.
 
@@ -190,16 +190,18 @@ func mcpEndpointFromRoster(rosterURL, project string) string {
 }
 
 // refusedClaimHandback reports the two refusals that mean "there is nothing to
-// do here": the run already ended, or a later run holds the task. Both are
-// normal after a child exit — the daemon may have settled the task and died
-// before removing its record — so they are logged and not treated as errors.
+// do here": the run already ended, or a later run holds the task. Both are the
+// refusal codes `release_task` documents (`not_holding`, `not_your_claim`) and
+// both are normal after a child exit — the daemon may have settled the task and
+// died before removing its record — so they are logged and not treated as
+// errors.
 func refusedClaimHandback(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	msg = strings.NewReplacer(" ", "_", "-", "_").Replace(msg)
-	return strings.Contains(msg, "not_holding") || strings.Contains(msg, "run_superseded")
+	return strings.Contains(msg, "not_holding") || strings.Contains(msg, "not_your_claim")
 }
 
 func claimLabel(c *loop.CurrentClaim) string {

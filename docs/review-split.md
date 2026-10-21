@@ -274,18 +274,19 @@ PR: a clean verification round carries the terminal step (push check, PR,
 The verifier is review-shaped (it writes a durable record like the review gate)
 and is scoped to the **fix delta** — the reviewed tip the previous record names
 through `HEAD`, plus the regression surface the fixes touch. Unlike the review
-gate, the verifier releases its OWN round in its terminal step, and on a plane
-serving `record_review` (protocol 40+) that is **two calls in a load-bearing
-order**: it closes the round with `record_review(..., { closeRound: n })` while
-the task is still `in_progress`, and only then moves the task with
-`submit_for_review(...)`. The order is the constraint, not a
-style: the plane accepts a close only from the run that still holds the task, so
-a close sent after the status move is refused — and a sealed holder's outcome
-write is refused whichever order it travels in. Below protocol 40 the only legal
-shape is the one call the pre-`record_review` CLI always made —
-`submit_for_review(..., closeRound: n)` — for the same
-reason. The driver accepts either state — sealed (it closes, as it does for the
-review gate) or already released — and never closes twice. Its brief lists the
+gate, the verifier releases its OWN round in its terminal step, and a clean
+round does that in the hand-over: **ONE call**, `submit_for_review(taskId,
+runId, closeRound: n)`, made after the branch is pushed and the PR is open. The
+close rides that call's atomic write and sits behind every guard the status move
+goes through — the only order the plane accepts, because once the task leaves
+`in_progress` this run can no longer close the round. A refused transition
+reopens the round rather than leaving the findings released against a task still
+in progress, and a sealed holder's outcome write is refused, so the hand-over
+carries no `outcome`. A round that still has an open MUST does not hand over at
+all: it closes the round with `record_review(..., { closeRound: n })` and ends
+holding the task, so the driver spawns the next fix. The driver accepts either
+state — sealed (it closes, as it does for the review gate) or already released —
+and never closes twice. Its brief lists the
 prior open MUST ids (read from the plane's released records), and it adjudicates
 each one **by its plane id** (`<round>.<reviewer role>.<n>`): resolved (`fixed`),
 resolved by dispatch (`filed`), refutation accepted (`refuted`), or left open with

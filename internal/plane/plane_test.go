@@ -340,11 +340,30 @@ func TestPark_RequestShape(t *testing.T) {
 		t.Errorf("second tool = %v, want ask_question", second["name"])
 	}
 	qargs, _ := second["arguments"].(map[string]any)
+	if qargs["taskId"] != "t-1" {
+		t.Errorf("question taskId = %v, want t-1", qargs["taskId"])
+	}
+	if qargs["body"] != body {
+		t.Errorf("question body = %+v, want the park body", qargs["body"])
+	}
+	opts, _ := qargs["options"].([]any)
+	if len(opts) != 2 || opts[0] != "a" || opts[1] != "b" {
+		t.Errorf("question options = %+v, want the driver's options", qargs["options"])
+	}
 	if qargs["blocking"] != false {
 		t.Errorf("blocking = %v, want false - a parked task has nothing left to block", qargs["blocking"])
 	}
 	if qargs["kind"] != "clarification" {
 		t.Errorf("kind = %v, want clarification - a decision is born answered", qargs["kind"])
+	}
+
+	// No decision is recorded anywhere: the park's record is the outcome plus
+	// the open question, never a record_decision call.
+	for i, b := range got.bodies {
+		params, _ := b["params"].(map[string]any)
+		if params["name"] == "record_decision" {
+			t.Errorf("call %d recorded a decision; the park must raise a question instead", i)
+		}
 	}
 }
 

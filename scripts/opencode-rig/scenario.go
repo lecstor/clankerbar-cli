@@ -35,14 +35,20 @@ func (s scenarioDef) promptFor(schemaTool string) string {
 	return s.Prompt
 }
 
+// defaultSchemaTool is the tool the schema scenario probes when --schema-tool
+// is not given. It must be a tool this release's plane serves (CLA-748): the
+// cutover deletes update_task, so a probe defaulting to it would exercise a
+// name the plane answers as unknown and prove nothing about a real schema.
+const defaultSchemaTool = "record_progress"
+
 // schemaToolName is the tool name the session sees. The catalog's tools are
-// served by the clankerbar MCP server, so opencode exposes `update_task` as
-// `clankerbar_update_task`; --schema-tool names the catalog's (unprefixed) tool
-// and this is the prefixed form the prompt must ask for.
+// served by the clankerbar MCP server, so opencode exposes `record_progress` as
+// `clankerbar_record_progress`; --schema-tool names the catalog's (unprefixed)
+// tool and this is the prefixed form the prompt must ask for.
 func schemaToolName(tool string) string {
 	tool = strings.TrimSpace(tool)
 	if tool == "" {
-		tool = "update_task"
+		tool = defaultSchemaTool
 	}
 	if strings.HasPrefix(tool, "clankerbar_") {
 		return tool
@@ -125,17 +131,13 @@ clankerbar_get_task once for CLA-754. Then say DONE and stop.`),
 		// schema serves whatever catalog --schemas names, so a proposed tool
 		// shape (nullable enums, a new tool) can be tested before the plane
 		// ships it. The prompt names the tool --schema-tool selects, so the
-		// selected tool is the one actually exercised; for update_task it also
-		// asks for exactly the shape a nullable enum is easy to get wrong on:
-		// nulls for the optional fields.
+		// selected tool is the one actually exercised: it asks for null on every
+		// optional argument the schema allows, the padding a strict-mode client
+		// is easy to get wrong on.
 		"schema": {
 			Name: "schema",
 			PromptFor: func(schemaTool string) string {
 				name := schemaToolName(schemaTool)
-				if strings.TrimPrefix(name, "clankerbar_") == "update_task" {
-					return strings.TrimSpace(fmt.Sprintf(`
-Call the tool %s exactly once with taskId "CLA-753", status "ready", priority null and schedule null. Then say DONE and stop.`, name))
-				}
 				return strings.TrimSpace(fmt.Sprintf(`
 Call the tool %s exactly once, sending null for every optional argument its schema allows to be null, and the arguments its schema requires. Then say DONE and stop.`, name))
 			},

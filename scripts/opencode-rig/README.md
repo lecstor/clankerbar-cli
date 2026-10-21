@@ -124,17 +124,17 @@ serve it:
 # keep the exact current catalog
 scripts/opencode-rig/run.sh fetch-schemas --out /tmp/schemas-live.json
 
-# copy it, change update_task's status to a nullable enum, add a new tool, then:
+# copy it, change record_progress's branch to a nullable enum, add a new tool, then:
 scripts/opencode-rig/run.sh \
   --model commandcode/deepseek/deepseek-v4.1-flash \
   --scenario schema \
   --schemas /tmp/schemas-proposed.json
 ```
 
-The scenario asks for `clankerbar_<--schema-tool>` (default `update_task`) with
-a null on the optional fields; the prompt is built from the selected name, so
-`--schema-tool frobnicate` asks the model to call `clankerbar_frobnicate` rather
-than the default tool. The report shows the tool catalog that went on the wire
+The scenario asks for `clankerbar_<--schema-tool>` (default `record_progress`,
+a tool this release's plane serves) with a null on the optional fields; the
+prompt is built from the selected name, so `--schema-tool frobnicate` asks the
+model to call `clankerbar_frobnicate` rather than the default tool. The report shows the tool catalog that went on the wire
 (count, names, one sha256 per request) and whether the model's call arrived at
 the stub. A provider or model that rejects the schema fails the run before any
 backlog write is possible — there is no backlog connection at all.

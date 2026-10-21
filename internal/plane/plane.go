@@ -78,9 +78,9 @@ type Releaser interface {
 	// wants ExpireLease below.
 	Release(ctx context.Context, taskID, runID string) error
 
-	// ReleaseDriver is Release carrying `driverReleased: true` — the same
-	// handback, recorded as one a driver made on a session's behalf rather than
-	// one the session chose. The supervisor uses it when a child it did not
+	// ReleaseDriver is Release carrying `driver: true` on `release_task` — the
+	// same handback, recorded as one a driver made on a session's behalf rather
+	// than one the session chose. The supervisor uses it when a child it did not
 	// start a drain for has exited holding a task with no branch.
 	ReleaseDriver(ctx context.Context, taskID, runID string) error
 
@@ -466,12 +466,6 @@ func (r *mcpReleaser) AskProjectQuestion(ctx context.Context, body string, optio
 	return nil
 }
 
-// AttestMergeVerified writes the driver's verdict onto the task's delivery record.
-//
-// The declaration is echoed back exactly as the session made it, so the stored
-// delivery stays internally consistent: an attestation has to name the thing it is
-// about, or a later reader cannot tell what was checked. No `status` and no
-// `outcome` are sent — this revises a record, it does not move the task or
 // AttestMergeVerified writes the driver's verdict onto the task's delivery record
 // with `record_progress`. It deliberately does NOT call `complete_task`: a
 // delivery is a record write, and closing a task is the close-out's act, not an
@@ -479,8 +473,8 @@ func (r *mcpReleaser) AskProjectQuestion(ctx context.Context, body string, optio
 //
 // The declaration is echoed back exactly as the session made it, so the stored
 // delivery stays internally consistent: an attestation has to name the thing it is
-// about, or a later reader cannot tell what was checked. No `outcome` is sent - this
-// revises a record, it does not overwrite the session's own words.
+// about, or a later reader cannot tell what was checked. No `outcome` is sent —
+// this revises a record, it does not overwrite the session's own words.
 //
 // It runs AFTER the session ended, which is later than any other write here. The
 // plane credits a `runId` while it is the task's most recent run — which it still

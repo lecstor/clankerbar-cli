@@ -1020,7 +1020,7 @@ func TestReviewOnlyBriefsPrescribeTheDurableRecord(t *testing.T) {
 	if !strings.Contains(noCodeReviewOnlyBrief, "record_progress(taskId, runId, outcome: ...)") {
 		t.Errorf("the no-code review-only brief does not prescribe the legacy block write:\n%s", noCodeReviewOnlyBrief)
 	}
-	for _, banned := range []string{"record_review(taskId, runId, {...})", "record_review(taskId, runId, {...})", "THEN append THIS run's durable"} {
+	for _, banned := range []string{"record_review(taskId, runId, {...})", "THEN append THIS run's durable"} {
 		if strings.Contains(noCodeReviewOnlyBrief, banned) {
 			t.Errorf("the no-code review-only brief prescribes %q, but the plane refuses every review write on a settled task (question 03a12578, option 1):\n%s", banned, noCodeReviewOnlyBrief)
 		}
@@ -1088,6 +1088,30 @@ func TestNoBriefNamesTheRemovedUpdateTaskTool(t *testing.T) {
 		for _, w := range want {
 			if !strings.Contains(src, w) {
 				t.Errorf("the %s does not name %q, so it does not tell the session which tool does the job:\n%s", name, w, src)
+			}
+		}
+	}
+}
+
+// CLA-748 replaced the deleted protocol test's branchless-brief ban. A
+// branchless round writes no durable record and has no round to close — the
+// plane refuses every review write on a settled task (question 03a12578,
+// option 1) and answers a close with `no_open_round` — so neither literal call
+// may reach any of the four branchless briefs. Their current wording is right;
+// this keeps it that way.
+func TestBranchlessBriefsPrescribeNoDurableReviewCall(t *testing.T) {
+	for name, brief := range map[string]string{
+		"no-code review-only": noCodeReviewOnlyBrief,
+		"no-code fix":         noCodeFixBrief,
+		"no-code fix-verify":  noCodeFixVerifyBrief,
+		"no-code verify":      noCodeVerifyBrief,
+	} {
+		for _, banned := range []string{
+			"record_review(taskId, runId, {findingUpdates:",
+			"submit_for_review(taskId, runId, closeRound:",
+		} {
+			if strings.Contains(brief, banned) {
+				t.Errorf("the %s brief prescribes %q, but a branchless round has no durable record and no open round:\n%s", name, banned, brief)
 			}
 		}
 	}

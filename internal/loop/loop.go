@@ -468,9 +468,10 @@ type Driver struct {
 	restartRequested atomic.Bool
 
 	// expireUnsupportedOnce says once, not once per abandoned phase, that the
-	// plane predates expireLease (CLA-707/708). Every such handback falls back
-	// to leaving the lease to expire, which is the old behaviour, so repeating
-	// the line adds nothing.
+	// plane does not serve this build's task tools at all — it is older than the
+	// protocol this release requires (CLA-707/708 predate that check). Every
+	// such handback falls back to leaving the lease to expire, which is the old
+	// behaviour, so repeating the line adds nothing.
 	expireUnsupportedOnce sync.Once
 
 	// beaconWriteFailed is the streak latch for the LOCAL beacon write
