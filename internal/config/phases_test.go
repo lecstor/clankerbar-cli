@@ -1131,6 +1131,10 @@ func TestReviewWriteToolFollowsPlaneProtocol(t *testing.T) {
 			ReviewRecordCallPlaceholder,
 			ReviewCloseCallPlaceholder,
 			ReviewFindingsCallPlaceholder,
+			// The verify hand-over is the fourth member of the family: the
+			// branch-shaped one tells the session to open a PR and then move
+			// the task to in_review, which a branchless round must never do.
+			VerifyHandoverStepPlaceholder,
 		} {
 			if strings.Contains(brief, banned) {
 				t.Errorf("the %s carries %s, but a branchless round writes no durable record:\n%s", name, banned, brief)

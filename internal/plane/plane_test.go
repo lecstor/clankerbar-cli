@@ -253,14 +253,6 @@ func TestRecordBranch_NotWiredIsNotARecorder(t *testing.T) {
 	}
 }
 
-// A dead-phase park makes two calls in order — the status write first, then the
-// OPEN question that raises the park to the operator. Both must carry exactly
-// the keys the MCP tool schemas name, or a park fails silently at 3am as "left
-// for the next claim" while the task never actually moves (review finding). The
-// question must be a non-blocking `clarification`: a `decision` is born answered
-// and raises nothing, and a blocking question would un-block to `ready` on any
-// answer, handing the task straight back to the fleet the guard just withheld it
-// from (CLA-395).
 // CLA-743: a round close takes the door the plane serves. record_review is the
 // strict-client-safe tool from protocol 40; below it the only shape is
 // update_task(review: {closeRound: n}). The caller decides from the protocol
@@ -326,6 +318,14 @@ func TestCloseReviewRound_RefusesEmptyIdentity(t *testing.T) {
 	}
 }
 
+// A dead-phase park makes two calls in order — the status write first, then the
+// OPEN question that raises the park to the operator. Both must carry exactly
+// the keys the MCP tool schemas name, or a park fails silently at 3am as "left
+// for the next claim" while the task never actually moves (review finding). The
+// question must be a non-blocking `clarification`: a `decision` is born answered
+// and raises nothing, and a blocking question would un-block to `ready` on any
+// answer, handing the task straight back to the fleet the guard just withheld it
+// from (CLA-395).
 func TestPark_RequestShape(t *testing.T) {
 	srv, got := serve(t, http.StatusOK, okBody)
 

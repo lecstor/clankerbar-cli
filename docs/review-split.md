@@ -222,10 +222,12 @@ The backlog tasks that own this, so this change does not re-file them:
   prune. **CLA-630** (`lecstor/clankerbar-cli`, ready, depends on CLA-629) sends
   it from the CLI. That is the attribution half of "which model reviewed this".
 - **CLA-636** (done, `lecstor/clankerbar`) — the durable per-reviewer
-  `task_review` store written through `record_review` / `update_task(review: ...)`, sealed until
-  the round closes. **CLA-637** (this work, `lecstor/clankerbar-cli`) makes the
-  review phase write it, gates the seam on it and closes the round before `fix`.
-  CLA-210 was archived pointing at CLA-636 and the `agent_review` state.
+  `task_review` store, written through `update_task(review: ...)`, sealed until
+  the round closes. **CLA-742** (plane, protocol 40) adds `record_review`, the
+  review-only tool a strict-tool-call client can use, which is the door a plane
+  at protocol 40+ serves. **CLA-637** (this work, `lecstor/clankerbar-cli`) makes
+  the review phase write it, gates the seam on it and closes the round before
+  `fix`. CLA-210 was archived pointing at CLA-636 and the `agent_review` state.
 
 If the operator wants the full multi-round history, unpark CLA-210 and give it
 this shape:
@@ -244,12 +246,20 @@ this shape:
 | `fix_commit`, `fixed_by_run` | which fixes landed, attributed |
 | `created_at` | receipt time |
 
-Write path: **extend `update_task` with an optional `review` object**, not a new
-MCP tool. The tool surface is token-budget-sensitive
-(`server/mcp/tool-surface.test.ts`, `docs/token-budget.md`); `update_task` is
-already the write path for everything that changes a task, and its receipt is
-compact. Read path: a compact `reviews` block on `get_task` only when reviews
-exist (newest first, bounded), with full text in `export_project` / the task page.
+Write path: **`record_review` on a plane at protocol 40+, the optional `review`
+object on `update_task` below it.** CLA-636 first carried the store on
+`update_task`; CLA-742 added `record_review`, a review-only tool whose schema has
+nothing but review fields — which is what a model served with strict tool calls
+forced on needs, because it pads a general-purpose call with task fields until
+the call is refused. The CLI resolves the door at spawn from the plane's protocol
+version (`Target.PlaneProtocol`, captured from the cheap summary poll; 0/unknown
+takes the legacy wording, which every plane that serves `record_review` still
+accepts), and the same choice picks the round-close door. `record_review` is
+token-budget-sensitive (`server/mcp/tool-surface.test.ts`, `docs/token-budget.md`)
+like the rest of the surface; the general write path stays `update_task` for
+everything that changes a task, and its receipt is compact. Read path: a compact
+`reviews` block on `get_task` only when reviews exist (newest first, bounded),
+with full text in `export_project` / the task page.
 
 **Ordering that matters:** CLA-629 must deploy before CLA-630 ships (CLA-492's
 precedent: a CLI ahead of the plane's parser had its fleet reports rejected). The
@@ -267,17 +277,22 @@ PR: a clean verification round carries the terminal step (push check, PR,
 The verifier is review-shaped (it writes a durable record like the review gate)
 and is scoped to the **fix delta** — the reviewed tip the previous record names
 through `HEAD`, plus the regression surface the fixes touch. Unlike the review
-gate, the verifier releases its OWN round in its terminal call: the plane
-refuses a sealed holder's outcome write, and the close must ride the same
-`update_task` call as the `in_review` move, because after the status move the
-run is no longer the task's live holder and cannot close. The driver accepts
-either state — sealed (it closes, as it does for the review gate) or already
-released — and never closes twice. Its brief lists the prior open MUST ids
-(read from the plane's released
-records), and it adjudicates each one **by its plane id**
-(`<round>.<reviewer role>.<n>`): resolved (`fixed`), resolved by dispatch
-(`filed`), refutation accepted (`refuted`), or left open with a reason. New
-MUSTs are allowed only inside the delta and get new ids.
+gate, the verifier releases its OWN round in its terminal step, and on a plane
+serving `record_review` (protocol 40+) that is **two calls in a load-bearing
+order**: it closes the round with `record_review(..., { closeRound: n })` while
+the task is still `in_progress`, and only then moves the task with
+`update_task(..., status: "in_review")`. The order is the constraint, not a
+style: the plane accepts a close only from the run that still holds the task, so
+a close sent after the status move is refused — and a sealed holder's outcome
+write is refused whichever order it travels in. Below protocol 40 the only legal
+shape is the one call the pre-`record_review` CLI always made —
+`update_task(..., status: "in_review", review: { closeRound: n })` — for the same
+reason. The driver accepts either state — sealed (it closes, as it does for the
+review gate) or already released — and never closes twice. Its brief lists the
+prior open MUST ids (read from the plane's released records), and it adjudicates
+each one **by its plane id** (`<round>.<reviewer role>.<n>`): resolved (`fixed`),
+resolved by dispatch (`filed`), refutation accepted (`refuted`), or left open with
+a reason. New MUSTs are allowed only inside the delta and get new ids.
 
 On a **branchless** task (the CLA-670 shape above) the verifier follows the
 review's block-only path instead: no durable record, no plane finding ids, no

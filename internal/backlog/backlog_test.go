@@ -58,10 +58,8 @@ func TestParseSummary_MissingPauseIsFalse(t *testing.T) {
 	}
 }
 
-// protocolVersion is the plane fact the review briefs key their review door on
-// (CLA-743): record_review from protocol 40, update_task(review: ...) below it.
-// It rides the same cheap poll; a plane that predates the field decodes to 0,
-// which every reader treats as "older" and answers with the legacy wording.
+// protocolVersion decodes where the plane serves it and defaults to 0 (UNKNOWN —
+// legacy review wording) on a summary without the field.
 func TestParseSummary_ProtocolVersion(t *testing.T) {
 	got, err := parseSummary([]byte(`{"version":1,"counts":{"ready":0,"in_progress":0},"claimable":0,"openQuestions":0,"protocolVersion":40}`))
 	if err != nil {
