@@ -233,6 +233,22 @@ type Driver struct {
 	// one nil check and changes nothing the panel does.
 	panelLaunch func(role string)
 
+	// panelRelease, when non-nil, is called with the member's index each time a
+	// PARALLEL panel member releases its successor, before that successor is
+	// unblocked. panelLaunch pins the launch ORDER; this pins the release POINT,
+	// which is the guarantee itself: a member must release from its launch
+	// boundary (phaseRunOpts.onSessionLaunch), not from its worktree being
+	// ready. At member k's launch exactly members 0..k-1 have been released, so
+	// a panel that released at worktree-ready — where release_k always precedes
+	// launch_k — reports k+1 releases at that launch. Deterministic, no
+	// scheduling window (CLA-757).
+	//
+	// It is wired at the scheduler's started wrapper rather than at the panel's
+	// call site, so a regression that calls started() earlier still reports the
+	// release where it really happened. Nil in every production build, like
+	// panelLaunch: a test seam, no behaviour change.
+	panelRelease func(k int)
+
 	// undeclared counts the sessions this run that ended still holding a task
 	// whose work they had already pushed — the phase did its job and then did not
 	// hand the task over (CLA-384). Nothing is lost: the branch is recorded and a

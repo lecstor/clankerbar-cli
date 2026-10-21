@@ -8,6 +8,7 @@ package loop
 // session overlaps the others instead of extending the round's tail.
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
@@ -35,7 +36,7 @@ func TestPanelMembersStartInListOrderAndBackfill(t *testing.T) {
 			started <- k
 			begun()
 			<-release[k]
-		})
+		}, nil)
 		close(done)
 	}()
 
@@ -78,5 +79,103 @@ func TestPanelMembersStartInListOrderAndBackfill(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("runPanelMembers did not return after every member was released")
+	}
+}
+
+// TestPanelMembersReleaseBeforeTheSuccessorRuns pins the ORDER of the release
+// against the scheduler: member k's release must be observed BEFORE member k+1's
+// run function begins. Closing the member's started channel is what unblocks the
+// scheduler, so a release observed after that close would let the successor run
+// first; the panel's release-point assertion counts releases at a launch and
+// would silently become a race (CLA-757 review 1.review-1.2).
+func TestPanelMembersReleaseBeforeTheSuccessorRuns(t *testing.T) {
+	const n = 4
+	var mu sync.Mutex
+	var released []int
+	// seen[k] is how many releases member k's run function observed when it
+	// began. Member k is spawned only after member k-1 released it, so it must
+	// see exactly k releases.
+	seen := make([]int, n)
+
+	runPanelMembers(n, n, func(k int, begun func()) {
+		mu.Lock()
+		seen[k] = len(released)
+		mu.Unlock()
+		begun()
+	}, func(k int) {
+		mu.Lock()
+		released = append(released, k)
+		mu.Unlock()
+	})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(released) != n {
+		t.Fatalf("release probe saw %v, want one release for each of the %d members", released, n)
+	}
+	for k := 0; k < n; k++ {
+		if seen[k] != k {
+			t.Errorf("member %d's run began with %d releases observed, want %d — a successor was unblocked before its predecessor's release was observed",
+				k, seen[k], k)
+		}
+	}
+}
+
+// TestReleaseFiresBeforeTheSuccessorIsUnblocked is the deterministic half of
+// TestPanelMembersReleaseBeforeTheSuccessorRuns. At the scheduler level the
+// successor's start after the close is a scheduling race, so a swapped order
+// could slip through on a lucky run; the release's own order is one function, so
+// it is checked here without a schedule.
+func TestReleaseFiresBeforeTheSuccessorIsUnblocked(t *testing.T) {
+	var released []int
+	var unblockedWith []int
+	releaseMember(2,
+		func(k int) { released = append(released, k) },
+		func() { unblockedWith = append(unblockedWith, released...) })
+	if len(unblockedWith) != 1 || unblockedWith[0] != 2 {
+		t.Fatalf("the successor was unblocked with releases %v observed, want [2] — the release must be observed before the successor is unblocked", unblockedWith)
+	}
+}
+
+// TestPanelMembersReleaseAMemberThatNeverStarts pins the safety-net defer: a
+// member whose session never reaches its launch boundary (a setup failure, a
+// budget refusal) never calls begun itself, and the defer is the only path that
+// releases its successor. Without it the scheduler waits forever, and the
+// release probe must still see exactly one release for that member so a panel
+// fixture's count cannot be satisfied by an accidental double release
+// (CLA-757 review 1.review-1.3).
+func TestPanelMembersReleaseAMemberThatNeverStarts(t *testing.T) {
+	const n = 3
+	var mu sync.Mutex
+	releases := make([]int, n)
+	done := make(chan struct{})
+
+	go func() {
+		runPanelMembers(n, 1, func(k int, begun func()) {
+			// Member 1 never launches a session.
+			if k == 1 {
+				return
+			}
+			begun()
+		}, func(k int) {
+			mu.Lock()
+			releases[k]++
+			mu.Unlock()
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runPanelMembers did not return — a member that never starts was not released by the safety-net defer")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for k := 0; k < n; k++ {
+		if releases[k] != 1 {
+			t.Errorf("member %d released %d times, want exactly 1 — the release probe must observe every member once, whether it started or not",
+				k, releases[k])
+		}
 	}
 }
