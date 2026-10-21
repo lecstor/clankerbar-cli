@@ -230,7 +230,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// Coherent: continue the session for real. The continuation's parser is
 		// seeded with the DEAD RUN'S live claim (not in.ResumeClaim, which on a
 		// phase 2+ holds the staler predecessor): `opencode run -s` streams only
-		// the new turn, so without the seed every update_task the continuation
+		// the new turn, so without the seed every progress write the continuation
 		// makes would go unobserved — no settle, no HasWIP, no delivery report —
 		// and releaseHeldClaim would post ready over work the session pushed.
 		contIn := in
@@ -1406,13 +1406,13 @@ func (p *opencodeParse) line(line []byte) {
 //
 // A tool part is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so
 // a re-delivered terminal event for a claim already settled by a later
-// update_task would resurrect it — and the driver would post `ready` over a task
+// a status write would resurrect it — and the driver would post `ready` over a task
 // that is in review. This is insurance, not an observed bug.
 //
 // # What this shape cannot do, and what it costs
 //
 // claude sets Claim.HasWIP on the REQUEST (see noteToolUse), deliberately: a
-// session killed between issuing `update_task(branch: …)` and its result has
+// session killed between issuing `record_progress(branch: …)` and its result has
 // still pushed work, and erring towards "there is WIP" only costs the reclaim an
 // expiring lease already costs. opencode gives no request-side event at all — the
 // arguments arrive fused to the result — so that arm cannot fire early here. A

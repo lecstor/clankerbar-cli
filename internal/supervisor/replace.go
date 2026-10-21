@@ -285,8 +285,9 @@ func (d *Supervisor) drainForReplace() string {
 		timeout = defaultVerifyTimeout
 	}
 	deadline := time.Now().Add(timeout)
-	done := map[*Instance]bool{}    // child exited (event consumed) or never spawned
-	stopped := map[*Instance]bool{} // STOP marker written; awaiting the child's exit
+	done := map[*Instance]bool{}      // child exited (event consumed) or never spawned
+	stopped := map[*Instance]bool{}   // a readable STOP marker is in place; awaiting the child's exit
+	attempted := map[*Instance]bool{} // writeStop already ran once for this child this drain
 	waitStart := time.Now()
 	lastLog := waitStart
 	tick := time.NewTicker(50 * time.Millisecond)
@@ -335,15 +336,18 @@ func (d *Supervisor) drainForReplace() string {
 			if _, err := os.Lstat(dir); err != nil {
 				continue // no state dir yet; the next tick writes it
 			}
-			// A STOP already sitting there is not an alarm: the drain is one
-			// of several paths that may have written it, and a pending STOP
-			// means the same wait applies.
-			if _, err := os.Lstat(filepath.Join(dir, "STOP")); err == nil {
-				stopped[inst] = true
-				continue
+			// writeStop both writes the marker and checks one already there,
+			// so the drain does not have to know why a STOP is present — but
+			// it only counts a marker the daemon can read as pending. One
+			// attempt per child: a failure already logged loudly, and retrying
+			// every 50ms would bury that line; the timeout bounds the wait and
+			// the "still waiting" log names the child.
+			if !attempted[inst] {
+				attempted[inst] = true
+				if d.writeStop(inst, dir) != stopFailed {
+					stopped[inst] = true
+				}
 			}
-			d.writeStop(inst, dir)
-			stopped[inst] = true
 		}
 	}
 	return ""

@@ -308,9 +308,10 @@ type Instance struct {
 	// refused marks an instance whose entry failed the allowlist or shape
 	// checks: refused loudly, child stopped, never respawned.
 	refused bool
-	// stopRequested is set once a STOP marker has been written for a stopped
-	// instance's live child, so repeated polls write nothing (idempotent
-	// reconcile). Cleared on the next spawn.
+	// stopRequested is set once a readable STOP marker is in place for a
+	// stopped instance's live child, so repeated polls write nothing
+	// (idempotent reconcile) and a failed write is retried instead. Cleared on
+	// the next spawn.
 	stopRequested bool
 	// policyRefused is set when the last config build hit the permission-
 	// policy gate: the spawn is refused (even on a last-known-good config
@@ -972,8 +973,13 @@ func (d *Supervisor) ensureStopped(inst *Instance) {
 	if _, err := os.Lstat(dir); err != nil {
 		return // no state dir yet; the next poll writes it
 	}
-	d.writeStop(inst, dir)
-	inst.stopRequested = true
+	// Set only when a marker the daemon can read is in place. A genuine write
+	// failure leaves it unset, so the next reconcile retries instead of the
+	// status card reporting a drain that is not happening (CLA-765 review
+	// finding 1.review-1.3).
+	if d.writeStop(inst, dir) != stopFailed {
+		inst.stopRequested = true
+	}
 }
 
 func (d *Supervisor) baseCtx() context.Context {
@@ -1477,41 +1483,99 @@ func (d *Supervisor) stopAll() error {
 	return nil
 }
 
+// stopOutcome is what one writeStop call achieved: whether a marker the daemon
+// can read now sits in the child's state dir, and whether this call put it
+// there. Callers that retry use it to tell "pending, stop asking" from "failed,
+// ask again on the next poll".
+type stopOutcome int
+
+const (
+	// stopFailed means no readable marker is in place: the child keeps running,
+	// and the operator was told so loudly.
+	stopFailed stopOutcome = iota
+	// stopWritten means this call wrote a fresh STOP marker.
+	stopWritten
+	// stopPending means a readable STOP marker was already there, and it was
+	// left untouched.
+	stopPending
+)
+
 // writeStop writes the STOP marker into one instance's state dir, or logs
-// loudly why it could not. Two rules keep the write honest:
+// loudly why it could not, and reports which of the three happened. Two rules
+// keep the write honest:
 //
-//   - The child must be past its STARTUP marker consumption before a STOP
-//     lands. A STOP the daemon finds at startup is consumed WITHOUT stopping
-//     (CLA-491: a marker a previous run left behind must not kill the next
-//     one), so a stop written into that window would be eaten and the child
-//     would run on. The callers only call this once the child has been alive
-//     for the settle window, which guarantees it has passed that consumption.
+//   - A STOP the supervisor writes only lands if the child is PAST its STARTUP
+//     marker consumption. A STOP the daemon finds at startup is consumed
+//     WITHOUT stopping (CLA-491: a marker a previous run left behind must not
+//     kill the next one), so a marker dropped into that window would be eaten
+//     and the child would run on. The callers therefore only call this once the
+//     child has been alive for the settle window, which guarantees it has
+//     passed that consumption. That guarantee is about WHEN this call writes:
+//     the supervisor cannot know when a marker it did not write was written.
 //   - The state dir is never CREATED here: a dir the supervisor created for a
 //     child that has not started yet would be adopted by that child, whose
 //     startup would then eat the marker exactly as above. Writing into a dir
 //     the child itself created (the Lstat gate in the callers) is what
 //     guarantees the child is past its startup marker check.
 //
-// A child that cannot be stopped this way — the state dir refuses to open, or
-// the marker write fails — is logged loudly and left running: the supervisor
-// keeps waiting for its exit, because stopping it by killing the process is
-// exactly what this phase must not do.
-func (d *Supervisor) writeStop(inst *Instance, dir string) {
+// A readable regular STOP already sitting in the state dir is not a failed
+// write: it is left untouched (its body records who asked first) and the daemon
+// picks it up at its next iteration boundary, so the line says only that —
+// never that this child will drain, which the supervisor cannot know about a
+// marker of unknown provenance. The occupancy alone proves nothing, though:
+// WriteFile also reports ErrExists for a symlink or a directory at the name, and
+// the daemon refuses to read either, so only a successful safe read of the
+// marker counts as pending. Everything else — the state dir refuses to open, an
+// unreadable occupant, any other marker write failure — is logged loudly and
+// the child is left running: the supervisor keeps waiting for its exit, because
+// stopping it by killing the process is exactly what this phase must not do.
+func (d *Supervisor) writeStop(inst *Instance, dir string) stopOutcome {
 	inst.mu.Lock()
 	cfg := inst.cfg
 	inst.mu.Unlock()
 	st, err := statedir.Open(dir, cfg.SessionWorkDirs()...)
 	if err != nil {
 		log.Printf("%s: cannot open its state dir to write STOP: %v - the child keeps running; stop it by hand (kill the supervisor's child pid %d)", inst.name, err, instPid(inst))
-		return
+		return stopFailed
 	}
 	defer st.Close() //nolint:errcheck // read-side handle on the way out
 	body := []byte(fmt.Sprintf("fleet-wide stop requested by the supervisor at %s\n", time.Now().UTC().Format(time.RFC3339)))
 	if err := st.WriteFile("STOP", body); err != nil {
+		if errors.Is(err, statedir.ErrExists) {
+			// Something already occupies STOP. Only a marker the daemon can
+			// actually read counts as a pending stop: the same ErrExists is
+			// what WriteFile reports for a symlink or a directory at the name,
+			// and the daemon's readMarker refuses both, so calling those
+			// pending would tell the operator a child is draining while it
+			// keeps running. The safe read is the only proof that counts.
+			if existing, rerr := st.ReadFile("STOP"); rerr == nil {
+				log.Printf("%s: STOP already present in %s%s - left in place for the daemon to read at its next iteration boundary", inst.name, dir, markerRequestedBy(existing))
+				return stopPending
+			}
+			// Occupied by something the daemon will not read (a symlink, a
+			// directory, anything else non-regular): fall through to the loud
+			// failure line. Nothing stops this child.
+		}
 		log.Printf("%s: cannot write STOP into %s: %v - the child keeps running; stop it by hand", inst.name, dir, err)
-		return
+		return stopFailed
 	}
 	log.Printf("%s: STOP written to %s - draining at its iteration boundary", inst.name, dir)
+	return stopWritten
+}
+
+// markerRequestedBy renders an existing STOP marker's first line for the
+// pending stop log — its body is the record of who asked first, and the daemon
+// discards the message when it honours the marker. %q keeps a hostile body from
+// injecting log lines.
+func markerRequestedBy(body []byte) string {
+	line := strings.TrimSpace(string(body))
+	if i := strings.IndexByte(line, '\n'); i >= 0 {
+		line = strings.TrimSpace(line[:i])
+	}
+	if line == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (requested by %q)", line)
 }
 
 // instPid is the child's pid for a stop-failure log line, or 0 when there is

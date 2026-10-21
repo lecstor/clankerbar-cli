@@ -149,7 +149,7 @@ func New(workdir, remote string) *Salvager {
 // ref, used in the commit message and the detail; it is cosmetic.
 //
 // recorded are the branches this session reported to the plane for this task
-// (`update_task(branch: …)`), in the order the driver read them, plus the branch
+// (`record_progress(branch: …)`), in the order the driver read them, plus the branch
 // the claim carried. They are what "delivered" is judged against, and they are
 // consulted only when nothing but untracked files is left: every other dirty tree
 // is salvaged exactly as it always was (CLA-695).

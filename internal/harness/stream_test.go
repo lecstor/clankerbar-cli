@@ -70,7 +70,7 @@ func TestClaudeOversizedLineIsReportedNotSwallowed(t *testing.T) {
 	before := strings.Join(withClaim(), "\n") + "\n" +
 		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"u9","name":"Read","input":{}}]}}` + "\n" +
 		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"u9","content":"`
-	after := "\n" + toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review"}`) + "\n" +
+	after := "\n" + toolUse("u2", submitForReviewTool, `{"taskId":"`+claimUUID+`","outcome":"**Tests** - x"}`) + "\n" +
 		toolResult("u2", `{"task":{"id":"`+claimUUID+`"}}`) + "\n" +
 		`{"type":"result","subtype":"success","total_cost_usd":312.50,"usage":{"input_tokens":900000,"output_tokens":40000}}` + "\n"
 

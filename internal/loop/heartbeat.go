@@ -143,7 +143,7 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 //
 // CURRENT_CLAIM (CLA-708) is persisted HERE, synchronously, before this
 // callback returns, rather than from the renewer goroutine in apply. The
-// difference is a lost takeover: `update_task(branch: ...)` succeeds, then the
+// difference is a lost takeover: `record_progress(branch: ...)` succeeds, then the
 // daemon dies while the renewer is still parked inside a Heartbeat call with
 // the branch snapshot queued, and the supervisor reads the old no-branch record
 // and sends `release` over pushed work. A local state-dir write is the one

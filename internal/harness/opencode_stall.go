@@ -91,7 +91,7 @@ func outputCapStallReasoning(res Result) int {
 //     (MaxSessionWallClock = what remains), so a stall cannot hand the session a
 //     fresh full cap the original never had;
 //   - the parser is seeded with the dead run's live claim, so any
-//     update_task/heartbeat the resumed turn makes is observed on the same
+//     progress write/heartbeat the resumed turn makes is observed on the same
 //     terms as the session it belongs to;
 //   - the resume's spend is never lost: mergeResume sums it on the success
 //     path, and an errored resume charges it explicitly — a resume re-sends the

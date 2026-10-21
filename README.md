@@ -86,11 +86,10 @@ targeted probe of a suspected defect, and the worktree is left clean. It is
 **review only**: it
 does not edit, commit, push, open a PR, or move the task. Its deliverable is the
 review record on the task: a sealed per-reviewer durable record written through
-`record_review` (or `update_task(review: ...)` against a plane older than protocol
-40) — round, reviewer role, the phase's resolved
+`record_review` — round, reviewer role, the phase's resolved
 harness/model, the reviewed tip, scope, a `verdict`, and every finding with its
 severity grade and `raisedByModel` — plus, for one release, the legacy block
-in the outcome (`update_task(outcome: ...)`, no status move) carrying the
+in the outcome (`record_progress(outcome: ...)`, no status move) carrying the
 reviewed tip, both sides' harness/model, the `verdict`, and every finding by ID
 with the required fix. Findings are graded
 — `must`, `should`, `nit` — and only a `must` gates. A `must` must carry its
@@ -183,14 +182,12 @@ only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, and a `status: "in_review"` move. On a plane that serves `record_review`
-(protocol 40+) that is TWO calls in a load-bearing order: close the round with
-`record_review(…, { closeRound: … })` while the task is still held, then move it
-with `update_task(…, status: "in_review")`. The plane refuses a sealed holder's
-outcome write and refuses a close after the task has left `in_progress`, so the
-close must land first; an older plane takes the one call that bundles both
-(`update_task(…, status: "in_review", review: { closeRound: … })`) for the same
-reason. The fix phase has already written the outcome with the
+PR, and a hand-over. That is ONE call: `submit_for_review(…, closeRound: …)`
+carries the round close in the same atomic write that moves the task to
+`in_review`, so the order that used to be load-bearing is now the plane's own
+guard rather than two client calls. The plane refuses a sealed holder's outcome
+write, so no outcome is sent on that call. The fix phase has already written
+the outcome with the
 `**Tests**` section the `in_review` guard reads. A round with any open MUST
 releases its round the same way but ends **without** the PR and without moving
 the task; the driver spawns another `fix`, then verifies again. SHOULD and NIT
@@ -1504,7 +1501,7 @@ daemon's presence row.
 ### Checking what a session says it delivered
 
 The control plane holds the backlog and takes a clanker at its word. When a session
-records a branch (`update_task(branch: …)`) or declares a delivery merged
+records a branch (`record_progress(branch: …)`) or declares a delivery merged
 (`delivery.commit` + `integrationBranch`), nothing on the plane can look at a
 repository to see whether either is true. One task read `done` for four days while
 about 900 lines of its work sat unpushed on one laptop, and its own PR merged a
@@ -2286,7 +2283,7 @@ heartbeats. When a session ends mid-task, that lease is left ticking with nobody
 renewing it — and clankerbar charges the task a *reclaim* to sweep it up, of which
 there are only two before the task is parked for a human. So the driver watches
 the session's stream for what it claimed, and hands the task straight back
-(`update_task(status: ready)`) on **every** exit: usage limit, transient blip,
+(`release_task`, the driver-marked variant) on **every** exit: usage limit, transient blip,
 outright failure, or a clean finish with the work unfinished. The usage-limit case
 is why this matters most — the pause that follows can be hours, and the release is
 ordered before it.

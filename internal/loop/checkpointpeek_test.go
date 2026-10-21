@@ -41,7 +41,7 @@ func (r *peekReleaser) PeekNextTask(context.Context) (plane.NextTask, error) {
 	return r.next, nil
 }
 
-func (r *peekReleaser) CloseReviewRound(_ context.Context, _, _ string, round int, _ bool) error {
+func (r *peekReleaser) CloseReviewRound(_ context.Context, _, _ string, round int) error {
 	if r.closeErr != nil {
 		return r.closeErr
 	}

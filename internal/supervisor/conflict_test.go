@@ -191,12 +191,12 @@ func TestConflictSessionSafetyNetReleaseMatchesTheBareHolderUUID(t *testing.T) {
 
 	lines := f.run(d)
 
-	releases := f.callsFor("update_task")
+	releases := f.callsFor("release_task")
 	if len(releases) != 1 {
-		t.Fatalf("update_task calls = %d, want exactly the safety-net release (the holder is our own bare uuid): %v", len(releases), releases)
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release (the holder is our own bare uuid): %v", len(releases), releases)
 	}
-	if got := releases[0].args["release"]; got != true {
-		t.Errorf("the repair call is not a release: %v", releases[0].args)
+	if got := releases[0].args["driver"]; got != true {
+		t.Errorf("the safety-net release does not carry the driver marker: %v", releases[0].args)
 	}
 	if got := releases[0].args["checkGreen"]; got != false {
 		t.Errorf("a failed resolution released with checkGreen=%v, want false (the merge never happened): %v", got, releases[0].args)
@@ -217,7 +217,7 @@ func TestConflictSessionLeavesAClaimAnotherRunHolds(t *testing.T) {
 
 	lines := f.run(d)
 
-	if got := f.callsFor("update_task"); len(got) != 0 {
+	if got := f.callsFor("release_task"); len(got) != 0 {
 		t.Errorf("a task held by another run was released under our id: %v", got)
 	}
 	if !strings.Contains(lines, "held by another run (some-other-run)") {
@@ -264,8 +264,8 @@ func TestConflictSessionMechanicalLeavesTheTaskApproved(t *testing.T) {
 
 	lines := f.run(d)
 
-	if got := f.callsFor("update_task"); len(got) != 0 {
-		t.Errorf("a mechanical hand-back was repaired with update_task: %v (the session released the claim itself)", got)
+	if got := f.callsFor("release_task"); len(got) != 0 {
+		t.Errorf("a mechanical hand-back was repaired with release_task: %v (the session released the claim itself)", got)
 	}
 	if !strings.Contains(lines, "outcome: mechanical") {
 		t.Errorf("the pass did not log the mechanical outcome:\n%s", lines)
@@ -284,8 +284,8 @@ func TestConflictSessionBehaviouralMovesTheTaskBackToReview(t *testing.T) {
 
 	lines := f.run(d)
 
-	if got := f.callsFor("update_task"); len(got) != 0 {
-		t.Errorf("a behavioural hand-back was written a second time: %v", got)
+	if got := f.callsFor("release_task"); len(got) != 0 {
+		t.Errorf("a behavioural hand-back was released a second time: %v", got)
 	}
 	for _, want := range []string{"outcome: behavioural", "kept the feature's field"} {
 		if !strings.Contains(lines, want) {
@@ -303,12 +303,12 @@ func TestConflictSessionFailureReleasesTheClaim(t *testing.T) {
 
 	lines := f.run(d)
 
-	releases := f.callsFor("update_task")
+	releases := f.callsFor("release_task")
 	if len(releases) != 1 {
-		t.Fatalf("update_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
+		t.Fatalf("release_task calls = %d, want exactly the safety-net release: %v", len(releases), releases)
 	}
-	if got := releases[0].args["release"]; got != true {
-		t.Errorf("the repair call is not a release: %v", releases[0].args)
+	if got := releases[0].args["driver"]; got != true {
+		t.Errorf("the safety-net release does not carry the driver marker: %v", releases[0].args)
 	}
 	if got := releases[0].args["runId"]; got != closeOutTestRunCredential {
 		t.Errorf("the release signs with runId %v, want the claim's credential %q", got, closeOutTestRunCredential)
@@ -327,11 +327,11 @@ func TestConflictSessionReleasesWhenThePlaneCannotBeRead(t *testing.T) {
 
 	lines := f.run(d)
 
-	if got := f.callsFor("update_task"); len(got) != 1 {
-		t.Fatalf("update_task calls = %d, want the safety-net release: %v", len(got), got)
+	if got := f.callsFor("release_task"); len(got) != 1 {
+		t.Fatalf("release_task calls = %d, want the safety-net release: %v", len(got), got)
 	}
-	if got := f.callsFor("update_task")[0].args["release"]; got != true {
-		t.Errorf("the repair call is not a release: %v", got)
+	if got := f.callsFor("release_task")[0].args["driver"]; got != true {
+		t.Errorf("the safety-net release does not carry the driver marker: %v", got)
 	}
 	if !strings.Contains(lines, "outcome: failed") || !strings.Contains(lines, "claim was released") {
 		t.Errorf("the failure line does not say what happened:\n%s", lines)

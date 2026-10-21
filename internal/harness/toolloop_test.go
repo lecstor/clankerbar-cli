@@ -15,7 +15,7 @@ import (
 )
 
 // The incident fixture (CLA-739): a trimmed excerpt of the 2026-10-20 Luna panel
-// session that called clankerbar_update_task 316 times, 315 of them refused with
+// session that called clankerbar_submit_for_review 316 times, 315 of them refused with
 // the same `invalid_release` error. Its shape, in order: a heartbeat that
 // succeeded, two refused update_task calls, a get_task that succeeded, then
 // seven more refused update_task calls. The run credential's secret half is
@@ -58,7 +58,7 @@ func feedOpencode(t *testing.T, lines [][]byte, threshold int) (cause string, fi
 		}
 	}
 	for _, l := range lines {
-		if bytes.Contains(l, []byte(`"tool":"clankerbar_update_task"`)) {
+		if bytes.Contains(l, []byte(`"tool":"clankerbar_submit_for_review"`)) {
 			updates++
 		}
 		p.line(l)
@@ -78,7 +78,7 @@ func TestToolLoopIncidentFixtureKillsOnTheFifthConsecutiveRefusal(t *testing.T) 
 	if firedAt != 7 {
 		t.Errorf("fired on update_task #%d, want #7: 2 refusals, a get_task that resets the streak, then 5 more", firedAt)
 	}
-	want := "repeated failing tool call: clankerbar_update_task x5: invalid_release: `driverReleased` marks a run the DRIVER ended"
+	want := "repeated failing tool call: clankerbar_submit_for_review x5: invalid_release: `driverReleased` marks a run the DRIVER ended"
 	if !strings.HasPrefix(cause, want) {
 		t.Errorf("cause = %q, want it to start %q", cause, want)
 	}
@@ -99,7 +99,7 @@ func TestToolLoopCountsIdenticalErrorsAcrossVaryingInputs(t *testing.T) {
 			continue
 		}
 		var ev opencodeEvent
-		if json.Unmarshal(l, &ev) == nil && ev.Part != nil && ev.Part.Tool == "clankerbar_update_task" {
+		if json.Unmarshal(l, &ev) == nil && ev.Part != nil && ev.Part.Tool == "clankerbar_submit_for_review" {
 			inputs[string(ev.Part.State.Input)] = true
 		}
 		lines = append(lines, l)
@@ -129,7 +129,7 @@ func TestToolLoopThresholdZeroDisablesTheCheck(t *testing.T) {
 
 // The streak rules, on the guard itself.
 func TestToolLoopGuardStreakRules(t *testing.T) {
-	const tool, err = "clankerbar_update_task", incidentError
+	const tool, err = "clankerbar_submit_for_review", incidentError
 	cases := []struct {
 		name  string
 		calls func(g *toolLoopGuard) bool // reports whether any call tripped
@@ -217,7 +217,7 @@ func TestOpencodeInvokeKillsASessionRepeatingAFailingToolCall(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 20*time.Second {
 		t.Fatalf("Invoke took %s - the guard did not end the session; it ran to the stub's own sleep", elapsed)
 	}
-	if !strings.HasPrefix(res.ToolLoop, ToolLoopCausePrefix+": clankerbar_update_task x5: invalid_release") {
+	if !strings.HasPrefix(res.ToolLoop, ToolLoopCausePrefix+": clankerbar_submit_for_review x5: invalid_release") {
 		t.Errorf("ToolLoop = %q, want the cause naming the tool, the count and the error", res.ToolLoop)
 	}
 	if res.ExitCode == 0 {
@@ -258,11 +258,11 @@ func claudeToolCall(id, name string, isError bool, text string) string {
 func TestClaudeConsumeKillsOnTheFifthIdenticalFailure(t *testing.T) {
 	var stream strings.Builder
 	for i := 0; i < 4; i++ {
-		stream.WriteString(claudeToolCall(fmt.Sprintf("a%d", i), "mcp__clankerbar__update_task", true, incidentError))
+		stream.WriteString(claudeToolCall(fmt.Sprintf("a%d", i), "mcp__clankerbar__submit_for_review", true, incidentError))
 	}
 	stream.WriteString(claudeToolCall("ok", "mcp__clankerbar__get_task", false, `{"task":{}}`))
 	for i := 0; i < 5; i++ {
-		stream.WriteString(claudeToolCall(fmt.Sprintf("b%d", i), "mcp__clankerbar__update_task", true, incidentError))
+		stream.WriteString(claudeToolCall(fmt.Sprintf("b%d", i), "mcp__clankerbar__submit_for_review", true, incidentError))
 	}
 	// Anything after the verdict is not read: the session is being killed.
 	stream.WriteString(`{"type":"result","result":"done","usage":{"input_tokens":1}}` + "\n")
@@ -273,7 +273,7 @@ func TestClaudeConsumeKillsOnTheFifthIdenticalFailure(t *testing.T) {
 	if kills != 1 {
 		t.Fatalf("kill called %d times, want 1", kills)
 	}
-	if !strings.HasPrefix(res.ToolLoop, "repeated failing tool call: mcp__clankerbar__update_task x5: invalid_release") {
+	if !strings.HasPrefix(res.ToolLoop, "repeated failing tool call: mcp__clankerbar__submit_for_review x5: invalid_release") {
 		t.Errorf("ToolLoop = %q", res.ToolLoop)
 	}
 	if res.FinalMessage != "" {
@@ -305,7 +305,7 @@ func TestClaudeInvokeKillsASessionRepeatingAFailingToolCall(t *testing.T) {
 	dir := t.TempDir()
 	var stream strings.Builder
 	for i := 0; i < 5; i++ {
-		stream.WriteString(claudeToolCall(fmt.Sprintf("a%d", i), "mcp__clankerbar__update_task", true, incidentError))
+		stream.WriteString(claudeToolCall(fmt.Sprintf("a%d", i), "mcp__clankerbar__submit_for_review", true, incidentError))
 	}
 	streamPath := filepath.Join(dir, "stream.jsonl")
 	if err := os.WriteFile(streamPath, []byte(stream.String()), 0o600); err != nil {
