@@ -769,10 +769,17 @@ func TestDrainPhases_ParallelPanelOptionalSeatFailureNeverEndsTheSequence(t *tes
 		name   string
 		fail   harness.Result
 		reason string
+		// deadTally is whether the existing per-member bookkeeping books this
+		// ending as a dead phase. A no-record clean exit is the no_mcp shape,
+		// which CLA-703 deliberately keeps OUT of the dead rate.
+		deadTally bool
 	}{
-		{"transient", transientResult(), "ended on a transient failure before recording"},
-		{"rolling usage limit", limitResult(), "hit a usage limit before recording"},
-		{"hard usage stop", limitStopResult(), "stopped on a usage limit (no reset to wait for) before recording"},
+		{"transient", transientResult(), "ended on a transient failure before recording", true},
+		{"rolling usage limit", limitResult(), "hit a usage limit before recording", true},
+		{"hard usage stop", limitStopResult(), "stopped on a usage limit (no reset to wait for) before recording", true},
+		// A clean exit that writes no record and makes no backlog call is the
+		// no_mcp shape; it is still that seat's failure, and the panel carries on.
+		{"no output", okResult(1, 0.01), "recorded no durable review record", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -794,6 +801,7 @@ func TestDrainPhases_ParallelPanelOptionalSeatFailureNeverEndsTheSequence(t *tes
 			a.mu.Lock()
 			errs := append([]string(nil), a.errs...)
 			fixCalls := a.fixCalls
+			fixPrompt := a.fixPrompt
 			maxInFlight := a.maxInFlight
 			a.mu.Unlock()
 			for _, e := range errs {
@@ -804,6 +812,9 @@ func TestDrainPhases_ParallelPanelOptionalSeatFailureNeverEndsTheSequence(t *tes
 			}
 			if fixCalls != 1 {
 				t.Fatalf("fix sessions = %d, want 1 — the required members' round must still reach the fix", fixCalls)
+			}
+			if !strings.Contains(fixPrompt, "INCOMPLETE") || !strings.Contains(fixPrompt, "review-3") {
+				t.Errorf("the fix brief does not name the failed optional seat as INCOMPLETE:\n%s", fixPrompt)
 			}
 			if len(rel.closes) != 1 || rel.closes[0] != 1 {
 				t.Errorf("closed rounds = %v, want exactly [1]", rel.closes)
@@ -831,6 +842,21 @@ func TestDrainPhases_ParallelPanelOptionalSeatFailureNeverEndsTheSequence(t *tes
 			}
 			if out := logs.String(); !strings.Contains(out, "review-3 (optional): "+tc.reason) {
 				t.Errorf("the daemon log does not name the optional seat with its reason %q:\n%s", tc.reason, out)
+			}
+			// The member's failure is still booked against the member: the dead
+			// rate where the ending is a death, and the consecutive-failure
+			// streak for every non-recorded member.
+			if tc.deadTally {
+				cell := d.deadTally[tallyKey{phase: "review-3", harness: "opencode"}]
+				if cell == nil || cell.dead != 1 {
+					t.Errorf("dead-phase tally for the optional seat = %+v, want 1 dead", cell)
+				}
+			}
+			d.stateMu.Lock()
+			streak := d.panelFailStreak["review-3"]
+			d.stateMu.Unlock()
+			if streak != 1 {
+				t.Errorf("the optional seat's failure streak = %d, want 1 — its failure counts toward its own assessment", streak)
 			}
 			requireOneFleetRecord(t, ff)
 		})

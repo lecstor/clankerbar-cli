@@ -5566,6 +5566,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
+			// CLA-784: an OPTIONAL seat never waits and never ends the sequence,
+			// resumed or not. The sequence-end signal is the member handler's
+			// reason; for a trial seat it is inert there (no run-level wait, no
+			// shared-claim handback).
+			if panelOptional {
+				log.Printf("%siteration %d: the OPTIONAL %s seat hit a usage limit (%s) — recording it against that seat and carrying on rather than waiting out a reset on a trial reviewer (log: %s)",
+					labelOf(t), drainNum, ph.Label(phaseIdx), limitReason(lim), logPath)
+				end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
+				return tokens, cost, false, end, nil
+			}
 			// A RESUMED phase must not wait one out (CLA-631). The seam's handback
 			// has already ended the claim: `release` puts a no-work claim straight
 			// back in the queue, and `expireLease` ends a pushed-work claim's lease
@@ -5783,6 +5793,14 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// opencode implement start can never see the claude blip, so without
 			// the run-level wait the same implement-and-lose loop would repeat with
 			// nothing bounding it.
+			// CLA-784: like a usage limit, an OPTIONAL seat's transient end is
+			// its own result — never the sequence's, resumed or not.
+			if panelOptional {
+				log.Printf("%siteration %d: the OPTIONAL %s seat hit a transient failure (%s) — recording it against that seat and carrying on rather than retrying a task the panel is still working (log: %s)",
+					labelOf(t), drainNum, ph.Label(phaseIdx), res.ExitString(), logPath)
+				end.sequenceEnd = &phaseSequenceEnd{}
+				return tokens, cost, false, end, nil
+			}
 			if prev != nil {
 				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting (log: %s)",
 					drainNum, res.ExitString(), logPath)
