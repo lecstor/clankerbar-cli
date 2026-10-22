@@ -753,3 +753,107 @@ func TestReviewPanel_MemberTierBeatsTheReviewPhasesModel(t *testing.T) {
 		t.Errorf("the model member expanded to model=%q tier=%q, want its own alias and no tier", modeld.Model, modeld.Tier)
 	}
 }
+
+// TestReviewPanel_OptionalParsesDefaultsFalseAndExpands (CLA-784): `optional`
+// is a per-member key, absent by default, and expansion carries it onto the
+// phase the driver runs — that phase flag is what tells a trial seat from a
+// required one without re-reading the panel by position at end time.
+func TestReviewPanel_OptionalParsesDefaultsFalseAndExpands(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"model": "a"}, {"model": "b", "optional": true}]
+	}`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want a panel with a required and an optional member accepted", err)
+	}
+	if cfg.ReviewPanel[0].Optional {
+		t.Error("a member with no `optional` key parsed as optional, want required (the default)")
+	}
+	if !cfg.ReviewPanel[1].Optional {
+		t.Error("`optional: true` did not parse")
+	}
+	phases := cfg.EffectivePhases()
+	if len(phases) != 4 {
+		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(phases))
+	}
+	if phases[1].IsOptionalPanelMember() {
+		t.Error("the required member's expanded phase is marked optional")
+	}
+	if !phases[2].IsOptionalPanelMember() {
+		t.Error("the optional member's expanded phase is not marked optional — the driver cannot tell a trial seat from a required one")
+	}
+	for _, idx := range []int{0, 3} {
+		if phases[idx].IsOptionalPanelMember() {
+			t.Errorf("phase %d is not a panel member but reports optional", idx)
+		}
+	}
+}
+
+// TestReviewPanel_OptionalKeepsTheConfigIdentity (CLA-784): `omitempty` is
+// load-bearing exactly as it is for the phase model — Config.Identity() hashes
+// the marshalled form, so a config that never writes `optional` must hash what
+// it hashed before the key existed. A member that sets it moves the identity,
+// correctly: a trial seat is a deliberate change to the panel.
+func TestReviewPanel_OptionalKeepsTheConfigIdentity(t *testing.T) {
+	const body = `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [%s]
+	}`
+	plain := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a"}`, 1))
+	explicitFalse := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a", "optional": false}`, 1))
+	withOptional := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a"}, {"model": "b", "optional": true}`, 1))
+
+	if got, want := plain.Identity(), explicitFalse.Identity(); got != want {
+		t.Errorf("an explicit `optional: false` changed the config identity: %s != %s — omitempty must keep the default out of the marshalled form", got, want)
+	}
+	if plain.Identity() == withOptional.Identity() {
+		t.Error("setting `optional: true` did not change the config identity — a trial seat is part of the panel")
+	}
+	for name, cfg := range map[string]*Config{"plain": plain, "explicit false": explicitFalse} {
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", name, err)
+		}
+		if strings.Contains(string(data), `"optional"`) {
+			t.Errorf("%s: the marshal carries an `optional` key with no true value, moving every existing panel's identity: %s", name, data)
+		}
+	}
+	data, err := json.Marshal(withOptional)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"optional":true`) {
+		t.Errorf("the configured trial seat did not marshal: %s", data)
+	}
+}
+
+// TestReviewPanel_ValidateRefusesAnAllOptionalPanel (CLA-784): an optional seat
+// is a trial reviewer whose failure never blocks the fix. With no required
+// member there is no review a round could be said to have produced, so every
+// task would run the members and spawn no fix — refused at the door.
+func TestReviewPanel_ValidateRefusesAnAllOptionalPanel(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"optional": true}, {"optional": true}]
+	}`)
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "ALL are optional") {
+		t.Fatalf("Validate() = %v, want an all-optional refusal", err)
+	}
+	if !strings.Contains(err.Error(), "required") {
+		t.Errorf("the refusal does not name the remedy (leave a member required): %v", err)
+	}
+
+	// One required member is enough — the shape every real panel has.
+	ok := writePanelConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"model": "a"}, {"optional": true}]
+	}`)
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want a panel with one required member accepted", err)
+	}
+}

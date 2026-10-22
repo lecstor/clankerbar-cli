@@ -1796,3 +1796,225 @@ func requireFleetOutcome(t *testing.T, outcome, want string) {
 		t.Errorf("iteration outcome = %q, want %q", outcome, want)
 	}
 }
+
+// --- CLA-784: optional (trial) seats on the SEQUENTIAL path ----------------
+//
+// `review_panel_concurrency: 1` runs the members through drainPhases' shipped
+// one-at-a-time handler, not the parallel join. The rule is the same: an
+// optional seat's failure is recorded against that seat, the round stays open
+// for the required members, and the fix runs from what they recorded.
+
+// optionalSequentialPanel is the three-member panel with the named member marked
+// optional, expanded for the sequential handler.
+func optionalSequentialPanel(optional string) []config.ReviewPanelMember {
+	members := panelMembers()
+	for i := range members {
+		members[i].Optional = members[i].Name == optional
+	}
+	return members
+}
+
+// TestDrainPhases_SequentialPanelOptionalSeatFailuresStillRunTheFix covers the
+// three endings an optional seat can produce on the sequential path: a transient
+// blip mid-panel, a rolling usage limit as the panel's last member, and a hard
+// credit stop as the panel's last member. In every case the required members'
+// records close the round and the fix runs; the INCOMPLETE line marks the seat
+// "(optional)".
+func TestDrainPhases_SequentialPanelOptionalSeatFailuresStillRunTheFix(t *testing.T) {
+	cases := []struct {
+		name     string
+		optional string
+		fail     harness.Result
+		reason   string
+		// failAt is the invocation index of the failing member's session.
+		failAt int
+	}{
+		{
+			name:     "mid-panel optional seat hits a transient",
+			optional: "review-2",
+			fail:     transientResult(),
+			reason:   "ended on a transient failure before recording",
+			failAt:   2,
+		},
+		{
+			name:     "last optional seat hits a rolling usage limit",
+			optional: "review-3",
+			fail:     limitResult(),
+			reason:   "hit a usage limit before recording",
+			failAt:   3,
+		},
+		{
+			name:     "last optional seat hits a hard usage stop",
+			optional: "review-3",
+			fail:     limitStopResult(),
+			reason:   "stopped on a usage limit (no reset to wait for) before recording",
+			failAt:   3,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+			h := &fakeAdapter{steps: []invokeStep{
+				{res: checkpointed(10, 0.10)}, // implement
+				{res: checkpointed(5, 0.50)},  // review-1 records
+				{res: checkpointed(5, 0.50)},  // review-2 records (or fails)
+				{res: checkpointed(5, 0.50)},  // review-3 records (or fails)
+				{res: checkpointed(5, 0.05)},  // fix
+			}}
+			h.steps[tc.failAt] = invokeStep{res: held(tc.fail, openClaim())}
+			var handbacksAtFix []int
+			h.onInvoke = func(i int) {
+				switch i {
+				case 1, 2, 3:
+					role := "review-" + strconv.Itoa(i)
+					if role != tc.optional || i != tc.failAt {
+						rel.records = append(rel.records, plane.ReviewRecordState{
+							Round: 1, ReviewerRole: role, RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+							Findings: []plane.ReviewFindingState{mustFinding("1."+role+".1", "open", "a defect only "+role+" saw")},
+						})
+					}
+				case 4:
+					rel.mu.Lock()
+					handbacksAtFix = append(handbacksAtFix, len(rel.calls)+len(rel.expireCalls))
+					rel.mu.Unlock()
+					rel.status = "in_review"
+					rel.outcome += "\n### Fixes\n- done\n"
+				}
+			}
+			d, _ := panelDriverWithFleet(t, h, rel, optionalSequentialPanel(tc.optional), panelPhases())
+			d.cfg.ReviewPanelConcurrency = 1
+			logs := captureLogs(t)
+
+			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+				t.Fatalf("drainPhases: err=%v stop=%v — an optional seat's failure must not end the run", err, stop)
+			}
+			if h.invokeCalls != 5 {
+				t.Fatalf("spawned %d sessions, want 5 — implement, three members, fix", h.invokeCalls)
+			}
+			if len(handbacksAtFix) != 1 || handbacksAtFix[0] != 0 {
+				t.Errorf("claim handbacks at the fix boundary = %v, want [0] — the optional seat must not hand the shared claim back", handbacksAtFix)
+			}
+			if len(rel.closes) != 1 || rel.closes[0] != 1 {
+				t.Errorf("closed rounds = %v, want exactly [1] — the required members' round closes before the fix", rel.closes)
+			}
+			if p := h.invocations[4].Prompt; !strings.Contains(p, "INCOMPLETE") || !strings.Contains(p, tc.optional) {
+				t.Errorf("the fix brief does not name the failed optional seat as INCOMPLETE:\n%s", p)
+			}
+			if out := logs.String(); !strings.Contains(out, tc.optional+" (optional): "+tc.reason) {
+				t.Errorf("the INCOMPLETE line does not mark %s optional with its reason %q:\n%s", tc.optional, tc.reason, out)
+			}
+		})
+	}
+}
+
+// TestDrainPhases_SequentialPanelOnlyOptionalSeatRecordedSpawnsNoFix: the
+// required members fail, the optional seat records, and the round is no review.
+// Left sealed, no fix, exactly as a panel where nobody recorded.
+func TestDrainPhases_SequentialPanelOnlyOptionalSeatRecordedSpawnsNoFix(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: nonRetryableResult()},   // review-1 (required) fails
+		{res: nonRetryableResult()},   // review-2 (required) fails
+		{res: checkpointed(5, 0.50)},  // review-3 (optional) records
+	}}
+	h.onInvoke = func(i int) {
+		if i == 3 {
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-3", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-3.1", "open", "only the trial seat saw this")},
+			})
+		}
+	}
+	d, _ := panelDriverWithFleet(t, h, rel, optionalSequentialPanel("review-3"), panelPhases())
+	d.cfg.ReviewPanelConcurrency = 1
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — no fix may run when only the optional seat recorded", h.invokeCalls)
+	}
+	if len(rel.closes) != 0 {
+		t.Errorf("closed rounds = %v, want none — the optional seat's record is not a review", rel.closes)
+	}
+	if len(rel.records) != 1 || rel.records[0].State != "sealed" {
+		t.Errorf("records = %+v, want the optional seat's one, left sealed with the round", rel.records)
+	}
+	if out := logs.String(); !strings.Contains(out, "no REQUIRED member of the review panel recorded") {
+		t.Errorf("the daemon log does not say why no fix spawned:\n%s", out)
+	}
+}
+
+// TestDrainPhases_SequentialPanelOptionalSeatSetupFailureLeavesTheSharedClaim:
+// an optional seat whose pre-spawn baseline read cannot be made is a setup
+// error — one of the endings the task names. It must be recorded against that
+// seat and the panel must carry on, NOT hand the shared claim back (which on
+// this path would end the run its required siblings are still recording under).
+func TestDrainPhases_SequentialPanelOptionalSeatSetupFailureLeavesTheSharedClaim(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review-1 records
+		// review-2 (optional) is refused before it spawns: no invocation.
+		{res: checkpointed(5, 0.50)}, // review-3 records
+		{res: checkpointed(5, 0.05)}, // fix
+	}}
+	// The optional seat is the SECOND member. The first two TaskState reads are
+	// required review-1's baseline and record match; the next three are the
+	// optional seat's baseline attempts (readReviewBaseline retries
+	// planeSeamReadAttempts times). Failing exactly those refuses the optional
+	// seat before it spawns and leaves every other read healthy.
+	reads := 0
+	rel.readErr = func() error {
+		reads++
+		if reads >= 3 && reads <= 2+planeSeamReadAttempts {
+			return errors.New("plane down")
+		}
+		return nil
+	}
+	var handbacksAtFix []int
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "the seam is untested")},
+			})
+		case 2:
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: "review-3", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1.review-3.1", "open", "the retry path bypasses the guard")},
+			})
+		case 3:
+			rel.mu.Lock()
+			handbacksAtFix = append(handbacksAtFix, len(rel.calls)+len(rel.expireCalls))
+			rel.mu.Unlock()
+			rel.status = "in_review"
+			rel.outcome += "\n### Fixes\n- done\n"
+		}
+	}
+	d, _ := panelDriverWithFleet(t, h, rel, optionalSequentialPanel("review-2"), panelPhases())
+	d.cfg.ReviewPanelConcurrency = 1
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — an optional seat's setup failure must not end the run", err, stop)
+	}
+	if h.invokeCalls != 4 {
+		t.Fatalf("spawned %d sessions, want 4 — implement, review-1, review-3, fix; the optional seat never launched", h.invokeCalls)
+	}
+	if len(handbacksAtFix) != 1 || handbacksAtFix[0] != 0 {
+		t.Errorf("claim handbacks at the fix boundary = %v, want [0] — the optional seat must not hand the shared claim back", handbacksAtFix)
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Errorf("closed rounds = %v, want exactly [1]", rel.closes)
+	}
+	if p := h.invocations[3].Prompt; !strings.Contains(p, "INCOMPLETE") || !strings.Contains(p, "review-2") {
+		t.Errorf("the fix brief does not name the failed optional seat as INCOMPLETE:\n%s", p)
+	}
+	if out := logs.String(); !strings.Contains(out, "review-2 (optional): the task's outcome could not be read") {
+		t.Errorf("the INCOMPLETE line does not mark the seat optional with its setup reason:\n%s", out)
+	}
+}

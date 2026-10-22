@@ -4349,6 +4349,24 @@ func (c *Config) Validate() error {
 		}
 	}
 	panel := c.EffectivePanel()
+	// CLA-784: an OPTIONAL member is a TRIAL seat — a reviewer the operator is
+	// evaluating, whose failure is recorded against that seat and never blocks
+	// the fix. A panel made ONLY of optional seats therefore has no reviewer a
+	// round could ever be said to have produced: every task would run the
+	// members, take whatever they wrote as nobody's review, and spawn no fix.
+	// Refused at the door rather than discovered from a log line.
+	if len(panel) > 0 {
+		required := 0
+		for _, m := range panel {
+			if !m.Optional {
+				required++
+			}
+		}
+		if required == 0 {
+			return fmt.Errorf("review_panel has %d members and ALL are optional: an `optional` member is a TRIAL reviewer whose failure is recorded against that seat and never blocks the fix, so a panel with no required member has no review to produce — leave at least one member without `optional` (required is the default), or remove `review_panel`",
+				len(panel))
+		}
+	}
 	labels := map[string]int{}
 	for i, m := range panel {
 		label := PanelMemberLabel(panel, i)

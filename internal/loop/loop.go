@@ -1295,11 +1295,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		panelIncomplete []string
 		panelRound      int
 	)
-	// CLA-639 M4: whether ANY member of this panel recorded, and why each member
-	// that did NOT failed. The first decides whether a failed LAST member hands
-	// the round to the fix phase (there is something to apply) or ends the drain;
-	// the second rides the fix brief, so "the panel was incomplete" names the
-	// members AND what happened to them.
+	// CLA-639 M4: whether any REQUIRED member of this panel recorded, and why
+	// each member that did NOT failed. The first decides whether a failed LAST
+	// member hands the round to the fix phase (there is something to apply) or
+	// ends the drain; the second rides the fix brief, so "the panel was
+	// incomplete" names the members AND what happened to them.
+	//
+	// CLA-784: an OPTIONAL (trial) seat's record deliberately does NOT set this.
+	// A round where only optional seats recorded is no review at all — there is
+	// no required member's findings for a fix to work — and is treated exactly
+	// as a panel where nobody recorded.
 	panelRecorded := false
 	panelFailed := map[string]string{}
 	// CLA-639 M5: the branchless-panel skip says its piece once, not once per
@@ -1711,7 +1716,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			start:  prior.start,
 			tokens: prior.tokens + tokens,
 			cost:   prior.cost + cost,
-		}, phases, panelState{round: panelRound, failed: panelFailed}, phaseRunOpts{})
+		}, phases, panelState{round: panelRound, failed: panelFailed, recorded: panelRecorded}, phaseRunOpts{})
 		tokens += ptokens
 		cost += pcost
 		// CLA-630: one entry per session this pass spawned, in spawn order. nil
@@ -1920,6 +1925,13 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				if seqEnd == nil {
 					return
 				}
+				// CLA-784: an OPTIONAL seat's end is that seat's own result. It
+				// may not end the sequence with a run-level wait; the panel
+				// carries on, and the fix spawns from the required members'
+				// records exactly as for any incomplete panel.
+				if end.panelOptional {
+					return
+				}
 				limitWait = seqEnd.limitWait
 				if limitWait == nil {
 					transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
@@ -1930,6 +1942,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// The member recorded, so its failure streak is over (CLA-639
 				// M4): the next failure, if any, is not consecutive with the last.
 				d.panelMemberRecorded(member)
+				// CLA-784: only a REQUIRED member's record is a review. An
+				// optional (trial) seat's record is that seat's result — it counts
+				// toward its own assessment, but a round where only optional
+				// seats recorded is no review at all (see the panel-last check
+				// below).
+				if !end.panelOptional {
+					panelRecorded = true
+				}
 			}
 			// A round that could not be closed is the single-review seam's
 			// fail-closed shape, for the panel: the member recorded, but the fix
@@ -1965,7 +1985,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				case reason == "":
 					reason = "recorded no durable review record"
 				}
-				panelIncomplete = append(panelIncomplete, role+": "+reason)
+				panelIncomplete = append(panelIncomplete, panelIncompleteRole(role, end.panelOptional)+": "+reason)
 				panelFailed[role] = reason
 				log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed", labelOf(t), drainNum, member, reason)
 				// CLA-639 M4: the member is a failure the operator has to be able
@@ -2011,7 +2031,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// Release what the earlier members wrote rather than leave it
 				// sealed behind a lease that will lapse — BEFORE any handback,
 				// because the close is legal only while we are still the holder.
-				if panelRound > 0 && live {
+				if panelRecorded && panelRound > 0 && live {
 					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
 						log.Printf("%siteration %d: the panel's round %d could not be closed after %s failed (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
 							labelOf(t), drainNum, panelRound, member, cerr)
@@ -2040,7 +2060,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				}
 				break
 			}
-			panelRecorded = true
+			// CLA-784: a panel where ONLY optional seats recorded has no review
+			// to apply — an optional seat's record is that seat's result, not a
+			// review the fix was waiting for. Treat it exactly as a panel where
+			// nobody recorded: leave the round sealed (no close) and spawn no
+			// fix. Reached only at the panel's LAST member; an earlier optional
+			// seat's record is kept while a required member may still record.
+			if end.panelLast && !panelRecorded {
+				log.Printf("%siteration %d: no REQUIRED member of the review panel recorded — the round is not closed and no fix spawns", labelOf(t), drainNum)
+				break
+			}
 			// This member recorded. A recorded mid-panel member whose session was
 			// then turned away by a run-level limit or transient failure continues
 			// the panel exactly as a failed one does: its deliverable is in the
@@ -2066,7 +2095,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// sequence-end is then read by the arm below. A second close is
 				// the plane's no_open_round, and failing closed on it would skip
 				// the fix against a round that is already released.
-				if live && panelRound > 0 && !end.reviewRecorded {
+				if live && panelRecorded && panelRound > 0 && !end.reviewRecorded {
 					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
 						log.Printf("%siteration %d: the panel's round %d could not be closed after %s recorded but ended the sequence (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
 							labelOf(t), drainNum, panelRound, member, cerr)
@@ -2499,6 +2528,13 @@ type panelState struct {
 	// brief names the incomplete members AND what happened to them, not only
 	// that the list is short.
 	failed map[string]string
+	// recorded reports that a REQUIRED member has already recorded in this
+	// panel (CLA-784). The last panel member's seam closes the round; an
+	// OPTIONAL seat may only trigger that close when a required member has
+	// actually recorded, because a round where only trial seats recorded is no
+	// review at all and must stay sealed — the same path as a panel where none
+	// recorded.
+	recorded bool
 }
 
 // phaseEnd is how a phase reports what it left behind, so drainPhases can decide
@@ -2606,6 +2642,12 @@ type phaseEnd struct {
 	// a lone review phase, whose failure keeps the shipped fail-closed ending.
 	panelMember bool
 	panelLast   bool
+	// panelOptional reports that this member is an OPTIONAL (trial) seat of the
+	// review panel (CLA-784). Its failure is recorded against the member and
+	// nothing more: drainPhases must not end the sequence, hand the shared claim
+	// back, or take a run-level wait for it. False for every phase that is not a
+	// panel member and for a required member.
+	panelOptional bool
 	// reviewRecorded reports that this pass's review seam gate PASSED — the
 	// member left a durable record behind. It is what the panel handler's
 	// "recorded or been recorded as failed" decision reads.
@@ -4322,6 +4364,13 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// recorded as failed and the round still closes — while a lone review phase
 	// is the sequence's only record and keeps the shipped fail-closed path.
 	panelMember := captured.IsPanelMember()
+	// CLA-784: an OPTIONAL member is a trial seat. Its end is recorded against
+	// that seat and nothing more: it may not end the sequence, hand the panel's
+	// shared claim back, or stop the run. The member handler below reads this
+	// flag instead of the member's end shape, so every end the task names
+	// (transient, usage limit, hard stop, death, tool-loop kill, setup error) is
+	// covered by one branch rather than a list that can rot.
+	panelOptional := captured.IsOptionalPanelMember()
 	panelLast := false
 	// A BRANCHLESS checkpoint runs exactly ONE reviewer: the record this shape
 	// can write is the legacy `## Review` block, not a durable one, so
@@ -4353,6 +4402,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// session records under exactly the role the seam will match.
 	review := reviewGate{required: requireReviewRecord}
 	end.panelMember = panelMember
+	end.panelOptional = panelOptional
 	end.panelLast = panelLast
 	if review.required {
 		review.role = reviewerRoleFor(phases, phaseIdx)
@@ -4360,7 +4410,8 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		if !review.read {
 			end.empty = true
 			end.emptyWhy = "the task's outcome could not be read before the review phase spawned"
-			if opts.panelParallel {
+			switch {
+			case opts.panelParallel:
 				// CLA-697 review finding 1.review-3.1: this claim is the ONE the
 				// whole panel is working under. Releasing it here would expire a
 				// lease the other members' in-flight sessions are still appending
@@ -4371,13 +4422,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				// member has ended.
 				log.Printf("%siteration %d: refusing to spawn the %s phase: the task could not be read before it spawned, so this phase's record cannot be judged against the task it found — the sequence ends here without the review; this member leaves the SHARED claim to the panel's join, because a release here would expire the lease its siblings are still recording under",
 					labelOf(t), drainNum, ph.Label(phaseIdx))
-			} else {
+			case panelOptional:
+				// CLA-784: an OPTIONAL seat's setup failure is that seat's own
+				// result. Handing the shared claim back here would end the run
+				// its required siblings are still recording under, which is
+				// exactly what a trial seat must never do.
+				log.Printf("%siteration %d: refusing to spawn the OPTIONAL %s seat: the task could not be read before it spawned — recording the seat as failed and leaving the SHARED claim to the panel, because a release here would hand back the run its required siblings are still recording under",
+					labelOf(t), drainNum, ph.Label(phaseIdx))
+			default:
 				log.Printf("%siteration %d: refusing to spawn the %s phase: the task could not be read before it spawned, so this phase's record cannot be judged against the task it found — the sequence ends here without the review; the claim is released when it is releasable, else left to lapse into a takeover",
 					labelOf(t), drainNum, ph.Label(phaseIdx))
 			}
 			if prev != nil {
 				end.claim = prev
-				if !opts.panelParallel {
+				if !opts.panelParallel && !panelOptional {
 					end.released = prev.Claim.Held()
 					end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
 				}
@@ -4874,6 +4932,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// ph.Prompt, never its identity), so a skipped member is recorded against
 		// the reviewer that was meant to run.
 		end.panelMember = panelMember
+		end.panelOptional = panelOptional
 		end.panelLast = panelLast
 		if res.Claim.TaskID != "" {
 			end.claim = &res
@@ -5057,7 +5116,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			// is what releases them all to the fix phase, and it happens in the
 			// SAME condition below because nextReviewShaped is false only for
 			// the last member (the panel's last phase, when no fix follows).
-			if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && handoff == "" && !nextReviewShaped && !opts.panelParallel {
+			// CLA-784: an OPTIONAL seat's record alone must not release the
+			// round. If no required member has recorded, this trial seat's
+			// record is kept sealed — the panel is treated as one where nobody
+			// recorded, so no fix runs against a round that is no review.
+			optionalOnly := panelOptional && !panel.recorded
+			if evidenceOK && review.required && review.round > 0 && review.state == "sealed" && handoff == "" && !nextReviewShaped && !opts.panelParallel && !optionalOnly {
 				if cerr := d.closeReviewRound(ctx, t, res, review.round); cerr != nil {
 					evidenceOK = false
 					end.reviewCloseFailed = true
@@ -5483,6 +5547,20 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// they've topped up.
 		if lim := a.DetectLimit(res); lim.Limited {
 			if lim.Stop {
+				// CLA-784: an OPTIONAL panel seat is a trial reviewer. A hard
+				// stop on its account is recorded against that seat — never the
+				// run. Today's stop path would end the daemon for a reviewer we
+				// were only evaluating, throwing away the required members' round
+				// with it. The optional member's failure rides the usual
+				// per-member bookkeeping: named INCOMPLETE with this reason, and
+				// the panel moves on.
+				if panelOptional {
+					log.Printf("%siteration %d: the %s member is an OPTIONAL trial seat — its usage stop is recorded against that seat, not the run (log: %s)",
+						labelOf(t), drainNum, ph.Label(phaseIdx), logPath)
+					end.empty = true
+					end.emptyWhy = "stopped on a usage limit (no reset to wait for) before recording"
+					return tokens, cost, false, end, nil
+				}
 				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
 					drainNum, limitReason(lim), logPath)
 				return tokens, cost, true, end, nil

@@ -401,6 +401,21 @@ record from a settled task — so it runs one reviewer, with the brief it would
 have had anyway, and that reviewer is the panel's last: if it records nothing,
 no fix runs.
 
+**A member can be a trial seat.** Writing `"optional": true` on a
+`review_panel` entry marks it as a reviewer being evaluated, not one the panel
+relies on. An optional member runs and records like any other — its record,
+findings and failure all count toward that member's own assessment — but its
+failure is that member's result and nothing more. Whatever its session ends in
+(a transient blip, a usage limit, a credit stop, a death, a tool-loop kill or a
+setup error), it does **not** end the sequence, does not hand the panel's shared
+claim back, and does not stop the run. The required members keep reviewing, the
+round still closes, and the fix runs on what they found; the INCOMPLETE line
+names the optional seat `(optional)` so the two are not confused. A member with
+no `optional` key is **required**, exactly as before. A panel must have at least
+one required member (`Validate` refuses an all-optional panel), and a round in
+which **only** optional seats recorded is no review at all: the round is not
+closed and no fix spawns, exactly as when nobody recorded.
+
 **The driver merges; the fixer never grades reviews.** Every MUST from ANY
 member of the panel's round is open — consensus never filters one out, because a
 blocker one reviewer found and another missed is exactly the case the panel
