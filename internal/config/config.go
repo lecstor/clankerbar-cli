@@ -303,6 +303,13 @@ type Phase struct {
 	// not mistake for one. Read through Phase.IsPanelMember.
 	PanelMember bool `json:"-"`
 
+	// PanelOptional marks this panel member as a TRIAL seat (CLA-784): the
+	// operator's ReviewPanelMember.Optional, carried onto the expanded phase so
+	// the driver can tell a seat the panel relies on from one it is evaluating.
+	// Like PanelMember it is set by EffectivePhases and NOT a config key, so it
+	// is invisible to Config.Identity(). Read through Phase.IsOptionalPanelMember.
+	PanelOptional bool `json:"-"`
+
 	// sourceIdx is the index in Config.Phases this phase was resolved from. It
 	// equals the position for every phase except an expanded panel member, whose
 	// source is the single `review` the operator wrote. Read through
@@ -351,6 +358,25 @@ type ReviewPanelMember struct {
 	// operator who keeps policy in buckets. Model wins when both are set: an
 	// alias is the more specific statement.
 	Tier string `json:"tier"`
+
+	// Optional marks a TRIAL seat: a reviewer the operator added to evaluate,
+	// not one the panel relies on (CLA-784). An optional member runs and records
+	// exactly like any other, but its failure is that member's own result and
+	// nothing more: whatever its session ends in — a transient blip, a usage
+	// limit, a stop, a death, a tool-loop kill, a setup error — it does not end
+	// the sequence, does not hand the panel's shared claim back, and does not
+	// trigger the run's limit wait. The required members' records still close the
+	// round and spawn the fix; a round where ONLY optional members recorded is no
+	// review at all, and no fix runs.
+	//
+	// Default false, and `omitempty` is load-bearing: Config.Identity() hashes the
+	// marshalled form, so a panel that does not write the key must hash exactly
+	// what it hashed before the field existed (a trial seat is a deliberate
+	// change to the panel, and the identity moving with it is correct).
+	//
+	// Validate refuses a panel whose members are ALL optional: with no required
+	// seat there is no review a round could ever be said to have produced.
+	Optional bool `json:"optional,omitempty"`
 }
 
 // HarnessConfig is one harness's own invocation fields, for a run whose phases
@@ -3146,6 +3172,7 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 	ph := p
 	ph.Name = PanelMemberLabel(panel, i)
 	ph.PanelMember = true
+	ph.PanelOptional = m.Optional
 	if h := strings.TrimSpace(m.Harness); h != "" {
 		ph.Harness = h
 	}
@@ -3174,6 +3201,12 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 // `review` the operator wrote. The driver reads it to tell a panel member that
 // may be skipped from a review phase whose record is the sequence's only gate.
 func (p Phase) IsPanelMember() bool { return p.PanelMember }
+
+// IsOptionalPanelMember reports whether this phase is a TRIAL seat of an
+// expanded review panel (CLA-784): a reviewer whose failure is recorded against
+// that member alone and never ends the sequence, hands back the panel's shared
+// claim, or blocks the fix. False for every phase that is not a panel member.
+func (p Phase) IsOptionalPanelMember() bool { return p.PanelMember && p.PanelOptional }
 
 // EffectivePhases is the sequence a task runs as: the configured phases with
 // their built-in prompts resolved and the review panel expanded, or — when none
@@ -4316,6 +4349,24 @@ func (c *Config) Validate() error {
 		}
 	}
 	panel := c.EffectivePanel()
+	// CLA-784: an OPTIONAL member is a TRIAL seat — a reviewer the operator is
+	// evaluating, whose failure is recorded against that seat and never blocks
+	// the fix. A panel made ONLY of optional seats therefore has no reviewer a
+	// round could ever be said to have produced: every task would run the
+	// members, take whatever they wrote as nobody's review, and spawn no fix.
+	// Refused at the door rather than discovered from a log line.
+	if len(panel) > 0 {
+		required := 0
+		for _, m := range panel {
+			if !m.Optional {
+				required++
+			}
+		}
+		if required == 0 {
+			return fmt.Errorf("review_panel has %d members and ALL are optional: an `optional` member is a TRIAL reviewer whose failure is recorded against that seat and never blocks the fix, so a panel with no required member has no review to produce — leave at least one member without `optional` (required is the default), or remove `review_panel`",
+				len(panel))
+		}
+	}
 	labels := map[string]int{}
 	for i, m := range panel {
 		label := PanelMemberLabel(panel, i)
