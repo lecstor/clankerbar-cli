@@ -805,6 +805,13 @@ func TestReviewPanel_OptionalKeepsTheConfigIdentity(t *testing.T) {
 	explicitFalse := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a", "optional": false}`, 1))
 	withOptional := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a"}, {"model": "b", "optional": true}`, 1))
 
+	// Computed from this exact literal at 5fc5ee1, BEFORE the field existed. A
+	// config that never writes `optional` must hash exactly what it hashed then;
+	// otherwise every existing panel's identity moves on upgrade.
+	const preOptionalPanelIdentity = "5714a6038b8f7c8f71591da2e3f88f326fc3ddce8cbb9797b31f0e8fe128087f"
+	if got := plain.Identity(); got != preOptionalPanelIdentity {
+		t.Errorf("Identity() = %s, want the pre-optional identity %s", got, preOptionalPanelIdentity)
+	}
 	if got, want := plain.Identity(), explicitFalse.Identity(); got != want {
 		t.Errorf("an explicit `optional: false` changed the config identity: %s != %s — omitempty must keep the default out of the marshalled form", got, want)
 	}

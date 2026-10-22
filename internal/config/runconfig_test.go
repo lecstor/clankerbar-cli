@@ -814,3 +814,76 @@ func TestRunConfigDocument_RefusesAPanelThePlaneCannotRatify(t *testing.T) {
 		t.Errorf("the expandable panel was omitted from the document: %v", rendered)
 	}
 }
+
+// TestReviewPanelOptionalSurvivesTheStoredPipeline (CLA-784): the stored
+// execution-config document carries the pipeline's `review_panel`, so a trial
+// seat must survive the overlay in BOTH directions. Were `optional` dropped on
+// apply, every machine reading that pipeline would silently promote the seat to
+// a required reviewer — the opposite of what the operator stored.
+func TestReviewPanelOptionalSurvivesTheStoredPipeline(t *testing.T) {
+	doc := &RunConfigDoc{
+		SchemaVersion: 1,
+		Phases: []RunConfigPhase{
+			{Name: "implement"},
+			{Name: "review"},
+			{Name: "fix"},
+		},
+		ReviewPanel: []RunConfigPanelMember{
+			{Model: "opencode-go/gpt-6-luna"},
+			{Model: "opencode-go/glm-5.3-flash", Optional: true},
+		},
+	}
+	base := pipelineBase()
+	if err := base.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("the overlaid pipeline must validate: %v", err)
+	}
+	if len(base.ReviewPanel) != 2 {
+		t.Fatalf("review panel = %+v, want the stored 2 members", base.ReviewPanel)
+	}
+	if base.ReviewPanel[0].Optional {
+		t.Error("the required member was promoted to optional by the overlay")
+	}
+	if !base.ReviewPanel[1].Optional {
+		t.Error("the stored trial seat lost `optional` on apply — a plane-side trial seat would silently become required")
+	}
+	// And the effective phase the driver reads carries it.
+	members := base.EffectivePhases()
+	if len(members) != 4 {
+		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(members))
+	}
+	if members[1].IsOptionalPanelMember() {
+		t.Error("the required member's expanded phase is marked optional")
+	}
+	if !members[2].IsOptionalPanelMember() {
+		t.Error("the stored trial seat is not marked optional on its expanded phase")
+	}
+
+	// The render direction: propose-config must hand the trial seat back to the
+	// plane, or the next ratification turns it required.
+	rendered, err := base.RunConfigDocument()
+	if err != nil {
+		t.Fatalf("RunConfigDocument: %v", err)
+	}
+	data, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw struct {
+		ReviewPanel []map[string]json.RawMessage `json:"review_panel"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v (%s)", err, data)
+	}
+	if len(raw.ReviewPanel) != 2 {
+		t.Fatalf("rendered review_panel = %d members, want 2 (%s)", len(raw.ReviewPanel), data)
+	}
+	if _, ok := raw.ReviewPanel[0]["optional"]; ok {
+		t.Errorf("the required member rendered an `optional` key: %s", data)
+	}
+	if _, ok := raw.ReviewPanel[1]["optional"]; !ok {
+		t.Errorf("the trial seat did not render `optional`, so the stored document loses it: %s", data)
+	}
+}

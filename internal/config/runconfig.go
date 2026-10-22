@@ -92,11 +92,16 @@ type RunConfigPhase struct {
 // ReviewPanelMember. A member may set both `model` and `tier` (the alias wins
 // on expansion), exactly as in the local file — the one-model rule applies to a
 // configured PHASE, not to a member.
+//
+// Optional travels with the member (CLA-784): a trial seat configured in the
+// stored document must stay a trial seat when the overlay applies it, or every
+// fleet applying that pipeline would silently promote it to a required reviewer.
 type RunConfigPanelMember struct {
-	Name    string `json:"name"`
-	Harness string `json:"harness"`
-	Model   string `json:"model"`
-	Tier    string `json:"tier"`
+	Name     string `json:"name"`
+	Harness  string `json:"harness"`
+	Model    string `json:"model"`
+	Tier     string `json:"tier"`
+	Optional bool   `json:"optional,omitempty"`
 }
 
 // RunConfigDoc mirrors the plane's stored execution-config document — only the
@@ -327,7 +332,7 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		} else {
 			panel := make([]ReviewPanelMember, len(doc.ReviewPanel))
 			for i, m := range doc.ReviewPanel {
-				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: m.Model, Tier: m.Tier}
+				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: m.Model, Tier: m.Tier, Optional: m.Optional}
 			}
 			c.ReviewPanel = panel
 		}
@@ -594,6 +599,9 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			}
 			if m.Tier != "" {
 				entry["tier"] = m.Tier
+			}
+			if m.Optional {
+				entry["optional"] = true
 			}
 			panel[i] = entry
 		}
