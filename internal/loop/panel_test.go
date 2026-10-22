@@ -622,13 +622,26 @@ func TestMergedFindingsDigest(t *testing.T) {
 
 	// A member with no record is named incomplete, so the fixer knows the list
 	// is the union of the reviewers that RAN — and with its reason, when the
-	// panel handler has one (M4).
-	got = mergedFindingsDigest(records, []string{"review-1", "review-2", "review-3"}, 1, map[string]string{"review-3": "hit a usage limit before recording"})
+	// panel handler has one (M4). A TRIAL seat carries its `(optional)` marker
+	// into BOTH the sentence and the per-member line, exactly as the daemon log
+	// does (CLA-784 review 1.review-1.2 / 1.review-3.1).
+	got = mergedFindingsDigest(records, []string{"review-1", "review-2", "review-3"}, 1, map[string]panelMemberFailure{
+		"review-3": {reason: "hit a usage limit before recording"},
+	})
 	if !strings.Contains(got, "INCOMPLETE") || !strings.Contains(got, "review-3") {
 		t.Errorf("the missing member is not named:\n%s", got)
 	}
 	if !strings.Contains(got, "review-3: hit a usage limit before recording") {
 		t.Errorf("the missing member's reason is not carried to the fixer:\n%s", got)
+	}
+	got = mergedFindingsDigest(records, []string{"review-1", "review-2", "review-3"}, 1, map[string]panelMemberFailure{
+		"review-3": {reason: "ended on a transient failure before recording", optional: true},
+	})
+	if !strings.Contains(got, "INCOMPLETE: review-3 (optional) recorded no review") {
+		t.Errorf("the INCOMPLETE sentence does not mark the trial seat `(optional)`:\n%s", got)
+	}
+	if !strings.Contains(got, "- review-3 (optional): ended on a transient failure before recording") {
+		t.Errorf("the per-member line does not mark the trial seat `(optional)`:\n%s", got)
 	}
 
 	// A sealed record contributes no FINDING: the merge reads only what the
@@ -859,6 +872,57 @@ func TestDrainPhases_ReviewPanelOnABranchlessTaskRunsOneReviewer(t *testing.T) {
 	out := logs.String()
 	if !strings.Contains(out, "BRANCHLESS") || !strings.Contains(out, "runs ONE reviewer") {
 		t.Errorf("the driver did not say the branchless panel runs one reviewer:\n%s", out)
+	}
+}
+
+// TestDrainPhases_BranchlessPanelChoosesARequiredSeatOverTheTrialSeat (CLA-784
+// review 1.review-2.1 / 1.review-4.1): a branchless checkpoint runs ONE
+// reviewer, and that seat must be a REQUIRED one. With the trial seat FIRST in
+// the panel — the shape the round-1 finding names — the old "keep only the first
+// configured member" rule spent the single review slot on the optional seat; if
+// it failed, no required reviewer ever ran and no fix could spawn. The trial
+// seat must be skipped so the required seat records and the fix runs.
+func TestDrainPhases_BranchlessPanelChoosesARequiredSeatOverTheTrialSeat(t *testing.T) {
+	settled := plane.TaskState{Status: "in_review", Outcome: "no-code delivery: the task body was updated\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(okResult(1, 0), openClaim())}, // implement: no branch, the plane's record is the evidence
+		{res: held(okResult(1, 0), openClaim())}, // review-2 (REQUIRED): appends its block and holds
+		{res: okResult(1, 0)},                    // the fix
+	}}
+	rel := &peekReleaser{state: map[string]plane.TaskState{"t-1": settled}}
+	h.onInvoke = func(i int) {
+		if i == 1 { // the REQUIRED seat's invocation: it writes the legacy block
+			st := rel.state["t-1"]
+			st.Outcome += "\n" + config.ReviewRecordHeading + "\n- reviewed tip: none (no branch - the plane record was reviewed)\n- verdict: pass\n"
+			rel.state["t-1"] = st
+		}
+	}
+	members := []config.ReviewPanelMember{
+		{Name: "review-1", Harness: "opencode", Model: "opencode-go/gpt-6-luna", Optional: true},
+		{Name: "review-2", Harness: "opencode", Model: "opencode-go/glm-5.3-flash"},
+	}
+	d := panelDriver(t, h, rel, members, panelPhases())
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	// implement, the REQUIRED reviewer, the fix.
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — the branchless panel must spend its ONE review slot on a required seat, not the trial seat", h.invokeCalls)
+	}
+	if out := logs.String(); !strings.Contains(out, "phase=review-2") || strings.Contains(out, "phase=review-1") {
+		t.Errorf("the branchless panel did not run the REQUIRED seat (review-2) as its one reviewer:\n%s", out)
+	}
+	if !strings.Contains(h.invocations[1].Prompt, "There is NO branch, because this task's correct delivery is no code") {
+		t.Errorf("the branchless reviewer did not get today's branchless brief:\n%s", h.invocations[1].Prompt)
+	}
+	if strings.Contains(h.invocations[1].Prompt, "ONE MEMBER of a review PANEL") {
+		t.Errorf("the branchless reviewer got the panel's durable-record brief, whose record this shape cannot write:\n%s", h.invocations[1].Prompt)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "OPTIONAL (trial) seat review-1") || !strings.Contains(out, "skipping") {
+		t.Errorf("the driver did not say it skipped the trial seat on a branchless panel:\n%s", out)
 	}
 }
 
@@ -1900,10 +1964,72 @@ func TestDrainPhases_SequentialPanelOptionalSeatFailuresStillRunTheFix(t *testin
 			if p := h.invocations[4].Prompt; !strings.Contains(p, "INCOMPLETE") || !strings.Contains(p, tc.optional) {
 				t.Errorf("the fix brief does not name the failed optional seat as INCOMPLETE:\n%s", p)
 			}
+			// CLA-784 review 1.review-1.2 / 1.review-3.1: the FIX BRIEF — the surface the
+			// fixer actually reads — carries the same `(optional)` marker as the
+			// daemon log, in the INCOMPLETE sentence and in the per-member line,
+			// so a failed trial seat cannot read as a lost required reviewer.
+			if p := h.invocations[4].Prompt; !strings.Contains(p, "INCOMPLETE: "+tc.optional+" (optional)") {
+				t.Errorf("the fix brief's INCOMPLETE sentence does not mark %s optional:\n%s", tc.optional, p)
+			}
+			if p := h.invocations[4].Prompt; !strings.Contains(p, "- "+tc.optional+" (optional): "+tc.reason) {
+				t.Errorf("the fix brief's per-member line does not mark %s optional with its reason %q:\n%s", tc.optional, tc.reason, p)
+			}
 			if out := logs.String(); !strings.Contains(out, tc.optional+" (optional): "+tc.reason) {
 				t.Errorf("the INCOMPLETE line does not mark %s optional with its reason %q:\n%s", tc.optional, tc.reason, out)
 			}
 		})
+	}
+}
+
+// TestDrainPhases_SequentialPanelOptionalSeatInvocationErrorIsThatSeatsResult
+// (CLA-784 review 1.review-1.4): a harness ERROR — not an exit status — on a
+// trial seat is that seat's result, exactly as the parallel join's
+// `!m.optional` guard makes it. The seat here RECORDS and then the invocation
+// fails, which is the only sequential shape that reaches the generic error
+// break: the required members' round must still close and the fix must spawn.
+func TestDrainPhases_SequentialPanelOptionalSeatInvocationErrorIsThatSeatsResult(t *testing.T) {
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented: pushed the branch\n"}
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)}, // implement
+		{res: checkpointed(5, 0.50)},  // review-1 (required) records
+		{res: checkpointed(5, 0.50)},  // review-2 (required) records
+		// review-3 (optional): records, then its harness call fails. The seam
+		// runs before the error is returned, so the record is matched.
+		{res: checkpointed(5, 0.50), err: errors.New("harness blew up after the record")},
+		{res: checkpointed(5, 0.05)}, // fix
+	}}
+	h.onInvoke = func(i int) {
+		switch i {
+		case 1, 2, 3:
+			role := "review-" + strconv.Itoa(i)
+			rel.records = append(rel.records, plane.ReviewRecordState{
+				Round: 1, ReviewerRole: role, RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+				Findings: []plane.ReviewFindingState{mustFinding("1."+role+".1", "open", "a defect only "+role+" saw")},
+			})
+		case 4:
+			rel.status = "in_review"
+			rel.outcome += "\n### Fixes\n- done\n"
+		}
+	}
+	d := panelDriver(t, h, rel, optionalSequentialPanel("review-3"), panelPhases())
+	d.cfg.ReviewPanelConcurrency = 1
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — an optional seat's invocation error must not end the run", err, stop)
+	}
+	if h.invokeCalls != 5 {
+		t.Fatalf("spawned %d sessions, want 5 — implement, all three members, fix; the trial seat's error ended the sequence", h.invokeCalls)
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Errorf("closed rounds = %v, want exactly [1] — the required members' records still close the round", rel.closes)
+	}
+	if len(rel.records) != 3 {
+		t.Fatalf("durable records = %d, want all three seats' records", len(rel.records))
+	}
+	for _, r := range rel.records {
+		if r.State != "open" {
+			t.Errorf("record %s is %q after the drain, want the round released", r.ReviewerRole, r.State)
+		}
 	}
 }
 

@@ -96,6 +96,11 @@ type panelParallelAdapter struct {
 	// transient, a rolling limit, a hard stop, or a plain no-record success.
 	// Nil keeps the pre-existing shape (okResult with no record).
 	failResult *harness.Result
+	// failErr, when set, is a HARNESS INVOCATION ERROR for the failing
+	// member(s) — not an exit status. It is the one ending the join's
+	// `!m.optional` guard exists for (CLA-784 review 1.review-1.4): a trial
+	// seat's error must be that seat's result, never the drain's.
+	failErr error
 	// failToolLoop, when set, is the cause the failing member's adapter
 	// reports for killing it on a repeated failing tool call (CLA-739),
 	// still holding the claim it resumed.
@@ -266,6 +271,11 @@ func (a *panelParallelAdapter) review(in harness.Invocation) (harness.Result, er
 		a.mu.Unlock()
 		if a.failResult != nil {
 			return *a.failResult, nil
+		}
+		if a.failErr != nil {
+			// A harness invocation error: no Result at all, exactly the shape the
+			// adapter returns when the process could not be run (CLA-299).
+			return harness.Result{}, a.failErr
 		}
 		if a.failToolLoop != "" {
 			res := okResult(1, 0.01)
@@ -861,6 +871,50 @@ func TestDrainPhases_ParallelPanelOptionalSeatFailureNeverEndsTheSequence(t *tes
 			requireOneFleetRecord(t, ff)
 		})
 	}
+}
+
+// TestDrainPhases_ParallelPanelOptionalSeatInvocationErrorNeverEndsTheDrain
+// (CLA-784 review 1.review-1.4) exercises the join's `!m.optional` guard on a
+// member's ERROR — a harness invocation failure, not an exit status, which the
+// existing optional-failure test never scripts. The trial seat's error is that
+// seat's result: the drain does not error, the required members' round still
+// closes, and the fix still spawns.
+func TestDrainPhases_ParallelPanelOptionalSeatInvocationErrorNeverEndsTheDrain(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers()
+	members[len(members)-1].Optional = true
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	a.failLabel = "review-3"
+	a.failErr = errors.New("harness exploded before the session could run")
+	a.wantRecords = len(members) - 1
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — an optional seat's invocation error must not end the run", err, stop)
+	}
+	a.mu.Lock()
+	fixCalls := a.fixCalls
+	fixPrompt := a.fixPrompt
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if fixCalls != 1 {
+		t.Fatalf("fix sessions = %d, want 1 — the required members' round must still reach the fix", fixCalls)
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Errorf("closed rounds = %v, want exactly [1]", rel.closes)
+	}
+	if !strings.Contains(fixPrompt, "INCOMPLETE: review-3 (optional)") {
+		t.Errorf("the fix brief does not mark the failed trial seat `(optional)`:\n%s", fixPrompt)
+	}
+	if out := logs.String(); !strings.Contains(out, "review-3 (optional):") || !strings.Contains(out, "harness exploded before the session could run") {
+		t.Errorf("the daemon log does not name the optional seat's invocation error:\n%s", out)
+	}
+	requireOneFleetRecord(t, ff)
 }
 
 // TestDrainPhases_ParallelPanelRequiredSeatTransientStillEndsTheSequence is the

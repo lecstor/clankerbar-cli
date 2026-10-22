@@ -169,7 +169,7 @@ type panelRunOutcome struct {
 	recorded    bool
 	round       int
 	incomplete  []string
-	failed      map[string]string
+	failed      map[string]panelMemberFailure
 	closeFailed bool
 
 	// limitWait/sequenceEnded carry a member's run-level sequence end (a rolling
@@ -300,7 +300,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		return nil, false
 	}
 
-	out := &panelRunOutcome{failed: map[string]string{}, sequenceEnded: false}
+	out := &panelRunOutcome{failed: map[string]panelMemberFailure{}, sequenceEnded: false}
 	n := end - start
 	out.members = make([]panelMemberOutcome, n)
 	// One presence beacon for the panel, not one per member: beginIteration also
@@ -432,7 +432,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		}
 		reason := panelMemberFailureReason(m)
 		out.incomplete = append(out.incomplete, panelIncompleteRole(m.role, m.optional)+": "+reason)
-		out.failed[m.role] = reason
+		out.failed[m.role] = panelMemberFailure{reason: reason, optional: m.optional}
 		log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed",
 			labelOf(t), drainNum, m.label, reason)
 		if !m.end.deadBooked {

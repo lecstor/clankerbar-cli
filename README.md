@@ -398,8 +398,11 @@ recorded, and the same member recording nothing on successive tasks is said
 loudly, with its harness and model. A **branchless** task cannot run a panel at
 all — its record is the legacy `## Review` block, and the plane takes no durable
 record from a settled task — so it runs one reviewer, with the brief it would
-have had anyway, and that reviewer is the panel's last: if it records nothing,
-no fix runs.
+have had anyway. That one reviewer is the first **required** seat: an optional
+trial seat is skipped there (a trial seat's failure would otherwise consume the
+single review slot and leave the task with no required review at all). It is
+the panel's last in every sense that matters: if it records nothing, no fix
+runs.
 
 **A member can be a trial seat.** Writing `"optional": true` on a
 `review_panel` entry marks it as a reviewer being evaluated, not one the panel
@@ -410,8 +413,9 @@ failure is that member's result and nothing more. Whatever its session ends in
 setup error), it does **not** end the sequence, does not hand the panel's shared
 claim back, and does not stop the run. The required members keep reviewing, the
 round still closes, and the fix runs on what they found; the INCOMPLETE line
-names the optional seat `(optional)` so the two are not confused. A member with
-no `optional` key is **required**, exactly as before. A panel must have at least
+names the optional seat `(optional)` — in the daemon log and in the fix brief
+alike — so the two are not confused. A member with no `optional` key is
+**required**, exactly as before. A panel must have at least
 one required member (`Validate` refuses an all-optional panel), and a round in
 which **only** optional seats recorded is no review at all: the round is not
 closed and no fix spawns, exactly as when nobody recorded.
@@ -2197,6 +2201,17 @@ and model, and the panel's composition are policy, so the run's result is the
 same on every machine, while how many panel seats run at once is how fast that
 machine gets there. The local file's value stays in force whatever the document
 carries.
+
+A panel member's `optional` flag travels with the member when a document is
+**applied**: a stored trial seat stays a trial seat, never silently promoted to
+a required reviewer. It cannot yet be **proposed**: the plane's stored-run-config
+schema refuses `review_panel[].optional` as an unknown panel key, so
+`propose-config` refuses a document whose panel carries a trial seat — rather
+than emitting a key the plane would reject, or dropping it and promoting the
+seat on every machine applying the pipeline. Keep a trial seat local until the
+plane's stored schema learns the key and this build's `$schema_version` moves in
+step; the two sides must land together (the phase-level `model` key needed the
+same lockstep).
 
 Edits apply at the **next iteration boundary**, never mid-session: the daemon
 watches the version on the backlog-summary poll it already makes, and on a bump

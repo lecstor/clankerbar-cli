@@ -387,6 +387,9 @@ func checkConfig(cfg *config.Config) check {
 // exactly as the driver derives the durable record's role). A member's `name` is
 // only its log label, so a named member is printed `review-N (label)` when the
 // two differ; printing the label alone would suggest the record is keyed on it.
+// A TRIAL seat is marked `(optional)`, the same marker the daemon's INCOMPLETE
+// line uses (CLA-784), so the operator's preflight shows which seat is being
+// evaluated and which ones the panel relies on.
 //
 // Empty when no panel is configured or none expands: a config whose review
 // carries its own prompt, an unphased run, or the absent key (the single
@@ -405,6 +408,9 @@ func panelLabels(cfg *config.Config) []string {
 		name := "review-" + strconv.Itoa(role)
 		if label := ph.Label(i); label != name {
 			name += " (" + label + ")"
+		}
+		if ph.IsOptionalPanelMember() {
+			name += " (optional)"
 		}
 		out = append(out, name+" -> "+reviewerHarnessModel(cfg, ph))
 	}

@@ -551,6 +551,29 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			"stored policy there, never a key that can do nothing). Give the config a built-in %q phase with a "+
 			"phase after it (the fix), or remove `review_panel`", ReviewPhaseName, ReviewPhaseName)
 	}
+	// CLA-784 (review 1.review-1.3): the stored-run-config schema is the
+	// PLANE's, and it does not yet know `review_panel[].optional` — its
+	// validator refuses the key as unknown, so a document carrying a trial seat
+	// is one the operator could never ratify. Refuse here rather than emit it,
+	// and rather than silently DROPPING the flag: dropping it would promote the
+	// trial seat to a required reviewer on every machine that applies the stored
+	// pipeline, the exact harm `optional` exists to prevent. The two sides must
+	// move in lockstep — the plane's stored-run-config schema learns the key and
+	// bumps its `$schema_version`, this build's RunConfigSchemaVersion moves in
+	// step, and this gate lifts.
+	if len(c.ReviewPanel) > 0 {
+		for i, m := range c.ReviewPanel {
+			if m.Optional {
+				return nil, fmt.Errorf("cannot propose this config: `review_panel[%d].optional` is a TRIAL seat, "+
+					"and the plane's stored-run-config schema does not accept that key yet (it refuses unknown "+
+					"panel keys), so the document would be refused at ratification — and emitting it without the "+
+					"flag would silently promote the trial seat to a required reviewer on every machine applying "+
+					"the pipeline. Keep the trial seat local until the plane's schema and this build's "+
+					"`$schema_version` (currently v%d) move in step, or remove `optional` from the member",
+					i, RunConfigSchemaVersion)
+			}
+		}
+	}
 	pipeline := map[string]any{}
 	if c.Prompt != "" && c.Prompt != defaultPrompt {
 		pipeline["prompt"] = c.Prompt
@@ -601,6 +624,11 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 				entry["tier"] = m.Tier
 			}
 			if m.Optional {
+				// Unreachable while the plane-side-schema gate above is in force
+				// (CLA-784 review 1.review-1.3): the field is kept so that the
+				// day the plane's stored schema learns the key — and this build's
+				// RunConfigSchemaVersion moves in step — the trial seat travels
+				// without a second edit here.
 				entry["optional"] = true
 			}
 			panel[i] = entry

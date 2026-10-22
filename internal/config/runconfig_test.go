@@ -861,11 +861,31 @@ func TestReviewPanelOptionalSurvivesTheStoredPipeline(t *testing.T) {
 		t.Error("the stored trial seat is not marked optional on its expanded phase")
 	}
 
-	// The render direction: propose-config must hand the trial seat back to the
-	// plane, or the next ratification turns it required.
+	// The render direction: the plane's stored-run-config schema does not know
+	// `review_panel[].optional` yet, so propose-config must REFUSE a document
+	// whose panel carries a trial seat (review 1.review-1.3). Emitting the key
+	// would be refused by the plane at ratification; dropping it would promote
+	// the trial seat to a required reviewer on every machine applying the
+	// pipeline. The gate lifts when the plane's schema and this build's
+	// `$schema_version` move in step.
 	rendered, err := base.RunConfigDocument()
+	if err == nil {
+		t.Fatalf("RunConfigDocument exported a document with a trial seat (%v), want a refusal: the plane's stored schema refuses `review_panel[].optional` as an unknown key", rendered)
+	}
+	if !strings.Contains(err.Error(), "optional") || !strings.Contains(err.Error(), "schema") {
+		t.Errorf("the refusal does not name the key and the plane-side schema: %v", err)
+	}
+
+	// A panel with no trial seat still exports, so the gate is scoped to the
+	// seat that cannot travel — not to panels in general.
+	required := pipelineBase()
+	required.Prompt = ""
+	if err := required.Validate(); err != nil {
+		t.Fatalf("the expandable fixture must validate: %v", err)
+	}
+	rendered, err = required.RunConfigDocument()
 	if err != nil {
-		t.Fatalf("RunConfigDocument: %v", err)
+		t.Fatalf("RunConfigDocument refused a panel with no trial seat: %v", err)
 	}
 	data, err := json.Marshal(rendered)
 	if err != nil {
@@ -877,13 +897,12 @@ func TestReviewPanelOptionalSurvivesTheStoredPipeline(t *testing.T) {
 	if err := json.Unmarshal(data, &raw); err != nil {
 		t.Fatalf("unmarshal raw: %v (%s)", err, data)
 	}
-	if len(raw.ReviewPanel) != 2 {
-		t.Fatalf("rendered review_panel = %d members, want 2 (%s)", len(raw.ReviewPanel), data)
+	if len(raw.ReviewPanel) == 0 {
+		t.Fatalf("rendered review_panel is empty: %s", data)
 	}
-	if _, ok := raw.ReviewPanel[0]["optional"]; ok {
-		t.Errorf("the required member rendered an `optional` key: %s", data)
-	}
-	if _, ok := raw.ReviewPanel[1]["optional"]; !ok {
-		t.Errorf("the trial seat did not render `optional`, so the stored document loses it: %s", data)
+	for i, m := range raw.ReviewPanel {
+		if _, ok := m["optional"]; ok {
+			t.Errorf("member %d rendered an `optional` key: %s", i, data)
+		}
 	}
 }
