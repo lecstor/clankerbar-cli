@@ -814,3 +814,95 @@ func TestRunConfigDocument_RefusesAPanelThePlaneCannotRatify(t *testing.T) {
 		t.Errorf("the expandable panel was omitted from the document: %v", rendered)
 	}
 }
+
+// TestReviewPanelOptionalSurvivesTheStoredPipeline (CLA-784): the stored
+// execution-config document carries the pipeline's `review_panel`, so a trial
+// seat must survive the overlay in BOTH directions. Were `optional` dropped on
+// apply, every machine reading that pipeline would silently promote the seat to
+// a required reviewer — the opposite of what the operator stored.
+func TestReviewPanelOptionalSurvivesTheStoredPipeline(t *testing.T) {
+	doc := &RunConfigDoc{
+		SchemaVersion: 1,
+		Phases: []RunConfigPhase{
+			{Name: "implement"},
+			{Name: "review"},
+			{Name: "fix"},
+		},
+		ReviewPanel: []RunConfigPanelMember{
+			{Model: "opencode-go/gpt-6-luna"},
+			{Model: "opencode-go/glm-5.3-flash", Optional: true},
+		},
+	}
+	base := pipelineBase()
+	if err := base.ApplyRunConfig(doc); err != nil {
+		t.Fatalf("ApplyRunConfig: %v", err)
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("the overlaid pipeline must validate: %v", err)
+	}
+	if len(base.ReviewPanel) != 2 {
+		t.Fatalf("review panel = %+v, want the stored 2 members", base.ReviewPanel)
+	}
+	if base.ReviewPanel[0].Optional {
+		t.Error("the required member was promoted to optional by the overlay")
+	}
+	if !base.ReviewPanel[1].Optional {
+		t.Error("the stored trial seat lost `optional` on apply — a plane-side trial seat would silently become required")
+	}
+	// And the effective phase the driver reads carries it.
+	members := base.EffectivePhases()
+	if len(members) != 4 {
+		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(members))
+	}
+	if members[1].IsOptionalPanelMember() {
+		t.Error("the required member's expanded phase is marked optional")
+	}
+	if !members[2].IsOptionalPanelMember() {
+		t.Error("the stored trial seat is not marked optional on its expanded phase")
+	}
+
+	// The render direction: the plane's stored-run-config schema does not know
+	// `review_panel[].optional` yet, so propose-config must REFUSE a document
+	// whose panel carries a trial seat (review 1.review-1.3). Emitting the key
+	// would be refused by the plane at ratification; dropping it would promote
+	// the trial seat to a required reviewer on every machine applying the
+	// pipeline. The gate lifts when the plane's schema and this build's
+	// `$schema_version` move in step.
+	rendered, err := base.RunConfigDocument()
+	if err == nil {
+		t.Fatalf("RunConfigDocument exported a document with a trial seat (%v), want a refusal: the plane's stored schema refuses `review_panel[].optional` as an unknown key", rendered)
+	}
+	if !strings.Contains(err.Error(), "optional") || !strings.Contains(err.Error(), "schema") {
+		t.Errorf("the refusal does not name the key and the plane-side schema: %v", err)
+	}
+
+	// A panel with no trial seat still exports, so the gate is scoped to the
+	// seat that cannot travel — not to panels in general.
+	required := pipelineBase()
+	required.Prompt = ""
+	if err := required.Validate(); err != nil {
+		t.Fatalf("the expandable fixture must validate: %v", err)
+	}
+	rendered, err = required.RunConfigDocument()
+	if err != nil {
+		t.Fatalf("RunConfigDocument refused a panel with no trial seat: %v", err)
+	}
+	data, err := json.Marshal(rendered)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var raw struct {
+		ReviewPanel []map[string]json.RawMessage `json:"review_panel"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatalf("unmarshal raw: %v (%s)", err, data)
+	}
+	if len(raw.ReviewPanel) == 0 {
+		t.Fatalf("rendered review_panel is empty: %s", data)
+	}
+	for i, m := range raw.ReviewPanel {
+		if _, ok := m["optional"]; ok {
+			t.Errorf("member %d rendered an `optional` key: %s", i, data)
+		}
+	}
+}

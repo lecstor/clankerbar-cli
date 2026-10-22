@@ -88,6 +88,19 @@ type panelParallelAdapter struct {
 	wantRecords int
 	// failLabel is the member that records nothing, when set.
 	failLabel string
+	// failLabels is the same for a test that needs MORE than one member to
+	// record nothing (the all-optional round, CLA-784). failLabel is kept
+	// because every pre-existing test uses it.
+	failLabels []string
+	// failResult, when set, is the scripted end of the failing member(s): a
+	// transient, a rolling limit, a hard stop, or a plain no-record success.
+	// Nil keeps the pre-existing shape (okResult with no record).
+	failResult *harness.Result
+	// failErr, when set, is a HARNESS INVOCATION ERROR for the failing
+	// member(s) — not an exit status. It is the one ending the join's
+	// `!m.optional` guard exists for (CLA-784 review 1.review-1.4): a trial
+	// seat's error must be that seat's result, never the drain's.
+	failErr error
 	// failToolLoop, when set, is the cause the failing member's adapter
 	// reports for killing it on a repeated failing tool call (CLA-739),
 	// still holding the claim it resumed.
@@ -171,6 +184,14 @@ func (a *panelParallelAdapter) Invoke(ctx context.Context, in harness.Invocation
 		closed := len(a.rel.closes)
 		records := len(a.rel.records)
 		a.mu.Unlock()
+		// And the panel's shared claim must still be live: a member's failure may
+		// not hand it back before the required members have finished (CLA-784).
+		a.rel.mu.Lock()
+		handbacks := len(a.rel.calls) + len(a.rel.expireCalls)
+		a.rel.mu.Unlock()
+		if handbacks != 0 {
+			a.recordErr("the fix phase spawned after %d claim handback(s) — the panel's shared claim must stay live until the sequence's deferred handback", handbacks)
+		}
 		if closed != 1 {
 			a.recordErr("the fix phase spawned with %d closes recorded, want exactly 1", closed)
 		}
@@ -191,6 +212,19 @@ func (a *panelParallelAdapter) Invoke(ctx context.Context, in harness.Invocation
 
 func (a *panelParallelAdapter) claim() harness.Claim {
 	return harness.Claim{TaskID: "t-1", RunID: "r-1", Branch: a.branch, HasWIP: true}
+}
+
+// fails reports whether this label is scripted to record nothing.
+func (a *panelParallelAdapter) fails(label string) bool {
+	if label == a.failLabel {
+		return true
+	}
+	for _, l := range a.failLabels {
+		if l == label {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *panelParallelAdapter) review(in harness.Invocation) (harness.Result, error) {
@@ -228,13 +262,21 @@ func (a *panelParallelAdapter) review(in harness.Invocation) (harness.Result, er
 	}
 	a.mu.Unlock()
 
-	if label == a.failLabel {
+	if a.fails(label) {
 		// The barrier still counts it as started — the panel's other members must
 		// not be serialised by the failure — but it writes NO durable record.
 		a.waitBarrier(label)
 		a.mu.Lock()
 		a.inFlight--
 		a.mu.Unlock()
+		if a.failResult != nil {
+			return *a.failResult, nil
+		}
+		if a.failErr != nil {
+			// A harness invocation error: no Result at all, exactly the shape the
+			// adapter returns when the process could not be run (CLA-299).
+			return harness.Result{}, a.failErr
+		}
 		if a.failToolLoop != "" {
 			res := okResult(1, 0.01)
 			res.ExitCode = -1
@@ -722,4 +764,233 @@ func TestDrainPhases_ParallelPanelBaselineFailureLeavesTheSharedClaimToTheJoin(t
 	if len(expires) != 1 {
 		t.Errorf("expireLease calls = %d, want exactly 1 (the join's single handback, not one per member): %v", len(expires), expires)
 	}
+}
+
+// --- CLA-784: optional (trial) panel seats --------------------------------
+
+// TestDrainPhases_ParallelPanelOptionalSeatFailureNeverEndsTheSequence is the
+// operator's intent, end to end: a trial seat that fails is recorded against
+// that seat and the panel carries on. Whatever the optional member's session
+// ends in, the required members' records still close the round and the fix still
+// runs; the shared claim is never handed back by the member, and there is no
+// run-level wait.
+func TestDrainPhases_ParallelPanelOptionalSeatFailureNeverEndsTheSequence(t *testing.T) {
+	cases := []struct {
+		name   string
+		fail   harness.Result
+		reason string
+		// deadTally is whether the existing per-member bookkeeping books this
+		// ending as a dead phase. A no-record clean exit is the no_mcp shape,
+		// which CLA-703 deliberately keeps OUT of the dead rate.
+		deadTally bool
+	}{
+		{"transient", transientResult(), "ended on a transient failure before recording", true},
+		{"rolling usage limit", limitResult(), "hit a usage limit before recording", true},
+		{"hard usage stop", limitStopResult(), "stopped on a usage limit (no reset to wait for) before recording", true},
+		// A clean exit that writes no record and makes no backlog call is the
+		// no_mcp shape; it is still that seat's failure, and the panel carries on.
+		{"no output", okResult(1, 0.01), "recorded no durable review record", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, branch, tip := panelParallelRepo(t)
+			rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+			members := panelMembers()
+			members[len(members)-1].Optional = true
+			a := newPanelParallelAdapter(rel, branch, tip, len(members))
+			a.failLabel = "review-3"
+			fail := tc.fail
+			a.failResult = &fail
+			a.wantRecords = len(members) - 1
+			d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+			logs := captureLogs(t)
+
+			if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+				t.Fatalf("drainPhases: err=%v stop=%v — an optional seat's failure must not end the run", err, stop)
+			}
+			a.mu.Lock()
+			errs := append([]string(nil), a.errs...)
+			fixCalls := a.fixCalls
+			fixPrompt := a.fixPrompt
+			maxInFlight := a.maxInFlight
+			a.mu.Unlock()
+			for _, e := range errs {
+				t.Error(e)
+			}
+			if maxInFlight != len(members) {
+				t.Errorf("max reviews in flight = %d, want %d — the optional failure must not serialise the panel", maxInFlight, len(members))
+			}
+			if fixCalls != 1 {
+				t.Fatalf("fix sessions = %d, want 1 — the required members' round must still reach the fix", fixCalls)
+			}
+			if !strings.Contains(fixPrompt, "INCOMPLETE") || !strings.Contains(fixPrompt, "review-3") {
+				t.Errorf("the fix brief does not name the failed optional seat as INCOMPLETE:\n%s", fixPrompt)
+			}
+			if len(rel.closes) != 1 || rel.closes[0] != 1 {
+				t.Errorf("closed rounds = %v, want exactly [1]", rel.closes)
+			}
+			if len(rel.records) != len(members)-1 {
+				t.Fatalf("durable records = %d, want %d (the required members' only)", len(rel.records), len(members)-1)
+			}
+			for _, r := range rel.records {
+				if r.State != "open" {
+					t.Errorf("record %s is %q after the drain, want the round released", r.ReviewerRole, r.State)
+				}
+			}
+			// The member's own handback never runs; the ONLY handback is the
+			// sequence's deferred one, after the fix. The adapter also asserts
+			// this at the fix boundary.
+			rel.mu.Lock()
+			releases := len(rel.calls)
+			expires := len(rel.expireCalls)
+			rel.mu.Unlock()
+			if releases != 0 {
+				t.Errorf("Release calls = %d, want 0 — the claim carries pushed work and must never be released to ready", releases)
+			}
+			if expires != 1 {
+				t.Errorf("expireLease calls = %d, want exactly 1 (the sequence's deferred handback, not one for the optional seat): %v", expires, rel.expireCalls)
+			}
+			if out := logs.String(); !strings.Contains(out, "review-3 (optional): "+tc.reason) {
+				t.Errorf("the daemon log does not name the optional seat with its reason %q:\n%s", tc.reason, out)
+			}
+			// The member's failure is still booked against the member: the dead
+			// rate where the ending is a death, and the consecutive-failure
+			// streak for every non-recorded member.
+			if tc.deadTally {
+				cell := d.deadTally[tallyKey{phase: "review-3", harness: "opencode"}]
+				if cell == nil || cell.dead != 1 {
+					t.Errorf("dead-phase tally for the optional seat = %+v, want 1 dead", cell)
+				}
+			}
+			d.stateMu.Lock()
+			streak := d.panelFailStreak["review-3"]
+			d.stateMu.Unlock()
+			if streak != 1 {
+				t.Errorf("the optional seat's failure streak = %d, want 1 — its failure counts toward its own assessment", streak)
+			}
+			requireOneFleetRecord(t, ff)
+		})
+	}
+}
+
+// TestDrainPhases_ParallelPanelOptionalSeatInvocationErrorNeverEndsTheDrain
+// (CLA-784 review 1.review-1.4) exercises the join's `!m.optional` guard on a
+// member's ERROR — a harness invocation failure, not an exit status, which the
+// existing optional-failure test never scripts. The trial seat's error is that
+// seat's result: the drain does not error, the required members' round still
+// closes, and the fix still spawns.
+func TestDrainPhases_ParallelPanelOptionalSeatInvocationErrorNeverEndsTheDrain(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers()
+	members[len(members)-1].Optional = true
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	a.failLabel = "review-3"
+	a.failErr = errors.New("harness exploded before the session could run")
+	a.wantRecords = len(members) - 1
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — an optional seat's invocation error must not end the run", err, stop)
+	}
+	a.mu.Lock()
+	fixCalls := a.fixCalls
+	fixPrompt := a.fixPrompt
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if fixCalls != 1 {
+		t.Fatalf("fix sessions = %d, want 1 — the required members' round must still reach the fix", fixCalls)
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Errorf("closed rounds = %v, want exactly [1]", rel.closes)
+	}
+	if !strings.Contains(fixPrompt, "INCOMPLETE: review-3 (optional)") {
+		t.Errorf("the fix brief does not mark the failed trial seat `(optional)`:\n%s", fixPrompt)
+	}
+	if out := logs.String(); !strings.Contains(out, "review-3 (optional):") || !strings.Contains(out, "harness exploded before the session could run") {
+		t.Errorf("the daemon log does not name the optional seat's invocation error:\n%s", out)
+	}
+	requireOneFleetRecord(t, ff)
+}
+
+// TestDrainPhases_ParallelPanelRequiredSeatTransientStillEndsTheSequence is the
+// CLA-639 behaviour CLA-784 must NOT change: a REQUIRED member's transient
+// failure still ends the sequence. The round the other required members wrote is
+// released, and no fix spawns.
+func TestDrainPhases_ParallelPanelRequiredSeatTransientStillEndsTheSequence(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers()
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	a.failLabel = "review-2"
+	fail := transientResult()
+	a.failResult = &fail
+	a.wantRecords = len(members) - 1
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v — a required member's transient ends the SEQUENCE, not the run", err, stop)
+	}
+	a.mu.Lock()
+	fixCalls := a.fixCalls
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if fixCalls != 0 {
+		t.Errorf("fix sessions = %d, want 0 — a required member's transient failure still ends the sequence", fixCalls)
+	}
+	if len(rel.closes) != 1 || rel.closes[0] != 1 {
+		t.Errorf("closed rounds = %v, want exactly [1] — the healthy required members' records are still released", rel.closes)
+	}
+	requireOneFleetRecord(t, ff)
+}
+
+// TestDrainPhases_ParallelPanelOnlyOptionalSeatsRecordedSpawnsNoFix: a round in
+// which only optional seats recorded is no review at all. The path is the same
+// as a panel where nobody recorded: the round is left sealed (no close) and no
+// fix spawns.
+func TestDrainPhases_ParallelPanelOnlyOptionalSeatsRecordedSpawnsNoFix(t *testing.T) {
+	repo, branch, tip := panelParallelRepo(t)
+	rel := &reviewReleaser{status: "in_progress", holder: "r-1", outcome: "implemented\n"}
+	members := panelMembers()
+	members[len(members)-1].Optional = true
+	a := newPanelParallelAdapter(rel, branch, tip, len(members))
+	// Both REQUIRED members record nothing; the optional seat records.
+	a.failLabels = []string{"review-1", "review-2"}
+	a.wantRecords = 1
+	d, ff := panelParallelDriver(t, a, rel, members, repo, tip, 0)
+	logs := captureLogs(t)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	a.mu.Lock()
+	fixCalls := a.fixCalls
+	errs := append([]string(nil), a.errs...)
+	a.mu.Unlock()
+	for _, e := range errs {
+		t.Error(e)
+	}
+	if fixCalls != 0 {
+		t.Errorf("fix sessions = %d, want 0 — a round where only optional seats recorded has no review to apply", fixCalls)
+	}
+	if len(rel.closes) != 0 {
+		t.Errorf("closed rounds = %v, want none — the round must stay sealed when no required member recorded", rel.closes)
+	}
+	if len(rel.records) != 1 {
+		t.Fatalf("durable records = %d, want the optional seat's one", len(rel.records))
+	}
+	if rel.records[0].State != "sealed" {
+		t.Errorf("the optional seat's record is %q, want it left sealed with the round", rel.records[0].State)
+	}
+	if out := logs.String(); !strings.Contains(out, "no REQUIRED member of the review panel recorded") {
+		t.Errorf("the daemon log does not say why no fix spawned:\n%s", out)
+	}
+	requireOneFleetRecord(t, ff)
 }
