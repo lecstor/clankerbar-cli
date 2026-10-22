@@ -23,10 +23,10 @@ func TestDoctor_ReportsTheReviewPanel(t *testing.T) {
 			{Name: "fix"},
 		},
 		ReviewPanel: []config.ReviewPanelMember{
-			{Model: "opencode-go/gpt-6-luna"},
-			{Model: "opencode-go/gpt-6-luna"},
-			{Model: "opencode-go/gpt-6-luna"},
-			{Model: "opencode-go/glm-5.3-flash"},
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
 		},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -107,7 +107,7 @@ func TestDoctor_PanelMemberHarnessIsTheResolvedOne(t *testing.T) {
 			{Name: "review"},
 			{Name: "fix"},
 		},
-		ReviewPanel: []config.ReviewPanelMember{{Model: "opencode-go/gpt-6-luna"}},
+		ReviewPanel: []config.ReviewPanelMember{{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture does not validate: %v", err)
@@ -213,7 +213,7 @@ func TestDoctor_PanelMemberLabelsAreNotRoles(t *testing.T) {
 			{Name: "fix"},
 		},
 		ReviewPanel: []config.ReviewPanelMember{
-			{Name: "alpha", Model: "opencode-go/gpt-6-luna"},
+			{Name: "alpha", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
 		},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -236,9 +236,9 @@ func TestDoctor_PanelMemberLabelsAreNotRoles(t *testing.T) {
 func TestDoctor_ReportsThePanelConcurrency(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	members := []config.ReviewPanelMember{
-		{Model: "opencode-go/gpt-6-luna"},
-		{Model: "opencode-go/gpt-6-luna"},
-		{Model: "opencode-go/glm-5.3-flash"},
+		{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+		{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+		{Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
 	}
 	lineFor := func(t *testing.T, concurrency int) string {
 		t.Helper()

@@ -42,9 +42,9 @@ func panelPhases() []config.Phase {
 // model twice plus another model once.
 func panelMembers() []config.ReviewPanelMember {
 	return []config.ReviewPanelMember{
-		{Name: "review-1", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},
-		{Name: "review-2", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},
-		{Name: "review-3", Harness: "opencode", Model: "opencode-go/glm-5.3-flash"},
+		{Name: "review-1", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+		{Name: "review-2", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+		{Name: "review-3", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
 	}
 }
 
@@ -1466,8 +1466,8 @@ func TestDrainPhases_ReviewPanelNamedMembersKeepPositionalRoles(t *testing.T) {
 		}
 	}
 	members := []config.ReviewPanelMember{
-		{Name: "alpha", Harness: "opencode", Model: "opencode-go/gpt-6-luna"},
-		{Name: "beta", Harness: "opencode", Model: "opencode-go/glm-5.3-flash"},
+		{Name: "alpha", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+		{Name: "beta", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
 	}
 	d := panelDriver(t, h, rel, members, panelPhases())
 

@@ -268,8 +268,15 @@ func CapabilitiesOf(name string) (Capabilities, bool) {
 // Invocation is everything a harness needs to run one session. The loop builds it
 // from config; adapters translate it into their own CLI dialect.
 type Invocation struct {
-	Prompt        string
-	Model         string
+	Prompt string
+	Model  string
+	// Routes is the ordered model route list this session may FALL BACK through
+	// (CLA-782): the free route first, its paid twin after it. Model is always
+	// the same value as Routes[0], so a single-route invocation is byte-for-byte
+	// the argv it was before this field existed; an adapter with no route support
+	// ignores it. A session that switches mid-flight resumes ITSELF on the next
+	// route, and reports the switch through Result.Raw (see RouteFallback).
+	Routes        []string
 	WorkDir       string
 	MCPConfigPath string
 	// ConfigDir sets the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
@@ -384,6 +391,40 @@ type Invocation struct {
 // A ratchet in the tests sweeps this package for adapters reading `.Model`
 // directly, because the failure mode is a NEW adapter, not this one.
 func (in Invocation) ModelArg() string { return strings.TrimSpace(in.Model) }
+
+// RouteList is the ordered, de-duplicated route list a fallback-capable adapter
+// runs through. Routes is authoritative when set; otherwise the single Model
+// alias (or nothing, for the harness's own default) is the whole list. Blank
+// entries are dropped for the same reason ModelArg trims: a whitespace alias
+// must never reach a child's model flag.
+func (in Invocation) RouteList() []string {
+	if len(in.Routes) == 0 {
+		if m := in.ModelArg(); m != "" {
+			return []string{m}
+		}
+		return nil
+	}
+	out := make([]string, 0, len(in.Routes))
+	seen := make(map[string]bool, len(in.Routes))
+	for _, route := range in.Routes {
+		r := strings.TrimSpace(route)
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	return out
+}
+
+// OnRoute returns a copy of the invocation pinned to one route of its list, for
+// the resume process a fallback starts. Set the whole field on the COPY rather
+// than threading a model argument through every argv builder: the builders keep
+// reading ModelArg, so a route switch cannot grow a second dialect for `--model`.
+func (in Invocation) OnRoute(route string) Invocation {
+	in.Model = strings.TrimSpace(route)
+	return in
+}
 
 // Result is the outcome of one session, both raw and parsed.
 //

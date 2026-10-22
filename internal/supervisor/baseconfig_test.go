@@ -292,7 +292,7 @@ func TestBuildConfigOperatorThreeProjectShapeValidates(t *testing.T) {
 		{Name: "review", Harness: "claude"},
 	}
 	base.Harnesses = map[string]config.HarnessConfig{
-		"claude": {Model: "opus"},
+		"claude": {Model: config.ModelRoutes{"opus"}},
 	}
 
 	slugs := []string{"clankerbar", "ezyapp", "makespdf"}

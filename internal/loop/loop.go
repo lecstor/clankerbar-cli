@@ -312,6 +312,19 @@ type Driver struct {
 	// ends is what the growing wait is there to bound.
 	resumedTransients map[resumedTransientKey]int
 
+	// routeMarks is this run's sticky memory of model routes that hit a usage
+	// limit (CLA-782): route alias -> the instant the mark expires. A run moved
+	// off its free route stays on the paid one for later PHASES until the mark
+	// lifts, so the fleet does not flip between routes at every phase boundary;
+	// it goes back to free only when the free route's reset has passed.
+	//
+	// Per run, not per host (operator decision 10164e9e): a sibling clanker
+	// discovers the same limit on its own next request and switches mid-session.
+	// Guarded by routeMarksMu because the review panel runs its members
+	// concurrently and each may record a switch.
+	routeMarks   map[string]time.Time
+	routeMarksMu sync.Mutex
+
 	// resumedTransientWait computes that wait from the streak: backoff(n) in
 	// production. A field so tests can observe the ladder and drive it without
 	// sleeping the real 30s/60s/... in the suite — the same reason waitGrace
@@ -4848,6 +4861,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		}
 		res, ierr := a.Invoke(ctx, inv)
 		renewer.stop()
+		// CLA-782: record the routes this session was denied and write each SWITCH
+		// to both logs before the iteration log is closed. Runs before every
+		// classification below, because a transient retry must already start on the
+		// route that worked.
+		d.noteRouteFallbacks(t, drainNum, inv, res)
 		if f != nil {
 			_ = f.Close()
 		}
@@ -5756,6 +5774,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			if zeroUsage {
 				log.Printf("iteration %d: the session ended with the zero-usage-unknown signature (final step reason %q, all-zero usage) — a quiet death, not a clean run (log: %s)",
 					drainNum, harness.FinishReasonUnknown, logPath)
+			} else if finished := harness.RouteFinished(res); finished != "" && finished != inv.Model {
+				// CLA-782: the spawn line names the route the session STARTED on;
+				// this line adds the route that finished it when a usage limit moved
+				// it mid-session.
+				log.Printf("iteration %d done (tokens=%d cost=$%.4f; finished on %s) (log: %s)", drainNum, tokens, cost, finished, logPath)
 			} else {
 				log.Printf("iteration %d done (tokens=%d cost=$%.4f) (log: %s)", drainNum, tokens, cost, logPath)
 			}
@@ -7488,7 +7511,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 				// the pinned alias is dropped.
 				raised := model
 				ph.Tier = tier
-				ph.Model = ""
+				ph.Model = nil
 				model, ok = tc.ModelForPhase(ph)
 				if !ok {
 					log.Printf("%sescalated tier %q resolves to no model — running on harness default", labelOf(t), tier)
@@ -7503,7 +7526,18 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		}
 	}
 
-	inv.Model = model
+	// CLA-782: the ordered route list this phase may fall back through, with
+	// this run's marks applied. ModelForPhase (and therefore inv.Model, the spawn
+	// line and the brief placeholder) keeps naming the FIRST routable route, so a
+	// single-route config is unchanged; the full list is what the adapter switches
+	// between when a provider denies the free route mid-session.
+	routes := d.routeRoutesFor(tc, ph)
+	if len(routes) > 0 {
+		inv.Model = routes[0]
+	} else {
+		inv.Model = model
+	}
+	inv.Routes = routes
 	if prev != nil && prev.Claim.Held() {
 		// The {{branch}} placeholder is filled from the recorded, VERIFIED hand-off
 		// (CLA-457): the checkpoint the driver ran against this claim already
@@ -7697,7 +7731,7 @@ func (d *Driver) invocationOn(t Target, harnessName string, probe bool) (harness
 	}
 	return harness.Invocation{
 		Prompt:        d.cfg.Prompt,
-		Model:         hc.Model,
+		Model:         hc.Model.First(),
 		WorkDir:       workdir,
 		MCPConfigPath: tc.ResolveMCPConfig(harnessName, t.MCPConfigPath, t.MCPConfigPaths),
 		ConfigDir:     hc.ConfigDir,

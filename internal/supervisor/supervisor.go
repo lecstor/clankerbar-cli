@@ -861,9 +861,15 @@ func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error)
 		}
 		for name, b := range overrideBlocks {
 			hc := cfg.Harnesses[name]
-			hc.Model = strings.TrimSpace(b.Model)
+			if m := strings.TrimSpace(b.Model); m != "" {
+				hc.Model = config.ModelRoutes{m}
+			}
 			if b.Models != nil {
-				hc.Models = b.Models
+				models := make(map[string]config.ModelRoutes, len(b.Models))
+				for bucket, alias := range b.Models {
+					models[bucket] = config.ModelRoutes{alias}
+				}
+				hc.Models = models
 			}
 			cfg.Harnesses[name] = hc
 		}

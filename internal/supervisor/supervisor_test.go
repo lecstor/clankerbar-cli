@@ -1392,7 +1392,7 @@ func TestBuildConfigHarnessesOverrideAllocatesNilBase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildConfig: %v", err)
 	}
-	if got := cfg.Harnesses["opencode"]; got.Model != "sonnet" {
+	if got := cfg.Harnesses["opencode"]; got.Model.First() != "sonnet" {
 		t.Errorf("opencode block model = %q, want the override (buildConfig must allocate the nil map)", got.Model)
 	}
 }
@@ -1455,7 +1455,7 @@ func TestBuildConfigHarnessOverrideRefusesInheritedWiring(t *testing.T) {
 	if cfg.Harness != "opencode" {
 		t.Errorf("harness = %q, want opencode", cfg.Harness)
 	}
-	if got := cfg.SessionFor("opencode"); got.Model != "oc-model" {
+	if got := cfg.SessionFor("opencode"); got.Model.First() != "oc-model" {
 		t.Errorf("opencode model = %q, want the entry's own oc-model", got.Model)
 	}
 
@@ -1464,7 +1464,7 @@ func TestBuildConfigHarnessOverrideRefusesInheritedWiring(t *testing.T) {
 	d3 := &Supervisor{cacheDir: t.TempDir()}
 	base := wiredBase()
 	base.Harnesses = map[string]config.HarnessConfig{
-		"opencode": {Model: "oc-model", Models: map[string]string{"strong": "oc-strong"}},
+		"opencode": {Model: config.ModelRoutes{"oc-model"}, Models: map[string]config.ModelRoutes{"strong": {"oc-strong"}}},
 	}
 	d3.o.BaseCfg = base
 	cfg, _, err = d3.buildConfig(newEntry(map[string]json.RawMessage{
