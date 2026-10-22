@@ -68,13 +68,6 @@ func (d *Driver) routeMarkExpiry(route string) (time.Time, bool) {
 	return until, true
 }
 
-// routeLimited reports whether route is still marked at now. Zero-value Driver
-// (no map) reports nothing limited, which is the historical single-route path.
-func (d *Driver) routeLimited(route string, now time.Time) bool {
-	until, ok := d.routeMarkExpiry(route)
-	return ok && now.Before(until)
-}
-
 // routableRoutes applies this run's marks to one phase's configured route list.
 //
 // Unmarked routes are kept in configured order. When EVERY route is marked — a

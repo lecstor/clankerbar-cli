@@ -25,9 +25,10 @@ import (
 //     existing limit branch (wait or stop) — this function never decides that;
 //   - a Probe never falls back: it is a liveness check, not work.
 //
-// Every run's spend is charged unconditionally (the same rule the resurrection
-// probe follows): a resume re-sends the transcript, so it is real money even when
-// the answer is a limit again.
+// Every run is charged EXACTLY ONCE: a successful continuation through
+// mergeRouteSwitch (mergeResume sums its tokens and cost), and a failed one
+// explicitly before the error is returned. A resume re-sends the transcript, so
+// it is real money even when the answer is a limit again.
 
 // routeFallbackPrompt is the short continuation sent after a route switch. It
 // says what happened and that the transcript is intact, because an agent that
@@ -87,15 +88,17 @@ func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes
 			contIn.MaxSessionWallClock = time.Until(deadline)
 		}
 		contRes, err := o.runSession(ctx, contIn, opencodeResumeArgs(contIn, sid, routeFallbackPrompt))
-		// Spend first, on every path — the budget must see a resume that cost
-		// real money even when the route refused the request.
-		res.Tokens += contRes.Tokens
-		res.CostUSD += contRes.CostUSD
-		res.Usage.Add(contRes.Usage)
-		res.UsageReported = res.UsageReported || contRes.UsageReported
-		res.CostReported = res.CostReported || contRes.CostReported
 		fallbacks = append(fallbacks, RouteFallback{Route: current, Next: to, Reason: lim.Reason, ResetAt: lim.ResetAt})
 		if err != nil {
+			// Charge a continuation that failed to start before reporting the
+			// error: whatever was parsed is real spend. A successful one is
+			// charged by mergeRouteSwitch (mergeResume sums it), so charging here
+			// too would count the same run twice.
+			res.Tokens += contRes.Tokens
+			res.CostUSD += contRes.CostUSD
+			res.Usage.Add(contRes.Usage)
+			res.UsageReported = res.UsageReported || contRes.UsageReported
+			res.CostReported = res.CostReported || contRes.CostReported
 			setRouteReport(res, started, current, fallbacks)
 			return err
 		}

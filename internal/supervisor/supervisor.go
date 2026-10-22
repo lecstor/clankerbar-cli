@@ -861,8 +861,12 @@ func (d *Supervisor) buildConfig(e *RosterEntry) (*config.Config, string, error)
 		}
 		for name, b := range overrideBlocks {
 			hc := cfg.Harnesses[name]
+			// An explicit empty model still CLEARS the inherited one, exactly as
+			// the plain-string field did before the route type existed.
 			if m := strings.TrimSpace(b.Model); m != "" {
 				hc.Model = config.ModelRoutes{m}
+			} else {
+				hc.Model = nil
 			}
 			if b.Models != nil {
 				models := make(map[string]config.ModelRoutes, len(b.Models))

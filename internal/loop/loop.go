@@ -7656,7 +7656,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	}
 	repl := []string{
 		config.PhaseHarnessPlaceholder, attributionOr(tc.HarnessFor(ph), "unknown harness"),
-		config.PhaseModelPlaceholder, attributionOr(model, "harness default"),
+		config.PhaseModelPlaceholder, attributionOr(inv.Model, "harness default"),
 		config.PhasePrevHarnessPlaceholder, attributionOr(prevHarness, "unknown harness"),
 		config.PhasePrevModelPlaceholder, attributionOr(prevModel, "harness default"),
 		config.PhaseNumberPlaceholder, strconv.Itoa(phaseIdx + 1),
