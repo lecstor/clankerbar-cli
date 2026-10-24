@@ -57,6 +57,14 @@ func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes
 	next := 1
 	var fallbacks []RouteFallback
 	for next < len(routes) {
+		// An UNTRUSTED stream never switches, for the reason it is never
+		// resurrected: a line overran the capture, so the limit event the
+		// classifier read may not be the session's last word, and CLA-262 forbids
+		// acting on parsed claim state (the continuation's seed) from such a
+		// capture. The driver's own untrusted path takes the Result as it is.
+		if res.Untrusted != "" {
+			break
+		}
 		lim := o.DetectLimit(*res)
 		if !lim.Limited {
 			break
@@ -109,7 +117,7 @@ func (o opencode) switchRoutesOnLimit(ctx context.Context, in Invocation, routes
 	// route: record it too, so the driver's marks cover every route this session
 	// exhausted. The Result keeps the limit, which is what the loop's existing
 	// limit branch reads.
-	if lim := o.DetectLimit(*res); lim.Limited {
+	if lim := o.DetectLimit(*res); lim.Limited && res.Untrusted == "" {
 		fallbacks = append(fallbacks, RouteFallback{Route: current, Reason: lim.Reason, ResetAt: lim.ResetAt})
 	}
 	setRouteReport(res, started, current, fallbacks)

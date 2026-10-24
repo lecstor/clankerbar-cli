@@ -279,3 +279,42 @@ echo '{"type":"step_finish","sessionID":"ses_clean","part":{"type":"step-finish"
 		t.Errorf("a single-route clean session reported routes: %q -> %q %+v", started, finished, fallbacks)
 	}
 }
+
+// A discarded oversized event makes the stream untrusted, so a limit event
+// parsed after it is not acted on: no continuation runs, no route is reported
+// limited, and the Result stays untrusted for the driver's own path (review
+// finding 1.review-2.1).
+func TestOpencodeInvokeUntrustedStreamDoesNotSwitch(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "log")
+	script := `#!/bin/sh
+echo "$*" >> "` + logPath + `"
+echo '{"type":"text","sessionID":"ses_live","part":{"type":"text","text":"working on the free route"}}'
+head -c 17000000 /dev/zero | tr '\0' 'x'
+echo
+echo '{"type":"error","sessionID":"ses_live","error":{"type":"unknown","message":"You are out of credits"}}'
+exit 1
+`
+	opencodeStub(t, script)
+
+	res, err := (opencode{}).Invoke(context.Background(), Invocation{
+		Prompt: "Work.",
+		Model:  routeFree,
+		Routes: []string{routeFree, routePaid},
+	})
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	if res.Untrusted == "" {
+		t.Fatal("an oversized event did not mark the Result untrusted; the test no longer exercises the guard")
+	}
+	if !(opencode{}).DetectLimit(res).Limited {
+		t.Fatal("the limit event after the oversized one was not parsed; the test no longer exercises the guard")
+	}
+	if calls := stubCalls(t, logPath); len(calls) != 1 {
+		t.Fatalf("the stub ran %d times, want 1 - an untrusted stream must not switch routes:\n%s", len(calls), strings.Join(calls, "\n"))
+	}
+	if _, _, fallbacks := RouteFallbacks(res); len(fallbacks) != 0 {
+		t.Errorf("an untrusted stream reported route fallbacks: %+v", fallbacks)
+	}
+}
