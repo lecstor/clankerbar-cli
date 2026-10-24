@@ -289,3 +289,16 @@ func TestModelRoutes_EmptyStringModelLeavesTheHarnessBlockEmpty(t *testing.T) {
 		t.Fatalf("Validate() = %v, want a refusal saying the block is missing or empty", err)
 	}
 }
+
+// A route list of blank entries names no model either, so the block is empty.
+func TestModelRoutes_BlankRouteListLeavesTheHarnessBlockEmpty(t *testing.T) {
+	for _, doc := range []string{`{"model":[""]}`, `{"model":["  "]}`, `{"model":[]}`} {
+		var hc HarnessConfig
+		if err := json.Unmarshal([]byte(doc), &hc); err != nil {
+			t.Fatalf("%s: decode: %v", doc, err)
+		}
+		if !hc.Empty() {
+			t.Errorf("%s: Empty() = false, want true", doc)
+		}
+	}
+}

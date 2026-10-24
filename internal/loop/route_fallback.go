@@ -180,3 +180,17 @@ func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
 	}
 	return ""
 }
+
+// probeInvocation is the supervised-wait probe's Invocation: the phase harness's
+// probe invocation, aimed at probeRouteFor's route when the phase has a route
+// list.
+func (d *Driver) probeInvocation(t Target, tc *config.Config, ph config.Phase) (harness.Invocation, error) {
+	inv, err := d.invocationOn(t, tc.HarnessFor(ph), true)
+	if err != nil {
+		return inv, err
+	}
+	if route := d.probeRouteFor(tc, ph); route != "" {
+		inv.Model = route
+	}
+	return inv, nil
+}

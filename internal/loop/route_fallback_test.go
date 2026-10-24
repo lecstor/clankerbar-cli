@@ -297,3 +297,29 @@ func TestProbeRouteFor_AimsAtTheRouteTheNextSessionStartsOn(t *testing.T) {
 		t.Errorf("single route: probe route = %q, want \"\" (the probe keeps its historical model)", got)
 	}
 }
+
+// The probe Invocation the supervised wait spawns is the one probeRouteFor aims:
+// with every route marked it probes the route whose mark lifts first, and a
+// single-route phase keeps the harness block's model.
+func TestProbeInvocation_UsesTheProbeRoute(t *testing.T) {
+	d := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias, routePaidAlias)
+	d.markRouteLimited(routeFreeAlias, time.Now().Add(2*time.Hour))
+	d.markRouteLimited(routePaidAlias, time.Now().Add(time.Hour))
+	inv, err := d.probeInvocation(Target{}, d.cfg, d.cfg.Phases[0])
+	if err != nil {
+		t.Fatalf("probeInvocation: %v", err)
+	}
+	if !inv.Probe || inv.Model != routePaidAlias {
+		t.Errorf("probe invocation = {Probe: %v, Model: %q}, want a probe on %q", inv.Probe, inv.Model, routePaidAlias)
+	}
+
+	single := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias)
+	single.markRouteLimited(routeFreeAlias, time.Now().Add(time.Hour))
+	inv, err = single.probeInvocation(Target{}, single.cfg, single.cfg.Phases[0])
+	if err != nil {
+		t.Fatalf("probeInvocation (single): %v", err)
+	}
+	if inv.Model != routeFreeAlias {
+		t.Errorf("single route: probe model = %q, want the harness block's %q", inv.Model, routeFreeAlias)
+	}
+}
