@@ -26,7 +26,8 @@ import (
 type ModelRoutes []string
 
 // UnmarshalJSON accepts either the historical plain string or an ordered JSON
-// array of strings. A JSON `null`, like an absent key, is no routes at all. A
+// array of strings. A JSON `null` or an empty string, like an absent key, is no
+// routes at all. A
 // non-string element is refused with a message naming the field's shape rather
 // than the decoder's, because a mistyped route list must be visible in the
 // config load that refused it.
@@ -47,6 +48,17 @@ func (m *ModelRoutes) UnmarshalJSON(b []byte) error {
 	var alias string
 	if err := json.Unmarshal(trimmed, &alias); err != nil {
 		return fmt.Errorf("a model must be a string or an array of route strings: %w", err)
+	}
+	// An explicit `"model": ""` is the historical "no model", so it decodes to no
+	// routes rather than one blank route. A one-element slice is non-empty to
+	// `omitempty` (Phase.Model) and to len()-based checks (HarnessConfig.Empty),
+	// so keeping it would emit a key the string field omitted, moving
+	// Config.Identity(), and make a block holding only `"model": ""` read as
+	// configured. Only the exact empty string: a whitespace alias always
+	// marshalled as itself, and still does.
+	if alias == "" {
+		*m = nil
+		return nil
 	}
 	*m = ModelRoutes{alias}
 	return nil

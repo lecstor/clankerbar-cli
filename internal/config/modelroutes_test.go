@@ -246,3 +246,46 @@ func TestReviewPanelMember_RouteListExpandsToThePhase(t *testing.T) {
 		t.Errorf("panel member ModelForPhase = %q, want the first route", got)
 	}
 }
+
+// An explicit `"model": ""` on a phase or a harness block must hash exactly what
+// the string field did, which is the same as leaving the key out (review
+// findings 1.review-3.1 and 1.review-1.1): Phase.Model is `omitempty`, so a
+// one-blank-route slice would emit a key the string never did.
+func TestModelRoutes_ExplicitEmptyStringKeepsTheConfigIdentity(t *testing.T) {
+	const preRoutesEmptyIdentity = "e6129f7e624d40d519e0545713aaa7b0200b680582a5c0698024d5faabcbe26d"
+	for name, doc := range map[string]string{
+		"phase":         `{"harnesses":{"opencode":{}},"phases":[{"name":"implement","model":""}]}`,
+		"harness block": `{"harnesses":{"opencode":{"model":""}},"phases":[{"name":"implement"}]}`,
+		"both":          `{"harnesses":{"opencode":{"model":""}},"phases":[{"name":"implement","model":""}]}`,
+	} {
+		var c Config
+		if err := json.Unmarshal([]byte(doc), &c); err != nil {
+			t.Fatalf("%s: decode: %v", name, err)
+		}
+		if got := c.Identity(); got != preRoutesEmptyIdentity {
+			t.Errorf("%s: Identity() = %s, want the pre-route identity %s for an explicit empty model", name, got, preRoutesEmptyIdentity)
+		}
+	}
+	var m ModelRoutes
+	if err := json.Unmarshal([]byte(`""`), &m); err != nil || m != nil {
+		t.Errorf(`decode "" = %#v, %v; want nil routes`, m, err)
+	}
+}
+
+// A harness block holding only `"model": ""` names nothing, so it is still the
+// empty block Validate refuses (review finding 1.review-1.2).
+func TestModelRoutes_EmptyStringModelLeavesTheHarnessBlockEmpty(t *testing.T) {
+	var hc HarnessConfig
+	if err := json.Unmarshal([]byte(`{"model":""}`), &hc); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !hc.Empty() {
+		t.Fatalf("HarnessConfig{model: \"\"}.Empty() = false, want true")
+	}
+	c := mixedCfg()
+	c.Harnesses["opencode"] = hc
+	err := c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "missing or empty") {
+		t.Fatalf("Validate() = %v, want a refusal saying the block is missing or empty", err)
+	}
+}
