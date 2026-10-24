@@ -24,5 +24,6 @@ only the operator merges the `staging -> main` promotion, which publishes a rele
 
 ## Gates
 
-`go build ./...`, `go vet ./...` and `go test ./...`. When the opencode adapter changes,
-also run the hermetic conformance suite (`docs/harness-conformance.md`).
+Locally: `go build ./...`, `go vet ./...` and `go test -race ./...`, as CI runs them (CI
+also runs `govulncheck`). When you change the opencode adapter or upgrade opencode, also
+run the hermetic conformance suite (`docs/harness-conformance.md`).
