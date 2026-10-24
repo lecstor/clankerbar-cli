@@ -70,7 +70,7 @@ func TestSessionFor_TopLevelHarnessInheritsTheRunWideFields(t *testing.T) {
 	if hc.ConfigDir != "/home/me/.claude" || hc.MCPConfigPath != "/repo/.mcp.json" || hc.SettingsPath != "/home/me/headless.json" {
 		t.Errorf("the top-level harness lost a run-wide field: %+v", hc)
 	}
-	if hc.Model != "claude-opus-5" || hc.Models["strong"] != "claude-opus-5" {
+	if hc.Model.First() != "claude-opus-5" || hc.Models["strong"].First() != "claude-opus-5" {
 		t.Errorf("the top-level harness lost the run-wide model/tier map: %+v", hc)
 	}
 }
@@ -91,7 +91,7 @@ func TestSessionFor_AnotherHarnessInheritsNothing(t *testing.T) {
 	if hc.MCPConfigPath != "/oc/opencode-mcp.json" {
 		t.Errorf("opencode mcp_config_path = %q, want its own — the Claude-shaped file makes opencode refuse to start", hc.MCPConfigPath)
 	}
-	if hc.SettingsPath != "" || hc.Model != "" || hc.Models != nil {
+	if hc.SettingsPath != "" || !hc.Model.Empty() || hc.Models != nil {
 		t.Errorf("opencode inherited a run-wide field it must not: %+v", hc)
 	}
 }
@@ -101,7 +101,7 @@ func TestModelForPhase_ResolvesTiersAgainstThePhasesOwnHarness(t *testing.T) {
 	c.Harnesses["opencode"] = HarnessConfig{
 		ConfigDir:     "/oc/config",
 		MCPConfigPath: "/oc/opencode-mcp.json",
-		Models:        map[string]string{"strong": "opencode-go/deepseek-v4-flash"},
+		Models:        map[string]ModelRoutes{"strong": {"opencode-go/deepseek-v4-flash"}},
 	}
 
 	// One bucket NAME, two aliases: that indirection is the whole reason tiers are
@@ -222,7 +222,7 @@ func TestValidate_RefusesAnUnknownPhaseHarness(t *testing.T) {
 // block was accepted and silently ignored.
 func TestValidate_RefusesAnUnknownHarnessesBlockKey(t *testing.T) {
 	c := mixedCfg()
-	c.Harnesses["opencode2"] = HarnessConfig{ConfigDir: "/oc2/config", Model: "opencode-go/gpt-6-luna"}
+	c.Harnesses["opencode2"] = HarnessConfig{ConfigDir: "/oc2/config", Model: ModelRoutes{"opencode-go/gpt-6-luna"}}
 
 	err := c.Validate()
 	if err == nil || !strings.Contains(err.Error(), `harnesses["opencode2"]`) {

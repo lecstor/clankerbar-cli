@@ -78,7 +78,7 @@ func (c *Config) ConflictStep() ConflictStep {
 		} else {
 			// A different harness is a different dialect with its own default
 			// model; another harness's alias would be a name it does not serve.
-			step.Model = c.SessionFor(step.Harness).Model
+			step.Model = c.SessionFor(step.Harness).Model.First()
 		}
 	}
 	if step.MaxTurns <= 0 {
@@ -108,11 +108,11 @@ func (c *Config) implementStep() (harnessName, model string) {
 		h := c.HarnessFor(ph)
 		m, _ := c.ModelForPhase(ph)
 		if strings.TrimSpace(m) == "" {
-			m = c.SessionFor(h).Model
+			m = c.SessionFor(h).Model.First()
 		}
 		return h, m
 	}
-	return c.Harness, c.SessionFor(c.Harness).Model
+	return c.Harness, c.SessionFor(c.Harness).Model.First()
 }
 
 // conflictHarness is the harness the conflict block names, or "" when the config

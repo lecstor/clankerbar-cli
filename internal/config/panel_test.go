@@ -83,10 +83,10 @@ func TestReviewPanel_ExplicitMembers(t *testing.T) {
 	}
 	// The same model twice is deliberate: two independent reviewers, not one
 	// deduplicated reviewer.
-	if got[1].Model != "opus" || got[2].Model != "opus" {
+	if got[1].Model.First() != "opus" || got[2].Model.First() != "opus" {
 		t.Errorf("models = %q/%q, want opus/opus", got[1].Model, got[2].Model)
 	}
-	if got[3].Tier != "cheap" || got[3].Model != "" {
+	if got[3].Tier != "cheap" || !got[3].Model.Empty() {
 		t.Errorf("the tier member resolved to model %q tier %q, want the tier with no pinned model", got[3].Model, got[3].Tier)
 	}
 	for _, ph := range got[1:4] {
@@ -130,7 +130,7 @@ func TestReviewPanel_FourMembersExpand(t *testing.T) {
 		if ph.Prompt != reviewOnlyBrief {
 			t.Errorf("%s did not inherit the review phase's resolved brief (the panel-member variant is swapped in at spawn, by invocationFor)", ph.Name)
 		}
-		switch ph.Model {
+		switch ph.Model.First() {
 		case "opencode-go/gpt-6-luna":
 			luna++
 		case "opencode-go/glm-5.3-flash":
@@ -255,7 +255,7 @@ func TestReviewPanel_UnphasedConfigWithAPanelStaysInert(t *testing.T) {
 	cfg := &Config{
 		Harness:     "claude",
 		Prompt:      "Work the backlog.",
-		ReviewPanel: []ReviewPanelMember{{Model: "opus"}},
+		ReviewPanel: []ReviewPanelMember{{Model: ModelRoutes{"opus"}}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("an unphased config with an inert panel must validate: %v", err)
@@ -309,7 +309,7 @@ func TestReviewPanel_ModelPinnedDirectly(t *testing.T) {
 		Harness: "opencode",
 		Phases:  []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}},
 		ReviewPanel: []ReviewPanelMember{
-			{Model: "opencode-go/gpt-6-luna"},
+			{Model: ModelRoutes{"opencode-go/gpt-6-luna"}},
 		},
 	}
 	member := cfg.EffectivePhases()[1]
@@ -412,7 +412,7 @@ func TestReviewPanel_MarshalledConfigRoundTrips(t *testing.T) {
 		if panel[0].Name != "alpha" || panel[0].Harness != "opencode" {
 			t.Errorf("member 0 = %+v, want alpha on opencode", panel[0])
 		}
-		if panel[1].Name != "beta" || panel[1].Model != "opencode-go/glm-5.3-flash" {
+		if panel[1].Name != "beta" || panel[1].Model.First() != "opencode-go/glm-5.3-flash" {
 			t.Errorf("member 1 = %+v, want beta with its pinned model", panel[1])
 		}
 		got := loaded.EffectivePhases()
@@ -662,7 +662,7 @@ func TestReviewPanel_PhaseModelIsAConfigKey(t *testing.T) {
 		"phases": [{"name": "implement", "model": "opencode-go/gpt-6-luna"}, {"name": "review"}, {"name": "fix"}],
 		"review_panel": [{"model": "opencode-go/gpt-6-luna"}]
 	}`)
-	if got := cfg.Phases[0].Model; got != "opencode-go/gpt-6-luna" {
+	if got := cfg.Phases[0].Model.First(); got != "opencode-go/gpt-6-luna" {
 		t.Fatalf("phases[0].model loaded as %q, want the configured alias", got)
 	}
 	if got, ok := cfg.ModelForPhase(cfg.Phases[0]); got != "opencode-go/gpt-6-luna" || !ok {
@@ -743,13 +743,13 @@ func TestReviewPanel_MemberTierBeatsTheReviewPhasesModel(t *testing.T) {
 		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(got))
 	}
 	tiered, modeld := got[1], got[2]
-	if tiered.Tier != "strong" || tiered.Model != "" {
+	if tiered.Tier != "strong" || !tiered.Model.Empty() {
 		t.Errorf("the tier member expanded to model=%q tier=%q, want tier strong with NO inherited model", tiered.Model, tiered.Tier)
 	}
 	if model, ok := cfg.ModelForPhase(tiered); !ok || model != "opencode-go/glm-5.3-flash" {
 		t.Errorf("the tier member resolves to %q/%v, want opencode-go/glm-5.3-flash — the tier it named", model, ok)
 	}
-	if modeld.Model != "opencode-go/gpt-6-luna" || modeld.Tier != "" {
+	if modeld.Model.First() != "opencode-go/gpt-6-luna" || modeld.Tier != "" {
 		t.Errorf("the model member expanded to model=%q tier=%q, want its own alias and no tier", modeld.Model, modeld.Tier)
 	}
 }

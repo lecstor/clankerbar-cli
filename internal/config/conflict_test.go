@@ -115,7 +115,7 @@ func TestConflictStepHonoursItsOwnBlock(t *testing.T) {
 	c := defaults()
 	c.Harness = "opencode"
 	c.Model = "run-model"
-	c.Harnesses = map[string]HarnessConfig{"codex": {Model: "codex-model"}}
+	c.Harnesses = map[string]HarnessConfig{"codex": {Model: ModelRoutes{"codex-model"}}}
 	c.Conflict = &ConflictStep{Harness: "codex", MaxTurns: 25}
 
 	step := c.ConflictStep()
@@ -223,7 +223,7 @@ func TestValidateHoldsTheConflictStepToTheHarnessRules(t *testing.T) {
 
 func TestConflictHarnessIsSpawned(t *testing.T) {
 	c := defaults()
-	c.Harnesses = map[string]HarnessConfig{"codex": {Model: "codex-model"}}
+	c.Harnesses = map[string]HarnessConfig{"codex": {Model: ModelRoutes{"codex-model"}}}
 	c.Conflict = &ConflictStep{Harness: "codex"}
 
 	found := false

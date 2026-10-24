@@ -217,7 +217,7 @@ func (c *Config) Clone() *Config {
 	if c.Harnesses != nil {
 		cp.Harnesses = make(map[string]HarnessConfig, len(c.Harnesses))
 		for name, hc := range c.Harnesses {
-			hc.Models = cloneStrMap(hc.Models)
+			hc.Models = cloneRoutesMap(hc.Models)
 			cp.Harnesses[name] = hc
 		}
 	}
@@ -321,7 +321,7 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 					MaxTurns:     p.MaxTurns,
 					MaxWallClock: p.MaxWallClock,
 					Tier:         p.Tier,
-					Model:        p.Model,
+					Model:        planeRoutes(p.Model),
 					Harness:      p.Harness,
 				}
 			}
@@ -332,7 +332,7 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		} else {
 			panel := make([]ReviewPanelMember, len(doc.ReviewPanel))
 			for i, m := range doc.ReviewPanel {
-				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: m.Model, Tier: m.Tier, Optional: m.Optional}
+				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: planeRoutes(m.Model), Tier: m.Tier, Optional: m.Optional}
 			}
 			c.ReviewPanel = panel
 		}
@@ -365,10 +365,10 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	for name, block := range doc.Harnesses {
 		hc := c.Harnesses[name]
 		if m := strings.TrimSpace(block.Model); m != "" {
-			hc.Model = m
+			hc.Model = ModelRoutes{m}
 		}
 		if block.Models != nil {
-			hc.Models = block.Models
+			hc.Models = stringMapToRoutes(block.Models)
 		}
 		c.Harnesses[name] = hc
 	}
@@ -454,11 +454,11 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 	// value (run-wide or per-harness) is the new harness's own, not an
 	// inheritance. Only the all-absent shape inherits the old alias.
 	if strings.TrimSpace(c.Model) != "" && docModel == "" &&
-		strings.TrimSpace(docBlock.Model) == "" && strings.TrimSpace(baseBlock.Model) == "" {
+		strings.TrimSpace(docBlock.Model) == "" && baseBlock.Model.Empty() {
 		inherited = append(inherited, "model")
 	}
 	if len(c.Models) > 0 && doc.Models == nil &&
-		docBlock.Models == nil && baseBlock.Models == nil {
+		docBlock.Models == nil && len(baseBlock.Models) == 0 {
 		inherited = append(inherited, "models")
 	}
 	// Machine twins: the document carries none, so only a local block value
@@ -521,12 +521,15 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 		blocks := map[string]any{}
 		for name, hc := range c.Harnesses {
 			block := map[string]any{}
-			if hc.Model != "" {
-				block["model"] = hc.Model
+			// The plane's schema carries plain strings (CLA-782), so a route
+			// list travels as its FIRST route: the run config is the operator's
+			// ratified policy half, and a fallback chain is a local-file shape
+			// until the plane grows one.
+			if first := hc.Model.First(); first != "" {
+				block["model"] = first
 			}
 			if len(hc.Models) > 0 {
-				m := cloneStrMap(hc.Models)
-				block["models"] = m
+				block["models"] = routesToPlainMap(hc.Models)
 			}
 			if len(block) > 0 {
 				blocks[name] = block
@@ -597,8 +600,8 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			if ph.Tier != "" {
 				entry["tier"] = ph.Tier
 			}
-			if ph.Model != "" {
-				entry["model"] = ph.Model
+			if first := ph.Model.First(); first != "" {
+				entry["model"] = first
 			}
 			if ph.Harness != "" {
 				entry["harness"] = ph.Harness
@@ -617,8 +620,8 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			if m.Harness != "" {
 				entry["harness"] = m.Harness
 			}
-			if m.Model != "" {
-				entry["model"] = m.Model
+			if first := m.Model.First(); first != "" {
+				entry["model"] = first
 			}
 			if m.Tier != "" {
 				entry["tier"] = m.Tier
@@ -691,4 +694,32 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 		doc["escalation"] = e
 	}
 	return doc, nil
+}
+
+// planeRoutes widens the plane's plain-string model field into this package's
+// route type. The stored schema has one string per model (CLA-782 keeps it
+// that way), so a stored document can only ever name a single route.
+func planeRoutes(model string) ModelRoutes {
+	if strings.TrimSpace(model) == "" {
+		return nil
+	}
+	return ModelRoutes{model}
+}
+
+// routesToPlainMap renders a route-valued tier map back into the plane's
+// plain-string schema, first route only — the same narrowing RunConfigDocument
+// applies to a single model field.
+func routesToPlainMap(m map[string]ModelRoutes) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for bucket, routes := range m {
+		first := routes.First()
+		if first == "" {
+			continue
+		}
+		out[bucket] = first
+	}
+	return out
 }

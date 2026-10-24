@@ -18,7 +18,7 @@ func overlayBase() *Config {
 	c.Model = "local-model"
 	c.Models = map[string]string{"strong": "local-strong"}
 	c.Harnesses = map[string]HarnessConfig{
-		"claude": {Model: "local-model", Models: map[string]string{"strong": "local-strong"}, ConfigDir: "/local/claude"},
+		"claude": {Model: ModelRoutes{"local-model"}, Models: map[string]ModelRoutes{"strong": {"local-strong"}}, ConfigDir: "/local/claude"},
 	}
 	c.MaxTurns = 111
 	c.MaxSessionWallClock = Duration(111 * time.Second)
@@ -59,10 +59,10 @@ func TestApplyRunConfig_EveryConsumedFamilyOverlaysAndAbsentKeepsLocal(t *testin
 		t.Errorf("models = %v, want %v (the ratified map replaces, not merges)", base.Models, doc.Models)
 	}
 	// The per-harness POLICY half overlays; the machine twins stay local.
-	if got := base.SessionFor("opencode"); got.Model != "oc-default" || got.ConfigDir != "" {
+	if got := base.SessionFor("opencode"); got.Model.First() != "oc-default" || got.ConfigDir != "" {
 		t.Errorf("opencode block model=%q configDir=%q, want the stored model and NO inherited local dir", got.Model, got.ConfigDir)
 	}
-	if got := base.SessionFor("claude"); got.Model != "local-model" || got.ConfigDir != "/local/claude" {
+	if got := base.SessionFor("claude"); got.Model.First() != "local-model" || got.ConfigDir != "/local/claude" {
 		t.Errorf("unnamed claude block drifted: %+v", got)
 	}
 	if base.MaxTurns != 42 || base.MaxSessionWallClock != Duration(42*time.Second) {
@@ -100,11 +100,11 @@ func TestApplyRunConfig_NilBaseHarnessesAllocatesOnOverlay(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("ApplyRunConfig: %v", err)
 	}
-	if got := base.Harnesses["opencode"]; got.Model != "oc-default" {
+	if got := base.Harnesses["opencode"]; got.Model.First() != "oc-default" {
 		t.Errorf("opencode block model = %q, want the stored one (overlay must allocate the nil map)", got.Model)
 	}
 	// The policy half lands; the machine-local half stays absent, as everywhere else.
-	if got := base.SessionFor("opencode"); got.Model != "oc-default" || got.ConfigDir != "" {
+	if got := base.SessionFor("opencode"); got.Model.First() != "oc-default" || got.ConfigDir != "" {
 		t.Errorf("opencode session model=%q configDir=%q, want the stored model and no machine-local wiring", got.Model, got.ConfigDir)
 	}
 }
@@ -233,14 +233,14 @@ func TestApplyRunConfig_HarnessSwapRefusesInheritedWiring(t *testing.T) {
 	}
 	// The new harness must not have inherited through SessionFor even though
 	// the overlay was refused: it still resolves ambient, never claude's.
-	if got := base.SessionFor("opencode"); got.ConfigDir != "" || got.MCPConfigPath != "" || got.SettingsPath != "" || got.Model != "" {
+	if got := base.SessionFor("opencode"); got.ConfigDir != "" || got.MCPConfigPath != "" || got.SettingsPath != "" || !got.Model.Empty() {
 		t.Errorf("refused swap still re-homes wiring via SessionFor: %+v", got)
 	}
 
 	// A partial block is still a refusal: a model alone does not cover the
 	// config dir gap the new top-level would inherit through.
 	partial := wiredBase()
-	partial.Harnesses = map[string]HarnessConfig{"opencode": {Model: "oc-model"}}
+	partial.Harnesses = map[string]HarnessConfig{"opencode": {Model: ModelRoutes{"oc-model"}}}
 	if err := partial.ApplyRunConfig(&RunConfigDoc{SchemaVersion: 1, Harness: "opencode"}); err == nil {
 		t.Error("a swap whose new block covers only the model was applied; want a refusal naming the machine gaps")
 	} else if got := err.Error(); !containsFold(got, "config_dir") {
@@ -251,7 +251,7 @@ func TestApplyRunConfig_HarnessSwapRefusesInheritedWiring(t *testing.T) {
 	// has its own value, so nothing is inherited.
 	complete := wiredBase()
 	complete.Harnesses = map[string]HarnessConfig{"opencode": {
-		Model: "oc-model", Models: map[string]string{"strong": "oc-strong"},
+		Model: ModelRoutes{"oc-model"}, Models: map[string]ModelRoutes{"strong": {"oc-strong"}},
 		ConfigDir: "/local/opencode-dir", MCPConfigPath: "/local/opencode-mcp.json", SettingsPath: "/local/opencode-settings.json",
 	}}
 	if err := complete.ApplyRunConfig(&RunConfigDoc{SchemaVersion: 1, Harness: "opencode"}); err != nil {
@@ -260,10 +260,10 @@ func TestApplyRunConfig_HarnessSwapRefusesInheritedWiring(t *testing.T) {
 	if complete.Harness != "opencode" {
 		t.Errorf("harness = %q, want opencode", complete.Harness)
 	}
-	if got := complete.SessionFor("opencode"); got.ConfigDir != "/local/opencode-dir" || got.Model != "oc-model" {
+	if got := complete.SessionFor("opencode"); got.ConfigDir != "/local/opencode-dir" || got.Model.First() != "oc-model" {
 		t.Errorf("wired swap resolved %+v, want the new block's own wiring", got)
 	}
-	if got := complete.SessionFor("claude"); got.ConfigDir != "" || got.Model != "" {
+	if got := complete.SessionFor("claude"); got.ConfigDir != "" || !got.Model.Empty() {
 		t.Errorf("the old harness kept run-wide wiring after the swap: %+v (run-wide must not follow the swap)", got)
 	}
 
@@ -400,7 +400,7 @@ func pipelineBase() *Config {
 		{Name: "review", Tier: "local"},
 		{Name: "fix", Tier: "local"},
 	}
-	c.ReviewPanel = []ReviewPanelMember{{Name: "local", Model: "local/one"}}
+	c.ReviewPanel = []ReviewPanelMember{{Name: "local", Model: ModelRoutes{"local/one"}}}
 	// The cap is the MACHINE's dial (decision e1365721). A distinct local value
 	// is what every overlay assertion uses to prove the stored document never
 	// moved it.
@@ -475,7 +475,7 @@ func TestApplyRunConfig_PipelineSectionClearsTheKeysItOmits(t *testing.T) {
 		base := defaults()
 		base.Harness = "opencode"
 		base.Prompt = "local prompt"
-		base.ReviewPanel = []ReviewPanelMember{{Model: "local/one"}}
+		base.ReviewPanel = []ReviewPanelMember{{Model: ModelRoutes{"local/one"}}}
 		base.ReviewPanelConcurrency = 2
 
 		if err := base.ApplyRunConfig(&RunConfigDoc{
@@ -526,7 +526,7 @@ func TestApplyRunConfig_DocumentWithoutPipelineKeepsTheLocalPipeline(t *testing.
 	if len(base.Phases) != 3 || base.Phases[0].Tier != "local" {
 		t.Errorf("phases = %+v, want the local sequence untouched", base.Phases)
 	}
-	if len(base.ReviewPanel) != 1 || base.ReviewPanel[0].Model != "local/one" || base.ReviewPanelConcurrency != 3 {
+	if len(base.ReviewPanel) != 1 || base.ReviewPanel[0].Model.First() != "local/one" || base.ReviewPanelConcurrency != 3 {
 		t.Errorf("panel = %+v/%d, want the local panel untouched", base.ReviewPanel, base.ReviewPanelConcurrency)
 	}
 	if base.MaxTurns != 9 {
@@ -560,7 +560,7 @@ func TestApplyRunConfig_StoredPanelConcurrencyIsIgnored(t *testing.T) {
 		if len(base.Phases) != 3 || base.Phases[0].Tier != "local" {
 			t.Errorf("phases = %+v, want the local sequence untouched", base.Phases)
 		}
-		if len(base.ReviewPanel) != 1 || base.ReviewPanel[0].Model != "local/one" {
+		if len(base.ReviewPanel) != 1 || base.ReviewPanel[0].Model.First() != "local/one" {
 			t.Errorf("panel = %+v, want the local panel untouched", base.ReviewPanel)
 		}
 		if base.ReviewPanelConcurrency != 3 {
@@ -575,15 +575,15 @@ func TestApplyRunConfig_StoredPanelConcurrencyIsIgnored(t *testing.T) {
 func TestClone_PipelineSlicesAreIndependent(t *testing.T) {
 	base := pipelineBase()
 	cp := base.Clone()
-	cp.Phases[0].Model = "clone-only"
+	cp.Phases[0].Model = ModelRoutes{"clone-only"}
 	cp.Phases[0].Tier = "clone-only"
-	cp.ReviewPanel[0].Model = "clone-only"
+	cp.ReviewPanel[0].Model = ModelRoutes{"clone-only"}
 	cp.ReviewPanelConcurrency = 7
 
-	if base.Phases[0].Model != "" || base.Phases[0].Tier != "local" {
+	if !base.Phases[0].Model.Empty() || base.Phases[0].Tier != "local" {
 		t.Errorf("base phases mutated through the clone: %+v", base.Phases[0])
 	}
-	if base.ReviewPanel[0].Model != "local/one" || base.ReviewPanelConcurrency != 3 {
+	if base.ReviewPanel[0].Model.First() != "local/one" || base.ReviewPanelConcurrency != 3 {
 		t.Errorf("base panel mutated through the clone: %+v/%d", base.ReviewPanel[0], base.ReviewPanelConcurrency)
 	}
 	// An overlay REPLACES the slices, so the clone must not end up aliasing the
@@ -607,7 +607,7 @@ func TestClone_PipelineSlicesAreIndependent(t *testing.T) {
 // stays behind: it is the machine's, not the run's (decision e1365721).
 func TestRunConfigDocument_RoundTripsThePipelineAndPhaseModel(t *testing.T) {
 	c := pipelineBase()
-	c.Phases[0].Model = "opencode-go/gpt-6-luna"
+	c.Phases[0].Model = ModelRoutes{"opencode-go/gpt-6-luna"}
 	c.Phases[0].Tier = ""
 	c.Phases[0].MaxWallClock = Duration(45 * time.Minute)
 	c.Phases[1].Tier = "strong"
@@ -700,7 +700,7 @@ func TestValidate_PhaseSetsModelOrTierNotBoth(t *testing.T) {
 			t.Fatalf("a member setting both model and tier must validate: %v", err)
 		}
 		member := cfg.EffectivePhases()[1]
-		if member.Model != "opencode-go/gpt-6-luna" || member.Tier != "" {
+		if member.Model.First() != "opencode-go/gpt-6-luna" || member.Tier != "" {
 			t.Errorf("expanded member = model %q tier %q, want the alias with the tier cleared", member.Model, member.Tier)
 		}
 	})
@@ -787,7 +787,7 @@ func TestRunConfigDocument_RefusesAPanelThePlaneCannotRatify(t *testing.T) {
 	c := defaults()
 	c.Harness = "opencode"
 	c.Prompt = "custom operator prompt"
-	c.ReviewPanel = []ReviewPanelMember{{Name: "a", Model: "opencode-go/gpt-6-luna"}}
+	c.ReviewPanel = []ReviewPanelMember{{Name: "a", Model: ModelRoutes{"opencode-go/gpt-6-luna"}}}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("the CLI itself tolerates this shape (the panel is inert locally): %v", err)
 	}
