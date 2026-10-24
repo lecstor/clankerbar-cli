@@ -69,8 +69,8 @@ func TestDoctor_PanelMarksTheTrialSeat(t *testing.T) {
 			{Name: "fix"},
 		},
 		ReviewPanel: []config.ReviewPanelMember{
-			{Model: "opencode-go/gpt-6-luna"},
-			{Name: "trial-ornith", Model: "commandcode/ornith", Optional: true},
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Name: "trial-ornith", Model: config.ModelRoutes{"commandcode/ornith"}, Optional: true},
 		},
 	}
 	if err := cfg.Validate(); err != nil {
