@@ -276,3 +276,24 @@ func TestInvocationFor_BriefNamesTheRoutableStartRoute(t *testing.T) {
 		t.Errorf("the brief's own attribution does not name the session's starting route %q", routePaidAlias)
 	}
 }
+
+// The supervised-wait probe tests the route the next session would start on,
+// marks applied - not the harness block's first route (review finding
+// 1.review-1.3). A single-route phase leaves the probe's model alone.
+func TestProbeRouteFor_AimsAtTheRouteTheNextSessionStartsOn(t *testing.T) {
+	d := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias, routePaidAlias)
+	ph := d.cfg.Phases[0]
+	if got := d.probeRouteFor(d.cfg, ph); got != routeFreeAlias {
+		t.Errorf("unmarked: probe route = %q, want %q", got, routeFreeAlias)
+	}
+	d.markRouteLimited(routeFreeAlias, time.Now().Add(2*time.Hour))
+	d.markRouteLimited(routePaidAlias, time.Now().Add(time.Hour))
+	if got := d.probeRouteFor(d.cfg, ph); got != routePaidAlias {
+		t.Errorf("both marked: probe route = %q, want %q, the route whose mark lifts first", got, routePaidAlias)
+	}
+
+	single := routedDriver(t, &fakeAdapter{}, twoPhases(), routeFreeAlias)
+	if got := single.probeRouteFor(single.cfg, single.cfg.Phases[0]); got != "" {
+		t.Errorf("single route: probe route = %q, want \"\" (the probe keeps its historical model)", got)
+	}
+}

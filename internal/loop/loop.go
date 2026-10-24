@@ -7211,6 +7211,9 @@ func (d *Driver) supervisedWait(ctx context.Context, lim harness.Limit, a harnes
 			return tokens, cost, false
 		}
 		inv, ierr := d.invocationOn(t, tc.HarnessFor(ph), true)
+		if route := d.probeRouteFor(tc, ph); ierr == nil && route != "" {
+			inv.Model = route
+		}
 		if ierr != nil {
 			// A refused probe spawn spends nothing and learns nothing about the
 			// limit, so it reads exactly like any other probe error: log the

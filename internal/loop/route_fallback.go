@@ -162,3 +162,21 @@ func (d *Driver) routeRoutesFor(tc *config.Config, ph config.Phase) []string {
 	routes, _ := tc.ModelRoutesForPhase(ph)
 	return d.routableRoutes(routes)
 }
+
+// probeRouteFor is the route a supervised-wait probe should test for a phase
+// with a route list (review finding 1.review-1.3): the route its next session
+// would start on, marks applied. A wait is entered only once every route is
+// spent, so that is the route whose mark lifts first - not the harness block's
+// first route, which may be a route this run has already moved off. It returns
+// "" for a phase with one route or none, so a single-route probe keeps the
+// model it always had.
+func (d *Driver) probeRouteFor(tc *config.Config, ph config.Phase) string {
+	routes, _ := tc.ModelRoutesForPhase(ph)
+	if len(routes) < 2 {
+		return ""
+	}
+	if routable := d.routableRoutes(routes); len(routable) > 0 {
+		return routable[0]
+	}
+	return ""
+}
