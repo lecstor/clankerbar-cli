@@ -554,6 +554,37 @@ defined runs on that model and says so in the iteration log; the run-wide `model
 itself empty means the harness picks, as it always has. A config written before any of this existed behaves exactly as it
 did. A mistyped bucket costs a log line at 3am, not a stopped drain.
 
+**Route lists: a free route first, its paid twin after it.** A model field may
+also name an **ordered list of routes** instead of one alias. The session starts
+on the first; if the provider denies it with a usage limit — a free tier that has
+run dry — the opencode adapter resumes the **same session** on the next route, so
+the transcript and the work in progress survive the switch:
+
+```json
+"harnesses": {
+  "opencode": {
+    "model": ["opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"]
+  }
+}
+```
+
+The array form is accepted anywhere a model alias is: a harness block's `model`,
+each value of its `models` tier map, a phase's `model`, and a review-panel
+member's `model`. The top-level `model` and `models` stay plain strings — that is
+the plane's stored schema — so on a single-harness config put the list in that
+harness's block.
+
+The switch is **sticky for the run, not per request**. The driver marks the
+denied route until the reset the provider stated, or 30 minutes when it stated
+none, and later phases start on the route that worked; the run returns to the
+free route at a phase boundary once the mark lifts, never mid-session. A
+transient 429 is not a switch — it stays on the retry ladder. When every route is
+denied the session is treated exactly as a limit always was: a rolling window is
+waited out and a hard budget stop ends the run. A phase that starts with every
+route still marked uses the one whose mark lifts first. A list of one behaves
+exactly like the plain string it replaced, including the config identity the
+fleet reports.
+
 **Which way to tier is a question of blast radius, not difficulty.** A phase that
 produces a durable artifact — code, a recorded decision, a bar someone will be
 measured against — is worth the strong bucket, because a mis-recorded decision is

@@ -656,7 +656,7 @@ func TestRun_ReviewTierEscalationBeatsAPinnedPhaseModel(t *testing.T) {
 	reviewPhases := func() []config.Phase {
 		return []config.Phase{
 			{Name: config.ImplementPhaseName},
-			{Name: config.ReviewPhaseName, Model: "pinned/review-model"},
+			{Name: config.ReviewPhaseName, Model: config.ModelRoutes{"pinned/review-model"}},
 		}
 	}
 	// A checkpointed implement phase whose claim declares the category the

@@ -129,6 +129,22 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if o.OutputCapNoOutput(res) {
 		o.resumeOutputCapStall(ctx, in, &res, deadline)
 	}
+	// CLA-782: a usage limit on one model route is not the end of the session
+	// when the config named a fallback. Runs BEFORE the resurrection loop (a
+	// switch resumes the same session, and a later quiet death then resurrects on
+	// the route that was working), never on a probe, and leaves a limit on the
+	// last route untouched for the driver's existing limit branch.
+	if !in.Probe {
+		if err := o.switchRoutesOnLimit(ctx, in, in.RouteList(), &res, deadline); err != nil {
+			return res, err
+		}
+		// Keep later resumes on the route that actually ran: the resurrection
+		// probe and continuation below read in.ModelArg(), and resuming on the
+		// route that was just denied would only re-hit its limit.
+		if finished := RouteFinished(res); finished != "" {
+			in = in.OnRoute(finished)
+		}
+	}
 	// An UNTRUSTED stream is never resurrected: CLA-262 forbids reading claim
 	// state off an over-run capture, and both the coherence ref and the
 	// continuation's seed come from exactly that state - while the driver's

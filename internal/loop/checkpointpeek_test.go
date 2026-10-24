@@ -424,8 +424,8 @@ func TestDrainPhases_RecoveredOptionalSeatRecordLeavesTheRoundSealed(t *testing.
 		},
 	}
 	members := []config.ReviewPanelMember{
-		{Name: "review-1", Harness: "opencode", Model: "opencode-go/gpt-6-luna", Optional: true},
-		{Name: "review-2", Harness: "opencode", Model: "opencode-go/glm-5.3-flash"},
+		{Name: "review-1", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}, Optional: true},
+		{Name: "review-2", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
 	}
 	d := panelDriver(t, h, rel, members, panelPhases())
 	d.cfg.ReviewPanelConcurrency = 1
