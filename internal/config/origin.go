@@ -88,6 +88,71 @@ type mcpFile struct {
 	Permission json.RawMessage `json:"permission"`
 	Plugin     json.RawMessage `json:"plugin"`
 	Agent      json.RawMessage `json:"agent"`
+	// Agents and DefaultAgent are the 2.x spellings: `agents.<name>` (with a
+	// `permissions` list) and the agent a session starts on.
+	Agents       json.RawMessage `json:"agents"`
+	DefaultAgent json.RawMessage `json:"default_agent"`
+}
+
+// UnmarshalJSON decodes the union mcpFile shape and additionally flattens the
+// opencode 2.x `mcp.servers` dialect into MCP, so every consumer (the
+// credential-origin gates, the local-process disclosure, the ambient-config
+// audit, the slug derivation) sees an opencode 2.x config's servers exactly as
+// a 1.x config's. Both dialects are accepted by opencode 2.0.32, and the
+// adapter rewrites 1.x entries into `mcp.servers` before a session sees them
+// (docs/opencode-build.md).
+//
+// The two dialects cannot collide on a real file: opencode 1.x writes `mcp` as
+// a map of server-name -> entry, opencode 2.x writes it as an object with a
+// `servers` sub-map. The one ambiguous document — a v1 file whose only server
+// is literally named "servers" — is resolved by the VALUE: the v2 container's
+// `servers` value is an object of entries, which decodes into mcpEntry as all
+// zero (its fields are entry fields, url/command/…, and none match), where a
+// v1 entry object carries at least one of those fields. An all-zero "servers"
+// entry is therefore read as the v2 container and flattened.
+func (f *mcpFile) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		MCPServers map[string]mcpEntry `json:"mcpServers"`
+		MCP        json.RawMessage     `json:"mcp"`
+		Permission json.RawMessage     `json:"permission"`
+		Plugin     json.RawMessage     `json:"plugin"`
+		Agent      json.RawMessage     `json:"agent"`
+		Agents     json.RawMessage     `json:"agents"`
+		Default    json.RawMessage     `json:"default_agent"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	f.MCPServers = raw.MCPServers
+	f.Permission, f.Plugin, f.Agent = raw.Permission, raw.Plugin, raw.Agent
+	f.Agents, f.DefaultAgent = raw.Agents, raw.Default
+	if len(raw.MCP) == 0 || string(raw.MCP) == "null" {
+		return nil
+	}
+	var v1 map[string]mcpEntry
+	if err := json.Unmarshal(raw.MCP, &v1); err != nil {
+		return err
+	}
+	if e, ok := v1["servers"]; ok && len(v1) == 1 && entryIsZero(e) {
+		var v2 struct {
+			Servers map[string]mcpEntry `json:"servers"`
+		}
+		if err := json.Unmarshal(raw.MCP, &v2); err == nil {
+			f.MCP = v2.Servers
+			return nil
+		}
+	}
+	f.MCP = v1
+	return nil
+}
+
+// entryIsZero reports whether an mcpEntry decoded as all-zero — no URL, no
+// header/env maps, no command/args, no enabled flag. It is the discriminator
+// between a v1 entry literally named "servers" and the v2 `mcp.servers`
+// container (see mcpFile.UnmarshalJSON).
+func entryIsZero(e mcpEntry) bool {
+	return e.URL == "" && e.Headers == nil && e.Env == nil && e.Environment == nil &&
+		e.Command == nil && e.Args == nil && e.Enabled == nil && e.Disabled == nil
 }
 
 type mcpEntry struct {
@@ -107,6 +172,29 @@ type mcpEntry struct {
 	// because the interesting part of `bash -c "curl ... | sh"` is entirely in
 	// here - naming the entry as running "bash" would be true and useless.
 	Args json.RawMessage `json:"args"`
+
+	// Enabled is opencode's per-server switch. A POINTER because absent means
+	// enabled and `false` means disabled, and a plain bool cannot tell those
+	// apart - which would read every entry of every Claude-shaped file, where
+	// the key does not exist at all, as switched off.
+	//
+	// Read by ONE caller: the ambient-config check, where a disabled server
+	// genuinely cannot redirect anything because opencode does not start it. It
+	// is deliberately NOT consulted by readMCPServers, whose callers are the
+	// credential-origin and local-process gates - see
+	// opencodeConfigClankerbarSlug for why a security gate must keep looking at
+	// an entry the file merely CLAIMS is off.
+	Enabled *bool `json:"enabled"`
+
+	// Disabled is the 2.x spelling of the same switch, inverted: `"disabled":
+	// true` turns a server off. Read only where Enabled is, for the same reason.
+	Disabled *bool `json:"disabled"`
+}
+
+// disabled reports whether this entry is switched off by an explicit 1.x
+// `"enabled": false` or 2.x `"disabled": true`.
+func (e mcpEntry) disabled() bool {
+	return (e.Enabled != nil && !*e.Enabled) || (e.Disabled != nil && *e.Disabled)
 }
 
 // startsProcess reports whether this entry would start a LOCAL PROCESS. A
@@ -259,6 +347,36 @@ func referencesKey(m map[string]string) bool {
 	return false
 }
 
+// MCPClankerbar reports the usable clankerbar server the file at path declares:
+// an entry named `clankerbar`, or one referencing `CLANKERBAR_API_KEY`, that is
+// not explicitly `"enabled": false`. It returns that entry's URL ("" for a
+// local-command entry, which has none) and whether such an entry exists at all.
+//
+// This is the "always has clankerbar set up" probe (CLA-448): it feeds both
+// Validate's refusal of a named MCP config that is present and silent about
+// clankerbar, and doctor's sessionCheck verdict for the opencode harness. It is
+// deliberately STRICTER than checkMCPConfigOrigins, which only constrains where
+// the key may go — a file with no clankerbar entry at all has nothing to check
+// there and passes, exactly the tool-less-session config this predicate exists
+// to refuse.
+func MCPClankerbar(path string) (url string, ok bool) {
+	f, err := readMCPFile(path)
+	if err != nil {
+		return "", false
+	}
+	for _, block := range []map[string]mcpEntry{f.MCPServers, f.MCP} {
+		for name, s := range block {
+			if s.disabled() {
+				continue
+			}
+			if name == "clankerbar" || referencesKey(s.Headers) || referencesKey(s.Env) || referencesKey(s.Environment) {
+				return s.URL, true
+			}
+		}
+	}
+	return "", false
+}
+
 // checkMCPConfigOrigins refuses a harness MCP config that would send the API key
 // somewhere this config does not trust.
 //
@@ -277,6 +395,35 @@ func referencesKey(m map[string]string) bool {
 // A refusal, not a silent drop: dropping the file would spawn a session with no
 // clankerbar tools at all, which burns an iteration and reads as "the backlog was
 // empty". The operator gets a named host and a remedy instead.
+// checkMCPConfigNamesClankerbar refuses a resolved MCP config file that is
+// PRESENT but silent about clankerbar (CLA-448): a file a daemon hands to every
+// session, whose sessions would therefore start with no clankerbar tools at
+// all — the shape that burned three clankers on CLA-351 and CLA-377 before
+// parking them. A missing file keeps today's behavior (doctor's no-.mcp.json
+// WARN covers it), and an empty path is the harness's fallback to its own
+// config dir, which this check must not second-guess.
+func checkMCPConfigNamesClankerbar(path, label string) error {
+	if path == "" {
+		return nil
+	}
+	fi, err := os.Stat(expandHome(path))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	if !fi.Mode().IsRegular() {
+		return fmt.Errorf("%s: %s is not a regular file", label, path)
+	}
+	if _, ok := MCPClankerbar(path); !ok {
+		return fmt.Errorf("%s: %s does not declare a usable clankerbar server — sessions would start with no clankerbar tools "+
+			"(add an entry named \"clankerbar\", or one referencing %s, that is not \"enabled\": false)",
+			label, path, credentialEnvVar)
+	}
+	return nil
+}
+
 func (c *Config) checkMCPConfigOrigins(path, label string) error {
 	if path == "" || path == MCPConfigNone {
 		// Nothing configured, or the explicit "none" opt-out (CLA-318): there is

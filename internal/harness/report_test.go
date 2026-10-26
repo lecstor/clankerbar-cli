@@ -4,7 +4,7 @@ import "testing"
 
 // Capturing the delivery claims the driver then checks against local git
 // (CLA-253). The discipline mirrors claim tracking exactly: a claim is kept only
-// if the PLANE accepted the call that made it, because a refused `update_task`
+// if the PLANE accepted the call that made it, because a refused progress or terminal call
 // recorded nothing and complaining about it would be noise.
 
 func TestClaudeDeliveryReports(t *testing.T) {
@@ -18,7 +18,7 @@ func TestClaudeDeliveryReports(t *testing.T) {
 			// past its first three commits.
 			name: "a recorded branch is a claim worth checking",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
 				toolResult("u2", `{}`),
 			),
 			want: []Report{{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Branch: "clanker/x"}},
@@ -26,7 +26,7 @@ func TestClaudeDeliveryReports(t *testing.T) {
 		{
 			name: "a declared delivery carries the ancestor check the plane only stores",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"done","delivery":{"commit":"abc123","integrationBranch":"main","mergeVerified":true}}`),
+				toolUse("u2", completeTaskTool, `{"taskId":"`+claimUUID+`","outcome":"**Tests** - x","delivery":{"commit":"abc123","integrationBranch":"main","mergeVerified":true}}`),
 				toolResult("u2", `{}`),
 			),
 			want: []Report{{
@@ -35,13 +35,13 @@ func TestClaudeDeliveryReports(t *testing.T) {
 			}},
 		},
 		{
-			name: "branch and delivery on one call is one report",
+			name: "branch and delivery on one progress write is one report",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimRef+`","status":"in_review","branch":"clanker/x","delivery":{"commit":"abc123","integrationBranch":"main"}}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimRef+`","branch":"clanker/x","delivery":{"commit":"abc123","integrationBranch":"main"}}`),
 				toolResult("u2", `{}`),
 			),
 			want: []Report{{
-				TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Status: "in_review",
+				TaskID: claimUUID, Ref: claimRef, RunID: "r-1",
 				Branch: "clanker/x", Commit: "abc123", IntegrationBranch: "main",
 			}},
 		},
@@ -50,7 +50,7 @@ func TestClaudeDeliveryReports(t *testing.T) {
 			// complaint about a hand-off that does not exist.
 			name: "a REFUSED update claims nothing",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
 				toolResultErr("u2", "run_superseded"),
 			),
 			want: nil,
@@ -58,7 +58,7 @@ func TestClaudeDeliveryReports(t *testing.T) {
 		{
 			name: "an update that claims no delivery is not a report",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_progress","outcome":"still going"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimUUID+`","outcome":"still going"}`),
 				toolResult("u2", `{}`),
 			),
 			want: nil,
@@ -68,7 +68,7 @@ func TestClaudeDeliveryReports(t *testing.T) {
 			// there is nothing to check — not a silent pass, simply not a claim.
 			name: "a commit with no integration branch is not checkable",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"done","delivery":{"commit":"abc123"}}`),
+				toolUse("u2", completeTaskTool, `{"taskId":"`+claimUUID+`","outcome":"**Tests** - x","delivery":{"commit":"abc123"}}`),
 				toolResult("u2", `{}`),
 			),
 			want: nil,
@@ -78,7 +78,7 @@ func TestClaudeDeliveryReports(t *testing.T) {
 			// task says nothing about the tree this session worked in.
 			name: "an update to another task is not this session's delivery",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"CLA-999","branch":"clanker/other"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"CLA-999","branch":"clanker/other"}`),
 				toolResult("u2", `{}`),
 			),
 			want: nil,
@@ -89,28 +89,28 @@ func TestClaudeDeliveryReports(t *testing.T) {
 			// network round trip, a duplicate log line and a duplicate plane write.
 			name: "the same claim restated is one report",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_progress","branch":"clanker/x"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
 				toolResult("u2", `{}`),
-				toolUse("u3", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_progress","branch":"clanker/x"}`),
+				toolUse("u3", recordProgressTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
 				toolResult("u3", `{}`),
-				toolUse("u4", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review","branch":"clanker/x"}`),
+				toolUse("u4", submitForReviewTool, `{"taskId":"`+claimUUID+`","outcome":"**Tests** - x"}`),
 				toolResult("u4", `{}`),
 			),
-			// The LAST status wins: it is the most recent one that says whether the
-			// work is being handed to review or declared landed.
-			want: []Report{{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Status: "in_review", Branch: "clanker/x"}},
+			// The later restatement wins, and the hand-over itself carries no
+			// branch: the report is the branch record.
+			want: []Report{{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Branch: "clanker/x"}},
 		},
 		{
 			name: "several deliveries are kept in order",
 			lines: withClaim(
-				toolUse("u2", updateTaskTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
+				toolUse("u2", recordProgressTool, `{"taskId":"`+claimUUID+`","branch":"clanker/x"}`),
 				toolResult("u2", `{}`),
-				toolUse("u3", updateTaskTool, `{"taskId":"`+claimUUID+`","status":"in_review","delivery":{"commit":"abc123","integrationBranch":"main"}}`),
+				toolUse("u3", recordProgressTool, `{"taskId":"`+claimUUID+`","delivery":{"commit":"abc123","integrationBranch":"main"}}`),
 				toolResult("u3", `{}`),
 			),
 			want: []Report{
 				{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Branch: "clanker/x"},
-				{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Status: "in_review", Commit: "abc123", IntegrationBranch: "main"},
+				{TaskID: claimUUID, Ref: claimRef, RunID: "r-1", Commit: "abc123", IntegrationBranch: "main"},
 			},
 		},
 	}

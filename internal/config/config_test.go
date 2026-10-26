@@ -50,7 +50,7 @@ func TestValidateHarnessFromRegistry(t *testing.T) {
 	}
 }
 
-func TestResolveEnv(t *testing.T) {
+func TestSessionEnvResolvesTopLevel(t *testing.T) {
 	dir := t.TempDir()
 	secret := filepath.Join(dir, "token")
 	if err := os.WriteFile(secret, []byte("  sk-ant-oat01-abc\n"), 0o600); err != nil {
@@ -58,7 +58,8 @@ func TestResolveEnv(t *testing.T) {
 	}
 
 	t.Run("nil map yields nil", func(t *testing.T) {
-		got, err := resolveEnv(nil)
+		c := defaults()
+		got, err := c.SessionEnv(c.Harness, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -68,11 +69,13 @@ func TestResolveEnv(t *testing.T) {
 	})
 
 	t.Run("literals and @file, sorted and trimmed", func(t *testing.T) {
-		got, err := resolveEnv(map[string]string{
-			"ZED":                     "last",
-			"CLAUDE_CODE_OAUTH_TOKEN": "@" + secret,
-			"ALPHA":                   "first",
-		})
+		c := defaults()
+		c.Env = EnvMap{
+			"ZED":                     {Literal: "last"},
+			"CLAUDE_CODE_OAUTH_TOKEN": {Literal: "@" + secret},
+			"ALPHA":                   {Literal: "first"},
+		}
+		got, err := c.SessionEnv(c.Harness, "")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -87,21 +90,23 @@ func TestResolveEnv(t *testing.T) {
 	})
 
 	t.Run("missing @file is an error naming the key", func(t *testing.T) {
-		_, err := resolveEnv(map[string]string{"TOK": "@" + filepath.Join(dir, "nope")})
+		c := defaults()
+		c.Env = EnvMap{"TOK": {Literal: "@" + filepath.Join(dir, "nope")}}
+		_, err := c.SessionEnv(c.Harness, "")
 		if err == nil {
 			t.Fatal("want error for missing file, got nil")
 		}
 	})
 }
 
-func TestValidatePopulatesEnvSlice(t *testing.T) {
+// CLA-462: resolution moved from Validate (once per daemon start) to every
+// spawn, so Validate now checks DECLARATIONS only — names and commands are
+// static facts of the file — and leaves values alone entirely.
+func TestValidateChecksEnvDeclarationsWithoutResolving(t *testing.T) {
 	c := defaults()
-	c.Env = map[string]string{"FOO": "bar"}
+	c.Env = EnvMap{"FOO": {Literal: "bar"}}
 	if err := c.Validate(); err != nil {
 		t.Fatalf("validate: %v", err)
-	}
-	if got := c.EnvSlice(); !reflect.DeepEqual(got, []string{"FOO=bar"}) {
-		t.Fatalf("EnvSlice = %v", got)
 	}
 }
 
@@ -272,7 +277,7 @@ func TestProjectsValidation(t *testing.T) {
 	t.Run("each project's mcp config defaults to its own workdir's .mcp.json", func(t *testing.T) {
 		dir := t.TempDir()
 		mcp := filepath.Join(dir, ".mcp.json")
-		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		c := base()
@@ -296,7 +301,7 @@ func TestProjectsValidation(t *testing.T) {
 		// clankerbar tools and the poller could derive no slug.
 		dir := t.TempDir()
 		mcp := filepath.Join(dir, ".mcp.json")
-		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{}}`), 0o600); err != nil {
+		if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		c := base()
@@ -614,6 +619,45 @@ func TestZeroSpendAttemptBound(t *testing.T) {
 	})
 }
 
+// TestRepeatedToolFailureBound pins the CLA-739 knob: unset is the default 5,
+// an explicit 0 is OFF (unlike max_zero_spend_attempts, where 0 defers to the
+// default), a negative is refused, and an unset knob is absent from the
+// marshalled config so adding it changes no existing daemon's identity.
+func TestRepeatedToolFailureBound(t *testing.T) {
+	load := func(t *testing.T, doc string) *Config {
+		t.Helper()
+		var c Config
+		if err := json.Unmarshal([]byte(doc), &c); err != nil {
+			t.Fatalf("unmarshal %s: %v", doc, err)
+		}
+		return &c
+	}
+	if got := load(t, `{}`).RepeatedToolFailureBound(); got != 5 {
+		t.Errorf("unset = %d, want the default 5", got)
+	}
+	if got := load(t, `{"max_repeated_tool_failures": 0}`).RepeatedToolFailureBound(); got != 0 {
+		t.Errorf("explicit 0 = %d, want 0 (off)", got)
+	}
+	if got := load(t, `{"max_repeated_tool_failures": 9}`).RepeatedToolFailureBound(); got != 9 {
+		t.Errorf("explicit 9 = %d, want 9", got)
+	}
+	c := load(t, `{"harness": "claude", "prompt": "work", "max_repeated_tool_failures": -1}`)
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "max_repeated_tool_failures") {
+		t.Errorf("Validate() = %v, want an error naming max_repeated_tool_failures", err)
+	}
+	c = load(t, `{"harness": "claude", "prompt": "work", "max_repeated_tool_failures": 0}`)
+	if err := c.Validate(); err != nil {
+		t.Errorf("Validate() with 0 (off) = %v, want nil", err)
+	}
+	out, err := json.Marshal(load(t, `{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(out), "max_repeated_tool_failures") {
+		t.Errorf("an unset knob is marshalled: %s", out)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Per-harness breakers (CLA-367).
 //
@@ -828,4 +872,44 @@ func TestSessionTokenCeilingFollowsAPerHarnessTokenCeiling(t *testing.T) {
 	if got := (Budget{MaxTokens: 75_000_000}).SessionTokenCeiling(); got != 150_000_000 {
 		t.Errorf("SessionTokenCeiling = %d, want 2x max_tokens as before", got)
 	}
+}
+
+// echo_sessions is opt-in and must default off (CLA-701): the session stream is
+// the whole harness transcript, and echoing it buries the daemon's own lines. It
+// is also part of the config's identity only when SET, so a config that never
+// names it keeps the identity it had before the field existed.
+func TestLoadEchoSessions(t *testing.T) {
+	write := func(t *testing.T, body string) *Config {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "clankerbar.json")
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		c, err := Load(path)
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		return c
+	}
+
+	t.Run("absent means off", func(t *testing.T) {
+		c := write(t, `{"harness":"claude"}`)
+		if c.EchoSessions {
+			t.Error("echo_sessions must default to false")
+		}
+	})
+	t.Run("true restores the echo", func(t *testing.T) {
+		c := write(t, `{"harness":"claude","echo_sessions":true}`)
+		if !c.EchoSessions {
+			t.Error("echo_sessions: true must be read")
+		}
+	})
+	t.Run("unset does not change the config identity", func(t *testing.T) {
+		without := write(t, `{"harness":"claude"}`)
+		other := write(t, `{"harness":"claude","prompt":"x"}`)
+		other.Prompt = without.Prompt
+		if without.Identity() != other.Identity() {
+			t.Errorf("an unset echo_sessions changed the config identity:\n%q\n%q", without.Identity(), other.Identity())
+		}
+	})
 }

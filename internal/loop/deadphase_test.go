@@ -37,6 +37,10 @@ func deadReleaserDriver(t *testing.T, h harness.Adapter) (*Driver, *parkingRelea
 	cfg.Prompt = ""
 	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel}})
 	openTestStateDir(t, d)
+	// The implement phase's evidence gate (CLA-457) needs a working tree to
+	// search and a verifier; stub both the way phaseDriver does.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 	return d, rel
 }
 
@@ -365,6 +369,10 @@ func TestRun_FleetPauseResumesWhenTheQuestionIsAnswered(t *testing.T) {
 	}, sum: backlog.Summary{Claimable: 0, OpenQuestions: 3}} // after: idle
 	d := NewMulti(cfg, h, []Target{{Poller: p, Releaser: rel}})
 	openTestStateDir(t, d)
+	// Drain 2's checkpoint (implement succeeds) needs the evidence gate stubbed
+	// (CLA-457): a working tree and a passing verifier, like the other helpers.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 	d.fleetDead[0] = fleetDeadBound - 1 // the first death trips it
 
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)

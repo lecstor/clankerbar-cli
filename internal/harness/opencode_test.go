@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 // opencodeParsed runs a stdout stream through exactly the machinery Invoke uses —
@@ -100,35 +101,360 @@ func TestOpencodeParse_empty(t *testing.T) {
 	}
 }
 
+// opencodeQuotaEventFixture is the verbatim terminal stream event CLA-736
+// captured from the Command Code plan's rolling 5-hour window
+// (2026-10-20T22:00 AEST) — the shape that was misread as a transient failure:
+// a 429 whose error.type is provider.quota and whose message STATES the reset
+// instant. Read from disk rather than inlined so the fixture stays the captured
+// bytes, and so the wrapping it proves is pinned by a file rather than a
+// comment:
+//
+//   - error.type / error.message / error.status survive as opencode's own fields
+//   - the provider's raw body survives VERBATIM as a JSON string under
+//     error.response.body, carrying code=RATE_LIMITED — opencode does not
+//     re-parse it, so this adapter has to
+//   - that body carried no rateLimit.window, which is why the window here comes
+//     from the wording (CLA-752)
+func opencodeQuotaEventFixture(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "opencode-quota-five-hour.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the 2026-10-20 five-hour quota fixture: %v", err)
+	}
+	return strings.TrimRight(string(b), "\n")
+}
+
 func TestOpencodeDetectLimit(t *testing.T) {
-	// DetectLimit is the HARD budget/credit-exhaustion STOP only, and only from the
+	// DetectLimit recognizes two shapes, and Stop is what separates them: a HARD
+	// budget/credit exhaustion (Stop — no reset to wait for) and a ROLLING
+	// subscription quota that states a window (wait-and-poll). Both scan only the
 	// harness's own diagnostics (an error event, or stderr) — never the agent's
-	// narration. An API 429 rate limit is transient (below), not this.
+	// narration.
+	quotaEvent := opencodeQuotaEventFixture(t)
 	cases := []struct {
-		name string
-		res  Result
-		want bool
+		name       string
+		res        Result
+		want       bool
+		wantStop   bool
+		wantReset  string // RFC3339; empty means the zero time
+		wantWindow string // the labelled usage window, empty when none was named
 	}{
-		{"402 payment required (opencode error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Payment Required","statusCode":402,"isRetryable":false}}}`}, true},
-		{"out of credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your account is out of credits"}}}`}, true},
-		{"insufficient credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Insufficient credits to run this request"}}}`}, true},
-		{"openrouter credit balance too low (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your credit balance is too low to access this model"}}}`}, true},
-		{"monthly limit reached (stderr diagnostic)", Result{Stderr: "opencode: you have reached your monthly limit"}, true},
-		{"spend cap (stderr diagnostic)", Result{Stderr: "spend cap exceeded for this workspace"}, true},
-		{"429 is transient not the cap", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`}, false},
-		{"agent narration about credits is NOT a stop", Result{Stdout: `{"type":"text","part":{"type":"text","text":"The billing note says the account is out of credits and hit its monthly limit."}}`}, false},
-		{"clean run", Result{Stdout: opencodeStream}, false},
+		{"402 payment required (opencode error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Payment Required","statusCode":402,"isRetryable":false}}}`}, true, true, "", ""},
+		{"out of credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your account is out of credits"}}}`}, true, true, "", ""},
+		{"insufficient credits (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Insufficient credits to run this request"}}}`}, true, true, "", ""},
+		{"openrouter credit balance too low (error event)", Result{Stdout: `{"type":"error","error":{"data":{"message":"Your credit balance is too low to access this model"}}}`}, true, true, "", ""},
+		{"monthly limit reached (stderr diagnostic)", Result{Stderr: "opencode: you have reached your monthly limit"}, true, true, "", ""},
+		{"spend cap (stderr diagnostic)", Result{Stderr: "spend cap exceeded for this workspace"}, true, true, "", ""},
+		// CLA-736: the rolling 5-hour quota. Limited, NOT Stop, with the provider's
+		// own stated reset parsed out of the message.
+		{"provider.quota 5-hour window (verbatim CLA-736 event)", Result{Stdout: quotaEvent}, true, false, "2026-10-20T15:56:48.251Z", "5-hour"},
+		// The same message with the reset sentence absent is still a rolling limit
+		// — the wait falls back to interval probing, which is why a missing reset
+		// must not demote it to "no limit".
+		{"provider.quota 5-hour window without a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You've reached your 5-hour usage limit for your plan.","status":429}}`}, true, false, "", "5-hour"},
+		// The hard-stop arm keeps winning when the event is typed as a quota: a
+		// monthly cap is not a window to wait out (settled 2).
+		{"provider.quota typed monthly cap is still a Stop", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You have reached your monthly usage limit","status":429}}`}, true, true, "", ""},
+		// Review 1.review-1.1 / 1.review-3.1: the GENERIC budget phrasings
+		// ("usage limit reached", "insufficient ... quota") must not win over the
+		// rolling classification. A provider.quota event carrying those words and
+		// a stated reset is a WAIT with the reset parsed, not a hard stop that
+		// discards it.
+		{"provider.quota 'Usage limit reached' with a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Usage limit reached. Your limit resets at 2026-10-20T15:56:48.251Z. Please wait for the window to reset.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z", ""},
+		{"provider.quota 'Insufficient quota remaining' with a stated reset", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Insufficient quota remaining. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z", ""},
+		// Review 1.review-3.1's exact probe: the legacy phrase alone, typed as a
+		// quota, with no stated reset — still waitable (interval probing).
+		{"provider.quota '5-hour usage limit reached'", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"5-hour usage limit reached","status":429}}`}, true, false, "", "5-hour"},
+		// Review 1.review-1.1's UNTYPED probe: a rolling window plus the legacy
+		// phrase, with no error.type — the window arm must win before the generic
+		// stop arm, or the loop never waits out the quota.
+		{"untyped 5-hour window with 'usage limit reached'", Result{Stdout: `{"type":"error","error":{"message":"You've reached your 5-hour usage limit. Usage limit reached for your plan.","status":429}}`}, true, false, "", "5-hour"},
+		// Review 1.review-5.1: the provider.quota TYPE alone classifies, with no
+		// duration/window wording anywhere in the message. Removing that
+		// alternative must fail this case.
+		{"provider.quota type alone (no window wording)", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Provider quota exhausted for this account.","status":429}}`}, true, false, "", ""},
+		// Review 1.review-1.2: the window arm must not require the word "usage" —
+		// an untyped "5-hour limit" is the same window.
+		{"untyped '5-hour limit has been reached'", Result{Stdout: `{"type":"error","error":{"message":"Your 5-hour limit has been reached","status":429}}`}, true, false, "", "5-hour"},
+		// The generic phrasings on their own are still a Stop: nothing says the
+		// window lifts, so there is no reset to wait for.
+		{"generic 'usage limit reached' alone is still a Stop", Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Upgrade your plan to continue.","status":429}}`}, true, true, "", ""},
+		{"generic 'insufficient quota' alone is still a Stop", Result{Stdout: `{"type":"error","error":{"message":"Insufficient quota to run this request.","status":429}}`}, true, true, "", ""},
+		// A generic phrasing that STATES the reset is a wait even untyped: the
+		// provider named when it lifts.
+		{"untyped 'usage limit reached' with a stated reset", Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z", ""},
+		// The wording arm, for a provider that does not type the error: an
+		// N-hour/N-minute/session/daily usage limit is a rolling window whichever
+		// type carries it.
+		{"untyped 5-hour usage limit on stderr", Result{Stderr: "You've reached your 5-hour usage limit for your plan"}, true, false, "", "5-hour"},
+		{"untyped 30-minute usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your 30-minute usage limit"}}`}, true, false, "", ""},
+		{"untyped session usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your session usage limit"}}`}, true, false, "", ""},
+		{"untyped daily usage limit (error event)", Result{Stdout: `{"type":"error","error":{"message":"You have reached your daily usage limit"}}`}, true, false, "", "daily"},
+		// Review 1.review-1.1: the WEEKLY window is the one this task adds, and a
+		// prose weekly cap must classify exactly like its siblings — a rolling
+		// limit labelled weekly — instead of reading as no limit at all (and, on
+		// a 429, riding the transient ladder).
+		{"untyped weekly usage limit on stderr", Result{Stderr: "You've reached your weekly usage limit for your plan"}, true, false, "", "weekly"},
+		{"untyped weekly usage limit without the plan phrase", Result{Stderr: "You've reached your weekly usage limit."}, true, false, "", "weekly"},
+		{"untyped weekly usage limit with a 429 but no plan phrase", Result{Stdout: `{"type":"error","error":{"message":"You've reached your weekly usage limit.","status":429}}`}, true, false, "", "weekly"},
+		// Review 1.review-2.2: the same rolling window with the limit word FIRST
+		// ("...has been reached (5-hour window)") matches neither the window-first
+		// arm nor the generic arm (which wants "usage limit reached" adjacent), so
+		// before the second rolling arm it rode the transient ladder instead of a
+		// supervised wait.
+		{"untyped limit with the window AFTER it", Result{Stdout: `{"type":"error","error":{"message":"Your usage limit has been reached (5-hour window)","status":429}}`}, true, false, "", "5-hour"},
+		// CLA-752: the STRUCTURED window, read from the provider's response body
+		// that opencode passes through verbatim. The wording deliberately names no
+		// window, so only the structured path can classify these.
+		{"structured weekly window at the body's top level", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Your plan limit has been reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"message\":\"Weekly usage limit reached\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, true, false, "", "weekly"},
+		{"structured weekly window nested under the body's error object", Result{Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"response":{"body":"{\"error\":{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}}"}}}`}, true, false, "", "weekly"},
+		// The window may also sit on the error object itself, not in a body —
+		// opencode's own ProviderError carries a rateLimit there.
+		{"structured weekly window on the error object", Result{Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"code":"RATE_LIMITED","rateLimit":{"window":"weekly"}}}`}, true, false, "", "weekly"},
+		{"structured daily window", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"Your plan limit has been reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"daily\"}}"}}}`}, true, false, "", "daily"},
+		{"structured fiveHour window with a stated reset", Result{Stdout: `{"type":"error","error":{"message":"Your plan limit has been reached. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"fiveHour\"}}"}}}`}, true, false, "2026-10-20T15:56:48.251Z", "5-hour"},
+		// The older APIError shape puts the same provider body under
+		// error.data.responseBody (the tool-schema-rejection capture's wrapping).
+		{"structured weekly window in error.data.responseBody", Result{Stdout: `{"type":"error","error":{"name":"APIError","data":{"message":"Rate limit reached.","statusCode":429,"responseBody":"{\"error\":{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}}"}}}`}, true, false, "", "weekly"},
+		// Review 1.review-1.4: a token the closed map does not know names NO
+		// window. Falling through to the wording default labelled an unknown cap
+		// 5-hour — a guess the map's own contract forbids — while the provider
+		// plainly named a window, so the limit survives with no label.
+		{"unrecognised structured window token names no window", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You've reached the usage limit for your plan.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"monthly\"}}"}}}`}, true, false, "", ""},
+		// The documented token is matched case- and separator-insensitively: a
+		// "FiveHour" variant is the same window, not an invisible cap that rides
+		// the transient ladder (review 1.review-1.4).
+		{"structured FiveHour variant", Result{Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"FiveHour\"}}"}}}`}, true, false, "", "5-hour"},
+		// Review 1.review-1.5: the body's own status is a restatement, never the
+		// transport. A body that says 200 must not mask the wrapper's 429 and
+		// send the cap down the transient ladder.
+		{"wrapper 429 outranks a body's own 200 status", Result{Stdout: `{"type":"error","error":{"message":"You've reached your plan limit.","status":429,"response":{"body":"{\"status\":200,\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, true, false, "", "weekly"},
+		// The message-only fallback, when no body survived the wrapping at all.
+		{"plan-limit wording with no body (5-hour default)", Result{Stdout: `{"type":"error","error":{"message":"You've reached the usage limit for your plan. Your limit resets at 2026-10-20T15:56:48.251Z.","status":429}}`}, true, false, "2026-10-20T15:56:48.251Z", "5-hour"},
+		{"plan-limit wording that says weekly", Result{Stdout: `{"type":"error","error":{"message":"You've reached the weekly usage limit for your plan.","status":429}}`}, true, false, "", "weekly"},
+		// The gate both classifiers share: a named window is a PLAN limit only on a
+		// rate-limit failure (429 or RATE_LIMITED). A 5xx carrying one is not a cap
+		// to wait out, and the wording alone does not make it one either.
+		{"structured window on a non-rate-limit status is not a plan limit", Result{Stdout: `{"type":"error","error":{"message":"Service unavailable","status":500,"response":{"body":"{\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, false, false, "", ""},
+		{"plan-limit wording without a 429 or RATE_LIMITED is not a plan limit", Result{Stdout: `{"type":"error","error":{"message":"You've reached the usage limit for your plan.","status":500}}`}, false, false, "", ""},
+		// A body that names the code but no window, with no plan-limit wording, is
+		// still the transient burst limit — not a plan cap.
+		{"RATE_LIMITED body with no window and no plan wording", Result{Stdout: `{"type":"error","error":{"message":"Rate limit exceeded","status":429,"response":{"body":"{\"error\":{\"code\":\"RATE_LIMITED\"}}"}}}`}, false, false, "", ""},
+		// The hard stop keeps winning over a structured window (settled 3).
+		{"structured window never outranks a hard budget stop", Result{Stdout: `{"type":"error","error":{"type":"provider.quota","message":"You have reached your monthly usage limit","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, true, true, "", ""},
+		// A plain 429 rate limit names no window: still transient, not a limit.
+		{"429 is transient not the cap", Result{Stdout: `{"type":"error","error":{"data":{"statusCode":429,"isRetryable":true}}}`}, false, false, "", ""},
+		{"agent narration about credits is NOT a stop", Result{Stdout: `{"type":"text","part":{"type":"text","text":"The billing note says the account is out of credits and hit its monthly limit."}}`}, false, false, "", ""},
+		// CLA-258 scoping: the quota sentence in assistant TEXT is narration, not a
+		// provider diagnostic.
+		{"quota sentence in assistant text is NOT a limit", Result{Stdout: `{"type":"text","part":{"type":"text","text":"You've reached your 5-hour usage limit for your plan. Your limit resets at 2026-10-20T15:56:48.251Z."}}`}, false, false, "", ""},
+		// CLA-700: an error event the session RECOVERED from classifies nothing.
+		// The same event followed by a further typed event is a session that
+		// carried on, so there is no limit to wait out.
+		{"quota event recovered by a later step is NOT a limit", Result{Stdout: quotaEvent + "\n" + `{"type":"step_start","part":{"type":"step-start"}}`}, false, false, "", ""},
+		{"clean run", Result{Stdout: opencodeStream}, false, false, "", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := (opencode{}).DetectLimit(tc.res)
 			if got.Limited != tc.want {
-				t.Errorf("DetectLimit.Limited = %v, want %v", got.Limited, tc.want)
+				t.Fatalf("DetectLimit.Limited = %v, want %v (reason %q)", got.Limited, tc.want, got.Reason)
 			}
-			// A recognized budget stop must flag Stop so the loop stops rather than
-			// waiting for a reset that never comes.
-			if tc.want && !got.Stop {
-				t.Errorf("DetectLimit recognized a budget limit but did not set Stop")
+			if got.Stop != tc.wantStop {
+				t.Errorf("DetectLimit.Stop = %v, want %v — a hard budget stop must stop, a rolling quota must wait", got.Stop, tc.wantStop)
+			}
+			want := time.Time{}
+			if tc.wantReset != "" {
+				ts, err := time.Parse(time.RFC3339Nano, tc.wantReset)
+				if err != nil {
+					t.Fatalf("bad wantReset %q: %v", tc.wantReset, err)
+				}
+				want = ts
+			}
+			if !got.ResetAt.Equal(want) {
+				t.Errorf("DetectLimit.ResetAt = %v, want %v", got.ResetAt, want)
+			}
+			if got.Window != tc.wantWindow {
+				t.Errorf("DetectLimit.Window = %q, want %q", got.Window, tc.wantWindow)
+			}
+		})
+	}
+}
+
+// TestOpencodeDetectLimitReadsTheCapturedProviderBody pins WHAT SURVIVES
+// opencode's error wrapping, using the real 2026-10-20 capture rather than a
+// hand-built event (CLA-752): opencode lifts the provider's message and status
+// onto `error` and passes its raw body through, as a JSON STRING, under
+// `error.response.body`. That string is never re-parsed by opencode — the
+// provider's `code` survives inside it verbatim — so the adapter has to decode
+// it to see a structured `rateLimit.window` at all.
+//
+// The captured 5-hour body carried the code but no window, which is why the
+// window is still resolved from the wording: the structured field is evidence
+// when present, not a requirement.
+func TestOpencodeDetectLimitReadsTheCapturedProviderBody(t *testing.T) {
+	event := opencodeQuotaEventFixture(t)
+
+	facts := opencodeErrorFactsOf(Result{Stdout: event})
+	if facts.Status != 429 {
+		t.Errorf("facts.Status = %d, want 429 — error.status is lifted by the wrapper", facts.Status)
+	}
+	if facts.Code != "RATE_LIMITED" {
+		t.Errorf("facts.Code = %q, want RATE_LIMITED — the provider body survives inside error.response.body", facts.Code)
+	}
+	if facts.Window != "" {
+		t.Errorf("facts.Window = %q, want empty — the captured body named no rateLimit.window", facts.Window)
+	}
+
+	lim := (opencode{}).DetectLimit(Result{Stdout: event})
+	if !lim.Limited || lim.Stop {
+		t.Fatalf("DetectLimit = %+v, want a waitable limit", lim)
+	}
+	if lim.Window != "5-hour" {
+		t.Errorf("Window = %q, want 5-hour (the wording fallback)", lim.Window)
+	}
+	if got := lim.ResetAt.UTC().Format(time.RFC3339Nano); got != "2026-10-20T15:56:48.251Z" {
+		t.Errorf("ResetAt = %s, want the reset the message states", got)
+	}
+}
+
+// TestOpencodeErrorFactsOf pins the STRUCTURAL read: which envelopes carry the
+// provider's code/window, that a JSON-string body is decoded at all, and that a
+// stream with no terminal error event — or a body that is not JSON — yields no
+// facts rather than a guess.
+func TestOpencodeErrorFactsOf(t *testing.T) {
+	tests := []struct {
+		name       string
+		stdout     string
+		wantStatus int
+		wantCode   string
+		wantWindow string
+	}{
+		{
+			// The 2.0.32 shape: error.status + error.response.body (a JSON string).
+			name:       "response.body string is decoded",
+			stdout:     `{"type":"error","error":{"message":"Rate limit","status":429,"response":{"body":"{\"error\":{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}}"}}}`,
+			wantStatus: 429, wantCode: "RATE_LIMITED", wantWindow: "weekly",
+		},
+		{
+			// The older APIError shape: error.data.statusCode + error.data.responseBody.
+			name:       "data.responseBody string is decoded",
+			stdout:     `{"type":"error","error":{"name":"APIError","data":{"statusCode":429,"responseBody":"{\"error\":{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"daily\"}}}"}}}`,
+			wantStatus: 429, wantCode: "RATE_LIMITED", wantWindow: "daily",
+		},
+		{
+			// A body that is not JSON is not facts: the envelope still supplies
+			// the status, and the wording arms classify from the text.
+			name:       "non-JSON body yields no body facts",
+			stdout:     `{"type":"error","error":{"message":"Rate limit","status":429,"response":{"body":"<html>429</html>"}}}`,
+			wantStatus: 429,
+		},
+		{
+			// A recovered error event is not the stream's ending, so it carries
+			// no facts at all (CLA-700).
+			name:   "recovered error event carries no facts",
+			stdout: `{"type":"error","error":{"response":{"body":"{\"code\":\"RATE_LIMITED\"}"}}}` + "\n" + `{"type":"step_start","part":{"type":"step-start"}}`,
+		},
+		{
+			// Review 1.review-1.5: the body's own status is a restatement, so a
+			// provider envelope carrying status:200 must not mask the wrapper's
+			// 429. Code and window still come from the body.
+			name:       "wrapper status outranks a body status",
+			stdout:     `{"type":"error","error":{"message":"Rate limit","status":429,"response":{"body":"{\"status\":200,\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`,
+			wantStatus: 429, wantCode: "RATE_LIMITED", wantWindow: "weekly",
+		},
+		{
+			// A body status outside the HTTP range is not a status at all (review
+			// 1.review-1.5).
+			name:   "body status outside the HTTP range is ignored",
+			stdout: `{"type":"error","error":{"message":"Rate limit","response":{"body":"{\"status\":7}"}}}`,
+		},
+		{name: "clean stream", stdout: opencodeStream},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := opencodeErrorFactsOf(Result{Stdout: tc.stdout})
+			if got.Status != tc.wantStatus {
+				t.Errorf("Status = %d, want %d", got.Status, tc.wantStatus)
+			}
+			if got.Code != tc.wantCode {
+				t.Errorf("Code = %q, want %q", got.Code, tc.wantCode)
+			}
+			if got.Window != tc.wantWindow {
+				t.Errorf("Window = %q, want %q", got.Window, tc.wantWindow)
+			}
+		})
+	}
+}
+
+// Review 1.review-2.2: a provider that states its window by DURATION states the
+// same thing as an absolute instant — when the limit lifts — so it classifies as
+// a wait, not as the generic arm's hard stop.
+func TestOpencodeDetectLimitRelativeReset(t *testing.T) {
+	got := (opencode{}).DetectLimit(Result{Stdout: `{"type":"error","error":{"message":"Usage limit reached. Resets in 4 hours.","status":429}}`})
+	if !got.Limited {
+		t.Fatal("Limited = false, want the rolling window to be a limit")
+	}
+	if got.Stop {
+		t.Error("Stop = true — a message that says when it lifts is a wait, not a top-up")
+	}
+	if d := time.Until(got.ResetAt); d < 4*time.Hour-time.Minute || d > 4*time.Hour {
+		t.Errorf("ResetAt = %v (%v away), want ~4h from now", got.ResetAt, d)
+	}
+}
+
+// parseOpencodeResetAt resolves both forms a provider states its window in: an
+// absolute RFC3339 instant, and a duration relative to the drain's now
+// ("resets in 4 hours"). The relative form was the gap review 1.review-2.2
+// found: the wording says when it lifts, but only the absolute form parsed, so
+// the generic arm turned the wait into a hard budget stop.
+func TestParseOpencodeResetAt(t *testing.T) {
+	now := time.Date(2026, 10, 21, 10, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		msg  string
+		want time.Time
+	}{
+		{"absolute RFC3339 instant", "Your limit resets at 2026-10-21T15:56:48.251Z", time.Date(2026, 10, 21, 15, 56, 48, 251000000, time.UTC)},
+		{"relative hours", "Usage limit reached. Resets in 4 hours.", now.Add(4 * time.Hour)},
+		{"relative singular hour", "reset in 1 hour", now.Add(time.Hour)},
+		{"relative short hours", "resets in 5h", now.Add(5 * time.Hour)},
+		{"relative minutes", "Your limit reset in 45m", now.Add(45 * time.Minute)},
+		{"relative minutes spelled out", "resets in 30 minutes", now.Add(30 * time.Minute)},
+		{"nothing stated", "Usage limit reached.", time.Time{}},
+		{"a zero window is not a reset", "resets in 0 minutes", time.Time{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseOpencodeResetAt(tc.msg, now); !got.Equal(tc.want) {
+				t.Errorf("parseOpencodeResetAt(%q) = %v, want %v", tc.msg, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOpencodeNamedWindow pins the wording arm's label — and its SCOPE (review
+// 1.review-1.6): the window word only counts inside the limit statement, so the
+// rest of the diagnostic text (the error envelope, the provider's raw body, a
+// session id) cannot relabel the cap.
+func TestOpencodeNamedWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want string
+	}{
+		{"weekly before the limit word", "You've reached your weekly usage limit", "weekly"},
+		{"daily after the limit word", "Your usage limit has been reached (daily window)", "daily"},
+		{"5-hour before the limit word", "You've reached your 5-hour limit", "5-hour"},
+		{"5 hour spelled out", "Your 5 hour usage limit has been reached", "5-hour"},
+		{"a duration that is not a plan window", "You have reached your 30-minute usage limit", ""},
+		{"session is not a plan window", "You have reached your session usage limit", ""},
+		{"a stray window word outside the limit statement", `{"type":"error","error":{"message":"Rate limit reached.","session":"weekly-report"}}`, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := opencodeNamedWindow(tc.text); got != tc.want {
+				t.Errorf("opencodeNamedWindow(%q) = %q, want %q", tc.text, got, tc.want)
 			}
 		})
 	}
@@ -142,8 +468,9 @@ func TestOpencodeDetectLimit(t *testing.T) {
 // an unknown exit 1 AFTER reported usage is retryable, because a session that
 // already reported usage evidently authenticated and started doing paid work,
 // while one that reported nothing is the config/auth signature and stays a stop.
-// A NAMED stop (opencodeBudgetRe, opencodeFatalRe) beats both scans, so the
-// heuristic cannot launder an exhausted account or a revoked key into a retry.
+// A NAMED stop (opencodeBudgetRe, opencodeRollingQuotaRe, opencodeFatalRe) beats
+// both scans, so the heuristic cannot launder an exhausted account, a rolling
+// quota window, or a revoked key into a retry.
 // Cases mark where the signal lives (stdout error event vs. stderr) to match how
 // opencode actually emits it.
 func TestOpencodeIsTransient(t *testing.T) {
@@ -184,6 +511,11 @@ func TestOpencodeIsTransient(t *testing.T) {
 		{"402 after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"data":{"statusCode":402,"isRetryable":false}}}`}, false},
 		{"budget exhaustion after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "Your account is out of credits"}, false},
 		{"auth failure after usage is still NOT transient", Result{ExitCode: 1, UsageReported: true, Stderr: "Error: authentication failed - invalid api key"}, false},
+		// Review 1.review-2.2: a rolling window named AFTER the limit word is
+		// still a limit the loop WAITS out, never a blip it retries — the same
+		// opencodeRollingQuotaRe arm that makes DetectLimit waitable also has to
+		// keep this off the backoff ladder.
+		{"a rolling window after the limit word is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"message":"Your usage limit has been reached (5-hour window)","status":429}}`}, false},
 		{"a key revoked mid-session is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"data":{"statusCode":401}}}`}, false},
 		// The bare-word `transport` regression. stderr carries text this adapter
 		// did not author, and the MCP SDK's class names all end in `Transport` —
@@ -224,7 +556,30 @@ func TestOpencodeIsTransient(t *testing.T) {
 		// Regression for finding #2: an assistant text part mentioning a rate limit
 		// must NOT be read as a transient error — only opencodeErrorText is scanned.
 		{"assistant narration mentioning a rate limit does NOT trip", Result{Stdout: `{"type":"text","text":"Earlier I hit a rate limit and connection error, so I paused before retrying."}`}, false},
+		// CLA-736: a rolling 5-hour quota is NOT a blip to retry at 30s/1m/2m. It
+		// carries a 429, so the status arm below would call it transient; the
+		// rolling-quota arm vetoes that, and the loop's DetectLimit branch is what
+		// actually waits the window out.
+		{"rolling 5-hour quota is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: opencodeQuotaEventFixture(t)}, false},
+		// Review 1.review-1.2: a plan cap whose only signal is the STRUCTURED
+		// window in the provider's body is a limit the loop WAITS out. DetectLimit
+		// says so from the same window arm; this classifier must agree, or a
+		// caller that asks IsTransient alone retries a weekly cap as a burst.
+		{"structured weekly body is NOT transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"error","error":{"message":"Rate limit reached.","status":429,"response":{"body":"{\"code\":\"RATE_LIMITED\",\"rateLimit\":{\"window\":\"weekly\"}}"}}}`}, false},
 		{"clean run", Result{Stdout: opencodeStream}, false},
+		// CLA-700, the 2026-10-19 incidents: an error event the session RECOVERED
+		// from classifies nothing. 2.x emits provider.invalid-output, retries the
+		// request itself and finishes the turn, but still exits 1 — so before this
+		// the whole delivered session read as a transient failure and its phase was
+		// abandoned mid-sequence. The rule is positional: only a stream that ENDS on
+		// the error event is a failure.
+		{"recovered error event followed by a step is NOT transient", recoveredFixture(t, opencodeRecoveredErrorStream(t)), false},
+		{"recovered error event followed by a final answer is NOT transient", recoveredFixture(t, opencodeRecoveredAnswerStream(t)), false},
+		{"a recovered error does not hide a TERMINAL one", Result{ExitCode: 1, UsageReported: true, Stdout: opencodeRecoveredErrorStream(t) + "\n" + `{"type":"error","error":{"data":{"statusCode":503}}}`}, true},
+		// The mirror: the same error text the incident hit, as the LAST event, is
+		// still a transient failure — recovery is what changed, not the wording.
+		{"a terminal invalid-output event is still transient", Result{ExitCode: 1, UsageReported: true, Stdout: `{"type":"step_start"}
+{"type":"error","error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}`}, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -241,6 +596,99 @@ func TestOpencodeIsTransient(t *testing.T) {
 				t.Errorf("IsUnclassifiedTransient = true on a result IsTransient rejected")
 			}
 		})
+	}
+}
+
+// opencodeRecoveredErrorStream and opencodeRecoveredAnswerStream are the same
+// 2026-10-19 stream (CLA-700), captured verbatim in
+// testdata/opencode-recovered-provider-error.jsonl: a session whose first turn
+// ends with `provider.invalid-output` / "OpenAI Chat stream ended without
+// finish_reason" (status 200, anomalyco/opencode#43622), which 2.x then RETRIES
+// itself and completes — a second step_start and a final text part follow the
+// error. Read from disk rather than inlined so the fixture stays the captured
+// bytes.
+func opencodeRecoveredErrorStream(t *testing.T) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("testdata", "opencode-recovered-provider-error.jsonl"))
+	if err != nil {
+		t.Fatalf("reading the 2026-10-19 recovered-provider-error fixture: %v", err)
+	}
+	return strings.TrimRight(string(b), "\n")
+}
+
+// opencodeRecoveredAnswerStream is the same capture with everything before the
+// recovered turn dropped: the error, then the retry's step and its final answer.
+func opencodeRecoveredAnswerStream(t *testing.T) string {
+	t.Helper()
+	lines := strings.Split(opencodeRecoveredErrorStream(t), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("fixture carries %d events, want 5 (2 before the error, the error, 2 after)", len(lines))
+	}
+	return strings.Join(lines[2:], "\n")
+}
+
+// recoveredFixture is a 2026-10-19 (CLA-700) stream shaped the way the ADAPTER
+// hands it to a classifier: parsed, non-zero exit, usage reported — the arm of
+// IsTransient's heuristic that would otherwise fire on the raw exit status.
+func recoveredFixture(t *testing.T, stdout string) Result {
+	t.Helper()
+	res := opencodeParsedFrom(Invocation{}, io.Discard, stdout)
+	res.ExitCode = 1
+	res.UsageReported = true
+	return res
+}
+
+// TestOpencodeRecoveredProviderErrorDoesNotClassifyTheSession is the CLA-700 rule
+// at the adapter: the 2026-10-19 stream's error event is followed by the retry's
+// own steps and final answer, so the session RECOVERED and none of the
+// classifiers may read it as a failure. IsTransient is the one that actually
+// stranded two delivered phases (opencodeTransientRe's `stream ... ended` arm
+// matched the recovered event, and once the event is out of the scan the
+// usage-gated heuristic had to be closed too — exit 1 plus reported usage is
+// exactly the shape it retries).
+func TestOpencodeRecoveredProviderErrorDoesNotClassifyTheSession(t *testing.T) {
+	// Through the PARSER, not hand-built: the marker the classifiers read is the
+	// parser's own output, and a Result assembled by hand would not prove it is
+	// written.
+	res := opencodeParsedFrom(Invocation{}, io.Discard, opencodeRecoveredErrorStream(t))
+	res.ExitCode = 1 // the status opencode 2.0.32 really exits with (probe + conformance suite)
+	// The session export reports the turn's usage on any real run of this shape,
+	// which is what arms the CLA-381 heuristic the classifiers below must not take.
+	res.UsageReported = true
+
+	if got := RecoveredErrors(res); got != 1 {
+		t.Fatalf("RecoveredErrors = %d, want 1 — the parser did not record the recovered error event (Raw: %v)", got, res.Raw)
+	}
+	if res.FinalMessage != "OK" {
+		t.Errorf("FinalMessage = %q, want OK — the recovered turn's answer is the session's final message", res.FinalMessage)
+	}
+	if (opencode{}).IsTransient(res) {
+		t.Errorf("IsTransient = true for a session that recovered from its error event; diagnostic = %q", (opencode{}).Diagnostic(res))
+	}
+	if (opencode{}).IsUnclassifiedTransient(res) {
+		t.Error("IsUnclassifiedTransient = true: the heuristic retried an exit status the harness's own recovery explains")
+	}
+	if (opencode{}).DetectLimit(res).Limited {
+		t.Error("DetectLimit fired on a recovered invalid-output event")
+	}
+	// The diagnosis is NOT the classification: opencodeErrorText (what IsTransient
+	// and Diagnostic share) carries no text for a recovered event, and the Raw
+	// diagnostic key still records what the stream saw. The two are deliberately
+	// different questions — "what did the session take?" vs "how did it end?".
+	if got := (opencode{}).Diagnostic(res); strings.Contains(got, "invalid-output") {
+		t.Errorf("Diagnostic quotes a recovered error event as if it were the failure: %q", got)
+	}
+	if got := res.Raw[OpencodeErrorTypeKey]; got != "provider.invalid-output" {
+		t.Errorf("opencode_error_type = %v, want the stream's error event recorded for diagnostics", got)
+	}
+	// And the terminal-error side is unchanged: a stream that ENDS on the same
+	// event is still a transient failure nothing about this fix softens.
+	terminal := opencodeParsedFrom(Invocation{}, io.Discard, strings.Split(opencodeRecoveredErrorStream(t), "\n")[2])
+	if (opencode{}).IsTransient(terminal) {
+		t.Errorf("a stream that ends ON the invalid-output event must stay transient; diagnostic = %q", (opencode{}).Diagnostic(terminal))
+	}
+	if RecoveredErrors(terminal) != 0 {
+		t.Errorf("RecoveredErrors = %d for a stream that ended on its error, want 0", RecoveredErrors(terminal))
 	}
 }
 
@@ -460,9 +908,9 @@ func TestUnclassifiedTransientImpliesTransient(t *testing.T) {
 }
 
 // opencode is the only adapter that guesses, and the others say so by returning
-// false rather than by not being asked. Pinned because the day a second one grows
-// a heuristic, it has to be a deliberate edit here too - the loop's bound is
-// per-adapter and silently applies to whoever opts in.
+// false rather than by not being asked. Pinned because the day
+// a third one grows a heuristic, it has to be a deliberate edit here too - the
+// loop's bound is per-adapter and silently applies to whoever opts in.
 func TestOnlyOpencodeGuesses(t *testing.T) {
 	// The heuristic's own shape: exit 1, usage reported, text nothing recognises.
 	res := Result{ExitCode: 1, UsageReported: true, Stderr: "some failure text no pattern recognises"}
@@ -480,18 +928,18 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 	args := opencodeArgs(Invocation{Probe: true, Prompt: "Work the backlog.", Model: "opencode/claude-haiku-4-5"})
 	joined := strings.Join(args, " ")
 	// The prompt sits last, behind a `--` terminator (see args_test.go).
-	if !strings.HasPrefix(joined, "run --format json") || !strings.HasSuffix(joined, " -- .") {
-		t.Errorf("probe args = %q, want a trivial `run --format json ... -- .` request", joined)
+	if !strings.HasPrefix(joined, "run --standalone --format json") || !strings.HasSuffix(joined, " -- .") {
+		t.Errorf("probe args = %q, want a trivial `run --standalone --format json ... -- .` request", joined)
 	}
 	for _, a := range args {
-		if a == "Work the backlog." {
+		if strings.Contains(a, "Work the backlog.") {
 			t.Error("probe leaked the real drain prompt into its invocation")
 		}
 	}
 
 	perm := opencodePermission(true, "/Users/jason/dev", nil) // readOnly
 	p := parsePolicy(t, perm)
-	for _, tool := range []string{"edit", "bash"} {
+	for _, tool := range []string{"edit", "shell", "execute"} {
 		if p[tool] != "deny" {
 			t.Errorf("read-only policy: %s = %q, want deny", tool, p[tool])
 		}
@@ -506,19 +954,26 @@ func TestOpencodeProbeIsReadOnly(t *testing.T) {
 	}
 	// The path-scoped working set survives the probe shape: reads inside the
 	// workdir are allowed, but nothing writes.
-	if p["read"] != "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
+	if p["read"] != "**:allow ../**:deny mcp:*:allow" || p["external_directory"] != "*:deny /Users/jason/dev/**:allow" {
 		t.Errorf("read-only policy must keep the path-scoped read/external_directory rules, got read=%q external_directory=%q",
 			p["read"], p["external_directory"])
 	}
 }
 
 // A real drain fails closed on exfil but must still allow edits and shell to do
-// the work; the prompt is carried through verbatim.
+// the work; the prompt is carried through unchanged. The raw argv still says
+// --standalone because that is the dialect's shape for a probe; a working run
+// has it swapped for `--server` once the adapter's own server has waited for
+// MCP (CLA-703), and the warm-up note it used to carry is gone with the race.
 func TestOpencodeDrainInvocation(t *testing.T) {
 	args := opencodeArgs(Invocation{Prompt: "Work the backlog.", Model: "opencode/claude-sonnet-4-5"})
 	joined := strings.Join(args, " ")
-	if !strings.HasPrefix(joined, "run --format json") || !strings.HasSuffix(joined, " -- Work the backlog.") {
-		t.Errorf("drain args = %q, want the prompt carried into `opencode run` behind a `--` terminator", joined)
+	if !strings.HasPrefix(joined, "run --standalone --format json") || args[len(args)-2] != "--" ||
+		args[len(args)-1] != "Work the backlog." {
+		t.Errorf("drain args = %q, want the prompt carried into `opencode run --standalone` behind a `--` terminator", joined)
+	}
+	if strings.Contains(joined, "connect in the background") {
+		t.Errorf("drain args still carry the removed MCP warm-up note: %q", joined)
 	}
 	if !strings.Contains(joined, "--model opencode/claude-sonnet-4-5") {
 		t.Errorf("drain args = %q, want the model passed through", joined)
@@ -526,24 +981,28 @@ func TestOpencodeDrainInvocation(t *testing.T) {
 
 	perm := opencodePermission(false, "/Users/jason/dev", nil) // drain
 	p := parsePolicy(t, perm)
-	if p["edit"] != "Users/jason/dev/**:allow Users/jason/dev:allow" || p["bash"] != "allow" {
-		t.Errorf("drain policy must allow edit (path-scoped) + bash (tool-level), got edit=%q bash=%q", p["edit"], p["bash"])
+	if p["edit"] != "**:allow ../**:deny" || p["shell"] != "allow" {
+		t.Errorf("drain policy must allow edit (path-scoped) + shell (tool-level), got edit=%q shell=%q", p["edit"], p["shell"])
+	}
+	if p["execute"] != "deny" {
+		t.Errorf("execute = %q, want deny - Code Mode stays closed", p["execute"])
 	}
 	assertNetworkDenied(t, p)
 }
 
-// The drain policy is a path-scoped PermissionConfig: read/edit/external_directory
-// carry pattern->action objects scoping the workdir subtree, `*` is the catch-all
-// that denies everything else, and `*_*` keeps the session's MCP access alive
-// under that catch-all. Key order is load-bearing (opencode evaluates rules
-// last-match-wins), so the catch-all must sort first.
+// The drain policy is a path-scoped PermissionConfig: read/edit carry
+// instance-relative pattern->action objects, external_directory scopes the
+// workdir subtree absolutely, `*` is the catch-all that denies everything else,
+// and `*_*` keeps the session's MCP access alive under that catch-all. Key
+// order is load-bearing (opencode evaluates rules last-match-wins), so the
+// catch-all must sort first.
 func TestOpencodePermissionPathScoping(t *testing.T) {
 	perm := opencodePermission(false, "/Users/jason/dev", nil)
 	p := parsePolicy(t, perm)
 
 	want := map[string]string{
-		"read":               "Users/jason/dev/**:allow Users/jason/dev:allow mcp:*:allow",
-		"edit":               "Users/jason/dev/**:allow Users/jason/dev:allow",
+		"read":               "**:allow ../**:deny mcp:*:allow",
+		"edit":               "**:allow ../**:deny",
 		"external_directory": "*:deny /Users/jason/dev/**:allow",
 		// The read-only search tools carry a flat `**` pattern allow: their
 		// asks hold the search pattern (regex/glob/directory), never a
@@ -559,8 +1018,8 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 			t.Errorf("%s = %q, want %q", tool, got, folded)
 		}
 	}
-	if p["bash"] != "allow" {
-		t.Errorf("bash must stay a tool-level allow (command patterns, not path-based), got %q", p["bash"])
+	if p["shell"] != "allow" {
+		t.Errorf("shell must stay a tool-level allow (command patterns, not path-based), got %q", p["shell"])
 	}
 	if p["*_*"] != "allow" {
 		t.Errorf("*_* = %q, want allow — MCP tool asks use the full tool name (<server>_<tool>, e.g. clankerbar_get_backlog_summary), which the `*` catch-all would otherwise deny", p["*_*"])
@@ -571,7 +1030,7 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 
 	// Last-match-wins: the catch-all must sort before every specific rule.
 	star := strings.Index(perm, `"*"`)
-	for _, key := range []string{"*_*", "bash", "edit", "external_directory", "glob", "grep", "list", "read", "webfetch", "websearch"} {
+	for _, key := range []string{"*_*", "edit", "execute", "external_directory", "glob", "grep", "list", "read", "shell", "webfetch", "websearch"} {
 		if i := strings.Index(perm, `"`+key+`"`); i == -1 {
 			t.Errorf("policy JSON missing key %q", key)
 		} else if i < star {
@@ -580,10 +1039,9 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 	}
 }
 
-// The path patterns derive from the run's workdir: read/edit use opencode's
-// root-relative form (path.relative("/", p) when the session's worktree is "/"),
-// external_directory uses the absolute form, and a trailing slash / empty workdir
-// resolve sensibly.
+// The path patterns derive from the run's workdir: external_directory uses the
+// absolute form (and rootRel, the 1.x read/edit form, is still derived), and a
+// trailing slash / empty workdir resolve sensibly.
 func TestOpencodeWorkdirPatterns(t *testing.T) {
 	rel, abs := opencodeWorkdirPatterns("/Users/jason/dev")
 	if rel != "Users/jason/dev/**" || abs != "/Users/jason/dev/**" {
@@ -608,31 +1066,31 @@ func TestOpencodeWorkdirPatterns(t *testing.T) {
 }
 
 // The EFFECTIVE decisions of the emitted policy, evaluated the way opencode
-// evaluates them (see opencodeEvaluate): this is the invariant the whole change
-// rests on — the working set works, everything else is denied, MCP survives the
-// catch-all, and the out-of-workdir external_directory gate stays closed even
-// though the `*_*` MCP rule's permission wildcard also matches that name.
+// evaluates them (see opencodeEvaluate): the working set works, everything else
+// is denied, MCP survives the catch-all, and the out-of-workdir
+// external_directory gate stays closed even though the `*_*` MCP rule's
+// permission wildcard also matches that name.
 func TestOpencodePermissionEffective(t *testing.T) {
 	perm := opencodePermission(false, "/Users/jason/dev", nil)
 	cases := []struct {
 		permission, pattern, want string
 	}{
-		// The working set: files and worktrees under the workdir, and the
-		// workdir root's own listing (exact pattern).
-		{"read", "Users/jason/dev/clankerbar-cli-wt/643a681b/internal/harness/harness.go", "allow"},
-		{"read", "Users/jason/dev", "allow"},
-		{"edit", "Users/jason/dev/clankerbar-cli-wt/643a681b/scratch.txt", "allow"},
+		// The working set: files and worktrees under the workdir, asked
+		// relative to it (2.x), and the workdir root's own listing.
+		{"read", "clankerbar-cli-wt/643a681b/internal/harness/harness.go", "allow"},
+		{"read", ".", "allow"},
+		{"edit", "clankerbar-cli-wt/643a681b/scratch.txt", "allow"},
 		{"external_directory", "/Users/jason/dev/clankerbar-cli-wt/643a681b/*", "allow"},
 		// Everything outside the workdir fails closed.
-		{"read", "Users/jason/.config/clankerbar/opencode.json", "deny"},
-		{"read", "etc/hosts", "deny"},
-		{"edit", "etc/passwd", "deny"},
+		{"read", "../.config/clankerbar/opencode.json", "deny"},
+		{"read", "../../../etc/hosts", "deny"},
+		{"edit", "../../../etc/passwd", "deny"},
 		{"external_directory", "/etc/*", "deny"},
 		{"external_directory", "/Users/jason/.config/clankerbar/*", "deny"},
-		// bash stays tool-level: commands are allowed, whatever they touch
-		// inside the workdir.
-		{"bash", "git status --short", "allow"},
-		{"bash", "sed -i s/x/y/ internal/harness/opencode.go", "allow"},
+		// shell stays tool-level: commands are allowed, whatever they touch.
+		// 2.x does not path-gate them (an accepted gap, see the policy doc).
+		{"shell", "git status --short", "allow"},
+		{"shell", "sed -i s/x/y/ internal/harness/opencode.go", "allow"},
 		// MCP tools (named <server>_<tool>) survive the catch-all.
 		{"clankerbar_get_backlog_summary", "*", "allow"},
 		{"context7_query-docs", "*", "allow"},
@@ -640,27 +1098,24 @@ func TestOpencodePermissionEffective(t *testing.T) {
 		// MCP RESOURCE reads ask under `read`, not under their tool name.
 		{"read", "mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md", "allow"},
 		{"read", "mcp:clankerbar:*", "allow"},
-		// The exfil and hidden tools stay denied.
+		// The exfil, Code Mode and hidden tools stay denied.
 		{"webfetch", "*", "deny"},
 		{"websearch", "*", "deny"},
+		{"execute", "*", "deny"},
 		// grep/glob/list are read-only search tools and their asks carry the
-		// SEARCH PATTERN, not a path — grep asks with the regex, glob with the
-		// glob, list (newer opencode) with the resolved directory — so the
-		// pattern ask is allowed flat and the workdir boundary lives in the
-		// external_directory gate each tool runs before searching. The asks
-		// below are the shapes the tools actually make; the boundary cases
-		// above ("/etc/*" and "~/.config/..." denied) are the gate that stops a
-		// search whose target is outside the subtree (CLA-390).
+		// SEARCH PATTERN, not a path, so the pattern ask is allowed flat and the
+		// workdir boundary lives in the external_directory gate (CLA-390).
 		{"grep", "TODO", "allow"},
 		{"grep", "func main", "allow"},
 		{"glob", "**/*.go", "allow"},
 		{"glob", "{src,test}/**", "allow"},
-		{"list", "Users/jason/dev/clankerbar-cli-wt/643a681b", "allow"},
-		// lsp/task/skill stay denied by the catch-all: they are not read-only
-		// search and are out of scope for this change.
+		{"list", "clankerbar-cli-wt/643a681b", "allow"},
+		// lsp/subagent/skill/question stay denied by the catch-all.
 		{"lsp", "*", "deny"},
+		{"subagent", "*", "deny"},
 		{"task", "*", "deny"},
 		{"skill", "*", "deny"},
+		{"question", "*", "deny"},
 	}
 	for _, tc := range cases {
 		if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != tc.want {
@@ -669,16 +1124,12 @@ func TestOpencodePermissionEffective(t *testing.T) {
 	}
 }
 
-// The served protocol has to be REACHABLE, or an unattended session never learns
-// the loop it is supposed to run. CLA-382: every opencode session's
-// read_mcp_resource call was denied, so no session read the skill that carries
-// the heartbeat cadence, and leases expired mid-work while the session kept
-// editing. The mechanism is that opencode's MCP RESOURCE tools do not ask under
-// their own names — list_mcp_resources, list_mcp_resource_templates and
-// read_mcp_resource all ask under permission `read` with `mcp:<server>:<uri>`
-// patterns (1.18.x, session/tools.ts) — so the `*_*` MCP allow never saw them and
-// the `*` catch-all denied them. This pins that they resolve to allow in BOTH run
-// shapes, while the fail-closed posture the policy exists for is unchanged.
+// The `mcp:*` carve-out on `read` (CLA-382) is kept, and it loosens nothing
+// else. On 1.x the MCP resource tools asked under `read` with
+// `mcp:<server>:<uri>` patterns; on 2.0.32 those tools are registered in Code
+// Mode only, so with `execute` denied a session has none of them and the
+// carve-out is inert until a build exposes them top-level again. It is pinned in
+// both run shapes so that day does not need a policy change.
 func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 	for _, shape := range []struct {
 		name     string
@@ -686,33 +1137,18 @@ func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 	}{{"drain", false}, {"probe", true}} {
 		t.Run(shape.name, func(t *testing.T) {
 			perm := opencodePermission(shape.readOnly, "/Users/jason/dev", nil)
-
-			// The three asks the resource tools actually make. The read's URI
-			// is a URL, so the pattern has to span both "/" and ":".
-			allowed := []string{
+			for _, pattern := range []string{
 				"mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md",
-				"mcp:clankerbar:https://clankerbar.com/skills/clankerbar/finishing.md",
-				"mcp:clankerbar:*", // list_mcp_resources(server: "clankerbar")
-				"mcp:context7:*",   // ...and the same listing for any other server
-				"mcp:chrome-devtools:*",
-			}
-			for _, pattern := range allowed {
+				"mcp:clankerbar:*",
+				"mcp:context7:*",
+			} {
 				if got := opencodeEvaluate(t, perm, "read", pattern); got != "allow" {
-					t.Errorf("ask(permission=read, pattern=%q) = %s, want allow — the session cannot read the served protocol", pattern, got)
+					t.Errorf("ask(permission=read, pattern=%q) = %s, want allow", pattern, got)
 				}
 			}
-
-			// Fail-closed elsewhere: the carve-out is one pattern on `read`,
-			// and it moves nothing else. A filesystem read outside the workdir
-			// is still denied, and the `mcp:` pattern cannot be reached by a
-			// filesystem ask (those carry worktree-relative paths). grep/glob
-			// are NOT in this list: they are allowed by their own separate
-			// pattern entries (CLA-390), never by this carve-out.
 			denied := []struct{ permission, pattern string }{
-				{"read", "etc/hosts"},
-				{"read", "Users/jason/.ssh/id_ed25519"},
-				{"read", "Users/jason/.config/clankerbar/opencode.json"},
-				{"edit", "mcp:clankerbar:https://clankerbar.com/skills/clankerbar.md"},
+				{"read", "../../../etc/hosts"},
+				{"read", "../.ssh/id_ed25519"},
 				{"external_directory", "/etc/*"},
 				{"webfetch", "*"},
 				{"websearch", "*"},
@@ -721,14 +1157,6 @@ func TestOpencodePermissionAllowsMCPResourceReads(t *testing.T) {
 				if got := opencodeEvaluate(t, perm, tc.permission, tc.pattern); got != "deny" {
 					t.Errorf("ask(permission=%s, pattern=%q) = %s, want deny — the MCP carve-out must not loosen anything else", tc.permission, tc.pattern, got)
 				}
-			}
-
-			// The carve-out must not hide the tools either: opencode drops a
-			// tool whose mapped permission's LAST matching rule is a `*`-pattern
-			// deny (read_mcp_resource maps onto `read`), so the emitted `read`
-			// entry must keep ending in a specific pattern, not a bare deny.
-			if got := opencodeEvaluate(t, perm, "read", "Users/jason/dev/x.go"); got != "allow" {
-				t.Errorf("workdir read = %s, want allow", got)
 			}
 		})
 	}
@@ -923,7 +1351,7 @@ func TestOpencodeObservesAClaimInARecordedSession(t *testing.T) {
 	var console strings.Builder
 	res := opencodeParsedFrom(Invocation{}, &console, opencodeRecording(t, 3))
 
-	want := Claim{TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun}
+	want := Claim{TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun, Category: "chore", Branch: "clanker/e1d01dae-temp-fixture-recording-target-for-cla-36"}
 	if res.Claim != want {
 		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
 	}
@@ -963,14 +1391,14 @@ func TestOpencodeRefusedClaimChangesNothing(t *testing.T) {
 // never recorded.
 func TestOpencodeRefusedSettleChangesNothing(t *testing.T) {
 	stream := opencodeRecording(t, 3) +
-		opencodeToolLine("call-refused", "clankerbar_update_task",
-			`{"taskId":"`+opencodeFixtureTask+`","status":"in_review","branch":"`+opencodeFixtureBranch+`"}`,
+		opencodeToolLine("call-refused", "clankerbar_submit_for_review",
+			`{"taskId":"`+opencodeFixtureTask+`","outcome":"**Tests** - fixture"}`,
 			"error", `{"error":{"code":"evidence_required","message":"outcome needs a **Tests** section"}}`) + "\n"
 
 	res := opencodeParsedFrom(Invocation{}, io.Discard, stream)
 
 	if res.Claim.Settled {
-		t.Error("a REFUSED update_task settled the claim — the driver would read a task the session still holds as one it let go of, and hand nothing back")
+		t.Error("a REFUSED submit_for_review settled the claim — the driver would read a task the session still holds as one it let go of, and hand nothing back")
 	}
 	if !res.Claim.Held() {
 		t.Errorf("Claim.Held() = false after a refused settle; Claim = %+v", res.Claim)
@@ -1004,17 +1432,23 @@ func TestOpencodeObservesTheSettleAndTheDeliveryReport(t *testing.T) {
 
 	want := Claim{
 		TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun,
-		HasWIP: true, Settled: true,
+		HasWIP: true, Settled: true, Category: "chore",
+		// The claim's branch was the HINT; the update_task branch is the branch
+		// the session actually recorded, and that is what CURRENT_CLAIM must
+		// carry (CLA-708) — it is the one a successor fetches.
+		Branch: opencodeFixtureBranch,
 	}
 	if res.Claim != want {
 		t.Errorf("Claim = %+v, want %+v", res.Claim, want)
 	}
 	if res.Claim.Held() {
-		t.Error("Claim.Held() is still true after update_task settled the task — the driver would post `ready` over a task the session had already let go of")
+		t.Error("Claim.Held() is still true after submit_for_review settled the task — the driver would post `ready` over a task the session had already let go of")
 	}
+	// The branch comes from record_progress and the settle from settle_task; the
+	// split means the report carries no status of its own.
 	wantReports := []Report{{
 		TaskID: opencodeFixtureTask, Ref: opencodeFixtureRef, RunID: opencodeFixtureRun,
-		Status: "parked", Branch: opencodeFixtureBranch,
+		Branch: opencodeFixtureBranch,
 	}}
 	if len(res.Reports) != 1 || res.Reports[0] != wantReports[0] {
 		t.Errorf("Reports = %+v, want %+v", res.Reports, wantReports)
@@ -1031,22 +1465,25 @@ func TestOpencodeObservesTheSettleAndTheDeliveryReport(t *testing.T) {
 
 // A resumed phase never calls claim_task, so its claim can only come from the
 // Invocation. The behavioural payload of the seed is that noteToolUse's
-// update_task arm matches — see the claude twin in resume_test.go.
+// record_progress/submit_for_review arms match — see the claude twin in resume_test.go.
 func TestOpencodeSeedsAResumedPhasesClaim(t *testing.T) {
-	stream := opencodeToolLine("call-1", "clankerbar_update_task", `{"taskId":"task-abc","branch":"clanker/task-abc-work"}`, "completed", `{}`) + "\n" +
-		opencodeToolLine("call-2", "clankerbar_update_task", `{"taskId":"task-abc","status":"in_review","branch":"clanker/task-abc-work","delivery":{"pr":"#42"}}`, "completed", `{}`) + "\n"
+	stream := opencodeToolLine("call-1", "clankerbar_record_progress", `{"taskId":"task-abc","branch":"clanker/task-abc-work"}`, "completed", `{}`) + "\n" +
+		opencodeToolLine("call-2", "clankerbar_submit_for_review", `{"taskId":"task-abc","outcome":"**Tests** - fixture"}`, "completed", `{}`) + "\n"
 
 	res := opencodeParsedFrom(Invocation{ResumeClaim: Claim{TaskID: "task-abc", RunID: "run-xyz"}}, io.Discard, stream)
 
 	if !res.Claim.HasWIP {
-		t.Error("update_task(branch:) did not set HasWIP on the seeded claim — the driver would read the task as safe to release and post it back to the queue over pushed work")
+		t.Error("record_progress(branch) did not set HasWIP on the seeded claim — the driver would read the task as safe to release and post it back to the queue over pushed work")
+	}
+	if res.Claim.Branch != "clanker/task-abc-work" {
+		t.Errorf("Claim.Branch = %q, want clanker/task-abc-work — CURRENT_CLAIM needs the NAME, not only the fact, to choose expireLease over release", res.Claim.Branch)
 	}
 	if !res.Claim.Settled {
-		t.Error("update_task(status: in_review) did not settle the seeded claim")
+		t.Error("submit_for_review did not settle the seeded claim")
 	}
-	// Two updates restating the same branch collapse to one report, and the later
-	// status wins — the same dedup claude's stream gets.
-	want := Report{TaskID: "task-abc", RunID: "run-xyz", Status: "in_review", Branch: "clanker/task-abc-work", PR: "#42"}
+	// The branch record survives as the report; the hand-over carries no branch
+	// and asserts nothing locally checkable.
+	want := Report{TaskID: "task-abc", RunID: "run-xyz", Branch: "clanker/task-abc-work"}
 	if len(res.Reports) != 1 || res.Reports[0] != want {
 		t.Errorf("Reports = %+v, want exactly %+v", res.Reports, want)
 	}
@@ -1064,7 +1501,7 @@ func opencodeToolLine(callID, tool, input, status, output string) string {
 	}
 	b, err := json.Marshal(map[string]any{
 		"type": "tool_use",
-		"part": map[string]any{"type": "tool", "tool": tool, "callID": callID, "state": state},
+		"part": map[string]any{"type": "tool", "tool": tool, "id": callID, "state": state},
 	})
 	if err != nil {
 		panic(err)
@@ -1097,7 +1534,9 @@ func TestOpencodeIgnoresNonTerminalAndForeignToolEvents(t *testing.T) {
 func TestOpencodeClankerbarToolMapsOntoTheWatchedNames(t *testing.T) {
 	for _, tt := range []struct{ in, want string }{
 		{"clankerbar_claim_task", claimTaskTool},
-		{"clankerbar_update_task", updateTaskTool},
+		{"clankerbar_submit_for_review", submitForReviewTool},
+		{"clankerbar_record_progress", recordProgressTool},
+		{"clankerbar_settle_task", settleTaskTool},
 		{"clankerbar_ask_question", askQuestionTool},
 		{"clankerbar_escalate_question", escalateQuestionTool},
 		{"clankerbar_", "mcp__clankerbar__"},

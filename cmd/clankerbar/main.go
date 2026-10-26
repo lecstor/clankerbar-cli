@@ -16,19 +16,21 @@ import (
 	"syscall"
 
 	"github.com/lecstor/clankerbar-cli/internal/cli"
+	"github.com/lecstor/clankerbar-cli/internal/version"
 )
 
-// version is overwritten at release time via -ldflags "-X main.version=...".
-var version = "0.0.0-dev"
-
 func main() {
+	os.Exit(run(os.Args))
+}
+
+// run executes one invocation and returns the process exit code. Extracted
+// from main so the command routing — bare `clankerbar` is the fleet
+// supervisor (CLA-525), help/version exit 0, an unknown command exits 2 — is
+// testable. A path that reaches log.Fatal still exits the process directly
+// (exit 1), exactly as main did; tests exercise only the paths that return.
+func run(args []string) int {
 	log.SetFlags(log.Ltime)
 	log.SetPrefix("clankerbar: ")
-
-	if len(os.Args) < 2 {
-		cli.Usage(os.Stderr)
-		os.Exit(2)
-	}
 
 	// Ctrl-C / SIGTERM cancels the context; the loop finishes the current
 	// iteration's cleanup and stops, rather than dying mid-write.
@@ -36,23 +38,48 @@ func main() {
 	defer stop()
 
 	var err error
-	switch os.Args[1] {
-	case "run":
-		err = cli.Run(ctx, os.Args[2:])
-	case "doctor":
-		err = cli.Doctor(ctx, os.Args[2:])
-	case "dead-rate":
-		err = cli.DeadRate(ctx, os.Args[2:])
-	case "version", "--version", "-v":
-		fmt.Println("clankerbar", version)
-	case "help", "--help", "-h":
-		cli.Usage(os.Stdout)
-	default:
-		fmt.Fprintf(os.Stderr, "clankerbar: unknown command %q\n\n", os.Args[1])
-		cli.Usage(os.Stderr)
-		os.Exit(2)
+	if len(args) < 2 {
+		// Bare `clankerbar` is the fleet supervisor (CLA-525): it reconciles
+		// this machine against the plane's account-scoped roster — a supervised
+		// child per entry with desiredState: running (placement local), a STOP
+		// marker for each stopped entry — and SIGINT/SIGTERM to this process
+		// drains the whole fleet. The old usage-and-exit-2 for a bare
+		// invocation is what this replaces.
+		err = cli.Supervise(ctx, nil)
+	} else {
+		switch args[1] {
+		case "run":
+			err = cli.Run(ctx, args[2:])
+		case "ctl":
+			err = cli.Ctl(ctx, args[2:])
+		case "doctor":
+			err = cli.Doctor(ctx, args[2:])
+		case "propose-config":
+			err = cli.ProposeConfig(ctx, args[2:])
+		case "dead-rate":
+			err = cli.DeadRate(ctx, args[2:])
+		case "upload":
+			err = cli.Upload(ctx, args[2:])
+		case "deck":
+			err = cli.Deck(ctx, args[2:])
+		case "supervise":
+			// The explicit alias of the bare invocation, so scripts and
+			// `--help` can name the supervisor.
+			err = cli.Supervise(ctx, args[2:])
+		case "version", "--version", "-v":
+			fmt.Println("clankerbar", version.Current)
+			return 0
+		case "help", "--help", "-h":
+			cli.Usage(os.Stdout)
+			return 0
+		default:
+			fmt.Fprintf(os.Stderr, "clankerbar: unknown command %q\n\n", args[1])
+			cli.Usage(os.Stderr)
+			return 2
+		}
 	}
 	if err != nil {
 		log.Fatal(err)
 	}
+	return 0
 }

@@ -1,10 +1,11 @@
 // Package statedir owns the one directory the DAEMON writes on its own account:
-// the loop's control markers (STOP/HALT) and its per-iteration transcripts.
+// the loop's control markers (STOP/HALT and the CLA-461 restart/reload family)
+// and its per-iteration transcripts.
 //
 // It exists because that directory is the daemon's blind spot. The daemon runs
 // OUTSIDE the confinement its own sessions run inside — claude gets
 // `--permission-mode acceptEdits` plus a deny policy, codex `--sandbox
-// workspace-write`, opencode a fail-closed `OPENCODE_PERMISSION` — so a session
+// workspace-write`, opencode a fail-closed pinned `permission` block — so a session
 // cannot write outside its workdir, but the daemon can write anywhere. Before
 // CLA-259 the state dir sat at `<workdir>/.clankerbar-loop`, i.e. squarely
 // inside the one tree the session IS allowed to write, with 0755/0644 modes and
@@ -78,8 +79,26 @@ const gitignoreBody = "*\n"
 // `state_dir` happened to name.
 const sentinelName = ".clankerbar-statedir"
 
-const sentinelBody = "clankerbar loop state dir: iteration transcripts and STOP/HALT markers.\n" +
+const sentinelBody = "clankerbar loop state dir: iteration transcripts, the daemon's own\n" +
+	"log (daemon.log), and control markers (STOP/HALT/RESTART/RESTART_NOW/RELOAD),\n" +
+	"plus the supervisor's generated instance config (materialized.json).\n" +
 	"Created and owned by clankerbar; safe to delete while no loop is running.\n"
+
+// MaterializedConfigName is the generated effective config the fleet
+// supervisor writes into each child's state dir (daemon-supervisor phase 2b)
+// and starts the child with: `run -c <state dir>/materialized.json`. It is a
+// cache — written at spawn, rewritten at reconcile only when an edit changes
+// its bytes (CLA-724), never hand-edited, safe to delete — which is why the
+// adoption check below must count it as ours: a state dir holding it must stay
+// adoptable by the daemon and by doctor.
+const MaterializedConfigName = "materialized.json"
+
+// DaemonLogName is the daemon's own log file in its state dir (CLA-701): the
+// process's `log.Printf` lines, rotated at a size bound by internal/logfile.
+// It is named here because this package's adoption check has to recognise it —
+// a state dir holding one is still ours — and because it sits beside the
+// iteration logs it can be joined to.
+const DaemonLogName = "daemon.log"
 
 // maxMarkerBytes caps a control-marker read. A marker holds a one-line reason;
 // the cap stops a large or endless file (a fifo, /dev/zero, a log someone
@@ -470,9 +489,74 @@ func (d *Dir) WriteFile(name string, data []byte) error {
 	return f.Close()
 }
 
+// WriteFileAtomic replaces name with data via a same-directory rename, so a
+// reader never sees a half-written file and a rewrite never follows a symlink
+// planted at name. The temporary name is ours by construction (fixed suffix,
+// O_EXCL, removed first). It exists for CURRENT_CLAIM, whose branch field is
+// updated while the daemon runs.
+//
+// WriteFile cannot be used for that: its O_EXCL refusal is the point (a marker
+// that already exists is somebody else's decision), while a claim record is
+// ours and must be replaced.
+func (d *Dir) WriteFileAtomic(name string, data []byte) error {
+	if err := checkName(name); err != nil {
+		return err
+	}
+	tmp := name + ".tmp"
+	// A stale temp is possible only after a crash between the write and the
+	// rename; Remove drops a planted symlink rather than following it.
+	if err := d.root.Remove(tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	f, err := d.root.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		_ = d.root.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = d.root.Remove(tmp)
+		return err
+	}
+	if err := d.root.Rename(tmp, name); err != nil {
+		_ = d.root.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
 // ReadFile reads a file from the directory, refusing to follow a symlink and
 // reading at most maxMarkerBytes.
 func (d *Dir) ReadFile(name string) ([]byte, error) {
+	f, err := d.openRegular(name, "a control marker")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, maxMarkerBytes))
+}
+
+// ReadFileAll reads a whole file from the directory with ReadFile's open
+// discipline — a symlink at the name is refused and the open goes through the
+// root, so nothing resolves outside the directory — but with no size cap. It
+// exists for the generated config, a whole document rather than a one-line
+// marker; every other read here is a marker and keeps the cap.
+func (d *Dir) ReadFileAll(name string) ([]byte, error) {
+	f, err := d.openRegular(name, "a generated config")
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// openRegular opens one regular file by name through the root, after refusing
+// a symlink or anything else at that name. kind names what is being read, for
+// the refusal message.
+func (d *Dir) openRegular(name, kind string) (*os.File, error) {
 	if err := checkName(name); err != nil {
 		return nil, err
 	}
@@ -481,17 +565,12 @@ func (d *Dir) ReadFile(name string) ([]byte, error) {
 		return nil, err
 	}
 	if fi.Mode()&os.ModeSymlink != 0 {
-		return nil, fmt.Errorf("%s is a symlink - refusing to read a control marker through one", filepath.Join(d.path, name))
+		return nil, fmt.Errorf("%s is a symlink - refusing to read %s through one", filepath.Join(d.path, name), kind)
 	}
 	if !fi.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s is not a regular file", filepath.Join(d.path, name))
 	}
-	f, err := d.root.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, maxMarkerBytes))
+	return d.root.Open(name)
 }
 
 // Exists reports whether name is present, without following a symlink and
@@ -562,7 +641,28 @@ func (d *Dir) checkAdoptable() error {
 // evidence it is something else and adoption stops.
 func (d *Dir) isOurArtifact(name string) bool {
 	switch {
-	case name == sentinelName, name == "STOP", name == "HALT":
+	case name == sentinelName,
+		name == "STOP", name == "HALT",
+		// CLA-461: the ctl-written restart/reload markers. A state dir holding a
+		// pending control request must stay adoptable — the daemon reading that
+		// request is exactly the process that opens this directory next.
+		name == "RESTART", name == "RESTART_NOW", name == "RELOAD",
+		// The supervisor's generated effective config (phase 2b). The daemon
+		// that opens this directory next was started with `run -c` pointing at
+		// it, and doctor opens the same directory — both must adopt it. The
+		// `.tmp` sibling is the in-flight half of the atomic replace a
+		// reconcile-time config edit performs (CLA-724); a crash can leave one
+		// behind, exactly as with CURRENT_CLAIM.tmp.
+		name == MaterializedConfigName, name == MaterializedConfigName+".tmp",
+		// The daemon's record of the claim its current child holds, written for
+		// the supervisor to hand back if the child dies without letting go
+		// (CLA-708). Its `.tmp` sibling is the in-flight half of an atomic
+		// replace; a crash can leave one behind.
+		name == "CURRENT_CLAIM", name == "CURRENT_CLAIM.tmp",
+		// The daemon's own log and its rotated siblings (CLA-701). A pre-sentinel
+		// state dir holding one is still ours, and `doctor` opens the same
+		// directory a daemon writes it into.
+		name == DaemonLogName, strings.HasPrefix(name, DaemonLogName+"."):
 		return true
 	case name == ".DS_Store", name == "Thumbs.db":
 		// Not ours, but not the operator's either: the file manager writes these

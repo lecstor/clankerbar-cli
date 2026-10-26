@@ -5,13 +5,16 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -45,6 +48,26 @@ func okEnv() doctorEnv {
 				return "   PreventUserIdleSystemSleep       0\n", nil
 			}
 			return " sleep                0\n displaysleep        10\n", nil
+		},
+		// The deploy_lag seams (CLA-322). No fixture config sets health_url, so
+		// these only have to answer honestly rather than well: a stamp-less
+		// health read warns before the git seams are ever touched, and the git
+		// stub refuses loudly instead of panicking on nil.
+		fetchHealth: func(context.Context, string) (deployHealth, error) {
+			return deployHealth{}, nil
+		},
+		repos: func(context.Context, string) []string { return nil },
+		gitRun: func(context.Context, string, ...string) (string, error) {
+			return "", errors.New("okEnv runs no git")
+		},
+		// The fleet seam (CLA-466): an empty-body probe that succeeds, i.e. a
+		// plane that is reachable and accepts the key. Tests break it explicitly.
+		fleetProbe: func(context.Context, string, string) error { return nil },
+		// The pr_gate probe (CLA-776): by default there is nothing to read, so
+		// the check stays an honest "not exercised" WARN. Tests that care about
+		// the probe install their own outcome.
+		probePRGate: func(context.Context, string, []string) (delivery.PRProbe, error) {
+			return delivery.PRProbe{}, delivery.ErrNoPRProbeTarget
 		},
 	}
 }
@@ -418,9 +441,11 @@ func mustResolveStateDir(t *testing.T, cfg *config.Config) string {
 }
 
 // A leftover marker is the failure that looks exactly like "the backlog was
-// empty": the loop stops on its first tick and exits clean.
+// empty": the loop stops on its first tick and exits clean. The CLA-461
+// restart/reload markers are the same class — a surprise re-exec or reload on
+// the first tick instead of a surprise stop — so every one of the five must warn.
 func TestStateDirLeftoverMarkersWarn(t *testing.T) {
-	for _, marker := range []string{"HALT", "STOP"} {
+	for _, marker := range []string{"HALT", "STOP", "RESTART", "RESTART_NOW", "RELOAD"} {
 		t.Run(marker, func(t *testing.T) {
 			cfg := validCfg(t)
 			stateDir := mustResolveStateDir(t, cfg)
@@ -1062,37 +1087,63 @@ func TestSessionCheckFailsOpencodePointedAtAClaudeShapedConfig(t *testing.T) {
 	}
 }
 
-// The other two opencode shapes must NOT fail. An absent path is normal - opencode
-// carries its own config - and a present non-Claude file is one doctor has no
-// schema to judge. Both get the caveat instead of a verdict, so a PASS is never
-// read as "the clankerbar wiring is there".
-func TestSessionCheckDoesNotClaimMCPWiringForOpencode(t *testing.T) {
-	native := filepath.Join(t.TempDir(), "opencode.json")
+// The absent opencode path must NOT fail: opencode legitimately carries its own
+// config, and doctor cannot parse that schema - that case keeps the caveat. But
+// a CONFIGURED opencode file is the statement, and doctor can now read it
+// (CLA-448): a file that is present and silent about clankerbar is exactly the
+// tool-less-session config that burned CLA-351 and CLA-377 to parked, so it
+// FAILs rather than earning the caveat.
+func TestSessionCheckVerifiesOpencodeConfigNamesClankerbar(t *testing.T) {
+	dir := t.TempDir()
+	native := filepath.Join(dir, "opencode.json")
 	if err := os.WriteFile(native, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	silent := filepath.Join(dir, "silent.json")
+	if err := os.WriteFile(silent, []byte(`{"mcp":{"context7":{"type":"remote","url":"https://context7.example/v1"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	disabled := filepath.Join(dir, "disabled.json")
+	if err := os.WriteFile(disabled, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/proj","enabled":false}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
-	cases := []struct {
-		name          string
-		mcpConfigPath string
-	}{
-		{"none is configured", ""},
-		{"an opencode-shaped config is configured", native},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), tc.mcpConfigPath, "opencode")
-			if c.status != pass {
-				t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
-			}
-			if strings.Contains(c.detail, ".mcp.json") {
-				t.Errorf("the verdict line must not rest on the .mcp.json for opencode, got %q", c.detail)
-			}
-			if !strings.Contains(strings.Join(c.info, "\n"), "OPENCODE_CONFIG") {
-				t.Errorf("an opencode workdir must SAY where its MCP servers come from, got info %q", c.info)
-			}
-		})
-	}
+	t.Run("none is configured -> caveat, not a verdict", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), "", "opencode")
+		if c.status != pass {
+			t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(strings.Join(c.info, "\n"), "not checked") {
+			t.Errorf("an unconfigured opencode workdir must say the wiring was not checked, got info %q", c.info)
+		}
+	})
+
+	t.Run("a configured opencode file that names clankerbar passes and names it", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), native, "opencode")
+		if c.status != pass {
+			t.Fatalf("opencode workdir: got %v, want PASS (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(strings.Join(c.info, "\n"), "clankerbar MCP server: https://clankerbar.com/mcp/proj") {
+			t.Errorf("a configured opencode workdir must NAME the wired clankerbar URL, got info %q", c.info)
+		}
+	})
+
+	t.Run("a configured opencode file silent about clankerbar fails", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), silent, "opencode")
+		if c.status != fail {
+			t.Fatalf("silent opencode config: got %v, want FAIL (%s)", c.status, c.detail)
+		}
+		if !strings.Contains(c.remedy, "clankerbar") {
+			t.Errorf("the remedy must name the missing clankerbar entry, got %q", c.remedy)
+		}
+	})
+
+	t.Run("a configured opencode file with clankerbar disabled fails", func(t *testing.T) {
+		c := sessionCheck("workdir", multiRepoParent(t, "AGENTS.md"), disabled, "opencode")
+		if c.status != fail {
+			t.Fatalf("disabled clankerbar config: got %v, want FAIL (%s)", c.status, c.detail)
+		}
+	})
 }
 
 // The backstop for the hole the first fix left: it gated the arm on a `switch`
@@ -1151,7 +1202,7 @@ func TestEveryRegisteredHarnessIsClassifiedByTheWorkdirCheck(t *testing.T) {
 // report green about a directory the loop will never use.
 func TestSessionFallsBackToTopLevelWorkDir(t *testing.T) {
 	parent := multiRepoParent(t, "AGENTS.md")
-	if err := os.WriteFile(filepath.Join(parent, ".mcp.json"), []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(parent, ".mcp.json"), []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/acme"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1180,7 +1231,7 @@ func TestSessionFallsBackToTopLevelWorkDir(t *testing.T) {
 func TestSessionFallsBackToTopLevelMCPConfig(t *testing.T) {
 	parent := multiRepoParent(t, "AGENTS.md")
 	mcp := filepath.Join(t.TempDir(), ".mcp.json")
-	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/acme"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1467,22 +1518,230 @@ func TestPermissionsClaudeValidSettingsPasses(t *testing.T) {
 	}
 }
 
-// exec takes the LAST duplicate env key, so an operator's own OPENCODE_PERMISSION
-// silently replaces the adapter's fail-closed policy.
+// opencode 2.x ignores OPENCODE_PERMISSION, so a declared one is a WARN that
+// says so: the operator is editing a knob that does nothing.
 func TestPermissionsOpencodeEnvOverrideWarns(t *testing.T) {
 	cfg := &config.Config{
 		Harness: "opencode",
 		Prompt:  "x",
 		WorkDir: t.TempDir(),
-		Env:     map[string]string{"OPENCODE_PERMISSION": `{"bash":"allow"}`},
+		Env:     config.EnvMap{"OPENCODE_PERMISSION": {Literal: `{"bash":"allow"}`}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
 
-	if c := checkPermissions(cfg); c.status != warn {
-		t.Errorf("opencode permission override: got %v, want WARN", c.status)
+	if c := checkPermissions(cfg); c.status != warn || !strings.Contains(c.detail, "ignores it") {
+		t.Errorf("opencode permission override: got %v %q, want a WARN saying 2.x ignores it", c.status, c.detail)
 	}
+}
+
+// The posture doctor reports is the adapter's own session config: fail-closed,
+// every MCP server out of Code Mode, and the accepted shell gap stated as
+// information rather than a failure (CLA-675).
+func TestPermissionsOpencodeReportsThePinnedPosture(t *testing.T) {
+	mcp := filepath.Join(t.TempDir(), "opencode-mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/p"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), MCPConfigPath: mcp}
+	c := checkPermissions(cfg)
+	if c.status != pass {
+		t.Fatalf("got %v %q, want PASS", c.status, c.detail)
+	}
+	if !strings.Contains(c.detail, "1 MCP server out of Code Mode") {
+		t.Errorf("detail = %q", c.detail)
+	}
+	if !slices.ContainsFunc(c.info, func(s string) bool { return strings.Contains(s, "accepted gap") }) {
+		t.Errorf("info = %v, want the accepted shell gap stated", c.info)
+	}
+
+	// An env OPENCODE_CONFIG_CONTENT replaces the whole pinned document.
+	cfg.Env = config.EnvMap{"OPENCODE_CONFIG_CONTENT": {Literal: `{}`}}
+	if c := checkPermissions(cfg); c.status != warn {
+		t.Errorf("content override: got %v, want WARN", c.status)
+	}
+
+	// A named file with its own permission block has no effect on 2.x: said
+	// as information, not warned.
+	cfg.Env = nil
+	if err := os.WriteFile(mcp, []byte(`{"permission":{"read":"allow"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkPermissions(cfg); c.status != pass || !slices.ContainsFunc(c.info, func(s string) bool { return strings.Contains(s, "no effect") }) {
+		t.Errorf("named permission block: got %v %q %v, want PASS with an info line", c.status, c.detail, c.info)
+	}
+
+	// A config the adapter refuses to build from is a FAIL: no session spawns.
+	if err := os.WriteFile(mcp, []byte(`{"mcp": // not json`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Env = nil
+	if c := checkPermissions(cfg); c.status != fail {
+		t.Errorf("unparseable mcp config: got %v, want FAIL", c.status)
+	}
+}
+
+func TestOpencodeVersionCheck(t *testing.T) {
+	for ver, want := range map[string]status{
+		"opencode v2.0.32":            pass,
+		"2.1.0":                       pass,
+		"1.18.27":                     fail,
+		"opencode2 v0.0.0-beta-18314": fail,
+		"weird":                       warn,
+	} {
+		c := check{status: pass}
+		checkOpencodeVersion(&c, ver)
+		if c.status != want {
+			t.Errorf("%q: got %v, want %v", ver, c.status, want)
+		}
+	}
+}
+
+// The auth check counts credentials per provider through the seam and never
+// fails the run: a key can also come from the provider config.
+func TestOpencodeAuthCheck(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", data)
+	cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir()}
+	e := doctorEnv{opencodeCredentials: func(context.Context, string) (map[string]int, error) {
+		return map[string]int{"opencode-go": 1}, nil
+	}}
+	if got := checkOpencodeAuth(context.Background(), cfg, e); len(got) != 1 || got[0].status != warn {
+		t.Fatalf("no db: got %+v, want one WARN", got)
+	}
+	if err := os.MkdirAll(filepath.Join(data, "opencode"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "opencode", "opencode.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := checkOpencodeAuth(context.Background(), cfg, e)
+	if len(got) != 1 || got[0].status != pass || !strings.Contains(got[0].detail, "opencode-go") {
+		t.Fatalf("got %+v, want PASS naming opencode-go", got)
+	}
+	cfg.Harness = "claude"
+	if got := checkOpencodeAuth(context.Background(), cfg, e); len(got) != 0 {
+		t.Errorf("a run that spawns no opencode got %+v", got)
+	}
+}
+
+// CLA-687: a store holding ANY credential is not a green. The check has to match
+// the providers the config's own models name — the operator's sessions run on
+// those, and a session whose provider has no stored credential dies with
+// `provider.auth` (401) on its first call, which is the failure the check exists
+// to catch early.
+func TestOpencodeAuthCheckMatchesTheConfiguredProviders(t *testing.T) {
+	data := t.TempDir()
+	t.Setenv("XDG_DATA_HOME", data)
+	if err := os.MkdirAll(filepath.Join(data, "opencode"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(data, "opencode", "opencode.db"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withStore := func(counts map[string]int) doctorEnv {
+		return doctorEnv{opencodeCredentials: func(context.Context, string) (map[string]int, error) {
+			return counts, nil
+		}}
+	}
+
+	t.Run("a credential for a provider the models do not use is NOT a pass", func(t *testing.T) {
+		cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), Model: "opencode-go/deepseek-v4-flash"}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"google": 1}))
+		if len(got) != 1 || got[0].status == pass {
+			t.Fatalf("store holds only google, model runs on opencode-go: got %+v, want a non-PASS naming the gap", got)
+		}
+		if !strings.Contains(got[0].detail, "opencode-go") {
+			t.Errorf("detail %q should name the provider the models need", got[0].detail)
+		}
+		if !strings.Contains(got[0].remedy, "opencode-go") {
+			t.Errorf("remedy %q should name the provider to log in to", got[0].remedy)
+		}
+	})
+
+	t.Run("every provider the models name being covered still passes", func(t *testing.T) {
+		cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), Model: "opencode-go/deepseek-v4-flash"}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1, "google": 2}))
+		if len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS", got)
+		}
+		if !strings.Contains(got[0].detail, "opencode-go") {
+			t.Errorf("detail %q should name the provider that covers the configured models", got[0].detail)
+		}
+	})
+
+	// The models are read through the same chain the driver resolves, not off the
+	// raw `model` field: a phase's tier and a model-pinned review-panel member
+	// each decide a session's provider, and a report that ignored them would go
+	// green on exactly the configs that need it most.
+	t.Run("phase tiers and panel members decide the providers too", func(t *testing.T) {
+		cfg := &config.Config{
+			Harness: "opencode",
+			Prompt:  "x",
+			WorkDir: t.TempDir(),
+			Model:   "opencode-go/deepseek-v4-flash",
+			Models:  map[string]string{"cheap": "opencode-go/gpt-6-luna"},
+			Phases: []config.Phase{
+				{Name: "implement", Tier: "cheap"},
+				{Name: "review"},
+				{Name: "fix"},
+			},
+			ReviewPanel: []config.ReviewPanelMember{{Model: config.ModelRoutes{"anthropic/claude-opus-5"}}},
+		}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1}))
+		if len(got) != 1 || got[0].status == pass {
+			t.Fatalf("the panel member runs on anthropic and the store has none: got %+v, want a non-PASS", got)
+		}
+		if !strings.Contains(got[0].detail, "anthropic") {
+			t.Errorf("detail %q should name anthropic, the provider only the panel member names", got[0].detail)
+		}
+		// Covering both providers covers the whole sequence.
+		got = checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1, "anthropic": 1}))
+		if len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS once every named provider has a credential", got)
+		}
+	})
+
+	// A mixed-harness config resolves each phase's model through its OWN
+	// harness's block: the opencode model lives under `harnesses.opencode`, which
+	// the run-wide `model` never mentions.
+	t.Run("a per-harness block's model decides the provider", func(t *testing.T) {
+		cfg := &config.Config{
+			Harness: "claude",
+			Prompt:  "x",
+			WorkDir: t.TempDir(),
+			Model:   "claude-opus-5",
+			Phases: []config.Phase{
+				{Name: "implement", Harness: "opencode"},
+				{Name: "review"},
+			},
+			Harnesses: map[string]config.HarnessConfig{
+				"opencode": {ConfigDir: "/oc/config", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			},
+		}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"anthropic": 1}))
+		if len(got) != 1 || got[0].status == pass {
+			t.Fatalf("the opencode phase runs on opencode-go and the store has none: got %+v, want a non-PASS", got)
+		}
+		if !strings.Contains(got[0].detail, "opencode-go") {
+			t.Errorf("detail %q should name the provider the opencode phase's own block names", got[0].detail)
+		}
+		if got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1})); len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS once opencode-go is covered", got)
+		}
+	})
+
+	t.Run("a bare alias names no provider and is said so, not guessed at", func(t *testing.T) {
+		cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), Model: "claude-opus-5"}
+		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"google": 1}))
+		if len(got) != 1 || got[0].status != pass {
+			t.Fatalf("got %+v, want PASS: an alias with no <provider>/<model> form cannot be checked against the store", got)
+		}
+		if !slices.ContainsFunc(got[0].info, func(s string) bool { return strings.Contains(s, "claude-opus-5") }) {
+			t.Errorf("info %v should name the model id it could not attribute to a provider", got[0].info)
+		}
+	})
 }
 
 // --- budget ------------------------------------------------------------------
@@ -1575,7 +1834,7 @@ func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
 		return "/usr/local/bin/" + file, nil
 	}
 
-	c := checkPRGate(validCfg(t), e)
+	c := checkPRGate(context.Background(), validCfg(t), e)
 	if c.status != warn {
 		t.Errorf("missing gh: got %v, want WARN", c.status)
 	}
@@ -1586,8 +1845,14 @@ func TestPRGateMissingGHWarnsWithARemedy(t *testing.T) {
 
 func TestPRGateWithGHPassesAndNamesTheDefault(t *testing.T) {
 	cfg := validCfg(t)
+	e := okEnv()
+	// A project/checkout with a readable PR is what earns a PASS; the
+	// unexercised probe is pinned as a WARN by its own test.
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{Slug: "acme/widgets", Number: 7}, nil
+	}
 
-	c := checkPRGate(cfg, okEnv())
+	c := checkPRGate(context.Background(), cfg, e)
 	if c.status != pass {
 		t.Errorf("gh present, default config: got %v, want PASS", c.status)
 	}
@@ -1610,8 +1875,12 @@ func TestPRGateNamesPerProjectOptOut(t *testing.T) {
 		{Slug: "strict"},
 		{Slug: "loose", AllowUncheckedPR: true},
 	}
+	e := okEnv()
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{Slug: "acme/widgets", Number: 7}, nil
+	}
 
-	c := checkPRGate(cfg, okEnv())
+	c := checkPRGate(context.Background(), cfg, e)
 	if c.status != pass {
 		t.Errorf("gh present: got %v, want PASS", c.status)
 	}
@@ -1627,6 +1896,188 @@ func TestPRGateNamesPerProjectOptOut(t *testing.T) {
 	if !strict || !loose {
 		t.Errorf("per-project lines missing: %q", c.info)
 	}
+}
+
+// CLA-776: doctor's pr_gate used to check only that gh EXISTED. gh existed on
+// every machine the bug broke; it coloured its `--json` output, so every real
+// delivery's PR went unjudged while doctor passed. The probe now runs a REAL
+// `gh pr view --json` and parses it with the gate's own decoder, so decorated
+// output is a FAIL — every delivery is affected at that moment, which is the
+// loudness this task exists to add.
+func TestPRGateFailsWhenTheProbeCannotParseGHOutput(t *testing.T) {
+	repo := cliGitRepoWithRemote(t, "https://github.com/acme/widgets.git")
+	gh := filepath.Join(t.TempDir(), "gh")
+	// Real gh with GH_FORCE_TTY set: pretty-printed, ANSI-coloured JSON.
+	body := `#!/bin/sh
+case "$1/$2" in
+pr/list) printf '[{"number":7}]\n' ;;
+*) printf '\033[1;37m{\033[m\n  \033[1;34m"mergeable"\033[m\033[1;37m:\033[m "MERGEABLE"\n\033[1;37m}\033[m\n' ;;
+esac
+`
+	if err := os.WriteFile(gh, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	e := okEnv()
+	e.lookPath = func(string) (string, error) { return gh, nil }
+	e.probePRGate = delivery.ProbeGHJSONDirs // the production probe, against the fake gh
+
+	c := checkPRGate(context.Background(), validCfgIn(t, repo), e)
+	if c.status != fail {
+		t.Fatalf("decorated gh output: got %v, want FAIL — this is the CLA-776 fault and doctor must stop the run (detail=%q info=%q)", c.status, c.detail, c.info)
+	}
+	if !strings.Contains(c.detail, "not parseable") {
+		t.Errorf("detail must say the output cannot be parsed: %q", c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "could not parse") {
+		t.Errorf("the probe line must carry gh's parse error: %q", c.info)
+	}
+	if !strings.Contains(c.remedy, "GH_FORCE_TTY") {
+		t.Errorf("remedy must name the known cause: %q", c.remedy)
+	}
+}
+
+// The other half of the classification: gh cannot READ a PR (no auth, no
+// network) is the prerequisite unavailable, not the gate broken. The delivery
+// path degrades exactly as it always did, so doctor warns rather than failing a
+// run whose gate might work fine an hour later.
+func TestPRGateWarnsWhenTheProbeCannotReachGitHub(t *testing.T) {
+	e := okEnv()
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{}, errors.New("gh pr list: exit status 1: authentication required")
+	}
+
+	c := checkPRGate(context.Background(), validCfg(t), e)
+	if c.status != warn {
+		t.Fatalf("unreachable GitHub: got %v, want WARN", c.status)
+	}
+	joined := strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "could not read a real PR") || !strings.Contains(joined, "authentication required") {
+		t.Errorf("the probe line must name what failed: %q", c.info)
+	}
+	if c.remedy == "" {
+		t.Error("an unavailable prerequisite needs a remedy")
+	}
+}
+
+// A successful probe states WHICH pull request it read, so a PASS means "this
+// exact command parsed" rather than "gh is installed".
+func TestPRGateProbeNamesThePullRequestItParsed(t *testing.T) {
+	e := okEnv()
+	e.probePRGate = func(context.Context, string, []string) (delivery.PRProbe, error) {
+		return delivery.PRProbe{Slug: "acme/widgets", Number: 7}, nil
+	}
+
+	c := checkPRGate(context.Background(), validCfg(t), e)
+	if c.status != pass {
+		t.Fatalf("parseable gh: got %v, want PASS", c.status)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "gh pr view 7 --repo acme/widgets --json` parsed") {
+		t.Errorf("the probe line must name the PR it read: %q", c.info)
+	}
+}
+
+// The probe must cover every configured project's EFFECTIVE workdir, not only
+// cfg.WorkDir (CLA-776 review 1.review-2.1 / 1.review-3.1): a project whose
+// checkout lives outside the top-level workdir still holds the PRs the delivery
+// gate will judge, and a probe that misses them reports the parse path untested.
+func TestPRGateProbesEachProjectsEffectiveWorkdir(t *testing.T) {
+	cfg := validCfgIn(t, t.TempDir()) // no repository at the top level
+	withPR := cliGitRepoWithRemote(t, "https://github.com/acme/widgets.git")
+	cfg.Projects = []config.Project{
+		{Slug: "empty", WorkDir: t.TempDir()},
+		{Slug: "withpr", WorkDir: withPR},
+	}
+	gh := cliPRProbeGH(t)
+
+	e := okEnv()
+	e.lookPath = func(string) (string, error) { return gh, nil }
+	e.probePRGate = delivery.ProbeGHJSONDirs
+
+	c := checkPRGate(context.Background(), cfg, e)
+	if c.status != pass {
+		t.Fatalf("a PR in the second project's workdir: got %v, want PASS (info=%q)", c.status, c.info)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "gh pr view 7 --repo acme/widgets --json` parsed") {
+		t.Errorf("the probe did not read the project workdir's PR: %q", c.info)
+	}
+}
+
+// A project's sessions start in a checkout its repos map declares, which need
+// not be under any workdir; the probe must search those declared checkouts too
+// (CLA-776 review 1.review-3.1).
+func TestPRGateProbesDeclaredCheckouts(t *testing.T) {
+	cfg := validCfgIn(t, t.TempDir())
+	repo := cliGitRepoWithRemote(t, "https://github.com/acme/widgets.git")
+	cfg.Repos = map[string]string{"acme/widgets": repo}
+	cfg.PrimaryRepo = "acme/widgets"
+	gh := cliPRProbeGH(t)
+
+	e := okEnv()
+	e.lookPath = func(string) (string, error) { return gh, nil }
+	e.probePRGate = delivery.ProbeGHJSONDirs
+
+	c := checkPRGate(context.Background(), cfg, e)
+	if c.status != pass {
+		t.Fatalf("a PR in a declared checkout: got %v, want PASS (info=%q)", c.status, c.info)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), "gh pr view 7 --repo acme/widgets --json` parsed") {
+		t.Errorf("the probe did not read the declared checkout's PR: %q", c.info)
+	}
+}
+
+// cliPRProbeGH writes a fake gh that answers the probe's discovery and read.
+func cliPRProbeGH(t *testing.T) string {
+	t.Helper()
+	gh := filepath.Join(t.TempDir(), "gh")
+	body := `#!/bin/sh
+case "$1/$2" in
+auth/token) exit 0 ;;
+pr/list) printf '[{"number":7}]\n' ;;
+*) printf '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]}\n' ;;
+esac
+`
+	if err := os.WriteFile(gh, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return gh
+}
+
+// No PR to read is not a pass on the parse path: the check WARNs (CLA-776
+// review 1.review-5.1) and says the probe was NOT exercised, so nobody mistakes
+// a pr_gate result for evidence gh output is clean.
+func TestPRGateWarnsWhenTheProbeHadNothingToRead(t *testing.T) {
+	c := checkPRGate(context.Background(), validCfg(t), okEnv()) // okEnv's probe: no target
+	if c.status != warn {
+		t.Errorf("nothing to probe: got %v, want WARN (an unexercised probe is not a validated gate)", c.status)
+	}
+	joined := strings.Join(c.info, "\n")
+	if !strings.Contains(joined, "NOT exercised") {
+		t.Errorf("doctor must say the probe did not run: %q", c.info)
+	}
+	if c.remedy == "" || !strings.Contains(c.remedy, "pull request") || !strings.Contains(c.remedy, "NOT validated") {
+		t.Errorf("an unexercised probe needs a remedy naming what was not validated: %q", c.remedy)
+	}
+}
+
+// cliGitRepoWithRemote builds a real working tree with the given origin, so the
+// production probe can find it the way it finds a fleet repository. git is a
+// dev prerequisite for this repo (go test ./internal/delivery uses it too).
+func cliGitRepoWithRemote(t *testing.T, remote string) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git is not on PATH")
+	}
+	dir := t.TempDir()
+	for _, args := range [][]string{
+		{"init", "-b", "main", dir},
+		{"-C", dir, "remote", "add", "origin", remote},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	return dir
 }
 
 // --- CLA-344: the guards that were silently absent --------------------------
@@ -1836,7 +2287,7 @@ func TestDoctorRunPrintsTheCodexMCPCaveat(t *testing.T) {
 		t.Fatal(err)
 	}
 	mcp := filepath.Join(dir, ".mcp.json")
-	if err := os.WriteFile(mcp, []byte(`{}`), 0o600); err != nil {
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/proj"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cfgPath := filepath.Join(t.TempDir(), "clankerbar.json")
@@ -1924,11 +2375,11 @@ func TestDoctorAcceptsTheSameConfigNamedExplicitly(t *testing.T) {
 // credential and doctor output is what an operator pastes into an issue.
 func TestConfigCheckNamesEnvKeysWithoutValues(t *testing.T) {
 	cfg := validCfg(t)
-	cfg.Env = map[string]string{"ZED": "zzz", "CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-secret"}
+	cfg.Env = config.EnvMap{"ZED": {Literal: "zzz"}, "CLAUDE_CODE_OAUTH_TOKEN": {Literal: "sk-ant-oat01-secret"}}
 
 	c := checkConfig(cfg)
 	joined := strings.Join(c.info, "\n")
-	if !strings.Contains(joined, "env: CLAUDE_CODE_OAUTH_TOKEN, ZED") {
+	if !strings.Contains(joined, "env[env]: CLAUDE_CODE_OAUTH_TOKEN, ZED") {
 		t.Errorf("config check should list the env keys, sorted:\n%s", joined)
 	}
 	if strings.Contains(joined, "sk-ant-oat01-secret") || strings.Contains(joined, "zzz") {
@@ -2003,11 +2454,15 @@ func TestEveryCheckIsReportedWithARemedy(t *testing.T) {
 
 	for _, want := range []string{
 		"config", "harness", "config_dir", "backlog",
-		"state_dir", "workdir", "mcp_servers", "permissions", "toolchains", "budget",
+		"state_dir", "workdir", "stranded", "mcp_servers", "permissions", "toolchains", "budget",
 		// power has three WARN branches, two of which are the "doctor does not
 		// know the sleep policy" states — exactly the kind of line that is useless
 		// without a remedy.
 		"power",
+		// deploy_lag reports even when unconfigured: one quiet PASS naming the
+		// field, so the feature is discoverable without warning anyone who
+		// opted out (CLA-322).
+		"deploy_lag",
 	} {
 		c := find(t, checks, want)
 		if c.detail == "" {
@@ -2678,5 +3133,89 @@ func TestBudgetEmptyPerHarnessBlockIsNamed(t *testing.T) {
 	c := checkBudget(cfg)
 	if !strings.Contains(c.detail, "per_harness[claude]") || !strings.Contains(c.detail, "no ceiling set") {
 		t.Errorf("an empty per-harness block was passed over in silence: %q", c.detail)
+	}
+}
+
+// CLA-441: an opencode config the driver never named, whose `clankerbar` server
+// points at a different project, is a WARN with the file named. Not a FAIL -
+// spawned sessions are pinned past it by OPENCODE_CONFIG_CONTENT, and the file
+// is frequently a checked-in artifact of somebody else's repo - and not silence,
+// because every interactive session in that tree still gets the wrong backlog.
+func TestDoctorWarnsOnAnAmbientOpencodeConfigNamingAnotherProject(t *testing.T) {
+	workdir := t.TempDir()
+	configDir := t.TempDir()
+	mcp := filepath.Join(workdir, "opencode-mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/ezyapp"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	global := filepath.Join(configDir, "opencode.jsonc")
+	if err := os.WriteFile(global, []byte(`{
+  // interactive setup, pointed at the other project
+  "mcp": { "clankerbar": { "type": "remote", "url": "https://clankerbar.com/mcp/clankerbar" } }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// opencode's global config dirs are ~/.opencode and
+	// $XDG_CONFIG_HOME/opencode (defaulting under HOME), so BOTH are isolated:
+	// the second half of this test asserts PASS, which would otherwise answer to
+	// whatever config root the machine or the CI image happens to have set
+	// (CLA-441 second review).
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness:       "opencode",
+		Prompt:        "Work the next backlog item.",
+		WorkDir:       workdir,
+		MCPConfigPath: mcp,
+		Harnesses:     map[string]config.HarnessConfig{"opencode": {ConfigDir: configDir}},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture config does not validate: %v", err)
+	}
+
+	c := checkOpencodeAmbientConfigs(cfg)
+	if c.status != warn {
+		t.Fatalf("status = %v, want WARN (%s)", c.status, c.detail)
+	}
+	if !strings.Contains(strings.Join(c.info, "\n"), global) {
+		t.Errorf("the check must name the file the operator has to go and edit; info = %v", c.info)
+	}
+	if c.remedy == "" {
+		t.Error("a WARN without a remedy is a line an operator can do nothing with")
+	}
+
+	// ...and a run whose files all agree is silent about the whole mechanism.
+	if err := os.WriteFile(global, []byte(`{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/ezyapp"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if c := checkOpencodeAmbientConfigs(cfg); c.status != pass {
+		t.Errorf("status = %v, want PASS once the file names the project this run drains (%s)", c.status, c.detail)
+	}
+}
+
+// Typeless MCP entries meant as disables are flagged with the full-entry remedy
+// (CLA-675 review S2): on 2.x they leave the globally declared server running.
+func TestOpencodeMCPDisablesCheck(t *testing.T) {
+	mcp := filepath.Join(t.TempDir(), "opencode-mcp.json")
+	body := `{"mcp":{"clankerbar":{"type":"remote","url":"https://clankerbar.com/mcp/p","enabled":true},"context7":{"enabled":false},"servers":{"chrome":{"disabled":true}}}}`
+	if err := os.WriteFile(mcp, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: t.TempDir(), MCPConfigPath: mcp}
+	got := checkOpencodeMCPDisables(cfg)
+	if len(got) != 1 || got[0].status != warn || !strings.Contains(got[0].detail, "mcp.context7") ||
+		!strings.Contains(got[0].detail, "mcp.servers.chrome") || strings.Contains(got[0].detail, "clankerbar") {
+		t.Fatalf("got %+v", got)
+	}
+	if !strings.Contains(got[0].remedy, `"type"`) {
+		t.Errorf("remedy = %q, want the full-entry shape", got[0].remedy)
+	}
+	if err := os.WriteFile(mcp, []byte(`{"mcp":{"context7":{"type":"remote","url":"u","enabled":false}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := checkOpencodeMCPDisables(cfg); got[0].status != pass {
+		t.Errorf("a full disable entry was flagged: %+v", got)
 	}
 }

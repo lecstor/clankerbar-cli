@@ -12,19 +12,19 @@ import (
 // salvage AND the CLA-253 delivery check, so an unseeded resumed phase runs with
 // all three inert, and it is the phase that pushes the branch and opens the PR.
 //
-// The behavioural payload of the seed is that noteToolUse's update_task arm
+// The behavioural payload of the seed is that noteToolUse's record_progress arm
 // matches (`res.Claim.Names(taskID)`) — the arm that arms the settle, the
 // delivery Report, and HasWIP. That is what these assert, so deleting the seed in
 // Invoke turns them red rather than leaving the whole suite green.
-func TestSeededResumeClaimArmsTheUpdateTaskArm(t *testing.T) {
+func TestSeededResumeClaimArmsTheProgressArm(t *testing.T) {
 	const seededTask = "task-abc"
 
 	stream := strings.Join([]string{
-		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"mcp__clankerbar__update_task",` +
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"mcp__clankerbar__record_progress",` +
 			`"input":{"taskId":"task-abc","branch":"clanker/task-abc-work"}}]}}`,
 		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu-1","is_error":false}]}}`,
-		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-2","name":"mcp__clankerbar__update_task",` +
-			`"input":{"taskId":"task-abc","status":"in_review","delivery":{"pr":"#42"}}}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-2","name":"mcp__clankerbar__submit_for_review",` +
+			`"input":{"taskId":"task-abc","outcome":"**Tests** - fixture"}}]}}`,
 		`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tu-2","is_error":false}]}}`,
 		`{"type":"result","subtype":"success","total_cost_usd":1.5,"usage":{"input_tokens":10,"output_tokens":20}}`,
 	}, "\n") + "\n"
@@ -36,10 +36,13 @@ func TestSeededResumeClaimArmsTheUpdateTaskArm(t *testing.T) {
 	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res, 0, func() {})
 
 	if !res.Claim.HasWIP {
-		t.Error("update_task(branch:) did not set HasWIP on the seeded claim — the claim would look releasable, so the driver would post a task with pushed work back to the queue instead of leaving the takeover hand-off")
+		t.Error("record_progress(branch) did not set HasWIP on the seeded claim — the claim would look releasable, so the driver would post a task with pushed work back to the queue instead of leaving the takeover hand-off")
+	}
+	if res.Claim.Branch != "clanker/task-abc-work" {
+		t.Errorf("Claim.Branch = %q, want clanker/task-abc-work — CURRENT_CLAIM needs the NAME, not only the fact, to choose expireLease over release", res.Claim.Branch)
 	}
 	if !res.Claim.Settled {
-		t.Error("update_task(status: in_review) did not settle the seeded claim — the driver would then hand back a task already in review, which is the one outcome CLA-262 calls worse than a lease expiring")
+		t.Error("submit_for_review did not settle the seeded claim — the driver would then hand back a task already in review, which is the one outcome CLA-262 calls worse than a lease expiring")
 	}
 	if len(res.Reports) == 0 {
 		t.Fatal("no delivery Report was armed for the seeded claim, so CLA-253's branch/commit/PR verification is silently off for the phase that actually opens the PR")
@@ -67,7 +70,7 @@ func TestSeededResumeClaimArmsTheUpdateTaskArm(t *testing.T) {
 // The seed must not swallow a call about some OTHER task — that is the guard
 // `Claim.Names` exists for, and seeding is what makes it reachable at all here.
 func TestSeededResumeClaimIgnoresAnUnrelatedTask(t *testing.T) {
-	stream := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"mcp__clankerbar__update_task",` +
+	stream := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"mcp__clankerbar__record_progress",` +
 		`"input":{"taskId":"some-other-task","branch":"clanker/not-ours"}}]}}` + "\n"
 
 	res := newSessionResult(Invocation{ResumeClaim: Claim{TaskID: "task-abc", RunID: "run-xyz"}})
@@ -78,15 +81,15 @@ func TestSeededResumeClaimIgnoresAnUnrelatedTask(t *testing.T) {
 		t.Error("a branch recorded against a DIFFERENT task set HasWIP on ours")
 	}
 	if len(res.Reports) != 0 {
-		t.Errorf("armed a delivery Report from another task's update_task: %+v", res.Reports)
+		t.Errorf("armed a delivery Report from another task's record_progress: %+v", res.Reports)
 	}
 }
 
 // An unseeded session (phase 1, or any unphased run) is unchanged: with no claim
-// yet, the update_task arm must stay shut, or a session's first act could forge
+// yet, the progress arm must stay shut, or a session's first act could forge
 // claim state it never earned.
-func TestAnUnseededSessionIgnoresUpdateTaskUntilItClaims(t *testing.T) {
-	stream := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"mcp__clankerbar__update_task",` +
+func TestAnUnseededSessionIgnoresProgressUntilItClaims(t *testing.T) {
+	stream := `{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tu-1","name":"mcp__clankerbar__record_progress",` +
 		`"input":{"taskId":"task-abc","branch":"clanker/task-abc-work"}}]}}` + "\n"
 
 	res := newSessionResult(Invocation{})
@@ -94,6 +97,6 @@ func TestAnUnseededSessionIgnoresUpdateTaskUntilItClaims(t *testing.T) {
 	(claude{}).consume(strings.NewReader(stream), io.Discard, newTail(), &res, 0, func() {})
 
 	if res.Claim.HasWIP || res.Claim.TaskID != "" {
-		t.Errorf("an unseeded session picked up claim state from an update_task it never claimed for: %+v", res.Claim)
+		t.Errorf("an unseeded session picked up claim state from a record_progress it never claimed for: %+v", res.Claim)
 	}
 }

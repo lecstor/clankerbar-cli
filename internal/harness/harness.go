@@ -268,8 +268,15 @@ func CapabilitiesOf(name string) (Capabilities, bool) {
 // Invocation is everything a harness needs to run one session. The loop builds it
 // from config; adapters translate it into their own CLI dialect.
 type Invocation struct {
-	Prompt        string
-	Model         string
+	Prompt string
+	Model  string
+	// Routes is the ordered model route list this session may FALL BACK through
+	// (CLA-782): the free route first, its paid twin after it. Model is always
+	// the same value as Routes[0], so a single-route invocation is byte-for-byte
+	// the argv it was before this field existed; an adapter with no route support
+	// ignores it. A session that switches mid-flight resumes ITSELF on the next
+	// route, and reports the switch through Result.Raw (see RouteFallback).
+	Routes        []string
 	WorkDir       string
 	MCPConfigPath string
 	// ConfigDir sets the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
@@ -286,7 +293,7 @@ type Invocation struct {
 	// piece 2 — permissions follow the project, not the cwd). Empty on every run
 	// whose project declares no repos, which leaves each adapter's policy exactly
 	// as it was. Each adapter expresses these in its own dialect — opencode's
-	// generated OPENCODE_PERMISSION gains read/edit/external_directory scope,
+	// pinned `permission` block gains read/edit/external_directory scope,
 	// claude gets --add-dir — and an adapter with no such concept ignores them;
 	// see the adapters for what each does and documents.
 	ExtraDirs []string
@@ -294,6 +301,12 @@ type Invocation struct {
 	// terminal and/or a per-iteration logfile). Nil → os.Stderr.
 	Console io.Writer
 	Env     []string // extra env, appended to the process environment
+	// EnvAllowlist names the INHERITED variables this session may keep
+	// (CLA-714). Nil/empty = inherit the daemon's whole environment, the
+	// unchanged default. When set, every other inherited variable is dropped
+	// before exec; Env is still appended in full, because a declared value is
+	// an instruction for the session rather than inherited state.
+	EnvAllowlist []string
 	// Probe marks this as a cheap liveness check, not real work — adapters run
 	// the smallest possible request instead of the drain prompt.
 	Probe bool
@@ -329,6 +342,16 @@ type Invocation struct {
 	// Only an adapter reporting Capabilities.HonoursSessionWallClock enforces
 	// it; opencode is that adapter today.
 	MaxSessionWallClock time.Duration
+
+	// MaxRepeatedToolFailures ends this session when the same tool returns the
+	// same error on this many CONSECUTIVE tool calls (CLA-739): the adapter kills
+	// the process mid-stream and records the cause on Result.ToolLoop, and the
+	// driver classifies the session as dead. The driver resolves it from
+	// Config.MaxRepeatedToolFailures. 0 = no check, which is also every probe.
+	//
+	// Enforced by the adapters that observe tool results as they stream: claude
+	// and opencode. codex does not, and the field is inert there.
+	MaxRepeatedToolFailures int
 
 	// ResumeClaim is the claim a PREVIOUS phase left held, seeded into this
 	// session's Result before its stream is parsed.
@@ -369,6 +392,40 @@ type Invocation struct {
 // directly, because the failure mode is a NEW adapter, not this one.
 func (in Invocation) ModelArg() string { return strings.TrimSpace(in.Model) }
 
+// RouteList is the ordered, de-duplicated route list a fallback-capable adapter
+// runs through. Routes is authoritative when set; otherwise the single Model
+// alias (or nothing, for the harness's own default) is the whole list. Blank
+// entries are dropped for the same reason ModelArg trims: a whitespace alias
+// must never reach a child's model flag.
+func (in Invocation) RouteList() []string {
+	if len(in.Routes) == 0 {
+		if m := in.ModelArg(); m != "" {
+			return []string{m}
+		}
+		return nil
+	}
+	out := make([]string, 0, len(in.Routes))
+	seen := make(map[string]bool, len(in.Routes))
+	for _, route := range in.Routes {
+		r := strings.TrimSpace(route)
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		out = append(out, r)
+	}
+	return out
+}
+
+// OnRoute returns a copy of the invocation pinned to one route of its list, for
+// the resume process a fallback starts. Set the whole field on the COPY rather
+// than threading a model argument through every argv builder: the builders keep
+// reading ModelArg, so a route switch cannot grow a second dialect for `--model`.
+func (in Invocation) OnRoute(route string) Invocation {
+	in.Model = strings.TrimSpace(route)
+	return in
+}
+
 // Result is the outcome of one session, both raw and parsed.
 //
 // Stdout and Stderr are the retained TAIL of each stream, not the whole of it: a
@@ -394,12 +451,126 @@ const TerminalReasonKey = "terminal_reason"
 // "stop" on a healthy completion.
 const FinishReasonUnknown = "unknown"
 
+// FinishReasonLength is opencode's step_finish reason for a step the model
+// ended by hitting its output token limit: the cap, not a completed answer and
+// not a silent death. A FINAL "length" step that produced zero output tokens is
+// the CLA-584 output-cap stall — the model spent the step's whole output budget
+// reasoning and emitted nothing (the MAK-123 shape: reasoning=32000, output=0).
+const FinishReasonLength = "length"
+
 // ZeroUsageReason is the terminal_reason the opencode adapter writes into a
 // Result when the session's final step_finish carried reason "unknown" with
 // all-zero usage — the CLA-398 quiet-death signature, read back through
 // Adapter.ZeroUsageUnknown. Like the finish_reason key it lives on Result.Raw,
 // which is the adapter-to-driver channel the loop already reads.
 const ZeroUsageReason = "zero_usage_unknown"
+
+// RecoveredErrorsKey is the Result.Raw key an adapter uses to record that its
+// session's stream carried a typed error event the session then RECOVERED from —
+// it retried and carried on — with no error event ending the stream (CLA-700).
+// The loop reads it off Raw rather than growing Adapter, the same way it reads
+// FinishReasonKey: it is the adapter-to-driver channel, and only opencode emits
+// this signal today.
+//
+// Its value is the COUNT of recovered events (an int), so a diagnostic can say
+// how many provider blips the session rode out. Absent — rather than zero —
+// when the session recovered from nothing, which is both the common case and
+// the one a missing key already means.
+const RecoveredErrorsKey = "recovered_error_events"
+
+// RecoveredErrors reports how many typed error events the session's stream
+// RECOVERED from — events with further transcript after them, and no error event
+// ending the stream (CLA-700). Zero covers both "nothing went wrong" and "the
+// stream ended on its error": the difference that matters to a classifier is
+// whether there is an unexplained exit status to judge, and only the second
+// shape has one.
+//
+// A RESURRECTED session (mergeResume) reports the count of the run that ENDED
+// it, not the sum of its runs: the marker answers "did this session recover",
+// and a continuation that ended on a real terminal error must read as not
+// recovered however many blips the dead run rode out first.
+func RecoveredErrors(res Result) int {
+	if res.Raw == nil {
+		return 0
+	}
+	n, _ := res.Raw[RecoveredErrorsKey].(int)
+	return n
+}
+
+// OutputCapReason is the terminal_reason the opencode adapter writes into a
+// Result when the session's final step_finish carried reason "length" with
+// ZERO output tokens — the CLA-584 output-cap stall, read back through
+// opencode.OutputCapNoOutput. It is a DIFFERENT end from the CLA-398 quiet
+// death: the model ran, spent real output budget on reasoning and emitted
+// nothing, and opencode ended the turn cleanly — so the session is alive and
+// resumable, where the quiet death's stream was dropped. The driver names the
+// end with it in place of its generic "never moved the task on" line.
+const OutputCapReason = "output_cap_no_output"
+
+// OutputCapReasoningKey is the Result.Raw key carrying the stalled final step's
+// OWN reasoning-token count, which is what makes the stall legible in a log
+// line — how much thinking bought nothing. Read by the driver's named
+// `stalled: output cap hit with no output (reasoning=<n>)` line. Because it
+// describes ONE step, mergeResume recomputes it from the continuation rather
+// than summing it: a second consecutive stall replaces the first's figure, and
+// a recovered resume clears it with the marker.
+const OutputCapReasoningKey = "output_cap_reasoning"
+
+// Usage is one session's token accounting in the CLI's OWN normalised
+// vocabulary: every adapter's report mapped onto the same five buckets, so a
+// consumer can compare two models, or reprice an old session against today's
+// rates, without knowing which harness ran it (CLA-691).
+//
+// The buckets are DISJOINT and sum to the total the harness itself reported —
+// that is what makes repricing possible, and why each adapter is mapped by
+// MEANING rather than field-for-field by name:
+//
+//   - claude reports input_tokens exclusive of the two cache figures, so those
+//     are the three buckets directly; thinking tokens are inside output_tokens
+//     (Anthropic folds them in), so Reasoning stays zero rather than being
+//     invented.
+//   - opencode's per-step tokens are already disjoint — its own `total` sums
+//     input+output+reasoning+cache — so every bucket is reported directly.
+//   - codex reports INCLUSIVE counters: cached_input_tokens is a SUBSET of
+//     input_tokens, and reasoning_output_tokens a subset of output_tokens. A
+//     field-for-field copy of that report would double count both, so the
+//     cached reads are subtracted out of Input and the reasoning tokens out of
+//     Output. The five buckets then sum to codex's own total_tokens.
+//
+// A harness that reported no usage at all leaves this zero, and Result.UsageReported
+// — not a zero here — is what tells the two apart.
+type TokenUsage struct {
+	Input      int // fresh (uncached) prompt tokens
+	Output     int // generated tokens, minus any reasoning the harness counts separately
+	Reasoning  int // thinking tokens the harness counts as their own bucket
+	CacheRead  int // prompt tokens served from a prompt cache
+	CacheWrite int // prompt tokens written to a prompt cache
+}
+
+// Add folds another run's usage into this one. It is how a session that spanned
+// a stall continuation (CLA-584) or a resurrection (CLA-406) reports its parts
+// as ONE session's spend, exactly as Tokens and CostUSD are summed there.
+func (u *TokenUsage) Add(o TokenUsage) {
+	u.Input += o.Input
+	u.Output += o.Output
+	u.Reasoning += o.Reasoning
+	u.CacheRead += o.CacheRead
+	u.CacheWrite += o.CacheWrite
+}
+
+// Total is the sum of the buckets: the token figure the harness itself
+// reported, recomputed here so a consumer repricing bucket by bucket can add up
+// what it was given.
+//
+// For claude and opencode it equals Result.Tokens exactly. codex is the one
+// exception TODAY, and the divergence is a known defect of the BUDGET figure
+// rather than of these buckets: codex's `reasoning_output_tokens` is a subset of
+// its `output_tokens`, while Result.Tokens still adds the reasoning count a
+// second time (CLA-692 tracks the fix). These buckets sum to codex's own
+// total_tokens, which is the correct figure.
+func (u TokenUsage) Total() int {
+	return u.Input + u.Output + u.Reasoning + u.CacheRead + u.CacheWrite
+}
 
 type Result struct {
 	ExitCode int
@@ -415,6 +586,28 @@ type Result struct {
 	Tokens       int            // tokens this session consumed (for the Budget)
 	CostUSD      float64        // $ this session consumed
 	Raw          map[string]any // adapter-specific parsed fields
+
+	// Usage is this session's token accounting normalised across harnesses (see
+	// TokenUsage's own comment for the buckets and the per-adapter mapping). It is
+	// the durable, repriceable form of what Tokens only totals, and it rides the
+	// fleet report's per-session entry (CLA-691) so a per-phase/per-reviewer
+	// cost analysis has something finer than the iteration's summed figure.
+	//
+	// Zero when the harness reported no usage, which UsageReported distinguishes
+	// from a reported zero.
+	Usage TokenUsage
+
+	// CostReported says the adapter actually SAW a cost figure for this session,
+	// as distinct from CostUSD merely being zero — the same question UsageReported
+	// answers for tokens, and NOT the same event.
+	//
+	// claude is why this is its own field: it reports per-turn TOKENS on the
+	// stream but the session's DOLLARS only on its terminal result event, so a
+	// claude session killed mid-stream (the token ceiling, the turn cap) has
+	// UsageReported true with CostUSD still 0 — a zero nobody measured. The fleet
+	// record's costUsd is nullable for exactly this reason, and this flag is what
+	// lets it stay absent instead of claiming "$0 spent".
+	CostReported bool
 
 	// UsageReported says the adapter actually SAW a usage-bearing event on this
 	// session's stream, as distinct from Tokens/CostUSD merely being zero.
@@ -446,6 +639,13 @@ type Result struct {
 	// not release the claim, do not classify the exit. See CLA-262.
 	Untrusted string
 
+	// ToolLoop is the cause, when the ADAPTER killed this session for making the
+	// same failing tool call MaxRepeatedToolFailures times in a row (CLA-739):
+	// "repeated failing tool call: <tool> x<n>: <error, cut short>". Empty for
+	// every other end. It is a verdict about the session, not a figure parsed out
+	// of its stream, so it is set after the stream is parsed and survives it.
+	ToolLoop string
+
 	// OutputDropped is how many bytes of this session's output were NOT retained,
 	// across both streams — the ordinary cost of the rolling window, not a fault.
 	//
@@ -459,6 +659,37 @@ type Result struct {
 	// Claim is the backlog task this session was still holding when it ended, so
 	// the driver can hand it back rather than leave the lease to die (CLA-242).
 	Claim Claim
+
+	// ClankerbarCalls is how many clankerbar MCP tool calls this session got a
+	// SUCCESSFUL result for. A refused call (the tool was not connected yet, the
+	// plane rejected it) does not count: it says nothing about whether the
+	// backlog was reachable, and the driver's no-MCP classification is exactly
+	// the question "was the backlog reachable at all?".
+	//
+	// Only adapters that observe a session's clankerbar traffic populate it
+	// (Capabilities.TracksClaims); on any other adapter it stays zero and the
+	// driver must not read a zero as "the MCP server was missing".
+	ClankerbarCalls int
+
+	// CheckpointUnverified marks this Result as the hand-off for a phase that
+	// reached its checkpoint on an UNVERIFIED branch (CLA-576): the phase
+	// recorded Claim.Branch on the plane, but the driver's read of the origin
+	// remote failed (network, a GitHub outage, a credential problem), so it is
+	// unknown whether the branch was ever pushed. The branch is still carried —
+	// the review phase is the backstop — but the successor's brief must not
+	// describe it as verified on the origin remote (CLA-457), and the review
+	// session is told to verify the hand-off itself. False for every verified
+	// checkpoint and for the branch-less plane-record forms (CLA-497).
+	CheckpointUnverified bool
+
+	// CheckpointTip is the origin tip the driver VERIFIED for Claim.Branch at
+	// the checkpoint (CLA-637): the remote commit the branch was at when the
+	// evidence gate read it. The review phase's brief carries it as the tip the
+	// reviewer must check out and record, and the durable-record seam gate
+	// matches the record's reviewedTip against it. Empty for a branchless
+	// checkpoint and for an unverified one (where the driver never read a tip),
+	// which is exactly the pair of cases where no tip can be demanded.
+	CheckpointTip string
 
 	// onClaim is the Invocation.OnClaim callback bound into this Result at
 	// construction (newSessionResult), so the shared observer can notify it
@@ -477,9 +708,17 @@ type Result struct {
 	// never on the request, because a refused call changes nothing.
 	pending map[string]pendingKind
 
-	// pendingReports is the same discipline for delivery claims: an `update_task`
-	// REFUSED by the plane (a missing Tests header, a superseded run) recorded
-	// nothing, so there is nothing to check and nothing to complain about.
+	// clankerbarCalls names the tool_use ids that are clankerbar calls, so the
+	// RESULT can decide ClankerbarCalls. It is separate from `pending` because
+	// most clankerbar calls (get_task, heartbeat, list_tasks) arm no claim or
+	// delivery state, yet a successful one still proves the MCP server was
+	// usable — which is the fact CLA-703's no-MCP classification needs.
+	clankerbarCalls map[string]bool
+
+	// pendingReports is the same discipline for delivery claims: a progress or
+	// terminal call REFUSED by the plane (a missing Tests header, a superseded
+	// run) recorded nothing, so there is nothing to check and nothing to complain
+	// about.
 	pendingReports map[string]Report
 
 	// claimRequests maps a claim_task tool_use id to the task it ASKED for. Kept
@@ -493,6 +732,14 @@ type Result struct {
 	// left to stop, and classifying a session that merely REPORTED a high total
 	// as killed would lie about what happened.
 	gotResult bool
+
+	// toolLoop is claude's repeated-failure guard (CLA-739), armed by
+	// newSessionResult from the Invocation; nil when the check is off. toolNames
+	// maps a pending tool_use id to its tool name, because claude reports a
+	// call's RESULT on a later event that carries only the id. Parser state, not
+	// output, like pending above. opencode keeps its own guard on its parser.
+	toolLoop  *toolLoopGuard
+	toolNames map[string]string
 
 	// scans memoizes the harness-authored text a classifier reads. See scan.
 	scans *scanCache
@@ -630,9 +877,15 @@ func (r *Result) settleReport(toolUseID string, accepted bool) {
 	// Deduplicated on the CLAIM, not on the whole call, and the later one wins: two
 	// updates can restate the same branch under different statuses, and it is the
 	// most recent status that says whether the work is being handed to review or
-	// declared landed.
+	// declared landed. The replace carries the PRIOR Repo when the restatement
+	// drops it (CLA-351): a session that declared `repo` on one update and then
+	// restates `branch` with a status change — the protocol-encouraged shape —
+	// must not have its repo wiped, or the resolved branch check is lost.
 	for i, prior := range r.Reports {
 		if prior.sameClaim(rep) {
+			if rep.Repo == "" {
+				rep.Repo = prior.Repo
+			}
 			r.Reports[i] = rep
 			return
 		}
@@ -660,6 +913,14 @@ type Report struct {
 
 	// Branch is a recorded work-in-progress branch.
 	Branch string
+
+	// Repo is the repository the session declared its work lives in
+	// ("owner/name") (CLA-351). Empty when the session did not declare one — and
+	// the cutover to intent-specific tools left no call that carries `repo`
+	// beside a branch, so it is normally empty and the plane's own task row is
+	// the authority (CLA-437). The verifier then falls back to its existing
+	// behaviour, and the driver resolves the ambiguity-free case as before.
+	Repo string
 
 	// Commit and IntegrationBranch are a declared delivery, and PR is the pull
 	// request that carried it. PR is echoed back in the plane attestation, and
@@ -733,6 +994,17 @@ type Claim struct {
 	// session after it pushed. It makes the claim UNSAFE to release: see
 	// Releasable.
 	HasWIP bool
+
+	// Category is the task-declared risk trigger value (e.g. "security",
+	// "migration", "feature", "chore"). Read from the claim payload so the
+	// review-phase escalation can apply CategoryRules without an extra plane
+	// call (CLA-379).
+	Category string
+
+	// Branch is the work-in-progress branch name recorded on the task
+	// (e.g. "clanker/x-..."). Used by the review-phase escalation to diff
+	// changed paths against the integration branch (CLA-379).
+	Branch string
 }
 
 // Held reports whether this session ended still holding a task — a claim that
@@ -776,7 +1048,7 @@ func (r *Result) notifyClaim() {
 	}
 }
 
-// settlesTask reports whether an update_task carrying this status would release
+// settlesTask reports whether a terminal call carrying this status would release
 // the task plane-side.
 //
 // Stated as "anything but in_progress" rather than as a list of terminal
@@ -795,10 +1067,22 @@ type Limit struct {
 	// exhaustion (out of credits, spend-cap or monthly-limit reached) with no
 	// rolling-window reset to poll for. The loop stops the run cleanly instead of
 	// entering the supervised wait. Zero value (false) keeps the wait-and-poll
-	// behaviour for the rolling-window subscription caps that claude/codex hit.
+	// behaviour for the rolling-window subscription caps that claude, codex and
+	// opencode hit.
 	Stop    bool
 	ResetAt time.Time // zero = unknown
 	Reason  string
+	// Window is the usage window the limit names, as a human label: "5-hour",
+	// "weekly" or "daily". Empty when the provider named no window (a bare
+	// "usage limit reached"), which is NOT the same as an unknown reset: the
+	// reset says when the limit lifts, the window says which plan cap it is.
+	//
+	// It is diagnostic, not decision-making: Stop already carries whether the
+	// loop may wait, and a weekly or daily window is a rolling cap like the
+	// 5-hour one, so it is never a reason to stop. The loop prints it beside the
+	// reason (a multi-day wait should say WHICH cap it is waiting out), and an
+	// adapter that names no window leaves it blank rather than guessing.
+	Window string
 }
 
 // ProbeResult is what a liveness probe learned, and what it cost.
@@ -846,6 +1130,18 @@ var ErrUsageUnsupported = errors.New("usage introspection not supported by this 
 // the harness's output is unreadable, and a wait that keeps polling on it is
 // spending money no ceiling can see. loop.supervisedWait tells them apart.
 var ErrUntrusted = errors.New("untrusted harness output")
+
+// ErrMCPNotConnected marks a session that never reached its first model turn
+// because the clankerbar MCP server did not report connected in time. It is an
+// INFRASTRUCTURE failure, not a verdict on the phase: the session did no work
+// and recorded no review, and the driver must retry it as such rather than read
+// an empty result as "the session reviewed nothing" (CLA-703).
+//
+// It is an error rather than a zero Result on purpose. A zero Result is
+// indistinguishable from a session that ran and produced nothing — exactly the
+// silent "no record" shape the task exists to kill — while the error carries the
+// reason to the driver's log and to whatever retry decision it makes.
+var ErrMCPNotConnected = errors.New("the clankerbar MCP server did not connect")
 
 // probeVerdict turns a finished probe session into what the caller may act on.
 //

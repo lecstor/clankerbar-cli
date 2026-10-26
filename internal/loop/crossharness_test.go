@@ -109,8 +109,10 @@ func (wallClockBlind) WallClockCapped(harness.Result) bool { return false }
 // those ARE is a question only the harness that ran them can answer.
 func TestPerPhaseHarness_WallClockCapIsClassifiedByThePhasesOwnAdapter(t *testing.T) {
 	// The implement session ends on ITS OWN wall clock, holding a claim with WIP:
-	// under CLA-368 that is a checkpoint, so the review phase runs.
-	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}
+	// under CLA-368 that is a checkpoint, so the review phase runs. The WIP claim
+	// names the salvaged branch, which the evidence gate (CLA-457) verifies via
+	// the stub verifier mixedDriver installs.
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
 	impl := &fakeAdapter{steps: []invokeStep{{res: held(wallClockResult(), wip)}}}
 	blind := &fakeAdapter{steps: []invokeStep{{res: okResult(5, 0.05)}}}
 	blind.name = "claude"

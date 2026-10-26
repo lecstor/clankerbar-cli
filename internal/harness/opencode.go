@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,58 +11,73 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 func init() { Register(opencode{}) }
 
-// opencode drives the open, provider-agnostic opencode CLI (`opencode run`). It is
-// the adapter that proves the loop isn't Claude-shaped: opencode points at
-// OpenRouter / opencode Zen / opencode Go / any provider, and the model choice
-// lives in opencode's own config (invisible here). Divergences this adapter
-// absorbs, verified against opencode 1.18.2:
+// opencode drives the open, provider-agnostic opencode CLI, 2.x line (`opencode
+// run`). It is the adapter that proves the loop isn't Claude-shaped: opencode
+// points at OpenRouter / opencode Zen / opencode Go / any provider, and the model
+// choice lives in opencode's own config (invisible here). The 1.x line is no
+// longer supported upstream and this adapter no longer speaks its dialect
+// (CLA-675). Divergences it absorbs, verified against opencode 2.0.32 with a
+// hermetic fake provider and fake MCP server (docs/opencode-build.md):
 //
-//   - Headless entry point is `opencode run <message> --format json`, which emits
-//     one JSON event per line. There is NO per-run --mcp-config flag: MCP servers,
-//     the model, providers and auth all come from opencode's config dir, so
-//     ConfigDir → OPENCODE_CONFIG_DIR is the parity of claude's CLAUDE_CONFIG_DIR.
-//   - Permissions are set via the OPENCODE_PERMISSION env var (a JSON allow/ask/deny
-//     policy), not a run flag. We fail closed: a drain allows read/edit/bash within
-//     the run's workdir subtree (path-scoped PermissionConfig — the session's
-//     worktrees live under it) but denies the exfil tools (webfetch/websearch) and
-//     everything outside the subtree; a probe / read-only run denies edits and
-//     shell too. (We never pass --auto, which blanket-approves everything not
-//     explicitly denied.)
+//   - Headless entry point is `opencode run --standalone --format json [--model
+//     m] -- <message>`, one JSON event per line. `--standalone` is load-bearing:
+//     2.x is client/server and `run` otherwise attaches to the managed background
+//     service, whose own config then wins over everything this adapter sets.
+//     Stdin is left nil: a non-TTY stdin left open hangs `run`, and piped stdin
+//     is appended to the prompt.
+//   - Permissions come from a config `permission` block. 2.x ignores the
+//     OPENCODE_PERMISSION env var entirely, and its default with no policy is
+//     fail-OPEN (write, shell and webfetch all execute, inside the workdir or
+//     not). The adapter therefore writes its fail-closed policy into the
+//     OPENCODE_CONFIG_CONTENT layer it pins on every spawn, which 2.x merges
+//     last. We never pass --auto, which approves every `ask`.
+//   - MCP servers default to Code Mode in 2.x: their tools are not top-level but
+//     callable only from inside the `execute` tool, whose stream shows no
+//     per-call output (so no claim can be observed) and whose sandbox reached the
+//     network with webfetch denied. The adapter sets `codemode: false` on every
+//     server it hands over and denies `execute`.
 //   - Billing depends on the configured backend, not opencode: metered pay-per-token
-//     (OpenRouter / Zen) or a monthly-limit subscription (opencode Go). NONE impose a
-//     short rolling-window cap, so there is no supervised-wait/early-reset case here.
-//     DetectLimit instead recognizes a HARD budget/credit-exhaustion stop (402 /
-//     "out of credits" / "monthly limit reached") and flags Limit.Stop so the loop
-//     stops cleanly rather than waiting for a reset that never comes. The
-//     self-accounted budget breaker is the primary control; ReadUsage is unsupported.
+//     (OpenRouter / Zen), a monthly-limit subscription (opencode Go), or the Command
+//     Code plan's rolling usage windows — 5-hour, daily and weekly. The first two
+//     are hard caps; a rolling window names the cap and usually states its reset,
+//     so DetectLimit reports it as a WAITABLE limit (Limit.Stop unset, ResetAt
+//     parsed when stated, Limit.Window labelled) and the loop supervises the wait.
+//     The window is read from the provider's structured `rateLimit.window` in the
+//     response body opencode passes through verbatim, falling back to the message
+//     wording. The hard cases (402 / "out of credits" / "monthly limit reached")
+//     still set Limit.Stop so the loop stops cleanly rather than waiting for a
+//     reset that never comes. The self-accounted budget breaker is the primary
+//     control; ReadUsage is unsupported.
+//   - Usage: 2.x emits step_finish only for tool-call steps, never for the final
+//     answer, so the stream under-counts. After each process exits the adapter
+//     reads `opencode session export --standalone <sid>` for the authoritative
+//     figures (see opencode_export.go).
 type opencode struct{}
 
 func (opencode) Name() string { return "opencode" }
 
-// opencode DOES receive mcp_config_path - as OPENCODE_CONFIG (see env below) -
-// and that is exactly why "does the adapter hand it over" was the wrong question
-// to gate a preflight on. What arrives has to be an opencode config, whose
-// servers live under `mcp`; the Claude-shaped `.mcp.json` that config.Validate
-// auto-discovers from the workdir is a different schema, and opencode does not
-// ignore the difference. Verified against opencode 1.18.2:
-//
-//	$ OPENCODE_CONFIG=<dir>/.mcp.json opencode run --format json ... -- hi
-//	Error: Configuration is invalid at <dir>/.mcp.json
-//	  Unrecognized key: mcpServers
-//
-// So every session dies at startup, which is why doctor treats that combination
-// as a FAIL rather than a missing-tools WARN (CLA-263).
+// opencode DOES receive mcp_config_path - as OPENCODE_CONFIG and, rewritten, as
+// OPENCODE_CONFIG_CONTENT (see env below) - and that is exactly why "does the
+// adapter hand it over" was the wrong question to gate a preflight on. What
+// arrives has to be an opencode config, whose servers live under `mcp` (1.x
+// dialect, still accepted) or `mcp.servers` (2.x dialect). The Claude-shaped
+// `.mcp.json` that config.Validate auto-discovers from the workdir is a
+// different schema: 1.18.2 refused to start on it, and 1.18.18 and 2.0.32
+// silently skip its `mcpServers` key, so the session runs with no clankerbar
+// tools at all. Either way that combination is a doctor FAIL rather than a
+// missing-tools WARN (CLA-263).
 func (opencode) MCPConfigUse() MCPConfigUse {
 	return MCPConfigUse{
 		Schema: MCPConfigNative,
-		Note: "the opencode adapter passes mcp_config_path as OPENCODE_CONFIG, which must be an opencode " +
-			"config (servers under `mcp`, not Claude's `mcpServers`) - opencode refuses to start on a file it cannot parse",
+		Note: "the opencode adapter passes mcp_config_path as OPENCODE_CONFIG (plus a rewritten copy as OPENCODE_CONFIG_CONTENT), which must be an opencode " +
+			"config (servers under `mcp` or `mcp.servers`, not Claude's `mcpServers`) - opencode skips a key it does not know, so a Claude-shaped file gives sessions no clankerbar tools",
 	}
 }
 
@@ -95,7 +111,40 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// Never resurrect a probe: a probe IS the liveness check.
 		return res, nil
 	}
+	if res.ToolLoop != "" {
+		// CLA-739: killed for repeating a failing tool call. Neither recovery
+		// below applies - a stall resume or a resurrection continues the same
+		// transcript, which is the one that was looping, at the price of
+		// re-sending all of it.
+		return res, nil
+	}
 	console := in.Console
+	// CLA-584: the output-cap stall. A final step that hit the output token
+	// limit with zero output is NOT the quiet death the loop below resumes —
+	// the session is alive and its transcript is intact; the step failed
+	// because the model spent its whole output budget thinking. It gets ONE
+	// resume carrying a steer (opencode_stall.go), and this runs BEFORE the
+	// quiet-death loop so a stall resume that then dies quietly still gets
+	// CLA-406's probe on its own terms.
+	if o.OutputCapNoOutput(res) {
+		o.resumeOutputCapStall(ctx, in, &res, deadline)
+	}
+	// CLA-782: a usage limit on one model route is not the end of the session
+	// when the config named a fallback. Runs BEFORE the resurrection loop (a
+	// switch resumes the same session, and a later quiet death then resurrects on
+	// the route that was working), never on a probe, and leaves a limit on the
+	// last route untouched for the driver's existing limit branch.
+	if !in.Probe {
+		if err := o.switchRoutesOnLimit(ctx, in, in.RouteList(), &res, deadline); err != nil {
+			return res, err
+		}
+		// Keep later resumes on the route that actually ran: the resurrection
+		// probe and continuation below read in.ModelArg(), and resuming on the
+		// route that was just denied would only re-hit its limit.
+		if finished := RouteFinished(res); finished != "" {
+			in = in.OnRoute(finished)
+		}
+	}
 	// An UNTRUSTED stream is never resurrected: CLA-262 forbids reading claim
 	// state off an over-run capture, and both the coherence ref and the
 	// continuation's seed come from exactly that state - while the driver's
@@ -103,7 +152,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// enlarge the accounting blind spot endUntrustedDrain exists to bound.
 	// The conjunct mirrors the driver's own gate (!capped && !ceiling &&
 	// !wallclock && untrusted) so adapter and tallyDead agree on what is dead.
-	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res) && res.Untrusted == ""; attempt++ {
+	for attempt := 1; attempt <= opencodeMaxResurrections && o.ZeroUsageUnknown(res) && res.Untrusted == "" && res.ToolLoop == ""; attempt++ {
 		sid, ref := resumeTargets(res)
 		if sid == "" || ref == "" {
 			// No session to resume into (died before its first event) or no
@@ -158,7 +207,9 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// observation folds separately, just as unconditionally.
 		res.Tokens += probeRes.Tokens
 		res.CostUSD += probeRes.CostUSD
+		res.Usage.Add(probeRes.Usage)
 		res.UsageReported = res.UsageReported || probeRes.UsageReported
+		res.CostReported = res.CostReported || probeRes.CostReported
 		// The claim observation folds ONLY when it is still about THIS task
 		// and arrived on a capture we may read: noteClaimed replaces a parser's
 		// claim WHOLESALE, so a decohered probe that re-claimed a different
@@ -195,7 +246,7 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// Coherent: continue the session for real. The continuation's parser is
 		// seeded with the DEAD RUN'S live claim (not in.ResumeClaim, which on a
 		// phase 2+ holds the staler predecessor): `opencode run -s` streams only
-		// the new turn, so without the seed every update_task the continuation
+		// the new turn, so without the seed every progress write the continuation
 		// makes would go unobserved — no settle, no HasWIP, no delivery report —
 		// and releaseHeldClaim would post ready over work the session pushed.
 		contIn := in
@@ -219,7 +270,9 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 			// Spend first, even on the error path.
 			res.Tokens += contRes.Tokens
 			res.CostUSD += contRes.CostUSD
+			res.Usage.Add(contRes.Usage)
 			res.UsageReported = res.UsageReported || contRes.UsageReported
+			res.CostReported = res.CostReported || contRes.CostReported
 			if console != nil {
 				fmt.Fprintf(console, "!! resurrection continuation errored (%v) — counting the death\n", contErr)
 			}
@@ -267,12 +320,80 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	}
 	defer cancel()
 
-	cmd := exec.CommandContext(sctx, "opencode", args...)
-	setupProcessGroup(cmd)
-	if in.WorkDir != "" {
-		cmd.Dir = in.WorkDir
+	// One canonical directory for the permission policy, the server process,
+	// the status query and the run: the server keys its MCP state by the
+	// resolved path, so a raw `/var/...` query would poll a location no session
+	// uses (see opencodeWorkDir). The policy's absolute paths must agree with
+	// the directory the session actually runs in, or an in-tree write can look
+	// external on a symlinked temp dir.
+	workDir := opencodeWorkDir(in.WorkDir)
+	if workDir != "" {
+		in.WorkDir = workDir
 	}
-	cmd.Env = o.env(in)
+	env, err := o.env(in)
+	if err != nil {
+		// Nothing has been spawned yet, so this is a clean refusal to start
+		// rather than a session to classify: an empty Result, and the error the
+		// caller reports. See env's fail-closed note.
+		return Result{}, err
+	}
+
+	// CLA-703: a working (non-probe) session gets a private server of the
+	// adapter's own, and does not run its first model turn until that server
+	// reports the clankerbar MCP connection established. The OLD shape —
+	// `run --standalone`, which spawns its own private server and submits the
+	// prompt immediately — is exactly the race: opencode 2.x connects MCP in the
+	// background, so a fast model could take its first turn with no clankerbar
+	// tools at all.
+	//
+	// A PROBE keeps `--standalone`: it is a one-word liveness check of an
+	// already-created session and does not use the backlog, so waiting for MCP
+	// would only eat its time box.
+	runArgs := args
+	runEnv := env
+	var srv *opencodeServer
+	if !in.Probe {
+		// Only a session with a clankerbar server gets the preflight. That
+		// server is resolved across the config layers opencode actually loads:
+		// the named file when there is one, otherwise the global config dir and
+		// the project-level files discovered from the instance directory. A
+		// layer that exists but cannot be read fails CLOSED — an unknown
+		// effective config is not evidence that no backlog server is declared —
+		// and a session that does declare one never gets its first turn until
+		// that server reports connected (CLA-703 review, findings 1.1 and 3.1).
+		names, err := opencodeEffectiveMCPServers(in, env)
+		if err != nil {
+			return mcpPreflightFailure(sctx, ctx, err)
+		}
+		if len(names) > 0 {
+			srv, err = startOpencodeServer(sctx, env, workDir)
+			if err != nil {
+				return mcpPreflightFailure(sctx, ctx, err)
+			}
+			defer srv.stop()
+			if err := srv.waitForMCP(sctx, names, workDir); err != nil {
+				return mcpPreflightFailure(sctx, ctx, err)
+			}
+			runArgs = withOpencodeServer(args, srv.url)
+			// The run must authenticate to the server the adapter started,
+			// whatever an inherited or configured OPENCODE_PASSWORD says.
+			// Appended last so it wins over env's own tail (in.Env).
+			runEnv = append(append([]string{}, env...), "OPENCODE_PASSWORD="+srv.password)
+		}
+	}
+
+	// CLA-739: the repeated-failing-tool-call kill cancels THIS context, a child
+	// of sctx, so the kill reaches the run alone - never the server above, which
+	// the deferred stop tears down, and never the caller. Created even when the
+	// guard is off, so there is one shape of exec context below.
+	lctx, loopKill := context.WithCancel(sctx)
+	defer loopKill()
+	cmd := exec.CommandContext(lctx, "opencode", runArgs...)
+	setupProcessGroup(cmd)
+	if workDir != "" {
+		cmd.Dir = workDir
+	}
+	cmd.Env = runEnv
 	// A cap that can hang is not a cap. The capture points Stdout/Stderr at
 	// io.MultiWriter values, so os/exec makes its own pipes and cmd.Run waits for
 	// every WRITER of them to close — and CommandContext kills the direct child
@@ -291,7 +412,15 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// exactly that case): an fd holder would otherwise keep the pipe open past
 	// the kill and hang Run past its own box. An ordinary uncapped session's
 	// I/O is never cut short by it.
-	if _, hasDeadline := sctx.Deadline(); hasDeadline {
+	//
+	// CLA-739 arms it too whenever the repeated-failure guard is armed, because
+	// that guard is a cancellation with no deadline, and a kill that can hang is
+	// not a kill either. What that changes for a session the guard never fires
+	// on: a grandchild still holding the pipes after opencode exits on its own
+	// now has Run return exec.ErrWaitDelay 5s later instead of blocking until the
+	// grandchild lets go - the CLA-414 branch below already reads that as the
+	// clean end it is.
+	if _, hasDeadline := sctx.Deadline(); hasDeadline || (in.MaxRepeatedToolFailures > 0 && !in.Probe) {
 		cmd.WaitDelay = 5 * time.Second
 	}
 
@@ -334,8 +463,13 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// claim seed, and the tests build the parser the same way so that dropping it
 	// here turns them red.
 	p := newOpencodeParse(in, console)
+	p.kill = loopKill
 	captured := newCapture(p.line)
 	captured.attach(cmd, console)
+	// Taken before the spawn, so every message this process adds to the session
+	// is stamped after it: applyExport attributes export figures to THIS run by
+	// that window (a resumed session's export also carries the earlier runs).
+	started := time.Now()
 	runErr := cmd.Run()
 
 	res := captured.result("opencode")
@@ -359,11 +493,17 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 			fmt.Fprintf(console, "\n!! session outlived its wall-clock cap (%s) — ending it here; whatever it wrote is still in the worktree, uncommitted\n", in.MaxSessionWallClock)
 		}
 	}
+	// CLA-739: the guard's verdict rides the Result whether or not the kill
+	// landed before the process ended on its own - the session WAS looping, and
+	// that is what the driver classifies. loopKilled is the narrower fact the
+	// exit handling below needs: Run's error is the kill's, not the session's.
+	res.ToolLoop = p.observed.toolLoop.tripped()
+	loopKilled := runErr != nil && res.ToolLoop != ""
 
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
-	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut {
+	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut && !loopKilled {
 		// The process exited cleanly on its own — ExitCode 0 — but a grandchild
 		// (a backgrounded build, a test run) inherited the output pipes and held
 		// them open past cmd.WaitDelay, so os/exec force-closed them and Run
@@ -383,16 +523,19 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// salvage, handback and spend are computed from res before any error
 		// check either way, and the cancelled driver ctx stops the run one spawn
 		// later — so the noise is left standing rather than guarded against.
+		o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
 		return res, nil
-	} else if runErr != nil && !timedOut {
+	} else if runErr != nil && !timedOut && !loopKilled {
 		// A launch failure (bad PATH, unreadable config): nothing was emitted,
 		// so res is an honest zero, and the failure is real.
 		return res, runErr
 	} else if runErr != nil {
-		// Our own kill: the child died on the cancel, so its error is the kill's
-		// and not a verdict. The marker above is the verdict.
+		// Our own kill (the wall-clock cap, or CLA-739's repeated failing tool
+		// call): the child died on the cancel, so its error is the kill's and
+		// not a verdict. The marker above is the verdict.
 		res.ExitCode = -1
 	}
+	o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
 	return res, nil
 }
 
@@ -403,18 +546,36 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 // codexArgs: it is a bare positional, and a prompt that is itself a flag token
 // would otherwise be parsed as a flag rather than as the message.
 func opencodeArgs(in Invocation) []string {
-	prompt := in.Prompt
+	prompt := opencodePrompt(in.Prompt)
 	if in.Probe {
 		// The cheapest possible request: a trivial prompt, tools all denied by the
 		// read-only permission policy (see env) — just enough to see whether the
 		// provider still answers or is budget-exhausted.
 		prompt = "."
 	}
-	args := []string{"run", "--format", "json"}
+	args := []string{"run", "--standalone", "--format", "json", "--agent", opencodeAgent}
 	if m := in.ModelArg(); m != "" {
 		args = append(args, "--model", m)
 	}
 	return append(args, "--", prompt)
+}
+
+// opencodePrompt is the message a working (non-probe) run sends. It is the
+// caller's prompt unchanged.
+//
+// It USED to prepend an MCP warm-up note ("MCP servers connect in the
+// background; call the tool again if it is missing"). CLA-703 removed the race
+// that note described: the adapter now starts its own server, waits until the
+// clankerbar server reports connected, and only then attaches the run, so the
+// first model turn already has the tools. Keeping the note would tell every
+// session to expect a failure that no longer happens, and would spend prompt
+// bytes on a workaround the code no longer needs.
+//
+// The function is kept (rather than inlined at its two call sites) because the
+// prompt shape is a contract this adapter owns, and the tests assert the
+// absence of the note through it.
+func opencodePrompt(prompt string) string {
+	return prompt
 }
 
 // opencodeMCPResourcePattern is the pattern shape opencode's MCP resource tools
@@ -424,8 +585,9 @@ func opencodeArgs(in Invocation) []string {
 // the URL-shaped resource URIs the clankerbar plane serves its protocol at.
 const opencodeMCPResourcePattern = "mcp:*"
 
-// opencodePermission is the fail-closed OPENCODE_PERMISSION policy: a path-scoped
-// PermissionConfig, not a flat tool map. The run's workdir subtree is the working
+// opencodePermission is the fail-closed policy the adapter writes into the
+// `permission` key of the config it pins via OPENCODE_CONFIG_CONTENT (see
+// opencodeSessionConfig): a path-scoped PermissionConfig, not a flat tool map. The run's workdir subtree is the working
 // set — `read`/`edit` are allowed there and `external_directory` (opencode's gate
 // for any path-taking tool whose target is outside the project directory) allows
 // the same subtree, so the session's own worktrees, which live under the workdir
@@ -436,39 +598,37 @@ const opencodeMCPResourcePattern = "mcp:*"
 //
 // EXTRA DIRECTORIES (CLA-437, agent-rule-scoping piece 2): each entry in
 // extraDirs — the project's other declared repos, plus any conventional worktree
-// area beside the spawn checkout — is granted the same reach the workdir has,
-// whatever directory the session starts in. Two layers, because the ask shapes
-// differ by where the session runs:
+// area beside the spawn checkout — is granted the same reach the workdir has:
+// an absolute external_directory allow, and a read/edit allow in the
+// instance-relative "../<dir>/**" form, which sorts after the blanket "../**"
+// deny and so wins for exactly the declared trees. See scopeExtraDirs.
 //
-//   - A session spawned OUTSIDE a git repo (the multi-repo parent, today's
-//     default) asks read/edit with worktree-relative paths whose worktree is "/",
-//     i.e. the absolute path minus its leading slash. Each extra dir therefore
-//     gains its own root-relative allow, exactly like the workdir's.
-//   - A session spawned INSIDE a checkout (the new normal once the driver starts
-//     sessions in the task's repo) gets that checkout as its git worktree, so
-//     in-tree files ask as plain relative paths ("internal/x.go") and other
-//     trees ask with "../sibling/file"-style paths. Neither form can match a
-//     root-relative pattern, so this shape adds three rules: read/edit allow
-//     "**" (every plain-relative ask is in-tree by construction), deny "../**"
-//     (escapes fail closed), then allow each extra dir's "../name/**" form,
-//     which sorts AFTER the blanket "../**" deny and therefore wins for exactly
-//     the declared trees. Absolute-form asks cannot occur with a git worktree,
-//     and external_directory still gates every path-taking tool before its ask,
-//     so the boundary holds even where the pattern layer is redundant.
+// `shell` (1.x called it `bash`; 2.x accepts both names) stays TOOL-LEVEL: its
+// permission patterns match parsed COMMANDS ("git status --porcelain"), not
+// paths, so a path rule can never express it. On 1.x, commands whose file
+// arguments fell outside the project boundary were gated separately via
+// external_directory. 2.x DROPPED THAT: verified against 2.0.32, under this policy
+// `touch /abs/outside` and `cat /etc/hosts` both ran, and only the shell tool's
+// own `workdir` argument reaches external_directory. The operator accepted that
+// gap on 2026-10-18 (CLA-675): an unattended session can already run arbitrary
+// commands inside the workdir, so no sandbox and no absolute-path shell deny
+// patterns were added (docs/opencode-build.md, "Shell is not path-gated").
 //
-// With no extraDirs the emitted policy is byte-identical to what shipped before
-// CLA-437 for every existing config — the fake-provider matrix depends on it.
+// `execute` is denied by name. It is 2.x's Code Mode tool: MCP tools left in Code
+// Mode are callable only through it, its stream carries no per-call output (no
+// claim could be observed), and code run inside it reached the network with
+// webfetch denied. The catch-all already denies it; naming it keeps that from
+// depending on the catch-all. Every MCP server the adapter hands over is moved
+// out of Code Mode instead (opencodeSessionConfig), so `*_*` below is what
+// reaches them.
 //
-// `bash` stays TOOL-LEVEL: its permission patterns match parsed COMMANDS ("git
-// status --porcelain"), not paths, so a path rule can never express it. Commands
-// whose file arguments fall outside the project boundary are gated separately via
-// external_directory, which IS scoped above — that is the carve-out that fixes
-// the old heuristic denials ("cp is denied but sed -i works").
-//
-// Five opencode quirks the emitted shape is fitted to (verified against opencode
-// 1.18.16 source, and the MCP-resource one re-verified against the shipped 1.18.18
-// bundle: permission/index.ts, session/tools.ts, tool/read.ts, tool/edit.ts,
-// tool/external-directory.ts):
+// Five quirks the emitted shape is fitted to. They were read out of opencode
+// 1.18.16 source (permission/index.ts, session/tools.ts, tool/read.ts,
+// tool/edit.ts, tool/external-directory.ts). Against 2.0.32 the first three were
+// re-checked behaviourally (last-match-wins, `<server>_<tool>` MCP names,
+// external_directory for out-of-tree file tools); the MCP-resource one no
+// longer applies the same way, because 2.x registers the resource tools in Code
+// Mode only, so with `execute` denied a session has no resource tools at all:
 //
 //   - Rules are evaluated LAST-MATCH-WINS on a flattened ruleset, so the specific
 //     rules must sort AFTER the `*` catch-all or the catch-all overrides them.
@@ -530,23 +690,41 @@ const opencodeMCPResourcePattern = "mcp:*"
 //     (CLA-390). `list` is allowed for the same read-only reason so a future
 //     opencode upgrade does not re-break directory listing the way grep/glob
 //     broke.
-//   - read/edit asks carry the path RELATIVE TO THE GIT WORKTREE
-//     (path.relative(worktree, file)); a session whose cwd is not inside a git
-//     repo — the multi-repo-parent case, workdir=~/dev — gets worktree "/", so
-//     its patterns are the absolute path minus the leading slash
-//     ("Users/jason/dev/..."). The read/edit patterns are therefore emitted in
-//     that same root-relative form. external_directory patterns are absolute
-//     globs (path.join(dir, "*")), so that rule uses the absolute form.
+//   - read/edit asks carry the path RELATIVE TO THE INSTANCE DIRECTORY on 2.x
+//     (verified against 2.0.32: in a git checkout's subdirectory a write of
+//     "w1.txt" asked "w1.txt", not "sub/w1.txt", and outside any repo it asked
+//     "w1.txt", not the root-relative form 1.x used). An in-tree ask is a plain
+//     relative path, so "**" allows the working set, and an escape is
+//     "../"-prefixed, so "../**" denies it. The deny sorts first ("*" 0x2a
+//     before "." 0x2e), so a declared extra dir's own "../<dir>/**" allow still
+//     wins on last-match-wins. external_directory patterns are absolute globs,
+//     and external_directory is judged against the instance directory too (a
+//     read of "../top.txt" from a checkout's subdirectory was refused there, git
+//     worktree or not), so that rule uses the absolute workdir form.
+//
+// 1.x made those asks relative to the git WORKTREE (or to "/" outside a repo),
+// which is why this policy used to carry a root-relative layer and an
+// in-checkout layer chosen by walking up for a .git entry (CLA-441). On 2.x the
+// instance directory alone decides the shape, so there is one layer, and the
+// PWD pin (pinPWD) is what makes the instance directory Invocation.WorkDir -
+// which the driver sets to the task's repo checkout (loop sessionDir), not the
+// project workdir.
 func opencodePermission(readOnly bool, workdir string, extraDirs []string) string {
-	rootRel, abs := opencodeWorkdirPatterns(workdir)
-	// The exact (non-wildcard) workdir pattern, so reading the workdir root
-	// itself — a directory listing of ~/dev, pattern "Users/jason/dev" — is
-	// allowed along with everything under it.
-	exact := strings.TrimSuffix(rootRel, "/**")
-	read := map[string]string{rootRel: "allow", exact: "allow", opencodeMCPResourcePattern: "allow"}
-	edit := map[string]string{rootRel: "allow", exact: "allow"}
+	b, _ := json.Marshal(opencodePermissionPolicy(readOnly, workdir, extraDirs))
+	return string(b)
+}
+
+// opencodePermissionPolicy is opencodePermission before marshalling, so the
+// session config can embed it as an object rather than a string.
+func opencodePermissionPolicy(readOnly bool, workdir string, extraDirs []string) map[string]any {
+	_, abs := opencodeWorkdirPatterns(workdir)
+	// "**" is everything under the instance directory, the root included;
+	// "../**" is every escape from it. See the function doc for why these are
+	// the only two shapes a 2.x ask can take.
+	read := map[string]string{"**": "allow", "../**": "deny", opencodeMCPResourcePattern: "allow"}
+	edit := map[string]string{"**": "allow", "../**": "deny"}
 	ext := map[string]string{"*": "deny", abs: "allow"}
-	scopeExtraDirs(read, edit, ext, workdir, extraDirs)
+	scopeExtraDirs(read, edit, ext, opencodeInstanceDir(workdir), extraDirs)
 	perm := map[string]any{
 		// The working set: read/edit scoped to the workdir subtree (root
 		// included), plus the external_directory carve-out for the same
@@ -577,78 +755,94 @@ func opencodePermission(readOnly bool, workdir string, extraDirs []string) strin
 		"webfetch":  "deny",
 		"websearch": "deny",
 	}
+	// Code Mode, denied by name: see the function doc.
+	perm["execute"] = "deny"
 	if readOnly {
 		perm["edit"] = "deny"
-		perm["bash"] = "deny"
+		perm["shell"] = "deny"
 	} else {
-		perm["bash"] = "allow"
+		perm["shell"] = "allow"
 	}
 	// The catch-all: anything not named above — lsp/task/skill, reads or edits
 	// outside the workdir — is denied rather than asked. Sorts first (see the
 	// doc), so every specific rule wins the last-match-wins evaluation.
 	perm["*"] = "deny"
-	b, _ := json.Marshal(perm)
-	return string(b)
+	return perm
 }
 
-// scopeExtraDirs widens the policy's three path-scoped rules to cover extraDirs,
-// per the two ask-shape layers in opencodePermission's doc. It mutates the maps
-// in place so the base construction above stays the single description of the
-// legacy shape.
-func scopeExtraDirs(read, edit, ext map[string]string, workdir string, extraDirs []string) {
-	if len(extraDirs) == 0 {
-		return
-	}
-	inRepo := hasGitEntry(workdir)
-	if inRepo {
-		// In-checkout ask forms: plain-relative paths are in-tree by
-		// construction ("**"), sibling trees escape with a "../" prefix and are
-		// denied wholesale, then each declared tree's specific ".." allow sorts
-		// after that deny and re-opens exactly those (last-match-wins).
-		read["**"] = "allow"
-		edit["**"] = "allow"
-		read["../**"] = "deny"
-		edit["../**"] = "deny"
-	}
+// scopeExtraDirs widens the policy's three path-scoped rules to cover extraDirs:
+// the absolute external_directory allow, and the instance-relative read/edit
+// form. It mutates the maps in place so the base construction stays the single
+// description of the working set.
+//
+// A tree INSIDE the instance directory needs no read/edit rule ("**" covers it).
+// A tree that CONTAINS the instance directory is skipped, and that skip is
+// load-bearing rather than tidy. filepath.Rel returns a pure dot-dot chain for
+// an ancestor ("..", "../.."), and opencode's matcher reads `*` as any run of
+// characters including "/", so "../**" is not "that directory" - it is
+// everything outside the instance directory. Emitting it would either overwrite
+// the "../**" deny with an allow or sort after it and beat it ("../../**"),
+// turning the policy's only stated escape boundary into an allow of the whole
+// filesystem. There is no bounded glob to give it ("../*" spans "/" exactly as
+// "../**" does), so the choice is that or an escape, and fail-closed wins
+// (CLA-441 reviews). The cost is a WITHDRAWN grant: a declared tree containing
+// the workdir is unreadable outside the workdir itself.
+func scopeExtraDirs(read, edit, ext map[string]string, base string, extraDirs []string) {
 	for _, dir := range extraDirs {
 		if dir == "" {
 			continue
 		}
-		rootRel, abs := opencodeWorkdirPatterns(dir)
-		exactDir := strings.TrimSuffix(rootRel, "/**")
-		read[rootRel] = "allow"
-		edit[rootRel] = "allow"
-		read[exactDir] = "allow"
-		edit[exactDir] = "allow"
+		_, abs := opencodeWorkdirPatterns(dir)
 		ext[abs] = "allow"
-		if inRepo {
-			if rel, err := filepath.Rel(workdir, dir); err == nil && rel != "." {
-				relGlob := filepath.ToSlash(rel) + "/**"
-				read[relGlob] = "allow"
-				edit[relGlob] = "allow"
-			}
+		rel, err := filepath.Rel(base, absOrSelf(dir))
+		if err != nil || rel == "." || isDotDotChain(rel) || !strings.HasPrefix(filepath.ToSlash(rel), "../") {
+			continue
+		}
+		relGlob := filepath.ToSlash(rel)
+		read[relGlob+"/**"] = "allow"
+		edit[relGlob+"/**"] = "allow"
+		read[relGlob] = "allow"
+		edit[relGlob] = "allow"
+	}
+}
+
+// isDotDotChain reports whether a slash-separated relative path is nothing but
+// ".." components - what filepath.Rel returns for a directory that CONTAINS the
+// base. Such a path has no bounded glob form in opencode's instance-relative ask
+// shape, which is why scopeExtraDirs refuses to emit one.
+func isDotDotChain(rel string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(rel), "/") {
+		if seg != ".." {
+			return false
 		}
 	}
+	return true
 }
 
-// hasGitEntry reports whether dir carries a .git entry — a directory in a normal
-// checkout, a FILE in a worktree of one. Either means opencode will discover a
-// git worktree there and shape its read/edit asks relative to it, which is what
-// decides which pattern layer the policy needs.
-func hasGitEntry(dir string) bool {
-	if dir == "" {
-		return false
+// opencodeInstanceDir is the directory a session's asks are relative to: the
+// workdir, or the process cwd when the workdir is empty (where the session
+// would actually run).
+func opencodeInstanceDir(workdir string) string {
+	if workdir == "" {
+		if cwd, err := os.Getwd(); err == nil {
+			return cwd
+		}
 	}
-	_, err := os.Stat(filepath.Join(dir, ".git"))
-	return err == nil
+	return absOrSelf(workdir)
 }
 
-// opencodeWorkdirPatterns derives the two pattern forms the policy needs from
-// the run's workdir. rootRel is the pattern for read/edit asks — opencode's
-// path.relative(worktree, file) form, i.e. the absolute path minus its leading
-// separator (and drive letter on Windows) — so "Users/jason/dev/**" matches the
-// patterns a session with worktree "/" asks for files under /Users/jason/dev.
-// abs is the pattern for external_directory asks, which are absolute globs. An
+func absOrSelf(dir string) string {
+	if abs, err := filepath.Abs(dir); err == nil {
+		return abs
+	}
+	return dir
+}
+
+// opencodeWorkdirPatterns derives two pattern forms from a directory. abs is the
+// pattern for external_directory asks, which are absolute globs. rootRel is the
+// root-relative form 1.x read/edit asks used (the absolute path minus its
+// leading separator); 2.x never asks in it, and the policy no longer emits it,
+// but the helper keeps returning it for the tests that pin its derivation. An
 // empty workdir (the config default: run in the driver's cwd) falls back to the
 // resolved cwd so the policy still scopes the session to where it actually runs.
 func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
@@ -671,67 +865,267 @@ func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
 	return filepath.ToSlash(rel) + "/**", filepath.ToSlash(abs) + "/**"
 }
 
-func (opencode) env(in Invocation) []string {
-	// OPENCODE_CONFIG is the driver's dial, never an inherited one: a value in
-	// the ambient environment would hand the session a config file nobody
-	// configured in clankerbar.json - the exact channel CLA-318 exists to close
-	// (the gate resolving "" must mean NOTHING is handed over, whatever the
-	// daemon that spawned this driver had exported). Filter it out of the
-	// inherited set rather than appending a duplicate, so the child sees our
-	// value or none - no dependence on dup-key resolution order.
-	var env []string
-	for _, kv := range os.Environ() {
+// withoutAmbientOpencodeConfig drops an inherited OPENCODE_CONFIG: the driver
+// decides which file a session is handed, and an ambient value would hand one
+// over even when config resolved none (CLA-318). An explicit in.Env value still
+// applies, since it is appended later.
+func withoutAmbientOpencodeConfig(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
 		if strings.HasPrefix(kv, "OPENCODE_CONFIG=") {
 			continue
 		}
-		env = append(env, kv)
+		out = append(out, kv)
 	}
-	// Fail-closed permission policy. Set before in.Env so an explicit caller
-	// OPENCODE_PERMISSION in in.Env still wins (exec takes the last of a dup key),
-	// but the ambient environment never silently loosens an unattended run.
-	env = append(env, "OPENCODE_PERMISSION="+opencodePermission(in.Probe, in.WorkDir, in.ExtraDirs))
-	// Pin the config dir so a headless session loads the SAME MCP servers,
-	// providers, model and auth as the interactive one (the claude/CODEX parity).
+	return out
+}
+
+func (opencode) env(in Invocation) ([]string, error) {
+	// The session's INSTANCE directory. opencode reads $PWD, not just the real
+	// cwd, so this is what decides which project-level opencode.json it merges
+	// and which git worktree its read/edit asks are relative to - see pinPWD.
+	env := pinPWD(inheritEnv(withoutAmbientOpencodeConfig(os.Environ()), in.EnvAllowlist), in.WorkDir)
+	// Pin the config dir so a headless session loads the SAME providers, model
+	// and plugins as the interactive one (the claude/CODEX parity). On 2.x
+	// OPENCODE_CONFIG_DIR REPLACES the global config dir (~/.config/opencode)
+	// rather than adding a layer after it. Auth is not here on 2.x: credentials
+	// live in the data dir's opencode.db, which this does not move.
 	if in.ConfigDir != "" {
 		env = append(env, "OPENCODE_CONFIG_DIR="+in.ConfigDir)
 	}
 	// opencode has no per-run MCP flag; when a caller supplies a config file path
 	// (in opencode's own schema, carrying the mcp block) point OPENCODE_CONFIG at
 	// it. A Claude-shaped .mcp.json is a different schema and is gated out by
-	// config.ResolveMCPConfig before it ever gets here (CLA-318), so empty means
-	// empty: no variable is exported at all.
+	// config.ResolveMCPConfig before it gets here (CLA-318), so empty exports nothing.
 	if in.MCPConfigPath != "" {
 		env = append(env, "OPENCODE_CONFIG="+in.MCPConfigPath)
 	}
+	// ...and hand the session config over again as OPENCODE_CONFIG_CONTENT,
+	// which opencode merges after every layer this driver or a checkout can
+	// write (CLA-441; re-verified on 2.0.32, where the content layer's
+	// `permission` beat a project-level opencode.json). OPENCODE_CONFIG is an
+	// early layer: the global dir, then that file, then every project-level
+	// opencode.json and .opencode/opencode.json discovered from the instance
+	// directory, THEN this. Later layers have been observed redirecting
+	// `mcp.clankerbar` at ANOTHER project, so naming the file does not pin which
+	// backlog an unattended session works. The content layer does.
+	//
+	// On 2.x it is also the ONLY place the permission policy can live: the
+	// OPENCODE_PERMISSION variable 1.x read is ignored (the string is absent from
+	// the 2.0.32 binary), and with no policy 2.x runs every tool. So the content
+	// is ALWAYS set, with or without an mcp config - see opencodeSessionConfig.
+	//
+	// This does not make the PWD pin redundant, nor it this: the content layer
+	// settles which MCP server the session talks to and what it may do, the
+	// instance directory settles which repo it reads, edits and asks permission
+	// for.
+	//
+	// Two costs of moving a file's bytes into the environment, neither large
+	// enough to change the call: a credential written LITERALLY into the mcp
+	// config (rather than as `{env:CLANKERBAR_API_KEY}`) is now in the child's
+	// environment, where a process listing or a crash dump reaches it and a 0600
+	// file did not; and environment plus argv is capped around 1 MB on macOS, so
+	// an enormous config would fail the spawn with E2BIG rather than merely being
+	// ignored.
+	content, err := opencodeSessionConfig(in)
+	if err != nil {
+		// FAIL CLOSED. The alternative - spawn without the content layer - is a
+		// session with no permission policy at all on 2.x, claiming from whichever
+		// project the ambient config names. A session that never starts is a loud,
+		// correct outage.
+		return nil, err
+	}
+	env = append(env, "OPENCODE_CONFIG_CONTENT="+string(content))
+	// Set last so an explicit caller value in in.Env still wins (exec takes the
+	// last of a duplicate key). doctor warns when a config declares
+	// OPENCODE_CONFIG_CONTENT, because that replaces the policy wholesale.
 	env = append(env, in.Env...)
-	return env
+	return env, nil
+}
+
+// opencodeSessionConfig builds the document pinned as OPENCODE_CONFIG_CONTENT:
+// the mcp config file's own keys, with every MCP server moved out of Code Mode
+// and the fail-closed permission policy under `permission`.
+//
+// The file is parsed as strict JSON, the same rule config applies to every file
+// the driver names (readMCPFile): those feed fail-closed gates, and a lenient
+// parse here would let the adapter accept what config refused. Numbers are kept
+// as written (UseNumber) so a re-marshalled timeout or port is byte-for-byte the
+// operator's value.
+//
+// The file's own `permission` key, if any, is replaced here rather than merged.
+// That does not neutralise it: the same file is also loaded as OPENCODE_CONFIG,
+// an earlier layer, and opencode merges permission blocks key by key in
+// insertion order, so a key the file declares sorts ahead of this policy's `*`
+// catch-all. doctor WARNs on a named file carrying one (and config refuses one
+// in a DISCOVERED file, checkDiscoveredMCPConfig).
+func opencodeSessionConfig(in Invocation) ([]byte, error) {
+	doc := map[string]any{}
+	if in.MCPConfigPath != "" {
+		data, err := os.ReadFile(in.MCPConfigPath)
+		if err != nil {
+			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
+		}
+		dec := json.NewDecoder(bytes.NewReader(data))
+		dec.UseNumber()
+		if err := dec.Decode(&doc); err != nil {
+			return nil, fmt.Errorf("mcp config %s: not a JSON object: %w", in.MCPConfigPath, err)
+		}
+		if doc == nil {
+			doc = map[string]any{}
+		}
+		if err := opencodeMCPOutOfCodeMode(doc); err != nil {
+			return nil, fmt.Errorf("mcp config %s: %w", in.MCPConfigPath, err)
+		}
+	}
+	policy := opencodePermissionPolicy(in.Probe, in.WorkDir, in.ExtraDirs)
+	doc["permission"] = policy
+	// Pin the same policy on every built-in agent. Verified against 2.0.32: an
+	// agent-level permission block in ANY layer (1.x `agent.<name>.permission`
+	// or 2.x `agents.<name>.permissions`) overrides the top-level one for that
+	// agent. With `{"agent":{"build":{"permission":{"external_directory":
+	// "allow",...}}}}` in a project opencode.json - a file a session can write
+	// into its own checkout for the next spawn - out-of-tree reads and writes
+	// succeeded and webfetch was offered. With this pin in the content layer
+	// they were refused again, in both dialects, and in-tree writes still
+	// landed. The file's own `agent` key is replaced, not merged.
+	agents := map[string]any{}
+	for _, name := range opencodePinnedAgents {
+		agents[name] = map[string]any{"permission": policy}
+	}
+	doc["agent"] = agents
+	delete(doc, "agents")
+	delete(doc, "default_agent")
+	return json.Marshal(doc)
+}
+
+// OpencodeSessionConfig is the document the opencode adapter pins as
+// OPENCODE_CONFIG_CONTENT for a session with these inputs. Exported so doctor
+// reports the posture the adapter will actually hand over, from the same code,
+// rather than re-deriving it.
+func OpencodeSessionConfig(mcpConfigPath, workdir string, readOnly bool) ([]byte, error) {
+	return opencodeSessionConfig(Invocation{MCPConfigPath: mcpConfigPath, WorkDir: workdir, Probe: readOnly})
+}
+
+// opencodePinnedAgents are the agents the session config pins the policy on:
+// opencodeAgent, which every run selects explicitly, and the other agents
+// 2.0.32 defines. The session's own policy denies the subagent tool, so the
+// others are pinned as a second line, not because a session can reach them.
+var opencodePinnedAgents = []string{opencodeAgent, "plan", "general", "explore"}
+
+// opencodeAgent is the agent every run selects with --agent. Selecting it
+// explicitly means an ambient `default_agent` cannot route the session to an
+// agent whose permissions this adapter never pinned.
+const opencodeAgent = "build"
+
+// opencodeMCPOutOfCodeMode rewrites a config's `mcp` block in place so every
+// server it declares is in the 2.x dialect (`mcp.servers.<name>`) with
+// `codemode: false`.
+//
+// Why both halves are needed, verified against 2.0.32:
+//
+//   - With Code Mode on (the 2.x default) a server's tools are reachable only
+//     from inside the `execute` tool, which this adapter denies, and whose
+//     stream would not show the claim anyway. `codemode: false` puts them back
+//     at the top level as `<server>_<tool>`, with input and output on the
+//     tool_use event as on 1.x.
+//   - `codemode` is only honoured in the 2.x dialect. A 1.x-dialect entry
+//     (`mcp.<name>` with a `type`) is still accepted by 2.x, but a `codemode`
+//     key on it is ignored and the tools stay in Code Mode. So 1.x entries are
+//     moved under `servers`, translating the one key whose spelling changed
+//     (1.x `enabled: false` is 2.x `disabled: true`).
+//
+// A server declared in both dialects under one name is refused rather than
+// guessed at. A key under `mcp` that is not a server entry is left alone for
+// opencode to judge.
+func opencodeMCPOutOfCodeMode(doc map[string]any) error {
+	raw, ok := doc["mcp"]
+	if !ok || raw == nil {
+		return nil
+	}
+	mcp, ok := raw.(map[string]any)
+	if !ok {
+		return fmt.Errorf("`mcp` is not an object")
+	}
+	servers := map[string]any{}
+	if rs, present := mcp["servers"]; present {
+		s, ok := rs.(map[string]any)
+		if !ok {
+			return fmt.Errorf("`mcp.servers` is not an object")
+		}
+		servers = s
+	}
+	for name, v := range mcp {
+		if name == "servers" {
+			continue
+		}
+		entry, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, typed := entry["type"].(string); !typed {
+			continue
+		}
+		if _, dup := servers[name]; dup {
+			return fmt.Errorf("MCP server %q is declared both as `mcp.%s` and `mcp.servers.%s`", name, name, name)
+		}
+		if enabled, isBool := entry["enabled"].(bool); isBool {
+			delete(entry, "enabled")
+			if !enabled {
+				entry["disabled"] = true
+			}
+		}
+		servers[name] = entry
+		delete(mcp, name)
+	}
+	for name, v := range servers {
+		entry, ok := v.(map[string]any)
+		if !ok {
+			return fmt.Errorf("`mcp.servers.%s` is not an object", name)
+		}
+		entry["codemode"] = false
+	}
+	mcp["servers"] = servers
+	return nil
 }
 
 // opencodeEvent is one line of `opencode run --format json`. The stream is a
 // sequence of typed events, each wrapping a message part; this captures only the
 // fields the loop needs and tolerates the rest.
 //
-// Success shape (verified against opencode 1.18.2):
+// Shapes, recorded against opencode 2.0.32 (every event also carries a
+// top-level `timestamp`):
 //
-//	{"type":"step_start","part":{"type":"step-start",...}}
-//	{"type":"text","part":{"type":"text","text":"OK",...}}
-//	{"type":"step_finish","part":{"type":"step-finish","reason":"stop",
-//	   "tokens":{"total":18909,"input":3,"output":4,"reasoning":0,
-//	             "cache":{"write":18902,"read":0}},"cost":0.0236505}}
+//	{"type":"step_start","sessionID":"ses_...","part":{"id":"prt_...","messageID":"msg_...","type":"step-start"}}
+//	{"type":"text","sessionID":"ses_...","part":{"id":"prt_...","type":"text","text":"DONE",...}}
+//	{"type":"step_finish","sessionID":"ses_...","part":{"type":"step-finish","reason":"tool-calls",
+//	   "cost":0.055563,"tokens":{"input":18511,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}
+//	{"type":"error","sessionID":"ses_...","error":{"type":"provider.auth","message":"...","status":401,...}}
 //
-// Error shape:
-//
-//	{"type":"error","error":{"name":"APIError","data":{
-//	   "message":"...","statusCode":401,"isRetryable":false,...}}}
+// step_finish is emitted for TOOL-CALL steps only: the step that ends the
+// session with a plain answer emits none, so neither the final reason nor the
+// final step's usage is on the stream. That is what the session export after
+// exit is for (opencode_export.go); the stream figures are the fallback.
 type opencodeEvent struct {
-	Type string        `json:"type"`
-	Part *opencodePart `json:"part"`
+	Type  string              `json:"type"`
+	Part  *opencodePart       `json:"part"`
+	Error *opencodeErrorEvent `json:"error"`
 
 	// SessionID is the opencode session every event of one run belongs to. It
 	// rides at the TOP level of each event, not on the part, and is constant for
-	// a run — captured once and used by the CLA-406 resurrection path as the
-	// handle a follow-up `opencode run --session <id>` continues.
+	// a run — captured once and used as the handle a follow-up `opencode run -s
+	// <id>` continues and `opencode session export` reads.
 	SessionID string `json:"sessionID"`
+}
+
+// opencodeErrorEvent is the typed error 2.x puts on a {"type":"error"} event.
+// The type is a stable dotted name ("provider.auth", "provider.rate-limit",
+// "provider.no-route", "provider.invalid-output"), which classification keys on
+// before it falls back to the word classes.
+type opencodeErrorEvent struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
+	Status  int    `json:"status"`
 }
 
 type opencodePart struct {
@@ -744,47 +1138,61 @@ type opencodePart struct {
 	// (CLA-288).
 	Cost *float64 `json:"cost"`
 
-	// tool parts, which arrive on a "tool_use" event.
+	// Tool parts, which arrive on a "tool_use" event. On 2.x the call id is
+	// `id` (1.x called it `callID`) and the part's own id moves to `partID`.
+	// The call id is the PROVIDER's, so it is not unique across steps - the
+	// fake provider used in the conformance suite numbers every step's calls
+	// from call_0 - which is why replays are recognised by partID.
 	Tool   string             `json:"tool"`
-	CallID string             `json:"callID"`
+	ID     string             `json:"id"`
+	PartID string             `json:"partID"`
 	State  *opencodeToolState `json:"state"`
 }
 
 // opencodeToolState is a tool call's lifecycle slot on its part. Where claude
 // splits a call across an `assistant` tool_use block and a later `user`
-// tool_result block, opencode re-emits the same part as its status advances and
-// carries the arguments and the result TOGETHER on the terminal one (recorded
-// against opencode 1.18.16, CLA-365):
+// tool_result block, opencode emits the part once it has settled and carries
+// the arguments and the result TOGETHER (recorded against opencode 2.0.32 with
+// the MCP server out of Code Mode):
 //
-//	{"type":"tool_use","part":{"type":"tool","tool":"clankerbar_claim_task",
-//	  "callID":"call_00_9Mb...","state":{"status":"completed",
-//	    "input":{"taskId":"e1d01dae-..."},
-//	    "output":"{\"task\":{\"id\":\"e1d01dae-...\",\"ref\":\"CLA-371\"},\"run\":{...}}"}}}
+//	{"type":"tool_use","part":{"partID":"prt_...","type":"tool","id":"call_0",
+//	  "tool":"clankerbar_claim_task","state":{"status":"completed",
+//	    "input":{"taskId":"T-9"},
+//	    "output":"{\"task\": {\"id\": \"T-9\", \"ref\": \"CLA-1\"}, \"run\": {\"id\": \"run-1\"}}",
+//	    "title":"clankerbar_claim_task","metadata":{...}}}}
 //
-// A refusal takes the other terminal status and puts the plane's error where the
-// output would have been. There is no `is_error` flag to read — the STATUS is the
-// flag, which is why a status this adapter does not recognise must never be
-// treated as success:
+// A refusal takes the other terminal status and puts the error where the output
+// would have been. There is no `is_error` flag to read — the STATUS is the flag,
+// which is why a status this adapter does not recognise must never be treated as
+// success:
 //
 //	{"state":{"status":"error","input":{...},
-//	  "error":"{\"error\":{\"code\":\"not_ready\",\"message\":\"...\"}}"}}
+//	  "error":"No tool named \"clankerbar_claim_task\" is currently available. ..."}}
 //
 // `output` is a STRING, not an object: an MCP tool's result arrives flattened to
 // its text content, which is the shape noteClaimed already parses.
 //
-// No spill envelope has been seen here. The `claim_task` result in the recording
-// was ~21 KB and arrived INLINE (the committed fixture is ~3 KB, because most of
-// that was a decisions block redacted out of it), where Claude Code substitutes a pointer
-// to a file above its own threshold and broke the phase seam doing it (CLA-330,
-// docs/large-tool-results.md). noteClaimed's rehydration still runs on this path,
-// so an opencode that grows the same behaviour with the same envelope is handled;
-// one with a DIFFERENT envelope would be a new bug, and the diagnostic noteClaimed
-// prints on an unparseable result is what would surface it.
+// A large result is TRUNCATED on 2.x, the same failure Claude Code's spill
+// caused on the phase seam (CLA-330, docs/large-tool-results.md). Verified
+// against 2.0.32: an MCP result above 51,200 bytes arrives as
+//
+//	"output":"[showing 0 lines of 1; full output saved to <data>/opencode/tool-output/tool_...]",
+//	"metadata":{"metadata":{"truncated":true,"outputPath":"<the same path>"},...}
+//
+// and the full text is in that file. Plane payloads reach that size (a
+// claim_task carrying decisions, a get_task at 56 KB). opencodeTruncatedOutput
+// rehydrates it from the file, under the guards that function states.
 type opencodeToolState struct {
-	Status string          `json:"status"`
-	Input  json.RawMessage `json:"input"`
-	Output string          `json:"output"`
-	Error  string          `json:"error"`
+	Status   string          `json:"status"`
+	Input    json.RawMessage `json:"input"`
+	Output   string          `json:"output"`
+	Error    string          `json:"error"`
+	Metadata *struct {
+		Metadata *struct {
+			Truncated  bool   `json:"truncated"`
+			OutputPath string `json:"outputPath"`
+		} `json:"metadata"`
+	} `json:"metadata"`
 }
 
 type opencodeTokens struct {
@@ -824,10 +1232,26 @@ type opencodeParse struct {
 	// session can do hours of real paid work and then die with an "unknown"
 	// final step that reported nothing, so the session total (p.total/p.cost)
 	// is NOT the discriminator. Only the final step's own usage is.
-	lastStepZeroUsage                     bool
+	lastStepZeroUsage bool
+	// lastStepOut and lastStepReason are the MOST RECENT step_finish's OWN
+	// output and reasoning token counts (CLA-584). lastStepOut is the
+	// discriminator for the output-cap stall — a final "length" step with ZERO
+	// output — and it is deliberately not the all-zero test above: the recorded
+	// MAK-123 stall carried reasoning=32000 and a nonzero total, so only the
+	// output figure sees it. lastStepReason rides onto the Result for the
+	// daemon's named log line. Both move only with a step_finish that carried a
+	// reason, so they always describe the same event as lastReason (deadscan's
+	// rule, kept in step so the two classifiers cannot disagree).
+	lastStepOut, lastStepReason           int
 	total, in, out, reason, cWrite, cRead int
 	cost                                  float64
 	sawUsage                              bool
+	// sawCost reports that a step_finish actually carried a cost figure
+	// (CLA-691). Deliberately separate from sawUsage: opencode reports a step's
+	// tokens and its cost as independent siblings, so a session can account for
+	// tokens and never for money, and the durable record carries the two
+	// questions apart.
+	sawCost bool
 
 	// sessionID is the opencode session this stream belongs to, taken from the
 	// top-level sessionID field every event carries. Constant for a run; the
@@ -841,9 +1265,36 @@ type opencodeParse struct {
 	// past, so anything written into it during the stream would be discarded.
 	observed Result
 	console  io.Writer
-	// settledCalls is the callIDs already acted on, so a re-delivered terminal
-	// event cannot rebuild a claim that a later call has since settled.
+	// settledCalls is the tool parts already acted on (by partID), so a
+	// re-delivered terminal event cannot rebuild a claim that a later call has
+	// since settled.
 	settledCalls map[string]bool
+
+	// toolOutputDir is where this session's opencode saves truncated tool
+	// output: <data home>/opencode/tool-output, resolved from the session's own
+	// environment. The only directory a truncated result is read back from.
+	toolOutputDir string
+
+	// errorType is the type of the last typed {"type":"error"} event
+	// ("provider.auth", ...), recorded on Result.Raw for diagnostics and the
+	// conformance suite. Classification itself reads the event text.
+	errorType string
+
+	// recoveredErrors counts the typed error events the stream did NOT end on:
+	// an event that is followed by any later typed event is one the session
+	// recovered from, because 2.x retries a provider failure itself and carries
+	// on (CLA-700). lastEventWasError is whether the most recent typed event was
+	// itself an error — exactly the question buildOpencodeErrorText asks of the
+	// finished stream, tracked here as the stream arrives so the two cannot
+	// disagree about how the session ended.
+	recoveredErrors   int
+	lastEventWasError bool
+
+	// kill ends the session's process, for the CLA-739 repeated-failure guard
+	// (armed on observed.toolLoop by newSessionResult). Set by runSession to the
+	// cancel of the run's own exec context; nil in the parser tests, where the
+	// guard still records its verdict and nothing is killed.
+	kill func()
 }
 
 // newOpencodeParse builds the parser a session streams into. It exists so the
@@ -853,7 +1304,7 @@ type opencodeParse struct {
 // would be false for the phase that pushes the branch and opens the PR. Assigned
 // inline in Invoke, deleting it would leave the whole suite green.
 func newOpencodeParse(in Invocation, console io.Writer) opencodeParse {
-	return opencodeParse{observed: newSessionResult(in), console: console}
+	return opencodeParse{observed: newSessionResult(in), console: console, toolOutputDir: opencodeToolOutputDir(in)}
 }
 
 // diag is where a claim diagnostic goes. The zero opencodeParse has no console (a
@@ -876,16 +1327,41 @@ func (p *opencodeParse) line(line []byte) {
 	if json.Unmarshal([]byte(trimmed), &ev) != nil {
 		return // partial/non-JSON line — skip
 	}
-	if ev.Part == nil {
-		return
-	}
 	// Every event names its session; the first one seen wins (they all agree
-	// within a run). Empty on malformed events, which the Part check above
-	// already mostly filters.
+	// within a run). Taken before the Part check, because an error event carries
+	// no part and can be the only event a failed run emits.
 	if p.sessionID == "" && ev.SessionID != "" {
 		p.sessionID = ev.SessionID
 	}
+	if ev.Type == "error" && ev.Error != nil && ev.Error.Type != "" {
+		p.errorType = ev.Error.Type
+	}
+	// CLA-700: an error event the stream moves past is one the session
+	// recovered from. Counted here for every typed event, before the Part check,
+	// because an error event carries no part and can be the last thing a failed
+	// run emits.
+	if ev.Type != "" {
+		if p.lastEventWasError {
+			// The PREVIOUS error event was followed by this one, so it was
+			// recovered from (whether or not this event is also an error).
+			p.recoveredErrors++
+		}
+		p.lastEventWasError = ev.Type == "error"
+	}
+	if ev.Part == nil {
+		return
+	}
 	switch ev.Type {
+	case "step_start":
+		// A new step has begun, so the previous step is no longer the final one.
+		// The final step of a 2.x session (the plain answer) emits no
+		// step_finish, so without this reset the last TOOL step's "tool-calls"
+		// would be reported as how the session ended. With it, a session whose
+		// last step never finished on the stream reports no streamed reason, and
+		// the export supplies the real one.
+		p.lastReason = ""
+		p.lastStepOut, p.lastStepReason = 0, 0
+		p.lastStepZeroUsage = false
 	case "text":
 		if t := strings.TrimSpace(ev.Part.Text); t != "" {
 			p.lastText = t
@@ -896,6 +1372,14 @@ func (p *opencodeParse) line(line []byte) {
 		// whether a final answer was produced.
 		if ev.Part.Reason != "" {
 			p.lastReason = ev.Part.Reason
+			// CLA-584: the stalled step's own figures move WITH the reason, so
+			// the pair always describes ONE event. A reason-less step_finish is
+			// skipped for this pair exactly as deadscan skips it for its own —
+			// otherwise the previous step's "length" would be paired with THIS
+			// event's zero output (or its output paired with the previous
+			// reason), and the live adapter would resume a session the
+			// retrospective scan reads as a mere long answer.
+			p.lastStepOut, p.lastStepReason = 0, 0
 		}
 		// tokens and cost are siblings on the part; count each independently so
 		// a step that reports one without the other still lands in the budget.
@@ -913,6 +1397,10 @@ func (p *opencodeParse) line(line []byte) {
 			p.reason += tk.Reasoning
 			p.cWrite += tk.Cache.Write
 			p.cRead += tk.Cache.Read
+			if ev.Part.Reason != "" {
+				p.lastStepOut = tk.Output
+				p.lastStepReason = tk.Reasoning
+			}
 			if tk.Total != 0 {
 				p.lastStepZeroUsage = false
 			}
@@ -924,6 +1412,7 @@ func (p *opencodeParse) line(line []byte) {
 				p.lastStepZeroUsage = false
 			}
 			p.sawUsage = true
+			p.sawCost = true
 		}
 	case "tool_use":
 		p.noteTool(ev.Part)
@@ -935,9 +1424,10 @@ func (p *opencodeParse) line(line []byte) {
 //
 // Only a TERMINAL state is acted on, and that is FUTURE-PROOFING rather than a
 // filter this stream needs today: `opencode run --format json` forwards a tool
-// part only once it has settled (cli/cmd/run.ts gates the emit on status
-// completed-or-error), which is why the recorded fixture carries exactly one
-// event per callID. The check is here because the status is the ONLY error flag
+// part only once it has settled (true of 1.x source, cli/cmd/run.ts, and of
+// every 2.0.32 stream recorded for this adapter), which is why the recorded
+// fixtures carry exactly one event per tool part. The check is here because the
+// status is the ONLY error flag
 // opencode gives — there is no is_error sibling — so a version that started
 // forwarding in-flight parts would otherwise have us read a call that had not
 // returned as a success. An unrecognised status is ignored for the same reason:
@@ -945,16 +1435,15 @@ func (p *opencodeParse) line(line []byte) {
 // task back — one expiring lease), against a claim recorded for a call that
 // failed, which is a task the driver believes it holds and does not.
 //
-// A callID is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so a
-// re-delivered terminal event for a claim already settled by a later update_task
-// would resurrect it — and the driver would post `ready` over a task that is in
-// review. Upstream transitions a part to terminal only from `running`
-// (session/processor.ts), so this is insurance, not an observed bug.
+// A tool part is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so
+// a re-delivered terminal event for a claim already settled by a later
+// a status write would resurrect it — and the driver would post `ready` over a task
+// that is in review. This is insurance, not an observed bug.
 //
 // # What this shape cannot do, and what it costs
 //
 // claude sets Claim.HasWIP on the REQUEST (see noteToolUse), deliberately: a
-// session killed between issuing `update_task(branch: …)` and its result has
+// session killed between issuing `record_progress(branch: …)` and its result has
 // still pushed work, and erring towards "there is WIP" only costs the reclaim an
 // expiring lease already costs. opencode gives no request-side event at all — the
 // arguments arrive fused to the result — so that arm cannot fire early here. A
@@ -966,33 +1455,133 @@ func (p *opencodeParse) line(line []byte) {
 func (p *opencodeParse) noteTool(part *opencodePart) {
 	st := part.State
 	// part.Type ("tool") is deliberately not checked: only a tool part carries a
-	// callID and a state, so the fields below are the discriminator.
-	if st == nil || part.CallID == "" {
+	// call id and a state, so the fields below are the discriminator.
+	if st == nil || part.ID == "" {
 		return
 	}
 	if st.Status != "completed" && st.Status != "error" {
 		return
 	}
-	name := opencodeClankerbarTool(part.Tool)
-	if name == "" {
-		return
+	// Replays are recognised by the part id, not the call id: the call id is
+	// the provider's and repeats across steps (see opencodePart), so keying on
+	// it would drop a later, genuine call. Taken for EVERY tool, ahead of the
+	// clankerbar filter, because the CLA-739 guard below counts every tool and
+	// a replayed failure must not count as a second one.
+	key := part.PartID
+	if key == "" {
+		key = part.ID
 	}
-	if p.settledCalls[part.CallID] {
+	if p.settledCalls[key] {
 		return
 	}
 	if p.settledCalls == nil {
 		p.settledCalls = map[string]bool{}
 	}
-	p.settledCalls[part.CallID] = true
+	p.settledCalls[key] = true
+	// CLA-739: the STATUS is the failure flag (see opencodeToolState), and the
+	// error text rides where the output would have been.
+	if p.observed.toolLoop.observe(part.Tool, st.Status == "error", st.Error) && p.kill != nil {
+		fmt.Fprintf(p.diag(), "\n!! %s - killing the session here instead of letting it retry the same failing call\n", p.observed.toolLoop.tripped())
+		p.kill()
+	}
+	name := opencodeClankerbarTool(part.Tool)
+	if name == "" {
+		return
+	}
 
-	noteToolUse(name, part.CallID, st.Input, &p.observed)
+	noteToolUse(name, part.ID, st.Input, &p.observed)
 	// The result text is handed over as JSON so it reaches noteClaimed by the same
 	// road claude's string-shaped tool_result content does. Marshalling a string
 	// cannot fail (invalid UTF-8 is replaced, not rejected), and the error is
 	// swallowed rather than returned on purpose: bailing here would strand the
 	// delivery Report noteToolUse just armed, unresolved and silently dropped.
-	content, _ := json.Marshal(st.Output)
-	noteToolResult(&p.observed, part.CallID, st.Status == "error", content, p.diag())
+	output := st.Output
+	if full, ok, err := opencodeTruncatedOutput(st, p.toolOutputDir); err != nil {
+		// Fail safe: the envelope goes on as the result, which no consumer can
+		// parse, so a claim is NOT tracked - the same outcome as any unreadable
+		// claim result, with the reason said first.
+		fmt.Fprintf(p.diag(), "  · %s result was truncated by opencode and could not be read back: %v\n", part.Tool, err)
+	} else if ok {
+		output = full
+	}
+	content, _ := json.Marshal(output)
+	noteToolResult(&p.observed, part.ID, st.Status == "error", content, p.diag())
+}
+
+// opencodeTruncatedOutput returns the full text of a tool result 2.x truncated
+// (see opencodeToolState), ok=false when the result was not truncated.
+//
+// The path comes from the event's own metadata, which opencode writes, not
+// from the output text a tool or the backlog controls. It is still checked
+// before anything is read, because a path that is merely read and parsed as a
+// claim is a way to hand the driver a claim on a task nobody asked for (the
+// threat injection_test.go covers):
+//
+//   - it must be a file directly inside dir, the session's own
+//     <data home>/opencode/tool-output, compared after resolving symlinks;
+//   - its name must start with "tool_", opencode's naming;
+//   - it must be a regular file, not a symlink;
+//   - the read is bounded by readSpilled, the same cap as Claude's spill.
+//
+// Any failure is returned as an error; the caller fails safe.
+func opencodeTruncatedOutput(st *opencodeToolState, dir string) (string, bool, error) {
+	if st.Metadata == nil || st.Metadata.Metadata == nil || !st.Metadata.Metadata.Truncated {
+		return "", false, nil
+	}
+	path := st.Metadata.Metadata.OutputPath
+	if path == "" || !filepath.IsAbs(path) {
+		return "", false, fmt.Errorf("no absolute outputPath in the truncation metadata (%q)", path)
+	}
+	if dir == "" {
+		return "", false, fmt.Errorf("the session's tool-output directory is unknown")
+	}
+	wantDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", false, fmt.Errorf("tool-output directory %s: %w", dir, err)
+	}
+	gotDir, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil || gotDir != wantDir {
+		return "", false, fmt.Errorf("%s is not in this session's tool-output directory %s", path, dir)
+	}
+	if !strings.HasPrefix(filepath.Base(path), "tool_") {
+		return "", false, fmt.Errorf("%s is not an opencode tool-output file", path)
+	}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return "", false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", false, fmt.Errorf("%s is not a regular file", path)
+	}
+	b, err := readSpilled(path)
+	if err != nil {
+		return "", false, err
+	}
+	return string(b), true, nil
+}
+
+// opencodeToolOutputDir is <data home>/opencode/tool-output for the session in:
+// XDG_DATA_HOME, else HOME/.local/share, each read from the session's own
+// environment (in.Env wins over the inherited one, as it does on exec).
+func opencodeToolOutputDir(in Invocation) string {
+	get := func(k string) string {
+		v := os.Getenv(k)
+		for _, kv := range in.Env {
+			if name, val, ok := strings.Cut(kv, "="); ok && name == k {
+				v = val
+			}
+		}
+		return v
+	}
+	data := get("XDG_DATA_HOME")
+	if data == "" {
+		home := get("HOME")
+		if home == "" {
+			return ""
+		}
+		data = filepath.Join(home, ".local", "share")
+	}
+	return filepath.Join(data, "opencode", "tool-output")
 }
 
 // opencodeClankerbarTool maps an opencode tool name onto the namespaced name the
@@ -1030,14 +1619,32 @@ func (p *opencodeParse) finish(res *Result) {
 	// `observed` field.
 	res.Claim = p.observed.Claim
 	res.Reports = p.observed.Reports
+	// CLA-703: how many clankerbar calls got a successful result, copied for the
+	// same reason as the claim — the parser's observation is stream-side state
+	// until the process ends.
+	res.ClankerbarCalls = p.observed.ClankerbarCalls
 	// Recorded whatever the figures come to: the driver bounds attempts that
 	// reported NOTHING, and a step_finish carrying zeros still reported (CLA-288).
 	res.UsageReported = p.sawUsage
+	// The cost figure is its own question (CLA-691): a stream whose steps carried
+	// tokens but no cost reported no money, and the durable record must say so
+	// rather than reporting 0.
+	res.CostReported = p.sawCost
 	if p.sawUsage {
 		// opencode's `total` already folds in input+output+reasoning+cache, so it
 		// is the honest spend figure for the budget.
 		res.Tokens = p.total
 		res.CostUSD = p.cost
+		// The normalised breakdown (CLA-691): opencode's step tokens are already
+		// disjoint across exactly these five buckets, so this is the report
+		// itself, summed over the session's steps.
+		res.Usage = TokenUsage{
+			Input:      p.in,
+			Output:     p.out,
+			Reasoning:  p.reason,
+			CacheRead:  p.cRead,
+			CacheWrite: p.cWrite,
+		}
 		res.Raw = map[string]any{
 			"input_tokens": p.in, "output_tokens": p.out, "reasoning_tokens": p.reason,
 			"cache_write_tokens": p.cWrite, "cache_read_tokens": p.cRead,
@@ -1065,6 +1672,18 @@ func (p *opencodeParse) finish(res *Result) {
 		if p.lastReason == FinishReasonUnknown && p.lastStepZeroUsage {
 			res.Raw[TerminalReasonKey] = ZeroUsageReason
 		}
+		// CLA-584: the output-cap stall — a FINAL step that hit the output token
+		// limit with ZERO output. Distinct from the quiet death above in the two
+		// ways that matter: the step reported real usage (reasoning and cost),
+		// and opencode ended the turn itself rather than the stream being
+		// dropped, so the session is alive and resumable. The reasoning count
+		// rides along because it is what makes the stall legible — thousands of
+		// tokens of thinking, nothing emitted — and it is the step's OWN count,
+		// like every other final-step figure here.
+		if p.lastReason == FinishReasonLength && p.lastStepOut == 0 {
+			res.Raw[TerminalReasonKey] = OutputCapReason
+			res.Raw[OutputCapReasoningKey] = p.lastStepReason
+		}
 	}
 	// The opencode session id, when the stream named one: the CLA-406
 	// resurrection path resumes INTO this session via `opencode run --session`,
@@ -1076,20 +1695,134 @@ func (p *opencodeParse) finish(res *Result) {
 		}
 		res.Raw[opencodeSessionIDKey] = p.sessionID
 	}
+	if p.errorType != "" {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[OpencodeErrorTypeKey] = p.errorType
+	}
+	// CLA-700: the events this session RECOVERED from, with no error event ending
+	// the stream. Recorded as a positive count so the driver can tell "nothing
+	// happened" from "provider blips were ridden out" — the difference between an
+	// exit status that means the session failed and one that is upstream's own
+	// bug (2.x exits non-zero after recovering, pinned by the conformance suite).
+	if p.recoveredErrors > 0 && !p.lastEventWasError {
+		if res.Raw == nil {
+			res.Raw = map[string]any{}
+		}
+		res.Raw[RecoveredErrorsKey] = p.recoveredErrors
+	}
 }
 
 // opencodeBudgetRe recognizes a HARD budget/credit-exhaustion stop from the
-// configured provider: out of credits, spend-cap or monthly-limit reached, or an
-// HTTP 402 Payment Required. This is a STOP (Limit.Stop), NOT the rolling-window
-// wait case — opencode's backends have no short reset to poll for. A plain 429
-// "rate limit" is a transient blip (IsTransient), not this.
+// configured provider: out of credits, spend-cap or monthly/billing-limit
+// reached, or an HTTP 402 Payment Required. This is a STOP (Limit.Stop) — there
+// is no window to wait out.
+//
+// It carries only phrasings that NAME a hard condition. The generic wordings
+// that name an exhausted quota without saying which window it is — "usage limit
+// reached", "insufficient quota" — live in opencodeGenericLimitRe, because the
+// SAME words arrive on a rolling subscription window that a wait can outlast: a
+// provider.quota event whose text is "Usage limit reached ... resets at ..." was
+// a Stop here and threw the stated reset away (CLA-736 review). A rolling
+// subscription quota (an N-hour/N-minute/session/daily usage limit, or
+// error.type "provider.quota") is the separate, WAITABLE case, matched by
+// opencodeRollingQuotaRe; a plain 429 "rate limit" with no quota wording is a
+// transient blip (IsTransient), not this.
 var opencodeBudgetRe = regexp.MustCompile(`(?i)"status(code)?": ?402` +
 	`|payment required` +
 	`|out of (credit|credits|balance)` +
-	`|insufficient (credit|credits|fund|funds|balance|quota)` +
+	`|insufficient (credit|credits|fund|funds|balance)` +
 	`|(credit|token) balance (is )?(too low|depleted)` +
 	`|spend[ -]?(cap|limit)|spending limit` +
-	`|monthly (usage )?limit|billing (hard )?limit|usage limit reached`)
+	`|monthly (usage )?limit|billing (hard )?limit`)
+
+// opencodeGenericLimitRe names an exhausted quota WITHOUT naming a window or a
+// hard condition: the legacy "usage limit reached", and "insufficient
+// [provider] quota". On its own that is still a Stop — nothing in it says the
+// window lifts — but DetectLimit lets the rolling classification win when the
+// same event is typed provider.quota or states a reset instant, which is the
+// whole difference between a top-up and a wait (CLA-736 review).
+var opencodeGenericLimitRe = regexp.MustCompile(`(?i)usage limit reached` +
+	`|insufficient (?:[\w-]+ )?quota`)
+
+// opencodeRollingQuotaRe recognizes the OTHER kind of provider limit: a rolling
+// subscription window that a wait can outlast (CLA-736). The Command Code plan's
+// 5-hour quota arrives as an HTTP 429 typed `provider.quota` and states the
+// reset instant in its message; the loop supervises that wait and re-runs the
+// session once the window lifts, so this must be reported as Limited with Stop
+// UNSET rather than falling through to the transient ladder.
+//
+// Three arms, all read from opencodeErrorText (stderr + a TERMINAL error event),
+// never the agent's narration:
+//   - 2.x types it: error.type == "provider.quota". This alone is enough — the
+//     type is the provider's own statement that the cap is a quota it will lift,
+//     so a message carrying no duration/window wording at all is still waitable.
+//   - the message names the window BEFORE the limit word: "5-hour usage limit",
+//     "Your 5-hour limit has been reached", "30-minute usage limit", "session
+//     usage limit", "daily usage limit", "weekly usage limit". The word "usage"
+//     is not required — an untyped provider that calls it a "5-hour limit" is
+//     the same window. The weekly arm is not optional: it is the window this
+//     task adds, and a prose weekly cap must classify exactly like its sibling
+//     windows instead of reading as no limit at all (review 1.review-1.1).
+//   - the message names the window AFTER the limit word: "Your usage limit has
+//     been reached (5-hour window)". Same statement with the clause order
+//     swapped; without this arm it matches neither the window-first arm (the
+//     limit must follow the window) nor the generic quota arm ("usage limit
+//     reached" wants those words adjacent), so a waitable window rode the
+//     transient ladder instead of a supervised wait (review 1.review-2.2).
+//
+// Deliberately narrow. A bare 429 "rate limit" names no window and stays
+// transient, and the hard budget arms above are checked FIRST — so a monthly cap
+// typed as provider.quota is still a Stop.
+var opencodeRollingQuotaRe = regexp.MustCompile(`(?i)"type": ?"provider\.quota"` +
+	`|\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b[^.\n"]{0,40}\blimit\b` +
+	`|\b(?:limit|quota)\b[^.\n"]{0,40}\b\d+\s*[- ]?\s*(hour|hr|minute|min)s?\b` +
+	`|\b(session|daily|weekly)\s+usage\s+limit`)
+
+// opencodeResetRe captures the reset instant a rolling quota STATES as RFC3339,
+// e.g. "Your limit resets at 2026-10-20T15:56:48.251Z." When the message does not
+// state one the parse returns the zero time and the supervised wait falls back to
+// interval probing — a missing reset must not demote the limit to "no limit".
+var opencodeResetRe = regexp.MustCompile(`(?i)resets?\s+at\s+` +
+	`(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))`)
+
+// opencodeResetInRe captures a RELATIVE reset a rolling quota states by duration,
+// e.g. "Usage limit reached. Resets in 4 hours." or "reset in 45m". The same
+// provider family emits either form, and a relative window is the same statement
+// of when the limit lifts — the classifier's own rule is that "a message that
+// says when it lifts is a wait" (review 1.review-2.2), and reading only the
+// absolute form turned the wait into an engineer-visible stop.
+var opencodeResetInRe = regexp.MustCompile(`(?i)resets?\s+in\s+(\d+)\s*(hours?|hrs?|minutes?|mins?|h|m)\b`)
+
+func parseOpencodeReset(s string) time.Time { return parseOpencodeResetAt(s, time.Now()) }
+
+// parseOpencodeResetAt is parseOpencodeReset with an injectable "now" for
+// testing — the same split parseClaudeResetAt uses. "now" is the drain's now: a
+// relative window is resolved at the moment the session's diagnostics are
+// classified.
+func parseOpencodeResetAt(s string, now time.Time) time.Time {
+	if m := opencodeResetRe.FindStringSubmatch(s); m != nil {
+		if t, err := time.Parse(time.RFC3339Nano, m[1]); err == nil {
+			return t
+		}
+	}
+	m := opencodeResetInRe.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil || n <= 0 {
+		return time.Time{}
+	}
+	switch strings.ToLower(m[2])[0] {
+	case 'h':
+		return now.Add(time.Duration(n) * time.Hour)
+	case 'm':
+		return now.Add(time.Duration(n) * time.Minute)
+	}
+	return time.Time{}
+}
 
 func (opencode) DetectLimit(res Result) Limit {
 	// Scan only the harness's own diagnostics, NOT the agent's narration: with
@@ -1097,22 +1830,311 @@ func (opencode) DetectLimit(res Result) Limit {
 	// task that merely discusses billing ("we're out of credits") must not trip a
 	// terminal stop. Budget errors arrive as a {"type":"error"} event (or plain
 	// text on stderr), which is what opencodeErrorText gathers.
-	if opencodeBudgetRe.MatchString(opencodeErrorText(res)) {
+	text := opencodeErrorText(res)
+	// Hard budget stops keep winning (CLA-736 settled 2): a monthly cap or an
+	// exhausted balance has no window to wait out, however the event is typed.
+	if opencodeBudgetRe.MatchString(text) {
+		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
+	}
+	// CLA-752: the provider's own STRUCTURED statement comes before its wording.
+	// The terminal error event carries the provider's response body verbatim
+	// (opencode 2.0.32 stores it under error.response.body), so a 429 that names
+	// its window there is classified from the window and the code, not from
+	// prose that may be reworded.
+	facts := opencodeErrorFactsOf(res)
+	if window, planLimit := opencodeWindowLimit(facts, text); planLimit {
+		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: window}
+	}
+	// A rolling subscription quota is a LIMIT the loop waits out, so Stop stays
+	// false. ResetAt is the provider's own stated instant when present.
+	if opencodeRollingQuotaRe.MatchString(text) {
+		return Limit{Limited: true, ResetAt: parseOpencodeReset(text), Reason: "usage_limit", Window: opencodeNamedWindow(text)}
+	}
+	// The generic exhausted-quota phrasings are a Stop only when nothing makes
+	// the limit waitable. A provider.quota type or a rolling window is the case
+	// above; here the one remaining signal is a STATED reset — absolute
+	// ("resets at <RFC3339>") or relative ("resets in 4 hours") — a message that
+	// says when it lifts is a wait, not a top-up, so it must not be turned into a
+	// hard stop by wording that names no hard condition (CLA-736 review,
+	// 1.review-2.2).
+	if opencodeGenericLimitRe.MatchString(text) {
+		if reset := parseOpencodeReset(text); !reset.IsZero() {
+			return Limit{Limited: true, ResetAt: reset, Reason: "usage_limit"}
+		}
 		return Limit{Limited: true, Stop: true, Reason: "budget_exhausted"}
 	}
 	return Limit{}
 }
 
+// opencodeRateLimitWindows maps the provider's structured `rateLimit.window`
+// token onto the label the loop reports. The tokens are Command Code's own —
+// `fiveHour`, `weekly`, `daily` — not opencode's. Keys are normalised
+// (lower-case, separators stripped) because the provider's spelling is not
+// stable: `FiveHour` and `five-hour` are the documented token too, and an
+// exact-match map made those variants invisible, which is how a plan cap rode
+// the transient ladder (review 1.review-1.4). The mapping stays deliberately
+// closed: an unrecognised token names no window this adapter understands, and
+// guessing one is how a hard stop becomes an unbounded wait.
+var opencodeRateLimitWindows = map[string]string{
+	"fivehour": "5-hour",
+	"weekly":   "weekly",
+	"daily":    "daily",
+}
+
+// opencodeWindowToken normalises a structured window token before the closed
+// map lookup: case- and separator-insensitive, so `fiveHour`, `five_hour` and
+// `five-hour` are one window rather than one known token and two unknown ones.
+func opencodeWindowToken(s string) string {
+	return strings.ToLower(strings.NewReplacer("-", "", "_", "").Replace(strings.TrimSpace(s)))
+}
+
+// opencodeLimitWindowPhrase is the plan-limit wording a provider uses when it
+// names no window in its body. It is the message-only fallback (CLA-752): a
+// weekly statement labels weekly, and the plan's default cap is the 5-hour one.
+const opencodeLimitWindowPhrase = "usage limit for your plan"
+
+// opencodeWindowLimit resolves the plan limit a failure states: the LABEL of
+// the usage window it names (empty when it names none this adapter knows), and
+// whether the failure is a plan limit at all. Two sources, in order:
+//
+//  1. The STRUCTURED `rateLimit.window` from the provider's response body —
+//     top level or nested under the body's `error` object. Its token is
+//     authoritative: when it names a window the closed map does not know, the
+//     window is UNKNOWN — the wording is not consulted over it, because a
+//     window the provider named is not something prose may relabel, and the
+//     plan's default is a guess the map's own contract forbids (reviews
+//     1.review-1.4, 1.review-2.2).
+//  2. The message's "usage limit for your plan" phrase, which is the same
+//     statement in prose: weekly when it says weekly, otherwise the plan's
+//     default 5-hour window.
+//
+// Only a rate limit can be a PLAN limit: the structured path requires a 429
+// status or the RATE_LIMITED code, and the wording path requires the same. A
+// window seen on a 5xx is not a plan cap, and a 429 that names no window stays
+// the transient burst limit IsTransient already handles — that is the difference
+// between waiting out a plan cap and backing off a burst.
+func opencodeWindowLimit(f opencodeErrorFacts, text string) (window string, planLimit bool) {
+	rateLimited := f.Status == 429 || strings.EqualFold(f.Code, "RATE_LIMITED")
+	if !rateLimited {
+		return "", false
+	}
+	if f.Window != "" {
+		// The body NAMED a window. The closed map decides the label — including
+		// "no label" for a token it does not know. The failure is still a plan
+		// limit (a rate-limited failure that names a window is one by the task's
+		// own rule); what it is NOT is the 5-hour default, which would label a
+		// cap the provider never described as 5-hour and turn an unknown window
+		// into an unbounded wait (reviews 1.review-1.4, 1.review-2.2).
+		return opencodeRateLimitWindows[opencodeWindowToken(f.Window)], true
+	}
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, opencodeLimitWindowPhrase) {
+		return "", false
+	}
+	if window := opencodeNamedWindow(text); window != "" {
+		return window, true
+	}
+	return "5-hour", true
+}
+
+// opencodeNamedWindow labels a window the text NAMES, when it names one. It is
+// the wording arm's label, used where a rolling window is recognised by its
+// shape rather than by the structured token: an untyped "daily usage limit" is
+// the daily window. A bare "30-minute usage limit" names a duration, not one of
+// the plan's windows, and stays unlabelled rather than being called 5-hour.
+//
+// The window word only counts inside the limit STATEMENT — the same clause as a
+// limit/quota word (either side of it, since the provider swaps the order). The
+// scan reads the whole diagnostic text, which includes the terminal error event
+// and the provider's raw body, so a stray "weekly" in a session id or a body
+// field must not relabel the cap (review 1.review-1.6).
+var opencodeNamedWindowRe = regexp.MustCompile(`(?i)\b(weekly|daily|5[- ]hour)\b[^.\n"]{0,40}\b(?:usage\s+)?(?:limit|quota)\b` +
+	`|\b(?:usage\s+)?(?:limit|quota)\b[^.\n"]{0,40}\b(weekly|daily|5[- ]hour)\b`)
+
+func opencodeNamedWindow(text string) string {
+	m := opencodeNamedWindowRe.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	token := m[1]
+	if token == "" {
+		token = m[2]
+	}
+	switch strings.ToLower(token) {
+	case "weekly":
+		return "weekly"
+	case "daily":
+		return "daily"
+	}
+	return "5-hour"
+}
+
+// opencodeErrorFacts is what the terminal error event states STRUCTURALLY:
+// fields a caller can trust without reading prose. The zero value means the
+// stream carried no terminal error event, or one whose JSON did not parse.
+type opencodeErrorFacts struct {
+	// Status is the HTTP status the wrapper reported (error.status, or the older
+	// APIError shape's error.data.statusCode).
+	Status int
+	// Code is the provider body's machine-readable error code, e.g.
+	// RATE_LIMITED. It is the body's, not opencode's error.type.
+	Code string
+	// Window is the raw `rateLimit.window` token, when the body carried one.
+	Window string
+}
+
+// opencodeErrorFactsOf reads the structured facts out of a finished Result's
+// terminal error event.
+//
+// What survives opencode's wrapping is verified against the 2.0.32 binary and
+// the 2026-10-20 capture in testdata/opencode-quota-five-hour.jsonl: the
+// provider's message and status are lifted onto `error`, and its raw response
+// body is passed through as a JSON STRING under `error.response.body` (the
+// binary's provider error is built with `response:{body:…}`). The older
+// APIError shape puts the same body under `error.data.responseBody`. Neither is
+// re-parsed by opencode, so `code` and `rateLimit` are only reachable by
+// decoding that string here.
+//
+// Wrapper first, body second: the transport's own `error.status` is the status
+// the request actually failed with, while a provider body may carry an envelope
+// `status: 200` (or any other non-HTTP value) that says nothing about the
+// failure. Filling the status from the body first masked a wrapper 429 and sent
+// a plan cap down the transient ladder (review 1.review-1.5). Code and window
+// live only in the body, so the wrapper merge leaves those holes for it.
+func opencodeErrorFactsOf(res Result) opencodeErrorFacts {
+	line := opencodeTerminalErrorLine(res)
+	if line == "" {
+		return opencodeErrorFacts{}
+	}
+	var ev map[string]any
+	if json.Unmarshal([]byte(line), &ev) != nil {
+		return opencodeErrorFacts{}
+	}
+	errObj := opencodeJSONObject(ev["error"])
+	dataObj := opencodeJSONObject(errObj["data"])
+
+	f := opencodeMergeFacts(opencodeFactsFromObject(errObj), opencodeFactsFromObject(dataObj))
+	for _, raw := range []any{
+		opencodeJSONObject(errObj["response"])["body"],
+		dataObj["responseBody"],
+		ev["responseBody"],
+		errObj["body"],
+	} {
+		body, ok := raw.(string)
+		if !ok || body == "" {
+			continue
+		}
+		var decoded map[string]any
+		if json.Unmarshal([]byte(body), &decoded) != nil {
+			continue
+		}
+		f = opencodeMergeFacts(f, opencodeFactsFromObject(decoded))
+		// The provider's body is normally an {error:{…}} envelope itself.
+		f = opencodeMergeFacts(f, opencodeFactsFromObject(opencodeJSONObject(decoded["error"])))
+	}
+	return f
+}
+
+// opencodeFactsFromObject reads the three structured fields out of one decoded
+// JSON object. Absent or wrongly-typed fields stay zero, and a `status` outside
+// the HTTP range is not a status at all (review 1.review-1.5).
+func opencodeFactsFromObject(o map[string]any) opencodeErrorFacts {
+	var f opencodeErrorFacts
+	if n, ok := opencodeJSONNumber(o["status"]); ok && n >= 100 && n <= 599 {
+		f.Status = n
+	} else if n, ok := opencodeJSONNumber(o["statusCode"]); ok && n >= 100 && n <= 599 {
+		f.Status = n
+	}
+	if s, ok := o["code"].(string); ok {
+		f.Code = s
+	}
+	if rl := opencodeJSONObject(o["rateLimit"]); rl != nil {
+		if w, ok := rl["window"].(string); ok {
+			f.Window = w
+		}
+	}
+	return f
+}
+
+// opencodeMergeFacts keeps base's facts and fills only its holes from next.
+func opencodeMergeFacts(base, next opencodeErrorFacts) opencodeErrorFacts {
+	if base.Status == 0 {
+		base.Status = next.Status
+	}
+	if base.Code == "" {
+		base.Code = next.Code
+	}
+	if base.Window == "" {
+		base.Window = next.Window
+	}
+	return base
+}
+
+// opencodeJSONObject is a decoded JSON object, or nil for anything else.
+func opencodeJSONObject(v any) map[string]any {
+	o, _ := v.(map[string]any)
+	return o
+}
+
+// opencodeJSONNumber is a decoded JSON number as an int, or false.
+func opencodeJSONNumber(v any) (int, bool) {
+	f, ok := v.(float64)
+	if !ok {
+		return 0, false
+	}
+	return int(f), true
+}
+
 // opencodeErrorText collects the harness-level diagnostic text — all of stderr,
-// plus the stdout lines that decode to a {"type":"error"} event — so a limit scan
-// sees provider/transport errors but never the agent's own assistant text.
+// plus a TERMINAL {"type":"error"} event on stdout — so a limit scan sees
+// provider/transport errors but never the agent's own assistant text.
 func opencodeErrorText(res Result) string {
 	return res.scan(scanErrorText, func() string { return buildOpencodeErrorText(res) })
 }
 
+// buildOpencodeErrorText appends the stream's error event ONLY when it is how
+// the session ENDED — the last typed event on stdout (CLA-700).
+//
+// 2.x emits a provider error mid-session, retries the request itself and carries
+// on: a stream whose error event is followed by a step_start / tool_use / text
+// part is a session that RECOVERED, and calling that session failed or
+// retryable is how a delivered phase got classified as a failed attempt (both
+// 2026-10-19 incidents). So an error event with any typed event after it is
+// recovery and contributes nothing here; only a stream that stops on the error
+// is a failure. The distinction is pinned by the conformance suite's
+// recovered-provider-error case, which execs the real binary.
+//
+// stderr is scanned unconditionally: it is the harness's own diagnostic channel,
+// written as the process winds down, and the fallback for the untyped failures
+// the typed-event scan cannot see.
+//
+// Note this is deliberately stricter than opencodeErrorType (the Raw
+// diagnostic key), which records the LAST error event whatever followed it —
+// that key is testimony about the stream, not a classification.
 func buildOpencodeErrorText(res Result) string {
 	var b strings.Builder
 	b.WriteString(res.Stderr)
+	// The error event is appended ONLY when the stream ENDED on it — the rule
+	// opencodeTerminalErrorLine owns, shared with the structured fact scan so
+	// the two can never disagree about which event is the failure.
+	if line := opencodeTerminalErrorLine(res); line != "" {
+		b.WriteByte('\n')
+		b.WriteString(line)
+	}
+	return b.String()
+}
+
+// opencodeTerminalErrorLine returns the LAST typed event on the stream when it
+// is a {"type":"error"} event, verbatim; "" otherwise.
+//
+// 2.x emits provider errors mid-session, retries the request itself and carries
+// on: a stream whose error event is followed by a step_start / tool_use / text
+// part is a session that RECOVERED, and calling that session failed or retryable
+// is how a delivered phase got classified as a failed attempt (both 2026-10-19
+// incidents). So an error event with any typed event after it contributes
+// nothing.
+func opencodeTerminalErrorLine(res Result) string {
+	last := ""
 	for _, line := range strings.Split(res.Stdout, "\n") {
 		line = strings.TrimSpace(line)
 		if !strings.HasPrefix(line, "{") {
@@ -1121,12 +2143,21 @@ func buildOpencodeErrorText(res Result) string {
 		var ev struct {
 			Type string `json:"type"`
 		}
-		if json.Unmarshal([]byte(line), &ev) == nil && ev.Type == "error" {
-			b.WriteByte('\n')
-			b.WriteString(line)
+		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type == "" {
+			continue
 		}
+		last = line
 	}
-	return b.String()
+	if last == "" {
+		return ""
+	}
+	var ev struct {
+		Type string `json:"type"`
+	}
+	if json.Unmarshal([]byte(last), &ev) != nil || ev.Type != "error" {
+		return ""
+	}
+	return last
 }
 
 // opencodeFatalRe: failures that are NEVER a blip, scanned before the transient
@@ -1160,7 +2191,13 @@ const opencodeFatalWords = `(authentication( \w+)? (failed|error|rejected)` +
 	`|unauthorized|forbidden|permission denied` +
 	`|invalid api key|api key (is )?(invalid|missing|not found|expired))`
 
-var opencodeFatalRe = regexp.MustCompile(`(?i)"status(code)?": ?40[13]` +
+// 2.x types its errors, and two of the types are fatal by definition, verified
+// against 2.0.32: `provider.auth` (a 401, exit 1, no retry) and
+// `provider.no-route` (an unknown provider or model, exit 1, no request sent).
+// Neither can be fixed by trying again, and a no-route carries no status code
+// for the arms below to read.
+var opencodeFatalRe = regexp.MustCompile(`(?i)"type": ?"provider\.(auth|no-route)"` +
+	`|"status(code)?": ?40[13]` +
 	`|"message": ?"[^"]*` + opencodeFatalWords +
 	`|error: ?[^\n]*` + opencodeFatalWords)
 
@@ -1196,7 +2233,15 @@ var opencodeFatalRe = regexp.MustCompile(`(?i)"status(code)?": ?40[13]` +
 // CLA-382 wired opencode to one) matched, and a stop became an unbounded retry.
 // The claude adapter anchors its provider arms on `api error:` for the same
 // reason.
-var opencodeTransientRe = regexp.MustCompile(`(?i)"status(code)?": ?(408|429|5\d\d)` +
+//
+// 2.x's `provider.rate-limit` is the typed form of the 429 arm. 2.0.32 retries a
+// 429 itself (about ten attempts over ~82s) before it exits 1 with that type,
+// so by the time the adapter sees it the burst has lasted a minute and a half;
+// it is still a rate limit and still rides the loop's backoff, and a budget stop
+// or a rolling quota window worded inside it is caught first by opencodeBudgetRe
+// / opencodeRollingQuotaRe.
+var opencodeTransientRe = regexp.MustCompile(`(?i)"type": ?"provider\.rate-limit"` +
+	`|"status(code)?": ?(408|429|5\d\d)` +
 	`|"isretryable": ?true` +
 	`|overloaded|too many requests|rate ?limit` +
 	`|unsupported_tool_schema|tool_count_limit` +
@@ -1254,11 +2299,32 @@ func (opencode) ZeroUsageUnknown(res Result) bool {
 	return r == ZeroUsageReason
 }
 
+// OutputCapNoOutput reports whether this session ended on the CLA-584 output-cap
+// stall: a FINAL step_finish carrying reason "length" whose OWN output tokens
+// were zero — the model spent the step's whole output budget thinking and
+// emitted nothing. Read back from the adapter's own terminal_reason marker, so
+// unlike the CLA-398 quiet death this is not a question about usage being
+// absent: the MAK-123 stall reported reasoning=32000 and real cost, and only
+// the output figure was zero.
+//
+// It is the resume gate in Invoke (one resume with a steer, see
+// opencode_stall.go) and the driver's marker for naming the end instead of its
+// generic "never moved the task on" line.
+func (opencode) OutputCapNoOutput(res Result) bool {
+	if res.Raw == nil {
+		return false
+	}
+	r, _ := res.Raw[TerminalReasonKey].(string)
+	return r == OutputCapReason
+}
+
 // No mid-stream token ceiling: opencode sums per-step usage but the adapter
 // never kills the process, so no exit of its can be attributed to one.
 func (opencode) TokenCeilingHit(Result) bool { return false }
 
-// TracksClaims is true as of CLA-365: opencode's `--format json` stream carries
+// TracksClaims is true as of CLA-365, and on 2.x only because the adapter takes
+// every MCP server out of Code Mode (opencodeMCPOutOfCodeMode): opencode's
+// `--format json` stream then carries
 // each tool call's arguments AND its result on one terminal `tool_use` event, so
 // the adapter reads the claim off the session the same way claude does and
 // populates Result.Claim. That is what config.Validate gates `phases` on, so this
@@ -1266,9 +2332,12 @@ func (opencode) TokenCeilingHit(Result) bool { return false }
 //
 // HonoursMaxTurns stays false — Invocation.MaxTurns still never reaches the CLI.
 //
-// ReportsCost is true: opencode's step_finish parts carry a `cost` sibling to the
-// token counts, and opencodeParse sums it into Result.CostUSD, so
-// `budget.max_cost_usd` is a live ceiling here (CLA-288).
+// ReportsCost is true: on 2.x the authoritative figure is the session export
+// read after each process exits (opencode_export.go), with the step_finish
+// `cost` siblings summed from the stream as the fallback when the export fails,
+// so `budget.max_cost_usd` is a live ceiling here (CLA-288). The cost is only
+// non-zero when the model's provider config declares a `cost` block; a model
+// without one reports tokens and $0.
 //
 // HonoursSessionWallClock is true and HonoursMaxTurns is false, which is the
 // whole point of the pair: this is the adapter whose CLI takes no turn flag, so
@@ -1287,11 +2356,38 @@ func (o opencode) IsTransient(res Result) bool {
 	// A named stop wins over every retry path below, including the heuristic. The
 	// loop already runs DetectLimit before IsTransient, so the budget arm is
 	// belt-and-braces there — but this function must not answer "retryable" about
-	// an exhausted account just because it happens to be asked out of that order.
-	// The braces are why the loop's ordering has no test of its own: with both
-	// classifiers agreeing, no order produces a retry, so there is nothing left for
-	// a test to distinguish (CLA-381).
-	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+	// an exhausted account just because it happens to be asked out of that order,
+	// and a rolling quota is the same shape: it is WAITED, not retried. The
+	// generic quota phrasings belong here even though DetectLimit may make them
+	// waitable on a stated reset: either way there is nothing to RETRY, and a 429
+	// saying "usage limit reached" must never ride the transient ladder. The
+	// braces are why the loop's ordering has no test of its own: with both
+	// classifiers agreeing, no order produces a retry, so there is nothing left
+	// for a test to distinguish (CLA-381).
+	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
+		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	// CLA-752: the same veto for a plan cap stated STRUCTURALLY. A rate-limited
+	// failure whose body names a usage window — or that says "usage limit for
+	// your plan" — is a limit the loop WAITS out; DetectLimit says so from the
+	// same function, and the two classifiers agreeing is what makes the loop's
+	// DetectLimit-first ordering safe (CLA-381, review 1.review-1.2). Without
+	// this, the body-only shape was "limited" to one classifier and "retryable"
+	// to the other, so a caller that asked this one alone retried a plan cap as
+	// if it were a burst.
+	if _, planLimit := opencodeWindowLimit(opencodeErrorFactsOf(res), text); planLimit {
+		return false
+	}
+	// CLA-700: a session that RECOVERED from its provider errors is not retryable,
+	// however its exit status reads. 2.x emits the error, retries the request
+	// itself and finishes the work, then exits 1 anyway (pinned by the conformance
+	// suite), so there is no failure here for a retry to ride out — the question
+	// this exit raises is whether the session DELIVERED, and that is the driver's
+	// to answer, not a classifier's. Both the pattern scan below and the
+	// usage-gated heuristic are skipped: the heuristic exists to catch failures no
+	// pattern names, and this one is named (and it is not a failure).
+	if RecoveredErrors(res) > 0 {
 		return false
 	}
 	if opencodeTransientRe.MatchString(text) {
@@ -1325,7 +2421,20 @@ func (opencode) IsUnclassifiedTransient(res Result) bool {
 		return false
 	}
 	text := opencodeErrorText(res)
-	if opencodeBudgetRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+	if opencodeBudgetRe.MatchString(text) || opencodeRollingQuotaRe.MatchString(text) ||
+		opencodeGenericLimitRe.MatchString(text) || opencodeFatalRe.MatchString(text) {
+		return false
+	}
+	// CLA-752: IsTransient's structural veto, for the same reason — the
+	// heuristic must not launder a body-named plan cap into a bounded guess
+	// (review 1.review-1.2).
+	if _, planLimit := opencodeWindowLimit(opencodeErrorFactsOf(res), text); planLimit {
+		return false
+	}
+	// CLA-700: the same rule as IsTransient's — a session that recovered from its
+	// error events has no unrecognised failure to guess at, so the heuristic must
+	// not launder its exit status into a retry.
+	if RecoveredErrors(res) > 0 {
 		return false
 	}
 	return !opencodeTransientRe.MatchString(text)

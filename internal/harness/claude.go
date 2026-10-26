@@ -43,16 +43,23 @@ func (claude) MCPConfigUse() MCPConfigUse { return MCPConfigUse{Schema: MCPConfi
 // was told to continue a run, not start one — so without this its claim would be
 // the zero value, and Result.Claim.Held() is what gates the driver's handback,
 // the CLA-314 salvage and the CLA-253 delivery check. Seeding leaves the stream
-// to supply Settled/HasWIP on top: noteToolUse matches `update_task` against this
-// TaskID, which is precisely the arm that would otherwise never fire for the
-// phase that pushes the branch and opens the PR.
+// to supply Settled/HasWIP on top: noteToolUse matches the progress and terminal
+// tools against this TaskID, which is precisely the arm that would otherwise
+// never fire for the phase that pushes the branch and opens the PR.
 //
 // Extracted rather than assigned inline because a test that builds its own
 // Result does not exercise an assignment inside Invoke — which is exactly how the
 // first cut of this shipped with the seed untested and a mutation of it surviving
 // the whole suite.
 func newSessionResult(in Invocation) Result {
-	return Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
+	res := Result{Claim: in.ResumeClaim, onClaim: in.OnClaim}
+	// CLA-739: never on a probe. A probe is a one-word liveness check with its
+	// tools denied, so it has no tool calls to repeat, and a probe killed for a
+	// "loop" would report a session-shaped verdict for something no phase ran.
+	if !in.Probe {
+		res.toolLoop = newToolLoopGuard(in.MaxRepeatedToolFailures)
+	}
+	return res
 }
 
 // claudeArgs builds the session's argv. Extracted from Invoke so it can be
@@ -76,12 +83,17 @@ func claudeArgs(in Invocation) []string {
 	// The project's other declared repos (CLA-437): --add-dir is Claude's own
 	// mechanism for granting tool access beyond the working directory, so a
 	// two-repo project's session can read and edit its sibling whatever directory
-	// it starts in. One flag carrying every dir — the CLI documents it as
-	// variadic (`--add-dir <directories...>`). The operator's --settings policy
-	// still governs: this widens what the session MAY be granted, the settings
-	// file's deny rules still say what it IS. Probes never reach here.
+	// it starts in. One flag, then each dir as its OWN argv element: the CLI
+	// documents the flag as variadic (`--add-dir <directories...>`), and a
+	// variadic consumes following elements until the next flag - so a single
+	// space-joined element parsed as ONE directory whose path contains spaces,
+	// and two or more extras granted nothing (CLA-443). The operator's
+	// --settings policy still governs: this widens what the session MAY be
+	// granted, the settings file's deny rules still say what it IS. Probes never
+	// reach here.
 	if len(in.ExtraDirs) > 0 {
-		args = append(args, "--add-dir", strings.Join(in.ExtraDirs, " "))
+		args = append(args, "--add-dir")
+		args = append(args, in.ExtraDirs...)
 	}
 	// The phase backstop. Claude ends the session at the cap; whatever the tree
 	// holds is then the salvage's problem, which is exactly what it is for.
@@ -121,11 +133,13 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// a data race (-race catches it) even where it would happen to take
 	// effect.
 	//
-	// Known gap, deliberate: a descendant that ESCAPED the group (daemonised
-	// with setsid) survives this kill and can hold cmd.Stderr's pipe open -
-	// this path sets no WaitDelay, so Wait would block for that escapee's
-	// lifetime. Every in-group descendant dies, which is the bar; the
-	// setsid escapee is filed as CLA-423.
+	// A descendant that ESCAPED the group (daemonised with setsid) survives
+	// this kill — but it can no longer stall Wait past cmd.WaitDelay below,
+	// which force-closes whatever exec-owned pipes it holds. What remains of
+	// the gap is bounded and accounted: the escapee itself outlives the
+	// session unfed (CLA-423 closed the hang, not the orphan), and an escapee
+	// holding the exec-owned STDOUT end still blocks consume() before Wait —
+	// and so before WaitDelay's clock — ever starts (CLA-431).
 	cmd.Cancel = func() error {
 		killProcessGroup(cmd)
 		return cmd.Process.Kill()
@@ -134,6 +148,21 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		cmd.Dir = in.WorkDir
 	}
 	cmd.Env = c.env(in)
+	// A cap that can hang is not a cap: the same grandchild-holds-the-pipe
+	// scenario the opencode adapter closes with WaitDelay (opencode.go:291-303).
+	// Armed UNCONDITIONALLY. An earlier revision set it only when the exec
+	// context carried a deadline, but no deadline ever reaches this path in
+	// production — the driver's run ctx is signal.NotifyContext (cancel-only),
+	// sctx below is WithCancel-only, and claude honours no wall-clock cap of
+	// its own — so that arm was dead code outside tests (phase-2 review of
+	// this branch). Arming always is safe for live sessions by WaitDelay's own
+	// semantics: its clock starts only once the exec context is done or Wait
+	// has observed child exit, so I/O of a still-running session is never cut
+	// short. It does NOT kill the escapee; it only lets the adapter return and
+	// account for what arrived before the forced close. That close triggers
+	// the same stream-drain path the scanner already handles: EOF, clean
+	// parse, and any bytes past the window counted in OutputDropped.
+	cmd.WaitDelay = 5 * time.Second
 
 	console := in.Console
 	if console == nil {
@@ -170,11 +199,12 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
-	} else if waitErr != nil && !c.TokenCeilingHit(res) {
+	} else if waitErr != nil && !c.TokenCeilingHit(res) && res.ToolLoop == "" {
 		return res, waitErr // couldn't run claude at all
 	} else if waitErr != nil {
-		// Our own ceiling kill: the child died on the cancel, and its exit code
-		// is the kill's, not a verdict. The marker below is the verdict.
+		// Our own kill (the ceiling, or CLA-739's repeated failing tool call):
+		// the child died on the cancel, and its exit code is the kill's, not a
+		// verdict. The marker is the verdict.
 		res.ExitCode = -1
 	}
 	return res, nil
@@ -238,6 +268,17 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result,
 			// printing $0.0000 as if it were real (CLA-343 review).
 			break
 		}
+		// CLA-739: the same tool returned the same error on enough consecutive
+		// calls that the session is looping, and every further retry re-sends
+		// the whole context. Killed here for the ceiling's reasons, and the
+		// stream ends here for the same one: what is still in the pipe arrived
+		// after the verdict.
+		if cause := res.toolLoop.tripped(); cause != "" && res.ToolLoop == "" {
+			res.ToolLoop = cause
+			fmt.Fprintf(console, "\n!! %s - killing the session here instead of letting it retry the same failing call\n", cause)
+			kill()
+			break
+		}
 	}
 	err := sc.Err()
 	if err == nil {
@@ -288,10 +329,13 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			// (CLA-288).
 			Usage *usage `json:"usage"`
 		} `json:"message"`
-		Result         string  `json:"result"`
-		TerminalReason string  `json:"terminal_reason"`
-		TotalCostUSD   float64 `json:"total_cost_usd"`
-		Usage          usage   `json:"usage"`
+		Result         string `json:"result"`
+		TerminalReason string `json:"terminal_reason"`
+		// A POINTER, so a result event that carries no cost at all is
+		// distinguishable from one that reports 0 (CLA-691): only the latter is a
+		// figure the durable record may carry.
+		TotalCostUSD *float64 `json:"total_cost_usd"`
+		Usage        usage    `json:"usage"`
 	}
 	if json.Unmarshal(line, &ev) != nil {
 		return
@@ -307,6 +351,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			case "tool_use":
 				fmt.Fprintf(console, "  → %s\n", b.Name)
 				noteToolUse(b.Name, b.ID, b.Input, res)
+				res.noteToolName(b.ID, b.Name)
 			}
 		}
 		// The API's per-turn usage rides on the assistant event's message, and it
@@ -321,6 +366,10 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 			if tot := u.total(); tot > 0 {
 				res.Tokens += tot
 			}
+			// The normalised breakdown (CLA-691) is summed on the same terms as
+			// Tokens above: the API reports each turn's own usage, and the
+			// result event below overwrites both if the stream reaches it.
+			res.Usage.Add(u.normalised())
 		}
 	case "user":
 		// Tool results come back on a synthetic user turn.
@@ -329,15 +378,35 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				continue
 			}
 			noteToolResult(res, b.ToolUseID, b.IsError, b.Content, console)
+			// CLA-739: every tool, not only clankerbar's - a loop on any tool
+			// re-sends the context just the same. The error text is only read
+			// for a failed call; a success resets the streak whatever it says.
+			if res.toolLoop != nil {
+				var text string
+				if b.IsError {
+					text = toolResultText(b.Content)
+				}
+				res.toolLoop.observe(res.takeToolName(b.ToolUseID), b.IsError, text)
+			}
 		}
 	case "result":
 		res.FinalMessage = ev.Result
-		res.CostUSD = ev.TotalCostUSD
+		// The session's DOLLARS arrive here and nowhere else, so the flag that says
+		// "a cost figure was seen" (CLA-691) is set here too: a session killed
+		// before this event reported tokens but no money, and the durable record
+		// must carry the absence rather than a zero nobody measured.
+		if ev.TotalCostUSD != nil {
+			res.CostUSD = *ev.TotalCostUSD
+			res.CostReported = true
+		}
 		// The result event's usage is the session's CUMULATIVE total, so it
 		// overwrites the running sum rather than adding to it. On a stream that
 		// reached its end this is the number the budget sees; on a stream we
 		// killed for the ceiling it never arrives, and the sum stands.
 		res.Tokens = ev.Usage.total()
+		// The CUMULATIVE usage, so the breakdown is overwritten rather than added
+		// to, exactly as Tokens is above (CLA-691).
+		res.Usage = ev.Usage.normalised()
 		res.Raw = map[string]any{"terminal_reason": ev.TerminalReason}
 		res.gotResult = true
 		// The session's own accounting arrived, whatever it adds up to - a
@@ -364,10 +433,21 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 	if toolUseID == "" {
 		return
 	}
+	// CLA-703: a clankerbar call's SUCCESS is the one fact that separates "the
+	// MCP server was not there" from "the session reached the backlog and still
+	// chose not to review". Every mapped call counts — a get_task or heartbeat
+	// proves the server just as well as a claim does — and a refusal counts for
+	// nothing, because that is the state the no-MCP arm is about.
+	if res.clankerbarCalls[toolUseID] {
+		delete(res.clankerbarCalls, toolUseID)
+		if !isError {
+			res.ClankerbarCalls++
+		}
+	}
 	// A delivery claim is kept only if the plane ACCEPTED the call that made it —
-	// same rule, same reason: a refused `update_task` recorded no branch and
-	// declared no delivery, so there is nothing to check and nothing to complain
-	// about.
+	// same rule, same reason: a refused progress or terminal call recorded no
+	// branch and declared no delivery, so there is nothing to check and nothing
+	// to complain about.
 	res.settleReport(toolUseID, !isError)
 
 	kind, waiting := res.pending[toolUseID]
@@ -393,21 +473,44 @@ func noteToolResult(res *Result, toolUseID string, isError bool, content json.Ra
 // before calling noteToolUse — see opencodeClankerbarTool.
 const (
 	claimTaskTool        = "mcp__clankerbar__claim_task"
-	updateTaskTool       = "mcp__clankerbar__update_task"
+	recordProgressTool   = "mcp__clankerbar__record_progress"
+	submitForReviewTool  = "mcp__clankerbar__submit_for_review"
+	completeTaskTool     = "mcp__clankerbar__complete_task"
+	settleTaskTool       = "mcp__clankerbar__settle_task"
+	setLaneTool          = "mcp__clankerbar__set_lane"
 	askQuestionTool      = "mcp__clankerbar__ask_question"
 	escalateQuestionTool = "mcp__clankerbar__escalate_question"
+
+	// clankerbarToolPrefix is the namespace every clankerbar MCP tool carries,
+	// whichever adapter reported it. CLA-703 asks "did this session reach the
+	// backlog at all?", which is true of any successful call — get_task and
+	// heartbeat included — so the counter keys on the namespace, not on the
+	// handful of calls that carry claim state.
+	clankerbarToolPrefix = "mcp__clankerbar__"
 )
+
+// isClankerbarTool reports whether name is one of the clankerbar MCP tools.
+func isClankerbarTool(name string) bool { return strings.HasPrefix(name, clankerbarToolPrefix) }
 
 // noteToolUse records what a clankerbar call will mean once its result lands.
 //
-// `update_task` is not the only way a session lets go. A BLOCKING question ends
-// the run and sets the task `blocked` without any `update_task` at all — it is
-// the documented one-call handback, and the protocol explicitly calls
-// `update_task(status: "blocked")` a trap and steers clankers here instead.
+// A terminal tool is not the only way a session lets go. A BLOCKING question
+// ends the run and sets the task `blocked` without any task write at all — it is
+// the documented one-call handback, and the protocol steers clankers here
+// instead of any bare status write.
 // Missing it is not a missed handback but a wrong one: the driver would post
 // `ready` over a task that is waiting on the operator, dropping it back into the
 // claimable queue with the question unanswered.
 func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
+	// Remember the request so its RESULT can say whether the backlog was
+	// reachable (CLA-703). A call that never returns — killed mid-flight —
+	// counts for nothing, which is right: it proved nothing either way.
+	if toolUseID != "" && isClankerbarTool(name) {
+		if res.clankerbarCalls == nil {
+			res.clankerbarCalls = map[string]bool{}
+		}
+		res.clankerbarCalls[toolUseID] = true
+	}
 	switch name {
 	case claimTaskTool:
 		// The ids are in the RESULT, not the arguments. A claim that loses the
@@ -423,12 +526,13 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 			res.noteClaimRequest(toolUseID, args.TaskID)
 		}
 
-	case updateTaskTool:
+	case recordProgressTool, submitForReviewTool, completeTaskTool, settleTaskTool, setLaneTool:
 		var args struct {
-			TaskID   string `json:"taskId"`
-			Status   string `json:"status"`
-			Branch   string `json:"branch"`
-			Delivery struct {
+			TaskID      string `json:"taskId"`
+			Branch      string `json:"branch"`
+			Disposition string `json:"disposition"`
+			Lane        string `json:"lane"`
+			Delivery    struct {
 				Commit            string `json:"commit"`
 				IntegrationBranch string `json:"integrationBranch"`
 				PR                string `json:"pr"`
@@ -437,17 +541,35 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		if json.Unmarshal(input, &args) != nil || !res.Claim.Names(args.TaskID) {
 			return
 		}
-		if settlesTask(args.Status) {
+		// The tool set is one job per call (CLA-748), so what a call means is
+		// read off WHICH tool it is rather than off a status field.
+		status := ""
+		switch name {
+		case submitForReviewTool:
+			status = "in_review"
+			res.expect(toolUseID, pendingSettle)
+		case completeTaskTool:
+			status = "done"
+			res.expect(toolUseID, pendingSettle)
+		case settleTaskTool:
+			// parked/archived: both clear the holder plane-side.
+			status = args.Disposition
+			res.expect(toolUseID, pendingSettle)
+		case setLaneTool:
+			// A lane move (ready/backlog) is a status write too: the plane clears
+			// the holder for every status but in_progress.
+			status = args.Lane
 			res.expect(toolUseID, pendingSettle)
 		}
 		// The two claims the plane cannot check for itself. Armed here, kept only if
 		// the call is accepted, and verified against local git once the session ends
-		// (CLA-253).
+		// (CLA-253). Only the tools that can carry one are reported; an
+		// outcome-only progress write asserts nothing checkable.
 		res.expectReport(toolUseID, Report{
 			TaskID:            res.Claim.TaskID,
 			Ref:               res.Claim.Ref,
 			RunID:             res.Claim.RunID,
-			Status:            args.Status,
+			Status:            status,
 			Branch:            args.Branch,
 			Commit:            args.Delivery.Commit,
 			IntegrationBranch: args.Delivery.IntegrationBranch,
@@ -460,6 +582,12 @@ func noteToolUse(name, toolUseID string, input json.RawMessage, res *Result) {
 		// strands the branch.
 		if args.Branch != "" {
 			res.Claim.HasWIP = true
+			// Carry the NAME too, not just the fact (CLA-708): CURRENT_CLAIM's
+			// branch field is what tells a supervisor to expireLease rather than
+			// release — release would post `ready` over the branch. Notifying is
+			// what gets the new name to the lease renewer's record mid-session.
+			res.Claim.Branch = args.Branch
+			res.notifyClaim()
 		}
 
 	case askQuestionTool:
@@ -521,14 +649,16 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 	}
 	var payload struct {
 		Task struct {
-			ID     string `json:"id"`
-			Ref    string `json:"ref"`
-			Branch string `json:"branch"`
+			ID       string `json:"id"`
+			Ref      string `json:"ref"`
+			Branch   string `json:"branch"`
+			Category string `json:"category"`
 		} `json:"task"`
 		Run struct {
 			ID string `json:"id"`
 		} `json:"run"`
-		HasWip bool `json:"hasWip"`
+		HasWip bool   `json:"hasWip"`
+		Branch string `json:"branch"`
 	}
 	if err := json.Unmarshal([]byte(text), &payload); err != nil {
 		fmt.Fprintf(console, "  · claim NOT tracked%s: its result is not JSON (%v) - %s\n", about, err, snippet(text))
@@ -545,11 +675,19 @@ func noteClaimed(content json.RawMessage, toolUseID string, res *Result, console
 	}
 	// A predecessor's pushed work arrives with the claim. Carry it: the task is no
 	// safer to release just because THIS session has not written anything yet.
+	// The claim's own branch (top-level) names the pushed WIP; the task-level
+	// branch indicates whether the plane records one for WIP tracking.
+	claimBranch := payload.Branch
+	if payload.Task.Branch != "" && claimBranch == "" {
+		claimBranch = payload.Task.Branch
+	}
 	res.Claim = Claim{
-		TaskID: payload.Task.ID,
-		Ref:    payload.Task.Ref,
-		RunID:  payload.Run.ID,
-		HasWIP: payload.HasWip || payload.Task.Branch != "",
+		TaskID:   payload.Task.ID,
+		Ref:      payload.Task.Ref,
+		RunID:    payload.Run.ID,
+		HasWIP:   payload.HasWip || payload.Task.Branch != "",
+		Category: payload.Task.Category,
+		Branch:   claimBranch,
 	}
 	// Any OnClaim watcher - the driver's lease renewer (CLA-358) - learns the
 	// claim the moment the stream carries it, not when the process exits.
@@ -743,6 +881,21 @@ func (u usage) total() int {
 	return u.InputTokens + u.OutputTokens + u.CacheCreationTokens + u.CacheReadTokens
 }
 
+// normalised maps claude's report onto the CLI's own usage vocabulary (CLA-691).
+// The mapping is the identity on three fields because claude's `input_tokens` is
+// UNCACHED input only — the cache fields sit beside it, not inside it — and zero
+// on Reasoning because Anthropic folds thinking tokens into `output_tokens` and
+// reports no separate figure. Inventing one (or splitting output on a guess)
+// would make the buckets disagree with the harness's own total.
+func (u usage) normalised() TokenUsage {
+	return TokenUsage{
+		Input:      u.InputTokens,
+		Output:     u.OutputTokens,
+		CacheRead:  u.CacheReadTokens,
+		CacheWrite: u.CacheCreationTokens,
+	}
+}
+
 // probe runs the cheapest possible request (tiny prompt, no tools, plain json) to
 // answer "am I still limited?" — no streaming, no console.
 func (c claude) probe(ctx context.Context, in Invocation) (Result, error) {
@@ -812,7 +965,10 @@ func (c claude) probeResult(stdout, stderr *tail, runErr error) (Result, error) 
 }
 
 func (claude) env(in Invocation) []string {
-	env := append(os.Environ(), in.Env...)
+	// Pin the child's PWD to the directory Invoke sets as cmd.Dir, dropping the
+	// daemon's inherited value - see pinPWD. Applied to the INHERITED
+	// environment, before in.Env, so an explicit caller value still wins.
+	env := append(pinPWD(inheritEnv(os.Environ(), in.EnvAllowlist), in.WorkDir), in.Env...)
 	// Never truncate the session while subagents/background work run.
 	env = append(env, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0")
 	if in.ConfigDir != "" {
@@ -839,9 +995,11 @@ func (claude) parse(res *Result) {
 	res.FinalMessage = p.Result
 	if p.TotalCostUSD != nil {
 		res.CostUSD = *p.TotalCostUSD
+		res.CostReported = true
 	}
 	if p.Usage != nil {
 		res.Tokens = p.Usage.total()
+		res.Usage = p.Usage.normalised()
 	}
 	res.UsageReported = p.TotalCostUSD != nil || p.Usage != nil
 	res.Raw = map[string]any{"terminal_reason": p.TerminalReason, "is_error": p.IsError}

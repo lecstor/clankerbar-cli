@@ -15,6 +15,7 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/backlog"
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
@@ -42,6 +43,13 @@ func openTestStateDir(t *testing.T, d *Driver) {
 type invokeStep struct {
 	res harness.Result
 	err error
+	// claims, when non-nil, are fired at Invocation.OnClaim in order before the
+	// step's result returns — the mid-session claim stream a real adapter's
+	// parser emits (CLA-510). afterClaims, when set, runs once they are all
+	// queued, so a test can hold the session open until the lease renewer has
+	// folded them in (which is what makes the fleet claim beacon deterministic).
+	claims      []harness.Claim
+	afterClaims func()
 }
 
 func okResult(tokens int, cost float64) harness.Result {
@@ -118,12 +126,30 @@ type fakeAdapter struct {
 	// failing it.
 	probeErrs  []error
 	probeCalls int
+	// probeStarts records each probe's start instant, so a test can measure the
+	// gap between two paid sessions — the cadence CLA-728 must not tighten
+	// (1.review-1.1). Appended on the loop goroutine, like probeCalls.
+	probeStarts []time.Time
+	// probeDelay is how long each probe BLOCKS before answering, which is what a
+	// real probe does: it spawns a harness session. Zero keeps every pre-existing
+	// test's timing exactly as it was.
+	probeDelay time.Duration
+	// onProbe, when set, fires at the start of each probe with the call number
+	// (0-based), before any probeDelay. The seam for driving something onto the
+	// daemon DURING a probe — a blocking probe that waits for a beacon is exactly
+	// what 1.review-4.1 needs.
+	onProbe func(call int)
 	// probeTokens/probeCost are what EACH probe reports spending. A probe is a real
 	// paid session (CLA-287), so the fake has to be able to charge for one; zero
 	// keeps every pre-existing test's arithmetic exactly as it was.
 	probeTokens  int
 	probeCost    float64
 	limitResetAt time.Time
+	// limitWindow is the usage window the fake's "limit" kind reports, so a test
+	// can pin what the loop's wait logs say about WHICH cap it is waiting out
+	// (CLA-752 review). Empty keeps every pre-existing test's limit exactly as it
+	// was.
+	limitWindow string
 	// caps overrides the fake's default capabilities, for the tests that drive an
 	// adapter which cannot observe a claim.
 	caps *harness.Capabilities
@@ -132,6 +158,11 @@ type fakeAdapter struct {
 	// the no-progress breaker tests set it so a fruitless session costs a real
 	// ~30M and the token threshold is actually reachable (CLA-343).
 	tokens int
+	// onInvoke, when set, fires just before each scripted step is returned, with
+	// the call number: the seam for dropping something onto a daemon DURING a
+	// live session (a soft-stop marker planted mid-flight, CLA-491). No earlier
+	// hook can express that without racing one of the loop's marker reads.
+	onInvoke func(call int)
 }
 
 // Name is what the driver charges this adapter's spend to, so the per-harness
@@ -154,7 +185,18 @@ func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harnes
 	f.invocations = append(f.invocations, in)
 	i := f.invokeCalls
 	f.invokeCalls++
+	if f.onInvoke != nil {
+		f.onInvoke(i)
+	}
 	if i < len(f.steps) {
+		if st := f.steps[i]; st.claims != nil && in.OnClaim != nil {
+			for _, c := range st.claims {
+				in.OnClaim(c)
+			}
+			if st.afterClaims != nil {
+				st.afterClaims()
+			}
+		}
 		return f.steps[i].res, f.steps[i].err
 	}
 	// Steps exhausted → a clean success, so a loop that keeps draining does not
@@ -165,7 +207,7 @@ func (f *fakeAdapter) Invoke(ctx context.Context, in harness.Invocation) (harnes
 func (f *fakeAdapter) DetectLimit(r harness.Result) harness.Limit {
 	switch kindOf(r) {
 	case "limit":
-		return harness.Limit{Limited: true, ResetAt: f.limitResetAt}
+		return harness.Limit{Limited: true, ResetAt: f.limitResetAt, Window: f.limitWindow}
 	case "limitStop":
 		return harness.Limit{Limited: true, Stop: true, Reason: "out of credits"}
 	}
@@ -208,6 +250,13 @@ func (f *fakeAdapter) Diagnostic(r harness.Result) string { return r.Stderr }
 func (f *fakeAdapter) Probe(ctx context.Context, in harness.Invocation) (harness.ProbeResult, error) {
 	i := f.probeCalls
 	f.probeCalls++
+	f.probeStarts = append(f.probeStarts, time.Now())
+	if f.onProbe != nil {
+		f.onProbe(i)
+	}
+	if f.probeDelay > 0 {
+		time.Sleep(f.probeDelay)
+	}
 	// Charged on every path, including the error one. That is the loop's contract
 	// with an adapter — whatever a ProbeResult carries is counted — not a claim
 	// about what the real adapters manage to parse from a failed run (CLA-299).
@@ -256,6 +305,11 @@ func (p *fakePoller) Poll(ctx context.Context) (backlog.Summary, error) {
 // ever sleeps for real. Crucially, RetryCap=1ms makes backoff() return the cap
 // for every retry n (the 30s base is always > the cap), so transient retries do
 // not incur the real 30s/60s/... backoff.
+//
+// It deliberately sets no `review_panel`: an absent panel is the historical
+// single review (CLA-639 is opt-in, with no default and no preset), which is the
+// shape every test that scripts one review phase per phase drives. The panel
+// tests set their own members.
 func fastCfg() *config.Config {
 	return &config.Config{
 		Harness:          "claude",
@@ -502,6 +556,35 @@ func TestDrainWithRetries_ResetInsideBudgetStillWaits(t *testing.T) {
 	}
 	if tokens != 7 {
 		t.Errorf("the session should have been re-run after the wait; got %d tokens", tokens)
+	}
+}
+
+// CLA-752 review 1.review-1.3 / 1.review-2.1 / 1.review-3.1 / 1.review-5.1: the
+// wait an operator actually sits through must say WHICH cap it is waiting out.
+// Both the wait-entry line and the paused line carry the window the adapter
+// reported, so a multi-day weekly pause is not logged identically to a 5-hour
+// one — which is the whole reason the adapter labels the window.
+func TestDrainWithRetries_WaitLogsNameTheWindow(t *testing.T) {
+	cfg := fastCfg()
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}},
+		limitResetAt: time.Now().Add(time.Minute),
+		limitWindow:  "weekly",
+	}
+	cfg.Budget = config.Budget{MaxWallClock: config.Duration(4 * time.Hour)}
+	d := New(cfg, h, &fakePoller{})
+	openTestStateDir(t, d)
+
+	logs := captureLogs(t)
+	if _, _, stop, err := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); err != nil || stop {
+		t.Fatalf("a reset inside the ceiling must be waited out: stop=%v err=%v", stop, err)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "hit a usage limit: usage limit (weekly window)") {
+		t.Errorf("the wait-entry log must name the window it is waiting out:\n%s", out)
+	}
+	if !strings.Contains(out, "paused (weekly window)") {
+		t.Errorf("the paused log must name the window it is waiting out:\n%s", out)
 	}
 }
 
@@ -1414,21 +1497,39 @@ func TestDrainWithRetries_BudgetExhaustionAfterUsageStopsRatherThanRetrying(t *t
 // Control markers and the max-iterations ceiling.
 
 func TestRun_Markers(t *testing.T) {
-	t.Run("STOP stops gracefully and is consumed", func(t *testing.T) {
+	// CLA-491: a STOP marker that PREDATES the run is a leftover from a previous
+	// daemon's exit path that never consumed it (a failure, a budget trip or a
+	// signal), not a fresh request. A fresh start warns, consumes it and gets on
+	// with the work; dropping a marker while a daemon RUNS remains the soft-stop
+	// switch (the waitOrStop tests pin that, and TestRun_SoftStopThenRelaunch
+	// pins the boundary drop end to end).
+	t.Run("a leftover STOP marker warns and does not stop a fresh start", func(t *testing.T) {
 		cfg := fastCfg()
 		dir := t.TempDir()
 		cfg.StateDir = dir
+		cfg.MaxIterations = 1 // the run must now DO work, so bound it
 		writeMarker(t, dir, "STOP", "please stop")
 		h := &fakeAdapter{}
 		p := &fakePoller{sum: backlog.Summary{Claimable: 1}}
+		logs := captureLogs(t)
 		if err := runLoop(t, cfg, h, p); err != nil {
 			t.Fatalf("Run returned error: %v", err)
 		}
-		if h.invokeCalls != 0 {
-			t.Errorf("STOP should stop before spending; got %d Invoke calls", h.invokeCalls)
+		if h.invokeCalls != 1 {
+			t.Errorf("a leftover STOP marker must not stop a fresh start before spending; got %d Invoke calls", h.invokeCalls)
 		}
 		if _, err := os.Stat(filepath.Join(dir, "STOP")); !errors.Is(err, os.ErrNotExist) {
-			t.Errorf("STOP marker should be removed after a graceful stop; stat err = %v", err)
+			t.Errorf("leftover STOP marker should be consumed at start-up; stat err = %v", err)
+		}
+		out := logs.String()
+		if !strings.Contains(out, "left over from a previous run") {
+			t.Errorf("start-up must warn loudly about the leftover marker; log was:\n%s", out)
+		}
+		if !strings.Contains(out, "please stop") {
+			t.Errorf("start-up warning must carry the leftover marker's message; log was:\n%s", out)
+		}
+		if strings.Contains(out, "STOP requested") {
+			t.Errorf("the leftover marker must not be acted on as a stop request; log was:\n%s", out)
 		}
 	})
 
@@ -1922,10 +2023,18 @@ func TestRun_MultiProject_PollErrorOnOneQueueStillDrainsSibling(t *testing.T) {
 
 type releaseCall struct{ taskID, runID string }
 
+// fakeReleaser is the plain Releaser fake: it can hand a claim back and
+// nothing else. It deliberately does NOT implement plane.TaskStateSource — a
+// test on this fake runs the UNWIRED-plane path, where every seam is judged on
+// branch evidence alone (CLA-457) and the review-only outcome gate has nothing
+// to read. Tests that need the plane's task state use wiredReleaser below.
 type fakeReleaser struct {
-	calls  []releaseCall
-	err    error
-	onCall func() // fired inside Release, to observe what has NOT happened yet
+	calls       []releaseCall
+	driverCalls []releaseCall
+	expireCalls []releaseCall
+	err         error
+	expireErr   error
+	onCall      func() // fired inside Release, to observe what has NOT happened yet
 }
 
 func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error {
@@ -1934,6 +2043,54 @@ func (f *fakeReleaser) Release(ctx context.Context, taskID, runID string) error 
 		f.onCall()
 	}
 	return f.err
+}
+
+func (f *fakeReleaser) ReleaseDriver(_ context.Context, taskID, runID string) error {
+	f.driverCalls = append(f.driverCalls, releaseCall{taskID, runID})
+	return f.err
+}
+
+// ExpireLease records the CLA-708 handback. The two lists are separate because
+// which one a branch-bearing claim uses is the whole safety property: Release
+// would post `ready` over the branch, ExpireLease keeps it for takeover.
+func (f *fakeReleaser) ExpireLease(_ context.Context, taskID, runID string) error {
+	f.expireCalls = append(f.expireCalls, releaseCall{taskID, runID})
+	return f.expireErr
+}
+
+// wiredReleaser is fakeReleaser plus the plane's single-task read
+// (plane.TaskStateSource): the shape the review-split seam tests need, where
+// the outcome on the task decides whether a checkpoint advances. `state` is
+// called on every read, so a test can let the review phase's own session change
+// the answer mid-drain (see the split tests' fakeAdapter.onInvoke hooks), and
+// `err` — also consulted on every read — is how a test blips the plane between
+// the review seam's two reads: a baseline that reads clean and a seam read that
+// fails is the shape the `!recordRead` refusal exists for.
+//
+// Kept separate rather than added to fakeReleaser: when the plain fake
+// satisfied the interface, every older loop test silently moved from the
+// unwired-plane path to a wired one — the driver began asking the plane where
+// it used to judge on branch evidence alone, with nothing in those tests
+// saying so. The explicit unwired-plane test pins the path that change
+// removed.
+type wiredReleaser struct {
+	fakeReleaser
+	state func() plane.TaskState
+	err   func() error // nil means every read succeeds
+	reads int          // TaskState calls made, for the baseline retry bound (CLA-663)
+}
+
+func (w *wiredReleaser) TaskState(_ context.Context, _ string) (plane.TaskState, error) {
+	w.reads++
+	if w.err != nil {
+		if err := w.err(); err != nil {
+			return plane.TaskState{}, err
+		}
+	}
+	if w.state == nil {
+		return plane.TaskState{}, nil
+	}
+	return w.state(), nil
 }
 
 // parkCall is one driver-side park: the task it moved, the run signing it, and
@@ -1994,6 +2151,16 @@ func held(base harness.Result, c harness.Claim) harness.Result {
 }
 
 func openClaim() harness.Claim { return harness.Claim{TaskID: "t-1", RunID: "r-1"} }
+
+// mcpReached marks a scripted result as one whose session successfully called a
+// clankerbar MCP tool. A review fixture that is meant to model a reviewer that
+// DID reach the backlog (and then recorded nothing, or made its own choices)
+// needs this: CLA-703's backstop otherwise reads the fixture's silence as a
+// missing MCP server and retries it.
+func mcpReached(r harness.Result) harness.Result {
+	r.ClankerbarCalls = 1
+	return r
+}
 
 // runWithReleaser drives one unnamed target that has both a poller and a releaser.
 func runWithReleaser(t *testing.T, cfg *config.Config, h harness.Adapter, p backlog.Poller, r *fakeReleaser) error {
@@ -2796,6 +2963,43 @@ func TestDrainExitLine_NamesTheSignalNotJustTheCode(t *testing.T) {
 			}
 			if tc.notWant != "" && strings.Contains(err.Error(), tc.notWant) {
 				t.Errorf("error = %q, must not say %q", err, tc.notWant)
+			}
+		})
+	}
+}
+
+// TestLimitWindowSuffix pins the wait's own label: the supervised-wait lines
+// already say what they are doing, so they only need the window appended — and a
+// window-less limit's line must stay byte-for-byte what it was.
+func TestLimitWindowSuffix(t *testing.T) {
+	if got := limitWindowSuffix(harness.Limit{Window: "weekly"}); got != " (weekly window)" {
+		t.Errorf("limitWindowSuffix(weekly) = %q, want %q", got, " (weekly window)")
+	}
+	if got := limitWindowSuffix(harness.Limit{}); got != "" {
+		t.Errorf("limitWindowSuffix(no window) = %q, want empty", got)
+	}
+}
+
+// TestLimitReasonNamesTheWindow pins what a paused log line says about WHICH cap
+// it is waiting out (CLA-752). The window is diagnostic only — Stop already
+// decided whether the loop may wait — but a multi-day weekly wait that logs a
+// bare "usage_limit" hides the one thing the operator needs to tell a plan cap
+// from a burst.
+func TestLimitReasonNamesTheWindow(t *testing.T) {
+	tests := []struct {
+		name string
+		lim  harness.Limit
+		want string
+	}{
+		{"the adapter's own reason", harness.Limit{Reason: "budget_exhausted"}, "budget_exhausted"},
+		{"a named window rides along", harness.Limit{Reason: "usage_limit", Window: "weekly"}, "usage_limit (weekly window)"},
+		{"an unnamed window leaves the reason alone", harness.Limit{Reason: "usage_limit"}, "usage_limit"},
+		{"a blank reason still defaults", harness.Limit{}, "usage limit"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := limitReason(tc.lim); got != tc.want {
+				t.Errorf("limitReason(%+v) = %q, want %q", tc.lim, got, tc.want)
 			}
 		})
 	}

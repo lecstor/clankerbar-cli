@@ -1,0 +1,95 @@
+{
+  "$comment": "An example proposed tool catalog for `run.sh --scenario schema --schemas testdata/schema-proposed.json`. It is deliberately NOT the live catalog: it shows the shape a proposal can be tested against before the plane ships it. For the real catalog, run `run.sh fetch-schemas --out /tmp/schemas-live.json` and edit a copy.",
+  "tools": [
+    {
+      "name": "edit_task",
+      "description": "Proposed edit_task shape: nullable enums and nullable booleans rendered as anyOf [type, null], which is what zod .nullable() serialises (CLA-745).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "taskId": {
+            "type": "string",
+            "description": "REQUIRED. A UUID or a CB-<n>."
+          },
+          "detail": {
+            "type": "string",
+            "description": "Markdown body."
+          },
+          "repo": {
+            "type": "string",
+            "description": "Repo 'owner/name'. \"\" clears to primary; null means not sent."
+          },
+          "priority": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["h", "m", "l"]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schedule": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["next", "later", "someday"]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "container": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "humanOnly": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": ["taskId"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "frobnicate",
+      "description": "A proposed NEW tool, to see whether a model and provider accept a tool the plane does not serve yet.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "target": {
+            "type": "string"
+          },
+          "mode": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": ["dry-run", "apply"]
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": ["target"],
+        "additionalProperties": false
+      }
+    }
+  ]
+}

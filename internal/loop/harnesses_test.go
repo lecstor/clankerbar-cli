@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
@@ -41,7 +42,7 @@ func mixedDriver(t *testing.T, impl, review *fakeAdapter) *Driver {
 		{Name: "review"},
 	}
 	cfg.Harnesses = map[string]config.HarnessConfig{
-		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json", Model: "opencode-go/deepseek-v4-flash"},
+		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json", Model: config.ModelRoutes{"opencode-go/deepseek-v4-flash"}},
 	}
 	d := NewMulti(cfg, review, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
 	d.newAdapter = func(name string) (harness.Adapter, error) {
@@ -51,6 +52,11 @@ func mixedDriver(t *testing.T, impl, review *fakeAdapter) *Driver {
 		return nil, errors.New("no adapter " + name)
 	}
 	openTestStateDir(t, d)
+	// The implement phase's evidence gate (CLA-457) needs a working tree to
+	// search and a verifier; stub both the way phaseDriver does, so the mixed
+	// tests' checkpointed fixtures advance as before.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
 	return d
 }
 
@@ -69,10 +75,14 @@ func TestDrainPhases_EachPhaseSpawnsItsOwnHarness(t *testing.T) {
 	}
 	// And the handoff still works ACROSS the harness boundary: the review session
 	// is seeded with the claim the implement session left held, which is what lets
-	// it resume the run instead of claiming a task of its own.
+	// it resume the run instead of claiming a task of its own. Since CLA-457 the
+	// seeded claim also carries the VERIFIED branch the seam folded onto it, so the
+	// review phase knows which branch to work in.
 	got := review.invocations[0]
-	if got.ResumeClaim != openClaim() {
-		t.Errorf("the review phase's ResumeClaim = %+v, want the implement phase's claim — a claim is plane state and crosses harnesses freely", got.ResumeClaim)
+	want := openClaim()
+	want.Branch = "clanker/x"
+	if got.ResumeClaim != want {
+		t.Errorf("the review phase's ResumeClaim = %+v, want the implement phase's claim with the verified branch folded on (%+v) — a claim is plane state and crosses harnesses freely", got.ResumeClaim, want)
 	}
 	if !strings.Contains(got.Prompt, openClaim().RunID) {
 		t.Errorf("the review phase's prompt did not get the run id substituted: %q", got.Prompt)
@@ -121,7 +131,7 @@ func TestInvocationFor_TiersResolveOnThePhasesOwnHarness(t *testing.T) {
 	d.cfg.Models = map[string]string{"strong": "claude-opus-5"}
 	d.cfg.Harnesses["opencode"] = config.HarnessConfig{
 		ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json",
-		Models: map[string]string{"strong": "opencode-go/deepseek-v4-flash"},
+		Models: map[string]config.ModelRoutes{"strong": {"opencode-go/deepseek-v4-flash"}},
 	}
 	d.cfg.Phases[0].Tier = "strong"
 	d.cfg.Phases[1].Tier = "strong"
@@ -196,5 +206,73 @@ func TestSupervisedWait_ProbesThePhasesOwnHarness(t *testing.T) {
 	}
 	if review.probeCalls != 0 {
 		t.Errorf("the claude adapter was probed %d time(s) for a limit opencode hit — a limit is one account's, and a probe is a real paid session", review.probeCalls)
+	}
+}
+
+// CLA-631: the same routing on the RESUMED arm of that wait. A rolling limit
+// that ends a resumed phase's sequence still owes the run its wait, and the
+// wait's probes must run on the harness that hit the limit, never the run's
+// default and never the first phase's, because a limit is one provider's
+// account and a probe is a real paid session. The harnesses are INVERTED from
+// mixedDriver on purpose: the resumed phase that hits the limit (review) runs
+// on opencode, off the driver's default, so a regression that probed the
+// driver's own adapter — or resolved the adapter for the wrong phase — answers
+// to this test and to the sibling above, whose limited phase is the first one.
+// Every CLA-631 test in phases_test.go drives a single adapter, so neither pin
+// could come from there. The wait's probe spend is the drain's spend, not a
+// separate figure (CLA-287), so the drain's returned totals are pinned too.
+func TestSupervisedWait_ResumedPhaseLimitProbesThePhasesOwnHarness(t *testing.T) {
+	impl := &fakeAdapter{steps: []invokeStep{{res: checkpointed(10, 0.50)}}} // claude: the driver's own, never limited
+	review := &fakeAdapter{                                                  // opencode: the resumed phase, the one the cap closes
+		steps:        []invokeStep{{res: held(limitResult(), openClaim())}},
+		probeTokens:  3,
+		probeCost:    0.25,
+		limitResetAt: time.Now().Add(2 * time.Hour),
+	}
+	cfg := fastCfg()
+	cfg.Prompt = ""
+	cfg.Model = "claude-opus-5"
+	cfg.ConfigDir = "/home/me/.claude"
+	cfg.MCPConfigPath = "/repo/.mcp.json"
+	cfg.SettingsPath = "/home/me/headless.json"
+	cfg.Phases = []config.Phase{
+		{Name: "implement"},
+		{Name: "review", Harness: "opencode"},
+	}
+	cfg.Harnesses = map[string]config.HarnessConfig{
+		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json", Model: config.ModelRoutes{"opencode-go/deepseek-v4-flash"}},
+	}
+	d := NewMulti(cfg, impl, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
+	d.newAdapter = func(name string) (harness.Adapter, error) {
+		if name == "opencode" {
+			return namedFake{review, "opencode"}, nil
+		}
+		return nil, errors.New("no adapter " + name)
+	}
+	openTestStateDir(t, d)
+	// The implement phase's evidence gate (CLA-457) needs a working tree to
+	// search and a verifier; stub both the way mixedDriver does, so the
+	// checkpointed fixture advances.
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+
+	tokens, cost, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if review.probeCalls == 0 {
+		t.Error("the resumed opencode phase hit a rolling limit and its adapter was never probed — the wait must poll the account the cap closed")
+	}
+	if impl.probeCalls != 0 {
+		t.Errorf("the claude adapter was probed %d time(s) for an opencode limit — a limit is one account's, and a probe is a real paid session", impl.probeCalls)
+	}
+	if impl.invokeCalls != 1 || review.invokeCalls != 1 {
+		t.Errorf("implement ran %d session(s) and review %d, want one each — a resumed phase's limit ends the sequence; neither phase re-spawns", impl.invokeCalls, review.invokeCalls)
+	}
+	if tokens != 13 {
+		t.Errorf("tokens = %d, want 13 (10 implement + 3 probe) — the wait's probe spend is the drain's spend, not a separate figure nothing measures", tokens)
+	}
+	if cost != 0.75 {
+		t.Errorf("cost = %v, want 0.75 ($0.50 implement + $0.25 probe)", cost)
 	}
 }

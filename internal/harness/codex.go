@@ -86,15 +86,28 @@ func codexArgs(in Invocation) []string {
 	return append(args, "--", in.Prompt)
 }
 
+// env builds the child environment. Split out of Invoke - where it was three
+// inline lines - so this adapter's environment is testable the way claude's and
+// opencode's already were, which is what the CLA-441 PWD pin is asserted
+// against: a fix "every adapter" has to carry needs every adapter's env to be
+// reachable from a test.
+func (c codex) env(in Invocation) []string {
+	// Pin the child's PWD to the directory Invoke sets as cmd.Dir, dropping the
+	// daemon's inherited value - see pinPWD. Applied to the INHERITED
+	// environment, before in.Env, so an explicit caller value still wins.
+	env := append(pinPWD(inheritEnv(os.Environ(), in.EnvAllowlist), in.WorkDir), in.Env...)
+	if in.ConfigDir != "" {
+		env = append(env, "CODEX_HOME="+in.ConfigDir)
+	}
+	return env
+}
+
 func (c codex) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	cmd := exec.CommandContext(ctx, "codex", codexArgs(in)...)
 	if in.WorkDir != "" {
 		cmd.Dir = in.WorkDir
 	}
-	cmd.Env = append(os.Environ(), in.Env...)
-	if in.ConfigDir != "" {
-		cmd.Env = append(cmd.Env, "CODEX_HOME="+in.ConfigDir)
-	}
+	cmd.Env = c.env(in)
 
 	// Parse as the stream arrives, retain only a bounded tail of it for the text
 	// scans, and tee live to the console when one is set (the JSONL event stream —
@@ -230,6 +243,17 @@ func (p *codexParse) finish(res *Result) {
 	if p.sawUsage {
 		// Exclude cached input (discounted reads); reasoning counts as output spend.
 		res.Tokens = p.in + p.out + p.reason
+		// The normalised breakdown (CLA-691). codex's counters are INCLUSIVE —
+		// cached_input_tokens is a subset of input_tokens, reasoning_output_tokens
+		// a subset of output_tokens — so the subsets are subtracted out to leave
+		// buckets that are disjoint (see Usage's own comment). Copying them
+		// field-for-field would double count both.
+		res.Usage = TokenUsage{
+			Input:     max(0, p.in-p.cached),
+			Output:    max(0, p.out-p.reason),
+			Reasoning: p.reason,
+			CacheRead: p.cached,
+		}
 		res.Raw = map[string]any{
 			"input_tokens": p.in, "cached_input_tokens": p.cached,
 			"output_tokens": p.out, "reasoning_output_tokens": p.reason,

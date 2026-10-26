@@ -205,8 +205,8 @@ func TestDrainPhases_AHandoffDuringReviewCarriesTheTerminalStepForward(t *testin
 		t.Fatalf("spawned %d sessions, want 3: implement, review, review's handoff successor", h.invokeCalls)
 	}
 	successor := h.invocations[2].Prompt
-	if !strings.Contains(successor, "update_task(taskId, runId, status: \"in_review\"") {
-		t.Errorf("the review phase's handoff successor lost the terminal update_task step: %q", successor)
+	if !strings.Contains(successor, "submit_for_review(taskId, runId, outcome:") {
+		t.Errorf("the review phase's handoff successor lost the terminal hand-off step: %q", successor)
 	}
 	if !strings.Contains(successor, "PR") || !strings.Contains(successor, "staging") {
 		t.Errorf("the review phase's handoff successor lost the PR-targeting-staging step: %q", successor)
@@ -219,7 +219,7 @@ func TestDrainPhases_AHandoffDuringReviewCarriesTheTerminalStepForward(t *testin
 // CLA-353 review finding: HandoffContinuation matches on phase NAME alone, so
 // without this gate an operator who reuses the name "review" for a phase
 // carrying their own custom Prompt would get the shipped brief's terminal step
-// (its own update_task/PR contract) force-injected into a handoff respawn of a
+// (its own hand-off/PR contract) force-injected into a handoff respawn of a
 // brief that never established that contract — clashing with whatever terminal
 // step, if any, the operator's own prompt names. Only a phase actually running
 // the BUILT-IN brief (no configured Prompt of its own) may carry it forward.
@@ -237,7 +237,7 @@ func TestDrainPhases_ACustomPromptNamedReviewGetsNoInjectedTerminalStep(t *testi
 		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
 	}
 	successor := h.invocations[1].Prompt
-	if strings.Contains(successor, "update_task(taskId, runId, status: \"in_review\"") {
+	if strings.Contains(successor, "submit_for_review(taskId, runId, outcome:") {
 		t.Errorf("a phase named %q running its OWN custom prompt got the shipped review brief's terminal step force-injected on handoff: %q", "review", successor)
 	}
 	if handoffs != 1 {
@@ -349,6 +349,9 @@ func TestDrainPhases_AHandoffCountsAgainstMaxIterations(t *testing.T) {
 		}
 		if len(rel.calls) != 0 {
 			t.Errorf("the driver released a claim holding pushed work %+v — the takeover hand-off would be lost: %+v", res.Claim, rel.calls)
+		}
+		if len(rel.expireCalls) != 1 {
+			t.Errorf("the driver ended the lease %d time(s), want once — CLA-708 turns the wait into an immediate takeover: %+v", len(rel.expireCalls), rel.expireCalls)
 		}
 	})
 	t.Run("one iteration of headroom buys exactly one respawn", func(t *testing.T) {

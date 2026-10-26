@@ -1,0 +1,139 @@
+package harness
+
+import (
+	"bufio"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+// fakeMCPDirEnv switches the test binary into a fake stdio MCP server instead
+// of running tests. The opencode conformance suite points an MCP config's
+// `command` at this binary with the variable set, so the fake needs nothing
+// installed beyond Go (no python, no node).
+const fakeMCPDirEnv = "CLANKERBAR_FAKE_MCP_DIR"
+
+// fakeMCPPadEnv pads the fake's claim_task result with a decisions block of
+// that many bytes, to push it past opencode's 51,200-byte truncation.
+const fakeMCPPadEnv = "CLANKERBAR_FAKE_MCP_PAD"
+
+func TestMain(m *testing.M) {
+	if dir := os.Getenv(fakeMCPDirEnv); dir != "" {
+		runFakeMCP(dir)
+		os.Exit(0)
+	}
+	// The suite must not inherit the opencode environment of the session that
+	// happens to be running it: OPENCODE_CONFIG / OPENCODE_CONFIG_DIR then name
+	// a real config whose clankerbar server the ambient-layer preflight would
+	// correctly wait for, but which no test's fake `opencode` script serves.
+	// Conformance tests hand their own values in Invocation.Env, which wins.
+	for _, k := range []string{"OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION"} {
+		os.Unsetenv(k)
+	}
+	// The conformance suite execs the opencode 2.x binary through the real
+	// adapter, which runs whatever `opencode` PATH resolves. PATH is set here,
+	// once, rather than per test with t.Setenv, so the slow error cases can run
+	// in parallel.
+	if os.Getenv(conformanceEnv) != "" {
+		if bin := conformanceBin(); bin != "" {
+			os.Setenv("PATH", filepath.Dir(bin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+		}
+	}
+	// The MCP preflight resolves opencode's ambient config layers when an
+	// invocation names no MCP config (CLA-703 review). Without isolation this
+	// suite would read the DEVELOPER's own ~/.config/opencode and behave
+	// differently depending on whether that file declares a clankerbar server.
+	// Point the default global config dir at an empty temp dir; a test that
+	// wants an ambient layer sets its own XDG_CONFIG_HOME or ConfigDir.
+	iso, err := os.MkdirTemp("", "clankerbar-harness-config-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "harness tests: cannot isolate XDG_CONFIG_HOME:", err)
+		os.Exit(1)
+	}
+	os.Setenv("XDG_CONFIG_HOME", iso)
+	code := m.Run()
+	os.RemoveAll(iso)
+	os.Exit(code)
+}
+
+// runFakeMCP serves newline-delimited JSON-RPC on stdin/stdout: initialize,
+// tools/list (claim_task, get_backlog_summary) and tools/call. claim_task
+// answers with the task/run ids the claim observer reads, and every call is
+// appended to calls.jsonl in dir so a test can see what reached the server.
+func runFakeMCP(dir string) {
+	tools := []map[string]any{
+		{"name": "claim_task", "description": "Claim a task", "inputSchema": map[string]any{
+			"type": "object", "properties": map[string]any{"taskId": map[string]any{"type": "string"}}, "required": []string{"taskId"},
+		}},
+		{"name": "get_backlog_summary", "description": "Summary", "inputSchema": map[string]any{"type": "object", "properties": map[string]any{}}},
+	}
+	// Record that the server was started at all, for the tests that check a
+	// disabled server stays off.
+	if f, err := os.OpenFile(filepath.Join(dir, "starts"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+		f.WriteString("start\n")
+		f.Close()
+	}
+	out := bufio.NewWriter(os.Stdout)
+	send := func(v any) {
+		b, _ := json.Marshal(v)
+		out.Write(append(b, '\n'))
+		out.Flush()
+	}
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 1<<20), 1<<24)
+	for sc.Scan() {
+		var msg struct {
+			ID     json.RawMessage `json:"id"`
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		if json.Unmarshal(sc.Bytes(), &msg) != nil {
+			continue
+		}
+		reply := func(result any) {
+			send(map[string]any{"jsonrpc": "2.0", "id": msg.ID, "result": result})
+		}
+		switch msg.Method {
+		case "initialize":
+			var p struct {
+				ProtocolVersion string `json:"protocolVersion"`
+			}
+			json.Unmarshal(msg.Params, &p)
+			if p.ProtocolVersion == "" {
+				p.ProtocolVersion = "2024-11-05"
+			}
+			reply(map[string]any{
+				"protocolVersion": p.ProtocolVersion,
+				"capabilities":    map[string]any{"tools": map[string]any{}},
+				"serverInfo":      map[string]any{"name": "fake-clankerbar", "version": "0.0.1"},
+			})
+		case "tools/list":
+			reply(map[string]any{"tools": tools})
+		case "tools/call":
+			var p struct {
+				Name      string         `json:"name"`
+				Arguments map[string]any `json:"arguments"`
+			}
+			json.Unmarshal(msg.Params, &p)
+			if f, err := os.OpenFile(filepath.Join(dir, "calls.jsonl"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+				f.Write(append(msg.Params, '\n'))
+				f.Close()
+			}
+			text := `{"summary":"empty"}`
+			if p.Name == "claim_task" {
+				pad, _ := strconv.Atoi(os.Getenv(fakeMCPPadEnv))
+				text = fmt.Sprintf(`{"task":{"id":%q,"ref":"CLA-1"},"run":{"id":"run-1"},"decisions":[{"id":"d0","body":%q}]}`,
+					p.Arguments["taskId"], strings.Repeat("x", pad))
+			}
+			reply(map[string]any{"content": []map[string]any{{"type": "text", "text": text}}})
+		default:
+			if len(msg.ID) > 0 {
+				reply(map[string]any{})
+			}
+		}
+	}
+}

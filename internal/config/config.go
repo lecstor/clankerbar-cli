@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/secureurl"
@@ -30,6 +31,12 @@ import (
 // the only host the account-scoped API key is sent to unless the operator names
 // another one in their own config file.
 const defaultBacklogURL = "https://clankerbar.com"
+
+// DefaultCloneURLBase is the URL prefix the fleet's derived clones are made
+// from when the operator sets no clone_url_base: <base><owner>/<name>.git.
+// Keeping the default HTTPS is deliberate — a config that says nothing about
+// the clone transport keeps the behaviour it had before the key existed.
+const DefaultCloneURLBase = "https://github.com/"
 
 // defaultPrompt asks each session for exactly ONE task.
 //
@@ -74,6 +81,24 @@ const DefaultMaxTurns = 400
 // if a harness of yours legitimately dies silently more often than that.
 const DefaultMaxZeroSpendAttempts = 3
 
+// DefaultMaxRepeatedToolFailures is how many CONSECUTIVE calls of one tool may
+// return the same error before the harness kills the session (see
+// Config.MaxRepeatedToolFailures, CLA-739).
+//
+// 5 because the measured loop is nothing like the ordinary shape. The incident
+// sessions made 65 to 316 identical refused calls each; a working session that
+// trips over the same refusal retries it once or twice and moves on. And the
+// largest legitimate run of identical failures in that incident's own logs was
+// 4: a session refused `external_directory` on four shell calls in a row, which
+// then recovered and carried on. So 5 sits just above what a session that is
+// still working does, and every call past it re-sends the whole context.
+const DefaultMaxRepeatedToolFailures = 5
+
+// MaxInstanceNameLen is the plane's cap on a daemon instance name (CLA-465's
+// report bounds): longer names are refused by Validate rather than beached as
+// silently-dropped beacons.
+const MaxInstanceNameLen = 100
+
 // The built-in phase names, as constants because Validate reasons about them: a
 // sequence that ENDS on the implement brief can never reach review. Exported so
 // the driver can name the implement phase for the fleet dead-phase counter
@@ -82,7 +107,68 @@ const DefaultMaxZeroSpendAttempts = 3
 const (
 	ImplementPhaseName = "implement"
 	ReviewPhaseName    = "review"
+	// FixPhaseName is the phase that APPLIES a review's findings. It is a
+	// separate name from ReviewPhaseName on purpose: the review phase's terminal
+	// step (PR, in_review) is injected by name, so a fix phase that reused the
+	// name would inherit review-only or review-and-fix wording it did not ask
+	// for. See reviewOnlyTerminalStep and the built-in briefs below.
+	FixPhaseName = "fix"
+	// VerifyPhaseName is the fix-verification round (CLA-638): it re-reviews the
+	// fix delta, adjudicates the prior round's open MUSTs by their plane finding
+	// ids, and carries the terminal step only when no MUST remains open. It is a
+	// review-shaped phase — it writes a sealed durable review record like the
+	// review gate — and it must be the LAST phase of the sequence, because the
+	// driver repeats the fix→verify pair after it until a round finds no open
+	// MUST or the round cap parks the task.
+	VerifyPhaseName = "verify"
 )
+
+// ReviewRoundCap is the hard round cap per review cycle (B8): a human verdict
+// starts a new cycle, a takeover or reclaim does not, and a void round does not
+// count. The plane derives the count from its non-void records and serves it as
+// `reviews.counted`; the driver refuses to spawn another fix after the third
+// round. It is a constant rather than a config knob on purpose: "never one more
+// round" is the stopping rule, not a tuning dial, and a config value of 0 would
+// be a sequence with no bound at all.
+const ReviewRoundCap = 3
+
+// The review panel (CLA-639, design §5.4 / A4 / B10). When a config SETS
+// `review_panel`, each built-in review phase expands into ONE review phase PER
+// MEMBER, run against the same reviewed tip, each writing its own sealed durable
+// record under its own reviewer role (`review-1`..`review-N`, by member
+// position). The members run concurrently by default, in private detached
+// worktrees; see ReviewPanelConcurrency. The round closes only once every member has recorded or been
+// recorded as failed — a sealed round is what keeps a later member from reading
+// an earlier member's findings, and a usage-limited or dead member therefore does
+// not stop the round.
+//
+// OPT-IN, and shipped with NO model-naming default and NO preset: the CLI cannot
+// know which harnesses, providers or models an operator has, so it never names
+// one (decision a0b1373b, superseding the trial panel of c8e7509a). A config
+// that sets no panel runs its one review phase as it always has — the historical
+// brief, the historical `review-1` role, the legacy fix path, byte for byte. See
+// Config.ReviewPanel.
+//
+// INTERIM, deliberately (B10): task-state-machine build phase 4 removes phase
+// logic from the CLI and routes findings as an `agent_review -> implementing`
+// plane transition, and panel membership becomes PLANE phase state (that is the
+// CLA-454 reshape). Until then the panel is local config and the members run
+// CONCURRENTLY by default (CLA-697), each in its own detached worktree at the
+// reviewed tip; `review_panel_concurrency: 1` restores the sequential sequence
+
+// PanelMemberLabel is the LOG LABEL of the member at position i: the name the
+// operator gave it, or the deterministic `review-<i+1>` derived from its
+// position. It names the member in daemon logs and iteration-log filenames; it
+// is NOT the reviewer role the durable record is keyed on. Roles are positional
+// (review-1..review-N), derived from the effective sequence by the driver, so
+// naming a member cannot change which record it writes or which record the seam
+// gate matches (CLA-639).
+func PanelMemberLabel(members []ReviewPanelMember, i int) string {
+	if i >= 0 && i < len(members) && strings.TrimSpace(members[i].Name) != "" {
+		return strings.TrimSpace(members[i].Name)
+	}
+	return "review-" + strconv.Itoa(i+1)
+}
 
 // Phase is one session in a task's sequence. A task runs as an ordered list of
 // them, each a separate harness process, so context resets between them.
@@ -169,6 +255,34 @@ type Phase struct {
 	// assignment.
 	Tier string `json:"tier"`
 
+	// Model pins this phase's session to a model alias directly, skipping the
+	// tier map. It is an operator-facing key (operator decision 3eddb7a5) on
+	// both the local file and the plane's stored document (CLA-598, mirrored by
+	// the plane in CLA-722), and it is what lets a REVIEW PANEL read as the
+	// harness/model pairs the operator wrote — see ReviewPanelMember, whose
+	// expansion sets it too. Empty = fall through to Tier, then the harness's
+	// default: an untouched config's resolution is unchanged.
+	//
+	// Unlike Tier it is an ALIAS, never a bucket name — the panel entries and the
+	// documented config examples name `opencode-go/gpt-6-luna` and friends, not a
+	// policy word. The two are deliberately not merged: keeping them apart is
+	// what makes a typo visible as a model the provider refuses, rather than a
+	// bucket that silently resolves to the harness default. A CONFIGURED phase
+	// sets one of them, not both (Validate refuses both, so which one wins is
+	// never ambiguous); a panel MEMBER may set both, and expansion lets the
+	// alias win, exactly as before.
+	//
+	// It carries an ordered ROUTE LIST since CLA-782: a plain string is the
+	// historical shape, and an array names the free route first and its paid
+	// fallback after it. The session starts on the first route and the opencode
+	// adapter may resume it on the next one when a provider usage limit denies
+	// the first; ModelForPhase still reports the first route, so a single-route
+	// (or string) phase resolves exactly as it did before.
+	//
+	// `omitempty` is load-bearing: Config.Identity() hashes the marshalled
+	// config, so an unset model must not add a key and move every identity.
+	Model ModelRoutes `json:"model,omitempty"`
+
 	// Harness selects which coding-agent CLI runs this phase. Empty = the
 	// run-wide Config.Harness, so an untouched config runs every phase on one
 	// harness exactly as before.
@@ -188,6 +302,89 @@ type Phase struct {
 	// That is what Config.Harnesses is for, and why Validate refuses a phase
 	// naming a harness with no block of its own.
 	Harness string `json:"harness"`
+
+	// PanelMember marks this phase as one reviewer of an expanded review panel
+	// (CLA-639). It is set by EffectivePhases and NOT a config key: the operator
+	// writes the panel, not its expansion, and a config that names a dozen
+	// review phases by hand is a different thing (no panel) that the driver must
+	// not mistake for one. Read through Phase.IsPanelMember.
+	PanelMember bool `json:"-"`
+
+	// PanelOptional marks this panel member as a TRIAL seat (CLA-784): the
+	// operator's ReviewPanelMember.Optional, carried onto the expanded phase so
+	// the driver can tell a seat the panel relies on from one it is evaluating.
+	// Like PanelMember it is set by EffectivePhases and NOT a config key, so it
+	// is invisible to Config.Identity(). Read through Phase.IsOptionalPanelMember.
+	PanelOptional bool `json:"-"`
+
+	// sourceIdx is the index in Config.Phases this phase was resolved from. It
+	// equals the position for every phase except an expanded panel member, whose
+	// source is the single `review` the operator wrote. Read through
+	// Phase.ConfiguredIndex; zero-value use (a Phase built by hand) is its own
+	// index, which is what all of them were before the panel existed.
+	sourceIdx int
+}
+
+// ConfiguredIndex is the index, in Config.Phases, of the phase the operator
+// actually wrote for this one. It differs from the effective position only for
+// an expanded review-panel member: every member reports the single `review`
+// phase it came from. The driver reads a phase's CONFIGURED prompt through it —
+// a handoff continuation must match the brief the operator asked for, not the
+// member's resolved copy of it.
+func (p Phase) ConfiguredIndex() int { return p.sourceIdx }
+
+// ReviewPanelMember is one reviewer in a review panel (CLA-639): a
+// driver-spawned review phase of its own, on its own harness and model, run
+// against the same reviewed tip as its siblings.
+//
+// A member is NOT a session: the driver still runs one review phase per member,
+// concurrently up to Config.ReviewPanelConcurrency, and each writes its own
+// sealed durable record under its own reviewer role (see Config.ReviewPanel).
+// Two entries naming the same harness/model are two INDEPENDENT REVIEWS of the
+// same revision — never a mistake to be deduplicated.
+type ReviewPanelMember struct {
+	// Name is the member's LOG LABEL only. Empty = the driver derives it from
+	// the member's position: `review-1` .. `review-N`. It names the member in
+	// daemon logs and iteration-log filenames; it is NOT the reviewer role the
+	// durable record is keyed on. The role is always positional (`review-N`,
+	// counted over the review-shaped phases of the sequence), so naming a member
+	// cannot change which record it writes or which record the seam gate matches,
+	// and a resumed or retried round maps a member to the same record either way.
+	Name string `json:"name"`
+
+	// Harness is the coding-agent CLI this member reviews on. Empty = the review
+	// phase's own harness (which is itself the run-wide one when unset), so a
+	// panel that names only models inherits the sequence's review harness.
+	Harness string `json:"harness"`
+
+	// Model pins this member's model alias, exactly as Phase.Model does — including
+	// the ordered route-list form (CLA-782). Empty = the review phase's own model
+	// (then its tier, then the harness default).
+	Model ModelRoutes `json:"model"`
+
+	// Tier resolves this member's model through the harness's tier map, for an
+	// operator who keeps policy in buckets. Model wins when both are set: an
+	// alias is the more specific statement.
+	Tier string `json:"tier"`
+
+	// Optional marks a TRIAL seat: a reviewer the operator added to evaluate,
+	// not one the panel relies on (CLA-784). An optional member runs and records
+	// exactly like any other, but its failure is that member's own result and
+	// nothing more: whatever its session ends in — a transient blip, a usage
+	// limit, a stop, a death, a tool-loop kill, a setup error — it does not end
+	// the sequence, does not hand the panel's shared claim back, and does not
+	// trigger the run's limit wait. The required members' records still close the
+	// round and spawn the fix; a round where ONLY optional members recorded is no
+	// review at all, and no fix runs.
+	//
+	// Default false, and `omitempty` is load-bearing: Config.Identity() hashes the
+	// marshalled form, so a panel that does not write the key must hash exactly
+	// what it hashed before the field existed (a trial seat is a deliberate
+	// change to the panel, and the identity moving with it is correct).
+	//
+	// Validate refuses a panel whose members are ALL optional: with no required
+	// seat there is no review a round could ever be said to have produced.
+	Optional bool `json:"optional,omitempty"`
 }
 
 // HarnessConfig is one harness's own invocation fields, for a run whose phases
@@ -206,15 +403,17 @@ type Phase struct {
 // which the adapter falls back on and `doctor` can talk about.
 type HarnessConfig struct {
 	// Model is this harness's default model alias, and the fallback its tiers
-	// resolve to. Empty = the harness's own default.
-	Model string `json:"model"`
+	// resolve to. Empty = the harness's own default. It accepts the ordered
+	// route-list form (CLA-782): free route first, paid fallback after it.
+	Model ModelRoutes `json:"model"`
 
 	// Models is this harness's tier map (bucket name -> model alias), the
 	// per-harness twin of Config.Models. A phase's Tier resolves against the map
 	// belonging to the harness that phase runs on, because a bucket NAME is
 	// portable across harnesses and the alias inside it is not — which is what
-	// lets one `"tier": "strong"` mean opus here and something else there.
-	Models map[string]string `json:"models"`
+	// lets one `"tier": "strong"` mean opus here and something else there. Each
+	// bucket's value also accepts the ordered route-list form (CLA-782).
+	Models map[string]ModelRoutes `json:"models"`
 
 	// ConfigDir pins this harness's config dir (CLAUDE_CONFIG_DIR /
 	// OPENCODE_CONFIG_DIR / CODEX_HOME) so a headless session loads the same
@@ -229,6 +428,19 @@ type HarnessConfig struct {
 	// SettingsPath is the extra settings file (Claude Code's --settings) carrying
 	// the headless permission policy. Claude-specific; other adapters ignore it.
 	SettingsPath string `json:"settings_path"`
+
+	// Env is this harness's own extra session environment, overlaid ON TOP of the
+	// top-level env map (per-key winner) — see Config.Env for what the map holds.
+	// Unlike the fields above it does NOT inherit the top-level value only for the
+	// run-wide harness: environment is not dialect-shaped, so every layer of the
+	// overlay applies to every harness, with SessionEnv stacking them in
+	// most-specific-wins order.
+	Env EnvMap `json:"env"`
+
+	// EnvAllowlist is this harness's inherited-env allowlist, replacing the
+	// top-level one wholly for sessions on THIS harness — see Config.EnvAllowlist
+	// for the semantics, the composition rule and the minimum `doctor` enforces.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
 }
 
 // Empty reports whether this block declares nothing at all — the shape that is
@@ -236,7 +448,7 @@ type HarnessConfig struct {
 // same reason. Written out rather than compared against the zero value because
 // the Models map makes the struct incomparable.
 func (h HarnessConfig) Empty() bool {
-	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == ""
+	return h.Model.Empty() && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0 && len(h.EnvAllowlist) == 0
 }
 
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
@@ -288,42 +500,543 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 // arguments, and comes last, did not fail once over the same evening. So this is
 // written in that shape and pinned to that place.
 //
-// CLA-353: the terminal sequence is push, then open a PR, then update_task - in
+// CLA-353: the terminal sequence is push, then open a PR, then the hand-off - in
 // that order, and now all three live here rather than "push" sitting one sentence
 // earlier. An overnight forensic drain found `gh pr create` appearing ZERO times
 // across four review-phase transcripts, and two tasks committed straight onto
 // `staging` because a session's cwd was already sitting there and nothing told it
 // that was wrong - so a task closed at in_review with no PR, and the close-out
 // flow's "merge its PR into staging" had nothing to merge. CLA-384 made
-// update_task the phase's emphatic final call, which if the PR step were bolted on
+// the hand-off the phase's emphatic final call, which if the PR step were bolted on
 // earlier would make it LESS likely to survive, not more - a step mentioned before
 // an emphatic final call loses to it. So the PR step is folded into this same
-// terminal block, before the update_task sentence, not left in the paragraph above.
-const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's integration " +
-	"branch (staging) if no PR exists yet for this branch - push, then the PR, in that order, before the " +
+// terminal block, before the hand-off sentence, not left in the paragraph above.
+//
+// CLA-608: the target was the literal "(staging)" here and in the never-commit
+// rule below. Neither read the config nor the task's repo, so every task in a
+// repo with no staging branch (the makesPDF plugins; lecstor/makespdf, whose
+// PRs target integration) was told to open its PR against a branch that does
+// not exist. The target is now {{prBase}}, resolved per repo by the driver.
+const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
+	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
 	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
-	"update_task(taskId, runId, status: \"in_review\", outcome: ...), where the outcome MUST carry a " +
+	"submit_for_review(taskId, runId, outcome: ...), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
 	"session that leaves it out has not handed anything over. Ending this session while you still hold the " +
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
+// reviewOnlyTerminalStep ends the review-only phase. It is the counterpart of
+// reviewTerminalStep for a phase that must NOT fix, commit, push, open a PR or
+// hand the task to in_review: the review is a checkpoint, and the next (fix)
+// phase resumes the same run from the branch the implement phase recorded.
+//
+// The review's FINDINGS are the deliverable, and they are recorded on the task
+// with record_progress(outcome: ...) — the plane's one owner of the statusless
+// outcome write. That keeps the record durable across the seam, readable by the
+// fix phase's get_task, and attributed to the run that wrote it. A file in the
+// worktree was rejected: it is invisible to the plane, dies with the worktree,
+// and cannot be read from another machine.
+const reviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE TASK " +
+	"in BOTH forms the shape above prescribes, in that order - FIRST the legacy outcome block with " +
+	"record_progress(taskId, runId, outcome: ...), THEN the sealed durable record with " +
+	"record_review(taskId, runId, {...}). The durable record is the driver's seam evidence; the block is " +
+	"the one-release compatibility copy. This is a CHECKPOINT, not a hand-off: " +
+	"keep holding the task - do NOT release it, do NOT move it to in_review, and do NOT COMMIT, PUSH or open a " +
+	"PR. The driver checkpoints on the branch the implement phase recorded, and the phase after you resumes " +
+	"this same run from it. Ending this session after recording the review is this phase " +
+	"FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
+
+// panelMemberTerminalStep ends a PANEL MEMBER's phase (CLA-639 M5). It is
+// reviewOnlyTerminalStep with the legacy outcome write REMOVED, not moved: the
+// member's only task write is the durable record, and the member after it must
+// not be able to read this member's findings through the task's outcome. A
+// session told to write both would have its outcome write refused by the plane
+// (the round is sealed the moment the record lands, CLA-636 B3) and could
+// easily read that refusal as the phase failing.
+const panelMemberTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
+	"TASK in the ONE form the shape above prescribes - the sealed durable record with " +
+	"record_review(taskId, runId, {...}) - and write NOTHING ELSE on the task: do NOT call record_progress with an outcome, do not write " +
+	"an outcome of your own, and do not touch the task's status or body. That is a CHECKPOINT, not a hand-off: " +
+	"keep holding the task - do NOT release it, do NOT move it to in_review, and do NOT COMMIT, PUSH or open a " +
+	"PR. The driver checkpoints on the branch the implement phase recorded, and the phase after you (the next " +
+	"panel member, or the fix phase) resumes this same run from it. Ending this session after recording the " +
+	"review is this phase FINISHING, not the task being abandoned. The ONLY exception is a declared handoff."
+
+// reviewRecordOutcomeShape is the LEGACY half of the review record: the
+// `## Review` block appended to the task's outcome. It is kept for one release
+// (CLA-637), so older planes and readers still find a review where they expect
+// one, while the durable per-reviewer record below is what the driver's seam
+// gate reads.
+//
+// It is a SHAPE, not a grade: the fix phase reads it back by finding ID, and
+// the driver still parses it (reviewFindingsDigest in internal/loop) when a
+// durable record is unavailable, so the severity bracket and the
+// `(<kind>): <evidence>` prefix after it are load-bearing.
+//
+// It APPENDS below the outcome as it stands. The plane's statusless outcome is
+// a full replacement, and the outcome may already carry phase 1's delivery
+// record (or, on a request_changes re-trip or a takeover, an earlier trip's
+// round); writing a fresh block over it would lose that record. The fix phase
+// keeps everything above the block for the same reason.
+const reviewRecordOutcomeShape = " THE REVIEW RECORD IS THE DELIVERABLE. First get_task and read the outcome as it " +
+	"stands: a statusless record_progress outcome replaces the WHOLE field, so preserve it. Record the LEGACY block " +
+	"with record_progress(taskId, runId, outcome: ...) by copying the existing outcome's text unchanged, then " +
+	"APPENDING, below it, a compact block in exactly this shape: a `" + ReviewRecordHeading + "` heading; then " +
+	"`- reviewed tip: <the SHA you actually reviewed>`; `- implemented by: harness " + PhasePrevHarnessPlaceholder +
+	", model " + PhasePrevModelPlaceholder + "`; `- reviewed by: harness " + PhaseHarnessPlaceholder + ", model " +
+	PhaseModelPlaceholder + "`; `- verdict: pass` or `- verdict: findings`; then a `### Findings` heading with " +
+	"one line per finding: `- R1 [must|should|nit]` followed, for a MUST, by ` (<kind>): <evidence>`, then " +
+	"` <file:line> - <what is wrong>. Required fix: <the smallest change that makes it right>.` Give every " +
+	"finding its own ID. If there are none, write `- none` under " +
+	"Findings and `verdict: pass`. Do not pad the list, and do not fix anything yourself - not even a typo: a " +
+	"fix applied here is a fix the next phase cannot attribute and may undo."
+
+// reviewRecordTipVerified tells the reviewer which commit the driver verified
+// and requires that exact tip in both halves of the record. Handing the SHA
+// over is not a shortcut around the check: the session must fetch and confirm
+// HEAD is that commit before reviewing, and the seam matches the recorded tip
+// against the origin tip the driver read.
+const reviewRecordTipVerified = " The driver verified the origin remote's tip for branch " + PhaseBranchPlaceholder +
+	" as `" + ReviewedTipPlaceholder + "`. Fetch and confirm the worktree is at that commit (`git rev-parse HEAD`) " +
+	"before you review, and record that SHA as `reviewedTip` in the durable record and on the block's " +
+	"`- reviewed tip:` line."
+
+// reviewRecordTipUnverified is the counterpart for a checkpoint the driver could
+// NOT verify against the origin remote (CLA-576): there is no driver-known tip,
+// so the reviewer establishes it itself, and the seam requires the record to
+// carry a non-empty tip rather than matching one it never had.
+const reviewRecordTipUnverified = " The driver could NOT verify the origin remote's tip, so there is no " +
+	"driver-verified tip to record: establish it yourself. Read the branch from the origin remote " +
+	"(`git ls-remote origin " + PhaseBranchPlaceholder + "`, or fetch it), check out the commit it names, review " +
+	"that revision, and record that SHA as `reviewedTip` in the durable record and on the block's " +
+	"`- reviewed tip:` line. If the branch is absent or the remote cannot be read, record the failed hand-off " +
+	"and end holding the task - do not invent a tip and do not review a phantom diff."
+
+// reviewRecordTipNone is the branchless counterpart: there is no branch and no
+// commit to review, and — per the operator's decision on question 03a12578,
+// option 1 — no durable record either. The plane accepts review writes only
+// from the task's LIVE holder: a settled task (phase 1's own session settled
+// it) refuses the append outright, and on a still-held no-code task it would
+// seal a round this variant's driver never closes, blocking the run's own
+// outcome writes. The legacy block IS this variant's record, and the driver's
+// seam gates on the block.
+const reviewRecordTipNone = " There is NO branch and NO tip to review: this record is about the PLANE'S RECORD of " +
+	"what phase 1 did. Write `- reviewed tip: none (no branch - the plane record was reviewed)` on the block's " +
+	"`- reviewed tip:` line. Do NOT append a durable review record: a settled task has no live holder to accept " +
+	"it, and on a still-held no-code task it would seal a round this variant never closes - the legacy block IS " +
+	"this variant's review record, and the driver gates the seam on it."
+
+// reviewRecordDurableShape is the durable half (CLA-637): one sealed
+// per-reviewer record per run, written through record_review. It is the
+// driver's seam evidence — round, role, run and reviewed tip are what the gate
+// matches — and per-finding `raisedByModel` is what the analytics need.
+//
+// ORDER IS LOAD-BEARING. While a run has a sealed record in an open round the
+// plane refuses that run's outcome, body and decision writes (CLA-636 B3), so
+// the legacy outcome block must be written FIRST. The driver closes the round
+// before spawning the fix phase, which releases the findings to it.
+const reviewRecordDurableShape = " THEN, and only after that outcome write has SUCCEEDED, append THIS run's durable " +
+	"review record with record_review(taskId, runId, {...}). This order is load-bearing: the plane seals the " +
+	"record's round, and a sealed record makes this run's outcome, body and decision writes illegal - so the legacy " +
+	"block above must already be on the task. The durable record is what the driver's review->fix seam checks; a " +
+	"missing or mismatched one means the fix phase does not spawn. Send exactly: reviewerRole: \"" +
+	ReviewerRolePlaceholder + "\" (this phase's role; the plane assigns the round and cycle from it), verdict: " +
+	"\"pass\" or \"findings\", harness: \"" + PhaseHarnessPlaceholder + "\", model: \"" + PhaseModelPlaceholder +
+	"\", branch: \"" + PhaseBranchPlaceholder + "\", reviewedTip as above, scope: {kind: \"full-diff\", base: \"" +
+	PhasePRBasePlaceholder + "\", range: \"" + PhasePRBasePlaceholder + "..<reviewedTip>\"} (the plane caps range at 100 " +
+	"characters, so never put the branch name there), and findings: one object per finding in the block, in " +
+	"the same order, at most 20 (the plane refuses a record with more: keep every MUST, then the most important " +
+	"of the rest, and say in the block how many you left out): {severity: \"must\" | \"should\" | \"nit\", " +
+	"evidenceKind: <the MUST's kind token>, evidence: <its payload>, file: <path>, line: <number>, kind: <short category>, summary: <what is " +
+	"wrong>, requiredFix: <the smallest fix>, raisedByModel: \"" + PhaseModelPlaceholder + "\"}. The plane assigns " +
+	"each finding's id (`<round>.<reviewer role>.<n>`); do NOT invent one - the fix phase updates by that id. A " +
+	"RETRY proves itself here: get_task before writing, and if a record for your reviewer role and THIS run is " +
+	"already there (records show the run id WITHOUT its secret: compare only the part of " + PhaseRunPlaceholder +
+	" before its first dot) in an open round, the record is written and its block landed before " +
+	"it (the plane seals the outcome once the record exists) - skip both writes and end. If instead the plane " +
+	"refuses the append with duplicate_reviewer, the same follows: a record for this role and round is already " +
+	"written, that refusal is the idempotency signal, and retrying it changes nothing. If there are no findings, " +
+	"send no findings (or an empty array), write `- none` under Findings, and verdict: pass."
+
+// reviewOnlyRecordShape is the verified review-only phase's full record
+// contract: the legacy outcome block, then the durable record. The driver
+// injected the phases' RESOLVED harness/model and the verified round, role and
+// tip, because a session cannot reliably name its own model, cannot see its
+// predecessor's, and cannot see whether the branch tip it read is the one the
+// driver verified.
+const reviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipVerified +
+	reviewRecordDurableShape + reviewMUSTBar
+
+// unverifiedReviewOnlyRecordShape is reviewOnlyRecordShape for a checkpoint the
+// driver could not verify on the origin remote (CLA-576): the reviewer
+// establishes the tip itself, and the seam demands a non-empty one.
+const unverifiedReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipUnverified +
+	reviewRecordDurableShape + reviewMUSTBar
+
+// noCodeReviewOnlyRecordShape is the branchless review-only phase's record
+// contract: the LEGACY outcome block alone, with no durable-record half —
+// the plane accepts review writes only from the task's LIVE holder and a
+// settled task has none (operator decision on question 03a12578, option 1), so
+// the seam gates this variant on the block (changed since the spawn, heading on
+// its own line, and a last block the baseline did not carry).
+const noCodeReviewOnlyRecordShape = reviewRecordOutcomeShape + reviewRecordTipNone + reviewMUSTBar
+
+// panelMemberRecordIntro and panelMemberRecordBody are the two halves of a
+// PANEL MEMBER's record contract (CLA-639 M5): the tip paragraph sits between
+// them, so the verified and unverified variants share everything else.
+//
+// A panel member writes the DURABLE record and NOTHING ELSE on the task. The
+// legacy outcome block reviewOnlyRecordShape prescribes is not merely deferred
+// here, it is forbidden: member 1's block would be readable by member 2 through
+// its own get_task — the exact cross-member leak the seal exists to prevent —
+// and the plane refuses a run's outcome writes while its record sits sealed in
+// the open round the panel writes into (CLA-636 B3), so the write would be
+// refused anyway. The panel's findings reach the task's outcome through the FIX
+// phase, from the merged list the driver releases to it (mergedFindingsDigest).
+//
+// The field list below is deliberately a second copy of the durable record's
+// rather than a shared constant: the two differ wherever the legacy block is
+// named ("one object per finding in the block", "write `- none` under
+// Findings"), and one string cannot say both. Both copies are pinned by
+// TestReviewOnlyBriefsPrescribeTheDurableRecord, so they cannot drift silently.
+//
+// No branchless variant exists: a branchless task writes no durable record (a
+// settled task has no live holder to accept one), so a panel cannot run that
+// way at all — the driver skips every member after the first, whose brief is
+// the shipped no-code one.
+const panelMemberRecordIntro = " You are ONE MEMBER of a review PANEL: several reviewers, possibly on " +
+	"different models, review the SAME revision independently, and the driver merges every member's findings " +
+	"into the fix phase's work list afterwards. Do not look for, wait for or defer to another member's " +
+	"findings - review the revision yourself and record your own."
+
+const panelMemberRecordBody = " THE RECORD IS YOUR DELIVERABLE, and it is the ONLY thing you write on the " +
+	"task: record it with record_review(taskId, runId, {...}). Do NOT write the task's outcome - do not " +
+	"call record_progress with an outcome, and do not hand the task over: the fix phase carries the " +
+	"panel's findings into the task's outcome, and the member after you reads the task, so an outcome write here " +
+	"would leak this review to a reviewer that must not see it. Send exactly: reviewerRole: \"" +
+	ReviewerRolePlaceholder + "\" (this member's role; the plane assigns the round and cycle from it), verdict: " +
+	"\"pass\" or \"findings\", harness: \"" + PhaseHarnessPlaceholder + "\", model: \"" + PhaseModelPlaceholder +
+	"\", branch: \"" + PhaseBranchPlaceholder + "\", reviewedTip as above, scope: {kind: \"full-diff\", base: \"" +
+	PhasePRBasePlaceholder + "\", range: \"" + PhasePRBasePlaceholder + "..<reviewedTip>\"} (the plane caps range at 100 " +
+	"characters, so never put the branch name there), and findings: one object per finding in YOUR review, in " +
+	"the same order you report them, at most 20 (the plane refuses a record with more: keep every MUST, then the " +
+	"most important of the rest, and say in your final message how many you left out): {severity: \"must\" | " +
+	"\"should\" | \"nit\", evidenceKind: <the MUST's kind token>, evidence: <its payload>, file: <path>, line: " +
+	"<number>, kind: <short category>, summary: <what is wrong>, requiredFix: <the smallest fix>, raisedByModel: \"" +
+	PhaseModelPlaceholder + "\"}. The plane assigns each finding's id (`<round>.<reviewer role>.<n>`); do NOT " +
+	"invent one - the fix phase updates by that id. A RETRY proves itself here: get_task before writing, and if " +
+	"a record for your reviewer role and THIS run is already there (records show the run id WITHOUT its secret: " +
+	"compare only the part of " + PhaseRunPlaceholder + " before its first dot) in an open round, the record is " +
+	"already written - skip the write and end. If instead the plane refuses the append with duplicate_reviewer, " +
+	"the same follows: a record for this role and round is already written, that refusal is the idempotency " +
+	"signal, and retrying it changes nothing. If there are no findings, send no findings (or an empty array), " +
+	"and verdict: pass."
+
+// panelMemberRecordTipVerified is the panel member's counterpart of
+// reviewRecordTipVerified: the same driver-verified tip, recorded in the
+// durable record alone.
+const panelMemberRecordTipVerified = " The driver verified the origin remote's tip for branch " +
+	PhaseBranchPlaceholder + " as `" + ReviewedTipPlaceholder + "`. Fetch and confirm the worktree is at that " +
+	"commit (`git rev-parse HEAD`) before you review, and record that SHA as `reviewedTip` in your durable " +
+	"record."
+
+// panelMemberRecordTipUnverified is the panel member's counterpart of
+// reviewRecordTipUnverified (CLA-576): the member establishes the tip itself.
+const panelMemberRecordTipUnverified = " The driver could NOT verify the origin remote's tip, so there is no " +
+	"driver-verified tip to record: establish it yourself. Read the branch from the origin remote " +
+	"(`git ls-remote origin " + PhaseBranchPlaceholder + "`, or fetch it), check out the commit it names, review " +
+	"that revision, and record that SHA as `reviewedTip` in your durable record. If the branch is absent or the " +
+	"remote cannot be read, record that failed hand-off IN YOUR DURABLE RECORD and end holding the task — do not " +
+	"write an outcome or touch the task's status, do not invent a tip, and do not review a phantom diff."
+
+// panelMemberRecordShape is the verified panel member's record contract: the
+// panel context, the verified tip, and the durable record alone.
+var panelMemberRecordShape = panelMemberRecordIntro + panelMemberRecordTipVerified +
+	panelMemberRecordBody + panelMemberMUSTBar
+
+// panelMemberUnverifiedRecordShape is panelMemberRecordShape for a checkpoint
+// the driver could not verify on the origin remote (CLA-576).
+var panelMemberUnverifiedRecordShape = panelMemberRecordIntro + panelMemberRecordTipUnverified +
+	panelMemberRecordBody + panelMemberMUSTBar
+
+// reviewMUSTBarGrades is the accepted bar for a MUST (task CLA-635; the
+// review-panel design's section 14 A2 as amended by B5/B6, decisions 3a57db6a
+// and 60ed0748 superseding it): the evidence a MUST must cite, the seventh kind
+// the operator added after the second review, and the things that are never a
+// MUST however confident the reviewer is.
+//
+// Only PRESENCE is checked structurally - here as the reviewer's own
+// obligation, and by the driver when it parses the block back
+// (loop.reviewFindingsDigest). The VALIDITY of the evidence is judged by a
+// verifier in the next round, never by the fixer: a fixer that disagrees with a
+// MUST refutes it with evidence, it does not downgrade it. Where a repo hard
+// rule concerns style, prose or documentation wording, the not-a-MUST list wins
+// over it (B6); missing tests stay not-a-MUST except the untested-guard case.
+//
+// The GRADING rules are one constant because they are the same for every
+// reviewer; the attribution sentence that closes the bar is not, so it is
+// separate (CLA-639) — see reviewMUSTBar and panelMemberMUSTBar.
+const reviewMUSTBarGrades = " GRADE EVERY FINDING. A severity in brackets is `[must]`, `[should]` or `[nit]`; " +
+	"MUST is the only gating grade and the only one that must carry evidence. A MUST must be followed by " +
+	"`(<kind>): <evidence>`, where <kind> is one of: doneWhen - quote the clause of the task's doneWhen the change " +
+	"violates; gate - name a repo gate (a test, typecheck, lint, build, CI check, or a check the repo's agent " +
+	"instructions require) that fails or would fail, with the command and the failing output or the reason it " +
+	"would fail; failure - a concrete input or state and the wrong output, crash, data loss or stuck state it " +
+	"produces in changed code or its direct regression surface; security - credential exposure, an authorization " +
+	"bypass, injection, or a widened permission, with the path; decision - a recorded standing decision it " +
+	"contradicts (cite its id) or a hard rule in the repo's agent instructions (cite the file and the rule); " +
+	"irreversible - an irreversible migration, deletion or publish step without the guard the repo requires; " +
+	"untested - a new or changed guard, gate or state transition with no test that pins it (cite its file:line " +
+	"and the missing test). NEVER a MUST, however confident you are: style, naming, a design you would prefer, a " +
+	"performance concern without a measurement, missing tests the doneWhen does not require (except untested), or " +
+	"documentation wording - and where a repo hard rule concerns style, prose or documentation wording, this " +
+	"not-a-MUST list wins. Write those as SHOULD or NIT; they need no evidence. "
+
+// reviewMUSTBarAttribution closes the bar for the SINGLE reviewer, whose record
+// has two halves: the legacy outcome block and the durable record. Both carry
+// the attribution, and the block's own line is what a human reading the task
+// sees.
+const reviewMUSTBarAttribution = "Every finding in the block is " +
+	"attributed by the block's own `- reviewed by:` line, and the durable record carries `raisedByModel` on every " +
+	"finding so the review is attributable per finding, not only per block."
+
+// reviewMUSTBar is the bar as the single reviewer's record shape carries it:
+// the grading rules, then the attribution sentence. Split into two constants
+// (CLA-639) so a PANEL MEMBER — whose record is the durable one alone — gets
+// the same grading rules with an attribution sentence that names no block.
+const reviewMUSTBar = reviewMUSTBarGrades + reviewMUSTBarAttribution
+
+// panelMemberMUSTBarAttribution is reviewMUSTBarAttribution for a panel member:
+// there is no block, so the record's own `raisedByModel` is the whole
+// attribution.
+const panelMemberMUSTBarAttribution = "Every finding is attributed in your durable " +
+	"record by its `raisedByModel` field, so the review is attributable per finding."
+
+// panelMemberMUSTBar is the panel member's bar: the same grading rules, the
+// record-only attribution.
+const panelMemberMUSTBar = reviewMUSTBarGrades + panelMemberMUSTBarAttribution
+
+// fixOutcomeRecord is the fix phase's outcome requirement, shared by both fix
+// variants. It carries the review forward: the final outcome is the only
+// durable task-record the round has (the ledgers excepted), so dropping the
+// review block here would lose the very record the split exists to keep. And it
+// must keep everything ABOVE the block: that is phase 1's delivery record (or
+// an earlier round's), and the statusless outcome replaces the field wholesale,
+// so a final outcome built only from the review block and ### Fixes would erase
+// it.
+const fixOutcomeRecord = "the outcome MUST keep everything the existing outcome carries ABOVE the LAST `" +
+	ReviewRecordHeading + "` block " +
+	"(phase 1's delivery record plus any earlier rounds, their `" + ReviewRecordHeading + "` blocks included) " +
+	"unchanged, keep that LAST block VERBATIM " +
+	"(verdict, every finding by ID, its required fix, and the attribution it already carries — do not restate " +
+	"that attribution from this brief), and add a `### Fixes` list saying, for every finding, whether you fixed " +
+	"it (with the commit SHA, or for a no-code task the record change you made, or the ref of the real follow-up " +
+	"task a code-needing finding was dispatched to) or did not (with the reason — for a MUST that reason must be " +
+	"a refutation carrying its evidence, because a MUST is never downgraded), plus 'fixed by: harness " +
+	PhaseHarnessPlaceholder + ", model " + PhaseModelPlaceholder + "'. A finding you neither fix nor answer is " +
+	"this phase failing."
+
+// fixFindingUpdates is the durable half of the fix phase's record requirement:
+// the per-finding status updates, which must go out while this run is still the
+// task's HOLDER because the plane refuses them once it is not. It is stated
+// without reference to WHO hands the task over — the last fix of a sequence
+// does, and a fix with a VERIFICATION round after it does not — so both
+// terminals can embed it without one contradicting the other (CLA-686 D1). The
+// ordering rule that DOES name the hand-over lives in fixTerminalRecord, where
+// the phase making that call is the one reading it.
+const fixFindingUpdates = " While you still hold the task, update every finding's " +
+	"status on the DURABLE review record with record_review(taskId, runId, {findingUpdates: [...]}) — one " +
+	"entry per finding, by the plane-assigned `id` the record gave you: {findingId, status: \"fixed\", " +
+	"fixCommit: <the commit SHA>} for a fixed finding; {findingId, status: \"refuted\", refutedReason: <the " +
+	"evidence that refutes it>} for a MUST you did not fix; {findingId, status: \"filed\", filedTaskRef: <the " +
+	"follow-up task's ref>} for a code-needing finding dispatched instead. The batch is all-or-nothing: an " +
+	"unknown id or a still-sealed round refuses it, so it must go out while this run is the holder. An empty " +
+	"array is refused; if the review found nothing, skip the call."
+
+// fixTerminalRecord is the BRANCH fix phase's record requirement when this fix
+// OWNS the sequence's terminal step, stated BEFORE the shared reviewTerminalStep
+// so the emphatic final block still ends the brief (the CLA-384 property): the
+// durable finding updates go out before the call that ends the run and clears
+// the holder, then the hand-over carries the outcome requirement
+// (fixOutcomeRecord) forward.
+//
+// The ordering sentence is here rather than in fixFindingUpdates because it is
+// advice about THIS phase's own hand-over call: the plane refuses the batch
+// after that call, even when the same call carries the outcome.
+const fixTerminalRecord = fixFindingUpdates + " It must go out BEFORE the hand-over call - before the call that " +
+	"moves the task to in_review, even when that same call carries your outcome. THEN hand the task over: " +
+	fixOutcomeRecord
+
+// fixVerifyRecord is the BRANCH fix phase's record requirement when a
+// VERIFICATION round FOLLOWS it (CLA-686 D1). fixVerifyBrief and its handoff
+// continuation end with fixOnlyTerminalStep — "do NOT move the task to
+// in_review", because the verifier owns that move — so they must not carry
+// fixTerminalRecord's "THEN hand the task over" as well: that is one brief
+// telling the fixer both to hand the task over and not to, and a fixer that
+// obeys the first half ships fixes no verification round has seen. Everything
+// the RECORD owes is unchanged; only the hand-over sentence is dropped, because
+// the hand-over is not this phase's.
+const fixVerifyRecord = fixFindingUpdates + " When you end the phase, " + fixOutcomeRecord
+
+// noCodeFixTerminalRecord is the BRANCHLESS fix phase's counterpart (question
+// 03a12578, option 1): the branchless review writes no durable record — a
+// settled task has no live holder to accept one — so there is no findingUpdates
+// call to make and no plane-assigned id to send. The record requirement is the
+// outcome alone, exactly as fixTerminalRecord's second half states it.
+const noCodeFixTerminalRecord = " When you hand the task over, " + fixOutcomeRecord
+
+// noCodeFixVerifyRecord is fixVerifyRecord for a BRANCHLESS fix (CLA-686 D1):
+// the outcome requirement alone, with no findingUpdates half — the branchless
+// round writes no durable record, so there is no plane-assigned id to send, the
+// same exemption noCodeFixTerminalRecord carries — and no hand-over, which the
+// verification round owns. Its terminal step is noCodeFixOnlyTerminalStep.
+const noCodeFixVerifyRecord = " When you end the phase, " + fixOutcomeRecord
+
+// fixGradingRule is the fix briefs' shared obligation for acting on the graded
+// review record (CLA-635): every MUST fixed or refuted with evidence, never
+// downgraded by the fixer, and SHOULD/NIT handled by the filing rule. B5's
+// structural check runs driver-side, so a MUST that reaches this brief has
+// already been judged to carry evidence; the fixer may not second-guess the
+// grade - it refutes the finding with evidence of its own, or fixes it. A1 is
+// restated because the interim record may hold a single reviewer: disagreement
+// is not a second opinion, and a lone reviewer's MUST still gates.
+const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
+	"recorded in your outcome - a refutation must actually refute the finding, and a MUST you neither fix nor " +
+	"refute is this phase failing. You may not downgrade a MUST: the driver has already applied its structural " +
+	"check, listing a recorded MUST with no evidence kind or no evidence payload as a SHOULD, and a MUST raised " +
+	"by a single reviewer is never dropped because nobody else raised it. Fix the SHOULDs that are cheap; record " +
+	"NITs and the SHOULDs you do not fix in your outcome as not done, with the reason, and file a follow-up task " +
+	"only for a SHOULD worth doing."
+
+// noCodeReviewTerminalStep is the no-code review brief's LAST instruction
+// (CLA-497), the counterpart of reviewTerminalStep for a phase-1 exit that was
+// evidenced by the plane's record rather than a branch. There is nothing to
+// commit and no PR to open - the task's correct delivery is no code - so the
+// step is the handover alone, with the same emphatic, final-call shape
+// CLA-384 pinned on the branch-shaped one. It also covers the form-(b) case
+// where phase 1 ALREADY settled the task (in_review / done / parked /
+// blocked): the handover happened before this phase ran, and the session's job
+// is to verify the record reads honestly and stop - re-opening or releasing a
+// settled task would restart the release loop this task exists to kill.
+const noCodeReviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: if the task still sits in " +
+	"in_progress with its no-code delivery declared, hand it over with submit_for_review(taskId, runId, " +
+	"outcome: ...), where the outcome MUST carry a **Tests** section saying what you actually " +
+	"verified - without one the plane REFUSES the call, so a session that leaves it out has not handed " +
+	"anything over. If phase 1 already settled the task (it left in_progress before this phase ran), the " +
+	"handover already happened: verify the record reads honestly and end the session - do NOT re-open, " +
+	"release or re-settle the task. Ending this session while the task still needs the handover is this " +
+	"phase FAILING, not finishing. The ONLY exception is a declared handoff."
+
 // HandoffContinuation is appended, by the driver, to a handoff respawn's prompt
-// (CLA-353) so a phase's own terminal step survives a session-authored hand-off.
+// (CLA-353) so a phase's own contract survives a session-authored hand-off.
 // HandoffPreamble carries the "resume, don't claim" contract forward on every
 // handoff; the ORIGINAL phase brief's own instructions do not — a handoff
 // respawn's prompt is HandoffPreamble plus the predecessor's self-authored
 // nextPrompt alone, so anything the built-in brief said is otherwise gone the
-// moment a session hands off instead of finishing itself. For the review phase
-// that includes reviewTerminalStep - the PR-then-update_task sequence CLA-353
-// exists to make land - so a handoff mid-review must not be a way to lose it.
-// Empty for a phase with no such step: the implement phase stops rather than
-// hands its task to in_review, so it has none to carry forward.
+// moment a session hands off instead of finishing itself.
+//
+// Two things ride, and the first rides for BOTH built-in phases. The rerun
+// bound (CLA-391) rides because a handoff must not be how unbounded rerunning
+// arrives: the review successor inheriting a half-fixed finding list is the
+// loopiest session there is, but the implement successor mid-verification is
+// the same shape — fresh context, no memory of the runs already paid for, and
+// every reason to start paying again — so bounding only the review respawn
+// would leave the asymmetry as the hole. The review phase ADDITIONALLY carries
+// reviewTerminalStep — the PR-then-hand-off sequence CLA-353 exists to make
+// land — so a handoff mid-review must not be a way to lose it. The implement
+// phase carries the bound alone: it has no terminal step, because it stops
+// rather than hands its task to in_review.
 func HandoffContinuation(phaseName string) string {
-	if phaseName == ReviewPhaseName {
-		return "\n\nThe phase's terminal step is unchanged by handing off:" + reviewTerminalStep
+	switch phaseName {
+	case ReviewPhaseName:
+		return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + reviewTerminalStep
+	case ImplementPhaseName:
+		return "\n\nThe phase's rerun bound is unchanged by handing off:" + rerunGuidance
+	case FixPhaseName:
+		// The fix phase owns the branch-shaped terminal step, exactly as a final
+		// review did before the split. A handoff mid-fix must not be a way to
+		// lose the commit/push/PR/in_review sequence, NOR the record contract:
+		// fixTerminalRecord is what makes the successor keep the review block
+		// verbatim and add the ### Fixes list. Dropping it here loses the only
+		// durable record of the round, which is the exact loss the split exists
+		// to prevent.
+		return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+			rerunGuidance + fixTerminalRecord + reviewTerminalStep
 	}
 	return ""
+}
+
+// HandoffContinuationFor is HandoffContinuation for a review phase whose mode is
+// POSITION-dependent (see EffectivePhases): a review-only phase has no terminal
+// step to carry, only the record-then-hold ending, and appending the shared
+// reviewTerminalStep would tell its successor to commit, push, open a PR and
+// hand the task to in_review — the exact actions the review-only mode forbids.
+//
+// It carries reviewOnlyRecordShape as well as the ending: the ending says
+// "in the shape above", and a respawned successor never saw the shape. The
+// driver's review→fix gate matches the DURABLE record, so a successor that
+// invented its own shape (or skipped the append) would fail the seam.
+//
+// The flag is only meaningful for ReviewPhaseName; every other phase ignores it.
+func HandoffContinuationFor(phaseName string, reviewOnly bool) string {
+	if phaseName == ReviewPhaseName && reviewOnly {
+		return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+			rerunGuidance + reviewOnlyRecordShape + reviewOnlyTerminalStep
+	}
+	return HandoffContinuation(phaseName)
+}
+
+// NoCodeReviewOnlyHandoffContinuation is the branchless review-only counterpart:
+// the record shape and record-then-hold ending without the branch-shaped PR step
+// or the no-code handover (which belongs to the fix phase).
+func NoCodeReviewOnlyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+		rerunGuidance + noCodeReviewOnlyRecordShape + noCodeReviewOnlyTerminalStep
+}
+
+// UnverifiedReviewOnlyHandoffContinuation is the review-only handoff for a
+// checkpoint the driver could NOT verify on the origin remote (CLA-576): the
+// successor must establish the tip itself, exactly as the first session was
+// told to, or its durable record cannot satisfy the seam.
+func UnverifiedReviewOnlyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record shape and review-only ending are unchanged by handing off:" +
+		rerunGuidance + unverifiedReviewOnlyRecordShape + reviewOnlyTerminalStep
+}
+
+// NoCodeFixHandoffContinuation is the fix phase's continuation for a branchless
+// checkpoint: the outcome requirement and the no-code handover, and never the
+// branch-shaped PR step. There is no durable record for this variant (question
+// 03a12578, option 1 — the branchless review writes none), so the continuation
+// carries noCodeFixTerminalRecord, not the branch fix's findingUpdates demand.
+func NoCodeFixHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + noCodeFixTerminalRecord + noCodeReviewTerminalStep
+}
+
+// FixVerifyHandoffContinuation is the fix phase's continuation when a
+// verification round follows (CLA-638): the successor must still answer every
+// finding, commit and push, and then STOP holding the task. Carrying the
+// legacy reviewTerminalStep here would tell it to open the PR and move the task
+// to in_review — the terminal actions the verifier owns, and precisely what
+// B12 says the fix phase must not do — and carrying fixTerminalRecord would do
+// the same thing in prose (CLA-686 D1): the record requirement here is
+// fixVerifyRecord, which keeps the finding updates and drops the hand-over.
+func FixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + fixVerifyRecord + fixOnlyTerminalStep
+}
+
+// NoCodeFixVerifyHandoffContinuation is FixVerifyHandoffContinuation for a
+// BRANCHLESS fix: the amendment is to the plane's record, so there is nothing
+// to commit or push, but the terminal step still belongs to the verifier.
+// NoCodeFixHandoffContinuation would carry the legacy no-code hand-over and tell
+// the successor to move the task to in_review before the verification round has
+// seen the amendment — the same B12 leak the branch-shaped variant exists to
+// close.
+func NoCodeFixVerifyHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound, record requirement and terminal step are unchanged by handing off:" +
+		rerunGuidance + noCodeFixVerifyRecord + noCodeFixOnlyTerminalStep
 }
 
 // handoffGuidance rides on every built-in phase brief (CLA-352): when a session
@@ -340,6 +1053,64 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 	"prompt reads: decisions made, state verified, exact next steps - nothing about the journey, nothing that " +
 	"already lives in the repo or on the task, and under 4KB. The successor resumes this same run under this " +
 	"same brief's scope, so do NOT settle, release or hand back the task first."
+
+// rerunGuidance rides on every built-in phase brief (CLA-391). Repeated
+// verification was the dominant measured waste of the 2026-08-19/20 drain: one
+// review phase ran the same Playwright spec fourteen times differing only in
+// the grep filter; another ran twelve identical `go test -race ./...` on a
+// two-file diff; a third managed seven full-suite runs, eight typechecks and
+// ten lints inside one phase. Cost is turns times context, and every rerun is
+// another turn over everything the session holds, so the brief bounds
+// CONSECUTIVE reruns of the same command and demands a stated reason past the
+// bound.
+//
+// The phase-2 adversarial review found three ways the first wording still let
+// the fourteen-run loop through, and the wording closes each:
+//
+//   - A reason phrased as "name what changed since the last run" was satisfied
+//     by the selector change ITSELF - "narrowed the grep" is a change, and it
+//     does make the output differ, so fourteen compliant runs each carried a
+//     truthful-looking reason line. The reason must name a change to what is
+//     UNDER TEST, or say why the last result may not reproduce; a narrower
+//     selector is neither.
+//   - "Consecutive" was undefined, so any interleaved call (read, grep, diff -
+//     the shape real sessions actually produce) reset the count every turn and
+//     the ceiling never engaged. Only a change to what the command tests
+//     resets it now; other tool calls do not.
+//   - The arithmetic past a reason was unstated: a reason buying a fresh pair
+//     makes fourteen runs four cheap lines, while an absolute ceiling collides
+//     with the review brief's own fix-and-reverify demand. A reason buys ONE
+//     run, and the count restarts only when the thing under test changed -
+//     which is exactly what happens each time a fix lands, so honest
+//     re-verification never reaches the bound at all.
+//
+// Two readings the task called out stay pinned in the wording: the bound is
+// per command, not on verification overall (typecheck, then tests, then lint
+// is three commands run once each); and a narrowed rerun is still a rerun
+// (same suite, different selector or filter - the fourteen-run case differed
+// ONLY by its filter). The sibling failure, consecutive turns idling on a
+// background job and re-polling its output, is the waiting problem the served
+// skill already carries a reference for - so the brief POINTS at it rather
+// than restating rules that live there and would drift here. That pointer is
+// SCOPED as well as pointed: waiting.md's Rule 1 tells a claim-holder to let
+// go, and read unscoped it directs a mid-phase session to release - the exact
+// failure the briefs' own endings forbid - so the session takes the polling
+// discipline and keeps hold of the task.
+const rerunGuidance = " RERUN BOUND: every rerun of a verification command is another turn over everything the " +
+	"session holds, so bound them - two consecutive reruns of the same command is the ceiling, and a third " +
+	"needs a stated reason first: one line saying either what changed in the code or environment UNDER TEST " +
+	"since the last run, or why the last result may not reproduce (flakiness, timing, state outside this " +
+	"checkout). A narrowed rerun is still a rerun: re-running the same suite with a different selector, filter " +
+	"or flag counts against the same command's bound, because a different selector is not a change to what is " +
+	"under test. Tool calls in between do not reset the count either, and a stated reason buys one run, not a " +
+	"fresh pair - the count starts over only when what the command tests actually changed, which for a " +
+	"fix-and-reverify loop is every fix landing, so honest re-verification never reaches the bound. Nothing " +
+	"changed means the result cannot differ - read the previous output instead of paying for it again. The " +
+	"bound is per command, not on verification overall - typecheck, then tests, then lint is three commands " +
+	"run once each. Consecutive turns spent idling on a background job or re-polling its output are the " +
+	"WAITING problem, not the rerun problem: read " +
+	"https://clankerbar.com/skills/clankerbar/waiting.md before your next poll and take from it the polling " +
+	"discipline while keeping hold of this task. This bound governs every verification command this phase runs."
 
 // implementResumedBranchRule is the implement brief's rule for resuming an EXISTING branch or
 // worktree (CLA-378). EZY-199 was a recovered stale claim whose implement phase followed the
@@ -358,61 +1129,865 @@ const handoffGuidance = " HANDOFF (most tasks need zero): if you reach a genuine
 // tip - or salvage only what still adds value; never re-verify and push stale work.
 //
 // Harness-neutral on purpose: one wording serves every harness's implement phase.
+//
+// CLA-608: the branch to merge in is the repo's PR BASE ({{prBase}}), resolved
+// per repo by the driver, not necessarily the project's integration_branch. The
+// resumed branch forked from its PR base and will merge back into it, so the
+// superseding commits to sync against land there; for a repo whose PRs target
+// main (the makesPDF plugins) the integration_branch would name a branch that
+// does not exist, and for lecstor/makespdf it would sync against the deploy
+// branch while the PR merges elsewhere.
 const implementResumedBranchRule = "RESUMED WORK comes first when you find it: if the claim hands you an EXISTING branch or " +
 	"worktree for this task (a recovered stale claim, a prior session's WIP - check the repo yourself whatever " +
-	"the claim's hasWip flag said), your FIRST step is to merge the project's integration branch into it - a " +
+	"the claim's hasWip flag said), your FIRST step is to merge the repo's PR base branch (" + PhasePRBasePlaceholder + ") into it - a " +
 	"merge, NEVER a rebase: the branch may already be pushed, and rewriting pushed history invalidates the " +
 	"daemon's phase-boundary check, which compares the pushed origin tip to your local tip. THEN re-validate " +
 	"the task against the merged tip BEFORE doing or verifying any of the found work: a clean merge is not " +
 	"proof the task still needs doing - a non-conflicting merge can silently revert a newer fix - so the " +
 	"check is the task's own bar (for a bug: does it still reproduce?), not the absence of conflict markers. " +
 	"If the merged tip supersedes the task, record the decision (record_decision), then PARK the task with an " +
-	"outcome citing it (update_task status: parked) - task.branch is already set on a resumed branch, so a bare " +
+	"outcome citing it (settle_task(taskId, runId, disposition: \"parked\", outcome: ...)) - task.branch is already set on a resumed branch, so a bare " +
 	"stop reads as checkpointed WIP and spends a phase 2 rediscovering the staleness - or salvage only what " +
 	"still adds value and carry on with the normal flow; either way do NOT spend the run re-verifying and " +
 	"pushing stale work."
 
+// implementCloseOutRule is the implement brief's disposition for the offer the
+// plane boosts ahead of fresh work (CLA-540): an approved-awaiting-merge task —
+// implementation and review already done, only the close-out remaining — which
+// next_task serves FIRST and which the phase-1 brief must not refuse by default.
+// A phased implement session is told to claim, work, commit, push and stop at
+// the checkpoint; a close-out has no commit, no branch and no worktree, and its
+// required act is a status move the brief's letter forbids — so without an
+// exception the session asks the operator about an offer that is exactly its
+// job (observed twice on 2026-08-28: CLA-533 and CLA-526, both green and
+// mergeable, both raised as blocking questions).
+//
+// Everything the plane already says on the offer stays there: the merge target,
+// the red-CI repair rule and the decline door all ride on the offer's mergeHint,
+// and the CLA-341 one-representation rule keeps them in that one place. The
+// clause also names ONE offer, never the queue — several close-outs pending
+// means this session serves the one it was offered and ends, not all of them on
+// one accumulating context, which is the failure the unphased prompt's
+// drain-vocabulary ban exists to stop.
+//
+// The ending deliberately does NOT reuse the checkpoint's "Then STOP and end the
+// session" sentence: TestBuiltinImplementBriefPinsTheResumedBranchRule locates
+// the terminal stop by that exact phrase, and this clause sits before the
+// resumed-work rule, so reusing it would move the pin's anchor.
+//
+// The fork also preempts the resumed-work rule below: a close-out claim carries
+// a recorded branch, so that rule's "existing branch" trigger would otherwise
+// match an offer it must never apply to - merging the integration branch into an
+// approved PR branch would rewrite the diff the approval and the green CI stand
+// on. "For found work, not this offer" says the boundary in the brief itself.
+const implementCloseOutRule = "If next_task instead offers an approved-awaiting-merge task - implementation and " +
+	"review already done, only the close-out remaining - that offer IS this session's job: follow the offer's " +
+	"own instructions, and once the close-out is done STOP and end the session. The resumed-work rule below is " +
+	"for found work, not this offer. Ending that way is the task going to plan, not the task being abandoned."
+
+// implementCommitEarlyRule is the implement brief's checkpoint floor (CLA-544):
+// get a first commit down EARLY, before the design is fully settled - and push
+// it and RECORD the branch on the task as soon as that first commit is down -
+// then commit and push as you go rather than once at the end. CLA-529 and
+// CLA-531 were each handed back empty three times on 2026-08-28: the four
+// heaviest sessions contained not one Edit, Write or Create tool call - each
+// read and planned for its whole life, a wall-clock kill ended it with a clean
+// worktree, and nothing was salvageable.
+//
+// The mechanism is the driver's checkpoint line (loop.go): a wall-clock-killed
+// session earns a checkpoint only with HasWIP, and HasWIP means a branch
+// recorded on the TASK - the session's own record_progress(branch), or the salvage
+// recording one. The salvage refuses a clean worktree on purpose (salvage.go:
+// "The one thing that must NOT happen here is recording a branch"), so a commit
+// nobody pushed and recorded is as invisible to the plane as no commit at all.
+// The clause therefore names all three acts - commit, push, record - because
+// the record is the checkpoint, and it must land as soon as the first commit is
+// pushed, not only at the terminal step.
+//
+// Two constraints shaped the wording. The trigger is an EVENT, never a
+// duration: a session cannot read its own wall clock (the constraint that
+// shaped handoffGuidance), so "commit within fifteen minutes" is not
+// implementable; a skeleton, a failing test, a stub with the signatures are
+// events it can recognise. And the clause is a FLOOR, not a ceiling: checkpoint
+// pushes are WIP, not deliveries - the terminal step's bar (self-verify, then
+// commit, push, record the branch) is unchanged, and a checkpoint push must not
+// be passed off as the self-verified terminal delivery.
+const implementCommitEarlyRule = " COMMIT EARLY, PUSH EARLY, RECORD EARLY: get a first commit down before the design is fully " +
+	"settled - a skeleton, a failing test, a stub with the signatures, the first thing that compiles - then " +
+	"push it and record the branch with record_progress(taskId, runId, branch), and commit and push as you go " +
+	"rather than once at the end. A checkpoint is a branch the plane was told about: an uncommitted " +
+	"worktree is lost when a session ends early, and a local commit nobody pushed and recorded is lost the " +
+	"same way - the next phase resumes from the branch recorded on the task, so record it as soon as the " +
+	"first commit is pushed, not only at the end. This adds an earlier floor, it does not lower the ceiling: " +
+	"the terminal step's bar is unchanged - self-verify, then COMMIT, PUSH, and record the branch - and " +
+	"checkpoint commits are not licence to commit broken or half-considered code as a habit, nor to pass a " +
+	"checkpoint push off as the self-verified terminal delivery."
+
 // builtinPhasePrompts are the shipped briefs, selected by phase name.
 //
-// The split is implement, then review-and-fix, and that grouping is deliberate:
-// the reviewing session dispatches the review itself, so it holds the findings
-// while it fixes them. A third "fix" phase would hold neither the implementation
-// nor the review context and would re-acquire both — which is why the repo's own
-// workflow puts implementation and fix in ONE actor and the review in a separate
-// read-only one. Splitting where that workflow already splits is the whole idea.
+// The split is implement, review, fix. The review phase's brief is chosen by
+// POSITION rather than a second name (see EffectivePhases): a review with a
+// phase after it is the read-only gate (reviewOnlyBrief), and a FINAL review
+// keeps this historical review-and-fix brief so an existing two-phase config
+// still reaches in_review. The fix phase applies the findings on a cheaper
+// harness and owns the PR/in_review terminal step.
+//
+// An earlier version of this comment argued a fix phase was wrong because it
+// "would hold neither the implementation nor the review context". That is still
+// true, and it was never an argument about COST. The review record on the task
+// (reviewOnlyRecordShape) is what replaces the shared context: the fix phase
+// re-reads it from the plane, the way any resumed phase re-reads the bar.
 var builtinPhasePrompts = map[string]string{
-	ImplementPhaseName: "Work the next backlog item. This session is PHASE 1 of 2, and its scope is implementation ONLY (plus the resumed-work disposition below): " +
+	ImplementPhaseName: "Work the next backlog item. This session is PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + ", and its scope is implementation ONLY (plus the resumed-work and close-out dispositions below): " +
+		implementCloseOutRule + " " +
 		implementResumedBranchRule +
-		" Unless you parked above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
-		"update_task(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
+		implementCommitEarlyRule +
+		" Unless you parked above or served a close-out above, the rest of the flow is unchanged: claim the task, work it in a worktree, self-verify, then COMMIT, PUSH, and record the branch with " +
+		"record_progress(taskId, runId, branch). Then STOP and end the session. Do NOT run the review gate, and do NOT " +
 		"move the task to in_review — a second session resumes this same run from that checkpoint and does both. " +
-		"Ending there is this task going to plan, not the task being abandoned." + handoffGuidance,
+		"Ending there is this task going to plan, not the task being abandoned." + rerunGuidance + handoffGuidance,
 
-	ReviewPhaseName: "You are PHASE 2 of 2 on task " + PhaseTaskPlaceholder + ", which an earlier session has already " +
-		"implemented, committed and pushed. You are RESUMING that run, not starting a new one: do not call " +
-		"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, " +
-		"then get_task with includeDecisions: true to re-read the bar and the standing decisions. An empty branch " +
-		"field on the task is a FAILED hand-off to report, not work to silently adopt and implement. Work in the " +
-		"worktree for the branch recorded on the task, and never commit to the integration branch (staging) - a " +
-		"session whose cwd is already the main checkout sitting on staging is not a decision to commit where you " +
-		"are, it is this failure mode. Read the diff on that branch. Then run the adversarial review gate, fix " +
-		"what it finds, and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you " +
-		"fixed, by name, and point it at the fix commits (or, if not yet committed, the fix diff) and the " +
-		"regression surface they touch - not at the whole diff, whose full pass already happened. A full second " +
-		"pass is the exception you state a reason for (a fix that had to reach outside its own area), never the " +
-		"default." + reviewTerminalStep + handoffGuidance,
+	ReviewPhaseName: "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " + PhaseTaskPlaceholder + ", whose implement phase recorded " +
+		"branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin " +
+		"remote with its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that " +
+		"run, not starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
+		PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the " +
+		"bar and the standing decisions. An empty branch field on the task is a FAILED hand-off to report, not " +
+		"work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
+		" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is " +
+		"already the main checkout sitting on that branch is not a decision to commit where you are, it is this " +
+		"failure mode. Read the diff on that branch. Then run the adversarial review gate, fix what it finds, " +
+		"and re-verify SCOPED to those fixes: brief the follow-up reviewer with the findings you fixed, by name, " +
+		"and point it at the fix commits (or, if not yet committed, the fix diff) and the regression surface they " +
+		"touch - not at the whole diff, whose full pass already happened. A full second pass is the exception you " +
+		"state a reason for (a fix that had to reach outside its own area), never the default." + rerunGuidance +
+		reviewTerminalStep + handoffGuidance,
+
+	FixPhaseName: fixBrief,
+
+	VerifyPhaseName: verifyBrief,
+}
+
+// noCodeReviewBrief is the review brief for a phase-1 exit evidenced by the
+// PLANE'S RECORD (CLA-497) instead of a branch: the task left `ready`
+// (in_review / done / parked / blocked - its own session settled it), or it
+// carries a declared no-code delivery. There is no branch because the task's
+// correct delivery is no code, so the branch-shaped builtin review brief would
+// misdirect its successor - it asserts a branch "the driver verified to exist"
+// that does not exist, and its "empty branch field is a FAILED hand-off to
+// report" instruction contradicts the checkpoint the driver just recorded. The
+// no-code review runs the adversarial gate over the plane's record of what
+// phase 1 did, and its terminal step is the handover alone - no commit, no PR.
+const noCodeReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " + PhaseTaskPlaceholder + ", whose implement phase's " +
+	"exit was evidenced by the PLANE'S RECORD rather than a branch: the task left `ready` (in_review / done / " +
+	"parked / blocked - its own session settled it) or carries a declared no-code delivery. There is NO " +
+	"branch, because this task's correct delivery is no code - nothing to check out, no worktree to work " +
+	"in, no PR to open. The empty branch field is NOT a failed hand-off: the driver recorded this " +
+	"checkpoint on exactly that record. You are RESUMING that run, not starting a new one: do not call " +
+	"next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
+	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"expected: the settlement IS the delivery, so proceed to the review below. Then get_task with " +
+	"includeDecisions: true to re-read the bar and the standing decisions. Run the adversarial review gate " +
+	"over the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the decisions " +
+	"recorded on this task or its siblings: is the settlement honest, does the record carry what the task's " +
+	"doneWhen required, does the no-code declaration match the work? Fix what the gate finds by amending " +
+	"the record (record_progress, record_decision) - never by inventing code, a branch or a PR." + rerunGuidance +
+	noCodeReviewTerminalStep + handoffGuidance
+
+// unverifiedReviewBrief is the review brief for a checkpoint the driver could
+// NOT verify against the origin remote (CLA-576): the implement phase recorded
+// branch {{branch}} on the plane, but the driver's branch check did not
+// complete — most often the remote could not be read (network, a GitHub
+// outage, a credential problem), though a check that never reached the remote
+// (no local branch to compare, an ambiguous repo, no git on PATH) lands in the
+// same delivery.Unknown — so whether the branch was ever pushed — and whether
+// phase 1 did anything at all — is unknown. The
+// branch-shaped builtin brief would tell the successor "a branch the driver
+// verified to exist on the origin remote with its tip reachable, so phase 1
+// really did implement, commit and push", which is exactly the claim this
+// checkpoint cannot support. The successor is told the truth instead, and told
+// to verify the hand-off itself before reviewing anything: the review phase is
+// the backstop the 2026-09-24 decision accepted for the narrow loosening of
+// CLA-457 (a session that recorded a branch it never pushed, during an outage,
+// still reaches a review phase).
+const unverifiedReviewBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " + PhaseTaskPlaceholder + ", whose implement phase " +
+	"recorded branch " + PhaseBranchPlaceholder + " on the plane — but the driver could NOT verify that branch on " +
+	"the origin remote: its check did not complete — most often because the remote could not be read (network, a " +
+	"GitHub outage, a credential problem), but a check that never reached the remote is possible too — so whether " +
+	"phase 1 pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a " +
+	"verified hand-off: do NOT assume the branch exists, and do NOT assume phase 1 implemented, committed and " +
+	"pushed. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. " +
+	"Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true " +
+	"to re-read the bar and the standing decisions. FIRST verify the hand-off yourself, before any review: read " +
+	"branch " + PhaseBranchPlaceholder + " from the origin remote (git ls-remote origin " + PhaseBranchPlaceholder +
+	", or fetch it) and confirm it carries phase 1's work. If the branch is not on the origin remote, phase 1 did " +
+	"NOT deliver: report the failed hand-off in your outcome and hand the task over for a human decision — do not " +
+	"review a phantom diff. If the remote still cannot be read, the hand-off could not be verified: say exactly " +
+	"that in your outcome and hand the task over as the terminal step below requires — do not invent work. If the " +
+	"branch is there, work in the worktree for branch " + PhaseBranchPlaceholder +
+	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already " +
+	"the main checkout sitting on that branch is not a decision to commit where you are, it is this failure mode. Read " +
+	"the diff on that branch. Then run the adversarial review gate, fix what it finds, and re-verify SCOPED to " +
+	"those fixes: brief the follow-up reviewer with the findings you fixed, by name, and point it at the fix " +
+	"commits (or, if not yet committed, the fix diff) and the regression surface they touch - not at the whole " +
+	"diff, whose full pass already happened. A full second pass is the exception you state a reason for (a fix " +
+	"that had to reach outside its own area), never the default." + rerunGuidance + reviewTerminalStep +
+	handoffGuidance
+
+// reviewGateScope defines what "run the adversarial review gate" means for a
+// review-only phase, and what it does NOT mean (CLA-696).
+//
+// On the first review-panel run (MAK-266, 2026-10-19) the implement phase had
+// already run typecheck, build, the full web suite (2935 tests), the
+// layout-engine suite and veraPDF at its tip, and the brief was silent on
+// whether the gate included running them again - so each of the four members
+// decided for itself: one re-ran all of it on effectively the same tree, two
+// ran focused subsets, and one read code. That is up to N redundant full-gate
+// runs per round (wall time, machine load, a context full of test output), and
+// it makes the members incomparable for the analytics (CLA-640) because some
+// spent the session reading and some watching builds.
+//
+// The gates belong to the phases that own them: implement self-verifies at its
+// tip, and the fix and verify phases run the gates again over what they change.
+// A reviewer's value is the reading, so a command is scoped to a PROBE of a
+// defect it already suspects - evidence for a finding, never a second gate.
+//
+// The last sentence is the panel's: members share one worktree, so a probe that
+// writes a report, coverage file or snapshot hands the next member (and the fix
+// phase) a dirty tree it must not commit.
+//
+// It names no evidence kind of its own. The MUST bar's seven kinds are what the
+// record is read and analysed with, so a probe's output is cited under the kind
+// that fits it - `gate` for a command that fails, `failure` for behaviour
+// reproduced by hand - not under a new one this brief alone would know.
+const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase self-verified at this tip and the fix " +
+	"and verify phases run the gates again over what they change, so do NOT run the repo's full test suite, " +
+	"typecheck, build or long checks (a PDF validator, a whole-browser e2e sweep - anything that takes minutes) " +
+	"as a matter of course: each reviewer re-running them is another identical run of the same tree, bought with " +
+	"wall time, machine load and a context full of test output. Spend the session READING instead - the diff " +
+	"against the base, and the code it touches that the diff does not show; that is where a defect the " +
+	"implementer's own gates missed is found. Run a command only as a TARGETED probe of a specific defect you " +
+	"suspect: one test file, one package, one short repro script, never the repo's gate list. Name the suspected " +
+	"defect the probe is for, and when it confirms one, the probe's output IS that finding's evidence - " +
+	"`(gate): <the command and its failing output>` for a command that fails, `(failure): <the input and the " +
+	"wrong output>` for behaviour you reproduced by hand. A probe must leave the worktree as it found it: if it " +
+	"writes a report, coverage file or snapshot, restore or delete the artifact (`git checkout -- <path>` for a tracked " +
+	"one) before you record. The panel shares this one worktree, so an artifact left behind is the next member's " +
+	"- and the fix phase's - dirty tree. "
+
+// reviewOnlyBrief is the review phase's brief when a LATER phase will apply its
+// findings (the shipped [implement, review, fix] sequence). It is the split's
+// whole point: the expensive model reads and judges, and changes nothing.
+//
+// A final `review` phase keeps the historical review-AND-fix brief
+// (builtinPhasePrompts[ReviewPhaseName]) so a two-phase config written before
+// this split keeps reaching in_review instead of silently stopping at a
+// checkpoint with no successor. The position, not a second name, selects the
+// mode; EffectivePhases resolves it, and the driver's variant selection matches
+// on the resolved prompt text.
+//
+// "Review only" is enforced as a scope, not a capability: the phase is told what
+// it may not do, and the fix phase is told to treat any fix it did not make as
+// its own job by ID. A session that edits anyway is a failure the fix phase can
+// still absorb - it re-reads the branch - which is why the prohibition is worded
+// as the default rather than as an impossible act.
+//
+// The brief is composed of a CORE plus a record shape and an ending, so the
+// panel member's variant (CLA-639 M5) can reuse the core verbatim and swap only
+// the two halves that differ: the panel member writes the durable record and
+// nothing else.
+var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: you find issues " +
+	"and specify fixes; the phase after you applies them. The implement phase (harness " +
+	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") recorded branch " +
+	PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin remote with " +
+	"its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that run, not " +
+	"starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
+	PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the bar " +
+	"and the standing decisions. An empty branch field on the task is a FAILED hand-off to report in the record " +
+	"below, not work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
+	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
+	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
+	"..." + PhaseBranchPlaceholder + ") and run the adversarial review gate." + reviewGateScope +
+	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
+	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
+	"and a fix applied here is a fix it cannot attribute."
+
+// reviewOnlyBrief is the single reviewer's brief: the core above, the two-half
+// record shape, and the two-half ending.
+var reviewOnlyBrief = reviewOnlyBriefCore +
+	reviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep + handoffGuidance
+
+// panelMemberReviewOnlyBrief is a PANEL MEMBER's brief (CLA-639 M5): the same
+// core, with the durable-record-only shape and an ending that forbids the
+// outcome write. It is selected by the driver at spawn time — the member's
+// captured prompt is the review-only brief, exactly as for the single reviewer
+// — and only for a checkpoint that carries a branch: a branchless checkpoint
+// cannot run a panel at all (no live holder accepts a durable record), so its
+// single reviewer keeps the shipped no-code brief.
+var panelMemberReviewOnlyBrief = reviewOnlyBriefCore +
+	panelMemberRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
+
+// panelMemberUnverifiedReviewOnlyBrief is panelMemberReviewOnlyBrief for a
+// checkpoint the driver could not verify against the origin remote (CLA-576).
+var panelMemberUnverifiedReviewOnlyBrief = reviewOnlyBriefCore +
+	panelMemberUnverifiedRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
+
+// unverifiedReviewOnlyBrief is reviewOnlyBrief for a checkpoint the driver could
+// NOT verify against the origin remote (CLA-576). The verified claim above is
+// exactly what such a checkpoint cannot support, so the session verifies the
+// hand-off itself before reviewing anything.
+var unverifiedReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder +
+	" on task " + PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: " +
+	"you find issues and specify fixes; the phase after you applies them. The implement phase (harness " +
+	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") recorded branch " +
+	PhaseBranchPlaceholder + " on the plane — but the driver could NOT verify that branch on the origin " +
+	"remote: its check did not complete — most often because the remote could not be read (network, a GitHub " +
+	"outage, a credential problem), but a check that never reached the remote is possible too — so whether " +
+	"phase 1 pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a " +
+	"verified hand-off: do NOT assume the branch exists, and do NOT assume phase 1 implemented, committed and " +
+	"pushed. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
+	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with " +
+	"includeDecisions: true to re-read the bar and the standing decisions. FIRST verify the hand-off yourself, " +
+	"before any review: read branch " + PhaseBranchPlaceholder + " from the origin remote (git ls-remote " +
+	"origin " + PhaseBranchPlaceholder + ", or fetch it) and confirm it carries phase 1's work. If the branch " +
+	"is not on the origin remote, phase 1 did NOT deliver: record that failed hand-off in the review record " +
+	"below and end holding the task — do not review a phantom diff. If the remote still cannot be read, say " +
+	"exactly that in the record and end holding the task; do not invent work. If the branch is there, work in " +
+	"the worktree for branch " + PhaseBranchPlaceholder + " recorded on the task, and never commit to the " +
+	"repo's PR base branch (" + PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout " +
+	"sitting on that branch is not a decision to commit where you are, it is this failure mode. Read the diff " +
+	"against the PR base (git diff " + PhasePRBasePlaceholder + "..." + PhaseBranchPlaceholder + ") and run " +
+	"the adversarial review gate." + reviewGateScope +
+	"REVIEW ONLY: do not edit, create or delete a source " +
+	"file, do not commit, do not push, and do not open a PR - not even to fix a typo. Do NOT fix what you " +
+	"find: the phase after you is responsible for applying it, and a fix you apply here is a fix it cannot " +
+	"attribute." + unverifiedReviewOnlyRecordShape + rerunGuidance + reviewOnlyTerminalStep +
+	handoffGuidance
+
+// noCodeReviewOnlyTerminalStep ends a branchless review-only phase. There is no
+// branch to keep a lease on and the task may already be settled by phase 1, so
+// the terminal step records the review and leaves the task's own status alone;
+// the fix phase decides whether a finding requires re-opening it. The record
+// here is the LEGACY block alone (operator decision on question 03a12578,
+// option 1): the durable table takes writes only from the task's live holder —
+// a settled task has none, and a still-held no-code task's write would seal a
+// round this variant never closes — so attempting the append would be a
+// refused call at best and a wedged run at worst, and the seam does not need it.
+const noCodeReviewOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: record the review ON THE " +
+	"TASK with record_progress(taskId, runId, outcome: ...), in the shape above - the LEGACY `" + ReviewRecordHeading +
+	"` block ONLY. Do NOT attempt a durable review record write here: a settled task has no live holder to accept it, " +
+	"and on a still-held no-code task it would seal a round this variant never closes - the block IS this " +
+	"variant's review record and the driver's seam gates on it. This " +
+	"is a CHECKPOINT, not a " +
+	"hand-off: do NOT change the task's status, delivery or body here, do NOT re-open it, do NOT invent code, a " +
+	"branch or a PR, and do NOT move it to in_review. If phase 1 already settled it, leave it settled; the " +
+	"phase after you decides whether a finding needs more than a record change. Ending this session after " +
+	"recording the review is this phase FINISHING."
+
+// noCodeReviewOnlyBrief is reviewOnlyBrief for a checkpoint evidenced by the
+// PLANE'S RECORD rather than a branch (CLA-497): there is nothing to check out
+// and nothing for the fix phase to edit, so the review is of the record itself.
+var noCodeReviewOnlyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: you find issues " +
+	"and specify fixes; the phase after you applies them. The implement phase's exit was evidenced by the " +
+	"PLANE'S RECORD rather than a branch: the task left `ready` (in_review / done / parked / blocked - its own " +
+	"session settled it) or carries a declared no-code delivery. There is NO branch, because this task's " +
+	"correct delivery is no code - nothing to check out, no worktree to work in, no PR to open. The empty " +
+	"branch field is NOT a failed hand-off: the driver recorded this checkpoint on exactly that record. You " +
+	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
+	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed " +
+	"to the review below. Then get_task with includeDecisions: true to re-read the bar and the standing " +
+	"decisions. Review the PLANE'S RECORD of what phase 1 actually did - the task-body edits, the outcome, the " +
+	"decisions recorded on this task or its siblings: is the settlement honest, does the record carry what the " +
+	"task's doneWhen required, does the no-code declaration match the work? REVIEW ONLY: do not amend what " +
+	"phase 1 wrote - the phase after you applies what you find - but DO append your legacy review block below " +
+	"it so its delivery record survives (the block, not a durable record: see the shape below); and do not " +
+	"invent code, a branch or a PR." +
+	noCodeReviewOnlyRecordShape + rerunGuidance + noCodeReviewOnlyTerminalStep + handoffGuidance
+
+// fixBrief is the phase that APPLIES a review's findings. It is deliberately not
+// named "review": reviewTerminalStep is injected by phase name, and a fix phase
+// that reused the name would be told it was review-only (or review-and-fix)
+// rather than the one actor that changes code.
+//
+// Why a separate phase at all, when the review used to fix its own findings: the
+// review model is the expensive one, and the fixing - apply, re-verify, commit,
+// push, open the PR - is the bulk of a review session's tool calls and context.
+// The reviewer keeps the judgement; the cheap harness gets the typing. The cost
+// is one more session startup and a hand-off the fixer must read; the review
+// record on the task is what makes that hand-off cheap and auditable.
+// fixCore is the part both fix variants share: read the released record, check
+// the reviewed tip, apply every finding by its plane id, re-verify scoped. The
+// variants differ ONLY in their terminal step, because whether the fix phase is
+// the last one depends on whether a verification round follows it (CLA-638).
+const fixCore = "Read BOTH the durable record and the block: `reviews.records` carries every released record in the newest " +
+	"round, each with its findings[] and the plane-assigned id (`<round>.<reviewer role>.<n>`) you update by; " +
+	"the outcome's `" + ReviewRecordHeading + "` block is the legacy copy. On a later fix round (after a " +
+	"verification round) the newest record carries only the verifier's NEW findings: the work list is every " +
+	"MUST the plane still shows OPEN on ANY released record (get_task's `reviews.openMustIds`), which the driver " +
+	"prepends when it can read it - an open MUST from an earlier round is yours to fix or refute too. If there is neither a released review " +
+	"record nor a review block, that is a FAILED hand-off: park the task with settle_task(taskId, runId, disposition: \"parked\", " +
+	"outcome: ...) naming the missing record - do NOT review the work yourself, do NOT invent findings, and do " +
+	"NOT open a PR over unreviewed work. Read the record's reviewedTip and compare it with " +
+	"`git rev-parse HEAD` in the worktree: if they differ, the branch moved after the review, so do NOT apply " +
+	"stale findings - park the task with settle_task(taskId, runId, disposition: \"parked\", outcome: ...) naming the mismatch. Work in the worktree for branch " +
+	PhaseBranchPlaceholder + " recorded on the task, and never commit to the repo's PR base branch (" +
+	PhasePRBasePlaceholder + ") - a session whose cwd is already the main checkout sitting on that branch is " +
+	"not a decision to commit where you are, it is this failure mode. Apply the review's findings, each by its " +
+	"PLANE id from the durable record - the block's R-numbers are labels, not the keys you update by." +
+	fixGradingRule +
+	" A finding you neither fix nor answer is this phase failing. The review " +
+	"ran checks, so the worktree may carry generated or cache files it did not commit: stage only the fixes " +
+	"you made, never those. Re-verify " +
+	"SCOPED to those fixes: run the gates the repo's own instructions name, and any check a finding says was " +
+	"red, not the whole suite again for no reason."
+
+// fixBrief is the phase that APPLIES a review's findings when it is the LAST
+// phase of the sequence. It is deliberately not named "review":
+// reviewTerminalStep is injected by phase name, and a fix phase that reused the
+// name would be told it was review-only (or review-and-fix) rather than the one
+// actor that changes code.
+//
+// Why a separate phase at all, when the review used to fix its own findings: the
+// review model is the expensive one, and the fixing - apply, re-verify, commit,
+// push, open the PR - is the bulk of a review session's tool calls and context.
+// The reviewer keeps the judgement; the cheap harness gets the typing. The cost
+// is one more session startup and a hand-off the fixer must read; the review
+// record on the task is what makes that hand-off cheap and auditable.
+var fixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed branch " +
+	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
+	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
+	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
+	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. You are " +
+	"RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true. " +
+	fixCore +
+	" If the review found nothing " +
+	"(verdict: pass), there is nothing to fix: still open the PR if none exists and hand over." +
+	rerunGuidance + fixTerminalRecord + reviewTerminalStep + handoffGuidance
+
+// fixVerifyBrief is the fix phase when a VERIFICATION round follows it (CLA-638,
+// B12). The verification round re-reviews the delta and adjudicates the prior
+// MUSTs, and IT carries the PR/in_review terminal step; a fix session that
+// opened the PR here would ship fixes no verifier has looked at. The rest of the
+// contract is identical, because it reads the same record and applies the same
+// findings.
+var fixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed branch " +
+	PhaseBranchPlaceholder + " and wrote its findings as a sealed DURABLE review record; the driver has now " +
+	"closed that round, so get_task releases the findings to you. It also left the legacy `" +
+	ReviewRecordHeading + "` block in the task's outcome for one release — the LAST such block, because an " +
+	"earlier `" + ReviewRecordHeading + "` block is an earlier round. It changed nothing. A VERIFICATION round " +
+	"runs after you: it re-reviews your fix delta and adjudicates the prior open MUSTs, and IT opens the PR " +
+	"and hands the task to in_review once no MUST remains open. You are RESUMING that run, not starting a " +
+	"new one: do not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder +
+	"\") to resume the run, then get_task with includeDecisions: true. " +
+	fixCore +
+	" If the review found nothing (verdict: pass), there is nothing to fix: commit nothing, leave the branch " +
+	"as it is, and end holding the task — the verification round still runs and carries the terminal step." +
+	rerunGuidance + fixVerifyRecord + fixOnlyTerminalStep + handoffGuidance
+
+// fixOnlyTerminalStep ends a fix phase that is NOT the sequence's last one
+// (CLA-638): the verification round owns the PR and in_review hand-over.
+const fixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: COMMIT and PUSH the fixes " +
+	"you made, append an outcome with record_progress(taskId, runId, outcome: ...) that carries the fixes and a " +
+	"**Tests** section saying what you actually verified — the plane requires that section on the task before " +
+	"the verifier can hand it to in_review, and the verifier cannot write the outcome itself once its own " +
+	"review record is sealed — then STOP still holding the task. Do NOT open a PR and do NOT move the task to " +
+	"in_review: the VERIFICATION round after you carries that terminal step once it finds no open MUST. A PR " +
+	"opened here would ship fixes the verifier never saw. Ending this session holding the task is the " +
+	"checkpoint the verification round resumes from."
+
+// noCodeFixOnlyTerminalStep is fixOnlyTerminalStep for a branchless fix: it
+// still records an outcome the in_review guard can read, but there is nothing to
+// commit or push.
+const noCodeFixOnlyTerminalStep = " FINALLY, and this is the step that ENDS the phase: append an outcome with " +
+	"record_progress(taskId, runId, outcome: ...) that carries what you amended and a **Tests** section (\"**Tests** " +
+	"— none, no-code delivery.\" is honest and valid) — the plane reads that section on the in_review move the " +
+	"verifier makes, and the verifier cannot write the outcome itself once its own review record is sealed. " +
+	"Do NOT open a PR and do NOT move the task to in_review: the VERIFICATION round after you carries that " +
+	"terminal step once it finds no open MUST. End holding the task."
+
+// noCodeFixBrief is fixBrief for a branchless checkpoint: the review judged the
+// plane's record, and the fix is an amendment to that record, never invented
+// code. The branchless review writes no durable record (question 03a12578,
+// option 1), so this brief reads the legacy `## Review` block ALONE and applies
+// its findings by amending the task's record - there is no `reviews.records`
+// entry and no plane-assigned id to update. Its terminal step is the no-code
+// handover alone.
+var noCodeFixBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase and the LAST phase of this task. The review phase reviewed the " +
+	"PLANE'S RECORD of what the implement phase did - there is NO branch, because this task's correct " +
+	"delivery is no code. You " +
+	"are RESUMING that run, not starting a new one: do not call next_task, and do not claim anything. Call " +
+	"heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the heartbeat because " +
+	"the task already left in_progress, that refusal is expected: the settlement IS the delivery, so proceed. " +
+	"Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading + "` block in the " +
+	"outcome — an earlier one is an earlier round, so read past it. That block IS the round's record: the " +
+	"branchless review writes no durable record (question 03a12578, option 1), so read and apply from the " +
+	"block alone and do not treat an empty record set as a failed hand-off. If the outcome carries no `" +
+	ReviewRecordHeading + "` block, that is a FAILED hand-off: say so " +
+	"in your outcome, and park the task if it is still in_progress - if phase 1 already settled it, leave it " +
+	"settled and end. Do not invent findings. Apply the findings by AMENDING THE RECORD " +
+	"(record_progress, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
+	" A finding that needs CODE cannot be fixed here: file it as its own task " +
+	"(create_task, with a real doneWhen) and say so in your outcome - for a MUST, that filed task is this " +
+	"phase's fix of it (record the new task's ref in your outcome as the fix; a dispatched MUST is fixed this " +
+	"way, not refuted, and not a failure) - do not re-open this task, do not rewrite " +
+	"its settlement, and do not fake the code. If the review found nothing, say so." + rerunGuidance +
+	noCodeFixTerminalRecord + noCodeReviewTerminalStep + handoffGuidance
+
+// noCodeFixVerifyBrief is the branchless fix phase when a verification round
+// follows: the amendment is to the plane's record, and the terminal step is the
+// silent hold — the verification round carries the hand-over.
+var noCodeFixVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the FIX phase. The review phase reviewed the PLANE'S RECORD of what the " +
+	"implement phase did - there is NO branch, because this task's correct delivery is no code. A " +
+	"VERIFICATION round runs after you and adjudicates the open MUSTs, so it, not you, decides the " +
+	"hand-over. You are RESUMING that run, not starting a new one: do not call next_task, and do not claim " +
+	"anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run - if the plane REFUSES the " +
+	"heartbeat because the task already left in_progress, that refusal is expected: the settlement IS the " +
+	"delivery, so proceed. Then get_task with includeDecisions: true and read the LAST `" + ReviewRecordHeading +
+	"` block in the outcome — an earlier one is an earlier round, so read past it. That block IS the round's " +
+	"record: the branchless review writes no durable record (question 03a12578, option 1), so read and apply " +
+	"from the block alone and do not treat an empty record set as a failed hand-off. Apply the findings by " +
+	"AMENDING THE RECORD (record_progress, record_decision) - never by inventing code, a branch or a PR." + fixGradingRule +
+	" A finding that needs CODE cannot be fixed here: file it as its own task (create_task, with a real " +
+	"doneWhen) and say so in your outcome - for a MUST, that filed task is this phase's fix of it. If the " +
+	"review found nothing, change nothing." + rerunGuidance + noCodeFixVerifyRecord + noCodeFixOnlyTerminalStep +
+	handoffGuidance
+
+// verifyStoppingRule is the stopping rule's core: what counts as a MUST that is
+// still open (CLA-638, D7/A6/B7/B12/B13). It is shared by the code and no-code
+// variants so the bar cannot drift between them; the ID-based machinery that
+// enforces it — the round cap and the non-convergence breaker — is
+// verifyDriverBounds, because the branchless variant has no plane finding ids
+// to count or park on.
+const verifyStoppingRule = " THE STOPPING RULE IS A BAR, NOT A FEELING. The gate is NO OPEN MUST. A MUST is open " +
+	"until it is fixed, filed as its own task, or refuted with evidence — a prior MUST that is neither stays " +
+	"open, and a refutation you reject also stays open. SHOULD and NIT findings are recorded, never gating."
+
+// verifyDriverBounds is the id-based machinery the CODE-shaped verification
+// round runs under: the driver's round cap and non-convergence breaker, both
+// read from the plane's durable records.
+const verifyDriverBounds = " The driver counts rounds: this is a hard cap of three non-void rounds per review " +
+	"cycle (a human verdict starts a new cycle; a takeover or reclaim does not). At the cap, any open MUST is " +
+	"the driver's park, never another round. Non-convergence is also the driver's: a MUST left unresolved " +
+	"after two fix attempts, or an id a previous verifier marked resolved that you reopen, parks the task for " +
+	"a human."
+
+// verifyTerminalStep ends a verification round: the hand-over only when no MUST
+// remains open, otherwise a silent hold for the driver to spawn another fix.
+const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and the round number the append returned.\n\n" +
+	"If ANY MUST remains open: release this round with ONE call — record_review(taskId, runId, " +
+	"{closeRound: <the round the append returned>}) — then do NOT open a PR, do NOT move the task to " +
+	"in_review, and do NOT change its status. End holding the task. The driver spawns another fix against " +
+	"the released findings, or parks the task at the round cap.\n\n" +
+	"If NO MUST remains open: carry the hand-over in ONE call, AFTER confirming the branch is pushed (push " +
+	"any fix commit that is still local) and opening a PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder +
+	") if none exists for the branch: submit_for_review(taskId, runId, closeRound: <the round the append " +
+	"returned>). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
+	"the task leaves in_progress this run can no longer close the round. Do NOT send an outcome in that call: " +
+	"your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), and the fix " +
+	"phase has already written the **Tests** section the in_review guard reads. Never decide to run one more " +
+	"round yourself."
+
+// noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
+// counterpart of verifyTerminalStep. This shape writes no durable record
+// (question 03a12578, option 1 — the branchless review writes none either), so
+// there is no round to release and no closeRound to make: the verifier appends
+// its OWN `## Review` block, which IS the record the driver's checkpoint reads,
+// and the disposition is an operator park (open MUST — the id-based loop the
+// driver runs cannot exist without plane finding ids) or the status move
+// (clean — the verifier carries the hand-over, and the fix phase has already
+// written the **Tests** section the in_review guard reads).
+const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. Two facts decide it: whether " +
+	"any MUST is still open after your adjudication, and whether the task still sits in_progress. The " +
+	"id-based machinery is the driver's and needs plane finding ids this shape does not have, so this " +
+	"terminal step is this shape's whole disposition.\n\n" +
+	"Append YOUR OWN legacy `" + ReviewRecordHeading + "` block to the task's outcome with " +
+	"record_progress(taskId, runId, outcome: ...) — append, never replace what sits above it: the block IS this " +
+	"shape's round record, and the driver's checkpoint reads exactly it. There is no durable record to " +
+	"append, no round to close and no PR to open for a no-code delivery.\n\n" +
+	"If ANY MUST remains open: do NOT hand the task over — park it with settle_task(taskId, runId, " +
+	"disposition: \"parked\", outcome: ...), carrying the open MUST(s) and why the amendment does not resolve them; the " +
+	"same disposition the round cap gives the id-based shape. If the task already left in_progress, do NOT " +
+	"re-open it: leave your block as the record and end.\n\n" +
+	"If NO MUST remains open: hand the task over. If it still sits in_progress with its no-code delivery " +
+	"declared, move it with submit_for_review(taskId, runId) — do NOT send an outcome in " +
+	"that call; your block write already landed and the fix phase wrote the **Tests** section the in_review " +
+	"guard reads. If it already left in_progress, the hand-over already happened: verify the record reads " +
+	"honestly and end. Never decide to run one more round yourself."
+
+// verifyBrief is the fix-verification round (CLA-638): review the fix delta plus
+// its regression surface, adjudicate every prior open MUST by its plane id, and
+// gate on no open MUST. It is review-shaped — it writes a sealed durable review
+// record and the driver closes the round at the seam — so it uses the same
+// record machinery as the review gate, with `scope: fix-delta` and the prior
+// round's reviewed tip as the delta base.
+//
+// The driver prepends the prior open MUST ids (and their findings) to this
+// brief: the list is plane state, not config, and the driver reads it from the
+// released records before spawning. The wording below assumes that block is
+// present and tells the session what to do if it is not.
+var verifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the VERIFICATION round. A review round found issues and a fix round applied " +
+	"them; your job is to verify the FIXES, not to review the whole diff again. The driver has closed the " +
+	"previous round, so get_task releases the records. You are RESUMING that run, not starting a new one: do " +
+	"not call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume " +
+	"the run, then get_task with includeDecisions: true. The driver has prepended the PRIOR OPEN MUST ids with " +
+	"their findings, and every MUST of this review cycle already MARKED settled; if that block is missing, read " +
+	"the released records yourself and list every finding with severity must, both those with status open and " +
+	"those of this cycle marked fixed, refuted or filed. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - " +
+	"a session whose cwd is already the main checkout sitting on that branch is not a decision to commit " +
+	"where you are, it is this failure mode. " +
+	"SCOPE: the fix delta is the reviewed tip the LAST released record names (`reviewedTip`) up to HEAD " +
+	"(`git diff <reviewedTip>..HEAD`), PLUS the regression surface those fixes touch. Do not re-review the " +
+	"whole diff, whose full pass already happened; a full second pass is the exception you state a reason for " +
+	"in the record. " +
+	"ADJUDICATE EVERY PRIOR OPEN MUST BY ITS PLANE ID — exactly one disposition each, recorded through " +
+	"record_review(taskId, runId, {findingUpdates: [...]}) on the CLOSED record it belongs to: " +
+	"(1) RESOLVED — the fix is present and correct: status \"fixed\" with fixCommit. " +
+	"(2) RESOLVED BY DISPATCH — the fix is a follow-up task: status \"filed\" with filedTaskRef. " +
+	"(3) REFUTATION ACCEPTED — the fixer's evidence shows the finding was wrong: status \"refuted\" with " +
+	"refutedReason. " +
+	"(4) UNRESOLVED or REFUTATION REJECTED — leave the finding's status \"open\" and record in this round's " +
+	"record why the fix or the refutation does not stand. " +
+	"A MUST the fix phase already MARKED fixed, refuted or filed is not settled by that marking: the fixer " +
+	"marks what it answers, and a refutation changes no code, so the delta will not show it. Check each one " +
+	"the same way. Confirm it by leaving its status; reject it by setting its status back to \"open\" with " +
+	"findingUpdates and recording why — that is disposition (4), and the gate then sees it open. " +
+	"You may raise NEW MUSTs ONLY within the fix delta and its regression surface; the plane assigns their " +
+	"new ids. Do not re-raise an earlier finding as a new id: adjudicate the existing id. " +
+	"REVIEW ONLY: you do not change code — do not edit, create or delete a source file, do not commit, and do " +
+	"not apply a fix yourself. The phase after you applies what you find, and a fix applied here is a fix it " +
+	"cannot attribute. The one exception is the hand-over below: when no MUST remains open, opening the PR " +
+	"(and pushing a fix commit that the fixer left local) is the terminal step, not a review change. " +
+	"RECORD THE ROUND IN BOTH FORMS: first append the legacy `" + ReviewRecordHeading + "` block to the task's " +
+	"outcome with record_progress(taskId, runId, outcome: ...) — append, never replace what sits above it — then " +
+	"append the sealed durable record with record_review(taskId, runId, {...}) naming reviewerRole " +
+	"\"{{reviewerRole}}\", reviewedTip `git rev-parse HEAD`, scope kind \"fix-delta\" with base and range " +
+	"(`<reviewedTip>..HEAD`), a verdict of pass or findings, and every new finding graded must/should/nit with " +
+	"the evidence a MUST requires. The durable record is the driver's seam evidence; the block is the " +
+	"one-release compatibility copy." +
+	verifyStoppingRule + verifyDriverBounds + verifyTerminalStep + rerunGuidance + handoffGuidance
+
+// noCodeVerifyBrief is verifyBrief for a branchless checkpoint: there is no
+// code delta to re-review, so the verification is of the plane record and the
+// fix's record amendments. It never opens a PR or invents code, and its
+// terminal step is the no-code hand-over (the verifier is the LAST phase, so
+// nothing after it can carry the move the review-only ending defers).
+var noCodeVerifyBrief = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+	PhaseTaskPlaceholder + ", the VERIFICATION round for a task whose correct delivery is NO CODE. There is " +
+	"NO branch and no diff; the fix round amended the PLANE'S RECORD. The driver has prepended the LAST `" +
+	ReviewRecordHeading + "` block of the task's outcome — that block, not a durable record, is this shape's " +
+	"round record (question 03a12578, option 1). You are RESUMING that run, not starting a new one: do not " +
+	"call next_task, and do not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the " +
+	"run - if the plane REFUSES the heartbeat because the task already left in_progress, that refusal is " +
+	"expected: the settlement IS the delivery, so proceed. Then get_task with includeDecisions: true. Review " +
+	"the amendment the fix made: does it resolve each prior open MUST, is it evidence rather than assertion, " +
+	"does the task's record still match its doneWhen? ADJUDICATE EVERY PRIOR OPEN MUST in the BLOCK's own " +
+	"terms — resolved, resolved by dispatch (the follow-up task's ref), refuted with evidence, or left open " +
+	"with your reason — and check on the ground what the amendment claims where you can. There are no plane " +
+	"finding ids to update on this shape, and do not treat the empty durable record set as a failed " +
+	"hand-off. You may raise new MUSTs only about the record changes and their regression surface. Do NOT " +
+	"invent code, a branch or a PR, and do NOT open a PR." +
+	verifyStoppingRule + noCodeVerifyTerminalStep + rerunGuidance + handoffGuidance
+
+// BuiltinReviewBrief returns the shipped review-and-fix brief, so the driver can
+// tell whether a phase runs the built-in brief (vs an operator's custom prompt)
+// when it must choose a variant (CLA-497): a checkpoint evidenced by the
+// plane's record names no branch, and the branch-shaped brief would tell the
+// successor its hand-off FAILED.
+func BuiltinReviewBrief() string { return builtinPhasePrompts[ReviewPhaseName] }
+
+// ReviewShaped reports whether a RESOLVED phase prompt is one of the review-only
+// briefs whose deliverable is the durable review record (CLA-637). It is the
+// driver's single "requires a review record" predicate: the seam gate must apply
+// to every review-shaped brief, not only the exact built-in review-only prompt
+// it was originally keyed to, so every variant — and, as later phases land,
+// every verifier and panel brief — is added HERE rather than in a second
+// condition that can drift.
+//
+// The resolved prompt, not the configured one: EffectivePhases swaps in
+// reviewOnlyBrief by position, and invocationFor later swaps the branchless and
+// unverified variants. A handoff continuation replaces the prompt wholesale, so
+// the caller reads this from EffectivePhases before any of that.
+func ReviewShaped(prompt string) bool {
+	switch prompt {
+	case reviewOnlyBrief, unverifiedReviewOnlyBrief, noCodeReviewOnlyBrief,
+		panelMemberReviewOnlyBrief, panelMemberUnverifiedReviewOnlyBrief,
+		verifyBrief, noCodeVerifyBrief:
+		return true
+	}
+	return false
+}
+
+// VerifyShaped reports whether a RESOLVED prompt is a fix-verification round
+// (CLA-638). It is deliberately narrower than ReviewShaped: a verifier writes a
+// durable record and is gated the same way, but it also adjudicates prior
+// findings and its terminal step depends on whether any MUST is still open, so
+// the driver must not mistake an ordinary review for it.
+func VerifyShaped(prompt string) bool {
+	switch prompt {
+	case verifyBrief, noCodeVerifyBrief:
+		return true
+	}
+	return false
+}
+
+// ReviewOnlyBrief returns the review-only brief a non-final review phase runs.
+func ReviewOnlyBrief() string { return reviewOnlyBrief }
+
+// NoCodeReviewOnlyBrief returns the review-only brief for a branchless
+// checkpoint (a no-code delivery or an already-settled task).
+func NoCodeReviewOnlyBrief() string { return noCodeReviewOnlyBrief }
+
+// UnverifiedReviewOnlyBrief returns the review-only brief for a checkpoint the
+// driver could not verify against the origin remote.
+func UnverifiedReviewOnlyBrief() string { return unverifiedReviewOnlyBrief }
+
+// PanelMemberReviewOnlyBrief returns the review-only brief a PANEL MEMBER
+// writes: the durable record alone, with no outcome write (CLA-639 M5). The
+// driver selects it at spawn time for a panel member whose checkpoint carries a
+// branch.
+func PanelMemberReviewOnlyBrief() string { return panelMemberReviewOnlyBrief }
+
+// PanelMemberUnverifiedReviewOnlyBrief returns the panel member's brief for a
+// checkpoint the driver could not verify against the origin remote.
+func PanelMemberUnverifiedReviewOnlyBrief() string { return panelMemberUnverifiedReviewOnlyBrief }
+
+// FixBrief returns the fix phase's shipped brief.
+func FixBrief() string { return fixBrief }
+
+// FixVerifyBrief returns the fix phase's brief when a verification round
+// follows it: it applies findings and stops holding the task; the verifier owns
+// the PR and in_review hand-over.
+func FixVerifyBrief() string { return fixVerifyBrief }
+
+// VerifyBrief returns the verification round's shipped brief.
+func VerifyBrief() string { return verifyBrief }
+
+// NoCodeVerifyBrief returns the verification round's brief for a branchless
+// checkpoint.
+func NoCodeVerifyBrief() string { return noCodeVerifyBrief }
+
+// NoCodeFixVerifyBrief returns the branchless fix phase's brief when a
+// verification round follows it.
+func NoCodeFixVerifyBrief() string { return noCodeFixVerifyBrief }
+
+// NoCodeFixBrief returns the fix phase's brief for a branchless checkpoint.
+func NoCodeFixBrief() string { return noCodeFixBrief }
+
+// NoCodeReviewBrief returns the review brief for a checkpoint evidenced by the
+// plane's record (CLA-497) - see noCodeReviewBrief.
+func NoCodeReviewBrief() string { return noCodeReviewBrief }
+
+// UnverifiedReviewBrief returns the review brief for a checkpoint the driver
+// could not verify against the origin remote (CLA-576) - see
+// unverifiedReviewBrief.
+func UnverifiedReviewBrief() string { return unverifiedReviewBrief }
+
+// NoCodeHandoffContinuation is HandoffContinuation for a no-code review
+// handoff (CLA-497): the branch-shaped reviewTerminalStep would tell the
+// successor to open a PR for a task that has no branch and no code.
+func NoCodeHandoffContinuation() string {
+	return "\n\nThe phase's rerun bound and terminal step are unchanged by handing off:" + rerunGuidance + noCodeReviewTerminalStep
 }
 
 // phaseNameRe is what a phase name may contain, because it becomes part of an
-// iteration log's filename.
-var phaseNameRe = regexp.MustCompile(`^[a-z0-9-]+$`)
+// iteration log's filename. It is the PLANE's own pattern verbatim
+// (/^[a-z0-9]+(-[a-z0-9]+)*$/, RUN_CONFIG built-ins aside): a proposal is
+// ratified by that validator, so a name this file accepts but the plane refuses
+// (a double hyphen, a leading or trailing one) would be a config `propose-config`
+// could never lift.
+var phaseNameRe = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// panelMemberPositionRe matches the DERIVED member-label family (`review-N`),
+// which is owned by member position (CLA-639). An explicit name from this family
+// must equal the member's own derived label; otherwise the logs, the INCOMPLETE
+// lines and the dead-phase tally would disagree about which member `review-2` is.
+var panelMemberPositionRe = regexp.MustCompile(`^review-[0-9]+$`)
 
 // The placeholders a phase prompt may carry, substituted by the driver from the
-// claim the previous phase left held.
+// claim the previous phase left held. {{branch}} names the recorded, verified
+// hand-off branch (CLA-457): the implement phase's checkpoint is gated on it
+// being real and on the origin remote, so the review brief can name it rather
+// than asserting an unverified "an earlier session already implemented".
+//
+// {{prBase}} names the branch the TASK'S REPO's PRs target (CLA-608), resolved
+// per repo at phase-spawn time (config.PRBaseFor, else loop.Driver.prBaseFor).
+// Unlike the other three it is not a per-run fact and rides EVERY built-in
+// phase, the implement phase included: the implement brief's resumed-work rule
+// needs a branch to name, and that rule runs in phase 1, before any claim
+// exists for the other placeholders to come from. It replaced literal
+// "(staging)" text in these briefs — the literal was wrong for every repo
+// whose PRs do not target staging, and the resolution above is what knows.
 const (
-	PhaseTaskPlaceholder = "{{taskId}}"
-	PhaseRunPlaceholder  = "{{runId}}"
+	PhaseTaskPlaceholder   = "{{taskId}}"
+	PhaseRunPlaceholder    = "{{runId}}"
+	PhaseBranchPlaceholder = "{{branch}}"
+	PhasePRBasePlaceholder = "{{prBase}}"
+
+	// PhaseHarnessPlaceholder and PhaseModelPlaceholder name the phase's OWN
+	// resolved harness and model. They are per-phase facts the driver knows and a
+	// session cannot reliably report for itself ("what model are you?" is a guess
+	// even when the provider exposes one), so the review record's attribution is
+	// injected rather than remembered.
+	PhaseHarnessPlaceholder = "{{harness}}"
+	PhaseModelPlaceholder   = "{{model}}"
+
+	// PhasePrevHarnessPlaceholder and PhasePrevModelPlaceholder name the phase
+	// BEFORE this one — for the review, the implementer whose work is being
+	// judged. Empty in phase 0, which has no predecessor, so a first-phase
+	// prompt carrying them is refused rather than spawned with a literal.
+	PhasePrevHarnessPlaceholder = "{{prevHarness}}"
+	PhasePrevModelPlaceholder   = "{{prevModel}}"
+
+	// PhaseNumberPlaceholder and PhaseTotalPlaceholder are this phase's 1-based
+	// position and the sequence length. The briefs used to say "PHASE 2 of 2"
+	// as text, which became a lie the moment a fix phase could follow: a
+	// three-phase review is phase 2 of 3, and a brief that miscounts the
+	// sequence is a session reasoning about a shape that is not there.
+	PhaseNumberPlaceholder = "{{phaseNumber}}"
+	PhaseTotalPlaceholder  = "{{phaseTotal}}"
+
+	// ReviewerRolePlaceholder and ReviewedTipPlaceholder are the durable review
+	// record's identity (CLA-637). The plane assigns the round and the cycle,
+	// so neither is a placeholder: the driver reads them back off the record it
+	// matches. The driver resolves the role from the phase and the reviewed tip
+	// from the checkpoint it VERIFIED on the origin remote, so the session
+	// records what the seam gate will match rather than inventing it. The role
+	// is unique per review phase (`review-1`, ...) so a panel member each
+	// appends its own record; the tip is the origin commit the reviewer must
+	// check out and review.
+	ReviewerRolePlaceholder = "{{reviewerRole}}"
+	ReviewedTipPlaceholder  = "{{reviewedTip}}"
 )
+
+// ReviewFindingsCall is the call that updates findings on a closed record. The
+// briefs carry this shape literally: there is no protocol-dependent wording left
+// to select, because the plane this build ships with is the one that serves
+// record_review and no older plane is supported.
+const ReviewFindingsCall = "record_review(taskId, runId, {findingUpdates: [...]})"
+
+// ReviewRecordHeading is the marker of the LEGACY block a review-only phase
+// still records in the task's outcome for one release (CLA-637), so older
+// readers keep seeing a review where they expect one. The durable
+// per-reviewer record, written through record_review, is the interface the
+// driver's review→fix seam gate reads now; this block is carried for
+// compatibility, and the fix phase keeps it verbatim in its own outcome.
+//
+// It deliberately carries no round number. The round lives in the durable
+// record, assigned by the plane; a hard-coded "round 1" would be false on any
+// later run of the same task.
+const ReviewRecordHeading = "## Review"
 
 // Config is the resolved loop configuration. The comments here are the source of
 // truth for each knob until the README/docs catch up.
@@ -493,13 +2068,19 @@ type Config struct {
 	// checkpoint the model cannot reach itself. See Phase for why this exists.
 	//
 	// OPT-IN, and deliberately so. Left empty, a task runs exactly as it always
-	// has: one session, asked Prompt. Two phases mean a task that reaches its
-	// checkpoint and stops there is only HALF finished until the next session
+	// has: one session, asked Prompt. Two or more phases mean a task that reaches
+	// its checkpoint and stops there is only HALF finished until the next session
 	// runs, so switching it on before the sequence has been watched end to end
 	// would turn a driver bug into tasks that silently never reach review. An
 	// operator opts in per config, and the shipped briefs are one line each:
 	//
-	//	"phases": [{"name": "implement"}, {"name": "review"}]
+	//	"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}]
+	//
+	// The three-phase shape is the shipped one: `review` with a phase after it is
+	// the REVIEW-ONLY gate (it records findings and changes nothing), and `fix`
+	// is the last phase and owns the PR plus in_review. A FINAL `review` keeps the
+	// historical review-and-fix brief, so an existing two-phase config still
+	// finishes its tasks; the mode is chosen by position, not by a second name.
 	//
 	// Naming a phase and leaving its prompt empty takes the built-in brief for
 	// that name; set `prompt` to override it, and `max_turns` to cap it.
@@ -509,8 +2090,134 @@ type Config struct {
 	// two prompts their sessions are actually being handed.
 	Phases []Phase `json:"phases"`
 
+	// Conflict is the supervisor's conflict-only session step (CLA-759): the
+	// harness and model for the short session it starts when CLA-758's
+	// deterministic close-out stands down on a CONFLICTING approved task. It is
+	// NOT a phase — it runs outside any task's sequence, for one task the
+	// supervisor picked, at most one at a time fleet-wide — so it is its own
+	// block rather than another entry in `phases`.
+	//
+	// ABSENT/partial = the fleet's IMPLEMENT step's harness and model, which is
+	// the documented default: resolving a conflict is implementation work that
+	// wants the model already trusted with the task's code. See ConflictStep.
+	//
+	// A pointer so an unset block is omitted from Identity(), exactly as
+	// ReviewPanel's `omitempty` keeps an untouched config's identity unchanged.
+	Conflict *ConflictStep `json:"conflict,omitempty"`
+
+	// ReviewPanel is the ordered list of independent reviewers a built-in review
+	// phase expands into (CLA-639). There is NO default and NO preset: the CLI
+	// cannot know which harnesses, providers or models an operator has, so it
+	// never names one (decision a0b1373b).
+	//
+	// ABSENT = one reviewer, exactly as before this feature: the config's own
+	// review phase runs once, on the harness/model the config already gives it,
+	// with the historical brief, the historical `review-1` role and the legacy
+	// single-review fix path — byte for byte.
+	//
+	// SET = those members, and only those: any number, the same model allowed
+	// more than once (each entry is an independent run). A member's `name` is
+	// only its log label; the reviewer role the durable record is keyed on is
+	// positional (`review-1`..`review-N`, counted over the review-shaped phases),
+	// so naming a member never changes which record it writes. The panel applies
+	// to a BUILT-IN review phase (no prompt of its own) that is not the last
+	// phase — the read-only gate. A final review phase (the historical
+	// review-and-fix brief) never expands, and a review phase with its own prompt
+	// owns its own contract; Validate refuses the combination rather than letting
+	// the panel silently not apply.
+	//
+	// An explicitly EMPTY array (`"review_panel": []`) is a half-edited config
+	// rather than an opt-out, and Validate refuses it — the opt-out is to remove
+	// the key. Read through Config.EffectivePanel.
+	//
+	// The panel hangs off the review PHASE, not the sequence, because that is
+	// what it multiplies: `phases` still reads [implement, review, fix], the
+	// config still has one review, and the driver is what fans it out.
+	//
+	// INTERIM placement (B10, A7): the panel is local config because phases are,
+	// until CLA-598 moves the sequence onto the plane and the state-machine
+	// reshape (CLA-454) carries panel membership as plane phase state. Nothing
+	// here should be read as the durable shape — the durable review RECORD is
+	// the plane's (CLA-636); this is only which reviewers run.
+	ReviewPanel []ReviewPanelMember `json:"review_panel,omitempty"`
+
+	// ReviewPanelConcurrency caps how many of a review panel's members run AT
+	// ONCE (CLA-697). The members are independent by design, so the default is
+	// all of them: 0 (or an absent key) means "the whole panel", and a value
+	// larger than the panel means the same. 1 is the historical behaviour — the
+	// members run one after another in the task's own worktree — and is the
+	// fallback for an operator who wants the old sequence, or whose machine or
+	// provider cannot take N sessions at once.
+	//
+	// Each concurrent member gets its own DETACHED worktree at the reviewed tip
+	// (created and removed by the driver), because members may run builds or
+	// probes: one shared checkout would let two reviewers write the same file.
+	// A member's detached worktree is discarded when it ends — there is nothing
+	// to salvage from a review-only session, and the fix phase owns the real
+	// worktree.
+	//
+	// Read through Config.EffectivePanelConcurrency. It only applies when
+	// `review_panel` expands; a single reviewer never fans out.
+	ReviewPanelConcurrency int `json:"review_panel_concurrency,omitempty"`
+
+	// reviewPanelSet records that `review_panel` was an EXPLICIT key — written
+	// by the config file at Load, or carried by a stored run-config document at
+	// ApplyRunConfig — so Validate can tell two shapes apart that the slice
+	// alone cannot: an operator who wrote `"review_panel": []` (a panel of none
+	// — refused, because it is almost certainly a half-edited config) and a
+	// config that never mentioned the key (nil, the single reviewer). An overlay
+	// REPLACES the pipeline section, so it rewrites this flag from the
+	// document's own key presence rather than inheriting the file's.
+	reviewPanelSet bool
+
 	// WorkDir is where the harness runs (its repo checkout). Empty = current dir.
 	WorkDir string `json:"workdir"`
+
+	// ProjectRoot marks every workdir in this file as a FLEET PROJECT ROOT
+	// (CLA-678): `<machine root>/<project slug>`, holding that project's clones
+	// (<project root>/<repo name>) and its worktrees directory
+	// (<project root>/worktrees). The supervisor's workdir derivation sets it
+	// on the config it materializes; set it by hand to adopt the layout without
+	// the supervisor.
+	//
+	// It is what decides a session's permission SCOPE. With it, a session
+	// starting in one of the project's checkouts reaches its whole project —
+	// every repo under the project root and every worktree in it — and nothing
+	// outside; without it, the scope stays the session's own checkout, exactly
+	// as before. So a config whose workdir is a developer's multi-repo parent
+	// (`~/dev`, say) must NOT set it: the flag is an assertion about the
+	// layout, and granting a whole directory tree on a guess is the wrong
+	// direction to be wrong in.
+	//
+	// `omitempty` is load-bearing: Config.Identity() hashes the marshalled
+	// form (see ReviewPanel for the same care), so the field must NOT alter the
+	// identity of a config that does not adopt the layout — an unset flag is
+	// the legacy shape, and a daemon's beacon must not report a config change
+	// just because this field exists. Set it, and the identity does change,
+	// correctly: the config now means something different.
+	ProjectRoot bool `json:"project_root,omitempty"`
+
+	// CloneURLBase is the URL PREFIX the supervisor clones a project's missing
+	// repos from: <base><owner>/<name>.git. Empty means the built-in
+	// DefaultCloneURLBase (`https://github.com/`), so a config that never
+	// mentions the key clones exactly as it always did.
+	//
+	// It exists because a derived fleet clone's origin is otherwise always
+	// HTTPS, which makes a session's branch pushes depend on a GitHub token
+	// riding in its environment (the `gh auth token` scoping on the clone).
+	// An SSH prefix — `git@github-personal:` for an ssh host alias, or
+	// `git@github.com:` — makes the clone authenticate with the key alone and
+	// skips the token scoping entirely. Any other mirror prefix works too;
+	// it is a prefix, not a GitHub-specific setting.
+	//
+	// The value is a PREFIX, so it has to end where the owner begins: a URL
+	// base ends with `/` (`https://github.com/`, `file:///srv/mirrors/`) and
+	// an scp-style ssh base ends with `:` (`git@github-personal:`). Anything
+	// else is refused by Validate rather than concatenated into a broken URL.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: an unset
+	// key must not change a daemon's identity, and a set one correctly does.
+	CloneURLBase string `json:"clone_url_base,omitempty"`
 
 	// ConfigDir pins the harness config dir (CLAUDE_CONFIG_DIR / CODEX_HOME) so a
 	// headless session loads the same skills, plugins, and auth as the interactive
@@ -522,6 +2229,18 @@ type Config struct {
 	// takes it as --mcp-config (NOT auto-discovered in -p mode); Codex merges it
 	// into config.toml [mcp_servers]. See the adapters.
 	MCPConfigPath string `json:"mcp_config_path"`
+
+	// InstanceName names this daemon on the console's Fleet page (CLA-466):
+	// presence beacons are keyed per (project, instance name), so this is how two
+	// daemons driving the same project stay distinguishable. Empty resolves to
+	// the machine's hostname plus the config file's basename (see
+	// ResolveInstanceName) - unique per running daemon, so co-located daemons
+	// with distinct config files no longer collapse into one Fleet row (CLA-501).
+	//
+	// The plane caps the name at 100 characters — Validate refuses longer here,
+	// so a too-long name fails loudly at startup instead of silently dropping
+	// every beacon. The resolved default is truncated to the same cap.
+	InstanceName string `json:"instance_name"`
 
 	// MaxIterations stops the loop after N respawns. 0 = no iteration ceiling:
 	// the loop runs until a STOP/HALT marker or a signal stops it (or a budget
@@ -593,6 +2312,36 @@ type Config struct {
 	// nothing.
 	MaxZeroSpendAttempts int `json:"max_zero_spend_attempts"`
 
+	// MaxRepeatedToolFailures ends a session whose SAME tool returns the SAME
+	// error on this many consecutive tool calls (CLA-739). The harness kills the
+	// session mid-stream, and the driver classifies it as dead with a cause
+	// naming the tool, the count and the error. Unset = the built-in default
+	// (DefaultMaxRepeatedToolFailures); 0 turns the check off; negative is
+	// refused.
+	//
+	// A POINTER, unlike max_zero_spend_attempts, because 0 here is a real
+	// setting (off) and not "use the default", so unset has to be a third state.
+	// And `omitempty`, because the config's marshalled form is its identity (see
+	// EchoSessions): adding the knob must not change an existing daemon's.
+	//
+	// Enforced by the harnesses that observe tool results as they stream -
+	// claude and opencode. Inert under codex.
+	MaxRepeatedToolFailures *int `json:"max_repeated_tool_failures,omitempty"`
+
+	// EchoSessions mirrors each session's output stream to the daemon's own
+	// stderr while it runs, as well as to its iteration log. Default FALSE
+	// (CLA-701): the stream is the whole harness transcript — opencode emits
+	// one JSON event per line, many carrying tool output inline — so echoing it
+	// buries the daemon's own lines (spawn, exit, classification, why the run
+	// ended) under thousands of rows of scrollback, and the iteration log keeps
+	// it in full anyway. Turn it on when watching one session live is worth
+	// more than the terminal being readable: `"echo_sessions": true`.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: the
+	// config's marshalled form is its identity, and the default must not change
+	// a daemon's identity merely because this field now exists.
+	EchoSessions bool `json:"echo_sessions,omitempty"`
+
 	// Budget is the circuit breaker / headroom knob. See Budget.
 	Budget Budget `json:"budget"`
 
@@ -640,6 +2389,13 @@ type Config struct {
 	// which case this whole feature is off and the legacy workdir behaviour runs.
 	PrimaryRepo string `json:"primary_repo"`
 
+	// Escalation holds the mechanical review-tier escalation rules (CLA-379).
+	// Config-owned: a glob-to-tier mapping (path_rules) and a category-to-tier
+	// mapping (category_rules). The CLI evaluates them at review-spawn time; the
+	// plane holds only the execution-config reference to them. Empty = no
+	// escalation — the review phase keeps its configured tier unchanged.
+	Escalation Escalation `json:"escalation"`
+
 	// AllowUncheckedPR opts this project out of CLA-310's empty-check-rollup
 	// refusal: a delivery whose PR carries NO checks is logged as a WARNING
 	// instead of refused. It exists for repos with NO CI at all, where refusing
@@ -655,6 +2411,58 @@ type Config struct {
 	// mode set it per project (see Project.AllowUncheckedPR), which overrides
 	// the top-level value for that project only.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// HealthURL is the deployment health endpoint (`/health`) doctor's deploy_lag
+	// check reads to learn WHICH commit is running out there - CLA-322. The plane
+	// stamps version.commit at BUILD time, so "is commit X live?" is one request
+	// and a string compare; this URL names where to ask. It is an operator-set
+	// value with no derived default, because a deployment can live anywhere
+	// (staging, production, a self-hosted plane) and deriving it from backlog_url
+	// would answer about whichever environment the guess happened to hit. Empty =
+	// not monitored: the check says so once, quietly, and moves on.
+	//
+	// The endpoint is read WITHOUT credentials - /health is public - so unlike
+	// backlog_url it is held only to "parses as an absolute URL", not to the
+	// bearer-token TLS floor.
+	HealthURL string `json:"health_url"`
+
+	// IntegrationBranch is the branch deployments are built from and promoted
+	// along - the branch whose tip a healthy deployed build should be an ancestor
+	// of. Doctor's deploy_lag check compares /health's version.commit against its
+	// REMOTE tip. Default: staging (the convention both of this project's repos
+	// use); override where your project integrates elsewhere. It deliberately does
+	// NOT come from delivery.Claim.IntegrationBranch: that is a per-session
+	// declaration of where one commit landed, while this is standing per-project
+	// configuration about how releases flow.
+	//
+	// It is NOT what the phase briefs call the PR base (CLA-608): a repo can
+	// deploy from one branch while its PRs target another (lecstor/makespdf
+	// deploys staging but merges task branches into integration), and a repo in
+	// a driven project can have no integration branch at all (the makesPDF
+	// plugin repos carry only main). See PRBase for the override that names a
+	// PR base explicitly; without one, each repo's PR base is resolved against
+	// the origin remote at phase-spawn time.
+	IntegrationBranch string `json:"integration_branch"`
+
+	// PRBase maps a repo identity ("owner/name", or its bare name) to the branch
+	// that repo's PRs TARGET - the branch a task branch forks from and merges
+	// back into, substituted into the phase briefs as {{prBase}} (CLA-608).
+	//
+	// It exists because the briefs used to hard-code "(staging)" for every repo
+	// of every project: the makesPDF plugins have no staging branch (their PRs
+	// all target main), and lecstor/makespdf and lecstor/clankerbar merge into
+	// integration - so a session was told to open its PR against a branch its
+	// repo does not have, and the setting raised itself as a decision on every
+	// task. An entry here wins outright, no probe: name the branch when the
+	// convention is not derivable. Without an entry the driver resolves per
+	// repo at phase-spawn time: the project's integration_branch when it
+	// exists on the origin remote, else origin's default branch (see
+	// loop.Driver.prBaseFor).
+	//
+	// This is deliberately NOT integration_branch renamed: that one keeps
+	// meaning the branch whose tip doctor's deploy_lag check judges, so a repo
+	// that deploys staging and merges integration needs both to stay truthful.
+	PRBase map[string]string `json:"pr_base"`
 
 	// AllowLocalMCPServers names the MCP server entries an operator means to run
 	// from a DISCOVERED `<workdir>/.mcp.json` — the file Validate adopts by
@@ -686,21 +2494,59 @@ type Config struct {
 	// member of; per-project keys are never needed.
 	Projects []Project `json:"projects"`
 
-	// Env is extra environment for the spawned harness process, as KEY=VALUE
-	// pairs. The child already inherits the loop's own environment, so this is for
-	// the unattended case (cron / launchd / systemd) where there is no interactive
-	// shell to export into — e.g. supplying CLAUDE_CODE_OAUTH_TOKEN when auth lives
-	// in a shell alias rather than the config dir.
+	// Env is extra environment for the spawned harness process. Each entry's
+	// value is either a literal string or an object {"fromCommand": "..."} whose
+	// stdout becomes the value, resolved FRESH AT EVERY SPAWN so a rotated token
+	// reaches the next session without a daemon restart (CLA-462). The child
+	// already inherits the loop's own environment, so this is for the unattended
+	// case: with GH_TOKEN declared here — per project if you drive several — the
+	// cb-run wrapper stops being load-bearing and launching the binary directly
+	// is safe.
 	//
-	// A value of the form "@path" is replaced by the contents of that file
-	// (trimmed; a leading ~ is expanded). Keep a secret in a 0600 file and point at
-	// it here rather than inlining it — mirroring CLANKERBAR_API_KEY, which is read
-	// from the environment, never this config file. That 0600 is ENFORCED, not
-	// advice: a file any other local account can read is refused (see resolveEnv).
-	Env map[string]string `json:"env"`
+	// The map overlays at FOUR levels in most-specific-wins order (the same
+	// precedence ResolveMCPConfig applies): this top-level map first, then
+	// `harnesses.<name>.env`, then `projects[].env`, then that project's
+	// `env_per_harness.<name>`. A value of the form "@path" is replaced by the
+	// contents of that file (trimmed; a leading ~ is expanded) — keep a secret in
+	// a 0600 file and point at it here rather than inlining it. That 0600 is
+	// ENFORCED, not advice: a file any other local account can read refuses the
+	// session spawn, as it always refused Validate.
+	//
+	// A fromCommand whose execution fails, times out (10s), or produces empty
+	// output REFUSES the session spawn with a log line naming the variable —
+	// fail closed, because a session missing its declared env is the incident,
+	// not a degraded mode. `doctor` verifies every declared command resolves
+	// before a run starts.
+	Env EnvMap `json:"env"`
 
-	source string   // path the config was loaded from, for diagnostics
-	env    []string // resolved KEY=VALUE pairs (built in Validate)
+	// EnvAllowlist, when non-empty, is the COMPLETE set of inherited environment
+	// variable NAMES a spawned session receives (CLA-714). Variables not named
+	// here are dropped from the harness process, so the session cannot read the
+	// tokens that happen to sit in the shell that started the supervisor.
+	//
+	// Unset is the default and keeps today's behaviour exactly: the harness
+	// inherits the daemon's whole environment. An explicitly EMPTY list is
+	// refused by Validate as a half-edit, so the only way to say "everything" is
+	// to omit the key. The list is about INHERITANCE only — the `env` maps above
+	// are still added on top of it at every level, which is how GH_TOKEN and
+	// CLAUDE_CODE_OAUTH_TOKEN arrive. A var may therefore be in the allowlist,
+	// in an `env` block, or in both; a `fromCommand` may read a variable that is
+	// NOT in the allowlist, because it runs in the daemon, before the filter.
+	//
+	// It composes at the same four levels as `env` (top level, harness, project,
+	// project-per-harness) but as a WHOLE LIST, not per key: the most specific
+	// level that declares one wins entirely. Restate a broader list where you
+	// narrow it; an intersection would make a level's own entry silently
+	// ineffective. `doctor` FAILS when the list in force omits a variable the
+	// fleet needs (HOME, PATH, CLANKERBAR_API_KEY, and CLANKERBAR_WORKDIR_ROOT
+	// when the workdir derivation is on), because a session missing one of those
+	// fails later and elsewhere.
+	//
+	// `omitempty` is load-bearing for the same reason as ProjectRoot: an unset
+	// key must not change a daemon's identity, and a set one correctly does.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
+
+	source string // path the config was loaded from, for diagnostics
 
 	// harnessFromFlag / modelFromFlag record that --harness / --model overrode
 	// the file. Both flags say "the run has ONE harness and this is it", which a
@@ -753,10 +2599,52 @@ type Project struct {
 	// Each entry is held to the same origin and slug checks as MCPConfigPath.
 	MCPConfigPaths map[string]string `json:"mcp_config_paths"`
 
+	// Env is this project's extra session environment, overlaid on top of the
+	// top-level env map for THIS project's sessions only — see Config.Env for
+	// what an entry holds. This is where a project's GH_TOKEN belongs when one
+	// daemon drives several backlogs: each project declares its own source, so
+	// no session ever carries another project's credential.
+	Env EnvMap `json:"env"`
+
+	// EnvPerHarness is this project's env PER HARNESS (harness name -> env map),
+	// the most specific layer of the four-level overlay: it wins per key over
+	// projects[].env, which wins over `harnesses.<name>.env`, which wins over
+	// the top level. Empty on every config that needs no per-pair override.
+	EnvPerHarness map[string]EnvMap `json:"env_per_harness"`
+
+	// EnvAllowlist is this project's inherited-env allowlist, replacing the
+	// top-level (and any harness-level) one wholly for this project's sessions —
+	// see Config.EnvAllowlist. It is how one daemon driving several backlogs
+	// keeps a credential one project needs out of another project's sessions.
+	EnvAllowlist []string `json:"env_allowlist,omitempty"`
+
+	// EnvAllowlistPerHarness is this project's allowlist PER HARNESS, the most
+	// specific level of the four: it wins over EnvAllowlist for sessions on that
+	// harness only. Empty on every config that needs no per-pair override.
+	EnvAllowlistPerHarness map[string][]string `json:"env_allowlist_per_harness,omitempty"`
+
 	// AllowUncheckedPR is this project's CLA-310 opt-out, overriding the
 	// top-level field of the same name for this project only. See
 	// Config.AllowUncheckedPR for what it does and why the default refuses.
 	AllowUncheckedPR bool `json:"allow_unchecked_pr"`
+
+	// HealthURL is this project's deployment health endpoint (`/health`),
+	// overriding the top-level field of the same name for this project only.
+	// See Config.HealthURL. Each project is a distinct backlog with its own
+	// deployment, so in multi-project mode each one names where ITS plane
+	// answers.
+	HealthURL string `json:"health_url"`
+
+	// IntegrationBranch is this project's integration branch, overriding the
+	// top-level field of the same name for this project only. See
+	// Config.IntegrationBranch for what it means; the default is staging.
+	IntegrationBranch string `json:"integration_branch"`
+
+	// PRBase is this project's repo -> PR-base-branch map, REPLACING the
+	// top-level map of the same name for this project when it declares
+	// anything; an entry that sets none inherits the top-level one. See
+	// Config.PRBase for what the map holds and how an unmatched repo resolves.
+	PRBase map[string]string `json:"pr_base"`
 
 	// AllowLocalMCPServers is this project's CLA-266 allowlist, REPLACING the
 	// top-level list of the same name for this project's discovered MCP config
@@ -815,6 +2703,161 @@ func (c *Config) AllowUncheckedPRFor(slug string) bool {
 		}
 	}
 	return c.AllowUncheckedPR
+}
+
+// DefaultIntegrationBranch is the branch whose tip doctor's deploy_lag check
+// (CLA-322) judges the deployed build against when neither the project nor the
+// top-level config names one. Both of this project's repos integrate through
+// `staging`, so that is the convention the default encodes; an operator whose
+// project integrates elsewhere sets integration_branch explicitly rather than
+// getting an answer about a branch they do not have.
+const DefaultIntegrationBranch = "staging"
+
+// HealthURLFor resolves the deploy_lag check's /health endpoint for one
+// project: a matching projects[] entry's value wins when it is set, and
+// everything else falls back to the top-level field. Empty means not
+// monitored - there is deliberately no derived default, because a guessed
+// environment would answer about the wrong deployment.
+func (c *Config) HealthURLFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return firstNonEmpty(p.HealthURL, c.HealthURL)
+		}
+	}
+	return c.HealthURL
+}
+
+// IntegrationBranchFor resolves the branch the deployed build is judged
+// against for one project: a matching projects[] entry's value wins when it is
+// set, then the top-level field, then DefaultIntegrationBranch. Total, so the
+// check never has to carry its own fallback.
+func (c *Config) IntegrationBranchFor(slug string) string {
+	for _, p := range c.Projects {
+		if p.Slug == slug {
+			return firstNonEmpty(p.IntegrationBranch, c.IntegrationBranch, DefaultIntegrationBranch)
+		}
+	}
+	return firstNonEmpty(c.IntegrationBranch, DefaultIntegrationBranch)
+}
+
+// firstNonEmpty returns the first argument that is not "", or "" if none is.
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// PRBaseFor resolves the operator's per-repo PR-base override for one project
+// and one task repo: a matching projects[] entry's own NON-EMPTY map replaces
+// the top-level one (the same replace-not-merge shape ReposFor uses), and the
+// map is then consulted by the FULL identity ("owner/name") first, then by the
+// bare name — the common spelling, and the same fallback ResolveCheckout
+// applies to checkouts (CLA-608).
+//
+// Empty means "nothing overridden": the caller resolves the branch against
+// the origin remote instead. It does NOT mean "no branch" — a validated map
+// entry always names one.
+func (c *Config) PRBaseFor(slug, repo string) string {
+	if strings.TrimSpace(repo) == "" {
+		return ""
+	}
+	m := c.PRBase
+	for _, p := range c.Projects {
+		if p.Slug == slug && len(p.PRBase) > 0 {
+			m = p.PRBase
+			break
+		}
+	}
+	if v, ok := m[repo]; ok {
+		return v
+	}
+	if i := strings.LastIndex(repo, "/"); i >= 0 {
+		if v, ok := m[repo[i+1:]]; ok {
+			return v
+		}
+	}
+	return ""
+}
+
+// validateHealthURL holds a health_url to "an absolute http(s) URL with a
+// host". It is deliberately weaker than backlog_url's TLS floor: /health is a
+// public endpoint read without credentials, so there is no bearer token to
+// keep off the wire, and a plain-http internal plane is a legitimate thing to
+// point at. What it refuses is a value that could never be fetched at all - a
+// relative reference, or a scheme no HTTP client speaks - which would
+// otherwise surface as an opaque "unsupported protocol scheme" error from
+// doctor instead of as the misfiled config line it is.
+func validateHealthURL(raw, label string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%s: %q is not a URL: %w", label, raw, err)
+	}
+	if u.Scheme == "" || u.Host == "" {
+		return fmt.Errorf("%s: %q is not an absolute URL with a scheme and host", label, raw)
+	}
+	switch u.Scheme {
+	case "http", "https":
+	default:
+		return fmt.Errorf("%s: %q must be an http or https URL; scheme %q can never be fetched", label, raw, u.Scheme)
+	}
+	return nil
+}
+
+// validateIntegrationBranch holds integration_branch to a bare ref-name shape.
+// The value is passed to `git fetch` and `git ls-remote` by doctor's deploy_lag
+// check (CLA-322); a value carrying refspec syntax (":") would make the fetch
+// argument a src:dst spec and MUTATE LOCAL REFS during a preflight, a leading
+// "-" reads as option syntax, and whitespace or anything outside a branch
+// name's alphabet is rejected by git downstream anyway. Empty is legal: it
+// means the default branch.
+func validateIntegrationBranch(raw, label string) error {
+	if raw == "" {
+		return nil
+	}
+	if strings.HasPrefix(raw, "-") || strings.ContainsAny(raw, ": \t\r\n") {
+		return fmt.Errorf("%s: %q must be a bare branch name (no leading \"-\", no \":\", no whitespace)", label, raw)
+	}
+	for _, r := range raw {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '/', r == '.', r == '_', r == '-':
+		default:
+			return fmt.Errorf("%s: %q must be a plain branch name ([A-Za-z0-9/._-])", label, raw)
+		}
+	}
+	return nil
+}
+
+// validatePRBase holds every pr_base entry to a bare branch name, one level
+// deeper than validateIntegrationBranch's own field: each VALUE reaches the
+// phase briefs and (through them) `git`/`gh pr create` arguments, so it carries
+// the same refspec-injection hazards a bad integration_branch does, plus the
+// extra one of being substituted into prose. An empty value is refused rather
+// than passed through: validateIntegrationBranch reads empty as "the default
+// branch", but a map entry saying nothing is a half-written override whose
+// silence would read as "resolved per repo" when the operator plainly meant to
+// name a branch — omit the entry instead. Keys are held to non-blank, sorted so
+// the reported entry does not change between runs on unchanged input.
+func validatePRBase(m map[string]string, label string) error {
+	for _, repo := range sortedKeys(m) {
+		if strings.TrimSpace(repo) == "" {
+			return fmt.Errorf("%s: a repo key is empty", label)
+		}
+		branch := m[repo]
+		if strings.TrimSpace(branch) == "" {
+			return fmt.Errorf("%s[%q]: names no branch (omit the entry to let the repo's PR base resolve against origin)", label, repo)
+		}
+		if err := validateIntegrationBranch(branch, fmt.Sprintf("%s[%q]", label, repo)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // AllowLocalMCPServersFor resolves the CLA-266 discovered-file allowlist for
@@ -1067,9 +3110,117 @@ func (b Budget) Remaining(elapsed time.Duration) (time.Duration, bool) {
 	return b.MaxWallClock.Duration() - elapsed, true
 }
 
+// expandsReviewPanel reports whether this config's sequence contains the shape
+// a panel multiplies: a configured phase that is the built-in review brief (no
+// prompt of its own) with a phase after it, i.e. the read-only gate. It is the
+// same shape EffectivePhases expands, so validation and expansion cannot
+// disagree about whether a panel applies.
+func (c *Config) expandsReviewPanel() bool {
+	for i, ph := range c.Phases {
+		if ph.Prompt == "" && ph.Name == ReviewPhaseName && i < len(c.Phases)-1 {
+			return true
+		}
+	}
+	return false
+}
+
+// reviewPhaseHarness is the harness a panel member with none of its own
+// inherits: the REVIEW phase's, which is itself the run-wide harness when that
+// phase names none — exactly the chain EffectivePhases' panelMember copies into
+// each member. The FIRST built-in review phase is the one that expands, so it is
+// the one whose harness a member inherits; nothing here assumes a review phase
+// exists (the caller checks).
+func (c *Config) reviewPhaseHarness() string {
+	for _, ph := range c.Phases {
+		if ph.Prompt == "" && ph.Name == ReviewPhaseName {
+			return c.HarnessFor(ph)
+		}
+	}
+	return c.Harness
+}
+
+// EffectivePanel is the review panel this config actually runs: the operator's
+// own list, and nothing else — an absent key (nil) means the historical single
+// review, not a panel of one (decision a0b1373b). There is no trial panel and no
+// preset: the CLI cannot know which harnesses, providers or models an operator
+// has, so it never names one. A FILE that writes `"review_panel": []` is refused
+// by Validate rather than silently meaning either thing (reviewPanelSet).
+func (c *Config) EffectivePanel() []ReviewPanelMember {
+	return c.ReviewPanel
+}
+
+// EffectivePanelConcurrency is how many members of a panel of n review AT ONCE
+// (CLA-697): the operator's `review_panel_concurrency` cap, or the whole panel
+// when the cap is absent, zero or larger than the panel. It never returns less
+// than 1, and a panel of fewer than two members always reports 1 — there is
+// nothing to fan out, and callers can use `1` as "the historical sequential
+// path" without a second check.
+//
+// A negative cap is a config error refused by Validate; this method is the
+// read path and stays total so a hand-built Config cannot make the driver
+// spawn a negative number of sessions.
+func (c *Config) EffectivePanelConcurrency(n int) int {
+	if n < 2 {
+		return 1
+	}
+	v := c.ReviewPanelConcurrency
+	if v <= 0 || v > n {
+		return n
+	}
+	return v
+}
+
+// panelMember is the review phase one panel member runs as: the configured
+// review phase's knobs (its turn and wall-clock caps, its tier, its prompt)
+// with the member's own identity, harness and model on top. Copying the phase
+// rather than synthesizing a fresh one is what lets an operator cap the whole
+// panel in one place — `{"name": "review", "max_turns": 80, "review_panel":
+// [...]}` caps every member — while a member that names its own harness or
+// model still wins where it does.
+func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
+	m := panel[i]
+	ph := p
+	ph.Name = PanelMemberLabel(panel, i)
+	ph.PanelMember = true
+	ph.PanelOptional = m.Optional
+	if h := strings.TrimSpace(m.Harness); h != "" {
+		ph.Harness = h
+	}
+	// Model and Tier are the same choice at two levels of indirection, and a
+	// member states one of them: either is the more specific statement than
+	// whatever the review phase carries, so setting one clears the other. An
+	// empty member field leaves the review phase's own value in place (itself
+	// empty on a config that resolved neither), which is the fall-through to
+	// the harness default.
+	if v := m.Model.List(); len(v) > 0 {
+		ph.Model = ModelRoutes(v)
+		ph.Tier = ""
+	} else if t := strings.TrimSpace(m.Tier); t != "" {
+		ph.Tier = t
+		// The inherited model would otherwise WIN: ModelForPhase resolves Model
+		// before Tier, so a member that asked for a bucket would silently run on
+		// the review phase's pinned alias. The member's own tier is the more
+		// specific statement, so it clears the inherited model too.
+		ph.Model = nil
+	}
+	return ph
+}
+
+// IsPanelMember reports whether this phase is one reviewer of an expanded
+// review panel (CLA-639) — the copy EffectivePhases makes, not the single
+// `review` the operator wrote. The driver reads it to tell a panel member that
+// may be skipped from a review phase whose record is the sequence's only gate.
+func (p Phase) IsPanelMember() bool { return p.PanelMember }
+
+// IsOptionalPanelMember reports whether this phase is a TRIAL seat of an
+// expanded review panel (CLA-784): a reviewer whose failure is recorded against
+// that member alone and never ends the sequence, hands back the panel's shared
+// claim, or blocks the fix. False for every phase that is not a panel member.
+func (p Phase) IsOptionalPanelMember() bool { return p.PanelMember && p.PanelOptional }
+
 // EffectivePhases is the sequence a task runs as: the configured phases with
-// their built-in prompts resolved, or — when none are configured — a single
-// phase carrying Prompt.
+// their built-in prompts resolved and the review panel expanded, or — when none
+// are configured — a single phase carrying Prompt.
 //
 // The unphased case is expressed as one phase on purpose, so the driver has
 // exactly ONE shape to run and the old behaviour is not a second code path that
@@ -1084,19 +3235,102 @@ func (c *Config) EffectivePhases() []Phase {
 	if len(phases) == 0 {
 		phases = []Phase{{Prompt: c.Prompt}}
 	}
-	out := make([]Phase, len(phases))
-	for i, ph := range phases {
+	// The panel expands AFTER each phase's built-in brief is resolved (below),
+	// because a member replaces the configured phase's identity with its own log
+	// label (no built-in prompt answers to `review-1`): the member inherits the
+	// resolved REVIEW brief and only its label, harness and model change.
+	panel := c.EffectivePanel()
+	out := make([]Phase, 0, len(phases)+len(panel))
+	for srcIdx, ph := range phases {
 		if ph.Prompt == "" {
-			ph.Prompt = builtinPhasePrompts[ph.Name]
+			// The review phase's MODE is positional: a review with a phase after
+			// it is the read-only gate, and a final review keeps the historical
+			// review-and-fix brief so a two-phase config still finishes. See
+			// reviewOnlyBrief and the builtinPhasePrompts comment.
+			//
+			// The fix phase's TERMINAL is positional for the same reason: a fix
+			// followed by a verification round must not open the PR (CLA-638,
+			// B12), because the verifier carries that terminal step only after it
+			// finds no open MUST.
+			switch {
+			case ph.Name == ReviewPhaseName && srcIdx < len(phases)-1:
+				ph.Prompt = reviewOnlyBrief
+			case ph.Name == FixPhaseName && srcIdx+1 < len(phases) && phases[srcIdx+1].Name == VerifyPhaseName && phases[srcIdx+1].Prompt == "":
+				ph.Prompt = fixVerifyBrief
+			default:
+				ph.Prompt = builtinPhasePrompts[ph.Name]
+			}
 		}
-		ph.MaxTurns = c.resolveMaxTurns(ph.MaxTurns)
-		ph.MaxWallClock = c.resolveWallClock(ph.MaxWallClock)
+		ph.sourceIdx = srcIdx
+		// CLA-639: a built-in review phase expands into one review phase PER
+		// PANEL MEMBER, so every consumer of the effective sequence — the
+		// driver's spawn loop, its seam, doctor — sees the reviewers that
+		// actually run rather than a single review the driver would have to
+		// remember to multiply. The panel is what the operator SET: an absent
+		// `review_panel` expands nothing (the single reviewer, as before), a
+		// phase carrying its own prompt is not expanded either (a custom review
+		// prompt owns its own contract), and a FINAL review keeps the historical
+		// combined brief — the position check is part of the expansion itself,
+		// not only of Validate, so EffectivePhases can never multiply a final
+		// review even when a caller skips validation. Validate refuses a
+		// configured panel in either of those shapes rather than letting it
+		// silently not apply.
+		if len(panel) > 0 && srcIdx < len(c.Phases)-1 && c.Phases[srcIdx].Prompt == "" && ph.Name == ReviewPhaseName {
+			for i := range panel {
+				member := ph.panelMember(panel, i)
+				member.sourceIdx = srcIdx
+				out = append(out, member)
+			}
+			continue
+		}
+		out = append(out, ph)
+	}
+	// A verify phase that names neither a harness nor a tier nor a model would
+	// otherwise run on the REVIEWER'S model — the one that raised the findings —
+	// which A5 (throughput, not only dollars) says is the wrong default:
+	// verification rounds are scoped and cheap, and a Claude subscription limit is
+	// shared with the operator's interactive use. So it inherits the FIX phase's
+	// harness and its model/tier pair instead (the shipped shape has fix on a
+	// cheap non-Claude harness), and an explicit harness/model/tier on the verify
+	// phase always wins. Configurable, never silent magic: the resolved values
+	// are what the spawn line stamps.
+	//
+	// Keyed on the RESOLVED built-in brief, not the name: an operator's own
+	// prompt under the name "verify" owns its own contract (the same convention
+	// every other variant follows — verifyBrief is what the driver treats as a
+	// verifier), so it must not silently inherit the fix phase's knobs.
+	if len(c.Phases) > 1 {
+		lastFix := -1
+		for i := range out {
+			if out[i].Name == FixPhaseName {
+				lastFix = i
+				continue
+			}
+			if out[i].Name != VerifyPhaseName || out[i].Prompt != verifyBrief || lastFix < 0 {
+				continue
+			}
+			if out[i].Harness == "" {
+				out[i].Harness = out[lastFix].Harness
+			}
+			// Model and tier are one choice, and the verify phase's own statement
+			// wins: inherit the fix phase's pair only when the verifier named
+			// neither. Inheriting the MODEL beside a tier the verifier named
+			// would make that tier inert, because ModelForPhase resolves Model
+			// first — the same trap a panel member's tier has.
+			if out[i].Model.Empty() && out[i].Tier == "" {
+				out[i].Model = out[lastFix].Model
+				out[i].Tier = out[lastFix].Tier
+			}
+		}
+	}
+	for i := range out {
+		out[i].MaxTurns = c.resolveMaxTurns(out[i].MaxTurns)
+		out[i].MaxWallClock = c.resolveWallClock(out[i].MaxWallClock)
 		// Resolve the harness here too, so every phase the driver iterates NAMES
 		// the harness it runs on and nothing downstream has to re-derive it from
 		// the config. The synthesized single phase of an unphased run gets the
 		// run-wide harness by the same rule, which is what it always ran on.
-		ph.Harness = c.HarnessFor(ph)
-		out[i] = ph
+		out[i].Harness = c.HarnessFor(out[i])
 	}
 	return out
 }
@@ -1133,6 +3367,17 @@ func (c *Config) ZeroSpendAttemptBound() int {
 		return c.MaxZeroSpendAttempts
 	}
 	return DefaultMaxZeroSpendAttempts
+}
+
+// RepeatedToolFailureBound is the effective repeated-failing-tool-call
+// threshold: the operator's own, else the built-in default. Unlike
+// ZeroSpendAttemptBound this one resolves to zero when the operator set zero,
+// which is how the check is turned off.
+func (c *Config) RepeatedToolFailureBound() int {
+	if c.MaxRepeatedToolFailures != nil {
+		return *c.MaxRepeatedToolFailures
+	}
+	return DefaultMaxRepeatedToolFailures
 }
 
 // BuiltinPhaseNames lists the shipped phase briefs, sorted so the error naming
@@ -1194,11 +3439,14 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 	if name != c.Harness {
 		return hc
 	}
-	if hc.Model == "" {
-		hc.Model = c.Model
+	// The run-wide twins are plain strings (they describe the top-level
+	// harness); a harness block accepts the route-list form, so the gap-fill
+	// widens a string into a one-route list rather than narrowing the block.
+	if len(hc.Model) == 0 && c.Model != "" {
+		hc.Model = ModelRoutes{c.Model}
 	}
 	if hc.Models == nil {
-		hc.Models = c.Models
+		hc.Models = stringMapToRoutes(c.Models)
 	}
 	if hc.ConfigDir == "" {
 		hc.ConfigDir = c.ConfigDir
@@ -1212,8 +3460,24 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 	return hc
 }
 
-// ModelForPhase resolves one phase's tier to the model alias its session runs
-// on, against the tier map of the harness THAT phase runs on.
+// stringMapToRoutes widens the run-wide tier map (plain strings) into a harness
+// block's route-valued map. Nil stays nil so SessionFor's "the block named no
+// map" test keeps distinguishing an absent map from an empty one.
+func stringMapToRoutes(m map[string]string) map[string]ModelRoutes {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]ModelRoutes, len(m))
+	for k, v := range m {
+		out[k] = ModelRoutes{v}
+	}
+	return out
+}
+
+// ModelForPhase resolves one phase's model: its own pinned alias (Phase.Model,
+// which is how a review-panel member names the model it runs on), else its tier
+// through the tier map of the harness THAT phase runs on, else that harness's
+// default model.
 //
 // Same total fallback chain as the single-harness case it replaces — unset tier,
 // unknown bucket, and a bucket mapped to blank all resolve to that harness's
@@ -1228,16 +3492,77 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 // therefore reports the typo case for any tier it names, which is honest — the
 // bucket really does resolve to nothing there.
 func (c *Config) ModelForPhase(ph Phase) (model string, ok bool) {
+	routes, ok := c.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		return "", ok
+	}
+	return routes[0], ok
+}
+
+// ModelRoutesForPhase is ModelForPhase with the whole ordered route list: the
+// phase's own pinned routes, else its tier's routes through the tier map of the
+// harness that phase runs on, else that harness's default routes. The first
+// entry is exactly what ModelForPhase returns, so a single-route phase (every
+// config written before CLA-782) resolves identically through both.
+//
+// The sibling exists because two callers need the whole list: the driver builds
+// the adapter's fallback chain from it, and doctor's credential check must see
+// every route the run may ask for, not only the first. `ok` keeps ModelForPhase's
+// meaning: false only when a tier was NAMED and resolved to nothing.
+func (c *Config) ModelRoutesForPhase(ph Phase) (routes []string, ok bool) {
 	hc := c.SessionFor(c.HarnessFor(ph))
-	dflt := strings.TrimSpace(hc.Model)
+	dflt := hc.Model.List()
+	// A pinned model is a complete answer and never a typo case: there is no
+	// bucket to resolve, so nothing can resolve to nothing. Reported in the
+	// spawn line as-is, which makes the panel's membership legible in the log.
+	if m := ph.Model.List(); len(m) > 0 {
+		return m, true
+	}
 	t := strings.TrimSpace(ph.Tier)
 	if t == "" {
 		return dflt, true
 	}
-	if alias := strings.TrimSpace(hc.Models[t]); alias != "" {
+	if alias := hc.Models[t].List(); len(alias) > 0 {
 		return alias, true
 	}
 	return dflt, false
+}
+
+// ModelIDsFor returns every model id the sessions on harnessName will actually
+// run with, deduplicated and sorted: each effective phase that resolves to that
+// harness (so the review panel and the unphased single phase are both included),
+// with its model resolved through the same chain the driver uses - Phase.Model,
+// else Phase.Tier through that harness's tier map, else that harness's default.
+//
+// It answers "which models is this config going to ask for", which is a question
+// about the RUN rather than about any one field, and there is exactly one caller
+// that needs it: `doctor`'s opencode credential check has to know which
+// providers those models name before it can say whether a stored credential
+// covers them (CLA-687). Reading `model` alone would miss the tier and panel
+// paths, which is precisely where a config pins a provider the top-level field
+// never mentions.
+//
+// An EMPTY id is skipped rather than reported: it means the harness's own
+// default model, which this config does not name and cannot check. A caller that
+// gets nothing back knows only that no session here names a model.
+func (c *Config) ModelIDsFor(harnessName string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, ph := range c.EffectivePhases() {
+		if c.HarnessFor(ph) != harnessName {
+			continue
+		}
+		routes, _ := c.ModelRoutesForPhase(ph)
+		for _, id := range routes {
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // ResolveMCPConfig picks the MCP config file one session gets, given the harness
@@ -1328,6 +3653,31 @@ func mcpConfigHandedTo(harnessName, path string) string {
 	return path
 }
 
+// panelMemberHarnesses is the harness each panel member resolves to when the
+// panel actually expands, in member order. A member with no harness of its own
+// inherits the review phase's (see reviewPhaseHarness). Empty when no panel is
+// set or no phase would expand — an inert panel spawns nothing.
+//
+// PhaseHarnesses and SpawnedHarnesses use it to add the members to the harnesses
+// a config DECLARES and SPAWNS while keeping their own iteration over c.Phases
+// (so an absent panel answers exactly as it did before CLA-639).
+func (c *Config) panelMemberHarnesses() []string {
+	panel := c.EffectivePanel()
+	if len(panel) == 0 || !c.expandsReviewPanel() {
+		return nil
+	}
+	inherited := c.reviewPhaseHarness()
+	out := make([]string, 0, len(panel))
+	for _, m := range panel {
+		h := strings.TrimSpace(m.Harness)
+		if h == "" {
+			h = inherited
+		}
+		out = append(out, h)
+	}
+	return out
+}
+
 // PhaseHarnesses lists every harness this config DECLARES — the run-wide one and
 // every phase's — deduplicated, with the run-wide one first and the rest in
 // sequence order.
@@ -1347,6 +3697,11 @@ func mcpConfigHandedTo(harnessName, path string) string {
 func (c *Config) PhaseHarnesses() []string {
 	out := []string{c.Harness}
 	seen := map[string]bool{c.Harness: true}
+	// The configured phases, exactly as before the panel existed. The panel's
+	// member harnesses are added on top (CLA-639): they are declared by the
+	// config and will be spawned, and a panel whose member harnesses were
+	// invisible here would be reported as configured for a harness it never uses
+	// while the one it does use went unchecked.
 	for _, ph := range c.Phases {
 		h := c.HarnessFor(ph)
 		if !seen[h] {
@@ -1354,12 +3709,29 @@ func (c *Config) PhaseHarnesses() []string {
 			out = append(out, h)
 		}
 	}
+	for _, h := range c.panelMemberHarnesses() {
+		if !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	// The conflict-only session's own harness (CLA-759), when the block names one
+	// that is not already listed. It is a harness this config can spawn a session
+	// on, so both questions below have to see it: doctor checks a DECLARED
+	// harness's binary, config dir and permission policy, and the spawn question
+	// must know the supervisor will really start one there.
+	if h := c.conflictHarness(); h != "" && !seen[h] {
+		seen[h] = true
+		out = append(out, h)
+	}
 	return out
 }
 
 // SpawnedHarnesses lists every harness this config will actually START A SESSION
 // on: the run-wide one for an unphased run, and otherwise exactly the harnesses
-// its phases resolve to. Deduplicated, in sequence order.
+// its phases resolve to — plus the conflict-only session's own harness (CLA-759)
+// when the `conflict` block names a different one, because the supervisor starts
+// a real session there on a conflicted approved task. Deduplicated, in sequence order.
 //
 // It differs from PhaseHarnesses in one shape, and the difference is the whole
 // reason it exists: when EVERY phase names its own harness, the run-wide
@@ -1381,18 +3753,42 @@ func (c *Config) PhaseHarnesses() []string {
 // So: ask PhaseHarnesses what is CONFIGURED, and SpawnedHarnesses what will RUN.
 func (c *Config) SpawnedHarnesses() []string {
 	// No phases means the synthesized single phase of EffectivePhases, which runs
-	// on the run-wide harness - so there the two are the same answer.
+	// on the run-wide harness - so there the two are the same answer. A panel
+	// beside an unphased run is inert (there is no sequence to multiply), so it
+	// adds nothing here either.
 	if len(c.Phases) == 0 {
-		return []string{c.Harness}
+		out := []string{c.Harness}
+		if h := c.conflictHarness(); h != "" && h != c.Harness {
+			out = append(out, h)
+		}
+		return out
 	}
 	var out []string
 	seen := map[string]bool{}
+	// The configured phases first, exactly as before the panel existed: an
+	// absent panel must answer byte-for-byte as it did at 5805722 (including a
+	// verify phase that names no harness resolving to the run-wide one, not to
+	// the fix phase's). The panel's members are added when one actually expands
+	// (CLA-639), because those are sessions this run really starts.
 	for _, ph := range c.Phases {
 		h := c.HarnessFor(ph)
 		if !seen[h] {
 			seen[h] = true
 			out = append(out, h)
 		}
+	}
+	for _, h := range c.panelMemberHarnesses() {
+		if !seen[h] {
+			seen[h] = true
+			out = append(out, h)
+		}
+	}
+	// The conflict-only session's own harness (CLA-759), when the block names one
+	// that is not already listed: the supervisor really starts a session there on
+	// a conflicted approved task, so this list must know about it.
+	if h := c.conflictHarness(); h != "" && !seen[h] {
+		seen[h] = true
+		out = append(out, h)
 	}
 	return out
 }
@@ -1454,6 +3850,18 @@ func Load(path string) (*Config, error) {
 	}
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", p, err)
+	}
+	// CLA-639: whether the file named `review_panel` with a JSON ARRAY. A
+	// present-but-empty array is the operator's own panel of none, which Validate
+	// refuses; absent (nil after unmarshal), or an explicit JSON `null` (what a
+	// marshalled config with no panel used to write), is the single reviewer,
+	// exactly as before the panel existed. Only an array counts as set: `null`
+	// carries no panel to honour.
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(data, &probe); err == nil {
+		if raw, ok := probe["review_panel"]; ok && strings.HasPrefix(strings.TrimSpace(string(raw)), "[") {
+			cfg.reviewPanelSet = true
+		}
 	}
 	cfg.source = p
 	return cfg, nil
@@ -1693,6 +4101,104 @@ func mcpUnderWorkDir(p, workdir string) string {
 	return underWorkDir(expandHome(p), workdir)
 }
 
+// RedactURLCredentials removes any URL userinfo - the `user:password@` part of
+// `scheme://user:password@host/...` - from raw, so a clone URL base carrying
+// embedded mirror credentials can be logged or quoted in an error without
+// writing the credential down. The host and path are kept: they are what makes
+// a log line or a failure diagnosable.
+//
+// An scp-style ssh prefix (`git@github-personal:`) is not a URL and its user is
+// a plain login name, not a credential, so it is returned unchanged. A value
+// with no userinfo is returned byte for byte.
+func RedactURLCredentials(raw string) string {
+	i := strings.Index(raw, "://")
+	if i < 0 {
+		return raw
+	}
+	rest := raw[i+3:]
+	authority := rest
+	if end := strings.IndexByte(rest, '/'); end >= 0 {
+		authority = rest[:end]
+	}
+	at := strings.LastIndexByte(authority, '@')
+	if at < 0 {
+		return raw
+	}
+	return raw[:i+3] + "redacted@" + rest[at+1:]
+}
+
+// ValidateCloneURLBase checks that base can be concatenated with an
+// `owner/name.git` identity to make ONE clone URL. The value is a prefix, so
+// the only structural mistake that is both common and silent is a missing
+// separator - `https://github.com` would otherwise produce
+// `https://github.comowner/name.git` - and that is refused here.
+//
+// Accepted shapes:
+//
+//	https://github.com/        (any URL-style base, ending in /)
+//	file:///srv/mirrors/       (a local mirror)
+//	/srv/mirrors/              (a bare path prefix)
+//	git@github-personal:       (an scp-style ssh host alias)
+//
+// An empty value is the default and therefore valid. Errors are recorded
+// with the key name by the caller, so they describe only what is wrong with
+// the value.
+func ValidateCloneURLBase(base string) error {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		return nil
+	}
+	if strings.ContainsAny(base, " \t\r\n") {
+		return errors.New("must not contain whitespace")
+	}
+	if strings.Contains(base, "://") {
+		if !strings.HasSuffix(base, "/") {
+			return fmt.Errorf("%q must end with / - it is a URL prefix (https://github.com/)", RedactURLCredentials(base))
+		}
+		return nil
+	}
+	if strings.HasSuffix(base, ":") {
+		host := strings.TrimSuffix(base, ":")
+		at := strings.LastIndexByte(host, '@')
+		// HasSuffix(host, ":") is the doubled separator - `git@host::` leaves a
+		// host that still ends in ':' after one is trimmed, and the concatenated
+		// URL is uncloneable (git reads the second ':' as the start of a path).
+		if at <= 0 || at == len(host)-1 || strings.HasSuffix(host, ":") || strings.Contains(host, "/") {
+			return fmt.Errorf("%q is not an ssh host alias - write it as user@host: (git@github-personal:)", RedactURLCredentials(base))
+		}
+		return nil
+	}
+	if strings.HasSuffix(base, "/") {
+		return nil
+	}
+	return fmt.Errorf("%q must end with / (https://github.com/, file:///srv/mirrors/) or be an ssh host alias ending in : (git@github-personal:)", RedactURLCredentials(base))
+}
+
+// StepHarnessError is Validate's refusal for a configured STEP whose harness
+// this machine cannot run: a phase, or a review-panel member, that names a
+// harness nothing registered, or one other than the run's top-level harness
+// with no local `harnesses.<h>` block to give it its machine wiring (CLA-598,
+// extending the rule CLA-366 set).
+//
+// The prose stays in Error(); the step label and harness are carried apart so a
+// caller can report them without matching on the message — `doctor` turns this
+// one into a FAILED check naming the project, step and harness, because a
+// stored document whose step this machine cannot spawn is a ratified policy
+// that silently will not run here, not the ordinary "keep the local rules"
+// trouble.
+type StepHarnessError struct {
+	// Step is the operator-facing label, e.g. `phases[1] ("review")` or
+	// `review_panel[2] ("review-3")`.
+	Step string
+	// Harness is the resolved harness name the step asked for.
+	Harness string
+	// Problem is the short reason: "unknown harness" or "no local harness block".
+	Problem string
+	msg     string
+}
+
+func (e *StepHarnessError) Error() string { return e.msg }
+
 // Validate normalizes path fields and checks the resolved config is runnable.
 func (c *Config) Validate() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
@@ -1747,7 +4253,21 @@ func (c *Config) Validate() error {
 	// rejected here before harness.Get is consulted, and a newly registered adapter is
 	// accepted automatically. harness does not import config, so there is no cycle.
 	if !harness.Known(c.Harness) {
-		return fmt.Errorf("unknown harness %q (want: %s)", c.Harness, strings.Join(harness.Names(), ", "))
+		return fmt.Errorf("unknown harness %q (want: %s)%s", c.Harness, strings.Join(harness.Names(), ", "), retiredHarnessHint(c.Harness))
+	}
+	// A `harnesses` block keyed by a name no adapter answers to is INERT: nothing
+	// ever looks that key up, so its model, tier map and paths are read by nobody
+	// and the operator's settings quietly stop applying. That is the shape a
+	// rename leaves behind - CLA-675 moved the 2.x preview onto `opencode`, and a
+	// config still carrying a `harnesses.opencode2` block (with the top-level
+	// `harness: opencode`) was accepted and ignored - so it is refused here,
+	// against the same registry as `harness` above and the budget blocks below,
+	// with the same rename hint. Names are checked in sorted order so the message
+	// does not depend on map iteration.
+	for _, name := range slices.Sorted(maps.Keys(c.Harnesses)) {
+		if !harness.Known(name) {
+			return fmt.Errorf("harnesses[%q]: unknown harness (want: %s)%s", name, strings.Join(harness.Names(), ", "), retiredHarnessHint(name))
+		}
 	}
 	// A per-harness block keyed by a name no adapter answers to is a ceiling that
 	// can never trip: nothing is ever charged to it, so the run is unbounded on
@@ -1758,7 +4278,7 @@ func (c *Config) Validate() error {
 	// one, exactly as for the dials beside it — see checkBudget.
 	for _, name := range slices.Sorted(maps.Keys(c.Budget.PerHarness)) {
 		if !harness.Known(name) {
-			return fmt.Errorf("budget.per_harness[%q]: unknown harness (want: %s)", name, strings.Join(harness.Names(), ", "))
+			return fmt.Errorf("budget.per_harness[%q]: unknown harness (want: %s)%s", name, strings.Join(harness.Names(), ", "), retiredHarnessHint(name))
 		}
 	}
 	if c.MaxTurns < 0 {
@@ -1778,6 +4298,18 @@ func (c *Config) Validate() error {
 	// doctor's negative-budget check exists to stop.
 	if c.MaxZeroSpendAttempts < 0 {
 		return errors.New("max_zero_spend_attempts is negative")
+	}
+	// Refused rather than read as "off": 0 is how the check is turned off, and a
+	// negative is a typo that would otherwise disable it silently.
+	if c.MaxRepeatedToolFailures != nil && *c.MaxRepeatedToolFailures < 0 {
+		return errors.New("max_repeated_tool_failures is negative")
+	}
+	// The plane refuses an instance name over 100 characters (CLA-465's report
+	// bounds), so a beacon carrying one would be dropped on EVERY poll — reporting
+	// silently off. Refuse it here instead, where it is a config typo with a
+	// readable error, not a mystery gap on the Fleet page.
+	if len(strings.TrimSpace(c.InstanceName)) > MaxInstanceNameLen {
+		return fmt.Errorf("instance_name exceeds %d characters (the plane's limit)", MaxInstanceNameLen)
 	}
 	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")
@@ -1828,8 +4360,12 @@ func (c *Config) Validate() error {
 	for i, ph := range c.Phases {
 		h := c.HarnessFor(ph)
 		if !harness.Known(h) {
-			return fmt.Errorf("phases[%d] (%q): unknown harness %q (want: %s)",
-				i, ph.Label(i), h, strings.Join(harness.Names(), ", "))
+			step := fmt.Sprintf("phases[%d] (%q)", i, ph.Label(i))
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "unknown harness",
+				msg: fmt.Sprintf("%s: unknown harness %q (want: %s)%s",
+					step, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h)),
+			}
 		}
 		// A phase on some OTHER harness inherits none of the run-wide
 		// harness-shaped fields, by design (see HarnessConfig), so with no block
@@ -1846,11 +4382,213 @@ func (c *Config) Validate() error {
 			// said that way: the promise this rule makes is that no session spawns
 			// with none of its harness's fields, and `"harnesses": {"opencode": {}}`
 			// spawns exactly that while satisfying a presence-of-key check.
-			return fmt.Errorf("phases[%d] (%q) runs on harness %q, but `harnesses.%s` is missing or empty: "+
-				"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
-				"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
-				i, ph.Label(i), h, h, h)
+			step := fmt.Sprintf("phases[%d] (%q)", i, ph.Label(i))
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "no local harness block",
+				msg: fmt.Sprintf("%s runs on harness %q, but `harnesses.%s` is missing or empty: "+
+					"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
+					"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
+					step, h, h, h),
+			}
 		}
+	}
+	// The conflict-only session step (CLA-759). It names a harness the SUPERVISOR
+	// will start a session on, so it is held to the same two rules as a phase's
+	// own harness above: it must exist in the registry, and when it is not the
+	// run-wide one it must carry a block of its own — inheriting another
+	// harness's dialect is the 3am failure the phase rule exists to prevent.
+	// Checked even when the block only pins the model, because the effective
+	// harness is then the implement step's and has already been checked.
+	if c.conflictDeclared() {
+		h := c.ConflictStep().Harness
+		if !harness.Known(h) {
+			return fmt.Errorf("conflict.harness: unknown harness %q (want: %s)%s",
+				h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
+		}
+		if c.Conflict.MaxTurns < 0 {
+			return errors.New("conflict.max_turns must not be negative")
+		}
+		if h != c.Harness {
+			hc, ok := c.Harnesses[h]
+			if !ok || hc.Empty() {
+				return fmt.Errorf("conflict.harness runs on harness %q, but `harnesses.%s` is missing or empty: "+
+					"a conflict session on a harness other than the run's `harness` inherits none of config_dir / "+
+					"mcp_config_path / settings_path / model — declare them under `harnesses.%s`", h, h, h)
+			}
+		}
+	}
+	// The review panel (CLA-639). Its members run one review phase each, so a
+	// member naming a harness is naming a harness the sequence will spawn on —
+	// held to the same two rules as a phase's own harness above, and refused
+	// here for the same reason: the alternative is a paid review session with
+	// none of its harness's fields, or one that dies on a name nothing answers
+	// to, discovered at 3am rather than at startup.
+	//
+	// Validation runs on the EFFECTIVE panel: a member with no harness of its own
+	// inherits the REVIEW phase's, so that inherited harness is checked here too
+	// (the phase rules above resolve it to the run-wide harness when the phase
+	// names none, so there is exactly one answer).
+	//
+	// An empty panel is refused when it is the key the FILE wrote and it would
+	// MEAN something — a phased config with a built-in review phase to expand.
+	// With no such phase the panel is inert (a config with its own review prompt
+	// owns its contract, an unphased config has no phase sequence at all) and
+	// refusing it would break the marshalled round trip of a config that never
+	// mentioned a panel.
+	if c.reviewPanelSet && len(c.EffectivePanel()) == 0 && c.expandsReviewPanel() {
+		return errors.New("review_panel is empty: a panel is one or more reviewers, each run as its own review phase " +
+			"(remove the key for a single reviewer, or list the members)")
+	}
+	// CLA-697: the concurrency cap is a count of sessions, so a negative one is
+	// meaningless rather than a way to say "unbounded" — that is 0 (or the
+	// absent key). Refused at the door like every other count.
+	if c.ReviewPanelConcurrency < 0 {
+		return fmt.Errorf("review_panel_concurrency is %d: it is the number of panel members that may run at once, "+
+			"so it must be 0 (the whole panel, the default) or a positive count (1 = sequential)", c.ReviewPanelConcurrency)
+	}
+	// A panel expands exactly ONE built-in review phase. A sequence with more
+	// than one is refused rather than resolved: the panel would multiply one and
+	// leave the other as a lone review, and which one it picked would be
+	// positional trivia the operator could only discover from the log. A review
+	// with its own prompt is not built-in and is not counted here; the
+	// no-expand refusal below catches a sequence whose only review is custom.
+	if len(c.EffectivePanel()) > 0 && len(c.Phases) > 0 {
+		var builtin []int
+		for i, ph := range c.Phases {
+			if ph.Prompt == "" && ph.Name == ReviewPhaseName {
+				builtin = append(builtin, i)
+			}
+		}
+		if len(builtin) > 1 {
+			at := make([]string, len(builtin))
+			for n, i := range builtin {
+				at[n] = strconv.Itoa(i)
+			}
+			return fmt.Errorf("review_panel is set, but the sequence has %d built-in %q phases (at %s): a panel expands "+
+				"exactly ONE built-in review phase, and the others would run as lone reviews — give the other review "+
+				"phases their own prompts, or remove `review_panel` to run the sequence's reviews as written",
+				len(builtin), ReviewPhaseName, strings.Join(at, ", "))
+		}
+	}
+	panel := c.EffectivePanel()
+	// CLA-784: an OPTIONAL member is a TRIAL seat — a reviewer the operator is
+	// evaluating, whose failure is recorded against that seat and never blocks
+	// the fix. A panel made ONLY of optional seats therefore has no reviewer a
+	// round could ever be said to have produced: every task would run the
+	// members, take whatever they wrote as nobody's review, and spawn no fix.
+	// Refused at the door rather than discovered from a log line.
+	if len(panel) > 0 {
+		required := 0
+		for _, m := range panel {
+			if !m.Optional {
+				required++
+			}
+		}
+		if required == 0 {
+			return fmt.Errorf("review_panel has %d members and ALL are optional: an `optional` member is a TRIAL reviewer whose failure is recorded against that seat and never blocks the fix, so a panel with no required member has no review to produce — leave at least one member without `optional` (required is the default), or remove `review_panel`",
+				len(panel))
+		}
+	}
+	labels := map[string]int{}
+	for i, m := range panel {
+		label := PanelMemberLabel(panel, i)
+		// Names become part of the iteration-log filename (the same rule a phase
+		// name follows), and one member's log must not be another's. The role is
+		// positional and unaffected by the label; this only keeps logs readable.
+		if j, dup := labels[label]; dup {
+			return fmt.Errorf("review_panel[%d] (%q): duplicate member name — review_panel[%d] already uses %q; a "+
+				"name is the member's log label, so each member needs its own", i, label, j, label)
+		}
+		labels[label] = i
+		if name := strings.TrimSpace(m.Name); name != "" && !phaseNameRe.MatchString(name) {
+			return fmt.Errorf("review_panel[%d]: name %q must be lowercase letters, digits and hyphens, with no leading, trailing or doubled hyphen (it becomes part of the iteration log filename)", i, name)
+		}
+		// The review-N family is owned by member POSITION: a member may write its
+		// own derived label, but not another member's, or the logs, the
+		// INCOMPLETE lines and the dead-phase tally would disagree about which
+		// member `review-2` is.
+		if name := strings.TrimSpace(m.Name); name != "" && panelMemberPositionRe.MatchString(name) {
+			derived := "review-" + strconv.Itoa(i+1)
+			if name != derived {
+				return fmt.Errorf("review_panel[%d]: name %q is in the reserved review-N family; this member's derived label is %q — name it something of its own, or remove `name` to let the position derive it", i, name, derived)
+			}
+		}
+		// The label is also the iteration-log tag, the phasesRun entry and the
+		// dead-phase tally cell, so it must not shadow a phase either: a member
+		// named `review` would merge with the real review phase in every log and
+		// tally (ReviewShaped/escalation still key on the phase's prompt, so only
+		// the reporting would be a lie — which is enough). An explicit name is
+		// refused rather than renamed because the operator wrote it; a DERIVED
+		// label that collides is refused with the remedy (set `name`), because
+		// the position alone cannot avoid the collision.
+		if slices.Contains(BuiltinPhaseNames(), label) {
+			return fmt.Errorf("review_panel[%d]: name %q is a built-in phase name; a member's name is its log label and iteration-log tag, so it must not shadow the %q phase — give the member a name of its own", i, label, label)
+		}
+		for j, ph := range c.Phases {
+			if ph.Name != label {
+				continue
+			}
+			if strings.TrimSpace(m.Name) == "" {
+				return fmt.Errorf("review_panel[%d]'s derived label %q collides with phases[%d]; set `name` on this member to label it without shadowing the phase", i, label, j)
+			}
+			return fmt.Errorf("review_panel[%d]: name %q is already the name of phases[%d]; a member's name labels its logs and dead-phase tally, so it must not merge with a configured phase", i, label, j)
+		}
+		h := strings.TrimSpace(m.Harness)
+		if h == "" {
+			h = c.reviewPhaseHarness()
+		}
+		if !harness.Known(h) {
+			step := fmt.Sprintf("review_panel[%d] (%q)", i, label)
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "unknown harness",
+				msg: fmt.Sprintf("%s: unknown harness %q (want: %s)%s",
+					step, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h)),
+			}
+		}
+		// A member runs one review phase of the sequence, so it is held to the
+		// same claim-tracking rule a configured phase is (the rule above): a
+		// member that cannot observe or resume the task claim would end the
+		// sequence early or hand the task back over its own work. Checked on the
+		// RESOLVED harness, so a member that inherits the review phase's
+		// harness is covered too.
+		if len(c.Phases) > 1 {
+			caps, known := harness.CapabilitiesOf(h)
+			if known && !caps.TracksClaims {
+				return fmt.Errorf("review_panel[%d] (%q) runs on harness %q, which does not observe the session's task claim — "+
+					"a phase either claims the task or resumes one it is handed, and this harness can do neither, so the "+
+					"sequence would end early or hand the task back over its own work (only the claim-tracking harnesses "+
+					"can run a phase in a sequence: use one, or drop the panel member)",
+					i, label, h)
+			}
+		}
+		if h == c.Harness {
+			continue
+		}
+		hc, ok := c.Harnesses[h]
+		if !ok || hc.Empty() {
+			step := fmt.Sprintf("review_panel[%d] (%q)", i, label)
+			return &StepHarnessError{
+				Step: step, Harness: h, Problem: "no local harness block",
+				msg: fmt.Sprintf("%s reviews on harness %q, but `harnesses.%s` is missing or empty: "+
+					"a phase on a harness other than the run's `harness` inherits none of config_dir / mcp_config_path / "+
+					"settings_path / model, because each is that harness's own dialect — declare them under `harnesses.%s`",
+					step, h, h, h),
+			}
+		}
+	}
+	// A panel multiplies the review phase, so a config that names one but has a
+	// review phase it cannot multiply is two contracts for one sequence. Refused
+	// rather than resolved: a FINAL review runs the historical combined brief and
+	// a review phase with its own prompt owns its own contract, so in either
+	// shape the panel would be a no-op the operator could only discover from the
+	// log. An UNPHASED config has no phase sequence at all — the key is inert
+	// there, not a no-op a run could have honoured.
+	if len(c.EffectivePanel()) > 0 && len(c.Phases) > 0 && !c.expandsReviewPanel() {
+		return fmt.Errorf("review_panel is set, but the sequence has no built-in, non-final %q phase to expand: "+
+			"a panel needs a built-in %q phase with a phase after it (the fix), because a FINAL review runs the "+
+			"historical combined brief and a review phase with its own prompt owns its own contract. Remove "+
+			"`review_panel` for a single reviewer, or make the review built-in and give it a phase after it",
+			ReviewPhaseName, ReviewPhaseName)
 	}
 	// Phases rest on EVERY phase's adapter observing the session's claim, not only
 	// the claiming one's.
@@ -1891,13 +4629,25 @@ func (c *Config) Validate() error {
 		// like — which would cost the phase its iteration log entirely, the one
 		// artifact an operator has to debug the sequence with.
 		if ph.Name != "" && !phaseNameRe.MatchString(ph.Name) {
-			return fmt.Errorf("phases[%d]: name %q must be lowercase letters, digits and hyphens (it becomes part of the iteration log filename)", i, ph.Name)
+			return fmt.Errorf("phases[%d]: name %q must be lowercase letters, digits and hyphens, with no leading, trailing or doubled hyphen (it becomes part of the iteration log filename)", i, ph.Name)
 		}
 		if ph.MaxTurns < 0 {
 			return fmt.Errorf("phases[%d]: max_turns is negative", i)
 		}
 		if ph.MaxWallClock < 0 {
 			return fmt.Errorf("phases[%d]: max_wall_clock is negative", i)
+		}
+		// A configured phase names its model ONE way (operator decision
+		// 3eddb7a5): a direct alias or a tier bucket, never both. ModelForPhase
+		// would silently let the alias win, which would leave an operator reading
+		// a tier that is stored but inert — the same ambiguity the plane refuses
+		// (CLA-722). Checked on c.Phases, which is the configured sequence: a
+		// phase SYNTHESIZED from a review-panel member is not here, and a member
+		// may still set both (its expansion clears the tier, so the alias wins by
+		// construction — see Phase.panelMember).
+		if first := ph.Model.First(); first != "" && strings.TrimSpace(ph.Tier) != "" {
+			return fmt.Errorf("phases[%d] (%q) sets both `model` (%q) and `tier` (%q): a phase names its model one way — remove one of them (`model` is the alias it runs on, `tier` a bucket in `models`)",
+				i, ph.Label(i), first, ph.Tier)
 		}
 		// The resume placeholders are filled from the claim the PREVIOUS phase left
 		// held, so the first phase has nothing to fill them from. The driver leaves
@@ -1913,9 +4663,9 @@ func (c *Config) Validate() error {
 			if effective == "" {
 				effective = builtinPhasePrompts[ph.Name]
 			}
-			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder} {
+			for _, pl := range []string{PhaseTaskPlaceholder, PhaseRunPlaceholder, PhaseBranchPlaceholder, PhasePrevHarnessPlaceholder, PhasePrevModelPlaceholder, ReviewerRolePlaceholder, ReviewedTipPlaceholder} {
 				if strings.Contains(effective, pl) {
-					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim to fill it from — it claims a task of its own, so a resume brief cannot go first",
+					return fmt.Errorf("phases[0] (%q): its prompt carries %s, but the FIRST phase has no previous claim or phase to fill it from — it claims a task of its own, so a resume brief cannot go first",
 						ph.Label(0), pl)
 				}
 			}
@@ -1929,6 +4679,97 @@ func (c *Config) Validate() error {
 		if lastPh.Prompt == "" && lastPh.Name == ImplementPhaseName {
 			return fmt.Errorf("phases[%d]: the sequence ends on the %q brief, which tells its session to stop at the checkpoint — nothing would ever hand a task to review (add a %q phase, or give this one its own prompt)",
 				n-1, ImplementPhaseName, ReviewPhaseName)
+		}
+	}
+	// The fix phase is the one that carries the branch-shaped terminal step (PR,
+	// in_review), so it must be LAST: a non-final fix would open the PR and hand
+	// the task over, and the phase after it would resume a task that has already
+	// left the run. It also needs a preceding review phase by name, because its
+	// shipped brief's first act is to read the review record's `## Review` block
+	// from the task — a fix with no review before it can only report a failed
+	// hand-off. Both rules apply to the BUILT-IN brief only; an operator's own
+	// prompt owns its own ordering.
+	//
+	// CLA-638 relaxes the LAST rule for exactly one successor: a built-in
+	// VERIFICATION phase. EffectivePhases swaps the fix's resolved prompt to the
+	// no-PR variant; the verifier then carries the terminal step, and the driver
+	// repeats the fix→verify pair until a round finds no open MUST or the round
+	// cap parks the task.
+	if n := len(c.Phases); n > 0 {
+		for i, ph := range c.Phases {
+			if ph.Prompt != "" || ph.Name != FixPhaseName {
+				continue
+			}
+			verifyFollows := i+1 < n && c.Phases[i+1].Name == VerifyPhaseName && c.Phases[i+1].Prompt == ""
+			if i != n-1 && !verifyFollows {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is the LAST phase of a sequence — it opens the PR and hands the task to in_review, so a phase after it would be spawned on a task that has already left the run (move %q to the end, or give this phase its own prompt)",
+					i, ph.Label(i), FixPhaseName, FixPhaseName)
+			}
+			reviewed := false
+			for _, prev := range c.Phases[:i] {
+				if prev.Name == ReviewPhaseName {
+					reviewed = true
+					break
+				}
+			}
+			if !reviewed {
+				return fmt.Errorf("phases[%d] (%q): the %q brief applies a review's findings, but no %q phase precedes it — there would be no review record to read, and its only honest outcome is a reported failed hand-off (add a %q phase, or give this one its own prompt)",
+					i, ph.Label(i), FixPhaseName, ReviewPhaseName, ReviewPhaseName)
+			}
+		}
+	}
+	// The verification round (CLA-638) has one legal position and one legal
+	// predecessor. Position: LAST, because the driver repeats the fix→verify pair
+	// after it and a phase after the verifier would never be reached. Predecessor:
+	// the built-in fix brief, because there must be a phase that applies findings
+	// between the verifier's rounds — without it the loop cannot make progress,
+	// which is exactly the non-terminating sequence this rule refuses. The
+	// verifier also needs an earlier review phase whose MUSTs it adjudicates; a
+	// sequence with no review has no findings and no ids to verify.
+	if n := len(c.Phases); n > 0 {
+		for i, ph := range c.Phases {
+			if ph.Prompt != "" || ph.Name != VerifyPhaseName {
+				continue
+			}
+			if i != n-1 {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is the LAST phase of a sequence — it ends the verification loop (no open MUST), so a phase after it would never run (move %q to the end)",
+					i, ph.Label(i), VerifyPhaseName, VerifyPhaseName)
+			}
+			if i == 0 || c.Phases[i-1].Prompt != "" || c.Phases[i-1].Name != FixPhaseName {
+				return fmt.Errorf("phases[%d] (%q): the %q brief verifies a fix round, so it must directly follow the %q brief — with no fix between verification rounds the loop cannot make progress (add a %q phase before %q)",
+					i, ph.Label(i), VerifyPhaseName, FixPhaseName, FixPhaseName, VerifyPhaseName)
+			}
+			reviewed := false
+			for _, prev := range c.Phases[:i] {
+				if prev.Name == ReviewPhaseName {
+					reviewed = true
+					break
+				}
+			}
+			if !reviewed {
+				return fmt.Errorf("phases[%d] (%q): the %q brief adjudicates a review's open MUSTs by id, but no %q phase precedes the fix it verifies — there would be no finding ids to adjudicate (add a %q phase before %q)",
+					i, ph.Label(i), VerifyPhaseName, ReviewPhaseName, ReviewPhaseName, FixPhaseName)
+			}
+		}
+	}
+	// A non-final BUILT-IN review names the phase after it as the one that applies
+	// its findings, and the driver's review→fix seam requires the review record to
+	// have been written. A built-in phase there that is NOT the fix brief cannot
+	// satisfy either (the other built-ins claim a task, or run the combined
+	// review-and-fix brief and re-review from scratch), so a config that names one
+	// is refused at startup rather than spending a review to discover it. A phase
+	// with its OWN prompt is allowed: applying the findings is then the operator's
+	// own contract.
+	if n := len(c.Phases); n > 1 {
+		for i, ph := range c.Phases[:n-1] {
+			if ph.Prompt != "" || ph.Name != ReviewPhaseName {
+				continue
+			}
+			next := c.Phases[i+1]
+			if next.Prompt == "" && next.Name != FixPhaseName {
+				return fmt.Errorf("phases[%d] (%q): the %q brief is REVIEW-ONLY — it records findings and changes nothing — so the phase after it must be the %q brief (or carry its own prompt saying who applies the findings); %q resolves to the %q built-in, which does neither",
+					i, ph.Label(i), ReviewPhaseName, FixPhaseName, next.Label(i+1), next.Name)
+			}
 		}
 	}
 
@@ -1965,7 +4806,37 @@ func (c *Config) Validate() error {
 	if _, err := secureurl.Origin(c.BacklogURL); err != nil {
 		return fmt.Errorf("backlog_url: %w", err)
 	}
+	// health_url is read WITHOUT credentials (/health is public), so unlike
+	// backlog_url it is not held to the bearer-token TLS floor - only to being
+	// a usable absolute URL. A value that cannot be fetched would otherwise
+	// surface as an opaque HTTP-client error from doctor's deploy_lag check
+	// instead of as the misfiled config it is.
+	if err := validateHealthURL(c.HealthURL, "health_url"); err != nil {
+		return err
+	}
+	// integration_branch reaches `git fetch`/`git ls-remote` in doctor's
+	// deploy_lag check; a refspec-shaped value would mutate local refs during a
+	// preflight. See validateIntegrationBranch.
+	if err := validateIntegrationBranch(c.IntegrationBranch, "integration_branch"); err != nil {
+		return err
+	}
+	// pr_base values reach the phase briefs and the remote checks behind them,
+	// so they are held to the same ref-name shape (CLA-608).
+	if err := validatePRBase(c.PRBase, "pr_base"); err != nil {
+		return err
+	}
+	// clone_url_base is concatenated with a repo identity to make the supervisor's
+	// clone URL (CLA-713), so a value with no trailing separator would silently
+	// build a URL nobody can clone. Refuse it here so doctor reports it once,
+	// before a reconcile ever tries to use it.
+	c.CloneURLBase = strings.TrimSpace(c.CloneURLBase)
+	if err := ValidateCloneURLBase(c.CloneURLBase); err != nil {
+		return fmt.Errorf("clone_url_base: %w", err)
+	}
 	if err := c.checkMCPConfigOrigins(c.MCPConfigPath, "mcp_config_path"); err != nil {
+		return err
+	}
+	if err := checkMCPConfigNamesClankerbar(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
 	// Each per-harness MCP config points the SAME account key at a host, so it is
@@ -1977,6 +4848,9 @@ func (c *Config) Validate() error {
 	for _, name := range sortedKeys(c.Harnesses) {
 		hc := c.Harnesses[name]
 		if err := c.checkMCPConfigOrigins(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
+			return err
+		}
+		if err := checkMCPConfigNamesClankerbar(hc.MCPConfigPath, "harnesses."+name+".mcp_config_path"); err != nil {
 			return err
 		}
 		// The single-project split-brain, refused the same way the multi-project
@@ -2068,6 +4942,18 @@ func (c *Config) Validate() error {
 		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
 			return err
 		}
+		if err := checkMCPConfigNamesClankerbar(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+			return err
+		}
+		if err := validateHealthURL(p.HealthURL, fmt.Sprintf("projects[%d].health_url", i)); err != nil {
+			return err
+		}
+		if err := validateIntegrationBranch(p.IntegrationBranch, fmt.Sprintf("projects[%d].integration_branch", i)); err != nil {
+			return err
+		}
+		if err := validatePRBase(p.PRBase, fmt.Sprintf("projects[%d].pr_base", i)); err != nil {
+			return err
+		}
 		// The slug decides which queue is POLLED; the .mcp.json decides which
 		// project the sessions WORK. If they disagree, the loop would gate on one
 		// project while draining another — a silent split-brain. Refuse it here.
@@ -2082,6 +4968,9 @@ func (c *Config) Validate() error {
 			p.MCPConfigPaths[name] = path
 			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
 			if err := c.checkMCPConfigOrigins(path, label); err != nil {
+				return err
+			}
+			if err := checkMCPConfigNamesClankerbar(path, label); err != nil {
 				return err
 			}
 			if fromMCP := slugFromMCPURL(mcpURLFromConfig(path)); fromMCP != "" && fromMCP != p.Slug {
@@ -2111,11 +5000,66 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	resolved, err := resolveEnv(c.Env)
-	if err != nil {
+	// The session env declarations (CLA-462) are validated at all FOUR levels
+	// here — names and commands are static facts of the file, so a bad one is a
+	// config error, not a spawn-time surprise. Resolution itself happens fresh
+	// at every spawn (SessionEnv), because command-derived values exist to be
+	// fresh.
+	if err := validateEnvDecls(c.Env, "env"); err != nil {
 		return err
 	}
-	c.env = resolved
+	for _, name := range sortedKeys(c.Harnesses) {
+		if err := validateEnvDecls(c.Harnesses[name].Env, "harnesses."+name+".env"); err != nil {
+			return err
+		}
+	}
+	for i := range c.Projects {
+		if err := validateEnvDecls(c.Projects[i].Env, fmt.Sprintf("projects[%d].env", i)); err != nil {
+			return err
+		}
+		for _, h := range sortedKeys(c.Projects[i].EnvPerHarness) {
+			if err := validateEnvDecls(c.Projects[i].EnvPerHarness[h], fmt.Sprintf("projects[%d].env_per_harness.%s", i, h)); err != nil {
+				return err
+			}
+		}
+	}
+
+	// The inherited-env allowlists (CLA-714) are validated at all four levels
+	// too: a name that can never match, a duplicate, or an explicit empty list
+	// is a config error, not a spawn-time surprise.
+	if err := validateEnvAllowlist(c.EnvAllowlist, "env_allowlist"); err != nil {
+		return err
+	}
+	for _, name := range sortedKeys(c.Harnesses) {
+		if err := validateEnvAllowlist(c.Harnesses[name].EnvAllowlist, "harnesses."+name+".env_allowlist"); err != nil {
+			return err
+		}
+	}
+	for i := range c.Projects {
+		if err := validateEnvAllowlist(c.Projects[i].EnvAllowlist, fmt.Sprintf("projects[%d].env_allowlist", i)); err != nil {
+			return err
+		}
+		for _, h := range sortedKeys(c.Projects[i].EnvAllowlistPerHarness) {
+			// The KEY is checked against the harness registry too, and here that
+			// matters more than in the sibling env maps: an inert
+			// `env_per_harness` entry merely fails to add a variable, whereas an
+			// allowlist keyed by a name no adapter answers to is never consulted.
+			// SessionEnvAllowlist looks up the harness actually spawned, finds no
+			// per-project list for it, and can then fall back to nil — which
+			// inheritEnv reads as FULL INHERITANCE. A typo or a retired name would
+			// therefore switch the filter OFF instead of narrowing it, the one
+			// direction this feature exists to prevent. Refused here, against the
+			// same registry as `harnesses` and `budget.per_harness`, with the same
+			// rename hint.
+			if !harness.Known(h) {
+				return fmt.Errorf("projects[%d].env_allowlist_per_harness[%q]: unknown harness (want: %s)%s",
+					i, h, strings.Join(harness.Names(), ", "), retiredHarnessHint(h))
+			}
+			if err := validateEnvAllowlist(c.Projects[i].EnvAllowlistPerHarness[h], fmt.Sprintf("projects[%d].env_allowlist_per_harness.%s", i, h)); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -2132,45 +5076,6 @@ func discoverMCPConfig(workdir string) string {
 	return ""
 }
 
-// resolveEnv turns the env map into sorted KEY=VALUE pairs, reading "@path"
-// values from disk so a secret needn't be inlined in the config file. Sorting
-// keeps the child's environment deterministic across runs.
-//
-// An `@path` file must be owner-only (CLA-260). The indirection exists for one
-// reason - holding a credential out of the config file - and the doc comment on
-// Env has always told operators to keep it at 0600, but nothing checked, so a
-// `chmod 644` token file was accepted in silence and every local account could
-// read the key that drives the whole backlog. Refused rather than warned: a WARN
-// in an overnight log is read after the fact, if at all, and the fix is one
-// chmod.
-func resolveEnv(m map[string]string) ([]string, error) {
-	if len(m) == 0 {
-		return nil, nil
-	}
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys))
-	for _, k := range keys {
-		v := m[k]
-		if strings.HasPrefix(v, "@") {
-			path := expandHome(strings.TrimPrefix(v, "@"))
-			data, err := readOwnerOnly(path, groupOtherAccess)
-			if err != nil {
-				if errors.Is(err, errInsecureMode) {
-					return nil, fmt.Errorf("env %s: %w - an @path secret must be readable only by you: chmod 600 %s", k, err, path)
-				}
-				return nil, fmt.Errorf("env %s: %w", k, err)
-			}
-			v = strings.TrimSpace(string(data))
-		}
-		out = append(out, k+"="+v)
-	}
-	return out, nil
-}
-
 // sortedKeys is map iteration made deterministic, for the checks whose ERROR
 // depends on which entry is reached first. A validation message that names a
 // different block on each run of the same file reads as a flaky check rather
@@ -2183,10 +5088,6 @@ func sortedKeys[V any](m map[string]V) []string {
 	sort.Strings(keys)
 	return keys
 }
-
-// EnvSlice returns the resolved extra environment (KEY=VALUE) for the harness,
-// populated by Validate. Nil when no env is configured.
-func (c *Config) EnvSlice() []string { return c.env }
 
 // legacyStateDirName is where the state dir used to live, relative to the
 // workdir. Kept only so `doctor` and the loop can point an operator at a
@@ -2413,6 +5314,12 @@ func (c *Config) BacklogEndpoint() string {
 	return ""
 }
 
+// Slug returns the project slug this config's wiring names — the `<slug>` in a
+// /mcp/<slug> endpoint or .mcp.json URL, "" when nothing derivable says. It is
+// how single-project mode answers "which project is this", the same derivation
+// the poll and the sessions already agree on.
+func (c *Config) Slug() string { return slugFromMCPURL(c.BacklogEndpoint()) }
+
 // ProjectEndpoint returns one configured project's MCP endpoint — the same
 // `/mcp/<slug>` URL that project's sessions are pointed at — so a write the driver
 // makes lands on the same project its sessions are working.
@@ -2483,6 +5390,115 @@ func projectSummaryPath(origin, slug string) string {
 	return origin + "/api/projects/" + url.PathEscape(slug) + "/backlog-summary"
 }
 
+// FleetReportURL returns the URL of the daemon's fleet presence beacon target
+// (CLA-466): the plane's `POST .../fleet/report` surface, which takes presence
+// plus any finished iteration records in one authenticated call.
+//
+// Unlike the summary route there is NO legacy slug-less form — the report
+// endpoint exists only as `/api/projects/<slug>/fleet/report` (CLA-465). So a
+// setup with no derivable slug has no fleet URL at all: reporting is off for
+// that run (doctor says so), and the loop behaves exactly as it did before
+// fleets existed. Same origin rule as every credentialed call: CredentialOrigin,
+// never a path read off the workdir's .mcp.json.
+func (c *Config) FleetReportURL() string {
+	origin := c.CredentialOrigin()
+	if origin == "" {
+		return ""
+	}
+	if slug := slugFromMCPURL(c.BacklogEndpoint()); slug != "" {
+		return projectFleetReportPath(origin, slug)
+	}
+	return ""
+}
+
+// ProjectFleetReportURL returns the fleet-report URL for one configured project:
+// `<origin>/api/projects/<slug>/fleet/report`, on the same trusted
+// CredentialOrigin as every other credentialed call.
+func (c *Config) ProjectFleetReportURL(p Project) string {
+	origin := c.CredentialOrigin()
+	if origin == "" || p.Slug == "" {
+		return ""
+	}
+	return projectFleetReportPath(origin, p.Slug)
+}
+
+func projectFleetReportPath(origin, slug string) string {
+	return origin + "/api/projects/" + url.PathEscape(slug) + "/fleet/report"
+}
+
+// ResolveInstanceName composes the Fleet-page instance identity a daemon
+// beacons under (CLA-466): an explicit instance_name wins verbatim; otherwise
+// the default is the machine's hostname plus the config file's basename minus
+// its .json suffix ("Jasons-MBP/clanker1"), because the config PATH is what
+// actually distinguishes co-located daemons (CLA-501). The earlier
+// bare-hostname fallback keyed every same-host daemon to one presence row,
+// each beacon overwriting the last.
+//
+// The config-identity hash was considered and rejected as the discriminator:
+// it fingerprints file CONTENT, and the live co-located configs hash identically.
+//
+// The composed default is truncated to MaxInstanceNameLen so it cannot exceed
+// the plane's cap. Two paths identical within that prefix would still collide;
+// that is pathological, and visible to doctor's sibling scan, which resolves
+// identities through this same function.
+func ResolveInstanceName(instanceName, sourcePath, hostname string) string {
+	if name := strings.TrimSpace(instanceName); name != "" {
+		return name
+	}
+	base := ""
+	if sourcePath != "" {
+		base = strings.TrimSuffix(filepath.Base(sourcePath), ".json")
+	}
+	var name string
+	switch {
+	case hostname != "" && base != "":
+		name = hostname + "/" + base
+	case hostname != "":
+		name = hostname // no config file in play  -  nothing better than the host
+	default:
+		name = base // hostname unreadable; the basename still disambiguates
+	}
+	if len(name) > MaxInstanceNameLen {
+		// Byte-truncate, but never split a multi-byte rune: a split rune would
+		// marshal as U+FFFD (encoding/json replaces invalid UTF-8), corrupting
+		// the very identity this function exists to pin - and two distinct long
+		// basenames could even collapse onto one mangled prefix, re-creating the
+		// collision CLA-501 exists to fix. Back off to a rune boundary instead.
+		name = name[:MaxInstanceNameLen]
+		for len(name) > 0 && !utf8.ValidString(name) {
+			name = name[:len(name)-1]
+		}
+	}
+	return name
+}
+
+// ResolvedInstanceName is ResolveInstanceName over this config's instance_name
+// and source path.
+func (c *Config) ResolvedInstanceName(hostname string) string {
+	return ResolveInstanceName(c.InstanceName, c.source, hostname)
+}
+
+// Identity fingerprints the effective config in force — what the fleet presence
+// beacon reports as `configIdentity` (CLA-466), so the console can tell two
+// daemons apart when they disagree about how to run and can see a RELOAD land.
+//
+// It is a SHA-256 over the JSON encoding of the config AS VALIDATED (flag
+// overrides applied), recomputed on demand rather than cached: a RELOAD swaps
+// d.cfg mid-run, and the next beacon must carry the new identity. Only exported
+// fields encode; no secret is in the config file by contract (the API key lives
+// in CLANKERBAR_API_KEY). Map fields encode with sorted keys, so the fingerprint
+// is stable across processes.
+func (c *Config) Identity() string {
+	b, err := json.Marshal(c)
+	if err != nil {
+		// Marshalling a Config cannot fail today (no channels/funcs/cycles); an
+		// empty identity reads plane-side as "unknown" rather than lying.
+		return ""
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
 // slugFromMCPURL extracts the `<slug>` from an `/mcp/<slug>` MCP endpoint URL, or
 // "" when the path is bare `/mcp` (a pre-CLA-99 project-key endpoint) or not an
 // MCP path at all.
@@ -2528,6 +5544,19 @@ func mcpURLFromConfig(path string) string {
 		if s.usesKey {
 			return s.url
 		}
+	}
+	return ""
+}
+
+// retiredHarnessHint names what replaced a harness that used to be registered,
+// so a config written for it fails with the fix in the message rather than a
+// bare "unknown harness". `opencode2` drove the 2.x preview; since CLA-675 the
+// `opencode` harness drives 2.x itself and the preview adapter is gone. It is
+// not kept as an alias: one name per adapter keeps the binary doctor looks up,
+// the harnesses block, budgets and logs all agreeing.
+func retiredHarnessHint(name string) string {
+	if name == "opencode2" {
+		return ` - "opencode2" was retired: the "opencode" harness now drives opencode 2.x; rename it (and any harnesses.opencode2 block) to "opencode"`
 	}
 	return ""
 }

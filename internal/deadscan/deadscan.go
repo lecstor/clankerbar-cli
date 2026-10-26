@@ -21,6 +21,17 @@
 //     without a final answer), and NO branch was recorded on the task — the
 //     "produced nothing" shape. A session that recorded a branch and THEN died
 //     still produced something, so it is not dead.
+//   - a session is STALLED when it got past its claim and its final step_finish
+//     carried reason "length" with ZERO output tokens (CLA-584): the model hit
+//     its output ceiling while thinking and emitted nothing. It gets its own
+//     column, separate from the dead count — the end is a different shape (the
+//     session was alive, and the opencode adapter resumes it once with a steer
+//     where it sees it), and folding the two together would hide which fix
+//     moved which number. The count is read off the logs' shape and is NOT a
+//     list of sessions the live driver acted on: another harness emitting the
+//     same shape is still counted here. The branch conjunct deliberately does
+//     not apply: a stalled session is stalled whether or not work was already
+//     pushed.
 //   - a session whose log carries the adapter's own cap/failure markers (a raw
 //     "!! session outlived its wall-clock cap" / "!! session crossed its
 //     per-session token ceiling" / "!! stream read failed" console line) ended
@@ -61,24 +72,32 @@ type Log struct {
 
 	Day     string // "2026-08-20"
 	Phase   string // the -p<phase> filename tag; "unphased" when absent
-	Harness string // inferred from content: opencode / claude / codex / opencode2
+	Harness string // inferred from content: opencode / claude / codex
 
 	// GotPastClaim reports whether the session got past its claim: a completed
 	// claim_task, or a completed heartbeat on a resumed phase. A refused claim
 	// leaves this false, and the session counts toward neither counter.
 	GotPastClaim bool
-	// BranchRecorded mirrors Claim.HasWIP: an update_task carrying a branch, or
-	// a claim result that already carried WIP. A session that recorded a branch
-	// before dying is not dead.
+	// BranchRecorded mirrors Claim.HasWIP: a record_progress carrying a branch,
+	// or a claim result that already carried WIP. A session that recorded a
+	// branch before dying is not dead.
 	BranchRecorded bool
 	// LastReason is the final step_finish part's reason, as the driver reads it
 	// off FinishReasonKey. Empty for harnesses that emit no step_finish (claude,
-	// codex, opencode2) — and therefore never dead.
+	// codex) — and therefore never dead. opencode 2.x emits step_finish only for
+	// tool-call steps, so a 2.x log's final step usually carries none either;
+	// the live adapter reads that verdict from the session export instead, which
+	// this scan of console logs cannot see.
 	LastReason string
 
 	// Dead is the classification: got past its claim, reason "unknown", no
 	// branch, no cap marker.
 	Dead bool
+
+	// Stalled is the CLA-584 output-cap stall: got past its claim, the FINAL
+	// step_finish carried reason "length" with zero output tokens, and no cap
+	// marker. Counted in its own column, never in Dead — see the package doc.
+	Stalled bool
 
 	// APIErrors are the structured error events this log carried (name + data),
 	// for the FindErrors known-positive control. Text an agent merely READ is
@@ -90,6 +109,9 @@ type Log struct {
 type Cell struct {
 	Day, Phase, Harness string
 	Run, Dead           int
+	// Stalled is the CLA-584 output-cap stall count, reported as its own
+	// column so it can be read without touching the dead rate.
+	Stalled int
 }
 
 // Rate is dead/run as a percentage, 0 when nothing ran.
@@ -157,6 +179,9 @@ func Summarize(logs []Log) []Cell {
 		c.Run++
 		if l.Dead {
 			c.Dead++
+		}
+		if l.Stalled {
+			c.Stalled++
 		}
 	}
 	sort.Slice(cells, func(i, j int) bool {
@@ -227,7 +252,7 @@ func classify(path string) (Log, error) {
 		return l, err
 	}
 	l.Harness = harnessOf(data)
-	l.GotPastClaim, l.BranchRecorded, l.LastReason, l.APIErrors, l.Dead =
+	l.GotPastClaim, l.BranchRecorded, l.LastReason, l.APIErrors, l.Dead, l.Stalled =
 		classifyEvents(l.Harness, data)
 	return l, nil
 }
@@ -236,8 +261,8 @@ func classify(path string) (Log, error) {
 // step events (step_start/step_finish/tool_use); codex emits `thread.`/`item.`/
 // `turn.`-prefixed JSON (internal/harness/codex.go: thread.started,
 // item.started/item.completed, turn.completed — verified against codex.go's
-// own test fixtures, not guessed); opencode2 emits only text-part JSON; claude
-// emits rendered text.
+// own test fixtures, not guessed); an opencode 2.x log of a plain answer can
+// carry only text-part JSON, which is opencode too; claude emits rendered text.
 func harnessOf(data []byte) string {
 	for _, line := range splitLines(data) {
 		var ev struct {
@@ -252,7 +277,7 @@ func harnessOf(data []byte) string {
 		case strings.HasPrefix(ev.Type, "thread.") || strings.HasPrefix(ev.Type, "item.") || strings.HasPrefix(ev.Type, "turn."):
 			return "codex"
 		case ev.Type == "text":
-			return "opencode2"
+			return "opencode"
 		}
 	}
 	return "claude"
@@ -266,14 +291,18 @@ func harnessOf(data []byte) string {
 // its claim observation shows as a "· holding" console line (noteClaimed) and a
 // resumed phase's heartbeat as a "→ mcp__clankerbar__heartbeat" marker, and
 // without reading those a claude session that ran would count toward neither
-// counter. Codex and opencode2 emit no claim state the scan can read, so their
+// counter. Codex emits no claim state the scan can read, so its
 // sessions count as run only when a claim marker appears; they can never be
-// dead either way (no step_finish reason on either surface).
-func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded bool, lastReason string, apiErrors []string, dead bool) {
+// dead either way (no step_finish reason on that surface).
+func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded bool, lastReason string, apiErrors []string, dead, stalled bool) {
 	// The driver's dead conjuncts, mirrored from the log:
 	//   reason "unknown" AND no branch AND got past its claim AND not a cap.
 	reasonUnknown := false
 	capKilled := false
+	// lastOut is the FINAL step_finish's own output-token count, tracked
+	// alongside lastReason so the two always describe the same step — the
+	// CLA-584 stall is exactly that pair: reason "length", output 0.
+	lastOut := 0
 	for _, line := range splitLines(data) {
 		if len(line) == 0 || line[0] != '{' {
 			// Raw console line: the adapter's own backstop markers, or the
@@ -313,10 +342,17 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 		case "step_finish":
 			var part struct {
 				Reason string `json:"reason"`
+				Tokens *struct {
+					Output int `json:"output"`
+				} `json:"tokens"`
 			}
 			_ = json.Unmarshal(ev.Part, &part)
 			if part.Reason != "" {
 				lastReason = part.Reason
+				lastOut = 0
+				if part.Tokens != nil {
+					lastOut = part.Tokens.Output
+				}
 				if part.Reason == "unknown" {
 					reasonUnknown = true
 				} else {
@@ -336,7 +372,13 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 		}
 	}
 	dead = gotPastClaim && reasonUnknown && !branchRecorded && !capKilled
-	return gotPastClaim, branchRecorded, lastReason, apiErrors, dead
+	// The stall is the OTHER terminal step reason, so dead and stalled can
+	// never both fire for one session. It is its own column (the live adapter
+	// resumes it once, and the dead rate must not absorb the resumable end),
+	// and the branch conjunct is deliberately absent: pushing a branch first
+	// does not un-stall a step that then burned its whole output budget.
+	stalled = gotPastClaim && lastReason == "length" && lastOut == 0 && !capKilled
+	return gotPastClaim, branchRecorded, lastReason, apiErrors, dead, stalled
 }
 
 // noteTool mirrors the shared claim observer (harness.noteToolUse /
@@ -345,7 +387,7 @@ func classifyEvents(harness string, data []byte) (gotPastClaim, branchRecorded b
 //   - a COMPLETED claim_task means the session got past its claim; a refused
 //     one has status "error" and changes nothing.
 //   - a COMPLETED heartbeat means a resumed phase holding a claim.
-//   - an update_task whose INPUT carries a branch, or a claim result that
+//   - a record_progress whose INPUT carries a branch, or a claim result that
 //     already carried WIP (hasWip / task.branch), is the HasWIP mirror.
 func noteTool(part json.RawMessage, gotPastClaim, branchRecorded bool) (bool, bool) {
 	var p struct {
@@ -382,7 +424,7 @@ func noteTool(part json.RawMessage, gotPastClaim, branchRecorded bool) (bool, bo
 				}
 			}
 		}
-	case strings.Contains(p.Tool, "update_task") && completed:
+	case strings.Contains(p.Tool, "record_progress") && completed:
 		// HasWIP is set on the REQUEST in the live adapter (the branch arg),
 		// which is the state.input here.
 		var args struct {

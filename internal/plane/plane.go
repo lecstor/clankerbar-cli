@@ -35,6 +35,24 @@ import (
 // stopping the run.
 var ErrNotWired = errors.New("plane writes not wired")
 
+// RequiredPlaneProtocol is the plane protocol version whose tool set this build
+// speaks. It is the cutover CLA-746 promotes and CLA-748 depends on: the nine
+// intent-specific task tools exist and `update_task` is deleted. The CLI and the
+// plane are released as one coordinated pair - the fleet is stopped, the plane is
+// promoted, this binary is installed, the fleet is restarted - so there is no
+// older plane to fall back to and no reason to feature-detect one.
+//
+// 41 is the changelog entry that made the cutover (CLA-746); record_review itself
+// arrived at 40, but every tool this file calls is present from 41 on.
+const RequiredPlaneProtocol = 41
+
+// ErrPlaneTooOld means the plane does not serve a tool this build needs - the
+// unknown-tool refusal an older plane gives. It is deliberately terminal rather
+// than a cue to retry an older spelling: `update_task` is gone, so the only
+// correct answer is to promote the plane to the same cutover this binary came
+// from, and the error names that version.
+var ErrPlaneTooOld = errors.New("the plane does not serve the task tools this build needs")
+
 // ErrQuestionNotFiled wraps a park that moved the task to `parked` but then
 // failed to file the question that raises it to the operator. The task IS
 // parked — it will not be retried by a clanker — so the caller must not report
@@ -45,8 +63,11 @@ var ErrQuestionNotFiled = errors.New("task parked but the question was not filed
 
 // Releaser hands a claim back to the queue.
 type Releaser interface {
-	// Release ends the run holding taskID and returns the task to `ready`, so the
-	// next iteration can claim it immediately instead of waiting out a dead lease.
+	// Release ends the run holding taskID as `released` (never `failed`) and
+	// returns a no-WIP task to `ready`, so the next iteration can claim it
+	// immediately instead of waiting out a dead lease. It calls `release_task`,
+	// the plane's hand-an-unfinished-claim-back primitive (CLA-246), which also
+	// leaves the reclaim budget untouched.
 	//
 	// It must only be called for a task with NO work-in-progress branch recorded.
 	// Releasing one that HAS a branch would be actively worse than doing nothing:
@@ -54,9 +75,22 @@ type Releaser interface {
 	// lease, so moving the task to `ready` discards the very hint that warns the
 	// next clanker there is pushed work to pick up. That trap is on the record —
 	// it is what standing decision 15 (CLA-191) was written about. The WIP case
-	// wants a plane-side primitive that preserves the handoff; until that exists,
-	// the driver leaves those tasks to expire.
+	// wants ExpireLease below.
 	Release(ctx context.Context, taskID, runID string) error
+
+	// ReleaseDriver is Release carrying `driver: true` on `release_task` — the
+	// same handback, recorded as one a driver made on a session's behalf rather
+	// than one the session chose. The supervisor uses it when a child it did not
+	// start a drain for has exited holding a task with no branch.
+	ReleaseDriver(ctx context.Context, taskID, runID string) error
+
+	// ExpireLease ends the holding run NOW instead of waiting out its 30-minute
+	// lease, and leaves the task an immediate takeover when a branch is recorded
+	// (or `ready` when there is none). It sends `expire: true` plus `driver: true`
+	// to release_task - the plane's CLA-707 primitive, written for a dead session
+	// whose work IS pushed. Unlike Release it keeps the WIP hand-off, so it is the
+	// correct handback for a claim with a branch recorded.
+	ExpireLease(ctx context.Context, taskID, runID string) error
 }
 
 // Attester records the driver's own verdict on a delivery a session declared.
@@ -85,7 +119,7 @@ type Attester interface {
 
 // Delivery is the declaration being attested to, echoed back exactly as the
 // session made it. The whole thing is resent, not just the two fields the check
-// used: `update_task` takes `delivery` as an object, and a partial one risks
+// used: `record_progress` takes `delivery` as an object, and a partial one risks
 // dropping whatever the session put in the fields this driver did not name.
 type Delivery struct {
 	Commit            string
@@ -98,8 +132,8 @@ type Delivery struct {
 //
 // It is deliberately NOT part of Releaser, and the difference is the whole point:
 // a release moves the task to `ready` and ends the run holding it, while this
-// carries no status at all. Plane-side, `updateStatus` is what clears a holder,
-// and a call with no status never reaches it - so recording a branch cannot
+// carries no status at all. Plane-side, the status write is what clears a holder,
+// and `record_progress` has no status field - so recording a branch cannot
 // settle a claim, cannot hand a task back, and cannot revert one that has already
 // reached review. That is what makes it safe on the CLA-262 untrusted path, where
 // handing the claim back is forbidden precisely because a settle we never saw may
@@ -115,6 +149,22 @@ type Recorder interface {
 	// one laptop sends the next clanker - routinely on another machine - to fetch
 	// nothing.
 	RecordBranch(ctx context.Context, taskID, runID, branch string) error
+}
+
+// ReviewRoundCloser closes a durable review round (CLA-637), releasing its
+// sealed findings to the fix phase. It is what the driver calls at the
+// review->fix seam, after the seam gate has matched this run's record.
+//
+// A separate interface, like Attester and Recorder, so a not-wired plane or a
+// test double degrades loudly at the caller that needs it rather than failing to
+// compile. The driver refuses the checkpoint when the closer is unavailable: a
+// fix phase that cannot see the findings would be spawned to apply nothing.
+type ReviewRoundCloser interface {
+	// CloseReviewRound closes round on taskID through
+	// record_review({closeRound: round}), signed by runID. The plane refuses a
+	// caller that is not the task's holding run, and answers no_open_round for a
+	// round already closed or voided - both reported as errors.
+	CloseReviewRound(ctx context.Context, taskID, runID string, round int) error
 }
 
 // ParkAPI is the optional interface a Releaser may implement to let the driver
@@ -161,10 +211,15 @@ type ParkAPI interface {
 
 type notWired struct{}
 
-func (notWired) Release(context.Context, string, string) error    { return ErrNotWired }
-func (notWired) Heartbeat(context.Context, string) error          { return ErrNotWired }
-func (notWired) PeekNextTask(context.Context) (NextTask, error)   { return NextTask{}, ErrNotWired }
-func (notWired) TaskRepo(context.Context, string) (string, error) { return "", ErrNotWired }
+func (notWired) Release(context.Context, string, string) error       { return ErrNotWired }
+func (notWired) ReleaseDriver(context.Context, string, string) error { return ErrNotWired }
+func (notWired) ExpireLease(context.Context, string, string) error   { return ErrNotWired }
+func (notWired) Heartbeat(context.Context, string) error             { return ErrNotWired }
+func (notWired) PeekNextTask(context.Context) (NextTask, error)      { return NextTask{}, ErrNotWired }
+func (notWired) TaskRepo(context.Context, string) (string, error)    { return "", ErrNotWired }
+func (notWired) TaskState(context.Context, string) (TaskState, error) {
+	return TaskState{}, ErrNotWired
+}
 
 // New builds a Releaser. Missing either the endpoint or the key yields a
 // not-wired one, so an operator running without a configured plane is degraded
@@ -175,10 +230,44 @@ func New(mcpURL, apiKey string) Releaser {
 	if mcpURL == "" || apiKey == "" {
 		return notWired{}
 	}
+	return wiredClient(mcpURL, apiKey)
+}
+
+// NewRunConfigAPI builds the run-config half of the surface: reading the stored
+// execution config and proposing one. Missing either the endpoint or the key
+// yields the not-wired client, degrading exactly like New.
+//
+// The not-wired value is deliberately a DIFFERENT type from New's: each
+// constructor hands out only its own capabilities, so a caller type-asserting
+// for one it did not ask for gets a refusal, not a silent claim (the same
+// property plane_test.go asserts for Recorder and ParkAPI).
+//
+// mcpURL is the project-scoped MCP endpoint (`https://…/mcp/<slug>`).
+func NewRunConfigAPI(mcpURL, apiKey string) RunConfigAPI {
+	if mcpURL == "" || apiKey == "" {
+		return rcNotWired{}
+	}
+	return wiredClient(mcpURL, apiKey)
+}
+
+// rcNotWired is NewRunConfigAPI's not-wired answer — only what RunConfigAPI
+// names, so it cannot be asserted into a capability nobody requested.
+type rcNotWired struct{}
+
+func (rcNotWired) RunConfig(context.Context) (*RunConfigState, error) { return nil, ErrNotWired }
+func (rcNotWired) ProposeRunConfig(context.Context, map[string]any, string) error {
+	return ErrNotWired
+}
+
+func wiredClient(mcpURL, apiKey string) *mcpReleaser {
 	return &mcpReleaser{
 		endpoint: strings.TrimRight(mcpURL, "/"),
 		apiKey:   apiKey,
 		client:   &http.Client{Timeout: 20 * time.Second, CheckRedirect: noDowngradeRedirect},
+		// The PUT carries a whole file, so it gets its own, longer deadline
+		// (see uploadTimeout); same redirect rule, since a downgrade would put
+		// the URL's capability token on the wire in cleartext.
+		upload: &http.Client{Timeout: uploadTimeout, CheckRedirect: noDowngradeRedirect},
 	}
 }
 
@@ -186,24 +275,61 @@ type mcpReleaser struct {
 	endpoint string
 	apiKey   string
 	client   *http.Client
+	upload   *http.Client
 }
 
 func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("release: taskId and runId are both required")
 	}
-	// `status: ready` is what returns the task to the claimable queue. It clears
-	// the holder and — unlike the plane's own expiry sweep — does not charge the
-	// task a reclaim, which is the whole point of releasing rather than going
-	// quiet. `runId` signs the write, so the revision is credited to this run.
-	//
-	// No `outcome` is sent on purpose: the session may have written one, and this
-	// call is a handback, not a report. Clobbering its words would lose the only
-	// trace of what actually happened.
-	return r.call(ctx, "update_task", map[string]any{
+	// `release_task` is the plane's hand-an-unfinished-claim-back primitive
+	// (CLA-246): it returns a no-WIP task to the claimable queue WITHOUT charging
+	// it a reclaim, and - unlike a status move - records the run as `released`,
+	// never `failed`. The default (neither `expire` nor `driver`) IS the handback;
+	// no `outcome` is sent: the session may have written one, and this call is a
+	// handback, not a report.
+	return r.call(ctx, "release_task", map[string]any{
 		"taskId": taskID,
 		"runId":  runID,
-		"status": "ready",
+	})
+}
+
+// ReleaseDriver is Release with `driver: true`, the marker the plane records for
+// a handback a driver made on a dead session's behalf (CLA-707 extended the
+// existing driver-marker guard to accept a handback as well as an expiry).
+//
+// It is separate from Release rather than a flag on it so the daemon's own
+// long-standing handback keeps the exact wire shape it has always had: a driver
+// marker is a claim about who ended the run, and the caller must decide it.
+func (r *mcpReleaser) ReleaseDriver(ctx context.Context, taskID, runID string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("release driver: taskId and runId are both required")
+	}
+	return r.call(ctx, "release_task", map[string]any{
+		"taskId": taskID,
+		"runId":  runID,
+		"driver": true,
+	})
+}
+
+// ExpireLease ends the run holding taskID now and leaves the task to the same
+// paths a natural expiry would: an immediate takeover when a branch is
+// recorded, `ready` when there is none (CLA-707). It is the handback for a
+// session that died holding PUSHED work, where Release is forbidden because it
+// would discard the takeover hand-off.
+//
+// `driver: true` marks it as a driver's call for a dead session, which is what
+// both the loop (on an abandoned phase) and the supervisor (on a child exit) are
+// making.
+func (r *mcpReleaser) ExpireLease(ctx context.Context, taskID, runID string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("expire lease: taskId and runId are both required")
+	}
+	return r.call(ctx, "release_task", map[string]any{
+		"taskId": taskID,
+		"runId":  runID,
+		"expire": true,
+		"driver": true,
 	})
 }
 
@@ -211,10 +337,11 @@ func (r *mcpReleaser) Release(ctx context.Context, taskID, runID string) error {
 // died before it could hand over still leaves a hand-off behind (CLA-314).
 //
 // No `status`, no `outcome`, no `delivery`. That is not minimalism, it is the
-// safety property: this call has to be legal on a session whose stream could not
-// be read whole, where the driver may be wrong about whether the task is still
-// held. A `branch` on its own revises a record; it cannot move a task, cannot
-// clear a holder, and cannot post `ready` over something already in review.
+// safety property: `record_progress` carries no status field at all, so this call
+// is legal on a session whose stream could not be read whole, where the driver
+// may be wrong about whether the task is still held. It revises a record; it
+// cannot move a task, cannot clear a holder, and cannot post `ready` over
+// something already in review.
 //
 // `runId` signs it. The plane credits the run while it is the task's most recent
 // one - which it still is after the session has ended - and refuses a superseded
@@ -227,32 +354,54 @@ func (r *mcpReleaser) RecordBranch(ctx context.Context, taskID, runID, branch st
 	if branch == "" {
 		return errors.New("record branch: refusing to record an empty branch")
 	}
-	return r.call(ctx, "update_task", map[string]any{
+	return r.call(ctx, "record_progress", map[string]any{
 		"taskId": taskID,
 		"runId":  runID,
 		"branch": branch,
 	})
 }
 
+// CloseReviewRound closes one round of the durable review record (CLA-637) with
+// record_review({closeRound: round}), signed by the holding run. It sends nothing
+// else - a close is not a revision, not a status move and not an outcome write.
+//
+// The round is the driver's, not the reviewer's: the session writes the sealed
+// record and the driver closes it at the seam, which is what releases the
+// findings to the fix phase while keeping each reviewer's record sealed from
+// the next reviewer reading the task.
+func (r *mcpReleaser) CloseReviewRound(ctx context.Context, taskID, runID string, round int) error {
+	if taskID == "" || runID == "" {
+		return errors.New("close review round: taskId and runId are both required")
+	}
+	if round <= 0 {
+		return errors.New("close review round: round must be positive")
+	}
+	return r.call(ctx, "record_review", map[string]any{
+		"taskId":     taskID,
+		"runId":      runID,
+		"closeRound": round,
+	})
+}
+
 // Park parks a task the driver has decided should reach the operator (CLA-386).
-// Unlike Release — which returns a held claim to the ready queue — this moves
-// the task to `parked`, the status a human reviews, because a task that has
-// killed two consecutive sessions must not be offered to a third.
+// Unlike Release - which returns a held claim to the ready queue - this moves the
+// task to `parked`, the status a human reviews, because a task that has killed
+// two consecutive sessions must not be offered to a third.
 //
 // The OUTCOME is the standalone record: the park commits before any question is
 // filed (the caller files it with AskQuestion), so if that insert fails this
 // text is all the operator gets, and it must still say what happened and that
-// the call is theirs — exactly as the plane's own escalateExhausted reasons
+// the call is theirs - exactly as the plane's own escalateExhausted reasons
 // about its ordering (CLA-186).
 func (r *mcpReleaser) Park(ctx context.Context, taskID, runID, outcome string) error {
 	if taskID == "" || runID == "" {
 		return errors.New("park: taskId and runId are both required")
 	}
-	return r.call(ctx, "update_task", map[string]any{
-		"taskId":  taskID,
-		"runId":   runID,
-		"status":  "parked",
-		"outcome": outcome,
+	return r.call(ctx, "settle_task", map[string]any{
+		"taskId":      taskID,
+		"runId":       runID,
+		"disposition": "parked",
+		"outcome":     outcome,
 	})
 }
 
@@ -317,13 +466,15 @@ func (r *mcpReleaser) AskProjectQuestion(ctx context.Context, body string, optio
 	return nil
 }
 
-// AttestMergeVerified writes the driver's verdict onto the task's delivery record.
+// AttestMergeVerified writes the driver's verdict onto the task's delivery record
+// with `record_progress`. It deliberately does NOT call `complete_task`: a
+// delivery is a record write, and closing a task is the close-out's act, not an
+// attestation's side effect.
 //
 // The declaration is echoed back exactly as the session made it, so the stored
 // delivery stays internally consistent: an attestation has to name the thing it is
-// about, or a later reader cannot tell what was checked. No `status` and no
-// `outcome` are sent — this revises a record, it does not move the task or
-// overwrite the session's own words.
+// about, or a later reader cannot tell what was checked. No `outcome` is sent —
+// this revises a record, it does not overwrite the session's own words.
 //
 // It runs AFTER the session ended, which is later than any other write here. The
 // plane credits a `runId` while it is the task's most recent run — which it still
@@ -345,7 +496,7 @@ func (r *mcpReleaser) AttestMergeVerified(ctx context.Context, taskID, runID str
 	if d.PR != "" {
 		delivery["pr"] = d.PR
 	}
-	return r.call(ctx, "update_task", map[string]any{
+	return r.call(ctx, "record_progress", map[string]any{
 		"taskId":   taskID,
 		"runId":    runID,
 		"delivery": delivery,
@@ -380,6 +531,9 @@ func checkResult(tool string, raw []byte) error {
 		return fmt.Errorf("%s: decode response: %w", tool, err)
 	}
 	if rpc.Error != nil {
+		if unknownTool(tool, rpc.Error.Message) {
+			return planeTooOld(tool, rpc.Error.Message)
+		}
 		return fmt.Errorf("%s: %s", tool, rpc.Error.Message)
 	}
 	if rpc.Result.IsError {
@@ -387,9 +541,47 @@ func checkResult(tool string, raw []byte) error {
 		for _, c := range rpc.Result.Content {
 			msg.WriteString(c.Text)
 		}
-		return fmt.Errorf("%s refused: %s", tool, strings.TrimSpace(msg.String()))
+		refusal := strings.TrimSpace(msg.String())
+		// The plane answers a tool it does not register as `MCP error -32602:
+		// Tool <name> not found`. That is not a refusal of the CALL, and it must
+		// never become a cue to retry an older spelling: update_task is deleted,
+		// so the only fix is a plane from the same cutover as this binary.
+		if unknownTool(tool, refusal) {
+			return planeTooOld(tool, refusal)
+		}
+		return fmt.Errorf("%s refused: %s", tool, refusal)
 	}
 	return nil
+}
+
+// planeTooOld wraps an unknown-tool refusal with the version this build needs, so
+// an operator is told what to promote rather than reading a bare MCP -32602.
+func planeTooOld(tool, refusal string) error {
+	return fmt.Errorf("%w: it does not serve %s, so promote it to plane protocol %d (the same cutover that installs this build): %s",
+		ErrPlaneTooOld, tool, RequiredPlaneProtocol, refusal)
+}
+
+// unknownTool reports whether a refusal says the plane does not REGISTER this
+// tool, rather than the tool refusing the call. The message must name the tool
+// and call it not found (or an equivalent), never one half alone: a task
+// refusal that happens to mention the tool name is still a refusal of the call.
+func unknownTool(tool, msg string) bool {
+	lower := strings.ToLower(msg)
+	if !strings.Contains(lower, strings.ToLower(tool)) {
+		return false
+	}
+	for _, phrase := range []string{
+		"not found",
+		"no such tool",
+		"unknown tool",
+		"tool not registered",
+		"not a registered tool",
+	} {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // sseData pulls the JSON payload out of an SSE frame, or returns the body

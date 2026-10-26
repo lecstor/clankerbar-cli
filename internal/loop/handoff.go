@@ -117,14 +117,18 @@ func parseHandoff(final string) (prompt string, found bool, refusal string) {
 //     NO OBSERVED CLAIM means the adapter never saw this session claim anything,
 //     so the driver holds no task/run ids - and without them the resume
 //     preamble cannot be seeded: handing the successor a brief carrying literal
-//     placeholders is worse than refusing. The driver cannot recover the ids by
-//     asking the plane either: attributing an unobserved claim to a task would
-//     be a guess, and a wrong guess heartbeats another instance's live run
-//     while its own session is still working it. So the marker is refused for
-//     THAT stated reason, and any lease the session did take is left to
-//     expire. The plane's expiry sweep is the one path that still gets the
-//     work picked up with its context intact: it keeps a recorded branch
-//     attached as the takeover hand-off.
+//     placeholders is worse than refusing. A marker from an unobserved claim is
+//     therefore refused even though the plain checkpoint path now CAN recover
+//     ids from the plane (CLA-451): there the successor runs a DRIVER-authored
+//     brief on the task the driver itself dispatched, while here the marker
+//     would seed a SESSION-authored prompt, and the guards against self-directed
+//     injection were sized for sessions whose claim state was observed. The
+//     refusal stays as stated, and any lease the session did take is left to
+//     expire — or, since CLA-451, handed to the next phase when the plane
+//     confirms the briefed task held with a verified branch. Otherwise the
+//     plane's expiry sweep is the path that still gets the work picked up with
+//     its context intact: it keeps a recorded branch attached as the takeover
+//     hand-off.
 func detectHandoff(drainNum int, t Target, res harness.Result) string {
 	prompt, found, refusal := parseHandoff(res.FinalMessage)
 	if !found || res.Untrusted != "" {

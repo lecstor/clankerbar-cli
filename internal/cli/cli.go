@@ -11,20 +11,72 @@ func Usage(w io.Writer) {
 	fmt.Fprint(w, `clankerbar — drive a coding agent through your clankerbar backlog, unattended.
 
 Usage:
-  clankerbar run [flags]     Start the loop: respawn fresh harness sessions that
-                             work the backlog one task at a time, surviving usage
-                             limits. The "prompt" config knob changes how much a
-                             single session takes on.
-  clankerbar doctor [flags]  Preflight the setup — config, harness, backlog
-                             wiring, workdir, permissions. Exits non-zero on any
-                             FAIL, so it gates a run: doctor && run.
-  clankerbar dead-rate       Scan the iteration logs and report, per day, per
-                             phase and per harness, how many sessions ran and
-                             how many died producing nothing (the dead-phase
-                             rate).
-  clankerbar version         Print the version.
-  clankerbar help            Show this help.
+  clankerbar                    THE FLEET SUPERVISOR: reconcile this machine
+                                against the plane's account-scoped roster: a
+                                supervised child per entry with desiredState:
+                                running (placement local), restarted with
+                                backoff if it exits unexpectedly; a stopped
+                                entry is drained by its STOP marker; and
+                                SIGINT/SIGTERM drains the whole fleet. Each
+                                child runs on a config generated from the base
+                                config (~/.config/clankerbar/config.json) and
+                                its roster entry. Same as "clankerbar supervise".
+  clankerbar run [flags]        Start the loop: respawn fresh harness sessions that
+                                work the backlog one task at a time, surviving usage
+                                limits. The "prompt" config knob changes how much a
+                                single session takes on.
+  clankerbar ctl [flags]        Control a RUNNING loop by writing a marker into its
+                                state dir: "ctl restart" re-execs the daemon at the
+                                next iteration boundary (--now kills the in-flight
+                                session and releases its claim first); "ctl reload"
+                                re-reads the config file without replacing anything.
+                                A restart preserves the daemon's CURRENT environment
+                                — it cannot conjure env it was never launched with.
+  clankerbar doctor [flags]     Preflight the setup — config, harness, backlog
+                                wiring, workdir, permissions. Exits non-zero on any
+                                FAIL, so it gates a run: doctor && run.
+  clankerbar propose-config     Import the local config's movable dials (harness,
+  [flags]                       model, tiers, budget, escalation) into the plane as a
+                                PENDING proposal the operator ratifies in the console.
+  clankerbar dead-rate          Scan the iteration logs and report, per day, per
+                                phase and per harness, how many sessions ran and
+                                how many died producing nothing (the dead-phase
+                                rate).
+  clankerbar upload <file>      Upload a file (screenshot, video, HTML) as a
+                                project asset and print exactly asset:<id> on
+                                stdout. The byte-free path: only the file's
+                                path, type, size and sha256 leave the shell —
+                                its bytes are sent by this process, never
+                                through a model or a tool argument. --task
+                                attributes the file to a task; --type overrides
+                                the content type its extension implies.
+  clankerbar deck <file.html>   Upload a self-contained review deck for a task
+    --task <ref|id>             and print its review URL. Same byte-free path:
+                                the HTML goes up as a text/html asset, then
+                                binds to the task as its review deck.
+  clankerbar supervise roll    Roll the fleet onto the version THIS binary
+                                runs, one child at a time: install the new
+                                build at the fleet's launch path and run this
+                                from it. Each child gets a RESTART marker, drains
+                                at its iteration boundary, and is verified — via
+                                its next beacon — to report the new version
+                                before the next child is touched; a child that
+                                does not come back on it halts the roll.
+  clankerbar supervise replace  Replace the SUPERVISOR itself in place: run
+                                this from the new build after installing it at
+                                the fleet's launch path (and after the roll).
+                                The running supervisor drains every child at
+                                its iteration boundary and then execs the
+                                launch path, so the fleet comes back under the
+                                new supervisor; a child that never drains
+                                halts the replacement. The launchd/systemd
+                                fallback: restart the unit after the drain
+                                instead.
+  clankerbar version            Print the version.
+  clankerbar help               Show this help.
 
-Run 'clankerbar run --help' or 'clankerbar doctor --help' for their flags.
+Run 'clankerbar supervise --help', 'clankerbar run --help', 'clankerbar ctl
+--help', 'clankerbar doctor --help', 'clankerbar propose-config --help',
+'clankerbar upload --help' or 'clankerbar deck --help' for their flags.
 `)
 }

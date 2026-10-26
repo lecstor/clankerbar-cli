@@ -84,7 +84,7 @@ func TestDeadTally_ReportCarriesTheDenominator(t *testing.T) {
 // that recorded a branch and THEN died on an unknown reason produced something,
 // so it is a run but not a dead.
 func TestDeadTally_DoesNotCountABranchBeforeDying(t *testing.T) {
-	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true}
+	wip := harness.Claim{TaskID: "t-1", RunID: "r-1", HasWIP: true, Branch: "clanker/x"}
 	h := &fakeAdapter{steps: []invokeStep{
 		{res: held(deadResult(), wip)},
 		{res: okResult(1, 0)},

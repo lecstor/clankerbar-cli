@@ -1,0 +1,1671 @@
+package loop
+
+// CLA-466: the driver's fleet activity reporting. These tests pin the three
+// seams the doneWhen names: a beacon accompanies every poll (and carries the
+// identity), state-change beacons fire at phase boundaries without waiting out
+// a poll interval, exactly ONE iteration record posts per drain with the right
+// outcome across all four paths (checkpoint / released / parked / dead), and an
+// outage of the report endpoint leaves loop timing and outcomes untouched with
+// the failure logged once.
+//
+// CLA-510: the mid-phase claim. A first-phase session claims INSIDE the drain,
+// after its boundary beacon has already gone out; the claim reflector riding
+// the lease-renewal seam revises the in-flight ref and beacons immediately —
+// so the card fills within seconds of the claim, follows the current claim,
+// and never invents a ref from a refused claim.
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/lecstor/clankerbar-cli/internal/backlog"
+	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
+	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
+	"github.com/lecstor/clankerbar-cli/internal/version"
+)
+
+// fakeFleet records every report the driver hands it, synchronously, so
+// assertions need no waiting.
+type fakeFleet struct {
+	mu     sync.Mutex
+	sent   []fleet.Report
+	closed []fleet.Report
+}
+
+func (f *fakeFleet) Send(r fleet.Report) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sent = append(f.sent, r)
+}
+
+func (f *fakeFleet) Close(r fleet.Report) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closed = append(f.closed, r)
+}
+
+func (f *fakeFleet) reports() ([]fleet.Report, []fleet.Report) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.sent, f.closed
+}
+
+func (f *fakeFleet) records() []fleet.Iteration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []fleet.Iteration
+	for _, r := range f.sent {
+		out = append(out, r.Iterations...)
+	}
+	return out
+}
+
+// fleetDriver is phaseDriver plus a fakeFleet on the target: the shape the
+// reporting tests drive. cfg comes pre-built so callers can set phases.
+func fleetDriver(t *testing.T, cfg *config.Config, h harness.Adapter) (*Driver, *fakeFleet) {
+	t.Helper()
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	return d, ff
+}
+
+// Log capture reuses captureLogs/syncBuf from delivery_test.go — the same
+// synchronized buffer, so reading it while the reporter's pump writes is safe.
+
+// waitFor polls cond until it holds or the deadline passes — the same discipline
+// heartbeatWaitFor uses, for the reporter's background pump.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// --- presence rides the poll --------------------------------------------------
+
+func TestRun_ABeaconAccompaniesEachPoll(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.InstanceName = "box-a"
+	// Idle queue: the loop keeps polling; the hook cancels after three polls so
+	// the test bounds at exactly those three beacons plus nothing else.
+	p := &fakePoller{sum: backlog.Summary{Ready: 0, Claimable: 0}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p.onCall = func(i int) {
+		if i >= 2 {
+			cancel()
+		}
+	}
+	h := &fakeAdapter{}
+	d, ff := fleetDriver(t, cfg, h)
+	d.targets[0].Poller = p
+
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	sent, closed := ff.reports()
+	if len(sent) < 3 {
+		t.Fatalf("expected a beacon per poll (3 polls), got %d", len(sent))
+	}
+	for i, r := range sent {
+		if r.State.Kind != fleet.StateIdle {
+			t.Errorf("beacon %d state = %q, want idle (queue empty, nothing paused)", i, r.State.Kind)
+		}
+		if r.Instance != "box-a" {
+			t.Errorf("beacon %d instance = %q, want the configured instance_name", i, r.Instance)
+		}
+		if r.Host == "" {
+			t.Errorf("beacon %d carries no host", i)
+		}
+		if r.Version == "" {
+			t.Errorf("beacon %d carries no binary version", i)
+		}
+		if r.ConfigIdentity == "" {
+			t.Errorf("beacon %d carries no config identity", i)
+		}
+	}
+	// Run's deferred shutdown says goodbye on the way out — that is what makes
+	// silence after this point mean "gone" rather than "stopped talking".
+	if len(closed) != 1 {
+		t.Fatalf("expected exactly one closing beacon, got %d", len(closed))
+	}
+	if closed[0].State.Kind != fleet.StateStopping {
+		t.Errorf("closing beacon state = %q, want stopping", closed[0].State.Kind)
+	}
+}
+
+// The state mapping, directly: paused targets read draining (alive, spawning
+// nothing new), mid-drain reads iteration {n, taskRef, phase}, everything else
+// idle.
+func TestFleetState_MapsWhatTheLoopKnows(t *testing.T) {
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller()}})
+	if got := d.fleetState(0); got.Kind != fleet.StateIdle {
+		t.Errorf("fresh target state = %v, want idle", got)
+	}
+	d.paused[0] = true
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining {
+		t.Errorf("console-paused state = %v, want draining", got)
+	}
+	d.paused[0] = false
+	d.fleetPaused[0] = true
+	if got := d.fleetState(0); got.Kind != fleet.StateDraining {
+		t.Errorf("fleet-paused state = %v, want draining", got)
+	}
+	d.fleetPaused[0] = false
+	d.iter = []iterState{{on: true, n: 7, ref: "CLA-9", phase: "review"}}
+	got := d.fleetState(0)
+	if got.Kind != fleet.StateIteration || got.N != 7 || got.TaskRef != "CLA-9" || got.Phase != "review" {
+		t.Errorf("mid-drain state = %+v, want iteration{n:7 taskRef:CLA-9 phase:review}", got)
+	}
+}
+
+// --- phase-boundary beacons -----------------------------------------------------
+
+func TestDrainPhases_StateChangeBeaconsFireAtPhaseBoundaries(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	cfg.InstanceName = "box-b"
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},
+		// Review SETTLES the task, so the drain ends with the claim consumed and
+		// the record's outcome is released (not the predecessor's checkpoint).
+		{res: held(okResult(5, 0.05), harness.Claim{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Settled: true})},
+	}}
+	d, ff := fleetDriver(t, cfg, h)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	sent, _ := ff.reports()
+	type key struct {
+		kind  string
+		phase string
+	}
+	var got []key
+	for _, r := range sent {
+		got = append(got, key{r.State.Kind, r.State.Phase})
+	}
+	want := []key{{fleet.StateIteration, "implement"}, {fleet.StateIteration, "review"}, {fleet.StateIdle, ""}}
+	if len(got) != len(want) {
+		t.Fatalf("state beacon sequence = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("state beacon sequence = %v, want %v", got, want)
+		}
+	}
+	// The boundary beacons carry the task once it is known (phase 2 resumes the
+	// claim phase 1 left held). openClaim carries only the UUID, so the label is
+	// the task id until a ref arrives.
+	if sent[0].State.TaskRef != "" {
+		t.Errorf("first boundary beacon names taskRef %q before any claim was observed", sent[0].State.TaskRef)
+	}
+	if sent[1].State.TaskRef != "t-1" || sent[1].State.N != 1 {
+		t.Errorf("second boundary beacon = {n:%d ref:%q}, want {n:1 ref:t-1}", sent[1].State.N, sent[1].State.TaskRef)
+	}
+}
+
+// --- the mid-phase claim (CLA-510) ------------------------------------------
+
+// fleetRenewingDriver is fleetDriver with a releaser that CAN heartbeat, so
+// startLeaseRenewal wires Invocation.OnClaim — the seam the CLA-510 claim
+// reflector rides (fleetDriver's plain fakeReleaser cannot).
+func fleetRenewingDriver(t *testing.T, cfg *config.Config, h harness.Adapter, ff *fakeFleet) *Driver {
+	t.Helper()
+	d := NewMulti(cfg, h, []Target{{
+		Poller:   busyPoller(),
+		Releaser: renewingReleaser{fakeReleaser: &fakeReleaser{}, hb: &recordingHeartbeat{}},
+		Fleet:    ff,
+	}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	return d
+}
+
+// waitForBeaconRef polls the fake fleet until a report whose state carries the
+// given task ref has been sent. Returns false on timeout. Used by the fake's
+// afterClaims hook to hold a session open until the renewer has folded its
+// claim stream into the fleet ref — the thing that makes the claim beacon
+// deterministic instead of a race against stop().
+func waitForBeaconRef(ff *fakeFleet, ref string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		sent, _ := ff.reports()
+		for _, r := range sent {
+			if r.State.TaskRef == ref {
+				return true
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+// waitForBeaconRefN polls the fake fleet until at least n reports carry an
+// iteration state naming ref. The renewal cadence is compressed to milliseconds
+// in the CLA-771 tests, so this is how a session is held open across several
+// ticks without guessing at timers.
+func waitForBeaconRefN(ff *fakeFleet, ref string, n int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		seen := 0
+		sent, _ := ff.reports()
+		for _, r := range sent {
+			if r.State.Kind == fleet.StateIteration && r.State.TaskRef == ref {
+				seen++
+			}
+		}
+		if seen >= n {
+			return true
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return false
+}
+
+// iterationRefs lists the task ref of every iteration-state beacon, in order —
+// the card's history through one drain. "" means the card shows no task.
+func iterationRefs(ff *fakeFleet) []string {
+	sent, _ := ff.reports()
+	var refs []string
+	for _, r := range sent {
+		if r.State.Kind == fleet.StateIteration {
+			refs = append(refs, r.State.TaskRef)
+		}
+	}
+	return refs
+}
+
+// A phase-1 drain whose session claims MID-phase: the reflector revises the
+// in-flight ref and beacons at the claim — the card fills within seconds, not
+// at the next phase boundary — and what the NEXT poll beacon would render
+// (fleetState, read mid-session) already carries the ref, so the revision is
+// durable state, not a one-shot beacon.
+func TestDrainPhases_MidPhaseClaimBeaconsTheRefAndPollBeaconsCarryIt(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-ref"
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	ff := &fakeFleet{}
+	var d *Driver
+	var midDrain fleet.State
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// Hold the session open until the renewer has folded the claim in —
+			// the claim beacon landing in the fake reporter is that proof — then
+			// read what the next poll beacon WOULD have rendered. A poll beacon
+			// cannot fire mid-drain by construction: the poll loop and the drain
+			// share one goroutine (loop.go), so fleetState is the durable state
+			// the next poll would read — pinning it here is what proves the
+			// revision is not a one-shot beacon.
+			if !waitForBeaconRef(ff, "CLA-1", 2*time.Second) {
+				t.Error("the renewer never folded the mid-phase claim into the fleet ref")
+			}
+			midDrain = d.fleetState(0)
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d = fleetRenewingDriver(t, cfg, h, ff)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	sent, _ := ff.reports()
+	// The card's history through the drain: boundary beacon with NO ref (the
+	// claim has not been observed yet — no guessing from next_task), the claim
+	// beacon, then the back-to-normal close.
+	if got := iterationRefs(ff); !slices.Equal(got, []string{"", "CLA-1"}) {
+		t.Fatalf("iteration beacon refs = %v, want [\"\" CLA-1]", got)
+	}
+	if len(sent) < 3 || sent[len(sent)-1].State.Kind != fleet.StateIdle {
+		t.Fatalf("last beacon = %+v, want the back-to-normal idle close", sent[len(sent)-1])
+	}
+	// The claim beacon itself names the task and the phase it was claimed in.
+	if sent[1].State.TaskRef != "CLA-1" || sent[1].State.N != 1 {
+		t.Errorf("claim beacon = {n:%d ref:%q}, want {n:1 ref:CLA-1}", sent[1].State.N, sent[1].State.TaskRef)
+	}
+	// What the next poll beacon renders mid-session: the ref must already be
+	// there, or a poll-driven beacon would wipe the card back to blank.
+	if midDrain.Kind != fleet.StateIteration || midDrain.TaskRef != "CLA-1" || midDrain.N != 1 {
+		t.Errorf("mid-drain poll state = %+v, want iteration {n:1 ref:CLA-1}", midDrain)
+	}
+	// The revision is not a second record: exactly one iteration still posts.
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+	if recs[0].TaskRef != "CLA-1" {
+		t.Errorf("record taskRef = %q, want CLA-1", recs[0].TaskRef)
+	}
+}
+
+// A session that settles one task and claims another mid-stream: the card
+// follows the CURRENT claim, and clears while nothing is held — it must not
+// latch the first claim it ever saw.
+func TestDrainPhases_RefFollowsTheCurrentClaimAndClears(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-follow"
+	claimA := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	claimB := harness.Claim{TaskID: "t-2", Ref: "CLA-2", RunID: "r-2"}
+	ff := &fakeFleet{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{
+			claimA,
+			{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true},
+			claimB,
+		},
+		afterClaims: func() {
+			if !waitForBeaconRef(ff, "CLA-2", 2*time.Second) {
+				t.Error("the renewer never folded the settle-and-reclaim stream into the fleet ref")
+			}
+		},
+		res: held(okResult(7, 0.5), claimB),
+	}}}
+	d := fleetRenewingDriver(t, cfg, h, ff)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	if got := iterationRefs(ff); !slices.Equal(got, []string{"", "CLA-1", "", "CLA-2"}) {
+		t.Fatalf("iteration beacon refs = %v, want [\"\" CLA-1 \"\" CLA-2] — the card must follow the current claim and clear while nothing is held", got)
+	}
+	if recs := ff.records(); len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+}
+
+// A refused claim is not a claim: it records no ids, so a real adapter fires
+// nothing at OnClaim (harness.Invocation). Drive the defensive half — even if
+// an empty snapshot reached the reflector, no ref may appear on the card.
+func TestDrainPhases_RefusedClaimCarriesNoRef(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-refused"
+	ff := &fakeFleet{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{{}},
+		res:    okResult(7, 0.5),
+	}}}
+	d := fleetRenewingDriver(t, cfg, h, ff)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	sent, _ := ff.reports()
+	for i, r := range sent {
+		if r.State.Kind == fleet.StateIteration && r.State.TaskRef != "" {
+			t.Errorf("beacon %d carries taskRef %q from a refused claim — no ref may be invented", i, r.State.TaskRef)
+		}
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+	if recs[0].TaskID != "" || recs[0].TaskRef != "" {
+		t.Errorf("record task fields = {%s %s}, want empty — a refused claim is not a claim", recs[0].TaskID, recs[0].TaskRef)
+	}
+}
+
+// longSessionDriver is fleetRenewingDriver with the heartbeat supplied by the
+// caller and the in-session renewal cadence compressed to a few milliseconds
+// (the CLA-771 seam), so a test can hold a session open across several renewal
+// ticks and count what each one carries.
+func longSessionDriver(t *testing.T, cfg *config.Config, h harness.Adapter, reporter fleet.Reporter, hb *recordingHeartbeat) *Driver {
+	t.Helper()
+	d := NewMulti(cfg, h, []Target{{
+		Poller:   busyPoller(),
+		Releaser: renewingReleaser{fakeReleaser: &fakeReleaser{}, hb: hb},
+		Fleet:    reporter,
+	}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.leaseRenewalInterval = 5 * time.Millisecond
+	return d
+}
+
+// A session that outlives the renewal interval keeps the instance's presence
+// row fresh: every renewal tick beacons the state the poll would have sent
+// (iteration, with the current claim's ref and the phase), so a healthy daemon
+// in a long session never reads on the console as a dead instance (CLA-771).
+func TestDrainPhases_LongSessionBeaconsPresenceOnEveryRenewalTick(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-long"
+	cfg.Phases = []config.Phase{{Name: "implement"}}
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	ff := &fakeFleet{}
+	hb := &recordingHeartbeat{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// Hold the session open across several renewal ticks. Four ref
+			// beacons is one claim reflector (the ref changing from "" to
+			// CLA-1) plus at least three renewal ticks.
+			if !waitForBeaconRefN(ff, "CLA-1", 4, 2*time.Second) {
+				t.Error("a session longer than the renewal interval did not beacon presence on every tick")
+			}
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d := longSessionDriver(t, cfg, h, ff, hb)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+
+	sent, _ := ff.reports()
+	refBeacons := 0
+	for _, r := range sent {
+		if r.State.Kind != fleet.StateIteration || r.State.TaskRef != "CLA-1" {
+			continue
+		}
+		refBeacons++
+		if r.State.N != 1 || r.State.Phase != "implement" {
+			t.Errorf("renewal-tick beacon = %+v, want iteration {n:1 ref:CLA-1 phase:implement}", r.State)
+		}
+	}
+	if refBeacons < 4 {
+		t.Fatalf("%d presence beacon(s) naming CLA-1, want at least 4 (one claim reflector + three renewal ticks)", refBeacons)
+	}
+	if n := hb.count(); n < 3 {
+		t.Errorf("renewed %d time(s) during the session, want at least 3 - each tick must beacon AND beat", n)
+	}
+	// Presence rides the same tick; it is not a second iteration record.
+	if recs := ff.records(); len(recs) != 1 {
+		t.Fatalf("exactly one record must post per drain, got %d", len(recs))
+	}
+}
+
+// A session on ONE target must not silence the sibling projects' presence rows:
+// each configured project has its own reporter and its own project-scoped row,
+// and the poll that covers them all does not run while a drain is in progress.
+// The renewal tick therefore carries the poll's per-target lap: the running
+// target reports its iteration, every other target its own idle (or draining)
+// state (CLA-771 review — beaconLimited is the same precedent for a
+// daemon-wide state).
+func TestDrainPhases_LongSessionBeaconsEveryTargetNotOnlyTheRunningOne(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-multi"
+	cfg.Phases = []config.Phase{{Name: "implement"}}
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	idleFF := &fakeFleet{}
+	busyFF := &fakeFleet{}
+	hb := &recordingHeartbeat{}
+	countIdle := func() int {
+		sent, _ := idleFF.reports()
+		n := 0
+		for _, r := range sent {
+			if r.State.Kind == fleet.StateIdle {
+				n++
+			}
+		}
+		return n
+	}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// Hold the session open across several renewal ticks, the way the
+			// single-target cadence test does: the sibling's row is refreshed by
+			// the tick, not by the drain boundary.
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) && countIdle() < 3 {
+				time.Sleep(time.Millisecond)
+			}
+			if countIdle() < 3 {
+				t.Error("a session on another target sent no idle presence to this project")
+			}
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d := NewMulti(cfg, h, []Target{
+		{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: idleFF},
+		{Poller: busyPoller(), Releaser: renewingReleaser{fakeReleaser: &fakeReleaser{}, hb: hb}, Fleet: busyFF},
+	})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+	d.leaseRenewalInterval = 5 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, _, _, err := d.drainPhases(ctx, 1, 1, d.targets[1], spend{start: time.Now()}); err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+
+	if n := countIdle(); n < 3 {
+		t.Fatalf("%d idle presence beacon(s) on the sibling target, want at least 3 across the session's renewal ticks", n)
+	}
+	// The sibling's row must not borrow the running target's work.
+	sent, _ := idleFF.reports()
+	for i, r := range sent {
+		if r.State.TaskRef != "" {
+			t.Errorf("sibling beacon %d carries taskRef %q from another target's session", i, r.State.TaskRef)
+		}
+	}
+	if n := hb.count(); n < 3 {
+		t.Errorf("renewed %d time(s) during the session, want at least 3 - each tick beacons every target", n)
+	}
+}
+
+// A failing presence report is telemetry: it must neither stop nor delay the
+// lease renewal that carries it. Every beacon this session sends is refused
+// (500), and the renewal keeps beating straight through the outage.
+func TestDrainPhases_FailingPresenceBeaconNeverStopsRenewal(t *testing.T) {
+	var mu sync.Mutex
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+	buf := captureLogs(t)
+
+	cfg := fastCfg()
+	cfg.Phases = []config.Phase{{Name: "implement"}}
+	claim := harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"}
+	hb := &recordingHeartbeat{}
+	h := &fakeAdapter{steps: []invokeStep{{
+		claims: []harness.Claim{claim},
+		afterClaims: func() {
+			// A beacon is attempted (and refused) before each beat. If the
+			// failure could stall or stop renewal, these three beats would not
+			// arrive while the session is held open here.
+			heartbeatWaitFor(t, "three renewal beats through a beacon outage", func() bool {
+				return hb.count() >= 3
+			})
+		},
+		res: held(okResult(7, 0.5), claim),
+	}}}
+	d := longSessionDriver(t, cfg, h, fleet.New(srv.URL, "k"), hb)
+
+	tokens, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if tokens != 7 {
+		t.Errorf("tokens = %d, want the session's 7 - a beacon outage must not change the drain's accounting", tokens)
+	}
+	if n := hb.count(); n < 3 {
+		t.Errorf("renewed %d time(s) through the outage, want at least 3 - a failed beacon must never stop renewal", n)
+	}
+	waitFor(t, "the refused beacons to reach the endpoint", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits >= 2
+	})
+	time.Sleep(50 * time.Millisecond) // let the last failure land in the buffer
+	if lines := countLines(buf.String(), "fleet report failed and was dropped"); lines != 1 {
+		t.Errorf("%d 'fleet report failed' lines for the outage, want exactly 1:\n%s", lines, buf.String())
+	}
+}
+
+// The reflector directly: a beacon only on a ref CHANGE — a session that
+// churns claims must not turn the card into a stream — and never outside a
+// live iteration.
+func TestReflectClaim_BeaconsOnlyOnARefChange(t *testing.T) {
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Fleet: ff}})
+	d.iter = []iterState{{on: true, n: 3, phase: "implement"}}
+	// A never-closed done: the unit test drives the reflector directly, with no
+	// renewer lifecycle to race.
+	reflect := d.reflectClaim(0, d.targets[0], make(chan struct{}))
+
+	// The refused shape (no ids): nothing held, nothing changed, no beacon.
+	reflect(harness.Claim{})
+	if got := d.fleetState(0); got.TaskRef != "" {
+		t.Fatalf("ref after an empty snapshot = %q, want empty — a refused claim is not a claim", got.TaskRef)
+	}
+	sent, _ := ff.reports()
+	if len(sent) != 0 {
+		t.Fatalf("a no-change snapshot beaconed %d time(s), want 0", len(sent))
+	}
+
+	// A real claim fills the card and beacons exactly once.
+	reflect(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"})
+	if got := d.fleetState(0); got.TaskRef != "CLA-1" || got.N != 3 {
+		t.Fatalf("state after the claim = %+v, want iteration {n:3 ref:CLA-1}", got)
+	}
+	sent, _ = ff.reports()
+	if len(sent) != 1 || sent[0].State.TaskRef != "CLA-1" {
+		t.Fatalf("claim beacon = %+v, want exactly one carrying CLA-1", sent)
+	}
+
+	// The same claim again: no churn.
+	reflect(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"})
+	sent, _ = ff.reports()
+	if len(sent) != 1 {
+		t.Fatalf("a duplicate claim snapshot beaconed again; want the single change beacon, got %d", len(sent))
+	}
+
+	// The settle clears the card and beacons.
+	reflect(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
+	if got := d.fleetState(0); got.TaskRef != "" {
+		t.Fatalf("ref after the settle = %q, want cleared", got.TaskRef)
+	}
+	sent, _ = ff.reports()
+	if len(sent) != 2 || sent[1].State.TaskRef != "" {
+		t.Fatalf("settle beacon = %+v, want exactly one clearing the ref", sent)
+	}
+
+	// A closed done channel refuses the write: a snapshot that reaches the
+	// reflector after renewer stop() must not revise the row, whatever claim
+	// it carries — the refusal branch that makes the no-cross-row invariant
+	// hold by construction.
+	closedDone := make(chan struct{})
+	close(closedDone)
+	reflectClosed := d.reflectClaim(0, d.targets[0], closedDone)
+	reflectClosed(harness.Claim{TaskID: "t-2", Ref: "CLA-2", RunID: "r-2"})
+	if got := d.fleetState(0); got.TaskRef != "" {
+		t.Fatalf("a post-stop snapshot wrote ref %q; the refusal branch must keep the row unchanged", got.TaskRef)
+	}
+	sent, _ = ff.reports()
+	if len(sent) != 2 {
+		t.Fatalf("a post-stop snapshot beaconed; want the 2 prior beacons, got %d", len(sent))
+	}
+
+	// A live iteration is required: no beacon outside a drain.
+	d.iter[0] = iterState{}
+	reflect(harness.Claim{TaskID: "t-9", Ref: "CLA-9", RunID: "r-9"})
+	sent, _ = ff.reports()
+	if len(sent) != 2 {
+		t.Fatalf("a snapshot with no live iteration beaconed; want no change, got %d", len(sent))
+	}
+}
+
+// --- one record per iteration, four outcome paths -------------------------------
+
+func TestDrainPhases_RecordOutcomeReleasedWhenTheClaimGoesBack(t *testing.T) {
+	cfg := fastCfg()
+	cfg.InstanceName = "box-c"
+	h := &fakeAdapter{steps: []invokeStep{
+		// A clean end still holding a releasable claim (no WIP): the seam's
+		// deferred handback returns it to ready.
+		{res: held(okResult(7, 0.5), harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1"})},
+	}}
+	d, ff := fleetDriver(t, cfg, h)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post per iteration, got %d: %+v", len(recs), recs)
+	}
+	r := recs[0]
+	if r.Outcome != fleet.OutcomeReleased {
+		t.Errorf("outcome = %q, want released", r.Outcome)
+	}
+	if r.TaskID != "t-1" || r.TaskRef != "CLA-1" {
+		t.Errorf("task fields = {%s %s}, want t-1/CLA-1", r.TaskID, r.TaskRef)
+	}
+	if r.Tokens != 7 {
+		t.Errorf("tokens = %d, want 7", r.Tokens)
+	}
+	// CLA-677: the drain's dollar spend rides the iteration record, from the
+	// same accumulator the budget breaker reads.
+	if r.CostUSD != 0.5 {
+		t.Errorf("costUsd = %v, want 0.5", r.CostUSD)
+	}
+	if r.DurationSeconds <= 0 {
+		t.Errorf("duration = %v, want > 0", r.DurationSeconds)
+	}
+}
+
+func TestDrainPhases_RecordOutcomeCheckpointWhenWorkIsLeftForATakeover(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(9, 0.9)},
+		// The review phase ALSO ends holding the task with pushed work — the
+		// drain's boundary leaves the lease for a successor takeover, which is
+		// the loop's own definition of checkpoint (see WhatTheSeamOwes).
+		{res: held(okResult(2, 0.1), harness.Claim{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", HasWIP: true})},
+	}}
+	d, ff := fleetDriver(t, cfg, h)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post per iteration, got %d", len(recs))
+	}
+	if recs[0].Outcome != fleet.OutcomeCheckpoint {
+		t.Errorf("outcome = %q, want checkpoint", recs[0].Outcome)
+	}
+	if len(recs[0].Phases) != 2 || recs[0].Phases[0] != "implement" || recs[0].Phases[1] != "review" {
+		t.Errorf("phases = %v, want [implement review]", recs[0].Phases)
+	}
+}
+
+func TestDrainPhases_RecordOutcomeParkedWhenTheDeadBudgetTrips(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())},
+		{res: held(deadResult(), openClaim())}, // the fourth parks
+	}}
+	rel := &parkingReleaser{}
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	ff := &fakeFleet{}
+	d := NewMulti(cfg, h, []Target{{Poller: busyPoller(), Releaser: rel, Fleet: ff}})
+	openTestStateDir(t, d)
+	d.cfg.WorkDir = t.TempDir()
+	d.newVerifier = func(string, bool) deliveryVerifier { return passVerifier() }
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if len(rel.parks) != 1 {
+		t.Fatalf("parked %d times, want 1: %+v", len(rel.parks), rel.parks)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post even on the park path, got %d", len(recs))
+	}
+	if recs[0].Outcome != fleet.OutcomeParked {
+		t.Errorf("outcome = %q, want parked", recs[0].Outcome)
+	}
+	if recs[0].TaskID != "t-1" {
+		t.Errorf("taskID = %q, want t-1", recs[0].TaskID)
+	}
+}
+
+func TestDrainPhases_RecordOutcomeDeadWhenTheFinalPhaseDiesProducingNothing(t *testing.T) {
+	cfg := fastCfg()
+	h := &fakeAdapter{steps: []invokeStep{
+		// A dead phase on the FINAL (only) phase: not retried (retries belong to
+		// a first phase that can re-claim), not parked — the drain just ends on
+		// the death, which is exactly the dead outcome.
+		{res: held(deadResult(), openClaim())},
+	}}
+	d, ff := fleetDriver(t, cfg, h)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	if recs[0].Outcome != fleet.OutcomeDead {
+		t.Errorf("outcome = %q, want dead", recs[0].Outcome)
+	}
+}
+
+// A death that was RETRIED past must not brand the iteration dead when a later
+// attempt delivers: the record describes how the iteration ENDED.
+func TestDrainPhases_ARetriedDeathDoesNotOutcomeTheRecordDead(t *testing.T) {
+	cfg := fastCfg()
+	cfg.Phases = twoPhases()
+	cfg.Prompt = ""
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: held(deadResult(), openClaim())}, // dies once...
+		{res: checkpointed(1, 0)},              // ...retry reaches its checkpoint
+		{res: held(okResult(1, 0), harness.Claim{TaskID: "t-1", Ref: "CLA-253", RunID: "r-1", Settled: true})},
+	}}
+	d, ff := fleetDriver(t, cfg, h)
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	if recs[0].Outcome != fleet.OutcomeReleased {
+		t.Errorf("outcome = %q, want released (the retry delivered; the early death is the tally's business, not the record's)", recs[0].Outcome)
+	}
+}
+
+// --- CLA-630: which harness and model each phase session ran on -----------------
+
+// The iteration record names every session the drain spawned, in order: a
+// two-phase sequence on different harnesses (implement on opencode, review on
+// claude) carries one entry per phase, with the phase's own resolved harness and
+// model — exactly what each spawn line printed.
+func TestDrainPhases_IterationRecordNamesEachSessionsHarnessAndModel(t *testing.T) {
+	impl := &fakeAdapter{steps: []invokeStep{{res: checkpointed(10, 0.10)}}}
+	// Named like production's registry adapter (Name() == the run harness), so
+	// the record's harness is the one the spawn line would print.
+	review := &fakeAdapter{name: "claude", steps: []invokeStep{{res: okResult(5, 0.05)}}}
+	d := mixedDriver(t, impl, review)
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{
+		{Phase: "implement", Harness: "opencode", Model: "opencode-go/deepseek-v4-flash", RunID: "r-1"},
+		// The review session never claimed the task — the driver resumed the run
+		// the implement phase left held — so its run id comes from the claim
+		// CARRIED into the phase (CLA-691), which is also the id the driver wrote
+		// into its brief.
+		{Phase: "review", Harness: "claude", Model: "claude-opus-5", RunID: "r-1"},
+	}
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — one entry per phase, in order, with the phase's own resolved harness and model", recs[0].Sessions, want)
+	}
+}
+
+// A handoff respawn is a session of its own: the phase the predecessor handed
+// off gets two entries for its two sessions, in spawn order, ahead of the next
+// phase's entry.
+func TestDrainPhases_IterationRecordCountsAHandoffRespawnInOrder(t *testing.T) {
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: handoffResult("Resume: finish the implementation.")},
+		{res: checkpointed(10, 0.10)},
+		{res: okResult(5, 0.05)},
+	}}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	_, _, handoffs, stop, err := drainPhasesHandoffs(t, d, 1)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if handoffs != 1 {
+		t.Fatalf("handoffs = %d, want 1", handoffs)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{
+		{Phase: "implement", Harness: "fake", RunID: "r-1"},
+		{Phase: "implement", Harness: "fake", RunID: "r-1"}, // the handoff successor: same phase, its own session, the same run
+		{Phase: "review", Harness: "fake", RunID: "r-1"},
+	}
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — the handoff respawn is a spawned session and must appear in spawn order", recs[0].Sessions, want)
+	}
+}
+
+// No model resolved (the operator configured none, so the harness ran its own
+// default) rides as the empty string: the record says "not resolved" and never
+// guesses a name. The same record still carries the other phase's resolved model.
+func TestDrainPhases_IterationRecordSendsAnUnresolvedModelAsTheEmptyString(t *testing.T) {
+	impl := &fakeAdapter{steps: []invokeStep{{res: checkpointed(10, 0.10)}}}
+	review := &fakeAdapter{name: "claude", steps: []invokeStep{{res: okResult(5, 0.05)}}}
+	d := mixedDriver(t, impl, review)
+	// Drop the opencode harness's model: the implement session runs on its
+	// default, and only the review phase has a resolved model.
+	d.cfg.Harnesses["opencode"] = config.HarnessConfig{
+		ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json",
+	}
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{
+		{Phase: "implement", Harness: "opencode", RunID: "r-1"}, // Model stays "" on purpose
+		{Phase: "review", Harness: "claude", Model: "claude-opus-5", RunID: "r-1"},
+	}
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — an unresolved model must be the empty string, never a guess", recs[0].Sessions, want)
+	}
+}
+
+// A pass that hit a rolling usage limit still spawned its session, so the record
+// must name it even when the limit's wait is refused. The limit branch runs
+// BEFORE the exit-code branches, so a CHECKPOINTABLE session (clean exit, held
+// claim, verified branch) can hit a limit on its way out — and a reset past the
+// run's ceiling is exactly the path where the phase returns right after
+// releaseCarriedEnd rebuilt the end, which is the end whose session the record
+// reads. The reconstruction must carry the field: it is record data, not a hold
+// to undo.
+func TestDrainPhases_ALimitStoppedPassStillNamesItsSession(t *testing.T) {
+	// Checkpointable AND limited: exit 0, the claim held with a verified branch,
+	// and the limit notice the fake's DetectLimit reads.
+	limited := checkpointed(10, 0.10)
+	limited.Raw = map[string]any{"kind": "limit"}
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limited}},
+		limitResetAt: time.Now().Add(3 * time.Hour),
+	}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+	// The reset lands past the run's ceiling, so waitPastBudget refuses the
+	// wait and the phase returns stopped — the return whose end the record
+	// reads.
+	d.cfg.Budget = config.Budget{MaxWallClock: config.Duration(30 * time.Minute)}
+
+	_, _, stop, err := drainPhasesOnce(t, d)
+	if err != nil {
+		t.Fatalf("drainPhases: %v", err)
+	}
+	if !stop {
+		t.Fatal("a reset past the run's ceiling did not stop the run")
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	want := []fleet.Session{{Phase: "implement", Harness: "fake", RunID: "r-1"}} // Model stays "": no model configured
+	if !slices.Equal(recs[0].Sessions, want) {
+		t.Errorf("sessions = %+v, want %+v — the limited pass still spawned a session, and the record must name it", recs[0].Sessions, want)
+	}
+}
+
+// --- fail-soft: an outage touches neither timing nor outcomes -------------------
+
+func TestRun_ReportEndpointOutageLeavesTheLoopAlone(t *testing.T) {
+	var mu sync.Mutex
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		hits++
+		mu.Unlock()
+		http.Error(w, "nope", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	buf := captureLogs(t)
+
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.MaxIterations = 1
+	h := &fakeAdapter{steps: []invokeStep{{res: okResult(3, 0)}}}
+	rel := &fakeReleaser{}
+	ff := fleet.New(srv.URL, "k") // the REAL reporter, pointed at a 500-ing plane
+	p := busyPoller()
+	d := NewMulti(cfg, h, []Target{{Poller: p, Releaser: rel, Fleet: ff}})
+	openTestStateDir(t, d)
+
+	start := time.Now()
+	if err := d.Run(context.Background()); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	// Loop outcomes untouched: one session spawned, the drain counted normally,
+	// and the run ended gracefully rather than failing on the reporting path.
+	if h.invokeCalls != 1 {
+		t.Errorf("spawned %d sessions, want 1", h.invokeCalls)
+	}
+	// Loop TIMING untouched: every report is enqueued, never awaited. Had Send
+	// blocked even on the report timeout alone, the several beacons this run
+	// makes would cost more than twice the budget below.
+	if elapsed > 2*time.Second {
+		t.Errorf("Run took %s — reporting must never delay the loop", elapsed.Round(time.Millisecond))
+	}
+	// The failure is logged ONCE for the whole outage, not once per report.
+	waitFor(t, "the background posts to finish", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits >= 2 // poll beacon + shutdown close, at least
+	})
+	time.Sleep(50 * time.Millisecond) // let the last failure land in the buffer
+	lines := countLines(buf.String(), "fleet report failed and was dropped")
+	if lines != 1 {
+		t.Errorf("%d 'fleet report failed' lines for a whole outage, want exactly 1:\n%s", lines, buf.String())
+	}
+}
+
+// countLines counts occurrences of substr in s, line-wise.
+func countLines(s, substr string) int {
+	n := 0
+	for _, ln := range strings.Split(s, "\n") {
+		if strings.Contains(ln, substr) {
+			n++
+		}
+	}
+	return n
+}
+
+// A healthy endpoint sees the recovery line say how much was lost — the one
+// trace a dropped report gets.
+func TestReporter_OutageThenRecoveryLogsOnceWithTheDropCount(t *testing.T) {
+	fail := true
+	var mu sync.Mutex
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		mu.Lock()
+		wasFail := fail
+		hits++
+		mu.Unlock()
+		if wasFail {
+			http.Error(w, "nope", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	buf := captureLogs(t)
+
+	rep := fleet.New(srv.URL, "k")
+	for i := 0; i < 5; i++ {
+		rep.Send(fleet.Report{Identity: fleet.Identity{Instance: "x"}, State: fleet.State{Kind: fleet.StateIdle}})
+	}
+	waitFor(t, "all five outage reports to be served", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return hits >= 5
+	})
+	waitFor(t, "the first streak to be logged", func() bool {
+		return countLines(buf.String(), "fleet report failed and was dropped") == 1
+	})
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+	rep.Send(fleet.Report{Identity: fleet.Identity{Instance: "x"}})
+	waitFor(t, "the recovery line", func() bool {
+		return strings.Contains(buf.String(), "fleet reporting recovered after")
+	})
+	if n := countLines(buf.String(), "fleet report failed and was dropped"); n != 1 {
+		t.Errorf("%d failure lines, want exactly one for the whole streak", n)
+	}
+	line := ""
+	for _, ln := range strings.Split(buf.String(), "\n") {
+		if strings.Contains(ln, "fleet reporting recovered after") {
+			line = ln
+		}
+	}
+	if !strings.Contains(line, "5 failed") {
+		t.Errorf("recovery line %q does not name the whole silent streak", line)
+	}
+}
+
+// --- CLA-501: the resolved instance identity ----------------------------------
+
+// writeDaemonConfig writes one owner-only daemon config body to dir/base and
+// loads it, so the config's source path (the half the default identity embeds)
+// is real.
+func writeDaemonConfig(t *testing.T, dir, base string) *config.Config {
+	t.Helper()
+	p := filepath.Join(dir, base)
+	body := `{"harness":"claude","prompt":"Work the backlog."}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatalf("write %s: %v", p, err)
+	}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("config.Load(%s): %v", p, err)
+	}
+	return cfg
+}
+
+// identityOf builds the minimal driver and reports what it would beacon.
+func identityOf(t *testing.T, cfg *config.Config) fleet.Identity {
+	t.Helper()
+	d := NewMulti(cfg, &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
+	return d.fleetIdentity()
+}
+
+// The bug CLA-501 fixes: four daemons on one host all beaconed the bare
+// hostname, so the plane's unique (project, instance_name) key collapsed them
+// into one Fleet row. Two daemons started from different config files in the
+// same directory must resolve to two DISTINCT identities.
+func TestFleetIdentityDistinctPerConfigFile(t *testing.T) {
+	dir := t.TempDir()
+	a := identityOf(t, writeDaemonConfig(t, dir, "clanker1.json"))
+	b := identityOf(t, writeDaemonConfig(t, dir, "clanker2.json"))
+	host, err := os.Hostname()
+	if err != nil {
+		t.Fatalf("os.Hostname: %v", err)
+	}
+	if a.Instance == b.Instance {
+		t.Fatalf("distinct config files must not share an instance identity; both %q", a.Instance)
+	}
+	if want := host + "/clanker1"; a.Instance != want {
+		t.Errorf("a.Instance = %q, want %q (hostname + config basename)", a.Instance, want)
+	}
+	if want := host + "/clanker2"; b.Instance != want {
+		t.Errorf("b.Instance = %q, want %q", b.Instance, want)
+	}
+	if a.Instance == host || b.Instance == host {
+		t.Error("the bare hostname alone must never be the identity when a config file names this daemon")
+	}
+}
+
+// An explicit instance_name still wins over the new default: the operator who
+// already named their daemons keeps exactly the names they chose.
+func TestFleetIdentityExplicitNameWins(t *testing.T) {
+	dir := t.TempDir()
+	cfg := writeDaemonConfig(t, dir, "clanker1.json")
+	cfg.InstanceName = "box-a"
+	id := identityOf(t, cfg)
+	if id.Instance != "box-a" {
+		t.Errorf("Instance = %q, want the explicit name verbatim", id.Instance)
+	}
+}
+
+// ctl reload re-reads the SAME config file, so the basename half of the default
+// cannot change under a live daemon: the Fleet page must keep seeing one row,
+// not watch its daemon rename itself mid-run.
+func TestFleetIdentityStableAcrossReload(t *testing.T) {
+	dir := t.TempDir()
+	cfg := writeDaemonConfig(t, dir, "clanker1.json")
+	d := NewMulti(cfg, &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
+	before := d.fleetIdentity()
+
+	path := cfg.Source()
+	d.SetReloader(func() (*config.Config, error) {
+		fresh, err := loadValidatedConfig(path)
+		if err != nil {
+			return nil, err
+		}
+		fresh.Prompt = "reloaded brief" // proves the swap actually happened
+		return fresh, nil
+	})
+	d.applyReload()
+	if d.cfg.Prompt != "reloaded brief" {
+		t.Fatal("the reload never swapped the config in; this test would pass vacuously")
+	}
+	after := d.fleetIdentity()
+	if after.Instance != before.Instance {
+		t.Errorf("identity changed across a reload: %q -> %q; a live daemon must keep its name",
+			before.Instance, after.Instance)
+	}
+}
+
+// The LOCAL beacon (phase 5b): every beacon also refreshes the state dir's
+// BEACON file — the daemon's own build and last state, written beside the
+// plane POST so the supervisor's roll can verify a restarted child WITHOUT a
+// plane read. The write is fail-soft like every telemetry write, and the
+// final `stopping` beacon lands in the file too, so after a run the file
+// says stopping.
+func TestRun_LocalBeaconAccompaniesEachBeacon(t *testing.T) {
+	cfg := fastCfg()
+	cfg.StateDir = t.TempDir()
+	cfg.InstanceName = "box-a"
+	// The state dir is opened by the test under a known path (Run skips its
+	// own open when d.state is already set), so the file's location is
+	// assertable.
+	st, err := statedir.Open(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("statedir.Open: %v", err)
+	}
+	defer st.Close() //nolint:errcheck
+	p := &fakePoller{sum: backlog.Summary{Ready: 0, Claimable: 0}}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	p.onCall = func(i int) {
+		if i >= 2 {
+			cancel()
+		}
+	}
+	h := &fakeAdapter{}
+	d, _ := fleetDriver(t, cfg, h)
+	d.targets[0].Poller = p
+	d.state = st
+	d.targets[0].Fleet = nil // the local beacon is independent of the reporter wiring
+
+	if err := d.Run(ctx); err != nil {
+		t.Fatalf("Run returned error: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cfg.StateDir, LocalBeaconName))
+	if err != nil {
+		t.Fatalf("no local beacon file after a beaconed run: %v", err)
+	}
+	var b localBeacon
+	if err := json.Unmarshal(data, &b); err != nil {
+		t.Fatalf("local beacon is not valid JSON: %v\n%s", err, data)
+	}
+	if b.Version != version.Current {
+		t.Errorf("local beacon version = %q, want the daemon's own build %q", b.Version, version.Current)
+	}
+	// fleetShutdown runs deferred from Run, so the file's LAST state is the
+	// stopping beacon — the same final word the plane POST carries.
+	if b.State != fleet.StateStopping {
+		t.Errorf("local beacon state after the run = %q, want %q (the final stopping beacon must land locally too)", b.State, fleet.StateStopping)
+	}
+}
+
+// --- CLA-691: what each session spent, durably per session ---------------------
+
+// The iteration record's per-session entry carries the session's normalised token
+// breakdown, whether the harness reported usage at all, and the harness-reported
+// cost — the figures a per-phase/per-reviewer cost analysis reads back out of the
+// durable phase_session record.
+func TestDrainPhases_IterationRecordCarriesEachSessionsUsage(t *testing.T) {
+	impl := checkpointed(10, 0.10)
+	impl.Usage = harness.TokenUsage{Input: 1000, Output: 200, CacheRead: 4000, CacheWrite: 50}
+	impl.UsageReported = true
+	impl.CostReported = true
+	review := okResult(5, 0.05)
+	review.Usage = harness.TokenUsage{Input: 900, Output: 30, Reasoning: 12, CacheRead: 100}
+	review.UsageReported = true
+	review.CostReported = true
+
+	reporting := &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true}
+	implAdapter := &fakeAdapter{steps: []invokeStep{{res: impl}}, caps: reporting}
+	reviewAdapter := &fakeAdapter{name: "claude", steps: []invokeStep{{res: review}}, caps: reporting}
+	d := mixedDriver(t, implAdapter, reviewAdapter)
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 || len(recs[0].Sessions) != 2 {
+		t.Fatalf("one record with two sessions must post, got %+v", recs)
+	}
+
+	implement, reviewSession := recs[0].Sessions[0], recs[0].Sessions[1]
+	wantImpl := fleet.TokenUsage{Input: 1000, Output: 200, CacheRead: 4000, CacheWrite: 50}
+	if implement.Usage != wantImpl || !implement.UsageReported {
+		t.Errorf("implement session = %+v, want usage %+v reported", implement, wantImpl)
+	}
+	wantReview := fleet.TokenUsage{Input: 900, Output: 30, Reasoning: 12, CacheRead: 100}
+	if reviewSession.Usage != wantReview || !reviewSession.UsageReported {
+		t.Errorf("review session = %+v, want usage %+v reported", reviewSession, wantReview)
+	}
+	if implement.CostUSD == nil || *implement.CostUSD != 0.10 {
+		t.Errorf("implement cost = %v, want 0.10 — a harness that reports cost must have its figure recorded per session", implement.CostUSD)
+	}
+	if reviewSession.CostUSD == nil || *reviewSession.CostUSD != 0.05 {
+		t.Errorf("review cost = %v, want 0.05", reviewSession.CostUSD)
+	}
+	// The run id joins each entry to the plane's per-run records; the review
+	// session never claimed, so it inherits the run the implement phase held.
+	if implement.RunID != "r-1" || reviewSession.RunID != "r-1" {
+		t.Errorf("run ids = %q/%q, want r-1/r-1 — a resumed phase's session works the same run", implement.RunID, reviewSession.RunID)
+	}
+}
+
+// A session that never held a claim — a phase whose predecessor claimed nothing,
+// or a launch that died before the stream carried one — records an empty run id
+// rather than inventing one.
+func TestSessionRunIDNeedsAClaimToNameARun(t *testing.T) {
+	if got := sessionRunID(harness.Result{}, nil); got != "" {
+		t.Errorf("sessionRunID = %q, want empty with no claim anywhere", got)
+	}
+	prev := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-9"}}
+	if got := sessionRunID(harness.Result{}, &prev); got != "r-9" {
+		t.Errorf("sessionRunID = %q, want the carried claim's run r-9", got)
+	}
+	own := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: "r-own"}}
+	if got := sessionRunID(own, &prev); got != "r-own" {
+		t.Errorf("sessionRunID = %q, want the session's OWN claim (r-own) ahead of the carried one", got)
+	}
+}
+
+// The claim's run id is the compound CREDENTIAL `<uuid>.<secret>` — the secret
+// half is what authorises a write as that run, and the plane keeps the plaintext
+// out of every durable record (CLA-509). The record gets the uuid, which is also
+// the only form that joins to the plane's per-run records.
+func TestSessionRunIDSendsTheUUIDNotTheCredential(t *testing.T) {
+	const (
+		uuid   = "4f0a2c11-8d3e-4a6b-9c7d-1e2f3a4b5c6d"
+		secret = "9yppJMvwZstZlDtUw4VIjNj-7QIT0iJ1CPwKiFz7jMM"
+	)
+	res := harness.Result{Claim: harness.Claim{TaskID: "t-1", RunID: uuid + "." + secret}}
+
+	if got := sessionRunID(res, nil); got != uuid {
+		t.Errorf("sessionRunID = %q, want just the uuid — the secret half is a bearer token and must not ride telemetry the plane stores and serves", got)
+	}
+	if got := runUUID(uuid); got != uuid {
+		t.Errorf("runUUID(%q) = %q, want a dot-less id taken whole (a grandfathered claim carries no secret)", uuid, got)
+	}
+	if got := runUUID(""); got != "" {
+		t.Errorf("runUUID(\"\") = %q, want empty", got)
+	}
+	// The FIRST dot is the seam, exactly as the plane parses it.
+	if got := runUUID(uuid + ".a.b"); got != uuid {
+		t.Errorf("runUUID = %q, want the first-dot split the plane uses", got)
+	}
+}
+
+// The dollar figure is recorded only when there IS one: an adapter that never
+// reports cost (Capabilities.ReportsCost false — codex today) and a session that
+// reported nothing at all both leave it nil, because a zero would read as "$0
+// spent" for a session nobody measured. A harness that really reported zero keeps
+// its zero.
+func TestSessionCost(t *testing.T) {
+	reporting := &fakeAdapter{caps: &harness.Capabilities{ReportsCost: true}}
+	noCost := &fakeAdapter{} // ReportsCost false, the codex shape
+	cost := 1.25
+
+	cases := []struct {
+		name    string
+		adapter harness.Adapter
+		res     *harness.Result
+		want    *float64
+	}{
+		{"a reported figure rides", reporting, &harness.Result{UsageReported: true, CostReported: true, CostUSD: cost}, &cost},
+		{"a reported zero is a figure", reporting, &harness.Result{UsageReported: true, CostReported: true}, new(float64)},
+		{"a session that reported nothing has no figure", reporting, &harness.Result{}, nil},
+		{
+			// The claude mid-stream kill: per-turn tokens were reported, the
+			// session's own accounting event never arrived, so there is no dollar
+			// figure and a 0 would claim a spend nobody measured.
+			"tokens reported without a cost figure", reporting,
+			&harness.Result{UsageReported: true, Tokens: 4200}, nil,
+		},
+		{"an adapter that never reports cost has no figure", noCost, &harness.Result{UsageReported: true, CostReported: true, CostUSD: cost}, nil},
+		{"no result at all", reporting, nil, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sessionCost(tc.adapter, tc.res)
+			switch {
+			case tc.want == nil && got != nil:
+				t.Errorf("sessionCost = %v, want nil", *got)
+			case tc.want != nil && got == nil:
+				t.Errorf("sessionCost = nil, want %v", *tc.want)
+			case tc.want != nil && got != nil && *got != *tc.want:
+				t.Errorf("sessionCost = %v, want %v", *got, *tc.want)
+			}
+		})
+	}
+}
+
+// CLA-737: a pass whose attempts never reported usage has an UNKNOWN cost, even
+// when the adapter reports money and the attempts carry a CostReported figure.
+// opencode's export path is the shape that made this matter: a session killed
+// before its first answered request (a provider.quota error was the one seen)
+// exports an all-zero run, so CostReported is true and UsageReported is false.
+// Publishing the 0 made the plane refuse the whole fleet report with
+// "session.costUsd requires session.usageReported".
+func TestSessionSpendCostNeedsAUsageReport(t *testing.T) {
+	reporting := &fakeAdapter{caps: &harness.Capabilities{ReportsCost: true}}
+
+	t.Run("no attempt reported usage, so there is no figure", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{CostReported: true})                // the export's all-zero run
+		pass.add(reporting, harness.Result{CostReported: true, CostUSD: 0.25}) // money, but still no usage report
+		if got := pass.cost(); got != nil {
+			t.Errorf("cost = %v, want nil — a zero from a session that reported no usage is silence, not a spend", *got)
+		}
+		if pass.usageReported {
+			t.Error("usageReported = true, want false — no attempt reported usage")
+		}
+	})
+
+	// A pass that DID report usage keeps today's arithmetic. The task pins this
+	// rather than changing it: the figure is the sum of what the attempts
+	// reported, and the silent attempt contributes its reported zero (or the
+	// pass is unknown when it reported no cost at all).
+	t.Run("one attempt with usage keeps the reported figure", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{CostReported: true})
+		pass.add(reporting, harness.Result{UsageReported: true, CostReported: true, CostUSD: 0.40})
+		got := pass.cost()
+		if got == nil || *got != 0.40 {
+			t.Errorf("cost = %v, want 0.40 — the pass reported usage, so its figure is a figure", got)
+		}
+		if !pass.usageReported {
+			t.Error("usageReported = false, want the pass's report ORed across attempts")
+		}
+	})
+
+	t.Run("an attempt that reported no dollars still leaves the pass unknown", func(t *testing.T) {
+		var pass sessionSpend
+		pass.add(reporting, harness.Result{UsageReported: true, CostReported: true, CostUSD: 0.40})
+		pass.add(reporting, harness.Result{UsageReported: true}) // tokens reported, no dollars (the claude mid-stream kill)
+		if got := pass.cost(); got != nil {
+			t.Errorf("cost = %v, want nil — one attempt's dollars were never reported, so the total is unknown, not partial", *got)
+		}
+	})
+}
+
+// A pass that RETRIED is several paid sessions: the loop counts every attempt
+// toward the iteration's total ("each attempt is a distinct session"), so the one
+// entry the record publishes for the pass must carry every attempt's money — or
+// the sessions would sum to less than the iteration they belong to, which is
+// exactly what a per-phase cost analysis reads them for.
+func TestDrainPhases_ASessionsEntrySumsARetriedPass(t *testing.T) {
+	// A usage-limit attempt is waited out and re-run: 1000 tokens and $0.40 burned
+	// on the attempt that was retried away, then a clean checkpoint.
+	limited := limitResult()
+	limited.Tokens = 1000
+	limited.CostUSD = 0.40
+	limited.Usage = harness.TokenUsage{Input: 900, Output: 100}
+	limited.UsageReported = true
+	limited.CostReported = true
+	second := checkpointed(10, 0.10)
+	second.Usage = harness.TokenUsage{Input: 8, Output: 2}
+	second.UsageReported = true
+	second.CostReported = true
+
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: limited}, {res: second}},
+		limitResetAt: time.Now().Add(-time.Minute), // already lifted: the wait is a no-op
+		caps:         &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true},
+	}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	sessions := recs[0].Sessions
+	if len(sessions) != 2 {
+		t.Fatalf("sessions = %+v, want one entry per pass (the retry is not a new pass)", sessions)
+	}
+	// The retried pass is the implement phase's entry: both attempts' tokens, and
+	// both attempts' dollars.
+	pass := sessions[0]
+	if pass.Phase != "implement" {
+		t.Fatalf("sessions[0] = %+v, want the implement pass", pass)
+	}
+	wantUsage := harness.TokenUsage{Input: 908, Output: 102}
+	if pass.Usage != fleet.TokenUsage(wantUsage) {
+		t.Errorf("usage = %+v, want %+v — a retried attempt's tokens are part of the pass", pass.Usage, wantUsage)
+	}
+	if pass.CostUSD == nil || *pass.CostUSD != 0.50 {
+		t.Errorf("cost = %v, want 0.50 — every attempt the ladder paid for counts toward the pass", pass.CostUSD)
+	}
+
+	// And the property the whole thing exists for: the per-session figures add up
+	// to the iteration's own total.
+	var summed int
+	for _, s := range sessions {
+		summed += int(s.Usage.Input + s.Usage.Output + s.Usage.Reasoning + s.Usage.CacheRead + s.Usage.CacheWrite)
+	}
+	if summed != recs[0].Tokens {
+		t.Errorf("session usage sums to %d, iteration Tokens = %d — the record's per-session figures must add up to the iteration total", summed, recs[0].Tokens)
+	}
+}
+
+// An attempt whose dollars were never reported makes the whole pass's cost
+// UNKNOWN rather than partial: the tokens are exact and still ride, but a partial
+// dollar figure presented as the session's cost would understate it.
+func TestDrainPhases_APassWithAnUnreportedCostCarriesNoFigure(t *testing.T) {
+	// The retried attempt reported tokens and no money (the claude mid-stream
+	// kill), the survivor reported both.
+	killed := limitResult()
+	killed.Tokens = 900
+	killed.Usage = harness.TokenUsage{Input: 900}
+	killed.UsageReported = true
+	survivor := checkpointed(10, 0.10)
+	survivor.Usage = harness.TokenUsage{Input: 8, Output: 2}
+	survivor.UsageReported = true
+	survivor.CostReported = true
+
+	h := &fakeAdapter{
+		steps:        []invokeStep{{res: killed}, {res: survivor}},
+		limitResetAt: time.Now().Add(-time.Minute),
+		caps:         &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true},
+	}
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("exactly one record must post, got %d", len(recs))
+	}
+	pass := recs[0].Sessions[0]
+	if pass.CostUSD != nil {
+		t.Errorf("cost = %v, want nil — one attempt's dollars were never reported, so the pass's total is unknown, not partial", *pass.CostUSD)
+	}
+	if !pass.UsageReported || pass.Usage != (fleet.TokenUsage{Input: 908, Output: 2}) {
+		t.Errorf("usage = %+v (reported=%v), want both attempts' exact token buckets", pass.Usage, pass.UsageReported)
+	}
+}
+
+// CLA-737 end to end: a session that died before its harness reported usage —
+// opencode's export leaves CostReported true and a zero behind for a run the
+// provider never answered — reaches the iteration record with no spend figures
+// at all, so the wire carries no costUsd and the plane accepts the report.
+func TestDrainPhases_ASessionWithNoUsageReportCarriesNoCost(t *testing.T) {
+	res := checkpointed(0, 0)
+	res.Usage = harness.TokenUsage{}
+	res.UsageReported = false
+	res.CostReported = true
+
+	h := &fakeAdapter{
+		steps: []invokeStep{{res: res}},
+		caps:  &harness.Capabilities{TracksClaims: true, HonoursMaxTurns: true, ReportsCost: true},
+	}
+	d, _ := phaseDriver(t, h, []config.Phase{{Name: "implement"}})
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	recs := ff.records()
+	if len(recs) != 1 || len(recs[0].Sessions) != 1 {
+		t.Fatalf("want one record with the pass's session entry, got %+v", recs)
+	}
+	s := recs[0].Sessions[0]
+	if s.UsageReported {
+		t.Error("usageReported = true, want false — no attempt reported usage")
+	}
+	if s.CostUSD != nil {
+		t.Errorf("cost = %v, want nil — the plane refuses the whole report when costUsd rides without usageReported", *s.CostUSD)
+	}
+}
+
+// An unreadable stream's figures are a floor, not a report: the iteration total
+// leaves them out, so the session entry must too, or the sessions would sum to
+// more than the iteration they belong to.
+func TestDrainPhases_AnUntrustedSessionReportsNoSpend(t *testing.T) {
+	res := untrustedResult(4321, 1.25)
+	res.Usage = harness.TokenUsage{Input: 4000, Output: 321}
+	res.UsageReported = true
+	res.CostReported = true
+	h := &fakeAdapter{steps: []invokeStep{{res: res}}}
+	// A second step is scripted but must never be reached: the phase ends on the
+	// unreadable stream.
+	d, _ := phaseDriver(t, h, twoPhases())
+	ff := &fakeFleet{}
+	d.targets[0].Fleet = ff
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 1 {
+		t.Fatalf("spawned %d sessions; an unreadable stream is not a checkpoint to build on", h.invokeCalls)
+	}
+	recs := ff.records()
+	if len(recs) != 1 || len(recs[0].Sessions) != 1 {
+		t.Fatalf("want one record with the pass's session entry, got %+v", recs)
+	}
+	s := recs[0].Sessions[0]
+	if s.UsageReported || s.Usage != (fleet.TokenUsage{}) || s.CostUSD != nil {
+		t.Errorf("session = %+v, want no spend figures at all — an unreadable stream proves nothing about what was spent", s)
+	}
+	if s.Phase != "implement" || s.Harness != "fake" {
+		t.Errorf("session = %+v, want the identity kept even when the spend is dropped", s)
+	}
+	if recs[0].Tokens != 0 {
+		t.Errorf("iteration Tokens = %d, want 0 — the floor is not counted", recs[0].Tokens)
+	}
+}
+
+// TestEndIterationDegradesAFreeTextOutcome is CLA-738 review 1.review-1.3: the
+// four-word invariant is a GUARD, not a convention. A future caller that appends
+// prose to the outcome must cost ONE degraded iteration (reported as released)
+// instead of the whole fleet report — which is what marshalReport's refusal does,
+// and the reporter logs only the first failure of a streak, so one bad word would
+// silence the plane for the rest of the session.
+func TestEndIterationDegradesAFreeTextOutcome(t *testing.T) {
+	logs := captureLogs(t)
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+
+	prose := "checkpoint — review panel INCOMPLETE: review-2: died producing nothing"
+	d.endIteration(0, d.targets[0], fleet.Iteration{TaskRef: "CLA-738", Outcome: prose})
+
+	recs := ff.records()
+	if len(recs) != 1 {
+		t.Fatalf("iteration records = %d, want 1 — the record must still reach the reporter", len(recs))
+	}
+	if recs[0].Outcome != fleet.OutcomeReleased {
+		t.Errorf("outcome = %q, want %q — a word outside the four must be degraded, not posted", recs[0].Outcome, fleet.OutcomeReleased)
+	}
+	out := logs.String()
+	for _, want := range []string{"BUG", prose, "not one of the four", fleet.OutcomeReleased} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the guard's log line does not carry %q:\n%s", want, out)
+		}
+	}
+}
+
+// And a known outcome passes through untouched, with no BUG line: the guard
+// degrades only what the plane would refuse.
+func TestEndIterationPassesAKnownOutcomeThrough(t *testing.T) {
+	logs := captureLogs(t)
+	ff := &fakeFleet{}
+	d := NewMulti(fastCfg(), &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}, Fleet: ff}})
+	openTestStateDir(t, d)
+
+	d.endIteration(0, d.targets[0], fleet.Iteration{TaskRef: "CLA-738", Outcome: fleet.OutcomeCheckpoint})
+
+	recs := ff.records()
+	if len(recs) != 1 || recs[0].Outcome != fleet.OutcomeCheckpoint {
+		t.Fatalf("records = %+v, want one checkpoint", recs)
+	}
+	if out := logs.String(); strings.Contains(out, "BUG") {
+		t.Errorf("a known outcome tripped the guard:\n%s", out)
+	}
+}
