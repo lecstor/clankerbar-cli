@@ -51,19 +51,24 @@ func TestLiveOpencodeSpawn_InAClaudeShapedWorkdirStarts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("harness.Get(opencode): %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	res, _ := a.Invoke(ctx, harness.Invocation{
-		Prompt:  ".",
-		Probe:   true,
-		Model:   "bogus/bogus",
-		WorkDir: dir,
-	})
-
-	if strings.Contains(res.Stdout, "Configuration is invalid") || strings.Contains(res.Stderr, "Configuration is invalid") {
-		t.Fatalf("opencode refused to start:\nstdout: %s\nstderr: %s", res.Stdout, res.Stderr)
-	}
-	if !strings.Contains(res.Stdout, "ses_") {
-		t.Fatalf("expected a created session (a \"ses_...\" id on the stream) before the bogus-model error, got:\nstdout: %s\nstderr: %s", res.Stdout, res.Stderr)
+	// Probe:false runs the MCP preflight a real session takes; an empty config
+	// dir keeps it from depending on this machine's global opencode config.
+	for _, probe := range []bool{true, false} {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		res, _ := a.Invoke(ctx, harness.Invocation{
+			Prompt:        ".",
+			Probe:         probe,
+			Model:         "bogus/bogus",
+			WorkDir:       dir,
+			MCPConfigPath: handoff,
+			ConfigDir:     t.TempDir(),
+		})
+		cancel()
+		if strings.Contains(res.Stdout, "Configuration is invalid") || strings.Contains(res.Stderr, "Configuration is invalid") {
+			t.Fatalf("probe=%v: opencode refused to start:\nstdout: %s\nstderr: %s", probe, res.Stdout, res.Stderr)
+		}
+		if !strings.Contains(res.Stdout, "ses_") {
+			t.Fatalf("probe=%v: expected a created session (a \"ses_...\" id on the stream) before the bogus-model error, got:\nstdout: %s\nstderr: %s", probe, res.Stdout, res.Stderr)
+		}
 	}
 }

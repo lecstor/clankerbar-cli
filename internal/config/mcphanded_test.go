@@ -39,8 +39,9 @@ func TestResolveMCPConfig_TheWorkdirFileOnlyReachesHarnessesThatReadIt(t *testin
 		// Asserted as exact equality on purpose. This is the mutation tripwire for
 		// the only harness actually in use: if the gate ever swallows claude's
 		// file too, every spawned session loses its clankerbar tools while every
-		// other test here still passes. Verified by mutation: dropping
-		// MCPConfigClaudeJSON in mcpConfigHandedTo fails this subtest.
+		// other test here still passes. Verified by mutation: adding
+		// MCPConfigClaudeJSON to the MCPConfigUnused case in mcpConfigHandedTo
+		// fails this subtest.
 		c := &Config{Harness: "claude", MCPConfigPath: "/w/.mcp.json"}
 		if got := c.ResolveMCPConfig("claude", "", nil); got != "/w/.mcp.json" {
 			t.Errorf("ResolveMCPConfig(claude) = %q, want \"/w/.mcp.json\" verbatim - claude's headless mode has no auto-discovery, so this path IS the wiring", got)
@@ -205,5 +206,56 @@ func TestValidate_AWorkdirDotMcpJsonUnderOpencodeStillFillsForThePollButResolves
 	}
 	if !strings.HasSuffix(mcp, ".mcp.json") {
 		t.Fatal("test setup drifted: the fixture file stopped being .mcp.json-shaped")
+	}
+}
+
+// A project's DISCOVERED .mcp.json must not shadow the opencode file the
+// operator named for the harness: the gated candidate is passed over, not final.
+func TestResolveMCPConfig_AGatedProjectFileFallsThroughToTheHarnessBlock(t *testing.T) {
+	c := &Config{Harness: "opencode", MCPConfigPath: "/w/.mcp.json",
+		Harnesses: map[string]HarnessConfig{"opencode": {MCPConfigPath: "/w/oc.json"}}}
+	if got := c.ResolveMCPConfig("opencode", "/proj/.mcp.json", nil); got != "/w/oc.json" {
+		t.Errorf("ResolveMCPConfig(opencode, project .mcp.json) = %q, want the harness block's /w/oc.json", got)
+	}
+	// ...but a project's explicit "none" is an opt-out, not a gap to fill.
+	if got := c.ResolveMCPConfig("opencode", MCPConfigNone, nil); got != "" {
+		t.Errorf("ResolveMCPConfig(opencode, project none) = %q, want \"\"", got)
+	}
+	if got := c.ResolveMCPConfig("opencode", "", map[string]string{"opencode": MCPConfigNone}); got != "" {
+		t.Errorf("ResolveMCPConfig(opencode, per-harness project none) = %q, want \"\"", got)
+	}
+	// claude still takes the project's own file first.
+	c.Harness = "claude"
+	c.Harnesses = map[string]HarnessConfig{}
+	if got := c.ResolveMCPConfig("claude", "/proj/.mcp.json", nil); got != "/proj/.mcp.json" {
+		t.Errorf("ResolveMCPConfig(claude, project file) = %q, want /proj/.mcp.json", got)
+	}
+}
+
+// "none" is a word, not a path: a file or directory called `none` in the
+// driver's cwd must not be read as the run's MCP config.
+func TestValidate_NoneIsNeverOpenedAsAFile(t *testing.T) {
+	for _, kind := range []string{"dir", "file"} {
+		t.Run(kind, func(t *testing.T) {
+			cwd := t.TempDir()
+			t.Chdir(cwd)
+			if kind == "dir" {
+				if err := os.Mkdir(filepath.Join(cwd, MCPConfigNone), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.WriteFile(filepath.Join(cwd, MCPConfigNone),
+				[]byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/other"}}}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			c := baseConfig(t.TempDir())
+			c.Harness = "opencode"
+			c.MCPConfigPath = MCPConfigNone
+			if err := c.Validate(); err != nil {
+				t.Fatalf("Validate() = %v, want nil - \"none\" must not be stat'd", err)
+			}
+			if got := c.BacklogEndpoint(); strings.Contains(got, "/mcp/other") {
+				t.Errorf("BacklogEndpoint() = %q, scoped by a cwd file named none", got)
+			}
+		})
 	}
 }

@@ -3580,25 +3580,29 @@ func (c *Config) ModelIDsFor(harnessName string) []string {
 // the project's file when this is the top-level harness — it is that harness's
 // schema and no other's — else the harness block's own path.
 //
-// The winner is then narrowed by mcpConfigHandedTo: a file this harness cannot
-// be handed (a Claude-shaped .mcp.json under opencode, anything under codex, or
-// the explicit "none" opt-out) resolves to "" rather than reaching the session
-// (CLA-318). The slug the driver's poll derives from the raw field is untouched
-// by this gate - splitting which-project from which-schema is the whole point -
-// see BacklogEndpoint.
+// Each candidate is narrowed by mcpConfigHandedTo (CLA-318): one this harness
+// cannot be handed (a .mcp.json under opencode, anything under codex) is passed
+// over for the next, so a project's discovered .mcp.json does not shadow
+// `harnesses.opencode.mcp_config_path`. An explicit "none" ends the search: it
+// is the operator opting this scope out. The poll's slug reads the raw field
+// instead (see BacklogEndpoint).
 func (c *Config) ResolveMCPConfig(harnessName, projectMCP string, projectPerHarness map[string]string) string {
-	p := projectPerHarness[harnessName]
-	if p == "" && harnessName == c.Harness {
-		p = projectMCP
+	candidates := []string{projectPerHarness[harnessName], "", c.SessionFor(harnessName).MCPConfigPath}
+	if harnessName == c.Harness {
+		candidates[1] = projectMCP
 	}
-	if p == "" {
-		p = c.SessionFor(harnessName).MCPConfigPath
+	for _, p := range candidates {
+		if p == "" {
+			continue
+		}
+		if p == MCPConfigNone {
+			return ""
+		}
+		if handed := mcpConfigHandedTo(harnessName, p); handed != "" {
+			return handed
+		}
 	}
-	// Selected first, gated second: a candidate this harness cannot be handed
-	// ends the search rather than falling through to a lower-precedence file -
-	// silently substituting a different config would hide the misconfiguration
-	// the operator wrote.
-	return mcpConfigHandedTo(harnessName, p)
+	return ""
 }
 
 // panelMemberHarnesses is the harness each panel member resolves to when the

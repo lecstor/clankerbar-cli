@@ -1905,7 +1905,10 @@ To give opencode sessions their own MCP config, point a per-harness or per-proje
 path (`harnesses.opencode.mcp_config_path`, or that project's `mcp_config_paths`)
 at an opencode-schema file. Naming a file `.mcp.json` under opencode resolves to
 nothing too — after validation there is no provenance left on a path, so the gate
-treats operator-named and discovered alike; `doctor` FAILs any Claude-shaped file
+treats operator-named and discovered alike. A gated file is passed over for the next
+one in precedence (project file for the harness, project file, harness block), so a
+project's discovered `.mcp.json` does not hide `harnesses.opencode.mcp_config_path`;
+only `"none"` stops the search; `doctor` FAILs any Claude-shaped file
 that still reaches an opencode session check, which after the gate means only ones
 you named.
 

@@ -9,8 +9,8 @@ import (
 // MCPConfigNone is the mcp_config_path value that means "no MCP config": set it
 // at any level (run-wide, per-harness, per-project) to opt out explicitly. It
 // exists because an empty value cannot opt out - empty re-runs the harness-blind
-// <workdir>/.mcp.json discovery, which is what handed opencode a file it refuses
-// to start on (CLA-318). "none" survives Validate untouched, skips the origin
+// <workdir>/.mcp.json discovery, whose Claude schema opencode cannot read
+// (CLA-318). "none" survives Validate untouched, skips the origin
 // checks (there is no file to check), and resolves to nothing at invocation time
 // for every harness. A single-project run that sets it loses the slug its poll
 // would otherwise derive from .mcp.json, so name the project in backlog_url

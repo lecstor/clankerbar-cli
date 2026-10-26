@@ -244,7 +244,7 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 			} else {
 				c.detail = workdirLabel(dir) + " has no .mcp.json"
 			}
-			c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools"
+			c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools; if mcp_config_path is \"none\", that opt-out is why"
 			return c
 		}
 
