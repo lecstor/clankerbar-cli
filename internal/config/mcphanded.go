@@ -21,7 +21,7 @@ const MCPConfigNone = "none"
 // actually be handed (CLA-318).
 //
 // The auto-discovered file is always named .mcp.json - Claude Code's project MCP
-// config, whose schema opencode refuses to start on and whose wiring codex never
+// config, whose schema opencode cannot read and whose wiring codex never
 // sees. That one discovery feeds two consumers with conflicting needs: the
 // driver's poll reads the slug out of the file whatever harness runs, while a
 // SESSION should receive only a file in ITS schema. So Validate keeps filling

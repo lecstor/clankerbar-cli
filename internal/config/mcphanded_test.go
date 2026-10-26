@@ -209,22 +209,22 @@ func TestValidate_AWorkdirDotMcpJsonUnderOpencodeStillFillsForThePollButResolves
 	}
 }
 
-// A project's DISCOVERED .mcp.json must not shadow the opencode file the
-// operator named for the harness: the gated candidate is passed over, not final.
-func TestResolveMCPConfig_AGatedProjectFileFallsThroughToTheHarnessBlock(t *testing.T) {
-	c := &Config{Harness: "opencode", MCPConfigPath: "/w/.mcp.json",
-		Harnesses: map[string]HarnessConfig{"opencode": {MCPConfigPath: "/w/oc.json"}}}
-	if got := c.ResolveMCPConfig("opencode", "/proj/.mcp.json", nil); got != "/w/oc.json" {
-		t.Errorf("ResolveMCPConfig(opencode, project .mcp.json) = %q, want the harness block's /w/oc.json", got)
+// A gated project file ends the search: it must NOT fall through to the
+// harness block, which in a multi-project run names another project, so beta's
+// sessions would be wired to alpha's backlog. Multi-project opencode runs name
+// each project's file under projects[].mcp_config_paths.opencode.
+func TestResolveMCPConfig_AGatedProjectFileDoesNotBorrowTheHarnessBlock(t *testing.T) {
+	c := &Config{Harness: "opencode",
+		Harnesses: map[string]HarnessConfig{"opencode": {MCPConfigPath: "/w/oc-alpha.json"}}}
+	if got := c.ResolveMCPConfig("opencode", "/beta/.mcp.json", nil); got != "" {
+		t.Errorf("ResolveMCPConfig(opencode, beta's .mcp.json) = %q, want \"\" - never another scope's file", got)
 	}
-	// ...but a project's explicit "none" is an opt-out, not a gap to fill.
+	if got := c.ResolveMCPConfig("opencode", "/beta/.mcp.json", map[string]string{"opencode": "/beta/oc.json"}); got != "/beta/oc.json" {
+		t.Errorf("ResolveMCPConfig(opencode, beta's mcp_config_paths.opencode) = %q, want /beta/oc.json", got)
+	}
 	if got := c.ResolveMCPConfig("opencode", MCPConfigNone, nil); got != "" {
 		t.Errorf("ResolveMCPConfig(opencode, project none) = %q, want \"\"", got)
 	}
-	if got := c.ResolveMCPConfig("opencode", "", map[string]string{"opencode": MCPConfigNone}); got != "" {
-		t.Errorf("ResolveMCPConfig(opencode, per-harness project none) = %q, want \"\"", got)
-	}
-	// claude still takes the project's own file first.
 	c.Harness = "claude"
 	c.Harnesses = map[string]HarnessConfig{}
 	if got := c.ResolveMCPConfig("claude", "/proj/.mcp.json", nil); got != "/proj/.mcp.json" {
