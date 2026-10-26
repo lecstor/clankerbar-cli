@@ -202,7 +202,11 @@ func checkOpencodeAuth(ctx context.Context, cfg *config.Config, e doctorEnv) []c
 // so what it carries is what wins for every key it sets.
 func checkOpencodePermissions(cfg *config.Config, label, harnessName string) check {
 	c := check{name: label}
+	// The gated path, as the adapter is handed it: "none" or a discovered
+	// .mcp.json resolve to "" here (CLA-318), and reporting on the raw field
+	// would certify a document no session receives.
 	sess := cfg.SessionFor(harnessName)
+	sess.MCPConfigPath = cfg.ResolveMCPConfig(harnessName, "", nil)
 	doc, err := harness.OpencodeSessionConfig(sess.MCPConfigPath, cfg.WorkDir, false)
 	if err != nil {
 		c.status = fail
@@ -285,11 +289,12 @@ func checkOpencodeMCPDisables(cfg *config.Config) []check {
 		return nil
 	}
 	paths := []string{}
-	if p := cfg.SessionFor("opencode").MCPConfigPath; p != "" {
+	// Only files an opencode session is actually handed (ResolveMCPConfig's gate).
+	if p := cfg.ResolveMCPConfig("opencode", "", nil); p != "" {
 		paths = append(paths, p)
 	}
 	for _, pr := range cfg.Projects {
-		if p := pr.MCPConfigPaths["opencode"]; p != "" && !slices.Contains(paths, p) {
+		if p := cfg.ResolveMCPConfig("opencode", pr.MCPConfigPath, pr.MCPConfigPaths); p != "" && !slices.Contains(paths, p) {
 			paths = append(paths, p)
 		}
 	}
