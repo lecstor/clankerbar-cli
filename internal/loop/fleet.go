@@ -52,27 +52,35 @@ func (d *Driver) hostnameOnce() string {
 	return d.hostname
 }
 
-// fleetIdentity composes what every beacon for target t carries: who it is,
-// where it runs, what build, which config. Read fresh per report so a RELOAD
-// (which swaps d.cfg) is visible to the console as a changed configIdentity
-// rather than requiring a restart.
-//
-// The fingerprint is the target's EFFECTIVE config — the stored run-config
-// overlay when one is in force (CLA-410, d.targetCfg), else the local file —
-// because that is what the drain actually runs on. Hashing d.cfg instead would
-// report the same identity for two targets under different ratified documents,
-// and leave it unmoved when a new document is ratified in the console: exactly
-// the "how to run" disagreement the field exists to surface, and the case the
-// console cannot otherwise see land.
-func (d *Driver) fleetIdentity(t Target) fleet.Identity {
+// fleetIdentity composes what every beacon for target ti carries: who it is,
+// where it runs, what build, which config. The fingerprint is the target's
+// EFFECTIVE config — the CLA-410 overlay when one is in force, else the base
+// file, the same rule the drain reads through d.targetCfg — because that is
+// what the drain runs on. Read fresh per report, so a RELOAD moves it without a
+// restart: at once for a target with no overlay in force, and for an overlaid
+// one when the refetch at the next poll boundary lands (d.invalidateRunConfigs).
+func (d *Driver) fleetIdentity(ti int) fleet.Identity {
+	// A target INDEX, not a captured Target: the poll beacons a target before
+	// checkRunConfigVersion rebuilds its overlay, so a copy would fingerprint
+	// the document being replaced. d.cfg is read under controlMu because a
+	// RELOAD swaps it on another goroutine (a panel member parked in
+	// waitResponsive); the pointer taken there is immutable — a reload installs
+	// a new config rather than editing this one.
+	d.controlMu.Lock()
+	base := d.cfg
+	eff := base
+	if ti >= 0 && ti < len(d.targets) && d.targets[ti].Cfg != nil {
+		eff = d.targets[ti].Cfg
+	}
 	// Explicit instance_name wins; otherwise hostname plus config basename,
 	// unique per running daemon, so co-located daemons no longer collapse into
 	// one presence row (CLA-501). Stable across a RELOAD: the reloader re-reads
 	// the same path, so the basename half cannot change under a live daemon.
-	inst := d.cfg.ResolvedInstanceName(d.hostnameOnce())
+	inst := base.ResolvedInstanceName(d.hostnameOnce())
+	d.controlMu.Unlock()
 	cfgID := ""
-	if tc := d.targetCfg(t); tc != nil {
-		cfgID = tc.Identity()
+	if eff != nil {
+		cfgID = eff.Identity()
 	}
 	return fleet.Identity{
 		Instance:       inst,
@@ -148,7 +156,7 @@ func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...flee
 		return
 	}
 	t.Fleet.Send(fleet.Report{
-		Identity:   d.fleetIdentity(t),
+		Identity:   d.fleetIdentity(ti),
 		State:      st,
 		Iterations: iterations,
 	})
@@ -342,13 +350,14 @@ func (d *Driver) reflectClaim(ti int, t Target, done <-chan struct{}) func(harne
 // which is what makes the console's silence-after-this-point meaningful: after
 // a stopping beacon, quiet means the daemon is gone, not that it stopped talking.
 func (d *Driver) fleetShutdown() {
-	for _, t := range d.targets {
+	for i := range d.targets {
+		t := d.targets[i]
 		d.writeLocalBeacon(fleet.State{Kind: fleet.StateStopping})
 		if t.Fleet == nil {
 			continue
 		}
 		t.Fleet.Close(fleet.Report{
-			Identity: d.fleetIdentity(t),
+			Identity: d.fleetIdentity(i),
 			State:    fleet.State{Kind: fleet.StateStopping},
 		})
 	}

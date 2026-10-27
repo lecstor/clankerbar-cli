@@ -1520,9 +1520,9 @@ because the pause is the one time that poll and session cadences both stop:
   basename, e.g. `Jasons-MBP/clanker1`, so several daemons started from
   different configs on one host stay distinct; set `instance_name` to override),
   the host and binary version, a
-  fingerprint of the config in force — each project's own effective config, so
-  a ratified run-config document is visible as a distinct fingerprint and moves
-  it when it changes, rather than every project reporting the local file's — and
+  fingerprint of each project's own effective config (the stored run-config
+  document when one is ratified, else the local file), so a ratified document
+  that changes what the project runs on moves it — and
   the state — `idle`,
   `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
   holds spawns, `limited` {resetAt} while the run is parked on a harness usage

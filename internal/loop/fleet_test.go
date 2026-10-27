@@ -1135,7 +1135,7 @@ func writeDaemonConfig(t *testing.T, dir, base string) *config.Config {
 func identityOf(t *testing.T, cfg *config.Config) fleet.Identity {
 	t.Helper()
 	d := NewMulti(cfg, &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
-	return d.fleetIdentity(d.targets[0])
+	return d.fleetIdentity(0)
 }
 
 // The bug CLA-501 fixes: four daemons on one host all beaconed the bare
@@ -1178,12 +1178,14 @@ func TestFleetIdentityExplicitNameWins(t *testing.T) {
 
 // ctl reload re-reads the SAME config file, so the basename half of the default
 // cannot change under a live daemon: the Fleet page must keep seeing one row,
-// not watch its daemon rename itself mid-run.
+// not watch its daemon rename itself mid-run. The CONFIGIDENTITY half is the
+// opposite promise (CLA-466): a reload IS a change of what the daemon runs on,
+// so the fingerprint has to move without a restart.
 func TestFleetIdentityStableAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	cfg := writeDaemonConfig(t, dir, "clanker1.json")
 	d := NewMulti(cfg, &fakeAdapter{}, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
-	before := d.fleetIdentity(d.targets[0])
+	before := d.fleetIdentity(0)
 
 	path := cfg.Source()
 	d.SetReloader(func() (*config.Config, error) {
@@ -1198,10 +1200,17 @@ func TestFleetIdentityStableAcrossReload(t *testing.T) {
 	if d.cfg.Prompt != "reloaded brief" {
 		t.Fatal("the reload never swapped the config in; this test would pass vacuously")
 	}
-	after := d.fleetIdentity(d.targets[0])
+	after := d.fleetIdentity(0)
 	if after.Instance != before.Instance {
 		t.Errorf("identity changed across a reload: %q -> %q; a live daemon must keep its name",
 			before.Instance, after.Instance)
+	}
+	if after.ConfigIdentity == before.ConfigIdentity {
+		t.Errorf("the fingerprint did not move across a reload: still %q; the console cannot see the new config land",
+			after.ConfigIdentity)
+	}
+	if want := d.cfg.Identity(); after.ConfigIdentity != want {
+		t.Errorf("after the reload the fingerprint is %q, want the live file's %q", after.ConfigIdentity, want)
 	}
 }
 
@@ -1280,13 +1289,13 @@ func TestFleetIdentityMovesWhenARunConfigIsRatified(t *testing.T) {
 	d := NewMulti(base, &fakeAdapter{}, []Target{{Poller: busyPoller()}})
 	openTestStateDir(t, d)
 
-	fromLocal := d.fleetIdentity(d.targets[0])
+	fromLocal := d.fleetIdentity(0)
 	if want := base.Identity(); fromLocal.ConfigIdentity != want {
 		t.Fatalf("with no overlay in force the fingerprint is %q, want the local file's %q", fromLocal.ConfigIdentity, want)
 	}
 
 	d.applyRunConfig(0, &d.targets[0], &plane.RunConfigState{Version: 1, Config: []byte(`{"model":"plane-1"}`)})
-	afterRatify := d.fleetIdentity(d.targets[0])
+	afterRatify := d.fleetIdentity(0)
 	if afterRatify.ConfigIdentity == fromLocal.ConfigIdentity {
 		t.Fatalf("ratifying v1 left the fingerprint at %q; the console cannot see the document land", afterRatify.ConfigIdentity)
 	}
@@ -1298,15 +1307,50 @@ func TestFleetIdentityMovesWhenARunConfigIsRatified(t *testing.T) {
 	// must not flap the identity: only a real change to the config in force is
 	// a "how to run" disagreement.
 	d.applyRunConfig(0, &d.targets[0], &plane.RunConfigState{Version: 2, Config: []byte(`{"model":"plane-1"}`)})
-	if got := d.fleetIdentity(d.targets[0]); got.ConfigIdentity != afterRatify.ConfigIdentity {
+	if got := d.fleetIdentity(0); got.ConfigIdentity != afterRatify.ConfigIdentity {
 		t.Errorf("an unchanged document moved the fingerprint: %q -> %q", afterRatify.ConfigIdentity, got.ConfigIdentity)
 	}
 
 	// Dropping back to the local file (the plane stores nothing) is a change
 	// too, and returns to the local fingerprint.
 	d.targets[0].Cfg = nil
-	if got := d.fleetIdentity(d.targets[0]); got.ConfigIdentity != fromLocal.ConfigIdentity {
+	if got := d.fleetIdentity(0); got.ConfigIdentity != fromLocal.ConfigIdentity {
 		t.Errorf("with the overlay gone the fingerprint is %q, want the local file's %q", got.ConfigIdentity, fromLocal.ConfigIdentity)
+	}
+}
+
+// The poll captures its Target BEFORE checkRunConfigVersion rebuilds the
+// overlay, and checkRunConfigVersion takes a pointer into d.targets so the copy
+// it was handed never moves. Identity must therefore come from the LIVE target:
+// a beacon sent with the captured copy would fingerprint the document the poll
+// just replaced.
+func TestFleetBeacon_FingerprintsTheLiveTargetNotTheCapturedCopy(t *testing.T) {
+	base := fastCfg()
+	base.InstanceName = "box-a"
+	base.Model = "base-model"
+	ff := &fakeFleet{}
+	d := NewMulti(base, &fakeAdapter{}, []Target{{Poller: busyPoller(), Fleet: ff}})
+	openTestStateDir(t, d)
+	d.applyRunConfig(0, &d.targets[0], &plane.RunConfigState{Version: 1, Config: []byte(`{"model":"plane-1"}`)})
+	if d.targets[0].Cfg == nil {
+		t.Fatal("the v1 overlay was refused; the test would pass vacuously")
+	}
+	stale := d.targets[0] // what the poll holds while the next boundary applies
+	d.applyRunConfig(0, &d.targets[0], &plane.RunConfigState{Version: 2, Config: []byte(`{"model":"plane-2"}`)})
+	if d.targets[0].Cfg == nil || d.targets[0].Cfg.Identity() == stale.Cfg.Identity() {
+		t.Fatal("the v2 overlay did not change the effective config; the test would pass vacuously")
+	}
+
+	d.sendBeacon(0, stale, fleet.State{Kind: fleet.StateIdle})
+	sent, _ := ff.reports()
+	if len(sent) != 1 {
+		t.Fatalf("beacons sent: %d, want 1", len(sent))
+	}
+	if got, want := sent[0].ConfigIdentity, d.targets[0].Cfg.Identity(); got != want {
+		t.Errorf("the beacon carried %q, want the live target's %q", got, want)
+	}
+	if got := sent[0].ConfigIdentity; got == stale.Cfg.Identity() {
+		t.Error("the beacon carried the captured copy's identity: the document the poll had just replaced")
 	}
 }
 
