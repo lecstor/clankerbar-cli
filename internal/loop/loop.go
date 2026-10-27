@@ -931,20 +931,11 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 						}
 					}
 				}
-				// CLA-466: the presence beacon rides THIS poll — no new cadence.
-				// It fires whatever the poll answered (even an error poll proves
-				// the daemon is alive and looping), and it fires AFTER the switch,
-				// because the switch is what updates the pause flags fleetState
-				// reads (CLA-483): beacons ahead of it carried the PREVIOUS cycle's
-				// pause state, so the first poll after an operator paused read
-				// `idle` and the first after an un-pause read `draining`, each
-				// wrong for a full idle_poll_interval (the same lag hit a
-				// fleet-pause clear, and daemon start against an already-paused
-				// project). The two hard-stop arms return before reaching here and
-				// get their `stopping` beacon from fleetShutdown.
-				// The poll is not the only carrier: a session blocks the poll for
-				// as long as it runs, so the in-session lease-renewal tick carries
-				// the same per-target lap (CLA-771, Driver.beaconSessionTargets).
+				// CLA-466: the presence beacon rides THIS poll — no new cadence. It
+				// fires AFTER the switch, whose default arm writes the pause flags
+				// fleetState reads (CLA-483); every poll beacons bar the two hard-stop
+				// arms, which get their `stopping` from fleetShutdown. A session blocks
+				// the poll, so the in-session renewal tick carries the same lap (CLA-771).
 				d.beacon(i, t, d.fleetState(i))
 				if d.blind {
 					break

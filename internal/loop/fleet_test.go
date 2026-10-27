@@ -155,11 +155,10 @@ func TestRun_ABeaconAccompaniesEachPoll(t *testing.T) {
 }
 
 // CLA-483: the beacon accompanying a poll carries THAT poll's pause state.
-// d.paused[i] is only learned inside the poll's switch, so a beacon fired ahead
-// of it reported the PREVIOUS cycle's answer — the first poll after an operator
-// paused beaconed `idle`, the first after an un-pause beaconed `draining`, each
-// wrong for a full idle_poll_interval (the same lag on the fleet-pause clear,
-// and on daemon start against an already-paused project).
+// d.paused[i] is learned inside the poll's switch, so a beacon ahead of it
+// reported the previous cycle's answer. The decisive assertion is the FIRST poll
+// of a transition (pause landing, pause clearing, or start against a paused
+// project), which is why each case scripts both sides of one.
 //
 // Driven through Run rather than by poking the flags: the ordering lives in
 // Run's per-target body, which TestFleetState_MapsWhatTheLoopKnows cannot see.
@@ -178,6 +177,13 @@ func TestRun_ABeaconCarriesThatPollsPauseState(t *testing.T) {
 			name: "operator pauses between polls",
 			sums: []backlog.Summary{{}, {Paused: true}, {Paused: true}},
 			want: []string{fleet.StateIdle, fleet.StateDraining, fleet.StateDraining},
+		},
+		{
+			// The clear direction: the first poll after an un-pause must beacon
+			// idle on that same poll, not draining for another interval.
+			name: "operator un-pauses between polls",
+			sums: []backlog.Summary{{Paused: true}, {}},
+			want: []string{fleet.StateDraining, fleet.StateIdle},
 		},
 	}
 	for _, tc := range cases {
