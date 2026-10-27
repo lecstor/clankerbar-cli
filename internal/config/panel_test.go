@@ -83,10 +83,10 @@ func TestReviewPanel_ExplicitMembers(t *testing.T) {
 	}
 	// The same model twice is deliberate: two independent reviewers, not one
 	// deduplicated reviewer.
-	if got[1].Model != "opus" || got[2].Model != "opus" {
+	if got[1].Model.First() != "opus" || got[2].Model.First() != "opus" {
 		t.Errorf("models = %q/%q, want opus/opus", got[1].Model, got[2].Model)
 	}
-	if got[3].Tier != "cheap" || got[3].Model != "" {
+	if got[3].Tier != "cheap" || !got[3].Model.Empty() {
 		t.Errorf("the tier member resolved to model %q tier %q, want the tier with no pinned model", got[3].Model, got[3].Tier)
 	}
 	for _, ph := range got[1:4] {
@@ -130,7 +130,7 @@ func TestReviewPanel_FourMembersExpand(t *testing.T) {
 		if ph.Prompt != reviewOnlyBrief {
 			t.Errorf("%s did not inherit the review phase's resolved brief (the panel-member variant is swapped in at spawn, by invocationFor)", ph.Name)
 		}
-		switch ph.Model {
+		switch ph.Model.First() {
 		case "opencode-go/gpt-6-luna":
 			luna++
 		case "opencode-go/glm-5.3-flash":
@@ -255,7 +255,7 @@ func TestReviewPanel_UnphasedConfigWithAPanelStaysInert(t *testing.T) {
 	cfg := &Config{
 		Harness:     "claude",
 		Prompt:      "Work the backlog.",
-		ReviewPanel: []ReviewPanelMember{{Model: "opus"}},
+		ReviewPanel: []ReviewPanelMember{{Model: ModelRoutes{"opus"}}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("an unphased config with an inert panel must validate: %v", err)
@@ -309,7 +309,7 @@ func TestReviewPanel_ModelPinnedDirectly(t *testing.T) {
 		Harness: "opencode",
 		Phases:  []Phase{{Name: ImplementPhaseName}, {Name: ReviewPhaseName}, {Name: FixPhaseName}},
 		ReviewPanel: []ReviewPanelMember{
-			{Model: "opencode-go/gpt-6-luna"},
+			{Model: ModelRoutes{"opencode-go/gpt-6-luna"}},
 		},
 	}
 	member := cfg.EffectivePhases()[1]
@@ -412,7 +412,7 @@ func TestReviewPanel_MarshalledConfigRoundTrips(t *testing.T) {
 		if panel[0].Name != "alpha" || panel[0].Harness != "opencode" {
 			t.Errorf("member 0 = %+v, want alpha on opencode", panel[0])
 		}
-		if panel[1].Name != "beta" || panel[1].Model != "opencode-go/glm-5.3-flash" {
+		if panel[1].Name != "beta" || panel[1].Model.First() != "opencode-go/glm-5.3-flash" {
 			t.Errorf("member 1 = %+v, want beta with its pinned model", panel[1])
 		}
 		got := loaded.EffectivePhases()
@@ -662,7 +662,7 @@ func TestReviewPanel_PhaseModelIsAConfigKey(t *testing.T) {
 		"phases": [{"name": "implement", "model": "opencode-go/gpt-6-luna"}, {"name": "review"}, {"name": "fix"}],
 		"review_panel": [{"model": "opencode-go/gpt-6-luna"}]
 	}`)
-	if got := cfg.Phases[0].Model; got != "opencode-go/gpt-6-luna" {
+	if got := cfg.Phases[0].Model.First(); got != "opencode-go/gpt-6-luna" {
 		t.Fatalf("phases[0].model loaded as %q, want the configured alias", got)
 	}
 	if got, ok := cfg.ModelForPhase(cfg.Phases[0]); got != "opencode-go/gpt-6-luna" || !ok {
@@ -743,13 +743,124 @@ func TestReviewPanel_MemberTierBeatsTheReviewPhasesModel(t *testing.T) {
 		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(got))
 	}
 	tiered, modeld := got[1], got[2]
-	if tiered.Tier != "strong" || tiered.Model != "" {
+	if tiered.Tier != "strong" || !tiered.Model.Empty() {
 		t.Errorf("the tier member expanded to model=%q tier=%q, want tier strong with NO inherited model", tiered.Model, tiered.Tier)
 	}
 	if model, ok := cfg.ModelForPhase(tiered); !ok || model != "opencode-go/glm-5.3-flash" {
 		t.Errorf("the tier member resolves to %q/%v, want opencode-go/glm-5.3-flash — the tier it named", model, ok)
 	}
-	if modeld.Model != "opencode-go/gpt-6-luna" || modeld.Tier != "" {
+	if modeld.Model.First() != "opencode-go/gpt-6-luna" || modeld.Tier != "" {
 		t.Errorf("the model member expanded to model=%q tier=%q, want its own alias and no tier", modeld.Model, modeld.Tier)
+	}
+}
+
+// TestReviewPanel_OptionalParsesDefaultsFalseAndExpands (CLA-784): `optional`
+// is a per-member key, absent by default, and expansion carries it onto the
+// phase the driver runs — that phase flag is what tells a trial seat from a
+// required one without re-reading the panel by position at end time.
+func TestReviewPanel_OptionalParsesDefaultsFalseAndExpands(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"model": "a"}, {"model": "b", "optional": true}]
+	}`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want a panel with a required and an optional member accepted", err)
+	}
+	if cfg.ReviewPanel[0].Optional {
+		t.Error("a member with no `optional` key parsed as optional, want required (the default)")
+	}
+	if !cfg.ReviewPanel[1].Optional {
+		t.Error("`optional: true` did not parse")
+	}
+	phases := cfg.EffectivePhases()
+	if len(phases) != 4 {
+		t.Fatalf("effective phases = %d, want 4 (implement, two reviewers, fix)", len(phases))
+	}
+	if phases[1].IsOptionalPanelMember() {
+		t.Error("the required member's expanded phase is marked optional")
+	}
+	if !phases[2].IsOptionalPanelMember() {
+		t.Error("the optional member's expanded phase is not marked optional — the driver cannot tell a trial seat from a required one")
+	}
+	for _, idx := range []int{0, 3} {
+		if phases[idx].IsOptionalPanelMember() {
+			t.Errorf("phase %d is not a panel member but reports optional", idx)
+		}
+	}
+}
+
+// TestReviewPanel_OptionalKeepsTheConfigIdentity (CLA-784): `omitempty` is
+// load-bearing exactly as it is for the phase model — Config.Identity() hashes
+// the marshalled form, so a config that never writes `optional` must hash what
+// it hashed before the key existed. A member that sets it moves the identity,
+// correctly: a trial seat is a deliberate change to the panel.
+func TestReviewPanel_OptionalKeepsTheConfigIdentity(t *testing.T) {
+	const body = `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [%s]
+	}`
+	plain := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a"}`, 1))
+	explicitFalse := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a", "optional": false}`, 1))
+	withOptional := writePanelConfig(t, strings.Replace(body, "%s", `{"model": "a"}, {"model": "b", "optional": true}`, 1))
+
+	// Computed from this exact literal at 5fc5ee1, BEFORE the field existed. A
+	// config that never writes `optional` must hash exactly what it hashed then;
+	// otherwise every existing panel's identity moves on upgrade.
+	const preOptionalPanelIdentity = "5714a6038b8f7c8f71591da2e3f88f326fc3ddce8cbb9797b31f0e8fe128087f"
+	if got := plain.Identity(); got != preOptionalPanelIdentity {
+		t.Errorf("Identity() = %s, want the pre-optional identity %s", got, preOptionalPanelIdentity)
+	}
+	if got, want := plain.Identity(), explicitFalse.Identity(); got != want {
+		t.Errorf("an explicit `optional: false` changed the config identity: %s != %s — omitempty must keep the default out of the marshalled form", got, want)
+	}
+	if plain.Identity() == withOptional.Identity() {
+		t.Error("setting `optional: true` did not change the config identity — a trial seat is part of the panel")
+	}
+	for name, cfg := range map[string]*Config{"plain": plain, "explicit false": explicitFalse} {
+		data, err := json.Marshal(cfg)
+		if err != nil {
+			t.Fatalf("%s: marshal: %v", name, err)
+		}
+		if strings.Contains(string(data), `"optional"`) {
+			t.Errorf("%s: the marshal carries an `optional` key with no true value, moving every existing panel's identity: %s", name, data)
+		}
+	}
+	data, err := json.Marshal(withOptional)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"optional":true`) {
+		t.Errorf("the configured trial seat did not marshal: %s", data)
+	}
+}
+
+// TestReviewPanel_ValidateRefusesAnAllOptionalPanel (CLA-784): an optional seat
+// is a trial reviewer whose failure never blocks the fix. With no required
+// member there is no review a round could be said to have produced, so every
+// task would run the members and spawn no fix — refused at the door.
+func TestReviewPanel_ValidateRefusesAnAllOptionalPanel(t *testing.T) {
+	cfg := writePanelConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"optional": true}, {"optional": true}]
+	}`)
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "ALL are optional") {
+		t.Fatalf("Validate() = %v, want an all-optional refusal", err)
+	}
+	if !strings.Contains(err.Error(), "required") {
+		t.Errorf("the refusal does not name the remedy (leave a member required): %v", err)
+	}
+
+	// One required member is enough — the shape every real panel has.
+	ok := writePanelConfig(t, `{
+		"harness": "opencode",
+		"phases": [{"name": "implement"}, {"name": "review"}, {"name": "fix"}],
+		"review_panel": [{"model": "a"}, {"optional": true}]
+	}`)
+	if err := ok.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want a panel with one required member accepted", err)
 	}
 }

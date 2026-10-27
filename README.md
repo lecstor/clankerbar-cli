@@ -398,8 +398,27 @@ recorded, and the same member recording nothing on successive tasks is said
 loudly, with its harness and model. A **branchless** task cannot run a panel at
 all — its record is the legacy `## Review` block, and the plane takes no durable
 record from a settled task — so it runs one reviewer, with the brief it would
-have had anyway, and that reviewer is the panel's last: if it records nothing,
-no fix runs.
+have had anyway. That one reviewer is the first **required** seat: an optional
+trial seat is skipped there (a trial seat's failure would otherwise consume the
+single review slot and leave the task with no required review at all). It is
+the panel's last in every sense that matters: if it records nothing, no fix
+runs.
+
+**A member can be a trial seat.** Writing `"optional": true` on a
+`review_panel` entry marks it as a reviewer being evaluated, not one the panel
+relies on. An optional member runs and records like any other — its record,
+findings and failure all count toward that member's own assessment — but its
+failure is that member's result and nothing more. Whatever its session ends in
+(a transient blip, a usage limit, a credit stop, a death, a tool-loop kill or a
+setup error), it does **not** end the sequence, does not hand the panel's shared
+claim back, and does not stop the run. The required members keep reviewing, the
+round still closes, and the fix runs on what they found; the INCOMPLETE line
+names the optional seat `(optional)` — in the daemon log and in the fix brief
+alike — so the two are not confused. A member with no `optional` key is
+**required**, exactly as before. A panel must have at least
+one required member (`Validate` refuses an all-optional panel), and a round in
+which **only** optional seats recorded is no review at all: the round is not
+closed and no fix spawns, exactly as when nobody recorded.
 
 **The driver merges; the fixer never grades reviews.** Every MUST from ANY
 member of the panel's round is open — consensus never filters one out, because a
@@ -534,6 +553,37 @@ rather than a bucket that silently resolves to the harness default.
 defined runs on that model and says so in the iteration log; the run-wide `model`
 itself empty means the harness picks, as it always has. A config written before any of this existed behaves exactly as it
 did. A mistyped bucket costs a log line at 3am, not a stopped drain.
+
+**Route lists: a free route first, its paid twin after it.** A model field may
+also name an **ordered list of routes** instead of one alias. The session starts
+on the first; if the provider denies it with a usage limit — a free tier that has
+run dry — the opencode adapter resumes the **same session** on the next route, so
+the transcript and the work in progress survive the switch:
+
+```json
+"harnesses": {
+  "opencode": {
+    "model": ["opencode/deepseek-v4.1-flash-free", "opencode-go/deepseek-v4.1-flash"]
+  }
+}
+```
+
+The array form is accepted anywhere a model alias is: a harness block's `model`,
+each value of its `models` tier map, a phase's `model`, and a review-panel
+member's `model`. The top-level `model` and `models` stay plain strings — that is
+the plane's stored schema — so on a single-harness config put the list in that
+harness's block.
+
+The switch is **sticky for the run, not per request**. The driver marks the
+denied route until the reset the provider stated, or 30 minutes when it stated
+none, and later phases start on the route that worked; the run returns to the
+free route at a phase boundary once the mark lifts, never mid-session. A
+transient 429 is not a switch — it stays on the retry ladder. When every route is
+denied the session is treated exactly as a limit always was: a rolling window is
+waited out and a hard budget stop ends the run. A phase that starts with every
+route still marked uses the one whose mark lifts first. A list of one behaves
+exactly like the plain string it replaced, including the config identity the
+fleet reports.
 
 **Which way to tier is a question of blast radius, not difficulty.** A phase that
 produces a durable artifact — code, a recorded decision, a bar someone will be
@@ -1840,20 +1890,44 @@ headless mode does not auto-discover it, so **under `harness: "claude"`** the de
 is what gives spawned sessions their clankerbar tools. It always gives the driver a
 project slug to poll with, whichever harness is configured.
 
-**The other two harnesses do not read that file, and one of them chokes on it.**
-The default is applied regardless of harness, so this matters the moment you switch:
+**What a SESSION is handed is decided per harness, at hand-off** — the same file feeds
+two consumers with conflicting needs: the driver's poll reads its slug off the file
+whatever harness runs, while a session can only read its own schema. So the field is
+still filled for everyone, and the hand-off gates it (CLA-318):
 
-| harness | what it does with `mcp_config_path` |
+| harness | what its sessions are handed |
 | --- | --- |
-| `claude` | passed as `--mcp-config` (with `--strict-mcp-config`) and read as Claude's `.mcp.json`. |
-| `codex` | **ignored.** codex has no per-run MCP flag; its servers come from `[mcp_servers]` in `config.toml` under `CODEX_HOME` (which `config_dir` pins). |
-| `opencode` | passed as `OPENCODE_CONFIG`, plus a rewritten copy (every server out of Code Mode, the permission policy added) as `OPENCODE_CONFIG_CONTENT`. It **must be a strict-JSON opencode config** - servers under `mcp` (1.x dialect, rewritten) or `mcp.servers` (2.x), not Claude's `mcpServers`. opencode 2.x skips a Claude-shaped file's `mcpServers` key, so every session would run with no clankerbar tools. |
+| `claude` | the file, passed as `--mcp-config` (with `--strict-mcp-config`) and read as Claude's `.mcp.json` - unchanged. |
+| `codex` | **nothing, whatever the field says.** codex has no per-run MCP flag; its servers come from `[mcp_servers]` in `config.toml` under `CODEX_HOME` (which `config_dir` pins). |
+| `opencode` | nothing named `.mcp.json`: the discovered default is Claude-shaped (`mcpServers`), which opencode cannot read (2.x skips the key, so sessions get no clankerbar tools; older binaries refuse to start), so it resolves to nothing instead of being passed as `OPENCODE_CONFIG`. Any other file is passed as `OPENCODE_CONFIG`, plus a rewritten copy (every server out of Code Mode, the permission policy added) as `OPENCODE_CONFIG_CONTENT`; it **must be a strict-JSON opencode config** - servers under `mcp` (1.x dialect, rewritten) or `mcp.servers` (2.x). |
 
-Under `opencode`, set `mcp_config_path` **explicitly** to an opencode config. Leaving
-it out does not opt out: an empty value re-runs the `<workdir>/.mcp.json` discovery,
-so a workdir that carries a Claude `.mcp.json` hands it over no matter what. Run
-`clankerbar doctor` - it prints the caveat instead of a verdict where the file is not
-read, and FAILs the workdir check when `opencode` is pointed at a Claude-shaped one.
+To give opencode sessions their own MCP config, point a per-harness or per-project
+path (`harnesses.opencode.mcp_config_path`, or that project's `mcp_config_paths`)
+at an opencode-schema file. Naming a file `.mcp.json` under opencode resolves to
+nothing too — after validation there is no provenance left on a path, so the gate
+treats operator-named and discovered alike. A gated file resolves to nothing rather
+than falling back to a lower-precedence one, so **in a multi-project run each project
+needs its own `mcp_config_paths.opencode`**: a project whose workdir holds a
+`.mcp.json` does not borrow `harnesses.opencode.mcp_config_path`, which would wire its
+sessions to whichever project that file names; `doctor` FAILs any Claude-shaped file
+that still reaches an opencode session check, which after the gate means only ones
+you named.
+
+The adapter also never inherits an ambient `OPENCODE_CONFIG` from the environment
+that started the driver: the variable is dropped from the inherited environment and
+exported only when the resolved path is non-empty, so what reaches a session is
+exactly this config's decision.
+
+**Opting out entirely:** set `mcp_config_path` to `"none"` — top level,
+`harnesses.<name>.mcp_config_path`, or per project. An empty value cannot opt out
+(it re-runs the `<workdir>/.mcp.json` discovery), but `"none"` survives `Validate`
+untouched, skips the origin checks, and resolves to nothing for every harness. The
+cost: a single-project run loses the slug its poll would have lifted from
+`.mcp.json`, so name the project in `backlog_url`
+(`https://<host>/mcp/<slug>`) to keep the poll project-scoped. Run `clankerbar
+doctor` to see how your workdir resolved: it prints the caveat where a harness reads
+no file at all, and FAILs a workdir check only when a file you named cannot be read
+by its harness.
 
 #### A discovered `.mcp.json` may not choose what runs
 
@@ -2182,6 +2256,17 @@ and model, and the panel's composition are policy, so the run's result is the
 same on every machine, while how many panel seats run at once is how fast that
 machine gets there. The local file's value stays in force whatever the document
 carries.
+
+A panel member's `optional` flag travels with the member when a document is
+**applied**: a stored trial seat stays a trial seat, never silently promoted to
+a required reviewer. It cannot yet be **proposed**: the plane's stored-run-config
+schema refuses `review_panel[].optional` as an unknown panel key, so
+`propose-config` refuses a document whose panel carries a trial seat — rather
+than emitting a key the plane would reject, or dropping it and promoting the
+seat on every machine applying the pipeline. Keep a trial seat local until the
+plane's stored schema learns the key and this build's `$schema_version` moves in
+step; the two sides must land together (the phase-level `model` key needed the
+same lockstep).
 
 Edits apply at the **next iteration boundary**, never mid-session: the daemon
 watches the version on the backlog-summary poll it already makes, and on a bump

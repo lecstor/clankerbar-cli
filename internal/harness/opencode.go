@@ -67,12 +67,11 @@ func (opencode) Name() string { return "opencode" }
 // OPENCODE_CONFIG_CONTENT (see env below) - and that is exactly why "does the
 // adapter hand it over" was the wrong question to gate a preflight on. What
 // arrives has to be an opencode config, whose servers live under `mcp` (1.x
-// dialect, still accepted) or `mcp.servers` (2.x dialect). The Claude-shaped
-// `.mcp.json` that config.Validate auto-discovers from the workdir is a
-// different schema: 1.18.2 refused to start on it, and 1.18.18 and 2.0.32
-// silently skip its `mcpServers` key, so the session runs with no clankerbar
-// tools at all. Either way that combination is a doctor FAIL rather than a
-// missing-tools WARN (CLA-263).
+// dialect, still accepted) or `mcp.servers` (2.x dialect). A Claude-shaped
+// file is a different schema: 1.18.2 refused to start on it, and 1.18.18 and
+// 2.0.32 silently skip its `mcpServers` key, so the session gets no clankerbar
+// tools. config.ResolveMCPConfig never hands opencode a .mcp.json; a
+// Claude-shaped file under another name is a doctor FAIL (CLA-263).
 func (opencode) MCPConfigUse() MCPConfigUse {
 	return MCPConfigUse{
 		Schema: MCPConfigNative,
@@ -128,6 +127,22 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// CLA-406's probe on its own terms.
 	if o.OutputCapNoOutput(res) {
 		o.resumeOutputCapStall(ctx, in, &res, deadline)
+	}
+	// CLA-782: a usage limit on one model route is not the end of the session
+	// when the config named a fallback. Runs BEFORE the resurrection loop (a
+	// switch resumes the same session, and a later quiet death then resurrects on
+	// the route that was working), never on a probe, and leaves a limit on the
+	// last route untouched for the driver's existing limit branch.
+	if !in.Probe {
+		if err := o.switchRoutesOnLimit(ctx, in, in.RouteList(), &res, deadline); err != nil {
+			return res, err
+		}
+		// Keep later resumes on the route that actually ran: the resurrection
+		// probe and continuation below read in.ModelArg(), and resuming on the
+		// route that was just denied would only re-hit its limit.
+		if finished := RouteFinished(res); finished != "" {
+			in = in.OnRoute(finished)
+		}
 	}
 	// An UNTRUSTED stream is never resurrected: CLA-262 forbids reading claim
 	// state off an over-run capture, and both the coherence ref and the
@@ -849,11 +864,26 @@ func opencodeWorkdirPatterns(workdir string) (rootRel, abs string) {
 	return filepath.ToSlash(rel) + "/**", filepath.ToSlash(abs) + "/**"
 }
 
+// withoutAmbientOpencodeConfig drops an inherited OPENCODE_CONFIG: the driver
+// decides which file a session is handed, and an ambient value would hand one
+// over even when config resolved none (CLA-318). An explicit in.Env value still
+// applies, since it is appended later.
+func withoutAmbientOpencodeConfig(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if strings.HasPrefix(kv, "OPENCODE_CONFIG=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 func (opencode) env(in Invocation) ([]string, error) {
 	// The session's INSTANCE directory. opencode reads $PWD, not just the real
 	// cwd, so this is what decides which project-level opencode.json it merges
 	// and which git worktree its read/edit asks are relative to - see pinPWD.
-	env := pinPWD(inheritEnv(os.Environ(), in.EnvAllowlist), in.WorkDir)
+	env := pinPWD(inheritEnv(withoutAmbientOpencodeConfig(os.Environ()), in.EnvAllowlist), in.WorkDir)
 	// Pin the config dir so a headless session loads the SAME providers, model
 	// and plugins as the interactive one (the claude/CODEX parity). On 2.x
 	// OPENCODE_CONFIG_DIR REPLACES the global config dir (~/.config/opencode)
@@ -864,8 +894,8 @@ func (opencode) env(in Invocation) ([]string, error) {
 	}
 	// opencode has no per-run MCP flag; when a caller supplies a config file path
 	// (in opencode's own schema, carrying the mcp block) point OPENCODE_CONFIG at
-	// it. The Claude-shaped .mcp.json is a different schema and is refused by
-	// doctor, not handed over.
+	// it. A Claude-shaped .mcp.json is a different schema and is gated out by
+	// config.ResolveMCPConfig before it gets here (CLA-318), so empty exports nothing.
 	if in.MCPConfigPath != "" {
 		env = append(env, "OPENCODE_CONFIG="+in.MCPConfigPath)
 	}

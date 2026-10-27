@@ -1687,7 +1687,7 @@ func TestOpencodeAuthCheckMatchesTheConfiguredProviders(t *testing.T) {
 				{Name: "review"},
 				{Name: "fix"},
 			},
-			ReviewPanel: []config.ReviewPanelMember{{Model: "anthropic/claude-opus-5"}},
+			ReviewPanel: []config.ReviewPanelMember{{Model: config.ModelRoutes{"anthropic/claude-opus-5"}}},
 		}
 		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"opencode-go": 1}))
 		if len(got) != 1 || got[0].status == pass {
@@ -1717,7 +1717,7 @@ func TestOpencodeAuthCheckMatchesTheConfiguredProviders(t *testing.T) {
 				{Name: "review"},
 			},
 			Harnesses: map[string]config.HarnessConfig{
-				"opencode": {ConfigDir: "/oc/config", Model: "opencode-go/gpt-6-luna"},
+				"opencode": {ConfigDir: "/oc/config", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
 			},
 		}
 		got := checkOpencodeAuth(context.Background(), cfg, withStore(map[string]int{"anthropic": 1}))

@@ -360,7 +360,8 @@ func TestConflictInvocationComposesTheSession(t *testing.T) {
 		Model:               "run-model",
 		MaxTurns:            150,
 		MaxSessionWallClock: config.Duration(20 * time.Minute),
-		Projects:            []config.Project{{Slug: "acme", MCPConfigPath: "/fleet/acme/.mcp.json"}},
+		// Not .mcp.json: that name is gated out of opencode's hand-off (CLA-318).
+		Projects: []config.Project{{Slug: "acme", MCPConfigPath: "/fleet/acme/opencode-mcp.json"}},
 	}
 	step := config.ConflictStep{Harness: "opencode", Model: "conflict-model", MaxTurns: 40}
 	req := ConflictRunRequest{
@@ -378,8 +379,12 @@ func TestConflictInvocationComposesTheSession(t *testing.T) {
 	if inv.Prompt != "the brief" || inv.Model != "conflict-model" || inv.WorkDir != "/fleet/acme/widgets" {
 		t.Errorf("invocation = %+v, want the request's prompt/model/workdir", inv)
 	}
-	if inv.MCPConfigPath != "/fleet/acme/.mcp.json" {
+	if inv.MCPConfigPath != "/fleet/acme/opencode-mcp.json" {
 		t.Errorf("MCP config = %q, want the project's own file", inv.MCPConfigPath)
+	}
+	cfg.Projects[0].MCPConfigPath = "/fleet/acme/.mcp.json"
+	if gated, err := conflictInvocation(cfg, "acme", req, step); err != nil || gated.MCPConfigPath != "" {
+		t.Errorf("opencode conflict session handed %q (err %v), want \"\" for a Claude-shaped .mcp.json", gated.MCPConfigPath, err)
 	}
 	if len(inv.ExtraDirs) != 1 || inv.ExtraDirs[0] != "/fleet/acme/worktrees" {
 		t.Errorf("ExtraDirs = %v, want the worktree area granted", inv.ExtraDirs)

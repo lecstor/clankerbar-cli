@@ -42,7 +42,7 @@ func mixedDriver(t *testing.T, impl, review *fakeAdapter) *Driver {
 		{Name: "review"},
 	}
 	cfg.Harnesses = map[string]config.HarnessConfig{
-		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json", Model: "opencode-go/deepseek-v4-flash"},
+		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json", Model: config.ModelRoutes{"opencode-go/deepseek-v4-flash"}},
 	}
 	d := NewMulti(cfg, review, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
 	d.newAdapter = func(name string) (harness.Adapter, error) {
@@ -131,7 +131,7 @@ func TestInvocationFor_TiersResolveOnThePhasesOwnHarness(t *testing.T) {
 	d.cfg.Models = map[string]string{"strong": "claude-opus-5"}
 	d.cfg.Harnesses["opencode"] = config.HarnessConfig{
 		ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json",
-		Models: map[string]string{"strong": "opencode-go/deepseek-v4-flash"},
+		Models: map[string]config.ModelRoutes{"strong": {"opencode-go/deepseek-v4-flash"}},
 	}
 	d.cfg.Phases[0].Tier = "strong"
 	d.cfg.Phases[1].Tier = "strong"
@@ -240,7 +240,7 @@ func TestSupervisedWait_ResumedPhaseLimitProbesThePhasesOwnHarness(t *testing.T)
 		{Name: "review", Harness: "opencode"},
 	}
 	cfg.Harnesses = map[string]config.HarnessConfig{
-		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json", Model: "opencode-go/deepseek-v4-flash"},
+		"opencode": {ConfigDir: "/oc/config", MCPConfigPath: "/oc/opencode-mcp.json", Model: config.ModelRoutes{"opencode-go/deepseek-v4-flash"}},
 	}
 	d := NewMulti(cfg, impl, []Target{{Poller: busyPoller(), Releaser: &fakeReleaser{}}})
 	d.newAdapter = func(name string) (harness.Adapter, error) {

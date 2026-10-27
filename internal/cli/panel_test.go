@@ -23,10 +23,10 @@ func TestDoctor_ReportsTheReviewPanel(t *testing.T) {
 			{Name: "fix"},
 		},
 		ReviewPanel: []config.ReviewPanelMember{
-			{Model: "opencode-go/gpt-6-luna"},
-			{Model: "opencode-go/gpt-6-luna"},
-			{Model: "opencode-go/gpt-6-luna"},
-			{Model: "opencode-go/glm-5.3-flash"},
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
 		},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -54,6 +54,46 @@ func TestDoctor_ReportsTheReviewPanel(t *testing.T) {
 	}
 }
 
+// A TRIAL seat is marked `(optional)` in doctor's panel line (CLA-784 review
+// 1.review-1.5), the same marker the daemon's INCOMPLETE line uses — the
+// operator's preflight has to show which seat is being evaluated, especially
+// when the next step is "turn this one on".
+func TestDoctor_PanelMarksTheTrialSeat(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	cfg := &config.Config{
+		Harness: "opencode",
+		WorkDir: t.TempDir(),
+		Phases: []config.Phase{
+			{Name: "implement"},
+			{Name: "review"},
+			{Name: "fix"},
+		},
+		ReviewPanel: []config.ReviewPanelMember{
+			{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+			{Name: "trial-ornith", Model: config.ModelRoutes{"commandcode/ornith"}, Optional: true},
+		},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("fixture does not validate: %v", err)
+	}
+
+	line := ""
+	for _, l := range checkConfig(cfg).info {
+		if strings.HasPrefix(l, "review panel: ") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("doctor does not report the review panel; info = %v", checkConfig(cfg).info)
+	}
+	if !strings.Contains(line, "review-1 -> opencode/opencode-go/gpt-6-luna") {
+		t.Errorf("the required seat is not reported plainly: %s", line)
+	}
+	if !strings.Contains(line, "review-2 (trial-ornith) (optional) -> opencode/commandcode/ornith") {
+		t.Errorf("the trial seat is not marked `(optional)` with its label and model: %s", line)
+	}
+}
+
 // A member that INHERITS its harness is reported with the harness it will
 // actually run on (CLA-639 N1): the line names where the session runs, not the
 // empty field on the member.
@@ -67,7 +107,7 @@ func TestDoctor_PanelMemberHarnessIsTheResolvedOne(t *testing.T) {
 			{Name: "review"},
 			{Name: "fix"},
 		},
-		ReviewPanel: []config.ReviewPanelMember{{Model: "opencode-go/gpt-6-luna"}},
+		ReviewPanel: []config.ReviewPanelMember{{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}}},
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("fixture does not validate: %v", err)
@@ -173,7 +213,7 @@ func TestDoctor_PanelMemberLabelsAreNotRoles(t *testing.T) {
 			{Name: "fix"},
 		},
 		ReviewPanel: []config.ReviewPanelMember{
-			{Name: "alpha", Model: "opencode-go/gpt-6-luna"},
+			{Name: "alpha", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
 		},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -196,9 +236,9 @@ func TestDoctor_PanelMemberLabelsAreNotRoles(t *testing.T) {
 func TestDoctor_ReportsThePanelConcurrency(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 	members := []config.ReviewPanelMember{
-		{Model: "opencode-go/gpt-6-luna"},
-		{Model: "opencode-go/gpt-6-luna"},
-		{Model: "opencode-go/glm-5.3-flash"},
+		{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+		{Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}},
+		{Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
 	}
 	lineFor := func(t *testing.T, concurrency int) string {
 		t.Helper()

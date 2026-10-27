@@ -57,7 +57,8 @@ type mcpServer struct {
 }
 
 // mcpFile is the union of the two schemas a harness MCP config can be in, because
-// the same `MCPConfigPath` is handed to whichever harness is configured:
+// the same `MCPConfigPath` field serves every harness (ResolveMCPConfig decides
+// which file a session is actually handed):
 //
 //   - `mcpServers` — Claude Code's `.mcp.json`, passed as `--mcp-config`.
 //   - `mcp` — opencode's config, exported as `OPENCODE_CONFIG` (harness/opencode.go).
@@ -222,7 +223,9 @@ func rawSet(r json.RawMessage) bool {
 // case — there is then nothing to hand over either.
 func readMCPFile(path string) (mcpFile, error) {
 	var f mcpFile
-	if path == "" {
+	// "none" is the opt-out word, never a file: a `none` in the driver's cwd
+	// must not be read as the run's MCP config (MCPConfigNone).
+	if path == "" || path == MCPConfigNone {
 		return f, nil
 	}
 	data, err := os.ReadFile(expandHome(path))
@@ -317,7 +320,7 @@ func (c *Config) LocalMCPServers() []LocalMCPServer {
 		}
 	}
 	for _, path := range paths {
-		if path == "" || seen[path] {
+		if path == "" || path == MCPConfigNone || seen[path] {
 			continue
 		}
 		seen[path] = true
@@ -403,7 +406,7 @@ func MCPClankerbar(path string) (url string, ok bool) {
 // WARN covers it), and an empty path is the harness's fallback to its own
 // config dir, which this check must not second-guess.
 func checkMCPConfigNamesClankerbar(path, label string) error {
-	if path == "" {
+	if path == "" || path == MCPConfigNone {
 		return nil
 	}
 	fi, err := os.Stat(expandHome(path))
@@ -425,6 +428,11 @@ func checkMCPConfigNamesClankerbar(path, label string) error {
 }
 
 func (c *Config) checkMCPConfigOrigins(path, label string) error {
+	if path == "" || path == MCPConfigNone {
+		// Nothing configured, or the explicit "none" opt-out (CLA-318): there is
+		// no file whose destinations could be checked.
+		return nil
+	}
 	servers, err := readMCPServers(path)
 	if err != nil {
 		return fmt.Errorf("%s: unreadable, so what it points the API key at cannot be checked: %w", label, err)

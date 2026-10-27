@@ -2347,11 +2347,11 @@ func TestEffectivePhases_VerifyInheritsTheFixModel(t *testing.T) {
 	c.Phases = []Phase{
 		{Name: ImplementPhaseName},
 		{Name: ReviewPhaseName},
-		{Name: FixPhaseName, Model: "cheap/alias"},
+		{Name: FixPhaseName, Model: ModelRoutes{"cheap/alias"}},
 		{Name: VerifyPhaseName},
 	}
 	got := c.EffectivePhases()
-	if got[3].Model != "cheap/alias" || got[3].Tier != "" {
+	if got[3].Model.First() != "cheap/alias" || got[3].Tier != "" {
 		t.Errorf("verify inherited model=%q tier=%q, want the fix phase's model %q", got[3].Model, got[3].Tier, "cheap/alias")
 	}
 
@@ -2361,14 +2361,14 @@ func TestEffectivePhases_VerifyInheritsTheFixModel(t *testing.T) {
 	c.Models = map[string]string{"strong": "strong/alias"}
 	c.Phases[3] = Phase{Name: VerifyPhaseName, Tier: "strong"}
 	got = c.EffectivePhases()
-	if got[3].Model != "" || got[3].Tier != "strong" {
+	if !got[3].Model.Empty() || got[3].Tier != "strong" {
 		t.Errorf("an explicit verify tier resolved to model=%q tier=%q, want tier strong and no inherited model", got[3].Model, got[3].Tier)
 	}
 
 	// And an explicit model on the verifier wins outright.
-	c.Phases[3] = Phase{Name: VerifyPhaseName, Model: "verify/own"}
+	c.Phases[3] = Phase{Name: VerifyPhaseName, Model: ModelRoutes{"verify/own"}}
 	got = c.EffectivePhases()
-	if got[3].Model != "verify/own" {
+	if got[3].Model.First() != "verify/own" {
 		t.Errorf("an explicit verify model was overwritten: %q", got[3].Model)
 	}
 }

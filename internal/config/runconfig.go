@@ -92,11 +92,16 @@ type RunConfigPhase struct {
 // ReviewPanelMember. A member may set both `model` and `tier` (the alias wins
 // on expansion), exactly as in the local file — the one-model rule applies to a
 // configured PHASE, not to a member.
+//
+// Optional travels with the member (CLA-784): a trial seat configured in the
+// stored document must stay a trial seat when the overlay applies it, or every
+// fleet applying that pipeline would silently promote it to a required reviewer.
 type RunConfigPanelMember struct {
-	Name    string `json:"name"`
-	Harness string `json:"harness"`
-	Model   string `json:"model"`
-	Tier    string `json:"tier"`
+	Name     string `json:"name"`
+	Harness  string `json:"harness"`
+	Model    string `json:"model"`
+	Tier     string `json:"tier"`
+	Optional bool   `json:"optional,omitempty"`
 }
 
 // RunConfigDoc mirrors the plane's stored execution-config document — only the
@@ -212,7 +217,7 @@ func (c *Config) Clone() *Config {
 	if c.Harnesses != nil {
 		cp.Harnesses = make(map[string]HarnessConfig, len(c.Harnesses))
 		for name, hc := range c.Harnesses {
-			hc.Models = cloneStrMap(hc.Models)
+			hc.Models = cloneRoutesMap(hc.Models)
 			cp.Harnesses[name] = hc
 		}
 	}
@@ -316,7 +321,7 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 					MaxTurns:     p.MaxTurns,
 					MaxWallClock: p.MaxWallClock,
 					Tier:         p.Tier,
-					Model:        p.Model,
+					Model:        planeRoutes(p.Model),
 					Harness:      p.Harness,
 				}
 			}
@@ -327,7 +332,7 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 		} else {
 			panel := make([]ReviewPanelMember, len(doc.ReviewPanel))
 			for i, m := range doc.ReviewPanel {
-				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: m.Model, Tier: m.Tier}
+				panel[i] = ReviewPanelMember{Name: m.Name, Harness: m.Harness, Model: planeRoutes(m.Model), Tier: m.Tier, Optional: m.Optional}
 			}
 			c.ReviewPanel = panel
 		}
@@ -360,10 +365,10 @@ func (c *Config) ApplyRunConfig(doc *RunConfigDoc) error {
 	for name, block := range doc.Harnesses {
 		hc := c.Harnesses[name]
 		if m := strings.TrimSpace(block.Model); m != "" {
-			hc.Model = m
+			hc.Model = ModelRoutes{m}
 		}
 		if block.Models != nil {
-			hc.Models = block.Models
+			hc.Models = stringMapToRoutes(block.Models)
 		}
 		c.Harnesses[name] = hc
 	}
@@ -449,11 +454,11 @@ func (c *Config) refuseHarnessSwap(doc *RunConfigDoc, newH string) error {
 	// value (run-wide or per-harness) is the new harness's own, not an
 	// inheritance. Only the all-absent shape inherits the old alias.
 	if strings.TrimSpace(c.Model) != "" && docModel == "" &&
-		strings.TrimSpace(docBlock.Model) == "" && strings.TrimSpace(baseBlock.Model) == "" {
+		strings.TrimSpace(docBlock.Model) == "" && baseBlock.Model.Empty() {
 		inherited = append(inherited, "model")
 	}
 	if len(c.Models) > 0 && doc.Models == nil &&
-		docBlock.Models == nil && baseBlock.Models == nil {
+		docBlock.Models == nil && len(baseBlock.Models) == 0 {
 		inherited = append(inherited, "models")
 	}
 	// Machine twins: the document carries none, so only a local block value
@@ -516,12 +521,15 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 		blocks := map[string]any{}
 		for name, hc := range c.Harnesses {
 			block := map[string]any{}
-			if hc.Model != "" {
-				block["model"] = hc.Model
+			// The plane's schema carries plain strings (CLA-782), so a route
+			// list travels as its FIRST route: the run config is the operator's
+			// ratified policy half, and a fallback chain is a local-file shape
+			// until the plane grows one.
+			if first := hc.Model.First(); first != "" {
+				block["model"] = first
 			}
 			if len(hc.Models) > 0 {
-				m := cloneStrMap(hc.Models)
-				block["models"] = m
+				block["models"] = routesToPlainMap(hc.Models)
 			}
 			if len(block) > 0 {
 				blocks[name] = block
@@ -546,6 +554,29 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			"stored policy there, never a key that can do nothing). Give the config a built-in %q phase with a "+
 			"phase after it (the fix), or remove `review_panel`", ReviewPhaseName, ReviewPhaseName)
 	}
+	// CLA-784 (review 1.review-1.3): the stored-run-config schema is the
+	// PLANE's, and it does not yet know `review_panel[].optional` — its
+	// validator refuses the key as unknown, so a document carrying a trial seat
+	// is one the operator could never ratify. Refuse here rather than emit it,
+	// and rather than silently DROPPING the flag: dropping it would promote the
+	// trial seat to a required reviewer on every machine that applies the stored
+	// pipeline, the exact harm `optional` exists to prevent. The two sides must
+	// move in lockstep — the plane's stored-run-config schema learns the key and
+	// bumps its `$schema_version`, this build's RunConfigSchemaVersion moves in
+	// step, and this gate lifts.
+	if len(c.ReviewPanel) > 0 {
+		for i, m := range c.ReviewPanel {
+			if m.Optional {
+				return nil, fmt.Errorf("cannot propose this config: `review_panel[%d].optional` is a TRIAL seat, "+
+					"and the plane's stored-run-config schema does not accept that key yet (it refuses unknown "+
+					"panel keys), so the document would be refused at ratification — and emitting it without the "+
+					"flag would silently promote the trial seat to a required reviewer on every machine applying "+
+					"the pipeline. Keep the trial seat local until the plane's schema and this build's "+
+					"`$schema_version` (currently v%d) move in step, or remove `optional` from the member",
+					i, RunConfigSchemaVersion)
+			}
+		}
+	}
 	pipeline := map[string]any{}
 	if c.Prompt != "" && c.Prompt != defaultPrompt {
 		pipeline["prompt"] = c.Prompt
@@ -569,8 +600,8 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			if ph.Tier != "" {
 				entry["tier"] = ph.Tier
 			}
-			if ph.Model != "" {
-				entry["model"] = ph.Model
+			if first := ph.Model.First(); first != "" {
+				entry["model"] = first
 			}
 			if ph.Harness != "" {
 				entry["harness"] = ph.Harness
@@ -589,11 +620,19 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 			if m.Harness != "" {
 				entry["harness"] = m.Harness
 			}
-			if m.Model != "" {
-				entry["model"] = m.Model
+			if first := m.Model.First(); first != "" {
+				entry["model"] = first
 			}
 			if m.Tier != "" {
 				entry["tier"] = m.Tier
+			}
+			if m.Optional {
+				// Unreachable while the plane-side-schema gate above is in force
+				// (CLA-784 review 1.review-1.3): the field is kept so that the
+				// day the plane's stored schema learns the key — and this build's
+				// RunConfigSchemaVersion moves in step — the trial seat travels
+				// without a second edit here.
+				entry["optional"] = true
 			}
 			panel[i] = entry
 		}
@@ -655,4 +694,32 @@ func (c *Config) RunConfigDocument() (map[string]any, error) {
 		doc["escalation"] = e
 	}
 	return doc, nil
+}
+
+// planeRoutes widens the plane's plain-string model field into this package's
+// route type. The stored schema has one string per model (CLA-782 keeps it
+// that way), so a stored document can only ever name a single route.
+func planeRoutes(model string) ModelRoutes {
+	if strings.TrimSpace(model) == "" {
+		return nil
+	}
+	return ModelRoutes{model}
+}
+
+// routesToPlainMap renders a route-valued tier map back into the plane's
+// plain-string schema, first route only — the same narrowing RunConfigDocument
+// applies to a single model field.
+func routesToPlainMap(m map[string]ModelRoutes) map[string]string {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]string, len(m))
+	for bucket, routes := range m {
+		first := routes.First()
+		if first == "" {
+			continue
+		}
+		out[bucket] = first
+	}
+	return out
 }

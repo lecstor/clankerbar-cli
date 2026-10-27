@@ -272,9 +272,16 @@ type Phase struct {
 	// never ambiguous); a panel MEMBER may set both, and expansion lets the
 	// alias win, exactly as before.
 	//
+	// It carries an ordered ROUTE LIST since CLA-782: a plain string is the
+	// historical shape, and an array names the free route first and its paid
+	// fallback after it. The session starts on the first route and the opencode
+	// adapter may resume it on the next one when a provider usage limit denies
+	// the first; ModelForPhase still reports the first route, so a single-route
+	// (or string) phase resolves exactly as it did before.
+	//
 	// `omitempty` is load-bearing: Config.Identity() hashes the marshalled
 	// config, so an unset model must not add a key and move every identity.
-	Model string `json:"model,omitempty"`
+	Model ModelRoutes `json:"model,omitempty"`
 
 	// Harness selects which coding-agent CLI runs this phase. Empty = the
 	// run-wide Config.Harness, so an untouched config runs every phase on one
@@ -302,6 +309,13 @@ type Phase struct {
 	// review phases by hand is a different thing (no panel) that the driver must
 	// not mistake for one. Read through Phase.IsPanelMember.
 	PanelMember bool `json:"-"`
+
+	// PanelOptional marks this panel member as a TRIAL seat (CLA-784): the
+	// operator's ReviewPanelMember.Optional, carried onto the expanded phase so
+	// the driver can tell a seat the panel relies on from one it is evaluating.
+	// Like PanelMember it is set by EffectivePhases and NOT a config key, so it
+	// is invisible to Config.Identity(). Read through Phase.IsOptionalPanelMember.
+	PanelOptional bool `json:"-"`
 
 	// sourceIdx is the index in Config.Phases this phase was resolved from. It
 	// equals the position for every phase except an expanded panel member, whose
@@ -343,14 +357,34 @@ type ReviewPanelMember struct {
 	// panel that names only models inherits the sequence's review harness.
 	Harness string `json:"harness"`
 
-	// Model pins this member's model alias, exactly as Phase.Model does. Empty =
-	// the review phase's own model (then its tier, then the harness default).
-	Model string `json:"model"`
+	// Model pins this member's model alias, exactly as Phase.Model does — including
+	// the ordered route-list form (CLA-782). Empty = the review phase's own model
+	// (then its tier, then the harness default).
+	Model ModelRoutes `json:"model"`
 
 	// Tier resolves this member's model through the harness's tier map, for an
 	// operator who keeps policy in buckets. Model wins when both are set: an
 	// alias is the more specific statement.
 	Tier string `json:"tier"`
+
+	// Optional marks a TRIAL seat: a reviewer the operator added to evaluate,
+	// not one the panel relies on (CLA-784). An optional member runs and records
+	// exactly like any other, but its failure is that member's own result and
+	// nothing more: whatever its session ends in — a transient blip, a usage
+	// limit, a stop, a death, a tool-loop kill, a setup error — it does not end
+	// the sequence, does not hand the panel's shared claim back, and does not
+	// trigger the run's limit wait. The required members' records still close the
+	// round and spawn the fix; a round where ONLY optional members recorded is no
+	// review at all, and no fix runs.
+	//
+	// Default false, and `omitempty` is load-bearing: Config.Identity() hashes the
+	// marshalled form, so a panel that does not write the key must hash exactly
+	// what it hashed before the field existed (a trial seat is a deliberate
+	// change to the panel, and the identity moving with it is correct).
+	//
+	// Validate refuses a panel whose members are ALL optional: with no required
+	// seat there is no review a round could ever be said to have produced.
+	Optional bool `json:"optional,omitempty"`
 }
 
 // HarnessConfig is one harness's own invocation fields, for a run whose phases
@@ -369,15 +403,17 @@ type ReviewPanelMember struct {
 // which the adapter falls back on and `doctor` can talk about.
 type HarnessConfig struct {
 	// Model is this harness's default model alias, and the fallback its tiers
-	// resolve to. Empty = the harness's own default.
-	Model string `json:"model"`
+	// resolve to. Empty = the harness's own default. It accepts the ordered
+	// route-list form (CLA-782): free route first, paid fallback after it.
+	Model ModelRoutes `json:"model"`
 
 	// Models is this harness's tier map (bucket name -> model alias), the
 	// per-harness twin of Config.Models. A phase's Tier resolves against the map
 	// belonging to the harness that phase runs on, because a bucket NAME is
 	// portable across harnesses and the alias inside it is not — which is what
-	// lets one `"tier": "strong"` mean opus here and something else there.
-	Models map[string]string `json:"models"`
+	// lets one `"tier": "strong"` mean opus here and something else there. Each
+	// bucket's value also accepts the ordered route-list form (CLA-782).
+	Models map[string]ModelRoutes `json:"models"`
 
 	// ConfigDir pins this harness's config dir (CLAUDE_CONFIG_DIR /
 	// OPENCODE_CONFIG_DIR / CODEX_HOME) so a headless session loads the same
@@ -412,7 +448,7 @@ type HarnessConfig struct {
 // same reason. Written out rather than compared against the zero value because
 // the Models map makes the struct incomparable.
 func (h HarnessConfig) Empty() bool {
-	return h.Model == "" && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0 && len(h.EnvAllowlist) == 0
+	return h.Model.Empty() && len(h.Models) == 0 && h.ConfigDir == "" && h.MCPConfigPath == "" && h.SettingsPath == "" && len(h.Env) == 0 && len(h.EnvAllowlist) == 0
 }
 
 // HandoffMarker is the exact line a session puts in its FINAL message to hand
@@ -3146,6 +3182,7 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 	ph := p
 	ph.Name = PanelMemberLabel(panel, i)
 	ph.PanelMember = true
+	ph.PanelOptional = m.Optional
 	if h := strings.TrimSpace(m.Harness); h != "" {
 		ph.Harness = h
 	}
@@ -3155,8 +3192,8 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 	// empty member field leaves the review phase's own value in place (itself
 	// empty on a config that resolved neither), which is the fall-through to
 	// the harness default.
-	if v := strings.TrimSpace(m.Model); v != "" {
-		ph.Model = v
+	if v := m.Model.List(); len(v) > 0 {
+		ph.Model = ModelRoutes(v)
 		ph.Tier = ""
 	} else if t := strings.TrimSpace(m.Tier); t != "" {
 		ph.Tier = t
@@ -3164,7 +3201,7 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 		// before Tier, so a member that asked for a bucket would silently run on
 		// the review phase's pinned alias. The member's own tier is the more
 		// specific statement, so it clears the inherited model too.
-		ph.Model = ""
+		ph.Model = nil
 	}
 	return ph
 }
@@ -3174,6 +3211,12 @@ func (p Phase) panelMember(panel []ReviewPanelMember, i int) Phase {
 // `review` the operator wrote. The driver reads it to tell a panel member that
 // may be skipped from a review phase whose record is the sequence's only gate.
 func (p Phase) IsPanelMember() bool { return p.PanelMember }
+
+// IsOptionalPanelMember reports whether this phase is a TRIAL seat of an
+// expanded review panel (CLA-784): a reviewer whose failure is recorded against
+// that member alone and never ends the sequence, hands back the panel's shared
+// claim, or blocks the fix. False for every phase that is not a panel member.
+func (p Phase) IsOptionalPanelMember() bool { return p.PanelMember && p.PanelOptional }
 
 // EffectivePhases is the sequence a task runs as: the configured phases with
 // their built-in prompts resolved and the review panel expanded, or — when none
@@ -3274,7 +3317,7 @@ func (c *Config) EffectivePhases() []Phase {
 			// neither. Inheriting the MODEL beside a tier the verifier named
 			// would make that tier inert, because ModelForPhase resolves Model
 			// first — the same trap a panel member's tier has.
-			if out[i].Model == "" && out[i].Tier == "" {
+			if out[i].Model.Empty() && out[i].Tier == "" {
 				out[i].Model = out[lastFix].Model
 				out[i].Tier = out[lastFix].Tier
 			}
@@ -3396,11 +3439,14 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 	if name != c.Harness {
 		return hc
 	}
-	if hc.Model == "" {
-		hc.Model = c.Model
+	// The run-wide twins are plain strings (they describe the top-level
+	// harness); a harness block accepts the route-list form, so the gap-fill
+	// widens a string into a one-route list rather than narrowing the block.
+	if len(hc.Model) == 0 && c.Model != "" {
+		hc.Model = ModelRoutes{c.Model}
 	}
 	if hc.Models == nil {
-		hc.Models = c.Models
+		hc.Models = stringMapToRoutes(c.Models)
 	}
 	if hc.ConfigDir == "" {
 		hc.ConfigDir = c.ConfigDir
@@ -3412,6 +3458,20 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 		hc.SettingsPath = c.SettingsPath
 	}
 	return hc
+}
+
+// stringMapToRoutes widens the run-wide tier map (plain strings) into a harness
+// block's route-valued map. Nil stays nil so SessionFor's "the block named no
+// map" test keeps distinguishing an absent map from an empty one.
+func stringMapToRoutes(m map[string]string) map[string]ModelRoutes {
+	if m == nil {
+		return nil
+	}
+	out := make(map[string]ModelRoutes, len(m))
+	for k, v := range m {
+		out[k] = ModelRoutes{v}
+	}
+	return out
 }
 
 // ModelForPhase resolves one phase's model: its own pinned alias (Phase.Model,
@@ -3432,19 +3492,37 @@ func (c *Config) SessionFor(name string) HarnessConfig {
 // therefore reports the typo case for any tier it names, which is honest — the
 // bucket really does resolve to nothing there.
 func (c *Config) ModelForPhase(ph Phase) (model string, ok bool) {
+	routes, ok := c.ModelRoutesForPhase(ph)
+	if len(routes) == 0 {
+		return "", ok
+	}
+	return routes[0], ok
+}
+
+// ModelRoutesForPhase is ModelForPhase with the whole ordered route list: the
+// phase's own pinned routes, else its tier's routes through the tier map of the
+// harness that phase runs on, else that harness's default routes. The first
+// entry is exactly what ModelForPhase returns, so a single-route phase (every
+// config written before CLA-782) resolves identically through both.
+//
+// The sibling exists because two callers need the whole list: the driver builds
+// the adapter's fallback chain from it, and doctor's credential check must see
+// every route the run may ask for, not only the first. `ok` keeps ModelForPhase's
+// meaning: false only when a tier was NAMED and resolved to nothing.
+func (c *Config) ModelRoutesForPhase(ph Phase) (routes []string, ok bool) {
 	hc := c.SessionFor(c.HarnessFor(ph))
-	dflt := strings.TrimSpace(hc.Model)
+	dflt := hc.Model.List()
 	// A pinned model is a complete answer and never a typo case: there is no
 	// bucket to resolve, so nothing can resolve to nothing. Reported in the
 	// spawn line as-is, which makes the panel's membership legible in the log.
-	if m := strings.TrimSpace(ph.Model); m != "" {
+	if m := ph.Model.List(); len(m) > 0 {
 		return m, true
 	}
 	t := strings.TrimSpace(ph.Tier)
 	if t == "" {
 		return dflt, true
 	}
-	if alias := strings.TrimSpace(hc.Models[t]); alias != "" {
+	if alias := hc.Models[t].List(); len(alias) > 0 {
 		return alias, true
 	}
 	return dflt, false
@@ -3474,12 +3552,14 @@ func (c *Config) ModelIDsFor(harnessName string) []string {
 		if c.HarnessFor(ph) != harnessName {
 			continue
 		}
-		id, _ := c.ModelForPhase(ph)
-		if id == "" || seen[id] {
-			continue
+		routes, _ := c.ModelRoutesForPhase(ph)
+		for _, id := range routes {
+			if id == "" || seen[id] {
+				continue
+			}
+			seen[id] = true
+			out = append(out, id)
 		}
-		seen[id] = true
-		out = append(out, id)
 	}
 	sort.Strings(out)
 	return out
@@ -3499,14 +3579,22 @@ func (c *Config) ModelIDsFor(harnessName string) []string {
 // a single-project run). Precedence: the project's file FOR THIS HARNESS, else
 // the project's file when this is the top-level harness — it is that harness's
 // schema and no other's — else the harness block's own path.
+//
+// The winner is then narrowed by mcpConfigHandedTo (CLA-318): a file this
+// harness cannot be handed (a .mcp.json under opencode, anything under codex,
+// or "none") resolves to "" rather than falling through to a lower-precedence
+// file. Falling through would hand a project's sessions the harness block's
+// file, which in a multi-project run names some other project. The poll's slug
+// reads the raw field instead (see BacklogEndpoint).
 func (c *Config) ResolveMCPConfig(harnessName, projectMCP string, projectPerHarness map[string]string) string {
-	if p := projectPerHarness[harnessName]; p != "" {
-		return p
+	p := projectPerHarness[harnessName]
+	if p == "" && harnessName == c.Harness {
+		p = projectMCP
 	}
-	if harnessName == c.Harness && projectMCP != "" {
-		return projectMCP
+	if p == "" {
+		p = c.SessionFor(harnessName).MCPConfigPath
 	}
-	return c.SessionFor(harnessName).MCPConfigPath
+	return mcpConfigHandedTo(harnessName, p)
 }
 
 // panelMemberHarnesses is the harness each panel member resolves to when the
@@ -4077,7 +4165,7 @@ func (c *Config) Validate() error {
 	}
 	c.WorkDir = absWorkDir
 
-	c.MCPConfigPath = underWorkDir(c.MCPConfigPath, c.WorkDir)
+	c.MCPConfigPath = mcpUnderWorkDir(c.MCPConfigPath, c.WorkDir)
 	c.SettingsPath = underWorkDir(c.SettingsPath, c.WorkDir)
 	c.ConfigDir = underWorkDir(c.ConfigDir, c.WorkDir)
 
@@ -4088,7 +4176,7 @@ func (c *Config) Validate() error {
 	// HarnessConfig is a value type.
 	for name, hc := range c.Harnesses {
 		hc.ConfigDir = underWorkDir(expandHome(hc.ConfigDir), c.WorkDir)
-		hc.MCPConfigPath = underWorkDir(expandHome(hc.MCPConfigPath), c.WorkDir)
+		hc.MCPConfigPath = mcpUnderWorkDir(hc.MCPConfigPath, c.WorkDir)
 		hc.SettingsPath = underWorkDir(expandHome(hc.SettingsPath), c.WorkDir)
 		c.Harnesses[name] = hc
 	}
@@ -4316,6 +4404,24 @@ func (c *Config) Validate() error {
 		}
 	}
 	panel := c.EffectivePanel()
+	// CLA-784: an OPTIONAL member is a TRIAL seat — a reviewer the operator is
+	// evaluating, whose failure is recorded against that seat and never blocks
+	// the fix. A panel made ONLY of optional seats therefore has no reviewer a
+	// round could ever be said to have produced: every task would run the
+	// members, take whatever they wrote as nobody's review, and spawn no fix.
+	// Refused at the door rather than discovered from a log line.
+	if len(panel) > 0 {
+		required := 0
+		for _, m := range panel {
+			if !m.Optional {
+				required++
+			}
+		}
+		if required == 0 {
+			return fmt.Errorf("review_panel has %d members and ALL are optional: an `optional` member is a TRIAL reviewer whose failure is recorded against that seat and never blocks the fix, so a panel with no required member has no review to produce — leave at least one member without `optional` (required is the default), or remove `review_panel`",
+				len(panel))
+		}
+	}
 	labels := map[string]int{}
 	for i, m := range panel {
 		label := PanelMemberLabel(panel, i)
@@ -4472,9 +4578,9 @@ func (c *Config) Validate() error {
 		// phase SYNTHESIZED from a review-panel member is not here, and a member
 		// may still set both (its expansion clears the tier, so the alias wins by
 		// construction — see Phase.panelMember).
-		if strings.TrimSpace(ph.Model) != "" && strings.TrimSpace(ph.Tier) != "" {
+		if first := ph.Model.First(); first != "" && strings.TrimSpace(ph.Tier) != "" {
 			return fmt.Errorf("phases[%d] (%q) sets both `model` (%q) and `tier` (%q): a phase names its model one way — remove one of them (`model` is the alias it runs on, `tier` a bucket in `models`)",
-				i, ph.Label(i), ph.Model, ph.Tier)
+				i, ph.Label(i), first, ph.Tier)
 		}
 		// The resume placeholders are filled from the claim the PREVIOUS phase left
 		// held, so the first phase has nothing to fill them from. The driver leaves
@@ -4755,7 +4861,7 @@ func (c *Config) Validate() error {
 		if effectiveWorkDir == "" {
 			effectiveWorkDir = c.WorkDir
 		}
-		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
+		p.MCPConfigPath = mcpUnderWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
 			// Discovered, not named, exactly like the top-level default above —
@@ -4791,7 +4897,7 @@ func (c *Config) Validate() error {
 		// they are the same account key pointed at the same kind of host, and the
 		// same split-brain is available through any one of them.
 		for _, name := range sortedKeys(p.MCPConfigPaths) {
-			path := underWorkDir(expandHome(p.MCPConfigPaths[name]), effectiveWorkDir)
+			path := mcpUnderWorkDir(p.MCPConfigPaths[name], effectiveWorkDir)
 			p.MCPConfigPaths[name] = path
 			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
 			if err := c.checkMCPConfigOrigins(path, label); err != nil {
@@ -5108,6 +5214,10 @@ func (c *Config) Source() string { return c.source }
 // origin always comes from CredentialOrigin, because this URL carries the API key
 // (CLA-257): a file inside the workdir may say which project, never which host.
 // An explicit backlog_url that already names a `/mcp/<project>` path wins outright.
+//
+// The raw field is read, not the harness-gated resolution (ResolveMCPConfig):
+// since CLA-318 the file stays every run's slug source even when the running
+// harness would not be handed it.
 //
 // Returns "" when no usable project-scoped endpoint can be resolved (a bare base
 // and no slug). That is deliberate: New("") yields a not-wired poller, so the loop

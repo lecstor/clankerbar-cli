@@ -395,3 +395,54 @@ func TestDrainPhases_NoBriefedTaskSkipsThePeek(t *testing.T) {
 		t.Errorf("the standard ending did not fire:\n%s", out)
 	}
 }
+
+// TestDrainPhases_RecoveredOptionalSeatRecordLeavesTheRoundSealed (CLA-784
+// review 1.review-1.1): the recovered-checkpoint seam is the SECOND place a
+// panel member's review round can be closed. An OPTIONAL seat can end without
+// observing the claim, be recovered through the plane's record, and have its
+// record matched there — and this close must carry the same "an optional seat's
+// record alone must not release the round" rule as the observed-claim close. No
+// required member has recorded, so the round must stay sealed and no fix may
+// spawn, exactly as a panel where nobody recorded.
+func TestDrainPhases_RecoveredOptionalSeatRecordLeavesTheRoundSealed(t *testing.T) {
+	logs := captureLogs(t)
+	h := &fakeAdapter{steps: []invokeStep{
+		{res: checkpointed(10, 0.10)},        // implement: a VERIFIED branch, so the panel is not branchless
+		{res: mcpReached(okResult(5, 0.50))}, // review-1 (optional): no claim observed, recovered by the peek
+		{res: nonRetryableResult()},          // review-2 (required): records nothing
+	}}
+	rel := &peekReleaser{
+		next: plane.NextTask{TaskID: "t-1"},
+		state: map[string]plane.TaskState{
+			"t-1": {
+				Status: "in_progress", Ref: "CLA-9", ClaimedByRun: "r-1", Branch: "clanker/x",
+				Reviews: []plane.ReviewRecordState{{
+					Round: 1, ReviewerRole: "review-1", RunID: "r-1", ReviewedTip: testCheckpointTip, State: "sealed",
+					Findings: []plane.ReviewFindingState{mustFinding("1.review-1.1", "open", "only the trial seat saw this")},
+				}},
+			},
+		},
+	}
+	members := []config.ReviewPanelMember{
+		{Name: "review-1", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/gpt-6-luna"}, Optional: true},
+		{Name: "review-2", Harness: "opencode", Model: config.ModelRoutes{"opencode-go/glm-5.3-flash"}},
+	}
+	d := panelDriver(t, h, rel, members, panelPhases())
+	d.cfg.ReviewPanelConcurrency = 1
+
+	if _, _, stop, err := drainPhasesOnce(t, d); err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if h.invokeCalls != 3 {
+		t.Fatalf("spawned %d sessions, want 3 — implement, both members, and NO fix (no required member recorded)", h.invokeCalls)
+	}
+	if len(rel.closes) != 0 {
+		t.Fatalf("closed rounds = %v, want none — a recovered trial seat's record alone must not release the round", rel.closes)
+	}
+	if recs := rel.state["t-1"].Reviews; len(recs) != 1 || recs[0].State != "sealed" {
+		t.Errorf("records = %+v, want the trial seat's one left sealed with the round", recs)
+	}
+	if out := logs.String(); !strings.Contains(out, "INCOMPLETE: review-1 (optional)") {
+		t.Errorf("the driver did not report the recovered trial seat as the incomplete one:\n%s", out)
+	}
+}

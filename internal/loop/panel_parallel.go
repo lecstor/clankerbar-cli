@@ -138,6 +138,11 @@ func (h *panelSpendHandle) peers() (int, float64) {
 type panelMemberOutcome struct {
 	label string
 	role  string
+	// optional marks a TRIAL seat (CLA-784): its end is that seat's own result
+	// and never the panel's. The join must not fold its sequence-end into the
+	// drain's run-level wait, nor let its error end the drain, and its record
+	// alone never earns a round close.
+	optional bool
 	// setupErr is a member whose own worktree could not be made. It is a FAILED
 	// member (recorded as INCOMPLETE), never a run error: one reviewer's checkout
 	// failing says nothing about the others.
@@ -164,7 +169,7 @@ type panelRunOutcome struct {
 	recorded    bool
 	round       int
 	incomplete  []string
-	failed      map[string]string
+	failed      map[string]panelMemberFailure
 	closeFailed bool
 
 	// limitWait/sequenceEnded carry a member's run-level sequence end (a rolling
@@ -295,7 +300,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		return nil, false
 	}
 
-	out := &panelRunOutcome{failed: map[string]string{}, sequenceEnded: false}
+	out := &panelRunOutcome{failed: map[string]panelMemberFailure{}, sequenceEnded: false}
 	n := end - start
 	out.members = make([]panelMemberOutcome, n)
 	// One presence beacon for the panel, not one per member: beginIteration also
@@ -318,7 +323,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		role := reviewerRoleFor(phases, idx)
 		last := idx == len(phases)-1
 
-		m := panelMemberOutcome{label: label, role: role}
+		m := panelMemberOutcome{label: label, role: role, optional: ph.IsOptionalPanelMember()}
 		dir, werr := d.createPanelWorktree(ctx, repoRoot, tip, label)
 		if werr != nil {
 			m.setupErr = "could not create its own detached worktree: " + werr.Error()
@@ -364,10 +369,17 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 	for k, m := range out.members {
 		out.tokens += m.tokens
 		out.cost += m.cost
+		// CLA-784: a run-level STOP (the budget breaker, a cancel) is the run's,
+		// not the member's, so it stops the run whoever the seat is. A member's
+		// OWN Stop — credit exhaustion — is converted to a recorded failure in
+		// drainPhase before it reaches here, so an optional seat cannot end the
+		// run through this flag.
 		if m.stop {
 			out.stop = true
 		}
-		if m.perr != nil && out.err == nil {
+		// An optional seat's error is that seat's failure, not the drain's: the
+		// panel carries on and the required members' records still reach the fix.
+		if m.perr != nil && out.err == nil && !m.optional {
 			out.err = m.perr
 		}
 		if m.end.claim != nil {
@@ -377,7 +389,11 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		out.finalDead = m.end.dead
 		out.lastProducedNothing = m.end.producedNothing
 		out.round = max(out.round, m.end.reviewRound)
-		if m.end.sequenceEnd != nil && !out.sequenceEnded {
+		// CLA-784: an optional seat's sequence-end (a rolling limit or a
+		// transient failure) is recorded against that seat and never ends the
+		// sequence or hands back the panel's shared claim. The required members
+		// still finish, the round still closes, and the fix still runs.
+		if m.end.sequenceEnd != nil && !m.optional && !out.sequenceEnded {
 			out.sequenceEnded = true
 			out.limitWait = m.end.sequenceEnd.limitWait
 			if out.limitWait == nil {
@@ -404,13 +420,19 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			}
 		}
 		if recorded {
-			out.recorded = true
+			// CLA-784: a required member's record is a review; an optional
+			// (trial) seat's record is that seat's own result. It still resets
+			// the member's failure streak, but a round where ONLY optional seats
+			// recorded earns no close and no fix.
+			if !m.optional {
+				out.recorded = true
+			}
 			d.panelMemberRecorded(m.label)
 			continue
 		}
 		reason := panelMemberFailureReason(m)
-		out.incomplete = append(out.incomplete, m.role+": "+reason)
-		out.failed[m.role] = reason
+		out.incomplete = append(out.incomplete, panelIncompleteRole(m.role, m.optional)+": "+reason)
+		out.failed[m.role] = panelMemberFailure{reason: reason, optional: m.optional}
 		log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed",
 			labelOf(t), drainNum, m.label, reason)
 		if !m.end.deadBooked {
@@ -436,9 +458,21 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		}
 	}
 	if !out.recorded {
-		log.Printf("%siteration %d: no member of the review panel recorded — the round is not closed and no fix spawns", labelOf(t), drainNum)
+		log.Printf("%siteration %d: no REQUIRED member of the review panel recorded — the round is not closed and no fix spawns", labelOf(t), drainNum)
 	}
 	return out, true
+}
+
+// panelIncompleteRole is how a failed panel member is named in the INCOMPLETE
+// log line: its positional reviewer role, marked "(optional)" for a TRIAL seat
+// (CLA-784), so an operator can tell a required reviewer's failure from a seat
+// we were only evaluating. The role stays first, so anything keying on it still
+// matches.
+func panelIncompleteRole(role string, optional bool) string {
+	if optional {
+		return role + " (optional)"
+	}
+	return role
 }
 
 // panelMemberFailureReason names why a member produced no durable record, in the
