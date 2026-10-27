@@ -522,9 +522,10 @@ const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting
 	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
 	"submit_for_review(taskId, runId, outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
-	"session that leaves it out has not handed anything over. The same call declares the change's risk: [] " +
-	"means it touches none of the project's risk classes, and an omitted risk is UNDECLARED and buys no " +
-	"per-batch auto-approval. Ending this session while you still hold the " +
+	"session that leaves it out has not handed anything over. The same call's risk declaration uses touches: [] " +
+	"when it touches none of the project's risk classes, an omitted risk being UNDECLARED and buying no " +
+	"per-batch auto-approval; the vocabulary and the judging rule are in the served `finishing` reference and " +
+	"the project's risk_vocabulary (get_project_policy). Ending this session while you still hold the " +
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
@@ -925,8 +926,10 @@ const noCodeReviewTerminalStep = " FINALLY, and this is the step that ENDS the p
 	"in_progress with its no-code delivery declared, hand it over with submit_for_review(taskId, runId, " +
 	"outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a **Tests** section saying what you actually " +
 	"verified - without one the plane REFUSES the call, so a session that leaves it out has not handed " +
-	"anything over. The same call declares the change's risk: [] means it touches none of the project's risk " +
-	"classes, and an omitted risk is UNDECLARED and buys no per-batch auto-approval. If phase 1 already settled the task (it left in_progress before this phase ran), the " +
+	"anything over. The same call's risk declaration uses touches: [] when it touches none of the project's risk " +
+	"classes, an omitted risk being UNDECLARED and buying no per-batch auto-approval; the vocabulary and the " +
+	"judging rule are in the served `finishing` reference and the project's risk_vocabulary (get_project_policy). " +
+	"If phase 1 already settled the task (it left in_progress before this phase ran), the " +
 	"handover already happened: verify the record reads honestly and end the session - do NOT re-open, " +
 	"release or re-settle the task. Ending this session while the task still needs the handover is this " +
 	"phase FAILING, not finishing. The ONLY exception is a declared handoff."
@@ -1697,9 +1700,10 @@ const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. 
 	"returned>, risk: { touches: [...] }). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
 	"the task leaves in_progress this run can no longer close the round. Do NOT send an outcome in that call: " +
 	"your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), and the fix " +
-	"phase has already written the **Tests** section the in_review guard reads. The same call declares the " +
-	"change's risk: [] means it touches none of the project's risk classes, and an omitted risk is UNDECLARED " +
-	"and buys no per-batch auto-approval. Never decide to run one more " +
+	"phase has already written the **Tests** section the in_review guard reads. The same call's risk declaration " +
+	"uses touches: [] when it touches none of the project's risk classes, an omitted risk being UNDECLARED and " +
+	"buying no per-batch auto-approval; the vocabulary and the judging rule are in the served `finishing` " +
+	"reference and the project's risk_vocabulary (get_project_policy). Never decide to run one more " +
 	"round yourself."
 
 // noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
@@ -1726,8 +1730,10 @@ const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the p
 	"If NO MUST remains open: hand the task over. If it still sits in_progress with its no-code delivery " +
 	"declared, move it with submit_for_review(taskId, runId, risk: { touches: [...] }) — do NOT send an outcome in " +
 	"that call; your block write already landed and the fix phase wrote the **Tests** section the in_review " +
-	"guard reads. The same call declares the change's risk: [] means it touches none of the project's risk " +
-	"classes, and an omitted risk is UNDECLARED and buys no per-batch auto-approval. If it already left " +
+	"guard reads. The same call's risk declaration uses touches: [] when it touches none of the project's risk " +
+	"classes, an omitted risk being UNDECLARED and buying no per-batch auto-approval; the vocabulary and the " +
+	"judging rule are in the served `finishing` reference and the project's risk_vocabulary " +
+	"(get_project_policy). If it already left " +
 	"in_progress, the hand-over already happened: verify the record reads " +
 	"honestly and end. Never decide to run one more round yourself."
 

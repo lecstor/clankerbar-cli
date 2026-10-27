@@ -182,8 +182,9 @@ only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, and a hand-over. That is ONE call: `submit_for_review(…, closeRound: …)`
-carries the round close in the same atomic write that moves the task to
+PR, and a hand-over. That is ONE call:
+`submit_for_review(…, closeRound: …, risk: { touches: […] })` carries the round
+close in the same atomic write that moves the task to
 `in_review`, so the order that used to be load-bearing is now the plane's own
 guard rather than two client calls. The plane refuses a sealed holder's outcome
 write, so no outcome is sent on that call. The fix phase has already written

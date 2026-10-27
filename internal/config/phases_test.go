@@ -916,6 +916,7 @@ func TestEveryHandoverBriefDeclaresRisk(t *testing.T) {
 		"no-code fix":                         noCodeFixBrief,
 		"no-code fix-verify":                  noCodeFixVerifyBrief,
 		"no-code verify":                      noCodeVerifyBrief,
+		"unverified review brief":             unverifiedReviewBrief,
 		"review terminal step":                reviewTerminalStep,
 		"review-only terminal step":           reviewOnlyTerminalStep,
 		"panel member terminal step":          panelMemberTerminalStep,
@@ -948,9 +949,10 @@ func TestEveryHandoverBriefDeclaresRisk(t *testing.T) {
 		t.Fatalf("only %d submit_for_review call(s) found across the shipped briefs; expected at least 4 (review, no-code review, verify, no-code verify)", calls)
 	}
 
-	// The four texts that carry a call also carry the two rules a session needs
-	// to fill the argument in. Checked on the text rather than the call span
-	// because they are prose, not arguments.
+	// The four texts that carry a call also carry the rules a session needs to
+	// fill the argument in: the empty declaration in its schema shape, what an
+	// omission costs, and where the vocabulary and judging rule live. Checked on
+	// the text rather than the call span because they are prose, not arguments.
 	for name, text := range map[string]string{
 		"review terminal step":         reviewTerminalStep,
 		"no-code review terminal step": noCodeReviewTerminalStep,
@@ -959,9 +961,12 @@ func TestEveryHandoverBriefDeclaresRisk(t *testing.T) {
 	} {
 		for _, want := range []string{
 			"risk: { touches: [...] }",
+			"touches: []",
 			"none of the project's risk classes",
 			"UNDECLARED",
 			"per-batch auto-approval",
+			"`finishing` reference",
+			"risk_vocabulary",
 		} {
 			if !strings.Contains(text, want) {
 				t.Errorf("the %s does not say %q, so a session cannot fill the declaration in:\n%s", name, want, text)
