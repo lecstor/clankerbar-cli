@@ -967,10 +967,20 @@ func TestUnverifiedPanelMemberBriefStatesItsShape(t *testing.T) {
 		"UNVERIFIED",
 		"the branch may not exist on the origin remote",
 		"do NOT assume phase 1 implemented, committed and pushed",
-		// The member establishes the tip itself, before any review; the record
-		// shape below carries the mechanics and the failure arm.
+		// The cause is the CHECK not completing, never a remote-read failure
+		// asserted as fact: delivery.Unknown also covers a check that never
+		// reached the remote (no local branch to compare, an ambiguous repo).
+		// CLA-576's phase-2 review caught that claim once (standing decision
+		// 00474195), so the hedge is pinned here too (1.review-2.2).
+		"its check did not complete",
+		"a check that never reached the remote is possible too",
+		// The member establishes the tip itself, before any review, and CONFIRMS
+		// the branch carries phase 1's work: a branch that exists but carries
+		// none of it is the same failed hand-off as an absent one (1.review-2.1).
 		"FIRST establish the tip yourself, before any review",
 		"read branch " + PhaseBranchPlaceholder + " from the origin remote",
+		"and confirm it carries phase 1's work",
+		"exists but carries none of phase 1's work",
 		"do not review a phantom diff",
 		// The panel's record-only contract and its ending are unchanged.
 		"ONE MEMBER of a review PANEL",
@@ -1007,18 +1017,24 @@ func TestUnverifiedPanelMemberBriefStatesItsShape(t *testing.T) {
 		t.Error("the unverified panel member brief is the verified one")
 	}
 
-	// The split must not disturb the briefs that were already right: the
-	// verified core is pinned at its seam, where a missing or doubled space in
-	// the reused halves would show.
+	// The split must not disturb the briefs that were already right. The
+	// full-content pin is TestReviewBriefsUnchangedByTheUnverifiedSplit below;
+	// these are the legible junctions, including the resume->worktree one the
+	// split introduced, where a dropped or doubled space would silently reword
+	// every review-only brief (1.review-2.3).
 	const verifiedSeam = "recorded branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver " +
 		"verified to exist on the origin remote with its tip reachable, so phase 1 really did implement, commit " +
 		"and push. You are RESUMING that run"
+	const resumeToWorktree = "adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder
 	for name, b := range map[string]string{
 		"review-only brief":  reviewOnlyBrief,
 		"panel member brief": panelMemberReviewOnlyBrief,
 	} {
 		if !strings.Contains(b, verifiedSeam) {
 			t.Errorf("the %s no longer carries its verified core intact:\n%s", name, b)
+		}
+		if !strings.Contains(b, resumeToWorktree) {
+			t.Errorf("the %s no longer joins its resume and worktree halves intact:\n%s", name, b)
 		}
 	}
 	const unverifiedSeam = "recorded branch " + PhaseBranchPlaceholder + " on the plane — but the driver could " +

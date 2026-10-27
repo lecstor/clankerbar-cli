@@ -1429,11 +1429,13 @@ var reviewOnlyBriefResume = " You are RESUMING that run, not starting a new one:
 	"a FAILED hand-off to report in the record below, not work to silently adopt and implement."
 
 // reviewHandoffUnverifiedCheck states the member's obligation; the record shape
-// carries the mechanics and the failure arm for an absent or unreadable branch.
+// carries the mechanics and the failure arm for a branch that is absent, empty
+// or unreadable.
 const reviewHandoffUnverifiedCheck = " FIRST establish the tip yourself, before any review: read branch " +
 	PhaseBranchPlaceholder + " from the origin remote - the record shape below tells you exactly how, and where " +
-	"to record the tip. If the branch is absent, phase 1 did NOT deliver: record that failed hand-off in your " +
-	"durable record and end holding the task — do not review a phantom diff."
+	"to record the tip - and confirm it carries phase 1's work. If the branch is absent, or exists but carries " +
+	"none of phase 1's work, phase 1 did NOT deliver: record that failed hand-off in your durable record and end " +
+	"holding the task — do not review a phantom diff."
 
 var reviewOnlyBriefWorktreeAndGate = " Work in the worktree for branch " + PhaseBranchPlaceholder +
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
