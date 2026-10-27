@@ -186,18 +186,16 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 		c.info = append(c.info, mcpConfigNotCheckedNote(use))
 
 	case harness.MCPConfigNative:
-		// The path IS handed over, but read in the harness's own schema. A
-		// Claude-shaped file here is not "no clankerbar tools", it is a config the
-		// harness refuses to start on - every iteration dies at spawn, forever. That
-		// is strictly worse than the missing-file case below, so it FAILs rather
-		// than WARNs: a WARN is advice, and there is no run to advise about.
+		// The path IS handed over, read in the harness's own schema. A
+		// Claude-shaped file wires nothing here (and stricter binaries refuse to
+		// start on it), so it FAILs rather than WARNs. Since CLA-318 a file named
+		// .mcp.json never reaches this arm (config.mcpConfigHandedTo), so only an
+		// operator-named file of another name can.
 		if mcpConfigIsClaudeShaped(mcpConfigPath) {
 			c.status = fail
 			c.detail = mcpConfigPath + " is a Claude-shaped .mcp.json (`mcpServers`), which " + harnessName + " cannot read"
-			// Deliberately not "or unset it": an empty mcp_config_path re-runs the
-			// <workdir>/.mcp.json discovery (config.discoverMCPConfig), which is
-			// harness-blind, so removing the setting hands the same file over again.
-			// Naming a config the harness can read is the only remedy that works.
+			// Naming a config the harness can read is the remedy that wires tools
+			// back; "none" (config.MCPConfigNone) is the explicit opt-out.
 			c.remedy = "point mcp_config_path at a " + harnessName + " config - " + use.Note
 			return c
 		}
@@ -246,7 +244,7 @@ func sessionCheck(name, dir, mcpConfigPath, harnessName string) check {
 			} else {
 				c.detail = workdirLabel(dir) + " has no .mcp.json"
 			}
-			c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools"
+			c.remedy = "add an .mcp.json there (or set mcp_config_path) — sessions spawned here would have no clankerbar tools; if mcp_config_path is \"none\", that opt-out is why"
 			return c
 		}
 

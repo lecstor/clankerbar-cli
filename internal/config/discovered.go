@@ -17,8 +17,10 @@ import (
 //
 //   - under claude, as `--mcp-config --strict-mcp-config`, making it the
 //     session's entire MCP surface;
-//   - under opencode, as `OPENCODE_CONFIG`, making it the session's ENTIRE
-//     configuration.
+//   - under opencode, never: a .mcp.json is gated out of opencode's hand-off
+//     (mcpConfigHandedTo), though a file named otherwise would be passed as
+//     `OPENCODE_CONFIG`, the session's ENTIRE configuration. The rules below
+//     still hold because the poll reads the discovered file for every harness.
 //
 // Three refusals follow for a file nobody named:
 //

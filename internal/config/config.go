@@ -3579,14 +3579,22 @@ func (c *Config) ModelIDsFor(harnessName string) []string {
 // a single-project run). Precedence: the project's file FOR THIS HARNESS, else
 // the project's file when this is the top-level harness — it is that harness's
 // schema and no other's — else the harness block's own path.
+//
+// The winner is then narrowed by mcpConfigHandedTo (CLA-318): a file this
+// harness cannot be handed (a .mcp.json under opencode, anything under codex,
+// or "none") resolves to "" rather than falling through to a lower-precedence
+// file. Falling through would hand a project's sessions the harness block's
+// file, which in a multi-project run names some other project. The poll's slug
+// reads the raw field instead (see BacklogEndpoint).
 func (c *Config) ResolveMCPConfig(harnessName, projectMCP string, projectPerHarness map[string]string) string {
-	if p := projectPerHarness[harnessName]; p != "" {
-		return p
+	p := projectPerHarness[harnessName]
+	if p == "" && harnessName == c.Harness {
+		p = projectMCP
 	}
-	if harnessName == c.Harness && projectMCP != "" {
-		return projectMCP
+	if p == "" {
+		p = c.SessionFor(harnessName).MCPConfigPath
 	}
-	return c.SessionFor(harnessName).MCPConfigPath
+	return mcpConfigHandedTo(harnessName, p)
 }
 
 // panelMemberHarnesses is the harness each panel member resolves to when the
@@ -4157,7 +4165,7 @@ func (c *Config) Validate() error {
 	}
 	c.WorkDir = absWorkDir
 
-	c.MCPConfigPath = underWorkDir(c.MCPConfigPath, c.WorkDir)
+	c.MCPConfigPath = mcpUnderWorkDir(c.MCPConfigPath, c.WorkDir)
 	c.SettingsPath = underWorkDir(c.SettingsPath, c.WorkDir)
 	c.ConfigDir = underWorkDir(c.ConfigDir, c.WorkDir)
 
@@ -4168,7 +4176,7 @@ func (c *Config) Validate() error {
 	// HarnessConfig is a value type.
 	for name, hc := range c.Harnesses {
 		hc.ConfigDir = underWorkDir(expandHome(hc.ConfigDir), c.WorkDir)
-		hc.MCPConfigPath = underWorkDir(expandHome(hc.MCPConfigPath), c.WorkDir)
+		hc.MCPConfigPath = mcpUnderWorkDir(hc.MCPConfigPath, c.WorkDir)
 		hc.SettingsPath = underWorkDir(expandHome(hc.SettingsPath), c.WorkDir)
 		c.Harnesses[name] = hc
 	}
@@ -4853,7 +4861,7 @@ func (c *Config) Validate() error {
 		if effectiveWorkDir == "" {
 			effectiveWorkDir = c.WorkDir
 		}
-		p.MCPConfigPath = underWorkDir(p.MCPConfigPath, effectiveWorkDir)
+		p.MCPConfigPath = mcpUnderWorkDir(p.MCPConfigPath, effectiveWorkDir)
 		if p.MCPConfigPath == "" {
 			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
 			// Discovered, not named, exactly like the top-level default above —
@@ -4889,7 +4897,7 @@ func (c *Config) Validate() error {
 		// they are the same account key pointed at the same kind of host, and the
 		// same split-brain is available through any one of them.
 		for _, name := range sortedKeys(p.MCPConfigPaths) {
-			path := underWorkDir(expandHome(p.MCPConfigPaths[name]), effectiveWorkDir)
+			path := mcpUnderWorkDir(p.MCPConfigPaths[name], effectiveWorkDir)
 			p.MCPConfigPaths[name] = path
 			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
 			if err := c.checkMCPConfigOrigins(path, label); err != nil {
@@ -5206,6 +5214,10 @@ func (c *Config) Source() string { return c.source }
 // origin always comes from CredentialOrigin, because this URL carries the API key
 // (CLA-257): a file inside the workdir may say which project, never which host.
 // An explicit backlog_url that already names a `/mcp/<project>` path wins outright.
+//
+// The raw field is read, not the harness-gated resolution (ResolveMCPConfig):
+// since CLA-318 the file stays every run's slug source even when the running
+// harness would not be handed it.
 //
 // Returns "" when no usable project-scoped endpoint can be resolved (a bare base
 // and no slug). That is deliberate: New("") yields a not-wired poller, so the loop
