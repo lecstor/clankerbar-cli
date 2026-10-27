@@ -38,7 +38,7 @@ type proposeConfigFlags struct {
 func newProposeConfigFlagSet(f *proposeConfigFlags) *pflag.FlagSet {
 	fs := newFlagSet("propose-config")
 	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ~/.config/clankerbar/config.json)")
-	fs.StringVar(&f.slug, "slug", "", "clankerbar project to propose against (default: this config's own). In single-project mode it redirects the proposal to the project it names; required when projects[] names more than one")
+	fs.StringVar(&f.slug, "slug", "", "clankerbar project to propose against (default: this config's own). In single-project mode it redirects the proposal to the project it names; when projects[] names more than one it is required and must name one of them")
 	fs.StringVar(&f.notes, "notes", "", "extra rationale carried on the proposal for the operator")
 	return fs
 }
