@@ -77,12 +77,14 @@ func ProposeConfig(ctx context.Context, args []string) error {
 		return errors.New("nothing to import: this config sets none of the dials the plane stores (prompt, phases, review_panel, harness, model, models, budget, escalation, max_turns, max_session_wall_clock)")
 	}
 
-	endpoint := cfg.BacklogEndpoint()
-	for _, p := range cfg.Projects {
-		if p.Slug == slug {
-			endpoint = cfg.ProjectEndpoint(p)
-			break
-		}
+	// Build the endpoint from the RESOLVED slug, never from the config's own
+	// wiring: in single-project mode cfg.Projects is empty, so anything derived
+	// from cfg.BacklogEndpoint() would send a --slug other-project proposal to
+	// this config's project while still printing the other name. ProjectEndpoint
+	// keeps the origin rule (CredentialOrigin, never a checkout's .mcp.json host).
+	endpoint := cfg.ProjectEndpoint(config.Project{Slug: slug})
+	if endpoint == "" {
+		return errors.New("cannot resolve a project-scoped MCP endpoint - set backlog_url in the config")
 	}
 	apiKey := os.Getenv("CLANKERBAR_API_KEY")
 	rc := plane.NewRunConfigAPI(endpoint, apiKey)
