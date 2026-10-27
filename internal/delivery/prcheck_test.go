@@ -9,8 +9,8 @@ package delivery
 //
 // Since CLA-460 the verifier also probes `auth token --user` before its first
 // API read, so every fake below serves that probe out of band (see
-// writeGHTo) and the CLA-460 tests record, per invocation, exactly which
-// credentials the child resolved.
+// writeGHTo). The CLA-460 tests record both legs: which ACCOUNT the probe
+// asked for, and exactly which credentials the API read then resolved.
 
 import (
 	"bytes"
@@ -45,7 +45,9 @@ const (
 	// ghFakeToken is what every fake gh answers the `auth token --user`
 	// credential probe with when GH_FAKE_TOKEN names it: the asserted VALUE,
 	// so the chain "derive owner -> resolve THAT account -> plumb the resolved
-	// value" is pinned end to end in the CLA-460 tests.
+	// value" is pinned end to end in the CLA-460 tests. The value alone proves
+	// only that whatever account was asked reached the child; the probe's
+	// recorded `user=` line is what pins WHICH account it was asked for.
 	ghFakeToken = "gho_cla460-fake-owner-token"
 )
 
@@ -113,9 +115,13 @@ func writeGHTo(t *testing.T, path, body string) string {
 	// consumes neither a fixture nor, for fakeGHSeq, a sequence slot. With
 	// GH_FAKE_TOKEN unset, or GH_FAKE_FAIL=1, the probe answers empty or
 	// fails: what callers read as "no resolvable token", the unscoped
-	// fallback's trigger.
+	// fallback's trigger. The probe RETURNS here, so recordingGH's own
+	// recording block never sees it: record the account it asks for here.
 	body = `case "$1/$2" in
 auth/token)
+	if [ -n "${GH_RECORD-}" ]; then
+		printf '=== auth token\nuser=%s\n' "$4" >> "$GH_RECORD"
+	fi
 	if [ "$GH_FAKE_FAIL" = 1 ]; then
 		echo "no oauth token found for github.com account $4" >&2
 		exit 1
@@ -133,7 +139,9 @@ esac
 
 // recordingGH writes a fake gh that appends one section per invocation to
 // $GH_RECORD — the argv head plus the exact GH_TOKEN/GITHUB_TOKEN the child
-// resolved — then answers every non-probe invocation with output.
+// resolved — then answers every non-probe invocation with output. The
+// credential probe is recorded by writeGHTo's own arm, because it exits
+// before this body runs.
 func recordingGH(t *testing.T, output string) string {
 	t.Helper()
 	body := `{
@@ -149,8 +157,9 @@ J
 }
 
 // ghSections splits a GH_RECORD into per-invocation sections keyed by the
-// argv head the fake saw ("pr view", "auth token"), each holding the token
-// lines the shim wrote.
+// argv head the fake saw ("pr view", "auth token"), each holding the lines the
+// shim wrote: the resolved token lines for an API read, `user=` for the
+// credential probe.
 func ghSections(t *testing.T, record string) map[string][]string {
 	t.Helper()
 	body, err := os.ReadFile(record)
@@ -413,6 +422,9 @@ func TestPollingResolvesWhenGitHubCatchesUp(t *testing.T) {
 // ambient spellings are DROPPED outright rather than raced. Decoy ambient
 // values are planted on purpose: the disease here is an ambient credential
 // answering for the wrong account, so the pin has to show one losing.
+//
+// The probe's ACCOUNT is pinned too: the credential half above alone would
+// stay green if the probe asked gh for the wrong owner.
 func TestPRCheckScopesTheAPIReadToTheRemoteOwner(t *testing.T) {
 	dir := prEnv(t)
 	record := filepath.Join(t.TempDir(), "gh-record.log")
@@ -425,6 +437,16 @@ func TestPRCheckScopesTheAPIReadToTheRemoteOwner(t *testing.T) {
 	v := prVerifier(t, dir, gh)
 	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
 	mustStatus(t, rep, PRVerified, Pass)
+
+	probe := ghSections(t, record)["auth token"]
+	if len(probe) == 0 {
+		t.Fatal("the credential probe never ran (or was not recorded) - the account it asks for is unpinned")
+	}
+	// prEnv's origin is https://github.com/acme/widgets.git, so acme is the
+	// owner; "widgets" is the repo name that a plausible bug would substitute.
+	if len(probe) != 1 || probe[0] != "user=acme" {
+		t.Errorf("credential probe asked %v; want exactly [user=acme], the owner of prEnv's origin", probe)
+	}
 
 	pr := ghSections(t, record)["pr view"]
 	if len(pr) == 0 {
