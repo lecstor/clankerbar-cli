@@ -891,18 +891,21 @@ func (v *Verifier) runGH(ctx context.Context, dir string, args ...string) (strin
 // allowed to lean on. Empty additions leave the environment untouched,
 // byte-for-byte the pre-scoping behavior.
 func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
-	return runGHBin(ctx, v.ghBin, dir, extraEnv, args...)
+	return runGHBin(ctx, v.ghBin, dir, extraEnv, false, args...)
 }
 
 // runGHBin is runGH with the binary spelled out, so the per-owner token
 // resolution in delivery.go (TokenForOwner, CLA-458) drives the same spawn
 // discipline without a Verifier in hand - CLA-459's doctor consumer passes
 // "gh" here. extraEnv carries per-invocation environment additions (see
-// runGHScoped); pass nil for the plain spawn.
-func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ...string) (string, error) {
+// runGHScoped); pass nil for the plain spawn. dropAmbientTokens removes the
+// parent's GH_TOKEN/GITHUB_TOKEN even when no additions ride the invocation:
+// the `auth token --user` probe must answer for the account it names, never
+// the one the ambient environment is authenticated as.
+func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, dropAmbientTokens bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, ghBin, args...)
 	cmd.Dir = dir
-	cmd.Env = ghEnv(os.Environ(), extraEnv)
+	cmd.Env = ghEnv(os.Environ(), extraEnv, dropAmbientTokens)
 	cmd.WaitDelay = ghWaitDelay
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -931,6 +934,11 @@ func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ..
 // driver requires — so neither an inherited value nor an addition can
 // reintroduce a colour switch the output parser depends on.
 //
+// The ambient GH_TOKEN/GITHUB_TOKEN go when a scoped token rides this
+// invocation or when dropAmbientTokens asks for it explicitly - the credential
+// probe, whose whole job is to answer for a NAMED account. With neither, the
+// inherited environment is kept, byte-for-byte the pre-scoping behavior.
+//
 // # Why GH_FORCE_TTY is gone, not zeroed (CLA-776)
 //
 // gh treats ANY value of GH_FORCE_TTY as "force terminal-style output", and
@@ -945,7 +953,7 @@ func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, args ..
 // value would do the same damage) and the colour-forcing family is stripped
 // alongside it. NO_COLOR and CLICOLOR=0 are set as the positive statement of
 // the same requirement, so a gh version that ignores one honours the other.
-func ghEnv(parent, extraEnv []string) []string {
+func ghEnv(parent, extraEnv []string, dropAmbientTokens bool) []string {
 	// Colour and interaction settings this child OWNS. Setting ours by
 	// appending over an inherited value is not enough: duplicate entries have
 	// unspecified precedence, so the parent's must be gone.
@@ -963,9 +971,10 @@ func ghEnv(parent, extraEnv []string) []string {
 		if owned(name) {
 			continue
 		}
-		// An ambient token only goes when a scoped one rides this invocation;
-		// with no additions the previous behaviour is kept exactly.
-		if len(extraEnv) > 0 && isGhTokenVar(name) {
+		// An ambient token only goes when a scoped one rides this invocation or
+		// the caller asked for it to be dropped; otherwise the previous
+		// behaviour is kept exactly.
+		if (len(extraEnv) > 0 || dropAmbientTokens) && isGhTokenVar(name) {
 			continue
 		}
 		env = append(env, e)

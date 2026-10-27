@@ -921,13 +921,15 @@ func ScopeEnv(token string) []string {
 }
 
 // TokenForOwner resolves owner's GitHub token with `gh auth token --user`,
-// spawning ghBin in dir under runGH's interaction-hostile discipline. Any
-// failure - gh missing, no such account, a wedged call - is an empty token,
-// which callers treat as "run unscoped". A token is also refused if it cannot
-// ride a single config value intact (embedded whitespace would corrupt the
-// insteadOf key into something silently wrong).
+// spawning ghBin in dir under runGH's interaction-hostile discipline. The
+// spawn drops the ambient GH_TOKEN/GITHUB_TOKEN: the answer must come from gh's
+// own credential store for the account named, never from the active account's
+// environment. Any failure - gh missing, no such account, a wedged call - is
+// an empty token, which callers treat as "run unscoped". A token is also
+// refused if it cannot ride a single config value intact (embedded whitespace
+// would corrupt the insteadOf key into something silently wrong).
 func TokenForOwner(ctx context.Context, dir, ghBin, owner string) string {
-	out, err := runGHBin(ctx, ghBin, dir, nil, "auth", "token", "--user", owner)
+	out, err := runGHBin(ctx, ghBin, dir, nil, true, "auth", "token", "--user", owner)
 	if err != nil {
 		return ""
 	}

@@ -821,7 +821,7 @@ func TestGHChildEnvironmentCarriesNoColourSwitch(t *testing.T) {
 	t.Setenv("FORCE_COLOR", "1")
 
 	gh := writeGH(t, "env\n")
-	out, err := runGHBin(context.Background(), gh, t.TempDir(), nil, "pr", "view")
+	out, err := runGHBin(context.Background(), gh, t.TempDir(), nil, false, "pr", "view")
 	if err != nil {
 		t.Fatalf("fake gh: %v", err)
 	}
@@ -847,7 +847,7 @@ func TestGHChildEnvironmentCarriesNoColourSwitch(t *testing.T) {
 	// held to the same ownership rule: an addition must not be able to turn
 	// colour back on behind the parser's back.
 	out, err = runGHBin(context.Background(), gh, t.TempDir(),
-		[]string{"GH_FORCE_TTY=1", "NO_COLOR=0", "CLICOLOR=1"}, "pr", "view")
+		[]string{"GH_FORCE_TTY=1", "NO_COLOR=0", "CLICOLOR=1"}, false, "pr", "view")
 	if err != nil {
 		t.Fatalf("fake gh: %v", err)
 	}
