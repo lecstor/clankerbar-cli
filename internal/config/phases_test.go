@@ -954,9 +954,9 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 }
 
 // CLA-702: the panel member's UNVERIFIED variant is selected for exactly the
-// checkpoint the core's verified-branch claim cannot describe (an unreadable
-// origin), so it must not inherit that claim. The split that gives it its own
-// core must leave the verified briefs untouched.
+// checkpoint the core's verified-branch claim cannot describe (a check that did
+// not complete), so it must not inherit that claim. The split that gives it its
+// own core must leave the verified briefs untouched.
 func TestUnverifiedPanelMemberBriefStatesItsShape(t *testing.T) {
 	brief := panelMemberUnverifiedReviewOnlyBrief
 	for _, want := range []string{

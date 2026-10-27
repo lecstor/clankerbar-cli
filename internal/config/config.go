@@ -1393,9 +1393,9 @@ const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase
 // as the default rather than as an impossible act.
 //
 // The brief is composed of a CORE plus a record shape and an ending, so the
-// panel member's variant (CLA-639 M5) can reuse the core verbatim and swap only
-// the two halves that differ: the panel member writes the durable record and
-// nothing else.
+// verified panel member's variant (CLA-639 M5) can reuse the core verbatim and
+// swap only the two halves that differ: the panel member writes the durable
+// record and nothing else.
 // The core is assembled from the parts that do and do not depend on the
 // hand-off's verification state: reviewOnlyBriefOpening names the recorded
 // branch, and the claim that follows is the one sentence an unverifiable
