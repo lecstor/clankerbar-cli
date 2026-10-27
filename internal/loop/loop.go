@@ -845,14 +845,6 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			for i := range d.targets {
 				t := d.targets[i]
 				sum, err := t.Poller.Poll(runCtx)
-				// CLA-466: the presence beacon rides THIS poll — no new cadence.
-				// It fires whatever the poll answered (even an error poll proves
-				// the daemon is alive and looping), and carries the state derived
-				// below, so a console-paused target reads `draining`, not `idle`.
-				// The poll is not the only carrier: a session blocks the poll for
-				// as long as it runs, so the in-session lease-renewal tick carries
-				// the same per-target lap (CLA-771, Driver.beaconSessionTargets).
-				d.beacon(i, t, d.fleetState(i))
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):
 					log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
@@ -939,6 +931,21 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 						}
 					}
 				}
+				// CLA-466: the presence beacon rides THIS poll — no new cadence.
+				// It fires whatever the poll answered (even an error poll proves
+				// the daemon is alive and looping), and it fires AFTER the switch,
+				// because the switch is what updates the pause flags fleetState
+				// reads (CLA-483): beacons ahead of it carried the PREVIOUS cycle's
+				// pause state, so the first poll after an operator paused read
+				// `idle` and the first after an un-pause read `draining`, each
+				// wrong for a full idle_poll_interval (the same lag hit a
+				// fleet-pause clear, and daemon start against an already-paused
+				// project). The two hard-stop arms return before reaching here and
+				// get their `stopping` beacon from fleetShutdown.
+				// The poll is not the only carrier: a session blocks the poll for
+				// as long as it runs, so the in-session lease-renewal tick carries
+				// the same per-target lap (CLA-771, Driver.beaconSessionTargets).
+				d.beacon(i, t, d.fleetState(i))
 				if d.blind {
 					break
 				}
