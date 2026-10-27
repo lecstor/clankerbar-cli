@@ -5253,13 +5253,16 @@ func (c *Config) BacklogEndpoint() string {
 // the poll and the sessions already agree on.
 func (c *Config) Slug() string { return slugFromMCPURL(c.BacklogEndpoint()) }
 
-// ProjectEndpoint returns one configured project's MCP endpoint — the same
-// `/mcp/<slug>` URL that project's sessions are pointed at — so a write the driver
-// makes lands on the same project its sessions are working.
+// ProjectEndpoint returns a project's MCP endpoint: `<origin>/mcp/<slug>`, the
+// slug path-escaped. The origin is CredentialOrigin — `backlog_url`, the
+// operator's own config, or the built-in default — never a host read off a
+// checkout's .mcp.json (CLA-257).
 //
-// The slug is the project's own declared `slug`, which Validate has already
-// cross-checked against its .mcp.json; the origin is CredentialOrigin. Neither
-// half is read off the workdir's file (CLA-257).
+// The slug need not be a project this config declares: propose-config --slug and
+// upload --project may both name one it does not, so the write lands where the
+// caller said rather than necessarily where this config's sessions are pointed.
+// The plane membership-gates /mcp/<slug>, so an unreachable slug is refused
+// there, never mapped onto a project here.
 func (c *Config) ProjectEndpoint(p Project) string {
 	origin := c.CredentialOrigin()
 	if origin == "" || p.Slug == "" {
