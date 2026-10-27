@@ -314,3 +314,38 @@ printf '%s\n' '`+credFakeToken+`'
 		}
 	}
 }
+
+// TestTokenProbeNamesItsHost pins the probe's argv. `gh auth token` without
+// --hostname answers for gh's DEFAULT host, which on a GHES-configured machine
+// is a different account's token; the owner is a github.com account by
+// construction, so the probe must say so. The exact string also keeps --user at
+// $3/$4 - the position every fake gh in this package reads the account from,
+// and gh's own "no oauth token ... account X" text echoes.
+func TestTokenProbeNamesItsHost(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(t.TempDir(), "probe-argv.log")
+	t.Setenv("PROBE_RECORD", record)
+
+	gh := filepath.Join(t.TempDir(), "gh")
+	writeFile(t, gh, `#!/bin/sh
+printf '%s\n' "$*" >> "$PROBE_RECORD"
+printf '%s\n' '`+credFakeToken+`'
+`)
+	if err := os.Chmod(gh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A failing spawn would pass an argv assertion for the wrong reason.
+	if got := TokenForOwner(context.Background(), dir, gh, "acme"); got != credFakeToken {
+		t.Fatalf("probe must answer the owner's token, got %q", got)
+	}
+
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("probe record missing - the fake gh never ran: %v", err)
+	}
+	const want = "auth token --user acme --hostname " + githubHost
+	if got := strings.TrimSpace(string(body)); got != want {
+		t.Errorf("probe must pin its host, and keep --user at $3/$4:\n want %q\n  got %q", want, got)
+	}
+}

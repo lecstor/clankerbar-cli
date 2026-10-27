@@ -894,14 +894,22 @@ func (v *Verifier) runGHScoped(ctx context.Context, dir string, extraEnv []strin
 	return runGHBin(ctx, v.ghBin, dir, extraEnv, false, args...)
 }
 
+// runGHProbe is the credential probe's spawn: runGHBin with the parent's
+// GH_TOKEN/GITHUB_TOKEN dropped. It is a named wrapper rather than a bare bool
+// at the call because this is the one spawn where the flag decides which
+// credential the child can see.
+func runGHProbe(ctx context.Context, ghBin, dir string, args ...string) (string, error) {
+	return runGHBin(ctx, ghBin, dir, nil, true, args...)
+}
+
 // runGHBin is runGH with the binary spelled out, so the per-owner token
 // resolution in delivery.go (TokenForOwner, CLA-458) drives the same spawn
 // discipline without a Verifier in hand - CLA-459's doctor consumer passes
 // "gh" here. extraEnv carries per-invocation environment additions (see
 // runGHScoped); pass nil for the plain spawn. dropAmbientTokens removes the
 // parent's GH_TOKEN/GITHUB_TOKEN even when no additions ride the invocation:
-// the `auth token --user` probe must answer for the account it names, never
-// the one the ambient environment is authenticated as.
+// the credential probe must answer for the account it names, never the one the
+// ambient environment is authenticated as - callers use runGHProbe for that.
 func runGHBin(ctx context.Context, ghBin, dir string, extraEnv []string, dropAmbientTokens bool, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, ghBin, args...)
 	cmd.Dir = dir
