@@ -67,7 +67,7 @@ queue still works), and the publish gate stays a human's.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck |
+| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck; on PRs, also reports the `ci` outcome to the plane |
 | `promote.yml` | push to `staging` | create-or-update the standing promotion PR |
 | `release-on-merge.yml` | push to `main` | gate on `ci`, derive the version, tag, publish |
 | `realign-staging.yml` | push to `main` | fast-forward `staging` back up to `main` |
@@ -181,11 +181,21 @@ gh attestation verify clankerbar_0.4.0_darwin_arm64.tar.gz -R lecstor/clankerbar
   decision, 2026-08-10, taken over provisioning a scoped PAT. `promote.yml` opens
   the standing PR with the default `GITHUB_TOKEN`, and with this setting off that
   token can edit an open PR but is refused when it must *create* one - which
-  happens every cycle, since merging the promotion closes it. This repo holds **no
-  secrets**, which is the point: the alternative was its first long-lived
-  credential. Turning the setting back off breaks the standing PR on the cycle
+  happens every cycle, since merging the promotion closes it. This repo held **no
+  secrets** when that decision was taken, which is the point: the alternative was
+  its first long-lived credential (CLA-821 has since added one report-only key,
+  below). Turning the setting back off breaks the standing PR on the cycle
   *after* the next publish, not immediately - so the failure lands well away from
   the change that caused it.
+- **`CLANKERBAR_REPORT_KEY`, and only that secret.** The last step of `ci.yml`
+  POSTs the check's own outcome to the plane on pull requests, because the plane's
+  CI arm accepts only rows a repo's own workflow POSTed - never an agent's
+  attestation. The secret is a **report-only** key (mint it at
+  `/projects/<slug>/api-keys`; see `docs/auth.md` in `lecstor/clankerbar`): it can
+  post one check outcome and reach nothing else, so a leaked CI secret cannot
+  claim a task, record a verdict or write the backlog. Empty - unset, or a fork
+  PR, which receives no repository secrets - logs one line and skips; it never
+  fails the run.
 - **`ci.yml` running on push to `staging`.** Not a convenience: it is what makes
   the promotion PR mergeable at all. A PR created by `GITHUB_TOKEN` triggers a
   `pull_request` run that parks at `action_required`, contributing no check run
