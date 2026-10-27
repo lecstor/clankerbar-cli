@@ -52,19 +52,27 @@ func (d *Driver) hostnameOnce() string {
 	return d.hostname
 }
 
-// fleetIdentity composes what every beacon from THIS daemon carries: who it is,
+// fleetIdentity composes what every beacon for target t carries: who it is,
 // where it runs, what build, which config. Read fresh per report so a RELOAD
 // (which swaps d.cfg) is visible to the console as a changed configIdentity
 // rather than requiring a restart.
-func (d *Driver) fleetIdentity() fleet.Identity {
+//
+// The fingerprint is the target's EFFECTIVE config — the stored run-config
+// overlay when one is in force (CLA-410, d.targetCfg), else the local file —
+// because that is what the drain actually runs on. Hashing d.cfg instead would
+// report the same identity for two targets under different ratified documents,
+// and leave it unmoved when a new document is ratified in the console: exactly
+// the "how to run" disagreement the field exists to surface, and the case the
+// console cannot otherwise see land.
+func (d *Driver) fleetIdentity(t Target) fleet.Identity {
 	// Explicit instance_name wins; otherwise hostname plus config basename,
 	// unique per running daemon, so co-located daemons no longer collapse into
 	// one presence row (CLA-501). Stable across a RELOAD: the reloader re-reads
 	// the same path, so the basename half cannot change under a live daemon.
 	inst := d.cfg.ResolvedInstanceName(d.hostnameOnce())
 	cfgID := ""
-	if d.cfg != nil {
-		cfgID = d.cfg.Identity()
+	if tc := d.targetCfg(t); tc != nil {
+		cfgID = tc.Identity()
 	}
 	return fleet.Identity{
 		Instance:       inst,
@@ -140,7 +148,7 @@ func (d *Driver) sendBeacon(ti int, t Target, st fleet.State, iterations ...flee
 		return
 	}
 	t.Fleet.Send(fleet.Report{
-		Identity:   d.fleetIdentity(),
+		Identity:   d.fleetIdentity(t),
 		State:      st,
 		Iterations: iterations,
 	})
@@ -340,7 +348,7 @@ func (d *Driver) fleetShutdown() {
 			continue
 		}
 		t.Fleet.Close(fleet.Report{
-			Identity: d.fleetIdentity(),
+			Identity: d.fleetIdentity(t),
 			State:    fleet.State{Kind: fleet.StateStopping},
 		})
 	}
