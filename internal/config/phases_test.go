@@ -953,6 +953,81 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 	}
 }
 
+// CLA-702: the panel member's UNVERIFIED variant is selected for exactly the
+// checkpoint the core's verified-branch claim cannot describe (an unreadable
+// origin), so it must not inherit that claim. The split that gives it its own
+// core must leave the verified briefs untouched.
+func TestUnverifiedPanelMemberBriefStatesItsShape(t *testing.T) {
+	brief := panelMemberUnverifiedReviewOnlyBrief
+	for _, want := range []string{
+		// The honest state of the checkpoint.
+		"could NOT verify that branch on the origin remote",
+		"the driver could not read the remote",
+		"UNKNOWN",
+		"UNVERIFIED",
+		"the branch may not exist on the origin remote",
+		"do NOT assume phase 1 implemented, committed and pushed",
+		// The member establishes the tip itself, before any review; the record
+		// shape below carries the mechanics and the failure arm.
+		"FIRST establish the tip yourself, before any review",
+		"read branch " + PhaseBranchPlaceholder + " from the origin remote",
+		"do not review a phantom diff",
+		// The panel's record-only contract and its ending are unchanged.
+		"ONE MEMBER of a review PANEL",
+		"THE RECORD IS YOUR DELIVERABLE",
+		"record_review(taskId, runId, {...})",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the unverified panel member brief does not say %q:\n%s", want, brief)
+		}
+	}
+	// The verified claim itself must be ABSENT: it is exactly what this
+	// checkpoint cannot support.
+	if strings.Contains(brief, "verified to exist on the origin remote") ||
+		strings.Contains(brief, "really did implement, commit and push") {
+		t.Errorf("the unverified panel member brief asserts the verified-branch claim it cannot support:\n%s", brief)
+	}
+	// The record shape is the UNVERIFIED one: the verified shape names a
+	// driver-verified tip the driver never read.
+	if !strings.Contains(brief, panelMemberUnverifiedRecordShape) {
+		t.Errorf("the unverified panel member brief does not carry the unverified record shape:\n%s", brief)
+	}
+	if strings.Contains(brief, panelMemberRecordShape) {
+		t.Errorf("the unverified panel member brief carries the verified record shape:\n%s", brief)
+	}
+	if strings.Contains(brief, ReviewedTipPlaceholder) {
+		t.Errorf("the unverified panel member brief carries a driver-verified-tip placeholder:\n%s", brief)
+	}
+	// Position, like the other panel briefs: the record-only ending is the last
+	// thing before the shared handoff guidance.
+	if !strings.HasSuffix(brief, panelMemberTerminalStep+handoffGuidance) {
+		t.Errorf("the unverified panel member ending is not the last thing before the handoff guidance:\n%s", brief)
+	}
+	if brief == panelMemberReviewOnlyBrief {
+		t.Error("the unverified panel member brief is the verified one")
+	}
+
+	// The split must not disturb the briefs that were already right: the
+	// verified core is pinned at its seam, where a missing or doubled space in
+	// the reused halves would show.
+	const verifiedSeam = "recorded branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver " +
+		"verified to exist on the origin remote with its tip reachable, so phase 1 really did implement, commit " +
+		"and push. You are RESUMING that run"
+	for name, b := range map[string]string{
+		"review-only brief":  reviewOnlyBrief,
+		"panel member brief": panelMemberReviewOnlyBrief,
+	} {
+		if !strings.Contains(b, verifiedSeam) {
+			t.Errorf("the %s no longer carries its verified core intact:\n%s", name, b)
+		}
+	}
+	const unverifiedSeam = "recorded branch " + PhaseBranchPlaceholder + " on the plane — but the driver could " +
+		"NOT verify that branch on the origin remote"
+	if !strings.Contains(unverifiedReviewOnlyBrief, unverifiedSeam) {
+		t.Errorf("the single reviewer's unverified brief no longer carries its own core intact:\n%s", unverifiedReviewOnlyBrief)
+	}
+}
+
 // CLA-637: the review-only brief is the CLI's whole lever on the durable
 // record's shape — the SESSION writes the record through its own MCP client —
 // so the tokens the plane and the seam gate read are pinned here: the
