@@ -67,7 +67,7 @@ queue still works), and the publish gate stays a human's.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck |
+| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck - on the self-hosted runner |
 | `promote.yml` | push to `staging` | create-or-update the standing promotion PR |
 | `release-on-merge.yml` | push to `main` | gate on `ci`, derive the version, tag, publish |
 | `realign-staging.yml` | push to `main` | fast-forward `staging` back up to `main` |
@@ -77,6 +77,56 @@ The decision logic - what version, and did CI pass - lives in Go
 (`internal/release`, driven by `cmd/release-tool`), not in YAML, because those
 are exactly the rules that need tests. `cmd/release-tool` is development tooling;
 `.goreleaser.yaml` builds `./cmd/clankerbar` only, so it never ships.
+
+## Where CI runs
+
+`ci.yml`'s job runs on the **self-hosted runner** labelled `headless`, a container on
+the fleet box (its name, as the run's log header reports it, is
+`headless-clankerbar-cli`). The reason is cost: this repo is private, so every hosted job
+minute is drawn from a finite allowance, and a self-hosted runner bills none. The other
+workflows stay on GitHub-hosted runners - `promote.yml`, `release-on-merge.yml`,
+`realign-staging.yml` and `release.yml` publish releases or hold tokens, and they run
+rarely enough not to be what spends the allowance.
+
+Moving the job here also moves a trust boundary. It checks out the PR's branch and
+`go test -race` compiles and executes that branch's own test code on a persistent
+container, whose installed toolchain, apt state and caches survive between jobs and are
+inherited by later runs - including the push runs on `main` and `staging` whose `ci` the
+release and realign gates read. The job holds only the run-scoped `contents: read`
+`GITHUB_TOKEN`, so there is no long-lived credential in reach, and the runner is
+registered to this repo alone - but any collaborator who can open a PR can reach this
+box's CI execution path, so the check's result is only as trustworthy as every branch
+that has ever run on it. Keep the container isolated from the fleet's own state and
+credentials: no host mounts, no long-lived secrets, and rebuild it periodically (or run
+it ephemeral) so a PR cannot persist into later checks.
+
+Two things to know before waiting on a check:
+
+- **It takes one job at a time**, capped at 2 CPUs and 4 GB. Two PRs pushed together
+  compile in sequence, and `go test -race` on two cores is slower than on the hosted
+  image - so allow more wall-clock, not less. The job carries a 20-minute timeout, so a
+  hang cannot hold the only slot for GitHub's six-hour default.
+- **If the runner is offline** - the box down, the container stopped, the runner
+  unregistered - jobs **queue** and report nothing for as long as it stays offline.
+  `ci` is a required check on `main` and `staging`, so nothing merges until it runs. A
+  PR whose check never appears is this, not a red build: look for the runner rather than
+  re-pushing.
+
+The one-slot queue also lengthens the wait for the two workflows gated on `ci` for the
+merge commit on `main`: `release-on-merge.yml` and `realign-staging.yml` both run
+`await-check --required ci` against `${{ github.sha }}`, and that window now covers the
+queued jobs ahead of this one as well as the job itself. Both allow 60 minutes
+(`--timeout 60m` inside a 75-minute job), widened from the 30 minutes that sufficed when
+`ci` was a parallel hosted run. A `ci` job hung behind a queued one can still exhaust the
+window; when it does, publishing is refused and `staging` is not fast-forwarded.
+
+That image is Ubuntu `actions-runner`, not the GitHub-hosted image, so a step needing a
+preinstalled tool must install it. `ci.yml` conditionally apt-installs `zstd` (what
+`actions/cache` shells out to, via `setup-go`'s `cache: true`) and a C toolchain
+(`go test -race` needs cgo); the step is conditional because the container persists, so
+only a fresh one pays the apt round trip. To move the job back to GitHub-hosted, change
+its `runs-on` to `ubuntu-latest`: the install step then no-ops, because the hosted image
+ships both.
 
 ## Versioning
 

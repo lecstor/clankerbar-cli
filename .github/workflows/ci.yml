@@ -56,13 +56,35 @@ jobs:
     # gate waits for a check that never arrives and refuses every release.
     # TestRequiredCheckMatchesTheCIWorkflow fails if this drifts.
     name: ci
-    runs-on: ubuntu-latest
+    # Self-hosted on the fleet box, so a private repo's runs bill no Actions
+    # minutes. It takes ONE job at a time and must not hang, hence the timeout;
+    # if it is offline this job queues and nothing merges. See docs/releases.md,
+    # "Where CI runs", for the offline behaviour and how to move it back.
+    runs-on: [self-hosted, headless]
+    timeout-minutes: 20
     steps:
       # Pinned to full commit SHAs, like release.yml - the trailing comment is the
       # version label, the SHA is what is fetched. This job only holds
       # `contents: read`, so the blast radius is smaller than release.yml's, but a
       # substituted action here still runs arbitrary code against every PR.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      # The runner image is not the GitHub-hosted one, and two tools below need
+      # it to look like the environment this workflow was written for: `zstd` is
+      # what actions/cache shells out to (setup-go's `cache: true`), and `-race`
+      # needs cgo, so a C compiler and libc headers. Conditional because the
+      # runner container persists - only a fresh one pays the apt round trip.
+      - name: Ensure zstd and a C toolchain, which the hosted image ships
+        run: |
+          missing=()
+          command -v zstd >/dev/null 2>&1 || missing+=(zstd)
+          if ! command -v gcc >/dev/null 2>&1 || [ ! -e /usr/include/stdio.h ]; then
+            missing+=(gcc libc6-dev)
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends "${missing[@]}"
+          fi
 
       # Pin Go to the version declared in go.mod (currently 1.26) so CI and the
       # module never drift. go-version-file reads the `go` DIRECTIVE - a range
