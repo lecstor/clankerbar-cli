@@ -2278,8 +2278,18 @@ stored document: `--model` on the command line wins over a ratified value.
 Import today's file as the starting point with:
 
 ```sh
-clankerbar propose-config            # --slug <project> when projects[] names several
+clankerbar propose-config                       # this config's own project
+clankerbar propose-config --slug other-project  # record it against another project
+clankerbar propose-config --slug beta           # required when projects[] names several
 ```
+
+`--slug` selects the project the proposal is recorded against and defaults to
+this config's own project (its `projects[]` entry when it declares one, otherwise
+the `/mcp/<slug>` in its wiring). When the config drives at most one project, a
+name it does not declare is still honoured — the plane membership-gates
+`/mcp/<slug>` — so `--slug` redirects a single-project config's proposal rather
+than merely disambiguating it. When `projects[]` names several, `--slug` is
+required and must name one of them.
 
 That records a PENDING proposal; nothing changes until you ratify it in the
 console (Settings -> Run configuration). The pipeline travels with it — `prompt`,
