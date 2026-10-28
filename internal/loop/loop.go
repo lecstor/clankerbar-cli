@@ -639,7 +639,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		},
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
-		probePRBase: probeOriginPRBase,
+		probePRBase: ProbeOriginPRBase,
 	}
 	for i := range d.rcVersions {
 		d.rcVersions[i] = -1 // unfetched; 0 is a REAL answer (nothing stored)
@@ -7832,49 +7832,31 @@ func (d *Driver) sessionDir(ctx context.Context, t Target, prev *harness.Result)
 var prBaseProbeTimeout = 30 * time.Second
 
 // prBaseFor resolves the branch this task's repo PRs target, substituted into
-// the phase briefs as {{prBase}} (CLA-608). Resolution order, first match wins:
+// the phase briefs as {{prBase}}. The rule itself is config.ResolvePRBase, shared
+// with the deterministic close-out so both judge a repo's merge target the same.
 //
-//  1. the operator's pr_base override for the repo, which needs no probe — the
-//     one way to name a branch that is not derivable (lecstor/makespdf PRs
-//     merge into `integration` while it deploys `staging`);
-//  2. the project's integration_branch, when that branch EXISTS on origin
-//     (repos that integrate through staging: clankerbar-cli, ezyapp);
-//  3. origin's default branch (the makesPDF plugins carry only main);
-//  4. the project's integration_branch anyway — the pre-CLA-608 text — when the
-//     probe could not run at all (no dir, no origin, offline, no git). The
-//     degradation is deliberate: failing the spawn would be worse than a brief
-//     naming today's default, and a probe that cannot read origin has no
-//     better answer to offer.
-//
-// It never fails, so a spawn is never blocked on it. The probe runs afresh per
-// phase rather than caching: a phase is spawned at most a few times per task,
-// and a cache keyed on remote state would outlive the branch creations it is
-// supposed to observe.
+// The probe runs afresh per phase rather than caching: a phase is spawned at most
+// a few times per task, and a cache keyed on remote state would outlive the branch
+// creations it is supposed to observe.
 func (d *Driver) prBaseFor(ctx context.Context, t Target, dir, repo string) string {
-	tc := d.targetCfg(t)
-	if b := tc.PRBaseFor(t.Name, repo); b != "" {
-		log.Printf("%spr_base override: %s PRs target %q", labelOf(t), displayRepo(dir, repo), b)
-		return b
+	var probe config.PRBaseProbe
+	if d.probePRBase != nil && dir != "" {
+		probe = func(integration string) (bool, string, error) {
+			return d.probePRBase(ctx, dir, integration)
+		}
 	}
-	integration := tc.IntegrationBranchFor(t.Name)
-	if d.probePRBase == nil || dir == "" {
-		return integration
-	}
-	onOrigin, def, err := d.probePRBase(ctx, dir, integration)
+	res := config.ResolvePRBase(d.targetCfg(t), t.Name, repo, probe)
 	switch {
-	case err != nil:
-		log.Printf("%scould not read origin to resolve the PR base of %s (%v) — the brief names the integration branch %q",
-			labelOf(t), displayRepo(dir, repo), err, integration)
-		return integration
-	case onOrigin:
-		return integration
-	case def != "":
+	case res.Source == config.PRBaseOverride:
+		log.Printf("%spr_base override: %s PRs target %q", labelOf(t), displayRepo(dir, repo), res.Base)
+	case res.Source == config.PRBaseOriginDefault:
 		log.Printf("%s%s has no %q on origin — its PRs target origin's default branch %q",
-			labelOf(t), displayRepo(dir, repo), integration, def)
-		return def
-	default:
-		return integration
+			labelOf(t), displayRepo(dir, repo), res.Integration, res.Base)
+	case res.Err != nil:
+		log.Printf("%scould not read origin to resolve the PR base of %s (%v) — the brief names the integration branch %q",
+			labelOf(t), displayRepo(dir, repo), res.Err, res.Integration)
 	}
+	return res.Base
 }
 
 // displayRepo names the subject of a prBaseFor log line: the task's repo
@@ -7886,9 +7868,11 @@ func displayRepo(dir, repo string) string {
 	return dir
 }
 
-// probeOriginPRBase asks the origin remote of dir two questions in ONE network
+// ProbeOriginPRBase asks the origin remote of dir two questions in ONE network
 // round-trip: whether refs/heads/<integration> exists there, and what its
-// symbolic HEAD points at — the answers prBaseFor's resolution order needs.
+// symbolic HEAD points at — the answers config.ResolvePRBase's resolution order
+// needs. Exported so the deterministic close-out can resolve the same merge
+// target the phase briefs were given (internal/supervisor/closeout.go).
 //
 // `git ls-remote --symref origin HEAD refs/heads/<integration>` prints the
 // symref line ("ref: refs/heads/main	HEAD") plus each matching ref, so one call
@@ -7908,7 +7892,7 @@ func displayRepo(dir, repo string) string {
 // degrades to running unscoped, the same fail-open shape delivery keeps; the
 // probe has no correctness cliff on top of it because its own failure mode is
 // prBaseFor's fallback.
-func probeOriginPRBase(ctx context.Context, dir, integration string) (bool, string, error) {
+func ProbeOriginPRBase(ctx context.Context, dir, integration string) (bool, string, error) {
 	ctx, cancel := context.WithTimeout(ctx, prBaseProbeTimeout)
 	defer cancel()
 	remoteURL, _ := originRemoteURL(ctx, dir)
@@ -7928,7 +7912,7 @@ func originRemoteURL(ctx context.Context, dir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// runOriginLsRemote is probeOriginPRBase's one git exec, split out so the probe
+// runOriginLsRemote is ProbeOriginPRBase's one git exec, split out so the probe
 // reads as its two answers. The environment discipline is delivery.Verifier's
 // gitRun: an unattended run has no terminal, and a git that decides to ask for
 // a password would hang the phase rather than answer. WaitDelay reaps the

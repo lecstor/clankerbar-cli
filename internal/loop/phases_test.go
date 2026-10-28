@@ -2530,6 +2530,17 @@ func TestPRBaseResolution_ShapesBothPhaseBriefsPerRepo(t *testing.T) {
 			wantProbes: 2,
 		},
 		{
+			// The close-out's bug in one row: a repo whose origin carries no
+			// `staging`, only `integration` as its default. The brief must name
+			// `integration`, and the close-out resolves its base the same way.
+			name:       "origin's default is integration and it holds no staging",
+			repo:       "lecstor/clankerbar",
+			onOrigin:   false,
+			defaultBr:  "integration",
+			want:       "integration",
+			wantProbes: 2,
+		},
+		{
 			name:       "the per-repo override wins outright, no probe",
 			repo:       "lecstor/makespdf",
 			prBase:     map[string]string{"lecstor/makespdf": "integration"},
