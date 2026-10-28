@@ -200,7 +200,10 @@ func wantProbeOwner(t *testing.T, record, owner string) {
 		t.Errorf("the credential probe ran %d times; want exactly 1", n)
 	}
 	probe := ghSections(t, record)["auth token"]
-	want := "argv=auth token --user " + owner + " --hostname " + githubHost
+	// The literal host, not githubHost: this is what pins what the probe asks
+	// for, and reading the production constant would let a drift of it move this
+	// expectation with the code and keep both green.
+	want := "argv=auth token --user " + owner + " --hostname github.com"
 	if len(probe) != 1 || probe[0] != want {
 		t.Errorf("credential probe asked %v; want exactly [%s]", probe, want)
 	}
