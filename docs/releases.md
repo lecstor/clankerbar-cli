@@ -67,7 +67,7 @@ queue still works), and the publish gate stays a human's.
 
 | Workflow | Trigger | What it does |
 |---|---|---|
-| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck |
+| `ci.yml` | PRs, pushes to `main` and `staging` | build, vet, `go test -race`, govulncheck - on the self-hosted runner |
 | `promote.yml` | push to `staging` | create-or-update the standing promotion PR |
 | `release-on-merge.yml` | push to `main` | gate on `ci`, derive the version, tag, publish |
 | `realign-staging.yml` | push to `main` | fast-forward `staging` back up to `main` |
@@ -77,6 +77,36 @@ The decision logic - what version, and did CI pass - lives in Go
 (`internal/release`, driven by `cmd/release-tool`), not in YAML, because those
 are exactly the rules that need tests. `cmd/release-tool` is development tooling;
 `.goreleaser.yaml` builds `./cmd/clankerbar` only, so it never ships.
+
+## Where CI runs
+
+`ci.yml`'s job runs on the **self-hosted runner** labelled `headless`, a container on
+the fleet box (its name, as the run's log header reports it, is
+`headless-clankerbar-cli`). The reason is cost: this repo is private, so every hosted job
+minute is drawn from a finite allowance, and a self-hosted runner bills none. The other
+workflows stay on GitHub-hosted runners - `promote.yml`, `release-on-merge.yml`,
+`realign-staging.yml` and `release.yml` publish releases or hold tokens, and they run
+rarely enough not to be what spends the allowance.
+
+Two things to know before waiting on a check:
+
+- **It takes one job at a time**, capped at 2 CPUs and 4 GB. Two PRs pushed together
+  compile in sequence, and `go test -race` on two cores is slower than on the hosted
+  image - so allow more wall-clock, not less. The job carries a 20-minute timeout, so a
+  hang cannot hold the only slot for GitHub's six-hour default.
+- **If the runner is offline** - the box down, the container stopped, the runner
+  unregistered - jobs **queue** and report nothing. `ci` is a required check on `main`
+  and `staging`, so nothing merges until it runs, and GitHub cancels a job still queued
+  after 24 hours. A PR whose check never appears is this, not a red build: look for the
+  runner rather than re-pushing.
+
+That image is Ubuntu `actions-runner`, not the GitHub-hosted image, so a step needing a
+preinstalled tool must install it. `ci.yml` conditionally apt-installs `zstd` (what
+`actions/cache` shells out to, via `setup-go`'s `cache: true`) and a C toolchain
+(`go test -race` needs cgo); the step is conditional because the container persists, so
+only a fresh one pays the apt round trip. To move the job back to GitHub-hosted, change
+its `runs-on` to `ubuntu-latest`: the install step then no-ops, because the hosted image
+ships both.
 
 ## Versioning
 
