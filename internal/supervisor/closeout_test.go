@@ -185,11 +185,22 @@ base=%q
 head=%q
 case "$1 $2" in
 "pr list")
-  cat "$dir/prlist.json"
+  # A test that drives TWO tasks in one repo gives each head branch its own list;
+  # otherwise the one shared list answers. (The head is what gh filters on.)
+  want=""; prev=""
+  for a in "$@"; do
+    if [ "$prev" = "--head" ]; then want=$a; fi
+    prev=$a
+  done
+  f="$dir/prlist-$(printf '%%s' "$want" | tr '/' '-').json"
+  [ -f "$f" ] || f="$dir/prlist.json"
+  cat "$f"
   ;;
 "pr view")
   sleep "$(cat "$dir/pr-view-delay" 2>/dev/null || echo 0)"
-  cat "$dir/prview.json"
+  f="$dir/prview-$3.json"
+  [ -f "$f" ] || f="$dir/prview.json"
+  cat "$f"
   ;;
 "auth token")
   echo "no token for that account" >&2
@@ -288,6 +299,36 @@ func (f *closeOutFixture) writePRList(numbers ...int) {
 	if err := os.WriteFile(filepath.Join(f.ghDir, "prlist.json"), []byte(body), 0o600); err != nil {
 		f.t.Fatalf("write prlist: %v", err)
 	}
+}
+
+// addSecondBranch pushes a second feature branch of the same repo, with its own
+// PR number (closeOutTestPR+1) and its own `gh` answers, so one pass can be
+// driven with two approved tasks that share a repo — the shape the per-pass base
+// cache exists for. It returns the branch and its PR number.
+func (f *closeOutFixture) addSecondBranch(t *testing.T) (branch string, number int) {
+	t.Helper()
+	branch = closeOutTestHead + "-b"
+	number = closeOutTestPR + 1
+	mustGit(t, f.seed, "checkout", "-q", "-b", branch, closeOutTestHead)
+	writeFile(t, filepath.Join(f.seed, "second.txt"), "the second work\n")
+	mustGit(t, f.seed, "add", "-A")
+	mustGit(t, f.seed, "commit", "-q", "-m", "second feature")
+	mustGit(t, f.seed, "push", "-q", "-u", "origin", branch)
+	headOID := strings.TrimSpace(mustGit(t, f.seed, "rev-parse", branch))
+
+	const passing = `[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]`
+	writeJSON := func(name, body string) {
+		if err := os.WriteFile(filepath.Join(f.ghDir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	writeJSON(fmt.Sprintf("prview-%d.json", number), fmt.Sprintf(
+		`{"number":%d,"url":"https://github.com/%s/pull/%d","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":%s,"baseRefName":%q,"headRefName":%q,"headRefOid":%q}`,
+		number, closeOutTestRepo, number, passing, f.base, branch, headOID))
+	writeJSON("prlist-"+strings.ReplaceAll(branch, "/", "-")+".json", fmt.Sprintf(
+		`[{"number":%d,"url":"https://github.com/%s/pull/%d","baseRefName":%q,"headRefName":%q,"headRefOid":%q}]`,
+		number, closeOutTestRepo, number, f.base, branch, headOID))
+	return branch, number
 }
 
 // servePlane starts the fake plane and answers the close-out's reads: the policy
@@ -542,6 +583,116 @@ func TestCloseOutMergesTheBaseTheBriefResolved(t *testing.T) {
 	}
 }
 
+// A pass that works TWO approved tasks in one repo resolves that repo's merge
+// target ONCE. The probe is three process spawns and a network round-trip, and the
+// supervisor starts a pass on every roster poll, so a queue of N approved tasks in
+// one repo must not pay it N times (CLA-833 review 1.review-2.2).
+func TestCloseOutResolvesEachReposBaseOncePerPass(t *testing.T) {
+	f := newCloseOutFixture(t, false)
+	secondBranch, secondPR := f.addSecondBranch(t)
+	f.servePlane(t, "clanker")
+	f.plane.serveTool("list_tasks", fmt.Sprintf(
+		`{"tasks":[{"id":%q,"ref":%q,"title":"one","branch":%q,"repo":%q},`+
+			`{"id":"task-2","ref":"CLA-2","title":"two","branch":%q,"repo":%q}],"count":2,"total":2,"view":"full"}`,
+		closeOutTestTask, closeOutTestRef, closeOutTestHead, closeOutTestRepo, secondBranch, closeOutTestRepo))
+	d := f.supervisor(0)
+
+	probes := 0
+	old := closeOutOriginProbe
+	closeOutOriginProbe = func(context.Context, string, string) (bool, string, error) {
+		probes++
+		return true, "", nil
+	}
+	defer func() { closeOutOriginProbe = old }()
+
+	lines := f.run(d)
+
+	if probes != 1 {
+		t.Errorf("origin was probed %d times for two tasks in one repo, want 1:\n%s", probes, lines)
+	}
+	if got := len(f.callsFor("claim_task")); got != 2 {
+		t.Errorf("claim_task calls = %d, want 2 (one per task):\n%s", got, lines)
+	}
+	closed := map[string]string{}
+	for _, c := range f.callsFor("complete_task") {
+		taskID, _ := c.args["taskId"].(string)
+		decl, _ := c.args["delivery"].(map[string]any)
+		pr, _ := decl["pr"].(string)
+		closed[taskID] = pr
+	}
+	if len(closed) != 2 {
+		t.Fatalf("complete_task closed %d task(s), want 2:\n%s", len(closed), lines)
+	}
+	if got := closed["task-2"]; got != fmt.Sprintf("#%d", secondPR) {
+		t.Errorf("the second task's delivery.pr = %q, want #%d", got, secondPR)
+	}
+}
+
+// The memo is keyed by repo AND integration branch: a second repo is a second
+// question, and so is the same repo under a changed integration branch.
+func TestCloseOutBasesProbeOncePerRepoAndIntegrationBranch(t *testing.T) {
+	old := closeOutOriginProbe
+	defer func() { closeOutOriginProbe = old }()
+	var asked []string
+	closeOutOriginProbe = func(_ context.Context, dir, integration string) (bool, string, error) {
+		asked = append(asked, dir+" "+integration)
+		return true, "", nil
+	}
+	cfg := &config.Config{Projects: []config.Project{{Slug: closeOutTestSlug, IntegrationBranch: closeOutTestBase}}}
+	bases := newCloseOutBases()
+	ctx := context.Background()
+
+	first := bases.resolve(ctx, "/checkouts/widgets", cfg, closeOutTestSlug, closeOutTestRepo)
+	second := bases.resolve(ctx, "/checkouts/widgets", cfg, closeOutTestSlug, closeOutTestRepo)
+	if len(asked) != 1 {
+		t.Fatalf("origin was probed %d times for one repo resolved twice, want 1: %v", len(asked), asked)
+	}
+	if first != second {
+		t.Errorf("the memoised resolution changed between calls: %+v then %+v", first, second)
+	}
+	if first.Base != closeOutTestBase {
+		t.Errorf("Base = %q, want the integration branch %q", first.Base, closeOutTestBase)
+	}
+
+	bases.resolve(ctx, "/checkouts/other", cfg, closeOutTestSlug, "acme/other")
+	if len(asked) != 2 {
+		t.Errorf("a task in a second repo did not probe: %v", asked)
+	}
+
+	cfg.Projects[0].IntegrationBranch = "integration"
+	bases.resolve(ctx, "/checkouts/widgets", cfg, closeOutTestSlug, closeOutTestRepo)
+	if len(asked) != 3 {
+		t.Errorf("a changed integration branch reused the cached answer: %v", asked)
+	}
+}
+
+// The close-out's probe carries its OWN short bound, not the driver's 30s one: it
+// runs inside a task budget shared with the PR judgement, the claim and the merge
+// check, and a stalled origin must not be able to cancel a merge mid-flight
+// (CLA-833 review 1.review-2.1). A probe that cannot answer still yields the
+// fail-closed integration-branch fallback.
+func TestCloseOutBasesBoundsItsOriginProbe(t *testing.T) {
+	oldProbe, oldTimeout := closeOutOriginProbe, closeOutBaseProbeTimeout
+	defer func() {
+		closeOutOriginProbe, closeOutBaseProbeTimeout = oldProbe, oldTimeout
+	}()
+	closeOutBaseProbeTimeout = 40 * time.Millisecond
+	closeOutOriginProbe = func(ctx context.Context, dir, integration string) (bool, string, error) {
+		<-ctx.Done()
+		return false, "", ctx.Err()
+	}
+	cfg := &config.Config{Projects: []config.Project{{Slug: closeOutTestSlug, IntegrationBranch: closeOutTestBase}}}
+
+	start := time.Now()
+	res := newCloseOutBases().resolve(context.Background(), "/checkouts/widgets", cfg, closeOutTestSlug, closeOutTestRepo)
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("the probe was not bounded by the close-out's own timeout: resolve took %s, its bound is %s", elapsed, closeOutBaseProbeTimeout)
+	}
+	if res.Err == nil || res.Source != config.PRBaseIntegrationFallback || res.Base != closeOutTestBase {
+		t.Errorf("a probe that could not answer resolved to %+v, want the integration-branch fallback %q with its error", res, closeOutTestBase)
+	}
+}
+
 // A PR based on a branch that is neither the resolved merge target nor a release
 // line is refused, and the line names BOTH bases without calling it a promotion.
 func TestCloseOutNamesBothBasesOnANonPromotionMismatch(t *testing.T) {
@@ -655,7 +806,7 @@ func TestCloseOutNeverMergesAMainBasedPR(t *testing.T) {
 		if got := f.callsFor("claim_task"); len(got) != 0 {
 			t.Errorf("a main-based PR was claimed: %v", got)
 		}
-		if !strings.Contains(lines, "not the integration branch") {
+		if !strings.Contains(lines, `not this project's merge target "staging"`) {
 			t.Errorf("the stand-down does not name the base mismatch:\n%s", lines)
 		}
 		if !strings.Contains(lines, "release-targeted") {
