@@ -1399,19 +1399,51 @@ const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase
 // as the default rather than as an impossible act.
 //
 // The brief is composed of a CORE plus a record shape and an ending, so the
-// panel member's variant (CLA-639 M5) can reuse the core verbatim and swap only
-// the two halves that differ: the panel member writes the durable record and
-// nothing else.
-var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+// verified panel member's variant (CLA-639 M5) can reuse the core verbatim and
+// swap only the two halves that differ: the panel member writes the durable
+// record and nothing else.
+// The core is assembled from the parts that do and do not depend on the
+// hand-off's verification state: reviewOnlyBriefOpening names the recorded
+// branch, and the claim that follows is the one sentence an unverifiable
+// checkpoint cannot support. The verified briefs append reviewHandoffVerified;
+// the panel member's unverified variant appends reviewHandoffUnverified and its
+// self-verification step. The remainder is identical in every variant.
+var reviewOnlyBriefOpening = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: you find issues " +
 	"and specify fixes; the phase after you applies them. The implement phase (harness " +
 	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") recorded branch " +
-	PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin remote with " +
-	"its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that run, not " +
-	"starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
-	PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the bar " +
-	"and the standing decisions. An empty branch field on the task is a FAILED hand-off to report in the record " +
-	"below, not work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	PhaseBranchPlaceholder + " on the plane — "
+
+// reviewHandoffVerified is the claim only a checkpoint the driver read on the
+// origin remote can make.
+const reviewHandoffVerified = "a branch the driver verified to exist on the origin remote with its tip " +
+	"reachable, so phase 1 really did implement, commit and push."
+
+// reviewHandoffUnverified is the panel member's counterpart: the check did not
+// complete, so the branch's existence and phase 1's push are UNKNOWN and the
+// member must establish the tip itself.
+const reviewHandoffUnverified = "but the driver could NOT verify that branch on the origin remote: its check did " +
+	"not complete — most often because the driver could not read the remote (network, a GitHub outage, a " +
+	"credential problem), but a check that never reached the remote is possible too — so whether phase 1 " +
+	"pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a verified " +
+	"hand-off: the branch may not exist on the origin remote, and do NOT assume phase 1 implemented, committed " +
+	"and pushed."
+
+var reviewOnlyBriefResume = " You are RESUMING that run, not starting a new one: do not call next_task, and do " +
+	"not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with " +
+	"includeDecisions: true to re-read the bar and the standing decisions. An empty branch field on the task is " +
+	"a FAILED hand-off to report in the record below, not work to silently adopt and implement."
+
+// reviewHandoffUnverifiedCheck states the member's obligation; the record shape
+// carries the mechanics and the failure arm for a branch that is absent, empty
+// or unreadable.
+const reviewHandoffUnverifiedCheck = " FIRST establish the tip yourself, before any review: read branch " +
+	PhaseBranchPlaceholder + " from the origin remote - the record shape below tells you exactly how, and where " +
+	"to record the tip - and confirm it carries phase 1's work. If the branch is absent, or exists but carries " +
+	"none of phase 1's work, phase 1 did NOT deliver: record that failed hand-off in your durable record and end " +
+	"holding the task — do not review a phantom diff."
+
+var reviewOnlyBriefWorktreeAndGate = " Work in the worktree for branch " + PhaseBranchPlaceholder +
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
 	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
 	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
@@ -1419,6 +1451,9 @@ var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + P
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
+
+var reviewOnlyBriefCore = reviewOnlyBriefOpening + reviewHandoffVerified + reviewOnlyBriefResume +
+	reviewOnlyBriefWorktreeAndGate
 
 // reviewOnlyBrief is the single reviewer's brief: the core above, the two-half
 // record shape, and the two-half ending.
@@ -1436,8 +1471,13 @@ var panelMemberReviewOnlyBrief = reviewOnlyBriefCore +
 	panelMemberRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
 
 // panelMemberUnverifiedReviewOnlyBrief is panelMemberReviewOnlyBrief for a
-// checkpoint the driver could not verify against the origin remote (CLA-576).
-var panelMemberUnverifiedReviewOnlyBrief = reviewOnlyBriefCore +
+// checkpoint the driver could not verify against the origin remote (CLA-576,
+// CLA-702). It cannot reuse the verified core: that core asserts the driver
+// verified the branch, which is exactly what an unreadable checkpoint cannot
+// support, while its record shape says the driver could NOT read the tip. It
+// keeps the panel's record-only contract and ending unchanged.
+var panelMemberUnverifiedReviewOnlyBrief = reviewOnlyBriefOpening + reviewHandoffUnverified +
+	reviewOnlyBriefResume + reviewHandoffUnverifiedCheck + reviewOnlyBriefWorktreeAndGate +
 	panelMemberUnverifiedRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
 
 // unverifiedReviewOnlyBrief is reviewOnlyBrief for a checkpoint the driver could
