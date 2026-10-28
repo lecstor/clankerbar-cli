@@ -154,6 +154,72 @@ func TestRun_ABeaconAccompaniesEachPoll(t *testing.T) {
 	}
 }
 
+// CLA-483: the beacon accompanying a poll carries THAT poll's pause state.
+// d.paused[i] is learned inside the poll's switch, so a beacon ahead of it
+// reported the previous cycle's answer. The decisive assertion is the FIRST poll
+// of a transition (pause landing, pause clearing, or start against a paused
+// project), which is why each case scripts both sides of one.
+//
+// Driven through Run rather than by poking the flags: the ordering lives in
+// Run's per-target body, which TestFleetState_MapsWhatTheLoopKnows cannot see.
+func TestRun_ABeaconCarriesThatPollsPauseState(t *testing.T) {
+	cases := []struct {
+		name string
+		sums []backlog.Summary // per-poll script; the last entry repeats
+		want []string          // beacon state kind per poll, same length as sums
+	}{
+		{
+			name: "daemon starts against an already-paused project",
+			sums: []backlog.Summary{{Paused: true}, {Paused: true}},
+			want: []string{fleet.StateDraining, fleet.StateDraining},
+		},
+		{
+			name: "operator pauses between polls",
+			sums: []backlog.Summary{{}, {Paused: true}, {Paused: true}},
+			want: []string{fleet.StateIdle, fleet.StateDraining, fleet.StateDraining},
+		},
+		{
+			// The clear direction: the first poll after an un-pause must beacon
+			// idle on that same poll, not draining for another interval.
+			name: "operator un-pauses between polls",
+			sums: []backlog.Summary{{Paused: true}, {}},
+			want: []string{fleet.StateDraining, fleet.StateIdle},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := fastCfg()
+			cfg.StateDir = t.TempDir()
+			// The script's last entry is the fallback, so cancelling on the
+			// final poll still answers with the state under test.
+			p := &fakePoller{sums: tc.sums, sum: tc.sums[len(tc.sums)-1]}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			last := len(tc.sums) - 1
+			p.onCall = func(i int) {
+				if i >= last {
+					cancel()
+				}
+			}
+			d, ff := fleetDriver(t, cfg, &fakeAdapter{})
+			d.targets[0].Poller = p
+
+			if err := d.Run(ctx); err != nil {
+				t.Fatalf("Run returned error: %v", err)
+			}
+			sent, _ := ff.reports()
+			if len(sent) != len(tc.want) {
+				t.Fatalf("got %d beacons, want one per poll (%d): %+v", len(sent), len(tc.want), sent)
+			}
+			for i, r := range sent {
+				if r.State.Kind != tc.want[i] {
+					t.Errorf("poll %d beacon state = %q, want %q", i, r.State.Kind, tc.want[i])
+				}
+			}
+		})
+	}
+}
+
 // The state mapping, directly: paused targets read draining (alive, spawning
 // nothing new), mid-drain reads iteration {n, taskRef, phase}, everything else
 // idle.

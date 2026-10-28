@@ -845,14 +845,6 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			for i := range d.targets {
 				t := d.targets[i]
 				sum, err := t.Poller.Poll(runCtx)
-				// CLA-466: the presence beacon rides THIS poll — no new cadence.
-				// It fires whatever the poll answered (even an error poll proves
-				// the daemon is alive and looping), and carries the state derived
-				// below, so a console-paused target reads `draining`, not `idle`.
-				// The poll is not the only carrier: a session blocks the poll for
-				// as long as it runs, so the in-session lease-renewal tick carries
-				// the same per-target lap (CLA-771, Driver.beaconSessionTargets).
-				d.beacon(i, t, d.fleetState(i))
 				switch {
 				case errors.Is(err, backlog.ErrNotWired):
 					log.Print("backlog polling not wired — blind mode: drain, then idle-poll by re-draining (wire backlog polling to gate on live counts cheaply)")
@@ -939,6 +931,12 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 						}
 					}
 				}
+				// CLA-466: the presence beacon rides THIS poll — no new cadence. It
+				// fires AFTER the switch, whose default arm writes the pause flags
+				// fleetState reads (CLA-483); every poll beacons bar the two hard-stop
+				// arms, which get their `stopping` from fleetShutdown. A session blocks
+				// the poll, so the in-session renewal tick carries the same lap (CLA-771).
+				d.beacon(i, t, d.fleetState(i))
 				if d.blind {
 					break
 				}
