@@ -62,6 +62,7 @@ type closeOutFixture struct {
 	dir    string // <root>/<slug>/widgets — the fleet's clone
 	seed   string // the clone the fake gh merges and pushes from
 	remote string // the bare repository both clones share
+	base   string // the remote's default branch: the PR base and the merge target
 	ghBin  string
 	ghDir  string
 
@@ -89,10 +90,17 @@ type conflictCall struct {
 	step config.ConflictStep
 }
 
-// newCloseOutFixture builds the world. conflicting controls whether the two
-// branches really do conflict on two files (a.txt and b.txt) or touch different
-// files and merge cleanly.
+// newCloseOutFixture builds the world with `staging` as the remote's default.
 func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
+	return newCloseOutFixtureOn(t, conflicting, closeOutTestBase)
+}
+
+// newCloseOutFixtureOn builds the world around a remote whose default branch is
+// base: the branch the seed pushes, the fixture's PR targets, and the fake gh
+// merges into. A repo whose PRs target a branch other than the config's
+// integration branch needs the remote to carry that branch, so the default is a
+// fixture input rather than a constant.
+func newCloseOutFixtureOn(t *testing.T, conflicting bool, base string) *closeOutFixture {
 	t.Helper()
 	root := t.TempDir()
 	// The bare remote's PATH carries the repo identity, because the fleet's
@@ -100,7 +108,7 @@ func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
 	// (delivery.MatchesRepoSlug) — a bare name would not match and the close-out
 	// would (correctly) refuse to work in it.
 	remote := filepath.Join(root, "github.com", "acme", "widgets.git")
-	mustGit(t, root, "init", "-q", "--bare", "-b", closeOutTestBase, remote)
+	mustGit(t, root, "init", "-q", "--bare", "-b", base, remote)
 
 	seed := filepath.Join(root, "seed")
 	mustGit(t, root, "clone", "-q", remote, seed)
@@ -111,7 +119,7 @@ func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
 	writeFile(t, filepath.Join(seed, "keep.txt"), "keep\n")
 	mustGit(t, seed, "add", "-A")
 	mustGit(t, seed, "commit", "-q", "-m", "base")
-	mustGit(t, seed, "push", "-q", "-u", "origin", closeOutTestBase)
+	mustGit(t, seed, "push", "-q", "-u", "origin", base)
 
 	mustGit(t, seed, "checkout", "-q", "-b", closeOutTestHead)
 	if conflicting {
@@ -126,12 +134,12 @@ func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
 
 	if conflicting {
 		// Move the base underneath the branch so the two conflict on BOTH files.
-		mustGit(t, seed, "checkout", "-q", closeOutTestBase)
+		mustGit(t, seed, "checkout", "-q", base)
 		writeFile(t, filepath.Join(seed, "a.txt"), "one\nTWO-base\nthree\n")
 		writeFile(t, filepath.Join(seed, "b.txt"), "x\nY-base\n")
 		mustGit(t, seed, "add", "-A")
 		mustGit(t, seed, "commit", "-q", "-m", "base moves on")
-		mustGit(t, seed, "push", "-q", "origin", closeOutTestBase)
+		mustGit(t, seed, "push", "-q", "origin", base)
 		mustGit(t, seed, "checkout", "-q", closeOutTestHead)
 	}
 
@@ -147,6 +155,7 @@ func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
 		dir:      dir,
 		seed:     seed,
 		remote:   remote,
+		base:     base,
 		ghDir:    filepath.Join(root, "fakegh"),
 		cacheDir: filepath.Join(root, "state", "roster"),
 	}
@@ -154,7 +163,7 @@ func newCloseOutFixture(t *testing.T, conflicting bool) *closeOutFixture {
 	if err := os.MkdirAll(f.ghDir, 0o755); err != nil {
 		t.Fatalf("mkdir fake gh: %v", err)
 	}
-	f.writePR("staging", "MERGEABLE", "CLEAN", `[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]`)
+	f.writePR(base, "MERGEABLE", "CLEAN", `[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]`)
 	f.writePRList(closeOutTestPR)
 	f.setMergeMode("ok")
 	f.writeGH()
@@ -228,7 +237,7 @@ case "$1 $2" in
   exit 9
   ;;
 esac
-`, f.ghDir, f.seed, closeOutTestBase, closeOutTestHead, closeOutTestPR)
+`, f.ghDir, f.seed, f.base, closeOutTestHead, closeOutTestPR)
 	if err := os.WriteFile(f.ghBin, []byte(script), 0o755); err != nil {
 		f.t.Fatalf("write fake gh: %v", err)
 	}
@@ -273,7 +282,7 @@ func (f *closeOutFixture) writePRList(numbers ...int) {
 	entries := make([]string, 0, len(numbers))
 	for _, n := range numbers {
 		entries = append(entries, fmt.Sprintf(`{"number":%d,"url":"https://github.com/%s/pull/%d","baseRefName":%q,"headRefName":%q,"headRefOid":%q}`,
-			n, closeOutTestRepo, n, closeOutTestBase, closeOutTestHead, f.headOID))
+			n, closeOutTestRepo, n, f.base, closeOutTestHead, f.headOID))
 	}
 	body := "[" + strings.Join(entries, ",") + "]"
 	if err := os.WriteFile(filepath.Join(f.ghDir, "prlist.json"), []byte(body), 0o600); err != nil {
@@ -490,6 +499,76 @@ func TestCloseOutMergesACleanApprovedTask(t *testing.T) {
 	}
 }
 
+// A repo whose origin carries no `staging`: its default branch is `integration`,
+// which is exactly what a phase brief resolves for it (config.ResolvePRBase: no
+// pr_base, no staging on origin, so origin's default). The close-out must merge
+// into that same branch, not judge the PR against the config default - the
+// disagreement that refused these correct deliveries as release-targeted.
+func TestCloseOutMergesTheBaseTheBriefResolved(t *testing.T) {
+	f := newCloseOutFixtureOn(t, false, "integration")
+	f.servePlane(t, "clanker")
+	d := f.supervisor(0)
+	// Neither pr_base nor integration_branch configured: only the origin probe
+	// can name this repo's merge target.
+	d.instances[0].cfg.Projects[0].IntegrationBranch = ""
+	d.instances[0].cfg.Projects[0].PRBase = nil
+
+	lines := f.run(d)
+
+	closedCalls := f.callsFor("complete_task")
+	if len(closedCalls) != 1 {
+		t.Fatalf("complete_task calls = %d, want 1 (the PR into integration is a correct delivery). lines:\n%s", len(closedCalls), lines)
+	}
+	decl, ok := closedCalls[0].args["delivery"].(map[string]any)
+	if !ok {
+		t.Fatalf("done call carries no delivery block: %v", closedCalls[0].args)
+	}
+	if got := decl["integrationBranch"]; got != "integration" {
+		t.Errorf("delivery.integrationBranch = %v, want %q - the base the driver's prBaseFor resolves", got, "integration")
+	}
+	if got := f.mergeArgs(); !strings.Contains(got, "base=integration") {
+		t.Errorf("the merge did not name base=integration: %q", got)
+	}
+	mergeSHA, _ := decl["commit"].(string)
+	if len(mergeSHA) != 40 {
+		t.Fatalf("delivery.commit = %q, want the merge commit's sha", mergeSHA)
+	}
+	mustGit(t, f.remote, "merge-base", "--is-ancestor", mergeSHA, "refs/heads/integration")
+	if strings.Contains(lines, "release-targeted") {
+		t.Errorf("a PR into the resolved merge target was called release-targeted:\n%s", lines)
+	}
+	if !strings.Contains(lines, `integrates on "integration"`) {
+		t.Errorf("the close-out did not report the probed merge target:\n%s", lines)
+	}
+}
+
+// A PR based on a branch that is neither the resolved merge target nor a release
+// line is refused, and the line names BOTH bases without calling it a promotion.
+func TestCloseOutNamesBothBasesOnANonPromotionMismatch(t *testing.T) {
+	const passing = `[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]`
+	f := newCloseOutFixture(t, false)
+	f.servePlane(t, "clanker")
+	f.writePR("release-2", "MERGEABLE", "CLEAN", passing)
+	d := f.supervisor(0)
+
+	lines := f.run(d)
+
+	if got := f.callsFor("claim_task"); len(got) != 0 {
+		t.Errorf("a PR based on another branch was claimed: %v", got)
+	}
+	if got := f.mergeArgs(); got != "" {
+		t.Errorf("a PR based on another branch was merged: %q", got)
+	}
+	for _, want := range []string{`"release-2"`, `"staging"`} {
+		if !strings.Contains(lines, want) {
+			t.Errorf("the mismatch line does not name %s:\n%s", want, lines)
+		}
+	}
+	if strings.Contains(lines, "release-targeted") {
+		t.Errorf("a non-promotion base was called release-targeted:\n%s", lines)
+	}
+}
+
 // --- stand-downs -------------------------------------------------------------
 
 func TestCloseOutStandsDownWhenThePRIsNotReady(t *testing.T) {
@@ -579,12 +658,18 @@ func TestCloseOutNeverMergesAMainBasedPR(t *testing.T) {
 		if !strings.Contains(lines, "not the integration branch") {
 			t.Errorf("the stand-down does not name the base mismatch:\n%s", lines)
 		}
+		if !strings.Contains(lines, "release-targeted") {
+			t.Errorf("a promotion-base mismatch is not named as release-targeted:\n%s", lines)
+		}
 	})
 
 	t.Run("the project integrates into main", func(t *testing.T) {
 		f := newCloseOutFixture(t, false)
 		f.servePlane(t, "clanker")
 		f.writePR("main", "MERGEABLE", "CLEAN", `[{"__typename":"CheckRun","name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}]`)
+		// The configured integration branch is the base only when origin HAS it.
+		mustGit(t, f.seed, "branch", "main", closeOutTestBase)
+		mustGit(t, f.seed, "push", "-q", "origin", "main")
 		d := f.supervisor(0)
 		d.instances[0].cfg.Projects[0].IntegrationBranch = "main"
 

@@ -61,6 +61,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
@@ -288,15 +289,21 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	}
 	pr := prs[0]
 
-	// The base is the merge target, and it is read from the project's own config
-	// (the operator's per-repo PR base, else the project's integration branch).
+	// The base is the merge target, resolved with the SAME rule the phase driver
+	// briefs a session with (config.ResolvePRBase): the operator's per-repo
+	// pr_base, else the project's integration branch when origin has it, else
+	// origin's default branch, else the integration branch. Resolving it from
+	// config alone made the close-out refuse the very PRs the briefs asked for.
 	// The promotion branch is refused outright: a PR based on main is never
 	// merged here, because `staging -> main` (or `integration -> main`) is the
 	// operator's release, not a task delivery.
-	base := closeOutBase(cfg, slug, task.Repo)
-	if base == "" {
-		d.closeOutSay(key, "close-out: %s has no integration branch configured for %s - leaving it to the agent close-out", label, task.Repo)
-		return
+	res := closeOutBase(ctx, dir, cfg, slug, task.Repo)
+	base := res.Base
+	switch {
+	case res.Source == config.PRBaseOriginDefault:
+		d.closeOutSay(key+":base", "close-out: %s integrates on %q - origin's default branch, because %q is not on origin", label, base, res.Integration)
+	case res.Err != nil:
+		d.closeOutSay(key+":base", "close-out: %s origin could not be read to resolve its merge target (%v) - using the integration branch %q", label, res.Err, base)
 	}
 	if isPromotionBranch(base) {
 		d.closeOutSay(key, "close-out: %s integrates into %s, which is a release branch - promotion is the operator's, so approved tasks here are not merged by the fleet", label, base)
@@ -311,7 +318,11 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	// separate calls, and a PR retargeted between them must not be merged into the
 	// target the older read named.
 	if state.Base != "" && state.Base != base {
-		d.closeOutSay(key, "close-out: %s PR #%d targets %q, not the integration branch %q - a release-targeted PR is the operator's promotion; leaving it", label, state.Number, state.Base, base)
+		if isPromotionBranch(state.Base) {
+			d.closeOutSay(key, "close-out: %s PR #%d targets %q, a promotion branch, not the integration branch %q - a release-targeted PR is the operator's promotion; leaving it", label, state.Number, state.Base, base)
+		} else {
+			d.closeOutSay(key, "close-out: %s PR #%d targets %q, not the integration branch %q this project integrates on - refusing to merge a PR based on another branch; leaving it", label, state.Number, state.Base, base)
+		}
 		return
 	}
 
@@ -684,14 +695,15 @@ func checkCloseOutCheckout(dir, repo string) error {
 	return nil
 }
 
-// closeOutBase resolves the branch a task PR must target: the operator's per-repo
-// PR base when one is configured (the makesPDF plugins, whose PRs target
-// `integration`), else the project's integration branch (default `staging`).
-func closeOutBase(cfg *config.Config, slug, repo string) string {
-	if base := strings.TrimSpace(cfg.PRBaseFor(slug, repo)); base != "" {
-		return base
-	}
-	return strings.TrimSpace(cfg.IntegrationBranchFor(slug))
+// closeOutBase resolves the branch a task PR must target, with the SAME rule the
+// phase driver briefs a session with (config.ResolvePRBase): the operator's
+// per-repo pr_base, else the project's integration branch when origin has it, else
+// origin's default branch, else the integration branch. A close-out that judged a
+// PR against a branch the brief never named refused correct deliveries.
+func closeOutBase(ctx context.Context, dir string, cfg *config.Config, slug, repo string) config.PRBaseResolution {
+	return config.ResolvePRBase(cfg, slug, repo, func(integration string) (bool, string, error) {
+		return loop.ProbeOriginPRBase(ctx, dir, integration)
+	})
 }
 
 // isPromotionBranch reports whether a branch is a release line the fleet must never
