@@ -11,11 +11,12 @@ package supervisor
 // Almost none of that needs a model. For every supervised project that lets a
 // clanker integrate, this pass takes each approved-awaiting-merge task whose open
 // PR is MERGEABLE, carries a check rollup that ran and passed, and is based on the
-// project's integration branch, and does the mechanical rest:
+// integration branch the phase briefs resolve for that repo, and does the
+// mechanical rest:
 //
 //  1. CLAIM the task first. The claim is atomic and first-wins, so an agent
 //     close-out and this path can never both merge the same PR.
-//  2. Merge the PR as a MERGE COMMIT into the CONFIGURED integration branch. The
+//  2. Merge the PR as a MERGE COMMIT into that RESOLVED integration branch. The
 //     request names that branch and the judged head revision explicitly: a PR's
 //     own base can be retargeted by anyone with write access, and the merge must
 //     not follow it (a main-based merge is the operator's promotion, never a task
@@ -33,7 +34,7 @@ package supervisor
 //   - the project's dial says the operator integrates (`authorityIntegrate: human`);
 //   - no open PR, or more than one, for the task's recorded branch;
 //   - a PR based on `main`/`master` — the staging→main promotion is the operator's;
-//   - a judged PR whose base is missing or is not the configured integration
+//   - a judged PR whose base is missing or is not the resolved integration
 //     branch: an unproven merge target is never merged;
 //   - CONFLICTING, failing, pending, empty or unresolvable checks. CONFLICTING is
 //     the one stand-down that carries evidence: the conflicting paths, computed
