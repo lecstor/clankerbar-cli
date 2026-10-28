@@ -330,8 +330,8 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	switch state.Verdict {
 	case delivery.PRReady:
 		// Fail CLOSED on an unproven merge target: this path merges into one
-		// configured branch, so a judged read that names no base has not shown
-		// that the PR targets it. (JudgePR refuses such a read too; the guard is
+		// resolved branch, so a judged read that names no base has not shown that
+		// the PR targets it. (JudgePR refuses such a read too; the guard is
 		// repeated here because this is the only place a merge is authorised.)
 		if state.Base == "" {
 			d.closeOutSay(key, "close-out: %s PR #%d is ready but was judged with no base branch, so its merge target is not proven to be %q - leaving it to the agent close-out", label, state.Number, base)
