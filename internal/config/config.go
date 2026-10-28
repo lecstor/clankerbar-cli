@@ -520,9 +520,12 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
 	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
 	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
-	"submit_for_review(taskId, runId, outcome: ...), where the outcome MUST carry a " +
+	"submit_for_review(taskId, runId, outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
-	"session that leaves it out has not handed anything over. Ending this session while you still hold the " +
+	"session that leaves it out has not handed anything over. The same call's risk declaration uses touches: [] " +
+	"when it touches none of the project's risk classes, an omitted risk being UNDECLARED and buying no " +
+	"per-batch auto-approval; the vocabulary and the judging rule are in the served `finishing` reference and " +
+	"the project's risk_vocabulary (get_project_policy). Ending this session while you still hold the " +
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
@@ -921,9 +924,12 @@ const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
 // settled task would restart the release loop this task exists to kill.
 const noCodeReviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: if the task still sits in " +
 	"in_progress with its no-code delivery declared, hand it over with submit_for_review(taskId, runId, " +
-	"outcome: ...), where the outcome MUST carry a **Tests** section saying what you actually " +
+	"outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a **Tests** section saying what you actually " +
 	"verified - without one the plane REFUSES the call, so a session that leaves it out has not handed " +
-	"anything over. If phase 1 already settled the task (it left in_progress before this phase ran), the " +
+	"anything over. The same call's risk declaration uses touches: [] when it touches none of the project's risk " +
+	"classes, an omitted risk being UNDECLARED and buying no per-batch auto-approval; the vocabulary and the " +
+	"judging rule are in the served `finishing` reference and the project's risk_vocabulary (get_project_policy). " +
+	"If phase 1 already settled the task (it left in_progress before this phase ran), the " +
 	"handover already happened: verify the record reads honestly and end the session - do NOT re-open, " +
 	"release or re-settle the task. Ending this session while the task still needs the handover is this " +
 	"phase FAILING, not finishing. The ONLY exception is a declared handoff."
@@ -1691,10 +1697,13 @@ const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. 
 	"If NO MUST remains open: carry the hand-over in ONE call, AFTER confirming the branch is pushed (push " +
 	"any fix commit that is still local) and opening a PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder +
 	") if none exists for the branch: submit_for_review(taskId, runId, closeRound: <the round the append " +
-	"returned>). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
+	"returned>, risk: { touches: [...] }). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
 	"the task leaves in_progress this run can no longer close the round. Do NOT send an outcome in that call: " +
 	"your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), and the fix " +
-	"phase has already written the **Tests** section the in_review guard reads. Never decide to run one more " +
+	"phase has already written the **Tests** section the in_review guard reads. The same call's risk declaration " +
+	"uses touches: [] when it touches none of the project's risk classes, an omitted risk being UNDECLARED and " +
+	"buying no per-batch auto-approval; the vocabulary and the judging rule are in the served `finishing` " +
+	"reference and the project's risk_vocabulary (get_project_policy). Never decide to run one more " +
 	"round yourself."
 
 // noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
@@ -1719,9 +1728,13 @@ const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the p
 	"same disposition the round cap gives the id-based shape. If the task already left in_progress, do NOT " +
 	"re-open it: leave your block as the record and end.\n\n" +
 	"If NO MUST remains open: hand the task over. If it still sits in_progress with its no-code delivery " +
-	"declared, move it with submit_for_review(taskId, runId) — do NOT send an outcome in " +
+	"declared, move it with submit_for_review(taskId, runId, risk: { touches: [...] }) — do NOT send an outcome in " +
 	"that call; your block write already landed and the fix phase wrote the **Tests** section the in_review " +
-	"guard reads. If it already left in_progress, the hand-over already happened: verify the record reads " +
+	"guard reads. The same call's risk declaration uses touches: [] when it touches none of the project's risk " +
+	"classes, an omitted risk being UNDECLARED and buying no per-batch auto-approval; the vocabulary and the " +
+	"judging rule are in the served `finishing` reference and the project's risk_vocabulary " +
+	"(get_project_policy). If it already left " +
+	"in_progress, the hand-over already happened: verify the record reads " +
 	"honestly and end. Never decide to run one more round yourself."
 
 // verifyBrief is the fix-verification round (CLA-638): review the fix delta plus

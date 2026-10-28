@@ -723,7 +723,8 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 
 	for _, want := range []string{
 		// The call, by name, with the arguments the plane actually requires.
-		"submit_for_review(taskId, runId, outcome: ...)",
+		// The risk argument is pinned by TestEveryHandoverBriefDeclaresRisk.
+		"submit_for_review(taskId, runId, outcome: ...",
 		// The outcome requirement, which the brief omitted entirely before this —
 		// a second way to end one call short, since the plane refuses an outcome
 		// with no Tests section and a session can read that refusal as "done".
@@ -848,8 +849,9 @@ func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
 		"evidenced by the PLANE'S RECORD",
 		// The successor is not told to treat the empty branch as a failure.
 		"NOT a failed hand-off",
-		// The terminal step: the handover, with the outcome's Tests section.
-		"submit_for_review(taskId, runId, outcome: ...)",
+		// The terminal step: the handover, with the outcome's Tests section. The
+		// risk argument is pinned by TestEveryHandoverBriefDeclaresRisk.
+		"submit_for_review(taskId, runId, outcome: ...",
 		"**Tests**",
 		"REFUSES",
 		// The form-(b) case where phase 1 already settled the task.
@@ -885,6 +887,124 @@ func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
 	}
 	if strings.Contains(cont, "Open a PR") {
 		t.Errorf("NoCodeHandoffContinuation carries the branch-shaped PR step:\n%s", cont)
+	}
+}
+
+// CLA-822: every hand-over a built-in brief prescribes must DECLARE the
+// change's risk. The plane reads risk: { touches: [...] } before it will
+// auto-approve a batch, and an omitted argument is UNDECLARED - so a brief that
+// leaves it out parks every CLI-driven hand-over at a per-task human verdict,
+// which is the gate the declaration exists to open.
+//
+// Pinned in two directions, because either half alone is satisfiable by a brief
+// that says the words without passing them: each submit_for_review call in the
+// shipped text carries the argument, and each text that carries a call also
+// tells the session what [] means and what an omission costs.
+func TestEveryHandoverBriefDeclaresRisk(t *testing.T) {
+	briefs := map[string]string{
+		"implement":                           builtinPhasePrompts[ImplementPhaseName],
+		"review":                              builtinPhasePrompts[ReviewPhaseName],
+		"fix":                                 builtinPhasePrompts[FixPhaseName],
+		"verify":                              builtinPhasePrompts[VerifyPhaseName],
+		"review-only":                         reviewOnlyBrief,
+		"unverified review-only":              unverifiedReviewOnlyBrief,
+		"no-code review":                      noCodeReviewBrief,
+		"no-code review-only":                 noCodeReviewOnlyBrief,
+		"panel member review-only":            panelMemberReviewOnlyBrief,
+		"unverified panel member review-only": panelMemberUnverifiedReviewOnlyBrief,
+		"fix-verify":                          fixVerifyBrief,
+		"no-code fix":                         noCodeFixBrief,
+		"no-code fix-verify":                  noCodeFixVerifyBrief,
+		"no-code verify":                      noCodeVerifyBrief,
+		"unverified review brief":             unverifiedReviewBrief,
+		"review terminal step":                reviewTerminalStep,
+		"review-only terminal step":           reviewOnlyTerminalStep,
+		"panel member terminal step":          panelMemberTerminalStep,
+		"no-code review terminal step":        noCodeReviewTerminalStep,
+		"no-code review-only terminal step":   noCodeReviewOnlyTerminalStep,
+		"fix only terminal step":              fixOnlyTerminalStep,
+		"no-code fix only terminal step":      noCodeFixOnlyTerminalStep,
+		"verify terminal step":                verifyTerminalStep,
+		"no-code verify terminal step":        noCodeVerifyTerminalStep,
+	}
+	calls := 0
+	for name, brief := range briefs {
+		spans, ok := submitForReviewCalls(brief)
+		if !ok {
+			t.Errorf("the %s has an unbalanced submit_for_review( call:\n%s", name, brief)
+			continue
+		}
+		for _, span := range spans {
+			calls++
+			if !strings.Contains(span, "risk: { touches:") {
+				t.Errorf("the %s calls submit_for_review without a risk declaration (%s), so its hand-over is UNDECLARED:\n%s", name, span, brief)
+			}
+		}
+	}
+	// A scan that found no calls at all would pass vacuously - the mutation this
+	// test exists to catch (the argument silently dropped from every brief) must
+	// still leave the calls themselves in place, but a refactor that moved the
+	// call out of these texts would otherwise disarm the pin.
+	if calls < 4 {
+		t.Fatalf("only %d submit_for_review call(s) found across the shipped briefs; expected at least 4 (review, no-code review, verify, no-code verify)", calls)
+	}
+
+	// The four texts that carry a call also carry the rules a session needs to
+	// fill the argument in: the empty declaration in its schema shape, what an
+	// omission costs, and where the vocabulary and judging rule live. Checked on
+	// the text rather than the call span because they are prose, not arguments.
+	for name, text := range map[string]string{
+		"review terminal step":         reviewTerminalStep,
+		"no-code review terminal step": noCodeReviewTerminalStep,
+		"verify terminal step":         verifyTerminalStep,
+		"no-code verify terminal step": noCodeVerifyTerminalStep,
+	} {
+		for _, want := range []string{
+			"risk: { touches: [...] }",
+			"touches: []",
+			"none of the project's risk classes",
+			"UNDECLARED",
+			"per-batch auto-approval",
+			"`finishing` reference",
+			"risk_vocabulary",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the %s does not say %q, so a session cannot fill the declaration in:\n%s", name, want, text)
+			}
+		}
+	}
+}
+
+// submitForReviewCalls returns the argument text of every submit_for_review(…)
+// call in brief, with parentheses matched. ok is false when a call's parentheses
+// do not balance, so a malformed call fails the pin instead of being silently
+// truncated at the end of the brief.
+func submitForReviewCalls(brief string) (spans []string, ok bool) {
+	const call = "submit_for_review("
+	for rest := brief; ; {
+		i := strings.Index(rest, call)
+		if i < 0 {
+			return spans, true
+		}
+		rest = rest[i+len(call):]
+		depth, end := 1, -1
+		for j := 0; j < len(rest); j++ {
+			switch rest[j] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
+			if depth == 0 {
+				end = j
+				break
+			}
+		}
+		if end < 0 {
+			return spans, false
+		}
+		spans = append(spans, rest[:end])
+		rest = rest[end+1:]
 	}
 }
 
@@ -1081,7 +1201,7 @@ func TestNoBriefNamesTheRemovedUpdateTaskTool(t *testing.T) {
 		"fix":                      {"record_review(taskId, runId, {findingUpdates:"},
 		"fix-verify":               {"record_review(taskId, runId, {findingUpdates:"},
 		"verify":                   {"record_review(taskId, runId, {findingUpdates:", "submit_for_review(taskId, runId, closeRound:"},
-		"no-code verify":           {"record_progress(taskId, runId, outcome: ...)", "settle_task(taskId, runId,", "submit_for_review(taskId, runId)"},
+		"no-code verify":           {"record_progress(taskId, runId, outcome: ...)", "settle_task(taskId, runId,", "submit_for_review(taskId, runId, risk:"},
 		"implement close-out rule": {},
 	} {
 		src := briefs[name]
@@ -2143,7 +2263,7 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 		"no durable record",
 		"no plane finding ids",
 		"the LAST",
-		"submit_for_review(taskId, runId)",
+		"submit_for_review(taskId, runId, risk: { touches: [...] })",
 		`disposition: "parked"`,
 		"do NOT open a PR",
 	} {
