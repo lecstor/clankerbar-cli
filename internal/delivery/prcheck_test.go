@@ -190,16 +190,17 @@ func ghSections(t *testing.T, record string) map[string][]string {
 }
 
 // wantProbeOwner pins the credential probe: it ran exactly once and asked gh
-// for owner's token. The header count comes from the raw record, because
-// ghSections would hide a second probe behind its last-wins sections; the
-// recorded argv is what proves the flag and the argument shape.
+// for owner's token at github.com. The header count comes from the raw record,
+// because ghSections would hide a second probe behind its last-wins sections;
+// the recorded argv is what proves the flag and the argument shape. `--hostname`
+// is part of the pin because without it gh answers for its DEFAULT host.
 func wantProbeOwner(t *testing.T, record, owner string) {
 	t.Helper()
 	if n := strings.Count(ghRecord(t, record), "=== auth token"); n != 1 {
 		t.Errorf("the credential probe ran %d times; want exactly 1", n)
 	}
 	probe := ghSections(t, record)["auth token"]
-	want := "argv=auth token --user " + owner
+	want := "argv=auth token --user " + owner + " --hostname " + githubHost
 	if len(probe) != 1 || probe[0] != want {
 		t.Errorf("credential probe asked %v; want exactly [%s]", probe, want)
 	}
