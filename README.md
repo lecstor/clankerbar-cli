@@ -886,8 +886,10 @@ PR retargeted after the judgement cannot be merged into `main`; its verification
 and conflict reads run in a throwaway clone, never in the checkout the fleet's
 sessions share. The base is resolved with the same rule the phase briefs use
 (`pr_base`, else the integration branch when origin has it, else origin's
-default), so a session and the close-out cannot disagree about a repo's merge
-target and refuse a correct PR as release-targeted.
+default, else the integration branch again when no probe could run — the
+`pr_base` section below carries the full rule), so a session and the close-out
+cannot disagree about a repo's merge target and refuse a correct PR as
+release-targeted.
 
 **A conflict gets a short dedicated session, not the next clanker's full one.**
 A CONFLICTING PR used to wait for whichever clanker finished its current task — a
