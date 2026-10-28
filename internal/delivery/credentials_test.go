@@ -274,3 +274,78 @@ func TestOwnerWithoutGhTokenFallsBackUnscoped(t *testing.T) {
 		}
 	}
 }
+
+// The probe that ANSWERS "what is this owner's token" must not itself inherit
+// the ambient credential. gh reads only its keyring and hosts.yml today, but
+// that is an upstream implementation detail: if it ever consulted GH_TOKEN,
+// this spawn would answer with the ACTIVE account's token and the scoping
+// built on it would silently no-op — invisible to every other test here,
+// whose fakes answer from their own variable and ignore the ambient one.
+func TestTokenProbeStripsAmbientCredentials(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(t.TempDir(), "probe-record.log")
+	t.Setenv("PROBE_RECORD", record)
+	t.Setenv("GH_TOKEN", "ambient-decoy-not-the-owners")
+	t.Setenv("GITHUB_TOKEN", "ambient-github-decoy")
+
+	gh := filepath.Join(t.TempDir(), "gh")
+	writeFile(t, gh, `#!/bin/sh
+printf 'GH_TOKEN=%s\n' "${GH_TOKEN-UNSET}" >> "$PROBE_RECORD"
+printf 'GITHUB_TOKEN=%s\n' "${GITHUB_TOKEN-UNSET}" >> "$PROBE_RECORD"
+printf '%s\n' '`+credFakeToken+`'
+`)
+	if err := os.Chmod(gh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The probe must still answer, or it is only possible to pass this test by
+	// making the spawn fail rather than by stripping anything.
+	if got := TokenForOwner(context.Background(), dir, gh, "acme"); got != credFakeToken {
+		t.Fatalf("probe must still answer the owner's token, got %q", got)
+	}
+
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("probe record missing - the fake gh never ran: %v", err)
+	}
+	for _, want := range []string{"GH_TOKEN=UNSET", "GITHUB_TOKEN=UNSET"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("probe child carried the ambient credential: want %s, env was:\n%s", want, body)
+		}
+	}
+}
+
+// TestTokenProbeNamesItsHost pins the probe's argv. `gh auth token` without
+// --hostname answers for gh's DEFAULT host, which on a GHES-configured machine
+// is a different account's token; the owner is a github.com account by
+// construction, so the probe must say so. The exact string also keeps --user at
+// $3/$4 - the position every fake gh in this package reads the account from,
+// and gh's own "no oauth token ... account X" text echoes.
+func TestTokenProbeNamesItsHost(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(t.TempDir(), "probe-argv.log")
+	t.Setenv("PROBE_RECORD", record)
+
+	gh := filepath.Join(t.TempDir(), "gh")
+	writeFile(t, gh, `#!/bin/sh
+printf '%s\n' "$*" >> "$PROBE_RECORD"
+printf '%s\n' '`+credFakeToken+`'
+`)
+	if err := os.Chmod(gh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A failing spawn would pass an argv assertion for the wrong reason.
+	if got := TokenForOwner(context.Background(), dir, gh, "acme"); got != credFakeToken {
+		t.Fatalf("probe must answer the owner's token, got %q", got)
+	}
+
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("probe record missing - the fake gh never ran: %v", err)
+	}
+	const want = "auth token --user acme --hostname " + githubHost
+	if got := strings.TrimSpace(string(body)); got != want {
+		t.Errorf("probe must pin its host, and keep --user at $3/$4:\n want %q\n  got %q", want, got)
+	}
+}
