@@ -374,7 +374,9 @@ printf '%s\n' '`+credFakeToken+`'
 	if err != nil {
 		t.Fatalf("probe record missing - the fake gh never ran: %v", err)
 	}
-	const want = "auth token --user acme --hostname " + githubHost
+	// The literal host, not githubHost: a test that reads the constant moves with
+	// a drift of it and stays green.
+	const want = "auth token --user acme --hostname github.com"
 	if got := strings.TrimSpace(string(body)); got != want {
 		t.Errorf("probe must pin its host, and keep --user at $3/$4:\n want %q\n  got %q", want, got)
 	}

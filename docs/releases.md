@@ -88,6 +88,18 @@ workflows stay on GitHub-hosted runners - `promote.yml`, `release-on-merge.yml`,
 `realign-staging.yml` and `release.yml` publish releases or hold tokens, and they run
 rarely enough not to be what spends the allowance.
 
+Moving the job here also moves a trust boundary. It checks out the PR's branch and
+`go test -race` compiles and executes that branch's own test code on a persistent
+container, whose installed toolchain, apt state and caches survive between jobs and are
+inherited by later runs - including the push runs on `main` and `staging` whose `ci` the
+release and realign gates read. The job holds only the run-scoped `contents: read`
+`GITHUB_TOKEN`, so there is no long-lived credential in reach, and the runner is
+registered to this repo alone - but any collaborator who can open a PR can reach this
+box's CI execution path, so the check's result is only as trustworthy as every branch
+that has ever run on it. Keep the container isolated from the fleet's own state and
+credentials: no host mounts, no long-lived secrets, and rebuild it periodically (or run
+it ephemeral) so a PR cannot persist into later checks.
+
 Two things to know before waiting on a check:
 
 - **It takes one job at a time**, capped at 2 CPUs and 4 GB. Two PRs pushed together
@@ -95,10 +107,18 @@ Two things to know before waiting on a check:
   image - so allow more wall-clock, not less. The job carries a 20-minute timeout, so a
   hang cannot hold the only slot for GitHub's six-hour default.
 - **If the runner is offline** - the box down, the container stopped, the runner
-  unregistered - jobs **queue** and report nothing. `ci` is a required check on `main`
-  and `staging`, so nothing merges until it runs, and GitHub cancels a job still queued
-  after 24 hours. A PR whose check never appears is this, not a red build: look for the
-  runner rather than re-pushing.
+  unregistered - jobs **queue** and report nothing for as long as it stays offline.
+  `ci` is a required check on `main` and `staging`, so nothing merges until it runs. A
+  PR whose check never appears is this, not a red build: look for the runner rather than
+  re-pushing.
+
+The one-slot queue also lengthens the wait for the two workflows gated on `ci` for the
+merge commit on `main`: `release-on-merge.yml` and `realign-staging.yml` both run
+`await-check --required ci` against `${{ github.sha }}`, and that window now covers the
+queued jobs ahead of this one as well as the job itself. Both allow 60 minutes
+(`--timeout 60m` inside a 75-minute job), widened from the 30 minutes that sufficed when
+`ci` was a parallel hosted run. A `ci` job hung behind a queued one can still exhaust the
+window; when it does, publishing is refused and `staging` is not fast-forwarded.
 
 That image is Ubuntu `actions-runner`, not the GitHub-hosted image, so a step needing a
 preinstalled tool must install it. `ci.yml` conditionally apt-installs `zstd` (what
