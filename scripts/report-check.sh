@@ -18,9 +18,9 @@
 # job's own conclusion, so a reporting step that could fail would be able to contradict
 # itself: `job.status` is read at the start of the step, a POST that then failed would
 # leave the plane holding "success" while GitHub turned the check red - two surfaces
-# disagreeing about one run, with the optimistic one stored. Every path here exits 0, and
-# every problem is an `::warning::` (an annotation on the run, not a silent skip) plus a
-# `report-check:` line. A dropped report costs evidence and so leaves the task at
+# disagreeing about one run, with the optimistic one stored. Every path here exits 0. A
+# failed POST is an `::warning::` annotation; a skip (no key, no jq/curl, nothing to report)
+# is a `report-check:` log line. A dropped report costs evidence and so leaves the task at
 # `in_review` for a human, which is the safe direction; a red `ci` because the plane had a
 # bad minute is not.
 #

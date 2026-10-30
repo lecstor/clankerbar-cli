@@ -95,9 +95,13 @@ inherited by later runs - including the push runs on `main` and `staging` whose 
 release and realign gates read. The job holds the run-scoped `contents: read`
 `GITHUB_TOKEN` and, on pull requests, the report-only `CLANKERBAR_REPORT_KEY` in its last
 step's environment. That key is long-lived but can do one thing: post a check outcome to
-the plane. A branch that persisted code into the container could read it and post a false
-green, which under the per-batch policy can auto-approve a CLI task; the promotion PR's
-human review is what still stands between that and a release. The runner is
+the plane. It does not need persisted code to reach it: a `pull_request` run uses the PR's
+own `ci.yml` and `scripts/report-check.sh`, so any same-repo branch can change them to
+print the key or post `success` for its own head. The key is project-scoped, not
+repo-scoped, so it can post for the plane repo's tasks too. A false green satisfies the CI
+arm of auto-approval (the other arms still apply), so a green report is only as
+trustworthy as the review of changes to those two files; the promotion PR's human review
+is what stands between it and a release. The runner is
 registered to this repo alone - but any collaborator who can open a PR can reach this
 box's CI execution path, so the check's result is only as trustworthy as every branch
 that has ever run on it. Keep the container isolated from the fleet's own state and
