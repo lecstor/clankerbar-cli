@@ -11,11 +11,12 @@ package supervisor
 // Almost none of that needs a model. For every supervised project that lets a
 // clanker integrate, this pass takes each approved-awaiting-merge task whose open
 // PR is MERGEABLE, carries a check rollup that ran and passed, and is based on the
-// project's integration branch, and does the mechanical rest:
+// integration branch the phase briefs resolve for that repo, and does the
+// mechanical rest:
 //
 //  1. CLAIM the task first. The claim is atomic and first-wins, so an agent
 //     close-out and this path can never both merge the same PR.
-//  2. Merge the PR as a MERGE COMMIT into the CONFIGURED integration branch. The
+//  2. Merge the PR as a MERGE COMMIT into that RESOLVED integration branch. The
 //     request names that branch and the judged head revision explicitly: a PR's
 //     own base can be retargeted by anyone with write access, and the merge must
 //     not follow it (a main-based merge is the operator's promotion, never a task
@@ -33,7 +34,7 @@ package supervisor
 //   - the project's dial says the operator integrates (`authorityIntegrate: human`);
 //   - no open PR, or more than one, for the task's recorded branch;
 //   - a PR based on `main`/`master` — the staging→main promotion is the operator's;
-//   - a judged PR whose base is missing or is not the configured integration
+//   - a judged PR whose base is missing or is not the resolved integration
 //     branch: an unproven merge target is never merged;
 //   - CONFLICTING, failing, pending, empty or unresolvable checks. CONFLICTING is
 //     the one stand-down that carries evidence: the conflicting paths, computed
@@ -61,6 +62,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
+	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
@@ -82,6 +84,20 @@ const (
 	// dozen clean close-outs, and everything past it waits for the next poll.
 	closeOutPassBudget = 2 * time.Minute
 )
+
+// closeOutBaseProbeTimeout bounds the close-out's own origin probe. The driver
+// gives its probe 30s (loop.prBaseProbeTimeout) because a phase spawn has nothing
+// else to do; a close-out shares its 90s task budget with the PR judgement, the
+// claim and the merge check, so one unreachable origin must not be able to spend a
+// third of it and get the task cancelled mid-flight. A few seconds is ample for the
+// one ls-remote, and a probe that cannot answer in that time is exactly the
+// fallback ResolvePRBase already handles. A var so a test can shrink it rather
+// than wait the real bound out, the same discipline loop.prBaseProbeTimeout keeps.
+var closeOutBaseProbeTimeout = 5 * time.Second
+
+// closeOutOriginProbe is the origin read closeOutBases resolves through; a var so
+// a test can count or stall the probes a pass makes without a wrapper on PATH.
+var closeOutOriginProbe = loop.ProbeOriginPRBase
 
 // reconcileCloseOuts is the pass body. The supervisor runs it on its own goroutine
 // (startCloseOutPass) and a test drives it directly.
@@ -171,11 +187,14 @@ func (d *Supervisor) waitCloseOut() {
 func (d *Supervisor) runCloseOutPass(targets []closeOutTarget) {
 	ctx := d.baseCtx()
 	budget := time.Now().Add(closeOutPassBudget)
+	// One base cache per pass: every task of the same repo resolves the same
+	// branch, so probing origin per task is the same answer at N times the cost.
+	bases := newCloseOutBases()
 	for _, t := range targets {
 		if ctx.Err() != nil || time.Now().After(budget) {
 			return
 		}
-		d.reconcileCloseOutProject(ctx, t.cfg, t.slug, budget)
+		d.reconcileCloseOutProject(ctx, t.cfg, t.slug, budget, bases)
 	}
 }
 
@@ -200,8 +219,8 @@ func closeOutProjects(cfg *config.Config) []string {
 // reconcileCloseOutProject stands the pass up or down for one project, then works
 // its approved queue. ctx is the pass's own (the supervisor lifetime): a fleet stop
 // cancels it, and every call below therefore aborts rather than finishing out its
-// timeout.
-func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.Config, slug string, budget time.Time) {
+// timeout. bases carries the pass's memoised PR bases.
+func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.Config, slug string, budget time.Time, bases *closeOutBases) {
 	client := d.closeOutFor(cfg, slug)
 	if client == nil {
 		d.closeOutSay("client:"+slug, "close-out %s: no plane endpoint could be resolved - standing down", slug)
@@ -240,14 +259,14 @@ func (d *Supervisor) reconcileCloseOutProject(ctx context.Context, cfg *config.C
 			d.closeOutSay("budget:"+slug, "close-out %s: this poll's close-out budget is spent - the remaining approved tasks wait for the next poll", slug)
 			return
 		}
-		d.reconcileCloseOutTask(ctx, cfg, slug, client, task)
+		d.reconcileCloseOutTask(ctx, cfg, slug, client, task, bases)
 	}
 }
 
 // reconcileCloseOutTask takes one approved task as far as the deterministic path
 // can, and says why it stopped otherwise. parent is the pass's cancellable context:
 // a fleet stop aborts this task's judgement, claim and merge.
-func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.Config, slug string, client plane.CloseOutAPI, task plane.CloseOutTask) {
+func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.Config, slug string, client plane.CloseOutAPI, task plane.CloseOutTask, bases *closeOutBases) {
 	label := strings.TrimSpace(task.Ref)
 	if label == "" {
 		label = task.ID
@@ -288,15 +307,23 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	}
 	pr := prs[0]
 
-	// The base is the merge target, and it is read from the project's own config
-	// (the operator's per-repo PR base, else the project's integration branch).
+	// The base is the merge target, resolved with the SAME rule the phase driver
+	// briefs a session with (config.ResolvePRBase): the operator's per-repo
+	// pr_base, else the project's integration branch when origin has it, else
+	// origin's default branch, else the integration branch. Resolving it from
+	// config alone made the close-out refuse the very PRs the briefs asked for.
+	// The pass memoises the answer per repo (closeOutBases), so a queue of tasks
+	// in one repo probes origin once; the line is per repo for the same reason.
 	// The promotion branch is refused outright: a PR based on main is never
 	// merged here, because `staging -> main` (or `integration -> main`) is the
 	// operator's release, not a task delivery.
-	base := closeOutBase(cfg, slug, task.Repo)
-	if base == "" {
-		d.closeOutSay(key, "close-out: %s has no integration branch configured for %s - leaving it to the agent close-out", label, task.Repo)
-		return
+	res := bases.resolve(ctx, dir, cfg, slug, task.Repo)
+	base := res.Base
+	switch {
+	case res.Source == config.PRBaseOriginDefault:
+		d.closeOutSay("base:"+slug+":"+task.Repo, "close-out: %s integrates on %q - origin's default branch, because %q is not on origin", task.Repo, base, res.Integration)
+	case res.Err != nil:
+		d.closeOutSay("base:"+slug+":"+task.Repo, "close-out: %s origin could not be read to resolve its merge target (%v) - using the integration branch %q", task.Repo, res.Err, base)
 	}
 	if isPromotionBranch(base) {
 		d.closeOutSay(key, "close-out: %s integrates into %s, which is a release branch - promotion is the operator's, so approved tasks here are not merged by the fleet", label, base)
@@ -311,15 +338,19 @@ func (d *Supervisor) reconcileCloseOutTask(parent context.Context, cfg *config.C
 	// separate calls, and a PR retargeted between them must not be merged into the
 	// target the older read named.
 	if state.Base != "" && state.Base != base {
-		d.closeOutSay(key, "close-out: %s PR #%d targets %q, not the integration branch %q - a release-targeted PR is the operator's promotion; leaving it", label, state.Number, state.Base, base)
+		if isPromotionBranch(state.Base) {
+			d.closeOutSay(key, "close-out: %s PR #%d targets %q, a promotion branch, not this project's merge target %q - a release-targeted PR is the operator's promotion; leaving it", label, state.Number, state.Base, base)
+		} else {
+			d.closeOutSay(key, "close-out: %s PR #%d targets %q, not this project's merge target %q - refusing to merge a PR based on another branch; leaving it", label, state.Number, state.Base, base)
+		}
 		return
 	}
 
 	switch state.Verdict {
 	case delivery.PRReady:
 		// Fail CLOSED on an unproven merge target: this path merges into one
-		// configured branch, so a judged read that names no base has not shown
-		// that the PR targets it. (JudgePR refuses such a read too; the guard is
+		// resolved branch, so a judged read that names no base has not shown that
+		// the PR targets it. (JudgePR refuses such a read too; the guard is
 		// repeated here because this is the only place a merge is authorised.)
 		if state.Base == "" {
 			d.closeOutSay(key, "close-out: %s PR #%d is ready but was judged with no base branch, so its merge target is not proven to be %q - leaving it to the agent close-out", label, state.Number, base)
@@ -684,14 +715,44 @@ func checkCloseOutCheckout(dir, repo string) error {
 	return nil
 }
 
-// closeOutBase resolves the branch a task PR must target: the operator's per-repo
-// PR base when one is configured (the makesPDF plugins, whose PRs target
-// `integration`), else the project's integration branch (default `staging`).
-func closeOutBase(cfg *config.Config, slug, repo string) string {
-	if base := strings.TrimSpace(cfg.PRBaseFor(slug, repo)); base != "" {
-		return base
+// closeOutBases memoises each repo's resolved PR base for the lifetime of ONE
+// pass. The probe is three process spawns and a network round-trip, and the
+// supervisor starts a pass on every roster poll, so an approved queue of N tasks
+// in one repo must not pay it N times - the answer is the same for every task of
+// that repo. A failed probe is memoised too: the pass has already learned it
+// cannot read origin, and retrying it per task would spend the same timeout N
+// times over. A pass works its queue on one goroutine, so the map needs no lock.
+// The zero value is not usable; build one with newCloseOutBases.
+type closeOutBases struct {
+	seen map[string]config.PRBaseResolution
+}
+
+func newCloseOutBases() *closeOutBases {
+	return &closeOutBases{seen: map[string]config.PRBaseResolution{}}
+}
+
+// resolve is the branch a task PR must target, with the SAME rule the phase
+// driver briefs a session with (config.ResolvePRBase): the operator's per-repo
+// pr_base, else the project's integration branch when origin has it, else origin's
+// default branch, else the integration branch. A close-out that judged a PR
+// against a branch the brief never named refused correct deliveries.
+//
+// The probe gets the close-out's own short bound, never the driver's 30s one: it
+// runs inside a task budget shared with the PR judgement, the claim and the merge
+// check. Only the first task of a repo pays it; the rest read the memo.
+func (c *closeOutBases) resolve(ctx context.Context, dir string, cfg *config.Config, slug, repo string) config.PRBaseResolution {
+	integration := cfg.IntegrationBranchFor(slug)
+	key := slug + "\x00" + repo + "\x00" + integration
+	if res, ok := c.seen[key]; ok {
+		return res
 	}
-	return strings.TrimSpace(cfg.IntegrationBranchFor(slug))
+	res := config.ResolvePRBase(cfg, slug, repo, func(integration string) (bool, string, error) {
+		pctx, cancel := context.WithTimeout(ctx, closeOutBaseProbeTimeout)
+		defer cancel()
+		return closeOutOriginProbe(pctx, dir, integration)
+	})
+	c.seen[key] = res
+	return res
 }
 
 // isPromotionBranch reports whether a branch is a release line the fleet must never

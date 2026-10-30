@@ -182,8 +182,9 @@ only the newest record's findings.
 
 The stopping rule is a bar, not a feeling: the gate is **no open MUST**. A
 verification round that ends with none carries the terminal step — push check,
-PR, and a hand-over. That is ONE call: `submit_for_review(…, closeRound: …)`
-carries the round close in the same atomic write that moves the task to
+PR, and a hand-over. That is ONE call:
+`submit_for_review(…, closeRound: …, risk: { touches: […] })` carries the round
+close in the same atomic write that moves the task to
 `in_review`, so the order that used to be load-bearing is now the plane's own
 guard rather than two client calls. The plane refuses a sealed holder's outcome
 write, so no outcome is sent on that call. The fix phase has already written
@@ -880,10 +881,15 @@ successful claim that cannot be finished releases it, so the task goes back to
 `approved` rather than being left held — with one exception: a merge that LANDED
 but whose ancestry could not be verified is closed `done` with `mergeVerified:
 false`, because the PR is no longer open and a release would strand the task.
-The merge itself names the configured base and the judged head revision, so a
+The merge itself names the resolved base and the judged head revision, so a
 PR retargeted after the judgement cannot be merged into `main`; its verification
 and conflict reads run in a throwaway clone, never in the checkout the fleet's
-sessions share.
+sessions share. The base is resolved with the same rule the phase briefs use
+(`pr_base`, else the integration branch when origin has it, else origin's
+default, else the integration branch again when no probe could run — the
+`pr_base` section below carries the full rule), so a session and the close-out
+cannot disagree about a repo's merge target and refuse a correct PR as
+release-targeted.
 
 **A conflict gets a short dedicated session, not the next clanker's full one.**
 A CONFLICTING PR used to wait for whichever clanker finished its current task — a
@@ -1520,7 +1526,10 @@ because the pause is the one time that poll and session cadences both stop:
   basename, e.g. `Jasons-MBP/clanker1`, so several daemons started from
   different configs on one host stay distinct; set `instance_name` to override),
   the host and binary version, a
-  fingerprint of the config in force, and the state — `idle`,
+  fingerprint of each project's own effective config (the stored run-config
+  document when one is ratified, else the local file), so a ratified document
+  that changes what the project runs on moves it — and
+  the state — `idle`,
   `iteration` {n, taskRef, phase} while a session runs, `draining` while a pause
   holds spawns, `limited` {resetAt} while the run is parked on a harness usage
   limit (with the stated reset instant when the harness stated one), `stopping`
@@ -2277,8 +2286,18 @@ stored document: `--model` on the command line wins over a ratified value.
 Import today's file as the starting point with:
 
 ```sh
-clankerbar propose-config            # --slug <project> when projects[] names several
+clankerbar propose-config                       # this config's own project
+clankerbar propose-config --slug other-project  # record it against another project
+clankerbar propose-config --slug beta           # required when projects[] names several
 ```
+
+`--slug` selects the project the proposal is recorded against and defaults to
+this config's own project (its `projects[]` entry when it declares one, otherwise
+the `/mcp/<slug>` in its wiring). When the config drives at most one project, a
+name it does not declare is still honoured — the plane membership-gates
+`/mcp/<slug>` — so `--slug` redirects a single-project config's proposal rather
+than merely disambiguating it. When `projects[]` names several, `--slug` is
+required and must name one of them.
 
 That records a PENDING proposal; nothing changes until you ratify it in the
 console (Settings -> Run configuration). The pipeline travels with it — `prompt`,

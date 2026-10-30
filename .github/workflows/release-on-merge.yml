@@ -40,7 +40,10 @@ jobs:
   gate:
     name: gate and derive
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    # Covers the 60-minute `await-check` below plus checkout and setup. `ci` runs
+    # on the one-slot self-hosted runner, so that wait includes the jobs queued
+    # ahead of the merge commit's run, not just the run itself.
+    timeout-minutes: 75
     permissions:
       contents: read
       # REQUIRED, and its absence fails in a way that looks like something else.
@@ -138,6 +141,11 @@ jobs:
       # FAILURE, never to a pass: an absent or never-finishing check refuses the
       # release exactly as a red one does. That rule is pinned by tests in
       # internal/release/checks_test.go, not asserted by this comment.
+      #
+      # 60 minutes, not one job's runtime: `ci` runs on the one-slot self-hosted
+      # runner, so the wait also covers the jobs queued ahead of this commit's run
+      # (ci.yml caps each at 20 minutes). Narrowing it lets a busy runner refuse a
+      # release that was never red.
       - name: Require a green ci on the merge commit
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -146,7 +154,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --sha "${{ github.sha }}" \
             --required ci \
-            --timeout 30m \
+            --timeout 60m \
             --interval 15s
 
       # ── THE DERIVATION ─────────────────────────────────────────────────────

@@ -723,7 +723,8 @@ func TestReviewBriefStatesItsTerminalStep(t *testing.T) {
 
 	for _, want := range []string{
 		// The call, by name, with the arguments the plane actually requires.
-		"submit_for_review(taskId, runId, outcome: ...)",
+		// The risk argument is pinned by TestEveryHandoverBriefDeclaresRisk.
+		"submit_for_review(taskId, runId, outcome: ...",
 		// The outcome requirement, which the brief omitted entirely before this —
 		// a second way to end one call short, since the plane refuses an outcome
 		// with no Tests section and a session can read that refusal as "done".
@@ -848,8 +849,9 @@ func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
 		"evidenced by the PLANE'S RECORD",
 		// The successor is not told to treat the empty branch as a failure.
 		"NOT a failed hand-off",
-		// The terminal step: the handover, with the outcome's Tests section.
-		"submit_for_review(taskId, runId, outcome: ...)",
+		// The terminal step: the handover, with the outcome's Tests section. The
+		// risk argument is pinned by TestEveryHandoverBriefDeclaresRisk.
+		"submit_for_review(taskId, runId, outcome: ...",
 		"**Tests**",
 		"REFUSES",
 		// The form-(b) case where phase 1 already settled the task.
@@ -885,6 +887,124 @@ func TestNoCodeReviewBriefStatesItsShape(t *testing.T) {
 	}
 	if strings.Contains(cont, "Open a PR") {
 		t.Errorf("NoCodeHandoffContinuation carries the branch-shaped PR step:\n%s", cont)
+	}
+}
+
+// CLA-822: every hand-over a built-in brief prescribes must DECLARE the
+// change's risk. The plane reads risk: { touches: [...] } before it will
+// auto-approve a batch, and an omitted argument is UNDECLARED - so a brief that
+// leaves it out parks every CLI-driven hand-over at a per-task human verdict,
+// which is the gate the declaration exists to open.
+//
+// Pinned in two directions, because either half alone is satisfiable by a brief
+// that says the words without passing them: each submit_for_review call in the
+// shipped text carries the argument, and each text that carries a call also
+// tells the session what [] means and what an omission costs.
+func TestEveryHandoverBriefDeclaresRisk(t *testing.T) {
+	briefs := map[string]string{
+		"implement":                           builtinPhasePrompts[ImplementPhaseName],
+		"review":                              builtinPhasePrompts[ReviewPhaseName],
+		"fix":                                 builtinPhasePrompts[FixPhaseName],
+		"verify":                              builtinPhasePrompts[VerifyPhaseName],
+		"review-only":                         reviewOnlyBrief,
+		"unverified review-only":              unverifiedReviewOnlyBrief,
+		"no-code review":                      noCodeReviewBrief,
+		"no-code review-only":                 noCodeReviewOnlyBrief,
+		"panel member review-only":            panelMemberReviewOnlyBrief,
+		"unverified panel member review-only": panelMemberUnverifiedReviewOnlyBrief,
+		"fix-verify":                          fixVerifyBrief,
+		"no-code fix":                         noCodeFixBrief,
+		"no-code fix-verify":                  noCodeFixVerifyBrief,
+		"no-code verify":                      noCodeVerifyBrief,
+		"unverified review brief":             unverifiedReviewBrief,
+		"review terminal step":                reviewTerminalStep,
+		"review-only terminal step":           reviewOnlyTerminalStep,
+		"panel member terminal step":          panelMemberTerminalStep,
+		"no-code review terminal step":        noCodeReviewTerminalStep,
+		"no-code review-only terminal step":   noCodeReviewOnlyTerminalStep,
+		"fix only terminal step":              fixOnlyTerminalStep,
+		"no-code fix only terminal step":      noCodeFixOnlyTerminalStep,
+		"verify terminal step":                verifyTerminalStep,
+		"no-code verify terminal step":        noCodeVerifyTerminalStep,
+	}
+	calls := 0
+	for name, brief := range briefs {
+		spans, ok := submitForReviewCalls(brief)
+		if !ok {
+			t.Errorf("the %s has an unbalanced submit_for_review( call:\n%s", name, brief)
+			continue
+		}
+		for _, span := range spans {
+			calls++
+			if !strings.Contains(span, "risk: { touches:") {
+				t.Errorf("the %s calls submit_for_review without a risk declaration (%s), so its hand-over is UNDECLARED:\n%s", name, span, brief)
+			}
+		}
+	}
+	// A scan that found no calls at all would pass vacuously - the mutation this
+	// test exists to catch (the argument silently dropped from every brief) must
+	// still leave the calls themselves in place, but a refactor that moved the
+	// call out of these texts would otherwise disarm the pin.
+	if calls < 4 {
+		t.Fatalf("only %d submit_for_review call(s) found across the shipped briefs; expected at least 4 (review, no-code review, verify, no-code verify)", calls)
+	}
+
+	// The four texts that carry a call also carry the rules a session needs to
+	// fill the argument in: the empty declaration in its schema shape, what an
+	// omission costs, and where the vocabulary and judging rule live. Checked on
+	// the text rather than the call span because they are prose, not arguments.
+	for name, text := range map[string]string{
+		"review terminal step":         reviewTerminalStep,
+		"no-code review terminal step": noCodeReviewTerminalStep,
+		"verify terminal step":         verifyTerminalStep,
+		"no-code verify terminal step": noCodeVerifyTerminalStep,
+	} {
+		for _, want := range []string{
+			"risk: { touches: [...] }",
+			"touches: []",
+			"none of the project's risk classes",
+			"UNDECLARED",
+			"per-batch auto-approval",
+			"`finishing` reference",
+			"risk_vocabulary",
+		} {
+			if !strings.Contains(text, want) {
+				t.Errorf("the %s does not say %q, so a session cannot fill the declaration in:\n%s", name, want, text)
+			}
+		}
+	}
+}
+
+// submitForReviewCalls returns the argument text of every submit_for_review(…)
+// call in brief, with parentheses matched. ok is false when a call's parentheses
+// do not balance, so a malformed call fails the pin instead of being silently
+// truncated at the end of the brief.
+func submitForReviewCalls(brief string) (spans []string, ok bool) {
+	const call = "submit_for_review("
+	for rest := brief; ; {
+		i := strings.Index(rest, call)
+		if i < 0 {
+			return spans, true
+		}
+		rest = rest[i+len(call):]
+		depth, end := 1, -1
+		for j := 0; j < len(rest); j++ {
+			switch rest[j] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+			}
+			if depth == 0 {
+				end = j
+				break
+			}
+		}
+		if end < 0 {
+			return spans, false
+		}
+		spans = append(spans, rest[:end])
+		rest = rest[end+1:]
 	}
 }
 
@@ -950,6 +1070,97 @@ func TestUnverifiedReviewBriefStatesItsShape(t *testing.T) {
 	// selection is meaningful: an unverified checkpoint swaps one for the other.
 	if unverifiedReviewBrief == builtinPhasePrompts[ReviewPhaseName] {
 		t.Error("the unverified brief is the branch-shaped built-in brief")
+	}
+}
+
+// CLA-702: the panel member's UNVERIFIED variant is selected for exactly the
+// checkpoint the core's verified-branch claim cannot describe (a check that did
+// not complete), so it must not inherit that claim. The split that gives it its
+// own core must leave the verified briefs untouched.
+func TestUnverifiedPanelMemberBriefStatesItsShape(t *testing.T) {
+	brief := panelMemberUnverifiedReviewOnlyBrief
+	for _, want := range []string{
+		// The honest state of the checkpoint.
+		"could NOT verify that branch on the origin remote",
+		"the driver could not read the remote",
+		"UNKNOWN",
+		"UNVERIFIED",
+		"the branch may not exist on the origin remote",
+		"do NOT assume phase 1 implemented, committed and pushed",
+		// The cause is the CHECK not completing, never a remote-read failure
+		// asserted as fact: delivery.Unknown also covers a check that never
+		// reached the remote (no local branch to compare, an ambiguous repo).
+		// CLA-576's phase-2 review caught that claim once (standing decision
+		// 00474195), so the hedge is pinned here too (1.review-2.2).
+		"its check did not complete",
+		"a check that never reached the remote is possible too",
+		// The member establishes the tip itself, before any review, and CONFIRMS
+		// the branch carries phase 1's work: a branch that exists but carries
+		// none of it is the same failed hand-off as an absent one (1.review-2.1).
+		"FIRST establish the tip yourself, before any review",
+		"read branch " + PhaseBranchPlaceholder + " from the origin remote",
+		"and confirm it carries phase 1's work",
+		"exists but carries none of phase 1's work",
+		"do not review a phantom diff",
+		// The panel's record-only contract and its ending are unchanged.
+		"ONE MEMBER of a review PANEL",
+		"THE RECORD IS YOUR DELIVERABLE",
+		"record_review(taskId, runId, {...})",
+	} {
+		if !strings.Contains(brief, want) {
+			t.Errorf("the unverified panel member brief does not say %q:\n%s", want, brief)
+		}
+	}
+	// The verified claim itself must be ABSENT: it is exactly what this
+	// checkpoint cannot support.
+	if strings.Contains(brief, "verified to exist on the origin remote") ||
+		strings.Contains(brief, "really did implement, commit and push") {
+		t.Errorf("the unverified panel member brief asserts the verified-branch claim it cannot support:\n%s", brief)
+	}
+	// The record shape is the UNVERIFIED one: the verified shape names a
+	// driver-verified tip the driver never read.
+	if !strings.Contains(brief, panelMemberUnverifiedRecordShape) {
+		t.Errorf("the unverified panel member brief does not carry the unverified record shape:\n%s", brief)
+	}
+	if strings.Contains(brief, panelMemberRecordShape) {
+		t.Errorf("the unverified panel member brief carries the verified record shape:\n%s", brief)
+	}
+	if strings.Contains(brief, ReviewedTipPlaceholder) {
+		t.Errorf("the unverified panel member brief carries a driver-verified-tip placeholder:\n%s", brief)
+	}
+	// Position, like the other panel briefs: the record-only ending is the last
+	// thing before the shared handoff guidance.
+	if !strings.HasSuffix(brief, panelMemberTerminalStep+handoffGuidance) {
+		t.Errorf("the unverified panel member ending is not the last thing before the handoff guidance:\n%s", brief)
+	}
+	if brief == panelMemberReviewOnlyBrief {
+		t.Error("the unverified panel member brief is the verified one")
+	}
+
+	// The split must not disturb the briefs that were already right. The
+	// full-content pin is TestReviewBriefsUnchangedByTheUnverifiedSplit below;
+	// these are the legible junctions, including the resume->worktree one the
+	// split introduced, where a dropped or doubled space would silently reword
+	// every review-only brief (1.review-2.3).
+	const verifiedSeam = "recorded branch " + PhaseBranchPlaceholder + " on the plane — a branch the driver " +
+		"verified to exist on the origin remote with its tip reachable, so phase 1 really did implement, commit " +
+		"and push. You are RESUMING that run"
+	const resumeToWorktree = "adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder
+	for name, b := range map[string]string{
+		"review-only brief":  reviewOnlyBrief,
+		"panel member brief": panelMemberReviewOnlyBrief,
+	} {
+		if !strings.Contains(b, verifiedSeam) {
+			t.Errorf("the %s no longer carries its verified core intact:\n%s", name, b)
+		}
+		if !strings.Contains(b, resumeToWorktree) {
+			t.Errorf("the %s no longer joins its resume and worktree halves intact:\n%s", name, b)
+		}
+	}
+	const unverifiedSeam = "recorded branch " + PhaseBranchPlaceholder + " on the plane — but the driver could " +
+		"NOT verify that branch on the origin remote"
+	if !strings.Contains(unverifiedReviewOnlyBrief, unverifiedSeam) {
+		t.Errorf("the single reviewer's unverified brief no longer carries its own core intact:\n%s", unverifiedReviewOnlyBrief)
 	}
 }
 
@@ -1081,7 +1292,7 @@ func TestNoBriefNamesTheRemovedUpdateTaskTool(t *testing.T) {
 		"fix":                      {"record_review(taskId, runId, {findingUpdates:"},
 		"fix-verify":               {"record_review(taskId, runId, {findingUpdates:"},
 		"verify":                   {"record_review(taskId, runId, {findingUpdates:", "submit_for_review(taskId, runId, closeRound:"},
-		"no-code verify":           {"record_progress(taskId, runId, outcome: ...)", "settle_task(taskId, runId,", "submit_for_review(taskId, runId)"},
+		"no-code verify":           {"record_progress(taskId, runId, outcome: ...)", "settle_task(taskId, runId,", "submit_for_review(taskId, runId, risk:"},
 		"implement close-out rule": {},
 	} {
 		src := briefs[name]
@@ -2143,7 +2354,7 @@ func TestVerifyBriefsStateTheStoppingRuleAndContract(t *testing.T) {
 		"no durable record",
 		"no plane finding ids",
 		"the LAST",
-		"submit_for_review(taskId, runId)",
+		"submit_for_review(taskId, runId, risk: { touches: [...] })",
 		`disposition: "parked"`,
 		"do NOT open a PR",
 	} {

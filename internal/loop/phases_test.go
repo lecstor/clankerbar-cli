@@ -2530,6 +2530,17 @@ func TestPRBaseResolution_ShapesBothPhaseBriefsPerRepo(t *testing.T) {
 			wantProbes: 2,
 		},
 		{
+			// The close-out's bug in one row: a repo whose origin carries no
+			// `staging`, only `integration` as its default. The brief must name
+			// `integration`, and the close-out resolves its base the same way.
+			name:       "origin's default is integration and it holds no staging",
+			repo:       "lecstor/clankerbar",
+			onOrigin:   false,
+			defaultBr:  "integration",
+			want:       "integration",
+			wantProbes: 2,
+		},
+		{
 			name:       "the per-repo override wins outright, no probe",
 			repo:       "lecstor/makespdf",
 			prBase:     map[string]string{"lecstor/makespdf": "integration"},
@@ -4212,6 +4223,27 @@ func TestInvocationForSelectsTheReviewAndFixVariants(t *testing.T) {
 	}
 	if !strings.Contains(inv.Prompt, `"review-1"`) {
 		t.Errorf("the unverified review brief does not carry the reviewer role the seam keys on:\n%s", inv.Prompt)
+	}
+
+	// The panel member's arm (CLA-702): the same unverified checkpoint selects the
+	// panel's variant when this phase is a member, and that variant must not
+	// inherit the core's verified-branch claim either.
+	panelPhases := append([]config.Phase(nil), phases...)
+	panelPhases[1].PanelMember = true
+	inv, err = d.invocationFor(d.targets[0], 1, panelPhases[1], unverified, "", "staging", panelPhases)
+	if err != nil {
+		t.Fatalf("invocationFor unverified panel member: %v", err)
+	}
+	if !strings.Contains(inv.Prompt, "ONE MEMBER of a review PANEL") ||
+		!strings.Contains(inv.Prompt, "FIRST establish the tip yourself") {
+		t.Errorf("an unverified checkpoint did not get the panel member's unverified brief:\n%s", inv.Prompt)
+	}
+	if strings.Contains(inv.Prompt, "verified to exist on the origin remote") ||
+		strings.Contains(inv.Prompt, "really did implement, commit and push") {
+		t.Errorf("the unverified panel member brief asserts the verification it cannot support:\n%s", inv.Prompt)
+	}
+	if strings.Contains(inv.Prompt, config.ReviewedTipPlaceholder) || strings.Contains(inv.Prompt, "{{") {
+		t.Errorf("the unverified panel member brief carries an unresolved placeholder:\n%s", inv.Prompt)
 	}
 }
 

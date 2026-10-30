@@ -49,7 +49,7 @@ implement  →  review            →  fix
 |---|---|---|---|
 | `implement` | cheap harness | claim, build, self-verify, commit, push, record branch | STOP holding the claim |
 | `review` (non-final) | the expensive reviewer | read the diff, run the adversarial gate (the record, not the repo's gates — see the brief's gate-scope rule), **record findings, change nothing** | `record_progress(outcome)` then STOP holding the claim |
-| `fix` | cheap harness | apply findings by ID, re-verify scoped to them, commit, push, open the PR, hand over | `submit_for_review(outcome)` |
+| `fix` | cheap harness | apply findings by ID, re-verify scoped to them, commit, push, open the PR, hand over | `submit_for_review(outcome, risk: { touches: [...] })` |
 
 `review` selects the read-only brief **by position**: a review with a phase after
 it is the gate; a *final* `review` keeps the historical review-and-fix brief. That
@@ -276,7 +276,8 @@ and is scoped to the **fix delta** — the reviewed tip the previous record name
 through `HEAD`, plus the regression surface the fixes touch. Unlike the review
 gate, the verifier releases its OWN round in its terminal step, and a clean
 round does that in the hand-over: **ONE call**, `submit_for_review(taskId,
-runId, closeRound: n)`, made after the branch is pushed and the PR is open. The
+runId, closeRound: n, risk: { touches: [...] })`, made after the branch is
+pushed and the PR is open. The
 close rides that call's atomic write and sits behind every guard the status move
 goes through — the only order the plane accepts, because once the task leaves
 `in_progress` this run can no longer close the round. A refused transition

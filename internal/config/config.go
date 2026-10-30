@@ -520,9 +520,12 @@ const HandoffPreamble = "You are resuming run " + PhaseRunPlaceholder + " on tas
 const reviewTerminalStep = " Then COMMIT and PUSH the fixes. Open a PR targeting the repo's PR base " +
 	"branch (" + PhasePRBasePlaceholder + ") if no PR exists yet for this branch - push, then the PR, in that order, before the " +
 	"hand-off below. FINALLY, and this is the step that ENDS the phase: hand the task over with " +
-	"submit_for_review(taskId, runId, outcome: ...), where the outcome MUST carry a " +
+	"submit_for_review(taskId, runId, outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a " +
 	"**Tests** section saying what you actually verified - without one the plane REFUSES the call, so a " +
-	"session that leaves it out has not handed anything over. Ending this session while you still hold the " +
+	"session that leaves it out has not handed anything over. The same call's risk declaration uses touches: [] " +
+	"when it touches none of the project's risk classes, an omitted risk being UNDECLARED and buying no " +
+	"per-batch auto-approval; the vocabulary and the judging rule are in the served `finishing` reference and " +
+	"the project's risk_vocabulary (get_project_policy). Ending this session while you still hold the " +
 	"task is this phase FAILING, not finishing: the work you pushed then gets rediscovered and paid for a " +
 	"second time by whoever takes it over. The ONLY exception is a declared handoff."
 
@@ -921,9 +924,12 @@ const fixGradingRule = " Every MUST is fixed, or REFUTED with evidence " +
 // settled task would restart the release loop this task exists to kill.
 const noCodeReviewTerminalStep = " FINALLY, and this is the step that ENDS the phase: if the task still sits in " +
 	"in_progress with its no-code delivery declared, hand it over with submit_for_review(taskId, runId, " +
-	"outcome: ...), where the outcome MUST carry a **Tests** section saying what you actually " +
+	"outcome: ..., risk: { touches: [...] }), where the outcome MUST carry a **Tests** section saying what you actually " +
 	"verified - without one the plane REFUSES the call, so a session that leaves it out has not handed " +
-	"anything over. If phase 1 already settled the task (it left in_progress before this phase ran), the " +
+	"anything over. The same call's risk declaration uses touches: [] when it touches none of the project's risk " +
+	"classes, an omitted risk being UNDECLARED and buying no per-batch auto-approval; the vocabulary and the " +
+	"judging rule are in the served `finishing` reference and the project's risk_vocabulary (get_project_policy). " +
+	"If phase 1 already settled the task (it left in_progress before this phase ran), the " +
 	"handover already happened: verify the record reads honestly and end the session - do NOT re-open, " +
 	"release or re-settle the task. Ending this session while the task still needs the handover is this " +
 	"phase FAILING, not finishing. The ONLY exception is a declared handoff."
@@ -1393,19 +1399,51 @@ const reviewGateScope = " THE GATES ARE NOT YOURS TO RE-RUN. The implement phase
 // as the default rather than as an impossible act.
 //
 // The brief is composed of a CORE plus a record shape and an ending, so the
-// panel member's variant (CLA-639 M5) can reuse the core verbatim and swap only
-// the two halves that differ: the panel member writes the durable record and
-// nothing else.
-var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
+// verified panel member's variant (CLA-639 M5) can reuse the core verbatim and
+// swap only the two halves that differ: the panel member writes the durable
+// record and nothing else.
+// The core is assembled from the parts that do and do not depend on the
+// hand-off's verification state: reviewOnlyBriefOpening names the recorded
+// branch, and the claim that follows is the one sentence an unverifiable
+// checkpoint cannot support. The verified briefs append reviewHandoffVerified;
+// the panel member's unverified variant appends reviewHandoffUnverified and its
+// self-verification step. The remainder is identical in every variant.
+var reviewOnlyBriefOpening = "You are PHASE " + PhaseNumberPlaceholder + " of " + PhaseTotalPlaceholder + " on task " +
 	PhaseTaskPlaceholder + ", the REVIEW-ONLY gate. Its scope is the review and nothing else: you find issues " +
 	"and specify fixes; the phase after you applies them. The implement phase (harness " +
 	PhasePrevHarnessPlaceholder + ", model " + PhasePrevModelPlaceholder + ") recorded branch " +
-	PhaseBranchPlaceholder + " on the plane — a branch the driver verified to exist on the origin remote with " +
-	"its tip reachable, so phase 1 really did implement, commit and push. You are RESUMING that run, not " +
-	"starting a new one: do not call next_task, and do not claim anything. Call heartbeat(\"" +
-	PhaseRunPlaceholder + "\") to resume the run, then get_task with includeDecisions: true to re-read the bar " +
-	"and the standing decisions. An empty branch field on the task is a FAILED hand-off to report in the record " +
-	"below, not work to silently adopt and implement. Work in the worktree for branch " + PhaseBranchPlaceholder +
+	PhaseBranchPlaceholder + " on the plane — "
+
+// reviewHandoffVerified is the claim only a checkpoint the driver read on the
+// origin remote can make.
+const reviewHandoffVerified = "a branch the driver verified to exist on the origin remote with its tip " +
+	"reachable, so phase 1 really did implement, commit and push."
+
+// reviewHandoffUnverified is the panel member's counterpart: the check did not
+// complete, so the branch's existence and phase 1's push are UNKNOWN and the
+// member must establish the tip itself.
+const reviewHandoffUnverified = "but the driver could NOT verify that branch on the origin remote: its check did " +
+	"not complete — most often because the driver could not read the remote (network, a GitHub outage, a " +
+	"credential problem), but a check that never reached the remote is possible too — so whether phase 1 " +
+	"pushed, and whether the branch exists at all, is UNKNOWN. This checkpoint is UNVERIFIED, not a verified " +
+	"hand-off: the branch may not exist on the origin remote, and do NOT assume phase 1 implemented, committed " +
+	"and pushed."
+
+var reviewOnlyBriefResume = " You are RESUMING that run, not starting a new one: do not call next_task, and do " +
+	"not claim anything. Call heartbeat(\"" + PhaseRunPlaceholder + "\") to resume the run, then get_task with " +
+	"includeDecisions: true to re-read the bar and the standing decisions. An empty branch field on the task is " +
+	"a FAILED hand-off to report in the record below, not work to silently adopt and implement."
+
+// reviewHandoffUnverifiedCheck states the member's obligation; the record shape
+// carries the mechanics and the failure arm for a branch that is absent, empty
+// or unreadable.
+const reviewHandoffUnverifiedCheck = " FIRST establish the tip yourself, before any review: read branch " +
+	PhaseBranchPlaceholder + " from the origin remote - the record shape below tells you exactly how, and where " +
+	"to record the tip - and confirm it carries phase 1's work. If the branch is absent, or exists but carries " +
+	"none of phase 1's work, phase 1 did NOT deliver: record that failed hand-off in your durable record and end " +
+	"holding the task — do not review a phantom diff."
+
+var reviewOnlyBriefWorktreeAndGate = " Work in the worktree for branch " + PhaseBranchPlaceholder +
 	" recorded on the task, and never commit to the repo's PR base branch (" + PhasePRBasePlaceholder + ") - a " +
 	"session whose cwd is already the main checkout sitting on that branch is not a decision to commit where " +
 	"you are, it is this failure mode. Read the diff against the PR base (git diff " + PhasePRBasePlaceholder +
@@ -1413,6 +1451,9 @@ var reviewOnlyBriefCore = "You are PHASE " + PhaseNumberPlaceholder + " of " + P
 	"REVIEW ONLY: do not edit, create or delete a source file, do not commit, do not push, and do not open a PR " +
 	"- not even to fix a typo. Do NOT fix what you find: the phase after you is responsible for applying it, " +
 	"and a fix applied here is a fix it cannot attribute."
+
+var reviewOnlyBriefCore = reviewOnlyBriefOpening + reviewHandoffVerified + reviewOnlyBriefResume +
+	reviewOnlyBriefWorktreeAndGate
 
 // reviewOnlyBrief is the single reviewer's brief: the core above, the two-half
 // record shape, and the two-half ending.
@@ -1430,8 +1471,13 @@ var panelMemberReviewOnlyBrief = reviewOnlyBriefCore +
 	panelMemberRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
 
 // panelMemberUnverifiedReviewOnlyBrief is panelMemberReviewOnlyBrief for a
-// checkpoint the driver could not verify against the origin remote (CLA-576).
-var panelMemberUnverifiedReviewOnlyBrief = reviewOnlyBriefCore +
+// checkpoint the driver could not verify against the origin remote (CLA-576,
+// CLA-702). It cannot reuse the verified core: that core asserts the driver
+// verified the branch, which is exactly what an unreadable checkpoint cannot
+// support, while its record shape says the driver could NOT read the tip. It
+// keeps the panel's record-only contract and ending unchanged.
+var panelMemberUnverifiedReviewOnlyBrief = reviewOnlyBriefOpening + reviewHandoffUnverified +
+	reviewOnlyBriefResume + reviewHandoffUnverifiedCheck + reviewOnlyBriefWorktreeAndGate +
 	panelMemberUnverifiedRecordShape + rerunGuidance + panelMemberTerminalStep + handoffGuidance
 
 // unverifiedReviewOnlyBrief is reviewOnlyBrief for a checkpoint the driver could
@@ -1691,10 +1737,13 @@ const verifyTerminalStep = " FINALLY, and this is the step that ENDS the phase. 
 	"If NO MUST remains open: carry the hand-over in ONE call, AFTER confirming the branch is pushed (push " +
 	"any fix commit that is still local) and opening a PR targeting the repo's PR base branch (" + PhasePRBasePlaceholder +
 	") if none exists for the branch: submit_for_review(taskId, runId, closeRound: <the round the append " +
-	"returned>). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
+	"returned>, risk: { touches: [...] }). The close rides the hand-over's atomic write, which is the only order the plane accepts: once " +
 	"the task leaves in_progress this run can no longer close the round. Do NOT send an outcome in that call: " +
 	"your own sealed record makes the plane refuse a sealed holder's outcome write (review_sealed), and the fix " +
-	"phase has already written the **Tests** section the in_review guard reads. Never decide to run one more " +
+	"phase has already written the **Tests** section the in_review guard reads. The same call's risk declaration " +
+	"uses touches: [] when it touches none of the project's risk classes, an omitted risk being UNDECLARED and " +
+	"buying no per-batch auto-approval; the vocabulary and the judging rule are in the served `finishing` " +
+	"reference and the project's risk_vocabulary (get_project_policy). Never decide to run one more " +
 	"round yourself."
 
 // noCodeVerifyTerminalStep ends a BRANCHLESS verification round: the no-code
@@ -1719,9 +1768,13 @@ const noCodeVerifyTerminalStep = " FINALLY, and this is the step that ENDS the p
 	"same disposition the round cap gives the id-based shape. If the task already left in_progress, do NOT " +
 	"re-open it: leave your block as the record and end.\n\n" +
 	"If NO MUST remains open: hand the task over. If it still sits in_progress with its no-code delivery " +
-	"declared, move it with submit_for_review(taskId, runId) — do NOT send an outcome in " +
+	"declared, move it with submit_for_review(taskId, runId, risk: { touches: [...] }) — do NOT send an outcome in " +
 	"that call; your block write already landed and the fix phase wrote the **Tests** section the in_review " +
-	"guard reads. If it already left in_progress, the hand-over already happened: verify the record reads " +
+	"guard reads. The same call's risk declaration uses touches: [] when it touches none of the project's risk " +
+	"classes, an omitted risk being UNDECLARED and buying no per-batch auto-approval; the vocabulary and the " +
+	"judging rule are in the served `finishing` reference and the project's risk_vocabulary " +
+	"(get_project_policy). If it already left " +
+	"in_progress, the hand-over already happened: verify the record reads " +
 	"honestly and end. Never decide to run one more round yourself."
 
 // verifyBrief is the fix-verification round (CLA-638): review the fix delta plus
@@ -5253,13 +5306,16 @@ func (c *Config) BacklogEndpoint() string {
 // the poll and the sessions already agree on.
 func (c *Config) Slug() string { return slugFromMCPURL(c.BacklogEndpoint()) }
 
-// ProjectEndpoint returns one configured project's MCP endpoint — the same
-// `/mcp/<slug>` URL that project's sessions are pointed at — so a write the driver
-// makes lands on the same project its sessions are working.
+// ProjectEndpoint returns a project's MCP endpoint: `<origin>/mcp/<slug>`, the
+// slug path-escaped. The origin is CredentialOrigin — `backlog_url`, the
+// operator's own config, or the built-in default — never a host read off a
+// checkout's .mcp.json (CLA-257).
 //
-// The slug is the project's own declared `slug`, which Validate has already
-// cross-checked against its .mcp.json; the origin is CredentialOrigin. Neither
-// half is read off the workdir's file (CLA-257).
+// The slug need not be a project this config declares: propose-config --slug and
+// upload --project may both name one it does not, so the write lands where the
+// caller said rather than necessarily where this config's sessions are pointed.
+// The plane membership-gates /mcp/<slug>, so an unreachable slug is refused
+// there, never mapped onto a project here.
 func (c *Config) ProjectEndpoint(p Project) string {
 	origin := c.CredentialOrigin()
 	if origin == "" || p.Slug == "" {

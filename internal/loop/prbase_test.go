@@ -74,7 +74,7 @@ func TestParseOriginRefs(t *testing.T) {
 	}
 }
 
-// probeOriginPRBase against real repositories: an origin whose default is main
+// ProbeOriginPRBase against real repositories: an origin whose default is main
 // with a staging branch on top (clankerbar-cli/ezyapp's shape), and an origin
 // with only main (the makesPDF plugins' shape). This covers the exec, the
 // --symref invocation and the parse together — the parse alone is unit-tested
@@ -96,12 +96,12 @@ func TestProbeOriginPRBase_RealGit(t *testing.T) {
 	runGitTest(t, workA, "branch", "staging")
 	runGitTest(t, workA, "push", "origin", "staging")
 
-	onOrigin, def, err := probeOriginPRBase(ctx, workA, "staging")
+	onOrigin, def, err := ProbeOriginPRBase(ctx, workA, "staging")
 	if err != nil || !onOrigin || def != "main" {
 		t.Errorf("probe with staging on origin = (%v, %q, %v), want (true, main, nil)", onOrigin, def, err)
 	}
 	// An integration branch that is NOT on origin falls to the default branch.
-	onOrigin, def, err = probeOriginPRBase(ctx, workA, "integration")
+	onOrigin, def, err = ProbeOriginPRBase(ctx, workA, "integration")
 	if err != nil || onOrigin || def != "main" {
 		t.Errorf("probe with no integration on origin = (%v, %q, %v), want (false, main, nil)", onOrigin, def, err)
 	}
@@ -114,14 +114,14 @@ func TestProbeOriginPRBase_RealGit(t *testing.T) {
 	runGitTest(t, workB, "-c", "user.email=t@test", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init")
 	runGitTest(t, workB, "push", "-u", "origin", "main")
 
-	onOrigin, def, err = probeOriginPRBase(ctx, workB, "staging")
+	onOrigin, def, err = ProbeOriginPRBase(ctx, workB, "staging")
 	if err != nil || onOrigin || def != "main" {
 		t.Errorf("probe against a main-only origin = (%v, %q, %v), want (false, main, nil)", onOrigin, def, err)
 	}
 
 	// Not a repository at all: the probe errors, which prBaseFor turns into the
 	// integration-branch fallback rather than a failed spawn.
-	if _, _, err := probeOriginPRBase(ctx, root, "staging"); err == nil {
+	if _, _, err := ProbeOriginPRBase(ctx, root, "staging"); err == nil {
 		t.Error("probe outside any repository must error so the caller can fall back")
 	}
 }

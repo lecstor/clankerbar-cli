@@ -9,8 +9,8 @@ package delivery
 //
 // Since CLA-460 the verifier also probes `auth token --user` before its first
 // API read, so every fake below serves that probe out of band (see
-// writeGHTo) and the CLA-460 tests record, per invocation, exactly which
-// credentials the child resolved.
+// writeGHTo). Every CLA-460 test pins both legs: which ACCOUNT the probe asked
+// for (wantProbeOwner) and exactly which credentials the API read resolved.
 
 import (
 	"bytes"
@@ -45,7 +45,9 @@ const (
 	// ghFakeToken is what every fake gh answers the `auth token --user`
 	// credential probe with when GH_FAKE_TOKEN names it: the asserted VALUE,
 	// so the chain "derive owner -> resolve THAT account -> plumb the resolved
-	// value" is pinned end to end in the CLA-460 tests.
+	// value" is pinned end to end in the CLA-460 tests. The value alone proves
+	// only that whatever account was asked reached the child; the probe's
+	// recorded `user=` line is what pins WHICH account it was asked for.
 	ghFakeToken = "gho_cla460-fake-owner-token"
 )
 
@@ -113,9 +115,14 @@ func writeGHTo(t *testing.T, path, body string) string {
 	// consumes neither a fixture nor, for fakeGHSeq, a sequence slot. With
 	// GH_FAKE_TOKEN unset, or GH_FAKE_FAIL=1, the probe answers empty or
 	// fails: what callers read as "no resolvable token", the unscoped
-	// fallback's trigger.
+	// fallback's trigger. The probe RETURNS here, so recordingGH's own
+	// recording block never sees it: record the whole argv it was asked with
+	// here, which pins both the account it named and the flag shape it used.
 	body = `case "$1/$2" in
 auth/token)
+	if [ -n "${GH_RECORD-}" ]; then
+		printf '=== auth token\nargv=%s\n' "$*" >> "$GH_RECORD"
+	fi
 	if [ "$GH_FAKE_FAIL" = 1 ]; then
 		echo "no oauth token found for github.com account $4" >&2
 		exit 1
@@ -133,7 +140,9 @@ esac
 
 // recordingGH writes a fake gh that appends one section per invocation to
 // $GH_RECORD — the argv head plus the exact GH_TOKEN/GITHUB_TOKEN the child
-// resolved — then answers every non-probe invocation with output.
+// resolved — then answers every non-probe invocation with output. The
+// credential probe is recorded by writeGHTo's own arm, because it exits
+// before this body runs.
 func recordingGH(t *testing.T, output string) string {
 	t.Helper()
 	body := `{
@@ -148,18 +157,27 @@ J
 	return writeGH(t, body)
 }
 
-// ghSections splits a GH_RECORD into per-invocation sections keyed by the
-// argv head the fake saw ("pr view", "auth token"), each holding the token
-// lines the shim wrote.
-func ghSections(t *testing.T, record string) map[string][]string {
+// ghRecord reads the raw $GH_RECORD the fake gh wrote.
+func ghRecord(t *testing.T, record string) string {
 	t.Helper()
 	body, err := os.ReadFile(record)
 	if err != nil {
 		t.Fatalf("gh record missing - the fake gh never ran: %v", err)
 	}
+	return string(body)
+}
+
+// ghSections splits a GH_RECORD into per-invocation sections keyed by the
+// argv head the fake saw ("pr view", "auth token"), each holding the lines the
+// shim wrote: the resolved token lines for an API read, the probe's argv for
+// the credential probe. A repeated key keeps only the LAST invocation's lines,
+// so a caller pinning how MANY times a command ran counts its headers in
+// ghRecord instead (see wantProbeOwner).
+func ghSections(t *testing.T, record string) map[string][]string {
+	t.Helper()
 	out := map[string][]string{}
 	cur := ""
-	for _, line := range strings.Split(string(body), "\n") {
+	for _, line := range strings.Split(ghRecord(t, record), "\n") {
 		switch {
 		case strings.HasPrefix(line, "=== "):
 			cur = strings.TrimPrefix(line, "=== ")
@@ -169,6 +187,26 @@ func ghSections(t *testing.T, record string) map[string][]string {
 		}
 	}
 	return out
+}
+
+// wantProbeOwner pins the credential probe: it ran exactly once and asked gh
+// for owner's token at github.com. The header count comes from the raw record,
+// because ghSections would hide a second probe behind its last-wins sections;
+// the recorded argv is what proves the flag and the argument shape. `--hostname`
+// is part of the pin because without it gh answers for its DEFAULT host.
+func wantProbeOwner(t *testing.T, record, owner string) {
+	t.Helper()
+	if n := strings.Count(ghRecord(t, record), "=== auth token"); n != 1 {
+		t.Errorf("the credential probe ran %d times; want exactly 1", n)
+	}
+	probe := ghSections(t, record)["auth token"]
+	// The literal host, not githubHost: this is what pins what the probe asks
+	// for, and reading the production constant would let a drift of it move this
+	// expectation with the code and keep both green.
+	want := "argv=auth token --user " + owner + " --hostname github.com"
+	if len(probe) != 1 || probe[0] != want {
+		t.Errorf("credential probe asked %v; want exactly [%s]", probe, want)
+	}
 }
 
 // prVerifier is the verifier under test with a fake gh and a polling window
@@ -413,6 +451,9 @@ func TestPollingResolvesWhenGitHubCatchesUp(t *testing.T) {
 // ambient spellings are DROPPED outright rather than raced. Decoy ambient
 // values are planted on purpose: the disease here is an ambient credential
 // answering for the wrong account, so the pin has to show one losing.
+//
+// The probe's ACCOUNT is pinned too: the credential half above alone would
+// stay green if the probe asked gh for the wrong owner.
 func TestPRCheckScopesTheAPIReadToTheRemoteOwner(t *testing.T) {
 	dir := prEnv(t)
 	record := filepath.Join(t.TempDir(), "gh-record.log")
@@ -425,6 +466,10 @@ func TestPRCheckScopesTheAPIReadToTheRemoteOwner(t *testing.T) {
 	v := prVerifier(t, dir, gh)
 	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
 	mustStatus(t, rep, PRVerified, Pass)
+
+	// prEnv's origin is https://github.com/acme/widgets.git, so acme is the
+	// owner; "widgets" is the repo name that a plausible bug would substitute.
+	wantProbeOwner(t, record, "acme")
 
 	pr := ghSections(t, record)["pr view"]
 	if len(pr) == 0 {
@@ -461,6 +506,12 @@ func TestPRCheckScopesAnSSHRemoteByItsResolvedSlug(t *testing.T) {
 	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
 	mustStatus(t, rep, PRVerified, Pass)
 
+	// The owner comes from the RESOLVED slug here, not from a plain https URL:
+	// the alias says nothing, so "acme" is reachable only through
+	// githubSlugResolving. Asking for the alias or the repo name is the bug
+	// this pins.
+	wantProbeOwner(t, record, "acme")
+
 	pr := ghSections(t, record)["pr view"]
 	if len(pr) == 0 {
 		t.Fatal("the PR read never ran - scoping cannot have ridden it")
@@ -489,6 +540,10 @@ func TestPRCheckRunsUnscopedWhenOwnerTokenDoesNotResolve(t *testing.T) {
 	v := prVerifier(t, dir, gh)
 	rep := verifyWith(t, v, Claim{Label: "CLA-460", PR: "7"})
 	mustStatus(t, rep, PRVerified, Pass)
+
+	// The fallback is about the ANSWER, not the question: the probe still named
+	// the URL's owner, it just resolved no token for it.
+	wantProbeOwner(t, record, "acme")
 
 	pr := ghSections(t, record)["pr view"]
 	if len(pr) == 0 {
@@ -821,7 +876,7 @@ func TestGHChildEnvironmentCarriesNoColourSwitch(t *testing.T) {
 	t.Setenv("FORCE_COLOR", "1")
 
 	gh := writeGH(t, "env\n")
-	out, err := runGHBin(context.Background(), gh, t.TempDir(), nil, "pr", "view")
+	out, err := runGHBin(context.Background(), gh, t.TempDir(), nil, false, "pr", "view")
 	if err != nil {
 		t.Fatalf("fake gh: %v", err)
 	}
@@ -847,7 +902,7 @@ func TestGHChildEnvironmentCarriesNoColourSwitch(t *testing.T) {
 	// held to the same ownership rule: an addition must not be able to turn
 	// colour back on behind the parser's back.
 	out, err = runGHBin(context.Background(), gh, t.TempDir(),
-		[]string{"GH_FORCE_TTY=1", "NO_COLOR=0", "CLICOLOR=1"}, "pr", "view")
+		[]string{"GH_FORCE_TTY=1", "NO_COLOR=0", "CLICOLOR=1"}, false, "pr", "view")
 	if err != nil {
 		t.Fatalf("fake gh: %v", err)
 	}
