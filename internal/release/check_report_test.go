@@ -194,7 +194,7 @@ func TestReportCheckPostsTheReportThePlaneExpects(t *testing.T) {
 		"outcome": "success",
 		"commit":  strings.Repeat("a", 40),
 		"branch":  "clanker/abc-a-task",
-		"pr":      "821",
+		"pr":      "#821",
 	}
 	if !reflect.DeepEqual(got[0].body, want) {
 		t.Errorf("report body = %#v, want %#v", got[0].body, want)

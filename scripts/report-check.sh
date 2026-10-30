@@ -98,6 +98,9 @@ if [ -z "$branch" ] && [ -z "$pr" ]; then
   skip "neither BRANCH nor PR is set, so the report would be about nothing"
 fi
 
+# Tasks record their PR as `#N` (delivery.pr), and the plane matches it exactly.
+case "$pr" in [0-9]*) pr="#$pr" ;; esac
+
 command -v jq >/dev/null 2>&1 || skip "jq is not installed"
 command -v curl >/dev/null 2>&1 || skip "curl is not installed"
 
@@ -124,6 +127,7 @@ body_file=$(mktemp)
 # shellcheck disable=SC2064  # expand now: the file exists now and the name is final
 trap "rm -f '$body_file'" EXIT
 
+# The key goes in on stdin (`--config -`), not argv, which other processes can read.
 code=$(
   curl --silent --show-error \
     --output "$body_file" \
@@ -132,9 +136,9 @@ code=$(
     --retry 2 --retry-delay 2 --retry-connrefused \
     --request POST \
     --header 'Content-Type: application/json' \
-    --header "Authorization: Bearer $key" \
+    --config - \
     --data "$payload" \
-    "$ENDPOINT" 2>/dev/null
+    "$ENDPOINT" 2>/dev/null <<<"header = \"Authorization: Bearer $key\""
 )
 curl_status=$?
 if [ "$curl_status" -ne 0 ]; then
@@ -149,7 +153,8 @@ case "$code" in
   *)
     # `--show-error` output went to /dev/null above, so the response body is the whole
     # diagnosis, and it is the plane's own `{ error: { code, message } }`.
-    warn "POST $ENDPOINT returned HTTP $code: $(head -c 400 "$body_file" | tr '\n' ' ')"
+    detail=$(head -c 400 "$body_file" | tr '\r\n' '  ' | sed 's/%/%25/g')
+    warn "POST $ENDPOINT returned HTTP $code: $detail"
     ;;
 esac
 exit 0
