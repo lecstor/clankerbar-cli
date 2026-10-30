@@ -71,13 +71,16 @@ jobs:
 
       # The runner image is not the GitHub-hosted one, and two tools below need
       # it to look like the environment this workflow was written for: `zstd` is
-      # what actions/cache shells out to (setup-go's `cache: true`), and `-race`
-      # needs cgo, so a C compiler and libc headers. Conditional because the
+      # what actions/cache shells out to (setup-go's `cache: true`), `-race`
+      # needs cgo, so a C compiler and libc headers, and the report step needs jq
+      # and curl (without them it skips silently). Conditional because the
       # runner container persists - only a fresh one pays the apt round trip.
-      - name: Ensure zstd and a C toolchain, which the hosted image ships
+      - name: Ensure zstd, a C toolchain, jq and curl, which the hosted image ships
         run: |
           missing=()
           command -v zstd >/dev/null 2>&1 || missing+=(zstd)
+          command -v jq >/dev/null 2>&1 || missing+=(jq)
+          command -v curl >/dev/null 2>&1 || missing+=(curl)
           if ! command -v gcc >/dev/null 2>&1 || [ ! -e /usr/include/stdio.h ]; then
             missing+=(gcc libc6-dev)
           fi

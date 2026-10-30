@@ -92,12 +92,16 @@ Moving the job here also moves a trust boundary. It checks out the PR's branch a
 `go test -race` compiles and executes that branch's own test code on a persistent
 container, whose installed toolchain, apt state and caches survive between jobs and are
 inherited by later runs - including the push runs on `main` and `staging` whose `ci` the
-release and realign gates read. The job holds only the run-scoped `contents: read`
-`GITHUB_TOKEN`, so there is no long-lived credential in reach, and the runner is
+release and realign gates read. The job holds the run-scoped `contents: read`
+`GITHUB_TOKEN` and, on pull requests, the report-only `CLANKERBAR_REPORT_KEY` in its last
+step's environment. That key is long-lived but can do one thing: post a check outcome to
+the plane. A branch that persisted code into the container could read it and post a false
+green, which under the per-batch policy can auto-approve a CLI task; the promotion PR's
+human review is what still stands between that and a release. The runner is
 registered to this repo alone - but any collaborator who can open a PR can reach this
 box's CI execution path, so the check's result is only as trustworthy as every branch
 that has ever run on it. Keep the container isolated from the fleet's own state and
-credentials: no host mounts, no long-lived secrets, and rebuild it periodically (or run
+credentials: no host mounts, no long-lived secrets beyond the report-only key, and rebuild it periodically (or run
 it ephemeral) so a PR cannot persist into later checks.
 
 Two things to know before waiting on a check:
@@ -122,11 +126,11 @@ window; when it does, publishing is refused and `staging` is not fast-forwarded.
 
 That image is Ubuntu `actions-runner`, not the GitHub-hosted image, so a step needing a
 preinstalled tool must install it. `ci.yml` conditionally apt-installs `zstd` (what
-`actions/cache` shells out to, via `setup-go`'s `cache: true`) and a C toolchain
-(`go test -race` needs cgo); the step is conditional because the container persists, so
+`actions/cache` shells out to, via `setup-go`'s `cache: true`), a C toolchain
+(`go test -race` needs cgo), and `jq` and `curl` (the report step skips without them); the step is conditional because the container persists, so
 only a fresh one pays the apt round trip. To move the job back to GitHub-hosted, change
 its `runs-on` to `ubuntu-latest`: the install step then no-ops, because the hosted image
-ships both.
+ships all of them.
 
 ## Versioning
 
