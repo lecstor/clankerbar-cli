@@ -34,18 +34,24 @@ const (
 	wantVal0 = "https://github.com/"
 )
 
-// writeCredShim installs two scripts and returns their paths: a fake `gh` that
-// answers `auth token --user` (or fails on demand), and a `git` shim that
-// appends each invocation's subcommand and credential-relevant environment to
-// $CRED_RECORD before either serving ls-remote itself (refusing unless the
-// scoping is present, when $CRED_REQUIRE_TOKEN names a token) or passing
-// through to the real git.
-func writeCredShim(t *testing.T) (gitShim, ghFake string) {
+// writeCredShim installs two scripts and returns their paths plus the record
+// the fake gh writes its argv to: a fake `gh` that answers `auth token --user`
+// (or fails on demand), and a `git` shim that appends each invocation's
+// subcommand and credential-relevant environment to $CRED_RECORD before either
+// serving ls-remote itself (refusing unless the scoping is present, when
+// $CRED_REQUIRE_TOKEN names a token) or passing through to the real git.
+func writeCredShim(t *testing.T) (gitShim, ghFake, ghRecord string) {
 	t.Helper()
 	dir := t.TempDir()
 
+	// The fake gh answers the SAME token for every account, so the insteadOf
+	// assertions alone cannot tell which account the resolution chain asked
+	// for. Its argv is the only evidence, so every call is recorded.
+	ghRecord = filepath.Join(dir, "gh-argv.log")
+
 	ghFake = filepath.Join(dir, "gh")
 	writeFile(t, ghFake, `#!/bin/sh
+printf '%s\n' "$*" >> '`+ghRecord+`'
 if [ "$1" = auth ] && [ "$2" = token ]; then
 	if [ "$GH_FAKE_FAIL" = 1 ]; then
 		echo "no oauth token found for github.com account $4" >&2
@@ -94,7 +100,7 @@ exec git "$@"
 	if err := os.Chmod(gitShim, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	return gitShim, ghFake
+	return gitShim, ghFake, ghRecord
 }
 
 // credSections splits a CRED_RECORD into per-invocation sections keyed by
@@ -127,6 +133,21 @@ func credSectionValue(t *testing.T, secs map[string][]string, cmd, prefix string
 		}
 	}
 	return ""
+}
+
+// wantGHProbedOwner asserts the fake gh was asked for owner's token. The shim
+// resolves EVERY account to the same token, so the insteadOf assertions cannot
+// tell the accounts apart: the recorded argv is what pins WHICH account the
+// resolution chain named.
+func wantGHProbedOwner(t *testing.T, ghRecord, owner string) {
+	t.Helper()
+	argv, err := os.ReadFile(ghRecord)
+	if err != nil {
+		t.Fatalf("gh argv record missing - the fake gh never ran: %v", err)
+	}
+	if want := "auth token --user " + owner; !strings.Contains(string(argv), want) {
+		t.Errorf("gh should have been asked for %s's token, got %q", owner, argv)
+	}
 }
 
 // TestGithubOwner pins the URL parsing the scoping stands on: an https
@@ -180,7 +201,7 @@ func TestPrivateGitHubRemoteIsReadAsTheURLOwner(t *testing.T) {
 	t.Setenv("CRED_RECORD", record)
 	t.Setenv("CRED_REQUIRE_TOKEN", credFakeToken)
 	t.Setenv("GH_FAKE_TOKEN", credFakeToken)
-	gitShim, ghFake := writeCredShim(t)
+	gitShim, ghFake, ghRecord := writeCredShim(t)
 
 	v := New(env.work, "origin")
 	v.gitBin = gitShim
@@ -188,6 +209,11 @@ func TestPrivateGitHubRemoteIsReadAsTheURLOwner(t *testing.T) {
 	rep := v.Verify(context.Background(), Claim{Label: "CLA-458", Branch: "clanker/private-feature"})
 
 	mustStatus(t, rep, BranchPushed, Pass)
+
+	// The account reached gh: asked for anything else - the active user, the
+	// repo name - the shim would still have answered the same token, so only
+	// the recorded argv can tell.
+	wantGHProbedOwner(t, ghRecord, "lecstor")
 
 	secs := credSections(t, record)
 	if got := credSectionValue(t, secs, "ls-remote", "key0="); got != wantKey0 {
@@ -226,7 +252,7 @@ func TestLocalRemoteStaysUnscoped(t *testing.T) {
 	record := filepath.Join(t.TempDir(), "cred-record.log")
 	t.Setenv("CRED_RECORD", record)
 	t.Setenv("GH_FAKE_TOKEN", credFakeToken)
-	gitShim, ghFake := writeCredShim(t)
+	gitShim, ghFake, _ := writeCredShim(t)
 
 	v := New(env.work, "origin")
 	v.gitBin = gitShim
@@ -258,7 +284,7 @@ func TestOwnerWithoutGhTokenFallsBackUnscoped(t *testing.T) {
 	record := filepath.Join(t.TempDir(), "cred-record.log")
 	t.Setenv("CRED_RECORD", record)
 	t.Setenv("GH_FAKE_FAIL", "1")
-	gitShim, ghFake := writeCredShim(t)
+	gitShim, ghFake, ghRecord := writeCredShim(t)
 
 	v := New(env.work, "origin")
 	v.gitBin = gitShim
@@ -267,10 +293,91 @@ func TestOwnerWithoutGhTokenFallsBackUnscoped(t *testing.T) {
 
 	mustStatus(t, rep, BranchPushed, Pass)
 
+	// gh failed to resolve, but it was asked about the URL's owner - the
+	// account the chain derived - not the ambient active one.
+	wantGHProbedOwner(t, ghRecord, "some-org")
+
 	secs := credSections(t, record)
 	for _, l := range secs["ls-remote"] {
 		if !strings.HasPrefix(l, "count=unset") {
 			t.Errorf("unresolvable owner should leave ls-remote unscoped, got %q", l)
 		}
+	}
+}
+
+// The probe that ANSWERS "what is this owner's token" must not itself inherit
+// the ambient credential. gh reads only its keyring and hosts.yml today, but
+// that is an upstream implementation detail: if it ever consulted GH_TOKEN,
+// this spawn would answer with the ACTIVE account's token and the scoping
+// built on it would silently no-op — invisible to every other test here,
+// whose fakes answer from their own variable and ignore the ambient one.
+func TestTokenProbeStripsAmbientCredentials(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(t.TempDir(), "probe-record.log")
+	t.Setenv("PROBE_RECORD", record)
+	t.Setenv("GH_TOKEN", "ambient-decoy-not-the-owners")
+	t.Setenv("GITHUB_TOKEN", "ambient-github-decoy")
+
+	gh := filepath.Join(t.TempDir(), "gh")
+	writeFile(t, gh, `#!/bin/sh
+printf 'GH_TOKEN=%s\n' "${GH_TOKEN-UNSET}" >> "$PROBE_RECORD"
+printf 'GITHUB_TOKEN=%s\n' "${GITHUB_TOKEN-UNSET}" >> "$PROBE_RECORD"
+printf '%s\n' '`+credFakeToken+`'
+`)
+	if err := os.Chmod(gh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// The probe must still answer, or it is only possible to pass this test by
+	// making the spawn fail rather than by stripping anything.
+	if got := TokenForOwner(context.Background(), dir, gh, "acme"); got != credFakeToken {
+		t.Fatalf("probe must still answer the owner's token, got %q", got)
+	}
+
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("probe record missing - the fake gh never ran: %v", err)
+	}
+	for _, want := range []string{"GH_TOKEN=UNSET", "GITHUB_TOKEN=UNSET"} {
+		if !strings.Contains(string(body), want) {
+			t.Errorf("probe child carried the ambient credential: want %s, env was:\n%s", want, body)
+		}
+	}
+}
+
+// TestTokenProbeNamesItsHost pins the probe's argv. `gh auth token` without
+// --hostname answers for gh's DEFAULT host, which on a GHES-configured machine
+// is a different account's token; the owner is a github.com account by
+// construction, so the probe must say so. The exact string also keeps --user at
+// $3/$4 - the position every fake gh in this package reads the account from,
+// and gh's own "no oauth token ... account X" text echoes.
+func TestTokenProbeNamesItsHost(t *testing.T) {
+	dir := t.TempDir()
+	record := filepath.Join(t.TempDir(), "probe-argv.log")
+	t.Setenv("PROBE_RECORD", record)
+
+	gh := filepath.Join(t.TempDir(), "gh")
+	writeFile(t, gh, `#!/bin/sh
+printf '%s\n' "$*" >> "$PROBE_RECORD"
+printf '%s\n' '`+credFakeToken+`'
+`)
+	if err := os.Chmod(gh, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A failing spawn would pass an argv assertion for the wrong reason.
+	if got := TokenForOwner(context.Background(), dir, gh, "acme"); got != credFakeToken {
+		t.Fatalf("probe must answer the owner's token, got %q", got)
+	}
+
+	body, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatalf("probe record missing - the fake gh never ran: %v", err)
+	}
+	// The literal host, not githubHost: a test that reads the constant moves with
+	// a drift of it and stays green.
+	const want = "auth token --user acme --hostname github.com"
+	if got := strings.TrimSpace(string(body)); got != want {
+		t.Errorf("probe must pin its host, and keep --user at $3/$4:\n want %q\n  got %q", want, got)
 	}
 }

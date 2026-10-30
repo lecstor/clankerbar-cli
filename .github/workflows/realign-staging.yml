@@ -48,9 +48,10 @@ concurrency:
 jobs:
   realign:
     runs-on: ubuntu-latest
-    # Long enough to wait out `ci` on the merge commit (see the gate step below),
-    # which is triggered by the same push and has not started when this begins.
-    timeout-minutes: 45
+    # Covers the 60-minute `await-check` below plus checkout and setup. `ci` runs
+    # on the one-slot self-hosted runner, so the wait includes the jobs queued
+    # ahead of the merge commit's run, not just the run itself.
+    timeout-minutes: 75
     permissions:
       # To push the fast-forward to `staging`.
       contents: write
@@ -80,6 +81,10 @@ jobs:
       # means `staging` only ever advances onto a commit that actually passed.
       # The wait resolves an absent or unfinished check to a FAILURE, so a red
       # `main` leaves `staging` where it is and says so, loudly, in Actions.
+      #
+      # 60 minutes, not one job's runtime: `ci` runs on the one-slot self-hosted
+      # runner, so the window also covers the jobs queued ahead of this commit's
+      # run (ci.yml caps each at 20 minutes).
       - name: Wait for a green ci on the commit being fast-forwarded onto
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -88,7 +93,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --sha "${{ github.sha }}" \
             --required ci \
-            --timeout 30m \
+            --timeout 60m \
             --interval 15s
 
       - name: Fast-forward staging up to main
@@ -103,7 +108,7 @@ jobs:
 
           # ${{ github.sha }}, NOT $(git rev-parse origin/main). The gate above
           # waited for `ci` on github.sha, and `main` can advance during that wait
-          # of up to 30 minutes - so reading origin/main here would fast-forward
+          # of up to 60 minutes - so reading origin/main here would fast-forward
           # `staging` onto a commit this job never gated, while the log claimed it
           # had been verified. staging's required-check protection would still
           # reject such a push, so it failed closed, but as an opaque rejection

@@ -38,7 +38,7 @@ type proposeConfigFlags struct {
 func newProposeConfigFlagSet(f *proposeConfigFlags) *pflag.FlagSet {
 	fs := newFlagSet("propose-config")
 	fs.StringVarP(&f.cfgPath, "config", "c", "", "config file (default: ~/.config/clankerbar/config.json)")
-	fs.StringVar(&f.slug, "slug", "", "clankerbar project to propose against (required when projects[] names more than one)")
+	fs.StringVar(&f.slug, "slug", "", "clankerbar project to propose against (default: this config's own). In single-project mode it redirects the proposal to the project it names; when projects[] names more than one it is required and must name one of them")
 	fs.StringVar(&f.notes, "notes", "", "extra rationale carried on the proposal for the operator")
 	return fs
 }
@@ -77,12 +77,13 @@ func ProposeConfig(ctx context.Context, args []string) error {
 		return errors.New("nothing to import: this config sets none of the dials the plane stores (prompt, phases, review_panel, harness, model, models, budget, escalation, max_turns, max_session_wall_clock)")
 	}
 
-	endpoint := cfg.BacklogEndpoint()
-	for _, p := range cfg.Projects {
-		if p.Slug == slug {
-			endpoint = cfg.ProjectEndpoint(p)
-			break
-		}
+	// The endpoint's slug is the RESOLVED one, so the write and the name printed
+	// below cannot disagree; ProjectEndpoint keeps the origin on CredentialOrigin.
+	endpoint := cfg.ProjectEndpoint(config.Project{Slug: slug})
+	// Unreachable after Validate; kept so a moved origin/slug invariant fails with
+	// this sentence rather than ErrNotWired.
+	if endpoint == "" {
+		return errors.New("cannot resolve a project-scoped MCP endpoint - set backlog_url in the config")
 	}
 	apiKey := os.Getenv("CLANKERBAR_API_KEY")
 	rc := plane.NewRunConfigAPI(endpoint, apiKey)
@@ -106,10 +107,16 @@ func ProposeConfig(ctx context.Context, args []string) error {
 	return nil
 }
 
-// pickSlug resolves the ONE project a command targets when the caller named
-// none. Multi-project configs have no single answer, so the caller's own flag
-// (named here so its rejections point at the flag that fixes them) is required
-// explicitly rather than one entry being fanned out silently.
+// pickSlug resolves the ONE project a command targets: the caller's explicit
+// name when there is one, otherwise the config's own answer. A multi-project
+// config has no single default and is refused rather than fanned out silently.
+//
+// An explicit name is honoured when the config drives at most one project,
+// whatever spelling named that project: `upload --project X` targets /mcp/X in
+// this shape, so refusing here only because X is not in a one-entry projects[]
+// would make the two commands disagree about what a named project means. With
+// several projects the name must match one, so a typo cannot drift onto a project
+// the config never mentioned.
 //
 // Called by propose-config with --slug and by upload/deck with --project.
 func pickSlug(cfg *config.Config, want, flag string) (string, error) {
@@ -120,14 +127,14 @@ func pickSlug(cfg *config.Config, want, flag string) (string, error) {
 				return want, nil
 			}
 		}
-		if len(cfg.Projects) > 0 {
-			var have []string
-			for _, p := range cfg.Projects {
-				have = append(have, p.Slug)
-			}
-			return "", fmt.Errorf("%s %q matches no configured project (have: %s)", flag, want, strings.Join(have, ", "))
+		if len(cfg.Projects) <= 1 {
+			return want, nil
 		}
-		return want, nil
+		var have []string
+		for _, p := range cfg.Projects {
+			have = append(have, p.Slug)
+		}
+		return "", fmt.Errorf("%s %q matches no configured project (have: %s)", flag, want, strings.Join(have, ", "))
 	case len(cfg.Projects) == 1:
 		return cfg.Projects[0].Slug, nil
 	case len(cfg.Projects) > 1:

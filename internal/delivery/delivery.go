@@ -866,6 +866,13 @@ const (
 	// invocation resolves - including through a remote name - reads as the
 	// token'd base above.
 	insteadOfPrefix = "https://github.com/"
+
+	// githubHost is the host every owner this package scopes belongs to:
+	// githubOwner derives an owner from github.com URLs only. The token probe
+	// names it explicitly because `gh auth token` otherwise answers for gh's
+	// DEFAULT host - on a machine whose gh default is a GHES instance that is
+	// a different account's token, silently scoping the wrong credential.
+	githubHost = "github.com"
 )
 
 // githubOwner extracts the account that owns a github.com HTTPS remote URL:
@@ -921,13 +928,20 @@ func ScopeEnv(token string) []string {
 }
 
 // TokenForOwner resolves owner's GitHub token with `gh auth token --user`,
-// spawning ghBin in dir under runGH's interaction-hostile discipline. Any
-// failure - gh missing, no such account, a wedged call - is an empty token,
-// which callers treat as "run unscoped". A token is also refused if it cannot
-// ride a single config value intact (embedded whitespace would corrupt the
-// insteadOf key into something silently wrong).
+// spawning ghBin in dir under runGH's interaction-hostile discipline. The spawn
+// drops the ambient GH_TOKEN/GITHUB_TOKEN and names github.com explicitly: the
+// answer must come from gh's own credential store for the account named, never
+// from the active account's environment, and never from whatever host gh treats
+// as its default - a github.com owner is a github.com account by construction
+// (see githubOwner), and a GHES default host would answer for a different
+// account. Any failure - gh missing, no such account, a wedged call - is an
+// empty token, which callers treat as "run unscoped". A token is also refused
+// if it cannot ride a single config value intact (embedded whitespace would
+// corrupt the insteadOf key into something silently wrong).
 func TokenForOwner(ctx context.Context, dir, ghBin, owner string) string {
-	out, err := runGHBin(ctx, ghBin, dir, nil, "auth", "token", "--user", owner)
+	// --user stays at $3/$4: every fake gh in this package, and the account
+	// name in its failure message, read the account from that position.
+	out, err := runGHProbe(ctx, ghBin, dir, "auth", "token", "--user", owner, "--hostname", githubHost)
 	if err != nil {
 		return ""
 	}

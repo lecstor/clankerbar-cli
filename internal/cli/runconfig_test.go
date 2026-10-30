@@ -345,3 +345,155 @@ func TestProposeConfig_RefusesAPanelThePlaneCannotExpand(t *testing.T) {
 		t.Error("a proposal was sent for a document the plane cannot ratify")
 	}
 }
+
+// CLA-482: single-project mode has no projects[] entry for --slug to match, and
+// that left the endpoint on the config's OWN project while the success line
+// echoed the requested one. The write must follow the slug it names.
+func TestProposeConfig_SingleProjectTargetsTheNamedSlug(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// body writes the config file and returns its JSON.
+		body func(t *testing.T, dir, planeURL string) string
+		slug string
+		want string
+	}{
+		{
+			// The wiring's own /mcp/<slug> names "demo"; --slug names another.
+			name: "backlog_url naming the config's own project",
+			body: func(t *testing.T, dir, planeURL string) string {
+				return `{"harness": "claude", "model": "opus", "workdir": "` + dir + `", "backlog_url": "` + planeURL + `/mcp/demo"}`
+			},
+			slug: "other",
+			want: "/mcp/other",
+		},
+		{
+			// Same single-project mode, but the slug is lifted from .mcp.json and
+			// the origin from backlog_url.
+			name: "mcp_config_path naming the config's own project",
+			body: func(t *testing.T, dir, planeURL string) string {
+				mcp := filepath.Join(dir, "mcp.json")
+				servers := `{"mcpServers": {"clankerbar": {"type": "http", "url": "` + planeURL + `/mcp/demo"}}}`
+				if err := os.WriteFile(mcp, []byte(servers), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return `{"harness": "claude", "model": "opus", "workdir": "` + dir + `", "backlog_url": "` + planeURL + `", "mcp_config_path": "` + mcp + `"}`
+			},
+			slug: "other",
+			want: "/mcp/other",
+		},
+		{
+			// Naming the config's own project still targets it.
+			name: "the config's own slug",
+			body: func(t *testing.T, dir, planeURL string) string {
+				return `{"harness": "claude", "model": "opus", "workdir": "` + dir + `", "backlog_url": "` + planeURL + `/mcp/demo"}`
+			},
+			slug: "demo",
+			want: "/mcp/demo",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`))
+			}))
+			defer srv.Close()
+
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			if err := os.WriteFile(path, []byte(tc.body(t, dir, srv.URL)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CLANKERBAR_API_KEY", "k-test")
+
+			if err := ProposeConfig(context.Background(), []string{"--config", path, "--slug", tc.slug}); err != nil {
+				t.Fatalf("ProposeConfig: %v", err)
+			}
+			if gotPath != tc.want {
+				t.Errorf("proposal went to %q, want %q - the endpoint must follow the slug the command named", gotPath, tc.want)
+			}
+		})
+	}
+}
+
+// A config that declares its project in projects[] must still target that
+// project: the endpoint is built from the resolved slug alone, so these cases
+// pin that the project's spelling does not change where the proposal lands.
+func TestProposeConfig_DeclaredProjectsTargetTheNamedProject(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		projects string
+		slug     string
+		want     string
+	}{
+		{
+			// A config driving one project answers the same way whether the
+			// project is spelled in projects[] or only in its wiring, so an
+			// explicit --slug names it in both.
+			name:     "one declared project, named explicitly",
+			projects: `[{"slug": "demo"}]`,
+			slug:     "demo",
+			want:     "/mcp/demo",
+		},
+		{
+			name:     "one declared project, another name given",
+			projects: `[{"slug": "demo"}]`,
+			slug:     "other",
+			want:     "/mcp/other",
+		},
+		{
+			name:     "several declared projects",
+			projects: `[{"slug": "alpha"}, {"slug": "beta"}]`,
+			slug:     "beta",
+			want:     "/mcp/beta",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"{}"}]}}`))
+			}))
+			defer srv.Close()
+
+			dir := t.TempDir()
+			path := filepath.Join(dir, "config.json")
+			body := `{"harness": "claude", "model": "opus", "workdir": "` + dir + `", "backlog_url": "` + srv.URL + `", "projects": ` + tc.projects + `}`
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("CLANKERBAR_API_KEY", "k-test")
+
+			if err := ProposeConfig(context.Background(), []string{"--config", path, "--slug", tc.slug}); err != nil {
+				t.Fatalf("ProposeConfig: %v", err)
+			}
+			if gotPath != tc.want {
+				t.Errorf("proposal went to %q, want %q", gotPath, tc.want)
+			}
+		})
+	}
+}
+
+// A multi-project config still refuses a --slug matching none of its entries, so
+// letting the one-project spelling name any project did not drop the typo guard.
+func TestProposeConfig_MultiProjectRefusesAnUnknownSlug(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.json")
+	body := `{"harness": "claude", "model": "opus", "workdir": "` + dir + `", "backlog_url": "https://plane.example", "projects": [{"slug": "alpha"}, {"slug": "beta"}]}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLANKERBAR_API_KEY", "k-test")
+
+	err := ProposeConfig(context.Background(), []string{"--config", path, "--slug", "gamma"})
+	if err == nil {
+		t.Fatal("ProposeConfig proposed gamma; a slug matching no configured project must be refused")
+	}
+	for _, want := range []string{`"gamma"`, "alpha", "beta"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal = %q, want it to name %s", err, want)
+		}
+	}
+}

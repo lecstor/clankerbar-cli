@@ -83,6 +83,50 @@ func TestCIWorkflowHasNoMatrix(t *testing.T) {
 	}
 }
 
+// The `ci` job runs on the self-hosted runner for one reason: this repo is
+// private, so every GitHub-hosted minute is drawn from a finite allowance. A
+// silent drift back to `ubuntu-latest` fails nothing - the job runs, the check
+// goes green, and the allowance quietly resumes draining - so the selector is
+// pinned here rather than left to the workflow's own comment.
+func TestCIWorkflowRunsOnTheSelfHostedRunner(t *testing.T) {
+	path := filepath.Join("..", "..", ".github", "workflows", "ci.yml")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Skipf("cannot read %s: %v", path, err)
+	}
+
+	// The `ci:` job key at two-space indentation, then its first `runs-on:` at
+	// four. `(?s)` lets the match span the job's comments and earlier keys; the
+	// four-space anchor keeps a step-level key (six or more spaces) out.
+	job := regexp.MustCompile(`(?ms)^  ci:\n.*?^    runs-on:[ \t]*([^\r\n]+)`)
+	m := job.FindStringSubmatch(string(raw))
+	if m == nil {
+		t.Fatalf("could not find the `ci` job's `runs-on:` in %s - the cost "+
+			"property this test guards cannot be checked, which is itself the "+
+			"problem. If the job was reshaped, reshape this test with it.", path)
+	}
+
+	selector := strings.TrimSpace(m[1])
+	if !strings.HasPrefix(selector, "[") || !strings.HasSuffix(selector, "]") {
+		t.Fatalf("the `ci` job's runs-on is %q, not the label list "+
+			"[self-hosted, headless]", selector)
+	}
+	var labels []string
+	for _, label := range strings.Split(strings.Trim(selector, "[]"), ",") {
+		labels = append(labels, strings.TrimSpace(label))
+	}
+
+	want := []string{"headless", "self-hosted"} // sorted, compared order-insensitively
+	got := slices.Clone(labels)
+	slices.Sort(got)
+	if !slices.Equal(got, want) {
+		t.Errorf("%s's `ci` job runs on %q, not %q. On a GitHub-hosted runner it "+
+			"silently resumes drawing this private repo's finite Actions "+
+			"allowance, and no gate fails. Restore the selector, or change this "+
+			"pin deliberately.", path, labels, want)
+	}
+}
+
 // Both integration branches must stay in ci.yml's `push:` list, and each is
 // load-bearing for a DIFFERENT thing - so losing either is silent until someone
 // tries to publish, which is exactly when a guard is worth having.
