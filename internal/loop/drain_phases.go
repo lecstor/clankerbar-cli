@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
-	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -57,175 +56,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			fixIdx = i
 		}
 	}
-	// MUST ids a verifier has already marked resolved in THIS drain. An id open
-	// again is non-convergence (A6). In-memory on purpose: it is a courtesy
-	// layer over the durable round-prefix check, which survives a takeover on
-	// its own because it reads the plane's round numbers.
-	verifyResolved := map[string]bool{}
-	// Verification rounds this drain has actually closed. The plane's counted is
-	// the cap of record (it survives takeovers and ignores void rounds); this
-	// local count is the last-resort bound that keeps the loop finite even if a
-	// plane read serves no count at all, which would otherwise make "counted >=
-	// 3" unreachable and the fix→verify pair unbounded.
-	verifyRoundsRun := 0
-	// CLA-639: the panel's members that wrote no record this round, and the round
-	// the panel's released records landed in. A dead, capped or otherwise
-	// record-less member does not stop the panel: it is listed here, the round
-	// still closes, and the fix phase is told the panel was incomplete. The
-	// round number is the one the seam MATCHED on a member that did record, so a
-	// later member's failure can still release the records already written.
-	var (
-		panelIncomplete []string
-		panelRound      int
-	)
-	// CLA-639 M4: whether any REQUIRED member of this panel recorded, and why
-	// each member that did NOT failed. The first decides whether a failed LAST
-	// member hands the round to the fix phase (there is something to apply) or
-	// ends the drain; the second rides the fix brief, so "the panel was
-	// incomplete" names the members AND what happened to them.
-	//
-	// CLA-784: an OPTIONAL (trial) seat's record deliberately does NOT set this.
-	// A round where only optional seats recorded is no review at all — there is
-	// no required member's findings for a fix to work — and is treated exactly
-	// as a panel where nobody recorded.
-	panelRecorded := false
-	panelFailed := map[string]panelMemberFailure{}
-	// CLA-639 M5: the branchless-panel skip says its piece once, not once per
-	// skipped member — N-1 identical lines would read as N problems.
-	branchlessPanelNoted := false
-	// CLA-784: the branchless panel's ONE reviewer is chosen from the REQUIRED
-	// seats, never the first configured member blindly. branchlessPanelRan says
-	// the chosen seat has already run (every later member is skipped);
-	// branchlessPanelChosen is its label, for the skip log line.
-	branchlessPanelRan := false
-	branchlessPanelChosen := ""
-	// CLA-697: a panel run whose fan-out could not be set up (no repo, no
-	// resolvable tip) falls back to the sequential members for THIS panel; the
-	// flag stops every later member re-running the same failing probes.
-	panelFanOutOff := false
-	// The claim a phase deliberately left held for its successor, and the source
-	// of the task/run ids that successor's prompt needs.
-	var carried *harness.Result
-
-	// A session-authored successor prompt, pending from the last session's
-	// handoff block (CLA-352). Non-empty means the next session is a handoff
-	// respawn continuing the SAME phase, not the next configured one.
-	nextPrompt := ""
-	chain := 0   // consecutive handoff respawns, against handoffChainCap
-	spawned := 0 // sessions this drain has launched, phase or respawn
-	// Consecutive dead phases this TASK has produced (CLA-386). The retry budget
-	// is per task, not per run: a single silent death is plausibly transient, a
-	// second on the same task is not, and the same task reached fresh in a later
-	// run earns its retry again. deadTask names which task the counter counts for,
-	// because the retry is a fresh claiming session (the dead claim was handed
-	// back): if next_task hands it a DIFFERENT task, that task has died once, not
-	// twice, and must not be parked for a second death it did not have (review
-	// finding). A dead phase always holds a claim, so deadTask is set whenever the
-	// classification fires.
-	deadRetries := 0
-	deadTask := ""
-	// Consecutive held-but-empty implement exits in this drain (CLA-457). Bounded
-	// at ONE retry per the 2026-08-24 decision, deliberately smaller than the
-	// dead-phase ladder: the empty shape returns to the queue rather than
-	// parking, so the retry is a courtesy to a plausibly-transient silent EOT,
-	// not a budget (see the end.empty branch below).
-	emptyRetries := 0
-	// Whether the checkpoint that opened the CURRENT phase was evidenced by the
-	// plane's record rather than a verified branch (CLA-497). Set at each seam
-	// from the claim carried INTO the phase; a handoff respawn continues the
-	// same phase and must keep the value, so it is never recomputed at the loop
-	// head (where `carried` has already become the phase's own claim).
-	branchlessCheckpoint := false
-
+	s := &drainSeq{
+		d: d, t: t, tc: tc, ti: ti, drainNum: drainNum, prior: prior, phases: phases, rawPhases: rawPhases, fixIdx: fixIdx,
+		verifyResolved: map[string]bool{}, panelFailed: map[string]panelMemberFailure{}, drainStart: time.Now(),
+	}
 	// CLA-466: one iteration record posts at this drain's boundary, whatever way
-	// it ends — hence the defer, and hence locals the deferred closure reads.
-	drainStart := time.Now()
-	var (
-		phasesRun []string // distinct phase labels attempted, in order
-		// CLA-630: one entry per session this drain spawned, in spawn order —
-		// every pass through the loop below (a configured phase, a handoff
-		// respawn, a dead- or empty-retry re-run), with the harness and model
-		// each actually spawned with. A retry ladder INSIDE one phase is one
-		// session re-run, not a new one; see drainPhase's phaseEnd.session.
-		sessionsRun []fleet.Session
-		seen        harness.Claim
-		parkFired   bool // the per-task dead budget parked the task
-		tripFired   bool // the fleet dead counter tripped and paused this target
-		// finalOutcome is the CLAIM's disposition at the drain boundary: one of
-		// the fleet.Outcome* constants, or "" when nothing was observed (no
-		// claim state at all, or claimDisposition's nil return). The deferred
-		// switch below is what makes the RECORDED outcome one of the four — it
-		// maps "" to released and the drain's own verdicts (parked/dead) over
-		// the disposition — so the variable itself is not always safe to hand
-		// on (CLA-738). Never append prose to it: marshalReport refuses the
-		// WHOLE report on a word it does not know, so free text here loses the
-		// iteration record AND the presence refresh riding the same report.
-		// Free-text notes belong in the log.
-		finalOutcome string
-		// CLA-631/CLA-651/CLA-662: the wait a RESUMED phase's sequence-end
-		// signal asks the run for. A rolling limit (CLA-631) hands its reset
-		// down here; the transient arm (CLA-662) hands its backoff rung down as
-		// transientRung/transientKey instead. Both waits are owed AFTER the
-		// sequence's handback, so both are taken holding no lease.
-		limitWait *phaseLimitWait
-		// CLA-662: the streak rung a transient sequence-end reached, and the
-		// target it belongs to — zero when no transient end happened.
-		transientRung int
-		transientKey  resumedTransientKey
-		// finalDead / lastProducedNothing are the FINAL attempt's dead
-		// classifications (the seam's, and the tally's wider one): a death that
-		// was retried past must not brand the record, and a LAST-phase death
-		// never sets end.dead at all (no retry/park applies) yet the record must
-		// still read `dead` — see phaseEnd.producedNothing.
-		finalDead           bool
-		lastProducedNothing bool
-	)
-	defer func() {
-		// CLA-639: the LOG says the panel was incomplete, by member, whether the
-		// drain then reached the fix phase or stopped before it. The reviewers
-		// that DID record are what the fix phase receives; this names the ones
-		// that did not, so "the panel" never reads as the full panel when it was
-		// not.
-		//
-		// CLA-738: the note is a log line and NOTHING more. It must never be
-		// folded into the iteration Outcome, which is one of the four
-		// fleet.Outcome* words: the pre-CLA-738 code appended it to the
-		// disposition, and marshalReport then refused the whole report on the
-		// free text — dropping the iteration record and the presence refresh for
-		// exactly the drains the operator most needs to see. The per-member
-		// failures already ride each session's `cause`.
-		if len(panelIncomplete) > 0 {
-			log.Printf("%siteration %d: review panel INCOMPLETE: %s", labelOf(t), drainNum, strings.Join(panelIncomplete, "; "))
-		}
-		outcome := finalOutcome
-		switch {
-		case parkFired:
-			outcome = fleet.OutcomeParked
-		case tripFired || finalDead || lastProducedNothing || err != nil:
-			outcome = fleet.OutcomeDead
-		case outcome == "":
-			// Nothing was ever observed — a launch failure with no claim state,
-			// say. The record still posts (exactly one per iteration); its task
-			// fields are simply empty and the outcome reads as released.
-			outcome = fleet.OutcomeReleased
-		}
-		d.endIteration(ti, t, fleet.Iteration{
-			TaskID:          seen.TaskID,
-			TaskRef:         seen.Ref,
-			Phases:          phasesRun,
-			Sessions:        sessionsRun,
-			Outcome:         outcome,
-			DurationSeconds: time.Since(drainStart).Seconds(),
-			Tokens:          tokens,
-			// CLA-677: the drain's dollar spend, from the same accumulator the
-			// budget breaker reads. It rides the iteration record so the plane
-			// can show what each drain cost.
-			CostUSD: cost,
-		})
-	}()
-
-	for i := 0; i < len(phases); {
-		ph := phases[i]
+	// it ends — hence the defer, and hence state the deferred record reads.
+	defer s.recordIteration()
+	for s.i = 0; s.i < len(phases); {
+		ph := phases[s.i]
 		// CLA-639: whether this position is one reviewer of a review panel. The
 		// members are consecutive review-shaped phases, so "before the next
 		// configured phase" is the same test the shipped sequence already uses.
@@ -234,7 +73,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// continuation's own review position must still be read from the phase
 		// identity, not from a prompt that is no longer a brief.
 		panelMember := ph.IsPanelMember()
-		last := i == len(phases)-1
+		last := s.i == len(phases)-1
 		// CLA-639 M5: a BRANCHLESS task cannot run a panel AT ALL, so its panel
 		// is one reviewer. This shape's review record is the legacy `## Review`
 		// block written to the task's outcome — the plane accepts a durable
@@ -257,24 +96,24 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// panel member — exactly the position where the trial seat sits in the
 		// shape this finding names. `carried` is what `drainPhase` itself reads
 		// for `branchlessPanel` (`prev.Claim.Branch == ""`), so the two agree.
-		if panelMember && carried != nil && carried.Claim.Branch == "" {
+		if panelMember && s.carried != nil && s.carried.Claim.Branch == "" {
 			if ph.IsOptionalPanelMember() {
 				log.Printf("%siteration %d: this task's checkpoint is BRANCHLESS (its review record is the legacy %q block, not a durable one), so its review panel runs ONE reviewer — skipping the OPTIONAL (trial) seat %s: the required seat is the one that must record",
-					labelOf(t), drainNum, config.ReviewRecordHeading, ph.Label(i))
-				i++
+					labelOf(t), drainNum, config.ReviewRecordHeading, ph.Label(s.i))
+				s.i++
 				continue
 			}
-			if branchlessPanelRan {
-				if !branchlessPanelNoted {
+			if s.branchlessPanelRan {
+				if !s.branchlessPanelNoted {
 					log.Printf("%siteration %d: this task's checkpoint is BRANCHLESS (its review record is the legacy %q block, not a durable one), so the review panel runs ONE reviewer: %s",
-						labelOf(t), drainNum, config.ReviewRecordHeading, branchlessPanelChosen)
-					branchlessPanelNoted = true
+						labelOf(t), drainNum, config.ReviewRecordHeading, s.branchlessPanelChosen)
+					s.branchlessPanelNoted = true
 				}
-				i++
+				s.i++
 				continue
 			}
-			branchlessPanelRan = true
-			branchlessPanelChosen = ph.Label(i)
+			s.branchlessPanelRan = true
+			s.branchlessPanelChosen = ph.Label(s.i)
 		}
 		// CLA-639: the panel's last member is the last REVIEW of the sequence even
 		// when a fix follows it, and the driver's plain-review seam must run for it
@@ -282,10 +121,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// this treatment: a shipped `review` before a fix is not "terminal", and
 		// passing that word over would tell it there is nothing to checkpoint for.
 		terminal := last
-		if panelMember && !last && !config.ReviewShaped(phases[i+1].Prompt) {
+		if panelMember && !last && !config.ReviewShaped(phases[s.i+1].Prompt) {
 			terminal = true
 		}
-		isHandoff := nextPrompt != ""
+		isHandoff := s.nextPrompt != ""
 		// CLA-697: fan the panel's contiguous members out concurrently, each in
 		// its own detached worktree. A handoff respawn continues ONE phase (never
 		// a panel run), and a branchless checkpoint runs one reviewer by design —
@@ -297,41 +136,41 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// nobody recorded. With cap = 1 (or a single member) this block does
 		// nothing at all and the old path runs byte for byte.
 		if !panelMember {
-			panelFanOutOff = false
+			s.panelFanOutOff = false
 		}
-		if panelMember && !isHandoff && !branchlessCheckpoint && !panelFanOutOff {
-			runEnd := i + 1
+		if panelMember && !isHandoff && !s.branchlessCheckpoint && !s.panelFanOutOff {
+			runEnd := s.i + 1
 			for runEnd < len(phases) && phases[runEnd].IsPanelMember() {
 				runEnd++
 			}
-			if n, conc := runEnd-i, tc.EffectivePanelConcurrency(runEnd-i); n > 1 && conc > 1 {
+			if n, conc := runEnd-s.i, tc.EffectivePanelConcurrency(runEnd-s.i); n > 1 && conc > 1 {
 				// The breaker at the boundary BEFORE the fan-out, exactly as the
 				// sequential path's per-spawn check would have stopped before the
 				// first member it could not afford.
-				if spawned > 0 {
-					if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
+				if s.spawned > 0 {
+					if dim := d.budgetTrip(prior.tokens+s.tokens, prior.cost+s.cost, time.Since(prior.start)); dim != "" {
 						log.Printf("iteration %d: budget reached at the %s phase boundary: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-							drainNum, ph.Label(i), dim, prior.tokens+tokens, prior.cost+cost,
+							drainNum, ph.Label(s.i), dim, prior.tokens+s.tokens, prior.cost+s.cost,
 							time.Since(prior.start).Round(time.Second))
-						stop = true
+						s.stop = true
 						break
 					}
 				}
-				if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, i, runEnd, conc, carried, spend{
+				if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, s.i, runEnd, conc, s.carried, spend{
 					start:  prior.start,
-					tokens: prior.tokens + tokens,
-					cost:   prior.cost + cost,
+					tokens: prior.tokens + s.tokens,
+					cost:   prior.cost + s.cost,
 				}); ok {
-					tokens += out.tokens
-					cost += out.cost
-					spawned += n
+					s.tokens += out.tokens
+					s.cost += out.cost
+					s.spawned += n
 					for k, m := range out.members {
 						if m.end.session != nil {
-							sessionsRun = append(sessionsRun, *m.end.session)
+							s.sessionsRun = append(s.sessionsRun, *m.end.session)
 						}
-						label := phases[i+k].Label(i + k)
-						if len(phasesRun) == 0 || phasesRun[len(phasesRun)-1] != label {
-							phasesRun = append(phasesRun, label)
+						label := phases[s.i+k].Label(s.i + k)
+						if len(s.phasesRun) == 0 || s.phasesRun[len(s.phasesRun)-1] != label {
+							s.phasesRun = append(s.phasesRun, label)
 						}
 					}
 					// The member claims are the same run the panel resumed; keep
@@ -340,17 +179,17 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// nothing can end holding a claim that never had the tip
 					// folded onto it, and adopting that one would hand the fix
 					// phase an unverified-looking checkpoint.
-					if out.claim != nil && (carried == nil || out.claim.Claim.TaskID == carried.Claim.TaskID) {
-						seen = out.claim.Claim
-						finalOutcome = out.disposition
+					if out.claim != nil && (s.carried == nil || out.claim.Claim.TaskID == s.carried.Claim.TaskID) {
+						s.seen = out.claim.Claim
+						s.finalOutcome = out.disposition
 					}
-					finalDead = out.finalDead
-					lastProducedNothing = out.lastProducedNothing
-					panelRecorded = panelRecorded || out.recorded
-					panelRound = max(panelRound, out.round)
-					panelIncomplete = append(panelIncomplete, out.incomplete...)
+					s.finalDead = out.finalDead
+					s.lastProducedNothing = out.lastProducedNothing
+					s.panelRecorded = s.panelRecorded || out.recorded
+					s.panelRound = max(s.panelRound, out.round)
+					s.panelIncomplete = append(s.panelIncomplete, out.incomplete...)
 					for role, why := range out.failed {
-						panelFailed[role] = why
+						s.panelFailed[role] = why
 					}
 					// The run-level endings, in the order the sequential handler
 					// checks them: a close that failed is fail-closed and stops the
@@ -360,25 +199,25 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// no fix.
 					switch {
 					case out.closeFailed:
-						if limitWait == nil && out.sequenceEnded && out.limitWait == nil {
-							transientKey = out.transientKey
-							transientRung = d.noteResumedTransient(transientKey)
+						if s.limitWait == nil && out.sequenceEnded && out.limitWait == nil {
+							s.transientKey = out.transientKey
+							s.transientRung = d.noteResumedTransient(s.transientKey)
 						}
 					case out.stop:
-						stop = true
+						s.stop = true
 					case out.err != nil:
-						err = out.err
+						s.err = out.err
 					case out.sequenceEnded:
-						limitWait = out.limitWait
-						if limitWait == nil {
-							transientKey = out.transientKey
-							transientRung = d.noteResumedTransient(transientKey)
+						s.limitWait = out.limitWait
+						if s.limitWait == nil {
+							s.transientKey = out.transientKey
+							s.transientRung = d.noteResumedTransient(s.transientKey)
 						}
 					}
-					if stop || err != nil || out.closeFailed || out.sequenceEnded || !out.recorded || runEnd >= len(phases) {
+					if s.stop || s.err != nil || out.closeFailed || out.sequenceEnded || !out.recorded || runEnd >= len(phases) {
 						break
 					}
-					i = runEnd
+					s.i = runEnd
 					continue
 				}
 			}
@@ -414,9 +253,9 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// other entry is its own configured phase. Never re-read live: a
 			// RELOAD applied mid-drain must not reshape the in-flight sequence's
 			// continuation (CLA-664) — the same rule the mode and the count follow.
-			promptBytes = len(nextPrompt)
+			promptBytes = len(s.nextPrompt)
 			continuation := ""
-			if i < len(rawPhases) && rawPhases[i].Prompt == "" {
+			if s.i < len(rawPhases) && rawPhases[s.i].Prompt == "" {
 				// CLA-497: a handoff during a NO-CODE review must not append the
 				// branch-shaped reviewTerminalStep, which tells the successor to
 				// open a PR for a task that has no branch and no code.
@@ -436,24 +275,24 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// successor gets the variant that tells the reviewer to
 				// establish the tip itself — the verified shape's {{reviewedTip}}
 				// could not be filled and would leak as a literal.
-				unverifiedCheckpoint := carried != nil && carried.CheckpointUnverified
+				unverifiedCheckpoint := s.carried != nil && s.carried.CheckpointUnverified
 				switch {
-				case ph.Name == config.ReviewPhaseName && branchlessCheckpoint && reviewOnly:
+				case ph.Name == config.ReviewPhaseName && s.branchlessCheckpoint && reviewOnly:
 					continuation = config.NoCodeReviewOnlyHandoffContinuation()
-				case ph.Name == config.ReviewPhaseName && branchlessCheckpoint:
+				case ph.Name == config.ReviewPhaseName && s.branchlessCheckpoint:
 					continuation = config.NoCodeHandoffContinuation()
 				case ph.Name == config.ReviewPhaseName && reviewOnly && unverifiedCheckpoint:
 					continuation = config.UnverifiedReviewOnlyHandoffContinuation()
-				case ph.Name == config.FixPhaseName && branchlessCheckpoint && i+1 < len(phases) && isVerifyPhase(phases[i+1]):
+				case ph.Name == config.FixPhaseName && s.branchlessCheckpoint && s.i+1 < len(phases) && isVerifyPhase(phases[s.i+1]):
 					// CLA-638: a BRANCHLESS fix whose verify round follows must
 					// still stop before the hand-over — the legacy no-code fix
 					// continuation would tell its successor to move the task to
 					// in_review (noCodeReviewTerminalStep), which is the
 					// verifier's move.
 					continuation = config.NoCodeFixVerifyHandoffContinuation()
-				case ph.Name == config.FixPhaseName && branchlessCheckpoint:
+				case ph.Name == config.FixPhaseName && s.branchlessCheckpoint:
 					continuation = config.NoCodeFixHandoffContinuation()
-				case ph.Name == config.FixPhaseName && i+1 < len(phases) && isVerifyPhase(phases[i+1]):
+				case ph.Name == config.FixPhaseName && s.i+1 < len(phases) && isVerifyPhase(phases[s.i+1]):
 					// CLA-638: the successor of a mid-fix handoff must still stop
 					// before the PR; the verification round owns the hand-over.
 					continuation = config.FixVerifyHandoffContinuation()
@@ -461,11 +300,11 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					continuation = config.HandoffContinuationFor(ph.Name, reviewOnly)
 				}
 			}
-			ph.Prompt = config.HandoffPreamble + nextPrompt + continuation
-			nextPrompt = ""
+			ph.Prompt = config.HandoffPreamble + s.nextPrompt + continuation
+			s.nextPrompt = ""
 		}
 
-		if spawned > 0 {
+		if s.spawned > 0 {
 			// The breaker at a phase boundary — the third place a session ends and
 			// the loop decides whether to spawn another, alongside between-drains
 			// and between-attempts, and the finest granularity the ceiling has had.
@@ -474,15 +313,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// cannot see coming and cannot interrupt. A handoff respawn gets the
 			// same check, BEFORE the respawn: a session cannot spend its way past
 			// the ceiling by handing off to itself.
-			if dim := d.budgetTrip(prior.tokens+tokens, prior.cost+cost, time.Since(prior.start)); dim != "" {
-				boundary := "the " + ph.Label(i) + " phase boundary"
+			if dim := d.budgetTrip(prior.tokens+s.tokens, prior.cost+s.cost, time.Since(prior.start)); dim != "" {
+				boundary := "the " + ph.Label(s.i) + " phase boundary"
 				if isHandoff {
 					boundary = "the handoff respawn"
 				}
 				log.Printf("iteration %d: budget reached at %s: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-					drainNum, boundary, dim, prior.tokens+tokens, prior.cost+cost,
+					drainNum, boundary, dim, prior.tokens+s.tokens, prior.cost+s.cost,
 					time.Since(prior.start).Round(time.Second))
-				stop = true
+				s.stop = true
 				break
 			}
 		}
@@ -492,16 +331,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// the daemon log does.
 		tag := ""
 		if len(phases) > 1 {
-			tag = "-p" + ph.Label(i)
+			tag = "-p" + ph.Label(s.i)
 		}
 		if isHandoff {
-			handoffs++
-			chain++
-			tag += fmt.Sprintf("-h%d", chain)
+			s.handoffs++
+			s.chain++
+			tag += fmt.Sprintf("-h%d", s.chain)
 			log.Printf("%siteration %d: handoff respawn %d — spawning a fresh session on the predecessor's own %d-byte prompt, framed by the driver's resume preamble (counts as an iteration)",
-				labelOf(t), drainNum, chain, promptBytes)
+				labelOf(t), drainNum, s.chain, promptBytes)
 		}
-		spawned++
+		s.spawned++
 
 		// CLA-466: announce the phase change NOW rather than at the next poll, so
 		// the console sees which phase is running without waiting out an idle
@@ -511,43 +350,43 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// boundary — the renewer's claim reflector (startLeaseRenewal) revises
 		// the in-flight ref and beacons the moment the session's claim lands.
 		ref := ""
-		if carried != nil {
-			ref = claimLabel(carried.Claim)
+		if s.carried != nil {
+			ref = claimLabel(s.carried.Claim)
 		}
-		if len(phasesRun) == 0 || phasesRun[len(phasesRun)-1] != ph.Label(i) {
-			phasesRun = append(phasesRun, ph.Label(i))
+		if len(s.phasesRun) == 0 || s.phasesRun[len(s.phasesRun)-1] != ph.Label(s.i) {
+			s.phasesRun = append(s.phasesRun, ph.Label(s.i))
 		}
-		d.beginIteration(ti, t, drainNum, ref, ph.Label(i))
+		d.beginIteration(ti, t, drainNum, ref, ph.Label(s.i))
 
 		// CLA-662: whether this session RESUMED a predecessor's claim — the
 		// exact condition drainPhase's transient arm keys on (prev != nil), so
 		// the streak follows the ends that arm produces. Captured BEFORE the
 		// call: the seam below may replace `carried` with this phase's own
 		// claim, which says nothing about how the phase was entered.
-		phaseResumed := carried != nil
-		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, i, tag, ph, terminal, carried, t, spend{
+		phaseResumed := s.carried != nil
+		ptokens, pcost, pstop, end, perr := d.drainPhase(ctx, drainNum, ti, s.i, tag, ph, terminal, s.carried, t, spend{
 			start:  prior.start,
-			tokens: prior.tokens + tokens,
-			cost:   prior.cost + cost,
-		}, phases, panelState{round: panelRound, failed: panelFailed, recorded: panelRecorded}, phaseRunOpts{})
-		tokens += ptokens
-		cost += pcost
+			tokens: prior.tokens + s.tokens,
+			cost:   prior.cost + s.cost,
+		}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, phaseRunOpts{})
+		s.tokens += ptokens
+		s.cost += pcost
 		// CLA-630: one entry per session this pass spawned, in spawn order. nil
 		// means the pass never launched a session (a harness or spawn-dir
 		// refusal above), which is nothing to record.
 		if end.session != nil {
-			sessionsRun = append(sessionsRun, *end.session)
+			s.sessionsRun = append(s.sessionsRun, *end.session)
 		}
-		finalDead = end.dead
-		lastProducedNothing = end.producedNothing
+		s.finalDead = end.dead
+		s.lastProducedNothing = end.producedNothing
 		// CLA-466: the record's task identity and claim disposition follow EVERY
 		// claim the sequence observed — including one a dead phase already handed
 		// back itself (end.released), which the switch below deliberately drops
 		// from `carried`. The off-brief exception matches the switch's own first
 		// arm: a claim on a DIFFERENT task does not re-attribute the iteration.
-		if end.claim != nil && !(carried != nil && carried.Claim.TaskID != end.claim.Claim.TaskID) {
-			seen = end.claim.Claim
-			finalOutcome = claimDisposition(end.claim)
+		if end.claim != nil && !(s.carried != nil && s.carried.Claim.TaskID != end.claim.Claim.TaskID) {
+			s.seen = end.claim.Claim
+			s.finalOutcome = claimDisposition(end.claim)
 		}
 		// What, if anything, is still owed a handback. Three cases, and getting any
 		// of them wrong is a task either stranded on a dead lease or posted back to
@@ -566,15 +405,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// still-live claim and hand back a task the sequence was never meant to
 		// touch. Keep what we had: the task phase 1 is holding is the one owed a
 		// handback, whatever its successor went and did.
-		seamClaim := carried
+		seamClaim := s.carried
 		switch {
-		case carried != nil && end.claim != nil && end.claim.Claim.TaskID != carried.Claim.TaskID:
+		case s.carried != nil && end.claim != nil && end.claim.Claim.TaskID != s.carried.Claim.TaskID:
 			log.Printf("iteration %d: the %s phase claimed %s, which is NOT the task it was resuming (%s) — it was told not to claim at all; keeping the original for the handback",
-				drainNum, ph.Label(i), end.claim.Claim.TaskID, carried.Claim.TaskID)
+				drainNum, ph.Label(s.i), end.claim.Claim.TaskID, s.carried.Claim.TaskID)
 		case end.released:
-			carried = nil
+			s.carried = nil
 		case end.claim != nil:
-			carried = end.claim
+			s.carried = end.claim
 		}
 		// CLA-497: whether the checkpoint that opened THIS phase was evidenced
 		// by the plane's record (no verified branch). Read from the PRE-switch
@@ -582,7 +421,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// this phase's OWN claim, whose branch says nothing about the checkpoint
 		// that opened the phase, and the handoff continuation must match the
 		// brief this phase's FIRST session ran, not what its last one recorded.
-		branchlessCheckpoint = seamClaim != nil && seamClaim.Claim.Branch == ""
+		s.branchlessCheckpoint = seamClaim != nil && seamClaim.Claim.Branch == ""
 
 		// CLA-639 M4: a PANEL MEMBER that produced no record leaves the run
 		// resumable — the next member, or the fix phase, picks up the SAME run
@@ -594,14 +433,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// use. So the checkpoint's resumption facts ride forward from the claim
 		// that opened this member, onto a claim that is still live and short of
 		// them. Only a member: every other phase's claim is its own.
-		if panelMember && !end.reviewRecorded && seamClaim != nil && carried != nil && carried.Claim.Held() {
-			if carried.Claim.Branch == "" {
-				carried.Claim.Branch = seamClaim.Claim.Branch
+		if panelMember && !end.reviewRecorded && seamClaim != nil && s.carried != nil && s.carried.Claim.Held() {
+			if s.carried.Claim.Branch == "" {
+				s.carried.Claim.Branch = seamClaim.Claim.Branch
 			}
-			if carried.CheckpointTip == "" {
-				carried.CheckpointTip = seamClaim.CheckpointTip
+			if s.carried.CheckpointTip == "" {
+				s.carried.CheckpointTip = seamClaim.CheckpointTip
 			}
-			carried.CheckpointUnverified = seamClaim.CheckpointUnverified
+			s.carried.CheckpointUnverified = seamClaim.CheckpointUnverified
 		}
 
 		// A run-level stop wins over a dead phase. drainPhase returns stop=true
@@ -616,7 +455,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// the sequence-end break below, deliberately before the dead arm,
 		// because that end leaves the run continuing.)
 		if pstop {
-			stop = true
+			s.stop = true
 			break
 		}
 
@@ -644,10 +483,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// earlier members wrote into, and only then lets the run-level wait take
 		// over. Every other resumed phase keeps the shipped break here.
 		if end.sequenceEnd != nil && !end.panelMember {
-			limitWait = end.sequenceEnd.limitWait
-			if limitWait == nil {
-				transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
-				transientRung = d.noteResumedTransient(transientKey)
+			s.limitWait = end.sequenceEnd.limitWait
+			if s.limitWait == nil {
+				s.transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
+				s.transientRung = d.noteResumedTransient(s.transientKey)
 			}
 			break
 		}
@@ -682,15 +521,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// when the panel is over, whichever way the last member ends.
 		if end.panelMember {
 			if round := end.reviewRound; round > 0 {
-				panelRound = round
+				s.panelRound = round
 			}
 			// The member's reviewer ROLE is positional (CLA-639): the durable
 			// record and the seam gate are keyed on it, and the operator's `name`
 			// is only the log label. The incomplete list and the fix brief must
 			// therefore speak roles, or a named member would be reported missing
 			// while its role-keyed record is sitting right there.
-			role := reviewerRoleFor(phases, i)
-			member := ph.Label(i)
+			role := reviewerRoleFor(phases, s.i)
+			member := ph.Label(s.i)
 			// CLA-639 M4: whether the NEXT member, or the fix phase after the
 			// panel, could still resume this run. The member's own claim is the
 			// live one when it observed any; a member that observed NOTHING (a
@@ -698,7 +537,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// that is still the run the panel is working. A claim the session
 			// settled itself, or one already handed back, is not live: nothing may
 			// be resumed from it, and only the live holder may close a round.
-			live := carried != nil && (end.claim == nil || end.claim.Claim.Held())
+			live := s.carried != nil && (end.claim == nil || end.claim.Claim.Held())
 			// A member ends the PANEL's stage when it recorded (its record passed
 			// the seam gate) or when no next member can run — the last member, a
 			// claim the failed member took with it, or a harness sequence-end.
@@ -723,11 +562,11 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// when the claim is not held — would make the matcher accept any
 			// record by run and role, looser than the seam ever is, so it is left
 			// to the failure arm (CLA-639 fix pass 5).
-			if !recorded && seqEnd != nil && carried != nil && (carried.CheckpointTip != "" || carried.CheckpointUnverified) {
-				if rec, matched := d.panelMemberRecordMatch(ctx, t, *carried, role); matched {
+			if !recorded && seqEnd != nil && s.carried != nil && (s.carried.CheckpointTip != "" || s.carried.CheckpointUnverified) {
+				if rec, matched := d.panelMemberRecordMatch(ctx, t, *s.carried, role); matched {
 					recorded = true
 					if rec.Round > 0 {
-						panelRound = rec.Round
+						s.panelRound = rec.Round
 					}
 				}
 			}
@@ -745,10 +584,10 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				if end.panelOptional {
 					return
 				}
-				limitWait = seqEnd.limitWait
-				if limitWait == nil {
-					transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
-					transientRung = d.noteResumedTransient(transientKey)
+				s.limitWait = seqEnd.limitWait
+				if s.limitWait == nil {
+					s.transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(ph)}
+					s.transientRung = d.noteResumedTransient(s.transientKey)
 				}
 			}
 			if recorded {
@@ -761,7 +600,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// seats recorded is no review at all (see the panel-last check
 				// below).
 				if !end.panelOptional {
-					panelRecorded = true
+					s.panelRecorded = true
 				}
 			}
 			// A round that could not be closed is the single-review seam's
@@ -771,7 +610,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// the single-review close-failure path does) and say why.
 			if end.reviewCloseFailed {
 				log.Printf("%siteration %d: the %s panel member recorded, but the panel's round %d could not be closed (%s) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
-					labelOf(t), drainNum, member, panelRound, end.emptyWhy)
+					labelOf(t), drainNum, member, s.panelRound, end.emptyWhy)
 				endSequenceEnd()
 				break
 			}
@@ -798,8 +637,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				case reason == "":
 					reason = "recorded no durable review record"
 				}
-				panelIncomplete = append(panelIncomplete, panelIncompleteRole(role, end.panelOptional)+": "+reason)
-				panelFailed[role] = panelMemberFailure{reason: reason, optional: end.panelOptional}
+				s.panelIncomplete = append(s.panelIncomplete, panelIncompleteRole(role, end.panelOptional)+": "+reason)
+				s.panelFailed[role] = panelMemberFailure{reason: reason, optional: end.panelOptional}
 				log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed", labelOf(t), drainNum, member, reason)
 				// CLA-639 M4: the member is a failure the operator has to be able
 				// to see, so it is counted in the run's per-harness dead-phase
@@ -836,7 +675,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// members' findings to the next reviewer. ADVANCE, never re-run
 					// this member: the loop has no post statement, so a `continue`
 					// without the increment would re-spawn index i forever.
-					i++
+					s.i++
 					continue
 				}
 				// The panel is over: nothing follows this member, or the claim it
@@ -844,16 +683,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// Release what the earlier members wrote rather than leave it
 				// sealed behind a lease that will lapse — BEFORE any handback,
 				// because the close is legal only while we are still the holder.
-				if panelRecorded && panelRound > 0 && live {
-					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
+				if s.panelRecorded && s.panelRound > 0 && live {
+					if cerr := d.closeReviewRound(ctx, t, *s.carried, s.panelRound); cerr != nil {
 						log.Printf("%siteration %d: the panel's round %d could not be closed after %s failed (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
-							labelOf(t), drainNum, panelRound, member, cerr)
+							labelOf(t), drainNum, s.panelRound, member, cerr)
 						endSequenceEnd()
 						break
 					}
 				}
 				switch {
-				case live && panelRecorded && i+1 < len(phases):
+				case live && s.panelRecorded && s.i+1 < len(phases):
 					// Earlier members DID record, so the panel hands over rather
 					// than ending: the phase after it (the fix) applies the merged
 					// list, which names this member as INCOMPLETE, and resumes the
@@ -863,7 +702,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// round"), and the sequence is not ending here: if the phase
 					// that follows hits the same limit it says so itself, with the
 					// wait that belongs to ITS end.
-					i++
+					s.i++
 					continue
 				case seqEnd != nil:
 					// The run-level sequence-end break above was deferred for this
@@ -879,7 +718,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// nobody recorded: leave the round sealed (no close) and spawn no
 			// fix. Reached only at the panel's LAST member; an earlier optional
 			// seat's record is kept while a required member may still record.
-			if end.panelLast && !panelRecorded {
+			if end.panelLast && !s.panelRecorded {
 				log.Printf("%siteration %d: no REQUIRED member of the review panel recorded — the round is not closed and no fix spawns", labelOf(t), drainNum)
 				break
 			}
@@ -897,8 +736,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// the drain ends with the wait and no fix runs against a sealed
 			// round.
 			if seqEnd != nil {
-				if live && !end.panelLast && i+1 < len(phases) {
-					i++
+				if live && !end.panelLast && s.i+1 < len(phases) {
+					s.i++
 					continue
 				}
 				// Close only when the seam did not already close the round for
@@ -908,16 +747,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// sequence-end is then read by the arm below. A second close is
 				// the plane's no_open_round, and failing closed on it would skip
 				// the fix against a round that is already released.
-				if live && panelRecorded && panelRound > 0 && !end.reviewRecorded {
-					if cerr := d.closeReviewRound(ctx, t, *carried, panelRound); cerr != nil {
+				if live && s.panelRecorded && s.panelRound > 0 && !end.reviewRecorded {
+					if cerr := d.closeReviewRound(ctx, t, *s.carried, s.panelRound); cerr != nil {
 						log.Printf("%siteration %d: the panel's round %d could not be closed after %s recorded but ended the sequence (%v) — ending the drain without spawning the fix: a fix spawned now would run against findings the plane still has sealed",
-							labelOf(t), drainNum, panelRound, member, cerr)
+							labelOf(t), drainNum, s.panelRound, member, cerr)
 						endSequenceEnd()
 						break
 					}
 				}
-				if live && panelRecorded && i+1 < len(phases) {
-					i++
+				if live && s.panelRecorded && s.i+1 < len(phases) {
+					s.i++
 					continue
 				}
 				endSequenceEnd()
@@ -936,8 +775,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// four-word enum the plane accepts — prose there makes marshalReport
 		// refuse the whole report, presence refresh included.
 		if end.noMCP && !end.panelMember {
-			d.tallyNoMCP(ph.Label(i), tc.HarnessFor(ph))
-			note := fmt.Sprintf("no_mcp: the %s session made no successful clankerbar MCP call and recorded no review record", ph.Label(i))
+			d.tallyNoMCP(ph.Label(s.i), tc.HarnessFor(ph))
+			note := fmt.Sprintf("no_mcp: the %s session made no successful clankerbar MCP call and recorded no review record", ph.Label(s.i))
 			log.Printf("%siteration %d: %s — ending the drain; this is an infrastructure miss, not a review result", labelOf(t), drainNum, note)
 			break
 		}
@@ -994,15 +833,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				taskID = end.claim.Claim.TaskID
 			}
 
-			if !last && i == 0 && taskID != "" && taskID == deadTask && deadRetries >= perTaskDeadBound-1 {
+			if !last && s.i == 0 && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
 				how := "died producing nothing"
 				if end.toolLoop != "" {
 					how = "was killed (" + end.toolLoop + "), dead"
 				}
 				log.Printf("%siteration %d: the %s phase %s for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
-					labelOf(t), drainNum, ph.Label(i), how, deadRetries+1, perTaskDeadBound)
-				d.parkDeadPhase(ctx, t, ph.Label(i), end.claim)
-				parkFired = true // CLA-466: the record says parked, not dead
+					labelOf(t), drainNum, ph.Label(s.i), how, s.deadRetries+1, perTaskDeadBound)
+				d.parkDeadPhase(ctx, t, ph.Label(s.i), end.claim)
+				s.parkFired = true // CLA-466: the record says parked, not dead
 				// The task is parked for the operator and this drain is over; the
 				// daemon carries on with the next task. Not a stop: the run did
 				// not fail, one task reached a human.
@@ -1012,30 +851,30 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			d.fleetDead[ti]++
 			if d.fleetDead[ti] >= fleetDeadBound {
 				d.fleetTrip(ctx, t, ti, drainNum, end.claim)
-				tripFired = true // CLA-466: a fleet trip ends this drain on a death
+				s.tripFired = true // CLA-466: a fleet trip ends this drain on a death
 				// The fleet trip pauses this target and this drain is over; the
 				// in-flight task was already released with the dead phase. Not a
 				// stop: the run itself did not fail.
 				break
 			}
 
-			if !last && i == 0 {
+			if !last && s.i == 0 {
 				// Either the first dead phase this task produced, or a dead phase
 				// on a task other than the one counted above: that task has died
 				// once, and earns its own retry ladder rather than being parked
 				// for deaths it did not have.
-				if taskID != deadTask {
-					deadRetries = 1
-					deadTask = taskID
+				if taskID != s.deadTask {
+					s.deadRetries = 1
+					s.deadTask = taskID
 				} else {
-					deadRetries++
+					s.deadRetries++
 				}
 				if end.toolLoop != "" {
 					log.Printf("%siteration %d: the %s phase was killed (%s) — retrying it (%d of %d) before any review brief sees the task",
-						labelOf(t), drainNum, ph.Label(i), end.toolLoop, deadRetries, perTaskDeadBound)
+						labelOf(t), drainNum, ph.Label(s.i), end.toolLoop, s.deadRetries, perTaskDeadBound)
 				} else {
 					log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
-						labelOf(t), drainNum, ph.Label(i), deadReason(end.claim), deadRetries, perTaskDeadBound)
+						labelOf(t), drainNum, ph.Label(s.i), deadReason(end.claim), s.deadRetries, perTaskDeadBound)
 				}
 				continue
 			}
@@ -1049,7 +888,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// trial-seat contract exists to prevent. A REQUIRED member's error still
 		// ends the drain exactly as before.
 		if perr != nil && !(end.panelMember && end.panelOptional) {
-			err = perr
+			s.err = perr
 			break
 		}
 
@@ -1060,16 +899,16 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// session's prompt (CLA-352).
 		if end.handoff != "" {
 			switch {
-			case chain >= handoffChainCap:
+			case s.chain >= handoffChainCap:
 				log.Printf("%siteration %d: handoff refused — this task has already chained %d consecutive handoff respawns, the cap; falling back to the standard brief so a session cannot chain itself indefinitely",
-					labelOf(t), drainNum, chain)
-			case d.cfg.MaxIterations > 0 && drainNum+handoffs >= d.cfg.MaxIterations:
+					labelOf(t), drainNum, s.chain)
+			case d.cfg.MaxIterations > 0 && drainNum+s.handoffs >= d.cfg.MaxIterations:
 				log.Printf("%siteration %d: handoff refused — a respawn counts as an iteration and max-iterations (%d) is already spent; falling back to the normal path",
 					labelOf(t), drainNum, d.cfg.MaxIterations)
 			default:
 				// Same phase index: the successor continues this phase's job. The
 				// budget breaker at the top of the loop runs before the spawn.
-				nextPrompt = end.handoff
+				s.nextPrompt = end.handoff
 				continue
 			}
 			// The handoff was REFUSED, so its exemption from the evidence gate ends
@@ -1085,25 +924,25 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// fix phase spawned against a sealed round can neither read nor answer
 			// (finding_sealed) the findings it was told to apply. A close that
 			// fails refuses the checkpoint, exactly as the seam's own close does.
-			nextReviewShaped := i+1 < len(phases) && config.ReviewShaped(phases[i+1].Prompt)
+			nextReviewShaped := s.i+1 < len(phases) && config.ReviewShaped(phases[s.i+1].Prompt)
 			if end.reviewRound > 0 && end.checkpoint && end.claim != nil && !nextReviewShaped {
 				if cerr := d.closeReviewRound(ctx, t, *end.claim, end.reviewRound); cerr != nil {
 					log.Printf("%siteration %d: the %s phase's review round %d could not be closed after its handoff was refused (%v) — refusing the checkpoint, because the next phase would be spawned against findings the plane still has sealed",
-						labelOf(t), drainNum, ph.Label(i), end.reviewRound, cerr)
-					d.tallyEmpty(ph.Label(i), tc.HarnessFor(ph))
+						labelOf(t), drainNum, ph.Label(s.i), end.reviewRound, cerr)
+					d.tallyEmpty(ph.Label(s.i), tc.HarnessFor(ph))
 					break
 				}
 			}
 			if !last && end.empty {
 				log.Printf("%siteration %d: the %s phase ended holding a task with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns (its handoff was refused)",
-					labelOf(t), drainNum, ph.Label(i), end.emptyWhy)
-				d.tallyEmpty(ph.Label(i), tc.HarnessFor(ph))
+					labelOf(t), drainNum, ph.Label(s.i), end.emptyWhy)
+				d.tallyEmpty(ph.Label(s.i), tc.HarnessFor(ph))
 				break
 			}
 		}
 		// This session ended without a respawn being accepted, so any chain is
 		// broken: a later handoff starts counting from a standard-brief session.
-		chain = 0
+		s.chain = 0
 
 		// A held-but-empty exit is a FAILED phase (2026-08-24), not a checkpoint
 		// and not an ordinary "ended without holding the task" end: the claim was
@@ -1122,8 +961,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// without tripping the park or fleet machinery, which is how a fleet-wide
 		// silent EOT shows up in the rate the operator watches.
 		if end.empty {
-			if !last && i == 0 && emptyRetries < 1 && end.releasedToQueue {
-				emptyRetries++
+			if !last && s.i == 0 && s.emptyRetries < 1 && end.releasedToQueue {
+				s.emptyRetries++
 				continue
 			}
 			break
@@ -1137,7 +976,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// is a task that got done.
 		if !last && !end.checkpoint {
 			log.Printf("iteration %d: the %s phase ended without holding the task — nothing for the next phase to resume, so this drain ends here",
-				drainNum, ph.Label(i))
+				drainNum, ph.Label(s.i))
 			break
 		}
 		// CLA-638: the verification round is the stopping rule's gate. It is the
@@ -1163,20 +1002,20 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// hand-over and the claim is released/lapses, so a takeover can
 				// retry it. It is not the stopping rule parking a disagreement.
 				log.Printf("%siteration %d: the %s phase's round could not be judged (%s) — refusing the sequence: no hand-over, and no PR was accepted from this round",
-					labelOf(t), drainNum, ph.Label(i), end.verifyFailure)
+					labelOf(t), drainNum, ph.Label(s.i), end.verifyFailure)
 				break
 			}
 			if !end.verifyChecked {
 				// A verification session that died or produced no judgeable exit.
 				// End the sequence; the normal takeover path retries it.
 				log.Printf("%siteration %d: the %s phase produced no judgeable verification round — ending the sequence without a hand-over",
-					labelOf(t), drainNum, ph.Label(i))
+					labelOf(t), drainNum, ph.Label(s.i))
 				break
 			}
 			if len(end.verifyOpenMusts) == 0 {
 				if end.verifyStatus == "in_progress" || end.verifyStatus == "ready" {
 					log.Printf("%siteration %d: the %s phase closed round %d with NO open MUST but left the task %q — it recorded a pass but did not carry the terminal step (push check, PR, in_review); the sequence ends without a hand-over for the operator to see",
-						labelOf(t), drainNum, ph.Label(i), end.verifyRound, end.verifyStatus)
+						labelOf(t), drainNum, ph.Label(s.i), end.verifyRound, end.verifyStatus)
 				}
 				if end.verifyRound == 0 {
 					// CLA-638 × CLA-670: a BRANCHLESS round. Its record is the
@@ -1185,15 +1024,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 					// carried the verdict, and the sequence ends without claiming
 					// the id-based stopping rule ran (it cannot, on this shape).
 					log.Printf("iteration %d: the %s phase's verification round rests on the legacy %q block (this shape writes no durable record) — no plane open-MUST set to judge; ending the sequence",
-						drainNum, ph.Label(i), config.ReviewRecordHeading)
+						drainNum, ph.Label(s.i), config.ReviewRecordHeading)
 					break
 				}
 				log.Printf("iteration %d: the %s phase closed round %d with NO open MUST — the stopping rule is satisfied and the sequence is done",
-					drainNum, ph.Label(i), end.verifyRound)
+					drainNum, ph.Label(s.i), end.verifyRound)
 				break
 			}
-			verifyRoundsRun++
-			reason := nonConvergenceReason(end.verifyOpenMusts, end.verifyRound, verifyResolved)
+			s.verifyRoundsRun++
+			reason := nonConvergenceReason(end.verifyOpenMusts, end.verifyRound, s.verifyResolved)
 			// The local fallback counts the same ROUNDS the plane does (CLA-686
 			// D2). A review cycle is one review round plus the verification
 			// rounds that follow it, and the plane's `counted` includes the
@@ -1201,14 +1040,14 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 			// cap allowed a cycle one round longer than the counted path, and
 			// the park then read "Round 4 of the 3-round cap". `+1` is the
 			// review round that opened this cycle.
-			localRounds := verifyRoundsRun + 1
+			localRounds := s.verifyRoundsRun + 1
 			capHit := end.verifyCounted >= config.ReviewRoundCap || localRounds >= config.ReviewRoundCap
-			if reason == "" && !capHit && fixIdx >= 0 && end.checkpoint && carried != nil {
+			if reason == "" && !capHit && fixIdx >= 0 && end.checkpoint && s.carried != nil {
 				for _, id := range end.verifyResolvedIDs {
-					verifyResolved[id] = true
+					s.verifyResolved[id] = true
 				}
 				log.Printf("iteration %d: the %s phase closed round %d (%d non-void round(s) this cycle) with open MUST(s) [%s] — spawning another %s round against them",
-					drainNum, ph.Label(i), end.verifyRound, end.verifyCounted,
+					drainNum, ph.Label(s.i), end.verifyRound, end.verifyCounted,
 					strings.Join(end.verifyOpenMusts, ", "), phases[fixIdx].Label(fixIdx))
 				// CLA-639: the merged panel list belongs to the FIRST fix after
 				// the panel, before any verification round has run. A verify
@@ -1217,8 +1056,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				// panel's list would replace the verifier's findings with a
 				// stale round. Clear the panel round so drainPhase falls back to
 				// the shipped single-review path unchanged.
-				panelRound = 0
-				i = fixIdx
+				s.panelRound = 0
+				s.i = fixIdx
 				continue
 			}
 			if reason == "" {
@@ -1232,8 +1071,8 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 				}
 			}
 			d.parkVerification(ctx, t, vres, reason, end.verifyRound, end.verifyCounted, end.verifyOpenMusts, end.verifyOpenDetails)
-			parkFired = true
-			carried = nil
+			s.parkFired = true
+			s.carried = nil
 			break
 		}
 		// A phase that ended dead was retried above and, on the retry, either
@@ -1241,9 +1080,9 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// Resetting on the advance keeps the retry per-PHASE rather than per-run:
 		// two dead phases separated by a healthy one are not "consecutive", and
 		// each phase earns its own retry ladder (CLA-386).
-		deadRetries = 0
-		deadTask = ""
-		emptyRetries = 0
+		s.deadRetries = 0
+		s.deadTask = ""
+		s.emptyRetries = 0
 		// CLA-396: a successful IMPLEMENT phase resets the FLEET-wide dead-phase
 		// counter. Only the implement phase runs the harness that can exhibit the
 		// zero-usage death — the review phase runs on the claude harness, which
@@ -1260,15 +1099,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// reviewer), so remember it — a later member that fails must still be able
 		// to release what the earlier ones wrote.
 		if panelMember && end.reviewRound > 0 {
-			panelRound = end.reviewRound
+			s.panelRound = end.reviewRound
 		}
-		i++
+		s.i++
 	}
 
 	// The deferred handback (2, above). Skipped at every seam that led to another
 	// phase; owed at the one that did not — including a final-phase handoff the
 	// guards above refused, whose claim was held for a successor that never ran.
-	carried = d.releaseCarried(ctx, t, carried)
+	s.carried = d.releaseCarried(ctx, t, s.carried)
 
 	// CLA-662: the transient arm's wait, in the same place and for the same
 	// reason as the limit wait below — after the sequence's handback, with NO
@@ -1292,12 +1131,12 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// redefining what a successful drain proves about the harness, well beyond
 	// this bound's need: the ladder's growth, capped by retry_cap, plus
 	// max_iterations is the brake the un-waited re-drain was missing.
-	if transientRung > 0 {
-		wait := d.resumedTransientDuration(transientRung)
+	if s.transientRung > 0 {
+		wait := d.resumedTransientDuration(s.transientRung)
 		log.Printf("iteration %d: the sequence is over and no lease is held — waiting %s before polling again (transient failure %d in a row on %s; the run stays up)",
-			drainNum, wait, transientRung, transientKey.harness)
+			drainNum, wait, s.transientRung, s.transientKey.harness)
 		if d.waitOrStop(ctx, wait) {
-			stop = true
+			s.stop = true
 		}
 	}
 
@@ -1313,28 +1152,28 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// again. waitPastBudget is consulted first, exactly as on the first-phase
 	// path: a reset beyond the run's remaining ceiling is not worth sleeping
 	// through, so the run stops and says when to start a fresh one.
-	if limitWait != nil {
+	if s.limitWait != nil {
 		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
-		if until, over := waitPastBudget(limitWait.lim.ResetAt, remaining, bounded); over {
+		if until, over := waitPastBudget(s.limitWait.lim.ResetAt, remaining, bounded); over {
 			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
 				drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
-			stop = true
+			s.stop = true
 		} else {
 			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
-				drainNum, resetSuffix(limitWait.lim.ResetAt))
-			ptokens, pcost, pstop := d.supervisedWait(ctx, limitWait.lim, limitWait.a, limitWait.ph, t, spend{
+				drainNum, resetSuffix(s.limitWait.lim.ResetAt))
+			ptokens, pcost, pstop := d.supervisedWait(ctx, s.limitWait.lim, s.limitWait.a, s.limitWait.ph, t, spend{
 				start:  prior.start,
-				tokens: prior.tokens + tokens,
-				cost:   prior.cost + cost,
+				tokens: prior.tokens + s.tokens,
+				cost:   prior.cost + s.cost,
 			})
-			tokens += ptokens
-			cost += pcost
+			s.tokens += ptokens
+			s.cost += pcost
 			if pstop {
-				stop = true
+				s.stop = true
 			}
 		}
 	}
-	return tokens, cost, handoffs, stop, err
+	return s.tokens, s.cost, s.handoffs, s.stop, s.err
 }
 
 // drainWithRetries runs a single unphased drain — the whole task in one session.
