@@ -176,6 +176,22 @@ func helperMain() {
 		os.Exit(1)
 	case "crash":
 		os.Exit(1)
+	case "limit-stop", "limit-stop-once":
+		// The loop's Stop-limit path: leave LIMIT_STOP, exit 0. The -once
+		// variant only does so on its first run, so a resume has a child to find.
+		if mode == "limit-stop" || countHelperRuns(spec.StateDir) == 1 {
+			if err := os.WriteFile(filepath.Join(spec.StateDir, loop.LimitStopName), []byte("budget_exhausted\n"), 0o600); err != nil {
+				os.Exit(9)
+			}
+			os.Exit(0)
+		}
+		for {
+			if _, err := os.Lstat(stopPath); err == nil {
+				_ = os.Remove(stopPath)
+				os.Exit(0)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	case "halt":
 		if err := os.WriteFile(filepath.Join(spec.StateDir, "HALT"), []byte("halted by test\n"), 0o600); err != nil {
 			os.Exit(9)
@@ -1700,4 +1716,15 @@ func TestSpawnEnvDropsAPreExistingChildVersion(t *testing.T) {
 	if got := len(env); got != len(os.Environ()) {
 		t.Fatalf("spawnEnv changed the variable count: %d entries -> %d", len(os.Environ()), got)
 	}
+}
+
+func countHelperRuns(stateDir string) int {
+	entries, _ := os.ReadDir(stateDir)
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "iteration-") && strings.HasSuffix(e.Name(), ".log") {
+			n++
+		}
+	}
+	return n
 }

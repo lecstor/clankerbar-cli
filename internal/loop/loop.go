@@ -694,6 +694,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			d.state = nil
 		}()
 	}
+	d.clearStaleLimitStop()
 	// Belt and braces on the way out (CLA-491). Every shutdown path that does not
 	// pass a STOP read (a non-retryable phase failure, a budget or zero-spend
 	// trip, max-iterations, HALT, a cancelled context) leaves a
@@ -5648,6 +5649,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				}
 				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
 					drainNum, limitReason(lim), logPath)
+				d.writeLimitStop(lim)
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
