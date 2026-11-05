@@ -119,6 +119,17 @@ jobs:
       - name: vet
         run: go vet ./...
 
+      # Fails on any unformatted file: gofmt -l exits 0 either way, so the step
+      # tests its output. Cheap subset of linting with no findings backlog.
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt: these files are not formatted (run gofmt -w):"
+            echo "$unformatted"
+            exit 1
+          fi
+
       - name: test
         run: go test -race ./...
 

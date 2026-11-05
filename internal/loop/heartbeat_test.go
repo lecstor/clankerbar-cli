@@ -252,16 +252,53 @@ func TestLeaseRenewerPausesWhenTheSessionSettlesItsClaim(t *testing.T) {
 	// THE regression this test pins: a settle keeps RunID and flips Settled, so a
 	// pause keyed off RunID going empty is unreachable and the renewer would go
 	// on beating a lease the plane already released.
+	//
+	// The cadence is hand-fired over an UNBUFFERED tick channel: a send returns
+	// only once the renewer has finished its previous iteration, including any
+	// beat, so a beat in flight at the settle cannot land after the count is read.
 	hb := &recordingHeartbeat{}
-	r, cancel := newStartedRenewer(t, hb, heartbeatClaim("r-1"))
+	ticks := make(chan time.Time)
+	r := &leaseRenewer{
+		hb:       hb,
+		interval: time.Minute, // cadence is hand-driven via r.tick
+		prefix:   "test: ",
+		claims:   make(chan harness.Claim, 4),
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+		tick:     ticks,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer r.stop()
+	go r.run(ctx, heartbeatClaim("r-1"))
 
-	heartbeatWaitFor(t, "beats before the settle", func() bool { return hb.count() >= 3 })
+	fire := func() {
+		t.Helper()
+		select {
+		case ticks <- time.Now():
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out handing a tick to the renewer")
+		}
+	}
+
+	// Four sends: the fourth is received only after the first three iterations
+	// (three beats) are complete.
+	for i := 0; i < 4; i++ {
+		fire()
+	}
+	if n := hb.count(); n < 3 {
+		t.Fatalf("beats before the settle = %d, want at least 3", n)
+	}
+
 	r.observe(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
-
+	// Received only after the in-flight iteration finished; the settle is queued
+	// ahead of the next tick, so the count read here is final for a pausing renewer.
+	fire()
 	settled := hb.count()
-	time.Sleep(40 * time.Millisecond) // ~40 ticks' worth of opportunity to misbehave
+
+	for i := 0; i < 5; i++ {
+		fire()
+	}
 	if n := hb.count(); n != settled {
 		t.Fatalf("beats after settle = %d (was %d): renewal did not pause on a settled claim", n, settled)
 	}

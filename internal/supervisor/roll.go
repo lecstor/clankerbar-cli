@@ -151,6 +151,13 @@ func Roll(ctx context.Context, o Options) error {
 			continue
 		}
 
+		if markerPresent(dir, limitStopMarker) {
+			// No child exists to answer a RESTART; the roll would wait out the verify timeout and halt.
+			log.Printf("roll: %s is stopped on a usage limit (%s present) - skipping; resume it, then re-run the roll", e.Name, limitStopMarker)
+			notRunning++
+			continue
+		}
+
 		before := "no beacon yet"
 		if cur != nil {
 			before = cur.Version

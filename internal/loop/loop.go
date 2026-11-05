@@ -312,13 +312,14 @@ type Driver struct {
 	// ends is what the growing wait is there to bound.
 	resumedTransients map[resumedTransientKey]int
 
-	// routeMarks is this run's sticky memory of model routes that hit a usage
+	// routeMarks is this instance's sticky memory of model routes that hit a usage
 	// limit (CLA-782): route alias -> the instant the mark expires. A run moved
 	// off its free route stays on the paid one for later PHASES until the mark
 	// lifts, so the fleet does not flip between routes at every phase boundary;
 	// it goes back to free only when the free route's reset has passed.
 	//
-	// Per run, not per host (operator decision 10164e9e): a sibling clanker
+	// Persisted in the state dir (ROUTE_MARKS) so a restart keeps them; per
+	// instance, not per host (operator decision 10164e9e): a sibling clanker
 	// discovers the same limit on its own next request and switches mid-session.
 	// Guarded by routeMarksMu because the review panel runs its members
 	// concurrently and each may record a switch.
@@ -694,6 +695,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			d.state = nil
 		}()
 	}
+	d.clearStaleLimitStop()
 	// Belt and braces on the way out (CLA-491). Every shutdown path that does not
 	// pass a STOP read (a non-retryable phase failure, a budget or zero-spend
 	// trip, max-iterations, HALT, a cancelled context) leaves a
@@ -717,6 +719,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// seen from the next idle poll on. This first value is only what the banner
 	// announces.
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
+	d.loadRouteMarks()
 	// Every harness this run will SPAWN, not just the configured one: a mixed
 	// sequence's banner naming one of them is a log that disagrees with the
 	// sessions underneath it from the first line (CLA-366). SpawnedHarnesses
@@ -2545,7 +2548,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
 		if until, over := waitPastBudget(limitWait.lim.ResetAt, remaining, bounded); over {
 			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
-				drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
+				drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
 			stop = true
 		} else {
 			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
@@ -5648,6 +5651,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				}
 				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
 					drainNum, limitReason(lim), logPath)
+				d.writeLimitStop(lim)
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
@@ -5690,7 +5694,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
 			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset (log: %s)",
-					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute), logPath)
+					drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute), logPath)
 				return tokens, cost, true, end, nil
 			}
 			// The wait's own probe spend lands in the SAME accumulator as the
@@ -8319,7 +8323,14 @@ func resetSuffix(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return " (stated reset " + t.Format("Mon 15:04") + ")"
+	return " (stated reset " + formatReset(t) + ")"
+}
+
+// formatReset renders a stated reset for a log line in the machine's local zone,
+// with date and zone name. Providers send UTC, and a weekly window runs up to 7
+// days out, so a bare weekday and clock read as the wrong hour or the wrong week.
+func formatReset(t time.Time) string {
+	return t.Local().Format("Mon 2 Jan 15:04 MST")
 }
 
 // limitReason renders a limit's reason for a log line, defaulting when a harness
