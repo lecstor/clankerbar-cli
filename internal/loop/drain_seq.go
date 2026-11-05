@@ -986,3 +986,112 @@ func (s *drainSeq) handlePanelMember(ctx context.Context, st *seqStep) seqNext {
 
 	return seqFall
 }
+
+// judgeDeadPhase retries a dead first phase up to the per-task bound, then parks
+// the task; a fleet-wide run of deaths pauses the target instead.
+func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
+	d := s.d
+	t := s.t
+	ti := s.ti
+	drainNum := s.drainNum
+	// CLA-386: a dead phase is a FAILED phase, not a completed one, and it is
+	// not "ended without holding the task" either — it never finished the job
+	// it was spawned to do. The claim was released back in drainPhase (a retry
+	// re-claims, exactly like a transient one), so the only question left is
+	// retry vs park. Consecutive dead phases on the SAME task: retry up to the
+	// per-task budget, then park — a task that can kill four full sessions
+	// reaches the operator rather than a fifth (CLA-396, raised from two by
+	// the 2026-08-20 operator decision).
+	//
+	// Deliberately BEFORE the error break below: the dead classification
+	// names a phase that produced nothing whatever its exit code, so a dead
+	// phase is retried-then-parked, never a run-failing error — the non-zero
+	// exit that would otherwise stop the daemon is itself part of the silent
+	// death, not a verdict.
+	//
+	// The retry is scoped to the FIRST phase (`i == 0`), the one that claimed
+	// its own task: a retry cannot re-seed a resumed phase — invocationFor
+	// only substitutes the task/run placeholders and sets ResumeClaim when the
+	// predecessor claim is present, which the dead handback cleared — so
+	// retrying a dead RESUMED phase would spawn a session whose brief still
+	// carries the literal {{taskId}}/{{runId}} and whose handback, salvage and
+	// delivery checks are all switched off. A resumed phase's dead signature
+	// still vetoes its checkpoint below (the false-premise guard applies to
+	// every phase); it just is not retried or parked here — the drain ends and
+	// the task returns to the queue, where a fresh claiming session retries it
+	// with a valid seed (review finding). The operator decision's "retry the
+	// implement phase N times, then park" is exactly `i == 0` in the shipped
+	// [implement, review] sequence.
+	//
+	// CLA-396: a dead phase feeds BOTH counters, but the per-task park is
+	// checked and taken FIRST — before the fleet counter's trip is even
+	// consulted. The fleet counter persists on the Driver across drains and
+	// only resets on a successful implement phase, so it can carry a residual
+	// count left over from an earlier, unrelated task's death into THIS
+	// task's own run of deaths. Checking fleet first would let that leftover
+	// tip the fleet bound one death before this task reaches its own —
+	// pre-empting a park this task legitimately earned with a fleet-wide
+	// pause that blames the provider for what is, this time, actually the
+	// task. Per-task takes priority: a task that has itself earned a park is
+	// parked, full stop; only once that is ruled out does a fleet-wide run
+	// of deaths across DIFFERENT tasks get to trip the fleet pause. A session
+	// that never got past its claim is excluded from both by construction:
+	// `end.dead` requires `res.Claim.Held()`, and a refused claim (lease_live,
+	// a lost race) observes no task id, so its death counts toward neither
+	// counter. This is the discriminator CLA-402's retrospective scan must
+	// agree with.
+	if st.end.dead {
+		taskID := ""
+		if st.end.claim != nil {
+			taskID = st.end.claim.Claim.TaskID
+		}
+
+		if !st.last && s.i == 0 && taskID != "" && taskID == s.deadTask && s.deadRetries >= perTaskDeadBound-1 {
+			how := "died producing nothing"
+			if st.end.toolLoop != "" {
+				how = "was killed (" + st.end.toolLoop + "), dead"
+			}
+			log.Printf("%siteration %d: the %s phase %s for the %dth consecutive time on this task — parking it per the 2026-08-20 decision (%d consecutive dead phases, then park)",
+				labelOf(t), drainNum, st.ph.Label(s.i), how, s.deadRetries+1, perTaskDeadBound)
+			d.parkDeadPhase(ctx, t, st.ph.Label(s.i), st.end.claim)
+			s.parkFired = true // CLA-466: the record says parked, not dead
+			// The task is parked for the operator and this drain is over; the
+			// daemon carries on with the next task. Not a stop: the run did
+			// not fail, one task reached a human.
+			return seqBreak
+		}
+
+		d.fleetDead[ti]++
+		if d.fleetDead[ti] >= fleetDeadBound {
+			d.fleetTrip(ctx, t, ti, drainNum, st.end.claim)
+			s.tripFired = true // CLA-466: a fleet trip ends this drain on a death
+			// The fleet trip pauses this target and this drain is over; the
+			// in-flight task was already released with the dead phase. Not a
+			// stop: the run itself did not fail.
+			return seqBreak
+		}
+
+		if !st.last && s.i == 0 {
+			// Either the first dead phase this task produced, or a dead phase
+			// on a task other than the one counted above: that task has died
+			// once, and earns its own retry ladder rather than being parked
+			// for deaths it did not have.
+			if taskID != s.deadTask {
+				s.deadRetries = 1
+				s.deadTask = taskID
+			} else {
+				s.deadRetries++
+			}
+			if st.end.toolLoop != "" {
+				log.Printf("%siteration %d: the %s phase was killed (%s) — retrying it (%d of %d) before any review brief sees the task",
+					labelOf(t), drainNum, st.ph.Label(s.i), st.end.toolLoop, s.deadRetries, perTaskDeadBound)
+			} else {
+				log.Printf("%siteration %d: the %s phase died producing nothing (final step reason %q, no branch recorded) — retrying it (%d of %d) before any review brief sees the task",
+					labelOf(t), drainNum, st.ph.Label(s.i), deadReason(st.end.claim), s.deadRetries, perTaskDeadBound)
+			}
+			return seqContinue
+		}
+	}
+
+	return seqFall
+}
