@@ -118,6 +118,9 @@ func (r *phaseRun) result(v attemptVerdict) (int, float64, bool, phaseEnd, error
 	if v.zeroSpend {
 		return 0, 0, v.stop, r.end, v.err
 	}
+	if v.spendOverride {
+		return v.tokens, v.cost, v.stop, r.end, v.err
+	}
 	return r.tokens, r.cost, v.stop, r.end, v.err
 }
 
@@ -137,6 +140,10 @@ type attemptVerdict struct {
 	err  error
 	// zeroSpend ends the phase reporting no spend, as the pre-spawn refusals do.
 	zeroSpend bool
+	// spendOverride ends the phase reporting tokens and cost instead of the ladder's totals.
+	spendOverride bool
+	tokens        int
+	cost          float64
 }
 
 // phaseAttempt is one pass through the ladder: the session it spawned, how that
@@ -1151,6 +1158,49 @@ func (r *phaseRun) endOnInvokeError(ctx context.Context, at *phaseAttempt) attem
 		// classification. Not a blip.
 		return attemptVerdict{next: attemptReturn, err: fmt.Errorf("invoke %s: %w (log: %s)", a.Name(), at.ierr, at.logPath)}
 	}
+
+	return attemptVerdict{}
+}
+
+// countAttemptSpend refuses a stream that could not be read whole, and otherwise
+// counts the attempt's spend toward the budget breaker and the pass's session entry.
+func (r *phaseRun) countAttemptSpend(ctx context.Context, at *phaseAttempt) attemptVerdict {
+	d := r.d
+	t := r.t
+	tc := r.tc
+	drainNum := r.drainNum
+	ph := r.ph
+	a := r.a
+	// A session whose stream could not be read whole (CLA-262). Everything below
+	// this line reads a figure parsed out of that stream, so counting the spend,
+	// classifying the exit or retrying on the strength of it are three ways to
+	// make a confident decision on data with a hole in it.
+	if at.res.Untrusted != "" {
+		// held is nil here by construction — an untrusted stream never holds a
+		// phase open — so the sequence ends and nothing is carried forward.
+		//
+		// CLA-691: no spend figures were recorded on this pass's session entry
+		// either (recordPassSpend runs only where the loop counts an attempt),
+		// so the record says "unknown" instead of publishing a FLOOR from a
+		// stream with a hole in it as if it were a report.
+		utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), at.logPath, at.res, r.tokens, r.cost)
+		return attemptVerdict{next: attemptReturn, spendOverride: true, tokens: utokens, cost: ucost, stop: ustop, err: uerr}
+	}
+
+	// Count THIS attempt's spend toward the budget breaker regardless of how it
+	// ends — usage-limit, transient, stop, or clean. A failed/retried attempt
+	// still burned tokens, and a "leave headroom" breaker must err toward seeing
+	// real spend, not under-counting it. Each attempt is a distinct session, so
+	// summing per attempt (and returning the accumulator, not the final res)
+	// counts every session exactly once.
+	r.tokens += at.res.Tokens
+	r.cost += at.res.CostUSD
+	r.publishSpend()
+	// The pass's own session entry takes the same figures, in the same breath
+	// (CLA-691): every attempt the loop counts is money the record attributes
+	// to the pass, and none it refuses is.
+	recordPassSpend(r.end.session, a, &r.pass, &at.res)
+	d.charge(tc.HarnessFor(ph), at.res.Tokens, at.res.CostUSD)
 
 	return attemptVerdict{}
 }

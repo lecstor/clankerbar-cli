@@ -232,37 +232,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		case attemptReturn:
 			return r.result(v)
 		}
-		// A session whose stream could not be read whole (CLA-262). Everything below
-		// this line reads a figure parsed out of that stream, so counting the spend,
-		// classifying the exit or retrying on the strength of it are three ways to
-		// make a confident decision on data with a hole in it.
-		if at.res.Untrusted != "" {
-			// held is nil here by construction — an untrusted stream never holds a
-			// phase open — so the sequence ends and nothing is carried forward.
-			//
-			// CLA-691: no spend figures were recorded on this pass's session entry
-			// either (recordPassSpend runs only where the loop counts an attempt),
-			// so the record says "unknown" instead of publishing a FLOOR from a
-			// stream with a hole in it as if it were a report.
-			utokens, ucost, ustop, uerr := d.endUntrustedDrain(t, drainNum, tc.HarnessFor(ph), at.logPath, at.res, r.tokens, r.cost)
-			return utokens, ucost, ustop, r.end, uerr
+		switch v := r.countAttemptSpend(ctx, at); v.next {
+		case attemptRetry:
+			continue
+		case attemptReturn:
+			return r.result(v)
 		}
-
-		// Count THIS attempt's spend toward the budget breaker regardless of how it
-		// ends — usage-limit, transient, stop, or clean. A failed/retried attempt
-		// still burned tokens, and a "leave headroom" breaker must err toward seeing
-		// real spend, not under-counting it. Each attempt is a distinct session, so
-		// summing per attempt (and returning the accumulator, not the final res)
-		// counts every session exactly once.
-		r.tokens += at.res.Tokens
-		r.cost += at.res.CostUSD
-		r.publishSpend()
-		// The pass's own session entry takes the same figures, in the same breath
-		// (CLA-691): every attempt the loop counts is money the record attributes
-		// to the pass, and none it refuses is.
-		recordPassSpend(r.end.session, a, &r.pass, &at.res)
-		d.charge(tc.HarnessFor(ph), at.res.Tokens, at.res.CostUSD)
-
 		// CLA-703 backstop: the primary fix is the adapter's MCP preflight, but
 		// a session can still end with no clankerbar call and no record (an
 		// older build, a session that acted before its tools were offered, a
