@@ -259,3 +259,66 @@ func TestValidate_NoneIsNeverOpenedAsAFile(t *testing.T) {
 		})
 	}
 }
+
+func TestWithheldMCPConfig_OnlyAnOperatorNamedFileIsReported(t *testing.T) {
+	dir := t.TempDir()
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(cla318ClaudeShaped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	newCfg := func(harness, named string) *Config {
+		return &Config{Harness: harness, WorkDir: dir, BacklogURL: "https://clankerbar.com", Prompt: "work", MCPConfigPath: named}
+	}
+
+	t.Run("named top-level .mcp.json under opencode is reported", func(t *testing.T) {
+		c := newCfg("opencode", mcp)
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.WithheldMCPConfig("opencode", nil); got != mcp {
+			t.Errorf("WithheldMCPConfig = %q, want %q", got, mcp)
+		}
+	})
+	t.Run("named project file under opencode is reported", func(t *testing.T) {
+		c := newCfg("opencode", "")
+		c.Projects = []Project{{Slug: "proj", MCPConfigPath: mcp}}
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.WithheldMCPConfig("opencode", &c.Projects[0]); got != mcp {
+			t.Errorf("WithheldMCPConfig = %q, want %q", got, mcp)
+		}
+	})
+	t.Run("a discovered file stays silent under opencode and codex", func(t *testing.T) {
+		for _, h := range []string{"opencode", "codex"} {
+			c := newCfg(h, "")
+			if err := c.Validate(); err != nil {
+				t.Fatal(err)
+			}
+			if c.MCPConfigPath != mcp {
+				t.Fatalf("%s: discovery did not fill %q", h, mcp)
+			}
+			if got := c.WithheldMCPConfig(h, nil); got != "" {
+				t.Errorf("%s: WithheldMCPConfig = %q, want \"\" for a discovered file", h, got)
+			}
+		}
+	})
+	t.Run("none stays silent", func(t *testing.T) {
+		c := newCfg("opencode", MCPConfigNone)
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.WithheldMCPConfig("opencode", nil); got != "" {
+			t.Errorf("WithheldMCPConfig = %q, want \"\"", got)
+		}
+	})
+	t.Run("claude is handed the named file, so nothing is withheld", func(t *testing.T) {
+		c := newCfg("claude", mcp)
+		if err := c.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.WithheldMCPConfig("claude", nil); got != "" {
+			t.Errorf("WithheldMCPConfig = %q, want \"\"", got)
+		}
+	})
+}

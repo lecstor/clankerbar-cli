@@ -68,3 +68,37 @@ func mcpUnderWorkDir(p, workdir string) string {
 	}
 	return underWorkDir(expandHome(p), workdir)
 }
+
+// WithheldMCPConfig returns the file an OPERATOR named for this harness (and
+// project, when p is non-nil) that mcpConfigHandedTo withholds from its sessions,
+// or "" when there is nothing to report. It follows ResolveMCPConfig's precedence
+// so doctor judges the file the loop would pick.
+//
+// A file Validate found in the workdir is not reported: the operator never chose
+// it, and the gate dropping it is the intended behaviour. "none" is not a file.
+func (c *Config) WithheldMCPConfig(harnessName string, p *Project) string {
+	var path string
+	named := true
+	if p != nil {
+		path = p.MCPConfigPaths[harnessName]
+		if path == "" && harnessName == c.Harness {
+			path, named = p.MCPConfigPath, !p.mcpDiscovered
+		}
+	}
+	if path == "" {
+		hc := c.Harnesses[harnessName]
+		path = hc.MCPConfigPath
+		if path == "" && harnessName == c.Harness {
+			path, named = c.MCPConfigPath, !c.mcpDiscovered
+		} else {
+			named = true
+		}
+	}
+	if path == "" || path == MCPConfigNone || !named {
+		return ""
+	}
+	if mcpConfigHandedTo(harnessName, path) != "" {
+		return ""
+	}
+	return path
+}

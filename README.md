@@ -1917,8 +1917,9 @@ still filled for everyone, and the hand-off gates it (CLA-318):
 To give opencode sessions their own MCP config, point a per-harness or per-project
 path (`harnesses.opencode.mcp_config_path`, or that project's `mcp_config_paths`)
 at an opencode-schema file. Naming a file `.mcp.json` under opencode resolves to
-nothing too — after validation there is no provenance left on a path, so the gate
-treats operator-named and discovered alike. A gated file resolves to nothing rather
+nothing too, and `doctor` WARNs that the file you named is not being handed over
+(naming the file and the harness); a `.mcp.json` it merely discovered stays
+silent, as does `"none"`. A gated file resolves to nothing rather
 than falling back to a lower-precedence one, so **in a multi-project run each project
 needs its own `mcp_config_paths.opencode`**: a project whose workdir holds a
 `.mcp.json` does not borrow `harnesses.opencode.mcp_config_path`, which would wire its

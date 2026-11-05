@@ -668,6 +668,11 @@ type Config struct {
 
 	source string // path the config was loaded from, for diagnostics
 
+	// mcpDiscovered records that Validate FILLED MCPConfigPath from the workdir
+	// rather than the operator naming it; WithheldMCPConfig stays silent for such
+	// a file. Project has the same field.
+	mcpDiscovered bool
+
 	// harnessFromFlag / modelFromFlag record that --harness / --model overrode
 	// the file. Both flags say "the run has ONE harness and this is it", which a
 	// mixed-harness config contradicts: --harness would re-point which harness
@@ -701,6 +706,9 @@ type Project struct {
 	// at. Empty = `<workdir>/.mcp.json` when that file exists, else the top-level
 	// mcp_config_path.
 	MCPConfigPath string `json:"mcp_config_path"`
+
+	// mcpDiscovered: Validate filled MCPConfigPath by discovery (see Config).
+	mcpDiscovered bool
 
 	// MCPConfigPaths is this project's MCP config PER HARNESS (harness name ->
 	// path), for a run whose phases are not all on one harness (CLA-366). Empty
