@@ -3362,6 +3362,11 @@ func (c *Config) EffectivePhases() []Phase {
 			if out[i].Name != VerifyPhaseName || out[i].Prompt != verifyBrief || lastFix < 0 {
 				continue
 			}
+			// A model alias is provider-specific: the model/tier pair crosses only
+			// when the verifier ends up on the fix phase's harness (the tier is
+			// dropped too, by the task's design, so the verifier resolves through
+			// its own harness's default).
+			sameHarness := out[i].Harness == "" || c.HarnessFor(out[i]) == c.HarnessFor(out[lastFix])
 			if out[i].Harness == "" {
 				out[i].Harness = out[lastFix].Harness
 			}
@@ -3370,7 +3375,7 @@ func (c *Config) EffectivePhases() []Phase {
 			// neither. Inheriting the MODEL beside a tier the verifier named
 			// would make that tier inert, because ModelForPhase resolves Model
 			// first — the same trap a panel member's tier has.
-			if out[i].Model.Empty() && out[i].Tier == "" {
+			if sameHarness && out[i].Model.Empty() && out[i].Tier == "" {
 				out[i].Model = out[lastFix].Model
 				out[i].Tier = out[lastFix].Tier
 			}
