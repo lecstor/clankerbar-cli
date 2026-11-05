@@ -911,12 +911,7 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 	phaseIdx := r.phaseIdx
 	ph := r.ph
 	last := r.last
-	panel := r.panel
-	opts := r.opts
-	briefedTask := r.briefedTask
-	nextReviewShaped := r.shape.nextReviewShaped
 	panelMember := r.shape.panelMember
-	panelOptional := r.shape.panelOptional
 	// `released` records only a handback that could actually have happened:
 	// a zero Result from a failed launch releases nothing, and reporting it
 	// as released would erase a predecessor's claim that is still live.
@@ -986,6 +981,24 @@ func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt
 		r.end.releasedToQueue = d.releaseHeldClaim(ctx, t, at.res, last && at.res.ExitCode == 0 && at.toolLoop == "")
 	}
 
+	r.recoverUnobservedClaim(ctx, at)
+}
+
+// recoverUnobservedClaim asks the plane about the one task this driver briefed
+// when the stream showed no claim at all, and treats a held task with a recorded
+// branch as the phase's checkpoint if the branch verifies on the origin remote.
+func (r *phaseRun) recoverUnobservedClaim(ctx context.Context, at *phaseAttempt) {
+	d := r.d
+	t := r.t
+	drainNum := r.drainNum
+	phaseIdx := r.phaseIdx
+	ph := r.ph
+	last := r.last
+	panel := r.panel
+	opts := r.opts
+	briefedTask := r.briefedTask
+	nextReviewShaped := r.shape.nextReviewShaped
+	panelOptional := r.shape.panelOptional
 	// CLA-451: the blind-spot convergence. Everything above learns about
 	// claims by parsing clankerbar tool calls out of the stream; a session
 	// that claimed by another channel (a raw API call with the same key,
