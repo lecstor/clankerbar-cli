@@ -477,6 +477,10 @@ func (d *Supervisor) statusInstance(inst *Instance) StatusInstance {
 			out.Reason = "HALT marker present in " + dir
 		}
 		out.Since = exitAt
+	case inst.limitStopped:
+		out.State = StatusStopped
+		out.Reason = "stopped: " + inst.limitReason
+		out.Since = exitAt
 	case inst.removed:
 		out.State = StatusStopped
 		out.Reason = "entry removed from the roster"

@@ -642,7 +642,7 @@ func (d *Dir) checkAdoptable() error {
 func (d *Dir) isOurArtifact(name string) bool {
 	switch {
 	case name == sentinelName,
-		name == "STOP", name == "HALT",
+		name == "STOP", name == "HALT", name == "LIMIT_STOP",
 		// CLA-461: the ctl-written restart/reload markers. A state dir holding a
 		// pending control request must stay adoptable — the daemon reading that
 		// request is exactly the process that opens this directory next.

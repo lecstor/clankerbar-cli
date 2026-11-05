@@ -176,6 +176,22 @@ func helperMain() {
 		os.Exit(1)
 	case "crash":
 		os.Exit(1)
+	case "limit-stop", "limit-stop-once":
+		// The loop's Stop-limit path: leave LIMIT_STOP, exit 0. The -once
+		// variant only does so on its first run, so a resume has a child to find.
+		if mode == "limit-stop" || countHelperRuns(spec.StateDir) == 1 {
+			if err := os.WriteFile(filepath.Join(spec.StateDir, loop.LimitStopName), []byte("budget_exhausted\n"), 0o600); err != nil {
+				os.Exit(9)
+			}
+			os.Exit(0)
+		}
+		for {
+			if _, err := os.Lstat(stopPath); err == nil {
+				_ = os.Remove(stopPath)
+				os.Exit(0)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
 	case "halt":
 		if err := os.WriteFile(filepath.Join(spec.StateDir, "HALT"), []byte("halted by test\n"), 0o600); err != nil {
 			os.Exit(9)
@@ -1699,5 +1715,83 @@ func TestSpawnEnvDropsAPreExistingChildVersion(t *testing.T) {
 	}
 	if got := len(env); got != len(os.Environ()) {
 		t.Fatalf("spawnEnv changed the variable count: %d entries -> %d", len(os.Environ()), got)
+	}
+}
+
+func countHelperRuns(stateDir string) int {
+	entries, _ := os.ReadDir(stateDir)
+	n := 0
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "iteration-") && strings.HasSuffix(e.Name(), ".log") {
+			n++
+		}
+	}
+	return n
+}
+
+// A child that ends through the Stop-limit path is not respawned, and the
+// report names the limit reason; it is a stop, not a crash.
+func TestLimitStopLeavesInstanceStopped(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "limit-stop")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("broke", "")})
+	srv := plane.serve(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+	state := entryStateDir(cacheDir, "broke")
+	rep := waitForStatusState(t, plane, "broke", StatusStopped)
+	inst := runningInstance(rep, "broke")
+	if inst.Reason != "stopped: budget_exhausted" {
+		t.Errorf("reason = %q, want %q", inst.Reason, "stopped: budget_exhausted")
+	}
+	if inst.NextRetryAt != nil {
+		t.Errorf("nextRetryAt = %v, want null", *inst.NextRetryAt)
+	}
+	time.Sleep(300 * time.Millisecond) // six base backoffs
+	if got := countRuns(t, state); got != 1 {
+		t.Fatalf("spawns = %d, want 1 - a Stop-limit exit must not be restarted", got)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Supervise returned %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Supervise did not return")
+	}
+}
+
+// Deleting the marker is the resume: the next poll respawns the child.
+func TestLimitStopResumesWhenMarkerDeleted(t *testing.T) {
+	cacheDir := t.TempDir()
+	setHelperMode(t, "limit-stop-once")
+	plane := &fakePlane{}
+	plane.set([]RosterEntry{runEntry("broke", "")})
+	srv := plane.serve(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := runSupervise(ctx, testOptions(t, cacheDir, srv))
+
+	state := entryStateDir(cacheDir, "broke")
+	waitForStatusState(t, plane, "broke", StatusStopped)
+	marker := filepath.Join(state, loop.LimitStopName)
+	if _, err := os.Lstat(marker); err != nil {
+		t.Fatalf("marker missing: %v", err)
+	}
+	if err := os.Remove(marker); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 5*time.Second, "the resumed child to be spawned", func() bool { return countRuns(t, state) == 2 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Supervise did not return")
 	}
 }

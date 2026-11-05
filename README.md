@@ -847,6 +847,10 @@ contrast, is consumed by the daemon when it honours it, so the supervisor
 cannot see it and reads the exit as unexpected: **to stop ONE instance while
 the supervisor runs, touch `HALT` in its state dir, not `STOP`.**
 
+A child that ends on a hard usage stop (`budget_exhausted`, credits gone) leaves a
+`LIMIT_STOP` marker and is not respawned; the fleet listing shows `stopped: budget_exhausted`.
+Delete the marker to resume it (`docs/limit-stop.md`).
+
 **A dead child's claim is handed back immediately.** A session that dies with
 the daemon process — a crash, a `kill`, the machine sleeping — would otherwise
 leave its lease ticking for the full 30 minutes with nobody working the task.

@@ -738,6 +738,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// what the upgraded clanker1 did seconds after its start banner. Consume it
 	// with a loud note instead. A stop dropped AFTER this point is fresh and
 	// still lands on every read below.
+	d.clearStaleLimitStop()
 	if present, msg := d.readMarker("STOP"); present {
 		_ = d.state.Remove("STOP")
 		note := ""
@@ -5648,6 +5649,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 				}
 				log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
 					drainNum, limitReason(lim), logPath)
+				d.writeLimitStop(lim)
 				return tokens, cost, true, end, nil
 			}
 			log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))

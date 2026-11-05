@@ -3004,3 +3004,37 @@ func TestLimitReasonNamesTheWindow(t *testing.T) {
 		})
 	}
 }
+
+// A Stop-class limit leaves the LIMIT_STOP marker the supervisor reads; a
+// rolling-window limit that is waited out leaves none.
+func TestDrainWithRetries_StopLimitWritesTheMarker(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{steps: []invokeStep{{res: limitStopResult()}}}, &fakePoller{})
+	openTestStateDir(t, d)
+	if _, _, stop, _ := d.drainWithRetries(context.Background(), 1, d.targets[0], spend{start: time.Now()}); !stop {
+		t.Fatal("stop = false, want true")
+	}
+	present, reason := d.readMarker(LimitStopName)
+	if !present || reason != "out of credits" {
+		t.Errorf("marker = (%v, %q), want present with the limit reason", present, reason)
+	}
+
+	d2 := New(fastCfg(), &fakeAdapter{steps: []invokeStep{{res: limitResult()}, {res: okResult(7, 0)}}}, &fakePoller{})
+	openTestStateDir(t, d2)
+	d2.drainWithRetries(context.Background(), 1, d2.targets[0], spend{start: time.Now()})
+	if present, _ := d2.readMarker(LimitStopName); present {
+		t.Error("a waited-out rolling limit must not write LIMIT_STOP")
+	}
+}
+
+// An unsupervised start is the operator's resume: a leftover marker is cleared.
+func TestClearStaleLimitStop(t *testing.T) {
+	d := New(fastCfg(), &fakeAdapter{}, &fakePoller{})
+	openTestStateDir(t, d)
+	if err := d.state.WriteFile(LimitStopName, []byte("budget_exhausted\n")); err != nil {
+		t.Fatal(err)
+	}
+	d.clearStaleLimitStop()
+	if present, _ := d.readMarker(LimitStopName); present {
+		t.Error("marker still present after clearStaleLimitStop")
+	}
+}
