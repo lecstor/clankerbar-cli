@@ -1313,3 +1313,157 @@ func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attem
 
 	return attemptVerdict{}
 }
+
+// endOnExitKind counts a silent attempt, then ends the phase on the exits that
+// are not a failure to retry: a tool-loop kill, a clean exit, a recovered exit and
+// the turn, token and wall-clock caps.
+func (r *phaseRun) endOnExitKind(ctx context.Context, at *phaseAttempt) attemptVerdict {
+	t := r.t
+	drainNum := r.drainNum
+	phaseIdx := r.phaseIdx
+	ph := r.ph
+	// Below the limit branch, so a usage-limit attempt is counted NEITHER way.
+	// A session the subscription cap turned away often reports nothing at all
+	// - under claude the notice can arrive on stderr with no stream, and under
+	// codex as free text - so counting it as silence would end the run on the
+	// ordinary overnight quota wait, and blame a harness that is starting
+	// perfectly well. It is not a reset either: the cap is a known cause with
+	// its own breakers (the budget check inside supervisedWait, waitPastBudget,
+	// and the probes' own spend), and clearing the count on it would let a
+	// limit between silences hide the loop this bounds.
+	//
+	// Everything from here down is an attempt that RAN and ended on its own
+	// terms, which is where "did it tell us anything?" is the right question -
+	// a different question from what it told us, since a report of zero is
+	// still a report (CLA-288). Counted here, enforced at the top of the loop,
+	// so the bound fires on the decision to spawn again rather than on this
+	// attempt's exit.
+	if at.res.UsageReported {
+		r.noUsage = 0
+	} else {
+		r.noUsage++
+	}
+
+	// CLA-739: killed for repeating a failing tool call. Ahead of the exit
+	// status, because the session can exit 0 in the instant before the kill
+	// lands. Never retried here as a transient (a fresh session would loop
+	// the same way, and each call re-sends the whole context), and never a
+	// run failure (the kill did its job). The dead classification above has
+	// already decided what follows: drainPhases' dead-phase ladder, or the
+	// panel's failed-member path.
+	if at.toolLoop != "" {
+		// claude reports dollars only on its terminal result event, which a
+		// killed stream never reaches - so say the cost was not captured
+		// rather than print $0 as if it were measured (the CLA-343 ceiling
+		// branch's rule). opencode sums each step's cost up to the kill.
+		spent := fmt.Sprintf("tokens=%d cost=$%.4f", r.tokens, r.cost)
+		if !at.res.CostReported {
+			spent = fmt.Sprintf("tokens=%d; cost not captured - killed mid-stream", r.tokens)
+		}
+		log.Printf("%siteration %d: the %s phase was killed by the driver: %s — classified dead, no delivery (%s) (log: %s)",
+			labelOf(t), drainNum, ph.Label(phaseIdx), at.toolLoop, spent, at.logPath)
+		return attemptVerdict{next: attemptReturn}
+	}
+
+	if at.res.ExitCode == 0 {
+		// A clean exit is the shape the CLA-398 quiet death wears, so the
+		// marker gets named here rather than inferred downstream: a final
+		// step_finish with reason "unknown" and all-zero usage used to read
+		// as "iteration done (tokens=0 cost=$0.00)" — indistinguishable from
+		// a cheap clean run, which is exactly what made these deaths
+		// invisible. The adapter's own marker is the only thing that can
+		// tell them apart.
+		if at.zeroUsage {
+			log.Printf("iteration %d: the session ended with the zero-usage-unknown signature (final step reason %q, all-zero usage) — a quiet death, not a clean run (log: %s)",
+				drainNum, harness.FinishReasonUnknown, at.logPath)
+		} else if finished := harness.RouteFinished(at.res); finished != "" && finished != at.inv.Model {
+			// CLA-782: the spawn line names the route the session STARTED on;
+			// this line adds the route that finished it when a usage limit moved
+			// it mid-session.
+			log.Printf("iteration %d done (tokens=%d cost=$%.4f; finished on %s) (log: %s)", drainNum, r.tokens, r.cost, finished, at.logPath)
+		} else {
+			log.Printf("iteration %d done (tokens=%d cost=$%.4f) (log: %s)", drainNum, r.tokens, r.cost, at.logPath)
+		}
+		return attemptVerdict{next: attemptReturn}
+	}
+
+	// CLA-700: a session that recovered from its provider errors is not judged
+	// by its exit status — the stream shows the harness took the error, retried
+	// and carried the session on, and 2.x exits non-zero regardless (pinned by
+	// the conformance suite). Everything this exit could have meant was settled
+	// above by the DELIVERY question: either the phase checkpoints (its work is
+	// verified on the origin remote, or its review record appended) and the
+	// sequence advances, or it delivered nothing and ends the drain as the
+	// held-but-empty shape. Falling through to the classifiers here would undo
+	// both — the transient ladder retries a session whose work is already
+	// pushed, and the non-retryable stop ends the run over an exit status that
+	// names no failure.
+	//
+	// Deliberately HERE, after the untrusted and spend-accounting arms and
+	// after DetectLimit: a usage limit or budget stop is still honoured (its
+	// scan reads stderr and a TERMINAL error event, so a recovered blip cannot
+	// trip it while a genuine account stop still can), and the cap branches
+	// below are unreachable from here by construction — a capped exit is
+	// `orderlyExit`, so it never sets recoveredExit.
+	if at.recoveredExit {
+		log.Printf("iteration %d: the session's stream shows %d provider error event(s) it recovered from and no terminal one (exit %s) — judging this phase on its delivery, not on the exit status (log: %s)",
+			drainNum, harness.RecoveredErrors(at.res), at.res.ExitString(), at.logPath)
+		return attemptVerdict{next: attemptReturn}
+	}
+
+	// A turn-capped end is this PHASE ending, never the run failing. It exits
+	// non-zero and matches neither the limit scan nor the transient one, so
+	// without this it would fall through to the non-retryable branch below and
+	// stop the daemon — the backstop killing what it was added to protect.
+	// Not retried either: the cap would fire again at the same place.
+	if at.capped {
+		log.Printf("iteration %d: the session hit its turn cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above (log: %s)",
+			drainNum, r.tokens, r.cost, at.logPath)
+		return attemptVerdict{next: attemptReturn}
+	}
+
+	// A session the ADAPTER killed for crossing its per-session token ceiling
+	// is the same shape as a turn cap: an orderly end with the salvage's
+	// problem to handle, never a failure and never a retry. Retrying would
+	// re-spend against the same runaway ceiling; failing would stop the run
+	// over a kill that did its job (CLA-343).
+	//
+	// The cost is reported as unmeasured, never as a number: the result event
+	// — the only carrier of total_cost_usd — is deliberately not parsed on a
+	// killed stream, so res.CostUSD is 0 and printing it would under-report
+	// the drain's spend as exactly nothing. The tokens are the honest figure.
+	if at.ceiling {
+		log.Printf("iteration %d: the session crossed its per-session token ceiling (tokens=%d; cost not captured — killed mid-stream) — ending this phase; anything uncommitted was salvaged above (log: %s)",
+			drainNum, r.tokens, at.logPath)
+		return attemptVerdict{next: attemptReturn}
+	}
+
+	// A session the ADAPTER ended for outliving its wall-clock cap is the same
+	// shape again: the phase ends, and neither a retry nor a failure is right -
+	// a retry would spend the same hours over again and reach the same deadline,
+	// and failing would stop the run over a cap doing its job (CLA-368).
+	//
+	// Spend IS reported here, unlike the token-ceiling branch: opencode's usage
+	// arrives per step_finish and is summed all the way to the kill, so the
+	// figures are the honest cost of the session up to the moment it ended.
+	//
+	// Since CLA-365 opencode has BOTH HonoursSessionWallClock and
+	// TracksClaims (Capabilities.TracksClaims: true), so a capped opencode
+	// session holding its claim IS salvaged - the res.Claim.Held() arm above
+	// is the one that fires today. The else branch (nothing salvaged) applies
+	// only if an adapter enforcing this cap ever lacks claim observation
+	// again; it is kept defensive, not descriptive of the present. The claim-held
+	// wording was earned by CLA-365, not reserved for a future adapter.
+	if at.wallclock {
+		if at.res.Claim.Held() {
+			log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase; anything uncommitted was salvaged above (log: %s)",
+				drainNum, r.tokens, r.cost, at.logPath)
+		} else {
+			log.Printf("iteration %d: the session outlived its wall-clock cap (tokens=%d cost=$%.4f) — ending this phase. NOTHING was salvaged: this harness does not observe the session's task claim, so whatever the session left uncommitted is still in the worktree (log: %s)",
+				drainNum, r.tokens, r.cost, at.logPath)
+		}
+		return attemptVerdict{next: attemptReturn}
+	}
+
+	return attemptVerdict{}
+}
