@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"context"
 	"log"
 	"strings"
 	"time"
@@ -279,3 +280,114 @@ const (
 	seqContinue                // take the next pass without advancing past this one
 	seqBreak                   // end the walk
 )
+
+// runPanelFanOut runs a panel's contiguous members concurrently when the panel
+// concurrency allows it, folding their joined result into the walk. It does
+// nothing at concurrency 1, and the sequential path then runs as before.
+func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
+	d := s.d
+	t := s.t
+	tc := s.tc
+	ti := s.ti
+	drainNum := s.drainNum
+	prior := s.prior
+	phases := s.phases
+	// CLA-697: fan the panel's contiguous members out concurrently, each in
+	// its own detached worktree. A handoff respawn continues ONE phase (never
+	// a panel run), and a branchless checkpoint runs one reviewer by design —
+	// both take the shipped sequential path below.
+	//
+	// The join owns everything the sequential member handler would have done
+	// one member at a time: the incomplete list, the round close, the run-level
+	// wait a limited member owes, and the decision not to spawn a fix when
+	// nobody recorded. With cap = 1 (or a single member) this block does
+	// nothing at all and the old path runs byte for byte.
+	if !st.panelMember {
+		s.panelFanOutOff = false
+	}
+	if st.panelMember && !st.isHandoff && !s.branchlessCheckpoint && !s.panelFanOutOff {
+		runEnd := s.i + 1
+		for runEnd < len(phases) && phases[runEnd].IsPanelMember() {
+			runEnd++
+		}
+		if n, conc := runEnd-s.i, tc.EffectivePanelConcurrency(runEnd-s.i); n > 1 && conc > 1 {
+			// The breaker at the boundary BEFORE the fan-out, exactly as the
+			// sequential path's per-spawn check would have stopped before the
+			// first member it could not afford.
+			if s.spawned > 0 {
+				if dim := d.budgetTrip(prior.tokens+s.tokens, prior.cost+s.cost, time.Since(prior.start)); dim != "" {
+					log.Printf("iteration %d: budget reached at the %s phase boundary: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
+						drainNum, st.ph.Label(s.i), dim, prior.tokens+s.tokens, prior.cost+s.cost,
+						time.Since(prior.start).Round(time.Second))
+					s.stop = true
+					return seqBreak
+				}
+			}
+			if out, ok := d.runPanelInParallel(ctx, drainNum, ti, t, phases, s.i, runEnd, conc, s.carried, spend{
+				start:  prior.start,
+				tokens: prior.tokens + s.tokens,
+				cost:   prior.cost + s.cost,
+			}); ok {
+				s.tokens += out.tokens
+				s.cost += out.cost
+				s.spawned += n
+				for k, m := range out.members {
+					if m.end.session != nil {
+						s.sessionsRun = append(s.sessionsRun, *m.end.session)
+					}
+					label := phases[s.i+k].Label(s.i + k)
+					if len(s.phasesRun) == 0 || s.phasesRun[len(s.phasesRun)-1] != label {
+						s.phasesRun = append(s.phasesRun, label)
+					}
+				}
+				// The member claims are the same run the panel resumed; keep
+				// the CARRIED claim (with its verified branch and tip) rather
+				// than adopting one member's copy. A member that recorded
+				// nothing can end holding a claim that never had the tip
+				// folded onto it, and adopting that one would hand the fix
+				// phase an unverified-looking checkpoint.
+				if out.claim != nil && (s.carried == nil || out.claim.Claim.TaskID == s.carried.Claim.TaskID) {
+					s.seen = out.claim.Claim
+					s.finalOutcome = out.disposition
+				}
+				s.finalDead = out.finalDead
+				s.lastProducedNothing = out.lastProducedNothing
+				s.panelRecorded = s.panelRecorded || out.recorded
+				s.panelRound = max(s.panelRound, out.round)
+				s.panelIncomplete = append(s.panelIncomplete, out.incomplete...)
+				for role, why := range out.failed {
+					s.panelFailed[role] = why
+				}
+				// The run-level endings, in the order the sequential handler
+				// checks them: a close that failed is fail-closed and stops the
+				// drain; a member's budget stop ends the run; a limit or
+				// transient end hands the drain its wait (the claim is left to
+				// lapse into a takeover, never released); no record at all means
+				// no fix.
+				switch {
+				case out.closeFailed:
+					if s.limitWait == nil && out.sequenceEnded && out.limitWait == nil {
+						s.transientKey = out.transientKey
+						s.transientRung = d.noteResumedTransient(s.transientKey)
+					}
+				case out.stop:
+					s.stop = true
+				case out.err != nil:
+					s.err = out.err
+				case out.sequenceEnded:
+					s.limitWait = out.limitWait
+					if s.limitWait == nil {
+						s.transientKey = out.transientKey
+						s.transientRung = d.noteResumedTransient(s.transientKey)
+					}
+				}
+				if s.stop || s.err != nil || out.closeFailed || out.sequenceEnded || !out.recorded || runEnd >= len(phases) {
+					return seqBreak
+				}
+				s.i = runEnd
+				return seqContinue
+			}
+		}
+	}
+	return seqFall
+}
