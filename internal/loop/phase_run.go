@@ -567,3 +567,51 @@ func (r *phaseRun) openPhaseEnd(at *phaseAttempt) {
 	// phaseEnd.producedNothing.
 	r.end.producedNothing = at.producedNothing
 }
+
+// classifyHandoff detects a handoff block, refuses it where the phase does not
+// chain, and works out whether the exit is a checkpoint contender.
+func (r *phaseRun) classifyHandoff(at *phaseAttempt) {
+	t := r.t
+	drainNum := r.drainNum
+	phaseIdx := r.phaseIdx
+	ph := r.ph
+	last := r.last
+	isVerify := r.shape.isVerify
+	panelMember := r.shape.panelMember
+	panelLast := r.shape.panelLast
+	// A handoff block ending the session's final message (CLA-352) holds the
+	// task open exactly like a phase seam — even on the LAST phase, where
+	// there is otherwise no successor to hold it for. The remaining guards
+	// live in drainPhases; if they refuse, the deferred handback there
+	// releases what this held.
+	at.handoff = detectHandoff(drainNum, t, at.res)
+	// A handoff the session emitted is evidence it worked, even where the
+	// driver then REFUSES to chain it (a panel member, a verification round).
+	// CLA-703's no-MCP backstop must not fire on such a session: it reached a
+	// conclusion and wrote a successor prompt, which a session with no tools
+	// does not do.
+	at.emittedHandoff = at.handoff != ""
+	// CLA-638: a verification round does not chain via a handoff. Its record
+	// is the deliverable, and the DRIVER decides what follows (another fix, a
+	// park, or nothing) from the open MUSTs the record releases; a successor
+	// prompt here would have nothing to continue that this round has not
+	// already written, and honoring it would defer the close/evaluation the
+	// driver owes the round.
+	if isVerify && at.handoff != "" {
+		log.Printf("%siteration %d: the verification round emitted a handoff block; verification rounds do not chain — the driver judges the round's record and decides whether another fix runs", labelOf(t), drainNum)
+		at.handoff = ""
+	}
+	if panelMember && at.handoff != "" {
+		log.Printf("%siteration %d: the %s panel member emitted a handoff block; panel members do not chain — a successor would continue this reviewer's role, but the phase after it is the next member, and the member's record is its deliverable", labelOf(t), drainNum, ph.Label(phaseIdx))
+		at.handoff = ""
+	}
+	// The seam contender: an orderly end still holding the task, minus the dead
+	// signature. This is the gate the incident put in question — see below.
+	at.canCheckpoint = at.res.Untrusted == "" && at.checkpointable && at.res.Claim.Held() && !at.dead
+	// CLA-639: a panel member may be the LAST phase of the sequence when the
+	// operator wrote no fix after the review, and its record gate must still
+	// run — that is how the round closes and how the merged list is released.
+	// `panelLast` (rather than !last) admits it, and only its review record
+	// gate: a settled or non-checkpointable exit is excluded exactly as before.
+	at.reviewable = (!last || panelLast) && at.canCheckpoint
+}
