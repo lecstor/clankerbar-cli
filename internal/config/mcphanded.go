@@ -82,16 +82,18 @@ func (c *Config) WithheldMCPConfig(harnessName string, p *Project) string {
 	if p != nil {
 		path = p.MCPConfigPaths[harnessName]
 		if path == "" && harnessName == c.Harness {
-			path, named = p.MCPConfigPath, !p.mcpDiscovered
+			// projectMCPConfig in doctor: the project's own, else the run-wide
+			// one, both ahead of the harness block (ResolveMCPConfig order).
+			if path, named = p.MCPConfigPath, !p.mcpDiscovered; path == "" {
+				path, named = c.MCPConfigPath, !c.mcpDiscovered
+			}
 		}
 	}
 	if path == "" {
 		hc := c.Harnesses[harnessName]
-		path = hc.MCPConfigPath
+		path, named = hc.MCPConfigPath, true
 		if path == "" && harnessName == c.Harness {
 			path, named = c.MCPConfigPath, !c.mcpDiscovered
-		} else {
-			named = true
 		}
 	}
 	if path == "" || path == MCPConfigNone || !named {

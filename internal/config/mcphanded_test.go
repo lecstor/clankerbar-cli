@@ -322,3 +322,64 @@ func TestWithheldMCPConfig_OnlyAnOperatorNamedFileIsReported(t *testing.T) {
 		}
 	})
 }
+
+func TestWithheldMCPConfig_FollowsResolveMCPConfigPrecedence(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "b"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{".mcp.json", "b/.mcp.json"} {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(cla318ClaudeShaped), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	top, block := filepath.Join(dir, ".mcp.json"), filepath.Join(dir, "b", ".mcp.json")
+	c := &Config{Harness: "opencode", WorkDir: dir, BacklogURL: "https://clankerbar.com", Prompt: "work",
+		MCPConfigPath: top, Harnesses: map[string]HarnessConfig{"opencode": {MCPConfigPath: block}},
+		Projects: []Project{{Slug: "proj", WorkDir: t.TempDir()}}}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// A project with no file of its own takes the run-wide path ahead of the harness block.
+	if got := c.WithheldMCPConfig("opencode", &c.Projects[0]); got != top {
+		t.Errorf("project: got %q, want the run-wide %q", got, top)
+	}
+	if got := c.WithheldMCPConfig("opencode", nil); got != block {
+		t.Errorf("no project: got %q, want the harness block %q", got, block)
+	}
+}
+
+func TestWithheldMCPConfig_ADiscoveredProjectFileStaysSilent(t *testing.T) {
+	wd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(wd, ".mcp.json"), []byte(cla318ClaudeShaped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Harness: "opencode", WorkDir: t.TempDir(), BacklogURL: "https://clankerbar.com", Prompt: "work",
+		Projects: []Project{{Slug: "proj", WorkDir: wd}}}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if c.Projects[0].MCPConfigPath == "" {
+		t.Fatal("setup: project discovery did not fill the path")
+	}
+	if got := c.WithheldMCPConfig("opencode", &c.Projects[0]); got != "" {
+		t.Errorf("got %q, want silence for a discovered project file", got)
+	}
+}
+
+// Codex is handed nothing, so any file the operator names is withheld; the WARN
+// is deliberate and says codex ignores the key.
+func TestWithheldMCPConfig_CodexReportsANamedFile(t *testing.T) {
+	dir := t.TempDir()
+	named := filepath.Join(dir, "oc.json")
+	if err := os.WriteFile(named, []byte(cla318ClaudeShaped), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c := &Config{Harness: "codex", WorkDir: dir, BacklogURL: "https://clankerbar.com", Prompt: "work", MCPConfigPath: named}
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.WithheldMCPConfig("codex", nil); got != named {
+		t.Errorf("got %q, want %q", got, named)
+	}
+}
