@@ -723,6 +723,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// rather than PhaseHarnesses, so a run-wide harness every phase overrides is
 	// not announced as being driven when nothing will ever run on it - the banner
 	// is the operator's first line of output, and it should describe the run.
+	d.loadRouteMarks()
 	log.Printf("driving %s; state in %s; idle poll every %s", strings.Join(d.cfg.SpawnedHarnesses(), "+"), d.state.Path(), idle)
 	// Say it once, loudly, if the pre-CLA-259 directory is still sitting in the
 	// workdir: an operator who touches STOP there would otherwise watch the loop

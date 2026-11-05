@@ -15,6 +15,7 @@ package loop
 // next phase's spawn, so the run keeps working on the route that worked.
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
@@ -22,6 +23,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
 // defaultRouteMarkInterval is how long a denied route with no stated reset is
@@ -54,6 +56,65 @@ func (d *Driver) markRouteLimited(route string, until time.Time) {
 	}
 	if current, ok := d.routeMarks[route]; !ok || until.After(current) {
 		d.routeMarks[route] = until
+		d.persistRouteMarksLocked()
+	}
+}
+
+// persistRouteMarksLocked writes the live marks to the state dir so a restarted
+// process keeps them (CLA-836). Caller holds routeMarksMu. A write failure is
+// logged and dropped: the in-memory mark still governs this process.
+func (d *Driver) persistRouteMarksLocked() {
+	if d.state == nil {
+		return
+	}
+	now := time.Now()
+	out := make(map[string]time.Time, len(d.routeMarks))
+	for route, until := range d.routeMarks {
+		if until.After(now) {
+			out[route] = until
+		}
+	}
+	b, err := json.Marshal(out)
+	if err == nil {
+		err = d.state.WriteFileAtomic(statedir.RouteMarksName, b)
+	}
+	if err != nil {
+		log.Printf("could not save route marks to the state dir (a restart will forget them): %v", err)
+	}
+}
+
+// loadRouteMarks reads the marks a previous process saved, dropping any that
+// have already expired. A missing file is the normal first start; an unreadable
+// or corrupt one is logged and ignored, never fatal. Existing in-memory marks
+// are kept when later than the loaded ones.
+func (d *Driver) loadRouteMarks() {
+	if d.state == nil || !d.state.Exists(statedir.RouteMarksName) {
+		return
+	}
+	b, err := d.state.ReadFile(statedir.RouteMarksName)
+	if err != nil {
+		log.Printf("ignoring saved route marks: %v", err)
+		return
+	}
+	var saved map[string]time.Time
+	if err := json.Unmarshal(b, &saved); err != nil {
+		log.Printf("ignoring corrupt saved route marks: %v", err)
+		return
+	}
+	now := time.Now()
+	d.routeMarksMu.Lock()
+	defer d.routeMarksMu.Unlock()
+	for route, until := range saved {
+		route = strings.TrimSpace(route)
+		if route == "" || !until.After(now) {
+			continue
+		}
+		if d.routeMarks == nil {
+			d.routeMarks = map[string]time.Time{}
+		}
+		if current, ok := d.routeMarks[route]; !ok || until.After(current) {
+			d.routeMarks[route] = until
+		}
 	}
 }
 
