@@ -209,7 +209,7 @@ func (d *Driver) noteRouteFallbacks(t Target, drainNum int, inv harness.Invocati
 }
 
 // routeRetryLabel renders a mark's expiry the way an operator reads a clock: a
-// bare time for something later today, and the weekday too when the wait runs
+// bare local time for something later today, and the date too when the wait runs
 // past a day (a weekly cap's reset) so "after 12:40" cannot be misread as hours
 // away when it is days.
 func routeRetryLabel(until time.Time) string {
@@ -217,9 +217,9 @@ func routeRetryLabel(until time.Time) string {
 		return "the reset"
 	}
 	if time.Until(until) > 24*time.Hour {
-		return until.Format("Mon 15:04")
+		return formatReset(until)
 	}
-	return until.Format("15:04")
+	return until.Local().Format("15:04 MST")
 }
 
 // routeRoutesFor is the one place the driver turns a phase into the routes its
