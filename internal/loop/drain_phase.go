@@ -150,30 +150,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			return r.result(v)
 		}
 		r.openAttemptLog(at)
-		// CLA-358: while THIS child runs, renew whatever task-lease it holds.
-		// Started before Invoke so a resumed phase's seeded claim renews from
-		// the first tick; stopped the moment Invoke returns, which is what makes
-		// renewal pause whenever no child process is running - between attempts,
-		// across supervised waits, after exit. Inside the window the adapter may
-		// run its own resurrection machinery (opencode CLA-406): those processes
-		// continue the SAME session on the SAME claim, so renewal spans them.
-		renewer := d.startLeaseRenewal(ctx, ti, t, &at.inv, fmt.Sprintf("%siteration %d: ", labelOf(t), drainNum))
-		// The launch boundary itself (CLA-738 review 3.2): a panel member releases
-		// its successor here, so nothing this member did before its adapter call
-		// (worktree, brief, budget check) can be overtaken by a later member's.
-		if opts.onSessionLaunch != nil {
-			opts.onSessionLaunch()
-		}
-		at.res, at.ierr = a.Invoke(ctx, at.inv)
-		renewer.stop()
-		// CLA-782: record the routes this session was denied and write each SWITCH
-		// to both logs before the iteration log is closed. Runs before every
-		// classification below, because a transient retry must already start on the
-		// route that worked.
-		d.noteRouteFallbacks(t, drainNum, at.inv, at.res)
-		if at.logFile != nil {
-			_ = at.logFile.Close()
-		}
+		r.spawnSession(ctx, at)
 		// The orderly-cap classifications, computed here (before the salvage) so
 		// the salvage can tell whether a clean tree means "produced nothing" — a
 		// question the caps answer: a capped session is an orderly end with its
