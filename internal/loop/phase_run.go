@@ -3,11 +3,15 @@ package loop
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/logfile"
 )
 
 // phaseRun is one phase's attempt ladder: what drainPhase resolved once before
@@ -142,6 +146,7 @@ type phaseAttempt struct {
 	res                harness.Result
 	ierr               error
 	logPath            string
+	logFile            *os.File
 	capped             bool
 	ceiling            bool
 	wallclock          bool
@@ -263,4 +268,84 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 		at.inv.Prompt = panelWorktreeNote + at.inv.Prompt
 	}
 	return attemptVerdict{}
+}
+
+// openAttemptLog opens this attempt's iteration log, points the invocation's
+// console at it (and the terminal when echo is on), and logs the spawn line.
+func (r *phaseRun) openAttemptLog(at *phaseAttempt) {
+	d := r.d
+	t := r.t
+	drainNum := r.drainNum
+	phaseIdx := r.phaseIdx
+	tag := r.tag
+	ph := r.ph
+	a := r.a
+	logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
+		time.Now().Format("20060102-150405"), drainNum, tag, r.retries, randomTail())
+	f, ferr := d.state.Create(logName)
+	at.logPath = filepath.Join(d.state.Path(), logName)
+	// The console is where the adapter streams the session: the file, and
+	// NOT the terminal unless the operator asked for the echo (CLA-701).
+	//
+	// The stream is the whole harness transcript — prompts, tool arguments,
+	// tool output — and once it also went to the daemon's stderr it left only
+	// the last few minutes of one session in the operator's scrollback, with
+	// none of the daemon's own lines beside it. Those lines (spawn, exit,
+	// classification, why the run ended) are the record of what the driver
+	// DECIDED, and nothing re-reads a terminal; the file keeps the stream in
+	// full, so echoing it only duplicates it over the top of the useful part.
+	//
+	// `echo_sessions: true` restores the old live echo for an operator
+	// watching one session. What stays live either way is the daemon's own
+	// logging (which also lands in daemon.log). Nothing harness-side is
+	// echoed separately: claude's stderr is part of its stream and lands in
+	// the iteration log with the rest of it, and a session worth watching
+	// live is why the opt-in exists.
+	var echo io.Writer
+	if d.cfg.EchoSessions {
+		echo = d.echoOut
+		if echo == nil {
+			echo = os.Stderr
+		}
+	}
+	// sink names where the stream actually LANDS, on the spawn line the
+	// operator joins the daemon log and the transcript by: whenever the
+	// iteration log could not be opened (ferr != nil) there is no such file
+	// to send a reader to, so the sink says so and names the fallback
+	// instead of a path that was never created.
+	sink := "log: " + at.logPath
+	switch {
+	case ferr == nil && echo != nil:
+		// Both sinks get the stream, INDEPENDENTLY: a terminal that has gone
+		// away must not cost the iteration log the chunk it would have
+		// received — io.MultiWriter stops at the first failing writer, which
+		// is the order that fails worst here (echo first, file second).
+		at.inv.Console = logfile.Tee(echo, f)
+	case ferr == nil:
+		at.inv.Console = f
+	case echo != nil:
+		// No log file: keep the live view rather than swallow the session.
+		at.inv.Console = echo
+		sink = fmt.Sprintf("log: none (could not open %s: %v - the session's stream goes to the terminal)", at.logPath, ferr)
+	default:
+		// No file and no echo: the stream has nowhere to go. Say so once —
+		// the daemon's own lines still land in daemon.log — rather than
+		// failing a paid session over its transcript.
+		at.inv.Console = io.Discard
+		sink = fmt.Sprintf("log: none (could not open %s: %v - the session's stream is discarded; the daemon log still records its own lines)", at.logPath, ferr)
+	}
+	// The spawn line stamps what the session was actually spawned WITH:
+	// phase and the resolved model id inv.Model carries (ModelForPhase's
+	// output, never the tier alias). A token/cost line in an old log is then
+	// attributable to the settings of THAT day rather than inferred from
+	// whatever the config file says now (CLA-345). An empty model= is itself
+	// evidence: no explicit model was configured at spawn time, and the
+	// harness ran its own default.
+	if r.retries == 0 {
+		log.Printf("iteration %d %s- spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
+	} else {
+		log.Printf("iteration %d %s- retry %d, spawning %s (phase=%s model=%s %s)", drainNum, labelOf(t), r.retries, a.Name(), ph.Label(phaseIdx), at.inv.Model, sink)
+	}
+
+	at.logFile = f
 }
