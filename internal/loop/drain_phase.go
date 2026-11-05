@@ -147,46 +147,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		case attemptReturn:
 			return r.result(v)
 		}
-		// Each attempt streams live to the terminal and to its own logfile. The name
-		// carries the drain number and attempt counter as well as the timestamp: two
-		// attempts in the same second (a sub-second backoff) would otherwise share a
-		// name, and a name already taken is REFUSED rather than truncated.
-		//
-		// The random tail is not decoration. This log carries the session's whole
-		// output — prompts, tool arguments, tool output, occasionally a token — and
-		// the rest of the name is derivable to within a second by the session that
-		// produced it. Unguessable names mean a session that CAN write to the state
-		// dir (an operator who pointed state_dir back inside the workdir) still
-		// cannot pre-plant a decoy at the name we are about to use. statedir.Create
-		// refuses an existing path either way; this stops it turning into a denial
-		// of the log itself.
-		at.inv, at.ierr = d.invocationFor(t, phaseIdx, ph, prev, spawnDir, prBase, phases)
-		if at.ierr != nil {
-			// The session env refused to resolve (a failing or empty-output
-			// fromCommand, an unreadable @path file — the error names the
-			// variable). REFUSING THE SPAWN is the fail-closed contract: no
-			// session starts without its declared env (CLA-462). This is not a
-			// retryable failure — nothing was spawned and the cause is config,
-			// not a blip — so it fails the phase like a bad spawnDir does.
-			return 0, 0, false, r.end, fmt.Errorf("iteration %d: phase %q: refusing to spawn: %w", drainNum, ph.Label(phaseIdx), at.ierr)
-		}
-		// The graded list is PREPENDED after placeholder substitution, never
-		// run through the one-pass replacer: it is driver-read text from the
-		// plane, and a finding quoting `{{model}}` must stay a quote.
-		if fixGrading != "" {
-			at.inv.Prompt = fixGrading + at.inv.Prompt
-		}
-		// The verification digest is the same contract for the verify phase
-		// (CLA-638): plane-read ids and findings, prepended verbatim.
-		if verifyDigest != "" {
-			at.inv.Prompt = verifyDigest + at.inv.Prompt
-		}
-		// CLA-697: a parallel member's own checkout is a fact only the driver
-		// knows — the panel brief still says "work in the worktree for branch X",
-		// which is the shared one. State it first, so the session's cwd and its
-		// brief agree.
-		if opts.worktree != "" {
-			at.inv.Prompt = panelWorktreeNote + at.inv.Prompt
+		switch v := r.buildInvocation(at); v.next {
+		case attemptRetry:
+			continue
+		case attemptReturn:
+			return r.result(v)
 		}
 		logName := fmt.Sprintf("iteration-%s-d%d%s-a%d-%s.log",
 			time.Now().Format("20060102-150405"), drainNum, tag, r.retries, randomTail())
