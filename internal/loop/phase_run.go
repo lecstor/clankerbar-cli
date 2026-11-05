@@ -384,3 +384,27 @@ func (r *phaseRun) spawnSession(ctx context.Context, at *phaseAttempt) {
 		_ = at.logFile.Close()
 	}
 }
+
+// classifyEnd reads the adapter's orderly-cap and tool-loop classifications off the
+// result. It runs before the salvage, which needs them.
+func (r *phaseRun) classifyEnd(at *phaseAttempt) {
+	a := r.a
+	// The orderly-cap classifications, computed here (before the salvage) so
+	// the salvage can tell whether a clean tree means "produced nothing" — a
+	// question the caps answer: a capped session is an orderly end with its
+	// own marker, not a silent death, and an untrusted stream's finish reason
+	// cannot be read at all. Purely adapter reads of `res`, so moving them up
+	// changes nothing else (review finding).
+	at.capped = a.TurnCapped(at.res)
+	at.ceiling = a.TokenCeilingHit(at.res)
+	at.wallclock = a.WallClockCapped(at.res)
+	at.zeroUsage = a.ZeroUsageUnknown(at.res)
+	// CLA-739: the adapter killed this session for making the same failing
+	// tool call over and over. That is a DEAD session - no delivery, whatever
+	// it pushed before it started looping - and it joins the dead signature
+	// everywhere below: the seam veto, the dead-phase ladder, the tally, the
+	// panel's failed-member path and the fleet record. Not a cap: a cap is an
+	// orderly end of a session doing its job, and this one had stopped.
+	at.toolLoop = at.res.ToolLoop
+	at.producedNothing = at.res.Untrusted == "" && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
+}
