@@ -141,34 +141,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	}
 	for {
 		at := &phaseAttempt{}
-		// The breaker, from inside the drain. Every path that loops back here has
-		// just waited — a supervised wait on a usage limit, an exponential backoff
-		// on a transient blip — and each of those waits used to be unbounded by
-		// anything but the wall clock, which is only one of three dials and the one
-		// an operator is least likely to have set. A drain that re-spawns a paid
-		// session on a loop is the expensive failure this stops, whatever put it
-		// there (CLA-258).
-		spentTokens, spentCost := r.sofar()
-		if dim := d.budgetTrip(spentTokens, spentCost, time.Since(prior.start)); dim != "" {
-			log.Printf("iteration %d: budget reached mid-drain: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
-				drainNum, dim, spentTokens, spentCost, time.Since(prior.start).Round(time.Second))
-			return r.tokens, r.cost, true, r.end, nil
+		switch v := r.checkBreakers(ctx); v.next {
+		case attemptRetry:
+			continue
+		case attemptReturn:
+			return r.result(v)
 		}
-
-		// The breaker's blind spot, bounded. The check above can only stop spend it
-		// was told about; an attempt that died before its harness reported usage
-		// added nothing to either accumulator, so a ladder of those attempts leaves
-		// a token or cost ceiling permanently unreachable and only max_wall_clock -
-		// the dial an operator is least likely to have set as a spend bound - can
-		// end the run. Reached only on an attempt re-spawn (the first pass has
-		// counted nothing), so a single silent attempt that ends the phase some
-		// other way never trips it.
-		if bound := d.cfg.ZeroSpendAttemptBound(); r.noUsage >= bound {
-			return r.tokens, r.cost, false, r.end, fmt.Errorf(
-				"iteration %d: %w: %d consecutive attempts died before %s reported any usage, so nothing the budget breaker reads was ever fed - the sessions are failing early rather than working (see the attempt logs in the state dir; raise max_zero_spend_attempts to allow more)",
-				drainNum, errZeroSpendLoop, r.noUsage, a.Name())
-		}
-
 		// Each attempt streams live to the terminal and to its own logfile. The name
 		// carries the drain number and attempt counter as well as the timestamp: two
 		// attempts in the same second (a sub-second backoff) would otherwise share a
