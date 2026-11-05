@@ -1,10 +1,12 @@
 package loop
 
 import (
+	"errors"
 	"log"
 	"strings"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
 // LimitStopName is the marker a daemon leaves in its state dir when it ends on
@@ -28,14 +30,15 @@ func (d *Driver) writeLimitStop(lim harness.Limit) {
 	if d.state == nil {
 		return
 	}
-	if err := d.state.WriteFile(LimitStopName, []byte(LimitStopReason(lim)+"\n")); err != nil {
+	// ErrExists: a parallel panel member already recorded the stop.
+	if err := d.state.WriteFile(LimitStopName, []byte(LimitStopReason(lim)+"\n")); err != nil && !errors.Is(err, statedir.ErrExists) {
 		log.Printf("could not write %s marker: %v", LimitStopName, err)
 	}
 }
 
-// clearStaleLimitStop removes a marker left by a previous run: an unsupervised
-// start is itself the operator's resume, and a leftover would keep a later
-// supervisor from starting this instance.
+// clearStaleLimitStop removes a marker left by a previous run. A supervised
+// spawn never reaches here with one (the supervisor holds the instance
+// stopped first), so this is the unsupervised start acting as the resume.
 func (d *Driver) clearStaleLimitStop() {
 	if present, msg := d.readMarker(LimitStopName); present {
 		_ = d.state.Remove(LimitStopName)

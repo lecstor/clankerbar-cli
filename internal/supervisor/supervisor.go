@@ -81,7 +81,6 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/delivery"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
-	"github.com/lecstor/clankerbar-cli/internal/loop"
 	"github.com/lecstor/clankerbar-cli/internal/plane"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
 	"github.com/lecstor/clankerbar-cli/internal/version"
@@ -1207,38 +1206,11 @@ func (d *Supervisor) onExit(inst *Instance, err error, at time.Time) {
 	// An explicit signal from the child, not an inference from uptime: the loop
 	// wrote LIMIT_STOP before it exited.
 	if d.limitStopHolds(inst) {
-		log.Printf("%s: stopped on %s - leaving it stopped; delete %s in %s to resume", inst.name, inst.limitReason, loop.LimitStopName, inst.stateDir)
 		d.publishStatus()
 		return
 	}
 
 	inst.scheduleRestart(d, err, uptime)
-}
-
-// limitStopHolds reports whether the instance's LIMIT_STOP marker is present,
-// recording its reason. An absent marker on a previously stopped instance is
-// the operator's resume: the flag clears and the caller proceeds to spawn.
-func (d *Supervisor) limitStopHolds(inst *Instance) bool {
-	inst.mu.Lock()
-	dir := inst.stateDir
-	inst.mu.Unlock()
-	if dir != "" {
-		if b, err := os.ReadFile(filepath.Join(dir, loop.LimitStopName)); err == nil {
-			reason := strings.TrimSpace(strings.SplitN(string(b), "\n", 2)[0])
-			if reason == "" {
-				reason = "usage limit"
-			}
-			inst.limitStopped, inst.limitReason = true, reason
-			return true
-		}
-	}
-	if inst.limitStopped {
-		log.Printf("%s: %s marker cleared - resuming", inst.name, loop.LimitStopName)
-		inst.limitStopped, inst.limitReason = false, ""
-		inst.lastBackoff = 0
-		d.publishStatus()
-	}
-	return false
 }
 
 // scheduleRestart computes the backoff for one unexpected exit and arms the

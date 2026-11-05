@@ -694,6 +694,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			d.state = nil
 		}()
 	}
+	d.clearStaleLimitStop()
 	// Belt and braces on the way out (CLA-491). Every shutdown path that does not
 	// pass a STOP read (a non-retryable phase failure, a budget or zero-spend
 	// trip, max-iterations, HALT, a cancelled context) leaves a
@@ -738,7 +739,6 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// what the upgraded clanker1 did seconds after its start banner. Consume it
 	// with a loud note instead. A stop dropped AFTER this point is fresh and
 	// still lands on every read below.
-	d.clearStaleLimitStop()
 	if present, msg := d.readMarker("STOP"); present {
 		_ = d.state.Remove("STOP")
 		note := ""
