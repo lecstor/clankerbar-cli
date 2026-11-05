@@ -1266,3 +1266,78 @@ func (s *drainSeq) judgeVerifyGate(ctx context.Context, st *seqStep) seqNext {
 	}
 	return seqFall
 }
+
+// payOwedWaits takes the waits a resumed phase's sequence end owes the run -- a
+// transient backoff and a usage-limit reset -- after the handback, with no lease
+// held.
+func (s *drainSeq) payOwedWaits(ctx context.Context) {
+	d := s.d
+	t := s.t
+	tc := s.tc
+	drainNum := s.drainNum
+	prior := s.prior
+	// CLA-662: the transient arm's wait, in the same place and for the same
+	// reason as the limit wait below — after the sequence's handback, with NO
+	// lease held. The rung is the target's streak of consecutive transient
+	// ends, so a provider that keeps blipping the resumed phase is slowed
+	// between drains instead of being re-drained the instant the last sequence
+	// died (and, with implement and the resumed phase on different harnesses,
+	// the only momentum the first-phase backoff could ever have was this).
+	// The wait is bounded by retry_cap like every backoff(n), and STOP /
+	// RESTART / RELOAD are honoured through waitOrStop exactly as they are
+	// during the limit wait; the drain returns when it ends and Run polls again.
+	//
+	// Deliberately NOT fed into sidelineTarget, which the task that added this
+	// asked us to consider: a sideline says "this target's harness is broken,
+	// bench it" — its counters and log line are built for a drain that FAILED
+	// to run a session — and this end returns err == nil. Run's success branch
+	// would immediately clear the failure counter it read while leaving the
+	// 15m+ skipUntil in place, so the log would report "the harness succeeded
+	// again — rejoining the rotation" against a target still benched by a
+	// sit-out nothing would then account for. Doing it properly means
+	// redefining what a successful drain proves about the harness, well beyond
+	// this bound's need: the ladder's growth, capped by retry_cap, plus
+	// max_iterations is the brake the un-waited re-drain was missing.
+	if s.transientRung > 0 {
+		wait := d.resumedTransientDuration(s.transientRung)
+		log.Printf("iteration %d: the sequence is over and no lease is held — waiting %s before polling again (transient failure %d in a row on %s; the run stays up)",
+			drainNum, wait, s.transientRung, s.transientKey.harness)
+		if d.waitOrStop(ctx, wait) {
+			s.stop = true
+		}
+	}
+
+	// CLA-631: the sequence ended on a rolling usage limit and the run is owed
+	// its wait — after the handback above, deliberately, so the wait is taken
+	// with NO lease held: the claim is back in the queue or, with pushed work,
+	// left to lapse into a takeover exactly as the old stop path left it. The
+	// wait itself is the first-phase path's own machinery, reused: the same
+	// budget breaker inside supervisedWait, the same STOP/RESTART/RELOAD reads
+	// in waitOrStop, the same probes on the harness that hit the limit, and the
+	// same stated-reset handling — the difference is only that there is no
+	// session left to re-run when it lifts, so the drain returns and Run polls
+	// again. waitPastBudget is consulted first, exactly as on the first-phase
+	// path: a reset beyond the run's remaining ceiling is not worth sleeping
+	// through, so the run stops and says when to start a fresh one.
+	if s.limitWait != nil {
+		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
+		if until, over := waitPastBudget(s.limitWait.lim.ResetAt, remaining, bounded); over {
+			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
+				drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
+			s.stop = true
+		} else {
+			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
+				drainNum, resetSuffix(s.limitWait.lim.ResetAt))
+			ptokens, pcost, pstop := d.supervisedWait(ctx, s.limitWait.lim, s.limitWait.a, s.limitWait.ph, t, spend{
+				start:  prior.start,
+				tokens: prior.tokens + s.tokens,
+				cost:   prior.cost + s.cost,
+			})
+			s.tokens += ptokens
+			s.cost += pcost
+			if pstop {
+				s.stop = true
+			}
+		}
+	}
+}
