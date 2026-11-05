@@ -1204,3 +1204,112 @@ func (r *phaseRun) countAttemptSpend(ctx context.Context, at *phaseAttempt) atte
 
 	return attemptVerdict{}
 }
+
+// handleUsageLimit waits out a rolling usage limit and re-runs the session, or
+// ends the phase on a hard stop or a limit the phase must not wait for.
+func (r *phaseRun) handleUsageLimit(ctx context.Context, at *phaseAttempt) attemptVerdict {
+	d := r.d
+	t := r.t
+	tc := r.tc
+	drainNum := r.drainNum
+	phaseIdx := r.phaseIdx
+	ph := r.ph
+	prev := r.prev
+	prior := r.prior
+	a := r.a
+	panelOptional := r.shape.panelOptional
+	// A usage limit. A rolling-window subscription cap is waited out and the
+	// session re-run; a hard budget/credit exhaustion (Stop) has no reset to
+	// poll for, so the run stops cleanly and the operator resumes it once
+	// they've topped up.
+	if lim := a.DetectLimit(at.res); lim.Limited {
+		if lim.Stop {
+			// CLA-784: an OPTIONAL panel seat is a trial reviewer. A hard
+			// stop on its account is recorded against that seat — never the
+			// run. Today's stop path would end the daemon for a reviewer we
+			// were only evaluating, throwing away the required members' round
+			// with it. The optional member's failure rides the usual
+			// per-member bookkeeping: named INCOMPLETE with this reason, and
+			// the panel moves on.
+			if panelOptional {
+				log.Printf("%siteration %d: the %s member is an OPTIONAL trial seat — its usage stop is recorded against that seat, not the run (log: %s)",
+					labelOf(t), drainNum, ph.Label(phaseIdx), at.logPath)
+				r.end.empty = true
+				r.end.emptyWhy = "stopped on a usage limit (no reset to wait for) before recording"
+				return attemptVerdict{next: attemptReturn}
+			}
+			log.Printf("iteration %d stopped: %s — no reset to wait for, stopping (resume once resolved) (log: %s)",
+				drainNum, limitReason(lim), at.logPath)
+			d.writeLimitStop(lim)
+			return attemptVerdict{next: attemptReturn, stop: true}
+		}
+		log.Printf("iteration %d hit a usage limit: %s", drainNum, limitReason(lim))
+		// CLA-784: an OPTIONAL seat never waits and never ends the sequence,
+		// resumed or not. The sequence-end signal is the member handler's
+		// reason; for a trial seat it is inert there (no run-level wait, no
+		// shared-claim handback).
+		if panelOptional {
+			log.Printf("%siteration %d: the OPTIONAL %s seat hit a usage limit (%s) — recording it against that seat and carrying on rather than waiting out a reset on a trial reviewer (log: %s)",
+				labelOf(t), drainNum, ph.Label(phaseIdx), limitReason(lim), at.logPath)
+			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
+			return attemptVerdict{next: attemptReturn}
+		}
+		// A RESUMED phase must not wait one out (CLA-631). The seam's handback
+		// has already ended the claim: `release` puts a no-work claim straight
+		// back in the queue, and `expireLease` ends a pushed-work claim's lease
+		// immediately, leaving the task an immediate takeover — so a supervised
+		// wait of hours would only run against a task this sequence no longer
+		// holds, with a runId in its prompt that no longer means anything. End
+		// the sequence instead. The RUN, though, must not end with it — exiting
+		// the daemon left a whole fleet idle until an operator noticed — so the
+		// wait is handed to drainPhases, which owes it only once the sequence's
+		// handback has run and no lease is held.
+		if prev != nil {
+			log.Printf("iteration %d: a resumed phase hit a usage limit — ending the sequence rather than waiting out a reset on a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to wait for the reset instead of exiting (log: %s)",
+				drainNum, at.logPath)
+			r.end.sequenceEnd = &phaseSequenceEnd{limitWait: &phaseLimitWait{lim: lim, ph: ph, a: a}}
+			return attemptVerdict{next: attemptReturn}
+		}
+		// Whatever this attempt held open is not held open any more: every path
+		// below either waits or retries with a FRESH session, which re-claims.
+		// Pre-phases the handback ran on every attempt, so this could not arise.
+		r.end = d.releaseCarriedEnd(ctx, t, r.end)
+		// Waiting out a reset that lands past the wall-clock ceiling buys
+		// nothing: the budget check runs between drains, so the loop would
+		// sleep through the window, run one session on the freshly reset quota
+		// and stop on the very next check — having spent the night waiting for
+		// headroom it then declines to use. Stop now and say when the quota
+		// returns, so the operator can start a fresh run against it.
+		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
+		if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
+			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset (log: %s)",
+				drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute), at.logPath)
+			return attemptVerdict{next: attemptReturn, stop: true}
+		}
+		// The wait's own probe spend lands in the SAME accumulator as the
+		// sessions', so it reaches the breaker at the top of this loop, the one in
+		// Run between drains, and the iteration's cost line — rather than a
+		// separate figure nothing is measured against (CLA-287).
+		// Probed on the harness that hit the limit, in that harness's own
+		// session shape: a usage limit is a property of one provider's account,
+		// so probing the run's default harness would answer a question nobody
+		// asked, and spend on it. The panel AGGREGATE rides `sofar` too (see
+		// above): a sibling's counted spend counts against the same ceiling
+		// this wait's probes are about to spend under.
+		waitTokens, waitCost := r.sofar()
+		ptokens, pcost, pstop := d.supervisedWait(ctx, lim, a, ph, t, spend{
+			start:  prior.start,
+			tokens: waitTokens,
+			cost:   waitCost,
+		})
+		r.tokens += ptokens
+		r.cost += pcost
+		r.publishSpend()
+		if pstop {
+			return attemptVerdict{next: attemptReturn, stop: true}
+		}
+		return attemptVerdict{next: attemptRetry}
+	}
+
+	return attemptVerdict{}
+}
