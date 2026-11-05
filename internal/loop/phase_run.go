@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
+	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/logfile"
 )
@@ -500,4 +501,69 @@ func (r *phaseRun) classifyExit(at *phaseAttempt) {
 	// own marker — retrying it would re-spend against the same cap and parking
 	// it would read a doing-its-job backstop as a silent death.
 	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
+}
+
+// openPhaseEnd books the exit into the dead-phase tally and starts the
+// attempt's phaseEnd: its panel identity, its claim and the fleet session entry.
+func (r *phaseRun) openPhaseEnd(at *phaseAttempt) {
+	d := r.d
+	tc := r.tc
+	phaseIdx := r.phaseIdx
+	ph := r.ph
+	prev := r.prev
+	a := r.a
+	panelMember := r.shape.panelMember
+	panelOptional := r.shape.panelOptional
+	panelLast := r.shape.panelLast
+	// CLA-402: book this session into the run's dead-phase tally, per phase
+	// label and harness, whatever the seam decided about retrying it. The
+	// tally's dead classification deliberately drops the `!last` conjunct
+	// that guards the checkpoint veto — a dead LAST phase is still a dead
+	// phase, and the rate is a measurement, not a seam decision (see
+	// deadtally.go). The report rides the end (CLA-639): the panel's member
+	// handler books a failed member into the same tally, and must not count
+	// an exit this call already booked.
+	at.bookedDead = d.tallyDead(ph.Label(phaseIdx), tc.HarnessFor(ph), at.res, at.capped, at.ceiling, at.wallclock)
+	r.end = phaseEnd{}
+	r.end.deadBooked = at.bookedDead
+	// CLA-639: the panel identity of this pass, for drainPhases' member
+	// handler. Set from the CAPTURED phase (a handoff respawn replaced
+	// ph.Prompt, never its identity), so a skipped member is recorded against
+	// the reviewer that was meant to run.
+	r.end.panelMember = panelMember
+	r.end.panelOptional = panelOptional
+	r.end.panelLast = panelLast
+	if at.res.Claim.TaskID != "" {
+		r.end.claim = &at.res
+	}
+	// CLA-630: the session this pass actually spawned, in exactly the words
+	// the spawn line above used — the phase's label, the phase's resolved
+	// harness, and the resolved model (empty when the harness default
+	// applied; never guessed). Set on every attempt, so the LAST attempt's
+	// values are the ones that ride: the entry describes the PASS, and a
+	// retry within the ladder cannot change what the pass ran — only a
+	// reload landing mid-ladder can.
+	//
+	// CLA-691: its spend is filled in later, at the point the loop counts the
+	// attempt's spend toward the iteration (recordPassSpend), so the two can
+	// never disagree about which attempts were counted. The pass sums every
+	// counted attempt, because the loop counts each one as its own paid
+	// session: an entry reporting only the surviving attempt's money would
+	// not add up to the iteration total.
+	r.end.session = &fleet.Session{
+		Phase:   ph.Label(phaseIdx),
+		Harness: a.Name(),
+		Model:   at.inv.Model,
+		RunID:   sessionRunID(at.res, prev),
+	}
+	// CLA-739: the tool-loop kill's cause rides the session entry on the
+	// fleet report, as CLA-703's no_mcp does - it is why this session
+	// produced nothing.
+	if at.toolLoop != "" {
+		r.end.session.Cause = at.toolLoop
+	}
+	r.end.toolLoop = at.toolLoop
+	// The wider classification rides the end for the fleet record only — see
+	// phaseEnd.producedNothing.
+	r.end.producedNothing = at.producedNothing
 }
