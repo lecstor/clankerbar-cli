@@ -118,56 +118,9 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 			log.Print("cancelled — stopping")
 			return nil
 		}
-		if present, msg := d.readMarker("HALT"); present {
-			log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
+		if d.checkMarkers() {
 			return nil
 		}
-		if present, _ := d.readMarker("STOP"); present {
-			_ = d.state.Remove("STOP")
-			log.Print("STOP requested — stopping")
-			return nil
-		}
-		// The restart/reload markers (CLA-461), honoured exactly where STOP is:
-		// the ITERATION boundary. Never a mid-drain phase seam — the run holds
-		// the task there. Reaching this point means the previous drain has fully
-		// unwound and handed its claim back, so a graceful restart holds no claim
-		// across the boundary by construction (resume is the plane's job anyway).
-		// A RESTART_NOW consumed here found no session in flight and acts as a
-		// plain restart; when one IS in flight the watcher in watchRestartNow has
-		// already cancelled the drain and this block is never reached.
-		if present, msg := d.readMarker(MarkerRestart); present {
-			_ = d.state.Remove(MarkerRestart)
-			if msg != "" {
-				log.Printf("RESTART requested: %s", msg)
-			} else {
-				log.Print("RESTART requested")
-			}
-			log.Print("re-executing at the iteration boundary")
-			d.restartRequested.Store(true)
-			return nil
-		}
-		if present, msg := d.readMarker(MarkerRestartNow); present {
-			_ = d.state.Remove(MarkerRestartNow)
-			if msg != "" {
-				log.Printf("RESTART_NOW requested: %s", msg)
-			} else {
-				log.Print("RESTART_NOW requested")
-			}
-			log.Print("nothing in flight here — re-executing immediately")
-			d.restartRequested.Store(true)
-			return nil
-		}
-		// Locked against a panel member's wait-side RELOAD (CLA-697 review finding
-		// 1.review-1.2): both consume the same marker, and the read-then-remove is
-		// not atomic — the lock is what makes the reload happen once, on one
-		// goroutine, whatever else is parked in waitOrStop.
-		d.controlMu.Lock()
-		if present, _ := d.readMarker(MarkerReload); present {
-			_ = d.state.Remove(MarkerReload)
-			log.Print("RELOAD requested — re-reading the config file at the iteration boundary")
-			d.applyReload()
-		}
-		d.controlMu.Unlock()
 		idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
 		if d.cfg.MaxIterations > 0 && drains >= d.cfg.MaxIterations {
 			log.Printf("reached max-iterations (%d) — stopping", d.cfg.MaxIterations)
@@ -524,3 +477,59 @@ const (
 	runContinue                // nothing to drain: take the next pass
 	runStop                    // end the run
 )
+
+// checkMarkers reads the operator's control markers at the iteration boundary:
+// HALT, STOP, RESTART and RESTART_NOW end the run (true), RELOAD re-reads the config.
+func (d *Driver) checkMarkers() bool {
+	if present, msg := d.readMarker("HALT"); present {
+		log.Printf("HALT present: %s — resolve and delete %s to resume", msg, filepath.Join(d.state.Path(), "HALT"))
+		return true
+	}
+	if present, _ := d.readMarker("STOP"); present {
+		_ = d.state.Remove("STOP")
+		log.Print("STOP requested — stopping")
+		return true
+	}
+	// The restart/reload markers (CLA-461), honoured exactly where STOP is:
+	// the ITERATION boundary. Never a mid-drain phase seam — the run holds
+	// the task there. Reaching this point means the previous drain has fully
+	// unwound and handed its claim back, so a graceful restart holds no claim
+	// across the boundary by construction (resume is the plane's job anyway).
+	// A RESTART_NOW consumed here found no session in flight and acts as a
+	// plain restart; when one IS in flight the watcher in watchRestartNow has
+	// already cancelled the drain and this block is never reached.
+	if present, msg := d.readMarker(MarkerRestart); present {
+		_ = d.state.Remove(MarkerRestart)
+		if msg != "" {
+			log.Printf("RESTART requested: %s", msg)
+		} else {
+			log.Print("RESTART requested")
+		}
+		log.Print("re-executing at the iteration boundary")
+		d.restartRequested.Store(true)
+		return true
+	}
+	if present, msg := d.readMarker(MarkerRestartNow); present {
+		_ = d.state.Remove(MarkerRestartNow)
+		if msg != "" {
+			log.Printf("RESTART_NOW requested: %s", msg)
+		} else {
+			log.Print("RESTART_NOW requested")
+		}
+		log.Print("nothing in flight here — re-executing immediately")
+		d.restartRequested.Store(true)
+		return true
+	}
+	// Locked against a panel member's wait-side RELOAD (CLA-697 review finding
+	// 1.review-1.2): both consume the same marker, and the read-then-remove is
+	// not atomic — the lock is what makes the reload happen once, on one
+	// goroutine, whatever else is parked in waitOrStop.
+	d.controlMu.Lock()
+	if present, _ := d.readMarker(MarkerReload); present {
+		_ = d.state.Remove(MarkerReload)
+		log.Print("RELOAD requested — re-reading the config file at the iteration boundary")
+		d.applyReload()
+	}
+	d.controlMu.Unlock()
+	return false
+}
