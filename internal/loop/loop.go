@@ -2545,7 +2545,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
 		if until, over := waitPastBudget(limitWait.lim.ResetAt, remaining, bounded); over {
 			log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset",
-				drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
+				drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute))
 			stop = true
 		} else {
 			log.Printf("iteration %d: the sequence is over and no lease is held — waiting for the reset%s before polling again (the run stays up)",
@@ -5690,7 +5690,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			remaining, bounded := tc.Budget.Remaining(time.Since(prior.start))
 			if until, over := waitPastBudget(lim.ResetAt, remaining, bounded); over {
 				log.Printf("iteration %d: the limit resets %s, in %s — more than the %s left of this run's ceiling; stopping now rather than waiting, so start a fresh run after the reset (log: %s)",
-					drainNum, until.Format("Mon 15:04"), time.Until(until).Round(time.Minute), remaining.Round(time.Minute), logPath)
+					drainNum, formatReset(until), time.Until(until).Round(time.Minute), remaining.Round(time.Minute), logPath)
 				return tokens, cost, true, end, nil
 			}
 			// The wait's own probe spend lands in the SAME accumulator as the
@@ -8319,7 +8319,14 @@ func resetSuffix(t time.Time) string {
 	if t.IsZero() {
 		return ""
 	}
-	return " (stated reset " + t.Format("Mon 15:04") + ")"
+	return " (stated reset " + formatReset(t) + ")"
+}
+
+// formatReset renders a stated reset for a log line in the machine's local zone,
+// with date and zone name. Providers send UTC, and a weekly window runs up to 7
+// days out, so a bare weekday and clock read as the wrong hour or the wrong week.
+func formatReset(t time.Time) string {
+	return t.Local().Format("Mon 2 Jan 15:04 MST")
 }
 
 // limitReason renders a limit's reason for a log line, defaulting when a harness
