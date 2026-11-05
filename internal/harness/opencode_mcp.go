@@ -48,9 +48,14 @@ import (
 	"github.com/lecstor/clankerbar-cli/internal/jsonc"
 )
 
-// opencodeMCPStartupTimeout bounds each preflight stage — the server announcing
-// itself, and then the clankerbar server reporting connected — and is a var so
-// tests can shrink it. Thirty seconds is six times opencode's own default MCP
+// opencodeServeAnnounceTimeout bounds the first preflight stage, the server
+// announcing its address and password. It is separate from the connect budget
+// so a test that shrinks the connect wait does not also race the fake
+// server's process start, which is slow under -race or load.
+var opencodeServeAnnounceTimeout = 30 * time.Second
+
+// opencodeMCPStartupTimeout bounds the second preflight stage, the clankerbar
+// server reporting connected, and is a var so tests can shrink it. Thirty seconds is six times opencode's own default MCP
 // startup timeout (5s), which leaves room for a remote server's handshake and
 // one opencode-side retry without making a broken MCP config look like a hang.
 var opencodeMCPStartupTimeout = 30 * time.Second
@@ -157,7 +162,7 @@ func startOpencodeServer(ctx context.Context, env []string, dir string) (*openco
 		}
 	}()
 
-	timer := time.NewTimer(opencodeMCPStartupTimeout)
+	timer := time.NewTimer(opencodeServeAnnounceTimeout)
 	defer timer.Stop()
 	for s.url == "" || s.password == "" {
 		select {
@@ -176,7 +181,7 @@ func startOpencodeServer(ctx context.Context, env []string, dir string) (*openco
 		case <-timer.C:
 			s.stop()
 			return nil, fmt.Errorf("%w: opencode serve did not announce its address and password within %s",
-				ErrMCPNotConnected, opencodeMCPStartupTimeout)
+				ErrMCPNotConnected, opencodeServeAnnounceTimeout)
 		case <-ctx.Done():
 			s.stop()
 			return nil, ctx.Err()
