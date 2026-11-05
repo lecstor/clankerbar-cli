@@ -1890,7 +1890,7 @@ func TestEndIterationPassesAKnownOutcomeThrough(t *testing.T) {
 // A hand-built Driver with no config must beacon an identity, not panic.
 func TestFleetIdentityToleratesNilConfig(t *testing.T) {
 	d := &Driver{}
-	if id := d.fleetIdentity(0); id.Instance == "" && id.Host != "" {
+	if id := d.fleetIdentity(0); id.Host != "" && id.Instance != id.Host {
 		t.Errorf("want a host-derived instance name, got %+v", id)
 	}
 }
