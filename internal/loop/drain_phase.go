@@ -263,74 +263,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		case attemptReturn:
 			return r.result(v)
 		}
-		// Non-zero exit, not the usage cap: a transient server/network blip backs
-		// off and retries; anything else is a genuine failure and stops.
-		if a.IsTransient(at.res) {
-			// A RESUMED phase does not retry, for the same reason it does not wait
-			// out a usage limit — and this path is the more dangerous of the two,
-			// because MaxRetries defaults to 0, meaning never give up. Seeding the
-			// resumed claim made the seam's handback live for phase 2, so a blip
-			// here hands the task back mid-sequence at once: `release` for a claim
-			// with nothing pushed, `expireLease` for pushed work, which ends that
-			// claim's lease immediately and leaves the task an immediate takeover.
-			// A retry would then be handed the very same heartbeat(runId) brief
-			// against a run that no longer holds anything. End the sequence. The
-			// RUN, though, must not end with it (CLA-651) — exiting the daemon on
-			// one provider blip left the fleet idle until an operator noticed, the
-			// same failure CLA-631 fixed for limits — so the sequence-end signal
-			// goes to drainPhases, which owes it a wait (CLA-662): there is no
-			// reset for a blip, so the run waits the target's growing backoff rung
-			// after the handback and then polls again. The rung matters precisely
-			// when this phase's harness is NOT the one the queue drains on: an
-			// opencode implement start can never see the claude blip, so without
-			// the run-level wait the same implement-and-lose loop would repeat with
-			// nothing bounding it.
-			// CLA-784: like a usage limit, an OPTIONAL seat's transient end is
-			// its own result — never the sequence's, resumed or not.
-			if panelOptional {
-				log.Printf("%siteration %d: the OPTIONAL %s seat hit a transient failure (%s) — recording it against that seat and carrying on rather than retrying a task the panel is still working (log: %s)",
-					labelOf(t), drainNum, ph.Label(phaseIdx), at.res.ExitString(), at.logPath)
-				r.end.sequenceEnd = &phaseSequenceEnd{}
-				return r.tokens, r.cost, false, r.end, nil
-			}
-			if prev != nil {
-				log.Printf("iteration %d: a resumed phase hit a transient failure (%s) — ending the sequence rather than retrying a task the handback has already returned; it comes back as an immediate takeover, and the run stays up to poll again instead of exiting (log: %s)",
-					drainNum, at.res.ExitString(), at.logPath)
-				r.end.sequenceEnd = &phaseSequenceEnd{}
-				return r.tokens, r.cost, false, r.end, nil
-			}
-			// A retry the adapter could not NAME is bounded on its own, because
-			// nothing else bounds it: the dials are off by default and the
-			// zero-spend counter is reset by the usage this heuristic requires. The
-			// diagnostic goes in the error because it is the whole remedy - the
-			// adapter has no pattern for this text, so an operator who can see it
-			// can say whether one should be added (CLA-381).
-			if a.IsUnclassifiedTransient(at.res) {
-				r.unclassified++
-				if r.unclassified > unclassifiedRetryBound {
-					return r.tokens, r.cost, false, r.end, fmt.Errorf(
-						"iteration %d: %w: %d retries on %s failures that matched no known-transient pattern - retried because the session had reported usage, but the same unrecognised failure keeps happening, so this is a real fault rather than a blip%s (log: %s)",
-						drainNum, errUnclassifiedRetryLoop, r.unclassified-1, a.Name(), failureDetail(a.Diagnostic(at.res)), at.logPath)
-				}
-			}
-			// As in the limit branch: the retry is a fresh session that re-claims,
-			// so nothing may stay held open across it.
-			r.end = d.releaseCarriedEnd(ctx, t, r.end)
-			r.retries++
-			if d.cfg.MaxRetries > 0 && r.retries > d.cfg.MaxRetries {
-				return r.tokens, r.cost, false, r.end, fmt.Errorf(
-					"iteration %d: transient failures persisted after %d retries (check https://status.claude.com; rerun to resume) (log: %s)",
-					drainNum, d.cfg.MaxRetries, at.logPath)
-			}
-			wait := d.backoff(r.retries)
-			log.Printf("iteration %d transient failure (%s) — %s in %s (a fresh session reclaims any half-done task) (log: %s)",
-				drainNum, at.res.ExitString(), retryLabel(r.retries, d.cfg.MaxRetries), wait, at.logPath)
-			if d.waitOrStop(ctx, wait) {
-				return r.tokens, r.cost, true, r.end, nil
-			}
+		switch v := r.handleTransient(ctx, at); v.next {
+		case attemptRetry:
 			continue
+		case attemptReturn:
+			return r.result(v)
 		}
-
 		// Stopping here ends the whole run, so say WHAT was judged non-retryable.
 		// Without it the operator gets "exited 1 (non-retryable)" and no way to
 		// tell a genuine failure from a blip the classifier merely does not know
