@@ -117,66 +117,12 @@ walk:
 		case seqBreak:
 			break walk
 		}
-		// A run-level stop wins over a dead phase. drainPhase returns stop=true
-		// for a budget trip and credit exhaustion (lim.Stop) — and on those
-		// paths end.dead can be set too (a credit-starved session is exactly the
-		// shape that dies on reason "unknown" with no branch). Retrying a dead
-		// phase against a stopped run burns another session into the same limit
-		// and, on the second, parks a task for what was actually a run-wide
-		// outage instead of stopping the daemon. A run stop is final; the dead
-		// branch only decides retry vs park when the run is continuing. (A
-		// resumed phase ending on a live lease is NOT one of those paths — see
-		// the sequence-end break below, deliberately before the dead arm,
-		// because that end leaves the run continuing.)
-		if st.pstop {
-			s.stop = true
-			break
+		switch s.judgeSequenceEnd(st) {
+		case seqContinue:
+			continue
+		case seqBreak:
+			break walk
 		}
-
-		// CLA-631/CLA-651/CLA-662: a RESUMED phase ended the sequence without
-		// completing it — a rolling usage limit (CLA-631) or a transient failure
-		// (CLA-651) — and the RUN must not end with it. The sequence stops
-		// exactly like the pstop above — the claim is not handed back to the
-		// queue, so the lease lapses into a takeover with its branch recorded —
-		// but the run carries on: the wait the signal owes is taken below,
-		// after the sequence's deferred handback, holding no lease. Broken here
-		// rather than flowing into the checks below because those read a session
-		// that merely got turned away: the dead/fleet counters would tick on a
-		// blip's exit shape (or a limit's "unknown" finish reason), and none of
-		// that machinery applies to a sequence end the run is ordered to survive.
-		//
-		// The transient arm ALSO extends its target's streak here (CLA-662):
-		// nothing else bounds a provider that keeps blipping the resumed phase
-		// while the implementing harness stays healthy — the drain is over, so
-		// drainPhase's retry ladder was never entered, and the re-drain would
-		// otherwise land the very next instant. A rolling limit extends no
-		// streak: its wait is a reset, not a rung, and the next drain is
-		// scheduled after it anyway.
-		// CLA-639: a PANEL member's sequence-end is judged by the panel handler
-		// below first — it records the member as failed, closes the round that the
-		// earlier members wrote into, and only then lets the run-level wait take
-		// over. Every other resumed phase keeps the shipped break here.
-		if st.end.sequenceEnd != nil && !st.end.panelMember {
-			s.limitWait = st.end.sequenceEnd.limitWait
-			if s.limitWait == nil {
-				s.transientKey = resumedTransientKey{target: ti, harness: tc.HarnessFor(st.ph)}
-				s.transientRung = d.noteResumedTransient(s.transientKey)
-			}
-			break
-		}
-
-		// CLA-662: a resumed phase that ended any OTHER way than the transient
-		// sequence-end above — completed, settled, died — breaks its target's
-		// streak: the next blip on that target+harness is not consecutive with
-		// the last, and starts the ladder over. The other sequence-end arm, a
-		// rolling limit, also breaks out above and so neither extends nor
-		// clears: the reset the run waits out is its own bound. Reset on the
-		// seam BETWEEN the arms, so "consecutive" means exactly what it says:
-		// the arm above extends, this one clears.
-		if st.phaseResumed {
-			d.clearResumedTransient(resumedTransientKey{target: ti, harness: tc.HarnessFor(st.ph)})
-		}
-
 		// CLA-639: the panel's members are skippable where a lone review phase is
 		// not. A member that recorded nothing — dead, capped before its record
 		// write, empty under the evidence gate, or turned away by a non-retryable
