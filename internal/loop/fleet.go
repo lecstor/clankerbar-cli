@@ -17,6 +17,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 	"github.com/lecstor/clankerbar-cli/internal/statedir"
@@ -76,7 +77,11 @@ func (d *Driver) fleetIdentity(ti int) fleet.Identity {
 	// unique per running daemon, so co-located daemons no longer collapse into
 	// one presence row (CLA-501). Stable across a RELOAD: the reloader re-reads
 	// the same path, so the basename half cannot change under a live daemon.
-	inst := base.ResolvedInstanceName(d.hostnameOnce())
+	// A hand-built test Driver may carry no config at all.
+	inst := config.ResolveInstanceName("", "", d.hostnameOnce())
+	if base != nil {
+		inst = base.ResolvedInstanceName(d.hostnameOnce())
+	}
 	d.controlMu.Unlock()
 	cfgID := ""
 	if eff != nil {

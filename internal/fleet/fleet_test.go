@@ -314,11 +314,16 @@ func TestMarshalReportDefaultsAndGuards(t *testing.T) {
 	if _, err := marshalReport(Report{}); err == nil {
 		t.Error("an unnamed instance must be refused, not upserted as \"\"")
 	}
-	if _, err := marshalReport(Report{
+	// A bad outcome drops that row only; the presence half and good rows still go.
+	b, err = marshalReport(Report{
 		Identity:   Identity{Instance: "x"},
-		Iterations: []Iteration{{Outcome: "done"}},
-	}); err == nil {
-		t.Error("an outcome outside the four-word vocabulary must be refused client-side: it would 400 the whole report plane-side")
+		Iterations: []Iteration{{Outcome: "done"}, {Outcome: OutcomeReleased}},
+	})
+	if err != nil {
+		t.Fatalf("a bad outcome must not fail the whole report: %v", err)
+	}
+	if strings.Contains(string(b), `"done"`) || !strings.Contains(string(b), `"released"`) || !strings.Contains(string(b), `"instance":"x"`) {
+		t.Errorf("want bad row dropped, good row and presence kept, got %s", b)
 	}
 }
 

@@ -548,9 +548,10 @@ func marshalReport(rep Report) ([]byte, error) {
 		default:
 			// A typo'd outcome would 400 the WHOLE report plane-side
 			// (all-or-nothing batch), losing the presence refresh too. Drop the
-			// row here instead; the loop only ever names the four constants, so
-			// reaching this means a programming error worth one loud line.
-			return nil, fmt.Errorf("iteration outcome %q is not one of the four the plane knows", it.Outcome)
+			// row here and log it directly: returning an error would lose the
+			// presence half locally, and deliver's failStreak could silence it.
+			log.Printf("fleet: dropping iteration %q: outcome %q is not one of the four the plane knows", it.TaskRef, it.Outcome)
+			continue
 		}
 		w.Iterations = append(w.Iterations, wireIteration{
 			TaskID:          it.TaskID,
