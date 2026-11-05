@@ -129,42 +129,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	// before this feature existed.
 	prBase := d.prBaseFor(ctx, t, spawnDir, briefedRepo)
 	fixGrading := d.fixGradingFor(ctx, t, prev, captured, phases, phaseIdx, panel)
-	// CLA-638: the VERIFICATION round's brief carries the prior open MUST ids and
-	// their findings, read from the plane's released records before the session
-	// spawns. Fail-closed: a round that cannot be told what it must adjudicate is
-	// refused before it is paid for, the same disposition CLA-663 gives the
-	// review baseline — which includes its RETRY (CLA-686 D3): one plane blip
-	// here would otherwise discard the fix round that just ran and hand the
-	// sequence back to the queue, so this read shares the baseline's bound
-	// instead of taking a single attempt. The task id comes from the carried
-	// claim; the phase is resumed, so it is exact.
-	verifyDigest := ""
-	if isVerify {
-		taskID := ""
-		if prev != nil {
-			taskID = prev.Claim.TaskID
-		}
-		st, read := d.readTaskStateRetry(ctx, t, taskID, "before the verification round spawned")
-		if !read {
-			log.Printf("%siteration %d: refusing to spawn the %s phase: the task's record could not be read, so the round would not know what to adjudicate — the sequence ends here; the claim is released when it is releasable, else left to lapse into a takeover",
-				labelOf(t), drainNum, ph.Label(phaseIdx))
-			end.empty = true
-			end.emptyWhy = "the task's record could not be read before the verification round spawned"
-			if prev != nil {
-				end.claim = prev
-				end.released = prev.Claim.Held()
-				end.releasedToQueue = d.releaseHeldClaim(ctx, t, *prev, false)
-			}
-			return 0, 0, false, end, nil
-		}
-		if prev != nil && prev.Claim.Branch == "" {
-			// CLA-638 × CLA-670: a BRANCHLESS verification round has no plane
-			// finding ids to adjudicate (the branchless review writes no durable
-			// record), so the digest hands it the LAST legacy block instead.
-			verifyDigest = branchlessVerificationDigest(st.Outcome)
-		} else {
-			verifyDigest = verificationDigest(st.Reviews, st.ReviewOpenMustIDs, st.ReviewsTotal)
-		}
+	verifyDigest, end, verifyRefused := d.verifyDigestFor(ctx, drainNum, t, ph, phaseIdx, prev, isVerify, end)
+	if verifyRefused {
+		return 0, 0, false, end, nil
 	}
 	retries := 0
 	// CLA-703: the ONE retry a phase gets for an infrastructure miss. TWO arms
