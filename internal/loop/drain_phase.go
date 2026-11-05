@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
-	"github.com/lecstor/clankerbar-cli/internal/fleet"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
@@ -55,7 +54,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	tc := d.targetCfg(t)
 	shape := phaseShapeOf(phases, phaseIdx, prev)
 	captured, nextReviewShaped, requireReviewRecord := shape.captured, shape.nextReviewShaped, shape.requireReviewRecord
-	isVerify, reviewOnly := shape.isVerify, shape.reviewOnly
+	isVerify := shape.isVerify
 	panelMember, panelOptional, panelLast := shape.panelMember, shape.panelOptional, shape.panelLast
 	// The review seam's freshness baseline, read ONCE before the attempt ladder:
 	// the phase's outcome as the review found it. A handoff respawn re-enters
@@ -195,57 +194,7 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		} else if at.reviewable {
 			r.judgeReviewRecord(ctx, at)
 		}
-		// A held-but-empty exit (2026-08-24): a would-be checkpoint refused by the
-		// evidence gate — not by any of the older vetoes (dead, untrusted, not
-		// checkpointable) — so this is a FAILED phase, not a completed one. It is
-		// carried on the result in BOTH branches on purpose: for a bare exit it is
-		// the classification of record, and for a handoff it is what lets
-		// drainPhases downgrade the exit when the handoff is refused. An honored
-		// handoff never reaches that downgrade — the phase continues first.
-		//
-		// CLA-639: a panel member is not special-cased here. A member whose
-		// review record did not pass the gate is a FAILED member, and the panel
-		// handler in drainPhases is what records it as failed and keeps the round
-		// going; the flag is shared with the shipped single-review path, which
-		// still refuses to advance on it.
-		at.empty = at.reviewable && !at.evidenceOK
-		r.end.empty = at.empty
-		r.end.emptyWhy = at.evidenceWhy
-		// CLA-639: whether this pass left a review RECORD behind, for the panel's
-		// member handler. It is the seam gate's verdict, not the round number: a
-		// member whose envelope was sealed and closed still recorded.
-		r.end.reviewRecorded = at.reviewable && r.review.required && at.evidenceOK
-		// CLA-703: did this review-only session ever reach the backlog? A clean
-		// end with no successful clankerbar call and no review record is the
-		// missing-MCP shape — the tools the brief tells it to use were not
-		// offered, so "recorded nothing" is not a reviewer's verdict.
-		//
-		// The dead signature is EXCLUDED: a silent death is already classified
-		// as dead and retried by the dead-phase ladder, and relabelling it no_mcp
-		// here would hide a real death behind an infrastructure excuse. A
-		// non-zero exit is excluded for the same reason — the transient/
-		// non-retryable classification owns it. Caps and untrusted streams are
-		// excluded because neither can be read as "the tools were missing".
-		at.noMCPNow = reviewOnly && !r.end.reviewRecorded && !r.end.reviewCloseFailed && at.res.ClankerbarCalls == 0 &&
-			!at.res.Claim.Settled && !at.emittedHandoff &&
-			at.res.Untrusted == "" && at.res.ExitCode == 0 && !at.capped && !at.ceiling && !at.wallclock &&
-			!at.producedNothing && a.Capabilities().TracksClaims
-		at.retryNoMCP = at.noMCPNow && !r.mcpRetried
-		if at.noMCPNow && r.mcpRetried {
-			// The retry ended the same way: this is the final classification.
-			r.end.noMCP = true
-			// The generic dead booking (if the retry happened to look like a
-			// death) and the held-but-empty booking below both belong to dead/
-			// empty, not to an infrastructure miss. Unbook the first and stop the
-			// second from firing; the handler books the no-MCP cell instead.
-			if at.bookedDead {
-				d.unbookDead(ph.Label(phaseIdx), tc.HarnessFor(ph))
-			}
-			r.end.deadBooked = true
-			if r.end.session != nil {
-				r.end.session.Cause = fleet.CauseNoMCP
-			}
-		}
+		r.classifyEmpty(at)
 		// A handoff holds the seam OPEN even without evidence: its successor
 		// continues THIS phase's job, so it is not the false-premise advance the
 		// gate exists to stop. The evidence gate governs only the bare seam
