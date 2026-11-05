@@ -5,23 +5,27 @@ package loop
 // The opencode adapter switches routes INSIDE one session: a usage limit on the
 // free route resumes the same session on the paid route and reports the switch on
 // Result.Raw (see harness.RouteFallback). This file is what makes the switch
-// STICKY across the run: it records a mark per denied route, keeps later phases
+// STICKY across the run AND across restarts (marks persist in the state dir, ROUTE_MARKS): it records a mark per denied route, keeps later phases
 // off a marked route until the mark lifts, and writes the switch to both logs
 // with the route, the reason and when the denied route is worth trying again.
 //
 // The mark's length is the provider's stated reset when it gave one, else the
 // same default interval the supervised wait probes at (config `poll_interval`,
 // 30 minutes). Nothing here waits: a marked route is simply not offered at the
-// next phase's spawn, so the run keeps working on the route that worked.
+// next phase's spawn, so the clanker keeps working on the route that worked.
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/statedir"
 )
 
 // defaultRouteMarkInterval is how long a denied route with no stated reset is
@@ -54,6 +58,70 @@ func (d *Driver) markRouteLimited(route string, until time.Time) {
 	}
 	if current, ok := d.routeMarks[route]; !ok || until.After(current) {
 		d.routeMarks[route] = until
+		d.persistRouteMarksLocked()
+	}
+}
+
+// persistRouteMarksLocked writes the live marks to the state dir so a restarted
+// process keeps them (CLA-836). Caller holds routeMarksMu. A write failure is
+// logged and dropped: the in-memory mark still governs this process.
+func (d *Driver) persistRouteMarksLocked() {
+	if d.state == nil {
+		return
+	}
+	now := time.Now()
+	out := make(map[string]time.Time, len(d.routeMarks))
+	for route, until := range d.routeMarks {
+		if until.After(now) {
+			out[route] = until
+		}
+	}
+	b, err := json.Marshal(out)
+	if err == nil {
+		err = d.state.WriteFileAtomic(statedir.RouteMarksName, b)
+	}
+	if err != nil {
+		log.Printf("could not save route marks to the state dir (a restart will forget them): %v", err)
+	}
+}
+
+// loadRouteMarks reads the marks a previous process saved, dropping any that
+// have already expired. A missing file is the normal first start; an unreadable
+// or corrupt one is logged and ignored, never fatal. Existing in-memory marks
+// are kept when later than the loaded ones.
+func (d *Driver) loadRouteMarks() {
+	if d.state == nil {
+		return
+	}
+	b, err := d.state.ReadFile(statedir.RouteMarksName)
+	if errors.Is(err, os.ErrNotExist) {
+		log.Printf("no saved route marks in %s (first start, or none were set)", d.state.Path())
+		return
+	}
+	if err != nil {
+		log.Printf("ignoring saved route marks: %v", err)
+		return
+	}
+	var saved map[string]time.Time
+	if err := json.Unmarshal(b, &saved); err != nil {
+		log.Printf("ignoring corrupt saved route marks: %v", err)
+		return
+	}
+	now := time.Now()
+	d.routeMarksMu.Lock()
+	defer d.routeMarksMu.Unlock()
+	for route, until := range saved {
+		route = strings.TrimSpace(route)
+		if route == "" || !until.After(now) {
+			continue
+		}
+		if d.routeMarks == nil {
+			d.routeMarks = map[string]time.Time{}
+		}
+		if current, ok := d.routeMarks[route]; !ok || until.After(current) {
+			d.routeMarks[route] = until
+			log.Printf("restored route mark: %s stays off until %s", route, routeRetryLabel(until))
+		}
 	}
 }
 
@@ -68,7 +136,7 @@ func (d *Driver) routeMarkExpiry(route string) (time.Time, bool) {
 	return until, true
 }
 
-// routableRoutes applies this run's marks to one phase's configured route list.
+// routableRoutes applies this instance's marks to one phase's configured route list.
 //
 // Unmarked routes are kept in configured order. When EVERY route is marked — a
 // phase that starts while the whole chain is still in its reset window — the

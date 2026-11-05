@@ -93,6 +93,11 @@ const sentinelBody = "clankerbar loop state dir: iteration transcripts, the daem
 // adoptable by the daemon and by doctor.
 const MaterializedConfigName = "materialized.json"
 
+// RouteMarksName is the daemon's record of model routes that hit a usage limit
+// (CLA-836), so a restarted process does not retry a route still inside its
+// reset window.
+const RouteMarksName = "ROUTE_MARKS"
+
 // DaemonLogName is the daemon's own log file in its state dir (CLA-701): the
 // process's `log.Printf` lines, rotated at a size bound by internal/logfile.
 // It is named here because this package's adoption check has to recognise it —
@@ -659,6 +664,7 @@ func (d *Dir) isOurArtifact(name string) bool {
 		// (CLA-708). Its `.tmp` sibling is the in-flight half of an atomic
 		// replace; a crash can leave one behind.
 		name == "CURRENT_CLAIM", name == "CURRENT_CLAIM.tmp",
+		name == RouteMarksName, name == RouteMarksName+".tmp",
 		// The daemon's own log and its rotated siblings (CLA-701). A pre-sentinel
 		// state dir holding one is still ours, and `doctor` opens the same
 		// directory a daemon writes it into.

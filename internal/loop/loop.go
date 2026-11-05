@@ -312,13 +312,14 @@ type Driver struct {
 	// ends is what the growing wait is there to bound.
 	resumedTransients map[resumedTransientKey]int
 
-	// routeMarks is this run's sticky memory of model routes that hit a usage
+	// routeMarks is this instance's sticky memory of model routes that hit a usage
 	// limit (CLA-782): route alias -> the instant the mark expires. A run moved
 	// off its free route stays on the paid one for later PHASES until the mark
 	// lifts, so the fleet does not flip between routes at every phase boundary;
 	// it goes back to free only when the free route's reset has passed.
 	//
-	// Per run, not per host (operator decision 10164e9e): a sibling clanker
+	// Persisted in the state dir (ROUTE_MARKS) so a restart keeps them; per
+	// instance, not per host (operator decision 10164e9e): a sibling clanker
 	// discovers the same limit on its own next request and switches mid-session.
 	// Guarded by routeMarksMu because the review panel runs its members
 	// concurrently and each may record a switch.
@@ -718,6 +719,7 @@ func (d *Driver) Run(ctx context.Context) (runErr error) {
 	// seen from the next idle poll on. This first value is only what the banner
 	// announces.
 	idle := d.cfg.IdlePollInterval.OrDefault(60 * time.Second)
+	d.loadRouteMarks()
 	// Every harness this run will SPAWN, not just the configured one: a mixed
 	// sequence's banner naming one of them is a log that disagrees with the
 	// sessions underneath it from the first line (CLA-366). SpawnedHarnesses
