@@ -254,10 +254,8 @@ func TestLeaseRenewerPausesWhenTheSessionSettlesItsClaim(t *testing.T) {
 	// on beating a lease the plane already released.
 	//
 	// The cadence is hand-fired over an UNBUFFERED tick channel: a send returns
-	// only once the renewer has received it, which means the renewer's previous
-	// iteration (including any beat) has finished. A beat already in flight when
-	// the settle is observed therefore cannot land after the count is read, which
-	// is what a wall-clock sleep-then-count raced on CI.
+	// only once the renewer has finished its previous iteration, including any
+	// beat, so a beat in flight at the settle cannot land after the count is read.
 	hb := &recordingHeartbeat{}
 	ticks := make(chan time.Time)
 	r := &leaseRenewer{
@@ -293,11 +291,8 @@ func TestLeaseRenewerPausesWhenTheSessionSettlesItsClaim(t *testing.T) {
 	}
 
 	r.observe(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
-	// The next send is received only after the in-flight iteration finished, and
-	// the settle is applied before any beat decision from here on. The send after
-	// it is received only once that iteration finished too, so the count is final
-	// for everything that could have seen the pre-settle claim.
-	fire()
+	// Received only after the in-flight iteration finished; the settle is queued
+	// ahead of the next tick, so the count read here is final for a pausing renewer.
 	fire()
 	settled := hb.count()
 
