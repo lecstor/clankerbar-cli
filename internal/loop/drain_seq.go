@@ -481,3 +481,34 @@ func (s *drainSeq) buildHandoffPrompt(st *seqStep) seqNext {
 
 	return seqFall
 }
+
+// checkPhaseBoundary runs the budget breaker at a phase boundary, before a
+// further session (or a handoff respawn) is spawned.
+func (s *drainSeq) checkPhaseBoundary(st *seqStep) seqNext {
+	d := s.d
+	drainNum := s.drainNum
+	prior := s.prior
+	if s.spawned > 0 {
+		// The breaker at a phase boundary — the third place a session ends and
+		// the loop decides whether to spawn another, alongside between-drains
+		// and between-attempts, and the finest granularity the ceiling has had.
+		// It is not decoration: one measured task spent 92% of a whole run's
+		// 75M ceiling inside a single session, which a between-drains check
+		// cannot see coming and cannot interrupt. A handoff respawn gets the
+		// same check, BEFORE the respawn: a session cannot spend its way past
+		// the ceiling by handing off to itself.
+		if dim := d.budgetTrip(prior.tokens+s.tokens, prior.cost+s.cost, time.Since(prior.start)); dim != "" {
+			boundary := "the " + st.ph.Label(s.i) + " phase boundary"
+			if st.isHandoff {
+				boundary = "the handoff respawn"
+			}
+			log.Printf("iteration %d: budget reached at %s: %s — stopping (tokens=%d cost=$%.2f elapsed=%s)",
+				drainNum, boundary, dim, prior.tokens+s.tokens, prior.cost+s.cost,
+				time.Since(prior.start).Round(time.Second))
+			s.stop = true
+			return seqBreak
+		}
+	}
+
+	return seqFall
+}
