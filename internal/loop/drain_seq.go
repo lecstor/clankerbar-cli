@@ -391,3 +391,93 @@ func (s *drainSeq) runPanelFanOut(ctx context.Context, st *seqStep) seqNext {
 	}
 	return seqFall
 }
+
+// buildHandoffPrompt turns a pending handoff into this pass's prompt: the
+// driver's resume preamble, the predecessor's own prompt, and the phase's own
+// continuation.
+func (s *drainSeq) buildHandoffPrompt(st *seqStep) seqNext {
+	phases := s.phases
+	rawPhases := s.rawPhases
+	if st.isHandoff {
+		// The respawn continues this phase's job under its knobs — turn cap
+		// and tier still apply. The session's own prompt is framed by
+		// config.HandoffPreamble, not handed over bare: the successor needs
+		// the same "resume, don't claim" contract a phase resume gets from
+		// its brief, and a session-authored prompt cannot be trusted to
+		// carry that forward on its own. promptBytes is the session's own
+		// prompt alone — what the size cap was measured against — not the
+		// preamble-inflated total, so the log line stays comparable to it.
+		//
+		// config.HandoffContinuation (CLA-353) is appended after it for the
+		// same reason: the phase's OWN brief — not only the preamble's
+		// contract — is otherwise dropped on a handoff, since ph.Prompt is
+		// replaced wholesale rather than framing the built-in text. For the
+		// review phase that would silently drop the PR-then-hand-off
+		// terminal step the moment a session hands off mid-review.
+		//
+		// Gated on the phase actually RUNNING the built-in brief (review
+		// finding): HandoffContinuation matches on name alone, so an
+		// operator who reuses the name "review" for a phase carrying their
+		// own custom Prompt would otherwise have the shipped terminal step
+		// force-injected into a handoff respawn of a brief that never
+		// established that contract in the first place — clashing with
+		// whatever terminal step their own prompt names, if any.
+		// rawPhases (the configured sequence captured at drain start, not
+		// EffectivePhases' output) is index-aligned with phases: a panel
+		// member maps back to the `review` phase it expanded from, and every
+		// other entry is its own configured phase. Never re-read live: a
+		// RELOAD applied mid-drain must not reshape the in-flight sequence's
+		// continuation (CLA-664) — the same rule the mode and the count follow.
+		st.promptBytes = len(s.nextPrompt)
+		continuation := ""
+		if s.i < len(rawPhases) && rawPhases[s.i].Prompt == "" {
+			// CLA-497: a handoff during a NO-CODE review must not append the
+			// branch-shaped reviewTerminalStep, which tells the successor to
+			// open a PR for a task that has no branch and no code.
+			// branchlessCheckpoint records the checkpoint that opened this
+			// phase (captured at the seam from the carried claim), so the
+			// continuation matches the brief this phase's first session ran.
+			//
+			// The split adds the POSITION-dependent review mode: a handoff
+			// during a review-only phase must carry the record-then-hold
+			// ending, never the commit/push/PR/in_review terminal step. A
+			// fix phase carries that terminal step by name.
+			reviewOnly := st.ph.Name == config.ReviewPhaseName && !st.terminal
+			// CLA-637: the checkpoint that OPENED this phase decides which
+			// review-only variant the successor continues. A branchless
+			// checkpoint's successor gets the no-tip shape; an UNVERIFIED
+			// one has no driver-known tip to hand over either, so its
+			// successor gets the variant that tells the reviewer to
+			// establish the tip itself — the verified shape's {{reviewedTip}}
+			// could not be filled and would leak as a literal.
+			unverifiedCheckpoint := s.carried != nil && s.carried.CheckpointUnverified
+			switch {
+			case st.ph.Name == config.ReviewPhaseName && s.branchlessCheckpoint && reviewOnly:
+				continuation = config.NoCodeReviewOnlyHandoffContinuation()
+			case st.ph.Name == config.ReviewPhaseName && s.branchlessCheckpoint:
+				continuation = config.NoCodeHandoffContinuation()
+			case st.ph.Name == config.ReviewPhaseName && reviewOnly && unverifiedCheckpoint:
+				continuation = config.UnverifiedReviewOnlyHandoffContinuation()
+			case st.ph.Name == config.FixPhaseName && s.branchlessCheckpoint && s.i+1 < len(phases) && isVerifyPhase(phases[s.i+1]):
+				// CLA-638: a BRANCHLESS fix whose verify round follows must
+				// still stop before the hand-over — the legacy no-code fix
+				// continuation would tell its successor to move the task to
+				// in_review (noCodeReviewTerminalStep), which is the
+				// verifier's move.
+				continuation = config.NoCodeFixVerifyHandoffContinuation()
+			case st.ph.Name == config.FixPhaseName && s.branchlessCheckpoint:
+				continuation = config.NoCodeFixHandoffContinuation()
+			case st.ph.Name == config.FixPhaseName && s.i+1 < len(phases) && isVerifyPhase(phases[s.i+1]):
+				// CLA-638: the successor of a mid-fix handoff must still stop
+				// before the PR; the verification round owns the hand-over.
+				continuation = config.FixVerifyHandoffContinuation()
+			default:
+				continuation = config.HandoffContinuationFor(st.ph.Name, reviewOnly)
+			}
+		}
+		st.ph.Prompt = config.HandoffPreamble + s.nextPrompt + continuation
+		s.nextPrompt = ""
+	}
+
+	return seqFall
+}
