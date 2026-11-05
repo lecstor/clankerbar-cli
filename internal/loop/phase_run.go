@@ -408,3 +408,96 @@ func (r *phaseRun) classifyEnd(at *phaseAttempt) {
 	at.toolLoop = at.res.ToolLoop
 	at.producedNothing = at.res.Untrusted == "" && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
 }
+
+// classifyExit decides, from the salvaged result, whether the session ended in a
+// way that can be a checkpoint, and whether it is the dead signature.
+func (r *phaseRun) classifyExit(at *phaseAttempt) {
+	last := r.last
+	// Hand back anything the session was still holding, BEFORE deciding what to
+	// do next — every branch below either waits, retries or returns, and all of
+	// them leave the lease unattended. Above the ierr check too: on every
+	// adapter, an Invoke whose run failed with something other than an exit
+	// status returns whatever the stream had announced by then, fully parsed,
+	// alongside the error (CLA-299) — claude's drain path parses its stream as
+	// it arrives; codex and opencode run their parsers to completion before
+	// classifying the failure — so a claim observed there is real and must not
+	// be dropped just because the process died untidily. A launch failure
+	// yields a zero Result, which releases nothing.
+	//
+	// UNLESS this phase reached its checkpoint with another phase still to run.
+	// Then the sequence is not over: the next phase resumes THIS run with
+	// heartbeat(runId) instead of claiming, so handing the lease back here
+	// would post the task to the queue while we are still working it, and the
+	// next phase would find someone else's task or none at all. drainPhases
+	// owns the handback in that case and performs it the moment the sequence
+	// ends for any other reason.
+	//
+	// Only an ORDERLY end holds it open, and each conjunct is load-bearing: a
+	// retry deliberately re-claims a half-done task with a fresh session
+	// (which is why an ordinary non-zero exit still releases), and an untrusted
+	// stream must not be read for claim state at all, because the settle we
+	// never saw may be in the bytes that never arrived (CLA-262).
+	//
+	// A turn-capped end CAN be orderly — but only if something durable came out
+	// of it. The salvage above is not a guarantee: it commits nothing on a
+	// clean worktree, and refuses outright on a diverged remote or a tree in
+	// the middle of a merge. A phase 1 that burned its turns reading and
+	// planning without writing therefore leaves no branch at all, and calling
+	// that a checkpoint spawns a session told "an earlier session has already
+	// implemented, committed and pushed" and pointed at a branch that is not
+	// there — a paid session that can only fail, or worse, move the task to
+	// review over no work.
+	//
+	// HasWIP is exactly that signal: it is set by the only two things that make
+	// a checkpoint real — the phase recording its own branch, or the salvage
+	// recording one for it and the PLANE accepting the record.
+	// A session the adapter ended on its wall-clock cap is the third member of
+	// the same family: an orderly cut-off mid-thought, whose survivability rests
+	// on the salvage exactly as a turn cap's does — so it earns a checkpoint on
+	// the same terms, HasWIP and all (CLA-368). Classified by the PHASE's adapter
+	// (`a`), never the run's: "did this session end on its own wall clock" is a
+	// question only the harness that RAN it can answer, and under per-phase
+	// harnesses (CLA-366) that harness is not necessarily d.h.
+	// CLA-700: the exit status, and the ONE exception it does not decide. A
+	// stream that shows the session took a provider error and then RECOVERED
+	// from it — retried and carried on — ends on something other than the
+	// error, and opencode 2.x exits non-zero anyway (pinned by the
+	// conformance suite). Judging that exit by its status is what stranded two
+	// delivered phases on 2026-10-19: the driver read the status as "failed
+	// attempt" and either retried (a resumed phase ending the sequence, its
+	// lease left to lapse into a takeover) or stopped, with the pushed work
+	// already on the origin remote and the task held mid-sequence.
+	//
+	// So a recovered exit is asked the DELIVERY question instead, through the
+	// same evidence gate an orderly checkpoint uses, read once below. It is
+	// deliberately narrow: it needs the adapter's own marker (a stream whose
+	// events include a recovered error and no terminal one), so a plain exit 1
+	// from a harness with no such marker — or from a session that really did
+	// stop on an error — keeps every shipped classification. A recovered exit
+	// is eligible for a checkpoint on the evidence alone; when the evidence
+	// says it delivered nothing, it is the existing held-but-empty shape
+	// (retry once, then hand the task back), never a run-ending stop over an
+	// exit status the harness itself explains.
+	//
+	// CLA-739: a tool-loop kill is none of these. The process usually reads
+	// exit -1 from the kill, but the session can exit on its own in the
+	// instant before the kill lands, and a zero exit must not turn a looping
+	// session into a checkpoint - nor can its stream's recovered provider
+	// errors (the incident's own log carries one).
+	at.orderlyExit = at.toolLoop == "" && (at.res.ExitCode == 0 || at.capped || at.ceiling || at.wallclock)
+	at.recoveredExit = !at.orderlyExit && at.toolLoop == "" && at.res.Untrusted == "" && harness.RecoveredErrors(at.res) > 0
+	at.checkpointable = at.toolLoop == "" && (at.res.ExitCode == 0 || ((at.capped || at.ceiling || at.wallclock) && at.res.Claim.HasWIP) || at.recoveredExit)
+	// CLA-386: a session whose final step finished with reason "unknown" and
+	// left no branch recorded produced NOTHING — a dead phase, not a completed
+	// one. It must not earn a checkpoint even on a zero exit, because a
+	// checkpoint is what hands the next phase a brief that claims "an earlier
+	// session has already implemented, committed and pushed". Two real
+	// implement phases died exactly this way and the seam advanced to review
+	// on the false premise; the signal has to veto the checkpoint.
+	//
+	// A capped session is excluded even when its stream carries "unknown": the
+	// wall-clock kill can land mid-turn, but a cap is an orderly end with its
+	// own marker — retrying it would re-spend against the same cap and parking
+	// it would read a doing-its-job backstop as a silent death.
+	at.dead = !last && at.res.Untrusted == "" && at.res.Claim.Held() && !at.capped && !at.ceiling && !at.wallclock && (deadPhase(at.res) || at.toolLoop != "")
+}
