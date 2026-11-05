@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -508,6 +509,135 @@ func (s *drainSeq) checkPhaseBoundary(st *seqStep) seqNext {
 			s.stop = true
 			return seqBreak
 		}
+	}
+
+	return seqFall
+}
+
+// runPhase spawns one phase session and folds how it ended into the walk: the
+// session entry, the claim the sequence now holds, and what is owed a handback.
+func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
+	d := s.d
+	t := s.t
+	ti := s.ti
+	drainNum := s.drainNum
+	prior := s.prior
+	phases := s.phases
+	// Unphased runs keep their log names byte-identical: no phase tag. A
+	// handoff respawn is tagged too, so the state dir shows the chain the way
+	// the daemon log does.
+	st.tag = ""
+	if len(phases) > 1 {
+		st.tag = "-p" + st.ph.Label(s.i)
+	}
+	if st.isHandoff {
+		s.handoffs++
+		s.chain++
+		st.tag += fmt.Sprintf("-h%d", s.chain)
+		log.Printf("%siteration %d: handoff respawn %d — spawning a fresh session on the predecessor's own %d-byte prompt, framed by the driver's resume preamble (counts as an iteration)",
+			labelOf(t), drainNum, s.chain, st.promptBytes)
+	}
+	s.spawned++
+
+	// CLA-466: announce the phase change NOW rather than at the next poll, so
+	// the console sees which phase is running without waiting out an idle
+	// interval. taskRef is empty until a claim has been observed (the first
+	// phase claims inside drainPhase); from then on it rides every beacon.
+	// CLA-510: a first-phase claim no longer waits for the next phase
+	// boundary — the renewer's claim reflector (startLeaseRenewal) revises
+	// the in-flight ref and beacons the moment the session's claim lands.
+	ref := ""
+	if s.carried != nil {
+		ref = claimLabel(s.carried.Claim)
+	}
+	if len(s.phasesRun) == 0 || s.phasesRun[len(s.phasesRun)-1] != st.ph.Label(s.i) {
+		s.phasesRun = append(s.phasesRun, st.ph.Label(s.i))
+	}
+	d.beginIteration(ti, t, drainNum, ref, st.ph.Label(s.i))
+
+	// CLA-662: whether this session RESUMED a predecessor's claim — the
+	// exact condition drainPhase's transient arm keys on (prev != nil), so
+	// the streak follows the ends that arm produces. Captured BEFORE the
+	// call: the seam below may replace `carried` with this phase's own
+	// claim, which says nothing about how the phase was entered.
+	st.phaseResumed = s.carried != nil
+	st.ptokens, st.pcost, st.pstop, st.end, st.perr = d.drainPhase(ctx, drainNum, ti, s.i, st.tag, st.ph, st.terminal, s.carried, t, spend{
+		start:  prior.start,
+		tokens: prior.tokens + s.tokens,
+		cost:   prior.cost + s.cost,
+	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, phaseRunOpts{})
+	s.tokens += st.ptokens
+	s.cost += st.pcost
+	// CLA-630: one entry per session this pass spawned, in spawn order. nil
+	// means the pass never launched a session (a harness or spawn-dir
+	// refusal above), which is nothing to record.
+	if st.end.session != nil {
+		s.sessionsRun = append(s.sessionsRun, *st.end.session)
+	}
+	s.finalDead = st.end.dead
+	s.lastProducedNothing = st.end.producedNothing
+	// CLA-466: the record's task identity and claim disposition follow EVERY
+	// claim the sequence observed — including one a dead phase already handed
+	// back itself (end.released), which the switch below deliberately drops
+	// from `carried`. The off-brief exception matches the switch's own first
+	// arm: a claim on a DIFFERENT task does not re-attribute the iteration.
+	if st.end.claim != nil && !(s.carried != nil && s.carried.Claim.TaskID != st.end.claim.Claim.TaskID) {
+		s.seen = st.end.claim.Claim
+		s.finalOutcome = claimDisposition(st.end.claim)
+	}
+	// What, if anything, is still owed a handback. Three cases, and getting any
+	// of them wrong is a task either stranded on a dead lease or posted back to
+	// the queue over work already in review:
+	//
+	//   - the phase handed the claim back itself → nothing is owed;
+	//   - the phase observed claim state → that is now the authoritative view,
+	//     including Settled and HasWIP, which releaseHeldClaim reads;
+	//   - the phase observed nothing (it never launched) → KEEP the predecessor's,
+	//     or a phase 2 that failed to start would silently drop the handback for
+	//     the task phase 1 is still holding.
+	//
+	// A phase that went off-brief and claimed a DIFFERENT task is its own case.
+	// noteClaimed replaces the observed claim wholesale, so the seam releases
+	// that task and reports `released` — which would drop the predecessor's
+	// still-live claim and hand back a task the sequence was never meant to
+	// touch. Keep what we had: the task phase 1 is holding is the one owed a
+	// handback, whatever its successor went and did.
+	st.seamClaim = s.carried
+	switch {
+	case s.carried != nil && st.end.claim != nil && st.end.claim.Claim.TaskID != s.carried.Claim.TaskID:
+		log.Printf("iteration %d: the %s phase claimed %s, which is NOT the task it was resuming (%s) — it was told not to claim at all; keeping the original for the handback",
+			drainNum, st.ph.Label(s.i), st.end.claim.Claim.TaskID, s.carried.Claim.TaskID)
+	case st.end.released:
+		s.carried = nil
+	case st.end.claim != nil:
+		s.carried = st.end.claim
+	}
+	// CLA-497: whether the checkpoint that opened THIS phase was evidenced
+	// by the plane's record (no verified branch). Read from the PRE-switch
+	// claim - the one the seam advanced with: after the switch, carried is
+	// this phase's OWN claim, whose branch says nothing about the checkpoint
+	// that opened the phase, and the handoff continuation must match the
+	// brief this phase's FIRST session ran, not what its last one recorded.
+	s.branchlessCheckpoint = st.seamClaim != nil && st.seamClaim.Claim.Branch == ""
+
+	// CLA-639 M4: a PANEL MEMBER that produced no record leaves the run
+	// resumable — the next member, or the fix phase, picks up the SAME run
+	// from the SAME verified checkpoint. Its own result is what carries the
+	// claim forward (the switch above), and a session that was turned away or
+	// died before reading the task reports no branch: without this, the next
+	// member's brief would be handed an empty branch and read as the
+	// BRANCHLESS variant, whose record is the legacy block the panel cannot
+	// use. So the checkpoint's resumption facts ride forward from the claim
+	// that opened this member, onto a claim that is still live and short of
+	// them. Only a member: every other phase's claim is its own.
+	if st.panelMember && !st.end.reviewRecorded && st.seamClaim != nil && s.carried != nil && s.carried.Claim.Held() {
+		if s.carried.Claim.Branch == "" {
+			s.carried.Claim.Branch = st.seamClaim.Claim.Branch
+		}
+		if s.carried.CheckpointTip == "" {
+			s.carried.CheckpointTip = st.seamClaim.CheckpointTip
+		}
+		s.carried.CheckpointUnverified = st.seamClaim.CheckpointUnverified
 	}
 
 	return seqFall
