@@ -50,18 +50,48 @@ func checkSessions(cfg *config.Config) []check {
 	if len(cfg.Projects) == 0 {
 		out := make([]check, 0, len(harnesses))
 		for _, h := range harnesses {
-			out = append(out, sessionCheck("workdir"+bracket(suffix(h)), cfg.WorkDir, cfg.ResolveMCPConfig(h, "", nil), h))
+			c := sessionCheck("workdir"+bracket(suffix(h)), cfg.WorkDir, cfg.ResolveMCPConfig(h, "", nil), h)
+			out = append(out, noteWithheldMCPConfig(c, cfg.WithheldMCPConfig(h, nil), h))
 		}
 		return out
 	}
 	out := make([]check, 0, len(cfg.Projects)*len(harnesses))
 	for _, p := range cfg.Projects {
 		for _, h := range harnesses {
-			out = append(out, sessionCheck("workdir["+p.Slug+suffix(h)+"]", projectWorkDir(cfg, p),
-				cfg.ResolveMCPConfig(h, projectMCPConfig(cfg, p), p.MCPConfigPaths), h))
+			c := sessionCheck("workdir["+p.Slug+suffix(h)+"]", projectWorkDir(cfg, p),
+				cfg.ResolveMCPConfig(h, projectMCPConfig(cfg, p), p.MCPConfigPaths), h)
+			out = append(out, noteWithheldMCPConfig(c, cfg.WithheldMCPConfig(h, &p), h))
 		}
 	}
 	return out
+}
+
+// noteWithheldMCPConfig raises a PASS to WARN when the operator named an MCP
+// config that the hand-off gate withholds from harnessName: the session starts
+// without it and the config reads as if it were in force. An existing WARN gains
+// the finding; a FAIL stands and carries it as info.
+func noteWithheldMCPConfig(c check, path, harnessName string) check {
+	if path == "" {
+		return c
+	}
+	detail := "mcp_config_path " + path + " is not being handed to " + harnessName + " sessions"
+	remedy := "codex ignores mcp_config_path (its servers come from [mcp_servers] in config.toml under CODEX_HOME)"
+	if harnessName != "codex" {
+		remedy = "a file named .mcp.json is Claude-shaped and is withheld from " + harnessName + "; name a config this harness reads instead, per project in projects[].mcp_config_paths." + harnessName + " or per harness in harnesses." + harnessName + ".mcp_config_path"
+	}
+	switch c.status {
+	case pass:
+		c.status = warn
+		c.detail = detail
+		c.remedy = remedy
+		return c
+	case warn:
+		c.detail += "; " + detail
+		c.remedy += "; " + remedy
+		return c
+	}
+	c.info = append(c.info, detail+" - "+remedy)
+	return c
 }
 
 // bracket wraps a non-empty qualifier in the [] the check names use, and leaves

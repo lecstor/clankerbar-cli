@@ -3219,3 +3219,57 @@ func TestOpencodeMCPDisablesCheck(t *testing.T) {
 		t.Errorf("a full disable entry was flagged: %+v", got)
 	}
 }
+
+func TestNoteWithheldMCPConfig(t *testing.T) {
+	pass0 := check{name: "workdir", status: pass}
+	t.Run("nothing withheld leaves the check alone", func(t *testing.T) {
+		if got := noteWithheldMCPConfig(pass0, "", "opencode"); got.status != pass || got.detail != "" {
+			t.Errorf("got %v %q, want an untouched PASS", got.status, got.detail)
+		}
+	})
+	t.Run("opencode names the file, the harness and the per-project key", func(t *testing.T) {
+		got := noteWithheldMCPConfig(pass0, "/w/.mcp.json", "opencode")
+		if got.status != warn {
+			t.Fatalf("status = %v, want WARN", got.status)
+		}
+		for _, want := range []string{"/w/.mcp.json", "opencode"} {
+			if !strings.Contains(got.detail, want) {
+				t.Errorf("detail %q missing %q", got.detail, want)
+			}
+		}
+		if !strings.Contains(got.remedy, "projects[].mcp_config_paths.opencode") {
+			t.Errorf("remedy %q does not point at projects[].mcp_config_paths.opencode", got.remedy)
+		}
+	})
+	t.Run("a worse verdict stands", func(t *testing.T) {
+		got := noteWithheldMCPConfig(check{status: fail, detail: "boom"}, "/w/.mcp.json", "opencode")
+		if got.status != fail || got.detail != "boom" || len(got.info) != 1 {
+			t.Errorf("got %v %q %v, want FAIL kept and the note in info", got.status, got.detail, got.info)
+		}
+	})
+}
+
+func TestCheckSessions_ReportsANamedMCPConfigTheGateWithholds(t *testing.T) {
+	dir := t.TempDir()
+	mcp := filepath.Join(dir, ".mcp.json")
+	if err := os.WriteFile(mcp, []byte(`{"mcpServers":{"clankerbar":{"type":"http","url":"https://clankerbar.com/mcp/p"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := func(named string) []check {
+		cfg := &config.Config{Harness: "opencode", Prompt: "x", WorkDir: dir, BacklogURL: "https://clankerbar.com", MCPConfigPath: named}
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+		return checkSessions(cfg)
+	}
+	if cs := run(mcp); len(cs) != 1 || cs[0].status != warn || !strings.Contains(cs[0].detail, mcp) {
+		t.Errorf("named: got %+v, want one WARN naming %s", cs, mcp)
+	}
+	for name, named := range map[string]string{"discovered": "", "none": "none"} {
+		for _, c := range run(named) {
+			if strings.Contains(c.detail, "not being handed") {
+				t.Errorf("%s: got %q, want silence", name, c.detail)
+			}
+		}
+	}
+}
