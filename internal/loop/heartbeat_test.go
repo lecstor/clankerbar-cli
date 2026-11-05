@@ -252,16 +252,58 @@ func TestLeaseRenewerPausesWhenTheSessionSettlesItsClaim(t *testing.T) {
 	// THE regression this test pins: a settle keeps RunID and flips Settled, so a
 	// pause keyed off RunID going empty is unreachable and the renewer would go
 	// on beating a lease the plane already released.
+	//
+	// The cadence is hand-fired over an UNBUFFERED tick channel: a send returns
+	// only once the renewer has received it, which means the renewer's previous
+	// iteration (including any beat) has finished. A beat already in flight when
+	// the settle is observed therefore cannot land after the count is read, which
+	// is what a wall-clock sleep-then-count raced on CI.
 	hb := &recordingHeartbeat{}
-	r, cancel := newStartedRenewer(t, hb, heartbeatClaim("r-1"))
+	ticks := make(chan time.Time)
+	r := &leaseRenewer{
+		hb:       hb,
+		interval: time.Minute, // cadence is hand-driven via r.tick
+		prefix:   "test: ",
+		claims:   make(chan harness.Claim, 4),
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+		tick:     ticks,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	defer r.stop()
+	go r.run(ctx, heartbeatClaim("r-1"))
 
-	heartbeatWaitFor(t, "beats before the settle", func() bool { return hb.count() >= 3 })
+	fire := func() {
+		t.Helper()
+		select {
+		case ticks <- time.Now():
+		case <-time.After(5 * time.Second):
+			t.Fatal("timed out handing a tick to the renewer")
+		}
+	}
+
+	// Four sends: the fourth is received only after the first three iterations
+	// (three beats) are complete.
+	for i := 0; i < 4; i++ {
+		fire()
+	}
+	if n := hb.count(); n < 3 {
+		t.Fatalf("beats before the settle = %d, want at least 3", n)
+	}
+
 	r.observe(harness.Claim{TaskID: "t-1", Ref: "CLA-1", RunID: "r-1", Settled: true})
-
+	// The next send is received only after the in-flight iteration finished, and
+	// the settle is applied before any beat decision from here on. The send after
+	// it is received only once that iteration finished too, so the count is final
+	// for everything that could have seen the pre-settle claim.
+	fire()
+	fire()
 	settled := hb.count()
-	time.Sleep(40 * time.Millisecond) // ~40 ticks' worth of opportunity to misbehave
+
+	for i := 0; i < 5; i++ {
+		fire()
+	}
 	if n := hb.count(); n != settled {
 		t.Fatalf("beats after settle = %d (was %d): renewal did not pause on a settled claim", n, settled)
 	}
