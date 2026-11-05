@@ -122,3 +122,37 @@ type attemptVerdict struct {
 	stop bool
 	err  error
 }
+
+// phaseAttempt is one pass through the ladder: the session it spawned, how that
+// session ended, and the seam's verdict on it. A fresh one is made per attempt.
+// res is shared by pointer with phaseEnd.claim, so it lives here rather than
+// being passed by value between stages.
+type phaseAttempt struct {
+	inv                harness.Invocation
+	res                harness.Result
+	ierr               error
+	logPath            string
+	capped             bool
+	ceiling            bool
+	wallclock          bool
+	zeroUsage          bool
+	toolLoop           string
+	producedNothing    bool
+	orderlyExit        bool
+	recoveredExit      bool
+	checkpointable     bool
+	dead               bool
+	bookedDead         bool
+	handoff            string
+	emittedHandoff     bool
+	canCheckpoint      bool
+	reviewable         bool
+	evidenceOK         bool
+	evidenceUnverified bool
+	evidenceWhy        string
+	evidenceTip        string
+	empty              bool
+	noMCPNow           bool
+	retryNoMCP         bool
+	verifyNeedsHold    bool
+}
