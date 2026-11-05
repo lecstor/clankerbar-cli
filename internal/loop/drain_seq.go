@@ -1095,3 +1095,66 @@ func (s *drainSeq) judgeDeadPhase(ctx context.Context, st *seqStep) seqNext {
 
 	return seqFall
 }
+
+// judgeHandoff respawns the same phase on an accepted handoff, or re-judges the
+// exit as a bare one when the chain cap or max-iterations refuses it.
+func (s *drainSeq) judgeHandoff(ctx context.Context, st *seqStep) seqNext {
+	d := s.d
+	t := s.t
+	tc := s.tc
+	drainNum := s.drainNum
+	phases := s.phases
+	// A handoff the session emitted and drainPhase judged safe (clean exit,
+	// trusted stream, task still held, prompt within the size cap). Two guards
+	// remain, and both refuse toward the STANDARD path — the next configured
+	// brief, or the drain ending — never toward truncating or rewriting the
+	// session's prompt (CLA-352).
+	if st.end.handoff != "" {
+		switch {
+		case s.chain >= handoffChainCap:
+			log.Printf("%siteration %d: handoff refused — this task has already chained %d consecutive handoff respawns, the cap; falling back to the standard brief so a session cannot chain itself indefinitely",
+				labelOf(t), drainNum, s.chain)
+		case d.cfg.MaxIterations > 0 && drainNum+s.handoffs >= d.cfg.MaxIterations:
+			log.Printf("%siteration %d: handoff refused — a respawn counts as an iteration and max-iterations (%d) is already spent; falling back to the normal path",
+				labelOf(t), drainNum, d.cfg.MaxIterations)
+		default:
+			// Same phase index: the successor continues this phase's job. The
+			// budget breaker at the top of the loop runs before the spawn.
+			s.nextPrompt = st.end.handoff
+			return seqContinue
+		}
+		// The handoff was REFUSED, so its exemption from the evidence gate ends
+		// here: the exit is re-judged as the bare exit it really is (CLA-457).
+		// With no durable, origin-reachable branch evidence that is a FAILED
+		// empty phase — logged, tallied, never handed to the review brief.
+		//
+		// CLA-637: the review stage is over after all. drainPhase deliberately
+		// left the matched review round SEALED when it detected the handoff —
+		// the successor was going to close it at its own seam — but the refused
+		// respawn is the last session that continuation was ever going to get,
+		// so the round must be released HERE, before the checkpoint advances: a
+		// fix phase spawned against a sealed round can neither read nor answer
+		// (finding_sealed) the findings it was told to apply. A close that
+		// fails refuses the checkpoint, exactly as the seam's own close does.
+		nextReviewShaped := s.i+1 < len(phases) && config.ReviewShaped(phases[s.i+1].Prompt)
+		if st.end.reviewRound > 0 && st.end.checkpoint && st.end.claim != nil && !nextReviewShaped {
+			if cerr := d.closeReviewRound(ctx, t, *st.end.claim, st.end.reviewRound); cerr != nil {
+				log.Printf("%siteration %d: the %s phase's review round %d could not be closed after its handoff was refused (%v) — refusing the checkpoint, because the next phase would be spawned against findings the plane still has sealed",
+					labelOf(t), drainNum, st.ph.Label(s.i), st.end.reviewRound, cerr)
+				d.tallyEmpty(st.ph.Label(s.i), tc.HarnessFor(st.ph))
+				return seqBreak
+			}
+		}
+		if !st.last && st.end.empty {
+			log.Printf("%siteration %d: the %s phase ended holding a task with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns (its handoff was refused)",
+				labelOf(t), drainNum, st.ph.Label(s.i), st.end.emptyWhy)
+			d.tallyEmpty(st.ph.Label(s.i), tc.HarnessFor(st.ph))
+			return seqBreak
+		}
+	}
+	// This session ended without a respawn being accepted, so any chain is
+	// broken: a later handoff starts counting from a standard-brief session.
+	s.chain = 0
+
+	return seqFall
+}
