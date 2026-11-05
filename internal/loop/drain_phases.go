@@ -4,11 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
-	"github.com/lecstor/clankerbar-cli/internal/harness"
 )
 
 // drainPhases runs ONE drain as its configured sequence of phase sessions —
@@ -205,101 +203,11 @@ walk:
 				drainNum, st.ph.Label(s.i))
 			break
 		}
-		// CLA-638: the verification round is the stopping rule's gate. It is the
-		// LAST configured phase, so the generic `!last` branches above never
-		// applied to it; what follows is decided HERE from the durable records
-		// the round just released:
-		//
-		//   - no open MUST → the gate passed. The verifier carried the terminal
-		//     step (push check, PR, in_review) itself; the sequence is done.
-		//   - open MUST(s) → another fix is spawned, unless the round cap or the
-		//     non-convergence breaker parks the task first. Never one more round
-		//     on the driver's own initiative.
-		if isVerifyPhase(st.ph) {
-			vres := harness.Result{}
-			if st.end.claim != nil {
-				vres = *st.end.claim
-			}
-			if st.end.verifyFailure != "" {
-				// The seam could not judge the round: no durable record this run
-				// wrote, a round that would not close, or a task that could not
-				// be read back. That is the same fail-closed shape CLA-637 gives
-				// a refused review checkpoint — the drain ends without the
-				// hand-over and the claim is released/lapses, so a takeover can
-				// retry it. It is not the stopping rule parking a disagreement.
-				log.Printf("%siteration %d: the %s phase's round could not be judged (%s) — refusing the sequence: no hand-over, and no PR was accepted from this round",
-					labelOf(t), drainNum, st.ph.Label(s.i), st.end.verifyFailure)
-				break
-			}
-			if !st.end.verifyChecked {
-				// A verification session that died or produced no judgeable exit.
-				// End the sequence; the normal takeover path retries it.
-				log.Printf("%siteration %d: the %s phase produced no judgeable verification round — ending the sequence without a hand-over",
-					labelOf(t), drainNum, st.ph.Label(s.i))
-				break
-			}
-			if len(st.end.verifyOpenMusts) == 0 {
-				if st.end.verifyStatus == "in_progress" || st.end.verifyStatus == "ready" {
-					log.Printf("%siteration %d: the %s phase closed round %d with NO open MUST but left the task %q — it recorded a pass but did not carry the terminal step (push check, PR, in_review); the sequence ends without a hand-over for the operator to see",
-						labelOf(t), drainNum, st.ph.Label(s.i), st.end.verifyRound, st.end.verifyStatus)
-				}
-				if st.end.verifyRound == 0 {
-					// CLA-638 × CLA-670: a BRANCHLESS round. Its record is the
-					// legacy `## Review` block, so there is no plane open-MUST set
-					// for the id-based gate to read — the verifier's own block
-					// carried the verdict, and the sequence ends without claiming
-					// the id-based stopping rule ran (it cannot, on this shape).
-					log.Printf("iteration %d: the %s phase's verification round rests on the legacy %q block (this shape writes no durable record) — no plane open-MUST set to judge; ending the sequence",
-						drainNum, st.ph.Label(s.i), config.ReviewRecordHeading)
-					break
-				}
-				log.Printf("iteration %d: the %s phase closed round %d with NO open MUST — the stopping rule is satisfied and the sequence is done",
-					drainNum, st.ph.Label(s.i), st.end.verifyRound)
-				break
-			}
-			s.verifyRoundsRun++
-			reason := nonConvergenceReason(st.end.verifyOpenMusts, st.end.verifyRound, s.verifyResolved)
-			// The local fallback counts the same ROUNDS the plane does (CLA-686
-			// D2). A review cycle is one review round plus the verification
-			// rounds that follow it, and the plane's `counted` includes the
-			// review round — so comparing verification rounds ALONE against the
-			// cap allowed a cycle one round longer than the counted path, and
-			// the park then read "Round 4 of the 3-round cap". `+1` is the
-			// review round that opened this cycle.
-			localRounds := s.verifyRoundsRun + 1
-			capHit := st.end.verifyCounted >= config.ReviewRoundCap || localRounds >= config.ReviewRoundCap
-			if reason == "" && !capHit && fixIdx >= 0 && st.end.checkpoint && s.carried != nil {
-				for _, id := range st.end.verifyResolvedIDs {
-					s.verifyResolved[id] = true
-				}
-				log.Printf("iteration %d: the %s phase closed round %d (%d non-void round(s) this cycle) with open MUST(s) [%s] — spawning another %s round against them",
-					drainNum, st.ph.Label(s.i), st.end.verifyRound, st.end.verifyCounted,
-					strings.Join(st.end.verifyOpenMusts, ", "), phases[fixIdx].Label(fixIdx))
-				// CLA-639: the merged panel list belongs to the FIRST fix after
-				// the panel, before any verification round has run. A verify
-				// rewind is a later fix round: its grading is the verifier's own
-				// record (plus the plane's open-MUST list), and reprinting the
-				// panel's list would replace the verifier's findings with a
-				// stale round. Clear the panel round so drainPhase falls back to
-				// the shipped single-review path unchanged.
-				s.panelRound = 0
-				s.i = fixIdx
-				continue
-			}
-			if reason == "" {
-				switch {
-				case capHit:
-					reason = fmt.Sprintf("the %d-round cap for this review cycle is reached", config.ReviewRoundCap)
-				case fixIdx < 0:
-					reason = "the sequence has no fix phase to run between verification rounds"
-				default:
-					reason = "the round ended without holding the task, so no fix can be spawned against its open MUSTs"
-				}
-			}
-			d.parkVerification(ctx, t, vres, reason, st.end.verifyRound, st.end.verifyCounted, st.end.verifyOpenMusts, st.end.verifyOpenDetails)
-			s.parkFired = true
-			s.carried = nil
-			break
+		switch s.judgeVerifyGate(ctx, st) {
+		case seqContinue:
+			continue
+		case seqBreak:
+			break walk
 		}
 		// A phase that ended dead was retried above and, on the retry, either
 		// parked or advanced — either way this phase's dead-phase budget is spent.
