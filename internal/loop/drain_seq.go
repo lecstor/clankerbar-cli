@@ -202,3 +202,22 @@ func (s *drainSeq) recordIteration() {
 		CostUSD: s.cost,
 	})
 }
+
+// seqStep is one pass through the walk: the phase it ran and how that phase
+// ended. A fresh one is made per pass.
+type seqStep struct {
+	ph           config.Phase
+	panelMember  bool
+	last         bool
+	terminal     bool
+	isHandoff    bool
+	promptBytes  int
+	tag          string
+	phaseResumed bool
+	seamClaim    *harness.Result
+	ptokens      int
+	pcost        float64
+	pstop        bool
+	end          phaseEnd
+	perr         error
+}
