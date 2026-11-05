@@ -899,3 +899,188 @@ func (r *phaseRun) holdCheckpoint(ctx context.Context, at *phaseAttempt) {
 			labelOf(t), drainNum, at.res.Claim.TaskID)
 	}
 }
+
+// settleWithoutCheckpoint is the exit that is not a checkpoint: it hands the claim
+// back, books the empty phase, and asks the plane whether a claim the stream
+// never showed is held.
+func (r *phaseRun) settleWithoutCheckpoint(ctx context.Context, at *phaseAttempt) {
+	d := r.d
+	t := r.t
+	tc := r.tc
+	drainNum := r.drainNum
+	phaseIdx := r.phaseIdx
+	ph := r.ph
+	last := r.last
+	panel := r.panel
+	opts := r.opts
+	briefedTask := r.briefedTask
+	nextReviewShaped := r.shape.nextReviewShaped
+	panelMember := r.shape.panelMember
+	panelOptional := r.shape.panelOptional
+	// `released` records only a handback that could actually have happened:
+	// a zero Result from a failed launch releases nothing, and reporting it
+	// as released would erase a predecessor's claim that is still live.
+	//
+	// CLA-639 M4: a PANEL MEMBER that ended without a record does NOT hand
+	// its claim back here. Everything the panel handler must do about a
+	// failed member needs the claim to still be live: closing the round (only
+	// the LIVE holder may, and a failed close would leave the earlier
+	// members' findings sealed behind a lease that is already gone) and
+	// handing the next member — or the fix phase — the same run to resume.
+	// A member that genuinely lost the claim is not special-cased: Held() is
+	// false, so there is nothing to release either way. The handler owns the
+	// handback for this shape, and takes it AFTER the close (see
+	// drainPhases).
+	// CLA-703: a retrying no-MCP attempt is not an ending — keep the claim
+	// (the retry resumes the same run) and book nothing yet. The final
+	// attempt goes through the normal handback.
+	if !panelMember && !at.retryNoMCP {
+		r.end.released = at.res.Claim.Held()
+	}
+	r.end.dead = at.dead
+	if r.end.empty && !r.end.noMCP && !at.retryNoMCP {
+		log.Printf("%siteration %d: the %s phase ended holding %s with no recorded branch on the origin remote — not a checkpoint (%s), so no review phase spawns",
+			labelOf(t), drainNum, ph.Label(phaseIdx), claimLabel(at.res.Claim), at.evidenceWhy)
+		// Book it into the dead-phase tally (CLA-457): this is the
+		// "produced nothing" class the rate exists to measure, and a
+		// fleet-wide silent EOT is exactly the incident in question.
+		//
+		// Unless the session's exit was already booked as the CLA-402
+		// SILENT death: a LAST phase can wear both shapes at once (its
+		// finish reason is "unknown" AND its evidence gate failed), and
+		// one session may not read as two dead ones out of one run —
+		// CLA-639 M4 needs this booking to be exactly one per failed
+		// panel member, and the operator's rate needs it to be honest.
+		//
+		// And unless this is a panel member whose review close failed
+		// (CLA-639 fix pass 3): a member that WROTE its record and whose
+		// round the plane then refused to release produced a review — the
+		// empty shape here would report it as a session that died
+		// producing nothing, which is the opposite of what happened. The
+		// skip is PANEL-ONLY: the plain single review keeps the untaxed
+		// CLA-457 booking it has had since the base commit, so an
+		// operator's dead-phase rate reads the same with no panel
+		// (CLA-639 fix pass 4).
+		if !at.bookedDead && !(panelMember && r.end.reviewCloseFailed) {
+			d.tallyEmpty(ph.Label(phaseIdx), tc.HarnessFor(ph))
+			// CLA-639 M4: this exit is booked, so the panel's member
+			// handler must not book it again when it records the member
+			// as failed.
+			r.end.deadBooked = true
+		}
+	}
+	// last && a clean exit is the shape CLA-384 is about: the phase ran to
+	// completion, pushed, and simply did not declare. A non-zero exit reached
+	// the same place by crashing, which is a different failure with its own
+	// reporting, and an earlier phase reaching here did not have declaring as
+	// its job at all.
+	//
+	// The return tells whether the claim is actually back in the ready queue
+	// — the thing a bounded retry can re-claim. A release the plane refused
+	// (or that never ran) leaves the lease live, so a retry session would
+	// only be refused and burned.
+	if !panelMember && !at.retryNoMCP {
+		// A tool-loop kill is never the undeclared hand-off CLA-384
+		// counts, even when the process exited 0 an instant before the
+		// kill landed: it was killed failing to move the task on.
+		r.end.releasedToQueue = d.releaseHeldClaim(ctx, t, at.res, last && at.res.ExitCode == 0 && at.toolLoop == "")
+	}
+
+	// CLA-451: the blind-spot convergence. Everything above learns about
+	// claims by parsing clankerbar tool calls out of the stream; a session
+	// that claimed by another channel (a raw API call with the same key,
+	// a harness quirk, a renamed tool) ends checkpointable with NO observed
+	// claim — and used to end the sequence here, stranding its pushed work
+	// behind an expiring lease until a takeover recovered it at a reclaim's
+	// cost. Before declaring the phase empty, ask the plane about the one
+	// task this driver can name: the task it BRIEFED. If that task is held,
+	// with a branch recorded, by some run of this project's key, treat it
+	// as the phase's checkpoint exactly as an observed claim would be.
+	//
+	// Every conjunct below keeps an existing guard absolute:
+	//
+	//   - end.claim == nil && !res.Claim.Held() — an OBSERVED claim,
+	//     settled or not, stays the authoritative view; the peek never
+	//     overwrites or second-guesses one.
+	//   - res.Untrusted == "" — a stream that could not be read whole is
+	//     never read for claim state, and the plane is not asked to fill
+	//     the hole either: the settle we never saw may be in the missing
+	//     bytes (CLA-262).
+	//   - !producedNothing — the dead-phase veto (CLA-386): a final step
+	//     that finished "unknown" having produced nothing is not a
+	//     checkpoint no matter what the plane says, so it is not even
+	//     consulted.
+	//   - the orderly-end disjunct mirrors `checkpointable` exactly, with
+	//     the plane's recorded branch standing in for the HasWIP the cap
+	//     path needs — a branch the PLANE confirms is stronger evidence
+	//     than one read off a stream.
+	//   - !last — a last phase has no successor to hold the lease for;
+	//     a handoff cannot widen this either, because detectHandoff
+	//     refuses on no observed claim before we get here.
+	//
+	// A claim the peek recovers then faces the SAME evidence gate as an
+	// observed one: the recorded branch must really be on the origin
+	// remote before the seam advances (CLA-457), because a plane record
+	// alone cannot tell a pushed branch from a phantom one. Evidence that
+	// fails keeps today's behavior — the drain ends, and the live lease
+	// expires with its recorded branch intact as the takeover hand-off.
+	// The peek itself is a READ of the briefed task (get_task), never a
+	// claim and never a heartbeat: it cannot race a session out of work,
+	// and a peek that fails or comes back not-held simply falls through
+	// to the standard ending below.
+	if r.end.claim == nil && !last && at.res.Untrusted == "" && !at.producedNothing &&
+		!at.res.Claim.Held() && (at.res.ExitCode == 0 || at.capped || at.ceiling || at.wallclock || at.recoveredExit) {
+		if claim := d.peekCheckpointClaim(ctx, t, drainNum, ph.Label(phaseIdx), briefedTask); claim != nil {
+			r.end.claim = claim
+			var peekTip string
+			r.end.branch, peekTip, at.evidenceOK, at.evidenceUnverified, at.evidenceWhy = d.checkpointEvidence(ctx, t, *claim, at.inv.WorkDir, &r.review)
+			r.end.reviewRound = r.review.round
+			// The review round's close rides this path too (CLA-637): a
+			// recovered review checkpoint whose round stayed sealed would
+			// spawn the fix phase against findings it cannot read. No
+			// handoff is possible here (detectHandoff refuses an
+			// unobserved claim), so the only skip is a following
+			// review-shaped phase.
+			//
+			// CLA-784: the same "an optional seat's record alone must not
+			// release the round" rule as the observed-claim close above.
+			// A trial seat that records here and is then recovered through
+			// the plane's peek must leave the round sealed unless a
+			// REQUIRED member has recorded; otherwise this close releases
+			// a round that is no review at all, before the panel handler's
+			// own "no required member recorded" check can see it.
+			optionalOnly := panelOptional && !panel.recorded
+			if at.evidenceOK && r.review.required && r.review.round > 0 && r.review.state == "sealed" && !nextReviewShaped && !opts.panelParallel && !optionalOnly {
+				if cerr := d.closeReviewRound(ctx, t, *claim, r.review.round); cerr != nil {
+					at.evidenceOK = false
+					at.evidenceWhy = fmt.Sprintf("review round %d could not be closed (%v) — refusing the checkpoint, because the fix phase would be spawned against findings the plane still has sealed", r.review.round, cerr)
+				}
+			}
+			if at.evidenceOK {
+				// Fold the VERIFIED branch onto the carried claim, exactly as
+				// the observed-claim checkpoint above does: a recovered claim
+				// carries the plane's recorded branch and checkpointEvidence
+				// re-verified it, so the two already agree today — but the
+				// invariant "the carried claim's branch is the verified one"
+				// is what verifiedBranch and the takeover hand-off depend on,
+				// so hold it by construction rather than by coincidence of a
+				// single-source read. CLA-576: an unverified recovery rides
+				// the same way, marked so its brief is the unverified variant.
+				r.end.claim.Claim.Branch = r.end.branch
+				r.end.claim.CheckpointUnverified = at.evidenceUnverified
+				r.end.claim.CheckpointTip = peekTip
+				r.end.checkpoint = true
+				if at.evidenceUnverified {
+					log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s recorded — it could not be verified on the origin remote (%s), so this is an UNVERIFIED checkpoint: keeping the lease for the next phase; the review phase must verify the branch itself",
+						labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, r.end.branch, at.evidenceWhy)
+				} else {
+					log.Printf("%siteration %d: %s ended with no claim observed in its stream, but the plane holds %s (run %s) with branch %s verified on the origin remote — treating it as the phase checkpoint and keeping the lease for the next phase",
+						labelOf(t), drainNum, ph.Label(phaseIdx), claim.Claim.TaskID, claim.Claim.RunID, r.end.branch)
+				}
+			} else {
+				log.Printf("%siteration %d: the plane holds %s (run %s) with branch %q recorded, but that branch could not be verified on the origin remote (%s) — not treating it as a checkpoint; the lease expires with its hand-off intact",
+					labelOf(t), drainNum, claim.Claim.TaskID, claim.Claim.RunID, r.end.branch, at.evidenceWhy)
+			}
+		}
+	}
+}
