@@ -2,6 +2,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -1096,4 +1097,60 @@ func (r *phaseRun) recoverUnobservedClaim(ctx context.Context, at *phaseAttempt)
 			}
 		}
 	}
+}
+
+// endOnInvokeError ends the attempt when the run itself failed rather than the
+// session exiting: a cancelled context stops the run, a failed MCP preflight is
+// retried once, anything else is an error.
+func (r *phaseRun) endOnInvokeError(ctx context.Context, at *phaseAttempt) attemptVerdict {
+	d := r.d
+	t := r.t
+	tc := r.tc
+	drainNum := r.drainNum
+	phaseIdx := r.phaseIdx
+	ph := r.ph
+	a := r.a
+	if at.ierr != nil {
+		if ctx.Err() != nil {
+			return attemptVerdict{next: attemptReturn, stop: true}
+		}
+		// Count this attempt's spend before giving up on it. A non-exit run
+		// failure is either a launch failure (nothing emitted, nothing parsed —
+		// adding zeroes changes nothing) or a session that ran, announced its
+		// spend and died in Wait (CLA-299): the Result was parsed precisely so
+		// the budget would not lose what the attempt actually cost. That holds
+		// only while the stream was read whole, which is what the guard below
+		// makes binding: a failure whose stream ALSO came back untrusted
+		// carries a floor, not a total, and gets the same refusal as the
+		// untrusted branch below and endUntrustedDrain (CLA-262) - counted
+		// nowhere, so no breaker ever acts on a figure that cannot be known.
+		if at.res.Untrusted == "" {
+			r.tokens += at.res.Tokens
+			r.cost += at.res.CostUSD
+			r.publishSpend()
+			recordPassSpend(r.end.session, a, &r.pass, &at.res)
+			d.charge(tc.HarnessFor(ph), at.res.Tokens, at.res.CostUSD)
+		}
+		// CLA-703: an MCP preflight failure is infrastructure, not a verdict
+		// on the phase. The session never reached its first turn, so the
+		// claim it was seeded with is untouched and the same run can be
+		// retried. One retry — the same bound the no-record backstop uses —
+		// then the run fails loudly with the reason rather than producing a
+		// silent empty phase.
+		if errors.Is(at.ierr, harness.ErrMCPNotConnected) {
+			if !r.mcpRetried {
+				r.mcpRetried = true
+				log.Printf("%siteration %d: %s could not start its first turn: %v — retrying the %s phase once (MCP preflight failure, not a phase verdict)",
+					labelOf(t), drainNum, a.Name(), at.ierr, ph.Label(phaseIdx))
+				return attemptVerdict{next: attemptRetry}
+			}
+			return attemptVerdict{next: attemptReturn, err: fmt.Errorf("iteration %d: %w", drainNum, at.ierr)}
+		}
+		// A run failure that was not an exit status — a launch failure, or one
+		// of the deaths in Wait above — ends the attempt without any retry
+		// classification. Not a blip.
+		return attemptVerdict{next: attemptReturn, err: fmt.Errorf("invoke %s: %w (log: %s)", a.Name(), at.ierr, at.logPath)}
+	}
+
+	return attemptVerdict{}
 }

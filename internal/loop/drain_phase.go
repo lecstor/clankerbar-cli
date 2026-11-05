@@ -2,7 +2,6 @@ package loop
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -227,48 +226,12 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// a branch as one that finished cleanly.
 		d.verifyDeliveries(ctx, t, at.res, at.inv.WorkDir)
 
-		if at.ierr != nil {
-			if ctx.Err() != nil {
-				return r.tokens, r.cost, true, r.end, nil
-			}
-			// Count this attempt's spend before giving up on it. A non-exit run
-			// failure is either a launch failure (nothing emitted, nothing parsed —
-			// adding zeroes changes nothing) or a session that ran, announced its
-			// spend and died in Wait (CLA-299): the Result was parsed precisely so
-			// the budget would not lose what the attempt actually cost. That holds
-			// only while the stream was read whole, which is what the guard below
-			// makes binding: a failure whose stream ALSO came back untrusted
-			// carries a floor, not a total, and gets the same refusal as the
-			// untrusted branch below and endUntrustedDrain (CLA-262) - counted
-			// nowhere, so no breaker ever acts on a figure that cannot be known.
-			if at.res.Untrusted == "" {
-				r.tokens += at.res.Tokens
-				r.cost += at.res.CostUSD
-				r.publishSpend()
-				recordPassSpend(r.end.session, a, &r.pass, &at.res)
-				d.charge(tc.HarnessFor(ph), at.res.Tokens, at.res.CostUSD)
-			}
-			// CLA-703: an MCP preflight failure is infrastructure, not a verdict
-			// on the phase. The session never reached its first turn, so the
-			// claim it was seeded with is untouched and the same run can be
-			// retried. One retry — the same bound the no-record backstop uses —
-			// then the run fails loudly with the reason rather than producing a
-			// silent empty phase.
-			if errors.Is(at.ierr, harness.ErrMCPNotConnected) {
-				if !r.mcpRetried {
-					r.mcpRetried = true
-					log.Printf("%siteration %d: %s could not start its first turn: %v — retrying the %s phase once (MCP preflight failure, not a phase verdict)",
-						labelOf(t), drainNum, a.Name(), at.ierr, ph.Label(phaseIdx))
-					continue
-				}
-				return r.tokens, r.cost, false, r.end, fmt.Errorf("iteration %d: %w", drainNum, at.ierr)
-			}
-			// A run failure that was not an exit status — a launch failure, or one
-			// of the deaths in Wait above — ends the attempt without any retry
-			// classification. Not a blip.
-			return r.tokens, r.cost, false, r.end, fmt.Errorf("invoke %s: %w (log: %s)", a.Name(), at.ierr, at.logPath)
+		switch v := r.endOnInvokeError(ctx, at); v.next {
+		case attemptRetry:
+			continue
+		case attemptReturn:
+			return r.result(v)
 		}
-
 		// A session whose stream could not be read whole (CLA-262). Everything below
 		// this line reads a figure parsed out of that stream, so counting the spend,
 		// classifying the exit or retrying on the strength of it are three ways to
