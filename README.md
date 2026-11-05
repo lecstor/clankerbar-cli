@@ -1727,7 +1727,7 @@ tree this exists to save, and a signing passphrase has nobody to ask at 3am.
 it is, because committing it would record a state nobody chose — it would
 fabricate a resolution out of the conflict markers and push a file that reads as
 source with `<<<<<<<` in it. That covers both a git operation still in flight (a
-merge, rebase, cherry-pick or revert) and a conflict nothing is holding open: a
+merge, rebase, cherry-pick, revert or bisect) and a conflict nothing is holding open: a
 `git stash pop`, `git apply --3way` or `git checkout -m` leaves unmerged entries
 with no state file at all, so the unmerged index is checked as well as the
 operation. Either way it is logged as `STRANDED WORK LEFT AS IS` with the path.
@@ -1885,7 +1885,7 @@ consequences of that pairing are worth knowing before you set it. First, the
 salvage applies here: since CLA-365 opencode observes the session's task claim,
 so when a capped session ends, whatever it left uncommitted is committed and
 pushed by the salvage, the same as for a turn-capped `claude` session - unless
-the salvage refuses (an interrupted merge, rebase, cherry-pick or revert;
+the salvage refuses (an interrupted merge, rebase, cherry-pick, revert or bisect;
 unresolved conflicts; an ambiguous worktree match) and leaves the work
 untouched, or the push is rejected and the work stays committed locally only.
 Both of those are named in the log. If instead no worktree at or below the
