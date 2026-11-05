@@ -804,3 +804,98 @@ func (r *phaseRun) classifyEmpty(at *phaseAttempt) {
 		}
 	}
 }
+
+// holdCheckpoint keeps the lease for the successor: it folds the verified branch
+// and tip onto the carried claim and says why the seam advances.
+func (r *phaseRun) holdCheckpoint(ctx context.Context, at *phaseAttempt) {
+	t := r.t
+	drainNum := r.drainNum
+	prev := r.prev
+	r.end.checkpoint = true
+	r.end.handoff = at.handoff
+	if r.end.claim != nil {
+		// The invariant "the carried claim's branch is the VERIFIED one"
+		// is held by construction, whatever form the evidence took
+		// (CLA-497): the branch form folds the verified branch on, and
+		// the plane-record forms clear whatever the session recorded -
+		// a recorded branch that FAILED origin verification must not
+		// ride into the successor's brief, which names {{branch}} as
+		// verified on the origin remote (CLA-457), and the no-code
+		// brief is selected exactly on an empty claim branch.
+		//
+		// CLA-576: an UNVERIFIED checkpoint is the one exception, and it
+		// is marked rather than hidden. Its branch rides the claim (the
+		// review phase needs the name to verify it) with
+		// CheckpointUnverified set, so the successor's brief is the
+		// unverified variant - never the verified wording, which this
+		// checkpoint cannot support.
+		if r.end.branch != "" {
+			r.end.claim.Claim.Branch = r.end.branch
+		} else {
+			r.end.claim.Claim.Branch = ""
+		}
+		r.end.claim.CheckpointUnverified = at.evidenceUnverified
+		// CLA-637: the origin tip the verified branch check read. The
+		// review brief hands it to the reviewer as the revision to
+		// check out and record, and the seam matches the record's
+		// reviewedTip against it. Empty exactly when no tip could be
+		// read (branchless or unverified), which is when no tip can be
+		// demanded of the reviewer either.
+		r.end.claim.CheckpointTip = at.evidenceTip
+		// CLA-685: a HANDOFF is the one checkpoint this session's own
+		// exit did not earn — it holds only because the successor
+		// continues THIS phase, which the claim carried in as `prev`
+		// opened. So when the exit evidenced NOTHING (evidenceOK false)
+		// the verdict just folded above is its REFUSAL's, not a
+		// checkpoint's: the record gate zeroes the unverified mark even
+		// though the branch leg had established it. The successor then
+		// reads carried.CheckpointUnverified as false, is handed the
+		// VERIFIED continuation - "The driver verified the origin
+		// remote's tip ... as {{reviewedTip}}" - for a tip this driver
+		// never read, and the placeholder stays literal, since it is
+		// filled only when the tip is non-empty.
+		//
+		// The exit's verdict about the checkpoint is empty exactly when
+		// it read no tip of its own: an evidenced branch leg always
+		// brings a tip (the verified form), and a non-empty tip implies
+		// unverified=false — the verified continuation, whose
+		// {{reviewedTip}} that tip then fills. So the opening
+		// checkpoint's mark is the only true one there, and it rides
+		// forward, as the panel-member block in drainPhases rides a
+		// claim's resumption facts onto the claim it hands on.
+		//
+		// The tip is carried only for the branch it was read for — it
+		// is `prev`'s, and a claim that now names another one must not
+		// be handed a tip that never belonged to it. The BRANCH stays as
+		// folded: it is the live truth about where the work is. An exit
+		// that WAS evidenced keeps its own verdict untouched, so the
+		// verified path is unaffected.
+		if at.handoff != "" && !at.evidenceOK && prev != nil && r.end.claim.CheckpointTip == "" {
+			r.end.claim.CheckpointUnverified = prev.CheckpointUnverified
+			if r.end.claim.Claim.Branch == prev.Claim.Branch {
+				r.end.claim.CheckpointTip = prev.CheckpointTip
+			}
+		}
+	}
+	if at.handoff != "" {
+		log.Printf("%siteration %d: the session ended its final message with a handoff block, still holding %s — keeping the lease for its successor",
+			labelOf(t), drainNum, at.res.Claim.TaskID)
+	} else if r.end.branch != "" && at.evidenceUnverified {
+		// The cause is the CHECK not completing, named by evidenceWhy
+		// (the Unknown check's own detail) — never "the origin remote
+		// could not be read" asserted as fact: delivery.Unknown also
+		// covers a check that never reached the remote (a branch no
+		// local repository has, an ambiguous repo, no git on PATH), and
+		// the log must not contradict the detail it prints.
+		log.Printf("%siteration %d: phase reached an UNVERIFIED checkpoint holding %s (branch %s recorded, but it could not be verified on the origin remote: %s) — keeping the lease for the next phase; the review phase must verify the branch itself",
+			labelOf(t), drainNum, at.res.Claim.TaskID, r.end.branch, at.evidenceWhy)
+	} else if r.end.branch != "" {
+		log.Printf("%siteration %d: phase reached its checkpoint holding %s (branch %s verified on the origin remote) — keeping the lease for the next phase",
+			labelOf(t), drainNum, at.res.Claim.TaskID, r.end.branch)
+	} else {
+		// The plane-record forms of exit evidence (CLA-497): a no-code or
+		// already-settled task checkpoints with no branch to name.
+		log.Printf("%siteration %d: phase reached its checkpoint holding %s (exit evidenced by the plane's record — task left ready or declared a no-code delivery; no branch) — keeping the lease for the next phase",
+			labelOf(t), drainNum, at.res.Claim.TaskID)
+	}
+}
