@@ -63,6 +63,7 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// CLA-466: one iteration record posts at this drain's boundary, whatever way
 	// it ends — hence the defer, and hence state the deferred record reads.
 	defer s.recordIteration()
+walk:
 	for s.i = 0; s.i < len(phases); {
 		st := &seqStep{}
 		st.ph = phases[s.i]
@@ -75,46 +76,11 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 		// identity, not from a prompt that is no longer a brief.
 		st.panelMember = st.ph.IsPanelMember()
 		st.last = s.i == len(phases)-1
-		// CLA-639 M5: a BRANCHLESS task cannot run a panel AT ALL, so its panel
-		// is one reviewer. This shape's review record is the legacy `## Review`
-		// block written to the task's outcome — the plane accepts a durable
-		// record only from the task's live holder, and a settled task has none
-		// (question 03a12578, option 1) — so a second member could record nothing
-		// a durable round could hold, and the block it would append is the FIRST
-		// member's own record.
-		//
-		// CLA-784: that ONE reviewer is the first REQUIRED member, never blindly
-		// the first configured one. An optional (trial) seat is skipped here: its
-		// failure is that seat's own result, and if it consumed the single review
-		// slot a branchless task would be left with no required review at all
-		// (review 1.review-2.1 / 1.review-4.1). Validate refuses an all-optional
-		// panel, so a required seat always exists; the members after the chosen
-		// one are skipped, with one log line.
-		//
-		// The test is the claim CARRIED INTO this phase (`carried`), not
-		// `branchlessCheckpoint`: that flag is set at the seam from the claim the
-		// PREVIOUS phase was entered with, so it is still false at the FIRST
-		// panel member — exactly the position where the trial seat sits in the
-		// shape this finding names. `carried` is what `drainPhase` itself reads
-		// for `branchlessPanel` (`prev.Claim.Branch == ""`), so the two agree.
-		if st.panelMember && s.carried != nil && s.carried.Claim.Branch == "" {
-			if st.ph.IsOptionalPanelMember() {
-				log.Printf("%siteration %d: this task's checkpoint is BRANCHLESS (its review record is the legacy %q block, not a durable one), so its review panel runs ONE reviewer — skipping the OPTIONAL (trial) seat %s: the required seat is the one that must record",
-					labelOf(t), drainNum, config.ReviewRecordHeading, st.ph.Label(s.i))
-				s.i++
-				continue
-			}
-			if s.branchlessPanelRan {
-				if !s.branchlessPanelNoted {
-					log.Printf("%siteration %d: this task's checkpoint is BRANCHLESS (its review record is the legacy %q block, not a durable one), so the review panel runs ONE reviewer: %s",
-						labelOf(t), drainNum, config.ReviewRecordHeading, s.branchlessPanelChosen)
-					s.branchlessPanelNoted = true
-				}
-				s.i++
-				continue
-			}
-			s.branchlessPanelRan = true
-			s.branchlessPanelChosen = st.ph.Label(s.i)
+		switch s.skipBranchlessSeat(st) {
+		case seqContinue:
+			continue
+		case seqBreak:
+			break walk
 		}
 		// CLA-639: the panel's last member is the last REVIEW of the sequence even
 		// when a fix follows it, and the driver's plain-review seam must run for it

@@ -221,3 +221,61 @@ type seqStep struct {
 	end          phaseEnd
 	perr         error
 }
+
+// skipBranchlessSeat applies the branchless panel's one-reviewer rule: it skips an
+// optional seat, and every member after the one required reviewer that runs.
+func (s *drainSeq) skipBranchlessSeat(st *seqStep) seqNext {
+	t := s.t
+	drainNum := s.drainNum
+	// CLA-639 M5: a BRANCHLESS task cannot run a panel AT ALL, so its panel
+	// is one reviewer. This shape's review record is the legacy `## Review`
+	// block written to the task's outcome — the plane accepts a durable
+	// record only from the task's live holder, and a settled task has none
+	// (question 03a12578, option 1) — so a second member could record nothing
+	// a durable round could hold, and the block it would append is the FIRST
+	// member's own record.
+	//
+	// CLA-784: that ONE reviewer is the first REQUIRED member, never blindly
+	// the first configured one. An optional (trial) seat is skipped here: its
+	// failure is that seat's own result, and if it consumed the single review
+	// slot a branchless task would be left with no required review at all
+	// (review 1.review-2.1 / 1.review-4.1). Validate refuses an all-optional
+	// panel, so a required seat always exists; the members after the chosen
+	// one are skipped, with one log line.
+	//
+	// The test is the claim CARRIED INTO this phase (`carried`), not
+	// `branchlessCheckpoint`: that flag is set at the seam from the claim the
+	// PREVIOUS phase was entered with, so it is still false at the FIRST
+	// panel member — exactly the position where the trial seat sits in the
+	// shape this finding names. `carried` is what `drainPhase` itself reads
+	// for `branchlessPanel` (`prev.Claim.Branch == ""`), so the two agree.
+	if st.panelMember && s.carried != nil && s.carried.Claim.Branch == "" {
+		if st.ph.IsOptionalPanelMember() {
+			log.Printf("%siteration %d: this task's checkpoint is BRANCHLESS (its review record is the legacy %q block, not a durable one), so its review panel runs ONE reviewer — skipping the OPTIONAL (trial) seat %s: the required seat is the one that must record",
+				labelOf(t), drainNum, config.ReviewRecordHeading, st.ph.Label(s.i))
+			s.i++
+			return seqContinue
+		}
+		if s.branchlessPanelRan {
+			if !s.branchlessPanelNoted {
+				log.Printf("%siteration %d: this task's checkpoint is BRANCHLESS (its review record is the legacy %q block, not a durable one), so the review panel runs ONE reviewer: %s",
+					labelOf(t), drainNum, config.ReviewRecordHeading, s.branchlessPanelChosen)
+				s.branchlessPanelNoted = true
+			}
+			s.i++
+			return seqContinue
+		}
+		s.branchlessPanelRan = true
+		s.branchlessPanelChosen = st.ph.Label(s.i)
+	}
+	return seqFall
+}
+
+// seqNext says what the walk does after a stage.
+type seqNext int
+
+const (
+	seqFall     seqNext = iota // carry on to the next stage
+	seqContinue                // take the next pass without advancing past this one
+	seqBreak                   // end the walk
+)
