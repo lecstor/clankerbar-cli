@@ -41,7 +41,88 @@ type StepHarnessError struct {
 func (e *StepHarnessError) Error() string { return e.msg }
 
 // Validate normalizes path fields and checks the resolved config is runnable.
+//
+// The sections run in a fixed order and the first error wins: the harness
+// must be known before the MCP auto-fill, and later checks read fields
+// earlier ones fill in. Do not reorder.
 func (c *Config) Validate() error {
+	if err := c.normalizePaths(); err != nil {
+		return err
+	}
+	if err := c.validateHarnessNames(); err != nil {
+		return err
+	}
+	if err := c.validateLimits(); err != nil {
+		return err
+	}
+	if err := c.validatePrompt(); err != nil {
+		return err
+	}
+	if err := c.validateHarnessFlag(); err != nil {
+		return err
+	}
+	if err := c.validatePhaseHarnesses(); err != nil {
+		return err
+	}
+	if err := c.validateConflictStep(); err != nil {
+		return err
+	}
+	if err := c.validatePanelBounds(); err != nil {
+		return err
+	}
+	if err := c.validatePanelMembers(); err != nil {
+		return err
+	}
+	if err := c.validatePanelExpands(); err != nil {
+		return err
+	}
+	if err := c.validatePhaseClaimTracking(); err != nil {
+		return err
+	}
+	if err := c.validatePhaseShapes(); err != nil {
+		return err
+	}
+	if err := c.validateLastPhase(); err != nil {
+		return err
+	}
+	if err := c.validateFixPhase(); err != nil {
+		return err
+	}
+	if err := c.validateVerifyPhase(); err != nil {
+		return err
+	}
+	if err := c.validateReviewSuccessor(); err != nil {
+		return err
+	}
+	if err := c.resolveTopMCPConfig(); err != nil {
+		return err
+	}
+	if err := c.validateEndpoints(); err != nil {
+		return err
+	}
+	if err := c.validateHarnessMCPConfigs(); err != nil {
+		return err
+	}
+	if err := c.validateSettingsMode(); err != nil {
+		return err
+	}
+	if err := c.validateProjects(); err != nil {
+		return err
+	}
+	if err := c.validatePhaseProjectMCP(); err != nil {
+		return err
+	}
+	if err := c.validateEnvDeclarations(); err != nil {
+		return err
+	}
+	if err := c.validateEnvAllowlists(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// normalizePaths expands and absolutizes the run-wide and per-harness path fields; the workdir is pinned first because everything else is derived from it.
+func (c *Config) normalizePaths() error {
 	c.ConfigDir = expandHome(c.ConfigDir)
 	c.WorkDir = expandHome(c.WorkDir)
 	c.MCPConfigPath = expandHome(c.MCPConfigPath)
@@ -88,7 +169,11 @@ func (c *Config) Validate() error {
 		hc.SettingsPath = underWorkDir(expandHome(hc.SettingsPath), c.WorkDir)
 		c.Harnesses[name] = hc
 	}
+	return nil
+}
 
+// validateHarnessNames refuses an unknown top-level harness, then unknown `harnesses` and `budget.per_harness` keys, in that order.
+func (c *Config) validateHarnessNames() error {
 	// Validate against the harness registry (not a hand-kept switch) so the accepted
 	// set can never drift from what is actually registered — an unregistered value is
 	// rejected here before harness.Get is consulted, and a newly registered adapter is
@@ -122,6 +207,11 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("budget.per_harness[%q]: unknown harness (want: %s)%s", name, strings.Join(harness.Names(), ", "), retiredHarnessHint(name))
 		}
 	}
+	return nil
+}
+
+// validateLimits refuses negative counts and caps and an over-long instance name.
+func (c *Config) validateLimits() error {
 	if c.MaxTurns < 0 {
 		return errors.New("max_turns is negative")
 	}
@@ -152,6 +242,11 @@ func (c *Config) Validate() error {
 	if len(strings.TrimSpace(c.InstanceName)) > MaxInstanceNameLen {
 		return fmt.Errorf("instance_name exceeds %d characters (the plane's limit)", MaxInstanceNameLen)
 	}
+	return nil
+}
+
+// validatePrompt checks the prompt/phases pairing.
+func (c *Config) validatePrompt() error {
 	if len(c.Phases) == 0 && c.Prompt == "" {
 		return errors.New("prompt is empty")
 	}
@@ -169,6 +264,11 @@ func (c *Config) Validate() error {
 		return errors.New("config sets both `prompt` and `phases`; a phased task is asked its phase's prompt " +
 			"and never `prompt`, so remove one of them")
 	}
+	return nil
+}
+
+// validateHarnessFlag refuses --harness/--model alongside a per-phase harness config.
+func (c *Config) validateHarnessFlag() error {
 	// Phases rest entirely on the adapter observing the session's claim: the
 	// handback across a seam, the salvage, and the delivery check all gate on
 	// Result.Claim.Held(). An adapter that never populates it would not fail —
@@ -194,7 +294,11 @@ func (c *Config) Validate() error {
 				"belong to — edit the config's `harnesses` block instead", flag)
 		}
 	}
+	return nil
+}
 
+// validatePhaseHarnesses checks that every phase names a registered harness and, off the top-level harness, has a local block.
+func (c *Config) validatePhaseHarnesses() error {
 	// Every harness a phase names has to exist and, when it is not the top-level
 	// one, has to be configured. Checked before the claim-tracking rule below,
 	// which looks a phase's harness up in the registry.
@@ -233,6 +337,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// validateConflictStep checks the conflict-only session step.
+func (c *Config) validateConflictStep() error {
 	// The conflict-only session step (CLA-759). It names a harness the SUPERVISOR
 	// will start a session on, so it is held to the same two rules as a phase's
 	// own harness above: it must exist in the registry, and when it is not the
@@ -258,6 +367,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// validatePanelBounds checks the review panel is non-empty when it means something, its concurrency cap, and that it expands at most one built-in review phase.
+func (c *Config) validatePanelBounds() error {
 	// The review panel (CLA-639). Its members run one review phase each, so a
 	// member naming a harness is naming a harness the sequence will spawn on —
 	// held to the same two rules as a phase's own harness above, and refused
@@ -311,6 +425,11 @@ func (c *Config) Validate() error {
 				len(builtin), ReviewPhaseName, strings.Join(at, ", "))
 		}
 	}
+	return nil
+}
+
+// validatePanelMembers checks each review panel member: required seats, labels, names, harness and claim tracking.
+func (c *Config) validatePanelMembers() error {
 	panel := c.EffectivePanel()
 	// CLA-784: an OPTIONAL member is a TRIAL seat — a reviewer the operator is
 	// evaluating, whose failure is recorded against that seat and never blocks
@@ -417,6 +536,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// validatePanelExpands refuses a panel the sequence has no built-in non-final review phase to expand.
+func (c *Config) validatePanelExpands() error {
 	// A panel multiplies the review phase, so a config that names one but has a
 	// review phase it cannot multiply is two contracts for one sequence. Refused
 	// rather than resolved: a FINAL review runs the historical combined brief and
@@ -431,6 +555,11 @@ func (c *Config) Validate() error {
 			"`review_panel` for a single reviewer, or make the review built-in and give it a phase after it",
 			ReviewPhaseName, ReviewPhaseName)
 	}
+	return nil
+}
+
+// validatePhaseClaimTracking checks every phase of a multi-phase sequence runs on a claim-tracking harness.
+func (c *Config) validatePhaseClaimTracking() error {
 	// Phases rest on EVERY phase's adapter observing the session's claim, not only
 	// the claiming one's.
 	//
@@ -461,6 +590,11 @@ func (c *Config) Validate() error {
 				i, ph.Label(i), h)
 		}
 	}
+	return nil
+}
+
+// validatePhaseShapes checks each configured phase individually: prompt, name, limits, model/tier and first-phase placeholders.
+func (c *Config) validatePhaseShapes() error {
 	for i, ph := range c.Phases {
 		if ph.Prompt == "" && builtinPhasePrompts[ph.Name] == "" {
 			return fmt.Errorf("phases[%d]: no `prompt`, and %q is not a built-in phase name (built-ins: %s)",
@@ -512,6 +646,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// validateLastPhase refuses a sequence that ends on the implement brief.
+func (c *Config) validateLastPhase() error {
 	// A sequence whose last phase is the implement brief has no path to in_review:
 	// every task would stop half-finished, forever. Cheap to catch here, expensive
 	// to discover a night later.
@@ -522,6 +661,11 @@ func (c *Config) Validate() error {
 				n-1, ImplementPhaseName, ReviewPhaseName)
 		}
 	}
+	return nil
+}
+
+// validateFixPhase checks the built-in fix brief is last (or followed by verify) and preceded by a review.
+func (c *Config) validateFixPhase() error {
 	// The fix phase is the one that carries the branch-shaped terminal step (PR,
 	// in_review), so it must be LAST: a non-final fix would open the PR and hand
 	// the task over, and the phase after it would resume a task that has already
@@ -559,6 +703,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// validateVerifyPhase checks the built-in verify brief position, predecessor and the review before it.
+func (c *Config) validateVerifyPhase() error {
 	// The verification round (CLA-638) has one legal position and one legal
 	// predecessor. Position: LAST, because the driver repeats the fix→verify pair
 	// after it and a phase after the verifier would never be reached. Predecessor:
@@ -593,6 +742,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
+
+// validateReviewSuccessor checks a non-final built-in review is followed by the fix brief or a phase with its own prompt.
+func (c *Config) validateReviewSuccessor() error {
 	// A non-final BUILT-IN review names the phase after it as the one that applies
 	// its findings, and the driver's review→fix seam requires the review record to
 	// have been written. A built-in phase there that is NOT the fix brief cannot
@@ -613,7 +767,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
 
+// resolveTopMCPConfig defaults mcp_config_path to the workdir's .mcp.json and holds a discovered file to the discovered-file rule.
+func (c *Config) resolveTopMCPConfig() error {
 	// Default mcp_config_path to <workdir>/.mcp.json when that file exists. Claude's
 	// -p mode does NOT auto-discover .mcp.json, so without this a bare `clankerbar
 	// run` from a workdir that carries one would spawn sessions with no clankerbar
@@ -630,7 +788,11 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	return nil
+}
 
+// validateEndpoints settles the trusted origin and checks the URL and ref-name fields and the top-level MCP config.
+func (c *Config) validateEndpoints() error {
 	// Where the account-scoped API key is allowed to go, settled once, here
 	// (CLA-257). backlog_url is the operator's own statement of it and is held to
 	// the TLS floor; the workdir's .mcp.json is untrusted input and may not name a
@@ -680,6 +842,11 @@ func (c *Config) Validate() error {
 	if err := checkMCPConfigNamesClankerbar(c.MCPConfigPath, "mcp_config_path"); err != nil {
 		return err
 	}
+	return nil
+}
+
+// validateHarnessMCPConfigs checks each per-harness MCP config and settings file.
+func (c *Config) validateHarnessMCPConfigs() error {
 	// Each per-harness MCP config points the SAME account key at a host, so it is
 	// held to the same trusted origin. Sorted so a config with two bad blocks
 	// reports the same one every time rather than whichever the map iterated
@@ -717,7 +884,11 @@ func (c *Config) Validate() error {
 				name, err, hc.SettingsPath)
 		}
 	}
+	return nil
+}
 
+// validateSettingsMode refuses a group/other-writable settings file.
+func (c *Config) validateSettingsMode() error {
 	// The settings file IS the permission policy - the allow/deny rules that are
 	// the only thing gating what an unattended session may call, since there is no
 	// human to prompt. Holding the config file to a mode check and not this one
@@ -726,7 +897,11 @@ func (c *Config) Validate() error {
 	if err := refuseInsecureMode(c.SettingsPath, groupOtherWrite); err != nil {
 		return fmt.Errorf("settings_path: %w - it is the allow/deny policy the unattended session is gated by: chmod go-w %s", err, c.SettingsPath)
 	}
+	return nil
+}
 
+// validateProjects checks multi-project entries: slug, repos, paths and MCP configs.
+func (c *Config) validateProjects() error {
 	// The top-level repo map, for single-project configs (multi-project entries
 	// carry their own, checked in the loop below).
 	if err := validateRepos(c.Repos, "top level"); err != nil {
@@ -738,87 +913,100 @@ func (c *Config) Validate() error {
 	// the top-level one at invocation time — see loop.Target).
 	seen := make(map[string]bool, len(c.Projects))
 	for i := range c.Projects {
-		p := &c.Projects[i]
-		if p.Slug == "" {
-			return fmt.Errorf("projects[%d]: slug is required", i)
-		}
-		if err := validateRepos(p.Repos, fmt.Sprintf("projects[%d] (%s)", i, p.Slug)); err != nil {
+		if err := c.validateProject(i, seen); err != nil {
 			return err
-		}
-		if seen[p.Slug] {
-			return fmt.Errorf("projects: duplicate slug %q", p.Slug)
-		}
-		seen[p.Slug] = true
-		p.WorkDir = expandHome(p.WorkDir)
-		if p.WorkDir != "" {
-			// Absolute for the same reason the top-level workdir is, and so
-			// SessionWorkDirs can be compared against a state dir path lexically.
-			// Left empty when empty: that means "the top-level workdir", which is
-			// already absolute, and filling it in here would hide the fallback.
-			abs, err := filepath.Abs(p.WorkDir)
-			if err != nil {
-				return fmt.Errorf("projects[%d].workdir %s: %w", i, p.WorkDir, err)
-			}
-			p.WorkDir = abs
-		}
-		p.MCPConfigPath = expandHome(p.MCPConfigPath)
-		// Against the workdir the SESSIONS for this project get - its own, falling
-		// back to the top-level one, exactly as loop.Driver.invocation resolves it.
-		// See underWorkDir for why a relative path may not be left to the daemon's cwd.
-		effectiveWorkDir := p.WorkDir
-		if effectiveWorkDir == "" {
-			effectiveWorkDir = c.WorkDir
-		}
-		p.MCPConfigPath = mcpUnderWorkDir(p.MCPConfigPath, effectiveWorkDir)
-		if p.MCPConfigPath == "" {
-			p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
-			// Discovered, not named, exactly like the top-level default above —
-			// same rule, labelled with THIS field so the remedy names the line
-			// the operator actually adds, and allowlisted per THIS project
-			// (CLA-266).
-			if err := c.checkDiscoveredMCPConfig(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i), c.AllowLocalMCPServersFor(p.Slug)); err != nil {
-				return err
-			}
-		}
-		if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
-			return err
-		}
-		if err := checkMCPConfigNamesClankerbar(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
-			return err
-		}
-		if err := validateHealthURL(p.HealthURL, fmt.Sprintf("projects[%d].health_url", i)); err != nil {
-			return err
-		}
-		if err := validateIntegrationBranch(p.IntegrationBranch, fmt.Sprintf("projects[%d].integration_branch", i)); err != nil {
-			return err
-		}
-		if err := validatePRBase(p.PRBase, fmt.Sprintf("projects[%d].pr_base", i)); err != nil {
-			return err
-		}
-		// The slug decides which queue is POLLED; the .mcp.json decides which
-		// project the sessions WORK. If they disagree, the loop would gate on one
-		// project while draining another — a silent split-brain. Refuse it here.
-		if fromMCP := slugFromMCPURL(mcpURLFromConfig(p.MCPConfigPath)); fromMCP != "" && fromMCP != p.Slug {
-			return fmt.Errorf("projects[%d]: slug %q does not match its .mcp.json, which names /mcp/%s — the poll would gate on one project while sessions work another", i, p.Slug, fromMCP)
-		}
-		// The per-harness files get every check the project's own file just had:
-		// they are the same account key pointed at the same kind of host, and the
-		// same split-brain is available through any one of them.
-		for _, name := range sortedKeys(p.MCPConfigPaths) {
-			path := mcpUnderWorkDir(p.MCPConfigPaths[name], effectiveWorkDir)
-			p.MCPConfigPaths[name] = path
-			label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
-			if err := c.checkMCPConfigOrigins(path, label); err != nil {
-				return err
-			}
-			if err := checkMCPConfigNamesClankerbar(path, label); err != nil {
-				return err
-			}
-			if fromMCP := slugFromMCPURL(mcpURLFromConfig(path)); fromMCP != "" && fromMCP != p.Slug {
-				return fmt.Errorf("%s: slug %q does not match that file, which names /mcp/%s — the poll would gate on one project while sessions work another", label, p.Slug, fromMCP)
-			}
 		}
 	}
+	return nil
+}
+
+// validateProject checks one multi-project entry; seen carries the slugs already taken.
+func (c *Config) validateProject(i int, seen map[string]bool) error {
+	p := &c.Projects[i]
+	if p.Slug == "" {
+		return fmt.Errorf("projects[%d]: slug is required", i)
+	}
+	if err := validateRepos(p.Repos, fmt.Sprintf("projects[%d] (%s)", i, p.Slug)); err != nil {
+		return err
+	}
+	if seen[p.Slug] {
+		return fmt.Errorf("projects: duplicate slug %q", p.Slug)
+	}
+	seen[p.Slug] = true
+	p.WorkDir = expandHome(p.WorkDir)
+	if p.WorkDir != "" {
+		// Absolute for the same reason the top-level workdir is, and so
+		// SessionWorkDirs can be compared against a state dir path lexically.
+		// Left empty when empty: that means "the top-level workdir", which is
+		// already absolute, and filling it in here would hide the fallback.
+		abs, err := filepath.Abs(p.WorkDir)
+		if err != nil {
+			return fmt.Errorf("projects[%d].workdir %s: %w", i, p.WorkDir, err)
+		}
+		p.WorkDir = abs
+	}
+	p.MCPConfigPath = expandHome(p.MCPConfigPath)
+	// Against the workdir the SESSIONS for this project get - its own, falling
+	// back to the top-level one, exactly as loop.Driver.invocation resolves it.
+	// See underWorkDir for why a relative path may not be left to the daemon's cwd.
+	effectiveWorkDir := p.WorkDir
+	if effectiveWorkDir == "" {
+		effectiveWorkDir = c.WorkDir
+	}
+	p.MCPConfigPath = mcpUnderWorkDir(p.MCPConfigPath, effectiveWorkDir)
+	if p.MCPConfigPath == "" {
+		p.MCPConfigPath = discoverMCPConfig(effectiveWorkDir)
+		// Discovered, not named, exactly like the top-level default above —
+		// same rule, labelled with THIS field so the remedy names the line
+		// the operator actually adds, and allowlisted per THIS project
+		// (CLA-266).
+		if err := c.checkDiscoveredMCPConfig(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i), c.AllowLocalMCPServersFor(p.Slug)); err != nil {
+			return err
+		}
+	}
+	if err := c.checkMCPConfigOrigins(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+		return err
+	}
+	if err := checkMCPConfigNamesClankerbar(p.MCPConfigPath, fmt.Sprintf("projects[%d].mcp_config_path", i)); err != nil {
+		return err
+	}
+	if err := validateHealthURL(p.HealthURL, fmt.Sprintf("projects[%d].health_url", i)); err != nil {
+		return err
+	}
+	if err := validateIntegrationBranch(p.IntegrationBranch, fmt.Sprintf("projects[%d].integration_branch", i)); err != nil {
+		return err
+	}
+	if err := validatePRBase(p.PRBase, fmt.Sprintf("projects[%d].pr_base", i)); err != nil {
+		return err
+	}
+	// The slug decides which queue is POLLED; the .mcp.json decides which
+	// project the sessions WORK. If they disagree, the loop would gate on one
+	// project while draining another — a silent split-brain. Refuse it here.
+	if fromMCP := slugFromMCPURL(mcpURLFromConfig(p.MCPConfigPath)); fromMCP != "" && fromMCP != p.Slug {
+		return fmt.Errorf("projects[%d]: slug %q does not match its .mcp.json, which names /mcp/%s — the poll would gate on one project while sessions work another", i, p.Slug, fromMCP)
+	}
+	// The per-harness files get every check the project's own file just had:
+	// they are the same account key pointed at the same kind of host, and the
+	// same split-brain is available through any one of them.
+	for _, name := range sortedKeys(p.MCPConfigPaths) {
+		path := mcpUnderWorkDir(p.MCPConfigPaths[name], effectiveWorkDir)
+		p.MCPConfigPaths[name] = path
+		label := fmt.Sprintf("projects[%d].mcp_config_paths.%s", i, name)
+		if err := c.checkMCPConfigOrigins(path, label); err != nil {
+			return err
+		}
+		if err := checkMCPConfigNamesClankerbar(path, label); err != nil {
+			return err
+		}
+		if fromMCP := slugFromMCPURL(mcpURLFromConfig(path)); fromMCP != "" && fromMCP != p.Slug {
+			return fmt.Errorf("%s: slug %q does not match that file, which names /mcp/%s — the poll would gate on one project while sessions work another", label, p.Slug, fromMCP)
+		}
+	}
+	return nil
+}
+
+// validatePhaseProjectMCP checks a phase on a non-top-level harness has a per-project MCP config for every project.
+func (c *Config) validatePhaseProjectMCP() error {
 	// A phase on a harness other than the run's needs its own MCP config PER
 	// PROJECT, because that file carries both the schema (the harness's) and the
 	// slug (the project's). Falling back to the single
@@ -840,7 +1028,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
 
+// validateEnvDeclarations validates the session env declarations at all four levels.
+func (c *Config) validateEnvDeclarations() error {
 	// The session env declarations (CLA-462) are validated at all FOUR levels
 	// here — names and commands are static facts of the file, so a bad one is a
 	// config error, not a spawn-time surprise. Resolution itself happens fresh
@@ -864,7 +1056,11 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	return nil
+}
 
+// validateEnvAllowlists validates the inherited-env allowlists at all four levels.
+func (c *Config) validateEnvAllowlists() error {
 	// The inherited-env allowlists (CLA-714) are validated at all four levels
 	// too: a name that can never match, a duplicate, or an explicit empty list
 	// is a config error, not a spawn-time surprise.
