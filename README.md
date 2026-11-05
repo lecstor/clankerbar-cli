@@ -575,9 +575,9 @@ member's `model`. The top-level `model` and `models` stay plain strings — that
 the plane's stored schema — so on a single-harness config put the list in that
 harness's block.
 
-The switch is **sticky for the run, not per request**. The driver marks the
+The switch is **sticky across phases and restarts, not per request**. Marks are saved in the instance state dir as `ROUTE_MARKS`; delete that file to clear a mark you know is wrong. The driver marks the
 denied route until the reset the provider stated, or 30 minutes when it stated
-none, and later phases start on the route that worked; the run returns to the
+none, and later phases start on the route that worked; the instance returns to the
 free route at a phase boundary once the mark lifts, never mid-session. A
 transient 429 is not a switch — it stays on the retry ladder. When every route is
 denied the session is treated exactly as a limit always was: a rolling window is

@@ -5,19 +5,21 @@ package loop
 // The opencode adapter switches routes INSIDE one session: a usage limit on the
 // free route resumes the same session on the paid route and reports the switch on
 // Result.Raw (see harness.RouteFallback). This file is what makes the switch
-// STICKY across the run: it records a mark per denied route, keeps later phases
+// STICKY across the run AND across restarts (marks persist in the state dir, ROUTE_MARKS): it records a mark per denied route, keeps later phases
 // off a marked route until the mark lifts, and writes the switch to both logs
 // with the route, the reason and when the denied route is worth trying again.
 //
 // The mark's length is the provider's stated reset when it gave one, else the
 // same default interval the supervised wait probes at (config `poll_interval`,
 // 30 minutes). Nothing here waits: a marked route is simply not offered at the
-// next phase's spawn, so the run keeps working on the route that worked.
+// next phase's spawn, so the clanker keeps working on the route that worked.
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"time"
 
@@ -88,10 +90,14 @@ func (d *Driver) persistRouteMarksLocked() {
 // or corrupt one is logged and ignored, never fatal. Existing in-memory marks
 // are kept when later than the loaded ones.
 func (d *Driver) loadRouteMarks() {
-	if d.state == nil || !d.state.Exists(statedir.RouteMarksName) {
+	if d.state == nil {
 		return
 	}
 	b, err := d.state.ReadFile(statedir.RouteMarksName)
+	if errors.Is(err, os.ErrNotExist) {
+		log.Printf("no saved route marks in %s (first start, or none were set)", d.state.Path())
+		return
+	}
 	if err != nil {
 		log.Printf("ignoring saved route marks: %v", err)
 		return
@@ -114,6 +120,7 @@ func (d *Driver) loadRouteMarks() {
 		}
 		if current, ok := d.routeMarks[route]; !ok || until.After(current) {
 			d.routeMarks[route] = until
+			log.Printf("restored route mark: %s stays off until %s", route, routeRetryLabel(until))
 		}
 	}
 }
@@ -129,7 +136,7 @@ func (d *Driver) routeMarkExpiry(route string) (time.Time, bool) {
 	return until, true
 }
 
-// routableRoutes applies this run's marks to one phase's configured route list.
+// routableRoutes applies this instance's marks to one phase's configured route list.
 //
 // Unmarked routes are kept in configured order. When EVERY route is marked — a
 // phase that starts while the whole chain is still in its reset window — the

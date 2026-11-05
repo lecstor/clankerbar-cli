@@ -1,6 +1,7 @@
 package loop
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -77,12 +78,40 @@ func TestRouteMarks_CorruptFileIgnored(t *testing.T) {
 	}
 }
 
-// A missing marks file is the normal first start: no marks, no log noise.
-func TestRouteMarks_MissingFileIsQuiet(t *testing.T) {
+// A missing marks file is ignored and logged.
+func TestRouteMarks_MissingFileLogged(t *testing.T) {
 	d := routedDriver(t, &fakeAdapter{}, nil, routeFreeAlias, routePaidAlias)
 	logs := captureLogs(t)
 	d.loadRouteMarks()
-	if logs.String() != "" {
-		t.Errorf("unexpected log: %q", logs.String())
+	if !strings.Contains(logs.String(), "no saved route marks") {
+		t.Errorf("missing file not logged: %q", logs.String())
+	}
+}
+
+// Run itself loads the marks: a second Run over the same state dir spawns its
+// first phase on the fallback route.
+func TestRouteMarks_RunLoadsMarksAtStart(t *testing.T) {
+	dir := t.TempDir()
+	h1 := &fakeAdapter{steps: []invokeStep{{res: switchedResult(okResult(1, 0), routeFreeAlias, routePaidAlias, time.Now().Add(time.Hour))}}}
+	first := routedDriver(t, h1, nil, routeFreeAlias, routePaidAlias)
+	first.state = nil
+	first.cfg.StateDir = dir
+	first.cfg.MaxIterations = 1
+	if err := first.Run(context.Background()); err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if len(h1.invocations) == 0 || h1.invocations[0].Model != routeFreeAlias {
+		t.Fatalf("first run invocations: %+v", h1.invocations)
+	}
+	h2 := &fakeAdapter{steps: []invokeStep{{res: okResult(1, 0)}}}
+	second := routedDriver(t, h2, nil, routeFreeAlias, routePaidAlias)
+	second.state = nil
+	second.cfg.StateDir = dir
+	second.cfg.MaxIterations = 1
+	if err := second.Run(context.Background()); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if len(h2.invocations) == 0 || h2.invocations[0].Model != routePaidAlias {
+		t.Fatalf("second run invocations: %+v, want first spawn on %s", h2.invocations, routePaidAlias)
 	}
 }

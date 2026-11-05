@@ -573,6 +573,8 @@ func TestOpenAdoptsAPreSentinelStateDir(t *testing.T) {
 		// CLA-724: the supervisor's generated config and the in-flight half of
 		// its atomic reconcile-time rewrite. A crash between the write and the
 		// rename must not leave a dir the daemon refuses to adopt.
+		RouteMarksName:                  `{}`,
+		RouteMarksName + ".tmp":         `{}`,
 		MaterializedConfigName:          `{"instance_name":"one"}`,
 		MaterializedConfigName + ".tmp": `{"instance_name":"two"}`,
 		// CLA-701: the daemon's own log and the rotated siblings it keeps
