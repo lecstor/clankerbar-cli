@@ -42,10 +42,20 @@ import (
 // Draining is not free — the bytes still arrive — but it is a fixed cost with
 // nothing retained, and it buys an honest exit code.
 func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result, ceiling int, kill context.CancelFunc) {
+	// The no-output watchdog. Armed here because this is where the session's kill
+	// switch is in hand, and the stream below is what feeds it. It is always
+	// non-nil so the deferred stop can be unconditional; a zero bound leaves it
+	// disabled.
+	res.idle = newIdleGuard(res.maxIdle, res.maxToolCall, func(cause string) {
+		fmt.Fprintf(console, "\n!! %s - killing the session here instead of waiting on a silent child\n", cause)
+		kill()
+	})
+	defer res.idle.stop()
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), maxStreamLine) // a result event can be large
 	for sc.Scan() {
 		line := sc.Bytes()
+		res.idle.seen()
 		keep.Write(line)
 		keep.Write(newline)
 		c.renderAndParse(line, console, res)
@@ -78,7 +88,17 @@ func (c claude) consume(r io.Reader, console io.Writer, keep *tail, res *Result,
 			kill()
 			break
 		}
+		// The idle watchdog fires on its own goroutine, with the same reasons for
+		// ending the read here: the child is dying and whatever is still buffered
+		// arrived after the verdict.
+		if res.idle.tripped() != "" {
+			break
+		}
 	}
+	// Disarmed BEFORE the verdict is read: a timer that lands as the stream ends
+	// must not report a kill for a session that had already finished.
+	res.idle.stop()
+	res.IdleKilled = res.idle.tripped()
 	err := sc.Err()
 	if err == nil {
 		return
@@ -151,6 +171,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				fmt.Fprintf(console, "  → %s\n", b.Name)
 				noteToolUse(b.Name, b.ID, b.Input, res)
 				res.noteToolName(b.ID, b.Name)
+				res.idle.toolStarted(b.ID)
 			}
 		}
 		// The API's per-turn usage rides on the assistant event's message, and it
@@ -177,6 +198,7 @@ func (claude) renderAndParse(line []byte, console io.Writer, res *Result) {
 				continue
 			}
 			noteToolResult(res, b.ToolUseID, b.IsError, b.Content, console)
+			res.idle.toolFinished(b.ToolUseID)
 			// CLA-739: every tool, not only clankerbar's - a loop on any tool
 			// re-sends the context just the same. The error text is only read
 			// for a failed call; a success resets the streak whatever it says.

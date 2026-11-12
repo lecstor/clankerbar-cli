@@ -132,12 +132,13 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	//
 	// CLA-739 arms it too whenever the repeated-failure guard is armed, because
 	// that guard is a cancellation with no deadline, and a kill that can hang is
-	// not a kill either. What that changes for a session the guard never fires
-	// on: a grandchild still holding the pipes after opencode exits on its own
-	// now has Run return exec.ErrWaitDelay 5s later instead of blocking until the
+	// not a kill either. The idle watchdog is the same shape of cancellation, so
+	// it arms it too. What that changes for a session neither guard fires on: a
+	// grandchild still holding the pipes after opencode exits on its own now has
+	// Run return exec.ErrWaitDelay 5s later instead of blocking until the
 	// grandchild lets go - the CLA-414 branch below already reads that as the
 	// clean end it is.
-	if _, hasDeadline := sctx.Deadline(); hasDeadline || (in.MaxRepeatedToolFailures > 0 && !in.Probe) {
+	if _, hasDeadline := sctx.Deadline(); hasDeadline || ((in.MaxRepeatedToolFailures > 0 || in.MaxSessionIdle > 0) && !in.Probe) {
 		cmd.WaitDelay = 5 * time.Second
 	}
 
@@ -181,6 +182,10 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// here turns them red.
 	p := newOpencodeParse(in, console)
 	p.kill = loopKill
+	// The no-output watchdog, on the same cancellation the tool-loop kill uses.
+	// Armed after p.kill so its callback has the kill switch; a probe leaves it
+	// disabled.
+	p.armIdle(in)
 	captured := newCapture(p.line)
 	captured.attach(cmd, console)
 	// Taken before the spawn, so every message this process adds to the session
@@ -189,8 +194,17 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	started := time.Now()
 	runErr := cmd.Run()
 
+	// Disarmed BEFORE the verdict is read: a timer that lands as the process
+	// exits must not report a kill for a session that had already finished.
+	p.idle.stop()
 	res := captured.result("opencode")
 	p.finish(&res)
+	// A clean exit beat the kill: the session finished, so it was not a hang.
+	if runErr == nil {
+		res.IdleKilled = ""
+	} else {
+		res.IdleKilled = p.idleCause()
+	}
 
 	// Our own deadline, not the caller's: ctx.Err() distinguishes a session we
 	// cut off from a run-wide Ctrl-C / SIGTERM / supervised-wait cancellation,
@@ -216,11 +230,12 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 	// exit handling below needs: Run's error is the kill's, not the session's.
 	res.ToolLoop = p.observed.toolLoop.tripped()
 	loopKilled := runErr != nil && res.ToolLoop != ""
+	idleKilled := res.IdleKilled != ""
 
 	if ee, ok := runErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
-	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut && !loopKilled {
+	} else if errors.Is(runErr, exec.ErrWaitDelay) && !timedOut && !loopKilled && !idleKilled {
 		// The process exited cleanly on its own — ExitCode 0 — but a grandchild
 		// (a backgrounded build, a test run) inherited the output pipes and held
 		// them open past cmd.WaitDelay, so os/exec force-closed them and Run
@@ -242,14 +257,14 @@ func (o opencode) runSession(ctx context.Context, in Invocation, args []string) 
 		// later — so the noise is left standing rather than guarded against.
 		o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
 		return res, nil
-	} else if runErr != nil && !timedOut && !loopKilled {
+	} else if runErr != nil && !timedOut && !loopKilled && !idleKilled {
 		// A launch failure (bad PATH, unreadable config): nothing was emitted,
 		// so res is an honest zero, and the failure is real.
 		return res, runErr
 	} else if runErr != nil {
-		// Our own kill (the wall-clock cap, or CLA-739's repeated failing tool
-		// call): the child died on the cancel, so its error is the kill's and
-		// not a verdict. The marker above is the verdict.
+		// Our own kill (the wall-clock cap, the CLA-739 repeated failing tool
+		// call, or the idle watchdog): the child died on the cancel, so its error
+		// is the kill's and not a verdict. The marker above is the verdict.
 		res.ExitCode = -1
 	}
 	o.settleUsage(ctx, in, &res, started, isResumeArgs(args))
@@ -462,6 +477,11 @@ type opencodeParse struct {
 	// cancel of the run's own exec context; nil in the parser tests, where the
 	// guard still records its verdict and nothing is killed.
 	kill func()
+
+	// idle is the no-output watchdog, armed by runSession from the Invocation.
+	// nil in the parser tests; a probe gets a disabled guard, where every method
+	// is a no-op.
+	idle *idleGuard
 }
 
 // newOpencodeParse builds the parser a session streams into. It exists so the
@@ -485,7 +505,29 @@ func (p *opencodeParse) diag() io.Writer {
 	return p.console
 }
 
+// armIdle starts the no-output watchdog for this session. A probe is exempt: it
+// is a one-word liveness check, not a session doing work, and killing one for
+// silence would report a session-shaped verdict for something no phase ran. The
+// guard is always non-nil so stop can be deferred unconditionally; a zero bound
+// leaves it disabled.
+func (p *opencodeParse) armIdle(in Invocation) {
+	idle := in.MaxSessionIdle
+	if in.Probe {
+		idle = 0
+	}
+	p.idle = newIdleGuard(idle, in.MaxToolCallDuration, func(cause string) {
+		fmt.Fprintf(p.diag(), "\n!! %s - killing the session here instead of waiting on a silent child\n", cause)
+		if p.kill != nil {
+			p.kill()
+		}
+	})
+}
+
+// idleCause is the watchdog's verdict, "" unless it fired.
+func (p *opencodeParse) idleCause() string { return p.idle.tripped() }
+
 func (p *opencodeParse) line(line []byte) {
+	p.idle.seen()
 	trimmed := strings.TrimSpace(string(line))
 	if !strings.HasPrefix(trimmed, "{") {
 		return
@@ -589,18 +631,22 @@ func (p *opencodeParse) line(line []byte) {
 // noteTool feeds one tool event into the shared clankerbar observation, which is
 // what populates Result.Claim and the delivery Reports.
 //
-// Only a TERMINAL state is acted on, and that is FUTURE-PROOFING rather than a
-// filter this stream needs today: `opencode run --format json` forwards a tool
-// part only once it has settled (true of 1.x source, cli/cmd/run.ts, and of
-// every 2.0.32 stream recorded for this adapter), which is why the recorded
-// fixtures carry exactly one event per tool part. The check is here because the
-// status is the ONLY error flag
+// Only a TERMINAL state is acted on for that observation, and that is
+// FUTURE-PROOFING rather than a filter this stream needs today: `opencode run
+// --format json` forwards a tool part only once it has settled (true of 1.x
+// source, cli/cmd/run.ts, and of every 2.0.32 stream recorded for this adapter),
+// which is why the recorded fixtures carry exactly one event per tool part. The
+// check is here because the status is the ONLY error flag
 // opencode gives — there is no is_error sibling — so a version that started
 // forwarding in-flight parts would otherwise have us read a call that had not
 // returned as a success. An unrecognised status is ignored for the same reason:
 // the cost of being wrong that way is an unobserved claim (the driver hands the
 // task back — one expiring lease), against a claim recorded for a call that
 // failed, which is a task the driver believes it holds and does not.
+//
+// A part still in flight is not a claim, but it DOES open a tool call for the
+// idle watchdog: the session is working rather than hanging, and the call's own
+// cap bounds it (see idleGuard).
 //
 // A tool part is acted on ONCE. noteClaimed rebuilds Result.Claim wholesale, so
 // a re-delivered terminal event for a claim already settled by a later
@@ -626,18 +672,25 @@ func (p *opencodeParse) noteTool(part *opencodePart) {
 	if st == nil || part.ID == "" {
 		return
 	}
-	if st.Status != "completed" && st.Status != "error" {
-		return
-	}
-	// Replays are recognised by the part id, not the call id: the call id is
-	// the provider's and repeats across steps (see opencodePart), so keying on
-	// it would drop a later, genuine call. Taken for EVERY tool, ahead of the
-	// clankerbar filter, because the CLA-739 guard below counts every tool and
-	// a replayed failure must not count as a second one.
+	// The call's identity for the replay guard. Replays are recognised by the
+	// part id, not the call id: the call id is the provider's and repeats across
+	// steps (see opencodePart), so keying on it would drop a later, genuine call.
 	key := part.PartID
 	if key == "" {
 		key = part.ID
 	}
+	// A part still in flight opens a tool call for the idle watchdog: the
+	// session is working rather than hanging, and the call's own cap bounds it.
+	// Keyed like the replay guard, so the running and settled events for one
+	// call always name the same id.
+	if st.Status == "running" {
+		p.idle.toolStarted(key)
+		return
+	}
+	if st.Status != "completed" && st.Status != "error" {
+		return
+	}
+	p.idle.toolFinished(key)
 	if p.settledCalls[key] {
 		return
 	}

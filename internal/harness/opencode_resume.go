@@ -246,6 +246,12 @@ func mergeResume(base *Result, add Result) {
 	if add.ToolLoop != "" && base.ToolLoop == "" {
 		base.ToolLoop = add.ToolLoop
 	}
+	// The idle watchdog's verdict folds the same way: a continuation killed for
+	// silence is how the merged session ended, and its cause must survive the
+	// merge or the driver would see an unexplained exit.
+	if add.IdleKilled != "" && base.IdleKilled == "" {
+		base.IdleKilled = add.IdleKilled
+	}
 	base.Tokens += add.Tokens
 	base.CostUSD += add.CostUSD
 	// A resurrection is part of the SAME session, so a clankerbar call the

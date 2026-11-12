@@ -55,8 +55,10 @@ func newSessionResult(in Invocation) Result {
 	// CLA-739: never on a probe. A probe is a one-word liveness check with its
 	// tools denied, so it has no tool calls to repeat, and a probe killed for a
 	// "loop" would report a session-shaped verdict for something no phase ran.
+	// The idle watchdog's bounds travel the same way, and for the same reason.
 	if !in.Probe {
 		res.toolLoop = newToolLoopGuard(in.MaxRepeatedToolFailures)
+		res.maxIdle, res.maxToolCall = in.MaxSessionIdle, in.MaxToolCallDuration
 	}
 	return res
 }
@@ -195,15 +197,21 @@ func (c claude) Invoke(ctx context.Context, in Invocation) (Result, error) {
 	// scope alone, a scan taken any earlier would freeze an answer built from an
 	// empty Stdout for the whole session.
 	res.scans = newScanCache()
+	// Unlike opencode, consume stopped reading when the guard tripped, so a child
+	// that then exited 0 left events unparsed: keep the cause and say so.
+	if waitErr == nil && res.IdleKilled != "" {
+		res.markUntrusted("the idle watchdog fired (" + res.IdleKilled + ") and claude's stream was not read " +
+			"to the end, so this session's spend, final message and claim settlement may be incomplete")
+	}
 	if ee, ok := waitErr.(*exec.ExitError); ok {
 		res.ExitCode = ee.ExitCode()
 		res.ExitSignal = exitSignal(ee)
-	} else if waitErr != nil && !c.TokenCeilingHit(res) && res.ToolLoop == "" {
+	} else if waitErr != nil && !c.TokenCeilingHit(res) && res.ToolLoop == "" && res.IdleKilled == "" {
 		return res, waitErr // couldn't run claude at all
 	} else if waitErr != nil {
-		// Our own kill (the ceiling, or CLA-739's repeated failing tool call):
-		// the child died on the cancel, and its exit code is the kill's, not a
-		// verdict. The marker is the verdict.
+		// Our own kill (the ceiling, the idle watchdog, or CLA-739's repeated
+		// failing tool call): the child died on the cancel, and its exit code is
+		// the kill's, not a verdict. The marker is the verdict.
 		res.ExitCode = -1
 	}
 	return res, nil

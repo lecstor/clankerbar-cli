@@ -107,11 +107,11 @@ func (o opencode) Invoke(ctx context.Context, in Invocation) (Result, error) {
 		// Never resurrect a probe: a probe IS the liveness check.
 		return res, nil
 	}
-	if res.ToolLoop != "" {
-		// CLA-739: killed for repeating a failing tool call. Neither recovery
-		// below applies - a stall resume or a resurrection continues the same
-		// transcript, which is the one that was looping, at the price of
-		// re-sending all of it.
+	if res.ToolLoop != "" || res.IdleKilled != "" {
+		// CLA-739 / the idle watchdog: killed for a cause of the adapter's own.
+		// Neither recovery below applies - a stall resume or a resurrection
+		// continues the same transcript, and the session was not silently dead,
+		// it was stopped. Resuming would re-send all of it at full price.
 		return res, nil
 	}
 	console := in.Console
