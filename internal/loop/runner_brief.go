@@ -27,9 +27,17 @@ func runnerPrompt(prompt string, rb *runnerBriefing, panelMember bool) string {
 	if rb == nil || panelMember {
 		return prompt
 	}
+	return runnerBriefSwap(prompt, rb.closeOut)
+}
+
+// runnerBriefSwap is the one mapping from a shipped brief to its runner
+// counterpart. It exists apart from runnerPrompt for the caller that must name a
+// phase's runner brief WITHOUT a briefing: the done-report note a handoff
+// successor is given is chosen from the captured phase, not from a live spawn.
+func runnerBriefSwap(prompt string, closeOut bool) string {
 	switch prompt {
 	case config.BuiltinImplementBrief():
-		if rb.closeOut {
+		if closeOut {
 			return config.RunnerCloseOutBrief()
 		}
 		return config.RunnerImplementBrief()

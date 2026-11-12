@@ -96,8 +96,10 @@ func (s *drainSeq) buildHandoffPrompt(st *seqStep) seqNext {
 		}
 		if s.runnerClaimed {
 			// The runner holds the lease and the worktree, so the successor must
-			// not resume the run itself nor fetch a skill page.
-			st.ph.Prompt = config.RunnerHandoffPreamble + s.nextPrompt + config.RunnerHandoffContinuation(continuation)
+			// not resume the run itself nor fetch a skill page. The report note
+			// rides last because a successor's prompt is the predecessor's own
+			// text, not a brief: without it the successor would write nothing.
+			st.ph.Prompt = config.RunnerHandoffPreamble + s.nextPrompt + config.RunnerHandoffContinuation(continuation) + s.runnerDoneNote()
 		} else {
 			st.ph.Prompt = config.HandoffPreamble + s.nextPrompt + continuation
 		}
@@ -105,6 +107,18 @@ func (s *drainSeq) buildHandoffPrompt(st *seqStep) seqNext {
 	}
 
 	return seqFall
+}
+
+// runnerDoneNote is the done-report format the handoff successor of the phase at
+// s.i must be told, "" for a phase whose runner brief writes no report (a
+// close-out, a panel member, a custom prompt).
+func (s *drainSeq) runnerDoneNote() string {
+	if s.i < 0 || s.i >= len(s.phases) {
+		return ""
+	}
+	ph := s.phases[s.i]
+	rb := &runnerBriefing{closeOut: s.closeOut && s.i == s.start}
+	return config.RunnerDoneReportFor(resolvedRunnerBrief(ph.Prompt, rb, ph.IsPanelMember(), s.carried))
 }
 
 // checkPhaseBoundary runs the budget breaker at a phase boundary, before a

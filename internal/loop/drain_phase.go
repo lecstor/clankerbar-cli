@@ -136,6 +136,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		last: last, prev: prev, prior: prior, phases: phases, panel: panel, opts: opts,
 		shape: shape, a: a, spawnDir: spawnDir, prBase: prBase, briefedTask: briefedTask,
 		fixGrading: fixGrading, verifyDigest: verifyDigest, review: review, end: end,
+		// From the CAPTURED sequence, so a handoff successor (whose ph.Prompt is
+		// the predecessor's successor text) still expects its phase's report.
+		kind: reportKindFor(phases, phaseIdx, opts.runner, panelMember, prev),
 	}
 	for {
 		at := &phaseAttempt{}
@@ -183,6 +186,16 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 			return r.result(r.endRunLost(at))
 		}
 		r.classifyHandoff(at)
+		// The session made no plane writes: its done report becomes the task's
+		// records here, before the evidence gate judges them. A successor that
+		// takes over from a handoff does the same for its own report.
+		r.applyDoneReport(ctx, at)
+		// classifyHandoff judged canCheckpoint on the claim as the session left
+		// it; a park or hand-over the runner just wrote settled it, and a settled
+		// task must not be carried into the next phase.
+		if !at.res.Claim.Held() {
+			at.canCheckpoint = false
+		}
 		// CLA-457: held-ness alone must never advance the seam. Since CLA-358 the
 		// driver's lease renewer renews a claim for a session's whole lifetime, so
 		// ANY session that claimed ends held — "still holding" is a constant, not

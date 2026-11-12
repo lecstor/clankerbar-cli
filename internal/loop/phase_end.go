@@ -235,6 +235,15 @@ type phaseEnd struct {
 	// driver says loudly rather than mistaking for a hand-over.
 	verifyStatus string
 
+	// reportProblem is why a runner-claimed session's done report became no
+	// records: missing, unreadable, invalid, or a write the plane refused. The
+	// seam gates append it to their own "no record matched" reason, because a
+	// phase that wrote nothing looks identical either way.
+	reportProblem string
+	// doneReport is the verification round's report, kept so the hand-over can
+	// carry its risk declaration after the round is closed.
+	doneReport *config.DoneReport
+
 	// sequenceEnd, when non-nil, reports that this RESUMED phase ended the
 	// sequence without completing it, and the RUN must not end with it. Two
 	// arms produce it: a ROLLING usage limit (CLA-631) and a TRANSIENT failure

@@ -95,6 +95,9 @@ func (r *phaseRun) buildInvocation(at *phaseAttempt) attemptVerdict {
 		// not a blip — so it fails the phase like a bad spawnDir does.
 		return attemptVerdict{next: attemptReturn, zeroSpend: true, err: fmt.Errorf("iteration %d: phase %q: refusing to spawn: %w", drainNum, ph.Label(phaseIdx), at.ierr)}
 	}
+	// Who this session is, for the record its done report becomes: resolved from
+	// the same inputs invocationFor filled the attribution placeholders from.
+	at.attr, at.role = d.doneAttribution(t, ph, phases, phaseIdx, at.inv)
 	// The graded list is PREPENDED after placeholder substitution, never
 	// run through the one-pass replacer: it is driver-read text from the
 	// plane, and a finding quoting `{{model}}` must stay a quote.

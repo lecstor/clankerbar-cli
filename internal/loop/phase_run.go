@@ -34,6 +34,11 @@ type phaseRun struct {
 	fixGrading   string
 	verifyDigest string
 
+	// The done-report contract of a runner-claimed phase: which report the phase
+	// expects, and the one-shot note for a plane client that cannot write.
+	kind              reportKind
+	reportWriterNoted bool
+
 	// Spend the ladder has counted so far, and the phase's disposition.
 	tokens int
 	cost   float64
@@ -168,6 +173,8 @@ type phaseAttempt struct {
 	evidenceUnverified bool
 	evidenceWhy        string
 	evidenceTip        string
+	attr               config.Attribution
+	role               string
 	empty              bool
 	noMCPNow           bool
 	retryNoMCP         bool
