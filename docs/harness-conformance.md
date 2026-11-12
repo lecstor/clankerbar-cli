@@ -30,7 +30,7 @@ limit for ~82s before it exits).
 | Test | Asserts |
 |---|---|
 | `_stop` | A plain answer exits 0 with the final message; usage comes from the session export (the stream carries none), title generation included; cost matches the model's `cost` block; `finish_reason` is `stop`. |
-| `_permissions/drain` | Under the adapter's policy, `webfetch`, `websearch`, `execute`, `question`, `skill` and `subagent` are not offered; a write and a shell command inside the workdir land; a write outside it and a read of `/etc/hosts` are refused by `external_directory`. Logs whether a shell command can still write outside the workdir (the accepted gap, docs/opencode-build.md). |
+| `_permissions/drain` | Under the adapter's policy, `webfetch`, `websearch`, `execute`, `question`, `subagent` and the 2.2.x `opencode_*` built-ins (except the two MCP resource reads, which must be offered) are not offered; `skill` (which 2.2.x offers regardless) is refused when called, and `opencode_worktree_remove` does not delete a directory opencode did not create; a write and a shell command inside the workdir land; a write outside it and a read of `/etc/hosts` are refused by `external_directory`. Logs whether a shell command can still write outside the workdir (the accepted gap, docs/opencode-build.md). |
 | `_permissions/readonly` | A probe-shaped run is offered no `edit`, `write` or `shell`, and writes nothing. |
 | `_permissions/ambient *` | A project opencode.json in the session's checkout carrying `agent.build.permission`, `agents.build.permissions`, `default_agent` or a top-level `permission` that allows everything leaves out-of-tree reads/writes refused, webfetch/subagent unoffered, and in-tree writes working. |
 | `_permissions/pattern` | Last-match-wins: `shell: {"*":"allow","git push*":"deny"}` denies the push and runs the other command. The policy's ordering depends on this. |
@@ -39,7 +39,7 @@ limit for ~82s before it exits).
 | `_mcpDisable` | A full MCP entry with the off switch stops a server the global config declares; a partial one (no `type`) is logged as leaving it running. |
 | `_resume` | `-s <sid>` continues the same session headlessly, the resumed run is charged only its own requests, and the session holds both turns. |
 | `_errors` | 401 -> `provider.auth`, not transient; unknown model -> `provider.no-route`, no request sent, not transient; 429 -> `provider.rate-limit`, transient. None reports usage. |
-| `_recoveredProviderError` | The #43622 stream shape (every `finish_reason` null, then `[DONE]`): 2.0.32 emits `provider.invalid-output`, RETRIES the request itself, finishes the turn — and exits **1** anyway. The adapter records the recovered events and classifies the session as neither transient nor failed (CLA-700). |
+| `_recoveredProviderError` | The #43622 stream shape (every `finish_reason` null, then `[DONE]`): opencode RETRIES the request itself and finishes the turn. 2.0.32 emits a `provider.invalid-output` error event and exits **1** anyway, and the adapter records the recovered events (CLA-700). 2.2.x emits a `retry` event carrying the error and exits 0; the adapter counts that as recovered too. Either way the session is neither transient nor failed. |
 | `_contentPin` | `OPENCODE_CONFIG_CONTENT` wins over `OPENCODE_CONFIG`. The permission policy and the Code Mode rewrite live in that layer. |
 
 ## How the hermetic harness works

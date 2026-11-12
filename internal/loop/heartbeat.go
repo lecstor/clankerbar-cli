@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"sync"
 	"time"
 
 	"github.com/lecstor/clankerbar-cli/internal/harness"
@@ -110,6 +111,10 @@ type leaseRenewer struct {
 	// contract, so a failed report is the Reporter's to log and drop, and there
 	// is nothing a caller could do with the failure anyway.
 	presence func()
+	// onLost, when non-nil, is called once when the plane says the run is gone
+	// (plane.ErrRunLost): the session is working a task that is not its own, so
+	// the caller ends it instead of waiting for the lease to lapse.
+	onLost func(error)
 }
 
 // startLeaseRenewal begins renewing the spawned session's claim lease and
@@ -125,7 +130,10 @@ type leaseRenewer struct {
 // tick also sends a presence beacon (CLA-771).
 //
 // The returned renewer's stop() must be called when Invoke returns.
-func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *harness.Invocation, prefix string) *leaseRenewer {
+//
+// onLost is called once if the plane refuses a renewal because the run no longer
+// holds its task; it is how a caller ends the session at once (see run).
+func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *harness.Invocation, prefix string, onLost func(error)) *leaseRenewer {
 	if t.Releaser == nil || inv.Probe {
 		return nil
 	}
@@ -144,6 +152,7 @@ func (d *Driver) startLeaseRenewal(ctx context.Context, ti int, t Target, inv *h
 		claims:   make(chan harness.Claim, 4),
 		done:     make(chan struct{}),
 		stopped:  make(chan struct{}),
+		onLost:   onLost,
 		// CURRENT_CLAIM (CLA-708): the same observation seam, a third consumer.
 		// The project rides along because a claim file outlives this process and
 		// the supervisor needs the endpoint the claim belongs to.
@@ -255,8 +264,9 @@ func (r *leaseRenewer) apply(c, current harness.Claim) harness.Claim {
 // itself), follow the claim as the session settles one task and claims the
 // next, and exit on cancellation or stop().
 //
-// The BEAT stands down - permanently, for this renewer - on a not-wired plane
-// or heartbeatGiveUp consecutive failures. The TICK does not: it keeps firing
+// The BEAT stands down - permanently, for this renewer - on a not-wired plane,
+// on plane.ErrRunLost (the run no longer holds the task, so the caller ends the
+// session), or on heartbeatGiveUp consecutive failures. The TICK does not: it keeps firing
 // for the rest of the Invoke so the presence beacon still goes out every
 // interval (CLA-771). Two transports, two fates: the MCP heartbeat may be
 // refusing (an older plane with no tool, a broken MCP transport) while the
@@ -360,6 +370,16 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 				stoodDown = true
 			case ctx.Err() != nil:
 				return
+			case errors.Is(err, plane.ErrRunLost):
+				// The plane says this run no longer holds the task: taken over,
+				// reclaimed, released or withheld. Retrying cannot get the lease
+				// back, and every further second is a session doing work that is
+				// someone else's - so end it now, once.
+				log.Printf("%sthe plane refused the lease renewal: %v - this run no longer holds the task, ending the session", r.prefix, err)
+				stoodDown = true
+				if r.onLost != nil {
+					r.onLost(err)
+				}
 			default:
 				failures++
 				log.Printf("%slease renewal failed (%d in a row): %v", r.prefix, failures, err)
@@ -374,17 +394,60 @@ func (r *leaseRenewer) run(ctx context.Context, current harness.Claim) {
 	}
 }
 
+// leaseLoss records what the renewer's onLost fired with. It holds the error
+// because the callback runs on the renewer goroutine: stop() may time out before
+// it fires, and the caller must still be able to read it after Invoke returns.
+type leaseLoss struct {
+	mu  sync.Mutex
+	val error
+}
+
+func (l *leaseLoss) record(err error) {
+	l.mu.Lock()
+	l.val = err
+	l.mu.Unlock()
+}
+
+func (l *leaseLoss) cause() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.val
+}
+
+// renewalCause is why the renewer ended this session, nil when it did not. The
+// plane's refusal wins over the derived cause, and an unjoined renewer fails
+// closed: it may still say the run was lost, so the attempt is not salvageable.
+func renewalCause(sctx context.Context, joined bool, lost error) error {
+	switch {
+	case lost != nil:
+		return lost
+	case sctx.Err() != nil:
+		return context.Cause(sctx)
+	case !joined:
+		return errRenewalUnresolved
+	}
+	return nil
+}
+
+// errRenewalUnresolved is why an attempt is treated as run-lost when the
+// renewer could not be joined: fail closed - no salvage, no handback - because
+// whether the run still holds the task is unknown.
+var errRenewalUnresolved = errors.New("the lease renewal could not be joined, so whether the run still holds the task is unknown")
+
 // stop ends the renewer and waits - bounded, so a wedged renewal call cannot
-// stall the attempt ladder - for the goroutine to exit. Nil-safe, so the
-// Invoke call site needs no conditional.
-func (r *leaseRenewer) stop() {
+// stall the attempt ladder - for the goroutine to exit. It reports whether the
+// goroutine was actually joined (true also for a nil renewer): a false means the
+// renewer may still fire onLost after the caller has read the session's state.
+func (r *leaseRenewer) stop() bool {
 	if r == nil {
-		return
+		return true
 	}
 	close(r.done)
 	select {
 	case <-r.stopped:
+		return true
 	case <-time.After(heartbeatBeatTimeout + 5*time.Second):
+		return false
 	}
 }
 

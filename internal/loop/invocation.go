@@ -47,12 +47,16 @@ import (
 // brief — phase 1, claim-free at spawn time — is itself one of the carriers, in
 // its resumed-work rule. Empty leaves the placeholder standing, like the rest.
 //
+// runner is the runner-claimed briefing, nil for the session-claim path: it
+// swaps the shipped briefs for the ones that assume the runner already holds the
+// claim, and names the branch a fresh claim has not recorded yet.
+//
 // phases is the sequence as CAPTURED when the drain started, and supplies every
 // positional/attribution fact here — the "PHASE i of N" total and the previous
 // phase's harness/model. A RELOAD applied inside a wait swaps the live config
 // under an in-flight sequence (CLA-664), and the sequence must keep its own
 // shape and attribution until the next drain.
-func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase) (harness.Invocation, error) {
+func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *harness.Result, spawnDir, prBase string, phases []config.Phase, runner *runnerBriefing) (harness.Invocation, error) {
 	tc := d.targetCfg(t)
 	inv, err := d.invocationOn(t, tc.HarnessFor(ph), false)
 	if err != nil {
@@ -82,6 +86,8 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	inv.MaxSessionWallClock = ph.MaxWallClock.Duration()
 	// CLA-739: the repeated-failing-tool-call kill. Default on (5), 0 off.
 	inv.MaxRepeatedToolFailures = tc.RepeatedToolFailureBound()
+	// The no-output watchdog, armed per harness: its adapter enforces the bounds, the loop only resolves them.
+	inv.MaxSessionIdle, inv.MaxToolCallDuration = tc.SessionIdleFor(tc.HarnessFor(ph))
 	inv.Prompt = ph.Prompt
 	// The phase's tier, or the run-wide model when it names none. Reported when a
 	// tier was named and resolved to nothing, because that is a typo in the
@@ -200,43 +206,8 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// durable one), so the first member keeps the shipped no-code brief and
 		// the driver skips the members after it (see drainPhases).
 		panelMember := phaseIdx < len(phases) && phases[phaseIdx].IsPanelMember()
-		switch {
-		case prompt == config.ReviewOnlyBrief():
-			switch {
-			case prev.Claim.Branch == "":
-				prompt = config.NoCodeReviewOnlyBrief()
-			case prev.CheckpointUnverified:
-				if panelMember {
-					prompt = config.PanelMemberUnverifiedReviewOnlyBrief()
-				} else {
-					prompt = config.UnverifiedReviewOnlyBrief()
-				}
-			case panelMember:
-				prompt = config.PanelMemberReviewOnlyBrief()
-			}
-		case prompt == config.BuiltinReviewBrief():
-			switch {
-			case prev.Claim.Branch == "":
-				prompt = config.NoCodeReviewBrief()
-			case prev.CheckpointUnverified:
-				prompt = config.UnverifiedReviewBrief()
-			}
-		case prompt == config.FixBrief() && prev.Claim.Branch == "":
-			// The FIX phase has no unverified variant: its brief asserts no
-			// verification at all. It reads the review's record (which names the
-			// hand-off's real state) and its reviewed-tip comparison fails closed
-			// when the branch is missing, so a variant would only restate what the
-			// record already says.
-			prompt = config.NoCodeFixBrief()
-		case prompt == config.FixVerifyBrief() && prev.Claim.Branch == "":
-			// Same for the fix phase that a verification round follows, in the
-			// shape whose fix is a record amendment.
-			prompt = config.NoCodeFixVerifyBrief()
-		case prompt == config.VerifyBrief() && prev.Claim.Branch == "":
-			// A verification round on a branchless checkpoint has no code delta
-			// to re-review; its brief adjudicates the record's findings.
-			prompt = config.NoCodeVerifyBrief()
-		}
+		prompt = variantPrompt(prompt, prev, panelMember)
+		prompt = runnerPrompt(prompt, runner, panelMember)
 		inv.Prompt = prompt
 		// Seed the claim as well as the prompt. The session is told not to claim,
 		// so the adapter would observe none — and Result.Claim.Held() is what gates
@@ -263,27 +234,14 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 	// mid-drain must not rewrite the "PHASE i of N" text of the sequence already
 	// in flight, nor attribute the previous phase to a shape it never ran.
 	phaseTotal := len(phases)
-	prevHarness, prevModel := "", ""
-	prevIdx := phaseIdx - 1
-	// CLA-639: inside a review panel every member's predecessor is the member
-	// before it, but the review briefs name {{prevHarness}}/{{prevModel}} as the
-	// IMPLEMENTER whose work is being judged. Walk back past the panel to the
-	// last non-review phase, so member 2 does not accuse member 1 of having
-	// implemented the branch. For the shipped single review this changes
-	// nothing: the phase before it is the implement phase.
-	for prevIdx >= 0 && config.ReviewShaped(phases[prevIdx].Prompt) && phases[prevIdx].IsPanelMember() {
-		prevIdx--
-	}
-	if prevIdx >= 0 && prevIdx < len(phases) {
-		prevPh := phases[prevIdx]
-		prevHarness = tc.HarnessFor(prevPh)
-		prevModel, _ = tc.ModelForPhase(prevPh)
-	}
+	// The attribution the brief renders and the done report's record is signed
+	// with are resolved once, together, so the two can never disagree.
+	attr, role := d.doneAttribution(t, ph, phases, phaseIdx, inv)
 	repl := []string{
-		config.PhaseHarnessPlaceholder, attributionOr(tc.HarnessFor(ph), "unknown harness"),
-		config.PhaseModelPlaceholder, attributionOr(inv.Model, "harness default"),
-		config.PhasePrevHarnessPlaceholder, attributionOr(prevHarness, "unknown harness"),
-		config.PhasePrevModelPlaceholder, attributionOr(prevModel, "harness default"),
+		config.PhaseHarnessPlaceholder, attributionOr(attr.Harness, "unknown harness"),
+		config.PhaseModelPlaceholder, attributionOr(attr.Model, "harness default"),
+		config.PhasePrevHarnessPlaceholder, attributionOr(attr.PrevHarness, "unknown harness"),
+		config.PhasePrevModelPlaceholder, attributionOr(attr.PrevModel, "harness default"),
 		config.PhaseNumberPlaceholder, strconv.Itoa(phaseIdx + 1),
 		config.PhaseTotalPlaceholder, strconv.Itoa(phaseTotal),
 	}
@@ -291,10 +249,16 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		repl = append(repl, config.PhasePRBasePlaceholder, prBase)
 	}
 	if prev != nil && prev.Claim.Held() {
+		branch := verifiedBranch(prev)
+		if branch == "" && runner != nil && (inv.Prompt == config.RunnerImplementBrief() || inv.Prompt == config.RunnerCloseOutBrief()) {
+			// A fresh claim has no recorded branch yet; the runner created the
+			// worktree on the plane's name.
+			branch = runner.task.Branch
+		}
 		repl = append(repl,
 			config.PhaseTaskPlaceholder, prev.Claim.TaskID,
 			config.PhaseRunPlaceholder, prev.Claim.RunID,
-			config.PhaseBranchPlaceholder, verifiedBranch(prev),
+			config.PhaseBranchPlaceholder, branch,
 		)
 		// CLA-637: the durable review record's identity. The role is the
 		// driver's assignment for THIS phase, and the tip is the origin commit
@@ -306,7 +270,7 @@ func (d *Driver) invocationFor(t Target, phaseIdx int, ph config.Phase, prev *ha
 		// checkpoint has one: the unverified and branchless variants carry no
 		// {{reviewedTip}} at all, and the verified variant is only ever chosen
 		// for a checkpoint whose verified branch check read a tip.
-		if role := reviewerRoleFor(phases, phaseIdx); role != "" {
+		if role != "" {
 			repl = append(repl, config.ReviewerRolePlaceholder, role)
 		}
 		if prev.CheckpointTip != "" {
@@ -617,4 +581,49 @@ func absOrSelfPath(dir string) string {
 		return abs
 	}
 	return dir
+}
+
+// variantPrompt swaps a built-in brief for the variant the carried checkpoint
+// needs (branchless, unverified, panel member). It is the one place that
+// decision is made, so the report kind and the handoff note see the brief the
+// session actually ran. prev must be a held claim.
+func variantPrompt(prompt string, prev *harness.Result, panelMember bool) string {
+	switch {
+	case prompt == config.ReviewOnlyBrief():
+		switch {
+		case prev.Claim.Branch == "":
+			prompt = config.NoCodeReviewOnlyBrief()
+		case prev.CheckpointUnverified:
+			if panelMember {
+				prompt = config.PanelMemberUnverifiedReviewOnlyBrief()
+			} else {
+				prompt = config.UnverifiedReviewOnlyBrief()
+			}
+		case panelMember:
+			prompt = config.PanelMemberReviewOnlyBrief()
+		}
+	case prompt == config.BuiltinReviewBrief():
+		switch {
+		case prev.Claim.Branch == "":
+			prompt = config.NoCodeReviewBrief()
+		case prev.CheckpointUnverified:
+			prompt = config.UnverifiedReviewBrief()
+		}
+	case prompt == config.FixBrief() && prev.Claim.Branch == "":
+		// The FIX phase has no unverified variant: its brief asserts no
+		// verification at all. It reads the review's record (which names the
+		// hand-off's real state) and its reviewed-tip comparison fails closed
+		// when the branch is missing, so a variant would only restate what the
+		// record already says.
+		prompt = config.NoCodeFixBrief()
+	case prompt == config.FixVerifyBrief() && prev.Claim.Branch == "":
+		// Same for the fix phase that a verification round follows, in the
+		// shape whose fix is a record amendment.
+		prompt = config.NoCodeFixVerifyBrief()
+	case prompt == config.VerifyBrief() && prev.Claim.Branch == "":
+		// A verification round on a branchless checkpoint has no code delta
+		// to re-review; its brief adjudicates the record's findings.
+		prompt = config.NoCodeVerifyBrief()
+	}
+	return prompt
 }

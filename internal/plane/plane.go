@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -361,6 +362,42 @@ func (r *mcpReleaser) RecordBranch(ctx context.Context, taskID, runID, branch st
 	})
 }
 
+// PhaseMarker writes the runner's per-phase completion marker. It is separate
+// from Releaser so a plane (or test fake) that predates the marker simply does
+// not offer it, and the runner skips the write.
+type PhaseMarker interface {
+	RecordPhaseDone(ctx context.Context, taskID, runID, phase, tip string) error
+}
+
+var _ PhaseMarker = (*mcpReleaser)(nil)
+
+// RecordPhaseDone records that phase finished at commit tip, signed by the
+// holding run. Like RecordBranch it carries no status, so it cannot move the
+// task. The plane validates phase (lowercase kebab-case, <=40) and tip (7-64
+// lowercase hex); the same rules are checked here so a bad value never costs a
+// round-trip.
+func (r *mcpReleaser) RecordPhaseDone(ctx context.Context, taskID, runID, phase, tip string) error {
+	if taskID == "" || runID == "" {
+		return errors.New("record phase done: taskId and runId are both required")
+	}
+	if !phaseNamePattern.MatchString(phase) || len(phase) > 40 {
+		return fmt.Errorf("record phase done: %q is not a lowercase kebab-case phase name", phase)
+	}
+	if !phaseTipPattern.MatchString(tip) {
+		return fmt.Errorf("record phase done: %q is not a 7-64 character lowercase hex commit", tip)
+	}
+	return r.call(ctx, "record_progress", map[string]any{
+		"taskId":    taskID,
+		"runId":     runID,
+		"phaseDone": map[string]any{"phase": phase, "tip": tip},
+	})
+}
+
+var (
+	phaseNamePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+	phaseTipPattern  = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
+)
+
 // CloseReviewRound closes one round of the durable review record (CLA-637) with
 // record_review({closeRound: round}), signed by the holding run. It sends nothing
 // else - a close is not a revision, not a status move and not an outcome write.
@@ -614,11 +651,18 @@ func noDowngradeRedirect(req *http.Request, _ []*http.Request) error {
 // Heartbeat renews a live claim's lease. It is the driver-side renewal (CLA-358):
 // the loop calls it periodically while a session lives, so a >30-minute session
 // does not have its lease expire and become a stale take-over offer.
+//
+// A refusal that says this run no longer holds the task is classified as
+// ErrRunLost, because it is the one answer the caller must act on at once.
 func (r *mcpReleaser) Heartbeat(ctx context.Context, runID string) error {
 	if runID == "" {
 		return errors.New("heartbeat: runId is required")
 	}
-	return r.call(ctx, "heartbeat", map[string]any{
+	err := r.call(ctx, "heartbeat", map[string]any{
 		"runId": runID,
 	})
+	if err != nil {
+		return classifyHeartbeatRefusal(err)
+	}
+	return nil
 }

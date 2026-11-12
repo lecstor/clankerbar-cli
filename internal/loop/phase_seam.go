@@ -24,6 +24,9 @@ func (r *phaseRun) judgeVerifyRound(ctx context.Context, at *phaseAttempt) {
 	// (CLA-638, B12).
 	r.end.verifyChecked = true
 	r.end.branch, at.evidenceTip, at.evidenceOK, at.evidenceUnverified, at.evidenceWhy = d.checkpointEvidence(ctx, t, at.res, at.inv.WorkDir, &r.review)
+	if !at.evidenceOK {
+		at.evidenceWhy = r.withReportProblem(at.evidenceWhy)
+	}
 	if r.review.state == "sealed" {
 		r.end.reviewRound = r.review.round
 	}
@@ -53,6 +56,10 @@ func (r *phaseRun) judgeVerifyRound(ctx context.Context, at *phaseAttempt) {
 				r.end.verifyCounted = st.ReviewCounted
 				r.end.verifyResolvedIDs = resolvedFindingIDs(st.Reviews)
 				r.end.verifyStatus = st.Status
+				// A runner-claimed verifier writes no record and makes no
+				// hand-over: with the round closed clean and the task still
+				// in_progress, the runner is the one that moves it to review.
+				r.handOverVerifiedRound(ctx, at, st)
 			}
 		}
 	} else if at.evidenceOK && r.review.required {
@@ -100,6 +107,11 @@ func (r *phaseRun) judgeReviewRecord(ctx context.Context, at *phaseAttempt) {
 	nextReviewShaped := r.shape.nextReviewShaped
 	panelOptional := r.shape.panelOptional
 	r.end.branch, at.evidenceTip, at.evidenceOK, at.evidenceUnverified, at.evidenceWhy = d.checkpointEvidence(ctx, t, at.res, at.inv.WorkDir, &r.review)
+	if !at.evidenceOK {
+		// The reason the record did not match, plus what the session's own
+		// report did — the two together are what the operator acts on.
+		at.evidenceWhy = r.withReportProblem(at.evidenceWhy)
+	}
 	// The matched round rides the end (CLA-637): drainPhases closes it if
 	// the handoff guards refuse the respawn this detected handoff asked
 	// for — the one advance path drainPhase cannot close on itself. Only a
@@ -178,7 +190,11 @@ func (r *phaseRun) classifyEmpty(at *phaseAttempt) {
 	// non-zero exit is excluded for the same reason — the transient/
 	// non-retryable classification owns it. Caps and untrusted streams are
 	// excluded because neither can be read as "the tools were missing".
-	at.noMCPNow = reviewOnly && !r.end.reviewRecorded && !r.end.reviewCloseFailed && at.res.ClankerbarCalls == 0 &&
+	//
+	// A runner-claimed phase is excluded too: its session is TOLD to write
+	// nothing, so no successful clankerbar call is its correct shape. Its
+	// missing record is a failed report, never a missing MCP server.
+	at.noMCPNow = r.kind == reportNone && reviewOnly && !r.end.reviewRecorded && !r.end.reviewCloseFailed && at.res.ClankerbarCalls == 0 &&
 		!at.res.Claim.Settled && !at.emittedHandoff &&
 		at.res.Untrusted == "" && at.res.ExitCode == 0 && !at.capped && !at.ceiling && !at.wallclock &&
 		!at.producedNothing && a.Capabilities().TracksClaims

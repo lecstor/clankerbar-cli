@@ -353,6 +353,23 @@ type Invocation struct {
 	// and opencode. codex does not, and the field is inert there.
 	MaxRepeatedToolFailures int
 
+	// MaxSessionIdle bounds how long a session may go without ANY stream output
+	// before the adapter kills it as a silent hang: the adapter kills the
+	// process mid-session and records the cause on Result.IdleKilled. While a
+	// tool call is open the idle clock is paused (a build or an MCP call can
+	// legitimately emit nothing) and MaxToolCallDuration bounds that call
+	// instead. 0 disables the watchdog for this invocation; probes never arm it.
+	//
+	// The loop resolves it per harness from Config.SessionIdleFor and classifies
+	// an IdleKilled end as dead, like a tool-loop kill.
+	MaxSessionIdle time.Duration
+
+	// MaxToolCallDuration bounds one tool call while MaxSessionIdle's watchdog
+	// is armed: a call left open longer than this kills the session with cause
+	// "tool call <id> open for <duration>". 0 leaves an open call unbounded.
+	// Inert when MaxSessionIdle is 0, because the watchdog itself is off.
+	MaxToolCallDuration time.Duration
+
 	// ResumeClaim is the claim a PREVIOUS phase left held, seeded into this
 	// session's Result before its stream is parsed.
 	//
@@ -646,6 +663,15 @@ type Result struct {
 	// of its stream, so it is set after the stream is parsed and survives it.
 	ToolLoop string
 
+	// IdleKilled is the cause when the ADAPTER killed this session for silence:
+	// "no output for <MaxSessionIdle>", or "tool call <id> open for
+	// <MaxToolCallDuration>" when a call was open. Empty for every other end.
+	// opencode clears it when the child exited cleanly anyway (its stream was
+	// parsed to the end); claude keeps it and marks the Result untrusted, because
+	// its reader stopped at the trip. Like ToolLoop it is a verdict about the
+	// session, set after the stream is parsed, never a figure parsed out of it.
+	IdleKilled string
+
 	// OutputDropped is how many bytes of this session's output were NOT retained,
 	// across both streams — the ordinary cost of the rolling window, not a fault.
 	//
@@ -740,6 +766,17 @@ type Result struct {
 	// output, like pending above. opencode keeps its own guard on its parser.
 	toolLoop  *toolLoopGuard
 	toolNames map[string]string
+
+	// idle is claude's no-output watchdog, armed by consume() from the bounds
+	// below; nil in tests that build a Result by hand, where every method is a
+	// no-op. Like toolLoop it is stream-side state, not output.
+	idle *idleGuard
+
+	// maxIdle and maxToolCall are this session's idle-watchdog bounds, resolved
+	// from the Invocation by newSessionResult. Stream-side state like toolLoop:
+	// the guard itself is armed by the reader, which is where the session's kill
+	// switch is in hand.
+	maxIdle, maxToolCall time.Duration
 
 	// scans memoizes the harness-authored text a classifier reads. See scan.
 	scans *scanCache

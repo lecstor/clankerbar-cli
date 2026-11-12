@@ -6,6 +6,7 @@ import (
 
 	"github.com/lecstor/clankerbar-cli/internal/config"
 	"github.com/lecstor/clankerbar-cli/internal/harness"
+	"github.com/lecstor/clankerbar-cli/internal/plane"
 )
 
 // handoffResult is a session that ended cleanly, still holding its task, with
@@ -149,6 +150,41 @@ func TestDrainPhases_AHandoffRespawnsAFreshSessionOnTheEmittedPrompt(t *testing.
 	both := strings.Join(logs, " ")
 	if !strings.Contains(both, "-h1-") {
 		t.Errorf("no iteration log carries the handoff tag -h1-: %v", logs)
+	}
+}
+
+// A handoff inside a RUNNER-claimed drain: the runner holds the lease, so the
+// successor must not be told to resume the run itself, and it may not be pointed
+// at a served skill page it is forbidden to fetch.
+func TestHandoffRespawnInARunnerClaimedDrainUsesTheRunnerPreamble(t *testing.T) {
+	brief := noWIPBrief("CLA-921")
+	res := handoffResult("Continue: the parser is written, wire it into the drain.")
+	res.Claim = harness.Claim{TaskID: brief.ID, RunID: "run-" + brief.ID}
+	f := newStartFixture(t, brief, plane.TaskState{}, twoPhases(), []invokeStep{
+		{res: res},
+		{res: okResult(1, 0)},
+	})
+
+	_, _, handoffs, stop, err := drainPhasesHandoffs(t, f.d, 1)
+	if err != nil || stop {
+		t.Fatalf("drainPhases: err=%v stop=%v", err, stop)
+	}
+	if handoffs != 1 || f.h.invokeCalls != 2 {
+		t.Fatalf("handoffs=%d invokes=%d, want the phase and its handoff successor", handoffs, f.h.invokeCalls)
+	}
+	successor := f.h.invocations[1].Prompt
+	want := strings.NewReplacer(
+		config.PhaseTaskPlaceholder, brief.ID,
+		config.PhaseRunPlaceholder, "run-"+brief.ID,
+	).Replace(config.RunnerHandoffPreamble)
+	if !strings.Contains(successor, want) {
+		t.Errorf("the successor is not framed by the runner handoff preamble:\n%s", successor)
+	}
+	if strings.Contains(successor, `heartbeat("`) {
+		t.Errorf("the successor is told to resume the run itself, but the runner holds the lease:\n%s", successor)
+	}
+	if strings.Contains(successor, "waiting.md") {
+		t.Errorf("the successor is pointed at a served skill page its brief forbids fetching:\n%s", successor)
 	}
 }
 

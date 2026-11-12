@@ -330,3 +330,55 @@ func (d *Driver) parkDeadPhase(ctx context.Context, t Target, phaseLabel string,
 	log.Printf("%sparked %s — four consecutive dead phases, question filed for the operator",
 		labelOf(t), claimLabel(res.Claim))
 }
+
+// parkStartRefusal parks a task whose worktree the runner refused on two
+// consecutive claims, and reports whether the task IS parked: only a Park that
+// took makes the claim safe to let go. The caller logs the outcome, because only
+// it knows the refusal count and the cause. Unlike a dead phase the claim is LIVE
+// here, so the park signs it with its own run and then lets it go: a dirty or
+// diverged tree refuses every claim identically, so another claim buys nothing and
+// only a human can clear it. The question is a non-blocking `clarification` for
+// the same reason parkDeadPhase's is — the task is already parked, so there is
+// nothing to block.
+func (d *Driver) parkStartRefusal(ctx context.Context, t Target, res *harness.Result, why string) bool {
+	if res == nil || res.Claim.TaskID == "" {
+		log.Printf("%sstart-refusal park: no claim observed, so there is no task to park", labelOf(t))
+		return false
+	}
+	pk, ok := t.Releaser.(plane.ParkAPI)
+	if !ok {
+		log.Printf("%sCANNOT PARK %s — two consecutive worktree refusals (%s), but the releaser cannot park or raise a question; the claim is handed back and the next refusal retries the park",
+			labelOf(t), claimLabel(res.Claim), why)
+		return false
+	}
+	ref := claimLabel(res.Claim)
+	outcome := fmt.Sprintf(
+		"Parked: the runner could not prepare this task's worktree on two consecutive claims (%s). The tree or branch needs a human: a dirty or diverged worktree, or a local branch with commits origin does not have. Iteration logs are in %s.",
+		why, d.state.Path())
+	body := fmt.Sprintf(
+		"**%s is parked: its worktree could not be prepared.** The runner refused twice: %s\n\nClean up or remove the worktree/branch named above, then set the task back to `ready`.",
+		ref, why)
+	options := []string{
+		"Set it back to `ready` — I fixed the worktree",
+		"Leave it parked — I will work it myself",
+		"Drop it",
+	}
+
+	pctx, pcancel := context.WithTimeout(context.WithoutCancel(ctx), 20*time.Second)
+	defer pcancel()
+	if err := pk.Park(pctx, res.Claim.TaskID, res.Claim.RunID, outcome); err != nil {
+		log.Printf("%spark failed for %s: %v — the claim is handed back and the next refusal retries the park",
+			labelOf(t), claimLabel(res.Claim), err)
+		return false
+	}
+	// Parked is a let-go: the record describes a run that no longer holds the
+	// task, and a supervisor must not try to hand it back.
+	d.clearCurrentClaim()
+	if err := pk.AskQuestion(pctx, res.Claim.TaskID, body, options, false, "clarification"); err != nil {
+		// The task IS parked — it will not be retried — so the park stands and the
+		// missing question is the failure the operator needs to know about.
+		log.Printf("%sparked %s — two consecutive worktree refusals, but the question for the operator could not be filed: %v",
+			labelOf(t), claimLabel(res.Claim), err)
+	}
+	return true
+}

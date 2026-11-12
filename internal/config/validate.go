@@ -172,7 +172,8 @@ func (c *Config) normalizePaths() error {
 	return nil
 }
 
-// validateHarnessNames refuses an unknown top-level harness, then unknown `harnesses` and `budget.per_harness` keys, in that order.
+// validateHarnessNames refuses an unknown top-level harness, then unknown `harnesses`, `budget.per_harness`
+// and `session_idle` keys, and a negative session_idle bound, in that order.
 func (c *Config) validateHarnessNames() error {
 	// Validate against the harness registry (not a hand-kept switch) so the accepted
 	// set can never drift from what is actually registered — an unregistered value is
@@ -205,6 +206,23 @@ func (c *Config) validateHarnessNames() error {
 	for _, name := range slices.Sorted(maps.Keys(c.Budget.PerHarness)) {
 		if !harness.Known(name) {
 			return fmt.Errorf("budget.per_harness[%q]: unknown harness (want: %s)%s", name, strings.Join(harness.Names(), ", "), retiredHarnessHint(name))
+		}
+	}
+	// A session_idle block keyed by an unregistered harness is an inert watchdog,
+	// so the name is refused here, in sorted order like the two maps above. Only
+	// the NAME is checked: a registered harness whose adapter does not enforce it
+	// (codex) is not detected. A negative bound is refused too - it would reach the
+	// adapter as an expired timer and kill every session at birth.
+	for _, name := range slices.Sorted(maps.Keys(c.SessionIdle)) {
+		if !harness.Known(name) {
+			return fmt.Errorf("session_idle[%q]: unknown harness (want: %s)%s", name, strings.Join(harness.Names(), ", "), retiredHarnessHint(name))
+		}
+		b := c.SessionIdle[name]
+		if b.MaxIdle != nil && *b.MaxIdle < 0 {
+			return fmt.Errorf("session_idle[%q].max_idle is negative", name)
+		}
+		if b.MaxToolCall != nil && *b.MaxToolCall < 0 {
+			return fmt.Errorf("session_idle[%q].max_tool_call is negative", name)
 		}
 	}
 	return nil
