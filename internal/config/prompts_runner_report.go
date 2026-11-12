@@ -1,6 +1,9 @@
 package config
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
 // The done report is how a runner-claimed session hands its work over: it writes
 // no plane record, and ends its final message with one JSON object after
@@ -30,18 +33,28 @@ func runnerDoneReport(fields string) string {
 }
 
 // runnerDoneFindingShape is the finding object the review and verify reports
-// carry, in the same shape the plane's durable record takes.
-const runnerDoneFindingShape = "{severity: \"must\" | \"should\" | \"nit\", summary, evidenceKind, evidence, file, " +
-	"line, kind, requiredFix}"
+// carry, in the same shape the plane's durable record takes. The limits are the
+// plane's bounds: it refuses an over-limit report whole, so a session cannot
+// discover them by trying.
+var runnerDoneFindingShape = "{severity: \"must\" | \"should\" | \"nit\", summary, evidenceKind, evidence, file, " +
+	"line, kind, requiredFix} - each a plain string within its limit, counted as the plane counts them, where a " +
+	"character outside the basic multilingual plane (an emoji, say) counts as two: summary at most " +
+	strconv.Itoa(boundFindingSummary) + ", requiredFix at most " + strconv.Itoa(boundFindingRequiredFix) +
+	", evidence at most " + strconv.Itoa(boundFindingEvidence) + ", evidenceKind " +
+	strconv.Itoa(boundFindingEvidenceKind) + ", file " + strconv.Itoa(boundFindingFile) + ", kind " +
+	strconv.Itoa(boundFindingKind) + "; a finding that needs more says the rest in evidence, never past a limit, " +
+	"because an over-limit report is refused whole"
 
 // runnerFindingUpdatesField is the per-finding update list the fix and verify
 // reports carry in place of the record_review/findingUpdates call. The ids are
 // the ones the sealed record already assigned.
-const runnerFindingUpdatesField = "findingUpdates (one entry per finding, by the plane-assigned id the record gave " +
+var runnerFindingUpdatesField = "findingUpdates (one entry per finding, by the plane-assigned id the record gave " +
 	"you: {findingId, status: \"fixed\", fixCommit: <the commit SHA>} for a fixed finding; {findingId, status: " +
-	"\"refuted\", refutedReason: <the evidence that refutes it>} for a MUST you did not fix; {findingId, status: " +
-	"\"filed\", filedTaskRef: <the follow-up's ref>} for a code-needing finding you dispatched after create_task; " +
-	"an empty array when there is nothing to update)"
+	"\"refuted\", refutedReason: <the evidence that refutes it, at most " +
+	strconv.Itoa(boundFindingRefutedReason) + " characters>} for a MUST you did not fix; {findingId, status: " +
+	"\"filed\", filedTaskRef: <the follow-up's ref alone, at most " +
+	strconv.Itoa(boundFindingFiledTaskRef) + " characters>} for a code-needing finding you dispatched after " +
+	"create_task; an empty array when there is nothing to update)"
 
 // runnerRiskField is the risk declaration the runner needs to hand the task over
 // with submit_for_review: an omitted risk is UNDECLARED and buys no per-batch
@@ -54,19 +67,19 @@ const runnerRiskField = "risk { touches: [...] } - the project's risk classes th
 const runnerImplementReportFields = "summary (what changed), tests (what you actually ran and saw), and park " +
 	"(only when the merged tip supersedes the task: why, naming the commit or the decision that supersedes it)"
 
-const runnerReviewReportFields = "verdict (\"pass\" with no findings, or \"findings\"), reviewedTip (the SHA " +
+var runnerReviewReportFields = "verdict (\"pass\" with no findings, or \"findings\"), reviewedTip (the SHA " +
 	"`git rev-parse HEAD` shows, which must be the tip the context block names), findings (at most 20: keep every " +
 	"MUST, then the most important of the rest, and put the count you left out in omitted - each finding is " +
 	runnerDoneFindingShape + ", and a MUST carries evidenceKind, one of the bar's kinds, and evidence), omitted, " +
 	"and notes (optional: anything the operator should read beside the findings)"
 
-const runnerFixReportFields = "summary (what changed), tests (what you actually ran and saw), " +
+var runnerFixReportFields = "summary (what changed), tests (what you actually ran and saw), " +
 	runnerFindingUpdatesField + ", notes (the reason for any SHOULD or NIT you did not fix), and park (only " +
 	"when the review record is missing or its reviewedTip is not HEAD: what is wrong, with nothing changed)"
 
-const runnerFixLastReportFields = runnerFixReportFields + ", and " + runnerRiskField
+var runnerFixLastReportFields = runnerFixReportFields + ", and " + runnerRiskField
 
-const runnerVerifyReportFields = "verdict (\"pass\" when this round raises no new findings, or \"findings\" when it " +
+var runnerVerifyReportFields = "verdict (\"pass\" when this round raises no new findings, or \"findings\" when it " +
 	"does), reviewedTip (the SHA `git rev-parse HEAD` shows), findings (the NEW MUSTs this round raises and " +
 	"nothing else - only within the fix delta and its regression surface, at most 20, each one " +
 	runnerDoneFindingShape + " carrying evidenceKind and evidence, and the count you left out in omitted), " +
