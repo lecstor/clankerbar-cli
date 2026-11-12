@@ -188,6 +188,11 @@ type panelRunOutcome struct {
 	// the iteration record, exactly as the sequential loop's locals do.
 	finalDead           bool
 	lastProducedNothing bool
+
+	// runLost reports that a member's session was ended because the plane says
+	// the run no longer holds the task. The task is someone else's from that
+	// point: no later phase may run and nothing may be handed back.
+	runLost bool
 }
 
 // runPanelMembers runs n work functions with at most `concurrency` in flight.
@@ -386,6 +391,9 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 			out.claim = m.end.claim
 			out.disposition = claimDisposition(m.end.claim)
 		}
+		if m.end.runLost {
+			out.runLost = true
+		}
 		out.finalDead = m.end.dead
 		out.lastProducedNothing = m.end.producedNothing
 		out.round = max(out.round, m.end.reviewRound)
@@ -435,7 +443,7 @@ func (d *Driver) runPanelInParallel(ctx context.Context, drainNum, ti int, t Tar
 		out.failed[m.role] = panelMemberFailure{reason: reason, optional: m.optional}
 		log.Printf("%siteration %d: the %s panel member recorded nothing (%s) — recording it as failed",
 			labelOf(t), drainNum, m.label, reason)
-		if !m.end.deadBooked {
+		if !m.end.deadBooked && !m.end.runLost {
 			d.tallyEmpty(m.label, d.targetCfg(t).HarnessFor(phases[start+k]))
 		}
 		if n := d.panelMemberFailed(m.label); n >= panelMemberFailBound {

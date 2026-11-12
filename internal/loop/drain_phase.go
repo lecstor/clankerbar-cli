@@ -114,6 +114,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	if opts.worktree != "" {
 		spawnDir = opts.worktree
 	}
+	if opts.taskDir != "" && opts.worktree == "" {
+		// The runner prepared the task's own worktree: run there, with no panel
+		// note, because the brief already describes that tree.
+		spawnDir = opts.taskDir
+	}
 	// The branch this task's repo PRs target, resolved ONCE per phase like the
 	// spawn directory above, and for the same reason: it does not change between
 	// attempts. Filled into the prompt's {{prBase}} placeholder by invocationFor
@@ -131,6 +136,9 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		last: last, prev: prev, prior: prior, phases: phases, panel: panel, opts: opts,
 		shape: shape, a: a, spawnDir: spawnDir, prBase: prBase, briefedTask: briefedTask,
 		fixGrading: fixGrading, verifyDigest: verifyDigest, review: review, end: end,
+		// From the CAPTURED sequence, so a handoff successor (whose ph.Prompt is
+		// the predecessor's successor text) still expects its phase's report.
+		kind: reportKindFor(phases, phaseIdx, opts.runner, panelMember, prev),
 	}
 	for {
 		at := &phaseAttempt{}
@@ -166,12 +174,28 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 		// A tool-loop kill is salvaged like any other end, but not with the
 		// emphatic "produced nothing" line: a clean tree there may well be work
 		// the session committed and pushed before it started looping.
-		if !requireReviewRecord {
+		//
+		// A run the plane says is gone is not salvaged at all: the task is
+		// someone else's now, and the plane told this run not to commit or push.
+		if !requireReviewRecord && at.runLost == nil {
 			d.salvageStrandedWork(ctx, t, &at.res, at.producedNothing && at.toolLoop == "", at.inv.WorkDir)
 		}
 		r.classifyExit(at)
 		r.openPhaseEnd(at)
+		if at.runLost != nil {
+			return r.result(r.endRunLost(at))
+		}
 		r.classifyHandoff(at)
+		// The session made no plane writes: its done report becomes the task's
+		// records here, before the evidence gate judges them. A successor that
+		// takes over from a handoff does the same for its own report.
+		r.applyDoneReport(ctx, at)
+		// classifyHandoff judged canCheckpoint on the claim as the session left
+		// it; a park or hand-over the runner just wrote settled it, and a settled
+		// task must not be carried into the next phase.
+		if !at.res.Claim.Held() {
+			at.canCheckpoint = false
+		}
 		// CLA-457: held-ness alone must never advance the seam. Since CLA-358 the
 		// driver's lease renewer renews a claim for a session's whole lifetime, so
 		// ANY session that claimed ends held — "still holding" is a constant, not

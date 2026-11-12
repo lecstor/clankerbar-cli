@@ -3,6 +3,7 @@ package loop
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -165,7 +166,7 @@ func TestStartLeaseRenewalSkipsWhenThereIsNothingToRenewWith(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d := &Driver{}
 			inv := harness.Invocation{Probe: tc.probe}
-			r := d.startLeaseRenewal(context.Background(), 0, tc.target, &inv, "")
+			r := d.startLeaseRenewal(context.Background(), 0, tc.target, &inv, "", nil)
 			if (r == nil) != tc.wantNil {
 				t.Fatalf("startLeaseRenewal returned %T, wantNil=%v", r, tc.wantNil)
 			}
@@ -189,7 +190,7 @@ func TestStartLeaseRenewalSkipsWhenThereIsNothingToRenewWith(t *testing.T) {
 func TestStartLeaseRenewalPinsTheProductionCadence(t *testing.T) {
 	d := &Driver{} // leaseRenewalInterval zero: the production path
 	inv := harness.Invocation{}
-	r := d.startLeaseRenewal(context.Background(), 0, Target{Releaser: renewingReleaser{hb: &recordingHeartbeat{}}}, &inv, "")
+	r := d.startLeaseRenewal(context.Background(), 0, Target{Releaser: renewingReleaser{hb: &recordingHeartbeat{}}}, &inv, "", nil)
 	if r == nil {
 		t.Fatal("startLeaseRenewal declined a heartbeat-capable releaser; nothing below can be checked")
 	}
@@ -211,6 +212,24 @@ func TestStartLeaseRenewalPinsTheProductionCadence(t *testing.T) {
 }
 
 // --- the beat lifecycle ------------------------------------------------------
+
+// stop reports whether the renewer goroutine was joined: the attempt ladder
+// fails closed on false, because a renewal may still be in flight.
+func TestLeaseRenewerStopReportsTheJoin(t *testing.T) {
+	var nilRenewer *leaseRenewer
+	if !nilRenewer.stop() {
+		t.Error("a nil renewer reported an unjoined stop; nothing was running")
+	}
+	d := &Driver{}
+	inv := harness.Invocation{}
+	r := d.startLeaseRenewal(context.Background(), 0, Target{Releaser: renewingReleaser{hb: &recordingHeartbeat{}}}, &inv, "", nil)
+	if r == nil {
+		t.Fatal("startLeaseRenewal declined a heartbeat-capable releaser")
+	}
+	if !r.stop() {
+		t.Error("stop() = false for a renewer that was running; want it joined")
+	}
+}
 
 func TestLeaseRenewerBeatsASeededClaimFromItsFirstTick(t *testing.T) {
 	// A resumed phase seeds the claim it never claimed (invocationFor): renewal
@@ -476,6 +495,78 @@ func TestLeaseRenewerFailureCounterResetsOnSuccess(t *testing.T) {
 	case <-r.stopped:
 		t.Fatal("renewer stood down despite an intervening success")
 	default:
+	}
+}
+
+// TestLeaseRenewerEndsTheSessionWhenThePlaneSaysTheRunIsGone pins the one refusal
+// the renewer must not retry: the run no longer holds the task, so the session is
+// working someone else's work. onLost fires exactly once - the beat stands down in
+// the same breath, so a later tick cannot call it again - and no further beat is
+// attempted, because no amount of retrying can make the claim ours again.
+func TestLeaseRenewerEndsTheSessionWhenThePlaneSaysTheRunIsGone(t *testing.T) {
+	hb := &recordingHeartbeat{err: fmt.Errorf("%w: run_superseded", plane.ErrRunLost), failuresLeft: 999}
+	var lost atomic.Int64
+	ticks := make(chan time.Time, 8)
+	r := &leaseRenewer{
+		hb:       hb,
+		interval: time.Minute, // cadence is hand-driven via r.tick
+		prefix:   "test: ",
+		claims:   make(chan harness.Claim, 4),
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+		tick:     ticks,
+		onLost: func(err error) {
+			if !errors.Is(err, plane.ErrRunLost) {
+				t.Errorf("onLost got %v, want the plane's ErrRunLost refusal", err)
+			}
+			lost.Add(1)
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer r.stop()
+	go r.run(ctx, heartbeatClaim("r-1"))
+
+	ticks <- time.Now()
+	heartbeatWaitFor(t, "the session to be ended", func() bool { return lost.Load() == 1 })
+
+	// Later ticks must find the beat stood down: the session is already ending.
+	for i := 0; i < 3; i++ {
+		ticks <- time.Now()
+	}
+	heartbeatWaitFor(t, "the later ticks to be consumed", func() bool { return len(ticks) == 0 })
+	time.Sleep(10 * time.Millisecond)
+
+	if n := hb.count(); n != 1 {
+		t.Fatalf("made %d heartbeat call(s) after the run was refused, want 1 and no more", n)
+	}
+	if n := lost.Load(); n != 1 {
+		t.Fatalf("onLost called %d time(s), want exactly once", n)
+	}
+}
+
+// A generic refusal is a blip: the give-up ladder owns it, and it must never be
+// read as "the run is gone" - that would kill healthy sessions.
+func TestLeaseRenewerDoesNotEndTheSessionOnAGenericRefusal(t *testing.T) {
+	hb := &recordingHeartbeat{err: errors.New("plane unreachable"), failuresLeft: 999}
+	var lost atomic.Int64
+	r := &leaseRenewer{
+		hb:       hb,
+		interval: time.Millisecond,
+		prefix:   "test: ",
+		claims:   make(chan harness.Claim, 4),
+		done:     make(chan struct{}),
+		stopped:  make(chan struct{}),
+		onLost:   func(error) { lost.Add(1) },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer r.stop()
+	go r.run(ctx, heartbeatClaim("r-1"))
+
+	heartbeatWaitFor(t, "the give-up ladder to be reached", func() bool { return hb.count() >= heartbeatGiveUp })
+	if n := lost.Load(); n != 0 {
+		t.Fatalf("onLost called %d time(s) on a generic refusal, want 0", n)
 	}
 }
 

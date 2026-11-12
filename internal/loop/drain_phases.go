@@ -61,8 +61,26 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	// CLA-466: one iteration record posts at this drain's boundary, whatever way
 	// it ends — hence the defer, and hence state the deferred record reads.
 	defer s.recordIteration()
+	// The runner takes the claim before the walk so every phase, including the
+	// first, resumes a task the driver holds. claimSessionPath keeps the old
+	// path; a start that cannot be prepared hands its claim back and ends the
+	// drain here.
+	if _, ok := s.runnerClaimEligible(); ok {
+		claim := s.claimForDrain(ctx)
+		if claim == claimHeld && s.prepareStart(ctx) != startReady {
+			s.carried = d.releaseCarried(ctx, t, s.carried)
+			claim = claimNothing
+		}
+		if claim == claimNothing {
+			// Wired mode loops straight back to the poll, and a zero-spend drain
+			// never trips the quiet breaker: idle here, or a poll that says
+			// "spawnable" while next_task offers nothing spins against the plane.
+			s.stop = d.waitOrStop(ctx, d.cfg.IdlePollInterval.OrDefault(60*time.Second))
+			return s.tokens, s.cost, s.handoffs, s.stop, s.err
+		}
+	}
 walk:
-	for s.i = 0; s.i < len(phases); {
+	for s.i = s.start; s.i < len(phases); {
 		st := &seqStep{}
 		st.ph = phases[s.i]
 		// CLA-639: whether this position is one reviewer of a review panel. The
@@ -114,6 +132,10 @@ walk:
 			continue
 		case seqBreak:
 			break walk
+		}
+		if st.end.runLost {
+			log.Printf("%siteration %d: ending the drain: the task is no longer this run's", labelOf(t), drainNum)
+			break
 		}
 		switch s.judgeSequenceEnd(st) {
 		case seqContinue:
@@ -184,8 +206,20 @@ walk:
 		// shape returns to the queue for the next drain — the tally measures it
 		// without tripping the park or fleet machinery, which is how a fleet-wide
 		// silent EOT shows up in the rate the operator watches.
+		//
+		// A runner-claimed retry re-claims first: the empty exit handed the
+		// task back, so nothing is held to resume.
 		if st.end.empty {
-			if !st.last && s.i == 0 && s.emptyRetries < 1 && st.end.releasedToQueue {
+			if !st.last && s.i == s.start && s.emptyRetries < 1 && st.end.releasedToQueue {
+				if s.runnerClaimed {
+					taskID := s.seen.TaskID
+					if st.end.claim != nil {
+						taskID = st.end.claim.Claim.TaskID
+					}
+					if !s.reclaimForRetry(ctx, taskID) {
+						break
+					}
+				}
 				s.emptyRetries++
 				continue
 			}
@@ -273,6 +307,10 @@ type phaseRunOpts struct {
 	// into the shared task worktree.
 	worktree string
 
+	// taskDir, when non-empty, is the runner-prepared task worktree: the spawn
+	// dir, with no panel note, because the brief already describes that tree.
+	taskDir string
+
 	// panelParallel says the JOIN that spawned this member owns the review
 	// round's close. A member must not close it itself: its siblings may still be
 	// recording, and the close is what releases the findings they must not see.
@@ -296,6 +334,11 @@ type phaseRunOpts struct {
 	// (CLA-738 review 3.2). Idempotent on the panel side, so a retry's repeat
 	// call is harmless. Nil for every other caller.
 	onSessionLaunch func()
+
+	// runner, when non-nil, briefs this phase as a session of a drain the RUNNER
+	// claimed: the runner-claimed briefs and the task context block. Nil is the
+	// session-claim path, which runs the shipped briefs.
+	runner *runnerBriefing
 }
 
 // panelWorktreeNote is prepended to a PARALLEL panel member's brief (CLA-697).

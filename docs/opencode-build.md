@@ -114,7 +114,7 @@ its headless default declining every tool call. 2.0.32 changed both, which is wh
 adapter was moved to 2.x rather than the preview adapter promoted. CLA-381 (the transport
 drop that made opencode exit-1 classification retry transient failures) still applies.
 
-**2.x still exits non-zero after a recovered provider error.** The #43622 stream shape
+**2.0.x exits non-zero after a recovered provider error (2.2.x does not).** The #43622 stream shape
 (a chat completion that drains with every `finish_reason` null) is now surfaced as a typed
 `provider.invalid-output` error event which 2.0.32 RETRIES itself — the session carries on and
 finishes the turn — but the process still exits **1** (probed 2026-10-19; pinned by the
@@ -122,7 +122,20 @@ conformance suite's `_recoveredProviderError`, CLA-700). So `opencode run`'s exi
 not a verdict on the session: the driver judges a phase whose stream shows recovered errors on
 its DELIVERY (a verified branch, or an appended review record), and only a stream that ENDS on
 an error event classifies the session as failed or transient. Drafted for the operator to post
-upstream (see CLA-700's outcome under `### Upstream report draft`).
+upstream (see CLA-700's outcome under `### Upstream report draft`). 2.2.7 (checked 2026-11-13)
+reports the same recovery as a `retry` event and exits 0, which the driver reads as an orderly
+exit.
+
+**2.2.x built-in tools.** 2.2.x adds `opencode_*` tools (worktree create/list/remove, session
+move/rename, models, MCP resource reads). Their names match the policy's `*_*` MCP allow, and
+`opencode_worktree_create` wrote a worktree under opencode's data directory from a drain
+session. So the policy denies `opencode_*` and allows back only `opencode_list_mcp_resources`
+and `opencode_read_mcp_resource` (the MCP resource reads it already permits). The cost: an MCP
+server named `opencode` would be shadowed. A future built-in with an underscore and another
+prefix would still pass `*_*`; denying `*_*` and allowing each configured server by name is the
+follow-up that closes that. 2.2.x still offers `skill` and `opencode_worktree_remove` whatever
+the policy says: `skill` is refused at call time, and `worktree_remove` only removes worktrees
+opencode created (the conformance suite pins both).
 
 ## See also
 

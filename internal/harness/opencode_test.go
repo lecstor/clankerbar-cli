@@ -692,6 +692,31 @@ func TestOpencodeRecoveredProviderErrorDoesNotClassifyTheSession(t *testing.T) {
 	}
 }
 
+// opencode 2.2.7 reports the #43622 recovery as a `retry` event (captured from
+// the conformance suite, 2026-11-13) and exits 0. A later non-zero exit must
+// still read as recovered, and a stream that stops on the retry must not.
+func TestOpencodeRetryEventCountsAsRecovered(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"step_start","timestamp":1,"sessionID":"ses_x","part":{"id":"p1","sessionID":"ses_x","messageID":"m1","type":"step-start"}}`,
+		`{"type":"text","timestamp":2,"sessionID":"ses_x","part":{"id":"p2","sessionID":"ses_x","messageID":"m1","type":"text","text":"OK","time":{"start":1,"end":2}}}`,
+		`{"type":"retry","timestamp":3,"sessionID":"ses_x","messageID":"m1","attempt":2,"nextRetryAt":4,"error":{"type":"provider.invalid-output","message":"OpenAI Chat stream ended without finish_reason","status":200}}`,
+		`{"type":"step_start","timestamp":5,"sessionID":"ses_x","part":{"id":"p3","sessionID":"ses_x","messageID":"m2","type":"step-start"}}`,
+		`{"type":"text","timestamp":6,"sessionID":"ses_x","part":{"id":"p4","sessionID":"ses_x","messageID":"m2","type":"text","text":"OK","time":{"start":5,"end":6}}}`,
+		`{"type":"step_finish","timestamp":7,"sessionID":"ses_x","part":{"id":"p5","sessionID":"ses_x","messageID":"m2","type":"step-finish","reason":"stop","cost":0.01,"tokens":{"input":10,"output":2,"reasoning":0,"cache":{"read":0,"write":0}}}}`,
+	}, "\n")
+	res := recoveredFixture(t, stream)
+	if got := RecoveredErrors(res); got != 1 {
+		t.Fatalf("RecoveredErrors = %d, want 1 for a retry event followed by the retried turn (Raw: %v)", got, res.Raw)
+	}
+	if (opencode{}).IsTransient(res) || (opencode{}).IsUnclassifiedTransient(res) {
+		t.Errorf("a recovered retry stream with exit 1 classified transient; diagnostic = %q", (opencode{}).Diagnostic(res))
+	}
+	stopped := recoveredFixture(t, strings.Join(strings.Split(stream, "\n")[:3], "\n"))
+	if got := RecoveredErrors(stopped); got != 0 {
+		t.Errorf("RecoveredErrors = %d for a stream that stopped on its retry event, want 0", got)
+	}
+}
+
 // opencodeToolSchemaRejection returns the REAL 2026-08-19 rejection fixture:
 // three `{"type":"error"}` APIError events, one per iteration log (16:42 /
 // 16:52 / 16:54 local), captured verbatim — the source of anomalyco/opencode
@@ -1030,7 +1055,7 @@ func TestOpencodePermissionPathScoping(t *testing.T) {
 
 	// Last-match-wins: the catch-all must sort before every specific rule.
 	star := strings.Index(perm, `"*"`)
-	for _, key := range []string{"*_*", "edit", "execute", "external_directory", "glob", "grep", "list", "read", "shell", "webfetch", "websearch"} {
+	for _, key := range []string{"*_*", "edit", "execute", "external_directory", "glob", "grep", "list", "opencode_*", "opencode_list_mcp_resources", "opencode_read_mcp_resource", "read", "shell", "webfetch", "websearch"} {
 		if i := strings.Index(perm, `"`+key+`"`); i == -1 {
 			t.Errorf("policy JSON missing key %q", key)
 		} else if i < star {
@@ -1102,6 +1127,15 @@ func TestOpencodePermissionEffective(t *testing.T) {
 		{"webfetch", "*", "deny"},
 		{"websearch", "*", "deny"},
 		{"execute", "*", "deny"},
+		// opencode 2.2 built-ins named like MCP tools; `*_*` would allow them.
+		// Names from the 2.2.7 conformance probe, plus a future one.
+		{"opencode_worktree_create", "*", "deny"},
+		{"opencode_worktree_remove", "*", "deny"},
+		{"opencode_session_move", "*", "deny"},
+		{"opencode_models", "*", "deny"},
+		{"opencode_some_future_tool", "*", "deny"},
+		{"opencode_list_mcp_resources", "*", "allow"},
+		{"opencode_read_mcp_resource", "*", "allow"},
 		// grep/glob/list are read-only search tools and their asks carry the
 		// SEARCH PATTERN, not a path, so the pattern ask is allowed flat and the
 		// workdir boundary lives in the external_directory gate (CLA-390).

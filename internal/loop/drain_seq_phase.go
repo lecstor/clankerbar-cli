@@ -94,11 +94,31 @@ func (s *drainSeq) buildHandoffPrompt(st *seqStep) seqNext {
 				continuation = config.HandoffContinuationFor(st.ph.Name, reviewOnly)
 			}
 		}
-		st.ph.Prompt = config.HandoffPreamble + s.nextPrompt + continuation
+		if s.runnerClaimed {
+			// The runner holds the lease and the worktree, so the successor must
+			// not resume the run itself nor fetch a skill page. The report note
+			// rides last because a successor's prompt is the predecessor's own
+			// text, not a brief: without it the successor would write nothing.
+			st.ph.Prompt = config.RunnerHandoffPreamble + s.nextPrompt + config.RunnerHandoffContinuation(continuation) + s.runnerDoneNote()
+		} else {
+			st.ph.Prompt = config.HandoffPreamble + s.nextPrompt + continuation
+		}
 		s.nextPrompt = ""
 	}
 
 	return seqFall
+}
+
+// runnerDoneNote is the done-report format the handoff successor of the phase at
+// s.i must be told, "" for a phase whose runner brief writes no report (a
+// close-out, a panel member, a custom prompt).
+func (s *drainSeq) runnerDoneNote() string {
+	if s.i < 0 || s.i >= len(s.phases) {
+		return ""
+	}
+	ph := s.phases[s.i]
+	rb := &runnerBriefing{closeOut: s.closeOut && s.i == s.start}
+	return config.RunnerDoneReportFor(resolvedRunnerBrief(ph.Prompt, rb, ph.IsPanelMember(), s.carried))
 }
 
 // checkPhaseBoundary runs the budget breaker at a phase boundary, before a
@@ -179,11 +199,19 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 	// call: the seam below may replace `carried` with this phase's own
 	// claim, which says nothing about how the phase was entered.
 	st.phaseResumed = s.carried != nil
+	opts := phaseRunOpts{taskDir: s.taskDir}
+	if s.runnerClaimed && s.carried != nil {
+		opts.runner = &runnerBriefing{task: s.claimedTask, runID: s.carried.Claim.RunID, start: s.i == s.start}
+		if opts.runner.start {
+			opts.runner.prep = s.prep
+			opts.runner.closeOut = s.closeOut
+		}
+	}
 	st.ptokens, st.pcost, st.pstop, st.end, st.perr = d.drainPhase(ctx, drainNum, ti, s.i, st.tag, st.ph, st.terminal, s.carried, t, spend{
 		start:  prior.start,
 		tokens: prior.tokens + s.tokens,
 		cost:   prior.cost + s.cost,
-	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, phaseRunOpts{})
+	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, opts)
 	s.tokens += st.ptokens
 	s.cost += st.pcost
 	// CLA-630: one entry per session this pass spawned, in spawn order. nil
@@ -257,6 +285,10 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 		}
 		s.carried.CheckpointUnverified = st.seamClaim.CheckpointUnverified
 	}
+
+	// The marker a later claim's start choice reads rides the checkpoint this
+	// phase already proved: the tip recorded here is the one origin holds.
+	s.markPhaseDone(ctx, st)
 
 	return seqFall
 }

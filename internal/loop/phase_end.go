@@ -58,6 +58,10 @@ type phaseEnd struct {
 	// whatever came next.
 	released bool
 
+	// runLost reports that the phase ended because the plane said the run no
+	// longer holds the task; the drain ends and nothing is salvaged or handed back.
+	runLost bool
+
 	// checkpoint reports an orderly end still holding the task, with the sequence
 	// meant to continue into the next phase.
 	checkpoint bool
@@ -165,10 +169,11 @@ type phaseEnd struct {
 	noMCP bool
 
 	// toolLoop is the cause when the adapter killed this pass's session for
-	// repeating a failing tool call (CLA-739), "" otherwise. The pass is also
-	// dead (when !last and held); this carries the NAME of the death, so the
-	// panel handler records the member as failed with the cause rather than
-	// with "died producing nothing".
+	// repeating a failing tool call (CLA-739), "" otherwise. It is also
+	// `idle: <IdleKilled>` when the adapter killed the session for silence. Both
+	// are driver kills: the pass is also dead (when !last and held), and this
+	// carries the NAME of the death, so the panel handler records the member as
+	// failed with the cause rather than with "died producing nothing".
 	toolLoop string
 
 	// reviewCloseFailed reports that this pass's review seam gate passed far
@@ -229,6 +234,15 @@ type phaseEnd struct {
 	// in_progress recorded a pass but did not carry the terminal step, which the
 	// driver says loudly rather than mistaking for a hand-over.
 	verifyStatus string
+
+	// reportProblem is why a runner-claimed session's done report became no
+	// records: missing, unreadable, invalid, or a write the plane refused. The
+	// seam gates append it to their own "no record matched" reason, because a
+	// phase that wrote nothing looks identical either way.
+	reportProblem string
+	// doneReport is the verification round's report, kept so the hand-over can
+	// carry its risk declaration after the round is closed.
+	doneReport *config.DoneReport
 
 	// sequenceEnd, when non-nil, reports that this RESUMED phase ended the
 	// sequence without completing it, and the RUN must not end with it. Two

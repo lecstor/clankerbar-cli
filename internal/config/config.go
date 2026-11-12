@@ -448,6 +448,13 @@ type Config struct {
 	// claude and opencode. Inert under codex.
 	MaxRepeatedToolFailures *int `json:"max_repeated_tool_failures,omitempty"`
 
+	// SessionIdle is the no-output watchdog, per harness: how long a session may
+	// stay silent before its adapter kills it, and how long one tool call may stay
+	// open. Unset harnesses use the shipped default (see SessionIdleFor); a
+	// harness whose adapter does not enforce it has none. `omitempty` for the same
+	// identity reason as the dial above.
+	SessionIdle map[string]IdleBounds `json:"session_idle,omitempty"`
+
 	// EchoSessions mirrors each session's output stream to the daemon's own
 	// stderr while it runs, as well as to its iteration log. Default FALSE
 	// (CLA-701): the stream is the whole harness transcript — opencode emits

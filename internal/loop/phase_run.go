@@ -34,6 +34,11 @@ type phaseRun struct {
 	fixGrading   string
 	verifyDigest string
 
+	// The done-report contract of a runner-claimed phase: which report the phase
+	// expects, and the one-shot note for a plane client that cannot write.
+	kind              reportKind
+	reportWriterNoted bool
+
 	// Spend the ladder has counted so far, and the phase's disposition.
 	tokens int
 	cost   float64
@@ -140,11 +145,13 @@ type attemptVerdict struct {
 // phaseAttempt is one pass through the ladder: the session it spawned, how that
 // session ended, and the seam's verdict on it. A fresh one is made per attempt.
 // res is shared by pointer with phaseEnd.claim, so it lives here rather than
-// being passed by value between stages.
+// being passed by value between stages. runLost is non-nil when the renewer
+// ended the session because the plane says the run no longer holds the task.
 type phaseAttempt struct {
 	inv                harness.Invocation
 	res                harness.Result
 	ierr               error
+	runLost            error
 	logPath            string
 	logFile            *os.File
 	capped             bool
@@ -166,6 +173,8 @@ type phaseAttempt struct {
 	evidenceUnverified bool
 	evidenceWhy        string
 	evidenceTip        string
+	attr               config.Attribution
+	role               string
 	empty              bool
 	noMCPNow           bool
 	retryNoMCP         bool
