@@ -63,9 +63,15 @@ func (d *Driver) drainPhases(ctx context.Context, drainNum, ti int, t Target, pr
 	defer s.recordIteration()
 	// The runner takes the claim before the walk so every phase, including the
 	// first, resumes a task the driver holds. claimSessionPath keeps the old
-	// path; only claimNothing ends the drain here.
+	// path; a start that cannot be prepared hands its claim back and ends the
+	// drain here.
 	if _, ok := s.runnerClaimEligible(); ok {
-		if s.claimForDrain(ctx) == claimNothing {
+		claim := s.claimForDrain(ctx)
+		if claim == claimHeld && s.prepareStart(ctx) != startReady {
+			s.carried = d.releaseCarried(ctx, t, s.carried)
+			claim = claimNothing
+		}
+		if claim == claimNothing {
 			// Wired mode loops straight back to the poll, and a zero-spend drain
 			// never trips the quiet breaker: idle here, or a poll that says
 			// "spawnable" while next_task offers nothing spins against the plane.
@@ -296,6 +302,10 @@ type phaseRunOpts struct {
 	// tip. The brief tells the session it is there, so a member cannot wander
 	// into the shared task worktree.
 	worktree string
+
+	// taskDir, when non-empty, is the runner-prepared task worktree: the spawn
+	// dir, with no panel note, because the brief already describes that tree.
+	taskDir string
 
 	// panelParallel says the JOIN that spawned this member owns the review
 	// round's close. A member must not close it itself: its siblings may still be

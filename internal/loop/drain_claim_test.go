@@ -22,7 +22,8 @@ type claimCall struct {
 
 // claimingReleaser is fakeReleaser plus the plane's TaskClaimer: offers are
 // served in order and ClaimTask is the test's own function, so one fake covers
-// a fresh claim, a race and a withheld task.
+// a fresh claim, a race and a withheld task. It serves TaskState as well, because
+// a runner-claimed drain cannot choose a start without the plane's record.
 type claimingReleaser struct {
 	fakeReleaser
 	offers     []plane.Offer
@@ -30,6 +31,20 @@ type claimingReleaser struct {
 	claimFn    func(taskID string, takeover bool) (plane.ClaimedTask, error)
 	offerCalls int
 	claimCalls []claimCall
+	// state answers for every task; a states entry overrides it per task id.
+	state    plane.TaskState
+	states   map[string]plane.TaskState
+	stateErr error // non-nil fails every read
+}
+
+func (c *claimingReleaser) TaskState(_ context.Context, taskID string) (plane.TaskState, error) {
+	if c.stateErr != nil {
+		return plane.TaskState{}, c.stateErr
+	}
+	if st, ok := c.states[taskID]; ok {
+		return st, nil
+	}
+	return c.state, nil
 }
 
 func (c *claimingReleaser) NextOffer(context.Context) (plane.Offer, error) {
@@ -64,8 +79,17 @@ func claimedBrief(b plane.TaskBrief) func(string, bool) (plane.ClaimedTask, erro
 // target whose Releaser is the fake.
 func claimSeq(rel plane.Releaser) *drainSeq {
 	phases := twoPhases()
+	d := &Driver{cfg: &config.Config{}}
+	// A retry re-chooses its start, which reads origin and prepares a worktree:
+	// stub both so these tests stay about claiming.
+	d.originBranch = func(context.Context, string, string, string) originBranchFacts {
+		return originBranchFacts{Known: true}
+	}
+	d.prepareWorktree = func(context.Context, worktreeRequest) (worktreePrep, error) {
+		return worktreePrep{}, nil
+	}
 	return &drainSeq{
-		d:         &Driver{},
+		d:         d,
 		t:         Target{Name: "t", Releaser: rel},
 		phases:    phases,
 		rawPhases: phases,

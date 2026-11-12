@@ -183,7 +183,7 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 		start:  prior.start,
 		tokens: prior.tokens + s.tokens,
 		cost:   prior.cost + s.cost,
-	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, phaseRunOpts{})
+	}, phases, panelState{round: s.panelRound, failed: s.panelFailed, recorded: s.panelRecorded}, phaseRunOpts{taskDir: s.taskDir})
 	s.tokens += st.ptokens
 	s.cost += st.pcost
 	// CLA-630: one entry per session this pass spawned, in spawn order. nil
@@ -257,6 +257,10 @@ func (s *drainSeq) runPhase(ctx context.Context, st *seqStep) seqNext {
 		}
 		s.carried.CheckpointUnverified = st.seamClaim.CheckpointUnverified
 	}
+
+	// The marker a later claim's start choice reads rides the checkpoint this
+	// phase already proved: the tip recorded here is the one origin holds.
+	s.markPhaseDone(ctx, st)
 
 	return seqFall
 }

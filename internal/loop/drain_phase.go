@@ -114,6 +114,11 @@ func (d *Driver) drainPhase(ctx context.Context, drainNum int, ti int, phaseIdx 
 	if opts.worktree != "" {
 		spawnDir = opts.worktree
 	}
+	if opts.taskDir != "" && opts.worktree == "" {
+		// The runner prepared the task's own worktree: run there, with no panel
+		// note, because the brief already describes that tree.
+		spawnDir = opts.taskDir
+	}
 	// The branch this task's repo PRs target, resolved ONCE per phase like the
 	// spawn directory above, and for the same reason: it does not change between
 	// attempts. Filled into the prompt's {{prBase}} placeholder by invocationFor

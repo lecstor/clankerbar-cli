@@ -38,6 +38,13 @@ type drainSeq struct {
 	// claimedTask is the brief behind a runner-claimed drain's claim, kept for
 	// the start-phase wiring.
 	claimedTask plane.TaskBrief
+	// taskDir is the runner-prepared worktree every phase of this drain runs in;
+	// empty when the start is branchless or the drain is not runner-claimed.
+	taskDir string
+	// prep is what preparing taskDir did (merge result, conflicts), for the brief.
+	prep worktreePrep
+	// closeOut marks a close-out claim, which takes the close-out brief.
+	closeOut bool
 
 	// What the drain returns.
 	tokens   int

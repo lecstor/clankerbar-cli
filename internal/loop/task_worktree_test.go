@@ -11,6 +11,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -383,6 +384,29 @@ func TestTaskWorktree_FetchFailureErrors(t *testing.T) {
 		t.Fatalf("an unreachable origin must fail the fetch")
 	} else if !strings.Contains(err.Error(), "fetching origin") {
 		t.Errorf("error %q is not reported as a fetch failure the caller can retry", err)
+	}
+}
+
+// Fetched is the caller saying it already ran the one fetch: a start that read
+// origin must not pay for a second round-trip, and must still work when the
+// remote has gone away in between.
+func TestTaskWorktree_FetchedSkipsTheFetch(t *testing.T) {
+	f := newTaskWorktreeRepo(t)
+	f.commitOn(t, taskWorktreeBranch, "origin/staging", "a.txt", "work", "work")
+	// The caller's fetch: the refs are local from here on, and only then does the
+	// remote go away.
+	gitRun(t, f.checkout, "fetch", "origin")
+	gitRun(t, f.checkout, "remote", "set-url", "origin", filepath.Join(f.root, "gone.git"))
+
+	req := f.request()
+	req.Resume = true
+	req.Fetched = true
+	if _, err := f.prepare(t, req); err != nil {
+		t.Fatalf("prepare with Fetched = true: %v", err)
+	}
+	req.Fetched = false
+	if _, err := f.prepare(t, req); !errors.Is(err, errWorktreeFetch) {
+		t.Fatalf("prepare with Fetched = false gave %v, want errWorktreeFetch", err)
 	}
 }
 

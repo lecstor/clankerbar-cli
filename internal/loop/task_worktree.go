@@ -20,6 +20,7 @@ package loop
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -39,6 +40,8 @@ type worktreeRequest struct {
 	PRBase   string // e.g. staging
 	Resume   bool   // branch already exists on origin
 	CloseOut bool   // approved close-out: check out, never merge PRBase
+	NoMerge  bool   // resume without merging PRBase: a review/fix/verify start must keep origin's tip
+	Fetched  bool   // the caller already fetched origin in Checkout
 }
 
 // worktreePrep is the prepared tree the caller briefs the session with.
@@ -63,6 +66,10 @@ type registeredWorktree struct {
 	prunable bool
 }
 
+// errWorktreeFetch marks a prep whose fetch failed: that is transient, so it
+// never counts against a task the way a deterministic refusal does.
+var errWorktreeFetch = errors.New("fetching origin")
+
 // prepareTaskWorktree makes the task's worktree ready for a session and reports
 // where it is and what happened to it. An error from the fetch is transient: the
 // caller should retry rather than treat the task as failed.
@@ -72,8 +79,10 @@ func prepareTaskWorktree(ctx context.Context, req worktreeRequest) (worktreePrep
 		return worktreePrep{}, err
 	}
 	prep := worktreePrep{Dir: dir}
-	if _, err := taskWorktreeGit(ctx, req.Checkout, "fetch", "origin", "--prune"); err != nil {
-		return prep, fmt.Errorf("fetching origin in %s: %w", req.Checkout, err)
+	if !req.Fetched {
+		if _, err := taskWorktreeGit(ctx, req.Checkout, "fetch", "origin", "--prune"); err != nil {
+			return prep, fmt.Errorf("%w in %s: %v", errWorktreeFetch, req.Checkout, err)
+		}
 	}
 	registered, err := taskWorktreeWorktrees(ctx, req.Checkout)
 	if err != nil {
@@ -183,7 +192,7 @@ func reuseTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreePr
 			return prep, err
 		}
 	}
-	if req.Resume && !req.CloseOut {
+	if req.Resume && !req.CloseOut && !req.NoMerge {
 		merged, upToDate, conflicts, err := taskWorktreeMerge(ctx, prep.Dir, "origin/"+req.PRBase)
 		if err != nil {
 			return prep, err
@@ -216,7 +225,7 @@ func createTaskWorktree(ctx context.Context, req worktreeRequest, prep worktreeP
 		return prep, err
 	}
 	prep.Created = true
-	if req.Resume && !req.CloseOut {
+	if req.Resume && !req.CloseOut && !req.NoMerge {
 		merged, upToDate, conflicts, err := taskWorktreeMerge(ctx, prep.Dir, "origin/"+req.PRBase)
 		if err != nil {
 			return prep, err

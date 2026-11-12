@@ -57,6 +57,15 @@ func phaseDriverWithReleaser(t *testing.T, h harness.Adapter, phases []config.Ph
 	// config's own branch and no test reaches git or the network. The tests
 	// that pin the RESOLUTION override this with their own fake.
 	d.probePRBase = func(context.Context, string, string) (bool, string, error) { return true, "", nil }
+	// The start-phase prep reads origin and prepares the task worktree, both by
+	// running git. Stub them so no phase test reaches a real repository: the
+	// origin read knows nothing, and the worktree is the temp workdir.
+	d.originBranch = func(context.Context, string, string, string) originBranchFacts {
+		return originBranchFacts{Known: true}
+	}
+	d.prepareWorktree = func(context.Context, worktreeRequest) (worktreePrep, error) {
+		return worktreePrep{Dir: d.cfg.WorkDir, Created: true}, nil
+	}
 	return d
 }
 

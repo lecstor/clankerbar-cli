@@ -422,6 +422,15 @@ type Driver struct {
 	// today's behaviour, never blocks a spawn.
 	probePRBase func(ctx context.Context, dir, integration string) (integrationOnOrigin bool, defaultBranch string, err error)
 
+	// originBranch reads what origin says about the task's branch, for the
+	// start-phase choice. A field because tests stub the git the start-phase
+	// prep does.
+	originBranch func(ctx context.Context, checkout, branch, doneTip string) originBranchFacts
+
+	// prepareWorktree prepares the task worktree every phase of a runner-claimed
+	// drain runs in. A field because tests stub the git the start-phase prep does.
+	prepareWorktree func(ctx context.Context, req worktreeRequest) (worktreePrep, error)
+
 	// newAdapter resolves a harness NAME to its adapter, for a sequence whose
 	// phases are not all on one harness (CLA-366). Production is harness.Get; a
 	// field so tests can hand out their own fakes per name.
@@ -446,9 +455,14 @@ type Driver struct {
 	// goroutine a session's result is processed on: with a review panel's members
 	// running concurrently (CLA-697) that is more than one at a time, and a Go map
 	// written from two goroutines is a data race, not a lost update. Every
-	// read-modify-write of spentBy, deadTally and panelFailStreak holds it;
-	// nothing that calls out to the plane or a harness may hold it.
+	// read-modify-write of spentBy, startRefusals, deadTally and panelFailStreak
+	// holds it; nothing that calls out to the plane or a harness may hold it.
 	stateMu sync.Mutex
+
+	// startRefusals counts consecutive worktree refusals per task id, so a tree
+	// that refuses every claim deterministically reaches the operator instead of
+	// the queue. Lazily built for a Driver built without the constructor.
+	startRefusals map[string]int
 
 	// claimFileMu serialises CURRENT_CLAIM writes (CLA-708). A review panel's
 	// members run concurrently (CLA-697) and each renewer persists the same
@@ -615,6 +629,7 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		tgtCost:             make([]float64, n),
 		waitGrace:           time.Minute,
 		limitBeaconInterval: 5 * time.Minute,
+		startRefusals:       make(map[string]int),
 		newVerifier: func(workdir string, allowUncheckedPR bool) deliveryVerifier {
 			v := delivery.New(workdir, "")
 			if allowUncheckedPR {
@@ -625,6 +640,9 @@ func NewMulti(cfg *config.Config, h harness.Adapter, targets []Target) *Driver {
 		newSalvager: func(workdir string) workSalvager { return salvage.New(workdir, "") },
 		newAdapter:  harness.Get,
 		probePRBase: ProbeOriginPRBase,
+
+		originBranch:    readOriginBranch,
+		prepareWorktree: prepareTaskWorktree,
 	}
 	for i := range d.rcVersions {
 		d.rcVersions[i] = -1 // unfetched; 0 is a REAL answer (nothing stored)
@@ -650,6 +668,23 @@ func (d *Driver) adapterFor(ph config.Phase) (harness.Adapter, error) {
 		return d.h, nil
 	}
 	return d.newAdapter(name)
+}
+
+// originBranchFn is the origin read, falling back to the default when a Driver
+// was built without the constructor (a test's &Driver{}).
+func (d *Driver) originBranchFn() func(ctx context.Context, checkout, branch, doneTip string) originBranchFacts {
+	if d.originBranch != nil {
+		return d.originBranch
+	}
+	return readOriginBranch
+}
+
+// prepareWorktreeFn is prepareTaskWorktree, with the same nil fallback.
+func (d *Driver) prepareWorktreeFn() func(ctx context.Context, req worktreeRequest) (worktreePrep, error) {
+	if d.prepareWorktree != nil {
+		return d.prepareWorktree
+	}
+	return prepareTaskWorktree
 }
 
 // orRef was folded into sessionDir's log line; kept out to avoid a helper with

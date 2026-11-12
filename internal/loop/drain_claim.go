@@ -134,10 +134,11 @@ func (s *drainSeq) plantClaim(ct plane.ClaimedTask) {
 	log.Printf("%siteration %d: runner claimed %s (%s)", labelOf(s.t), s.drainNum, claimLabel(res.Claim), kind)
 }
 
-// reclaimForRetry re-takes the claim a runner-claimed retry is about to resume.
-// A plain claim first; an expired lease needs the takeover. When this task is
-// gone it falls back to any claim at all — the dead-retry counters key on task
-// id, so a different task simply earns its own budget.
+// reclaimForRetry re-takes the claim a runner-claimed retry is about to resume,
+// and re-chooses the start the respawn begins at. A plain claim first; an
+// expired lease needs the takeover. When this task is gone it falls back to any
+// claim at all — the dead-retry counters key on task id, so a different task
+// simply earns its own budget.
 func (s *drainSeq) reclaimForRetry(ctx context.Context, taskID string) bool {
 	claimer, ok := s.runnerClaimEligible()
 	if !ok {
@@ -146,7 +147,7 @@ func (s *drainSeq) reclaimForRetry(ctx context.Context, taskID string) bool {
 	if taskID == "" {
 		// The dead session named no task, so a claim by id cannot be tried:
 		// fall through to whatever the queue offers.
-		return s.claimForDrain(ctx) == claimHeld
+		return s.claimForDrain(ctx) == claimHeld && s.startAfterReclaim(ctx)
 	}
 	ct, err := claimer.ClaimTask(ctx, taskID, false)
 	if errors.Is(err, plane.ErrClaimLost) {
@@ -155,12 +156,23 @@ func (s *drainSeq) reclaimForRetry(ctx context.Context, taskID string) bool {
 	switch {
 	case err == nil:
 		s.plantClaim(ct)
-		return true
+		return s.startAfterReclaim(ctx)
 	case errors.Is(err, plane.ErrClaimLost), errors.Is(err, plane.ErrNotClaimable):
-		return s.claimForDrain(ctx) == claimHeld
+		return s.claimForDrain(ctx) == claimHeld && s.startAfterReclaim(ctx)
 	default:
 		log.Printf("%siteration %d: could not re-claim %s for a retry (%v) — ending the drain",
 			labelOf(s.t), s.drainNum, taskID, err)
 		return false
 	}
+}
+
+// startAfterReclaim re-chooses the start for the claim a retry just planted: the
+// retry may land a different task, or a different start on the same one, so the
+// walk resumes wherever the fresh facts say.
+func (s *drainSeq) startAfterReclaim(ctx context.Context) bool {
+	if s.prepareStart(ctx) != startReady {
+		return false
+	}
+	s.i = s.start
+	return true
 }
